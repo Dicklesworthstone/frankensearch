@@ -5,9 +5,12 @@
 //! attach only applicable fields from this common vocabulary: `phase`,
 //! `schema_id`, `generation`, `segment_id`, `shard_id`, `doc_count`,
 //! `query_len`, `result_count`, `duration_us`, privacy-safe query-shape counts
-//! and topology hash, `plan`, `segments_touched`, `pruning_windows`,
-//! `blocks_skipped`, and `candidate_docs`. High-cardinality document IDs,
-//! terms, query text, source content, and score cutoffs are never span fields.
+//! and topology hash, low-cardinality `query_form` (`raw` or `preparsed`) and
+//! `cache_lookup` (`not_checked`, `disabled`, `miss`, or `hit`), `plan`,
+//! `segments_touched`, `pruning_windows`, `blocks_skipped`, and
+//! `candidate_docs`. High-cardinality document IDs, terms, query text, cache
+//! keys or fingerprints, source content, and score cutoffs are never span
+//! fields.
 
 use std::time::Instant;
 

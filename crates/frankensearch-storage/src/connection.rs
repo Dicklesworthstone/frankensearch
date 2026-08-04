@@ -1,8 +1,11 @@
+use std::error::Error;
+use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use frankensearch_core::{SearchError, SearchResult};
-use fsqlite::Connection;
+use fsqlite::{Connection, FrankenError};
 use serde::{Deserialize, Serialize};
 
 use crate::metrics::{StorageMetrics, StorageMetricsSnapshot};
@@ -59,6 +62,92 @@ pub struct Storage {
 
 static FILE_BOOTSTRAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+// FrankenSQLite already retries contention while it opens the pager, but later
+// connection-admission stages can still return a typed Busy/Locked error while
+// a just-used peer connection releases its namespace state. Keep this outer
+// handoff short and bounded: seven waits total 113 ms, enough to cross a normal
+// scheduler handoff without turning persistent lock contention into a hang.
+const CONNECTION_OPEN_MAX_ATTEMPTS: u32 = 8;
+const CONNECTION_OPEN_RETRY_BASE_DELAY_MS: u64 = 1;
+const CONNECTION_OPEN_RETRY_MAX_DELAY_MS: u64 = 50;
+
+fn is_retryable_connection_open_error(error: &FrankenError) -> bool {
+    matches!(
+        error,
+        FrankenError::Busy | FrankenError::BusyRecovery | FrankenError::DatabaseLocked { .. }
+    )
+}
+
+fn connection_open_retry_delay(failed_attempt: u32) -> Duration {
+    let growth = failed_attempt.saturating_sub(1).min(6);
+    let delay_ms =
+        (CONNECTION_OPEN_RETRY_BASE_DELAY_MS << growth).min(CONNECTION_OPEN_RETRY_MAX_DELAY_MS);
+    Duration::from_millis(delay_ms)
+}
+
+fn retry_connection_open<T>(
+    mut operation: impl FnMut() -> Result<T, FrankenError>,
+    mut on_retry: impl FnMut(u32, Duration, &FrankenError),
+) -> Result<T, FrankenError> {
+    let mut attempt = 1;
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if is_retryable_connection_open_error(&error)
+                    && attempt < CONNECTION_OPEN_MAX_ATTEMPTS =>
+            {
+                let delay = connection_open_retry_delay(attempt);
+                on_retry(attempt.saturating_add(1), delay, &error);
+                attempt = attempt.saturating_add(1);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn open_connection_with_retry(path: &str) -> Result<Connection, FrankenError> {
+    retry_connection_open(
+        || Connection::open(path),
+        |next_attempt, delay, error| {
+            tracing::debug!(
+                target: "frankensearch.storage",
+                path,
+                next_attempt,
+                max_attempts = CONNECTION_OPEN_MAX_ATTEMPTS,
+                ?delay,
+                error = %error,
+                "retrying transient storage connection-open contention"
+            );
+            std::thread::sleep(delay);
+        },
+    )
+}
+
+#[derive(Debug)]
+struct StorageStageError<E> {
+    stage: &'static str,
+    source: E,
+}
+
+impl<E> fmt::Display for StorageStageError<E>
+where
+    E: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.stage, self.source)
+    }
+}
+
+impl<E> Error for StorageStageError<E>
+where
+    E: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 impl std::fmt::Debug for Storage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Storage")
@@ -84,18 +173,17 @@ impl Storage {
         let file_bootstrap_guard = if config.db_path.as_os_str() == ":memory:" {
             None
         } else {
-            Some(
-                FILE_BOOTSTRAP_LOCK
-                    .lock()
-                    .map_err(|_| SearchError::SubsystemError {
-                        subsystem: "storage",
-                        source: Box::new(std::io::Error::other("file bootstrap lock poisoned")),
-                    })?,
-            )
+            Some(FILE_BOOTSTRAP_LOCK.lock().map_err(|_| {
+                map_storage_error_at(
+                    "file bootstrap lock",
+                    std::io::Error::other("lock poisoned"),
+                )
+            })?)
         };
 
         let path = config.db_path.to_string_lossy().to_string();
-        let conn = Connection::open(path).map_err(map_storage_error)?;
+        let conn = open_connection_with_retry(&path)
+            .map_err(|error| map_storage_error_at("connection open", error))?;
 
         let storage = Self {
             conn,
@@ -107,15 +195,15 @@ impl Storage {
         storage.apply_pragmas()?;
         schema::bootstrap(storage.connection())?;
         storage.metrics.record_schema_bootstrap();
-        drop(file_bootstrap_guard);
 
-        if let Ok(version) = schema::current_version(storage.connection()) {
-            tracing::debug!(
-                target: "frankensearch.storage",
-                schema_version = version,
-                "storage bootstrap complete"
-            );
-        }
+        let version =
+            schema::current_version_at(storage.connection(), "post-open schema verification")?;
+        drop(file_bootstrap_guard);
+        tracing::debug!(
+            target: "frankensearch.storage",
+            schema_version = version,
+            "storage bootstrap complete"
+        );
 
         Ok(storage)
     }
@@ -235,12 +323,12 @@ impl Storage {
 
         self.conn
             .execute("PRAGMA foreign_keys=ON;")
-            .map_err(map_storage_error)?;
+            .map_err(|error| map_storage_error_at("apply foreign_keys pragma", error))?;
 
         if self.config.wal_mode {
             self.conn
                 .execute("PRAGMA journal_mode=WAL;")
-                .map_err(map_storage_error)?;
+                .map_err(|error| map_storage_error_at("apply journal_mode pragma", error))?;
         } else if let Err(error) = self.conn.execute("PRAGMA journal_mode=DELETE;") {
             tracing::warn!(
                 target: "frankensearch.storage",
@@ -249,7 +337,9 @@ impl Storage {
             );
             self.conn
                 .execute("PRAGMA journal_mode=WAL;")
-                .map_err(map_storage_error)?;
+                .map_err(|error| {
+                    map_storage_error_at("apply journal_mode fallback pragma", error)
+                })?;
         }
 
         self.conn
@@ -257,14 +347,14 @@ impl Storage {
                 "PRAGMA busy_timeout={};",
                 self.config.busy_timeout_ms
             ))
-            .map_err(map_storage_error)?;
+            .map_err(|error| map_storage_error_at("apply busy_timeout pragma", error))?;
 
         self.conn
             .execute(&format!(
                 "PRAGMA cache_size={};",
                 self.config.cache_size_pages
             ))
-            .map_err(map_storage_error)?;
+            .map_err(|error| map_storage_error_at("apply cache_size pragma", error))?;
 
         if self.config.raptorq_repair_symbols > 0 {
             tracing::warn!(
@@ -284,22 +374,30 @@ pub(crate) fn map_storage_error<E>(source: E) -> SearchError
 where
     E: std::error::Error + Send + Sync + 'static,
 {
+    map_storage_error_at("storage operation", source)
+}
+
+pub(crate) fn map_storage_error_at<E>(stage: &'static str, source: E) -> SearchError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
     SearchError::SubsystemError {
         subsystem: "storage",
-        source: Box::new(source),
+        source: Box::new(StorageStageError { stage, source }),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::panic::{self, AssertUnwindSafe};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process;
     use std::sync::{Arc, Barrier, mpsc};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use frankensearch_core::{SearchError, SearchResult};
+    use fsqlite::FrankenError;
     use fsqlite_types::value::SqliteValue;
     use serde_json::json;
 
@@ -361,7 +459,8 @@ mod tests {
     }
 
     const CONCURRENT_OPEN_THREADS: usize = 4;
-    const CONCURRENT_OPEN_STRESS_ROUNDS: usize = 24;
+    const CONCURRENT_OPEN_STRESS_ROUNDS: usize = 100;
+    const REPEATED_CURRENT_SCHEMA_OPENS: usize = 32;
 
     fn run_concurrent_open_round(config: &StorageConfig) -> Vec<SearchResult<i64>> {
         let barrier = Arc::new(Barrier::new(CONCURRENT_OPEN_THREADS));
@@ -462,6 +561,117 @@ mod tests {
         }
     }
 
+    fn checkpoint_metric(conn: &fsqlite::Connection, name: &str) -> SearchResult<i64> {
+        let rows = conn
+            .query("PRAGMA fsqlite_checkpoint_stats;")
+            .map_err(super::map_storage_error)?;
+        for row in rows {
+            let Some(SqliteValue::Text(metric_name)) = row.get(0) else {
+                continue;
+            };
+            if metric_name.as_ref() != name {
+                continue;
+            }
+            return match row.get(1) {
+                Some(SqliteValue::Integer(value)) => Ok(*value),
+                Some(other) => Err(SearchError::SubsystemError {
+                    subsystem: "storage",
+                    source: Box::new(std::io::Error::other(format!(
+                        "unexpected checkpoint metric type for {name}: {other:?}"
+                    ))),
+                }),
+                None => Err(SearchError::SubsystemError {
+                    subsystem: "storage",
+                    source: Box::new(std::io::Error::other(format!(
+                        "missing checkpoint metric value for {name}"
+                    ))),
+                }),
+            };
+        }
+        Err(SearchError::SubsystemError {
+            subsystem: "storage",
+            source: Box::new(std::io::Error::other(format!(
+                "checkpoint metric {name} was not reported"
+            ))),
+        })
+    }
+
+    fn schema_version_markers(conn: &fsqlite::Connection) -> SearchResult<Vec<i64>> {
+        conn.query("SELECT version FROM schema_version ORDER BY version;")
+            .map_err(super::map_storage_error)?
+            .iter()
+            .map(|row| schema::row_i64(row, 0, "schema_version.version"))
+            .collect()
+    }
+
+    fn artifact_len(path: &Path) -> u64 {
+        match std::fs::metadata(path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => panic!(
+                "metadata for {} should be readable: {error}",
+                path.display()
+            ),
+        }
+    }
+
+    fn wal_artifact_lengths(db_path: &Path) -> [u64; 2] {
+        let dot_wal = PathBuf::from(format!("{}.wal", db_path.display()));
+        let dash_wal = PathBuf::from(format!("{}-wal", db_path.display()));
+        [artifact_len(&dot_wal), artifact_len(&dash_wal)]
+    }
+
+    #[test]
+    fn connection_open_retry_exhaustion_preserves_typed_busy_error() {
+        let mut attempts = 0_u32;
+        let mut observed_retries = Vec::new();
+
+        let error = super::retry_connection_open(
+            || {
+                attempts = attempts.saturating_add(1);
+                Err::<(), _>(FrankenError::Busy)
+            },
+            |next_attempt, delay, error| {
+                assert!(matches!(error, FrankenError::Busy));
+                observed_retries.push((next_attempt, delay));
+            },
+        )
+        .expect_err("persistent Busy must exhaust the bounded retry budget");
+
+        assert!(matches!(error, FrankenError::Busy));
+        assert_eq!(attempts, super::CONNECTION_OPEN_MAX_ATTEMPTS);
+        let expected_retries: Vec<_> = (1..super::CONNECTION_OPEN_MAX_ATTEMPTS)
+            .map(|failed_attempt| {
+                (
+                    failed_attempt.saturating_add(1),
+                    super::connection_open_retry_delay(failed_attempt),
+                )
+            })
+            .collect();
+        assert_eq!(observed_retries, expected_retries);
+    }
+
+    #[test]
+    fn connection_open_retry_propagates_non_busy_error_without_retry() {
+        let mut attempts = 0_u32;
+        let mut retries = 0_u32;
+
+        let error = super::retry_connection_open(
+            || {
+                attempts = attempts.saturating_add(1);
+                Err::<(), _>(FrankenError::NoSuchTable {
+                    name: "unrelated".to_owned(),
+                })
+            },
+            |_, _, _| retries = retries.saturating_add(1),
+        )
+        .expect_err("non-Busy connection errors must fail immediately");
+
+        assert!(matches!(error, FrankenError::NoSuchTable { name } if name == "unrelated"));
+        assert_eq!(attempts, 1);
+        assert_eq!(retries, 0);
+    }
+
     #[test]
     fn open_in_memory_bootstraps_schema() {
         let storage = Storage::open_in_memory().expect("in-memory storage should open");
@@ -517,7 +727,10 @@ mod tests {
     #[test]
     fn concurrent_open_initializes_schema_consistently() {
         let tmp = TempDbPath::new("concurrent-bootstrap");
-        let config = tmp.config();
+        let config = StorageConfig {
+            busy_timeout_ms: 0,
+            ..tmp.config()
+        };
         let results = run_concurrent_open_round(&config);
         assert_eq!(results.len(), CONCURRENT_OPEN_THREADS);
         for (thread_idx, result) in results.into_iter().enumerate() {
@@ -534,7 +747,17 @@ mod tests {
     #[test]
     fn concurrent_open_stays_stable_across_repeated_rounds() {
         let tmp = TempDbPath::new("concurrent-bootstrap-rounds");
-        let config = tmp.config();
+        let config = StorageConfig {
+            busy_timeout_ms: 0,
+            ..tmp.config()
+        };
+
+        let seed = Storage::open(config.clone()).expect("schema-v6 seed should open");
+        assert_eq!(
+            schema::current_version(seed.connection()).expect("seed version should read"),
+            SCHEMA_VERSION
+        );
+        drop(seed);
 
         for round in 0..CONCURRENT_OPEN_STRESS_ROUNDS {
             let results = run_concurrent_open_round(&config);
@@ -555,6 +778,60 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn repeated_current_schema_opens_do_not_mutate_marker_or_grow_wal() {
+        let tmp = TempDbPath::new("current-schema-read-only");
+        let config = StorageConfig {
+            busy_timeout_ms: 0,
+            ..tmp.config()
+        };
+        let seed = Storage::open(config.clone()).expect("schema-v6 seed should open");
+        seed.connection()
+            .execute("PRAGMA wal_autocheckpoint=0;")
+            .expect("test should disable automatic checkpoints");
+
+        let before_frames = checkpoint_metric(seed.connection(), "wal_frames_estimate")
+            .expect("baseline WAL frame count should be observable");
+        let before_lengths = wal_artifact_lengths(&tmp.path);
+        let before_markers = schema_version_markers(seed.connection())
+            .expect("baseline schema markers should be readable");
+
+        let mut opened = Vec::with_capacity(REPEATED_CURRENT_SCHEMA_OPENS);
+        for iteration in 0..REPEATED_CURRENT_SCHEMA_OPENS {
+            let storage = Storage::open(config.clone()).unwrap_or_else(|error| {
+                panic!("current-schema open {iteration} should succeed: {error}")
+            });
+            assert_eq!(
+                schema::current_version(storage.connection())
+                    .expect("current-schema version should remain readable"),
+                SCHEMA_VERSION,
+                "open {iteration} should observe v6"
+            );
+            opened.push(storage);
+        }
+
+        let after_frames = checkpoint_metric(seed.connection(), "wal_frames_estimate")
+            .expect("final WAL frame count should be observable");
+        let after_lengths = wal_artifact_lengths(&tmp.path);
+        let after_markers = schema_version_markers(seed.connection())
+            .expect("final schema markers should be readable");
+
+        assert_eq!(
+            after_frames, before_frames,
+            "read-only current-schema opens must not append WAL frames"
+        );
+        assert_eq!(
+            after_lengths, before_lengths,
+            "read-only current-schema opens must not grow either supported WAL artifact"
+        );
+        assert_eq!(
+            after_markers, before_markers,
+            "read-only current-schema opens must not rewrite schema markers"
+        );
+
+        drop(opened);
     }
 
     #[test]

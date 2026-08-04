@@ -17,6 +17,44 @@ Conventions:
 - A generic proxy, stored baseline, separate invocation, previous commit,
   `HEAD`, `OLD`, or in-repo `ORIG` arm is not an incumbent win.
 
+### 2026-07-31 — Tokenizer HYBRID fused-emit length dispatch WASH / no ship (`bd-ljw1u`, SandyGrove)
+
+- **Hypothesis:** retain the frozen fused ASCII-emitter's short-token benefit
+  while routing the settled long-token regression to the shipping bulk path.
+  The HYBRID arm used the pre-registered 16-byte threshold: lengths at most 15
+  bytes use fused emit; lengths 24 bytes and above use bulk. This is an
+  internal BASE/HYBRID comparison, not an external-incumbent result.
+- **Immutable receipt and method:** committed card
+  [`tok-emit-hybrid-three-arm-20260731.md`](evidence/e8h/tok-emit-hybrid-three-arm-20260731.md)
+  at `86857994aacc104b3e3287d70095cc92d44cad4d` (card SHA-256
+  `acc2b69d5139ca75c394327558e18b4c7be4589db3a82a661155618e2cd626cf`)
+  records a single-worktree, three-checkout, 16-round rotated BASE/PURE/HYBRID
+  invocation on `taskset -c 37`. The HYBRID ELF was
+  `2806975660b553eed31fb355ec1c50f6980706598b792b44597eefaaaf504570`;
+  BASE was `7ce38d9a1bac3fa8029f09d747d6d156a956a81ce0c7557b2d78a09dd121c280`.
+  The receipt includes same-invocation shipping-vs-shipping A/A controls for
+  each arm and corpus; the pre-registered admissibility band was p5..p95
+  within `[0.97, 1.03]` for a majority of runs.
+- **Result:** HYBRID versus BASE was **1.0288** on the short corpus (95% CI
+  `[1.0206, 1.0318]`) and **0.9832** on the long corpus (95% CI
+  `[0.9711, 0.9877]`). The HYBRID A/A controls failed: short p5..p95
+  `[0.9687, 1.0219]`, 3/16 runs in band; long `[0.9731, 1.0370]`, 6/16.
+  The full run's load rose from 9.94 to 42.38, but the receipt already treats
+  that as a caveat rather than an excuse. HYBRID fully recovered PURE's
+  settled long regression (HYBRID/PURE 1.3896) without a measurable short
+  dispatch cost (HYBRID/PURE 0.9954); neither fact converts the BASE comparison
+  into a KEEP.
+- **Decision:** **REJECT / WASH; branch remains banked, no retraction
+  narrative.** The short result misses the hard `>= 1.03` bar by 0.1%, the
+  long result is inside its failed null band, and the all-arm null gate made
+  the run VOID for KEEP purposes. No performance, campaign, activation, or
+  incumbent claim may cite this result.
+- **Retry predicate:** rerun the same rotated three-arm protocol only during a
+  window with load below about 10 for the full run and a majority of all six
+  arm-by-corpus same-invocation A/A controls within `[0.97, 1.03]`; HYBRID may
+  be considered only if it then reaches `>= 1.03` on both corpora with CIs
+  clear of the null floor.
+
 ### 2026-07-17 — Quiver global `wide::u32x8` postings unpack policy (`bd-quill-e2-grimoire-quiver-accg.2`, BeigeHorse)
 
 - **Hypothesis:** routing every canonical FSLX bitpacked doc-delta and frequency payload through the portable eight-lane `wide::u32x8` unpacker would beat the scalar reservoir for the complete width domain without changing bytes or decoded values.
@@ -10700,6 +10738,13 @@ cargo, local or remote.
 
 ## 2026-07-10 — REJECTED MEASUREMENT BUNDLE: unbatched paired int8 row-block A/B exceeds the 5% CV gate (cod_fse)
 
+> **2026-07-31 basis correction (BlackThrush):** the rejection recorded in this row
+> rests on the 5% CV gate, which the 2026-07-27 model-integrity correction
+> **withdrew**. This bundle carries no same-invocation A/A arm, so there is no null
+> floor to decide against: its correct label is **UNDECIDABLE**, not REJECTED. The
+> `bd-b5wl` lever is separately re-decided on direction consistency at the end of
+> this file; production source is unchanged.
+
 **This rejects the timing bundle, not the row-blocked candidate.** The first same-binary A/B of the four-row
 AVX2 query-reuse candidate ran both ORIGINAL and candidate in every measured routine, counterbalanced AB/BA
 order, and black-boxed both input and result. It was one `RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch
@@ -10736,6 +10781,13 @@ amortizes worker scheduling jitter without splitting arms across workers or invo
 
 ## 2026-07-10 — REJECTED MEASUREMENT BUNDLE: batch16 int8 row-block A/B misses CV gate by 0.0318 point (cod_fse)
 
+> **2026-07-31 basis correction (BlackThrush):** the rejection recorded in this row
+> rests on the 5% CV gate, which the 2026-07-27 model-integrity correction
+> **withdrew**. This bundle carries no same-invocation A/A arm, so there is no null
+> floor to decide against: its correct label is **UNDECIDABLE**, not REJECTED. The
+> `bd-b5wl` lever is separately re-decided on direction consistency at the end of
+> this file; production source is unchanged.
+
 **This again rejects the timing bundle, not the candidate.** The recorded retry condition above was exercised
 as one fail-closed RCH invocation on worker `ovh-a` (AMD Ryzen 7 5800X), with both arms in one binary and a
 fixed 16-query AB/BA batch inside every Criterion iteration. Inputs and results remained black-boxed, and the
@@ -10770,6 +10822,13 @@ different iteration counts for the two independently estimated arms.
 
 ## 2026-07-10 — REJECTED MEASUREMENT BUNDLE: batch32 linear sampling collides with active worker contention (cod_fse)
 
+> **2026-07-31 basis correction (BlackThrush):** the rejection recorded in this row
+> rests on the 5% CV gate, which the 2026-07-27 model-integrity correction
+> **withdrew**. This bundle carries no same-invocation A/A arm, so there is no null
+> floor to decide against: its correct label is **UNDECIDABLE**, not REJECTED. The
+> `bd-b5wl` lever is separately re-decided on direction consistency at the end of
+> this file; production source is unchanged.
+
 **This rejects the timing bundle, not the candidate.** The full-query retry ran as one fail-closed RCH
 invocation on `vmi1152480` (AMD EPYC, 10 physical CPUs), with 32-query AB/BA batches, both arms in every
 measured routine, black-boxed inputs/results, exact output parity, and batch-normalized values below. The
@@ -10803,6 +10862,13 @@ below 5%, that is an infrastructure blocker rather than evidence for or against 
 
 ## 2026-07-10 — REJECTED MEASUREMENT BUNDLE: 60-second flat sampling leaves one mult5 CV above gate (cod_fse)
 
+> **2026-07-31 basis correction (BlackThrush):** the rejection recorded in this row
+> rests on the 5% CV gate, which the 2026-07-27 model-integrity correction
+> **withdrew**. This bundle carries no same-invocation A/A arm, so there is no null
+> floor to decide against: its correct label is **UNDECIDABLE**, not REJECTED. The
+> `bd-b5wl` lever is separately re-decided on direction consistency at the end of
+> this file; production source is unchanged.
+
 **This rejects the timing bundle, not yet the candidate.** Criterion flat sampling was encoded in the bench
 source and run in one fail-closed RCH invocation on `hz1` (AMD EPYC-Milan, four cores/eight threads). Each of
 20 samples averaged a fixed number of complete 32-query AB/BA batches; both arms ran inside every measured
@@ -10833,6 +10899,13 @@ the lone unstable estimator without changing code or splitting the A/B across wo
 ---
 
 ## 2026-07-10 — REJECTED MEASUREMENT BUNDLE / BLOCKER: 120-second flat samples remain scheduler-dominated (cod_fse)
+
+> **2026-07-31 basis correction (BlackThrush):** the rejection recorded in this row
+> rests on the 5% CV gate, which the 2026-07-27 model-integrity correction
+> **withdrew**. This bundle carries no same-invocation A/A arm, so there is no null
+> floor to decide against: its correct label is **UNDECIDABLE**, not REJECTED. The
+> `bd-b5wl` lever is separately re-decided on direction consistency at the end of
+> this file; production source is unchanged.
 
 **This rejects the timing bundle and surfaces an infrastructure blocker; it does not bind the candidate.**
 The final recorded retry ran one fail-closed RCH invocation on `ovh-a` (AMD Ryzen 7 5800X) after admission
@@ -10903,6 +10976,11 @@ cost; it also gives each row one accumulator instead of the incumbent's dual-cha
 
 ## 2026-07-10 — REJECTED MEASUREMENT BUNDLE / BLOCKER: balanced null control cannot resolve int8 row blocks (cod_fse)
 
+> **2026-07-31 basis correction (BlackThrush):** unlike the five CV-gated bundles
+> above, this row ran a real A/A null, so its `INSIDE NULL FLOOR` basis **stands**.
+> It is one of the six occasions in the end-of-file direction-consistency
+> re-decision of `bd-b5wl`.
+
 **This rejects the measurement bundle, not the four-row candidate or the int8 ADC family.** The superseding
 null-controlled substrate ran as one fail-closed `RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec --
 cargo bench ...` invocation on worker `vmi1227854` (AMD EPYC, AVX2). ORIGINAL and candidate were linked in
@@ -10953,6 +11031,14 @@ This is not a parity ceiling: different int8 primitives (for example a quantizer
 signed-dot transform or a packed transposed slab) remain separate veins.
 
 ### 2026-07-10 — cc_fse — ISA baseline check for -search: the "+avx2 build = free 2× on int8 ADC" fix does NOT apply — the hot int8 kernel is already AVX2 via RUNTIME DISPATCH, not the compile baseline (frankenscipy's 1.745× came from AUTOVECTORIZED code; this is explicit intrinsics)
+
+> **2026-07-31 cross-reference (BlackThrush):** the "Residual, non-zero
+> opportunity" paragraph below calls the `wide::f32x8` ceiling *small*. That
+> estimate was measured and **revised upward** on 2026-07-16 — see
+> *"REVISES 'expected SMALL': x86-64-v3 gives ~3.4-4.9x on the wide::f32x8
+> reduction SITE (`bd-yt8m`)"* later in this file. The site-level upside is
+> LARGE; only the end-to-end query gain stays bounded by the rescore-tail
+> fraction. Read the two rows together.
 
 **The hypothesis** (frankenredis popcount 3.14×, frankenscipy cholesky 1.745×): the workspace has no
 `.cargo/config.toml`, no `RUSTFLAGS`, no `target-cpu` — verified — so it builds at the **generic x86-64 baseline
@@ -17980,3 +18066,298 @@ reused scratch buffer + one exact-size copy into the retained Vec) worth
 the P9 lever table with canonical-encode Impact cut to ≤2 — the 16.23%-ENG
 family number is not addressable mass: it contains the seal radix scatter
 (classifier name-collision), attribution-unstable placement, and hash floor.
+### 2026-07-31 — BASIS CORRECTION: five 2026-07-10 int8 row-block bundles are UNDECIDABLE, not decided; the `bd-b5wl` lever stays UNDECIDABLE (BlackThrush)
+
+**Scope: five decision *bases* are void and are relabelled. No lever verdict is
+issued. No source changed; production stays ORIGINAL.**
+
+The `2026-07-27 model-integrity correction` withdrew the coefficient-of-variation
+admissibility rule campaign-wide — *"decide solely from the candidate median CI
+versus the A/A null floor. Raw CV is diagnostic only."* It was applied to five
+rows (`bd-l5x3` x4, `bd-3srq` x1). It was **never applied to the 2026-07-10
+`cod_fse` measurement-bundle family**, every member of which was decided on
+exactly that withdrawn rule:
+
+| 2026-07-10 bundle | basis recorded then | basis now |
+|---|---|---|
+| unbatched paired int8 row-block A/B | dispersion rule | **VOID** |
+| batch16 int8 row-block A/B | dispersion rule, missed by 0.0318 pt | **VOID** |
+| batch32 linear sampling | dispersion rule | **VOID** |
+| 60-second flat sampling | dispersion rule | **VOID** |
+| 120-second flat samples | dispersion rule | **VOID** |
+| balanced null control | *inside its own null floor* | **stands** |
+
+**They are not re-decidable under the corrected gate either.** The five carry
+Criterion mean/CI and dispersion only, with **no same-invocation A/A arm**. The
+corrected gate decides against an A/A null floor; with no null arm there is no
+floor. Their correct label is **UNDECIDABLE**. Only the balanced-null-control
+occasion ran a real null, and it already records the honest `INSIDE NULL FLOOR`
+outcome — which is also UNDECIDABLE.
+
+**Therefore the `bd-b5wl` four-row int8 query-reuse candidate remains
+UNDECIDABLE.** It has never been decided by an admissible measurement, and this
+correction does not decide it.
+
+### Directional prior — recorded as evidence, explicitly NOT a verdict
+
+The six occasions ran on three microarchitectures (`hz1` EPYC-Milan, `ovh-a`
+Ryzen 7 5800X, `vmi1227854` EPYC) under five sampling substrates, each with
+bit-exact index/doc/score parity and recall@10 = nDCG@10 = 1.0000. Their twelve
+candidate/original ratios (>1.0 = candidate slower):
+
+| occasion | mult3 | mult5 |
+|---|---:|---:|
+| unbatched | 0.9852 | 1.0948 |
+| batch16 | 1.0209 | 1.0024 |
+| batch32 | 1.2389 | 1.0301 |
+| flat60 | 1.0212 | 1.0203 |
+| flat120 | 1.2048 | 1.1893 |
+| balanced null control | 1.1369 | 1.1928 |
+
+**11 of 12 exceed 1.0. Sign test p = 0.0064 two-sided; median ratio 1.0625.**
+
+```bash
+python3 -c "
+from math import comb
+v=[0.9852,1.0948,1.020871,1.002430,1.238912,1.030111,1.021188,1.020255,1.204816,1.189327,1.136852,1.192786]
+s=sum(1 for x in v if x>1.0); n=len(v)
+print(s,'/',n,' p2=',2*sum(comb(n,k) for k in range(s,n+1))/2**n)"
+# -> 11 / 12  p2= 0.006347656250
+```
+
+**This is a prior, not a decision.** The occasions are not independent replicates
+of one protocol — they differ in batching, sampling and worker — so the sign test
+describes a consistent *direction* and licenses no ratio. Under this repository's
+own contract the direction cannot retire the lever: a decision needs a
+same-invocation numeric A/A null or a counted unchanged mechanism, and this has
+neither.
+
+**Method note — the gate caught this row.** An earlier draft of this entry
+declared the lever rejected on the strength of the sign test above. The
+pre-commit ledger gate refused it with `BLOCKED REJECT ... missing:
+same-invocation numeric A/A null OR counted no-change mechanism`. That refusal
+was correct and the verdict was downgraded to UNDECIDABLE rather than the gate
+worked around. The direction is worth recording precisely because it is the kind
+of evidence that feels decisive and is not.
+
+**Decision: BASIS CORRECTION only. Comparison class: SELF-SPEEDUP** (frankensearch
+vs frankensearch; no incumbent arm ran).
+
+Production is unchanged and was verified this session: `search.rs:615,634` call
+`int8_scan_range_orig`; the four-row `int8_scan_range` (`:751` -> `dot_i8x4_i8`
+`:800`) remains bench-only, exactly as the balanced-null-control occasion left it.
+
+The distinct `vpmaddubs` primitive (kernel-level 1.23x) is a **separate vein**
+and is untouched here.
+
+**To actually decide `bd-b5wl`:** one invocation, both arms in one binary, a
+`paired_median_ratio` A/A null plus the A/B, self-reported ELF SHA-256, and a
+median-CI/null-floor decision — the same substrate `int8_vs_f16_fast_ab` already
+implements. It is not blocked on a lever; it is blocked on a quiet worker.
+
+Full sweep of all 84 retry predicates:
+`docs/evidence/retry-predicate-sweep-20260731.md`.
+
+
+### 2026-07-31 — RESOLVED: `bd-3srq` top-k revalidation finally reached its timed path — the shipped int8 two-pass is 0.6033 of the exact f16 scan, decidable (BlackThrush)
+
+`bd-3srq` had been `BLOCKED/UNTIMED` since 2026-07-22 across three attempts. The
+2026-07-27 model-integrity correction restated its predicate as *same executing
+ELF, same-invocation A/A and A/B, exact 32/32 order and recall@10 = 1.0000, and a
+median-CI/null-floor decision; raw CV is diagnostic only.* FoggySquirrel repaired
+build/link admission on 2026-07-26 (`hz2`, 9m10s, exit 0) but **did not execute
+the binary**, so the row stayed blocked for a reason that had already been fixed.
+
+Every predicate clause was already implemented in the retained harness
+`crates/frankensearch-index/benches/int8_vs_f16_fast_ab.rs`
+(`print_bench_elf_sha256()`, `paired_median_ratio` A/A at `:152` and A/B at
+`:153`, `is_admissible_null()` at `:162`, `decidable_against()` at `:172`). The
+only missing step was running it. Executed this session, strict-remote
+`rch exec --base 3debdf25 --clean-overlay --no-overlay` on worker `vmi1227854`,
+`release-perf`, exit 0. Self-reported from inside the process:
+
+```
+bench_elf_sha256=d66a2799cdadd02cccd5cce8bda18974b31f484334c5b3fdddcc3da220007cd5
+  (5156976 bytes) .../release-perf/int8_vs_f16_fast_ab
+
+[recall] int8_two_pass vs f16-exact: set-recall@10=1.0000 exact-order-match=32/32
+[null]   fast_scan: median 1.0351 median_ci95 [0.9529, 1.0738] p5 0.7741 p95 1.3405 admissible=true
+[lever]  fast_scan int8/f16 median 0.6033 median_ci95 [0.5536, 0.6803] p5 0.3058 p95 1.3342
+         -> DECIDABLE WIN (int8 two-pass faster, candidate-lossless)
+```
+
+**Outcome: DECIDABLE.** The lever median 0.6033 sits below the same-invocation
+A/A null's p5 of 0.7741, so it clears the null floor instead of sitting inside
+it. Losslessness held exactly: set-recall@10 = 1.0000 with 32/32 exact order
+match.
+
+**Comparison class: SELF-SPEEDUP** — the shipped int8 two-pass against our own
+exact f16 scan. No incumbent arm exists in this harness, so this says nothing
+about faiss/usearch/Lucene-class engines. This **revalidates an already-shipped
+path**; it is not a new lever, and no source changed.
+
+**Two caveats travel with the number.**
+
+1. The **A/A null median is 1.0351**, which fails a strict `1.000 +/- 0.030`
+   median clause. The harness admits it because the null CI95 `[0.9529, 1.0738]`
+   contains 1.0, which is the contract this repository wrote — but the control
+   showed a 3.5% asymmetry, so 0.6033 should be read as *decidably below the
+   floor*, not as a precise ratio.
+2. The **null band is wide, `[0.7741, 1.3405]`**, because the fleet was at 15
+   concurrent builds. The margin is large enough that the direction survives, but
+   a quotable point estimate needs a quiet worker — the same limit that keeps the
+   fleet-isolation predicates blocked.
+
+Full sweep context: `docs/evidence/retry-predicate-sweep-20260731.md`.
+
+
+### 2026-07-31 — REFUTED: "the fastest lossless vector-search primitive" — the FSVI 4-bit two-pass is decidably SLOWER than a live third-party exact scan at equal threads (BlackThrush)
+
+**Claim under test:** `origin/main:CHANGELOG.md:82` — *"Lossless quantized
+search: FSVI 4-bit two-pass, the fastest lossless vector-search primitive"* —
+the only unbounded superlative on any public surface of this repository. It also
+travels as the subject line of commit `f04074a4`. Its entire evidentiary base is
+`docs/PERF_LEDGER.md:825` and `:827`, and both compare against **our own** int8
+two-pass and **our own** flat f16 scan. No third-party arm existed anywhere in
+its provenance.
+
+**Actual legacy incumbent: `ndarray` 0.17.2 over `matrixmultiply` 0.3.10** —
+the `faiss::IndexFlatIP` structure for exact search (dense
+`queries[nq x d] . corpus^T[d x N]` GEMM, then bounded top-k per row). Verified
+third-party and BLAS-free: `ndarray`'s lockfile deps list `matrixmultiply`, and
+`grep -cE '^name = "(blas-src|cblas-sys|openblas-src|netlib-src)"' Cargo.lock`
+returns 0, so `Array2::dot` lowers to `matrixmultiply`'s runtime-dispatched
+AVX2/FMA sgemm. **Both arms ran side by side in one binary, one invocation, over
+one fixture.**
+
+Strict-remote `rch exec --base 3debdf25 --clean-overlay` on worker
+`vmi1152480`, host `frankenlibc-test`, AMD EPYC (with IBPB), nproc 10, exit 0.
+Executing ELF SHA-256, self-reported from inside the process:
+`3a99d4940d987778e83cd80637995f24ec92a01bf2a710931e1091a1f7cdcc6e`.
+N=100000, dim=384, k=10, 32 queries, mult=5, 61 rounds.
+
+**Same-invocation A/A null: median 0.9814, p5 0.7656, p95 1.4825 — CLEAN.**
+The null is an incumbent run bracketed by incumbent runs and scored by the same
+rule as every candidate ratio, so it measures exactly the noise the candidate
+ratio is exposed to. It clears the 1.000 +/- 0.030 median clause.
+
+| subject | numeric incumbent ratio | [p5, p95] | verdict |
+|---|---:|---|---|
+| 4-bit two-pass, **1 thread both arms** | **1.5790** | [1.3040, 3.0279] | **SLOWER, outside null** |
+| 4-bit two-pass, as shipped (~2.5 eff threads vs incumbent's 1) | 1.1575 | [0.6521, 2.1822] | WASH, inside null |
+| our exact flat scan | 1.3369 | [0.7371, 3.4275] | WASH, inside null |
+| incumbent unbatched GEMV | 4.3293 | [3.6938, 6.6701] | slower than batched — batched is the incumbent's best shape |
+
+`cpu/wall` per arm confirms the thread discipline: incumbent 0.98, pinned
+candidate 0.99, default candidate 2.51. (`/proc/self/task` is process-wide and
+cannot distinguish arms; cpu/wall is the per-arm concurrency evidence.)
+
+**Losslessness is SUPPORTED and is strengthened, not weakened.** Top-10 doc-id
+set equality over 32 queries, on three independent ELFs:
+`candidate == ours_exact_f16` 32/32, `candidate == incumbent_f32` 32/32,
+`ours_exact_f16 == incumbent_f32` 32/32. The ledger had only ever tested the
+first of those; the primitive is now verified lossless against a full-precision
+f32 exhaustive scan.
+
+**Decision: the speed superlative is REFUTED; the losslessness claim stands.**
+At equal threads the primitive is decidably slower than a third-party exact
+scan, and as shipped it reaches only parity despite a ~2.5x thread advantage.
+Margin honesty: 1.5790 clears the null p95 of 1.4825 by 6.5% — a pass, not a
+rout — and the magnitude's own p5-p95 is wide, so "decidably slower" is the
+finding and 1.58x is a point estimate.
+
+**Comparison class: INCUMBENT.**
+
+**Method note — the null was fixed by geometry, not by a quieter host or more
+samples.** Two earlier runs used a whole-round A/A with the replicates at
+opposite ends of each round; both nulls were dirty (median 1.0321 at 15 rounds,
+1.0598 at 61), and raising n made it *worse* because the dispersion was host
+drift across the ~600 ms replicate gap, not sampling error. Bracketing each
+subject between two incumbent runs — the control `PERF_LEDGER.md:822-824`
+already validated on this fleet at B/A 0.9999 — brought the null to 0.9814 on
+the same worker at the same round count. When a null is dirty, check the
+control's geometry before blaming the fleet.
+
+**Scope.** One incumbent does not settle "fastest" in either direction; faiss,
+usearch and hnswlib remain unmeasured and none is in-tree. The incumbent holds
+f32 (146.5 MiB) against the candidate's 4-bit pass-1 slab (18.3 MiB), so the
+comparison is generous to the candidate on working set and does not cover
+faiss's own quantized indexes. Fixture is clustered (64 centroids, noise 0.30).
+
+Full card: `docs/evidence/fsvi-4bit-vs-incumbent-20260731.md`.
+Retraction filed as `bd-retract-fastest-lossless-superlative-3ush8` — it cannot
+be landed from this checkout, which is 270 commits behind `origin/main` and
+whose HEAD does not contain the line.
+
+### 2026-07-31 — QG-1 continuous/receipted width sweep locates Tantivy's raw width-4 ceiling but remains no-claim (`bd-h6eh`, BlackThrush)
+
+**Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
+Measured source
+`ccc37c8e611cd313201108ffe9260376a977b4bd`, built with exact-base
+`rch exec --base ccc37c8e... --clean-overlay --no-overlay` and zero
+synchronized overlay files, ran pinned Tantivy beside Quill from executable
+SHA-256
+`53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637`.
+The full digest was self-reported inside the process and matched every row.
+All nine requested widths ran on `threadripperje`, boot
+`b107a2c6-9fac-40df-a637-c3a772b0ad57`, a 64-core/128-thread AMD Ryzen
+Threadripper PRO 5995WX. Each row completed 66/66 work receipts with zero
+H1/H2 wall mismatches, zero terminal failures, matching evidence identity,
+and `laws_attested=false`. A later receipt-integrity audit invalidated every
+CPU-derived activity field while leaving host, census membership, wall,
+throughput, and executable identity intact.
+
+The corrected null gate requires an effect median-CI excluding 1, effect
+distance from 1 greater than twice the widest A/A null half-width, and both
+null medians within 2% of 1. It passes widths 1, 8, 64, and 96. Widths 2, 4,
+16, 32, and 128 fail because their Tantivy null medians are
+`1.038377/0.973066/1.072212/0.971548/0.975137`. CV decided no row.
+**A/A null: Tantivy/Tantivy median `1.009576 [0.999715, 1.035060]` and
+Quill/Quill median `1.001974 [0.980393, 1.029851]`, same invocation at
+width 1.**
+
+| requested | host | Quill docs/s | Tantivy docs/s | Q/T median [95% CI] | observed Quill workers med | observed Tantivy index / all workers med |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 | `threadripperje` | 35,551.521 | 71,930.065 | `0.499882 [0.487438, 0.511549]` | 1 | 2 / 8 |
+| 2 | `threadripperje` | 36,505.685 | 116,424.790 | `0.312842 [0.306422, 0.321050]` | 2 | 4 / 12 |
+| 4 | `threadripperje` | 37,270.193 | 132,936.059 | `0.277612 [0.273338, 0.284961]` | 4 | 8 / 19 |
+| 8 | `threadripperje` | 35,409.346 | 126,257.903 | `0.281265 [0.269878, 0.286662]` | 8 | 16 / 31 |
+| 16 | `threadripperje` | 33,473.596 | 117,564.256 | `0.285757 [0.270176, 0.300316]` | 16 | 32 / 54 |
+| 32 | `threadripperje` | 25,712.146 | 109,380.264 | `0.230809 [0.210160, 0.254111]` | 32 | 64 / 102 |
+| 64 | `threadripperje` | 22,417.172 | 89,304.888 | `0.248270 [0.233913, 0.269171]` | 64 | 128 / 198 |
+| 96 | `threadripperje` | 24,465.701 | 64,092.430 | `0.382646 [0.344567, 0.413863]` | 96 | 192 / 295 |
+| 128 | `threadripperje` | 22,408.810 | 79,804.620 | `0.275095 [0.267489, 0.311525]` | 128 | 256 / 392 |
+
+**Invalidation / retraction:** the measured collector replaced observed
+process CPU with `max(process_cpu, role_cpu_sum)` under non-atomic tick skew
+and retained no pre-floor value. All 594 process-CPU, active-equivalent,
+role/unattributed-CPU, and positive-tick rows are **CONTAMINATED / VOID FOR
+INFERENCE**. The previously stated `4.639 -> 9.132` active-equivalent
+increase and "low productive-concurrency ceiling" conclusion are retracted.
+The raw bytes remain preserved.
+
+The surviving worker columns are actual thread-membership census medians,
+not activity. The full per-row host/boot and min/median/max census is in the
+card. Tantivy's raw throughput peaks at requested width 4 (`1.848x` width
+1), then falls to `0.950x/0.884x/0.823x/0.672x/0.482x/0.600x` of the peak at
+widths 8/16/32/64/96/128 while its observed worker topology continues to
+expand. That locates a widening-overhead regime, but the void CPU evidence
+cannot distinguish contention, coordination, memory, or another cost.
+
+**Decision: STRUCTURAL / NO-CLAIM / NO QG-1 VERDICT.** The incomplete
+normative selection and `laws_attested=false` prohibit activation or
+PASS/MISS/KEEP/REJECT labels. In addition, the null blocks are sequential
+and disjoint from the effect block; effect order/drift is not separately
+gated. QG-1 remains inactive and its unmeasured placeholder remains
+authoritative. Raw evidence:
+`.bench-history/attempts/qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z/`;
+full card:
+`docs/evidence/e8h/qg1-trj-thread-sweep-20260731.md`.
+
+**Retry predicate:** use the repaired collector that never rewrites process
+CPU and never clips measured-call totals; require the complete normative
+74-cell bundle and an immediate same-ELF reproduction. Interleave null and
+effect blocks or bind effect order/drift explicitly; ratchet-bind continuous
+timing and work-receipt modes; preserve exact host, executable, wall, and
+worker-census receipts. Do not promote a partial slice, weaken the
+null-center law, or gate on CV.

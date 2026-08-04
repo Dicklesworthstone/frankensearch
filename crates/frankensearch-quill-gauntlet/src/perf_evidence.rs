@@ -34,8 +34,9 @@ use crate::perf::{
     PairedEstimatorConfig, PairedEstimatorError, PairedEvidenceStatus, PairedExperimentResult,
     PerfApplicabilityPlan, PerfApplicabilityPlanBinding, PerfCellApplicability,
     PerfExecutionProvenance, PerfGate, PerfGateArtifact, PerfInputIdentity, PerfMatrixSpec,
-    PerfRawSample, PerfSampleArm, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, median_sorted, percentile,
-    splitmix64, validate_paired_blocks,
+    PerfRawSample, PerfSampleArm, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, median_sorted,
+    parse_cpu_list_ids, percentile, perf_metric_unit, perf_operation_scope, splitmix64,
+    validate_paired_blocks,
 };
 use crate::qg6_prepared::{
     Qg6ArmRole, Qg6QueryIdentityReceipt, Qg6QuerySpec, Qg6SemanticContract,
@@ -50,7 +51,7 @@ use crate::{MachineClassEvidenceBinding, MachineClassRegistry, VerifiedRunnerIde
 /// [`EvidenceArtifactError::SchemaMismatch`], and legacy v3 gate artifacts are
 /// only readable through the explicit, read-only
 /// [`load_legacy_gate_artifact_v3`].
-pub const PERF_EVIDENCE_SCHEMA_VERSION: &str = "quill-perf-evidence-v4";
+pub const PERF_EVIDENCE_SCHEMA_VERSION: &str = "quill-perf-evidence-v5";
 /// Version of the hierarchical latency estimate carried by latency cells.
 pub const HIERARCHICAL_LATENCY_SCHEMA_VERSION: &str = "quill-hierarchical-latency-v1";
 /// Upper bound on retained reasons per artifact or cell.
@@ -270,14 +271,18 @@ impl EvidencePolicy {
             && self.reconciliation_dead_band_log >= 0.0
             && self.reconciliation_tolerance_log.is_finite()
             && self.reconciliation_tolerance_log > 0.0;
+        let mut expected = Self::predeclared();
+        expected.warmup_rounds = self.warmup_rounds;
         if !finite
             || self.min_hierarchical_groups < 2
             || self.min_group_pairs < 2
+            || self.warmup_rounds == 0
             || self.max_raw_samples == 0
+            || *self != expected
         {
             return Err(EvidenceArtifactError::InvalidPolicy {
-                reason: "evidence policy requires finite bounds, >=2 groups, >=2 pairs per \
-                         group, and a positive raw-sample cap"
+                reason: "evidence policy must equal the predeclared thresholds with only a \
+                         positive warmup-round count varying"
                     .to_owned(),
             });
         }
@@ -303,13 +308,21 @@ pub struct BuildIdentity {
     /// SHA-256 of the typed producer's canonical build and workload environment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_sha256: Option<String>,
-    /// `rustc --version` of the toolchain that built the binary.
+    /// Benchmark-reported `rustc --version` of the toolchain that built the
+    /// binary. The receipt independently binds the controlled compiler path,
+    /// digest, environment policy, source, and resulting ELF; it does not
+    /// repeat this display string as a separate attested fact.
     pub rustc_version: String,
-    /// Compilation target triple.
+    /// Benchmark-reported compilation target triple. Receipt projection
+    /// independently requires this triple to be compatible with the admitted
+    /// hardware OS and architecture, but does not attest the exact string.
     pub target_triple: String,
-    /// Cargo profile label.
+    /// Benchmark-reported Cargo profile label, sealed into the exact evidence
+    /// bytes and attributable to the receipt-bound source and ELF.
     pub build_profile: String,
-    /// Cargo features active in the measuring binary.
+    /// Benchmark-reported Cargo features active in the measuring binary,
+    /// sealed into the exact evidence bytes and attributable to the
+    /// receipt-bound source and ELF.
     pub cargo_features: Vec<String>,
 }
 
@@ -359,7 +372,10 @@ impl BuildIdentity {
 /// Machine identity captured at run start.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MachineIdentity {
-    /// Deterministic machine label from [`crate::perf::machine_fingerprint`].
+    /// Benchmark-reported deterministic machine label from
+    /// [`crate::perf::machine_fingerprint`]. This is a diagnostic correlation
+    /// label, not an independently receipt-attested hostname; registry class,
+    /// hardware, topology, and execution facts remain authoritative.
     pub fingerprint: String,
     /// Operating system constant.
     pub os: String,
@@ -382,13 +398,21 @@ impl MachineIdentity {
     /// Capture the current machine identity. Unavailable probes report
     /// `None` rather than fabricating zeros.
     #[must_use]
-    pub fn capture(configured_engine_thread_widths: impl IntoIterator<Item = usize>) -> Self {
+    pub fn capture(
+        execution_capacity: u64,
+        max_exercised_cell_width: u64,
+        configured_engine_thread_widths: impl IntoIterator<Item = usize>,
+    ) -> Self {
         Self {
             fingerprint: crate::perf::machine_fingerprint(),
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
             logical_cpus: std::thread::available_parallelism().map_or(1, usize::from),
-            execution: PerfExecutionProvenance::capture(configured_engine_thread_widths),
+            execution: PerfExecutionProvenance::capture(
+                execution_capacity,
+                max_exercised_cell_width,
+                configured_engine_thread_widths,
+            ),
             cpu_governor: fs::read_to_string(
                 "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
             )
@@ -409,12 +433,13 @@ impl MachineIdentity {
             || self.os.trim().is_empty()
             || self.arch.trim().is_empty()
             || self.logical_cpus == 0
+            || self.logical_cpus != self.execution.process_available_threads
             || !self.execution.is_complete()
             || self.execution.producer_os.as_str() != self.os
         {
             return Err(EvidenceArtifactError::InvalidProvenance {
-                reason: "machine identity requires fingerprint, os, arch, CPUs, and matching \
-                         serialized producer OS"
+                reason: "machine identity requires fingerprint, os, arch, process-available \
+                         CPUs, and matching serialized producer OS"
                     .to_owned(),
             });
         }
@@ -1739,7 +1764,7 @@ impl PerfEvidenceArtifact {
         cells: &[EvidenceCell],
         matrix: &PerfMatrixSpec,
         plan: &PerfApplicabilityPlan,
-    ) -> Result<(), EvidenceArtifactError> {
+    ) -> Result<BTreeSet<usize>, EvidenceArtifactError> {
         if cells.is_empty() {
             return Err(EvidenceArtifactError::InconsistentArtifact {
                 reason: "an evidence artifact requires at least one cell".to_owned(),
@@ -1758,6 +1783,7 @@ impl PerfEvidenceArtifact {
             });
         }
         let mut cell_ids = BTreeSet::new();
+        let mut selected_widths = BTreeSet::new();
         for cell in cells {
             if cell.spec.gate != gate {
                 return Err(EvidenceArtifactError::InconsistentArtifact {
@@ -1785,7 +1811,7 @@ impl PerfEvidenceArtifact {
             let mut matching = canonical_cells.iter().enumerate().filter(|(_, canonical)| {
                 canonical.fixture == cell.spec.fixture && canonical.metric == cell.spec.metric
             });
-            let Some((ordinal, _)) = matching.next() else {
+            let Some((ordinal, canonical)) = matching.next() else {
                 return Err(EvidenceArtifactError::InconsistentArtifact {
                     reason: format!(
                         "measured cell {} is not in the complete canonical {gate} matrix",
@@ -1828,6 +1854,98 @@ impl PerfEvidenceArtifact {
                     ),
                 });
             }
+            if cell.spec.unit != perf_metric_unit(&canonical.metric) {
+                return Err(EvidenceArtifactError::InconsistentArtifact {
+                    reason: format!(
+                        "measured cell {} has unit {:?}; canonical metric {} requires {:?}",
+                        cell.cell_id,
+                        cell.spec.unit,
+                        canonical.metric,
+                        perf_metric_unit(&canonical.metric)
+                    ),
+                });
+            }
+            let requires_concurrency_witness = gate == PerfGate::Qg8
+                || (gate == PerfGate::Qg1 && expected_role == EvidenceRole::Required);
+            if requires_concurrency_witness
+                && cell
+                    .spec
+                    .concurrency_witness
+                    .as_ref()
+                    .is_none_or(|witness| {
+                        witness.configured_threads != classification.configured_threads
+                    })
+            {
+                return Err(EvidenceArtifactError::InconsistentArtifact {
+                    reason: format!(
+                        "measured cell {} concurrency witness does not equal canonical width {}",
+                        cell.cell_id, classification.configured_threads
+                    ),
+                });
+            }
+            selected_widths.insert(classification.configured_threads);
+        }
+        Ok(selected_widths)
+    }
+
+    fn verify_cell_provenance(&self, cell: &EvidenceCell) -> Result<(), EvidenceArtifactError> {
+        let EvidenceCellBody::Paired {
+            paired,
+            treatment_arm_null,
+            ..
+        } = &cell.body
+        else {
+            return Ok(());
+        };
+        let expected_scope =
+            perf_operation_scope(cell.spec.gate, &cell.spec.fixture, &cell.spec.metric);
+        let expected_provenance = crate::PerfSampleProvenance {
+            run_id: self.provenance.run_id.clone(),
+            executable_sha256: self.provenance.build.executable_sha256.clone(),
+            corpus_sha256: self.provenance.corpus.corpus_sha256.clone(),
+            input_identity: cell.spec.input_identity.clone(),
+            worker_id: self.provenance.machine.fingerprint.clone(),
+            build_profile: self.provenance.build.build_profile.clone(),
+        };
+        if paired.scope != expected_scope || paired.provenance != expected_provenance {
+            return Err(EvidenceArtifactError::InvalidProvenance {
+                reason: format!(
+                    "cell {} operation scope or sample provenance differs from its canonical cell and top-level evidence",
+                    cell.cell_id
+                ),
+            });
+        }
+        if paired.config != crate::PairedEstimatorConfig::predeclared(paired.config.bootstrap_seed)
+        {
+            return Err(EvidenceArtifactError::InvalidProvenance {
+                reason: format!(
+                    "cell {} does not use the exact predeclared estimator configuration",
+                    cell.cell_id
+                ),
+            });
+        }
+        if cell.spec.gate != PerfGate::Qg1 && treatment_arm_null.is_some() {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: format!(
+                    "only QG-1 cells may carry a treatment-arm A/A null: {}",
+                    cell.cell_id
+                ),
+            });
+        }
+        if let Some(treatment_arm_null) = treatment_arm_null {
+            if treatment_arm_null.scope != expected_scope
+                || treatment_arm_null.provenance != expected_provenance
+                || treatment_arm_null.config != paired.config
+                || treatment_arm_null.effect != paired.effect
+                || treatment_arm_null.effect_samples != paired.effect_samples
+            {
+                return Err(EvidenceArtifactError::InvalidProvenance {
+                    reason: format!(
+                        "cell {} treatment-arm null does not share the exact canonical scope, provenance, configuration, and A/B stream",
+                        cell.cell_id
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -1849,7 +1967,12 @@ impl PerfEvidenceArtifact {
         provenance.validate()?;
         let (matrix, reconstructed_plan) =
             Self::reconstruct_applicability_plan(gate, &applicability_plan)?;
-        Self::validate_cell_set(gate, &cells, &matrix, &reconstructed_plan)?;
+        let selected_widths = Self::validate_cell_set(gate, &cells, &matrix, &reconstructed_plan)?;
+        Self::verify_execution_plan_envelope(
+            &provenance.machine.execution,
+            &reconstructed_plan,
+            &selected_widths,
+        )?;
         let admission_no_claim = None;
         let (gate_status, reasons) = Self::fold(&cells, admission_no_claim.as_ref());
         Ok(Self {
@@ -1958,11 +2081,36 @@ impl PerfEvidenceArtifact {
             || identity.capacity_semantics() != plan.capacity_semantics
             || plan.execution_capacity != Some(identity.execution_capacity())
             || plan.max_exercised_cell_width != Some(identity.max_exercised_cell_width())
+            || identity
+                .artifact_manifest()
+                .is_some_and(|binding| binding.manifest().applicability_plan() != plan.binding())
         {
             return Err(EvidenceArtifactError::InvalidProvenance {
                 reason: format!(
                     "verified runner profile/capacity/maximum envelope does not equal \
                      applicability plan {:?} {}",
+                    plan.binding.profile, plan.binding.gate
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn verify_execution_plan_envelope(
+        execution: &PerfExecutionProvenance,
+        plan: &PerfApplicabilityPlan,
+        selected_widths: &BTreeSet<usize>,
+    ) -> Result<(), EvidenceArtifactError> {
+        if plan.execution_capacity != Some(execution.execution_capacity)
+            || plan.max_exercised_cell_width != Some(execution.max_exercised_cell_width)
+            || !execution.matches_capacity_semantics(plan.capacity_semantics)
+            || execution.configured_engine_thread_widths
+                != selected_widths.iter().copied().collect::<Vec<_>>()
+        {
+            return Err(EvidenceArtifactError::InvalidProvenance {
+                reason: format!(
+                    "execution provenance capacity/maximum/selected-width envelope does not \
+                     equal applicability plan {:?} {}",
                     plan.binding.profile, plan.binding.gate
                 ),
             });
@@ -1986,6 +2134,246 @@ impl PerfEvidenceArtifact {
                 .iter()
                 .filter(|cell| cell.spec.role == EvidenceRole::Required)
                 .all(EvidenceCell::claim_eligible)
+    }
+
+    fn verify_runner_identity_projection(
+        &self,
+        identity: &VerifiedRunnerIdentity,
+    ) -> Result<(), EvidenceArtifactError> {
+        let invalid = |reason: String| EvidenceArtifactError::InvalidProvenance { reason };
+        let build = identity
+            .build()
+            .as_object()
+            .ok_or_else(|| invalid("verified runner build facts are not an object".to_owned()))?;
+        let runner_string = |field: &str| {
+            build
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "verified runner build field {field:?} is not a string"
+                    ))
+                })
+        };
+        let runner_git_dirty = build
+            .get("git_dirty")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| {
+                invalid("verified runner build field \"git_dirty\" is not a boolean".to_owned())
+            })?;
+        let runner_worktree_state = match build.get("worktree_state_sha256") {
+            Some(serde_json::Value::String(value)) => Some(value.as_str()),
+            Some(serde_json::Value::Null) => None,
+            _ => {
+                return Err(invalid(
+                    "verified runner worktree-state identity is malformed".to_owned(),
+                ));
+            }
+        };
+        let evidence_build = &self.provenance.build;
+        // These are the build facts the typed runner captures independently.
+        // The remaining BuildIdentity display/context fields stay sealed and
+        // attributable to this exact source/ELF, but are not duplicated as
+        // direct receipt facts.
+        let build_matches = evidence_build.git_revision == runner_string("git_revision")?
+            && evidence_build.git_dirty == runner_git_dirty
+            && evidence_build.worktree_state_sha256.as_deref() == runner_worktree_state
+            && evidence_build.cargo_lock_sha256.as_deref()
+                == Some(runner_string("cargo_lock_sha256")?)
+            && evidence_build.executable_sha256 == runner_string("executable_sha256")?
+            && evidence_build.command_sha256 == runner_string("command_sha256")?
+            && evidence_build.environment_sha256.as_deref()
+                == Some(runner_string("environment_sha256")?);
+        if !build_matches {
+            return Err(invalid(
+                "evidence build identity differs from the verified runner receipt".to_owned(),
+            ));
+        }
+
+        let hardware = identity.hardware().as_object().ok_or_else(|| {
+            invalid("verified runner hardware facts are not an object".to_owned())
+        })?;
+        let hardware_string = |field: &str| {
+            hardware
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "verified runner hardware field {field:?} is not a string"
+                    ))
+                })
+        };
+        let hardware_usize = |field: &str| {
+            hardware
+                .get(field)
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "verified runner hardware field {field:?} is not a host-sized integer"
+                    ))
+                })
+        };
+        let hardware_os = hardware_string("os")?;
+        let hardware_arch = hardware_string("arch")?;
+        let hardware_physical = hardware_usize("physical_cores")?;
+        let hardware_logical = hardware_usize("logical_cpus")?;
+        let target_matches = match (hardware_os, hardware_arch) {
+            ("linux", "x86_64") => {
+                evidence_build.target_triple.starts_with("x86_64-")
+                    && evidence_build.target_triple.contains("linux")
+            }
+            ("macos", "aarch64") => {
+                evidence_build.target_triple.starts_with("aarch64-")
+                    && evidence_build.target_triple.contains("apple-darwin")
+            }
+            _ => false,
+        };
+        let machine = &self.provenance.machine;
+        let execution = &machine.execution;
+        let serialized_isa = serde_json::to_value(&execution.runtime_detected_isa)?;
+        if machine.os != hardware_os
+            || machine.arch != hardware_arch
+            || execution.producer_os.as_str() != hardware_os
+            || execution.physical_cores != hardware_physical
+            || execution.logical_threads != hardware_logical
+            || hardware.get("runtime_detected_isa") != Some(&serialized_isa)
+            || !target_matches
+        {
+            return Err(invalid(
+                "evidence OS, architecture, topology, runtime ISA, or target differs from the verified runner hardware"
+                    .to_owned(),
+            ));
+        }
+
+        let observed_cpu_ids = identity
+            .execution_start()
+            .get("observed_logical_cpu_ids")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                invalid("verified runner execution start omits observed logical CPU IDs".to_owned())
+            })?
+            .iter()
+            .map(|value| {
+                value.as_u64().ok_or_else(|| {
+                    invalid("verified runner observed CPU ID is not an integer".to_owned())
+                })
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let expected_process_threads = if observed_cpu_ids.is_empty() {
+            hardware_logical
+        } else {
+            observed_cpu_ids.len()
+        };
+        if execution.process_available_threads != expected_process_threads {
+            return Err(invalid(
+                "evidence process-available topology differs from the verified runner execution snapshot"
+                    .to_owned(),
+            ));
+        }
+
+        let allowed_threads = match hardware_os {
+            "linux" => {
+                let projected = execution
+                    .cpu_affinity_allowed_list
+                    .as_deref()
+                    .and_then(parse_cpu_list_ids)
+                    .ok_or_else(|| {
+                        invalid(
+                            "Linux evidence requires a valid exact CPU-affinity projection"
+                                .to_owned(),
+                        )
+                    })?;
+                if projected != observed_cpu_ids {
+                    return Err(invalid(
+                        "evidence CPU-affinity projection differs from the verified runner execution snapshot"
+                            .to_owned(),
+                    ));
+                }
+                let runner_governor = identity
+                    .execution_start()
+                    .get("governor")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        invalid("verified runner governor is not a string".to_owned())
+                    })?;
+                if machine.cpu_governor.as_deref() != Some(runner_governor) {
+                    return Err(invalid(
+                        "evidence CPU governor differs from the verified runner execution snapshot"
+                            .to_owned(),
+                    ));
+                }
+                Some(projected.len())
+            }
+            "macos" => {
+                if execution.cpu_affinity_allowed_list.is_some()
+                    || machine.cpu_governor.is_some()
+                    || !observed_cpu_ids.is_empty()
+                {
+                    return Err(invalid(
+                        "macOS scheduler evidence cannot fabricate Linux affinity or governor projections"
+                            .to_owned(),
+                    ));
+                }
+                None
+            }
+            unsupported => {
+                return Err(invalid(format!(
+                    "verified runner OS {unsupported:?} is not supported for execution-topology evidence"
+                )));
+            }
+        };
+        let expected_cap = if let Some(allowed_threads) =
+            allowed_threads.filter(|count| *count < hardware_logical)
+        {
+            let allowed_list = execution
+                .cpu_affinity_allowed_list
+                .as_deref()
+                .ok_or_else(|| {
+                    invalid(
+                        "verified Linux affinity count is missing its serialized CPU list"
+                            .to_owned(),
+                    )
+                })?;
+            Some(format!(
+                "Cpus_allowed_list={} ({} of {} host logical threads)",
+                allowed_list, allowed_threads, hardware_logical,
+            ))
+        } else if execution.process_available_threads < hardware_logical {
+            Some(format!(
+                "available_parallelism={} of {} host logical threads",
+                execution.process_available_threads, hardware_logical,
+            ))
+        } else {
+            None
+        };
+        if execution.affinity_or_cpuset_cap != expected_cap {
+            return Err(invalid(
+                "evidence affinity/cpuset cap text is not the deterministic projection of verified topology"
+                    .to_owned(),
+            ));
+        }
+        let cpu_label = if hardware_os == "linux" {
+            hardware_string("cpu_model_name")?.replace(['/', ' '], "_")
+        } else {
+            "unknown-cpu".to_owned()
+        };
+        // The hostname component is benchmark-reported rather than an
+        // independent receipt fact. This equality is therefore an internal
+        // fingerprint-consistency check; promotion authority comes from the
+        // receipt-projected class, hardware, topology, ISA, and execution
+        // envelope checked above.
+        let expected_fingerprint = format!(
+            "{hardware_os}-{hardware_arch}-{}-{hardware_logical}thread-{cpu_label}",
+            execution.host_identity
+        );
+        if machine.fingerprint != expected_fingerprint {
+            return Err(invalid(
+                "evidence machine fingerprint is not the deterministic projection of verified hardware and host identity"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Bind the exact registry-admitted runner identity before sealing.
@@ -2032,9 +2420,12 @@ impl PerfEvidenceArtifact {
         if artifact_manifest.gate() != self.gate.label()
             || artifact_manifest.run_id() != self.provenance.run_id
             || artifact_manifest.run_window() != self.provenance.run_window
+            || artifact_manifest.applicability_plan() != &self.applicability_plan
+            || self.provenance.manifest_sha256
+                != self.applicability_plan.normalized_perf_manifest_sha256
         {
             return Err(EvidenceArtifactError::InvalidProvenance {
-                reason: "runner artifact manifest names a different gate, run ID, or run window"
+                reason: "runner artifact manifest names a different gate, run, manifest, or applicability-plan identity"
                     .to_owned(),
             });
         }
@@ -2065,86 +2456,7 @@ impl PerfEvidenceArtifact {
                 ),
             });
         }
-        let build = identity.build().as_object().ok_or_else(|| {
-            EvidenceArtifactError::InvalidProvenance {
-                reason: "verified runner build facts are not an object".to_owned(),
-            }
-        })?;
-        let runner_string = |field: &str| {
-            build
-                .get(field)
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| EvidenceArtifactError::InvalidProvenance {
-                    reason: format!("verified runner build field {field:?} is not a string"),
-                })
-        };
-        let runner_git_dirty = build
-            .get("git_dirty")
-            .and_then(serde_json::Value::as_bool)
-            .ok_or_else(|| EvidenceArtifactError::InvalidProvenance {
-                reason: "verified runner build field \"git_dirty\" is not a boolean".to_owned(),
-            })?;
-        let runner_worktree_state = match build.get("worktree_state_sha256") {
-            Some(serde_json::Value::String(value)) => Some(value.as_str()),
-            Some(serde_json::Value::Null) => None,
-            _ => {
-                return Err(EvidenceArtifactError::InvalidProvenance {
-                    reason: "verified runner worktree-state identity is malformed".to_owned(),
-                });
-            }
-        };
-        let runner_cargo_lock = runner_string("cargo_lock_sha256")?;
-        let evidence_build = &self.provenance.build;
-        let build_matches = evidence_build.git_revision == runner_string("git_revision")?
-            && evidence_build.git_dirty == runner_git_dirty
-            && evidence_build.worktree_state_sha256.as_deref() == runner_worktree_state
-            && evidence_build.cargo_lock_sha256.as_deref() == Some(runner_cargo_lock)
-            && evidence_build.executable_sha256 == runner_string("executable_sha256")?
-            && evidence_build.command_sha256 == runner_string("command_sha256")?
-            && evidence_build.environment_sha256.as_deref()
-                == Some(runner_string("environment_sha256")?);
-        if !build_matches {
-            return Err(EvidenceArtifactError::InvalidProvenance {
-                reason: "evidence build identity differs from the verified runner receipt"
-                    .to_owned(),
-            });
-        }
-        let hardware = identity.hardware().as_object().ok_or_else(|| {
-            EvidenceArtifactError::InvalidProvenance {
-                reason: "verified runner hardware facts are not an object".to_owned(),
-            }
-        })?;
-        let hardware_string = |field: &str| {
-            hardware
-                .get(field)
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| EvidenceArtifactError::InvalidProvenance {
-                    reason: format!("verified runner hardware field {field:?} is not a string"),
-                })
-        };
-        let hardware_os = hardware_string("os")?;
-        let hardware_arch = hardware_string("arch")?;
-        let target_matches = match (hardware_os, hardware_arch) {
-            ("linux", "x86_64") => {
-                evidence_build.target_triple.starts_with("x86_64-")
-                    && evidence_build.target_triple.contains("linux")
-            }
-            ("macos", "aarch64") => {
-                evidence_build.target_triple.starts_with("aarch64-")
-                    && evidence_build.target_triple.contains("apple-darwin")
-            }
-            _ => false,
-        };
-        if self.provenance.machine.os != hardware_os
-            || self.provenance.machine.arch != hardware_arch
-            || self.provenance.machine.execution.producer_os.as_str() != hardware_os
-            || !target_matches
-        {
-            return Err(EvidenceArtifactError::InvalidProvenance {
-                reason: "evidence OS/architecture/target differs from verified runner hardware"
-                    .to_owned(),
-            });
-        }
+        self.verify_runner_identity_projection(&identity)?;
         self.machine_class = MachineClassEvidenceBinding::verified(identity);
         self.gate_decision = None;
         self.artifact_sha256.clear();
@@ -2255,7 +2567,7 @@ impl PerfEvidenceArtifact {
         Ok(serde_json::to_string_pretty(&sealed)?)
     }
 
-    fn reconstructed_prebinding_bytes(&self) -> Result<Vec<u8>, EvidenceArtifactError> {
+    pub(crate) fn reconstructed_prebinding_bytes(&self) -> Result<Vec<u8>, EvidenceArtifactError> {
         let mut source = self.clone();
         source.machine_class =
             MachineClassEvidenceBinding::unverified("sealed runner receipt has not been bound");
@@ -2296,6 +2608,22 @@ impl PerfEvidenceArtifact {
         self.provenance.validate()?;
         let (matrix, reconstructed_plan) =
             Self::reconstruct_applicability_plan(self.gate, &self.applicability_plan)?;
+        if self.provenance.manifest_sha256
+            != reconstructed_plan.binding.normalized_perf_manifest_sha256
+        {
+            return Err(EvidenceArtifactError::InvalidProvenance {
+                reason:
+                    "evidence manifest digest differs from its reconstructed applicability plan"
+                        .to_owned(),
+            });
+        }
+        let selected_widths =
+            Self::validate_cell_set(self.gate, &self.cells, &matrix, &reconstructed_plan)?;
+        Self::verify_execution_plan_envelope(
+            &self.provenance.machine.execution,
+            &reconstructed_plan,
+            &selected_widths,
+        )?;
         self.machine_class.validate().map_err(|error| {
             EvidenceArtifactError::InvalidProvenance {
                 reason: format!("machine-class binding rejected: {error}"),
@@ -2303,6 +2631,7 @@ impl PerfEvidenceArtifact {
         })?;
         if let Some(identity) = self.machine_class.identity() {
             Self::verify_runner_plan_envelope(identity, &reconstructed_plan)?;
+            self.verify_runner_identity_projection(identity)?;
             let prebinding_bytes = self.reconstructed_prebinding_bytes()?;
             identity
                 .verify_evidence_artifact(&prebinding_bytes)
@@ -2316,14 +2645,14 @@ impl PerfEvidenceArtifact {
             if manifest.gate() != self.gate.label()
                 || manifest.run_id() != self.provenance.run_id
                 || manifest.run_window() != self.provenance.run_window
+                || manifest.applicability_plan() != reconstructed_plan.binding()
             {
                 return Err(EvidenceArtifactError::InvalidProvenance {
-                    reason: "bound artifact manifest names a different gate, run ID, or run window"
+                    reason: "bound artifact manifest names a different gate, run, or applicability-plan identity"
                         .to_owned(),
                 });
             }
         }
-        Self::validate_cell_set(self.gate, &self.cells, &matrix, &reconstructed_plan)?;
         if let Some(reason) = self.admission_no_claim.as_ref()
             && (reason.severity != EvidenceSeverity::NoClaim
                 || reason.code.trim().is_empty()
@@ -2336,6 +2665,7 @@ impl PerfEvidenceArtifact {
             });
         }
         for cell in &self.cells {
+            self.verify_cell_provenance(cell)?;
             cell.verify_recomputed(&self.policy)?;
         }
         let (expected_status, expected_reasons) =
@@ -2507,6 +2837,11 @@ impl PerfEvidenceArtifact {
                     .to_owned(),
             });
         }
+        if serde_json::to_vec_pretty(&artifact)? != contents {
+            return Err(EvidenceArtifactError::Malformed {
+                reason: "artifact bytes are not exact canonical pretty JSON".to_owned(),
+            });
+        }
         artifact.verify_integrity()?;
         Ok(artifact)
     }
@@ -2611,7 +2946,7 @@ pub enum EvidenceArtifactError {
         reason: String,
     },
     /// The artifact carries a non-current schema version.
-    #[error("evidence artifact schema is {found}; current is quill-perf-evidence-v4")]
+    #[error("evidence artifact schema is {found}; current is quill-perf-evidence-v5")]
     SchemaMismatch {
         /// The version string found in the file.
         found: String,
@@ -2756,14 +3091,11 @@ mod tests {
     use crate::qg6_prepared::Qg6ResultReceipt;
 
     const CANARY: &str = "CANARY_DOCUMENT_TEXT_MUST_NEVER_PERSIST";
+    const TEST_MACHINE_FINGERPRINT: &str =
+        "linux-x86_64-test-machine-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores";
 
     fn scope() -> PerfOperationScope {
-        PerfOperationScope {
-            operation_id: "qg.synthetic_gauge".to_owned(),
-            version: 1,
-            semantics: PerfMetricSemantics::GaugeLowerIsBetter,
-            unit: "ms".to_owned(),
-        }
+        perf_operation_scope(PerfGate::Qg1, "bulk/tiny/1/positions_on", "docs_per_second")
     }
 
     fn sample_provenance(run_id: &str) -> PerfSampleProvenance {
@@ -2772,7 +3104,7 @@ mod tests {
             executable_sha256: "a".repeat(64),
             corpus_sha256: "b".repeat(64),
             input_identity: None,
-            worker_id: "test-worker".to_owned(),
+            worker_id: TEST_MACHINE_FINGERPRINT.to_owned(),
             build_profile: "test".to_owned(),
         }
     }
@@ -2922,6 +3254,41 @@ mod tests {
             .expect("valid treatment-arm null experiment")
     }
 
+    fn bind_experiment_to_spec(
+        mut experiment: PairedExperimentResult,
+        spec: &EvidenceCellSpec,
+    ) -> PairedExperimentResult {
+        let scope = perf_operation_scope(spec.gate, &spec.fixture, &spec.metric);
+        let mut provenance = sample_provenance("run-a");
+        provenance.input_identity = spec.input_identity.clone();
+        experiment.scope = scope.clone();
+        experiment.provenance = provenance.clone();
+        bind_samples_to_spec(&mut experiment.effect_samples, spec);
+        bind_samples_to_spec(&mut experiment.null_samples, spec);
+        experiment
+    }
+
+    fn bind_samples_to_spec(samples: &mut [PerfRawSample], spec: &EvidenceCellSpec) {
+        let scope = perf_operation_scope(spec.gate, &spec.fixture, &spec.metric);
+        let mut provenance = sample_provenance("run-a");
+        provenance.input_identity = spec.input_identity.clone();
+        for sample in samples {
+            sample.scope = scope.clone();
+            sample.provenance = provenance.clone();
+        }
+    }
+
+    fn valid_experiment_for_spec(spec: &EvidenceCellSpec, ratio: f64) -> PairedExperimentResult {
+        bind_experiment_to_spec(valid_experiment(ratio), spec)
+    }
+
+    fn valid_treatment_arm_null_for_spec(
+        spec: &EvidenceCellSpec,
+        ratio: f64,
+    ) -> PairedExperimentResult {
+        bind_experiment_to_spec(valid_treatment_arm_null_experiment(ratio), spec)
+    }
+
     fn policy() -> EvidencePolicy {
         EvidencePolicy::predeclared()
     }
@@ -2964,31 +3331,41 @@ mod tests {
         }
     }
 
-    fn evidence_provenance() -> EvidenceProvenance {
+    fn evidence_provenance(gate: PerfGate) -> EvidenceProvenance {
+        let plan = applicability_plan(gate);
         EvidenceProvenance {
             run_id: "run-a".to_owned(),
             run_window: "window-1".to_owned(),
-            manifest_sha256: "e".repeat(64),
+            manifest_sha256: plan.binding.normalized_perf_manifest_sha256.clone(),
             build: build_identity(),
             machine: MachineIdentity {
-                fingerprint: "test-machine".to_owned(),
+                fingerprint: TEST_MACHINE_FINGERPRINT.to_owned(),
                 os: "linux".to_owned(),
                 arch: "x86_64".to_owned(),
-                logical_cpus: 8,
+                logical_cpus: 64,
                 execution: PerfExecutionProvenance {
                     host_identity: "test-machine".to_owned(),
                     producer_os: crate::PerfProducerOs::Linux,
                     physical_cores: 64,
                     logical_threads: 128,
                     process_available_threads: 64,
+                    execution_capacity: plan
+                        .execution_capacity
+                        .expect("test profile has a frozen execution capacity"),
+                    max_exercised_cell_width: plan
+                        .max_exercised_cell_width
+                        .expect("test profile has a frozen gate maximum"),
                     configured_engine_thread_widths: vec![1],
-                    runtime_detected_isa: vec!["avx2".to_owned()],
+                    runtime_detected_isa: ["aes", "avx2", "bmi2", "fma", "vaes"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
                     cpu_affinity_allowed_list: Some("0-63".to_owned()),
                     affinity_or_cpuset_cap: Some(
-                        "physical-64 profile: one hardware thread per physical core".to_owned(),
+                        "Cpus_allowed_list=0-63 (64 of 128 host logical threads)".to_owned(),
                     ),
                 },
-                cpu_governor: None,
+                cpu_governor: Some("performance".to_owned()),
                 load_average_start: Some(0.5),
                 load_average_end: Some(0.6),
             },
@@ -3066,6 +3443,33 @@ mod tests {
         value["artifact_sha256"] =
             serde_json::Value::String(lower_hex(&Sha256::digest(unsealed.as_bytes())));
         serde_json::to_vec_pretty(&value).expect("serialize sealed JSON")
+    }
+
+    /// Build a fully coherent hostile object: the mutated pre-binding bytes
+    /// receive a fresh artifact manifest and admitted completion receipt, then
+    /// the enclosing evidence is resealed. Strict reload must therefore reject
+    /// the semantic join itself rather than merely noticing a stale digest.
+    fn coherently_bind_and_reseal(
+        mut artifact: PerfEvidenceArtifact,
+        threshold_artifact_bytes: &[u8],
+        run_label: &str,
+    ) -> Vec<u8> {
+        let gate = artifact.gate;
+        unbind_test_artifact(&mut artifact);
+        let prebinding_bytes = artifact
+            .sealed_json()
+            .expect("seal hostile pre-binding evidence")
+            .into_bytes();
+        let mut bound: PerfEvidenceArtifact = serde_json::from_slice(&prebinding_bytes)
+            .expect("decode hostile pre-binding evidence without admitting it");
+        let identity =
+            admitted_identity(gate, threshold_artifact_bytes, &prebinding_bytes, run_label);
+        bound.machine_class = MachineClassEvidenceBinding::verified(identity);
+        bound.artifact_sha256.clear();
+        bound
+            .sealed_json()
+            .expect("seal hostile receipt-bound evidence")
+            .into_bytes()
     }
 
     fn cell_spec(gate: PerfGate, role: EvidenceRole) -> EvidenceCellSpec {
@@ -3149,8 +3553,8 @@ mod tests {
         EvidenceCellSpec {
             gate,
             fixture,
+            unit: perf_metric_unit(&metric).to_owned(),
             metric,
-            unit: "ms".to_owned(),
             role,
             input_identity,
             qg6_semantic_contract,
@@ -3160,21 +3564,23 @@ mod tests {
     }
 
     fn provisional_cell() -> EvidenceCell {
+        let spec = cell_spec(PerfGate::Qg1, EvidenceRole::Required);
         let mut cell = EvidenceCell::evaluate(
-            cell_spec(PerfGate::Qg1, EvidenceRole::Required),
-            valid_experiment(1.10),
+            spec.clone(),
+            valid_experiment_for_spec(&spec, 1.10),
             &policy(),
         )
         .expect("provisional cell");
-        cell.attach_treatment_arm_null(valid_treatment_arm_null_experiment(1.10), &policy())
+        cell.attach_treatment_arm_null(valid_treatment_arm_null_for_spec(&spec, 1.10), &policy())
             .expect("attach QG-1 treatment-arm null");
         cell
     }
 
     fn provisional_qg2_cell() -> EvidenceCell {
+        let spec = cell_spec(PerfGate::Qg2, EvidenceRole::Required);
         EvidenceCell::evaluate(
-            cell_spec(PerfGate::Qg2, EvidenceRole::Required),
-            valid_experiment(1.10),
+            spec.clone(),
+            valid_experiment_for_spec(&spec, 1.10),
             &policy(),
         )
         .expect("provisional QG-2 cell")
@@ -3185,7 +3591,7 @@ mod tests {
             PerfGate::Qg2,
             plan_binding(PerfGate::Qg2),
             policy(),
-            evidence_provenance(),
+            evidence_provenance(PerfGate::Qg2),
             vec![provisional_qg2_cell()],
         )
         .expect("provisional artifact");
@@ -3207,12 +3613,14 @@ mod tests {
             .expect("QG-6 semantic contract");
         let mut effect = qg6_hierarchical_stream_with_ratio(1.02, 0);
         let mut null = qg6_hierarchical_stream_with_ratio(1.0, 10_000);
+        bind_samples_to_spec(&mut effect, &spec);
+        bind_samples_to_spec(&mut null, &spec);
         qg6_test_fixture::attach_stream(&mut effect, true, input_identity, semantic_contract);
         qg6_test_fixture::attach_stream(&mut null, false, input_identity, semantic_contract);
         let paired =
             estimate_paired_experiment(&effect, &null, &config()).expect("QG-6 paired estimate");
         let cell = EvidenceCell::evaluate(spec, paired, &policy()).expect("QG-6 evidence cell");
-        let mut provenance = evidence_provenance();
+        let mut provenance = evidence_provenance(PerfGate::Qg6);
         provenance.corpus.query_set_sha256 = Some("d".repeat(64));
         let mut artifact = PerfEvidenceArtifact::assemble(
             PerfGate::Qg6,
@@ -3433,7 +3841,7 @@ mod tests {
             PerfGate::Qg1,
             plan_binding(PerfGate::Qg1),
             policy(),
-            evidence_provenance(),
+            evidence_provenance(PerfGate::Qg1),
             vec![cell],
         )
         .expect("artifact");
@@ -3458,7 +3866,7 @@ mod tests {
             PerfGate::Qg1,
             plan_binding(PerfGate::Qg1),
             policy(),
-            evidence_provenance(),
+            evidence_provenance(PerfGate::Qg1),
             vec![provisional_cell()],
         )
         .expect("unverified evidence artifact");
@@ -3487,7 +3895,7 @@ mod tests {
             PerfGate::Qg2,
             plan_binding(PerfGate::Qg2),
             policy(),
-            evidence_provenance(),
+            evidence_provenance(PerfGate::Qg2),
             vec![provisional_qg2_cell()],
         )
         .expect("unverified producer evidence");
@@ -3518,7 +3926,7 @@ mod tests {
             PerfGate::Qg2,
             plan_binding(PerfGate::Qg2),
             policy(),
-            evidence_provenance(),
+            evidence_provenance(PerfGate::Qg2),
             vec![provisional_qg2_cell()],
         )
         .expect("unverified producer evidence");
@@ -3561,7 +3969,7 @@ mod tests {
             PerfGate::Qg2,
             plan_binding(PerfGate::Qg2),
             policy(),
-            evidence_provenance(),
+            evidence_provenance(PerfGate::Qg2),
             vec![provisional_qg2_cell()],
         )
         .expect("unverified QG-2 producer evidence");
@@ -3706,13 +4114,25 @@ mod tests {
 
     #[test]
     fn absolute_relative_contradiction_is_no_decision() {
-        let mut pairs = Vec::new();
-        for _ in 0..6 {
-            pairs.push((1.0, 1.2));
-        }
-        for _ in 0..6 {
-            pairs.push((100.0, 90.0));
-        }
+        // Eight blocks at an identical 0.9 per-block ratio plus two extreme
+        // blocks (tiny control, enormous treatment): the paired median stays
+        // 0.9 while the marginal arm-median ratio flips above 1.0. Any
+        // half/order-subset median contains at most two extreme blocks and
+        // stays at 0.9, so the bd-yo5by effect drift/order-effect gates stay
+        // quiet (the previous half-split fixture drifted between halves and
+        // now correctly classifies as InvalidExperiment first).
+        let pairs = vec![
+            (100.0, 90.0),
+            (110.0, 99.0),
+            (120.0, 108.0),
+            (130.0, 117.0),
+            (140.0, 126.0),
+            (150.0, 135.0),
+            (160.0, 144.0),
+            (170.0, 153.0),
+            (1.0, 100_000.0),
+            (2.0, 200_000.0),
+        ];
         let effect = gauge_stream(&pairs, 0, 0, None);
         let null = gauge_stream(&quiet_null_pairs(12), 10_000, 0, None);
         let experiment = estimate_paired_experiment(&effect, &null, &config()).expect("estimate");
@@ -3994,7 +4414,7 @@ mod tests {
 
         assert!(matches!(
             PerfEvidenceArtifact::load_verified(&path),
-            Err(EvidenceArtifactError::InconsistentArtifact { .. })
+            Err(EvidenceArtifactError::InvalidProvenance { .. })
         ));
     }
 
@@ -4452,6 +4872,8 @@ mod tests {
         }
         let mut effect = grouped_gauge_stream(&effect_pairs, 0, None);
         let mut null = grouped_gauge_stream(&null_pairs, 10_000, None);
+        bind_samples_to_spec(&mut effect, &spec);
+        bind_samples_to_spec(&mut null, &spec);
         qg6_test_fixture::attach_stream(&mut effect, true, identity, contract);
         qg6_test_fixture::attach_stream(&mut null, false, identity, contract);
 
@@ -4489,7 +4911,7 @@ mod tests {
             PerfGate::Qg6,
             plan_binding(PerfGate::Qg6),
             policy(),
-            evidence_provenance(),
+            evidence_provenance(PerfGate::Qg6),
             vec![cell],
         )
         .expect("QG-6 artifact");
@@ -4527,6 +4949,8 @@ mod tests {
         }
         let mut effect = grouped_gauge_stream(&effect_pairs, 0, None);
         let mut null = grouped_gauge_stream(&null_pairs, 10_000, None);
+        bind_samples_to_spec(&mut effect, &spec);
+        bind_samples_to_spec(&mut null, &spec);
         qg6_test_fixture::attach_stream(&mut effect, true, identity, contract);
         qg6_test_fixture::attach_stream(&mut null, false, identity, contract);
 
@@ -4566,7 +4990,7 @@ mod tests {
             PerfGate::Qg6,
             plan_binding(PerfGate::Qg6),
             policy(),
-            evidence_provenance(),
+            evidence_provenance(PerfGate::Qg6),
             vec![cell],
         )
         .expect("QG-6 artifact");
@@ -4659,7 +5083,7 @@ mod tests {
             PerfGate::Qg10,
             plan_binding(PerfGate::Qg10),
             policy(),
-            evidence_provenance(),
+            evidence_provenance(PerfGate::Qg10),
             vec![cell],
         )
         .expect("artifact");
@@ -4677,6 +5101,13 @@ mod tests {
     fn qg6_incomplete_gate_selection_is_durable_but_forced_to_no_claim() {
         let mut artifact = provisional_artifact();
         assert!(artifact.ratchet_admissible());
+        artifact
+            .apply_gate_decision(EvidenceDecisionStatus::Quarantine)
+            .expect("eligible evidence accepts a terminal decision before its scope changes");
+        assert_eq!(
+            artifact.gate_decision,
+            Some(EvidenceDecisionStatus::Quarantine)
+        );
 
         artifact.force_no_claim(
             "evidence.incomplete_gate_selection",
@@ -4684,6 +5115,7 @@ mod tests {
         );
 
         assert_eq!(artifact.gate_status, EvidenceDecisionStatus::NoDecision);
+        assert_eq!(artifact.gate_decision, None);
         assert!(!artifact.ratchet_admissible());
         assert!(matches!(
             artifact.machine_class,
@@ -4871,7 +5303,7 @@ mod tests {
     }
 
     #[test]
-    fn v4_rejects_resealed_applicability_binding_profile_plan_hash_and_gate_mutations() {
+    fn v5_rejects_resealed_applicability_binding_profile_plan_hash_and_gate_mutations() {
         let directory = tempfile::tempdir().expect("applicability mutation directory");
 
         let mut wrong_profile = provisional_artifact();
@@ -4931,7 +5363,7 @@ mod tests {
     }
 
     #[test]
-    fn v4_rejects_resealed_role_and_not_applicable_cell_mutations() {
+    fn v5_rejects_resealed_role_and_not_applicable_cell_mutations() {
         let directory = tempfile::tempdir().expect("applicability cell mutation directory");
 
         let mut wrong_role = provisional_artifact();
@@ -4955,7 +5387,7 @@ mod tests {
             PerfGate::Qg1,
             plan_binding(PerfGate::Qg1),
             policy(),
-            evidence_provenance(),
+            evidence_provenance(PerfGate::Qg1),
             vec![provisional_cell()],
         )
         .expect("applicable QG-1 artifact");
@@ -4987,7 +5419,7 @@ mod tests {
             PerfGate::Qg1,
             plan_binding(PerfGate::Qg1),
             policy(),
-            evidence_provenance(),
+            evidence_provenance(PerfGate::Qg1),
             vec![provisional_cell()],
         )
         .expect("partial required QG-1 evidence");
@@ -5014,14 +5446,18 @@ mod tests {
         let mut diagnostic_spec = cell_spec(PerfGate::Qg1, EvidenceRole::Diagnostic);
         diagnostic_spec.fixture = "tokenize_only/medium".to_owned();
         diagnostic_spec.metric = "tokenize_docs_per_second".to_owned();
-        let diagnostic_cell =
-            EvidenceCell::evaluate(diagnostic_spec, valid_experiment(1.10), &policy())
-                .expect("partial diagnostic cell");
+        diagnostic_spec.unit = perf_metric_unit(&diagnostic_spec.metric).to_owned();
+        let diagnostic_cell = EvidenceCell::evaluate(
+            diagnostic_spec.clone(),
+            valid_experiment_for_spec(&diagnostic_spec, 1.10),
+            &policy(),
+        )
+        .expect("partial diagnostic cell");
         let partial_diagnostic = PerfEvidenceArtifact::assemble(
             PerfGate::Qg1,
             plan_binding(PerfGate::Qg1),
             policy(),
-            evidence_provenance(),
+            evidence_provenance(PerfGate::Qg1),
             vec![diagnostic_cell],
         )
         .expect("partial diagnostic QG-1 evidence");
@@ -5080,7 +5516,7 @@ mod tests {
     }
 
     #[test]
-    fn v4_rejects_class_only_applicability_identity_even_when_outer_seal_is_valid() {
+    fn v5_rejects_class_only_applicability_identity_even_when_outer_seal_is_valid() {
         let artifact = provisional_artifact();
         let mut value = serde_json::to_value(artifact).expect("artifact JSON");
         value["applicability_plan"] = serde_json::json!({
@@ -5279,7 +5715,7 @@ mod tests {
 
     #[test]
     fn unsupported_rss_probe_must_not_fabricate_zero() {
-        let mut provenance = evidence_provenance();
+        let mut provenance = evidence_provenance(PerfGate::Qg1);
         provenance.peak_rss = PeakRssEvidence {
             method: "unsupported".to_owned(),
             bytes: Some(0),
@@ -5295,7 +5731,7 @@ mod tests {
             Err(EvidenceArtifactError::InvalidProvenance { .. })
         ));
 
-        let mut zeroed = evidence_provenance();
+        let mut zeroed = evidence_provenance(PerfGate::Qg1);
         zeroed.peak_rss = PeakRssEvidence {
             method: "linux_vmhwm".to_owned(),
             bytes: Some(0),
@@ -5313,17 +5749,315 @@ mod tests {
     }
 
     #[test]
-    fn gate_decisions_only_apply_to_eligible_evidence() {
-        let mut artifact = provisional_artifact();
-        artifact
-            .apply_gate_decision(EvidenceDecisionStatus::Allow)
-            .expect("eligible promotion");
-        assert_eq!(artifact.gate_decision, Some(EvidenceDecisionStatus::Allow));
+    fn execution_provenance_must_equal_the_reconstructed_plan_envelope() {
+        let mut capacity_drift = evidence_provenance(PerfGate::Qg1);
+        capacity_drift.machine.execution.execution_capacity = 63;
+        capacity_drift.machine.execution.max_exercised_cell_width = 63;
+        assert!(matches!(
+            PerfEvidenceArtifact::assemble(
+                PerfGate::Qg1,
+                plan_binding(PerfGate::Qg1),
+                policy(),
+                capacity_drift,
+                vec![provisional_cell()],
+            ),
+            Err(EvidenceArtifactError::InvalidProvenance { reason })
+                if reason.contains("capacity/maximum/selected-width envelope")
+        ));
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let paths = artifact.write_atomic(dir.path()).expect("write");
-        let reloaded = PerfEvidenceArtifact::load_verified(&paths.json).expect("reload");
-        assert_eq!(reloaded.gate_decision, Some(EvidenceDecisionStatus::Allow));
+        let mut maximum_drift = evidence_provenance(PerfGate::Qg2);
+        maximum_drift.machine.execution.max_exercised_cell_width = 2;
+        assert!(matches!(
+            PerfEvidenceArtifact::assemble(
+                PerfGate::Qg2,
+                plan_binding(PerfGate::Qg2),
+                policy(),
+                maximum_drift,
+                vec![provisional_qg2_cell()],
+            ),
+            Err(EvidenceArtifactError::InvalidProvenance { reason })
+                if reason.contains("capacity/maximum/selected-width envelope")
+        ));
+    }
+
+    #[test]
+    fn verified_loader_requires_the_exact_canonical_pretty_bytes() {
+        let artifact = provisional_artifact();
+        let canonical = artifact
+            .sealed_json()
+            .expect("canonical sealed evidence bytes");
+        let value: serde_json::Value =
+            serde_json::from_str(&canonical).expect("canonical evidence JSON");
+        let compact = serde_json::to_vec(&value).expect("compact equivalent evidence JSON");
+        assert!(matches!(
+            PerfEvidenceArtifact::from_verified_slice(&compact),
+            Err(EvidenceArtifactError::Malformed { reason })
+                if reason.contains("exact canonical pretty JSON")
+        ));
+    }
+
+    #[test]
+    fn coherent_receipt_reseals_cannot_forge_runner_build_or_machine_projection() {
+        for mutation in [
+            "git_revision",
+            "git_dirty_worktree",
+            "cargo_lock",
+            "executable",
+            "command",
+            "environment",
+            "runtime_isa",
+            "affinity",
+            "governor",
+            "capacity_text",
+            "machine_fingerprint",
+        ] {
+            let mut artifact = provisional_artifact();
+            match mutation {
+                "git_revision" => artifact.provenance.build.git_revision = "9".repeat(40),
+                "git_dirty_worktree" => {
+                    artifact.provenance.build.git_dirty = true;
+                    artifact.provenance.build.worktree_state_sha256 = Some("9".repeat(64));
+                }
+                "cargo_lock" => {
+                    artifact.provenance.build.cargo_lock_sha256 = Some("9".repeat(64));
+                }
+                "executable" => {
+                    let forged = "9".repeat(64);
+                    artifact
+                        .provenance
+                        .build
+                        .executable_sha256
+                        .clone_from(&forged);
+                    let EvidenceCellBody::Paired { paired, .. } = &mut artifact.cells[0].body
+                    else {
+                        unreachable!("QG-2 fixture must be paired");
+                    };
+                    paired.provenance.executable_sha256.clone_from(&forged);
+                    for sample in paired
+                        .effect_samples
+                        .iter_mut()
+                        .chain(&mut paired.null_samples)
+                    {
+                        sample.provenance.executable_sha256.clone_from(&forged);
+                    }
+                }
+                "command" => artifact.provenance.build.command_sha256 = "9".repeat(64),
+                "environment" => {
+                    artifact.provenance.build.environment_sha256 = Some("9".repeat(64));
+                }
+                "runtime_isa" => {
+                    artifact
+                        .provenance
+                        .machine
+                        .execution
+                        .runtime_detected_isa
+                        .remove(0);
+                }
+                "affinity" => {
+                    artifact
+                        .provenance
+                        .machine
+                        .execution
+                        .cpu_affinity_allowed_list = Some("1-64".to_owned());
+                    artifact.provenance.machine.execution.affinity_or_cpuset_cap =
+                        Some("Cpus_allowed_list=1-64 (64 of 128 host logical threads)".to_owned());
+                }
+                "governor" => {
+                    artifact.provenance.machine.cpu_governor = Some("powersave".to_owned());
+                }
+                "capacity_text" => {
+                    artifact.provenance.machine.execution.affinity_or_cpuset_cap =
+                        Some("available_parallelism=64 of 128 host logical threads".to_owned());
+                }
+                "machine_fingerprint" => {
+                    let forged = format!("{TEST_MACHINE_FINGERPRINT}-forged");
+                    artifact.provenance.machine.fingerprint.clone_from(&forged);
+                    let EvidenceCellBody::Paired { paired, .. } = &mut artifact.cells[0].body
+                    else {
+                        unreachable!("QG-2 fixture must be paired");
+                    };
+                    paired.provenance.worker_id.clone_from(&forged);
+                    for sample in paired
+                        .effect_samples
+                        .iter_mut()
+                        .chain(&mut paired.null_samples)
+                    {
+                        sample.provenance.worker_id.clone_from(&forged);
+                    }
+                }
+                _ => unreachable!("bounded mutation table"),
+            }
+            let bytes = coherently_bind_and_reseal(
+                artifact,
+                b"qg2-threshold",
+                &format!("qg2-hostile-{mutation}"),
+            );
+            let result = PerfEvidenceArtifact::from_verified_slice(&bytes);
+            assert!(
+                matches!(
+                    &result,
+                    Err(EvidenceArtifactError::InvalidProvenance { .. })
+                ),
+                "coherently receipt-bound {mutation} mutation was not rejected: {result:?}"
+            );
+            if mutation == "executable" {
+                assert!(
+                    matches!(
+                        &result,
+                        Err(EvidenceArtifactError::InvalidProvenance { reason })
+                            if reason.contains(
+                                "evidence build identity differs from the verified runner receipt"
+                            )
+                    ),
+                    "coherent executable mutation did not reach the receipt projection: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coherent_receipt_reseals_cannot_forge_cell_scope_provenance_or_estimator() {
+        for mutation in [
+            "scope_id",
+            "scope_version",
+            "scope_semantics",
+            "scope_unit",
+            "run_id",
+            "executable",
+            "corpus",
+            "worker",
+            "build_profile",
+            "estimator_config",
+        ] {
+            let mut artifact = provisional_artifact();
+            let EvidenceCellBody::Paired { paired, .. } = &mut artifact.cells[0].body else {
+                unreachable!("QG-2 fixture must be paired");
+            };
+            match mutation {
+                "scope_id" => paired.scope.operation_id.push_str(".forged"),
+                "scope_version" => paired.scope.version += 1,
+                "scope_semantics" => {
+                    paired.scope.semantics = PerfMetricSemantics::GaugeLowerIsBetter;
+                }
+                "scope_unit" => paired.scope.unit = "docs/second".to_owned(),
+                "run_id" => paired.provenance.run_id = "forged-run".to_owned(),
+                "executable" => paired.provenance.executable_sha256 = "9".repeat(64),
+                "corpus" => paired.provenance.corpus_sha256 = "9".repeat(64),
+                "worker" => paired.provenance.worker_id = "forged-worker".to_owned(),
+                "build_profile" => paired.provenance.build_profile = "forged".to_owned(),
+                "estimator_config" => paired.config.bootstrap_resamples += 1,
+                _ => unreachable!("bounded mutation table"),
+            }
+            let scope = paired.scope.clone();
+            let provenance = paired.provenance.clone();
+            for sample in paired
+                .effect_samples
+                .iter_mut()
+                .chain(&mut paired.null_samples)
+            {
+                sample.scope.clone_from(&scope);
+                sample.provenance.clone_from(&provenance);
+            }
+            let bytes = coherently_bind_and_reseal(
+                artifact,
+                b"qg2-threshold",
+                &format!("qg2-cell-hostile-{mutation}"),
+            );
+            let result = PerfEvidenceArtifact::from_verified_slice(&bytes);
+            assert!(
+                matches!(
+                    &result,
+                    Err(EvidenceArtifactError::InvalidProvenance { .. })
+                ),
+                "coherently receipt-bound {mutation} mutation was not rejected: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn coherent_reseals_cannot_change_policy_unit_or_configured_widths() {
+        let mut policy_drift = provisional_artifact();
+        policy_drift.policy.reconciliation_tolerance_log = 1.30_f64.ln();
+        let bytes =
+            coherently_bind_and_reseal(policy_drift, b"qg2-threshold", "qg2-hostile-policy");
+        assert!(matches!(
+            PerfEvidenceArtifact::from_verified_slice(&bytes),
+            Err(EvidenceArtifactError::InvalidPolicy { .. })
+        ));
+
+        let mut unit_drift = provisional_artifact();
+        unit_drift.cells[0].spec.unit = "docs/second".to_owned();
+        let bytes = coherently_bind_and_reseal(unit_drift, b"qg2-threshold", "qg2-hostile-unit");
+        assert!(matches!(
+            PerfEvidenceArtifact::from_verified_slice(&bytes),
+            Err(EvidenceArtifactError::InconsistentArtifact { .. })
+        ));
+
+        let mut width_drift = provisional_artifact();
+        width_drift
+            .provenance
+            .machine
+            .execution
+            .configured_engine_thread_widths = vec![2];
+        let bytes =
+            coherently_bind_and_reseal(width_drift, b"qg2-threshold", "qg2-hostile-width-envelope");
+        assert!(matches!(
+            PerfEvidenceArtifact::from_verified_slice(&bytes),
+            Err(EvidenceArtifactError::InvalidProvenance { .. })
+        ));
+
+        let mut witness_drift = PerfEvidenceArtifact::assemble(
+            PerfGate::Qg1,
+            plan_binding(PerfGate::Qg1),
+            policy(),
+            evidence_provenance(PerfGate::Qg1),
+            vec![provisional_cell()],
+        )
+        .expect("QG-1 witness mutation fixture");
+        let witness = witness_drift.cells[0]
+            .spec
+            .concurrency_witness
+            .as_mut()
+            .expect("QG-1 concurrency witness");
+        witness.configured_threads = 2;
+        for observation in &mut witness.observations {
+            observation.min_observed_worker_pool_threads = 2;
+            observation.max_observed_worker_pool_threads = 2;
+        }
+        witness_drift
+            .provenance
+            .machine
+            .execution
+            .configured_engine_thread_widths = vec![2];
+        let bytes = coherently_bind_and_reseal(
+            witness_drift,
+            b"qg1-threshold",
+            "qg1-hostile-concurrency-witness",
+        );
+        assert!(matches!(
+            PerfEvidenceArtifact::from_verified_slice(&bytes),
+            Err(EvidenceArtifactError::InconsistentArtifact { .. })
+        ));
+    }
+
+    #[test]
+    fn gate_decisions_only_apply_to_eligible_evidence() {
+        for decision in [
+            EvidenceDecisionStatus::Allow,
+            EvidenceDecisionStatus::Quarantine,
+            EvidenceDecisionStatus::Block,
+        ] {
+            let mut artifact = provisional_artifact();
+            artifact
+                .apply_gate_decision(decision)
+                .expect("eligible terminal decision");
+            assert_eq!(artifact.gate_decision, Some(decision));
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let paths = artifact.write_atomic(dir.path()).expect("write");
+            let reloaded = PerfEvidenceArtifact::load_verified(&paths.json).expect("reload");
+            assert_eq!(reloaded.gate_decision, Some(decision));
+        }
 
         let mut artifact = provisional_artifact();
         assert!(matches!(

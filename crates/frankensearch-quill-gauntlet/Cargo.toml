@@ -15,6 +15,8 @@ tantivy-oracle = [
     "frankensearch-lexical/tantivy-oracle",
     "frankensearch-quill/bench-internals",
 ]
+fuzz-harness = ["tantivy-oracle"]
+pruning-conformance = ["frankensearch-quill/pruning-conformance"]
 perf-harness = [
     "tantivy-oracle",
     "frankensearch-lexical/bench-internals",
@@ -38,6 +40,7 @@ rustix = { version = "1.1.4", features = ["fs", "process"] }
 
 [build-dependencies]
 sha2 = { workspace = true }
+toml = { workspace = true }
 
 [[bin]]
 name = "quill-perf-ratchet"
@@ -46,6 +49,10 @@ path = "src/bin/quill_perf_ratchet.rs"
 [[bin]]
 name = "quill-perf-finalize"
 path = "src/bin/quill_perf_finalize.rs"
+
+[[bin]]
+name = "quill-qg2-contract"
+path = "src/bin/quill_qg2_contract.rs"
 
 [dev-dependencies]
 asupersync = { workspace = true, features = ["test-internals"] }

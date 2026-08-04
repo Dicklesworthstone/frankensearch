@@ -15,7 +15,7 @@ fastembed = ["frankensearch-embed/fastembed"]
 lexical = ["dep:frankensearch-lexical"]
 lexical-tantivy = ["dep:frankensearch-lexical"]
 cass-compat = ["lexical-tantivy"]
-quill = ["dep:frankensearch-quill"]
+quill = ["dep:frankensearch-quill", "frankensearch-fusion/quill"]
 graph = ["frankensearch-fusion/graph"]
 storage = ["dep:frankensearch-storage"]
 durability = [
@@ -59,6 +59,13 @@ frankensearch-fusion = { workspace = true }
 serde_json = { workspace = true }
 criterion = { workspace = true }
 toml = { workspace = true }
+# Third-party incumbent arm for benches/fsvi_4bit_vs_incumbent.rs: ndarray's
+# f32 dot routes to matrixmultiply's runtime-dispatched AVX2 sgemm/sgemv, which
+# is the kernel shape faiss `IndexFlatIP` uses for exact search. Kept in
+# dev-dependencies so no incumbent code enters the shipped crate.
+ndarray = { workspace = true }
+rayon = { workspace = true }
+sha2 = { workspace = true }
 # Lets a test claim `tracing`'s global default subscriber before
 # `asupersync::test_utils::run_test_with_cx` installs its own TRACE-level one.
 # Without this the HuggingFace tokenizer logs five lines per character and a
@@ -69,6 +76,10 @@ tracing-subscriber = { workspace = true }
 name = "search_bench"
 harness = false
 required-features = ["lexical-tantivy"]
+
+[[bench]]
+name = "fsvi_4bit_vs_incumbent"
+harness = false
 
 [[bench]]
 name = "index_builder_lexical_staging"

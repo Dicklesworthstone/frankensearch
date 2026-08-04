@@ -117,9 +117,9 @@ Hypothesis:        After gwd4, residual QG-6 fixed cost is re-DECODING termdict 
 Minimal repro:     QG-6 smoke cell, repeat-query lane, gwd4-landed build vs cache build.
 Expected signal:   large fraction of the residual post-gwd4 QG-6 gap on m4-macos (quantify % once the m4 P1 card + ceiling land).
 Falsified if:      post-gwd4 profile shows decode frames <0.1% self-time.
-Invocation:        PENDING a diagnostic-only M4 profiler that materializes the exact scheduler-10 applicability plan; the promotion runner intentionally rejects M4 until executing-image attestation exists.
+Invocation:        scripts/perf-diagnostic.sh --class m4-macos -- cargo bench -p frankensearch-quill-gauntlet --bench perf_matrix --features perf-harness --profile release-perf (QG-6 fixture narrowed). DIAGNOSTIC ONLY — produces no promotable evidence. The promotion runner (scripts/perf-runner.sh) intentionally rejects m4-macos/scheduler-10 until executing-image attestation exists, and this diagnostic path does not yet materialize the exact scheduler-10 applicability plan.
 Machine profiles:  m4-macos/scheduler-10 primary; x86-vps-ovh/x86-diagnostic and both trj-zen3-5995wx profiles secondary.
-Results (inline):  PENDING (blocked: gwd4 landing + M4 profile card + truthful diagnostic producer).
+Results (inline):  PENDING (blocked: gwd4 landing + M4 profile card + scheduler-10 applicability plan).
 Retry predicate:   n/a
 
 ### bd-e8h-w1-verify-once-checksums-d06f — verify-once checksum memoization

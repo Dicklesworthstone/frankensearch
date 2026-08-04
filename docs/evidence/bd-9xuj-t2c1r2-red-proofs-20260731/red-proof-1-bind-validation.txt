@@ -1,0 +1,18 @@
+=== RED-PROOF 1: BoundQueryEmbedding::new identity.validate() DISABLED — working-tree mutation on top of HEAD 890e64c44a559ece8a7a26995a384614471ff7ef (branch codex/sandygrove-t2c1r2-20260731) ===
+ crates/frankensearch-core/src/types.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+---- types::tests::bind_time_validation_rejects_incoherent_identity_bundle stdout ----
+
+thread 'types::tests::bind_time_validation_rejects_incoherent_identity_bundle' (2115770) panicked at crates/frankensearch-core/src/types.rs:884:14:
+an incoherent identity bundle must not bind: BoundQueryEmbedding { vector: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5], identity: EmbeddingIdentityBundleV1 { space: EmbeddingSpaceIdentityV1 { schema_version: 1, logical_model_id: "bind-validate-model", immutable_revision: "explicit-test-v1", kind: HashControl, artifact_manifest_fingerprint: "5de2575dc5d85d8fe63d3e29f02a9f9dd5490438f9c8813b84678c682462c37e", artifacts: [], tokenizer_fingerprint: "184c772c5f45cc9be88eb4727cdd3bd797ca0c85deed6c5684dec01d8f3858f1", vocabulary_fingerprint: "184c772c5f45cc9be88eb4727cdd3bd797ca0c85deed6c5684dec01d8f3858f1", model_config_fingerprint: "184c772c5f45cc9be88eb4727cdd3bd797ca0c85deed6c5684dec01d8f3858f1", model_preprocessing: "test-defined", sequence_policy: "test-defined", query_instruction: "", document_instruction: "", pooling: "test-defined", output_normalization: "test-defined", dimension: 8, input_contract_fingerprint: "380f3eac64d804afda859fe5005041cd27d73b7beedb461c641337d18ae89a90", hash_control: Some(HashControlProfileV1 { algorithm: "explicit-test-vector-source", algorithm_revision: "v1", seed: 0, feature_rules: "bind-validate-model", tokenization_rules: "test-defined", signing_rules: "test-defined", normalization_rules: "test-defined" }), projection: None }, producer: EmbeddingProducerAttestationV1 { schema_version: 1, backend: "explicit-test-backend", implementation_revision: "v1", protocol_revision: "in-process-v1", numeric_profile: "test-defined-f32", provenance_manifest_fingerprint: "5de2575dc5d85d8fe63d3e29f02a9f9dd5490438f9c8813b84678c682462c37e", space_fingerprint: "184c772c5f45cc9be88eb4727cdd3bd797ca0c85deed6c5684dec01d8f3858f1", golden_vectors: GoldenVectorCertificateV1 { corpus_sha256: "184c772c5f45cc9be88eb4727cdd3bd797ca0c85deed6c5684dec01d8f3858f1", vectors_sha256: "184c772c5f45cc9be88eb4727cdd3bd797ca0c85deed6c5684dec01d8f3858f1", vector_count: 1, dimension: 8 } }, input: EmbeddingInputContractV1 { schema_version: 1, canonicalization: "explicit-test-identity-v1", content_selection: "caller-provided-test-text", chunking: "none", query_instruction: "", document_instruction: "", doc_id_semantics: "test-only-no-document-binding" }, storage: VectorStorageIdentityV1 { schema_version: 1, format: "in-memory-test-vector-v1", quantization: F32, endianness: "native-test-only", vector_normalization: "test-defined", dimension: 8 } }, identity_fingerprint: "0e2d1433a991b0dc6a319537c3a4b4aba444867382edb7d19f7cb04be0adb070", space_fingerprint: "3478d68b03a3710c8363bc776d4fc254ede2cb94ac35baada9baa67e0e14f15a" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    types::tests::bind_time_validation_rejects_incoherent_identity_bundle
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1000 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p frankensearch-core --lib`
+EXIT_STATUS=101

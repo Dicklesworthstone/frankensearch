@@ -17,31 +17,94 @@ Define a deterministic packaging/release/install workflow for `fsfs` that covers
 - `SHOULD`: expected default unless explicitly justified
 - `MUST NOT`: forbidden behavior
 
-## Target Platform Matrix (Required)
+## Target and Capability Matrices (Required)
 
-Release artifacts MUST be produced for exactly these targets:
+The release has two distinct profiles. Their names and capability metadata MUST
+make the distinction machine-readable; a lite artifact is never a substitute
+for a full embedded artifact.
+
+The full embedded profile MUST be produced for exactly these targets:
+
+- `aarch64-apple-darwin`
+- `x86_64-pc-windows-msvc`
+
+The explicit model-free lite profile MUST be produced for exactly these targets:
 
 - `x86_64-unknown-linux-musl`
 - `aarch64-unknown-linux-musl`
 - `x86_64-apple-darwin`
 - `aarch64-apple-darwin`
 
-Linux MUSL targets MUST be built with `cargo-zigbuild`; macOS targets MUST be built with Cargo target builds.
+Linux MUSL lite targets MUST be built with `cargo-zigbuild`; macOS and Windows
+targets MUST be built with Cargo target builds. Apple Silicon therefore has both
+a full artifact and a separately named lite artifact. Intel macOS and Linux MUSL
+have only explicit lite artifacts until a loader-capable backend is supported
+and exercised in CI.
 
 ## Model Feature and Build-Input Boundary
 
-The `frankensearch-fsfs` crate default feature set MUST be model-free. Normal
+The `frankensearch-fsfs` crate default feature set MUST compile the registered
+Model2Vec and FastEmbed loaders without embedding large model artifacts. Normal
 workspace checks, source builds, crates.io packaging, dry runs, and publication
-MUST NOT require local Potion or MiniLM artifacts.
+MUST NOT require local Potion or MiniLM files at compile time. A plain default
+build MUST become a real semantic binary after the operator runs the documented
+`fsfs download-models` commands; no Cargo feature flag or rebuild is permitted
+in that recovery path.
 
-The model-free profile enables model acquisition and verification, but MUST NOT
-compile or advertise Model2Vec or FastEmbed execution. Downloading model files
-alone MUST NOT be presented as enabling semantic execution in an already-built
-model-free binary. Explicit semantic requests MUST fail closed until the
-operator installs a full release binary or builds with
-`--no-default-features --features embedded-models`. An explicitly authorized
-hybrid lexical fallback MAY return lexical results, but MUST report zero
-admitted semantic scores and stable degradation/recovery metadata.
+Default-profile downloads MUST use revision-pinned manifests, verify every
+declared length and SHA-256, and atomically promote the complete installation.
+Missing, corrupt, or offline-blocked models MUST produce typed actionable
+failures. Production indexing and search MUST NOT admit hash control embeddings
+as semantic results.
+
+A `.verified` receipt MAY avoid re-hashing a previously verified cache only when
+it binds the exact canonical production manifest (including pinned revision and
+every file name, size, URL, and SHA-256) plus the complete current file-state
+set. The receipt is a same-UID performance optimization, not an authenticated
+trust root: an actor that can rewrite both model bytes and the user-owned receipt
+can forge them together. Protecting against that actor requires an OS-backed
+trust boundary such as fs-verity or privileged immutable ownership. Explicit
+`download-models --verify` requests, download promotion, and every bundled-model
+promotion MUST perform full size-and-SHA verification before reporting success
+or writing a new receipt. Receipt construction and publication MUST remain
+private to that full-verification boundary: no public raw writer may mint a
+current receipt from file metadata alone. The boundary MUST compare complete
+file state before and after hashing, atomically replace and sync the receipt,
+and fail rather than publish when a file changes during verification.
+
+`fsfs download-models MODEL --verify` MUST return a typed nonzero error when the
+registered installation is missing, incomplete, or checksum-mismatched; a
+diagnostic success envelope for any of those states is forbidden. On success it
+MUST refresh the current receipt. `fsfs status`
+MUST classify registered caches as `missing`, `incomplete`, `mismatch`, or
+`verified` by checking the matching manifest rather than directory existence,
+but it MUST remain observational and MUST NOT create or refresh a receipt.
+Status MUST NOT claim that a verified cache is loadable. `fsfs doctor` MUST
+exercise the compiled loader for every manifest-verified configured semantic
+model and MUST fail when a loader rejects the cache. Doctor MUST NOT probe
+writability by creating and removing files in model or index directories;
+permission metadata MAY be reported, but effective writability MUST be labeled
+unknown/not tested because proving it would violate the observation-only
+boundary. Any hard doctor check MUST
+produce exactly one rendered report, return a nonzero exit status, and use an
+`ok: false` machine envelope with the established stable `subsystem_error` code
+and the failing checks in its context. Warning-only
+and passing reports return zero.
+
+The explicit `--no-default-features` profile is the model-free lite binary. It
+enables acquisition and verification commands but MUST NOT compile or advertise
+Model2Vec or FastEmbed execution. Downloading model files alone MUST NOT be
+presented as enabling semantic execution in this deliberately stripped binary.
+An explicitly authorized lexical-only fallback MAY return lexical results, but
+MUST report zero admitted semantic scores and stable degradation/recovery
+metadata.
+
+The shipping CLI's `Full` and `FastOnly` search modes MUST fail before Initial
+when the vector generation or matching real fast embedder is missing, corrupt,
+or inadmissible. They MUST NOT silently reinterpret that failure as
+lexical-only. `LexicalOnly` remains an explicit operator choice. A failure
+isolated to quality initialization or inference MUST preserve the admitted
+Initial payload and emit a sanitized, actionable `RefinementFailed` phase.
 
 The full GitHub release lane is the explicit exception:
 
@@ -54,18 +117,43 @@ The full GitHub release lane is the explicit exception:
   the release provisioning step.
 
 The `release-build-lite` lane, including every Linux MUSL target, MUST retain
-`--no-default-features` and MUST NOT provision or enable embedded models.
+`--no-default-features` and MUST NOT provision or enable semantic loaders or
+embedded models.
+
+The end-user installer's ordinary profile MUST NOT silently substitute one of
+those deliberately stripped lite artifacts. It MAY install a full embedded
+release artifact. If no full artifact exists for the selected platform, it
+MUST build the loader-capable Cargo default from source. Only an explicit
+`install.sh --lite` request may select the model-free source profile.
+
+Intel macOS (`x86_64-apple-darwin`) is a declared temporary exception to that
+source fallback: the pinned ONNX Runtime distribution has no supported Intel
+Darwin binary, so the default semantic source build is not routable. Until a
+loader-capable Intel backend is built and exercised in CI, ordinary installation
+MUST fail with the stable `unsupported_platform` outcome and actionable `--lite`
+guidance. It MUST NOT attempt the known-unbuildable default source command or
+silently install the lite artifact.
 
 ## Artifact Contract
 
-Each release target MUST publish:
+For a `v<version>` release tag, every full embedded target MUST publish:
 
-- archive: `fsfs-<tag>-<target>.tar.xz`
-- checksum file: `fsfs-<tag>-<target>.tar.xz.sha256`
-- metadata file: `fsfs-<tag>-<target>.metadata.json`
-- optional signing files:
-  - `fsfs-<tag>-<target>.tar.xz.sig`
-  - `fsfs-<tag>-<target>.tar.xz.pem`
+- versioned archive: `fsfs-<version>-<target>.<ext>`
+- checksum: `fsfs-<version>-<target>.<ext>.sha256`
+- metadata: `fsfs-<version>-<target>.metadata.json`
+- installer alias: `fsfs-<target>.<ext>` plus its `.sha256` sidecar
+
+`<ext>` is `tar.xz` for `aarch64-apple-darwin` and `zip` for
+`x86_64-pc-windows-msvc`.
+
+Every lite target MUST instead publish:
+
+- archive: `fsfs-lite-<version>-<target>.tar.xz`
+- checksum: `fsfs-lite-<version>-<target>.tar.xz.sha256`
+- metadata: `fsfs-lite-<version>-<target>.metadata.json`
+
+Optional signing files append `.sig` and `.pem` to the archive name. Lite and
+full names MUST remain distinct even when both profiles exist for one target.
 
 Metadata MUST include:
 
@@ -74,11 +162,17 @@ Metadata MUST include:
 - `binary`
 - `build_timestamp_utc`
 - `rustc`
+- `profile` (`embedded` or `lite`)
+- `semantic_loaders` (boolean)
+- `embedded_models` (boolean)
 
 ## Integrity and Signature Policy
 
 - All released archives MUST include SHA-256 checksums in `sha256:<64 hex>` form.
 - Installer default behavior MUST always verify checksum before replacing a binary.
+- A missing checksum manifest entry or sidecar, a malformed digest, an absent
+  `sha256sum`/`shasum` implementation, or a checksum mismatch MUST fail closed.
+  No skip token, warning-only bypass, or unverified replacement is permitted.
 - Signature verification SHOULD be supported through `--verify` mode and Sigstore/Cosign blob signatures.
 - Missing signatures in optional-signing mode MUST emit a deterministic warning reason code, not silent success.
 
@@ -109,6 +203,15 @@ Installer flags MUST include:
 - `--force`
 
 Non-root install MUST be default behavior.
+Ordinary artifact-download failure MUST fall back to the loader-capable default
+source build on supported semantic targets. Loader-free fallback is forbidden
+unless `--lite` was supplied; Intel macOS follows the typed unsupported-platform
+exception above.
+
+The user-facing Quick Start MUST provision and explicitly verify Potion and
+MiniLM before its first `fsfs index` command whenever the installed profile does
+not embed those artifacts. Documentation MUST NOT promise a fixed 60-second
+setup for a path that downloads roughly 621 MB of pinned model data.
 
 ## Upgrade UX Expectations
 
@@ -584,6 +687,13 @@ Workflow alignment MUST map to:
 - `release-build` (per-target archive/checksum/signature generation)
 - `release-publish` (GitHub release publishing)
 - `publish-crates` (optional crates.io publish gate)
+
+`release-publish` MUST require successful completion of both `release-build` and
+`release-build-lite`; an OR condition is forbidden. Before uploading, it MUST
+admit exactly the six profile/target pairs above, validate each metadata truth
+table (`profile`, `semantic_loaders`, and `embedded_models`), require the
+platform-correct `tar.xz` or `zip` archive and `.sha256` sidecar, and recompute
+every checksum. Missing, duplicate, or extra versioned pairs MUST fail closed.
 
 ### Crates.io publish lane policy (required when enabled)
 

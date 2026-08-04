@@ -1,0 +1,15 @@
+RED PROOF 1: from_open_index embedder id/revision retention DISABLED (both captures -> None)
+mutation applied to crates/frankensearch-index/src/in_memory.rs at commit e5693265b11c31cb98ba4864a6fa8ff21524a643
+expected RED: from_fsvi_preserves_embedder_identity_strings, admitted_v2_load_preserves_embedder_identity_strings
+test in_memory::tests::from_fsvi_preserves_embedder_identity_strings ... FAILED
+test in_memory::tests::admitted_v2_load_preserves_embedder_identity_strings ... FAILED
+thread 'in_memory::tests::from_fsvi_preserves_embedder_identity_strings' (1734374) panicked at crates/frankensearch-index/src/in_memory.rs:1840:9:
+assertion `left == right` failed
+  left: None
+ right: Some("kept-embedder")
+thread 'in_memory::tests::admitted_v2_load_preserves_embedder_identity_strings' (1734373) panicked at crates/frankensearch-index/src/in_memory.rs:1916:9:
+assertion `left == right` failed
+  left: None
+ right: Some("v2-embedder-model")
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 525 filtered out; finished in 0.03s
+EXIT_STATUS=101

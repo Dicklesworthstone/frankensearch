@@ -9,11 +9,21 @@ cargo-fuzz = true
 
 [dependencies]
 frankensearch-quill = { path = "../../frankensearch-quill" }
+frankensearch-core = { path = "../../frankensearch-core" }
+frankensearch-quill-gauntlet = { path = "..", features = ["fuzz-harness"] }
+asupersync = { path = "../../../../asupersync", default-features = false, features = ["test-internals"] }
 libfuzzer-sys = "=0.4.13"
 
 [[bin]]
 name = "codec_bytes"
 path = "fuzz_targets/codec_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "typed_query_tree"
+path = "fuzz_targets/typed_query_tree.rs"
 test = false
 doc = false
 bench = false

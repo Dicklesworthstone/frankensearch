@@ -491,7 +491,7 @@ Reference machines: (a) Apple Silicon ≥ M2 Pro-class (P/E asymmetric, 10–12 
 | **QG-2 Bulk indexing, single-thread** | ≥ **1.5×** tantivy |
 | **QG-3 Watch-mode incremental** (5k-update batches, upsert-heavy) | ≥ existing contract floor (5k updates/s, 25ms p95) with ≥ **4×** headroom on update→searchable latency vs tantivy commit+reload path |
 | **QG-4 Commit latency** (100k-doc index, warm) | p99 ≤ 50ms sealed-commit; visibility lead (searchable-before-commit) demonstrated in the harness |
-| **QG-5 Full compaction** (1M docs, 20% tombstones) | ≥ **5×** tantivy force-merge wall-clock |
+| **QG-5 Full compaction** (50k docs / medium, 20% tombstones — scored on medium, not the still-PENDING xlarge generator, so the cell actually completes) | ≥ **5×** tantivy force-merge wall-clock |
 | **QG-6 Query latency** (query-class mix from the quality harness, k∈{10,100}, 1M docs) | p50 parity (±10%), p99 ≤ tantivy per class; no class regresses >10% |
 | **QG-7 Memory** | Peak ingest RSS ≤ tantivy at equal budget config; index bytes/doc ≤ 1.15× tantivy (positions on) and ≤ 0.8× (positions off vs tantivy positions-on default) |
 | **QG-8 Scaling curve** | Indexing throughput at 16 threads ≥ 1.8× its own 4-thread number (contention honesty gate) on the x86 reference |

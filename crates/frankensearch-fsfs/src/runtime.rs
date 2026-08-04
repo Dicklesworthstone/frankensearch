@@ -7,6 +7,8 @@ use std::io::{BufRead, BufReader, BufWriter, ErrorKind, IsTerminal, Read, Write}
 #[cfg(unix)]
 use std::net::Shutdown;
 #[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -28,10 +30,14 @@ use frankensearch_core::{
 use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FileProtector};
 #[cfg(test)]
 use frankensearch_embed::HashEmbedder;
+#[cfg(feature = "embedded-models")]
+use frankensearch_embed::ensure_default_semantic_models;
 use frankensearch_embed::{
     ConsentSource, DetectOptions, DownloadConsent, EmbedderStack, ModelDownloader, ModelLifecycle,
-    ModelManifest, ensure_default_semantic_models,
+    ModelManifest, ModelTier as ManifestModelTier, verify_dir_and_record, verify_dir_cached,
 };
+#[cfg(feature = "semantic-loaders")]
+use frankensearch_embed::{FastEmbedEmbedder, Model2VecEmbedder};
 use frankensearch_index::VectorIndex;
 use frankensearch_quill::{
     BlueGreenEngine, CURRENT_FILE_NAME, CurrentPointer, DEFAULT_SCHEMA, FSLX_FORMAT_VERSION,
@@ -75,7 +81,7 @@ use sha2::{Digest, Sha256};
 use sysinfo::Disks;
 use tracing::{debug, info, warn};
 
-use crate::adapters::cli::{CliCommand, CliInput, CompletionShell, OutputFormat};
+use crate::adapters::cli::{CliCommand, CliInput, CompletionShell, OutputFormat, exit_code};
 use crate::adapters::format_emitter::{emit_envelope, emit_stream_frame, meta_for_format};
 use crate::adapters::tui::FsfsTuiShellModel;
 use crate::agent_ergonomics::result_id;
@@ -106,8 +112,8 @@ use crate::lifecycle::{
 };
 use crate::mount_info::{MountTable, read_system_mounts};
 use crate::output_schema::{
-    IndexFreshnessPayload, OutputEnvelope, SearchHitPayload, SearchOutputPhase, SearchPayload,
-    error_code_for,
+    IndexFreshnessPayload, OutputEnvelope, OutputError, SearchHitPayload, SearchOutputPhase,
+    SearchPayload, error_code_for,
 };
 use crate::pressure::{
     DegradationControllerConfig, DegradationSignal, DegradationStateMachine, DegradationTransition,
@@ -127,6 +133,7 @@ use crate::stream_protocol::{
     StreamEvent, StreamFrame, StreamProgressEvent, StreamResultEvent, StreamStartedEvent,
     is_retryable_error, terminal_event_completed, terminal_event_from_error,
 };
+use crate::tracing_setup::current_unicode_environment;
 use crate::watcher::{FsWatcher, WatchIngestOp, WatchIngestPipeline};
 
 /// Supported fsfs interfaces.
@@ -544,18 +551,11 @@ struct SearchExecutionResources {
     shadow_observer: Option<frankensearch_core::ShadowLexicalObserver>,
     shadow_pressure_sampler: Option<Arc<ShadowPressureSampler>>,
     vector_index: Option<VectorIndex>,
-    pending_semantic_initialization_failure: Option<PendingSemanticInitializationFailure>,
     fast_embedder: Option<Arc<dyn Embedder>>,
     quality_embedder: Option<Arc<dyn Embedder>>,
     fast_embedder_attempted: bool,
     quality_embedder_attempted: bool,
     degradation_advice: Vec<DegradationAdvice>,
-}
-
-#[derive(Debug, Clone)]
-struct PendingSemanticInitializationFailure {
-    error_code: &'static str,
-    sanitized_summary: &'static str,
 }
 
 struct ShadowPressureSampler {
@@ -1800,7 +1800,9 @@ impl EmbeddingVectorSink for LiveVectorSink {
             .vector_index
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        vi.soft_delete(doc_id)?;
+        // `VectorIndex::append` is the atomic replacement primitive: it
+        // durably logs the new value before superseding older resident copies.
+        // Deleting first would turn a failed WAL append into durable data loss.
         vi.append(doc_id, embedding)?;
         drop(vi);
         Ok(())
@@ -2012,18 +2014,16 @@ impl LiveIngestPipeline {
         Ok((canonical, rel_key))
     }
 
-    fn soft_delete_vector(&self, rel_key: &str) {
+    fn soft_delete_vector(&self, rel_key: &str) -> SearchResult<()> {
         let mut vi = self
             .vector_index
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Err(error) = vi.soft_delete(rel_key) {
-            tracing::debug!(
-                file_key = %rel_key,
-                error = %error,
-                "soft_delete_vector: ignored (doc may not exist yet)"
-            );
-        }
+        // Missing documents are `Ok(false)`; an error is a real durability or
+        // integrity failure and must not be reported as a successful delete.
+        let _was_present = vi.soft_delete(rel_key)?;
+        drop(vi);
+        Ok(())
     }
 
     async fn prune_indexes(&self, cx: &Cx, rel_key: &str) -> frankensearch_core::SearchResult<()> {
@@ -2034,7 +2034,7 @@ impl LiveIngestPipeline {
             "watch_delete",
         )];
         self.apply_lexical_mutations(cx, &mutations).await?;
-        self.soft_delete_vector(rel_key);
+        self.soft_delete_vector(rel_key)?;
         Ok(())
     }
 
@@ -2187,7 +2187,7 @@ impl LiveIngestPipeline {
                         reason_code = %vector_plan.reason_code,
                         "watcher ingest: tombstoning stale vector for revision invalidation"
                     );
-                    self.soft_delete_vector(rel_key);
+                    self.soft_delete_vector(rel_key)?;
                 }
                 VectorIndexWriteAction::AppendFast { .. } => {
                     match self.embedder.embed(cx, canonical).await {
@@ -2196,9 +2196,8 @@ impl LiveIngestPipeline {
                                 .vector_index
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            // soft_delete returns Ok(false) if doc doesn't exist, so Err is a real failure
-                            // (IO/corruption) that must prevent appending.
-                            vi.soft_delete(rel_key)?;
+                            // Append is log-before-supersede. Never tombstone
+                            // the old vector until the replacement is durable.
                             vi.append(rel_key, &embedding)?;
                         }
                         Err(error) => {
@@ -2222,7 +2221,7 @@ impl LiveIngestPipeline {
                 }
                 VectorIndexWriteAction::MarkLexicalFallback { .. }
                 | VectorIndexWriteAction::Skip { .. } => {
-                    self.soft_delete_vector(rel_key);
+                    self.soft_delete_vector(rel_key)?;
                 }
             }
         }
@@ -2361,7 +2360,7 @@ impl LiveIngestPipeline {
                     .await?;
             }
         } else {
-            self.soft_delete_vector(&rel_key);
+            self.soft_delete_vector(&rel_key)?;
             Self::purge_storage_document(storage_ctx, &rel_key)?;
         }
 
@@ -2439,7 +2438,7 @@ impl LiveIngestPipeline {
             self.apply_live_vector_actions(cx, &rel_key, revision, &canonical, &vector_plan)
                 .await?;
         } else {
-            self.soft_delete_vector(&rel_key);
+            self.soft_delete_vector(&rel_key)?;
         }
 
         Ok(true)
@@ -2561,8 +2560,43 @@ struct FsfsModelStatus {
     tier: String,
     name: String,
     cache_path: String,
+    verification_state: String,
+    diagnostic: Option<String>,
     cached: bool,
     size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelCacheVerificationState {
+    Missing,
+    Unregistered,
+    Incomplete,
+    Mismatch,
+    Verified,
+}
+
+impl ModelCacheVerificationState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Unregistered => "unregistered",
+            Self::Incomplete => "incomplete",
+            Self::Mismatch => "mismatch",
+            Self::Verified => "verified",
+        }
+    }
+
+    const fn is_verified(self) -> bool {
+        matches!(self, Self::Verified)
+    }
+}
+
+#[derive(Debug)]
+struct ModelCacheInspection {
+    path: PathBuf,
+    state: ModelCacheVerificationState,
+    size_bytes: u64,
+    diagnostic: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2989,6 +3023,13 @@ fn release_checksum_url(tag: &str) -> String {
 }
 
 /// Construct the asset filename for a given version and target triple.
+///
+/// The release pipeline ships two archive families: full builds (embedded
+/// models; aarch64 macOS and Windows) named `fsfs-VERSION-TRIPLE`, and lite
+/// builds (loader-capable, no embedded models; both musl Linux targets and
+/// Intel macOS) named `fsfs-lite-VERSION-TRIPLE`. This constructor previously
+/// always produced the full-build name, so Linux self-update requested an
+/// asset that no release has ever contained and 404ed unconditionally.
 fn release_asset_filename(tag: &str, triple: &str) -> String {
     let version = tag.strip_prefix('v').unwrap_or(tag);
     let ext = if triple.contains("windows") {
@@ -2996,7 +3037,15 @@ fn release_asset_filename(tag: &str, triple: &str) -> String {
     } else {
         "tar.xz"
     };
-    format!("fsfs-{version}-{triple}.{ext}")
+    let family = if matches!(
+        triple,
+        "x86_64-unknown-linux-musl" | "aarch64-unknown-linux-musl" | "x86_64-apple-darwin"
+    ) {
+        "fsfs-lite"
+    } else {
+        "fsfs"
+    };
+    format!("{family}-{version}-{triple}.{ext}")
 }
 
 /// Extract the expected SHA-256 hash for a given asset filename from a
@@ -3025,6 +3074,20 @@ fn extract_hash_from_sums(sums_content: &str, asset_filename: &str) -> Option<St
         }
     }
     None
+}
+
+/// Extract the SHA-256 hash from a per-asset `.sha256` sidecar file.
+///
+/// The release pipeline writes these with `sha256sum archive > archive.sha256`,
+/// so the hash is the first whitespace-delimited token; anything that is not
+/// exactly 64 hex digits is rejected rather than trusted.
+fn extract_hash_from_sidecar(sidecar_content: &str) -> Option<String> {
+    let token = sidecar_content.split_whitespace().next()?;
+    if token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(token.to_owned())
+    } else {
+        None
+    }
 }
 
 // ─── Version Check Cache ───────────────────────────────────────────────────
@@ -3983,7 +4046,15 @@ impl FsfsRuntime {
     #[must_use]
     pub fn vector_index_write_actions(plan: &VectorPipelinePlan) -> Vec<VectorIndexWriteAction> {
         let mut actions = Vec::new();
-        if let Some(revision) = plan.invalidate_revisions_through {
+        // When the plan publishes a replacement vector, `VectorIndex::append`
+        // supersedes the stale revision durably (log-before-supersede); a
+        // separate tombstone first would destroy the old vector if the append
+        // fails. Invalidate explicitly only when no replacement is published.
+        let publishes_replacement = matches!(
+            plan.tier,
+            VectorSchedulingTier::FastAndQuality | VectorSchedulingTier::FastOnly
+        );
+        if !publishes_replacement && let Some(revision) = plan.invalidate_revisions_through {
             actions.push(VectorIndexWriteAction::InvalidateRevisionsThrough {
                 file_key: plan.file_key.clone(),
                 revision,
@@ -4214,26 +4285,49 @@ impl FsfsRuntime {
         notes.push(format!("downloading {asset_url}"));
         download_release_asset(&asset_url, &archive_path)?;
 
-        // Download and verify checksum.
-        let expected_hash = if download_release_asset(&checksum_url, &checksum_path).is_ok() {
+        // Download and verify checksum: prefer the release-level SHA256SUMS,
+        // fall back to the per-asset `.sha256` sidecar the release pipeline
+        // ships for every archive, and refuse to install unverified bytes if
+        // neither source yields a hash (previously this path silently skipped
+        // verification whenever SHA256SUMS was absent — which it was for every
+        // release before v1.4.3).
+        let mut expected_hash = if download_release_asset(&checksum_url, &checksum_path).is_ok() {
             let content = fs::read_to_string(&checksum_path).unwrap_or_default();
             extract_hash_from_sums(&content, &asset_filename)
         } else {
-            notes.push("SHA256SUMS not available; skipping verification".into());
             None
         };
-
-        if let Some(ref expected) = expected_hash {
-            let actual = compute_sha256_of_file(&archive_path)?;
-            if !actual.eq_ignore_ascii_case(expected) {
-                return Err(SearchError::InvalidConfig {
-                    field: "update.checksum".into(),
-                    value: actual,
-                    reason: format!("SHA-256 mismatch: expected {expected}"),
-                });
+        if expected_hash.is_none() {
+            let sidecar_url = format!("{asset_url}.sha256");
+            let sidecar_path = temp_dir.join("asset.sha256");
+            if download_release_asset(&sidecar_url, &sidecar_path).is_ok() {
+                let content = fs::read_to_string(&sidecar_path).unwrap_or_default();
+                expected_hash = extract_hash_from_sidecar(&content);
+                if expected_hash.is_some() {
+                    notes.push("checksum sourced from per-asset .sha256 sidecar".into());
+                }
             }
-            notes.push("SHA-256 checksum verified".into());
         }
+        let Some(expected) = expected_hash else {
+            return Err(SearchError::InvalidConfig {
+                field: "update.checksum".into(),
+                value: asset_filename.clone(),
+                reason: format!(
+                    "no usable checksum: {checksum_url} lacks this asset and \
+                     {asset_url}.sha256 is unavailable; refusing to install an \
+                     unverified artifact"
+                ),
+            });
+        };
+        let actual = compute_sha256_of_file(&archive_path)?;
+        if !actual.eq_ignore_ascii_case(&expected) {
+            return Err(SearchError::InvalidConfig {
+                field: "update.checksum".into(),
+                value: actual,
+                reason: format!("SHA-256 mismatch: expected {expected}"),
+            });
+        }
+        notes.push("SHA-256 checksum verified".into());
 
         // Extract binary from the archive.
         let extract_dir = temp_dir.join("extract");
@@ -5004,16 +5098,16 @@ impl FsfsRuntime {
     }
 
     #[cfg_attr(
-        not(feature = "embedded-models"),
+        not(feature = "semantic-loaders"),
         allow(clippy::unnecessary_wraps, clippy::unused_self)
     )]
     fn search_mode_hint(&self) -> SearchResult<Option<String>> {
-        #[cfg(not(feature = "embedded-models"))]
+        #[cfg(not(feature = "semantic-loaders"))]
         {
             Ok(Some(model_free_semantic_recovery_guidance().to_owned()))
         }
 
-        #[cfg(feature = "embedded-models")]
+        #[cfg(feature = "semantic-loaders")]
         {
             let models = self.collect_model_statuses()?;
             let fast_cached = models
@@ -5024,22 +5118,25 @@ impl FsfsRuntime {
                 .any(|model| model.tier == "quality" && model.cached);
 
             if fast_cached && quality_cached && !self.config.search.fast_only {
-                return Ok(None);
+                return Ok(Some(
+                    "Search readiness: fast and quality model caches passed their registered manifests. Run `fsfs doctor` to exercise both compiled loaders before indexing. Full search fails before Initial if the fast lane is unavailable; a quality-only failure preserves Initial and emits an actionable RefinementFailed phase."
+                        .to_owned(),
+                ));
             }
             if fast_cached {
                 if self.config.search.fast_only {
                     return Ok(Some(
-                        "Search mode: fast semantic tier only (quality disabled by `fast_only=true`)."
+                        "Search readiness: the fast model cache passed its registered manifest and quality is disabled by `fast_only=true`. Run `fsfs doctor` to exercise the compiled fast loader before indexing."
                             .to_owned(),
                     ));
                 }
                 return Ok(Some(
-                    "Search mode: fast semantic tier active; quality model missing, so refinement is skipped."
+                    "Search readiness: the fast model cache passed its registered manifest, but the quality cache did not. Run `fsfs download-models` and `fsfs doctor`; status alone does not claim that a compiled loader can open either cache."
                         .to_owned(),
                 ));
             }
             Ok(Some(
-                "Search mode: lexical-only because no verified semantic model is available. Check model-cache permissions and `fsfs status`; semantic results never use the hash control embedder."
+                "Search readiness: no semantic model cache passed a registered manifest. Run `fsfs download-models`, or point FRANKENSEARCH_MODEL_DIR at a registered cache, then run `fsfs doctor`; semantic results never use the hash control embedder."
                     .to_owned(),
             ))
         }
@@ -5688,6 +5785,7 @@ impl FsfsRuntime {
 
     #[cfg(unix)]
     fn spawn_search_daemon(&self, socket_path: &Path) -> SearchResult<()> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         use std::os::unix::process::CommandExt;
 
         if let Some(parent) = socket_path.parent()
@@ -5756,6 +5854,7 @@ impl FsfsRuntime {
         // async-signal-safety of whatever the caller puts in there; the
         // two calls we make — `prctl` and `getppid` — are both on the
         // signal-safe list (see signal-safety(7)).
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         #[allow(unsafe_code)]
         unsafe {
             command.pre_exec(|| {
@@ -6333,7 +6432,7 @@ impl FsfsRuntime {
         query: &str,
         limit: usize,
     ) -> SearchResult<Vec<SearchPayload>> {
-        let env_map: HashMap<String, String> = std::env::vars().collect();
+        let env_map = current_unicode_environment();
         let query_for_expansion = query.to_owned();
         let expansion =
             spawn_blocking(move || query_expansion::expand_query(&query_for_expansion, &env_map))
@@ -7158,7 +7257,6 @@ impl FsfsRuntime {
         let output_limit = Self::resolve_output_limit(limit, lexical_doc_count, vector_doc_count);
         let planning_limit = Self::resolve_planning_limit(output_limit);
         let search_start = Instant::now();
-        let lexical_available = resources.lexical_index.is_some();
 
         let capabilities = resources.capabilities_for_mode(mode, self.config.search.fast_only);
         let planner = QueryPlanner::from_fsfs(&self.config);
@@ -7381,29 +7479,15 @@ impl FsfsRuntime {
             "fsfs semantic-stage VOI decision"
         );
 
-        // FastOnly is an explicit semantic-readiness contract. A favorable
-        // lexical head may still let VOI skip the expensive embed/search, but
-        // it must never hide a missing, corrupt, or inadmissible semantic lane.
-        // Full may continue without that lane only after the planner selects a
-        // real lexical stage and the response records stable recovery advice.
-        let lexical_fallback_authorized = matches!(mode, SearchExecutionMode::Full)
-            && plan.lexical_stage.enabled
-            && lexical_available;
-        let semantic_initialization_fallback_required =
-            lexical_fallback_authorized && resources.vector_index.is_none();
-        let semantic_readiness_required = matches!(mode, SearchExecutionMode::FastOnly)
-            || semantic_initialization_fallback_required
-            || (plan.semantic_stage.enabled
-                && semantic_decision.run_semantic
-                && !matches!(mode, SearchExecutionMode::LexicalOnly));
+        // Full and FastOnly are explicit semantic-readiness contracts. A
+        // favorable lexical head may still let VOI skip expensive inference,
+        // but it must never hide a missing, corrupt, or inadmissible semantic
+        // lane. Operators who intentionally want lexical-only behavior must
+        // select LexicalOnly explicitly.
+        let semantic_readiness_required = !matches!(mode, SearchExecutionMode::LexicalOnly);
 
         if semantic_readiness_required && resources.vector_index.is_none() {
-            let error = Self::semantic_index_unavailable_error(resources);
-            if lexical_fallback_authorized {
-                Self::record_semantic_initialization_fallback(resources, &normalized_query, &error);
-            } else {
-                return Err(error);
-            }
+            return Err(Self::semantic_index_unavailable_error(resources));
         }
 
         if semantic_readiness_required
@@ -7411,16 +7495,11 @@ impl FsfsRuntime {
             && resources.fast_embedder.is_none()
             && !resources.fast_embedder_attempted
         {
-            self.maybe_prepare_fast_embedder(
-                resources,
-                lexical_fallback_authorized,
-                &normalized_query,
-            )?;
+            self.maybe_prepare_fast_embedder(resources)?;
         }
         if semantic_readiness_required
             && resources.vector_index.is_some()
             && resources.fast_embedder.is_none()
-            && !lexical_fallback_authorized
         {
             return Err(SearchError::EmbedderUnavailable {
                 model: "semantic".to_owned(),
@@ -7466,14 +7545,6 @@ impl FsfsRuntime {
                             Err(error) if matches!(error, SearchError::Cancelled { .. }) => {
                                 return Err(error);
                             }
-                            Err(error) if lexical_fallback_authorized => {
-                                Self::record_semantic_lexical_fallback(
-                                    resources,
-                                    &normalized_query,
-                                    &error,
-                                );
-                                Vec::new()
-                            }
                             Err(error) => return Err(error),
                         }
                     }
@@ -7481,14 +7552,6 @@ impl FsfsRuntime {
                         // Cancellation is never a fallback signal: propagate so
                         // the stream command can emit the Cancelled terminal.
                         return Err(error);
-                    }
-                    Err(error) if lexical_fallback_authorized => {
-                        Self::record_semantic_lexical_fallback(
-                            resources,
-                            &normalized_query,
-                            &error,
-                        );
-                        Vec::new()
                     }
                     Err(error) => return Err(error),
                 }
@@ -7552,165 +7615,178 @@ impl FsfsRuntime {
         let mut artifacts = vec![initial_artifact];
 
         if plan.quality_stage.enabled {
-            if matches!(mode, SearchExecutionMode::Full)
+            let quality_initialization = if matches!(mode, SearchExecutionMode::Full)
                 && !self.config.search.fast_only
                 && resources.vector_index.is_some()
                 && resources.quality_embedder.is_none()
                 && !resources.quality_embedder_attempted
             {
-                self.maybe_prepare_quality_embedder(resources, lexical_available)?;
-            }
-            if let (Some(index), Some(embedder)) = (
-                resources.vector_index.as_ref(),
-                resources.quality_embedder.as_ref(),
-            ) {
-                let quality_budget_floor = planning_limit;
-                let quality_budget_ceiling = if lexical_tail_complete {
-                    planning_limit
-                } else {
-                    output_limit
-                };
-                let quality_budget = plan
-                    .quality_stage
-                    .candidate_budget
-                    .max(quality_budget_floor)
-                    .min(quality_budget_ceiling);
-                let quality_outcome = match embedder.embed(cx, &normalized_query).await {
-                    Ok(query_embedding) => {
-                        match index.search_top_k(&query_embedding, quality_budget, None) {
-                            Ok(hits) => Ok(hits
-                                .into_iter()
-                                .map(|hit| SemanticCandidate::new(hit.doc_id, hit.score))
-                                .collect::<Vec<_>>()),
+                self.maybe_prepare_quality_embedder(resources)
+            } else {
+                Ok(())
+            };
+            let quality_outcome = match quality_initialization {
+                Err(error) => Err(error),
+                Ok(()) => {
+                    if let (Some(index), Some(embedder)) = (
+                        resources.vector_index.as_ref(),
+                        resources.quality_embedder.as_ref(),
+                    ) {
+                        let quality_budget_floor = planning_limit;
+                        let quality_budget_ceiling = if lexical_tail_complete {
+                            planning_limit
+                        } else {
+                            output_limit
+                        };
+                        let quality_budget = plan
+                            .quality_stage
+                            .candidate_budget
+                            .max(quality_budget_floor)
+                            .min(quality_budget_ceiling);
+                        match embedder.embed(cx, &normalized_query).await {
+                            Ok(query_embedding) => {
+                                match index.search_top_k(&query_embedding, quality_budget, None) {
+                                    Ok(hits) => Ok(Some(
+                                        hits.into_iter()
+                                            .map(|hit| {
+                                                SemanticCandidate::new(hit.doc_id, hit.score)
+                                            })
+                                            .collect::<Vec<_>>(),
+                                    )),
+                                    Err(error) => Err(error),
+                                }
+                            }
                             Err(error) => Err(error),
                         }
+                    } else {
+                        Ok(None)
                     }
-                    Err(error) => Err(error),
-                };
+                }
+            };
 
-                match quality_outcome {
-                    Err(error) if matches!(error, SearchError::Cancelled { .. }) => {
-                        // Cancellation is never a refinement failure: propagate
-                        // so the stream command emits the Cancelled terminal
-                        // and no Refined/RefinementFailed artifact follows it.
-                        return Err(error);
-                    }
-                    Ok(quality_candidates) => {
-                        let fused_refined_head = orchestrator.fuse_rankings(
-                            &lexical_head_candidates,
-                            &quality_candidates,
-                            fusion_budget,
-                            0,
-                        );
-                        let filtered_refined_head =
-                            Self::apply_search_filter(&fused_refined_head, filter_expr.as_ref());
-                        let fused_refined = Self::merge_with_fallback_tail(
-                            &filtered_refined_head,
-                            &fused_initial,
-                            output_limit,
-                        );
-                        let refined_payload = Self::attach_index_freshness(
-                            Self::build_limited_payload(
-                                orchestrator,
-                                &normalized_query,
-                                SearchOutputPhase::Refined,
-                                &fused_refined,
-                                &snippets_by_doc,
-                                output_limit,
-                            ),
-                            index_freshness,
-                        );
-                        let refined_artifact = SearchPhaseArtifact {
-                            phase: SearchOutputPhase::Refined,
-                            fused: fused_refined,
-                            payload: refined_payload,
-                        };
-                        Self::validate_bound_search_resources(resources, mode)?;
-                        if let Some(sink) = phase_sink.as_deref_mut() {
-                            sink(&refined_artifact.payload)?;
-                        }
-                        artifacts.push(refined_artifact);
-                    }
-                    Err(error) => {
-                        let error_code = error_code_for(&error);
-                        let reason = Self::semantic_runtime_failure_summary(&error);
-                        if let SearchError::DimensionMismatch { .. } = error {
-                            resources.quality_embedder = None;
-                            resources.quality_embedder_attempted = true;
-                            info!(
-                                error_code,
-                                reason,
-                                "fsfs quality refinement disabled for this session after embedder/index dimension mismatch"
-                            );
-                        } else {
-                            info!(
-                                error_code,
-                                reason,
-                                "fsfs quality refinement failed; falling back to initial phase payload"
-                            );
-                        }
-                        let mut advice = resources.degradation_advice.clone();
-                        advice.push(Self::sanitized_semantic_degradation_advice(
-                            classify_search_error(&error),
-                            &normalized_query,
-                            &resources.index_root,
-                            &error,
-                        ));
-                        let failed_payload = Self::attach_index_freshness(
-                            Self::build_limited_payload(
-                                orchestrator,
-                                &normalized_query,
-                                SearchOutputPhase::RefinementFailed,
-                                &fused_initial,
-                                &snippets_by_doc,
-                                output_limit,
-                            )
-                            .with_degradation_advice(advice),
-                            index_freshness,
-                        );
-                        let failed_artifact = SearchPhaseArtifact {
-                            phase: SearchOutputPhase::RefinementFailed,
-                            fused: fused_initial.clone(),
-                            payload: failed_payload,
-                        };
-                        Self::validate_bound_search_resources(resources, mode)?;
-                        if let Some(sink) = phase_sink.as_deref_mut() {
-                            sink(&failed_artifact.payload)?;
-                        }
-                        artifacts.push(failed_artifact);
-                    }
+            match quality_outcome {
+                Err(error) if matches!(error, SearchError::Cancelled { .. }) => {
+                    // Cancellation is never a refinement failure: propagate
+                    // so the stream command emits the Cancelled terminal
+                    // and no Refined/RefinementFailed artifact follows it.
+                    return Err(error);
                 }
-            } else {
-                let mut advice = resources.degradation_advice.clone();
-                advice.push(DegradationAdvice::from_input(DegradationAdviceInput {
-                    failure: DegradationFailureKind::MissingQualityModel,
-                    query: &normalized_query,
-                    index_dir: Some(&resources.index_root),
-                    original_error: None,
-                    replay_command: None,
-                }));
-                let failed_payload = Self::attach_index_freshness(
-                    Self::build_limited_payload(
-                        orchestrator,
-                        &normalized_query,
-                        SearchOutputPhase::RefinementFailed,
+                Ok(Some(quality_candidates)) => {
+                    let fused_refined_head = orchestrator.fuse_rankings(
+                        &lexical_head_candidates,
+                        &quality_candidates,
+                        fusion_budget,
+                        0,
+                    );
+                    let filtered_refined_head =
+                        Self::apply_search_filter(&fused_refined_head, filter_expr.as_ref());
+                    let fused_refined = Self::merge_with_fallback_tail(
+                        &filtered_refined_head,
                         &fused_initial,
-                        &snippets_by_doc,
                         output_limit,
-                    )
-                    .with_degradation_advice(advice),
-                    index_freshness,
-                );
-                let failed_artifact = SearchPhaseArtifact {
-                    phase: SearchOutputPhase::RefinementFailed,
-                    fused: fused_initial.clone(),
-                    payload: failed_payload,
-                };
-                Self::validate_bound_search_resources(resources, mode)?;
-                if let Some(sink) = phase_sink {
-                    sink(&failed_artifact.payload)?;
+                    );
+                    let refined_payload = Self::attach_index_freshness(
+                        Self::build_limited_payload(
+                            orchestrator,
+                            &normalized_query,
+                            SearchOutputPhase::Refined,
+                            &fused_refined,
+                            &snippets_by_doc,
+                            output_limit,
+                        ),
+                        index_freshness,
+                    );
+                    let refined_artifact = SearchPhaseArtifact {
+                        phase: SearchOutputPhase::Refined,
+                        fused: fused_refined,
+                        payload: refined_payload,
+                    };
+                    Self::validate_bound_search_resources(resources, mode)?;
+                    if let Some(sink) = phase_sink.as_deref_mut() {
+                        sink(&refined_artifact.payload)?;
+                    }
+                    artifacts.push(refined_artifact);
                 }
-                artifacts.push(failed_artifact);
+                Err(error) => {
+                    let error_code = error_code_for(&error);
+                    let reason = Self::semantic_runtime_failure_summary(&error);
+                    if let SearchError::DimensionMismatch { .. } = error {
+                        resources.quality_embedder = None;
+                        resources.quality_embedder_attempted = true;
+                        info!(
+                            error_code,
+                            reason,
+                            "fsfs quality refinement disabled for this session after embedder/index dimension mismatch"
+                        );
+                    } else {
+                        info!(
+                            error_code,
+                            reason,
+                            "fsfs quality refinement failed; falling back to initial phase payload"
+                        );
+                    }
+                    let mut advice = resources.degradation_advice.clone();
+                    advice.push(Self::sanitized_semantic_degradation_advice(
+                        classify_search_error(&error),
+                        &normalized_query,
+                        &resources.index_root,
+                        &error,
+                    ));
+                    let failed_payload = Self::attach_index_freshness(
+                        Self::build_limited_payload(
+                            orchestrator,
+                            &normalized_query,
+                            SearchOutputPhase::RefinementFailed,
+                            &fused_initial,
+                            &snippets_by_doc,
+                            output_limit,
+                        )
+                        .with_degradation_advice(advice),
+                        index_freshness,
+                    );
+                    let failed_artifact = SearchPhaseArtifact {
+                        phase: SearchOutputPhase::RefinementFailed,
+                        fused: fused_initial.clone(),
+                        payload: failed_payload,
+                    };
+                    Self::validate_bound_search_resources(resources, mode)?;
+                    if let Some(sink) = phase_sink.as_deref_mut() {
+                        sink(&failed_artifact.payload)?;
+                    }
+                    artifacts.push(failed_artifact);
+                }
+                Ok(None) => {
+                    let mut advice = resources.degradation_advice.clone();
+                    advice.push(DegradationAdvice::from_input(DegradationAdviceInput {
+                        failure: DegradationFailureKind::MissingQualityModel,
+                        query: &normalized_query,
+                        index_dir: Some(&resources.index_root),
+                        original_error: None,
+                        replay_command: None,
+                    }));
+                    let failed_payload = Self::attach_index_freshness(
+                        Self::build_limited_payload(
+                            orchestrator,
+                            &normalized_query,
+                            SearchOutputPhase::RefinementFailed,
+                            &fused_initial,
+                            &snippets_by_doc,
+                            output_limit,
+                        )
+                        .with_degradation_advice(advice),
+                        index_freshness,
+                    );
+                    let failed_artifact = SearchPhaseArtifact {
+                        phase: SearchOutputPhase::RefinementFailed,
+                        fused: fused_initial.clone(),
+                        payload: failed_payload,
+                    };
+                    Self::validate_bound_search_resources(resources, mode)?;
+                    if let Some(sink) = phase_sink {
+                        sink(&failed_artifact.payload)?;
+                    }
+                    artifacts.push(failed_artifact);
+                }
             }
         }
 
@@ -7859,8 +7935,13 @@ impl FsfsRuntime {
                 continue;
             }
 
-            let (present, verified, verify_message) =
-                Self::inspect_manifest_installation(&manifest, &destination);
+            // ubs:ignore -- public CLI operation tag, not secret material.
+            let (present, verified, verify_message) = if operation == "verify" {
+                verify_dir_and_record(&manifest, &destination)?;
+                (true, Some(true), None)
+            } else {
+                Self::inspect_manifest_installation(&manifest, &destination)
+            };
 
             let entry = match operation {
                 "list" => {
@@ -7881,24 +7962,15 @@ impl FsfsRuntime {
                         verify_message,
                     )
                 }
-                "verify" => {
-                    let state = if !present {
-                        "missing"
-                    } else if verified == Some(true) {
-                        "verified"
-                    } else {
-                        "mismatch"
-                    };
-                    Self::download_model_entry(
-                        &manifest,
-                        &install_dir,
-                        &destination,
-                        state,
-                        verified,
-                        Self::path_bytes(&destination)?,
-                        verify_message,
-                    )
-                }
+                "verify" => Self::download_model_entry(
+                    &manifest,
+                    &install_dir,
+                    &destination,
+                    "verified",
+                    Some(true),
+                    Self::path_bytes(&destination)?,
+                    None,
+                ),
                 _ => {
                     if !self.cli_input.full_reindex && verified == Some(true) {
                         Self::download_model_entry(
@@ -7956,16 +8028,35 @@ impl FsfsRuntime {
 
     fn run_doctor_command(&self) -> SearchResult<()> {
         let payload = self.collect_doctor_payload()?;
+        let failed = matches!(payload.overall, DoctorVerdict::Fail);
         if self.cli_input.format == OutputFormat::Table {
             let table = render_doctor_table(&payload, self.cli_input.no_color);
             print!("{table}");
+            std::io::stdout()
+                .flush()
+                .map_err(|source| SearchError::SubsystemError {
+                    subsystem: "fsfs.doctor",
+                    source: Box::new(source),
+                })?;
+            if failed {
+                std::process::exit(exit_code::RUNTIME_ERROR);
+            }
             return Ok(());
         }
 
         let meta = meta_for_format("doctor", self.cli_input.format);
-        let envelope = OutputEnvelope::success(payload, meta, iso_timestamp_now());
         let mut stdout = std::io::stdout();
-        emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
+        if failed {
+            let envelope: OutputEnvelope<()> = OutputEnvelope::error(
+                Self::doctor_failure_error(&payload),
+                meta,
+                iso_timestamp_now(),
+            );
+            emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
+        } else {
+            let envelope = OutputEnvelope::success(payload, meta, iso_timestamp_now());
+            emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
+        }
         if self.cli_input.format != OutputFormat::Jsonl {
             stdout
                 .write_all(b"\n")
@@ -7974,7 +8065,53 @@ impl FsfsRuntime {
                     source: Box::new(source),
                 })?;
         }
+        stdout
+            .flush()
+            .map_err(|source| SearchError::SubsystemError {
+                subsystem: "fsfs.doctor",
+                source: Box::new(source),
+            })?;
+        if failed {
+            std::process::exit(exit_code::RUNTIME_ERROR);
+        }
         Ok(())
+    }
+
+    fn doctor_failure_error(payload: &FsfsDoctorPayload) -> OutputError {
+        let failing_checks = payload
+            .checks
+            .iter()
+            .filter(|check| matches!(check.verdict, DoctorVerdict::Fail))
+            .map(|check| format!("{}: {}", check.name, check.detail))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let recovery = payload
+            .checks
+            .iter()
+            .filter(|check| matches!(check.verdict, DoctorVerdict::Fail))
+            .filter_map(|check| check.suggestion.as_deref())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        let error = OutputError::new(
+            "subsystem_error",
+            format!(
+                "fsfs doctor found {} failing check(s); the installation is not ready",
+                payload.fail_count
+            ),
+            exit_code::RUNTIME_ERROR,
+        )
+        .with_context(format!(
+            "{} passed, {} warnings, {} failures. Failing checks: {failing_checks}",
+            payload.pass_count, payload.warn_count, payload.fail_count
+        ));
+        if recovery.is_empty() {
+            error.with_suggestion("resolve every failing check reported by `fsfs doctor`")
+        } else {
+            error.with_suggestion(recovery)
+        }
     }
 
     // ─── WAL-based incremental mutation commands ─────────────────────────
@@ -7992,6 +8129,7 @@ impl FsfsRuntime {
         if !vector_path.exists() {
             return Err(SearchError::IndexNotFound { path: vector_path });
         }
+        let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
 
         let embedder = self.resolve_fast_embedder()?;
         let dimension = embedder.dimension();
@@ -8088,7 +8226,9 @@ impl FsfsRuntime {
             entries.push((id.clone(), embedding));
         }
 
-        // Open index and append.
+        // Open index and append, refencing the held lease at the publication
+        // boundary so a substituted lock file aborts before any WAL mutation.
+        publication_lease.fence("append-batch WAL publication")?;
         let mut index = VectorIndex::open(&vector_path)?;
         index.append_batch(&entries)?;
 
@@ -8256,7 +8396,9 @@ impl FsfsRuntime {
         if !vector_path.exists() {
             return Err(SearchError::IndexNotFound { path: vector_path });
         }
+        let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
 
+        publication_lease.fence("delete WAL publication")?;
         let mut index = VectorIndex::open(&vector_path)?;
         let ids = &self.cli_input.delete_ids;
 
@@ -8350,7 +8492,9 @@ impl FsfsRuntime {
         if !vector_path.exists() {
             return Err(SearchError::IndexNotFound { path: vector_path });
         }
+        let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
 
+        publication_lease.fence("explicit vector compaction")?;
         let mut index = VectorIndex::open(&vector_path)?;
 
         // First compact WAL into main index.
@@ -8424,6 +8568,9 @@ impl FsfsRuntime {
                 path: vector_path.clone(),
             });
         }
+        // Held for the daemon's whole lifetime: its WAL-triggered compactions
+        // are mutually exclusive with every other mutating fsfs process.
+        let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
 
         let poll_ms = self.cli_input.daemon_poll_ms.unwrap_or(1000);
         let wal_sidecar = frankensearch_index::wal_path_for(&vector_path);
@@ -8482,6 +8629,10 @@ impl FsfsRuntime {
                     );
                 }
 
+                // A fence failure means the long-held lease no longer proves
+                // exclusivity (lock file substituted); abort rather than
+                // compact alongside a possible second publisher.
+                publication_lease.fence("daemon vector compaction")?;
                 match VectorIndex::open(&vector_path) {
                     Ok(mut index) => match index.compact() {
                         Ok(stats) => {
@@ -8526,6 +8677,52 @@ impl FsfsRuntime {
         Ok(())
     }
 
+    fn directory_write_permission_doctor_check(name: &str, path: &Path) -> DoctorCheck {
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return DoctorCheck {
+                    name: name.to_owned(),
+                    verdict: DoctorVerdict::Fail,
+                    detail: format!("cannot inspect {}: {error}", path.display()),
+                    suggestion: Some(format!("check permissions on {}", path.display())),
+                };
+            }
+        };
+        if !metadata.is_dir() {
+            return DoctorCheck {
+                name: name.to_owned(),
+                verdict: DoctorVerdict::Fail,
+                detail: format!("{} is not a directory", path.display()),
+                suggestion: Some("configure a directory path".to_owned()),
+            };
+        }
+
+        #[cfg(unix)]
+        let permission_metadata_allows_write = metadata.permissions().mode() & 0o222 != 0;
+        #[cfg(not(unix))]
+        let permission_metadata_allows_write = !metadata.permissions().readonly();
+
+        if permission_metadata_allows_write {
+            DoctorCheck {
+                name: name.to_owned(),
+                verdict: DoctorVerdict::Warn,
+                detail: format!(
+                    "{} exposes write permission metadata; effective writability is unknown/not tested to preserve observation-only diagnostics",
+                    path.display()
+                ),
+                suggestion: None,
+            }
+        } else {
+            DoctorCheck {
+                name: name.to_owned(),
+                verdict: DoctorVerdict::Fail,
+                detail: format!("{} permission metadata is read-only", path.display()),
+                suggestion: Some(format!("check permissions on {}", path.display())),
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn collect_doctor_payload(&self) -> SearchResult<FsfsDoctorPayload> {
         let mut checks = Vec::new();
@@ -8540,41 +8737,17 @@ impl FsfsRuntime {
 
         // 2. Model cache checks
         let model_root = PathBuf::from(&self.config.indexing.model_dir);
-        for (tier, model_name) in [
-            ("fast", self.config.indexing.fast_model.as_str()),
-            ("quality", self.config.indexing.quality_model.as_str()),
-        ] {
-            let model_path = model_root.join(model_name);
-            checks.push(Self::model_doctor_check(
-                tier,
-                model_name,
-                &model_path,
-                model_path.exists(),
-            ));
+        for status in self.collect_model_statuses()? {
+            checks.push(Self::model_doctor_check(&status));
         }
 
-        // 3. Model directory writable
+        // 3. Model directory permissions. Doctor is an observer: an actual
+        // create/remove probe would mutate directory metadata and model caches.
         if model_root.exists() {
-            let probe = model_root.join(".fsfs_doctor_probe");
-            match fs::write(&probe, b"probe") {
-                Ok(()) => {
-                    let _ = fs::remove_file(&probe);
-                    checks.push(DoctorCheck {
-                        name: "model_dir.writable".to_owned(),
-                        verdict: DoctorVerdict::Pass,
-                        detail: format!("{} is writable", model_root.display()),
-                        suggestion: None,
-                    });
-                }
-                Err(error) => {
-                    checks.push(DoctorCheck {
-                        name: "model_dir.writable".to_owned(),
-                        verdict: DoctorVerdict::Fail,
-                        detail: format!("{} is not writable: {error}", model_root.display()),
-                        suggestion: Some(format!("check permissions on {}", model_root.display())),
-                    });
-                }
-            }
+            checks.push(Self::directory_write_permission_doctor_check(
+                "model_dir.writable",
+                &model_root,
+            ));
         } else {
             checks.push(DoctorCheck {
                 name: "model_dir.writable".to_owned(),
@@ -8645,28 +8818,12 @@ impl FsfsRuntime {
         checks.push(self.collect_shadow_oracle_doctor_check(&index_root)?);
         checks.push(Self::collect_zero_signal_doctor_check(&index_root));
 
-        // 5. Index directory writable
+        // 5. Index directory permissions, without mutating the live index.
         if index_root.exists() {
-            let probe = index_root.join(".fsfs_doctor_probe");
-            match fs::write(&probe, b"probe") {
-                Ok(()) => {
-                    let _ = fs::remove_file(&probe);
-                    checks.push(DoctorCheck {
-                        name: "index_dir.writable".to_owned(),
-                        verdict: DoctorVerdict::Pass,
-                        detail: format!("{} is writable", index_root.display()),
-                        suggestion: None,
-                    });
-                }
-                Err(error) => {
-                    checks.push(DoctorCheck {
-                        name: "index_dir.writable".to_owned(),
-                        verdict: DoctorVerdict::Fail,
-                        detail: format!("{} is not writable: {error}", index_root.display()),
-                        suggestion: Some(format!("check permissions on {}", index_root.display())),
-                    });
-                }
-            }
+            checks.push(Self::directory_write_permission_doctor_check(
+                "index_dir.writable",
+                &index_root,
+            ));
         }
 
         // 6. Disk space check
@@ -8751,40 +8908,105 @@ impl FsfsRuntime {
         })
     }
 
-    fn model_doctor_check(
-        tier: &str,
-        model_name: &str,
-        model_path: &Path,
-        cached: bool,
-    ) -> DoctorCheck {
-        if cached {
-            #[cfg(feature = "embedded-models")]
-            {
-                return DoctorCheck {
-                    name: format!("model.{tier}"),
-                    verdict: DoctorVerdict::Pass,
-                    detail: format!("{model_name} cached at {}", model_path.display()),
-                    suggestion: None,
-                };
+    fn model_doctor_check(status: &FsfsModelStatus) -> DoctorCheck {
+        let name = format!("model.{}", status.tier);
+        match status.verification_state.as_str() {
+            "verified" => {
+                #[cfg(feature = "semantic-loaders")]
+                {
+                    match Self::probe_model_loader(status) {
+                        Ok(()) => DoctorCheck {
+                            name,
+                            verdict: DoctorVerdict::Pass,
+                            detail: format!(
+                                "{} is manifest-verified and loadable at {}",
+                                status.name, status.cache_path
+                            ),
+                            suggestion: None,
+                        },
+                        Err(error) => DoctorCheck {
+                            name,
+                            verdict: DoctorVerdict::Fail,
+                            detail: format!(
+                                "{} passed manifest verification at {}, but its compiled loader rejected it: {error}",
+                                status.name, status.cache_path
+                            ),
+                            suggestion: Some(
+                                "reinstall the selected model with `fsfs download-models --model MODEL_ID --force`, then run `fsfs download-models --model MODEL_ID --verify`"
+                                    .to_owned(),
+                            ),
+                        },
+                    }
+                }
+                #[cfg(not(feature = "semantic-loaders"))]
+                {
+                    DoctorCheck {
+                        name,
+                        verdict: DoctorVerdict::Warn,
+                        detail: format!(
+                            "{} is manifest-verified at {}, but this explicit lite binary has no Model2Vec/FastEmbed loader",
+                            status.name, status.cache_path
+                        ),
+                        suggestion: Some(semantic_model_doctor_recovery_guidance().to_owned()),
+                    }
+                }
             }
-            #[cfg(not(feature = "embedded-models"))]
-            {
-                return DoctorCheck {
-                    name: format!("model.{tier}"),
-                    verdict: DoctorVerdict::Warn,
-                    detail: format!(
-                        "{model_name} files are present at {}, but this binary has no Model2Vec/FastEmbed loader",
-                        model_path.display()
-                    ),
-                    suggestion: Some(semantic_model_doctor_recovery_guidance().to_owned()),
-                };
-            }
+            "missing" => DoctorCheck {
+                name,
+                verdict: DoctorVerdict::Warn,
+                detail: format!("{} is missing at {}", status.name, status.cache_path),
+                suggestion: Some(semantic_model_doctor_recovery_guidance().to_owned()),
+            },
+            "unregistered" => DoctorCheck {
+                name,
+                verdict: DoctorVerdict::Fail,
+                detail: format!(
+                    "{} is not a registered semantic model: {}",
+                    status.name,
+                    status.diagnostic.as_deref().unwrap_or("no matching manifest")
+                ),
+                suggestion: Some(
+                    "select a model listed by `fsfs download-models --list`, then verify it before indexing"
+                        .to_owned(),
+                ),
+            },
+            "incomplete" | "mismatch" => DoctorCheck {
+                name,
+                verdict: DoctorVerdict::Fail,
+                detail: format!(
+                    "{} cache is {} at {}: {}",
+                    status.name,
+                    status.verification_state,
+                    status.cache_path,
+                    status.diagnostic.as_deref().unwrap_or("manifest verification failed")
+                ),
+                suggestion: Some(
+                    "replace the rejected cache with `fsfs download-models --model MODEL_ID --force`, then verify it with `fsfs download-models --model MODEL_ID --verify`"
+                        .to_owned(),
+                ),
+            },
+            other => DoctorCheck {
+                name,
+                verdict: DoctorVerdict::Fail,
+                detail: format!("{} has unknown verification state {other}", status.name),
+                suggestion: Some(
+                    "run `fsfs download-models --list` and reinstall the model".to_owned(),
+                ),
+            },
         }
-        DoctorCheck {
-            name: format!("model.{tier}"),
-            verdict: DoctorVerdict::Warn,
-            detail: format!("{model_name} not found at {}", model_path.display()),
-            suggestion: Some(semantic_model_doctor_recovery_guidance().to_owned()),
+    }
+
+    #[cfg(feature = "semantic-loaders")]
+    fn probe_model_loader(status: &FsfsModelStatus) -> SearchResult<()> {
+        let model_path = Path::new(&status.cache_path);
+        match status.tier.as_str() {
+            "fast" => Model2VecEmbedder::load_with_name(model_path, &status.name).map(|_| ()),
+            "quality" => FastEmbedEmbedder::load_with_name(model_path, &status.name).map(|_| ()),
+            other => Err(SearchError::InvalidConfig {
+                field: "model.tier".to_owned(),
+                value: other.to_owned(),
+                reason: "doctor only probes registered fast and quality semantic tiers".to_owned(),
+            }),
         }
     }
 
@@ -9810,24 +10032,6 @@ impl FsfsRuntime {
 
     fn collect_model_statuses(&self) -> SearchResult<Vec<FsfsModelStatus>> {
         let model_root = PathBuf::from(&self.config.indexing.model_dir);
-        info!(model_root = %model_root.display(), "materializing bundled semantic models");
-        match ensure_default_semantic_models(Some(&model_root)) {
-            Ok(summary) if summary.bytes_written > 0 => {
-                info!(
-                    models_written = summary.models_written,
-                    bytes_written = summary.bytes_written,
-                    "bundled semantic models materialized"
-                );
-            }
-            Err(error) => {
-                warn!(
-                    model_root = %model_root.display(),
-                    error = %error,
-                    "failed to materialize bundled semantic models while collecting status"
-                );
-            }
-            _ => {}
-        }
         Ok(vec![
             Self::collect_model_status("fast", &self.config.indexing.fast_model, &model_root)?,
             Self::collect_model_status(
@@ -9843,62 +10047,124 @@ impl FsfsRuntime {
         model_name: &str,
         model_root: &Path,
     ) -> SearchResult<FsfsModelStatus> {
-        let direct_path = model_root.join(model_name);
-        if direct_path.exists() {
-            let size_bytes = Self::path_bytes(&direct_path)?;
-            if size_bytes > 0 {
-                return Ok(FsfsModelStatus {
-                    tier: tier.to_owned(),
-                    name: model_name.to_owned(),
-                    cache_path: direct_path.display().to_string(),
-                    cached: true,
-                    size_bytes,
-                });
-            }
-        }
-
-        let mut candidates = Vec::new();
-        if model_root.exists() {
-            for entry in fs::read_dir(model_root)? {
-                let entry = entry?;
-                let name = entry.file_name();
-                let Some(name) = name.to_str() else {
-                    continue;
-                };
-                if normalize_model_key(name).contains(&normalize_model_key(model_name)) {
-                    candidates.push(entry.path());
-                }
-            }
-        }
-
-        if candidates.is_empty() {
-            return Ok(FsfsModelStatus {
-                tier: tier.to_owned(),
-                name: model_name.to_owned(),
-                cache_path: direct_path.display().to_string(),
-                cached: false,
-                size_bytes: 0,
-            });
-        }
-
-        let size_bytes = Self::total_bytes_for_paths(&candidates)?;
-        if size_bytes == 0 {
-            return Ok(FsfsModelStatus {
-                tier: tier.to_owned(),
-                name: model_name.to_owned(),
-                cache_path: direct_path.display().to_string(),
-                cached: false,
-                size_bytes: 0,
-            });
-        }
-
+        let inspection = Self::inspect_registered_model_cache(tier, model_name, model_root)?;
         Ok(FsfsModelStatus {
             tier: tier.to_owned(),
             name: model_name.to_owned(),
-            cache_path: candidates[0].display().to_string(),
-            cached: true,
-            size_bytes,
+            cache_path: inspection.path.display().to_string(),
+            verification_state: inspection.state.as_str().to_owned(),
+            diagnostic: inspection.diagnostic,
+            cached: inspection.state.is_verified(),
+            size_bytes: inspection.size_bytes,
         })
+    }
+
+    fn inspect_registered_model_cache(
+        tier: &str,
+        model_name: &str,
+        model_root: &Path,
+    ) -> SearchResult<ModelCacheInspection> {
+        let Some(manifest) = Self::registered_manifest_for_model(tier, model_name) else {
+            let path = model_root.join(model_name);
+            let size_bytes = if path.exists() {
+                Self::path_bytes(&path)?
+            } else {
+                0
+            };
+            return Ok(ModelCacheInspection {
+                path,
+                state: ModelCacheVerificationState::Unregistered,
+                size_bytes,
+                diagnostic: Some(format!(
+                    "no unique registered {tier} manifest matches configured model '{model_name}'"
+                )),
+            });
+        };
+
+        let canonical_path = model_root.join(Self::manifest_install_dir_name(&manifest));
+        let root_is_direct_model = manifest
+            .files
+            .iter()
+            .any(|file| model_root.join(&file.name).exists());
+        let path = if canonical_path.exists() || !root_is_direct_model {
+            canonical_path
+        } else {
+            model_root.to_path_buf()
+        };
+        if !path.exists() {
+            return Ok(ModelCacheInspection {
+                path,
+                state: ModelCacheVerificationState::Missing,
+                size_bytes: 0,
+                diagnostic: None,
+            });
+        }
+
+        let size_bytes = Self::path_bytes(&path)?;
+        let (state, diagnostic) = match verify_dir_cached(&manifest, &path) {
+            Ok(()) => (ModelCacheVerificationState::Verified, None),
+            Err(error @ SearchError::ModelNotFound { .. }) => (
+                ModelCacheVerificationState::Incomplete,
+                Some(error.to_string()),
+            ),
+            Err(
+                error @ (SearchError::HashMismatch { .. } | SearchError::ModelLoadFailed { .. }),
+            ) => (
+                ModelCacheVerificationState::Mismatch,
+                Some(error.to_string()),
+            ),
+            Err(error) => (
+                ModelCacheVerificationState::Mismatch,
+                Some(error.to_string()),
+            ),
+        };
+        Ok(ModelCacheInspection {
+            path,
+            state,
+            size_bytes,
+            diagnostic,
+        })
+    }
+
+    fn registered_manifest_for_model(tier: &str, model_name: &str) -> Option<ModelManifest> {
+        let expected_tier = match tier {
+            "fast" => ManifestModelTier::Fast,
+            "quality" => ManifestModelTier::Quality,
+            _ => return None,
+        };
+        let requested_key = normalize_model_key(model_name);
+        let mut exact = Vec::new();
+        let mut fuzzy = Vec::new();
+        for manifest in ModelManifest::builtin_catalog()
+            .models
+            .into_iter()
+            // ubs:ignore -- public model-tier enum, not secret material.
+            .filter(|manifest| manifest.tier == Some(expected_tier))
+        {
+            let install_dir = Self::manifest_install_dir_name(&manifest);
+            let keys = [
+                normalize_model_key(&manifest.id),
+                normalize_model_key(&install_dir),
+                manifest
+                    .display_name
+                    .as_deref()
+                    .map(normalize_model_key)
+                    .unwrap_or_default(),
+                normalize_model_key(&manifest.repo),
+            ];
+            if keys[..3].contains(&requested_key) {
+                exact.push(manifest);
+            } else if keys.iter().any(|key| key.contains(&requested_key)) {
+                fuzzy.push(manifest);
+            }
+        }
+        if exact.len() == 1 {
+            return exact.pop();
+        }
+        if fuzzy.len() == 1 {
+            return fuzzy.pop();
+        }
+        None
     }
 
     #[allow(clippy::too_many_lines)]
@@ -9936,6 +10202,12 @@ impl FsfsRuntime {
         let total_start = Instant::now();
         let target_root = self.resolve_target_root()?;
         let index_root = self.resolve_index_root(&target_root)?;
+        // One-shot and watch-mode indexing mutate checkpoint + FSVI + sentinel
+        // state; exclude every other mutating fsfs process for the duration.
+        // The held lease is refenced immediately before every publication
+        // boundary below so a substituted lock file aborts the publication.
+        let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
+        publication_lease.fence("one-shot index entry")?;
 
         let root_decision = self.config.discovery.evaluate_root(&target_root, None);
         if !root_decision.include() {
@@ -10071,6 +10343,7 @@ impl FsfsRuntime {
         Self::ensure_semantic_embedder_admissible(embedder.as_ref(), cfg!(test))?;
         Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;
 
+        publication_lease.fence("one-shot index artifact directories")?;
         fs::create_dir_all(index_root.join("vector"))?;
         fs::create_dir_all(index_root.join("cache"))?;
 
@@ -10149,6 +10422,7 @@ impl FsfsRuntime {
             .as_ref()
             .filter(|_| checkpoint_metadata_valid)
             .map_or_else(pressure_timestamp_ms, |previous| previous.started_at_ms);
+        publication_lease.fence("one-shot initial checkpoint publication")?;
         write_indexing_checkpoint(
             &index_root,
             &IndexingCheckpoint {
@@ -10176,21 +10450,36 @@ impl FsfsRuntime {
         )?;
 
         let mut vector_generation_compatible = false;
-        #[allow(
-            clippy::suspicious_operation_groupings,
-            reason = "VectorIndex and Embedder intentionally expose different identifier method names"
-        )]
+        let embedder_revision = embedder
+            .identity()
+            .map(frankensearch_core::EmbeddingIdentityBundleV1::fingerprint)
+            .unwrap_or_default();
         let mut vector_index = if checkpoint_manifests.is_some() && vector_path.exists() {
             match VectorIndex::open(&vector_path) {
                 Ok(index)
-                    if index.embedder_id() == embedder.id()
-                        && index.dimension() == embedder.dimension()
-                        && index.wal_record_count() == 0 =>
+                    if vector_checkpoint_reusable(
+                        &index,
+                        embedder.id(),
+                        &embedder_revision,
+                        embedder.dimension(),
+                    ) =>
                 {
                     vector_generation_compatible = true;
                     Some(index)
                 }
-                Ok(_) => None,
+                Ok(index) => {
+                    warn!(
+                        stored_embedder_id = index.embedder_id(),
+                        active_embedder_id = embedder.id(),
+                        stored_revision = index.embedder_revision(),
+                        active_revision = %embedder_revision,
+                        stored_dimension = index.dimension(),
+                        active_dimension = embedder.dimension(),
+                        wal_records = index.wal_record_count(),
+                        "checkpoint FSVI does not match the active embedder identity; rebuilding vectors"
+                    );
+                    None
+                }
                 Err(error) => {
                     warn!(error = %error, "checkpoint FSVI is unavailable; rebuilding vectors");
                     None
@@ -10200,9 +10489,11 @@ impl FsfsRuntime {
             None
         };
         if vector_index.is_none() {
+            publication_lease.fence("one-shot vector generation replacement")?;
             vector_index = Some(VectorIndex::replace_with_empty(
                 &vector_path,
                 embedder.id(),
+                &embedder_revision,
                 embedder.dimension(),
             )?);
         }
@@ -10213,6 +10504,7 @@ impl FsfsRuntime {
             HashSet::new()
         };
 
+        publication_lease.fence("one-shot lexical generation planning")?;
         let lexical_plan = Self::plan_lexical_build(&index_root)?;
         let lexical_path = lexical_plan.engine_dir.clone();
         let lexical_manifest_path = if lexical_plan.lexical_root == index_root {
@@ -10235,6 +10527,7 @@ impl FsfsRuntime {
         // One-shot construction uses Quill's routed shard set and suppresses
         // ordinary tier merges until the final bulk concat. Watch sessions use
         // the deterministic singleton policy in `build_live_ingest_pipeline`.
+        publication_lease.fence("one-shot lexical writer admission")?;
         let lexical_index = QuillIndex::create(
             cx,
             &lexical_path,
@@ -10245,6 +10538,7 @@ impl FsfsRuntime {
         )
         .await?;
         if discard_undurable_lexical_generation {
+            publication_lease.fence("one-shot undurable lexical generation reset")?;
             lexical_index.delete_all(cx).await?;
         }
 
@@ -10317,6 +10611,7 @@ impl FsfsRuntime {
             .map(String::as_str)
             .collect::<Vec<_>>();
         if !stale_vector_ids.is_empty() {
+            publication_lease.fence("one-shot stale vector tombstones")?;
             vector_index.soft_delete_batch(&stale_vector_ids)?;
         }
 
@@ -10392,6 +10687,7 @@ impl FsfsRuntime {
         for chunk in candidates.chunks(BATCH_SIZE) {
             checkpoint.artifacts_durable = false;
             checkpoint.updated_at_ms = pressure_timestamp_ms();
+            publication_lease.fence("one-shot batch checkpoint publication")?;
             write_indexing_checkpoint(&index_root, &checkpoint)?;
             let mut chunk_docs = Vec::with_capacity(chunk.len());
 
@@ -10557,9 +10853,11 @@ impl FsfsRuntime {
                 })
                 .collect::<Vec<_>>();
             if !lexical_batch.is_empty() {
+                publication_lease.fence("one-shot lexical batch mutation")?;
                 let backend = QuillLexicalBackend::new(&lexical_index);
                 let mut pipeline = LexicalPipeline::new(backend);
                 let _stats = pipeline.apply_initial(&lexical_batch)?;
+                publication_lease.fence("one-shot lexical batch resumable flush")?;
                 let resume_stats = pipeline.backend_mut().flush_resumable(cx).await?;
                 lexical_resume_absent = lexical_resume_absent.saturating_add(resume_stats.absent);
                 lexical_resume_unchanged =
@@ -10654,6 +10952,7 @@ impl FsfsRuntime {
                             .zip(embeddings)
                             .map(|(pending, embedding)| (pending.document.id.clone(), embedding))
                             .collect::<Vec<_>>();
+                        publication_lease.fence("one-shot vector WAL append")?;
                         vector_index.append_batch(&vector_batch)?;
                         semantic_succeeded_this_chunk
                             .extend(semantic_docs.iter().map(|pending| pending.file_key.clone()));
@@ -10717,16 +11016,19 @@ impl FsfsRuntime {
 
             batch_counter = batch_counter.saturating_add(1);
             if batch_counter % CHECKPOINT_PERSIST_INTERVAL == 0 && remaining_reused_semantic == 0 {
+                publication_lease.fence("one-shot incremental generation publication")?;
                 checkpoint.artifacts_durable = false;
                 checkpoint.updated_at_ms = pressure_timestamp_ms();
                 write_indexing_checkpoint(&index_root, &checkpoint)?;
 
                 let lexical_commit_start = Instant::now();
+                publication_lease.fence("one-shot incremental lexical commit")?;
                 lexical_index.commit(cx).await?;
                 lexical_elapsed_ms =
                     lexical_elapsed_ms.saturating_add(lexical_commit_start.elapsed().as_millis());
 
                 let vector_compact_start = Instant::now();
+                publication_lease.fence("one-shot incremental vector reconciliation")?;
                 reconcile_vector_generation(&mut vector_index, &checkpoint)?;
                 vector_elapsed_ms =
                     vector_elapsed_ms.saturating_add(vector_compact_start.elapsed().as_millis());
@@ -10738,6 +11040,8 @@ impl FsfsRuntime {
                 checkpoint.skipped_files = stats
                     .discovered_files
                     .saturating_sub(published_manifests.len());
+                publication_lease
+                    .fence("one-shot incremental manifest and sentinel publication")?;
                 self.write_index_artifacts(
                     &index_root,
                     &lexical_manifest_path,
@@ -10765,6 +11069,7 @@ impl FsfsRuntime {
                     },
                 )?;
                 checkpoint.artifacts_durable = true;
+                publication_lease.fence("one-shot incremental durable checkpoint publication")?;
                 write_indexing_checkpoint(&index_root, &checkpoint)?;
             }
 
@@ -10807,9 +11112,11 @@ impl FsfsRuntime {
                     )
                 })
                 .collect::<Vec<_>>();
+            publication_lease.fence("one-shot stale lexical reconciliation")?;
             let backend = QuillLexicalBackend::new(&lexical_index);
             let mut pipeline = LexicalPipeline::new(backend);
             let _stats = pipeline.apply_initial(&mutations)?;
+            publication_lease.fence("one-shot stale lexical reconciliation flush")?;
             pipeline.backend_mut().flush_resumable(cx).await?.deleted
         };
         info!(
@@ -10848,15 +11155,18 @@ impl FsfsRuntime {
 
         // 4. Publish the final durable generation. The checkpoint is always
         // last, so every row it advertises is already represented on disk.
+        publication_lease.fence("final generation checkpoint publication")?;
         checkpoint.artifacts_durable = false;
         checkpoint.updated_at_ms = pressure_timestamp_ms();
         write_indexing_checkpoint(&index_root, &checkpoint)?;
         let lexical_commit_start = Instant::now();
+        publication_lease.fence("final lexical bulk-load publication")?;
         lexical_index.finish_bulk_load(cx).await?;
         lexical_elapsed_ms =
             lexical_elapsed_ms.saturating_add(lexical_commit_start.elapsed().as_millis());
 
         let vector_finish_start = Instant::now();
+        publication_lease.fence("final vector generation reconciliation")?;
         reconcile_vector_generation(&mut vector_index, &checkpoint)?;
         vector_elapsed_ms =
             vector_elapsed_ms.saturating_add(vector_finish_start.elapsed().as_millis());
@@ -10870,6 +11180,7 @@ impl FsfsRuntime {
         });
         let reason_codes = observed_reason_codes.into_iter().collect::<Vec<_>>();
 
+        publication_lease.fence("final paired manifest publication")?;
         self.write_index_artifacts(&index_root, &lexical_manifest_path, &manifests)?;
         let generation_complete = semantic_generation_complete(semantic_deferred_files);
         let sentinel = IndexSentinel {
@@ -10899,6 +11210,7 @@ impl FsfsRuntime {
         let final_stage = indexing_final_stage(embedder_degraded, generation_complete);
 
         if let Some(pointer) = lexical_plan.publish_pointer.as_ref() {
+            publication_lease.fence("final lexical CURRENT publication")?;
             publish_current(&lexical_plan.lexical_root, pointer).map_err(|source| {
                 SearchError::SubsystemError {
                     subsystem: "fsfs.lexical.current",
@@ -10920,7 +11232,9 @@ impl FsfsRuntime {
         // checkpoint remains an admission lock across the entire publication
         // window, so a concurrent search cannot combine the successor vector
         // generation with the predecessor lexical CURRENT.
+        publication_lease.fence("final generation admission publication")?;
         self.write_index_sentinel(&index_root, &sentinel)?;
+        publication_lease.fence("final checkpoint admission transition")?;
         if generation_complete {
             remove_indexing_checkpoint(&index_root)?;
         } else {
@@ -11453,84 +11767,6 @@ impl FsfsRuntime {
         Self::probe_indexing_embedder_with_backoffs(cx, embedder, &RETRY_BACKOFFS_MS).await
     }
 
-    fn record_semantic_lexical_fallback(
-        resources: &mut SearchExecutionResources,
-        query: &str,
-        error: &SearchError,
-    ) {
-        let error_code = error_code_for(error);
-        let advice = Self::sanitized_semantic_degradation_advice(
-            DegradationFailureKind::LexicalFallback,
-            query,
-            &resources.index_root,
-            error,
-        );
-        info!(
-            event = "fsfs.semantic_lexical_fallback",
-            error_code,
-            reason_code = advice.reason_code,
-            "fsfs semantic retrieval unavailable; using the authorized lexical stage"
-        );
-        resources
-            .degradation_advice
-            .retain(|existing| existing.reason_code != advice.reason_code);
-        resources.degradation_advice.push(advice);
-    }
-
-    fn record_semantic_initialization_fallback(
-        resources: &mut SearchExecutionResources,
-        query: &str,
-        fallback_error: &SearchError,
-    ) {
-        let (error_code, sanitized_summary) = resources
-            .pending_semantic_initialization_failure
-            .as_ref()
-            .map_or_else(
-                || {
-                    (
-                        error_code_for(fallback_error),
-                        Self::semantic_initialization_failure_summary(fallback_error),
-                    )
-                },
-                |pending| (pending.error_code, pending.sanitized_summary),
-            );
-        let mut advice = DegradationAdvice::from_input(DegradationAdviceInput {
-            failure: DegradationFailureKind::LexicalFallback,
-            query,
-            index_dir: Some(&resources.index_root),
-            original_error: None,
-            replay_command: None,
-        });
-        advice.original_error = Some(format!("{error_code}: {sanitized_summary}"));
-        info!(
-            event = "fsfs.semantic_lexical_fallback",
-            error_code,
-            reason_code = advice.reason_code,
-            "fsfs semantic retrieval unavailable; using the authorized lexical stage"
-        );
-        resources
-            .degradation_advice
-            .retain(|existing| existing.reason_code != advice.reason_code);
-        resources.degradation_advice.push(advice);
-    }
-
-    #[must_use]
-    const fn semantic_initialization_failure_summary(error: &SearchError) -> &'static str {
-        match error {
-            SearchError::IndexCorrupted { .. } => {
-                "semantic vector generation failed integrity validation"
-            }
-            SearchError::IndexVersionMismatch { .. } => {
-                "semantic vector generation uses an incompatible format version"
-            }
-            SearchError::IndexNotFound { .. } | SearchError::IndexCandidatesNotFound { .. } => {
-                "semantic vector generation is missing"
-            }
-            SearchError::Io(_) => "semantic vector generation could not be read",
-            _ => "semantic vector generation could not be opened safely",
-        }
-    }
-
     fn sanitized_semantic_degradation_advice(
         failure: DegradationFailureKind,
         query: &str,
@@ -11607,8 +11843,37 @@ impl FsfsRuntime {
         }
     }
 
+    /// Materialize the embedded defaults only at a semantic execution boundary.
+    ///
+    /// Auto-detection, status, and doctor are observers: they must never repair
+    /// model bytes or mint verification receipts. Index/search/watch/append all
+    /// cross this boundary through the embedder resolvers before they execute
+    /// semantic work.
+    #[cfg(feature = "embedded-models")]
+    fn prepare_bundled_semantic_models_for_execution(&self) -> SearchResult<()> {
+        let model_root = PathBuf::from(&self.config.indexing.model_dir);
+        let summary = ensure_default_semantic_models(Some(&model_root))?;
+        if summary.models_written > 0 {
+            info!(
+                model_root = %summary.model_root.display(),
+                models_written = summary.models_written,
+                bytes_written = summary.bytes_written,
+                "materialized and verified bundled semantic models for execution"
+            );
+        } else {
+            debug!(
+                model_root = %summary.model_root.display(),
+                "bundled semantic models already verified for execution"
+            );
+        }
+        Ok(())
+    }
+
     #[cfg_attr(test, allow(clippy::unnecessary_wraps, clippy::unused_self))]
     fn resolve_fast_embedder(&self) -> SearchResult<Arc<dyn Embedder>> {
+        #[cfg(feature = "embedded-models")]
+        self.prepare_bundled_semantic_models_for_execution()?;
+
         #[cfg(test)]
         {
             Ok(Arc::new(HashEmbedder::default_256()))
@@ -11629,7 +11894,7 @@ impl FsfsRuntime {
                     },
                 );
 
-            #[cfg(not(feature = "embedded-models"))]
+            #[cfg(not(feature = "semantic-loaders"))]
             let embedder = embedder.inspect_err(|_| {
                 emit_model_free_build_hint();
             });
@@ -11639,6 +11904,9 @@ impl FsfsRuntime {
     }
 
     fn resolve_quality_embedder(&self) -> SearchResult<Option<Arc<dyn Embedder>>> {
+        #[cfg(feature = "embedded-models")]
+        self.prepare_bundled_semantic_models_for_execution()?;
+
         if cfg!(test) {
             return Ok(None);
         }
@@ -11649,7 +11917,7 @@ impl FsfsRuntime {
         };
         let stack = EmbedderStack::auto_detect_with_options(Some(&configured_root), &options);
 
-        #[cfg(not(feature = "embedded-models"))]
+        #[cfg(not(feature = "semantic-loaders"))]
         let stack = stack.inspect_err(|_| {
             emit_model_free_build_hint();
         });
@@ -11784,7 +12052,6 @@ impl FsfsRuntime {
             }
             _ => None,
         };
-        let lexical_available = lexical_index.is_some();
         let shadow_runtime = lexical_index.as_ref().and_then(|index| {
             self.prepare_shadow_oracle_observer(index_root, &lexical_layout, index)
         });
@@ -11796,29 +12063,8 @@ impl FsfsRuntime {
         let should_open_vector =
             !matches!(resource_mode, SearchExecutionMode::LexicalOnly) || lexical_index.is_none();
         let degradation_advice = Vec::new();
-        let mut pending_semantic_initialization_failure = None;
         let vector_index = if should_open_vector && vector_path.exists() {
-            match VectorIndex::open(&vector_path) {
-                Ok(index) => Some(index),
-                Err(error)
-                    if lexical_available && matches!(resource_mode, SearchExecutionMode::Full) =>
-                {
-                    pending_semantic_initialization_failure =
-                        Some(PendingSemanticInitializationFailure {
-                            error_code: error_code_for(&error),
-                            sanitized_summary: Self::semantic_initialization_failure_summary(
-                                &error,
-                            ),
-                        });
-                    warn!(
-                        event = "fsfs.semantic_index_open_failed",
-                        error_code = error_code_for(&error),
-                        "fsfs semantic vector generation could not be opened"
-                    );
-                    None
-                }
-                Err(error) => return Err(error),
-            }
+            Some(VectorIndex::open(&vector_path)?)
         } else {
             None
         };
@@ -11849,7 +12095,6 @@ impl FsfsRuntime {
             shadow_observer,
             shadow_pressure_sampler,
             vector_index,
-            pending_semantic_initialization_failure,
             fast_embedder: None,
             quality_embedder: None,
             fast_embedder_attempted: false,
@@ -12036,8 +12281,6 @@ impl FsfsRuntime {
     fn maybe_prepare_fast_embedder(
         &self,
         resources: &mut SearchExecutionResources,
-        lexical_fallback_authorized: bool,
-        query: &str,
     ) -> SearchResult<()> {
         if resources.fast_embedder.is_some() || resources.fast_embedder_attempted {
             return Ok(());
@@ -12047,17 +12290,11 @@ impl FsfsRuntime {
         match self.resolve_fast_embedder() {
             Ok(embedder) => {
                 if let Some(index) = resources.vector_index.as_ref() {
-                    if let Err(error) = Self::validate_fast_embedder_for_vector_index(
+                    Self::validate_fast_embedder_for_vector_index(
                         index,
                         embedder.as_ref(),
                         cfg!(test),
-                    ) {
-                        if lexical_fallback_authorized {
-                            Self::record_semantic_lexical_fallback(resources, query, &error);
-                            return Ok(());
-                        }
-                        return Err(error);
-                    }
+                    )?;
                 }
                 info!(
                     event = "fsfs.fast_semantic_admitted",
@@ -12068,10 +12305,6 @@ impl FsfsRuntime {
                 resources.fast_embedder = Some(embedder);
                 Ok(())
             }
-            Err(error) if lexical_fallback_authorized => {
-                Self::record_semantic_lexical_fallback(resources, query, &error);
-                Ok(())
-            }
             Err(error) => Err(error),
         }
     }
@@ -12079,7 +12312,6 @@ impl FsfsRuntime {
     fn maybe_prepare_quality_embedder(
         &self,
         resources: &mut SearchExecutionResources,
-        lexical_available: bool,
     ) -> SearchResult<()> {
         if resources.quality_embedder.is_some() || resources.quality_embedder_attempted {
             return Ok(());
@@ -12090,37 +12322,25 @@ impl FsfsRuntime {
                 if let Some(index) = resources.vector_index.as_ref() {
                     let index_embedder_id = index.embedder_id();
                     if !index_embedder_id.eq_ignore_ascii_case(embedder.id()) {
-                        info!(
-                            index_embedder_id,
-                            quality_embedder_id = embedder.id(),
-                            "fsfs search skipping quality semantic tier after embedder-id mismatch"
-                        );
-                        return Ok(());
+                        return Err(SearchError::UnverifiableRemoteSpace {
+                            producer: "fsfs.quality_vector_generation".to_owned(),
+                            reason: "the quality embedder identity does not match the stored vector generation"
+                                .to_owned(),
+                        });
                     }
                     let index_dimension = index.dimension();
                     let embedder_dimension = embedder.dimension();
                     if embedder_dimension != index_dimension {
-                        info!(
-                            index_dimension,
-                            embedder_dimension,
-                            embedder_id = embedder.id(),
-                            "fsfs search skipping quality semantic tier after embedder/index dimension mismatch"
-                        );
-                        return Ok(());
+                        return Err(SearchError::DimensionMismatch {
+                            expected: index_dimension,
+                            found: embedder_dimension,
+                        });
                     }
                 }
                 resources.quality_embedder = Some(embedder);
                 Ok(())
             }
             Ok(None) => Ok(()),
-            Err(error) if lexical_available => {
-                info!(
-                    error_code = error_code_for(&error),
-                    reason = Self::semantic_runtime_failure_summary(&error),
-                    "fsfs search continuing without quality embedder after initialization failure"
-                );
-                Ok(())
-            }
             Err(error) => Err(error),
         }
     }
@@ -12959,39 +13179,39 @@ impl FsfsRuntime {
         } else {
             payload.index.size_bytes / u64::try_from(indexed_files).unwrap_or(1)
         };
-        #[cfg(feature = "embedded-models")]
+        #[cfg(feature = "semantic-loaders")]
         let fast_cached = payload
             .models
             .iter()
             .find(|model| model.tier == "fast")
             .is_some_and(|model| model.cached);
-        #[cfg(feature = "embedded-models")]
+        #[cfg(feature = "semantic-loaders")]
         let quality_cached = payload
             .models
             .iter()
             .find(|model| model.tier == "quality")
             .is_some_and(|model| model.cached);
-        #[cfg(not(feature = "embedded-models"))]
+        #[cfg(not(feature = "semantic-loaders"))]
         let mode_summary = paint(
-            "lexical only (binary lacks embedded-models loaders)",
+            "lexical only (binary lacks semantic model loaders)",
             "38;5;214",
             no_color,
         );
-        #[cfg(feature = "embedded-models")]
+        #[cfg(feature = "semantic-loaders")]
         let mode_summary = if fast_cached && quality_cached && !self.config.search.fast_only {
-            paint("full hybrid (fast + quality semantic)", "32", no_color)
+            paint(
+                "fast + quality manifest-verified (doctor probes loaders)",
+                "32",
+                no_color,
+            )
         } else if fast_cached {
             paint(
-                "fast semantic + lexical (quality unavailable)",
+                "fast manifest-verified; quality not verified",
                 "33",
                 no_color,
             )
         } else {
-            paint(
-                "lexical only (no verified semantic model available)",
-                "38;5;214",
-                no_color,
-            )
+            paint("no manifest-verified semantic cache", "38;5;214", no_color)
         };
         let mut stdout = std::io::stdout();
         write!(stdout, "\u{1b}[2J\u{1b}[H").map_err(tui_io_error)?;
@@ -13008,7 +13228,7 @@ impl FsfsRuntime {
             "{} {}   {} {}",
             paint("status:", "38;5;244", no_color),
             paint("ready", "1;32", no_color),
-            paint("search mode:", "38;5;244", no_color),
+            paint("model cache:", "38;5;244", no_color),
             mode_summary
         )
         .map_err(tui_io_error)?;
@@ -13062,14 +13282,14 @@ impl FsfsRuntime {
         writeln!(stdout, "{}", paint("MODELS", "1;38;5;214", no_color)).map_err(tui_io_error)?;
         if !payload.models.is_empty() {
             for model in &payload.models {
-                let state = if model.cached {
-                    paint("cached", "32", no_color)
-                } else {
-                    paint("missing", "31", no_color)
+                let state = match model.verification_state.as_str() {
+                    "verified" => paint("verified", "32", no_color),
+                    "missing" => paint("missing", "33", no_color),
+                    other => paint(other, "31", no_color),
                 };
                 writeln!(
                     stdout,
-                    "  {:<7} {:<30} {:<8} {}",
+                    "  {:<7} {:<30} {:<12} {}",
                     format!("{}:", model.tier),
                     model.name,
                     state,
@@ -15135,7 +15355,7 @@ fn render_existing_index_dashboard_frame(
     fast_only: bool,
     no_color: bool,
 ) {
-    #[cfg(not(feature = "embedded-models"))]
+    #[cfg(not(feature = "semantic-loaders"))]
     let _ = fast_only;
 
     let area = frame.bounds();
@@ -15174,31 +15394,31 @@ fn render_existing_index_dashboard_frame(
     } else {
         payload.index.lexical_index_bytes as f64 / payload.index.size_bytes as f64
     };
-    #[cfg(feature = "embedded-models")]
+    #[cfg(feature = "semantic-loaders")]
     let fast_cached = payload
         .models
         .iter()
         .find(|model| model.tier == "fast")
         .is_some_and(|model| model.cached);
-    #[cfg(feature = "embedded-models")]
+    #[cfg(feature = "semantic-loaders")]
     let quality_cached = payload
         .models
         .iter()
         .find(|model| model.tier == "quality")
         .is_some_and(|model| model.cached);
-    #[cfg(not(feature = "embedded-models"))]
-    let mode_label = "lexical only (binary lacks embedded-models loaders)";
-    #[cfg(feature = "embedded-models")]
+    #[cfg(not(feature = "semantic-loaders"))]
+    let mode_label = "loader unavailable (explicit lite binary)";
+    #[cfg(feature = "semantic-loaders")]
     let mode_label = if fast_cached && quality_cached && !fast_only {
-        "full hybrid semantic + lexical"
+        "fast + quality caches manifest-verified; doctor probes loaders"
     } else if fast_cached {
-        "fast semantic + lexical"
+        "fast cache manifest-verified; quality not verified"
     } else {
-        "lexical only (no verified semantic model)"
+        "no manifest-verified semantic cache"
     };
-    #[cfg(not(feature = "embedded-models"))]
+    #[cfg(not(feature = "semantic-loaders"))]
     let mode_style = ui_fg(no_color, PackedRgba::rgb(255, 156, 156)).bold();
-    #[cfg(feature = "embedded-models")]
+    #[cfg(feature = "semantic-loaders")]
     let mode_style = if fast_cached && quality_cached && !fast_only {
         ui_fg(no_color, PackedRgba::rgb(131, 231, 157)).bold()
     } else if fast_cached {
@@ -15219,7 +15439,10 @@ fn render_existing_index_dashboard_frame(
             ),
         ]),
         Line::from_spans(vec![
-            Span::styled("mode: ", ui_fg(no_color, PackedRgba::rgb(164, 184, 219))),
+            Span::styled(
+                "model cache: ",
+                ui_fg(no_color, PackedRgba::rgb(164, 184, 219)),
+            ),
             Span::styled(mode_label, mode_style),
         ]),
         Line::from(Span::styled(
@@ -15331,10 +15554,10 @@ fn render_existing_index_dashboard_frame(
 
     let mut model_lines = Vec::new();
     for model in &payload.models {
-        let state_style = if model.cached {
-            ui_fg(no_color, PackedRgba::rgb(131, 231, 157)).bold()
-        } else {
-            ui_fg(no_color, PackedRgba::rgb(255, 156, 156)).bold()
+        let state_style = match model.verification_state.as_str() {
+            "verified" => ui_fg(no_color, PackedRgba::rgb(131, 231, 157)).bold(),
+            "missing" => ui_fg(no_color, PackedRgba::rgb(255, 202, 123)).bold(),
+            _ => ui_fg(no_color, PackedRgba::rgb(255, 156, 156)).bold(),
         };
         model_lines.push(Line::from_spans(vec![
             Span::styled(
@@ -15345,10 +15568,7 @@ fn render_existing_index_dashboard_frame(
                 truncate_middle(&model.name, usize::from(right[0].width).saturating_sub(24)),
                 ui_fg(no_color, PackedRgba::rgb(216, 231, 255)),
             ),
-            Span::styled(
-                if model.cached { " cached" } else { " missing" },
-                state_style,
-            ),
+            Span::styled(format!(" {}", model.verification_state), state_style),
         ]));
     }
     Paragraph::new(Text::from_lines(model_lines))
@@ -15361,6 +15581,15 @@ fn render_existing_index_dashboard_frame(
         )
         .render(right[0], frame);
 
+    #[cfg(feature = "embedded-models")]
+    let capability_footer =
+        "Bundled semantic defaults are materialized and verified at first semantic execution.";
+    #[cfg(all(feature = "semantic-loaders", not(feature = "embedded-models")))]
+    let capability_footer =
+        "Stock defaults include semantic loaders; provision models, then run fsfs doctor.";
+    #[cfg(not(feature = "semantic-loaders"))]
+    let capability_footer =
+        "Explicit lite build: install a standard fsfs build to enable semantic loaders.";
     Paragraph::new(Text::from_lines(vec![
         Line::from(Span::styled(
             "fsfs search \"query\" --limit all",
@@ -15399,7 +15628,7 @@ fn render_existing_index_dashboard_frame(
             ui_fg(no_color, PackedRgba::rgb(165, 183, 216)),
         )),
         Line::from(Span::styled(
-            "Bundled semantic defaults are materialized automatically at runtime.",
+            capability_footer,
             ui_fg(no_color, PackedRgba::rgb(132, 151, 184)),
         )),
     ]))
@@ -15630,7 +15859,7 @@ fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState
     let mode_hint = state
         .mode_hint
         .as_deref()
-        .unwrap_or("Search mode: full hybrid semantic + lexical.");
+        .unwrap_or("Search readiness unavailable; run `fsfs doctor` before indexing.");
     let adaptive_debounce_line = format!(
         "adaptive debounce={} / {} / {} ms  cadence~{} ms",
         format_count_u64(state.lexical_debounce_window_ms),
@@ -17367,48 +17596,48 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
     } else {
         status.index.size_bytes / u64::try_from(indexed_files).unwrap_or(1)
     };
-    #[cfg(feature = "embedded-models")]
+    #[cfg(feature = "semantic-loaders")]
     let fast_cached = status
         .models
         .iter()
         .find(|model| model.tier == "fast")
         .is_some_and(|model| model.cached);
-    #[cfg(feature = "embedded-models")]
+    #[cfg(feature = "semantic-loaders")]
     let quality_cached = status
         .models
         .iter()
         .find(|model| model.tier == "quality")
         .is_some_and(|model| model.cached);
-    #[cfg(not(feature = "embedded-models"))]
+    #[cfg(not(feature = "semantic-loaders"))]
     let search_mode_line = paint(
-        "  mode: lexical only (this binary lacks the embedded-models loaders)",
+        "  semantic readiness: loader unavailable (explicit lite binary)",
         "38;5;214",
         no_color,
     );
-    #[cfg(feature = "embedded-models")]
+    #[cfg(feature = "semantic-loaders")]
     let search_mode_line = if fast_cached && quality_cached && !status.config.fast_only {
         paint(
-            "  mode: full hybrid (fast + quality semantic)",
+            "  semantic readiness: fast + quality caches manifest-verified; run `fsfs doctor` to probe loaders",
             "32",
             no_color,
         )
     } else if fast_cached {
         if status.config.fast_only {
             paint(
-                "  mode: fast semantic only (fast_only=true)",
+                "  semantic readiness: fast cache manifest-verified, quality disabled; run `fsfs doctor` to probe the loader",
                 "33",
                 no_color,
             )
         } else {
             paint(
-                "  mode: fast semantic + lexical (quality model missing)",
+                "  semantic readiness: fast cache manifest-verified; quality cache not verified",
                 "33",
                 no_color,
             )
         }
     } else {
         paint(
-            "  mode: lexical only (no verified semantic model available)",
+            "  semantic readiness: no manifest-verified semantic cache",
             "38;5;214",
             no_color,
         )
@@ -17492,10 +17721,10 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
     let _ = writeln!(out);
     let _ = writeln!(out, "{}", paint("MODELS", "1;38;5;214", no_color));
     for model in &status.models {
-        let state = if model.cached {
-            paint("cached", "32", no_color)
-        } else {
-            paint("missing", "31", no_color)
+        let state = match model.verification_state.as_str() {
+            "verified" => paint("verified", "32", no_color),
+            "missing" => paint("missing", "33", no_color),
+            other => paint(other, "31", no_color),
         };
         let _ = writeln!(
             out,
@@ -17510,6 +17739,13 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
             "      path: {}",
             truncate_middle(&model.cache_path, width.saturating_sub(13))
         );
+        if let Some(diagnostic) = model.diagnostic.as_deref() {
+            let _ = writeln!(
+                out,
+                "      diagnostic: {}",
+                truncate_tail(diagnostic, width.saturating_sub(19).max(24))
+            );
+        }
     }
     let _ = writeln!(out, "{search_mode_line}");
 
@@ -17926,6 +18162,25 @@ fn content_sha256_hex(bytes: &[u8]) -> String {
     sha256_digest_hex(Sha256::digest(bytes))
 }
 
+/// A checkpointed FSVI generation is reusable only when its embedding
+/// identity matches the ACTIVE embedder completely: producer id, immutable
+/// identity revision, and dimension, with no unreplayed WAL. The revision is
+/// the embedder's identity-bundle fingerprint, so a same-id same-dimension
+/// model retrain (new weights shipped under the old name) invalidates the
+/// checkpoint instead of silently serving vectors from the previous embedding
+/// space (bd-qj7h5).
+fn vector_checkpoint_reusable(
+    index: &VectorIndex,
+    embedder_id: &str,
+    embedder_revision: &str,
+    dimension: usize,
+) -> bool {
+    index.embedder_id() == embedder_id
+        && index.embedder_revision() == embedder_revision
+        && index.dimension() == dimension
+        && index.wal_record_count() == 0
+}
+
 fn vector_live_doc_ids(index: &VectorIndex) -> SearchResult<HashSet<String>> {
     index.live_doc_ids()
 }
@@ -18337,34 +18592,34 @@ fn remove_indexing_checkpoint(index_root: &Path) -> SearchResult<()> {
     }
 }
 
-#[cfg(not(feature = "embedded-models"))]
+#[cfg(not(feature = "semantic-loaders"))]
 const fn model_free_semantic_recovery_guidance() -> &'static str {
-    "Search mode: lexical-only. This model-free binary has download support but no Model2Vec/FastEmbed loaders, so downloaded model files alone cannot activate semantic retrieval. Install a full fsfs prebuilt, or rebuild verified inputs with `cargo build --release -p frankensearch-fsfs --no-default-features --features embedded-models`. Hash control embeddings are never admitted as semantic results."
+    "Search mode: lexical-only. This explicit lite binary has download support but no Model2Vec/FastEmbed loaders, so downloaded model files alone cannot activate semantic retrieval. Install a standard fsfs build, or rebuild with `cargo build --release -p frankensearch-fsfs`; then provision verified models with `fsfs download-models`. Hash control embeddings are never admitted as semantic results."
 }
 
-#[cfg(feature = "embedded-models")]
+#[cfg(feature = "semantic-loaders")]
 const fn semantic_model_doctor_recovery_guidance() -> &'static str {
     "provision the configured model with `fsfs download-models`, verify it with `fsfs download-models --verify`, or point FRANKENSEARCH_MODEL_DIR at a verified cache"
 }
 
-#[cfg(not(feature = "embedded-models"))]
+#[cfg(not(feature = "semantic-loaders"))]
 const fn semantic_model_doctor_recovery_guidance() -> &'static str {
-    "install a full fsfs prebuilt, or rebuild verified inputs with `cargo build --release -p frankensearch-fsfs --no-default-features --features embedded-models`; downloaded files alone cannot activate this binary"
+    "install a standard fsfs build, or rebuild with `cargo build --release -p frankensearch-fsfs`; downloaded files alone cannot activate this explicit lite binary"
 }
 
-#[cfg(feature = "embedded-models")]
+#[cfg(feature = "semantic-loaders")]
 const fn semantic_model_directory_guidance() -> &'static str {
     "create a verified model cache with `fsfs download-models`, or set FRANKENSEARCH_MODEL_DIR to an existing verified cache"
 }
 
-#[cfg(not(feature = "embedded-models"))]
+#[cfg(not(feature = "semantic-loaders"))]
 const fn semantic_model_directory_guidance() -> &'static str {
-    "a model directory alone cannot activate this binary; install a full fsfs prebuilt, or rebuild with `--no-default-features --features embedded-models`"
+    "a model directory alone cannot activate this explicit lite binary; install a standard fsfs build, or rebuild without `--no-default-features`"
 }
 
 /// Explain why a model-free binary cannot activate semantic retrieval even
 /// when verified model files are already present.
-#[cfg(not(feature = "embedded-models"))]
+#[cfg(not(feature = "semantic-loaders"))]
 fn emit_model_free_build_hint() {
     eprintln!();
     eprintln!("--- fsfs model-free build: semantic loaders unavailable ---");
@@ -18378,7 +18633,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use std::future::{Future, poll_fn};
-    use std::io::Write as _;
+    use std::io::{ErrorKind, Write as _};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -18392,6 +18647,8 @@ mod tests {
     use frankensearch_core::{
         Embedder, IndexableDocument, LexicalSearch, ModelCategory, SearchError, SearchFuture,
     };
+    #[cfg(feature = "embedded-models")]
+    use frankensearch_embed::verify_dir_cached;
     use frankensearch_embed::{HashEmbedder, ModelManifest};
     use frankensearch_index::VectorIndex;
     use frankensearch_lexical::TantivyIndex;
@@ -18404,22 +18661,22 @@ mod tests {
     use fsqlite_types::value::SqliteValue;
 
     use super::{
-        ContextPreviewFormat, DegradationFailureKind, EmbedderAvailability,
-        FSFS_DAEMON_REQUEST_MAX_BYTES, FSFS_SEARCH_SNIPPET_HEAD_LIMIT,
-        FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS,
-        FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS, FSFS_TUI_LEXICAL_DEBOUNCE_MS,
-        FSFS_TUI_LEXICAL_DEBOUNCE_SHORT_QUERY_CAP_MS, FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS,
-        FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS, FSFS_TUI_QUALITY_DEBOUNCE_MS,
-        FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS, FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS,
-        FSFS_TUI_SEMANTIC_DEBOUNCE_MS, FsfsConfigStatus, FsfsFlushAck, FsfsFlushRequest,
-        FsfsIndexStatus, FsfsModelStatus, FsfsRuntime, FsfsRuntimeStatus, FsfsStatusPayload,
-        IndexStoragePaths, IndexingBatchEmbeddingOutcome, InterfaceMode, LiveIngestPipeline,
-        SearchCacheRecord, SearchDashboardState, SearchExecutionFlags, SearchExecutionMode,
-        SearchExecutionResources, SearchServeRequest, SemanticGateDecisionInput,
-        SemanticRecallDecisionInput, VectorIndexWriteAction, VectorPipelineInput,
-        VectorSchedulingTier, degradation_controller_config_for_profile,
-        detect_context_preview_format, is_likely_html_fragment,
-        normalize_html_fragment_for_markdown, read_durable_json, render_status_table,
+        ContextPreviewFormat, EmbedderAvailability, FSFS_DAEMON_REQUEST_MAX_BYTES,
+        FSFS_SEARCH_SNIPPET_HEAD_LIMIT, FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL,
+        FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS, FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS,
+        FSFS_TUI_LEXICAL_DEBOUNCE_MS, FSFS_TUI_LEXICAL_DEBOUNCE_SHORT_QUERY_CAP_MS,
+        FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS, FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS,
+        FSFS_TUI_QUALITY_DEBOUNCE_MS, FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS,
+        FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS, FSFS_TUI_SEMANTIC_DEBOUNCE_MS, FsfsConfigStatus,
+        FsfsFlushAck, FsfsFlushRequest, FsfsIndexStatus, FsfsModelStatus, FsfsRuntime,
+        FsfsRuntimeStatus, FsfsStatusPayload, IndexStoragePaths, IndexingBatchEmbeddingOutcome,
+        InterfaceMode, LiveIngestPipeline, LiveVectorSink, SearchCacheRecord, SearchDashboardState,
+        SearchExecutionFlags, SearchExecutionMode, SearchExecutionResources, SearchServeRequest,
+        SemanticGateDecisionInput, SemanticRecallDecisionInput, VectorIndexWriteAction,
+        VectorPipelineInput, VectorPipelinePlan, VectorSchedulingTier,
+        degradation_controller_config_for_profile, detect_context_preview_format,
+        is_likely_html_fragment, normalize_html_fragment_for_markdown, read_durable_json,
+        render_status_table,
     };
     use crate::adapters::cli::{CliCommand, CliInput, CompletionShell, OutputFormat};
     use crate::catalog::bootstrap_catalog_schema;
@@ -18445,6 +18702,14 @@ mod tests {
         TOON_STREAM_RECORD_SEPARATOR_BYTE, decode_stream_frame_ndjson, decode_stream_frame_toon,
     };
     use crate::watcher::{WatchIngestOp, WatchIngestPipeline};
+    use frankensearch_storage::EmbeddingVectorSink;
+
+    use std::process::{Command, Output, Stdio};
+
+    const PUBLICATION_LEASE_RUNTIME_HELPER_ROOT_ENV: &str =
+        "FSFS_RUNTIME_PUBLICATION_LEASE_TEST_ROOT";
+    const PUBLICATION_LEASE_RUNTIME_HELPER_OPERATION_ENV: &str =
+        "FSFS_RUNTIME_PUBLICATION_LEASE_TEST_OPERATION";
 
     async fn create_test_quill(cx: &Cx, path: &Path) -> QuillIndex {
         QuillIndex::create(
@@ -18458,6 +18723,97 @@ mod tests {
         )
         .await
         .expect("create Quill index")
+    }
+
+    fn publication_lease_runtime_helper_command(index_root: &Path, operation: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().expect("current test binary"));
+        command
+            .arg("publication_lease_runtime_subprocess_helper")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(PUBLICATION_LEASE_RUNTIME_HELPER_ROOT_ENV, index_root)
+            .env(PUBLICATION_LEASE_RUNTIME_HELPER_OPERATION_ENV, operation);
+        command
+    }
+
+    fn assert_publication_lease_runtime_helper_output(output: &Output, token: &str) {
+        assert!(
+            output.status.success(),
+            "runtime publication-lease helper failed: status={:?}, stdout={}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(token),
+            "runtime publication-lease helper omitted {token}: stdout={}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    fn publication_lease_test_checkpoint(
+        index_root: &Path,
+        generation: &str,
+        artifacts_durable: bool,
+    ) -> super::IndexingCheckpoint {
+        super::IndexingCheckpoint {
+            schema_version: super::INDEXING_CHECKPOINT_SCHEMA_VERSION,
+            target_root: index_root
+                .parent()
+                .unwrap_or(index_root)
+                .display()
+                .to_string(),
+            index_root: index_root.display().to_string(),
+            started_at_ms: 1,
+            updated_at_ms: 2,
+            embedder_id: "publication-lease-test".to_owned(),
+            embedder_dimension: 4,
+            embedder_is_hash_fallback: false,
+            artifacts_durable,
+            source_hash_hex: generation.to_owned(),
+            reason_codes: vec!["test.publication_lease.paired_generation".to_owned()],
+            files: BTreeMap::from([(
+                generation.to_owned(),
+                super::CheckpointFileEntry {
+                    revision: 1,
+                    ingestion_class: super::ingestion_class_label(
+                        IngestionClass::FullSemanticLexical,
+                    )
+                    .to_owned(),
+                    canonical_bytes: 16,
+                    reason_code: "test.publication_lease.paired_generation".to_owned(),
+                    lexical_indexed: true,
+                    semantic_indexed: true,
+                    content_hash_hex: generation.to_owned(),
+                },
+            )]),
+            discovered_files: 1,
+            skipped_files: 0,
+        }
+    }
+
+    fn publication_lease_test_sentinel(
+        index_root: &Path,
+        generation: &str,
+    ) -> super::IndexSentinel {
+        super::IndexSentinel {
+            schema_version: 1,
+            generation_complete: true,
+            generated_at_ms: super::pressure_timestamp_ms(),
+            command: "publication-lease-test".to_owned(),
+            target_root: index_root
+                .parent()
+                .unwrap_or(index_root)
+                .display()
+                .to_string(),
+            index_root: index_root.display().to_string(),
+            discovered_files: 1,
+            indexed_files: 1,
+            skipped_files: 0,
+            reason_codes: vec!["test.publication_lease.paired_generation".to_owned()],
+            total_canonical_bytes: 16,
+            source_hash_hex: generation.to_owned(),
+        }
     }
 
     async fn open_test_quill(cx: &Cx, path: &Path) -> QuillIndex {
@@ -18504,6 +18860,86 @@ mod tests {
         let mut files = BTreeMap::new();
         visit(path, path, &mut files);
         files
+    }
+
+    #[cfg(feature = "embedded-models")]
+    #[derive(Debug, PartialEq, Eq)]
+    struct ObservedTreeEntry {
+        file_kind: u8,
+        len: u64,
+        modified: SystemTime,
+        created: Option<SystemTime>,
+        changed: Option<(i64, i64)>,
+        permission_key: u64,
+        bytes: Option<Vec<u8>>,
+    }
+
+    #[cfg(feature = "embedded-models")]
+    fn snapshot_observed_tree(path: &Path) -> BTreeMap<PathBuf, ObservedTreeEntry> {
+        fn visit(root: &Path, current: &Path, entries: &mut BTreeMap<PathBuf, ObservedTreeEntry>) {
+            let metadata = fs::symlink_metadata(current).expect("read observed-tree metadata");
+            let file_type = metadata.file_type();
+            let file_kind = if file_type.is_dir() {
+                1
+            } else if file_type.is_file() {
+                2
+            } else if file_type.is_symlink() {
+                3
+            } else {
+                4
+            };
+            #[cfg(unix)]
+            let (permission_key, changed) = {
+                use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+                (
+                    u64::from(metadata.permissions().mode()),
+                    Some((metadata.ctime(), metadata.ctime_nsec())),
+                )
+            };
+            #[cfg(not(unix))]
+            let permission_key = u64::from(metadata.permissions().readonly());
+            #[cfg(not(unix))]
+            let changed = None;
+            let relative = current
+                .strip_prefix(root)
+                .expect("observed entry below root")
+                .to_path_buf();
+            let bytes = file_type
+                .is_file()
+                .then(|| fs::read(current).expect("read observed-tree file"));
+            entries.insert(
+                relative,
+                ObservedTreeEntry {
+                    file_kind,
+                    len: metadata.len(),
+                    modified: metadata.modified().expect("read observed-tree mtime"),
+                    created: metadata.created().ok(),
+                    changed,
+                    permission_key,
+                    bytes,
+                },
+            );
+
+            if file_type.is_dir() {
+                let mut children = fs::read_dir(current)
+                    .expect("read observed-tree directory")
+                    .map(|entry| entry.expect("read observed-tree entry").path())
+                    .collect::<Vec<_>>();
+                children.sort();
+                for child in children {
+                    visit(root, &child, entries);
+                }
+            }
+        }
+
+        let mut entries = BTreeMap::new();
+        visit(path, path, &mut entries);
+        entries
+    }
+
+    #[cfg(feature = "embedded-models")]
+    fn verified_model_install_snapshot(model_root: &Path) -> BTreeMap<PathBuf, ObservedTreeEntry> {
+        snapshot_observed_tree(model_root)
     }
 
     fn copy_tantivy_mini_fixture(destination: &Path) {
@@ -18998,19 +19434,11 @@ mod tests {
                 ),
             ),
             (
-                "quality refinement",
+                "quality initialization and refinement",
                 source_region(
                     source,
-                    "Err(error) => {\n                        let error_code = error_code_for(&error);",
-                    "let mut advice = resources.degradation_advice.clone();",
-                ),
-            ),
-            (
-                "quality initialization",
-                source_region(
-                    source,
-                    "fn maybe_prepare_quality_embedder",
-                    "async fn build_live_ingest_pipeline",
+                    "let quality_initialization = if matches!(mode, SearchExecutionMode::Full)",
+                    "if flags.persist_explain_session",
                 ),
             ),
         ];
@@ -19096,6 +19524,9 @@ mod tests {
     #[test]
     fn async_query_expansion_offloads_blocking_llm_http() {
         let source = include_str!("runtime.rs");
+        let (production_source, _) = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("runtime.rs must preserve the exact test-module boundary");
         let direct_call = [
             "let expansion = ",
             "query_expansion",
@@ -19119,17 +19550,39 @@ mod tests {
             "execute_expanded_search should offload blocking query expansion with spawn_blocking"
         );
         assert!(
+            production_source.contains("let env_map = current_unicode_environment();")
+                && !production_source.contains("std::env::vars()"),
+            "query expansion must use the OS-safe Unicode environment projection"
+        );
+        assert!(
             !source.contains(&stale_comment),
             "blocking executor justification comment should not return"
         );
     }
+
+    static NEXT_UNIQUE_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
 
     fn unique_test_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        std::env::temp_dir().join(format!("fsfs_test_{label}_{nanos}"))
+        let sequence = NEXT_UNIQUE_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "fsfs_test_{label}_{}_{nanos}_{sequence}",
+            std::process::id()
+        ))
+    }
+
+    fn reserve_unique_test_dir(label: &str) -> std::io::Result<PathBuf> {
+        loop {
+            let path = unique_test_dir(label);
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(path),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn with_test_backup_dir<F, T>(label: &str, f: F) -> T
@@ -19176,6 +19629,8 @@ mod tests {
                 tier: "quality".to_owned(),
                 name: "all-MiniLM-L6-v2".to_owned(),
                 cache_path: "/tmp/models/all-MiniLM-L6-v2".to_owned(),
+                verification_state: "verified".to_owned(),
+                diagnostic: None,
                 cached: true,
                 size_bytes: 90_873_196,
             }],
@@ -19470,6 +19925,57 @@ mod tests {
     }
 
     #[test]
+    fn vector_checkpoint_rejects_same_id_same_dimension_revision_change() {
+        let temp = tempfile::tempdir().expect("index root");
+        let vector_path = temp.path().join(super::FSFS_VECTOR_INDEX_FILE);
+        if let Some(parent) = vector_path.parent() {
+            fs::create_dir_all(parent).expect("vector parent dir");
+        }
+        let writer = VectorIndex::create_with_revision(
+            &vector_path,
+            "potion-multilingual-128",
+            "identity-rev-a",
+            4,
+            frankensearch_index::Quantization::F32,
+        )
+        .expect("create checkpoint index");
+        writer.finish().expect("finish checkpoint index");
+        let index = VectorIndex::open(&vector_path).expect("open checkpoint index");
+
+        assert!(
+            super::vector_checkpoint_reusable(
+                &index,
+                "potion-multilingual-128",
+                "identity-rev-a",
+                4
+            ),
+            "an identical embedder identity must reuse the checkpoint"
+        );
+        assert!(
+            !super::vector_checkpoint_reusable(&index, "other-model", "identity-rev-a", 4),
+            "an embedder id change must invalidate the checkpoint"
+        );
+        assert!(
+            !super::vector_checkpoint_reusable(
+                &index,
+                "potion-multilingual-128",
+                "identity-rev-a",
+                8
+            ),
+            "a dimension change must invalidate the checkpoint"
+        );
+        assert!(
+            !super::vector_checkpoint_reusable(
+                &index,
+                "potion-multilingual-128",
+                "identity-rev-b",
+                4
+            ),
+            "a same-id same-dimension REVISION change (model retrain) must invalidate the checkpoint"
+        );
+    }
+
+    #[test]
     fn search_generation_fingerprint_tracks_exact_current_pointer_bytes() {
         let temp = tempfile::tempdir().expect("index root");
         let first = CurrentPointer::new(
@@ -19632,8 +20138,29 @@ mod tests {
                 .await
                 .expect("publish first expansion witness");
 
+            // Full-mode execution requires a complete generation: the vector
+            // arm must exist alongside the lexical arm (fail-closed semantic
+            // generation contract). The cross-generation rejection under test
+            // is still driven by the lexical successor commit below.
+            let vector_path = temp.path().join(super::FSFS_VECTOR_INDEX_FILE);
+            fs::create_dir_all(vector_path.parent().expect("vector parent"))
+                .expect("create vector parent");
+            // cfg(test) resolves the fast embedder to HashEmbedder::default_256
+            // (id fnv1a-256), so the stored generation must carry that identity.
+            let vector = vec![0.125_f32; 256];
+            let mut vector_writer = VectorIndex::create(&vector_path, "fnv1a-256", vector.len())
+                .expect("create expansion vector index");
+            vector_writer
+                .write_record("alpha.md", &vector)
+                .expect("write expansion vector");
+            vector_writer.finish().expect("finish expansion vector arm");
+
             let mut config = FsfsConfig::default();
             config.storage.index_dir = temp.path().display().to_string();
+            // Hermetic embedder resolution: an empty model_dir forces the hash
+            // fallback so the active identity matches the hash-384 generation
+            // regardless of models cached on the host.
+            config.indexing.model_dir = temp.path().join("models").display().to_string();
             let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
                 index_dir: Some(temp.path().to_path_buf()),
                 ..CliInput::default()
@@ -19729,7 +20256,6 @@ mod tests {
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
                 vector_index: None,
-                pending_semantic_initialization_failure: None,
                 fast_embedder: None,
                 quality_embedder: None,
                 fast_embedder_attempted: true,
@@ -21200,6 +21726,416 @@ mod tests {
     }
 
     #[test]
+    fn live_vector_sink_preserves_old_vector_on_append_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        fs::create_dir_all(&index_root).expect("create index root");
+        let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+        fs::create_dir_all(vector_path.parent().expect("vector parent"))
+            .expect("create vector artifact directory");
+        let old_vector = [1.0_f32, 0.0, 0.0, 0.0];
+        let new_vector = [0.0_f32, 1.0, 0.0, 0.0];
+        let mut writer =
+            VectorIndex::create(&vector_path, "publication-lease-test", old_vector.len())
+                .expect("create vector index");
+        writer
+            .write_record("doc.md", &old_vector)
+            .expect("write old vector");
+        writer.finish().expect("finish vector index");
+
+        let sink = LiveVectorSink {
+            vector_index: Arc::new(Mutex::new(
+                VectorIndex::open(&vector_path).expect("open live vector index"),
+            )),
+        };
+        let wal_path = frankensearch_index::wal_path_for(&vector_path);
+        fs::create_dir(&wal_path).expect("block WAL creation with a directory");
+
+        sink.persist("doc.md", "publication-lease-test", &new_vector)
+            .expect_err("blocked WAL append must fail");
+
+        let displaced_wal = index_root.join("blocked-vector-wal");
+        fs::rename(&wal_path, &displaced_wal).expect("preserve and displace WAL blocker");
+        let mut live = sink
+            .vector_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut durable = VectorIndex::open(&vector_path).expect("reopen durable vector index");
+        for (label, index) in [("live handle", &mut *live), ("fresh open", &mut durable)] {
+            let hits = index
+                .search_top_k(&old_vector, 1, None)
+                .expect("search old vector");
+            assert_eq!(hits.len(), 1, "{label}");
+            assert_eq!(hits[0].doc_id, "doc.md", "{label}");
+            assert!(hits[0].score > 0.99, "{label}: old vector changed");
+            assert!(
+                !index.is_deleted(0),
+                "{label}: failed replacement tombstoned the old vector"
+            );
+        }
+    }
+
+    #[test]
+    fn watcher_preserves_old_vector_on_append_failure() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let target_root = temp.path().join("project");
+            let index_root = temp.path().join("index");
+            fs::create_dir_all(&target_root).expect("create target root");
+            fs::create_dir_all(&index_root).expect("create index root");
+            let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+            fs::create_dir_all(vector_path.parent().expect("vector parent"))
+                .expect("create vector artifact directory");
+            let lexical_path = index_root.join("lexical");
+            let old_vector = {
+                let mut vector = vec![0.0_f32; 256];
+                vector[0] = 1.0;
+                vector
+            };
+            let mut writer = VectorIndex::create(&vector_path, "hash", old_vector.len())
+                .expect("create vector index");
+            writer
+                .write_record("doc.md", &old_vector)
+                .expect("write old vector");
+            writer.finish().expect("finish vector index");
+            let pipeline = LiveIngestPipeline::new(
+                target_root,
+                create_test_quill(&cx, &lexical_path).await,
+                VectorIndex::open(&vector_path).expect("open live vector index"),
+                Arc::new(HashEmbedder::default_256()),
+            );
+            let plan = VectorPipelinePlan {
+                file_key: "doc.md".to_owned(),
+                revision: 2,
+                chunk_count: 1,
+                batch_size: 1,
+                tier: VectorSchedulingTier::FastOnly,
+                invalidate_revisions_through: Some(1),
+                reason_code: "vector.plan.fast_only_quality_unavailable".to_owned(),
+            };
+            let wal_path = frankensearch_index::wal_path_for(&vector_path);
+            fs::create_dir(&wal_path).expect("block WAL creation with a directory");
+
+            pipeline
+                .apply_live_vector_actions(&cx, "doc.md", 2, "replacement text", &plan)
+                .await
+                .expect_err("blocked watcher WAL append must fail");
+
+            fs::rename(&wal_path, index_root.join("blocked-watcher-wal"))
+                .expect("preserve and displace WAL blocker");
+            let mut live = pipeline
+                .vector_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut durable = VectorIndex::open(&vector_path).expect("reopen durable vector index");
+            for (label, index) in [("live handle", &mut *live), ("fresh open", &mut durable)] {
+                let hits = index
+                    .search_top_k(&old_vector, 1, None)
+                    .expect("search old vector");
+                assert_eq!(hits.len(), 1, "{label}");
+                assert_eq!(hits[0].doc_id, "doc.md", "{label}");
+                assert!(hits[0].score > 0.99, "{label}: old vector changed");
+                assert!(
+                    !index.is_deleted(0),
+                    "{label}: failed watcher replacement tombstoned the old vector"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn publication_lease_acceptance_rejects_b_a_then_admits_b_b() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let index_root = temp.path().join("index");
+            fs::create_dir_all(&index_root).expect("create index root");
+            let lexical_path = index_root.join("lexical");
+            let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+            fs::create_dir_all(vector_path.parent().expect("vector parent"))
+                .expect("create vector artifact directory");
+
+            let seed_lease = crate::lifecycle::PublicationLease::acquire(&index_root)
+                .expect("seed generation lease");
+            let lexical = create_test_quill(&cx, &lexical_path).await;
+            lexical
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("generation-a", "alphaonlytoken"),
+                )
+                .await
+                .expect("stage lexical generation A");
+            lexical
+                .commit(&cx)
+                .await
+                .expect("publish lexical generation A");
+            let mut vector = VectorIndex::create(&vector_path, "publication-lease-test", 4)
+                .expect("create vector generation A");
+            vector
+                .write_record("generation-a", &[1.0, 0.0, 0.0, 0.0])
+                .expect("write vector generation A");
+            vector.finish().expect("finish vector generation A");
+            super::write_indexing_checkpoint(
+                &index_root,
+                &publication_lease_test_checkpoint(&index_root, "generation-a", true),
+            )
+            .expect("publish generation A checkpoint");
+            FsfsRuntime::new(FsfsConfig::default())
+                .write_index_sentinel(
+                    &index_root,
+                    &publication_lease_test_sentinel(&index_root, "generation-a"),
+                )
+                .expect("publish generation A sentinel");
+            seed_lease
+                .fence("generation A complete")
+                .expect("fence generation A");
+            drop(seed_lease);
+            drop(lexical);
+
+            assert_publication_lease_runtime_helper_output(
+                &publication_lease_runtime_helper_command(&index_root, "resolve")
+                    .output()
+                    .expect("resolve generation A in fresh process"),
+                "FSFS_RUNTIME_RESOLVER_PAIR:generation-a:generation-a",
+            );
+
+            let mut publisher_command =
+                publication_lease_runtime_helper_command(&index_root, "publish-generation-b");
+            publisher_command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let publisher = publisher_command
+                .spawn()
+                .expect("spawn generation B publisher");
+            for _ in 0..400 {
+                if index_root.join("generation-b-midpoint-ready").is_file() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                index_root.join("generation-b-midpoint-ready").is_file(),
+                "publisher must pause after lexical B and before vector/sentinel B"
+            );
+
+            assert_publication_lease_runtime_helper_output(
+                &publication_lease_runtime_helper_command(&index_root, "probe-second-publisher")
+                    .output()
+                    .expect("probe deterministic second publisher"),
+                "FSFS_RUNTIME_SECOND_PUBLISHER_BUSY",
+            );
+            assert!(
+                !index_root.join("second-publisher-mutated").exists(),
+                "a second publisher must not mutate while generation B owns the lease"
+            );
+            assert_publication_lease_runtime_helper_output(
+                &publication_lease_runtime_helper_command(&index_root, "resolve")
+                    .output()
+                    .expect("resolve lexical/vector midpoint in fresh process"),
+                "FSFS_RUNTIME_RESOLVER_INCOMPLETE",
+            );
+
+            fs::write(index_root.join("generation-b-release"), b"release")
+                .expect("release generation B publisher");
+            assert_publication_lease_runtime_helper_output(
+                &publisher
+                    .wait_with_output()
+                    .expect("wait generation B publisher"),
+                "FSFS_RUNTIME_PUBLISH_B_OK",
+            );
+            assert_publication_lease_runtime_helper_output(
+                &publication_lease_runtime_helper_command(&index_root, "resolve")
+                    .output()
+                    .expect("resolve generation B in fresh process"),
+                "FSFS_RUNTIME_RESOLVER_PAIR:generation-b:generation-b",
+            );
+        });
+    }
+
+    #[test]
+    fn publication_lease_runtime_subprocess_helper() {
+        let Some(index_root) =
+            std::env::var_os(PUBLICATION_LEASE_RUNTIME_HELPER_ROOT_ENV).map(PathBuf::from)
+        else {
+            return;
+        };
+        let operation = std::env::var(PUBLICATION_LEASE_RUNTIME_HELPER_OPERATION_ENV)
+            .expect("runtime helper operation");
+        match operation.as_str() {
+            "resolve" => {
+                let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                    index_dir: Some(index_root.clone()),
+                    ..CliInput::default()
+                });
+                let test_runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build resolver runtime");
+                let cx = Cx::for_request();
+                match test_runtime.block_on(
+                    runtime.prepare_search_execution_resources_at_root_with_modes(
+                        &cx,
+                        &index_root,
+                        SearchExecutionMode::Full,
+                        SearchExecutionMode::Full,
+                    ),
+                ) {
+                    Err(error) => {
+                        assert!(
+                            error.to_string().contains("incomplete"),
+                            "resolver failed for a reason other than typed incomplete generation: {error}"
+                        );
+                        println!("FSFS_RUNTIME_RESOLVER_INCOMPLETE");
+                    }
+                    Ok(resources) => {
+                        let lexical = resources
+                            .lexical_index
+                            .as_ref()
+                            .expect("resolver lexical resource");
+                        let lexical_a = test_runtime
+                            .block_on(frankensearch_core::LexicalRead::search(
+                                lexical,
+                                &cx,
+                                "alphaonlytoken",
+                                5,
+                            ))
+                            .expect("search lexical A")
+                            .iter()
+                            .any(|hit| hit.doc_id == "generation-a");
+                        let lexical_b = test_runtime
+                            .block_on(frankensearch_core::LexicalRead::search(
+                                lexical,
+                                &cx,
+                                "betaonlytoken",
+                                5,
+                            ))
+                            .expect("search lexical B")
+                            .iter()
+                            .any(|hit| hit.doc_id == "generation-b");
+                        let lexical_generation = match (lexical_a, lexical_b) {
+                            (true, false) => "generation-a",
+                            (false, true) => "generation-b",
+                            _ => "mixed-or-missing",
+                        };
+                        let vector_ids = super::vector_live_doc_ids(
+                            resources
+                                .vector_index
+                                .as_ref()
+                                .expect("resolver vector resource"),
+                        )
+                        .expect("read resolved vector ids");
+                        let vector_generation = match (
+                            vector_ids.contains("generation-a"),
+                            vector_ids.contains("generation-b"),
+                        ) {
+                            (true, false) => "generation-a",
+                            (false, true) => "generation-b",
+                            _ => "mixed-or-missing",
+                        };
+                        println!(
+                            "FSFS_RUNTIME_RESOLVER_PAIR:{lexical_generation}:{vector_generation}"
+                        );
+                    }
+                }
+            }
+            "publish-generation-b" => {
+                let lease = crate::lifecycle::PublicationLease::acquire(&index_root)
+                    .expect("acquire generation B lease");
+                let mut checkpoint = super::read_indexing_checkpoint(&index_root)
+                    .expect("read generation A checkpoint")
+                    .expect("generation A checkpoint exists");
+                checkpoint.artifacts_durable = false;
+                checkpoint.updated_at_ms = super::pressure_timestamp_ms();
+                lease
+                    .fence("generation B incomplete checkpoint")
+                    .expect("fence incomplete checkpoint");
+                super::write_indexing_checkpoint(&index_root, &checkpoint)
+                    .expect("publish incomplete checkpoint before B artifacts");
+
+                let lexical_path = index_root.join("lexical");
+                let test_runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build publisher runtime");
+                let cx = Cx::for_request();
+                let lexical = test_runtime
+                    .block_on(QuillIndex::open(&cx, &lexical_path, QuillConfig::default()))
+                    .expect("open lexical generation A");
+                lease
+                    .fence("generation B lexical mutation")
+                    .expect("fence lexical B");
+                test_runtime
+                    .block_on(lexical.delete_document(&cx, "generation-a"))
+                    .expect("delete lexical generation A");
+                test_runtime
+                    .block_on(lexical.index_document(
+                        &cx,
+                        &IndexableDocument::new("generation-b", "betaonlytoken"),
+                    ))
+                    .expect("stage lexical generation B");
+                test_runtime
+                    .block_on(lexical.commit(&cx))
+                    .expect("publish lexical generation B");
+                fs::write(index_root.join("generation-b-midpoint-ready"), b"ready")
+                    .expect("publish B midpoint handshake");
+                for _ in 0..400 {
+                    if index_root.join("generation-b-release").is_file() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                assert!(
+                    index_root.join("generation-b-release").is_file(),
+                    "timed out waiting to release generation B midpoint"
+                );
+
+                lease
+                    .fence("generation B vector append")
+                    .expect("fence vector B");
+                let mut vector = VectorIndex::open(&index_root.join(super::FSFS_VECTOR_INDEX_FILE))
+                    .expect("open vector generation A");
+                vector
+                    .append("generation-b", &[0.0, 1.0, 0.0, 0.0])
+                    .expect("log vector generation B");
+                vector
+                    .soft_delete("generation-a")
+                    .expect("retire vector generation A");
+                lease
+                    .fence("generation B sentinel publication")
+                    .expect("fence sentinel B");
+                FsfsRuntime::new(FsfsConfig::default())
+                    .write_index_sentinel(
+                        &index_root,
+                        &publication_lease_test_sentinel(&index_root, "generation-b"),
+                    )
+                    .expect("publish sentinel B last");
+                super::remove_indexing_checkpoint(&index_root)
+                    .expect("retire incomplete checkpoint after sentinel B");
+                println!("FSFS_RUNTIME_PUBLISH_B_OK");
+            }
+            "probe-second-publisher" => {
+                match crate::lifecycle::PublicationLease::acquire(&index_root) {
+                    Err(SearchError::SubsystemError { subsystem, source })
+                        if subsystem == "publication-lease"
+                            && source
+                                .downcast_ref::<crate::lifecycle::PublicationLeaseBusy>()
+                                .is_some() =>
+                    {
+                        println!("FSFS_RUNTIME_SECOND_PUBLISHER_BUSY");
+                    }
+                    Err(error) => panic!("unexpected second-publisher admission error: {error}"),
+                    Ok(lease) => {
+                        lease
+                            .fence("unexpected second publisher")
+                            .expect("fence unexpected publisher");
+                        fs::write(index_root.join("second-publisher-mutated"), b"mutated")
+                            .expect("record unexpected second-publisher mutation");
+                        println!("FSFS_RUNTIME_SECOND_PUBLISHER_MUTATED");
+                    }
+                }
+            }
+            other => panic!("unknown runtime publication-lease helper operation {other}"),
+        }
+    }
+
+    #[test]
     fn live_ingest_pipeline_wires_storage_runner_for_semantic_upserts() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
@@ -21881,16 +22817,9 @@ mod tests {
             .expect("plan");
 
         let actions = FsfsRuntime::vector_index_write_actions(&plan);
-        assert_eq!(actions.len(), 3);
+        assert_eq!(actions.len(), 2);
         assert_eq!(
             actions[0],
-            VectorIndexWriteAction::InvalidateRevisionsThrough {
-                file_key: "doc/a.md".to_owned(),
-                revision: 10
-            }
-        );
-        assert_eq!(
-            actions[1],
             VectorIndexWriteAction::AppendFast {
                 file_key: "doc/a.md".to_owned(),
                 revision: 12,
@@ -21898,12 +22827,48 @@ mod tests {
             }
         );
         assert_eq!(
-            actions[2],
+            actions[1],
             VectorIndexWriteAction::AppendQuality {
                 file_key: "doc/a.md".to_owned(),
                 revision: 12,
                 chunk_count: 2
             }
+        );
+        assert!(
+            actions.iter().all(|action| !matches!(
+                action,
+                VectorIndexWriteAction::InvalidateRevisionsThrough { .. }
+            )),
+            "replacement plans must log the successor before superseding the old vector"
+        );
+    }
+
+    #[test]
+    fn vector_index_actions_invalidate_only_when_policy_publishes_no_replacement() {
+        let plan = VectorPipelinePlan {
+            file_key: "doc/no-semantic.md".to_owned(),
+            revision: 12,
+            chunk_count: 0,
+            batch_size: 1,
+            tier: VectorSchedulingTier::LexicalFallback,
+            invalidate_revisions_through: Some(10),
+            reason_code: "vector.plan.lexical_fallback".to_owned(),
+        };
+
+        let actions = FsfsRuntime::vector_index_write_actions(&plan);
+        assert_eq!(
+            actions,
+            vec![
+                VectorIndexWriteAction::InvalidateRevisionsThrough {
+                    file_key: "doc/no-semantic.md".to_owned(),
+                    revision: 10,
+                },
+                VectorIndexWriteAction::MarkLexicalFallback {
+                    file_key: "doc/no-semantic.md".to_owned(),
+                    revision: 12,
+                    reason_code: "vector.plan.lexical_fallback".to_owned(),
+                },
+            ]
         );
     }
 
@@ -22834,7 +23799,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_only_strong_lexical_head_still_requires_semantic_readiness() {
+    fn full_search_strong_lexical_head_still_requires_semantic_readiness() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
             let lexical_path = temp.path().join("lexical");
@@ -22873,7 +23838,7 @@ mod tests {
                 "fixture must produce a lexical head"
             );
             let voi = FsfsRuntime::semantic_voi_decision(
-                SearchExecutionMode::FastOnly,
+                SearchExecutionMode::Full,
                 QueryIntentClass::ShortKeyword,
                 "needle",
                 5,
@@ -22892,7 +23857,6 @@ mod tests {
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
                 vector_index: None,
-                pending_semantic_initialization_failure: None,
                 fast_embedder: None,
                 quality_embedder: None,
                 fast_embedder_attempted: false,
@@ -22905,7 +23869,7 @@ mod tests {
                     &cx,
                     "needle",
                     5,
-                    SearchExecutionMode::FastOnly,
+                    SearchExecutionMode::Full,
                     &mut resources,
                     SearchExecutionFlags {
                         include_snippets: false,
@@ -22914,16 +23878,59 @@ mod tests {
                     None,
                 )
                 .await
-                .expect_err("FastOnly readiness must fail closed before lexical-only output");
+                .expect_err("Full readiness must fail closed before lexical-only output");
             assert!(
                 matches!(error, SearchError::IndexNotFound { .. }),
-                "FastOnly lost the typed missing-vector error: {error:?}"
+                "Full lost the typed missing-vector error: {error:?}"
+            );
+
+            let vector_path = temp.path().join(super::FSFS_VECTOR_INDEX_FILE);
+            fs::create_dir_all(
+                vector_path
+                    .parent()
+                    .expect("vector fixture path must have a parent"),
+            )
+            .expect("create vector fixture directory");
+            let mut writer = VectorIndex::create(&vector_path, "hash-fnv1a-256", 256)
+                .expect("create admitted vector fixture");
+            writer
+                .write_record(
+                    "src/needle.rs",
+                    &HashEmbedder::default_256().embed_sync("needle"),
+                )
+                .expect("write vector fixture");
+            writer.finish().expect("seal vector fixture");
+            resources.vector_index =
+                Some(VectorIndex::open(&vector_path).expect("open vector fixture"));
+            resources.generation_fingerprint =
+                FsfsRuntime::search_index_fingerprint_at_root(temp.path())
+                    .expect("refresh search generation fingerprint");
+            resources.fast_embedder_attempted = true;
+
+            let error = runtime
+                .execute_search_phase_artifacts_with_mode_using_resources(
+                    &cx,
+                    "needle",
+                    5,
+                    SearchExecutionMode::Full,
+                    &mut resources,
+                    SearchExecutionFlags {
+                        include_snippets: false,
+                        persist_explain_session: false,
+                    },
+                    None,
+                )
+                .await
+                .expect_err("Full readiness must reject a generation without its fast embedder");
+            assert!(
+                matches!(error, SearchError::EmbedderUnavailable { .. }),
+                "Full lost the typed missing-fast-embedder error: {error:?}"
             );
         });
     }
 
     #[test]
-    fn runtime_search_payload_falls_back_to_lexical_when_vector_index_is_corrupt() {
+    fn full_search_fails_closed_on_corrupt_vector_while_lexical_only_remains_explicit() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
             let project = temp.path().join("project");
@@ -22959,20 +23966,36 @@ mod tests {
             )
             .expect("corrupt vector index file");
 
-            let payload = FsfsRuntime::new(config)
-                .with_cli_input(CliInput {
-                    command: CliCommand::Search,
-                    query: Some("authentication middleware".to_owned()),
-                    index_dir: Some(project.join(".frankensearch")),
-                    ..CliInput::default()
-                })
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                query: Some("authentication middleware".to_owned()),
+                index_dir: Some(project.join(".frankensearch")),
+                ..CliInput::default()
+            });
+            let error = runtime
                 .execute_search_payload(&cx, "authentication middleware", 5)
                 .await
-                .expect("search payload should fall back to lexical index");
+                .expect_err("Full search must reject a corrupt semantic generation");
+            assert!(
+                matches!(error, SearchError::IndexCorrupted { .. }),
+                "Full search lost the typed vector-integrity failure: {error:?}"
+            );
 
+            let lexical_payloads = runtime
+                .execute_search_payloads_with_mode(
+                    &cx,
+                    "authentication middleware",
+                    5,
+                    SearchExecutionMode::LexicalOnly,
+                )
+                .await
+                .expect("explicit LexicalOnly search must ignore the corrupt vector lane");
+            let payload = lexical_payloads
+                .last()
+                .expect("LexicalOnly search must return a payload");
             assert!(
                 !payload.hits.is_empty(),
-                "expected lexical hits after fallback"
+                "explicit LexicalOnly search should return lexical hits"
             );
             let freshness = payload
                 .index_freshness
@@ -22982,39 +24005,15 @@ mod tests {
                 !freshness.live_writer,
                 "read-only search must not manufacture a live writer lease"
             );
-            let fallback = payload
-                .degradation_advice
-                .get(DegradationFailureKind::LexicalFallback.reason_code())
-                .expect("authorized Full fallback must attach stable recovery advice");
-            assert_eq!(
-                fallback.schema_version,
-                crate::degradation_advisor::DEGRADATION_ADVICE_SCHEMA_VERSION
-            );
-            assert!(fallback.preserves_initial_results);
-            assert_eq!(
-                fallback.original_error.as_deref(),
-                Some("index_corrupted: semantic vector generation failed integrity validation"),
-                "Full fallback advice must retain the original typed classification in sanitized stable form"
-            );
-            let index_path = project.join(".frankensearch");
             assert!(
-                fallback
-                    .original_error
-                    .as_deref()
-                    .is_some_and(|summary| !summary.contains(&index_path.display().to_string())),
-                "fallback advice must not expose a temporary index path"
-            );
-            assert!(
-                fallback
-                    .next_actions
-                    .iter()
-                    .any(|action| action.reason_code == "degrade.action.verify_vector_index")
+                payload.degradation_advice.is_empty(),
+                "LexicalOnly is an explicit mode, not a semantic degradation"
             );
         });
     }
 
     #[test]
-    fn semantic_lexical_fallback_serialization_excludes_provider_paths_and_reasons() {
+    fn semantic_refinement_failure_serialization_excludes_provider_paths_and_reasons() {
         const SENTINEL_PATH: &str = "/private/fsfs/SENTINEL_MODEL_PATH/model.onnx";
         const SENTINEL_REASON: &str = "SENTINEL_PROVIDER_REASON_DO_NOT_SERIALIZE";
 
@@ -23036,51 +24035,6 @@ mod tests {
         ];
 
         for (error, expected_summary) in cases {
-            let mut resources = SearchExecutionResources {
-                index_root: PathBuf::from("/verified/index"),
-                generation_fingerprint: FsfsRuntime::search_index_fingerprint_at_root(Path::new(
-                    "/verified/index",
-                ))
-                .expect("verified generation fingerprint"),
-                lexical_index: None,
-                shadow_observer: None,
-                shadow_pressure_sampler: None,
-                vector_index: None,
-                pending_semantic_initialization_failure: None,
-                fast_embedder: None,
-                quality_embedder: None,
-                fast_embedder_attempted: false,
-                quality_embedder_attempted: false,
-                degradation_advice: Vec::new(),
-            };
-            FsfsRuntime::record_semantic_lexical_fallback(&mut resources, "needle", &error);
-            let payload = crate::output_schema::SearchPayload::new(
-                "needle",
-                crate::output_schema::SearchOutputPhase::Initial,
-                0,
-                Vec::new(),
-            )
-            .with_degradation_advice(resources.degradation_advice.clone());
-            let fallback = payload
-                .degradation_advice
-                .get(DegradationFailureKind::LexicalFallback.reason_code())
-                .expect("serialized payload must retain lexical fallback advice");
-            assert_eq!(
-                fallback.original_error.as_deref(),
-                Some(expected_summary),
-                "fallback must retain only a stable typed classification and static summary"
-            );
-
-            for serialized in [
-                serde_json::to_string(fallback).expect("serialize fallback advice"),
-                serde_json::to_string(&payload).expect("serialize search payload"),
-            ] {
-                assert!(
-                    !serialized.contains(SENTINEL_PATH) && !serialized.contains(SENTINEL_REASON),
-                    "fallback serialization leaked raw provider state: {serialized}"
-                );
-            }
-
             let refinement_advice = FsfsRuntime::sanitized_semantic_degradation_advice(
                 crate::degradation_advisor::classify_search_error(&error),
                 "needle",
@@ -23703,6 +24657,43 @@ mod tests {
         }
     }
 
+    struct FailedQualityEmbedder;
+
+    impl Embedder for FailedQualityEmbedder {
+        fn embed<'a>(
+            &'a self,
+            _cx: &'a asupersync::Cx,
+            _text: &'a str,
+        ) -> SearchFuture<'a, Vec<f32>> {
+            Box::pin(async {
+                Err(SearchError::EmbedderUnavailable {
+                    model: "quality-test".to_owned(),
+                    reason: "injected quality initialization failure".to_owned(),
+                })
+            })
+        }
+
+        fn dimension(&self) -> usize {
+            384
+        }
+
+        fn id(&self) -> &'static str {
+            "failed-quality-384"
+        }
+
+        fn model_name(&self) -> &'static str {
+            "Failed Quality Embedder"
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
     #[derive(Default)]
     struct FlushVisibleState {
         pending: Vec<u8>,
@@ -23787,7 +24778,6 @@ mod tests {
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
                 vector_index: Some(VectorIndex::open(&vector_path).expect("open vector index")),
-                pending_semantic_initialization_failure: None,
                 fast_embedder: Some(Arc::new(fast_embedder)),
                 quality_embedder: Some(Arc::new(BarrierQualityEmbedder::new(Arc::clone(&barrier)))),
                 fast_embedder_attempted: true,
@@ -23874,6 +24864,76 @@ mod tests {
             for (expected, frame) in final_frames.iter().enumerate() {
                 assert_eq!(frame.seq, expected as u64);
             }
+        });
+    }
+
+    #[test]
+    fn full_search_preserves_initial_results_when_quality_refinement_fails() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let vector_path = temp.path().join("quality-failure.fsvi");
+            let query = "recover after a temporary network outage";
+            let fast_embedder = HashEmbedder::default_384();
+            let query_vector = fast_embedder.embed_sync(query);
+            // Exercise the quality-generation branch: the stored generation is
+            // bound to the quality embedder, while the deterministic hash
+            // control supplies a stable initial-phase vector for this test.
+            let mut vector_writer = VectorIndex::create(
+                &vector_path,
+                "failed-quality-384",
+                fast_embedder.dimension(),
+            )
+            .expect("create vector index");
+            vector_writer
+                .write_record("docs/retry.md", &query_vector)
+                .expect("write vector record");
+            vector_writer.finish().expect("finish vector index");
+
+            let mut resources = SearchExecutionResources {
+                index_root: temp.path().to_path_buf(),
+                generation_fingerprint: FsfsRuntime::search_index_fingerprint_at_root(temp.path())
+                    .expect("quality-failure generation fingerprint"),
+                lexical_index: None,
+                shadow_observer: None,
+                shadow_pressure_sampler: None,
+                vector_index: Some(VectorIndex::open(&vector_path).expect("open vector index")),
+                fast_embedder: Some(Arc::new(fast_embedder)),
+                quality_embedder: Some(Arc::new(FailedQualityEmbedder)),
+                fast_embedder_attempted: true,
+                quality_embedder_attempted: true,
+                degradation_advice: Vec::new(),
+            };
+            let runtime = FsfsRuntime::new(FsfsConfig::default());
+            let artifacts = runtime
+                .execute_search_phase_artifacts_with_mode_using_resources(
+                    &cx,
+                    query,
+                    5,
+                    SearchExecutionMode::Full,
+                    &mut resources,
+                    SearchExecutionFlags {
+                        include_snippets: false,
+                        persist_explain_session: false,
+                    },
+                    None,
+                )
+                .await
+                .expect("quality failure must preserve the admitted initial phase");
+
+            assert_eq!(artifacts.len(), 2);
+            assert_eq!(artifacts[0].phase, SearchOutputPhase::Initial);
+            assert_eq!(artifacts[1].phase, SearchOutputPhase::RefinementFailed);
+            assert_eq!(artifacts[0].payload.hits, artifacts[1].payload.hits);
+            assert!(
+                artifacts[1]
+                    .payload
+                    .degradation_advice
+                    .iter()
+                    .any(|(_, advice)| advice.original_error.as_deref()
+                        == Some("embedder_unavailable: semantic embedder is unavailable")),
+                "RefinementFailed must carry sanitized actionable quality advice: {:?}",
+                artifacts[1].payload.degradation_advice
+            );
         });
     }
 
@@ -23966,7 +25026,6 @@ mod tests {
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
                 vector_index: Some(VectorIndex::open(&vector_path).expect("open vector index")),
-                pending_semantic_initialization_failure: None,
                 fast_embedder: Some(Arc::new(CancelledEmbedder)),
                 quality_embedder: None,
                 fast_embedder_attempted: true,
@@ -24048,7 +25107,6 @@ mod tests {
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
                 vector_index: Some(VectorIndex::open(&vector_path).expect("open vector index")),
-                pending_semantic_initialization_failure: None,
                 fast_embedder: Some(Arc::new(fast_embedder)),
                 quality_embedder: Some(Arc::new(CancelledEmbedder)),
                 fast_embedder_attempted: true,
@@ -24231,6 +25289,174 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "embedded-models")]
+    fn bundled_semantic_models_status_and_doctor_are_observational() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let absent_model_root = temp.path().join("absent-models");
+        let absent_index_root = temp.path().join("absent-index");
+        let mut config = FsfsConfig::default();
+        config.indexing.model_dir = absent_model_root.display().to_string();
+        config.storage.db_path = temp.path().join("absent.db").display().to_string();
+        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            command: CliCommand::Status,
+            index_dir: Some(absent_index_root.clone()),
+            ..CliInput::default()
+        });
+
+        for _ in 0..2 {
+            runtime
+                .collect_status_payload()
+                .expect("status observes absent model cache");
+            runtime
+                .collect_doctor_payload()
+                .expect("doctor observes absent model cache");
+            assert!(
+                !absent_model_root.exists(),
+                "repeated status and doctor must not create an absent embedded-model cache"
+            );
+            assert!(
+                !absent_index_root.exists(),
+                "repeated status and doctor must not create an absent index root"
+            );
+        }
+
+        let corrupt_model_root = temp.path().join("corrupt-models");
+        let fast_dir = corrupt_model_root.join("potion-multilingual-128M");
+        let quality_dir = corrupt_model_root.join("all-MiniLM-L6-v2");
+        fs::create_dir_all(&fast_dir).expect("create corrupt fast model dir");
+        fs::create_dir_all(&quality_dir).expect("create corrupt quality model dir");
+        fs::write(fast_dir.join("tokenizer.json"), b"corrupt-fast-tokenizer")
+            .expect("write corrupt fast bytes");
+        fs::write(fast_dir.join(".verified"), b"stale-fast-receipt")
+            .expect("write stale fast receipt");
+        fs::write(quality_dir.join("model.onnx"), b"corrupt-quality-model")
+            .expect("write corrupt quality bytes");
+        fs::write(quality_dir.join(".verified"), b"stale-quality-receipt")
+            .expect("write stale quality receipt");
+        let corrupt_index_root = temp.path().join("corrupt-index");
+        fs::create_dir_all(&corrupt_index_root).expect("create observed index dir");
+        fs::write(corrupt_index_root.join("operator-marker"), b"unchanged")
+            .expect("write observed index marker");
+        let model_before = snapshot_observed_tree(&corrupt_model_root);
+        let index_before = snapshot_observed_tree(&corrupt_index_root);
+
+        let mut config = FsfsConfig::default();
+        config.indexing.model_dir = corrupt_model_root.display().to_string();
+        config.storage.db_path = temp.path().join("corrupt.db").display().to_string();
+        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            command: CliCommand::Doctor,
+            index_dir: Some(corrupt_index_root.clone()),
+            ..CliInput::default()
+        });
+        for _ in 0..2 {
+            runtime
+                .collect_status_payload()
+                .expect("status observes corrupt model cache");
+            assert_eq!(
+                snapshot_observed_tree(&corrupt_model_root),
+                model_before,
+                "repeated status must leave model bytes, receipts, and metadata unchanged"
+            );
+            assert_eq!(
+                snapshot_observed_tree(&corrupt_index_root),
+                index_before,
+                "repeated status must leave index bytes and metadata unchanged"
+            );
+            runtime
+                .collect_doctor_payload()
+                .expect("doctor observes corrupt model cache");
+            assert_eq!(
+                snapshot_observed_tree(&corrupt_model_root),
+                model_before,
+                "repeated doctor must leave model bytes, receipts, and metadata unchanged"
+            );
+            assert_eq!(
+                snapshot_observed_tree(&corrupt_index_root),
+                index_before,
+                "repeated doctor must leave index bytes and metadata unchanged"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "embedded-models")]
+    fn bundled_semantic_models_materialize_once_at_execution() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let model_root = temp.path().join("models");
+        let mut config = FsfsConfig::default();
+        config.indexing.model_dir = model_root.display().to_string();
+        let runtime = FsfsRuntime::new(config);
+
+        runtime
+            .resolve_fast_embedder()
+            .expect("fast semantic execution preparation");
+        let fast_manifest = ModelManifest::potion_128m();
+        let quality_manifest = ModelManifest::minilm_v2();
+        verify_dir_cached(&fast_manifest, &model_root.join("potion-multilingual-128M"))
+            .expect("fast model has a current verified receipt");
+        verify_dir_cached(&quality_manifest, &model_root.join("all-MiniLM-L6-v2"))
+            .expect("quality model has a current verified receipt");
+        let first_install = verified_model_install_snapshot(&model_root);
+
+        runtime
+            .resolve_quality_embedder()
+            .expect("quality semantic execution preparation");
+        runtime
+            .resolve_fast_embedder()
+            .expect("repeated fast semantic execution preparation");
+
+        assert_eq!(
+            verified_model_install_snapshot(&model_root),
+            first_install,
+            "repeated semantic execution must not rewrite model bytes or receipts"
+        );
+
+        let valid_index_root = temp.path().join("valid-index");
+        let valid_vector_path = valid_index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+        fs::create_dir_all(
+            valid_vector_path
+                .parent()
+                .expect("valid vector path must have a parent"),
+        )
+        .expect("create valid vector directory");
+        let mut writer = VectorIndex::create(&valid_vector_path, "potion-multilingual-128m", 256)
+            .expect("create structurally valid vector generation");
+        writer
+            .write_record("docs/witness.md", &vec![1.0; 256])
+            .expect("write structurally valid vector record");
+        writer.finish().expect("seal valid vector generation");
+
+        let valid_model_before = snapshot_observed_tree(&model_root);
+        let valid_index_before = snapshot_observed_tree(&valid_index_root);
+        let mut observer_config = FsfsConfig::default();
+        observer_config.indexing.model_dir = model_root.display().to_string();
+        observer_config.storage.db_path = temp.path().join("valid.db").display().to_string();
+        let observer = FsfsRuntime::new(observer_config).with_cli_input(CliInput {
+            command: CliCommand::Doctor,
+            index_dir: Some(valid_index_root.clone()),
+            ..CliInput::default()
+        });
+        for _ in 0..2 {
+            observer
+                .collect_status_payload()
+                .expect("status observes valid model and index roots");
+            observer
+                .collect_doctor_payload()
+                .expect("doctor observes valid model and index roots");
+            assert_eq!(
+                snapshot_observed_tree(&model_root),
+                valid_model_before,
+                "status and doctor must preserve valid model bytes, modes, mtimes, and ctimes"
+            );
+            assert_eq!(
+                snapshot_observed_tree(&valid_index_root),
+                valid_index_before,
+                "status and doctor must preserve valid index bytes, modes, mtimes, and ctimes"
+            );
+        }
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn runtime_status_payload_reports_index_and_model_state() {
         run_test_with_cx(|cx| async move {
@@ -24345,18 +25571,13 @@ mod tests {
                 })
             );
             assert_eq!(payload.models[0].tier, "fast");
-            assert!(payload.models[0].cached);
             assert_eq!(payload.models[1].tier, "quality");
-            #[cfg(feature = "embedded-models")]
-            {
-                assert!(payload.models[1].cached);
-                assert!(payload.models[1].size_bytes > 0);
-            }
-            #[cfg(not(feature = "embedded-models"))]
-            {
-                assert!(!payload.models[1].cached);
-                assert_eq!(payload.models[1].size_bytes, 0);
-            }
+            assert!(!payload.models[0].cached);
+            assert_eq!(payload.models[0].verification_state, "incomplete");
+            assert!(payload.models[0].diagnostic.is_some());
+            assert!(!payload.models[1].cached);
+            assert_eq!(payload.models[1].verification_state, "missing");
+            assert_eq!(payload.models[1].size_bytes, 0);
             assert_eq!(
                 payload.runtime.tracked_index_bytes,
                 Some(payload.index.size_bytes)
@@ -24637,7 +25858,19 @@ mod tests {
             let model_root = temp.path().join("models");
             let potion_dir = model_root.join("potion-multilingual-128M");
             fs::create_dir_all(&potion_dir).expect("create model dir");
+            // The verifier requires the complete file set before checksumming;
+            // an absent member reports ModelNotFound instead of the checksum
+            // error this test pins. Corrupt every required file.
             fs::write(potion_dir.join("tokenizer.json"), b"broken").expect("write model file");
+            // The registered potion manifest lists tokenizer.json THEN
+            // model.safetensors. The fixture must be complete: with the
+            // weights file absent, per-file resolution fell through to the
+            // HOST cache on provisioned machines (mismatch reported, test
+            // green) but yielded ModelNotFound on bare CI runners. Writing
+            // both files pins the typed HashMismatch on tokenizer.json in
+            // every environment.
+            fs::write(potion_dir.join("model.safetensors"), b"also-broken")
+                .expect("write weights file");
 
             let mut config = FsfsConfig::default();
             config.indexing.model_dir = model_root.display().to_string();
@@ -24648,15 +25881,49 @@ mod tests {
                 ..CliInput::default()
             });
 
-            let payload = runtime
-                .collect_download_models_payload()
-                .await
-                .expect("verify payload");
-            assert_eq!(payload.operation, "verify");
-            assert_eq!(payload.models.len(), 1);
-            assert_eq!(payload.models[0].id, "potion-multilingual-128m");
-            assert_eq!(payload.models[0].state, "mismatch");
-            assert_eq!(payload.models[0].verified, Some(false));
+            let result = runtime.collect_download_models_payload().await;
+            assert!(
+                result.is_err(),
+                "corrupt model verification must fail closed"
+            );
+            let Some(error) = result.err() else {
+                return;
+            };
+            assert!(
+                matches!(error, SearchError::HashMismatch { ref path, .. }
+                    if path.ends_with("tokenizer.json")),
+                "verification must preserve the typed checksum error: {error:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_download_models_verify_reports_missing_as_error() {
+        run_test_with_cx(|_cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let model_root = temp.path().join("models");
+
+            let mut config = FsfsConfig::default();
+            config.indexing.model_dir = model_root.display().to_string();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Download,
+                download_verify: true,
+                model_name: Some("potion".to_owned()),
+                ..CliInput::default()
+            });
+
+            let result = runtime.collect_download_models_payload().await;
+            assert!(
+                result.is_err(),
+                "missing model verification must fail closed"
+            );
+            let Some(error) = result.err() else {
+                return;
+            };
+            assert!(
+                matches!(error, SearchError::ModelNotFound { .. }),
+                "verification must preserve the typed missing-model error: {error:?}"
+            );
         });
     }
 
@@ -25134,6 +26401,48 @@ mod tests {
     }
 
     #[test]
+    fn doctor_writability_checks_are_observational_and_create_no_probe_or_lease() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        let model_root = temp.path().join("models");
+        fs::create_dir_all(&index_root).expect("create index root");
+        fs::create_dir_all(&model_root).expect("create model root");
+        fs::write(index_root.join("stable-index-byte"), b"index").expect("seed stable index byte");
+        fs::write(model_root.join("stable-model-byte"), b"model").expect("seed stable model byte");
+        let index_before = snapshot_directory(&index_root);
+        let model_before = snapshot_directory(&model_root);
+
+        let mut config = FsfsConfig::default();
+        config.storage.index_dir = index_root.display().to_string();
+        config.indexing.model_dir = model_root.display().to_string();
+        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            command: CliCommand::Doctor,
+            index_dir: Some(index_root.clone()),
+            ..CliInput::default()
+        });
+        let _payload = runtime
+            .collect_doctor_payload()
+            .expect("collect observational doctor payload");
+
+        assert_eq!(
+            snapshot_directory(&index_root),
+            index_before,
+            "doctor must not mutate the admitted index root"
+        );
+        assert_eq!(
+            snapshot_directory(&model_root),
+            model_before,
+            "doctor must not create and delete model-directory probes"
+        );
+        assert!(
+            !index_root
+                .join(crate::lifecycle::PUBLICATION_LOCK_FILE_NAME)
+                .exists(),
+            "doctor must not manufacture a publication lease"
+        );
+    }
+
+    #[test]
     fn doctor_warns_when_semantic_generation_is_incomplete() {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_root = temp.path().join("index");
@@ -25343,6 +26652,48 @@ mod tests {
         assert_eq!(has_warn.overall, super::DoctorVerdict::Warn);
     }
 
+    #[test]
+    fn doctor_hard_failure_has_stable_machine_error_and_recovery() {
+        let payload = super::FsfsDoctorPayload {
+            version: "test".to_owned(),
+            checks: vec![
+                super::DoctorCheck {
+                    name: "version".to_owned(),
+                    verdict: super::DoctorVerdict::Pass,
+                    detail: "ok".to_owned(),
+                    suggestion: None,
+                },
+                super::DoctorCheck {
+                    name: "model.fast".to_owned(),
+                    verdict: super::DoctorVerdict::Fail,
+                    detail: "loader rejected the verified cache".to_owned(),
+                    suggestion: Some("reinstall and verify the fast model".to_owned()),
+                },
+            ],
+            pass_count: 1,
+            warn_count: 0,
+            fail_count: 1,
+            overall: super::DoctorVerdict::Fail,
+        };
+
+        let error = FsfsRuntime::doctor_failure_error(&payload);
+        assert_eq!(error.code, "subsystem_error");
+        assert_eq!(
+            error.exit_code,
+            crate::adapters::cli::exit_code::RUNTIME_ERROR
+        );
+        assert!(
+            error
+                .context
+                .as_deref()
+                .is_some_and(|context| context.contains("model.fast"))
+        );
+        assert_eq!(
+            error.suggestion.as_deref(),
+            Some("reinstall and verify the fast model")
+        );
+    }
+
     // ─── Self-Update Tests ─────────────────────────────────────────────────
 
     #[test]
@@ -25469,9 +26820,12 @@ mod tests {
 
     #[test]
     fn release_asset_url_format() {
+        // Linux ships lite archives only; the URL must use the fsfs-lite
+        // family or self-update 404s against every real release (the previous
+        // pin of the full-build name froze exactly that defect).
         let url = super::release_asset_url("v0.2.0", "x86_64-unknown-linux-musl");
         assert!(url.contains("v0.2.0"));
-        assert!(url.contains("fsfs-0.2.0-x86_64-unknown-linux-musl.tar.xz"));
+        assert!(url.contains("fsfs-lite-0.2.0-x86_64-unknown-linux-musl.tar.xz"));
         assert!(url.starts_with("https://github.com/"));
     }
 
@@ -25479,6 +26833,28 @@ mod tests {
     fn release_asset_url_windows_uses_zip() {
         let url = super::release_asset_url("v1.1.2", "x86_64-pc-windows-msvc");
         assert!(url.contains("fsfs-1.1.2-x86_64-pc-windows-msvc.zip"));
+    }
+
+    #[test]
+    fn release_asset_url_families_match_release_matrix() {
+        // Lite family: both musl targets and Intel macOS.
+        for triple in [
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-musl",
+            "x86_64-apple-darwin",
+        ] {
+            let name = super::release_asset_filename("v1.4.2", triple);
+            assert_eq!(name, format!("fsfs-lite-1.4.2-{triple}.tar.xz"));
+        }
+        // Full family: aarch64 macOS tarball and the Windows zip.
+        assert_eq!(
+            super::release_asset_filename("v1.4.2", "aarch64-apple-darwin"),
+            "fsfs-1.4.2-aarch64-apple-darwin.tar.xz"
+        );
+        assert_eq!(
+            super::release_asset_filename("v1.4.2", "x86_64-pc-windows-msvc"),
+            "fsfs-1.4.2-x86_64-pc-windows-msvc.zip"
+        );
     }
 
     #[test]
@@ -25521,7 +26897,7 @@ mod tests {
     fn release_asset_filename_includes_version_and_triple() {
         assert_eq!(
             super::release_asset_filename("v1.1.2", "x86_64-unknown-linux-musl"),
-            "fsfs-1.1.2-x86_64-unknown-linux-musl.tar.xz"
+            "fsfs-lite-1.1.2-x86_64-unknown-linux-musl.tar.xz"
         );
         assert_eq!(
             super::release_asset_filename("v1.1.2", "x86_64-pc-windows-msvc"),
@@ -26176,7 +27552,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "embedded-models"))]
+    #[cfg(not(feature = "semantic-loaders"))]
     #[test]
     fn model_free_guidance_requires_a_loader_capable_build() {
         let runtime = FsfsRuntime::new(FsfsConfig::default());
@@ -26189,8 +27565,9 @@ mod tests {
 
         for guidance in [mode_hint.as_str(), doctor_hint, directory_hint] {
             assert!(
-                guidance.contains("--no-default-features --features embedded-models"),
-                "guidance must name the verified-input loader build contract: {guidance}"
+                guidance.contains("standard fsfs build")
+                    || guidance.contains("without `--no-default-features`"),
+                "guidance must name the loader-capable default build contract: {guidance}"
             );
             assert!(
                 !guidance.contains("fall back to hash")
@@ -26203,17 +27580,21 @@ mod tests {
             "downloaded files are inputs, not a runtime loader capability: {mode_hint}"
         );
         assert!(
-            mode_hint.contains("full fsfs prebuilt"),
-            "the supported full-prebuilt recovery path must remain explicit: {mode_hint}"
+            mode_hint.contains("cargo build --release -p frankensearch-fsfs"),
+            "the supported default source-build recovery path must remain explicit: {mode_hint}"
         );
 
         for tier in ["fast", "quality"] {
-            let check = FsfsRuntime::model_doctor_check(
-                tier,
-                "verified-model",
-                Path::new("/verified/model-cache"),
-                true,
-            );
+            let status = FsfsModelStatus {
+                tier: tier.to_owned(),
+                name: "verified-model".to_owned(),
+                cache_path: "/verified/model-cache".to_owned(),
+                verification_state: "verified".to_owned(),
+                diagnostic: None,
+                cached: true,
+                size_bytes: 1,
+            };
+            let check = FsfsRuntime::model_doctor_check(&status);
             assert_eq!(
                 check.verdict,
                 super::DoctorVerdict::Warn,
@@ -26222,11 +27603,91 @@ mod tests {
             assert!(check.detail.contains("this binary has no"));
             assert!(
                 check.suggestion.as_deref().is_some_and(|suggestion| {
-                    suggestion.contains("--no-default-features --features embedded-models")
+                    suggestion.contains("cargo build --release -p frankensearch-fsfs")
                 }),
                 "doctor must prescribe a loader-capable build"
             );
         }
+    }
+
+    #[cfg(all(feature = "semantic-loaders", not(feature = "embedded-models")))]
+    #[test]
+    fn default_loader_guidance_provisions_models_without_a_rebuild() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = FsfsConfig::default();
+        config.indexing.model_dir = temp.path().join("models").display().to_string();
+        config.indexing.offline = true;
+        let runtime = FsfsRuntime::new(config);
+
+        let mode_hint = runtime
+            .search_mode_hint()
+            .expect("loader-capable mode hint")
+            .expect("empty model cache must produce recovery guidance");
+        assert!(mode_hint.contains("fsfs download-models"));
+        assert!(!mode_hint.contains("lacks semantic model loaders"));
+        assert!(!mode_hint.contains("--features"));
+
+        let status =
+            FsfsRuntime::collect_model_status("fast", "potion-multilingual-128M", temp.path())
+                .expect("missing default model status");
+        assert_eq!(status.verification_state, "missing");
+        let doctor = FsfsRuntime::model_doctor_check(&status);
+        assert_eq!(doctor.verdict, super::DoctorVerdict::Warn);
+        assert!(
+            doctor
+                .suggestion
+                .as_deref()
+                .is_some_and(|suggestion| suggestion.contains("fsfs download-models"))
+        );
+    }
+
+    #[test]
+    fn model_status_and_doctor_distinguish_missing_incomplete_mismatch_and_unregistered() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let model_root = temp.path().join("models");
+
+        let missing =
+            FsfsRuntime::collect_model_status("fast", "potion-multilingual-128M", &model_root)
+                .expect("missing model inspection");
+        assert_eq!(missing.verification_state, "missing");
+        assert!(!missing.cached);
+        assert_eq!(
+            FsfsRuntime::model_doctor_check(&missing).verdict,
+            super::DoctorVerdict::Warn
+        );
+
+        let potion_dir = model_root.join("potion-multilingual-128M");
+        fs::create_dir_all(&potion_dir).expect("create incomplete model cache");
+        let incomplete =
+            FsfsRuntime::collect_model_status("fast", "potion-multilingual-128M", &model_root)
+                .expect("incomplete model inspection");
+        assert_eq!(incomplete.verification_state, "incomplete");
+        assert!(incomplete.diagnostic.is_some());
+        assert_eq!(
+            FsfsRuntime::model_doctor_check(&incomplete).verdict,
+            super::DoctorVerdict::Fail
+        );
+
+        fs::write(potion_dir.join("tokenizer.json"), b"broken")
+            .expect("write corrupt registered model file");
+        let mismatch =
+            FsfsRuntime::collect_model_status("fast", "potion-multilingual-128M", &model_root)
+                .expect("mismatched model inspection");
+        assert_eq!(mismatch.verification_state, "mismatch");
+        assert!(mismatch.diagnostic.is_some());
+        assert_eq!(
+            FsfsRuntime::model_doctor_check(&mismatch).verdict,
+            super::DoctorVerdict::Fail
+        );
+
+        let unregistered =
+            FsfsRuntime::collect_model_status("fast", "custom-unregistered-model", &model_root)
+                .expect("unregistered model inspection");
+        assert_eq!(unregistered.verification_state, "unregistered");
+        assert_eq!(
+            FsfsRuntime::model_doctor_check(&unregistered).verdict,
+            super::DoctorVerdict::Fail
+        );
     }
 
     #[test]
@@ -27122,9 +28583,8 @@ mod tests {
     fn verify_new_binary_uses_version_subcommand_not_flag() {
         // Create a fake binary that succeeds on `version` subcommand
         // but fails on `--version` flag, proving we use the subcommand.
-        let dir =
-            std::env::temp_dir().join(format!("fsfs_test_version_subcmd_{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
+        let dir = reserve_unique_test_dir("version_subcmd")
+            .expect("version-subcommand fixture directory should be atomically reservable");
         let binary = dir.join("fsfs-verify-subcmd");
         fs::write(
             &binary,
@@ -27149,16 +28609,13 @@ mod tests {
             version_out.contains("fsfs"),
             "version output should contain binary name"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
     #[test]
     fn verify_binary_returning_valid_version_output_passes() {
-        let dir =
-            std::env::temp_dir().join(format!("fsfs_test_valid_version_{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
+        let dir = reserve_unique_test_dir("valid_version")
+            .expect("valid-version fixture directory should be atomically reservable");
         let binary = dir.join("fsfs-valid");
         fs::write(&binary, b"#!/bin/sh\necho \"fsfs 1.2.3\"\n").unwrap();
 
@@ -27172,16 +28629,13 @@ mod tests {
         assert!(verify.status.success());
         let stdout = String::from_utf8_lossy(&verify.stdout);
         assert!(stdout.contains("1.2.3"));
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
     #[test]
     fn verify_binary_returning_error_fails_gracefully() {
-        let dir =
-            std::env::temp_dir().join(format!("fsfs_test_error_version_{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
+        let dir = reserve_unique_test_dir("error_version")
+            .expect("error-version fixture directory should be atomically reservable");
         let binary = dir.join("fsfs-broken");
         fs::write(&binary, b"#!/bin/sh\necho \"segfault\" >&2\nexit 139\n").unwrap();
 
@@ -27201,8 +28655,6 @@ mod tests {
             stderr.contains("segfault"),
             "error output should be captured: got {stderr}"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -27325,35 +28777,33 @@ mod tests {
     }
 
     #[test]
-    fn missing_checksum_file_not_reported_as_verified() {
-        // Simulate the update path where SHA256SUMS download fails:
-        // expected_hash should be None, and "SHA-256 checksum verified"
-        // should NOT appear in notes.
-        let mut notes: Vec<String> = Vec::new();
-        let checksum_download_ok = false; // simulate download failure
+    fn sidecar_hash_extraction_accepts_sha256sum_output() {
+        // `sha256sum archive > archive.sha256` format: hash, spaces, filename.
+        let content = "b4fd38c6488aaff5e73af315c1d5f923277e1d1f7b987f96cd028515f5e564a6  fsfs-lite-1.4.3-x86_64-unknown-linux-musl.tar.xz\n";
+        assert_eq!(
+            super::extract_hash_from_sidecar(content).as_deref(),
+            Some("b4fd38c6488aaff5e73af315c1d5f923277e1d1f7b987f96cd028515f5e564a6")
+        );
+        // Bare hash with no filename is also acceptable sidecar content.
+        let bare = "b4fd38c6488aaff5e73af315c1d5f923277e1d1f7b987f96cd028515f5e564a6";
+        assert!(super::extract_hash_from_sidecar(bare).is_some());
+    }
 
-        let expected_hash: Option<String> = if checksum_download_ok {
-            Some("abc".into())
-        } else {
-            notes.push("SHA256SUMS not available; skipping verification".into());
-            None
-        };
-
-        // When expected_hash is None, the checksum block is skipped entirely.
-        if let Some(ref expected) = expected_hash {
-            notes.push(format!("SHA-256 checksum verified against {expected}"));
+    #[test]
+    fn sidecar_hash_extraction_rejects_non_hash_content() {
+        // A 404 HTML page, truncated hash, or non-hex token must never be
+        // trusted as a checksum (the fallback would otherwise turn an error
+        // page into a guaranteed mismatch at best, or worse with a crafted
+        // token).
+        for bad in [
+            "<html>Not Found</html>",
+            "abc123",
+            "zz".repeat(32).as_str(),
+            "",
+            "   \n",
+        ] {
+            assert_eq!(super::extract_hash_from_sidecar(bad), None, "{bad:?}");
         }
-
-        assert!(expected_hash.is_none());
-        assert!(
-            !notes.iter().any(|n| n.contains("checksum verified")),
-            "missing checksum file must NOT produce 'verified' note: {:?}",
-            notes
-        );
-        assert!(
-            notes.iter().any(|n| n.contains("skipping verification")),
-            "missing checksum file should note that verification was skipped"
-        );
     }
 
     // --- 3. Platform detection ---
@@ -27400,15 +28850,15 @@ mod tests {
         let triples = [
             (
                 "x86_64-unknown-linux-musl",
-                "fsfs-1.0.0-x86_64-unknown-linux-musl.tar.xz",
+                "fsfs-lite-1.0.0-x86_64-unknown-linux-musl.tar.xz",
             ),
             (
                 "aarch64-unknown-linux-musl",
-                "fsfs-1.0.0-aarch64-unknown-linux-musl.tar.xz",
+                "fsfs-lite-1.0.0-aarch64-unknown-linux-musl.tar.xz",
             ),
             (
                 "x86_64-apple-darwin",
-                "fsfs-1.0.0-x86_64-apple-darwin.tar.xz",
+                "fsfs-lite-1.0.0-x86_64-apple-darwin.tar.xz",
             ),
             (
                 "aarch64-apple-darwin",
@@ -27440,7 +28890,7 @@ mod tests {
             "should not double-prefix the version"
         );
         assert!(
-            filename.starts_with("fsfs-2.3.4-"),
+            filename.starts_with("fsfs-lite-2.3.4-"),
             "version in filename should have v stripped: {filename}"
         );
     }

@@ -76,7 +76,7 @@ fields, reason codes, and shared conformance fixtures are in
 [`quill-machine-classes.json`](quill-machine-classes.json); prose in this
 document cannot weaken or override that contract.
 
-| Canonical hardware/profile key | Hardware and capacity semantics | Campaign role | Mandatory provenance (beyond evidence-v4) |
+| Canonical hardware/profile key | Hardware and capacity semantics | Campaign role | Mandatory provenance (beyond evidence-v5) |
 |---|---|---|---|
 | `x86-vps-ovh/x86-diagnostic` | Existing heterogeneous RCH workers; runtime-derived diagnostic capacity only | Diagnostic continuity; never supplies default-flip authority | Exact worker facts and receipt are retained. Every gate is `Diagnostic`, has no frozen maximum width, and cannot promote history |
 | `trj-zen3-5995wx/physical-64` | AMD Threadripper PRO 5995WX; 64 physical cores, one admitted worker per core | Required default-flip profile; physical-core QG-1 scale-out plus QG-8/allocator/NUMA truth | Exact 64-core capacity; one-thread-per-core cpuset/sibling map, SMT state, NUMA policy, governor, observable worker activity, local execution, exclusive lease, and pre/post fingerprints. QG-1 max width 64; QG-8 max width 32 |
@@ -91,7 +91,7 @@ The registry is a specification plus executable conformance corpus:
 | Identity and resolution | Closed hardware IDs plus closed execution-profile IDs, obsolete/unknown/cross-profile rejection, immutable fingerprint provenance | `bd-e8h-p0-machine-classes-26os` |
 | Applicability plan | Exact registry-v2 plus matrix-v2 plus gate hash reconstruction; every canonical cell is `Required`, `Diagnostic`, or `NotApplicable` for one profile | `bd-e8h-p0-machine-classes-26os` |
 | Receipt admission | Hardware identity plus explicit request/start/end execution snapshots, registry-derived capacity/max width, observed CPU assignment, SMT/NUMA/scheduler facts, canonical hashes, durability, and sealed completion-v6 | `bd-e8h-p0-machine-classes-26os` |
-| Rust evidence and ratchet | Evidence-v4 reconstructs the plan; threshold-v6, finalizer, ratchet, and history pointer enforce exact profile/plan/destination identity and zero history writes on rejection | `bd-e8h-p0-machine-classes-26os` |
+| Rust evidence and ratchet | Evidence-v5 reconstructs the plan; threshold-v7, finalizer, ratchet, and history pointer enforce exact profile/plan/destination identity and zero history writes on rejection | `bd-e8h-p0-machine-classes-26os` |
 | Shell runner | Accepts only `--hardware-class` plus `--execution-profile`; callers cannot supply widths, Apple modes, lease paths, or legacy class aliases | `bd-e8h-p0-machine-classes-26os` |
 
 Rules:
@@ -460,6 +460,14 @@ this contract was written).
 - Runner: `scripts/perf-runner.sh` plus `quill-perf-finalize` (registered-host
   lease, probes, exact child/log binding, receipt admission, and transactional
   finalization).
+- Diagnostic profiler: `scripts/perf-diagnostic.sh` (machine-class provenance
+  capture around an arbitrary benchmark command, plus `--calibrate-aa`). It is
+  the diagnostic-only counterpart the promotion producer defers to, it produces
+  **no promotable evidence**, and its `--class` values map onto
+  `--hardware-class`/`--execution-profile` by the table in its own header. It
+  is how a host is fingerprinted *before* the registry admits it: the
+  `docs/evidence/e8h/fingerprints/*/` artifacts that
+  `machine_class_registry.rs` embeds are its output.
 - QG-1 provisional miss row: `docs/NEGATIVE_EVIDENCE.md` § 2026-07-27
   (bd-h6eh). QG-2 pre-fix quarantined diagnostic: `73444b59` from timed
   source `5bb74e76`; corrected terminal-lifecycle attempts ended in an explicit

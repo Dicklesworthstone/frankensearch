@@ -294,6 +294,53 @@ pub enum QueryWorkKind {
     PositionDocument,
 }
 
+/// Exact competitive-union phase surrounding one conformance-only query-work
+/// admission.
+#[cfg(feature = "pruning-conformance")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConformanceQueryWorkPhase {
+    /// Shadow cursors are discovering competitive documents for this refill.
+    Discovery,
+    /// A real scorer cursor is seeking to a selected candidate or horizon.
+    Seek,
+    /// A scored candidate contribution is complete and its real cursor is
+    /// being drained or advanced.
+    Drain,
+}
+
+/// Per-query location installed by the competitive-union scorer around an
+/// exact conformance-only work admission.
+#[cfg(feature = "pruning-conformance")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConformanceQueryWorkContext {
+    pub(crate) refill_ordinal: u64,
+    pub(crate) window_start: u32,
+    pub(crate) phase: ConformanceQueryWorkPhase,
+    pub(crate) candidate_doc: Option<u32>,
+    pub(crate) candidate_scored: bool,
+}
+
+#[cfg(feature = "pruning-conformance")]
+impl ConformanceQueryWorkContext {
+    const fn new(
+        refill_ordinal: u64,
+        window_start: u32,
+        phase: ConformanceQueryWorkPhase,
+        candidate_doc: Option<u32>,
+        candidate_scored: bool,
+    ) -> Self {
+        Self {
+            refill_ordinal,
+            window_start,
+            phase,
+            candidate_doc,
+            candidate_scored,
+        }
+    }
+}
+
 /// Cancel-aware deterministic query-work admission.
 ///
 /// Implementations must be thread-safe because ordinary, comfortably
@@ -308,10 +355,25 @@ pub trait QueryWorkCheckpoint: Send + Sync {
     /// Returns [`ArgusError::QueryCancelled`] or
     /// [`ArgusError::QueryFuelExhausted`] before the guarded work begins.
     fn admit(&self, kind: QueryWorkKind, units: u64) -> Result<(), ArgusError>;
+
+    /// Install or clear the exact competitive-refill location surrounding
+    /// subsequent admissions. Normal builds do not contain this hook.
+    #[cfg(feature = "pruning-conformance")]
+    #[doc(hidden)]
+    fn set_conformance_query_work_context(&self, _context: Option<ConformanceQueryWorkContext>) {}
 }
 
 /// Forward-only posting access shared by sealed and future delta segments.
 ///
+/// Unforgeable evidence that a cursor's backing codec validates each
+/// post-move scorer invariant.
+///
+/// The private field prevents custom [`PostingCursor`] implementations from
+/// claiming this contract. Only the sealed Quiver adapter and wrappers that
+/// preserve its exact cursor semantics may return this token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ValidatedPostMoveContract(());
+
 /// A cursor starts on its first posting. `advance` is an inclusive lower-bound
 /// seek and does not move when the current document already satisfies the
 /// target. Exhaustion is fused and represented by `None`.
@@ -351,6 +413,18 @@ pub trait PostingCursor {
     /// Returns a typed error if the cursor cannot preserve its validated
     /// storage invariants.
     fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError>;
+
+    /// Return evidence that this cursor's backing storage validates every
+    /// post-move invariant required by a term scorer.
+    ///
+    /// The default keeps defensive post-move validation enabled for custom
+    /// and Delta cursors. The sealed Quiver adapter may opt in only because
+    /// its validated codec guarantees ordered document ids and positive
+    /// frequencies for every decoded posting. The marker is unforgeable by a
+    /// custom cursor implementation.
+    fn validated_post_move_contract(&self) -> Option<ValidatedPostMoveContract> {
+        None
+    }
 
     /// Fork the current position into an independent cursor suitable for
     /// competitive candidate generation.
@@ -459,6 +533,10 @@ where
         (**self).advance(target)
     }
 
+    fn validated_post_move_contract(&self) -> Option<ValidatedPostMoveContract> {
+        (**self).validated_post_move_contract()
+    }
+
     fn fork_for_pruning(&self) -> Option<Box<dyn PostingCursor + '_>> {
         (**self).fork_for_pruning()
     }
@@ -551,7 +629,10 @@ impl<'a> CheckpointPostingCursor<'a> {
 
     fn checkpoint_move(&self, previous: Option<u64>) -> Result<(), ArgusError> {
         let units = self.inner.work_blocks_since(previous);
-        self.checkpoint.admit(QueryWorkKind::PostingBlock, units)
+        if units != 0 {
+            self.checkpoint.admit(QueryWorkKind::PostingBlock, units)?;
+        }
+        Ok(())
     }
 }
 
@@ -592,6 +673,10 @@ impl PostingCursor for CheckpointPostingCursor<'_> {
         let moved = self.inner.advance(target)?;
         self.checkpoint_move(previous)?;
         Ok(moved)
+    }
+
+    fn validated_post_move_contract(&self) -> Option<ValidatedPostMoveContract> {
+        self.inner.validated_post_move_contract()
     }
 
     fn fork_for_pruning(&self) -> Option<Box<dyn PostingCursor + '_>> {
@@ -822,6 +907,10 @@ impl PostingCursor for SealedPostingCursor<'_> {
                 Ok(cursor.advance(target)?.map(|posting| posting.doc_id))
             }
         }
+    }
+
+    fn validated_post_move_contract(&self) -> Option<ValidatedPostMoveContract> {
+        Some(ValidatedPostMoveContract(()))
     }
 
     fn fork_for_pruning(&self) -> Option<Box<dyn PostingCursor + '_>> {
@@ -1335,6 +1424,7 @@ pub struct TermScorer<'a> {
     cost: u64,
     size_hint: u32,
     segment_num_docs: u32,
+    validated_post_move_contract: bool,
 }
 
 impl<'a> TermScorer<'a> {
@@ -1379,6 +1469,7 @@ impl<'a> TermScorer<'a> {
         let size_hint = cursor.size_hint();
         let cost = cursor.cost();
         let segment_num_docs = cursor.segment_num_docs();
+        let validated_post_move_contract = cursor.validated_post_move_contract().is_some();
         if u64::from(segment_num_docs) > snapshot.doc_count() {
             return Err(ArgusError::InvalidSnapshot {
                 field_ord: snapshot.field_ord(),
@@ -1454,6 +1545,7 @@ impl<'a> TermScorer<'a> {
             cost,
             size_hint,
             segment_num_docs,
+            validated_post_move_contract,
         })
     }
 
@@ -1464,8 +1556,11 @@ impl<'a> TermScorer<'a> {
     fn next(&mut self) -> Result<Option<u32>, ArgusError> {
         let previous = self.cursor.doc();
         let moved = self.cursor.next()?;
-        let moved =
-            validate_cursor_after_move(self.cursor.as_ref(), self.fieldnorms.as_ref(), moved)?;
+        let moved = if self.validated_post_move_contract {
+            moved
+        } else {
+            validate_cursor_after_move(self.cursor.as_ref(), self.fieldnorms.as_ref(), moved)?
+        };
         match (previous, moved) {
             (None, Some(_)) => Err(ArgusError::CursorInvariant(
                 "exhausted cursor resurrected during next",
@@ -1480,8 +1575,11 @@ impl<'a> TermScorer<'a> {
     fn seek(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
         let previous = self.cursor.doc();
         let moved = self.cursor.advance(target)?;
-        let moved =
-            validate_cursor_after_move(self.cursor.as_ref(), self.fieldnorms.as_ref(), moved)?;
+        let moved = if self.validated_post_move_contract {
+            moved
+        } else {
+            validate_cursor_after_move(self.cursor.as_ref(), self.fieldnorms.as_ref(), moved)?
+        };
         match (previous, moved) {
             (None, Some(_)) => Err(ArgusError::CursorInvariant(
                 "exhausted cursor resurrected during advance",
@@ -2709,6 +2807,16 @@ impl<'a> ReferenceScorer<'a> {
             .map_or_else(PruningTelemetry::default, PruningTelemetry::from)
     }
 
+    /// Return exact refill receipts for method-bound conformance only.
+    #[cfg(feature = "pruning-conformance")]
+    #[must_use]
+    pub(crate) fn conformance_union_refills(&self) -> &[ConformanceUnionRefill] {
+        let ScorerNode::Union(union) = &self.node else {
+            return &[];
+        };
+        &union.conformance_refills
+    }
+
     #[cfg(test)]
     pub(crate) fn pruning_window_counts(&self) -> Option<(u64, u64)> {
         self.union_pruning_stats()
@@ -2725,7 +2833,13 @@ impl<'a> ReferenceScorer<'a> {
     /// Returns a typed error if bounded scorer buffers cannot be allocated or
     /// initial cursor alignment detects malformed state.
     pub fn boolean(clauses: Vec<ScorerClause<'a>>) -> Result<Self, ArgusError> {
-        Self::boolean_with_mode(clauses, BooleanMode::Scored, false)
+        Self::boolean_with_mode(
+            clauses,
+            BooleanMode::Scored,
+            false,
+            #[cfg(feature = "pruning-conformance")]
+            None,
+        )
     }
 
     /// Lower a ranked root Boolean through Tantivy's frequency-term `TopDocs`
@@ -2740,7 +2854,23 @@ impl<'a> ReferenceScorer<'a> {
     /// Returns the same typed allocation, cursor-alignment, and scorer-shape
     /// failures as [`Self::boolean`].
     pub(crate) fn boolean_topdocs(clauses: Vec<ScorerClause<'a>>) -> Result<Self, ArgusError> {
-        Self::boolean_with_mode(clauses, BooleanMode::Scored, true)
+        Self::boolean_with_mode(
+            clauses,
+            BooleanMode::Scored,
+            true,
+            #[cfg(feature = "pruning-conformance")]
+            None,
+        )
+    }
+
+    /// Lower a ranked root Boolean while attaching exact interruption-location
+    /// context to conformance-only query-work admissions.
+    #[cfg(feature = "pruning-conformance")]
+    pub(crate) fn boolean_topdocs_with_checkpoint(
+        clauses: Vec<ScorerClause<'a>>,
+        checkpoint: Arc<dyn QueryWorkCheckpoint + 'a>,
+    ) -> Result<Self, ArgusError> {
+        Self::boolean_with_mode(clauses, BooleanMode::Scored, true, Some(checkpoint))
     }
 
     /// Lower Boolean clauses into a genuinely scoreless matching tree.
@@ -2755,13 +2885,22 @@ impl<'a> ReferenceScorer<'a> {
     /// Rejects a child tree containing a scored buffered union, or any ordinary
     /// allocation and cursor-alignment failure.
     pub fn boolean_unscored(clauses: Vec<ScorerClause<'a>>) -> Result<Self, ArgusError> {
-        Self::boolean_with_mode(clauses, BooleanMode::Unscored, false)
+        Self::boolean_with_mode(
+            clauses,
+            BooleanMode::Unscored,
+            false,
+            #[cfg(feature = "pruning-conformance")]
+            None,
+        )
     }
 
     fn boolean_with_mode(
         clauses: Vec<ScorerClause<'a>>,
         mode: BooleanMode,
         topdocs_root: bool,
+        #[cfg(feature = "pruning-conformance")] conformance_checkpoint: Option<
+            Arc<dyn QueryWorkCheckpoint + 'a>,
+        >,
     ) -> Result<Self, ArgusError> {
         if mode == BooleanMode::Unscored
             && clauses
@@ -2823,7 +2962,12 @@ impl<'a> ReferenceScorer<'a> {
                 if should.is_empty() || mode == BooleanMode::Unscored {
                     required
                 } else {
-                    let optional = scorer_union(should, false)?;
+                    let optional = scorer_union(
+                        should,
+                        false,
+                        #[cfg(feature = "pruning-conformance")]
+                        None,
+                    )?;
                     Self {
                         node: ScorerNode::RequiredOptional(RequiredOptionalScorer::new(
                             required, optional,
@@ -2837,12 +2981,25 @@ impl<'a> ReferenceScorer<'a> {
                 (Some(all), BooleanMode::Scored) => {
                     // Preserve Tantivy's nested score order: first aggregate
                     // the ordinary SHOULD scorers, then union one AllScorer.
-                    let ordinary_should = scorer_union(should, false)?;
-                    scorer_union(vec![ordinary_should, all], false)?
+                    let ordinary_should = scorer_union(
+                        should,
+                        false,
+                        #[cfg(feature = "pruning-conformance")]
+                        None,
+                    )?;
+                    scorer_union(
+                        vec![ordinary_should, all],
+                        false,
+                        #[cfg(feature = "pruning-conformance")]
+                        None,
+                    )?
                 }
-                (None, BooleanMode::Scored) => {
-                    scorer_union(should, topdocs_root && excluded.is_empty())?
-                }
+                (None, BooleanMode::Scored) => scorer_union(
+                    should,
+                    topdocs_root && excluded.is_empty(),
+                    #[cfg(feature = "pruning-conformance")]
+                    conformance_checkpoint,
+                )?,
                 (None, BooleanMode::Unscored) => scorer_union_unscored(should)?,
             },
         };
@@ -3211,17 +3368,28 @@ fn scorer_intersection(
     }
 }
 
-fn scorer_union(
-    mut scorers: Vec<ReferenceScorer<'_>>,
+// `'a` is load-bearing under `pruning-conformance`, where the checkpoint
+// parameter shares it; elision only type-checks with the feature off.
+#[allow(clippy::elidable_lifetime_names)]
+fn scorer_union<'a>(
+    mut scorers: Vec<ReferenceScorer<'a>>,
     topdocs_root: bool,
-) -> Result<ReferenceScorer<'_>, ArgusError> {
+    #[cfg(feature = "pruning-conformance")] conformance_checkpoint: Option<
+        Arc<dyn QueryWorkCheckpoint + 'a>,
+    >,
+) -> Result<ReferenceScorer<'a>, ArgusError> {
     match scorers.len() {
         0 => Ok(ReferenceScorer::empty()),
         1 => scorers.pop().ok_or(ArgusError::CursorInvariant(
             "optional scorer count changed during lowering",
         )),
         _ => Ok(ReferenceScorer {
-            node: ScorerNode::Union(BufferedUnionScorer::new(scorers, topdocs_root)?),
+            node: ScorerNode::Union(BufferedUnionScorer::new(
+                scorers,
+                topdocs_root,
+                #[cfg(feature = "pruning-conformance")]
+                conformance_checkpoint,
+            )?),
         }),
     }
 }
@@ -3791,6 +3959,33 @@ enum UnionPruningStrategy {
     BlockMaxWand,
 }
 
+/// Exact refill strategy captured only by tests and method-bound conformance.
+#[cfg(any(test, feature = "pruning-conformance"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConformanceUnionRefillStrategy {
+    Exhaustive,
+    MaxScore,
+    BlockMaxWand,
+}
+
+/// Typed, bounded witness for one direct-term union refill.
+///
+/// Window bounds and cutoff bits are intentionally absent from shipping
+/// builds. The conformance harness uses them to prove temporal path coverage
+/// without scraping operational logs or exposing terms/document identities.
+#[cfg(any(test, feature = "pruning-conformance"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ConformanceUnionRefill {
+    pub(crate) ordinal: u64,
+    pub(crate) window_start: u32,
+    pub(crate) horizon_end: u64,
+    pub(crate) cutoff_bits: Option<u32>,
+    pub(crate) strategy: ConformanceUnionRefillStrategy,
+    pub(crate) candidate_docs: u64,
+    pub(crate) buffer_empty: bool,
+    pub(crate) live_work_remains: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct UnionPruningStats {
     max_score_windows: u64,
@@ -3874,6 +4069,10 @@ struct BufferedUnionScorer<'a> {
     current_score: f32,
     segment_num_docs: u32,
     pruning_stats: UnionPruningStats,
+    #[cfg(any(test, feature = "pruning-conformance"))]
+    conformance_refills: Vec<ConformanceUnionRefill>,
+    #[cfg(feature = "pruning-conformance")]
+    conformance_checkpoint: Option<Arc<dyn QueryWorkCheckpoint + 'a>>,
     /// Whole-group score ceiling captured once at construction, before the
     /// first refill drains any child into [`Self::score_window`].
     ///
@@ -3891,7 +4090,13 @@ struct BufferedUnionScorer<'a> {
 }
 
 impl<'a> BufferedUnionScorer<'a> {
-    fn new(mut scorers: Vec<ReferenceScorer<'a>>, topdocs_root: bool) -> Result<Self, ArgusError> {
+    fn new(
+        mut scorers: Vec<ReferenceScorer<'a>>,
+        topdocs_root: bool,
+        #[cfg(feature = "pruning-conformance")] conformance_checkpoint: Option<
+            Arc<dyn QueryWorkCheckpoint + 'a>,
+        >,
+    ) -> Result<Self, ArgusError> {
         let segment_num_docs = shared_segment_num_docs(&scorers)?;
         scorers.retain(|scorer| scorer.doc().is_some());
         let tantivy_topdocs_term_union = topdocs_root
@@ -3930,6 +4135,10 @@ impl<'a> BufferedUnionScorer<'a> {
             current_score: 0.0,
             segment_num_docs,
             pruning_stats: UnionPruningStats::default(),
+            #[cfg(any(test, feature = "pruning-conformance"))]
+            conformance_refills: Vec::new(),
+            #[cfg(feature = "pruning-conformance")]
+            conformance_checkpoint,
             group_ceiling,
         };
         if scorer.refill()? {
@@ -3961,6 +4170,37 @@ impl<'a> BufferedUnionScorer<'a> {
         self.scan_offset = 0;
         self.current = None;
         self.current_score = 0.0;
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    fn set_conformance_query_work_context(
+        &self,
+        phase: ConformanceQueryWorkPhase,
+        candidate_doc: Option<u32>,
+        candidate_scored: bool,
+    ) {
+        let (Some(checkpoint), Some(window_start)) =
+            (&self.conformance_checkpoint, self.window_start)
+        else {
+            return;
+        };
+        let refill_ordinal = u64::try_from(self.conformance_refills.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        checkpoint.set_conformance_query_work_context(Some(ConformanceQueryWorkContext::new(
+            refill_ordinal,
+            window_start,
+            phase,
+            candidate_doc,
+            candidate_scored,
+        )));
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    fn clear_conformance_query_work_context(&self) {
+        if let Some(checkpoint) = &self.conformance_checkpoint {
+            checkpoint.set_conformance_query_work_context(None);
+        }
     }
 
     fn refill(&mut self) -> Result<bool, ArgusError> {
@@ -3995,6 +4235,8 @@ impl<'a> BufferedUnionScorer<'a> {
     }
 
     fn refill_with_cutoff(&mut self, cutoff: Option<f32>) -> Result<bool, ArgusError> {
+        #[cfg(feature = "pruning-conformance")]
+        self.clear_conformance_query_work_context();
         self.clear_buffer();
         let Some(window_start) = self.active.iter().filter_map(ReferenceScorer::doc).min() else {
             self.window_start = None;
@@ -4002,6 +4244,14 @@ impl<'a> BufferedUnionScorer<'a> {
         };
         self.window_start = Some(window_start);
         let horizon_end = u64::from(window_start) + UNION_HORIZON_U64;
+        #[cfg(feature = "pruning-conformance")]
+        if cutoff.is_some_and(f32::is_finite) {
+            self.set_conformance_query_work_context(
+                ConformanceQueryWorkPhase::Discovery,
+                None,
+                false,
+            );
+        }
         if let Some(cutoff) = cutoff
             && cutoff.is_finite()
             && let Some(candidates) =
@@ -4025,11 +4275,68 @@ impl<'a> BufferedUnionScorer<'a> {
                 .pruning_stats
                 .candidate_docs
                 .saturating_add(u64::try_from(candidates.docs.len()).unwrap_or(u64::MAX));
+            #[cfg(any(test, feature = "pruning-conformance"))]
+            let strategy = match candidates.strategy {
+                UnionPruningStrategy::MaxScore => ConformanceUnionRefillStrategy::MaxScore,
+                UnionPruningStrategy::BlockMaxWand => ConformanceUnionRefillStrategy::BlockMaxWand,
+            };
+            #[cfg(any(test, feature = "pruning-conformance"))]
+            let candidate_docs = u64::try_from(candidates.docs.len()).unwrap_or(u64::MAX);
             self.fill_candidate_window(window_start, horizon_end, &candidates.docs)?;
+            #[cfg(feature = "pruning-conformance")]
+            self.clear_conformance_query_work_context();
+            #[cfg(any(test, feature = "pruning-conformance"))]
+            self.record_conformance_refill(
+                window_start,
+                horizon_end,
+                Some(cutoff.to_bits()),
+                strategy,
+                candidate_docs,
+            );
             return Ok(true);
         }
+        #[cfg(feature = "pruning-conformance")]
+        self.clear_conformance_query_work_context();
         self.fill_exhaustive_window(window_start, horizon_end)?;
+        #[cfg(any(test, feature = "pruning-conformance"))]
+        self.record_conformance_refill(
+            window_start,
+            horizon_end,
+            cutoff.filter(|value| value.is_finite()).map(f32::to_bits),
+            ConformanceUnionRefillStrategy::Exhaustive,
+            u64::try_from(
+                self.score_window
+                    .iter()
+                    .filter(|score| score.is_some())
+                    .count(),
+            )
+            .unwrap_or(u64::MAX),
+        );
         Ok(true)
+    }
+
+    #[cfg(any(test, feature = "pruning-conformance"))]
+    fn record_conformance_refill(
+        &mut self,
+        window_start: u32,
+        horizon_end: u64,
+        cutoff_bits: Option<u32>,
+        strategy: ConformanceUnionRefillStrategy,
+        candidate_docs: u64,
+    ) {
+        let ordinal = u64::try_from(self.conformance_refills.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        self.conformance_refills.push(ConformanceUnionRefill {
+            ordinal,
+            window_start,
+            horizon_end,
+            cutoff_bits,
+            strategy,
+            candidate_docs,
+            buffer_empty: self.score_window.iter().all(Option::is_none),
+            live_work_remains: !self.active.is_empty(),
+        });
     }
 
     fn fill_exhaustive_window(
@@ -4535,6 +4842,12 @@ impl<'a> BufferedUnionScorer<'a> {
                 }
                 let candidate_index = candidates.partition_point(|candidate| *candidate < doc);
                 let Some(&candidate) = candidates.get(candidate_index) else {
+                    #[cfg(feature = "pruning-conformance")]
+                    self.set_conformance_query_work_context(
+                        ConformanceQueryWorkPhase::Seek,
+                        None,
+                        false,
+                    );
                     Self::advance_scorer_to_horizon(&mut self.active[index], horizon_end)?;
                     if self.active[index].doc().is_none() {
                         self.active.swap_remove(index);
@@ -4544,6 +4857,12 @@ impl<'a> BufferedUnionScorer<'a> {
                     break;
                 };
                 if doc < candidate {
+                    #[cfg(feature = "pruning-conformance")]
+                    self.set_conformance_query_work_context(
+                        ConformanceQueryWorkPhase::Seek,
+                        Some(candidate),
+                        false,
+                    );
                     self.active[index].advance(candidate)?;
                     continue;
                 }
@@ -4552,6 +4871,12 @@ impl<'a> BufferedUnionScorer<'a> {
                 let contribution = self.active[index].score()?;
                 let total = self.score_window[offset].unwrap_or(0.0) + contribution;
                 self.score_window[offset] = Some(finite_score(total, doc)?);
+                #[cfg(feature = "pruning-conformance")]
+                self.set_conformance_query_work_context(
+                    ConformanceQueryWorkPhase::Drain,
+                    Some(doc),
+                    true,
+                );
                 self.active[index].next()?;
                 if self.active[index].doc().is_none() {
                     self.active.swap_remove(index);
@@ -5387,6 +5712,63 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct CountingCheckpoint {
+        admissions: std::sync::atomic::AtomicUsize,
+        admitted_units: std::sync::atomic::AtomicU64,
+    }
+
+    impl QueryWorkCheckpoint for CountingCheckpoint {
+        fn admit(&self, kind: QueryWorkKind, units: u64) -> Result<(), ArgusError> {
+            assert_eq!(kind, QueryWorkKind::PostingBlock);
+            self.admissions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.admitted_units
+                .fetch_add(units, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn checkpoint_cursor_admits_only_entered_posting_blocks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let postings = (0..257)
+            .map(|docid| Posting::new(docid, 1))
+            .collect::<Vec<_>>();
+        let encoded = EncodedPostingList::encode(&postings)?;
+        let list = encoded.posting_list()?;
+        let block_count = list.block_count();
+        assert!(
+            block_count > 1,
+            "fixture must cross a posting-block boundary"
+        );
+        let checkpoint = Arc::new(CountingCheckpoint::default());
+        let checkpoint_for_cursor: Arc<dyn QueryWorkCheckpoint> = checkpoint.clone();
+        let segment_num_docs = u32::try_from(postings.len())?;
+        let sealed = SealedPostingCursor::new(&list, segment_num_docs)?;
+        let mut cursor = CheckpointPostingCursor::new(sealed, checkpoint_for_cursor)?;
+
+        assert!(PostingCursor::has_validated_post_move_contract(&cursor));
+
+        while cursor.next()?.is_some() {}
+
+        assert_eq!(
+            checkpoint
+                .admissions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            block_count,
+            "the checkpoint runs once for each entered block, never for an in-block posting"
+        );
+        assert_eq!(
+            checkpoint
+                .admitted_units
+                .load(std::sync::atomic::Ordering::SeqCst),
+            u64::try_from(block_count)?,
+            "the charged work is unchanged"
+        );
+        Ok(())
+    }
+
     #[derive(Clone, Debug)]
     struct TermBoundOnlyCursor(VecCursor);
 
@@ -6013,6 +6395,70 @@ mod tests {
         }
     }
 
+    /// Bench-only control retaining the sealed cursor's data path while forcing
+    /// `TermScorer` through its defensive post-move validation branch.
+    #[cfg(feature = "bench-internals")]
+    struct ForcedPostMoveValidationCursor<'a> {
+        inner: SealedPostingCursor<'a>,
+    }
+
+    #[cfg(feature = "bench-internals")]
+    impl PostingCursor for ForcedPostMoveValidationCursor<'_> {
+        fn doc(&self) -> Option<u32> {
+            self.inner.doc()
+        }
+        fn freq(&self) -> Option<u32> {
+            self.inner.freq()
+        }
+        fn positions_handle(&self) -> Option<PositionsHandle<'_>> {
+            self.inner.positions_handle()
+        }
+        fn size_hint(&self) -> u32 {
+            self.inner.size_hint()
+        }
+        fn cost(&self) -> u64 {
+            self.inner.cost()
+        }
+        fn segment_num_docs(&self) -> u32 {
+            self.inner.segment_num_docs()
+        }
+        fn next(&mut self) -> Result<Option<u32>, ArgusError> {
+            self.inner.next()
+        }
+        fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+            self.inner.advance(target)
+        }
+        fn term_score_upper_bound(
+            &self,
+            average: f32,
+            weight: f32,
+            option: TermRecordOption,
+        ) -> Option<f32> {
+            self.inner.term_score_upper_bound(average, weight, option)
+        }
+        fn supports_block_max(&self) -> bool {
+            self.inner.supports_block_max()
+        }
+        fn current_block_score_upper_bound(
+            &self,
+            average: f32,
+            weight: f32,
+            option: TermRecordOption,
+        ) -> Option<f32> {
+            self.inner
+                .current_block_score_upper_bound(average, weight, option)
+        }
+        fn current_block_last_doc(&self) -> Option<u32> {
+            self.inner.current_block_last_doc()
+        }
+        fn current_work_block(&self) -> Option<u64> {
+            self.inner.current_work_block()
+        }
+        fn work_blocks_since(&self, previous: Option<u64>) -> u64 {
+            self.inner.work_blocks_since(previous)
+        }
+    }
+
     #[cfg(feature = "bench-internals")]
     fn timed_encoded_grouped_union(
         encoded_doclens: &EncodedDocLenSection,
@@ -6025,6 +6471,35 @@ mod tests {
         limit: usize,
         group_size: usize,
         rank_pruning: bool,
+    ) -> Result<(u128, Vec<ScoredDoc>, UnionPruningStats), Box<dyn std::error::Error>> {
+        timed_encoded_grouped_union_with_contract(
+            encoded_doclens,
+            encoded_terms,
+            cached_metadata,
+            snapshot,
+            rows_by_term,
+            boosts,
+            segment_num_docs,
+            limit,
+            group_size,
+            rank_pruning,
+            true,
+        )
+    }
+
+    #[cfg(feature = "bench-internals")]
+    fn timed_encoded_grouped_union_with_contract(
+        encoded_doclens: &EncodedDocLenSection,
+        encoded_terms: &[(EncodedPostingList, EncodedBlockMax)],
+        cached_metadata: Option<&[Arc<ValidatedTermPruningMetadata>]>,
+        snapshot: &Bm25FieldSnapshot,
+        rows_by_term: &[Vec<Posting>],
+        boosts: &[f32],
+        segment_num_docs: u32,
+        limit: usize,
+        group_size: usize,
+        rank_pruning: bool,
+        trusted_post_move_contract: bool,
     ) -> Result<(u128, Vec<ScoredDoc>, UnionPruningStats), Box<dyn std::error::Error>> {
         if group_size == 0
             || encoded_terms.len() != rows_by_term.len()
@@ -6090,6 +6565,11 @@ mod tests {
                     size_hint,
                     segment_num_docs,
                 )
+            };
+            let cursor: Box<dyn PostingCursor> = if trusted_post_move_contract {
+                Box::new(cursor)
+            } else {
+                Box::new(ForcedPostMoveValidationCursor { inner: cursor })
             };
             let term = ReferenceScorer::term(TermScorer::new(
                 cursor,
@@ -6651,6 +7131,10 @@ mod tests {
             )
         };
 
+        assert!(!PostingCursor::has_validated_post_move_contract(
+            &FaultCursor::new(CursorFault::StickyNext)
+        ));
+
         let mut sticky = scorer(CursorFault::StickyNext)?;
         assert!(matches!(sticky.next(), Err(ArgusError::CursorInvariant(_))));
         let mut backward = scorer(CursorFault::BackwardNext)?;
@@ -6700,6 +7184,7 @@ mod tests {
         let positions = encoded_positions.position_list(&list)?;
         let mut cursor = SealedPostingCursor::with_positions(&positions, 3)?;
 
+        assert!(PostingCursor::has_validated_post_move_contract(&cursor));
         assert_eq!(PostingCursor::doc(&cursor), Some(3));
         assert_eq!(PostingCursor::freq(&cursor), Some(2));
         let handle = PostingCursor::positions_handle(&cursor).expect("position handle");
@@ -6729,8 +7214,55 @@ mod tests {
         assert!(PostingCursor::positions_handle(&cursor).is_none());
 
         let cursor = SealedPostingCursor::new(&list, 3)?;
+        assert!(PostingCursor::has_validated_post_move_contract(&cursor));
         assert_eq!(PostingCursor::doc(&cursor), Some(3));
         assert!(PostingCursor::positions_handle(&cursor).is_none());
+        Ok(())
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn forced_post_move_validation_control_preserves_sealed_cursor_scores()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let postings = [Posting::new(0, 2), Posting::new(1, 1), Posting::new(2, 3)];
+        let encoded_postings = EncodedPostingList::encode(&postings)?;
+        let posting_list = encoded_postings.posting_list()?;
+        let lengths = [Some(8); 3];
+        let encoded_doclens =
+            EncodedDocLenSection::encode(0, 3, &[1], &[DocLenFieldInput::new(1, &lengths)])?;
+        let doclens = encoded_doclens.section(&[1])?;
+        let fieldnorms = doclens.field(1).expect("fixture field exists");
+        let snapshot = snapshot(1, 24, 3)?;
+
+        let scores = |trusted_post_move_contract| -> Result<Vec<(u32, u32)>, ArgusError> {
+            let cursor = SealedPostingCursor::new(&posting_list, 3)?;
+            let cursor: Box<dyn PostingCursor> = if trusted_post_move_contract {
+                Box::new(cursor)
+            } else {
+                Box::new(ForcedPostMoveValidationCursor { inner: cursor })
+            };
+            assert_eq!(
+                cursor.has_validated_post_move_contract(),
+                trusted_post_move_contract,
+                "the control must select the intended post-move contract"
+            );
+            let mut scorer = TermScorer::new(
+                cursor,
+                fieldnorms,
+                snapshot.clone(),
+                3,
+                TermRecordOption::WithFreqs,
+                1.0,
+            )?;
+            let mut observed = Vec::new();
+            while let Some(doc) = scorer.doc() {
+                observed.push((doc, scorer.score()?.to_bits()));
+                scorer.next()?;
+            }
+            Ok(observed)
+        };
+
+        assert_eq!(scores(true)?, scores(false)?);
         Ok(())
     }
 
@@ -8932,7 +9464,7 @@ mod tests {
     /// exhaustive buffer, attempt exactly one competitive refill and stop when
     /// that window contains no candidates. Production must keep refilling
     /// because a later horizon can still contain an essential-term winner.
-    fn collect_one_competitive_refill_for_negative_control(
+    fn collect_until_first_empty_competitive_refill_for_negative_control(
         union: &mut BufferedUnionScorer<'_>,
         collector: &mut TopDocsCollector,
     ) -> Result<(), ArgusError> {
@@ -8950,6 +9482,40 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// Conservative control that keeps applying the first legitimate
+    /// competitive cutoff while still allowing the real collector heap to
+    /// improve. The retained cutoff can admit extra work but cannot exclude a
+    /// document admitted by a later, higher cutoff.
+    fn collect_with_first_competitive_cutoff_for_control(
+        union: &mut BufferedUnionScorer<'_>,
+        collector: &mut TopDocsCollector,
+    ) -> Result<(UnionPruningStats, Vec<u32>), ArgusError> {
+        let mut first_cutoff = None;
+        let mut refreshed_cutoff_bits = Vec::new();
+        while let Some(doc) = union.doc() {
+            collector.record_live(doc, Some(union.score()?))?;
+            if union.advance_buffered().is_some() {
+                continue;
+            }
+            loop {
+                let refreshed_cutoff = collector.competitive_cutoff_score();
+                if let Some(refreshed_cutoff) = refreshed_cutoff {
+                    first_cutoff.get_or_insert(refreshed_cutoff);
+                }
+                if !union.refill_with_cutoff(first_cutoff.or(refreshed_cutoff))? {
+                    return Ok((union.pruning_stats, refreshed_cutoff_bits));
+                }
+                if let Some(refreshed_cutoff) = refreshed_cutoff {
+                    refreshed_cutoff_bits.push(refreshed_cutoff.to_bits());
+                }
+                if union.advance_buffered().is_some() {
+                    break;
+                }
+            }
+        }
+        Ok((union.pruning_stats, refreshed_cutoff_bits))
     }
 
     #[test]
@@ -9021,7 +9587,10 @@ mod tests {
         let ScorerNode::Union(broken_union) = &mut broken.node else {
             panic!("UNION_HORIZON fixture must lower to a buffered union");
         };
-        collect_one_competitive_refill_for_negative_control(broken_union, &mut broken_collector)?;
+        collect_until_first_empty_competitive_refill_for_negative_control(
+            broken_union,
+            &mut broken_collector,
+        )?;
         assert_eq!(broken_union.pruning_stats.max_score_windows, 1);
         assert_eq!(broken_union.pruning_stats.block_max_wand_windows, 0);
         assert_eq!(broken_union.pruning_stats.candidate_docs, 0);
@@ -9064,6 +9633,328 @@ mod tests {
         assert_eq!(stats.block_max_wand_windows, 0);
         assert_eq!(stats.candidate_docs, 1);
         assert_eq!(stats.blocks_skipped, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn block_max_wand_empty_competitive_window_refills_again_for_late_winner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const NUM_DOCS: u32 = 9_001;
+        const TARGET_DOC: u32 = 9_000;
+        const FIELD_LENGTH: u32 = 64;
+        assert_eq!(BMW_MIN_CLAUSES, 9, "fixture requires nine direct terms");
+
+        let lengths = vec![Some(FIELD_LENGTH); usize::try_from(NUM_DOCS)?];
+        let encoded_doclens = EncodedDocLenSection::encode(
+            0,
+            u64::from(NUM_DOCS),
+            &[1],
+            &[DocLenFieldInput::new(1, &lengths)],
+        )?;
+        let doclens = encoded_doclens.section(&[1])?;
+        let field = doclens.field(1).ok_or(ArgusError::CursorInvariant(
+            "BMW UNION_HORIZON fixture has no field 1",
+        ))?;
+        let snapshot = snapshot(
+            1,
+            u64::from(NUM_DOCS) * u64::from(FIELD_LENGTH),
+            u64::from(NUM_DOCS),
+        )?;
+
+        // Every term is dense so all nine cursors remain active across the
+        // first two 4,096-document horizons and their aggregate cost forces
+        // BMW rather than MaxScore. Fixed field lengths isolate frequency as
+        // the only score lever: doc 0 establishes the first cutoff, the low-TF
+        // middle horizon is entirely skippable, and doc 9,000 is strictly
+        // stronger than the incumbent in the terminal horizon.
+        let dense_rows = (0..NUM_DOCS)
+            .map(|doc| {
+                Posting::new(
+                    doc,
+                    if doc == 0 {
+                        4
+                    } else if doc == TARGET_DOC {
+                        8
+                    } else {
+                        1
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let rows_by_term = (0..BMW_MIN_CLAUSES)
+            .map(|_| dense_rows.clone())
+            .collect::<Vec<_>>();
+        let boosts = vec![1.0; BMW_MIN_CLAUSES];
+        let encoded_terms = rows_by_term
+            .iter()
+            .map(|rows| {
+                EncodedPostingList::encode_with_block_max(rows, |doc| {
+                    field.fieldnorm_id(u64::from(doc))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let posting_lists = encoded_terms
+            .iter()
+            .map(|(postings, _)| postings.posting_list())
+            .collect::<Result<Vec<_>, _>>()?;
+        let block_max = validated_block_max_entries(&encoded_terms, &posting_lists, field)?;
+
+        let mut broken = sealed_union(
+            &posting_lists,
+            Some(&block_max),
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut broken_collector = TopDocsCollector::new(1, 0)?;
+        let ScorerNode::Union(broken_union) = &mut broken.node else {
+            return Err(Box::new(ArgusError::CursorInvariant(
+                "UNION_HORIZON fixture must lower to a buffered union",
+            )));
+        };
+        collect_until_first_empty_competitive_refill_for_negative_control(
+            broken_union,
+            &mut broken_collector,
+        )?;
+        assert_eq!(broken_union.pruning_stats.max_score_windows, 0);
+        assert_eq!(broken_union.pruning_stats.block_max_wand_windows, 1);
+        assert_eq!(broken_union.pruning_stats.candidate_docs, 0);
+        assert!(broken_union.pruning_stats.blocks_skipped > 0);
+        assert_eq!(broken_union.conformance_refills.len(), 2);
+        assert_eq!(
+            broken_union.conformance_refills[1].strategy,
+            ConformanceUnionRefillStrategy::BlockMaxWand,
+        );
+        assert!(broken_union.conformance_refills[1].buffer_empty);
+        assert!(broken_union.conformance_refills[1].live_work_remains);
+        let broken_hits = broken_collector.finish()?.hits;
+        assert_eq!(broken_hits[0].global_docid, 0);
+        assert_ne!(broken_hits[0].global_docid, TARGET_DOC);
+
+        let mut oracle = sealed_union(
+            &posting_lists,
+            None,
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut oracle_collector = TopDocsCollector::new(1, 0)?;
+        oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
+        let oracle_hits = oracle_collector.finish()?.hits;
+
+        let mut candidate = sealed_union(
+            &posting_lists,
+            Some(&block_max),
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut candidate_collector = TopDocsCollector::new(1, 0)?;
+        candidate_collector.collect(&mut candidate, &AllLiveDocs)?;
+        let ScorerNode::Union(candidate_union) = &candidate.node else {
+            return Err(Box::new(ArgusError::CursorInvariant(
+                "UNION_HORIZON fixture must lower to a buffered union",
+            )));
+        };
+        let stats = candidate_union.pruning_stats;
+        let trace = candidate_union.conformance_refills.clone();
+        let candidate_hits = candidate_collector.finish()?.hits;
+
+        assert_hits_bit_exact(&candidate_hits, &oracle_hits);
+        assert_eq!(candidate_hits[0].global_docid, TARGET_DOC);
+        assert_eq!(stats.max_score_windows, 0);
+        assert_eq!(stats.block_max_wand_windows, 2);
+        assert!(stats.blocks_skipped > 0);
+
+        assert_eq!(
+            trace.len(),
+            3,
+            "expected one exhaustive and two BMW refills"
+        );
+        assert_eq!(
+            (
+                trace[0].ordinal,
+                trace[0].window_start,
+                trace[0].horizon_end,
+                trace[0].strategy,
+            ),
+            (1, 0, 4_096, ConformanceUnionRefillStrategy::Exhaustive),
+        );
+        assert!(trace[0].cutoff_bits.is_none());
+        assert!(trace[0].candidate_docs > 0);
+        assert!(!trace[0].buffer_empty);
+        assert!(trace[0].live_work_remains);
+
+        assert_eq!(
+            (
+                trace[1].ordinal,
+                trace[1].window_start,
+                trace[1].horizon_end,
+                trace[1].strategy,
+            ),
+            (
+                2,
+                4_096,
+                8_192,
+                ConformanceUnionRefillStrategy::BlockMaxWand,
+            ),
+        );
+        assert!(
+            trace[1]
+                .cutoff_bits
+                .is_some_and(|bits| f32::from_bits(bits).is_finite())
+        );
+        assert_eq!(trace[1].candidate_docs, 0);
+        assert!(trace[1].buffer_empty);
+        assert!(trace[1].live_work_remains);
+
+        assert_eq!(
+            (
+                trace[2].ordinal,
+                trace[2].window_start,
+                trace[2].horizon_end,
+                trace[2].strategy,
+            ),
+            (
+                3,
+                8_192,
+                12_288,
+                ConformanceUnionRefillStrategy::BlockMaxWand,
+            ),
+        );
+        assert!(
+            trace[2]
+                .cutoff_bits
+                .is_some_and(|bits| f32::from_bits(bits).is_finite())
+        );
+        assert!(trace[2].candidate_docs > 0);
+        assert!(!trace[2].buffer_empty);
+        assert!(!trace[2].live_work_remains);
+        Ok(())
+    }
+
+    #[test]
+    fn older_monotone_cutoff_is_exact_but_admits_more_candidates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const NUM_DOCS: u32 = 10_001;
+        const FIRST_DOC: u32 = 0;
+        const WINNER_DOC: u32 = 5_000;
+        const STALE_ONLY_DOC: u32 = 10_000;
+        let lengths = vec![Some(1); usize::try_from(NUM_DOCS)?];
+        let encoded_doclens = EncodedDocLenSection::encode(
+            0,
+            u64::from(NUM_DOCS),
+            &[1],
+            &[DocLenFieldInput::new(1, &lengths)],
+        )?;
+        let doclens = encoded_doclens.section(&[1])?;
+        let field = doclens.field(1).expect("field exists");
+        let snapshot = snapshot(1, u64::from(NUM_DOCS), u64::from(NUM_DOCS))?;
+        let rows_by_term = vec![
+            vec![Posting::new(FIRST_DOC, 1)],
+            vec![Posting::new(WINNER_DOC, 1)],
+            vec![Posting::new(STALE_ONLY_DOC, 1)],
+            vec![Posting::new(STALE_ONLY_DOC, 1)],
+        ];
+        // The low companion makes direct-term MaxScore admissible without
+        // changing the ordering we need to prove:
+        //
+        // * first cutoff ~= 2.0;
+        // * middle winner ~= 4.0;
+        // * stale-only document ~= 2.75.
+        //
+        // With the old cutoff, the 2.5 term remains essential and admits the
+        // stale-only document. With the refreshed cutoff, 2.5 + 0.25 is below
+        // the heap threshold and both terms are safely non-essential.
+        let boosts = [2.0, 4.0, 2.5, 0.25];
+        let encoded_terms = rows_by_term
+            .iter()
+            .map(|rows| {
+                EncodedPostingList::encode_with_block_max(rows, |doc| {
+                    field.fieldnorm_id(u64::from(doc))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let posting_lists = encoded_terms
+            .iter()
+            .map(|(postings, _)| postings.posting_list())
+            .collect::<Result<Vec<_>, _>>()?;
+        let block_max = validated_block_max_entries(&encoded_terms, &posting_lists, field)?;
+
+        let mut exhaustive = sealed_union(
+            &posting_lists,
+            None,
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut exhaustive_collector = TopDocsCollector::new(1, 0)?;
+        exhaustive_collector.collect(&mut exhaustive, &AllLiveDocs)?;
+        let exhaustive_hits = exhaustive_collector.finish()?.hits;
+
+        let mut refreshed = sealed_union(
+            &posting_lists,
+            Some(&block_max),
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut refreshed_collector = TopDocsCollector::new(1, 0)?;
+        refreshed_collector.collect(&mut refreshed, &AllLiveDocs)?;
+        let refreshed_stats = refreshed
+            .union_pruning_stats()
+            .expect("top-level refreshed union retains pruning stats");
+        let refreshed_hits = refreshed_collector.finish()?.hits;
+
+        let mut fixed = sealed_union(
+            &posting_lists,
+            Some(&block_max),
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut fixed_collector = TopDocsCollector::new(1, 0)?;
+        let ScorerNode::Union(fixed_union) = &mut fixed.node else {
+            return Err(std::io::Error::other(
+                "cutoff-control fixture must lower to a buffered union",
+            )
+            .into());
+        };
+        let (fixed_stats, refreshed_cutoff_bits) =
+            collect_with_first_competitive_cutoff_for_control(fixed_union, &mut fixed_collector)?;
+        let fixed_hits = fixed_collector.finish()?.hits;
+
+        assert_hits_bit_exact(&refreshed_hits, &exhaustive_hits);
+        assert_hits_bit_exact(&fixed_hits, &exhaustive_hits);
+        assert_eq!(exhaustive_hits[0].global_docid, WINNER_DOC);
+        assert_eq!(refreshed_stats.max_score_windows, 2);
+        assert_eq!(fixed_stats.max_score_windows, 2);
+        assert_eq!(refreshed_stats.candidate_docs, 1);
+        assert_eq!(fixed_stats.candidate_docs, 2);
+        assert!(
+            fixed_stats.candidate_docs > refreshed_stats.candidate_docs,
+            "older cutoff must be no more selective than the refreshed cutoff",
+        );
+        assert_eq!(refreshed_cutoff_bits.len(), 2);
+        let first_cutoff = f32::from_bits(refreshed_cutoff_bits[0]);
+        let second_cutoff = f32::from_bits(refreshed_cutoff_bits[1]);
+        assert_eq!(
+            second_cutoff.total_cmp(&first_cutoff),
+            std::cmp::Ordering::Greater,
+            "the real collector cutoff must increase after the middle-horizon winner",
+        );
         Ok(())
     }
 
@@ -9719,11 +10610,137 @@ mod tests {
                     true,
                 )?;
                 assert_hits_bit_exact(&cold_pruned.1, &cold_exhaustive.1);
+                let forced_validation_exhaustive = timed_encoded_grouped_union_with_contract(
+                    &encoded_doclens,
+                    encoded_terms,
+                    None,
+                    &snapshot,
+                    rows_by_term,
+                    boosts,
+                    num_docs,
+                    10,
+                    group_size,
+                    false,
+                    false,
+                )?;
+                assert_hits_bit_exact(&forced_validation_exhaustive.1, &cold_exhaustive.1);
                 let cached_metadata =
                     validate_encoded_pruning_metadata(&encoded_doclens, encoded_terms)?;
                 let cache_payload_bytes = cached_metadata.iter().fold(0_usize, |bytes, term| {
                     bytes.saturating_add(term.heap_bytes())
                 });
+                let cached_trusted_validation = timed_encoded_grouped_union_with_contract(
+                    &encoded_doclens,
+                    encoded_terms,
+                    Some(&cached_metadata),
+                    &snapshot,
+                    rows_by_term,
+                    boosts,
+                    num_docs,
+                    10,
+                    group_size,
+                    false,
+                    true,
+                )?;
+                let cached_forced_validation = timed_encoded_grouped_union_with_contract(
+                    &encoded_doclens,
+                    encoded_terms,
+                    Some(&cached_metadata),
+                    &snapshot,
+                    rows_by_term,
+                    boosts,
+                    num_docs,
+                    10,
+                    group_size,
+                    false,
+                    false,
+                )?;
+                assert_hits_bit_exact(&cached_trusted_validation.1, &cached_forced_validation.1);
+
+                // This is a maintenance diagnostic: both arms run the same
+                // sealed cursor and cache payload in one invocation. It
+                // controls only the redundant post-move validation branch;
+                // it does not put an incumbent in the comparison.
+                let h3_null = frankensearch_core::bench_support::paired_median_ratio(
+                    PAIRED_ROUNDS,
+                    1,
+                    || {
+                        let _ = std::hint::black_box(
+                            timed_encoded_grouped_union_with_contract(
+                                &encoded_doclens,
+                                encoded_terms,
+                                Some(&cached_metadata),
+                                &snapshot,
+                                rows_by_term,
+                                boosts,
+                                num_docs,
+                                10,
+                                group_size,
+                                false,
+                                true,
+                            )
+                            .expect("run first trusted H3 null arm"),
+                        );
+                    },
+                    || {
+                        let _ = std::hint::black_box(
+                            timed_encoded_grouped_union_with_contract(
+                                &encoded_doclens,
+                                encoded_terms,
+                                Some(&cached_metadata),
+                                &snapshot,
+                                rows_by_term,
+                                boosts,
+                                num_docs,
+                                10,
+                                group_size,
+                                false,
+                                true,
+                            )
+                            .expect("run second trusted H3 null arm"),
+                        );
+                    },
+                );
+                let h3_trusted_over_forced = frankensearch_core::bench_support::paired_median_ratio(
+                    PAIRED_ROUNDS,
+                    1,
+                    || {
+                        let _ = std::hint::black_box(
+                            timed_encoded_grouped_union_with_contract(
+                                &encoded_doclens,
+                                encoded_terms,
+                                Some(&cached_metadata),
+                                &snapshot,
+                                rows_by_term,
+                                boosts,
+                                num_docs,
+                                10,
+                                group_size,
+                                false,
+                                false,
+                            )
+                            .expect("run forced-validation H3 control arm"),
+                        );
+                    },
+                    || {
+                        let _ = std::hint::black_box(
+                            timed_encoded_grouped_union_with_contract(
+                                &encoded_doclens,
+                                encoded_terms,
+                                Some(&cached_metadata),
+                                &snapshot,
+                                rows_by_term,
+                                boosts,
+                                num_docs,
+                                10,
+                                group_size,
+                                false,
+                                true,
+                            )
+                            .expect("run trusted-validation H3 control arm"),
+                        );
+                    },
+                );
 
                 let null = frankensearch_core::bench_support::paired_median_ratio(
                     PAIRED_ROUNDS,
@@ -9908,6 +10925,9 @@ mod tests {
                      pruned_median_us={pruned_median_us} trials={TRIALS} hits={} \
                      checksum={checksum} null_median={:.6} null_p5={:.6} null_p95={:.6} \
                      lever_median={:.6} lever_p5={:.6} lever_p95={:.6} \
+                     h3_null_median={:.6} h3_null_p5={:.6} h3_null_p95={:.6} \
+                     h3_trusted_over_forced_median={:.6} \
+                     h3_trusted_over_forced_p5={:.6} h3_trusted_over_forced_p95={:.6} \
                      paired_rounds={PAIRED_ROUNDS}",
                     cold_exhaustive.0,
                     cold_pruned.0,
@@ -9919,6 +10939,12 @@ mod tests {
                     lever.median,
                     lever.p5,
                     lever.p95,
+                    h3_null.median,
+                    h3_null.p5,
+                    h3_null.p95,
+                    h3_trusted_over_forced.median,
+                    h3_trusted_over_forced.p5,
+                    h3_trusted_over_forced.p95,
                 );
             }
         }

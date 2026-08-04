@@ -10,11 +10,11 @@ use frankensearch_core::{SearchError, SearchResult};
 use frankensearch_fsfs::{
     CliCommand, CliInput, CliOverrides, ConfigAction, ConfigLoadResult, ConfigWarning, FsfsConfig,
     FsfsRuntime, InterfaceMode, OutputEnvelope, OutputFormat, ShutdownCoordinator, ShutdownReason,
-    Verbosity, default_project_config_file_path, default_user_config_file_path, detect_auto_mode,
-    emit_config_loaded, emit_envelope, exit_code, exit_code_for, init_subscriber, is_cache_valid,
-    load_from_layered_sources, load_from_sources, load_from_str, maybe_print_update_notice,
-    meta_for_format, output_error_from, parse_cli_args, read_version_cache, resolve_output_format,
-    spawn_version_cache_refresh,
+    Verbosity, current_unicode_environment, default_project_config_file_path,
+    default_user_config_file_path, detect_auto_mode, emit_config_loaded, emit_envelope, exit_code,
+    exit_code_for, init_subscriber, is_cache_valid, load_from_layered_sources, load_from_sources,
+    load_from_str, maybe_print_update_notice, meta_for_format, output_error_from, parse_cli_args,
+    read_version_cache, resolve_output_format, spawn_version_cache_refresh,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -120,7 +120,7 @@ fn main() {
 #[allow(clippy::too_many_lines)]
 fn run(args: Vec<String>) -> SearchResult<()> {
     let mut cli_input = parse_cli_args(args)?;
-    let env_map: HashMap<String, String> = std::env::vars().collect();
+    let env_map = current_unicode_environment();
     apply_cli_env_overrides(&mut cli_input, &env_map)?;
 
     // Version is handled immediately, before config loading.

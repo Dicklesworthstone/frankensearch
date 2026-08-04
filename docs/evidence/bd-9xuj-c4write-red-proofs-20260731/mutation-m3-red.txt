@@ -1,0 +1,13 @@
+=== MUTATION M3 (FINAL bytes): admit_attested_tier space join disabled ===
+date: 2026-07-31T16:06:20-04:00
+pristine sha256: 33d9e386e5210a572381505071e0b31bc2007ac4ef49520696a2393be1466fc8
+mutated sha256: 1ee88193d165164f1126e1a432bb161da6187f54bd9de6627a86c972e0507dac
+
+
+failures:
+    refresh::tests::cross_space_attempt_rejects_with_typed_space_identity
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 932 filtered out; finished in 0.07s
+
+error: test failed, to rerun pass `-p frankensearch-fusion --lib`
+EXIT_STATUS=101

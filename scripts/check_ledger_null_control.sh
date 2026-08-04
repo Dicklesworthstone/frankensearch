@@ -33,20 +33,34 @@ Usage:
   scripts/check_ledger_null_control.sh [--staged | --since <ref> | --all]
   scripts/check_ledger_null_control.sh --selfcheck
   scripts/check_ledger_null_control.sh --leakcheck
+  scripts/check_ledger_null_control.sh --gatecheck
+  scripts/check_ledger_null_control.sh --mergecheck
   scripts/check_ledger_null_control.sh --install-hook
 
 Options:
   --candidate <text>  Search NEGATIVE_EVIDENCE before proposing a lever.
   --surface <text>    Function/path/target surface paired with --candidate.
   --staged            Gate newly added staged rows (default; pre-commit).
+                      Merge-aware: while MERGE_HEAD exists, a row is "new"
+                      only if it is absent from BOTH parents, so committed
+                      second-parent history is never re-gated.
   --since <ref>       Gate rows added between merge-base(ref, HEAD) and HEAD.
   --all               Mechanical whole-ledger report; never blocks.
   --selfcheck         Exercise fail-closed synthetic contract cases
-                      (also runs --leakcheck).
+                      (also runs --leakcheck, --gatecheck, and --mergecheck).
   --leakcheck         Regression-check per-entry flag leakage across mixed
                       history (the 79d999ad bug) via a temp-repo staged
                       simulation. LEDGER_LEAKCHECK_TARGET=<path> substitutes
                       the script under test (RED-proofing old versions).
+  --gatecheck         Regression-check the bd-z4lqq fail-open bypasses through
+                      the real staged/--since Git path in temp repos.
+                      LEDGER_LEAKCHECK_TARGET=<path> substitutes the script
+                      under test (RED-proofing old versions).
+  --mergecheck        Regression-check merge blindness: a temp-repo merge
+                      must admit second-parent ledger history while still
+                      blocking a row present in neither parent.
+                      LEDGER_MERGECHECK_TARGET=<path> substitutes the script
+                      under test (RED-proofing old versions).
   --ledger <path>     Override the default ledger set (test/diagnostic use).
   --install-hook      Point this checkout at the tracked .githooks directory.
 
@@ -107,6 +121,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --leakcheck)
       MODE="leakcheck"
+      shift
+      ;;
+    --gatecheck)
+      MODE="gatecheck"
+      shift
+      ;;
+    --mergecheck)
+      MODE="mergecheck"
       shift
       ;;
     --ledger)
@@ -174,7 +196,11 @@ candidate_preflight() {
   awk -v candidate="${CANDIDATE}" -v surface="${SURFACE}" \
       -v ledger="${LEDGER_REL}" '
     function is_entry_heading(line) {
-      return line ~ /^##+ 20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
+      # Ledger rows have historically appeared as conventional ATX headings,
+      # indented headings, no-space headings, and bolded date titles.  Do not
+      # make evidence admission depend on one preferred Markdown spelling.
+      return line ~ /^[[:space:]]{0,3}#{2,6}[[:space:]]*(\*\*)?20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/ ||
+             line ~ /^[[:space:]]{0,3}\*\*20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
     }
     function flush(    low, retry_text) {
       if (header == "") return
@@ -223,13 +249,73 @@ candidate_preflight() {
   ' "${LEDGER_ABS}"
 }
 
+# Print the staged blob's +line numbers that are additions relative to the
+# given commit. Only hunk headers are consumed downstream, so content lines
+# are discarded here.
+staged_added_lines_vs() {
+  local base="$1"
+  local rel="$2"
+  git -C "${ROOT_DIR}" diff --cached -U0 "${base}" -- "${rel}" \
+    | awk '/^@@ /{
+        hunk = $0
+        sub(/^@@ -[^ ]+ [+]/, "", hunk)
+        sub(/ .*/, "", hunk)
+        split(hunk, range, ",")
+        first = range[1] + 0
+        count = (length(range[2]) ? range[2] + 0 : 1)
+        for (i = 0; i < count; i++) print first + i
+      }'
+}
+
 diff_stream() {
   local rel="$1"
   # A sentinel avoids the empty-first-file FNR==NR trap in awk.
   printf '%s\n' "__FRANKENSEARCH_DIFF_SENTINEL__"
   case "${MODE}" in
     staged)
-      git -C "${ROOT_DIR}" diff --cached -U0 -- "${rel}"
+      local merge_head
+      merge_head="$(git -C "${ROOT_DIR}" rev-parse -q --verify MERGE_HEAD 2>/dev/null || true)"
+      if [[ -n "${merge_head}" ]]; then
+        # Merge in progress: `diff --cached` compares against the FIRST
+        # parent only, so every ledger row inherited from the second
+        # parent's committed history reads as newly added (12 false blocks
+        # on the 2026-08-02 harmonization merge). A row is genuinely new
+        # only if it is an addition relative to BOTH parents; emit the
+        # intersection as synthetic header-only hunks, the same form the
+        # selfcheck lane feeds the gate awk.
+        #
+        # bd-z4lqq: that intersection used to be computed inside process
+        # substitutions <(...), whose failures `set -euo pipefail` cannot
+        # observe — the very fail-open this gate was hardened against on the
+        # non-merge path, reintroduced on the merge path. A failing
+        # second-parent `git diff` yielded an EMPTY added-line set, so `comm`
+        # succeeded with an empty intersection, no row read as new, and the
+        # merge commit passed vacuously with the fatal visible only on stderr.
+        # Both parents' sets are now captured through command substitution,
+        # which does propagate status, and intersected in awk.
+        local head_added merge_added
+        if ! head_added="$(staged_added_lines_vs "HEAD" "${rel}" | sort -u)"; then
+          echo "ERROR: staged diff against HEAD failed for ${rel} during a merge;" \
+               "refusing to lint against a partial added-line set" >&2
+          return 64
+        fi
+        if ! merge_added="$(staged_added_lines_vs "${merge_head}" "${rel}" | sort -u)"; then
+          echo "ERROR: staged diff against MERGE_HEAD (${merge_head}) failed for" \
+               "${rel}; refusing to lint against a partial added-line set" >&2
+          return 64
+        fi
+        {
+          printf '%s\n' "${head_added}"
+          printf '%s\n' "__FRANKENSEARCH_PARENT_SPLIT__"
+          printf '%s\n' "${merge_added}"
+        } | awk '
+            $0 == "__FRANKENSEARCH_PARENT_SPLIT__" { second = 1; next }
+            !second { if (length($0)) first_parent[$0] = 1; next }
+            { if (length($0) && ($0 in first_parent)) printf "@@ -0,0 +%s @@\n", $0 }
+          '
+      else
+        git -C "${ROOT_DIR}" diff --cached -U0 -- "${rel}"
+      fi
       ;;
     since)
       git -C "${ROOT_DIR}" diff -U0 "${SINCE_REF}...HEAD" -- "${rel}"
@@ -262,7 +348,17 @@ blob_stream() {
         fi
       fi
       ;;
-    since|all)
+    since)
+      # --since describes the committed range merge-base(ref, HEAD)..HEAD.
+      # Its hunk line numbers must be read against the matching HEAD blob, not
+      # a mutable worktree that may have inserted lines before those hunks.
+      # A ledger absent at HEAD is an error, not empty (fail-closed;
+      # bd-z4lqq --since line-map desync).
+      if ! git -C "${ROOT_DIR}" show "HEAD:${rel}" 2>/dev/null; then
+        return 64
+      fi
+      ;;
+    all)
       command cat "${abs}"
       ;;
     selfcheck)
@@ -271,7 +367,7 @@ blob_stream() {
   esac
 }
 
-lint_one() {
+lint_one_materialized() {
   local requested="$1"
   resolve_ledger "${requested}"
 
@@ -286,12 +382,27 @@ lint_one() {
       return 0
     }
     function is_entry_heading(line) {
-      # This ledger has used both ## and ### for entries. Date-bearing headings
-      # are entries; undated headings are grouping labels.
-      return line ~ /^##+ 20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
+      # Date-bearing ledger rows have appeared as conventional ATX headings,
+      # indented headings, no-space headings, and bolded date titles.  All are
+      # evidence entries; undated headings remain grouping labels.
+      return line ~ /^[[:space:]]{0,3}#{2,6}[[:space:]]*(\*\*)?20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/ ||
+             line ~ /^[[:space:]]{0,3}\*\*20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
     }
-    function note_line(line,    low, absent, metric, decisive, value) {
+    function unemphasize(line,    out) {
+      # bd-z4lqq: Markdown emphasis is decoration, not semantics. Detectors
+      # whose firing makes the gate STRICTER must see through it, or a row
+      # hides a verdict or a competitive claim behind bold/italic/code markers
+      # ("**Verdict** — KEEP") and is judged on the weaker contract. Detectors
+      # for POSITIVE evidence (nulls, ELF SHA, comparison class, incumbent
+      # identity) deliberately keep reading the raw line: an emphasis-mangled
+      # evidence line that fails to parse must block, never silently count.
+      out = tolower(line)
+      gsub(/[*_`~]/, "", out)
+      return out
+    }
+    function note_line(line,    low, plain, absent, metric, decisive, value) {
       low = tolower(line)
+      plain = unemphasize(line)
 
       if (low ~ /same[- ]invocation|same binary invocation/) {
         same_invocation = 1
@@ -341,16 +452,16 @@ no (counted )?change|0([.]0+)?% change)/)
           line ~ /[0-9][.][0-9]/) {
         incumbent_ratio = 1
       }
-      if (low ~ /(campaign|competitive)[-_ ]+(win|speedup|claim|advantage)/ ||
-          low ~ /(beats?|faster than|dominates).*actual legacy incumbent/) {
+      if (plain ~ /(campaign|competitive)[-_ ]+(win|speedup|claim|advantage)/ ||
+          plain ~ /(beats?|faster than|dominates).*actual legacy incumbent/) {
         competitive_claim = 1
       }
 
-      if (low ~ /invalid[-_ ]?cv|cv[_ -]*only|cv[_ -]*gate|\
+      if (plain ~ /invalid[-_ ]?cv|cv[_ -]*only|cv[_ -]*gate|\
 coefficient of variation[_ -]*gate/ ||
-          low ~ /(decision|verdict|outcome|status).*(cv|coefficient of variation)/ ||
-          low ~ /(reject|no[- ]?ship|no[- ]?land).*(cv|coefficient of variation)/ ||
-          low ~ /(cv|coefficient of variation).*(reject|invalid|inadmissible)/) {
+          plain ~ /(decision|verdict|outcome|status).*(cv|coefficient of variation)/ ||
+          plain ~ /(reject|no[- ]?ship|no[- ]?land).*(cv|coefficient of variation)/ ||
+          plain ~ /(cv|coefficient of variation).*(reject|invalid|inadmissible)/) {
         cv_verdict = 1
       }
     }
@@ -366,13 +477,23 @@ coefficient of variation[_ -]*gate/ ||
       side_by_side = 0; self_speedup_class = 0; incumbent_class = 0
       actual_incumbent = 0; incumbent_ratio = 0; competitive_claim = 0
     }
-    function flush(    upper, explicit_reject, explicit_keep, exempt,
+    function entry_touched(first, last,    i) {
+      # bd-z4lqq: newness used to key on the HEADING line alone, so a body-only
+      # edit to a historical entry (e.g. flipping a REJECT rationale to KEEP
+      # wording) was never gated. An entry is touched if ANY line of its span
+      # appears in the diff.
+      for (i = first; i <= last; i++) {
+        if (added[i]) return 1
+      }
+      return 0
+    }
+    function flush(end_line,    upper, explicit_reject, explicit_keep, exempt,
                        is_reject, is_keep, new_entry, has_null,
                        incumbent_complete) {
       if (header == "") return
       new_entry = (mode == "all" ||
                    (mode == "selfcheck" && selfcheck_added_heading == "") ||
-                   added[start_line])
+                   entry_touched(start_line, end_line))
       if (!new_entry) {
         reset_entry_state()
         return
@@ -390,9 +511,32 @@ AUDIT|INVENTORY|METHODOLOGY|BLOCKED|UNTIMED|INVALID|HOLD/)
 
       is_keep = explicit_keep
       is_reject = explicit_reject
+      # bd-z4lqq: NEGATIVE_EVIDENCE rows default to REJECT. That is right for a
+      # row that states no verdict at all, but it also swallowed rows whose
+      # STATED verdict fell outside every enumerated vocabulary (the ADOPTED
+      # example): they were silently judged on the REJECT contract, so
+      # an adoption landed on an A/A null alone with no ELF SHA-256, no
+      # comparison class, and no incumbent. PERF_LEDGER already failed closed
+      # here; the default now applies only to rows that state no verdict, and a
+      # stated-but-unrecognized verdict fails closed in BOTH ledgers.
       if (ledger ~ /NEGATIVE_EVIDENCE[.]md$/ &&
-          !explicit_keep && !exempt) {
+          !explicit_keep && !explicit_reject && !exempt &&
+          decision_lines == "") {
         is_reject = 1
+      }
+      # bd-z4lqq: classification was an opt-in keyword allowlist — a new row
+      # whose verdict word fell outside every enumerated set (e.g. "ADOPTED")
+      # matched neither KEEP nor REJECT nor an exempt class and was admitted
+      # with zero evidence checks. Fail closed instead.
+      if (!is_keep && !is_reject && !exempt) {
+        violations++
+        if (mode != "all" || violations <= 20) {
+          print "BLOCKED UNCLASSIFIED " ledger ":" start_line
+          print "  " header
+          print "  missing: explicit verdict — the heading or a Decision/Verdict line"
+          print "           must classify the row as KEEP, REJECT, or an exempt"
+          print "           survey/audit/route-next class"
+        }
       }
       has_null = numeric_null && same_invocation
       incumbent_complete = actual_incumbent && incumbent_ratio &&
@@ -474,7 +618,7 @@ AUDIT|INVENTORY|METHODOLOGY|BLOCKED|UNTIMED|INVALID|HOLD/)
 
     {
       if (is_entry_heading($0)) {
-        flush()
+        flush(FNR - 1)
         header = $0
         sub(/^##+ /, "", header)
         start_line = FNR
@@ -483,14 +627,16 @@ AUDIT|INVENTORY|METHODOLOGY|BLOCKED|UNTIMED|INVALID|HOLD/)
       }
       if (header != "") {
         note_line($0)
-        low = tolower($0)
+        # Emphasis-tolerant: "**Verdict** — KEEP" is a verdict statement, and
+        # missing it let a KEEP be judged on the weaker REJECT contract.
+        low = unemphasize($0)
         if (low ~ /(verdict|decision|outcome|status)[[:space:]:-]/) {
           decision_lines = decision_lines "\n" $0
         }
       }
     }
     END {
-      flush()
+      flush(FNR)
       if (mode == "all") {
         print "[ledger-gate] mechanical report " ledger \
               ": checked=" (checked + 0) " violations=" (violations + 0)
@@ -500,7 +646,34 @@ AUDIT|INVENTORY|METHODOLOGY|BLOCKED|UNTIMED|INVALID|HOLD/)
       print "[ledger-gate] OK " ledger ": checked_new_rows=" (checked + 0)
       exit 0
     }
-  ' <(diff_stream "${LEDGER_REL}") <(blob_stream "${LEDGER_REL}" "${LEDGER_ABS}")
+  ' "${LINT_DIFF_TMP}" "${LINT_BLOB_TMP}"
+}
+
+lint_one() {
+  # bd-z4lqq: diff_stream/blob_stream used to run inside process substitutions
+  # <(...) whose failures are invisible to `set -euo pipefail` — a failing
+  # `git diff` (e.g. --since with no merge-base) produced an empty diff and the
+  # gate passed vacuously with checked_new_rows=0. Materialize both streams and
+  # check their exit status explicitly before awk runs.
+  local requested="$1"
+  local status=0
+  LINT_DIFF_TMP="$(mktemp "${TMPDIR:-/tmp}/ledger-gate-diff.XXXXXX")"
+  LINT_BLOB_TMP="$(mktemp "${TMPDIR:-/tmp}/ledger-gate-blob.XXXXXX")"
+  resolve_ledger "${requested}"
+  if ! diff_stream "${LEDGER_REL}" >"${LINT_DIFF_TMP}"; then
+    echo "ERROR: ledger diff stream failed for ${LEDGER_REL} (mode=${MODE}," \
+         "since=${SINCE_REF:-n/a}); refusing to lint against an empty diff" >&2
+    rm -f "${LINT_DIFF_TMP}" "${LINT_BLOB_TMP}"
+    return 64
+  fi
+  if ! blob_stream "${LEDGER_REL}" "${LEDGER_ABS}" >"${LINT_BLOB_TMP}"; then
+    echo "ERROR: ledger blob stream failed for ${LEDGER_REL} (mode=${MODE})" >&2
+    rm -f "${LINT_DIFF_TMP}" "${LINT_BLOB_TMP}"
+    return 64
+  fi
+  lint_one_materialized "${requested}" || status=$?
+  rm -f "${LINT_DIFF_TMP}" "${LINT_BLOB_TMP}"
+  return "${status}"
 }
 
 lint_ledgers() {
@@ -632,6 +805,24 @@ Decision: KEEP." || SELF_CHECK_FAILED=1
 Comparison class: SELF-SPEEDUP
 ELF sha256: ${sha}
 Decision: KEEP." || SELF_CHECK_FAILED=1
+  run_selfcheck_case "unclassified verdict word is blocked" 2 "${ledger}" $'### 2099-01-14 — synthetic adopted row\nA/B median CI: 0.900 [0.880, 0.920]\nDecision: ADOPTED into the build.' || SELF_CHECK_FAILED=1
+  run_selfcheck_case "body-only edit of an existing entry is gated" 2 "${ledger}" $'### 2099-01-15 — REJECT: synthetic historical row\nA/B median ratio: 1.02\nDecision: reject as no improvement.' 2 || SELF_CHECK_FAILED=1
+  run_selfcheck_case "body-only edit of a conformant entry stays admitted" 0 "${ledger}" $'### 2099-01-16 — REJECT: synthetic null-contained row\nA/A null: 1.000 [0.980, 1.020], same invocation\nDecision: no-ship because the effect remains inside the A/A null floor.' 2 || SELF_CHECK_FAILED=1
+  run_selfcheck_case "indented bold heading is gated" 2 "${ledger}" $'   ### **2099-01-17 — REJECT: indented bold heading without evidence**\nDecision: REJECT — reverted.' || SELF_CHECK_FAILED=1
+  run_selfcheck_case "no-space heading is gated" 2 "${ledger}" $'##2099-01-18 — REJECT: no-space heading without evidence\nDecision: REJECT — reverted.' || SELF_CHECK_FAILED=1
+  run_selfcheck_case "bold date title is gated" 2 "${ledger}" $'**2099-01-19 — REJECT: bold date title without evidence**\nDecision: REJECT — reverted.' || SELF_CHECK_FAILED=1
+  run_selfcheck_case "emphasised KEEP verdict is gated as a KEEP" 2 "${ledger}" $'### 2099-01-20 — synthetic bolded-verdict row\nA/A null: 1.000 [0.980, 1.020], same invocation\n**Verdict** — KEEP: landed on the default path.' || SELF_CHECK_FAILED=1
+  run_selfcheck_case "emphasised body reclassification to KEEP is gated" 2 "${ledger}" $'### 2099-01-21 — REJECT: synthetic bolded-reclassification row\nA/A null: 1.000 [0.980, 1.020], same invocation\n**Verdict** — KEEP: shipped as the default after all.' || SELF_CHECK_FAILED=1
+  run_selfcheck_case "unenumerated verdict word is blocked with a null present" 2 "${ledger}" $'### 2099-01-22 — synthetic adopted row\nA/A null: 1.000 [0.980, 1.020], same invocation\nVerdict: ADOPTED into the default build.' || SELF_CHECK_FAILED=1
+  run_selfcheck_case "emphasised competitive claim on a SELF-SPEEDUP row is blocked" 2 "${ledger}" $"### 2099-01-25 — KEEP: synthetic emphasis-hidden overreach
+Comparison class: SELF-SPEEDUP
+ELF sha256: ${sha}
+**Competitive** **win**: 1.11x over the shipping backend.
+A/B median CI: 0.900 [0.880, 0.920]." || SELF_CHECK_FAILED=1
+  run_selfcheck_case "conformant emphasised KEEP is still admitted" 0 "${ledger}" $"### 2099-01-23 — synthetic conformant bolded keep
+*Comparison class: SELF-SPEEDUP*
+ELF sha256: ${sha}
+**Verdict** — KEEP: landed." || SELF_CHECK_FAILED=1
 }
 
 run_selfcheck() {
@@ -641,6 +832,18 @@ run_selfcheck() {
 
   run_selfcheck_suite "docs/NEGATIVE_EVIDENCE.md"
   run_selfcheck_suite "docs/PERF_LEDGER.md"
+
+  # Ledger-specific halves of the default-verdict rule. A row that states NO
+  # verdict at all is still a rejection in the negative-evidence ledger and is
+  # admitted on a null; the same row in PERF_LEDGER has no default to fall back
+  # on and must fail closed. These cannot live in the shared suite because they
+  # are the one contract whose expected exit differs per ledger.
+  local bare_row
+  bare_row=$'### 2099-01-24 — synthetic verdict-free row\nA/A null: 1.000 [0.980, 1.020], same invocation\nThe candidate stayed inside the null floor across all rounds.'
+  run_selfcheck_case "verdict-free row defaults to REJECT in NEGATIVE_EVIDENCE" 0 \
+    "docs/NEGATIVE_EVIDENCE.md" "${bare_row}" || SELF_CHECK_FAILED=1
+  run_selfcheck_case "verdict-free row is unclassified in PERF_LEDGER" 2 \
+    "docs/PERF_LEDGER.md" "${bare_row}" || SELF_CHECK_FAILED=1
 
   if [[ ${SELF_CHECK_FAILED} -ne 0 ]]; then
     echo "[ledger-selfcheck] BLOCKED: one or more contract cases failed" >&2
@@ -780,6 +983,377 @@ run_leakcheck() {
   echo "[ledger-leakcheck] OK: 2/2 leak-regression cases"
 }
 
+# --- gatecheck: real-repo regression coverage for the bd-z4lqq bypasses ---
+# The awk fixture selfcheck cannot reach the bash-level stream materialization,
+# so these run the real staged/--since Git path. A gate that is fail-closed
+# blocks each fraudulent input (exit 2) or errors on a broken invocation (exit
+# 64); the conformant control (exit 0) proves the harness exercises the linter
+# so it can never pass vacuously.
+run_gatecheck_once() {
+  # $1 = script under test (abs); $2 = variant. Prints nothing; returns the
+  # linter exit code, or 64 on a harness/setup failure.
+  local target="$1" variant="$2" repo rc=0
+  repo="$(mktemp -d "${TMPDIR:-/tmp}/ledger-gatecheck.XXXXXX")" || return 64
+  GATECHECK_LAST_DIR="${repo}"
+  leakcheck_env git -C "${repo}" init -q -b main || return 64
+  mkdir -p "${repo}/docs" "${repo}/scripts"
+  cp "${target}" "${repo}/scripts/check_ledger_null_control.sh"
+  chmod +x "${repo}/scripts/check_ledger_null_control.sh"
+  printf '# PERF_LEDGER (gatecheck)\n' > "${repo}/docs/PERF_LEDGER.md"
+  printf '# NEGATIVE_EVIDENCE (gatecheck)\n' > "${repo}/docs/NEGATIVE_EVIDENCE.md"
+  local gc="leakcheck_env git -C ${repo} -c user.name=gc -c user.email=gc@local"
+  ${gc} add -A || return 64
+  ${gc} commit -q -m base || return 64
+
+  case "${variant}" in
+    unclassified)
+      cat >> "${repo}/docs/PERF_LEDGER.md" <<'ROW'
+
+## 2099-03-01 — adopted, promote to default path
+Verdict: ADOPTED — promote everywhere.
+ROW
+      ${gc} add -A || return 64
+      leakcheck_env "${repo}/scripts/check_ledger_null_control.sh" --staged >/dev/null 2>&1 || rc=$?
+      ;;
+    bodyonly)
+      cat >> "${repo}/docs/NEGATIVE_EVIDENCE.md" <<'ROW'
+
+## 2099-03-02 — historical reject
+A/A null: 1.000 [0.98,1.02], same invocation
+Decision: REJECT — reverted.
+ROW
+      ${gc} add -A || return 64
+      ${gc} commit -q -m "historical reject" || return 64
+      # Edit the BODY only; the heading line is untouched.
+      leakcheck_env sed -i 's/Decision: REJECT — reverted./Decision: KEEP — reclassified in place./' \
+        "${repo}/docs/NEGATIVE_EVIDENCE.md" || return 64
+      ${gc} add -A || return 64
+      leakcheck_env "${repo}/scripts/check_ledger_null_control.sh" --staged >/dev/null 2>&1 || rc=$?
+      ;;
+    nomergebase)
+      # An orphan commit shares no history with HEAD, so `git diff O...HEAD`
+      # is fatal; a fail-closed gate must error (64), never pass vacuously.
+      cat >> "${repo}/docs/PERF_LEDGER.md" <<'ROW'
+
+## 2099-03-03 — bogus reject with no evidence
+Verdict: REJECT.
+ROW
+      ${gc} add -A || return 64
+      ${gc} commit -q -m "bogus reject" || return 64
+      leakcheck_env git -C "${repo}" checkout -q --orphan orphanb || return 64
+      leakcheck_env git -C "${repo}" reset -q --hard || true
+      printf 'x\n' > "${repo}/unrelated.txt"
+      ${gc} add unrelated.txt || return 64
+      ${gc} commit -q -m orphan || return 64
+      local orphan
+      orphan="$(leakcheck_env git -C "${repo}" rev-parse HEAD)" || return 64
+      leakcheck_env git -C "${repo}" checkout -q main || return 64
+      leakcheck_env "${repo}/scripts/check_ledger_null_control.sh" --since "${orphan}" >/dev/null 2>&1 || rc=$?
+      ;;
+    boldkeep)
+      # A KEEP whose verdict word hides behind Markdown emphasis. The row
+      # carries a valid A/A null but NO ELF SHA-256 and NO comparison class, so
+      # it satisfies only the weaker REJECT contract. Before the fix the
+      # decision-line detector required a bare "Verdict"/"Decision" token, so
+      # this row never registered as a KEEP: NEGATIVE_EVIDENCE defaulted it to
+      # REJECT and admitted it on the null alone.
+      cat >> "${repo}/docs/NEGATIVE_EVIDENCE.md" <<'ROW'
+
+## 2099-03-05 — synthetic bolded-verdict row
+A/A null: 1.000 [0.98,1.02], same invocation
+**Verdict** — KEEP: landed on the default path.
+ROW
+      ${gc} add -A || return 64
+      leakcheck_env "${repo}/scripts/check_ledger_null_control.sh" --staged >/dev/null 2>&1 || rc=$?
+      ;;
+    boldreclass)
+      # Same evasion aimed the other way: the heading self-declares REJECT while
+      # an emphasised body line reclassifies the row to KEEP. Only the REJECT
+      # contract was enforced, so the KEEP admission checks never ran.
+      cat >> "${repo}/docs/PERF_LEDGER.md" <<'ROW'
+
+## 2099-03-06 — REJECT: synthetic bolded-reclassification row
+A/A null: 1.000 [0.98,1.02], same invocation
+**Verdict** — KEEP: shipped as the default after all.
+ROW
+      ${gc} add -A || return 64
+      leakcheck_env "${repo}/scripts/check_ledger_null_control.sh" --staged >/dev/null 2>&1 || rc=$?
+      ;;
+    adopted)
+      # The fail-open verdict allowlist, surviving in the other ledger.
+      # PERF_LEDGER already blocked an unenumerated verdict word, but
+      # NEGATIVE_EVIDENCE silently defaulted it to REJECT, so an ADOPTION
+      # landed on an A/A null alone: no ELF SHA-256, no comparison class, no
+      # named incumbent.
+      cat >> "${repo}/docs/NEGATIVE_EVIDENCE.md" <<'ROW'
+
+## 2099-03-07 — synthetic adopted row
+A/A null: 1.000 [0.98,1.02], same invocation
+Verdict: ADOPTED into the default build.
+ROW
+      ${gc} add -A || return 64
+      leakcheck_env "${repo}/scripts/check_ledger_null_control.sh" --staged >/dev/null 2>&1 || rc=$?
+      ;;
+    boldclaim)
+      # Emphasis hiding a competitive claim rather than a verdict: a
+      # SELF-SPEEDUP row that presents itself as beating the incumbent. The
+      # claim detector required bare "competitive win", so splitting the phrase
+      # across emphasis markers dodged the SELF-SPEEDUP-CLAIM block and let
+      # maintenance ship as campaign output.
+      cat >> "${repo}/docs/PERF_LEDGER.md" <<'ROW'
+
+## 2099-03-09 — KEEP: synthetic emphasis-hidden overreach
+Comparison class: SELF-SPEEDUP
+ELF sha256: 5555555555555555555555555555555555555555555555555555555555555555
+**Competitive** **win**: 1.11x over the shipping backend.
+ROW
+      ${gc} add -A || return 64
+      leakcheck_env "${repo}/scripts/check_ledger_null_control.sh" --staged >/dev/null 2>&1 || rc=$?
+      ;;
+    control)
+      cat >> "${repo}/docs/PERF_LEDGER.md" <<'ROW'
+
+## 2099-03-04 — conformant maintenance keep
+Comparison class: SELF-SPEEDUP
+ELF sha256: 3333333333333333333333333333333333333333333333333333333333333333
+Verdict: KEEP.
+ROW
+      ${gc} add -A || return 64
+      leakcheck_env "${repo}/scripts/check_ledger_null_control.sh" --staged >/dev/null 2>&1 || rc=$?
+      ;;
+    boldcontrol)
+      # Emphasis recognition must classify, not merely block: an emphasised
+      # verdict on a row that DOES carry its ELF SHA-256 and comparison class is
+      # still admitted. Without this the previous three cases could be passed by
+      # a degenerate gate that blocks every emphasised row.
+      cat >> "${repo}/docs/PERF_LEDGER.md" <<'ROW'
+
+## 2099-03-08 — synthetic conformant bolded keep
+*Comparison class: SELF-SPEEDUP*
+ELF sha256: 4444444444444444444444444444444444444444444444444444444444444444
+**Verdict** — KEEP: landed.
+ROW
+      ${gc} add -A || return 64
+      leakcheck_env "${repo}/scripts/check_ledger_null_control.sh" --staged >/dev/null 2>&1 || rc=$?
+      ;;
+    *) return 64 ;;
+  esac
+  return "${rc}"
+}
+
+run_gatecheck() {
+  local target="${LEDGER_LEAKCHECK_TARGET:-${BASH_SOURCE[0]}}"
+  if [[ "${target}" != /* ]]; then
+    target="$(cd "$(dirname "${target}")" && pwd)/$(basename "${target}")"
+  fi
+  local failed=0 rc dir
+  # variant : expected-exit : description
+  local cases=(
+    "unclassified:2:unclassified PERF verdict is blocked (fail-open verdict allowlist)"
+    "bodyonly:2:body-only flip of a historical entry is gated"
+    "nomergebase:64:no-merge-base --since errors instead of passing vacuously"
+    "boldkeep:2:emphasised KEEP verdict cannot hide behind the REJECT contract"
+    "boldreclass:2:emphasised body reclassification to KEEP is gated as a KEEP"
+    "adopted:2:unenumerated verdict word is blocked in NEGATIVE_EVIDENCE too"
+    "boldclaim:2:emphasis-split competitive claim on a SELF-SPEEDUP row is blocked"
+    "control:0:conformant KEEP is admitted (harness exercises the linter)"
+    "boldcontrol:0:conformant emphasised KEEP is still admitted (not blanket blocking)"
+  )
+  local entry variant want desc
+  for entry in "${cases[@]}"; do
+    variant="${entry%%:*}"; entry="${entry#*:}"
+    want="${entry%%:*}"; desc="${entry#*:}"
+    GATECHECK_LAST_DIR=""
+    rc=0
+    run_gatecheck_once "${target}" "${variant}" || rc=$?
+    dir="${GATECHECK_LAST_DIR}"
+    if [[ ${rc} -eq ${want} ]]; then
+      echo "[ledger-gatecheck] PASS ${desc}: exit ${rc}"
+    else
+      echo "[ledger-gatecheck] BLOCKED ${desc}: expected exit ${want}, got ${rc}" >&2
+      failed=1
+    fi
+    if [[ -n "${dir}" && -d "${dir}" && "${dir}" == *ledger-gatecheck* && ${rc} -ne ${want} ]]; then
+      echo "[ledger-gatecheck] retained temp repo: ${dir}" >&2
+    else
+      rm -rf "${dir}" 2>/dev/null || true
+    fi
+  done
+  if [[ ${failed} -ne 0 ]]; then
+    echo "[ledger-gatecheck] BLOCKED: bypass regression detected" >&2
+    return 2
+  fi
+  echo "[ledger-gatecheck] OK: ${#cases[@]}/${#cases[@]} bypass-regression cases"
+}
+
+# --- mergecheck: regression coverage for merge blindness ---
+# `--staged` reads `git diff --cached`, which compares the index against the
+# FIRST parent only; during a merge commit, every ledger row inherited from
+# the second parent's committed history therefore read as newly added and was
+# re-gated (12 false blocks on the 2026-08-02 harmonization merge, all rows
+# pre-existing on a parent). The probe proves second-parent history is
+# admitted; the control proves a row present in NEITHER parent is still
+# blocked, so the merge path cannot be used to smuggle ungated rows.
+
+run_mergecheck_once() {
+  # $1 = script under test (abs path); $2 = variant: probe | control
+  # Returns the linter's exit code.
+  local target="$1" variant="$2"
+  local repo
+  repo="$(mktemp -d "${TMPDIR:-/tmp}/ledger-mergecheck.XXXXXX")" || return 64
+  MERGECHECK_LAST_DIR="${repo}"
+
+  leakcheck_env git -C "${repo}" init -q -b main || return 64
+  mkdir -p "${repo}/docs" "${repo}/scripts"
+  cp "${target}" "${repo}/scripts/check_ledger_null_control.sh"
+  chmod +x "${repo}/scripts/check_ledger_null_control.sh"
+
+  cat > "${repo}/docs/PERF_LEDGER.md" <<'LEDGER'
+# PERF_LEDGER (mergecheck synthetic)
+LEDGER
+  cat > "${repo}/docs/NEGATIVE_EVIDENCE.md" <<'LEDGER'
+# NEGATIVE_EVIDENCE (mergecheck synthetic base)
+
+### 2098-03-01 — REJECT synthetic shared-history base row
+A/A null: 1.001 ratio, measured in the same invocation as the paired run.
+Decision: REJECT — reverted.
+LEDGER
+
+  leakcheck_env git -C "${repo}" -c user.name=mergecheck -c user.email=mergecheck@local \
+    add docs scripts || return 64
+  leakcheck_env git -C "${repo}" -c user.name=mergecheck -c user.email=mergecheck@local \
+    commit -q -m "mergecheck base" || return 64
+
+  # Second parent: committed history carrying a row that HAS no same-invocation
+  # null — exactly the shape the merge-blind gate falsely re-blocked. It was
+  # committed on its own line; the merge must not re-litigate it.
+  leakcheck_env git -C "${repo}" checkout -q -b side || return 64
+  cat >> "${repo}/docs/NEGATIVE_EVIDENCE.md" <<'ROW'
+
+### 2099-03-02 — REJECT synthetic second-parent history row
+Decision: REJECT — reverted; recorded before the evidence contract hardened.
+ROW
+  leakcheck_env git -C "${repo}" -c user.name=mergecheck -c user.email=mergecheck@local \
+    commit -q -am "side: historical ledger row" || return 64
+
+  # Diverge main so the merge is a true two-parent merge, not a fast-forward.
+  leakcheck_env git -C "${repo}" checkout -q main || return 64
+  echo "divergence marker" >> "${repo}/docs/PERF_LEDGER.md"
+  leakcheck_env git -C "${repo}" -c user.name=mergecheck -c user.email=mergecheck@local \
+    commit -q -am "main: diverge" || return 64
+
+  leakcheck_env git -C "${repo}" -c user.name=mergecheck -c user.email=mergecheck@local \
+    merge --no-commit --no-ff -q side >/dev/null 2>&1 || return 64
+
+  if [[ "${variant}" == "control" || "${variant}" == "procsub" ]]; then
+    # A genuinely new row (present in neither parent), added mid-merge with no
+    # evidence: the gate must still block the merge commit.
+    cat >> "${repo}/docs/NEGATIVE_EVIDENCE.md" <<'ROW'
+
+### 2099-03-03 — REJECT synthetic mid-merge smuggled row without evidence
+Decision: REJECT — reverted without recorded evidence.
+ROW
+    leakcheck_env git -C "${repo}" add docs/NEGATIVE_EVIDENCE.md || return 64
+  fi
+
+  local rc=0
+  if [[ "${variant}" == "procsub" ]]; then
+    # bd-z4lqq: the merge-aware added-line intersection used to be computed
+    # inside process substitutions, whose failures `set -euo pipefail` cannot
+    # see. Shim `git` so ONLY the second-parent diff fails (the invocation that
+    # carries a 40-hex base); everything else reaches the real binary. With the
+    # failure invisible the intersection came back empty, the smuggled row above
+    # read as not-new, and the gate exited 0 with the fatal on stderr alone. A
+    # fail-closed gate must refuse to lint a partial added-line set: exit 64.
+    mkdir -p "${repo}/shim"
+    cat > "${repo}/shim/git" <<'SHIM'
+#!/usr/bin/env bash
+real="$(command -v -p git 2>/dev/null || echo /usr/bin/git)"
+seen_diff=0; seen_cached=0; seen_sha=0
+for a in "$@"; do
+  case "$a" in
+    diff) seen_diff=1 ;;
+    --cached) seen_cached=1 ;;
+    *) [[ "$a" =~ ^[0-9a-f]{40}$ ]] && seen_sha=1 ;;
+  esac
+done
+if (( seen_diff && seen_cached && seen_sha )); then
+  echo "fatal: synthetic object-store failure" >&2
+  exit 128
+fi
+exec "$real" "$@"
+SHIM
+    chmod +x "${repo}/shim/git"
+    PATH="${repo}/shim:${PATH}" leakcheck_env \
+      "${repo}/scripts/check_ledger_null_control.sh" --staged || rc=$?
+  else
+    leakcheck_env "${repo}/scripts/check_ledger_null_control.sh" --staged || rc=$?
+  fi
+  return "${rc}"
+}
+
+run_mergecheck() {
+  local target="${LEDGER_MERGECHECK_TARGET:-${BASH_SOURCE[0]}}"
+  if [[ "${target}" != /* ]]; then
+    target="$(cd "$(dirname "${target}")" && pwd)/$(basename "${target}")"
+  fi
+  if [[ ! -f "${target}" ]]; then
+    echo "ERROR: mergecheck target not found: ${target}" >&2
+    return 64
+  fi
+
+  local failed=0 rc dir
+
+  MERGECHECK_LAST_DIR=""
+  rc=0
+  run_mergecheck_once "${target}" probe > /dev/null 2>&1 || rc=$?
+  dir="${MERGECHECK_LAST_DIR}"
+  if [[ ${rc} -eq 0 ]]; then
+    echo "[ledger-mergecheck] PASS merge probe: second-parent committed history admitted during a merge: exit 0"
+  else
+    echo "[ledger-mergecheck] BLOCKED merge probe: second-parent history was re-gated (exit ${rc}) — merge blindness" >&2
+    failed=1
+  fi
+  retain_mergecheck_dir "${dir}"
+
+  MERGECHECK_LAST_DIR=""
+  rc=0
+  run_mergecheck_once "${target}" control > /dev/null 2>&1 || rc=$?
+  dir="${MERGECHECK_LAST_DIR}"
+  if [[ ${rc} -eq 2 ]]; then
+    echo "[ledger-mergecheck] PASS merge control: neither-parent row is still blocked mid-merge: exit 2"
+  else
+    echo "[ledger-mergecheck] BLOCKED merge control: expected exit 2, got ${rc} — the merge path admits ungated rows" >&2
+    failed=1
+  fi
+  retain_mergecheck_dir "${dir}"
+
+  MERGECHECK_LAST_DIR=""
+  rc=0
+  run_mergecheck_once "${target}" procsub > /dev/null 2>&1 || rc=$?
+  dir="${MERGECHECK_LAST_DIR}"
+  if [[ ${rc} -eq 64 ]]; then
+    echo "[ledger-mergecheck] PASS merge stream failure: a failing second-parent diff errors instead of passing vacuously: exit 64"
+  else
+    echo "[ledger-mergecheck] BLOCKED merge stream failure: expected exit 64, got ${rc} — a failing parent diff is invisible and the merge passes vacuously" >&2
+    failed=1
+  fi
+  retain_mergecheck_dir "${dir}"
+
+  if [[ ${failed} -ne 0 ]]; then
+    echo "[ledger-mergecheck] BLOCKED: merge-blindness regression detected" >&2
+    return 2
+  fi
+  echo "[ledger-mergecheck] OK: 3/3 merge-awareness cases"
+}
+
+retain_mergecheck_dir() {
+  local dir="$1"
+  if [[ -n "${dir}" && -d "${dir}" && "${dir}" == *ledger-mergecheck* ]]; then
+    echo "[ledger-mergecheck] retained temp repo: ${dir}" >&2
+  fi
+}
+
 case "${MODE}" in
   candidate)
     candidate_preflight
@@ -791,10 +1365,18 @@ case "${MODE}" in
     LEDGER_GATE_STATUS=0
     if ! run_selfcheck; then LEDGER_GATE_STATUS=2; fi
     if ! run_leakcheck; then LEDGER_GATE_STATUS=2; fi
+    if ! run_gatecheck; then LEDGER_GATE_STATUS=2; fi
+    if ! run_mergecheck; then LEDGER_GATE_STATUS=2; fi
     exit "${LEDGER_GATE_STATUS}"
     ;;
   leakcheck)
     run_leakcheck
+    ;;
+  gatecheck)
+    run_gatecheck
+    ;;
+  mergecheck)
+    run_mergecheck
     ;;
   staged|since|all)
     lint_ledgers

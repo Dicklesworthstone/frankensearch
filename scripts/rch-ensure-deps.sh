@@ -172,7 +172,10 @@ log_error() { echo "[rch-deps] ERROR: $*" >&2; }
 
 validate_model_specs() {
     local spec model relative_path url sha256 size destination
-    local -A seen_destinations=()
+    # Newline-delimited membership list instead of an associative array:
+    # macOS system bash is 3.2, and the release-build lane runs this script
+    # through /bin/bash — `local -A` aborts the whole model provisioning step.
+    local seen_destinations=$'\n'
     for spec in "${BUNDLED_MODEL_SPECS[@]}"; do
         IFS='|' read -r model relative_path url sha256 size <<<"${spec}"
         if [[ -z "${model}" || "${model}" == */* || -z "${relative_path}" || "${relative_path}" == /* ]] ||
@@ -193,11 +196,13 @@ validate_model_specs() {
             return 1
         fi
         destination="${model}/${relative_path}"
-        if [[ -n "${seen_destinations[${destination}]:-}" ]]; then
-            log_error "duplicate bundled-model destination: ${destination}"
-            return 1
-        fi
-        seen_destinations["${destination}"]=1
+        case "${seen_destinations}" in
+            *$'\n'"${destination}"$'\n'*)
+                log_error "duplicate bundled-model destination: ${destination}"
+                return 1
+                ;;
+        esac
+        seen_destinations="${seen_destinations}${destination}"$'\n'
     done
 }
 
@@ -841,11 +846,15 @@ EOF
 
 run_remote_bootstrap() {
     local -a workers=()
+    local worker_line
 
     if [[ -n "${TARGET_WORKER}" ]]; then
         workers=("$(resolve_worker_target "${TARGET_WORKER}")")
     elif [[ "${ALL_WORKERS}" == true ]]; then
-        mapfile -t workers < <(list_workers_from_rch)
+        # while-read instead of mapfile for macOS bash 3.2 compatibility.
+        while IFS= read -r worker_line; do
+            [[ -n "${worker_line}" ]] && workers+=("${worker_line}")
+        done < <(list_workers_from_rch)
         if [[ ${#workers[@]} -eq 0 ]]; then
             log_error "no workers found from 'rch workers list --json'"
             return 1

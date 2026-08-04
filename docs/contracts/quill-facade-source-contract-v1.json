@@ -6,7 +6,11 @@
     "kind": "source-workspace-only",
     "performance_claim": false,
     "registry_or_package_claim": false,
-    "registry_or_package_owner": "bd-8nqz.6"
+    "registry_or_package_owner": "bd-8nqz.6",
+    "flip_authorized": false,
+    "flip_authorization_owner": "bd-3beo",
+    "semantic_foundation_f_in_scope": false,
+    "semantic_foundation_f_disposition": "excluded-post-batch4"
   },
   "namespace_contract": {
     "production_feature": "lexical",

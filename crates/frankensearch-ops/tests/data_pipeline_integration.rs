@@ -496,10 +496,13 @@ fn pipeline_performance_entrypoint_enforces_deterministic_budgets() {
         .run_performance_entrypoint(&storage, 16_384)
         .expect("performance replay should succeed");
 
-    assert!(
-        report.events_ingested >= 300,
-        "expected sustained load volume, got {} events",
-        report.events_ingested
+    assert_eq!(
+        report.events_ingested, 976,
+        "seed-777 event count drifted; recalibrate the deterministic performance fixture explicitly"
+    );
+    assert_eq!(
+        report.run_signature, 14_882_636_011_770_579,
+        "seed-777 run signature drifted; inspect fixture semantics before accepting new timings"
     );
     assert!(
         report.events_per_second >= 50.0,

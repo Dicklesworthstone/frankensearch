@@ -1308,7 +1308,9 @@ pub struct PreparedQuery4bit {
     tail: Vec<(i32, i32)>,
 }
 
+#[cfg(target_arch = "x86_64")]
 const FOUR_BIT_DIM384_BYTES: usize = 384 / 2;
+#[cfg(target_arch = "x86_64")]
 const FOUR_BIT_DIM384_CHUNKS: usize = FOUR_BIT_DIM384_BYTES / 16;
 
 /// Pre-unpack a packed 4-bit query (the loop-invariant operand of a scan).

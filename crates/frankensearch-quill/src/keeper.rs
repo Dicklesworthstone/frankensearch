@@ -1897,7 +1897,7 @@ impl TombstoneIndex {
 
 enum RecoveredSegmentBacking {
     Mapped(SegmentReader<ReadOnlyMappedFile>),
-    Owned(SegmentReader<Vec<u8>>),
+    Owned(SegmentReader<EncodedSegment>),
 }
 
 impl RecoveredSegmentBacking {
@@ -1934,6 +1934,30 @@ impl RecoveredSegmentBacking {
             Self::Mapped(reader) => reader.source_bytes(),
             Self::Owned(reader) => reader.source_bytes(),
         }
+    }
+
+    /// Trailer-verified xxh3-64 over the file prefix, recorded at parse time.
+    ///
+    /// This is the content-identity witness for the whole immutable backing:
+    /// it was checked against the actual bytes when the reader was
+    /// constructed, and [`validate_segment_witnesses`] re-checks it against
+    /// every manifest generation that binds this backing.
+    fn file_xxh3(&self) -> u64 {
+        match self {
+            Self::Mapped(reader) => reader.file_xxh3(),
+            Self::Owned(reader) => reader.file_xxh3(),
+        }
+    }
+
+    /// Whether this backing is a memory-mapped durable file.
+    ///
+    /// Mapped bytes are mutable out from under the process by external file
+    /// writes, and a warm reader's section-checksum gates do not re-verify on
+    /// later access, so no in-place rebind path may treat a mapped backing's
+    /// re-validation as fresh. Mapped successor generations must go through a
+    /// durable reopen.
+    const fn is_mapped(&self) -> bool {
+        matches!(self, Self::Mapped(_))
     }
 
     fn validate_witnesses(
@@ -2218,6 +2242,7 @@ impl RankPruningCache {
 struct TermDictionaryCacheCounters {
     full_validations: AtomicU64,
     borrowed_views: AtomicU64,
+    metadata_reuses: AtomicU64,
 }
 
 #[cfg(test)]
@@ -2226,6 +2251,7 @@ impl TermDictionaryCacheCounters {
         Self {
             full_validations: AtomicU64::new(0),
             borrowed_views: AtomicU64::new(0),
+            metadata_reuses: AtomicU64::new(0),
         }
     }
 }
@@ -2240,6 +2266,11 @@ pub struct RecoveredSegment {
     live_doc_count: u32,
     rank_pruning_cache: Arc<RankPruningCache>,
     term_dictionary_metadata: Arc<ValidatedTermDictionaryMetadata>,
+    /// Whole-file xxh3 witness of the exact bytes the retained TERMDICT
+    /// metadata was completely validated against. Recorded from the
+    /// trailer-verified reader at validation time and carried unchanged
+    /// across tombstone-only rebinds of the same immutable backing.
+    term_dictionary_file_xxh3: u64,
     #[cfg(test)]
     term_dictionary_cache_counters: Arc<TermDictionaryCacheCounters>,
 }
@@ -2265,7 +2296,7 @@ impl RecoveredSegment {
         encoded: EncodedSegment,
         schema: SchemaDescriptor,
     ) -> Result<Self, KeeperError> {
-        let reader = SegmentReader::from_owned(encoded.into_bytes(), schema).map_err(|source| {
+        let reader = SegmentReader::from_encoded(encoded, schema).map_err(|source| {
             KeeperError::SegmentOpen {
                 path: path.clone(),
                 source,
@@ -2292,16 +2323,51 @@ impl RecoveredSegment {
             Arc::new(reader),
             Arc::new(RankPruningCache::new()),
             schema,
+            None,
         )
     }
 
+    /// Bind one manifest generation over a shared immutable backing.
+    ///
+    /// `reuse_from` names the predecessor binding of the exact same backing
+    /// when the caller is performing a tombstone-only manifest rebind. This
+    /// path is OWNED-ONLY: a mapped predecessor is rejected up front with a
+    /// typed reopen-required transition error, because mapped bytes can
+    /// change on disk behind warm checksum gates and neither reuse nor an
+    /// in-place "fresh" validation would be honest there. For owned
+    /// backings, the already-validated TERMDICT metadata is reused only
+    /// after every content-identity witness holds: the backing must be the
+    /// same `Arc` allocation, the trailer-verified whole-file xxh3 recorded
+    /// at validation time must equal this reader's, the schema must match,
+    /// and the live TERMDICT slice must still be the exact address/length
+    /// the metadata was minted for. Any witness mismatch falls back to one
+    /// complete fresh validation of the immutable owned bytes, so reuse can
+    /// never weaken admission; it can only skip re-validating bytes that
+    /// were already proven valid.
     fn bind_shared(
         path: PathBuf,
         manifest: ManifestSegment,
         reader: Arc<RecoveredSegmentBacking>,
         rank_pruning_cache: Arc<RankPruningCache>,
         schema: SchemaDescriptor,
+        reuse_from: Option<&Self>,
     ) -> Result<Self, KeeperError> {
+        // TRUST BOUNDARY: in-place rebind (any binding that names a
+        // predecessor) is owned-only. A mapped backing's bytes can change on
+        // disk after open while the reader's stored trailer hash and warm
+        // section-checksum gates keep vouching for the ORIGINAL bytes, so
+        // neither the reuse path nor its fresh-validation fallback would be
+        // honest for a mapped rebind. Mapped successor generations require a
+        // durable reopen, which re-verifies everything from actual bytes.
+        if reuse_from.is_some() && reader.is_mapped() {
+            return Err(KeeperError::InvalidTransition {
+                detail: format!(
+                    "mapped segment {} cannot rebind in place; a durable reopen \
+                     is required (validated TERMDICT metadata reuse is owned-only)",
+                    path.display()
+                ),
+            });
+        }
         let id_map_bytes = required_identity_section(&path, &reader, SectionKind::IDMAP)?;
         let id_map = IdMapSection::parse(id_map_bytes, manifest.docid_lo, manifest.docid_hi)
             .map_err(|source| KeeperError::IdMapCorrupted {
@@ -2346,14 +2412,47 @@ impl RecoveredSegment {
             }
         })?;
         let live_doc_count = manifest.live_doc_count();
+
+        // Reuse the predecessor's validated TERMDICT metadata only when every
+        // content-identity witness proves the backing is byte-identical to
+        // what that metadata was completely validated against.
+        let reused_metadata = reuse_from.and_then(|previous| {
+            let identical_backing = Arc::ptr_eq(&previous.reader, &reader)
+                && previous.term_dictionary_file_xxh3 == reader.file_xxh3()
+                && schema == previous.term_dictionary_metadata.schema()
+                && validated_term_dictionary_is_bound(&reader, &previous.term_dictionary_metadata);
+            identical_backing.then(|| Arc::clone(&previous.term_dictionary_metadata))
+        });
         #[cfg(test)]
-        let term_dictionary_cache_counters = Arc::new(TermDictionaryCacheCounters::new());
-        let term_dictionary_metadata =
-            Arc::new(validate_term_dictionary_metadata(&path, &reader, schema)?);
-        #[cfg(test)]
-        term_dictionary_cache_counters
-            .full_validations
-            .fetch_add(1, AtomicOrdering::Relaxed);
+        let term_dictionary_cache_counters = match (&reused_metadata, reuse_from) {
+            // A reused binding shares its predecessor's counters so the
+            // observable contract stays "exactly one complete validation per
+            // unique immutable backing", not merely per binding.
+            (Some(_), Some(previous)) => {
+                let counters = Arc::clone(&previous.term_dictionary_cache_counters);
+                counters
+                    .metadata_reuses
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                counters
+            }
+            _ => Arc::new(TermDictionaryCacheCounters::new()),
+        };
+        let term_dictionary_metadata = match reused_metadata {
+            Some(metadata) => metadata,
+            None => {
+                let metadata = Arc::new(validate_term_dictionary_metadata(&path, &reader, schema)?);
+                #[cfg(test)]
+                term_dictionary_cache_counters
+                    .full_validations
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                metadata
+            }
+        };
+        // The reader's trailer hash was verified against the actual bytes at
+        // parse time; on reuse it was just proven equal to the predecessor's
+        // recorded witness, so recording it preserves the anchor to the
+        // originally validated content across rebind chains.
+        let term_dictionary_file_xxh3 = reader.file_xxh3();
         Ok(Self {
             path,
             manifest,
@@ -2363,11 +2462,21 @@ impl RecoveredSegment {
             live_doc_count,
             rank_pruning_cache,
             term_dictionary_metadata,
+            term_dictionary_file_xxh3,
             #[cfg(test)]
             term_dictionary_cache_counters,
         })
     }
 
+    /// Rebind this immutable backing under a successor manifest generation.
+    ///
+    /// Tombstones live in the MANIFEST, not in the FSLX image, so a
+    /// tombstone-only rebind re-checks the manifest witnesses against the
+    /// backing and then reuses the already-validated TERMDICT metadata via
+    /// [`Self::bind_shared`]'s identity-gated reuse path instead of
+    /// re-validating unchanged bytes. Rebind is owned-only: a mapped backing
+    /// is rejected there with a typed reopen-required transition error and
+    /// must go through a durable reopen instead.
     fn rebind(&self, manifest: ManifestSegment) -> Result<Self, KeeperError> {
         self.reader.validate_witnesses(&self.path, &manifest)?;
         let schema = self.term_dictionary_metadata.schema();
@@ -2377,6 +2486,7 @@ impl RecoveredSegment {
             Arc::clone(&self.reader),
             Arc::clone(&self.rank_pruning_cache),
             schema,
+            Some(self),
         )
     }
 
@@ -2422,6 +2532,29 @@ impl RecoveredSegment {
                 .borrowed_views
                 .load(AtomicOrdering::Relaxed),
         )
+    }
+
+    /// Test-only count of identity-verified TERMDICT metadata reuses across
+    /// tombstone-only rebinds of this segment's immutable backing.
+    #[cfg(test)]
+    pub(crate) fn term_dictionary_metadata_reuse_count(&self) -> u64 {
+        self.term_dictionary_cache_counters
+            .metadata_reuses
+            .load(AtomicOrdering::Relaxed)
+    }
+
+    /// Estimated payload bytes retained by this binding's validated TERMDICT
+    /// metadata.
+    ///
+    /// Payload estimate only: excludes `Arc` control-block overhead,
+    /// allocation alignment, and allocator slack — not an exact RSS claim.
+    /// Rebound generations of the same immutable backing share one metadata
+    /// allocation, and each binding reports the FULL payload of that shared
+    /// object: summing this value across concurrently held snapshot
+    /// generations double-counts the shared allocation.
+    #[must_use]
+    pub fn term_dictionary_metadata_payload_bytes(&self) -> usize {
+        self.term_dictionary_metadata.payload_bytes()
     }
 
     pub(crate) fn cached_rank_pruning_metadata(
@@ -2569,6 +2702,24 @@ fn bind_validated_term_dictionary<'a>(
 ) -> Result<TermDictionary<'a>, KeeperError> {
     TermDictionary::from_validated_metadata(bytes, metadata)
         .map_err(|source| term_dictionary_admission_error(path, source))
+}
+
+/// Whether `metadata` is still bound to `reader`'s live TERMDICT slice.
+///
+/// Resolves the TERMDICT section (its payload checksum gate is a warm
+/// `OnceLock` on a shared backing, so no bytes are re-hashed) and checks the
+/// exact address/length binding recorded at validation time. This is the
+/// pointer fast path of the once-per-unique-backing reuse contract; it never
+/// re-validates content.
+fn validated_term_dictionary_is_bound(
+    reader: &RecoveredSegmentBacking,
+    metadata: &ValidatedTermDictionaryMetadata,
+) -> bool {
+    reader
+        .section(SectionKind::TERMDICT)
+        .ok()
+        .flatten()
+        .is_some_and(|bytes| TermDictionary::from_validated_metadata(bytes, metadata).is_ok())
 }
 
 impl crate::argus::LiveDocs for RecoveredSegment {
@@ -3017,6 +3168,26 @@ impl KeeperSnapshot {
     #[must_use]
     pub fn segments(&self) -> &[RecoveredSegment] {
         &self.segments
+    }
+
+    /// Total estimated payload bytes of validated TERMDICT metadata across
+    /// every segment bound in this snapshot.
+    ///
+    /// Payload estimate only (see
+    /// [`RecoveredSegment::term_dictionary_metadata_payload_bytes`]): it
+    /// excludes `Arc` control-block overhead, alignment, and allocator slack,
+    /// so it is not an exact memory claim. A snapshot holds each segment
+    /// exactly once, so this sum never double-counts inside ONE snapshot.
+    /// Successive snapshot generations that share a backing also share one
+    /// metadata allocation, and each generation reports that shared payload
+    /// in full: summing across concurrently held snapshots double-counts it.
+    #[must_use]
+    pub fn term_dictionary_metadata_payload_bytes(&self) -> u64 {
+        self.segments.iter().fold(0_u64, |total, segment| {
+            total.saturating_add(
+                u64::try_from(segment.term_dictionary_metadata_payload_bytes()).unwrap_or(u64::MAX),
+            )
+        })
     }
 
     /// Physical at-seal rows retained for BM25 statistics until compaction.
@@ -6194,15 +6365,20 @@ impl WriterLockRecord {
 fn writer_pid_start_nonce(pid: u32, acquired_unix_s: i64) -> u64 {
     #[cfg(target_os = "linux")]
     if let Some(start_time) = linux_process_start_time(pid) {
-        let mut identity = [0_u8; 12];
-        identity[..4].copy_from_slice(&pid.to_le_bytes());
-        identity[4..].copy_from_slice(&start_time.to_le_bytes());
-        return xxhash_rust::xxh3::xxh3_64(&identity);
+        return writer_pid_start_nonce_from_linux_start_time(pid, start_time);
     }
 
     let mut identity = [0_u8; 12];
     identity[..4].copy_from_slice(&pid.to_le_bytes());
     identity[4..].copy_from_slice(&acquired_unix_s.to_le_bytes());
+    xxhash_rust::xxh3::xxh3_64(&identity)
+}
+
+#[cfg(target_os = "linux")]
+fn writer_pid_start_nonce_from_linux_start_time(pid: u32, start_time: u64) -> u64 {
+    let mut identity = [0_u8; 12];
+    identity[..4].copy_from_slice(&pid.to_le_bytes());
+    identity[4..].copy_from_slice(&start_time.to_le_bytes());
     xxhash_rust::xxh3::xxh3_64(&identity)
 }
 
@@ -6281,12 +6457,14 @@ fn acquire_writer_admission(directory: &Path) -> Result<Arc<WriterAdmissionInner
         path: lock_path.clone(),
         source,
     })?;
-    let mut lock_file = File::from(lock);
-    let metadata = lock_file.metadata().map_err(|source| KeeperError::Io {
-        operation: "inspect writer lock",
-        path: lock_path.clone(),
-        source,
-    })?;
+    let mut previous_lock_file = File::from(lock);
+    let metadata = previous_lock_file
+        .metadata()
+        .map_err(|source| KeeperError::Io {
+            operation: "inspect writer lock",
+            path: lock_path.clone(),
+            source,
+        })?;
     if !metadata.file_type().is_file() {
         return Err(KeeperError::WriterLockCorrupted {
             path: lock_path,
@@ -6294,11 +6472,14 @@ fn acquire_writer_admission(directory: &Path) -> Result<Arc<WriterAdmissionInner
         });
     }
     use std::os::unix::fs::MetadataExt;
-    let lock_device = metadata.dev();
-    let lock_inode = metadata.ino();
-    if let Err(source) = flock(&lock_file, FlockOperation::NonBlockingLockExclusive) {
+    let previous_lock_device = metadata.dev();
+    let previous_lock_inode = metadata.ino();
+    if let Err(source) = flock(
+        &previous_lock_file,
+        FlockOperation::NonBlockingLockExclusive,
+    ) {
         if source == rustix::io::Errno::AGAIN {
-            let owner_pid = read_writer_lock_record(&lock_path, &mut lock_file)
+            let owner_pid = read_writer_lock_record(&lock_path, &mut previous_lock_file)
                 .ok()
                 .flatten()
                 .map(|record| record.pid);
@@ -6314,8 +6495,26 @@ fn acquire_writer_admission(directory: &Path) -> Result<Arc<WriterAdmissionInner
         });
     }
 
-    if let Some(previous) = read_writer_lock_record(&lock_path, &mut lock_file)?
-        && !writer_pid_is_dead(previous.pid)
+    if !writer_lock_path_matches(&lock_path, previous_lock_device, previous_lock_inode)? {
+        return Err(KeeperError::WriterLockCorrupted {
+            path: lock_path,
+            detail: "LOCK pathname changed before writer admission completed".to_owned(),
+        });
+    }
+
+    // A won flock is the authoritative proof that no cooperating writer owns
+    // this inode. The record remains a conservative cross-check for a live
+    // process on platforms where the recorded start identity can be observed.
+    // A corrupt record cannot strand the directory forever: replace it
+    // atomically while the authoritative flock is held.
+    let previous = match read_writer_lock_record(&lock_path, &mut previous_lock_file) {
+        Ok(record) => record,
+        Err(KeeperError::WriterLockCorrupted { .. }) => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(previous) = previous
+        && previous.pid != std::process::id()
+        && writer_lock_record_names_live_owner(previous)
     {
         return Err(KeeperError::WriterBusy {
             path: lock_path,
@@ -6324,14 +6523,9 @@ fn acquire_writer_admission(directory: &Path) -> Result<Arc<WriterAdmissionInner
     }
 
     let record = WriterLockRecord::current(&lock_path)?;
-    if let Err(error) = write_writer_lock_record(&lock_path, &mut lock_file, record) {
-        // The flock proves this descriptor is the only cooperating writer for
-        // this inode. Best-effort truncation prevents a short failed write from
-        // becoming a permanent corrupt residual record.
-        let _ = lock_file.set_len(0);
-        let _ = lock_file.sync_all();
-        return Err(error);
-    }
+    let (lock_file, lock_device, lock_inode) =
+        publish_writer_lock_record(&directory_file, directory, &lock_path, record)?;
+    drop(previous_lock_file);
     let admission = Arc::new(WriterAdmissionInner {
         directory: directory.to_path_buf(),
         directory_file,
@@ -6413,21 +6607,151 @@ fn read_writer_lock_record(
         })
 }
 
-fn write_writer_lock_record(
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "solaris",
+        target_os = "vita",
+        target_os = "wasi"
+    ))
+))]
+fn publish_writer_lock_record(
+    directory_file: &File,
+    directory: &Path,
     path: &Path,
-    file: &mut File,
     record: WriterLockRecord,
-) -> Result<(), KeeperError> {
+) -> Result<(File, u64, u64), KeeperError> {
+    use rustix::fs::{
+        AtFlags, FileType, FlockOperation, Mode, OFlags, flock, openat, renameat, statat,
+    };
+    use std::os::unix::fs::MetadataExt;
+
     let bytes = record.to_bytes();
-    file.set_len(0)
-        .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
-        .and_then(|()| file.write_all(&bytes))
+    let base = format!(".tmp-lock-{:016x}", record.pid_start_nonce);
+    let mut collision = 0_u64;
+    let (temporary_name, mut file, metadata) = loop {
+        let name = if collision == 0 {
+            OsString::from(&base)
+        } else {
+            OsString::from(format!("{base}.{collision}"))
+        };
+        safe_direct_child(directory, Path::new(&name))?;
+        match openat(
+            directory_file,
+            &name,
+            OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::CREATE | OFlags::EXCL,
+            Mode::RUSR | Mode::WUSR,
+        ) {
+            Ok(file) => {
+                let file = File::from(file);
+                let metadata = file.metadata().map_err(|source| KeeperError::Io {
+                    operation: "inspect writer-lock temp",
+                    path: directory.join(&name),
+                    source,
+                })?;
+                break (name, file, metadata);
+            }
+            Err(source) if source == rustix::io::Errno::EXIST => {
+                collision = collision.checked_add(1).ok_or_else(|| KeeperError::Io {
+                    operation: "allocate writer-lock temp",
+                    path: directory.join(&base),
+                    source: io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "writer-lock temp suffix space is exhausted",
+                    ),
+                })?;
+            }
+            Err(source) => {
+                return Err(KeeperError::Io {
+                    operation: "create writer-lock temp",
+                    path: directory.join(&name),
+                    source: io::Error::from(source),
+                });
+            }
+        }
+    };
+    let temporary_path = directory.join(&temporary_name);
+    if !metadata.file_type().is_file() || metadata.len() != 0 {
+        return Err(KeeperError::WriterLockCorrupted {
+            path: temporary_path,
+            detail: "new writer-lock temp is not an empty regular file".to_owned(),
+        });
+    }
+    file.write_all(&bytes)
         .and_then(|()| file.sync_all())
         .map_err(|source| KeeperError::Io {
-            operation: "persist writer-lock record",
+            operation: "persist writer-lock temp",
+            path: temporary_path.clone(),
+            source,
+        })?;
+    flock(&file, FlockOperation::NonBlockingLockExclusive)
+        .map_err(io::Error::from)
+        .map_err(|source| KeeperError::Io {
+            operation: "lock writer-lock temp",
+            path: temporary_path.clone(),
+            source,
+        })?;
+    let temp_stat = statat(directory_file, &temporary_name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(io::Error::from)
+        .map_err(|source| KeeperError::Io {
+            operation: "verify writer-lock temp",
+            path: temporary_path.clone(),
+            source,
+        })?;
+    if FileType::from_raw_mode(temp_stat.st_mode) != FileType::RegularFile
+        || stat_dev_as_u64(&temp_stat) != metadata.dev()
+        || temp_stat.st_ino != metadata.ino()
+        || temp_stat.st_size != 36
+    {
+        return Err(KeeperError::WriterLockCorrupted {
+            path: temporary_path,
+            detail: "writer-lock temp pathname no longer names the synced locked inode".to_owned(),
+        });
+    }
+    renameat(directory_file, &temporary_name, directory_file, "LOCK")
+        .map_err(io::Error::from)
+        .map_err(|source| KeeperError::Io {
+            operation: "atomically publish writer-lock record",
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+    directory_file
+        .sync_all()
+        .map_err(|source| KeeperError::Io {
+            operation: "fsync writer-lock directory",
+            path: directory.to_path_buf(),
+            source,
+        })?;
+    if !writer_lock_path_matches(path, metadata.dev(), metadata.ino())? {
+        return Err(KeeperError::WriterLockCorrupted {
+            path: path.to_path_buf(),
+            detail: "published LOCK pathname does not name the synced locked inode".to_owned(),
+        });
+    }
+    Ok((file, metadata.dev(), metadata.ino()))
+}
+
+fn writer_lock_record_names_live_owner(record: WriterLockRecord) -> bool {
+    if writer_pid_is_dead(record.pid) {
+        return false;
+    }
+
+    // A live pid whose start identity cannot be inspected remains a
+    // conservative live-owner result. Only a positively observed nonce
+    // mismatch proves PID reuse.
+    #[cfg(target_os = "linux")]
+    {
+        let Some(start_time) = linux_process_start_time(record.pid) else {
+            return true;
+        };
+        writer_pid_start_nonce_from_linux_start_time(record.pid, start_time)
+            == record.pid_start_nonce
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    true
 }
 
 #[cfg(unix)]
@@ -6450,19 +6774,24 @@ fn writer_pid_is_dead(_: u32) -> bool {
 }
 
 #[cfg(unix)]
-fn ensure_writer_lock_identity(admission: &WriterAdmissionInner) -> Result<(), KeeperError> {
+fn writer_lock_path_matches(path: &Path, device: u64, inode: u64) -> Result<bool, KeeperError> {
     use std::os::unix::fs::MetadataExt;
 
-    let metadata =
-        std::fs::symlink_metadata(&admission.lock_path).map_err(|source| KeeperError::Io {
-            operation: "verify writer-lock pathname",
-            path: admission.lock_path.clone(),
-            source,
-        })?;
-    if !metadata.file_type().is_file()
-        || metadata.dev() != admission.lock_device
-        || metadata.ino() != admission.lock_inode
-    {
+    let metadata = std::fs::symlink_metadata(path).map_err(|source| KeeperError::Io {
+        operation: "verify writer-lock pathname",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(metadata.file_type().is_file() && metadata.dev() == device && metadata.ino() == inode)
+}
+
+#[cfg(unix)]
+fn ensure_writer_lock_identity(admission: &WriterAdmissionInner) -> Result<(), KeeperError> {
+    if !writer_lock_path_matches(
+        &admission.lock_path,
+        admission.lock_device,
+        admission.lock_inode,
+    )? {
         return Err(KeeperError::WriterLockCorrupted {
             path: admission.lock_path.clone(),
             detail: "LOCK pathname no longer resolves to the flocked inode".to_owned(),
@@ -8930,11 +9259,14 @@ fn collect_writer_garbage_at_platform(
     ensure_gc_directory_identity(directory, &directory_file)?;
     let live_segments = live_segment_names_at(&directory_file, directory, &snapshot)?;
     let current_generation = snapshot.loaded_manifest().manifest.generation;
+    let segment_unreachable_since =
+        segment_unreachability_floor_at(&directory_file, directory, &snapshot, now)?;
     sweep_garbage_directory(
         &directory_file,
         directory,
         &live_segments,
         current_generation,
+        segment_unreachable_since,
         options,
         now,
     )
@@ -8994,7 +9326,15 @@ fn collect_abandoned_genesis_garbage_at_platform(
         }
     }
     ensure_gc_directory_identity(directory, &directory_file)?;
-    sweep_garbage_directory(&directory_file, directory, &HashSet::new(), 0, options, now)
+    sweep_garbage_directory(
+        &directory_file,
+        directory,
+        &HashSet::new(),
+        0,
+        None,
+        options,
+        now,
+    )
 }
 
 #[cfg(unix)]
@@ -9004,6 +9344,7 @@ fn sweep_garbage_directory(
     directory: &Path,
     live_segments: &HashSet<OsString>,
     current_generation: u64,
+    segment_unreachable_since: Option<SystemTime>,
     options: GarbageCollectionOptions,
     now: SystemTime,
 ) -> Result<GarbageCollectionReport, KeeperError> {
@@ -9083,7 +9424,7 @@ fn sweep_garbage_directory(
     for (name, candidate, stat) in &candidates {
         if matches!(candidate, GarbageCandidate::Segment)
             && !live_segments.contains(name)
-            && stat_old_enough(stat, now, options.grace_period)
+            && segment_old_enough(stat, now, options.grace_period, segment_unreachable_since)
         {
             removable_segments.insert(name.clone());
         }
@@ -9144,6 +9485,151 @@ fn sweep_garbage_directory(
         sync_gc_directory(directory_file, directory)?;
     }
     Ok(GarbageCollectionReport { removed })
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn segment_unreachability_floor_at(
+    directory_file: &File,
+    directory: &Path,
+    snapshot: &KeeperSnapshot,
+    _observation_time: SystemTime,
+) -> Result<Option<SystemTime>, KeeperError> {
+    use rustix::fs::{AtFlags, FileType, fstat, statat};
+
+    let source = snapshot.loaded_manifest().source;
+    match source {
+        ManifestSource::PreviousAfterCorruptCurrent => {
+            // An invalid current inode does not reveal when latent or silent
+            // content corruption was first observed. Its ctime/mtime may be
+            // arbitrarily older than the moment its segments became
+            // unreachable to recovery, so no timestamp-derived grace floor is
+            // admissible. Fail before the sweep until writer recovery
+            // durably republishes a valid current slot.
+            return Err(KeeperError::RecoveryRequired {
+                path: directory.join("MANIFEST"),
+            });
+        }
+        ManifestSource::InMemory => {
+            return Err(KeeperError::GarbageDirectoryChanged {
+                directory: directory.to_path_buf(),
+            });
+        }
+        ManifestSource::PreviousAfterMissingCurrent | ManifestSource::Current => {}
+    }
+
+    if source != ManifestSource::Current {
+        // The namespace mutation that removed or replaced MANIFEST is the
+        // durable recovery-window witness. Unlike the caller's observation
+        // time, it remains stable across repeated GC attempts. Include the
+        // selected previous inode so the inferred floor cannot predate its
+        // publication. Unrelated directory mutations may postpone
+        // reclamation, but cannot accelerate it.
+        let directory_stat = fstat(directory_file)
+            .map_err(io::Error::from)
+            .map_err(|source| KeeperError::Io {
+                operation: "inspect recovery GC directory witness",
+                path: directory.to_path_buf(),
+                source,
+            })?;
+        if FileType::from_raw_mode(directory_stat.st_mode) != FileType::Directory {
+            return Err(KeeperError::GarbageDirectoryChanged {
+                directory: directory.to_path_buf(),
+            });
+        }
+        let mut changed = required_gc_witness_time(
+            &directory_stat,
+            directory,
+            "decode recovery GC directory timestamp",
+        )?;
+
+        let previous_path = directory.join("MANIFEST.prev");
+        let previous_stat = statat(directory_file, "MANIFEST.prev", AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(io::Error::from)
+            .map_err(|source| KeeperError::Io {
+                operation: "inspect recovery MANIFEST.prev witness",
+                path: previous_path.clone(),
+                source,
+            })?;
+        if FileType::from_raw_mode(previous_stat.st_mode) != FileType::RegularFile {
+            return Err(KeeperError::GarbageDirectoryChanged {
+                directory: directory.to_path_buf(),
+            });
+        }
+        changed = std::cmp::max(
+            changed,
+            required_gc_witness_time(
+                &previous_stat,
+                &previous_path,
+                "decode recovery MANIFEST.prev timestamp",
+            )?,
+        );
+        return Ok(Some(changed));
+    }
+
+    let path = directory.join("MANIFEST");
+    let stat = statat(directory_file, "MANIFEST", AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(io::Error::from)
+        .map_err(|source| KeeperError::Io {
+            operation: "inspect MANIFEST unreachability witness",
+            path: path.clone(),
+            source,
+        })?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(KeeperError::GarbageDirectoryChanged {
+            directory: directory.to_path_buf(),
+        });
+    }
+
+    // Renaming the freshly synced current MANIFEST advances its inode ctime,
+    // even when publication reuses an older temp whose mtime and embedded
+    // informational timestamp predate the rename. The embedded witness may be
+    // later (for example after a wall-clock step), so use the later boundary.
+    let changed = required_gc_witness_time(&stat, &path, "decode MANIFEST GC timestamp")?;
+    let manifest = &snapshot.loaded_manifest().manifest;
+    let published = if manifest.last_publish_unix_s > 0 {
+        Some(
+            manifest_publish_time(manifest).ok_or_else(|| KeeperError::Io {
+                operation: "decode MANIFEST publish timestamp",
+                path,
+                source: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "MANIFEST publish timestamp is outside the SystemTime domain",
+                ),
+            })?,
+        )
+    } else {
+        None
+    };
+    Ok(Some(published.map_or(changed, |published| {
+        std::cmp::max(changed, published)
+    })))
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn required_gc_witness_time(
+    stat: &rustix::fs::Stat,
+    path: &Path,
+    operation: &'static str,
+) -> Result<SystemTime, KeeperError> {
+    let changed = stat_change_time(stat).ok_or_else(|| KeeperError::Io {
+        operation,
+        path: path.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidData,
+            "filesystem change timestamp is outside the SystemTime domain",
+        ),
+    })?;
+    let modified = stat_modified_time(stat).ok_or_else(|| KeeperError::Io {
+        operation,
+        path: path.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidData,
+            "filesystem modification timestamp is outside the SystemTime domain",
+        ),
+    })?;
+    Ok(std::cmp::max(changed, modified))
 }
 
 #[cfg(unix)]
@@ -9257,6 +9743,21 @@ fn sidecar_is_orphan_at(
 
 #[cfg(unix)]
 #[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn segment_old_enough(
+    stat: &rustix::fs::Stat,
+    now: SystemTime,
+    grace_period: Duration,
+    unreachable_since: Option<SystemTime>,
+) -> bool {
+    stat_old_enough(stat, now, grace_period)
+        && unreachable_since.is_none_or(|unreachable_since| {
+            now.duration_since(unreachable_since)
+                .is_ok_and(|age| age >= grace_period)
+        })
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
 fn stat_old_enough(stat: &rustix::fs::Stat, now: SystemTime, grace_period: Duration) -> bool {
     stat_modified_time(stat).is_some_and(|modified| {
         now.duration_since(modified)
@@ -9267,8 +9768,26 @@ fn stat_old_enough(stat: &rustix::fs::Stat, now: SystemTime, grace_period: Durat
 #[cfg(unix)]
 #[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
 fn stat_modified_time(stat: &rustix::fs::Stat) -> Option<SystemTime> {
-    let seconds = stat.st_mtime;
-    let nanoseconds = u32::try_from(stat.st_mtime_nsec).ok()?;
+    unix_system_time(stat.st_mtime, u32::try_from(stat.st_mtime_nsec).ok()?)
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn stat_change_time(stat: &rustix::fs::Stat) -> Option<SystemTime> {
+    unix_system_time(stat.st_ctime, u32::try_from(stat.st_ctime_nsec).ok()?)
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn manifest_publish_time(manifest: &Manifest) -> Option<SystemTime> {
+    (manifest.last_publish_unix_s > 0)
+        .then_some(manifest.last_publish_unix_s)
+        .and_then(|seconds| unix_system_time(seconds, 0))
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn unix_system_time(seconds: i64, nanoseconds: u32) -> Option<SystemTime> {
     if nanoseconds >= 1_000_000_000 {
         return None;
     }
@@ -9625,6 +10144,7 @@ fn parse_claim_name(name: &OsStr) -> Option<u64> {
 /// dev()` always yields the raw value widened to `u64` with a sign-extending
 /// cast. Device-identity checks must apply the identical conversion or they
 /// compare different bits on macOS.
+#[cfg(unix)]
 #[allow(clippy::unnecessary_cast, clippy::cast_sign_loss)]
 fn stat_dev_as_u64(stat: &rustix::fs::Stat) -> u64 {
     stat.st_dev as u64
@@ -12687,9 +13207,11 @@ fn managed_disk_bytes(directory: &Path) -> u64 {
 /// Whether a live writer currently holds `directory`'s LOCK.
 ///
 /// Reads the D1 LOCK record and applies the POSIX `kill(pid, 0)` liveness
-/// rule: only a valid record whose pid is demonstrably alive counts. Any
-/// read/parse failure conservatively reports no live writer. Non-Unix targets
-/// cannot prove liveness, so a valid record alone decides there.
+/// rule. Linux additionally requires the recorded process-start nonce to
+/// match the currently observed identity for that pid; an unavailable start
+/// witness stays conservatively live. Any read/parse failure reports no live
+/// writer. Non-Unix targets cannot prove liveness, so a valid record alone
+/// decides there.
 fn detect_live_writer(directory: &Path) -> bool {
     let lock_path = directory.join("LOCK");
     let Ok(mut file) = File::open(&lock_path) else {
@@ -12698,7 +13220,7 @@ fn detect_live_writer(directory: &Path) -> bool {
     let Ok(Some(record)) = read_writer_lock_record(&lock_path, &mut file) else {
         return false;
     };
-    !writer_pid_is_dead(record.pid)
+    writer_lock_record_names_live_owner(record)
 }
 
 impl SegmentStatsProvider for KeeperSnapshot {
@@ -15410,15 +15932,244 @@ mod tests {
         let mut tombstoned = published.next_manifest()?;
         assert!(tombstoned.segments[0].insert_tombstone(0)?);
         let rebound = published.publish_owned_segments(&tombstoned, Vec::new())?;
+        assert!(
+            Arc::ptr_eq(
+                &rebound.segments()[0].term_dictionary_metadata,
+                &published.segments()[0].term_dictionary_metadata,
+            ),
+            "a tombstone-only rebind must reuse the exact validated metadata \
+             allocation for the identical immutable backing"
+        );
         assert_eq!(
             rebound.segments()[0].term_dictionary_cache_counts(),
-            (1, 0),
-            "a new manifest generation receives a fresh validation"
+            (1, 128),
+            "the rebound binding shares its backing's counters: still exactly \
+             one complete validation for these bytes"
+        );
+        assert_eq!(
+            rebound.segments()[0].term_dictionary_metadata_reuse_count(),
+            1
         );
         assert_eq!(
             published.segments()[0].term_dictionary_cache_counts(),
             (1, 128),
-            "the prior snapshot retains its own cache generation"
+            "the prior snapshot observes the same shared backing counters"
+        );
+
+        let mut chained = rebound.next_manifest()?;
+        assert!(chained.segments[1].insert_tombstone(65_536)?);
+        let chained_snapshot = rebound.publish_owned_segments(&chained, Vec::new())?;
+        assert!(Arc::ptr_eq(
+            &chained_snapshot.segments()[0].term_dictionary_metadata,
+            &published.segments()[0].term_dictionary_metadata,
+        ));
+        assert_eq!(
+            chained_snapshot.segments()[0].term_dictionary_metadata_reuse_count(),
+            2,
+            "rebind chains keep reusing the original validation"
+        );
+        assert_eq!(
+            chained_snapshot.segments()[0]
+                .term_dictionary_cache_counts()
+                .0,
+            1,
+            "no rebind in the chain may repeat a complete validation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn term_dictionary_reuse_witness_mismatch_falls_back_to_fresh_validation() -> TestResult {
+        let original = KeeperSnapshot::in_memory(DEFAULT_SCHEMA)?;
+        let first = encoded_identity_test_segment(0xd01, 0, &[Some("wit-a")])?;
+        let second = encoded_identity_test_segment(0xd02, 65_536, &[Some("wit-b")])?;
+        let mut proposed = original.next_manifest()?;
+        proposed.docid_high_watermark = 65_537;
+        proposed.segments = vec![manifest_segment(&first, 10), manifest_segment(&second, 20)];
+        let published = original.publish_owned_segments(&proposed, vec![first, second])?;
+        let [seg_a, seg_b] = published.segments() else {
+            panic!("fixture publishes exactly two segments");
+        };
+
+        // A predecessor naming a DIFFERENT immutable backing must never leak
+        // its validated metadata into this binding: the Arc identity witness
+        // fails first and the binding falls back to one complete validation.
+        let rebound = RecoveredSegment::bind_shared(
+            seg_b.path.clone(),
+            seg_b.manifest.clone(),
+            Arc::clone(&seg_b.reader),
+            Arc::clone(&seg_b.rank_pruning_cache),
+            DEFAULT_SCHEMA,
+            Some(seg_a),
+        )?;
+        assert!(
+            !Arc::ptr_eq(
+                &rebound.term_dictionary_metadata,
+                &seg_a.term_dictionary_metadata
+            ),
+            "cross-backing reuse must be rejected"
+        );
+        assert_eq!(
+            rebound.term_dictionary_cache_counts(),
+            (1, 0),
+            "the fallback path performs exactly one complete fresh validation"
+        );
+        assert_eq!(rebound.term_dictionary_metadata_reuse_count(), 0);
+        assert_eq!(rebound.term_dictionary(DEFAULT_SCHEMA)?.term_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn cached_termdict_views_do_not_re_read_bytes_while_fresh_open_fails_closed() -> TestResult {
+        let directory = tempdir()?;
+        let encoded = encoded_identity_test_segment(0xe01, 0, &[Some("live"), Some("spare")])?;
+        let segment_path = directory.path().join(canonical_segment_name(0xe01));
+        std::fs::write(&segment_path, encoded.as_bytes())?;
+        let manifest = durable_test_manifest(1, vec![manifest_segment(&encoded, 1)]);
+        write_manifest(&directory.path().join("MANIFEST"), &manifest)?;
+
+        let snapshot = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+        assert_eq!(
+            snapshot.segments()[0].term_dictionary_cache_counts(),
+            (1, 0)
+        );
+        assert_eq!(
+            snapshot.segments()[0]
+                .term_dictionary(DEFAULT_SCHEMA)?
+                .term_count(),
+            0
+        );
+
+        // Corrupt the durable TERMDICT payload AFTER the snapshot validated
+        // and cached its metadata. The empty dictionary's leading block_count
+        // becomes non-zero, so ANY re-validation of these bytes must fail.
+        //
+        // Note the structural QG-3 guard this test leans on: mutable bytes
+        // exist only on the durable path, and every durable successor
+        // snapshot is a cold reopen that re-validates from scratch. The
+        // in-memory rebind reuse path can never observe divergent bytes
+        // because its backing is an immutable shared allocation.
+        let termdict_offset = usize::try_from(
+            encoded
+                .section_entries()
+                .iter()
+                .find(|entry| entry.kind == SectionKind::TERMDICT)
+                .expect("fixture TERMDICT entry")
+                .offset,
+        )?;
+        let mut corrupted = std::fs::read(&segment_path)?;
+        corrupted[termdict_offset] ^= 0x01;
+        std::fs::write(&segment_path, corrupted)?;
+
+        // The live snapshot keeps serving borrowed views from the cached
+        // validated metadata without re-reading or re-hashing TERMDICT
+        // content, so it must not detect the on-disk mutation.
+        assert_eq!(
+            snapshot.segments()[0]
+                .term_dictionary(DEFAULT_SCHEMA)?
+                .term_count(),
+            0,
+            "cached views must not re-read durable TERMDICT bytes"
+        );
+        assert_eq!(
+            snapshot.segments()[0].term_dictionary_cache_counts().0,
+            1,
+            "the cached path must not run a second complete validation"
+        );
+
+        // A cold open of the same directory sees the corrupted bytes with no
+        // cache to lean on and must fail closed before publication.
+        let Err(error) = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA) else {
+            panic!("fresh open must re-validate and reject corrupted TERMDICT bytes");
+        };
+        assert!(
+            matches!(&error, KeeperError::SegmentOpen { path, .. } if path == &segment_path),
+            "fresh open must fail closed on the corrupted segment: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_segment_rebind_is_rejected_with_reopen_required_transition_error() -> TestResult {
+        let directory = tempdir()?;
+        let encoded = encoded_identity_test_segment(0xe02, 0, &[Some("map-a"), Some("map-b")])?;
+        std::fs::write(
+            directory.path().join(canonical_segment_name(0xe02)),
+            encoded.as_bytes(),
+        )?;
+        let manifest = durable_test_manifest(1, vec![manifest_segment(&encoded, 1)]);
+        write_manifest(&directory.path().join("MANIFEST"), &manifest)?;
+
+        let snapshot = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+        let segment = &snapshot.segments()[0];
+        assert_eq!(segment.term_dictionary_cache_counts(), (1, 0));
+
+        // A mapped backing must never rebind in place: neither metadata reuse
+        // nor the fresh-validation fallback is honest over bytes that can
+        // change on disk behind warm checksum gates. The typed transition
+        // error tells the caller a durable reopen is required.
+        let mut successor = snapshot.next_manifest()?;
+        assert!(successor.segments[0].insert_tombstone(1)?);
+        let error = segment.rebind(successor.segments[0].clone()).err();
+        assert!(
+            matches!(
+                error.as_ref(),
+                Some(KeeperError::InvalidTransition { detail })
+                    if detail.contains("cannot rebind in place")
+                        && detail.contains("durable reopen")
+                        && detail.contains("owned-only")
+            ),
+            "mapped rebind must fail with the typed reopen-required transition \
+             error: {error:?}"
+        );
+        assert_eq!(
+            segment.term_dictionary_cache_counts(),
+            (1, 0),
+            "the rejected rebind must not validate or reuse anything"
+        );
+        assert_eq!(segment.term_dictionary_metadata_reuse_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn validated_termdict_metadata_bytes_are_accounted_and_shared_across_rebinds() -> TestResult {
+        let original = KeeperSnapshot::in_memory(DEFAULT_SCHEMA)?;
+        let first = encoded_identity_test_segment(0xf01, 0, &[Some("acct-a")])?;
+        let second = encoded_identity_test_segment(0xf02, 65_536, &[Some("acct-b")])?;
+        let mut proposed = original.next_manifest()?;
+        proposed.docid_high_watermark = 65_537;
+        proposed.segments = vec![manifest_segment(&first, 10), manifest_segment(&second, 20)];
+        let published = original.publish_owned_segments(&proposed, vec![first, second])?;
+
+        let per_segment = published
+            .segments()
+            .iter()
+            .map(RecoveredSegment::term_dictionary_metadata_payload_bytes)
+            .collect::<Vec<_>>();
+        assert!(
+            per_segment.iter().all(|&bytes| bytes > 0),
+            "every binding must account its retained metadata object"
+        );
+        let expected_total = per_segment.iter().fold(0_u64, |total, &bytes| {
+            total.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX))
+        });
+        assert_eq!(
+            published.term_dictionary_metadata_payload_bytes(),
+            expected_total
+        );
+
+        let mut tombstoned = published.next_manifest()?;
+        assert!(tombstoned.segments[0].insert_tombstone(0)?);
+        let rebound = published.publish_owned_segments(&tombstoned, Vec::new())?;
+        assert_eq!(
+            rebound.segments()[0].term_dictionary_metadata_payload_bytes(),
+            per_segment[0],
+            "a rebound binding reports the shared allocation, not a new one"
+        );
+        assert_eq!(
+            rebound.term_dictionary_metadata_payload_bytes(),
+            expected_total,
+            "tombstone-only rebinds must not grow persistent metadata bytes"
         );
         Ok(())
     }
@@ -16412,6 +17163,472 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn old_segment_gets_a_full_grace_window_after_becoming_unreachable() -> TestResult {
+        let directory = tempdir()?;
+        let unreachable = write_test_segment(directory.path(), 0xdead, 1, 0, 2)?;
+        let unreachable_path = directory
+            .path()
+            .join(canonical_segment_name(unreachable.segment_id));
+        File::options()
+            .write(true)
+            .open(&unreachable_path)?
+            .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))?;
+
+        // The segment was reachable before generation 2 and has only just
+        // fallen out of the two-slot union at generation 3. Its ancient file
+        // mtime must not consume the grace period that starts at that
+        // unreachability transition.
+        write_manifest(
+            &directory.path().join("MANIFEST.prev"),
+            &durable_test_manifest(2, Vec::new()),
+        )?;
+        write_manifest(
+            &directory.path().join("MANIFEST"),
+            &durable_test_manifest(3, Vec::new()),
+        )?;
+        let snapshot = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+        let directory_file = open_gc_directory(directory.path())?;
+        let observed = SystemTime::now();
+        let unreachable_since = segment_unreachability_floor_at(
+            &directory_file,
+            directory.path(),
+            &snapshot,
+            observed,
+        )?
+        .ok_or_else(|| io::Error::other("current MANIFEST supplies a GC floor"))?;
+        let options = GarbageCollectionOptions {
+            grace_period: Duration::from_secs(60),
+        };
+
+        let before_grace = unreachable_since
+            .checked_add(Duration::from_secs(59))
+            .ok_or_else(|| io::Error::other("test clock remains representable"))?;
+        assert!(
+            collect_writer_garbage_at(directory.path(), DEFAULT_SCHEMA, options, before_grace,)?
+                .is_empty(),
+            "an old segment must survive until it has been unreachable for the full grace period"
+        );
+        assert!(unreachable_path.exists());
+
+        let after_grace = unreachable_since
+            .checked_add(Duration::from_secs(60))
+            .ok_or_else(|| io::Error::other("test clock remains representable"))?;
+        assert_eq!(
+            collect_writer_garbage_at(directory.path(), DEFAULT_SCHEMA, options, after_grace,)?
+                .removed,
+            vec![PathBuf::from(canonical_segment_name(
+                unreachable.segment_id
+            ))]
+        );
+        assert!(!unreachable_path.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_gc_floor_is_stable_across_repeated_attempts() -> TestResult {
+        let directory = tempdir()?;
+        let unreachable = write_test_segment(directory.path(), 0xbeef, 1, 0, 2)?;
+        let segment_name = canonical_segment_name(unreachable.segment_id);
+        let segment_path = directory.path().join(&segment_name);
+        File::options()
+            .write(true)
+            .open(&segment_path)?
+            .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))?;
+
+        write_manifest(
+            &directory.path().join("MANIFEST.prev"),
+            &durable_test_manifest(1, Vec::new()),
+        )?;
+        write_manifest(
+            &directory.path().join(".tmp-manifest-2"),
+            &durable_test_manifest(2, vec![unreachable]),
+        )?;
+
+        let snapshot = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+        assert_eq!(
+            snapshot.loaded_manifest().source,
+            ManifestSource::PreviousAfterMissingCurrent
+        );
+        let directory_file = open_gc_directory(directory.path())?;
+        let first_observation = SystemTime::now();
+        let first_floor = segment_unreachability_floor_at(
+            &directory_file,
+            directory.path(),
+            &snapshot,
+            first_observation,
+        )?
+        .ok_or_else(|| io::Error::other("recovery must supply a GC floor"))?;
+        let later_observation = first_observation
+            .checked_add(Duration::from_secs(3_600))
+            .ok_or_else(|| io::Error::other("test clock remains representable"))?;
+        let second_floor = segment_unreachability_floor_at(
+            &directory_file,
+            directory.path(),
+            &snapshot,
+            later_observation,
+        )?
+        .ok_or_else(|| io::Error::other("recovery must supply a stable GC floor"))?;
+        assert_eq!(
+            second_floor, first_floor,
+            "a later observation must not restart the recovery grace window"
+        );
+
+        let options = GarbageCollectionOptions {
+            grace_period: Duration::from_secs(60),
+        };
+        let before_grace = first_floor
+            .checked_add(Duration::from_secs(59))
+            .ok_or_else(|| io::Error::other("test clock remains representable"))?;
+        assert!(
+            collect_writer_garbage_at(directory.path(), DEFAULT_SCHEMA, options, before_grace)?
+                .is_empty(),
+            "the first recovery attempt must preserve the segment for the full grace"
+        );
+        assert!(segment_path.exists());
+
+        let after_grace = first_floor
+            .checked_add(options.grace_period)
+            .ok_or_else(|| io::Error::other("test clock remains representable"))?;
+        let mut expected_removed = vec![
+            PathBuf::from(".tmp-manifest-2"),
+            PathBuf::from(segment_name),
+        ];
+        expected_removed.sort_unstable();
+        assert_eq!(
+            collect_writer_garbage_at(directory.path(), DEFAULT_SCHEMA, options, after_grace)?
+                .removed,
+            expected_removed,
+            "the second recovery attempt must not reset the grace to its call time"
+        );
+        assert!(!segment_path.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn corrupt_current_blocks_gc_until_valid_current_is_republished() -> TestResult {
+        use rustix::fs::{AtFlags, statat};
+
+        let directory = tempdir()?;
+        let unreachable = write_test_segment(directory.path(), 0x00c0_ffee, 1, 0, 2)?;
+        let segment_name = canonical_segment_name(unreachable.segment_id);
+        let segment_path = directory.path().join(&segment_name);
+        File::options()
+            .write(true)
+            .open(&segment_path)?
+            .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))?;
+
+        write_manifest(
+            &directory.path().join("MANIFEST.prev"),
+            &durable_test_manifest(1, Vec::new()),
+        )?;
+        let current_path = directory.path().join("MANIFEST");
+        std::fs::write(&current_path, b"old latent corruption")?;
+        File::options()
+            .write(true)
+            .open(&current_path)?
+            .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))?;
+
+        let snapshot = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+        assert_eq!(
+            snapshot.loaded_manifest().source,
+            ManifestSource::PreviousAfterCorruptCurrent
+        );
+        let directory_file = open_gc_directory(directory.path())?;
+        let current_stat = statat(&directory_file, "MANIFEST", AtFlags::SYMLINK_NOFOLLOW)?;
+        let stale_inode_time = required_gc_witness_time(
+            &current_stat,
+            &current_path,
+            "decode test corrupt-current timestamp",
+        )?;
+        let first_observation = stale_inode_time
+            .checked_add(DEFAULT_GARBAGE_GRACE + Duration::from_secs(1))
+            .ok_or_else(|| io::Error::other("test clock remains representable"))?;
+        let second_observation = first_observation
+            .checked_add(Duration::from_secs(3_600))
+            .ok_or_else(|| io::Error::other("test clock remains representable"))?;
+        let before = directory_bytes(directory.path())?;
+
+        assert!(matches!(
+            collect_writer_garbage_at(
+                directory.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions::default(),
+                first_observation,
+            ),
+            Err(KeeperError::RecoveryRequired { .. })
+        ));
+        assert_eq!(directory_bytes(directory.path())?, before);
+        assert!(segment_path.exists());
+
+        assert!(matches!(
+            collect_writer_garbage_at(
+                directory.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions::default(),
+                second_observation,
+            ),
+            Err(KeeperError::RecoveryRequired { .. })
+        ));
+        assert_eq!(directory_bytes(directory.path())?, before);
+        assert!(segment_path.exists());
+
+        write_manifest(&current_path, &durable_test_manifest(2, Vec::new()))?;
+        File::open(&current_path)?.sync_all()?;
+        sync_directory(directory.path())?;
+        let recovered = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+        assert_eq!(recovered.loaded_manifest().source, ManifestSource::Current);
+        let directory_file = open_gc_directory(directory.path())?;
+        let republish_floor = segment_unreachability_floor_at(
+            &directory_file,
+            directory.path(),
+            &recovered,
+            second_observation,
+        )?
+        .ok_or_else(|| io::Error::other("valid republish supplies a GC floor"))?;
+        let after_republish_grace = republish_floor
+            .checked_add(DEFAULT_GARBAGE_GRACE)
+            .ok_or_else(|| io::Error::other("test clock remains representable"))?;
+        assert_eq!(
+            collect_writer_garbage_at(
+                directory.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions::default(),
+                after_republish_grace,
+            )?
+            .removed,
+            vec![PathBuf::from(segment_name)]
+        );
+        assert!(!segment_path.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_publication_resets_unreachable_segment_grace() -> TestResult {
+        fn valid_manifest(path: &Path) -> Result<Manifest, String> {
+            match read_manifest_slot(path).map_err(|error| error.to_string())? {
+                ManifestSlot::Valid(manifest) => Ok(manifest),
+                ManifestSlot::Missing => Err(format!("{} is missing", path.display())),
+                ManifestSlot::Invalid(error) => {
+                    Err(format!("{} is invalid: {error}", path.display()))
+                }
+            }
+        }
+
+        let index = tempdir()?;
+        let segment = write_test_segment(index.path(), 0xd00d, 1, 0, 2)?;
+        let segment_id = segment.segment_id;
+        let segment_path = index.path().join(canonical_segment_name(segment_id));
+        File::options()
+            .write(true)
+            .open(&segment_path)?
+            .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))?;
+        write_manifest(
+            &index.path().join("MANIFEST"),
+            &durable_test_manifest(1, vec![segment]),
+        )?;
+
+        let directory = index.path().to_path_buf();
+        let outcome: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let mut writer = KeeperWriter::open(&cx, &directory, DEFAULT_SCHEMA)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !writer
+                .snapshot()
+                .loaded_manifest()
+                .manifest
+                .segments
+                .iter()
+                .any(|segment| segment.segment_id == segment_id)
+            {
+                return Err("generation 1 does not reference the segment".to_owned());
+            }
+
+            let mut publish_two = writer
+                .snapshot()
+                .next_manifest()
+                .map_err(|error| error.to_string())?;
+            writer
+                .snapshot()
+                .delete_all(&mut publish_two)
+                .map_err(|error| error.to_string())?;
+            publish_two.last_publish_unix_s = 0;
+            writer
+                .publish(&cx, &publish_two)
+                .await
+                .map_err(|error| error.to_string())?;
+
+            let current = valid_manifest(&directory.join("MANIFEST"))?;
+            let previous = valid_manifest(&directory.join("MANIFEST.prev"))?;
+            if current.generation != 2
+                || current
+                    .segments
+                    .iter()
+                    .any(|segment| segment.segment_id == segment_id)
+                || previous.generation != 1
+                || !previous
+                    .segments
+                    .iter()
+                    .any(|segment| segment.segment_id == segment_id)
+            {
+                return Err(
+                    "generation 2 must retain the segment only through MANIFEST.prev".to_owned(),
+                );
+            }
+            let options = GarbageCollectionOptions {
+                grace_period: Duration::from_secs(60),
+            };
+            let while_previous_is_live = SystemTime::now()
+                .checked_add(Duration::from_secs(120))
+                .ok_or_else(|| "test clock remains representable".to_owned())?;
+            if !collect_writer_garbage_at(
+                &directory,
+                DEFAULT_SCHEMA,
+                options,
+                while_previous_is_live,
+            )
+            .map_err(|error| error.to_string())?
+            .is_empty()
+                || !segment_path.exists()
+            {
+                return Err("MANIFEST.prev reachability did not protect the segment".to_owned());
+            }
+
+            let mut publish_three = writer
+                .snapshot()
+                .next_manifest()
+                .map_err(|error| error.to_string())?;
+            publish_three.last_publish_unix_s = 0;
+            writer
+                .publish(&cx, &publish_three)
+                .await
+                .map_err(|error| error.to_string())?;
+            let current = valid_manifest(&directory.join("MANIFEST"))?;
+            let previous = valid_manifest(&directory.join("MANIFEST.prev"))?;
+            if current.generation != 3
+                || previous.generation != 2
+                || current
+                    .segments
+                    .iter()
+                    .chain(&previous.segments)
+                    .any(|segment| segment.segment_id == segment_id)
+            {
+                return Err("generation 3 did not make the segment unreachable".to_owned());
+            }
+
+            let directory_file =
+                open_gc_directory(&directory).map_err(|error| error.to_string())?;
+            let third_publish_floor = segment_unreachability_floor_at(
+                &directory_file,
+                &directory,
+                writer.snapshot(),
+                SystemTime::now(),
+            )
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "generation 3 did not supply an unreachability floor".to_owned())?;
+            let before_first_grace = third_publish_floor
+                .checked_add(Duration::from_secs(59))
+                .ok_or_else(|| "test clock remains representable".to_owned())?;
+            if !collect_writer_garbage_at(&directory, DEFAULT_SCHEMA, options, before_first_grace)
+                .map_err(|error| error.to_string())?
+                .is_empty()
+                || !segment_path.exists()
+            {
+                return Err("newly unreachable segment did not receive its full grace".to_owned());
+            }
+
+            std::thread::sleep(Duration::from_millis(10));
+            let mut publish_four = writer
+                .snapshot()
+                .next_manifest()
+                .map_err(|error| error.to_string())?;
+            publish_four.last_publish_unix_s = 0;
+            writer
+                .publish(&cx, &publish_four)
+                .await
+                .map_err(|error| error.to_string())?;
+            let directory_file =
+                open_gc_directory(&directory).map_err(|error| error.to_string())?;
+            let fourth_publish_floor = segment_unreachability_floor_at(
+                &directory_file,
+                &directory,
+                writer.snapshot(),
+                SystemTime::now(),
+            )
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "generation 4 did not supply an unreachability floor".to_owned())?;
+            if fourth_publish_floor <= third_publish_floor {
+                return Err("later publication did not advance the conservative floor".to_owned());
+            }
+
+            let old_grace_deadline = third_publish_floor
+                .checked_add(options.grace_period)
+                .ok_or_else(|| "test clock remains representable".to_owned())?;
+            if !collect_writer_garbage_at(&directory, DEFAULT_SCHEMA, options, old_grace_deadline)
+                .map_err(|error| error.to_string())?
+                .is_empty()
+                || !segment_path.exists()
+            {
+                return Err("later publication did not reset the conservative floor".to_owned());
+            }
+
+            let reset_grace_deadline = fourth_publish_floor
+                .checked_add(options.grace_period)
+                .ok_or_else(|| "test clock remains representable".to_owned())?;
+            let report = collect_writer_garbage_at(
+                &directory,
+                DEFAULT_SCHEMA,
+                options,
+                reset_grace_deadline,
+            )
+            .map_err(|error| error.to_string())?;
+            if report.removed != vec![PathBuf::from(canonical_segment_name(segment_id))]
+                || segment_path.exists()
+            {
+                return Err("segment was not reclaimed at the reset grace deadline".to_owned());
+            }
+            Ok(())
+        });
+        outcome.map_err(io::Error::other)?;
+        Ok(())
+    }
+
+    #[test]
+    fn gc_refuses_to_delete_a_newly_unreachable_segment_without_provenance() -> TestResult {
+        let directory = tempdir()?;
+        let live = write_test_segment(directory.path(), 0xa, 1, 0, 2)?;
+        let newly_unreachable = write_test_segment(directory.path(), 0xb, 2, 2, 4)?;
+        let previous = durable_test_manifest(2, vec![live.clone()]);
+        let mut current = durable_test_manifest(3, vec![live]);
+        current.docid_high_watermark = previous.docid_high_watermark;
+        write_manifest(&directory.path().join("MANIFEST.prev"), &previous)?;
+        write_manifest(&directory.path().join("MANIFEST"), &current)?;
+
+        let now = SystemTime::now()
+            .checked_add(DEFAULT_GARBAGE_GRACE + Duration::from_secs(1))
+            .expect("test clock remains representable");
+        let report = collect_writer_garbage_at(
+            directory.path(),
+            DEFAULT_SCHEMA,
+            GarbageCollectionOptions::default(),
+            now,
+        )?;
+
+        assert!(report.is_empty());
+        assert!(
+            directory
+                .path()
+                .join(canonical_segment_name(newly_unreachable.segment_id))
+                .exists(),
+            "a missing first-unreachable receipt must fail closed rather than infer age from mtime"
+        );
+        Ok(())
+    }
+
     #[test]
     fn future_claim_blocks_gc_before_any_deletion() -> TestResult {
         let directory = tempdir()?;
@@ -16862,6 +18079,15 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(10));
                 }
             }
+            if role == "live_pid" {
+                std::fs::write(control.join(format!("ready-{identifier}")), [])
+                    .map_err(|error| error.to_string())?;
+                let release = control.join("RELEASE");
+                while !release.exists() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                return Ok(());
+            }
             match KeeperWriter::open(&cx, &directory, DEFAULT_SCHEMA).await {
                 Ok(writer) => {
                     if role == "hold_unpublished" {
@@ -16930,7 +18156,59 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn writer_admission_is_exclusive_reusable_and_corruption_fails_closed() -> TestResult {
+    fn writer_admission_atomically_replaces_and_recovers_a_torn_record() -> TestResult {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempdir()?;
+        let lock_path = directory.path().join("LOCK");
+        std::fs::write(&lock_path, [])?;
+        let empty_inode = std::fs::metadata(&lock_path)?.ino();
+        let first = acquire_writer_admission(directory.path())?;
+        let active_inode = std::fs::metadata(&lock_path)?.ino();
+        assert_ne!(
+            active_inode, empty_inode,
+            "record publication must replace rather than overwrite LOCK"
+        );
+        let active_bytes = std::fs::read(&lock_path)?;
+        assert_eq!(active_bytes.len(), WRITER_LOCK_RECORD_BYTES);
+        assert!(matches!(
+            acquire_writer_admission(directory.path()),
+            Err(KeeperError::WriterBusy {
+                owner_pid: Some(pid),
+                ..
+            }) if pid == std::process::id()
+        ));
+        assert_eq!(std::fs::read(&lock_path)?, active_bytes);
+        drop(first);
+        assert_eq!(std::fs::metadata(&lock_path)?.len(), 0);
+
+        let second = acquire_writer_admission(directory.path())?;
+        drop(second);
+        std::fs::write(&lock_path, b"truncated")?;
+        let torn_inode = std::fs::metadata(&lock_path)?.ino();
+        let recovered = acquire_writer_admission(directory.path())?;
+        assert_ne!(
+            std::fs::metadata(&lock_path)?.ino(),
+            torn_inode,
+            "torn record recovery must install a complete replacement inode"
+        );
+        let recovered_bytes = std::fs::read(&lock_path)?;
+        assert_eq!(
+            WriterLockRecord::from_bytes(&recovered_bytes),
+            Ok(recovered.record)
+        );
+        assert!(matches!(
+            acquire_writer_admission(directory.path()),
+            Err(KeeperError::WriterBusy { .. })
+        ));
+        drop(recovered);
+        assert_eq!(std::fs::metadata(lock_path)?.len(), 0);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_admission_is_exclusive_reusable_and_repairs_torn_records() -> TestResult {
         let directory = tempdir()?;
         let first = acquire_writer_admission(directory.path())?;
         let lock_path = directory.path().join("LOCK");
@@ -16950,12 +18228,101 @@ mod tests {
         let second = acquire_writer_admission(directory.path())?;
         drop(second);
         std::fs::write(&lock_path, b"truncated")?;
-        let before = std::fs::read(&lock_path)?;
+        let repaired = acquire_writer_admission(directory.path())?;
+        assert_eq!(
+            std::fs::metadata(&lock_path)?.len(),
+            usize_to_u64(WRITER_LOCK_RECORD_BYTES)
+        );
+        drop(repaired);
+        assert_eq!(std::fs::metadata(lock_path)?.len(), 0);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_reused_pid_with_a_different_start_nonce_does_not_block_takeover() -> TestResult {
+        let directory = tempdir()?;
+        let control = tempdir()?;
+        let ready = control.path().join("ready-reused");
+        let mut child = spawn_writer_child("live_pid", directory.path(), control.path(), "reused")?;
+        wait_for_child_marker(&mut child, &ready, "live pid fixture")?;
+
+        let pid = child.child_mut().id();
+        let acquired_unix_s = 1_700_000_000;
+        let observed_nonce = linux_process_start_time(pid)
+            .map(|start_time| writer_pid_start_nonce_from_linux_start_time(pid, start_time))
+            .ok_or_else(|| io::Error::other("live child start identity is observable"))?;
+        let stale = WriterLockRecord {
+            pid,
+            pid_start_nonce: observed_nonce ^ 1,
+            acquired_unix_s,
+        };
+        std::fs::write(directory.path().join("LOCK"), stale.to_bytes())?;
+        assert!(
+            !writer_lock_record_names_live_owner(stale),
+            "same numeric pid with a different process start must be stale"
+        );
+
+        let admission = acquire_writer_admission(directory.path())?;
+        drop(admission);
+
+        let matching = WriterLockRecord {
+            pid,
+            pid_start_nonce: observed_nonce,
+            acquired_unix_s,
+        };
+        std::fs::write(directory.path().join("LOCK"), matching.to_bytes())?;
+        assert!(writer_lock_record_names_live_owner(matching));
         assert!(matches!(
             acquire_writer_admission(directory.path()),
-            Err(KeeperError::WriterLockCorrupted { .. })
+            Err(KeeperError::WriterBusy {
+                owner_pid: Some(owner),
+                ..
+            }) if owner == pid
         ));
-        assert_eq!(std::fs::read(lock_path)?, before);
+
+        std::fs::write(control.path().join("RELEASE"), [])?;
+        child.wait_success()?;
+        let after_exit = acquire_writer_admission(directory.path())?;
+        drop(after_exit);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_admission_replaces_a_live_pid_record_with_a_stale_start_nonce() -> TestResult {
+        let directory = tempdir()?;
+        let admission = acquire_writer_admission(directory.path())?;
+        let lock_path = directory.path().join("LOCK");
+        drop(admission);
+
+        let current = WriterLockRecord::current(&lock_path)?;
+        let stale = WriterLockRecord {
+            pid_start_nonce: current.pid_start_nonce ^ 1,
+            ..current
+        };
+        std::fs::write(&lock_path, stale.to_bytes())?;
+
+        let replacement = acquire_writer_admission(directory.path())?;
+        assert_ne!(replacement.record.pid_start_nonce, stale.pid_start_nonce);
+        drop(replacement);
+        assert_eq!(std::fs::metadata(lock_path)?.len(), 0);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_writer_start_nonce_is_not_reported_as_live() -> TestResult {
+        let directory = tempdir()?;
+        let lock_path = directory.path().join("LOCK");
+        let current = WriterLockRecord::current(&lock_path)?;
+        let stale = WriterLockRecord {
+            pid_start_nonce: current.pid_start_nonce ^ 1,
+            ..current
+        };
+        std::fs::write(&lock_path, stale.to_bytes())?;
+
+        assert!(!detect_live_writer(directory.path()));
         Ok(())
     }
 

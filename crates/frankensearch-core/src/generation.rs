@@ -71,6 +71,8 @@ pub const EMBEDDING_PRODUCER_ATTESTATION_SCHEMA_V1: u16 = 1;
 pub const EMBEDDING_INPUT_CONTRACT_SCHEMA_V1: u16 = 1;
 /// Current schema for vector-storage identities.
 pub const VECTOR_STORAGE_IDENTITY_SCHEMA_V1: u16 = 1;
+/// Current schema for explicit foreign-producer conformance certificates.
+pub const FOREIGN_PRODUCER_CONFORMANCE_CERTIFICATE_SCHEMA_V1: u16 = 1;
 /// Current schema for immutable artifact-generation identities.
 pub const ARTIFACT_GENERATION_IDENTITY_SCHEMA_V1: u16 = 1;
 
@@ -125,6 +127,7 @@ impl ArtifactGenerationIdentityV1 {
             self.schema_version,
             ARTIFACT_GENERATION_IDENTITY_SCHEMA_V1,
         )?;
+        // ubs:ignore — this serialized generation-uniqueness nonce is public, not an authenticator.
         if self.nonce == [0; 16] {
             return Err(identity_error(
                 "artifact_generation.nonce",
@@ -151,6 +154,1624 @@ impl ArtifactGenerationIdentityV1 {
     pub fn fingerprint(&self) -> String {
         sha256_hex(&self.canonical_bytes())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Immutable generation authority
+// ---------------------------------------------------------------------------
+
+/// Schema carried by immutable generation-authority references and slot frames.
+pub const GENERATION_AUTHORITY_SCHEMA_V1: u16 = 1;
+/// Schema for the deterministic anti-rollback floor reference provider.
+pub const ANTI_ROLLBACK_FLOOR_SCHEMA_V1: u16 = 1;
+/// Exact byte size of one physical `AUTHORITY` slot frame.
+pub const GENERATION_AUTHORITY_SLOT_BYTES_V1: usize = 4_096;
+/// Maximum canonical activation-manifest size accepted before decoding.
+pub const GENERATION_ACTIVATION_MANIFEST_MAX_BYTES_V1: usize = 4_096;
+/// Exact byte size of one physical `LOCK` owner or attempt frame.
+pub const GENERATION_LOCK_FRAME_BYTES_V1: usize = 4_096;
+
+const AUTHORITY_SLOT_DIGEST_BYTES: usize = 32;
+const AUTHORITY_SLOT_BODY_BYTES: usize =
+    GENERATION_AUTHORITY_SLOT_BYTES_V1 - AUTHORITY_SLOT_DIGEST_BYTES;
+const AUTHORITY_SLOT_MAGIC_V1: [u8; 8] = *b"FSAUTH01";
+const AUTHORITY_SLOT_HEADER_BYTES: usize = 131;
+const AUTHORITY_REF_MAGIC_V1: [u8; 9] = *b"FSAUTHREF";
+const AUTHORITY_REF_BYTES_V1: usize = 108;
+const LOCK_FRAME_DIGEST_BYTES: usize = 32;
+const LOCK_FRAME_BODY_BYTES: usize = GENERATION_LOCK_FRAME_BYTES_V1 - LOCK_FRAME_DIGEST_BYTES;
+const LOCK_FRAME_MAGIC_V1: [u8; 8] = *b"FSLOCK01";
+const LOCK_FRAME_HEADER_BYTES: usize = 104;
+
+/// A bounded reason why an authority reference, physical slot, or slot pair was
+/// rejected. The error deliberately contains no paths, opaque object contents,
+/// or unbounded caller data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum GenerationAuthorityErrorV1 {
+    /// A required fixed-format field had an unsupported or reserved value.
+    #[error("generation authority has an invalid {field}")]
+    InvalidField {
+        /// Stable field identifier.
+        field: &'static str,
+    },
+    /// A fixed-size frame was truncated or extended.
+    #[error("generation authority slot has an invalid length")]
+    InvalidSlotLength,
+    /// The frame checksum did not authenticate its exact body bytes.
+    #[error("generation authority slot checksum mismatch")]
+    ChecksumMismatch,
+    /// A frame was copied into the wrong physical slot.
+    #[error("generation authority slot index mismatch")]
+    SlotIndexMismatch,
+    /// A frame was copied between authority roots.
+    #[error("generation authority root mismatch")]
+    RootMismatch,
+    /// Canonical zero padding contained data.
+    #[error("generation authority slot contains non-canonical padding")]
+    NonCanonicalPadding,
+    /// Both slots represented an equal-sequence fork.
+    #[error("generation authority slots contain an equal-sequence fork")]
+    EqualSequenceFork,
+    /// A duplicate authority was not the permitted sequence-one genesis form.
+    #[error("generation authority slots contain a non-genesis duplicate")]
+    NonGenesisDuplicate,
+    /// Both resolver inputs claimed the same physical authority slot.
+    #[error("generation authority resolver received one physical slot twice")]
+    DuplicatePhysicalSlot,
+    /// A non-genesis authority was stored in the wrong physical slot.
+    #[error("generation authority slot does not match its sequence parity")]
+    SlotSequenceParity,
+    /// The newer slot skipped a sequence or lacked an exact predecessor link.
+    #[error("generation authority slots lack a consecutive predecessor link")]
+    BrokenPredecessorLink,
+    /// A lock frame belonged to a different authority root than the slots.
+    #[error("generation authority lock root does not match the resolved authority")]
+    LockRootMismatch,
+    /// An owner lock did not attest the resolved authority head.
+    #[error("generation authority lock does not attest the resolved authority")]
+    LockAuthorityMismatch,
+    /// A valid publication attempt remains unresolved and must be reconciled.
+    #[error("generation authority publication attempt remains unresolved")]
+    UnresolvedAttempt,
+    /// The immutable authority counter cannot advance beyond `u64::MAX`.
+    #[error("generation authority sequence is exhausted")]
+    SequenceExhausted,
+    /// A selected authority is missing or predates the required external floor.
+    #[error("generation authority does not satisfy the required external floor")]
+    AuthorityBelowFloor,
+    /// A required-external profile was selected without an injected floor.
+    #[error("generation authority required-external profile has no external floor")]
+    ExternalFloorRequired,
+    /// A mutation was attempted through an inspection-only profile.
+    #[error("generation authority read-only profile forbids mutation")]
+    ReadOnlyProfile,
+    /// An anti-rollback floor compare-and-advance did not name the current
+    /// exact record.
+    #[error("generation authority anti-rollback floor compare-and-advance conflicted")]
+    FloorCompareAndAdvanceConflict,
+    /// An anti-rollback floor update did not advance its authority sequence.
+    #[error("generation authority anti-rollback floor did not advance")]
+    FloorSequenceRegression,
+    /// An idempotency key was reused for a different floor operation.
+    #[error("generation authority anti-rollback floor idempotency key conflicted")]
+    FloorIdempotencyConflict,
+    /// The deterministic reference provider's CAS version was exhausted.
+    #[error("generation authority anti-rollback floor CAS version is exhausted")]
+    FloorVersionExhausted,
+    /// The deterministic reference provider cannot safely continue after a
+    /// poisoned lock.
+    #[error("generation authority anti-rollback floor store is unavailable")]
+    FloorStoreUnavailable,
+    /// The immutable activation manifest did not match its stored self-seal.
+    #[error("generation activation manifest self-seal mismatch")]
+    ManifestSelfSealMismatch,
+    /// An externally addressed manifest did not match its authority reference.
+    #[error("generation activation manifest does not match its authority reference")]
+    ManifestReferenceMismatch,
+}
+
+/// Immutable pointer to one activation-manifest object.
+///
+/// This is intentionally distinct from [`ArtifactGenerationIdentityV1`]: the
+/// latter identifies one artifact build, while this counter is the monotone
+/// activation authority for a root. Object IDs are random opaque bytes, never a
+/// filename or display name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AuthorityRefV1 {
+    /// [`GENERATION_AUTHORITY_SCHEMA_V1`].
+    pub schema_version: u16,
+    /// Monotone activation sequence, beginning at one.
+    pub sequence: u64,
+    /// Opaque immutable activation-manifest object identifier.
+    pub object_id: [u8; 16],
+    /// Exact activation-manifest byte length.
+    pub manifest_len: u64,
+    /// SHA-256 of the exact activation-manifest bytes.
+    pub manifest_sha256: [u8; 32],
+    /// SHA-256 fingerprint of the immediately preceding authority reference.
+    /// Genesis has no predecessor.
+    pub predecessor: Option<[u8; 32]>,
+}
+
+impl AuthorityRefV1 {
+    /// Construct and validate one immutable activation authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded typed error when a reserved identity value is used or
+    /// the sequence/predecessor relation is not canonical.
+    pub fn new(
+        sequence: u64,
+        object_id: [u8; 16],
+        manifest_len: u64,
+        manifest_sha256: [u8; 32],
+        predecessor: Option<[u8; 32]>,
+    ) -> Result<Self, GenerationAuthorityErrorV1> {
+        let reference = Self {
+            schema_version: GENERATION_AUTHORITY_SCHEMA_V1,
+            sequence,
+            object_id,
+            manifest_len,
+            manifest_sha256,
+            predecessor,
+        };
+        reference.validate()?;
+        Ok(reference)
+    }
+
+    /// Validate the fixed, forward-safe authority-reference contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded typed error for every invalid field.
+    pub fn validate(&self) -> Result<(), GenerationAuthorityErrorV1> {
+        if self.schema_version != GENERATION_AUTHORITY_SCHEMA_V1 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.schema_version",
+            });
+        }
+        if self.sequence == 0 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.sequence",
+            });
+        }
+        if self.object_id == [0; 16] {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.object_id",
+            });
+        }
+        if self.manifest_len == 0 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.manifest_len",
+            });
+        }
+        if self.manifest_sha256 == [0; 32] {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.manifest_sha256",
+            });
+        }
+        if self.sequence == 1 && self.predecessor.is_some() {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.predecessor",
+            });
+        }
+        if self.sequence > 1 && self.predecessor.is_none() {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.predecessor",
+            });
+        }
+        if self.predecessor == Some([0; 32]) {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.predecessor",
+            });
+        }
+        Ok(())
+    }
+
+    /// Return the next authority sequence without allowing counter rollover.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed exhaustion error for the terminal `u64::MAX` authority
+    /// rather than permitting an ABA-like wrap to an earlier sequence.
+    pub fn next_sequence(&self) -> Result<u64, GenerationAuthorityErrorV1> {
+        self.validate()?;
+        self.sequence
+            .checked_add(1)
+            .ok_or(GenerationAuthorityErrorV1::SequenceExhausted)
+    }
+
+    /// Canonical bytes used to link consecutive authority references.
+    #[must_use]
+    pub fn canonical_bytes(&self) -> [u8; AUTHORITY_REF_BYTES_V1] {
+        let mut bytes = [0_u8; AUTHORITY_REF_BYTES_V1];
+        bytes[..9].copy_from_slice(&AUTHORITY_REF_MAGIC_V1);
+        bytes[9..11].copy_from_slice(&self.schema_version.to_be_bytes());
+        bytes[11..19].copy_from_slice(&self.sequence.to_be_bytes());
+        bytes[19..35].copy_from_slice(&self.object_id);
+        bytes[35..43].copy_from_slice(&self.manifest_len.to_be_bytes());
+        bytes[43..75].copy_from_slice(&self.manifest_sha256);
+        bytes[75] = u8::from(self.predecessor.is_some());
+        if let Some(predecessor) = self.predecessor {
+            bytes[76..].copy_from_slice(&predecessor);
+        }
+        bytes
+    }
+
+    /// Decode the exact fixed canonical representation of one authority
+    /// reference without allocating from caller-controlled lengths.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for malformed, future, or non-canonical bytes.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, GenerationAuthorityErrorV1> {
+        if bytes.len() != AUTHORITY_REF_BYTES_V1 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.canonical_bytes",
+            });
+        }
+        if !bytes[..9].eq(AUTHORITY_REF_MAGIC_V1.as_slice()) {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.magic",
+            });
+        }
+        let predecessor = match bytes[75] {
+            0 => {
+                if !bytes[76..].iter().all(|byte| byte.eq(&0)) {
+                    return Err(GenerationAuthorityErrorV1::NonCanonicalPadding);
+                }
+                None
+            }
+            1 => Some(bytes[76..].try_into().map_err(|_| {
+                GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_ref.predecessor",
+                }
+            })?),
+            _ => {
+                return Err(GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_ref.predecessor_present",
+                });
+            }
+        };
+        let reference = Self {
+            schema_version: u16::from_be_bytes([bytes[9], bytes[10]]),
+            sequence: u64::from_be_bytes(bytes[11..19].try_into().map_err(|_| {
+                GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_ref.sequence",
+                }
+            })?),
+            object_id: bytes[19..35].try_into().map_err(|_| {
+                GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_ref.object_id",
+                }
+            })?,
+            manifest_len: u64::from_be_bytes(bytes[35..43].try_into().map_err(|_| {
+                GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_ref.manifest_len",
+                }
+            })?),
+            manifest_sha256: bytes[43..75].try_into().map_err(|_| {
+                GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_ref.manifest_sha256",
+                }
+            })?,
+            predecessor,
+        };
+        reference.validate()?;
+        if !reference.canonical_bytes().eq(bytes) {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.canonical_bytes",
+            });
+        }
+        Ok(reference)
+    }
+
+    /// SHA-256 fingerprint of this exact canonical reference.
+    #[must_use]
+    pub fn fingerprint(&self) -> [u8; 32] {
+        Sha256::digest(self.canonical_bytes()).into()
+    }
+}
+
+fn predecessor_matches_authority(predecessor: Option<[u8; 32]>, authority: AuthorityRefV1) -> bool {
+    predecessor.is_some_and(|predecessor| {
+        constant_time_fingerprint_eq(&predecessor, &authority.fingerprint())
+    })
+}
+
+fn constant_time_fingerprint_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    let mut difference = 0_u8;
+    for index in 0..left.len() {
+        difference |= left[index] ^ right[index];
+    }
+    difference == 0
+}
+
+/// A decoded, authenticated physical authority slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthoritySlotV1 {
+    /// Physical slot selected by the publisher (`0` or `1`).
+    pub slot_index: u8,
+    /// Root identity bound into the frame.
+    pub root_id: [u8; 16],
+    /// Immutable authority reference carried by the frame.
+    pub authority: AuthorityRefV1,
+}
+
+/// An externally retained immutable authority that bounds acceptable recovery.
+///
+/// It is pure evidence, not a filesystem pointer: consumers may require an
+/// exact floor or its immediately predecessor-linked successor without
+/// silently accepting a stale or unprovable authority head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AuthorityFloorV1 {
+    /// Root identity that prevents a floor from being replayed across roots.
+    pub root_id: [u8; 16],
+    /// Exact externally retained authority reference.
+    pub authority: AuthorityRefV1,
+}
+
+impl AuthorityFloorV1 {
+    /// Construct and validate one bounded external authority floor.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for reserved root or authority values.
+    pub fn new(
+        root_id: [u8; 16],
+        authority: AuthorityRefV1,
+    ) -> Result<Self, GenerationAuthorityErrorV1> {
+        let floor = Self { root_id, authority };
+        floor.validate()?;
+        Ok(floor)
+    }
+
+    fn validate(&self) -> Result<(), GenerationAuthorityErrorV1> {
+        if self.root_id == [0; 16] {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_floor.root_id",
+            });
+        }
+        self.authority.validate()
+    }
+}
+
+/// Explicit security posture for opening one generation root.
+///
+/// There is deliberately no `Default` implementation: a caller must choose a
+/// posture instead of silently falling back from an externally anchored root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GenerationRootSecurityProfileV1 {
+    /// Require a consumer-owned, externally retained authority floor before a
+    /// root can be selected for use.
+    RequiredExternal,
+    /// Permit owner-controlled local recovery while reporting that it cannot
+    /// detect a hostile whole-store rollback.
+    CooperativeLocal,
+    /// Permit inspection only; publication, repair, rollback, and garbage
+    /// collection must be rejected by the caller before mutation.
+    ReadOnlyUnanchored,
+}
+
+impl GenerationRootSecurityProfileV1 {
+    /// Whether this profile authorizes a caller to mutate a generation root.
+    #[must_use]
+    pub const fn permits_mutation(self) -> bool {
+        !matches!(self, Self::ReadOnlyUnanchored)
+    }
+
+    /// Reject a mutation through an inspection-only profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationAuthorityErrorV1::ReadOnlyProfile`] when this is
+    /// [`Self::ReadOnlyUnanchored`].
+    pub const fn require_mutation_authorized(self) -> Result<(), GenerationAuthorityErrorV1> {
+        if self.permits_mutation() {
+            Ok(())
+        } else {
+            Err(GenerationAuthorityErrorV1::ReadOnlyProfile)
+        }
+    }
+}
+
+/// Versioned, digest-bound result of one successful anti-rollback floor CAS.
+///
+/// The record is intentionally independent of any generation-root path: its
+/// caller owns storage and replication of this receipt outside the replaceable
+/// root it anchors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AntiRollbackFloorRecordV1 {
+    /// [`ANTI_ROLLBACK_FLOOR_SCHEMA_V1`].
+    pub schema_version: u16,
+    /// Generation root anchored by this record.
+    pub root_id: [u8; 16],
+    /// Exact externally retained authority floor.
+    pub authority: AuthorityRefV1,
+    /// Monotone successful compare-and-advance version for this root.
+    pub cas_version: u64,
+    /// SHA-256 over the canonical record fields above.
+    pub record_sha256: [u8; 32],
+}
+
+impl AntiRollbackFloorRecordV1 {
+    fn new(floor: AuthorityFloorV1, cas_version: u64) -> Result<Self, GenerationAuthorityErrorV1> {
+        floor.validate()?;
+        if cas_version == 0 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.cas_version",
+            });
+        }
+        let mut record = Self {
+            schema_version: ANTI_ROLLBACK_FLOOR_SCHEMA_V1,
+            root_id: floor.root_id,
+            authority: floor.authority,
+            cas_version,
+            record_sha256: [0; 32],
+        };
+        record.record_sha256 = record.computed_record_sha256();
+        Ok(record)
+    }
+
+    fn validate(&self) -> Result<(), GenerationAuthorityErrorV1> {
+        if self.schema_version != ANTI_ROLLBACK_FLOOR_SCHEMA_V1 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.schema_version",
+            });
+        }
+        AuthorityFloorV1::new(self.root_id, self.authority)?;
+        if self.cas_version == 0 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.cas_version",
+            });
+        }
+        if self.record_sha256 != self.computed_record_sha256() {
+            return Err(GenerationAuthorityErrorV1::ChecksumMismatch);
+        }
+        Ok(())
+    }
+
+    fn computed_record_sha256(&self) -> [u8; 32] {
+        let mut encoder = CanonicalEncoder::new(b"frankensearch.anti-rollback-floor-record.v1");
+        encoder.u16(self.schema_version);
+        encoder.bytes(&self.root_id);
+        encoder.bytes(&self.authority.canonical_bytes());
+        encoder.u64(self.cas_version);
+        Sha256::digest(encoder.finish()).into()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AntiRollbackFloorRequestV1 {
+    root_id: [u8; 16],
+    expected_record_sha256: Option<[u8; 32]>,
+    next_authority: AuthorityRefV1,
+    result: AntiRollbackFloorRecordV1,
+}
+
+#[derive(Default)]
+struct AntiRollbackFloorStoreStateV1 {
+    records: BTreeMap<[u8; 16], AntiRollbackFloorRecordV1>,
+    requests: BTreeMap<[u8; 16], AntiRollbackFloorRequestV1>,
+}
+
+/// Deterministic, linearizable in-memory reference provider for anti-rollback
+/// floor conformance tests and consumer integration tests.
+///
+/// This provider is deliberately not a crash-durable authority. Production
+/// callers must inject a consumer-owned provider outside the generation root;
+/// this implementation makes the exact load/CAS/idempotency contract testable
+/// without selecting a storage backend.
+#[derive(Default)]
+pub struct InMemoryAntiRollbackFloorStoreV1 {
+    state: std::sync::Mutex<AntiRollbackFloorStoreStateV1>,
+}
+
+impl InMemoryAntiRollbackFloorStoreV1 {
+    /// Construct an empty deterministic reference provider.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Load the exact current floor record for one root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationAuthorityErrorV1::FloorStoreUnavailable`] when a
+    /// prior panic poisoned the reference-provider lock.
+    pub fn load(
+        &self,
+        root_id: [u8; 16],
+    ) -> Result<Option<AntiRollbackFloorRecordV1>, GenerationAuthorityErrorV1> {
+        if root_id == [0; 16] {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.root_id",
+            });
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| GenerationAuthorityErrorV1::FloorStoreUnavailable)?;
+        Ok(state.records.get(&root_id).copied())
+    }
+
+    /// Atomically compare and advance one root's anti-rollback floor.
+    ///
+    /// `expected` must be the exact record returned by a prior [`Self::load`]
+    /// call (or `None` for a previously unanchored root). Repeating the same
+    /// operation with the same non-zero `idempotency_key` returns the original
+    /// successful receipt; reusing that key for another operation fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed conflict, regression, idempotency, exhaustion, or store
+    /// availability error without changing the recorded floor.
+    pub fn compare_and_advance(
+        &self,
+        expected: Option<AntiRollbackFloorRecordV1>,
+        next: AuthorityFloorV1,
+        idempotency_key: [u8; 16],
+    ) -> Result<AntiRollbackFloorRecordV1, GenerationAuthorityErrorV1> {
+        next.validate()?;
+        if idempotency_key == [0; 16] {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.idempotency_key",
+            });
+        }
+        if let Some(expected) = expected {
+            expected.validate()?;
+            if expected.root_id != next.root_id {
+                return Err(GenerationAuthorityErrorV1::RootMismatch);
+            }
+        }
+
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| GenerationAuthorityErrorV1::FloorStoreUnavailable)?;
+        let expected_record_sha256 = expected.map(|record| record.record_sha256);
+        if let Some(previous) = state.requests.get(&idempotency_key) {
+            if previous.root_id == next.root_id
+                && previous.expected_record_sha256 == expected_record_sha256
+                && previous.next_authority == next.authority
+            {
+                return Ok(previous.result);
+            }
+            return Err(GenerationAuthorityErrorV1::FloorIdempotencyConflict);
+        }
+
+        let current = state.records.get(&next.root_id).copied();
+        if current != expected {
+            return Err(GenerationAuthorityErrorV1::FloorCompareAndAdvanceConflict);
+        }
+        match current {
+            Some(record) => {
+                let expected_sequence = record.authority.next_sequence()?;
+                if next.authority.sequence <= record.authority.sequence {
+                    return Err(GenerationAuthorityErrorV1::FloorSequenceRegression);
+                }
+                if next.authority.sequence != expected_sequence
+                    || !predecessor_matches_authority(next.authority.predecessor, record.authority)
+                {
+                    return Err(GenerationAuthorityErrorV1::BrokenPredecessorLink);
+                }
+            }
+            None if next.authority.sequence != 1 || next.authority.predecessor.is_some() => {
+                return Err(GenerationAuthorityErrorV1::BrokenPredecessorLink);
+            }
+            None => {}
+        }
+        let cas_version = current
+            .map(|record| record.cas_version)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(GenerationAuthorityErrorV1::FloorVersionExhausted)?;
+        let result = AntiRollbackFloorRecordV1::new(next, cas_version)?;
+        state.records.insert(next.root_id, result);
+        state.requests.insert(
+            idempotency_key,
+            AntiRollbackFloorRequestV1 {
+                root_id: next.root_id,
+                expected_record_sha256,
+                next_authority: next.authority,
+                result,
+            },
+        );
+        drop(state);
+        Ok(result)
+    }
+}
+
+/// Kind of fixed `LOCK` frame. Owner and attempt remain distinct on disk so an
+/// interrupted attempt cannot be silently mistaken for authority ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GenerationLockFrameKindV1 {
+    /// Current writer ownership record.
+    Owner,
+    /// In-progress publication attempt record.
+    Attempt,
+}
+
+impl GenerationLockFrameKindV1 {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Owner => 1,
+            Self::Attempt => 2,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Result<Self, GenerationAuthorityErrorV1> {
+        match tag {
+            1 => Ok(Self::Owner),
+            2 => Ok(Self::Attempt),
+            _ => Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "generation_lock.kind",
+            }),
+        }
+    }
+}
+
+/// Bounded owner/attempt evidence for the fixed generation-root `LOCK` path.
+///
+/// It is an immutable byte contract only: taking a filesystem lock or deciding
+/// whether an attempt may publish belongs to the publisher lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GenerationLockFrameV1 {
+    /// Owner or attempt frame classification.
+    pub kind: GenerationLockFrameKindV1,
+    /// Root ID that prevents cross-root frame replay.
+    pub root_id: [u8; 16],
+    /// Opaque writer identity.
+    pub writer_id: [u8; 16],
+    /// Opaque immutable publication attempt identity.
+    pub attempt_id: [u8; 16],
+    /// Monotone writer fence, beginning at one.
+    pub fence: u64,
+    /// Fingerprint of the authority reference the lock state observed.
+    pub authority_fingerprint: [u8; 32],
+}
+
+impl GenerationLockFrameV1 {
+    /// Construct and validate a bounded lock owner/attempt frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when any identity or fence is reserved.
+    pub fn new(
+        kind: GenerationLockFrameKindV1,
+        root_id: [u8; 16],
+        writer_id: [u8; 16],
+        attempt_id: [u8; 16],
+        fence: u64,
+        authority_fingerprint: [u8; 32],
+    ) -> Result<Self, GenerationAuthorityErrorV1> {
+        let frame = Self {
+            kind,
+            root_id,
+            writer_id,
+            attempt_id,
+            fence,
+            authority_fingerprint,
+        };
+        frame.validate()?;
+        Ok(frame)
+    }
+
+    /// Validate the fixed lock-frame facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when any fact is reserved or cannot identify a
+    /// specific publication attempt.
+    pub fn validate(&self) -> Result<(), GenerationAuthorityErrorV1> {
+        if self.root_id == [0; 16]
+            || self.writer_id == [0; 16]
+            || self.attempt_id == [0; 16]
+            || self.fence == 0
+            || self.authority_fingerprint == [0; 32]
+        {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "generation_lock.frame",
+            });
+        }
+        Ok(())
+    }
+
+    /// Encode this owner/attempt frame into its fixed canonical form.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error instead of serializing a reserved frame.
+    pub fn encode(
+        self,
+    ) -> Result<[u8; GENERATION_LOCK_FRAME_BYTES_V1], GenerationAuthorityErrorV1> {
+        self.validate()?;
+        let mut bytes = [0_u8; GENERATION_LOCK_FRAME_BYTES_V1];
+        bytes[..8].copy_from_slice(&LOCK_FRAME_MAGIC_V1);
+        bytes[8..10].copy_from_slice(&GENERATION_AUTHORITY_SCHEMA_V1.to_be_bytes());
+        bytes[10] = self.kind.tag();
+        bytes[16..32].copy_from_slice(&self.root_id);
+        bytes[32..48].copy_from_slice(&self.writer_id);
+        bytes[48..64].copy_from_slice(&self.attempt_id);
+        bytes[64..72].copy_from_slice(&self.fence.to_be_bytes());
+        bytes[72..104].copy_from_slice(&self.authority_fingerprint);
+        let digest = Sha256::digest(&bytes[..LOCK_FRAME_BODY_BYTES]);
+        bytes[LOCK_FRAME_BODY_BYTES..].copy_from_slice(&digest);
+        Ok(bytes)
+    }
+
+    /// Parse and authenticate a fixed `LOCK` frame for the expected root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for malformed, copied, tampered, or noncanonical
+    /// owner/attempt frames.
+    pub fn from_authenticated_bytes(
+        bytes: &[u8],
+        expected_root_id: [u8; 16],
+    ) -> Result<Self, GenerationAuthorityErrorV1> {
+        if bytes.len() != GENERATION_LOCK_FRAME_BYTES_V1 {
+            return Err(GenerationAuthorityErrorV1::InvalidSlotLength);
+        }
+        if !bytes[..8].eq(LOCK_FRAME_MAGIC_V1.as_slice())
+            || !bytes[8..10].eq(GENERATION_AUTHORITY_SCHEMA_V1.to_be_bytes().as_slice())
+            || !bytes[11..16].iter().all(|byte| byte.eq(&0))
+        {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "generation_lock.header",
+            });
+        }
+        if !bytes[16..32].eq(expected_root_id.as_slice()) {
+            return Err(GenerationAuthorityErrorV1::RootMismatch);
+        }
+        let expected_digest = Sha256::digest(&bytes[..LOCK_FRAME_BODY_BYTES]);
+        if !bytes[LOCK_FRAME_BODY_BYTES..].eq(&expected_digest[..]) {
+            return Err(GenerationAuthorityErrorV1::ChecksumMismatch);
+        }
+        if bytes[LOCK_FRAME_HEADER_BYTES..LOCK_FRAME_BODY_BYTES]
+            .iter()
+            .any(|byte| !byte.eq(&0))
+        {
+            return Err(GenerationAuthorityErrorV1::NonCanonicalPadding);
+        }
+        let mut writer_id = [0_u8; 16];
+        writer_id.copy_from_slice(&bytes[32..48]);
+        let mut attempt_id = [0_u8; 16];
+        attempt_id.copy_from_slice(&bytes[48..64]);
+        let mut authority_fingerprint = [0_u8; 32];
+        authority_fingerprint.copy_from_slice(&bytes[72..104]);
+        Self::new(
+            GenerationLockFrameKindV1::from_tag(bytes[10])?,
+            expected_root_id,
+            writer_id,
+            attempt_id,
+            u64::from_be_bytes(bytes[64..72].try_into().map_err(|_| {
+                GenerationAuthorityErrorV1::InvalidField {
+                    field: "generation_lock.fence",
+                }
+            })?),
+            authority_fingerprint,
+        )
+    }
+}
+
+impl AuthoritySlotV1 {
+    /// Construct one physical authority-slot frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded typed error when the physical slot/root or its
+    /// authority reference is invalid.
+    pub fn new(
+        slot_index: u8,
+        root_id: [u8; 16],
+        authority: AuthorityRefV1,
+    ) -> Result<Self, GenerationAuthorityErrorV1> {
+        let slot = Self {
+            slot_index,
+            root_id,
+            authority,
+        };
+        slot.validate()?;
+        Ok(slot)
+    }
+
+    /// Validate this in-memory physical slot before encoding or resolving it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded typed error for invalid physical binding data.
+    pub fn validate(&self) -> Result<(), GenerationAuthorityErrorV1> {
+        if self.slot_index > 1 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_slot.slot_index",
+            });
+        }
+        if self.root_id == [0; 16] {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_slot.root_id",
+            });
+        }
+        self.authority.validate()
+    }
+
+    /// Encode this slot into its fixed 4096-byte canonical representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded typed error instead of serializing an invalid slot.
+    pub fn encode(
+        self,
+    ) -> Result<[u8; GENERATION_AUTHORITY_SLOT_BYTES_V1], GenerationAuthorityErrorV1> {
+        self.validate()?;
+        let mut bytes = [0_u8; GENERATION_AUTHORITY_SLOT_BYTES_V1];
+        bytes[..8].copy_from_slice(&AUTHORITY_SLOT_MAGIC_V1);
+        bytes[8..10].copy_from_slice(&GENERATION_AUTHORITY_SCHEMA_V1.to_be_bytes());
+        bytes[10] = self.slot_index;
+        bytes[16..32].copy_from_slice(&self.root_id);
+        bytes[32..34].copy_from_slice(&self.authority.schema_version.to_be_bytes());
+        bytes[34..42].copy_from_slice(&self.authority.sequence.to_be_bytes());
+        bytes[42..58].copy_from_slice(&self.authority.object_id);
+        bytes[58..66].copy_from_slice(&self.authority.manifest_len.to_be_bytes());
+        bytes[66..98].copy_from_slice(&self.authority.manifest_sha256);
+        bytes[98] = u8::from(self.authority.predecessor.is_some());
+        if let Some(predecessor) = self.authority.predecessor {
+            bytes[99..131].copy_from_slice(&predecessor);
+        }
+        let digest = Sha256::digest(&bytes[..AUTHORITY_SLOT_BODY_BYTES]);
+        bytes[AUTHORITY_SLOT_BODY_BYTES..].copy_from_slice(&digest);
+        Ok(bytes)
+    }
+
+    /// Decode and authenticate one physical slot for the expected root and
+    /// physical index.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for checksum, root, index, canonical-padding, or
+    /// authority-reference violations.
+    pub fn from_authenticated_bytes(
+        bytes: &[u8],
+        expected_slot_index: u8,
+        expected_root_id: [u8; 16],
+    ) -> Result<Self, GenerationAuthorityErrorV1> {
+        if bytes.len() != GENERATION_AUTHORITY_SLOT_BYTES_V1 {
+            return Err(GenerationAuthorityErrorV1::InvalidSlotLength);
+        }
+        if expected_slot_index > 1 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_slot.expected_slot_index",
+            });
+        }
+        if !bytes[..8].eq(AUTHORITY_SLOT_MAGIC_V1.as_slice())
+            || !bytes[8..10].eq(GENERATION_AUTHORITY_SCHEMA_V1.to_be_bytes().as_slice())
+            || !bytes[11..16].iter().all(|byte| byte.eq(&0))
+        {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_slot.header",
+            });
+        }
+        if !bytes[10].eq(&expected_slot_index) {
+            return Err(GenerationAuthorityErrorV1::SlotIndexMismatch);
+        }
+        if !bytes[16..32].eq(expected_root_id.as_slice()) {
+            return Err(GenerationAuthorityErrorV1::RootMismatch);
+        }
+        let expected_digest = Sha256::digest(&bytes[..AUTHORITY_SLOT_BODY_BYTES]);
+        if !bytes[AUTHORITY_SLOT_BODY_BYTES..].eq(&expected_digest[..]) {
+            return Err(GenerationAuthorityErrorV1::ChecksumMismatch);
+        }
+        if bytes[AUTHORITY_SLOT_HEADER_BYTES..AUTHORITY_SLOT_BODY_BYTES]
+            .iter()
+            .any(|byte| !byte.eq(&0))
+        {
+            return Err(GenerationAuthorityErrorV1::NonCanonicalPadding);
+        }
+
+        let mut object_id = [0_u8; 16];
+        object_id.copy_from_slice(&bytes[42..58]);
+        let mut manifest_sha256 = [0_u8; 32];
+        manifest_sha256.copy_from_slice(&bytes[66..98]);
+        let predecessor = match bytes[98] {
+            0 => {
+                if !bytes[99..131].iter().all(|byte| byte.eq(&0)) {
+                    return Err(GenerationAuthorityErrorV1::NonCanonicalPadding);
+                }
+                None
+            }
+            1 => {
+                let mut predecessor = [0_u8; 32];
+                predecessor.copy_from_slice(&bytes[99..131]);
+                Some(predecessor)
+            }
+            _ => {
+                return Err(GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_slot.predecessor_present",
+                });
+            }
+        };
+        let authority = AuthorityRefV1 {
+            schema_version: u16::from_be_bytes([bytes[32], bytes[33]]),
+            sequence: u64::from_be_bytes(bytes[34..42].try_into().map_err(|_| {
+                GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_slot.sequence",
+                }
+            })?),
+            object_id,
+            manifest_len: u64::from_be_bytes(bytes[58..66].try_into().map_err(|_| {
+                GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_slot.manifest_len",
+                }
+            })?),
+            manifest_sha256,
+            predecessor,
+        };
+        authority.validate()?;
+        Self::new(expected_slot_index, expected_root_id, authority)
+    }
+}
+
+/// Resolve the two physical authority slots without performing I/O.
+///
+/// A single surviving valid slot remains usable. Two different slots must be
+/// exactly consecutive and predecessor-linked; an equal reference is legal
+/// only for the duplicated sequence-one genesis record.
+///
+/// # Errors
+///
+/// Returns a typed error instead of selecting a structurally credible fork or
+/// skipping a missing authority history edge.
+pub fn resolve_authority_slots_v1(
+    first: Option<AuthoritySlotV1>,
+    second: Option<AuthoritySlotV1>,
+) -> Result<Option<AuthoritySlotV1>, GenerationAuthorityErrorV1> {
+    if let Some(slot) = first {
+        slot.validate()?;
+    }
+    if let Some(slot) = second {
+        slot.validate()?;
+    }
+    match (first, second) {
+        (None, None) => Ok(None),
+        (Some(slot), None) | (None, Some(slot)) => {
+            if !slot_matches_authority_sequence(slot) {
+                return Err(GenerationAuthorityErrorV1::SlotSequenceParity);
+            }
+            Ok(Some(slot))
+        }
+        (Some(first), Some(second)) => {
+            // ubs:ignore — slot indices and root IDs are public structural identities.
+            if first.root_id != second.root_id {
+                return Err(GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_slot.pair",
+                });
+            }
+            // ubs:ignore — physical slot indices are public structural identities.
+            if first.slot_index == second.slot_index {
+                return Err(GenerationAuthorityErrorV1::DuplicatePhysicalSlot);
+            }
+            // ubs:ignore — authority sequences are public monotone counters.
+            if first.authority.sequence == second.authority.sequence {
+                // ubs:ignore — authority references carry only public immutable identities.
+                if first.authority != second.authority {
+                    return Err(GenerationAuthorityErrorV1::EqualSequenceFork);
+                }
+                if first.authority.sequence != 1 {
+                    return Err(GenerationAuthorityErrorV1::NonGenesisDuplicate);
+                }
+                return Ok(Some(first));
+            }
+
+            let (older, newer) = if first.authority.sequence < second.authority.sequence {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            if !slot_matches_authority_sequence(older) || !slot_matches_authority_sequence(newer) {
+                return Err(GenerationAuthorityErrorV1::SlotSequenceParity);
+            }
+            // ubs:ignore — sequence/predecessor fingerprints are public history identities.
+            if newer.authority.sequence != older.authority.sequence.saturating_add(1)
+                // ubs:ignore — predecessor fingerprints are public immutable history identities.
+                || newer.authority.predecessor != Some(older.authority.fingerprint())
+            {
+                return Err(GenerationAuthorityErrorV1::BrokenPredecessorLink);
+            }
+            Ok(Some(newer))
+        }
+    }
+}
+
+/// Decode and resolve the two physical authority frames without filesystem
+/// access.
+///
+/// A present but malformed frame is never converted to `None`: callers must
+/// reconcile that corruption explicitly rather than treating it as one-slot
+/// survival. Only an absent physical frame may enter the survival path.
+///
+/// # Errors
+///
+/// Returns the exact bounded slot decode error for malformed, copied, or
+/// cross-root frames before attempting pair resolution.
+pub fn resolve_authority_slot_frames_v1(
+    first: Option<&[u8]>,
+    second: Option<&[u8]>,
+    expected_root_id: [u8; 16],
+) -> Result<Option<AuthoritySlotV1>, GenerationAuthorityErrorV1> {
+    let first = first
+        .map(|bytes| AuthoritySlotV1::from_authenticated_bytes(bytes, 0, expected_root_id))
+        .transpose()?;
+    let second = second
+        .map(|bytes| AuthoritySlotV1::from_authenticated_bytes(bytes, 1, expected_root_id))
+        .transpose()?;
+    resolve_authority_slots_v1(first, second)
+}
+
+/// Resolve two authority slots against one exact externally retained floor.
+///
+/// The selected authority must be the exact floor or its immediate
+/// predecessor-linked successor. A later but unprovable head is not selected;
+/// callers must supply its intervening authority evidence explicitly.
+///
+/// # Errors
+///
+/// Returns a typed error for missing/stale authorities, cross-root floors,
+/// equal-sequence divergence, gaps, or sequence exhaustion.
+pub fn resolve_authority_slots_at_floor_v1(
+    first: Option<AuthoritySlotV1>,
+    second: Option<AuthoritySlotV1>,
+    floor: AuthorityFloorV1,
+) -> Result<AuthoritySlotV1, GenerationAuthorityErrorV1> {
+    let resolved = resolve_authority_slots_v1(first, second)?
+        .ok_or(GenerationAuthorityErrorV1::AuthorityBelowFloor)?;
+    resolve_selected_authority_at_floor_v1(resolved, floor)
+}
+
+fn resolve_selected_authority_at_floor_v1(
+    resolved: AuthoritySlotV1,
+    floor: AuthorityFloorV1,
+) -> Result<AuthoritySlotV1, GenerationAuthorityErrorV1> {
+    floor.validate()?;
+    // ubs:ignore — root IDs are public structural identities.
+    if resolved.root_id != floor.root_id {
+        return Err(GenerationAuthorityErrorV1::RootMismatch);
+    }
+    if resolved.authority.sequence < floor.authority.sequence {
+        return Err(GenerationAuthorityErrorV1::AuthorityBelowFloor);
+    }
+    // ubs:ignore — authority sequences are public monotone counters.
+    if resolved.authority.sequence == floor.authority.sequence {
+        // ubs:ignore — authority references are public immutable identities.
+        if resolved.authority != floor.authority {
+            return Err(GenerationAuthorityErrorV1::EqualSequenceFork);
+        }
+        return Ok(resolved);
+    }
+    let successor = floor
+        .authority
+        .next_sequence()
+        .map_err(|_| GenerationAuthorityErrorV1::SequenceExhausted)?;
+    // ubs:ignore — authority sequences are public monotone counters.
+    if resolved.authority.sequence != successor {
+        return Err(GenerationAuthorityErrorV1::BrokenPredecessorLink);
+    }
+    // ubs:ignore — predecessor fingerprints are public immutable history identities.
+    if resolved.authority.predecessor != Some(floor.authority.fingerprint()) {
+        return Err(GenerationAuthorityErrorV1::BrokenPredecessorLink);
+    }
+    Ok(resolved)
+}
+
+/// Resolve authority slots while refusing to silently step around a valid
+/// owner/attempt `LOCK` state.
+///
+/// A persisted attempt is evidence of an outcome the caller has not yet
+/// reconciled, so it fails closed even if an older authority pair resolves.
+/// The helper performs no filesystem I/O and does not mutate either frame.
+///
+/// # Errors
+///
+/// Returns a bounded typed error when frame kind, root binding, owner binding,
+/// or a pending attempt prevents a safe selection.
+pub fn resolve_authority_slots_with_locks_v1(
+    first: Option<AuthoritySlotV1>,
+    second: Option<AuthoritySlotV1>,
+    owner: Option<GenerationLockFrameV1>,
+    attempt: Option<GenerationLockFrameV1>,
+) -> Result<Option<AuthoritySlotV1>, GenerationAuthorityErrorV1> {
+    let resolved = resolve_authority_slots_v1(first, second)?;
+    if let Some(owner) = owner {
+        owner.validate()?;
+        // ubs:ignore — lock kinds are public fixed-format state tags.
+        if owner.kind != GenerationLockFrameKindV1::Owner {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "generation_lock.owner.kind",
+            });
+        }
+    }
+    if let Some(attempt) = attempt {
+        attempt.validate()?;
+        // ubs:ignore — lock kinds are public fixed-format state tags.
+        if attempt.kind != GenerationLockFrameKindV1::Attempt {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "generation_lock.attempt.kind",
+            });
+        }
+    }
+    if let (Some(owner), Some(attempt)) = (owner, attempt) {
+        // ubs:ignore — root IDs are public structural identities.
+        if owner.root_id != attempt.root_id {
+            return Err(GenerationAuthorityErrorV1::LockRootMismatch);
+        }
+    }
+    if let Some(slot) = resolved {
+        // ubs:ignore — root IDs are public structural identities.
+        if owner.is_some_and(|frame| frame.root_id != slot.root_id) {
+            return Err(GenerationAuthorityErrorV1::LockRootMismatch);
+        }
+        // ubs:ignore — root IDs are public structural identities.
+        if attempt.is_some_and(|frame| frame.root_id != slot.root_id) {
+            return Err(GenerationAuthorityErrorV1::LockRootMismatch);
+        }
+    }
+    if attempt.is_some() {
+        return Err(GenerationAuthorityErrorV1::UnresolvedAttempt);
+    }
+    if let Some(owner) = owner {
+        let resolved = resolved.ok_or(GenerationAuthorityErrorV1::LockAuthorityMismatch)?;
+        // ubs:ignore — authority fingerprints are public immutable-integrity identities.
+        if owner.authority_fingerprint != resolved.authority.fingerprint() {
+            return Err(GenerationAuthorityErrorV1::LockAuthorityMismatch);
+        }
+    }
+    Ok(resolved)
+}
+
+/// Resolve authority slots under one explicit generation-root security profile.
+///
+/// The lock-aware resolver always runs first, so an unresolved publication
+/// attempt cannot be bypassed by selecting a weaker profile. Required external
+/// roots additionally require an injected retained floor; local and inspection
+/// profiles intentionally remain unanchored and are distinguishable to callers.
+///
+/// # Errors
+///
+/// Returns a typed error when lock reconciliation fails, an external floor is
+/// absent or not satisfied, or the underlying slots are malformed.
+pub fn resolve_authority_slots_with_profile_v1(
+    first: Option<AuthoritySlotV1>,
+    second: Option<AuthoritySlotV1>,
+    owner: Option<GenerationLockFrameV1>,
+    attempt: Option<GenerationLockFrameV1>,
+    profile: GenerationRootSecurityProfileV1,
+    external_floor: Option<AuthorityFloorV1>,
+) -> Result<Option<AuthoritySlotV1>, GenerationAuthorityErrorV1> {
+    let resolved = resolve_authority_slots_with_locks_v1(first, second, owner, attempt)?;
+    match profile {
+        GenerationRootSecurityProfileV1::RequiredExternal => {
+            let floor = external_floor.ok_or(GenerationAuthorityErrorV1::ExternalFloorRequired)?;
+            let resolved = resolved.ok_or(GenerationAuthorityErrorV1::AuthorityBelowFloor)?;
+            resolve_selected_authority_at_floor_v1(resolved, floor).map(Some)
+        }
+        GenerationRootSecurityProfileV1::CooperativeLocal
+        | GenerationRootSecurityProfileV1::ReadOnlyUnanchored => Ok(resolved),
+    }
+}
+
+fn slot_matches_authority_sequence(slot: AuthoritySlotV1) -> bool {
+    if slot.authority.sequence == 1 {
+        return true;
+    }
+    let expected_slot = (slot.authority.sequence & 1) as u8;
+    slot.slot_index == expected_slot
+}
+
+/// The transition that created an immutable activation manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GenerationAuthorityActionV1 {
+    /// Select a newly built generation.
+    Activate,
+    /// Select a previously published generation under a newer authority.
+    Rollback,
+    /// Publish a repaired replacement for a damaged generation.
+    Repair,
+    /// Publish a schema-preserving migrated generation.
+    Migrate,
+}
+
+impl GenerationAuthorityActionV1 {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Activate => 1,
+            Self::Rollback => 2,
+            Self::Repair => 3,
+            Self::Migrate => 4,
+        }
+    }
+}
+
+/// Immutable receipt for one exact generation component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GenerationComponentReceiptV1 {
+    /// Exact component byte length.
+    pub byte_len: u64,
+    /// SHA-256 of the exact component bytes.
+    pub sha256: [u8; 32],
+}
+
+impl GenerationComponentReceiptV1 {
+    /// Validate the bounded immutable component receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the receipt cannot identify real bytes.
+    pub fn validate(&self) -> Result<(), GenerationAuthorityErrorV1> {
+        if self.byte_len == 0 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "activation_manifest.component.byte_len",
+            });
+        }
+        if self.sha256 == [0; 32] {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "activation_manifest.component.sha256",
+            });
+        }
+        Ok(())
+    }
+
+    fn encode(self, encoder: &mut CanonicalEncoder) {
+        encoder.u64(self.byte_len);
+        encoder.bytes(&self.sha256);
+    }
+}
+
+/// The four component receipts that make one generation selectable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GenerationComponentReceiptsV1 {
+    /// Vector-index component receipt.
+    pub vector: GenerationComponentReceiptV1,
+    /// Lexical-index component receipt.
+    pub lexical: GenerationComponentReceiptV1,
+    /// ANN component receipt.
+    pub ann: GenerationComponentReceiptV1,
+    /// Metadata component receipt.
+    pub metadata: GenerationComponentReceiptV1,
+}
+
+impl GenerationComponentReceiptsV1 {
+    fn validate(self) -> Result<(), GenerationAuthorityErrorV1> {
+        self.vector.validate()?;
+        self.lexical.validate()?;
+        self.ann.validate()?;
+        self.metadata.validate()
+    }
+
+    fn encode(self, encoder: &mut CanonicalEncoder) {
+        self.vector.encode(encoder);
+        self.lexical.encode(encoder);
+        self.ann.encode(encoder);
+        self.metadata.encode(encoder);
+    }
+}
+
+/// Immutable payload addressed by [`AuthorityRefV1`].
+///
+/// It is pure data: publishing the payload, selecting its object ID, and any
+/// filesystem action belong to the generation-root publisher lane. The
+/// self-seal detects an in-memory or decoded field substitution before a
+/// caller uses the externally addressed manifest digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationManifestV1 {
+    /// [`GENERATION_AUTHORITY_SCHEMA_V1`].
+    pub schema_version: u16,
+    /// Authority sequence this manifest is eligible to serve.
+    pub authority_sequence: u64,
+    /// Exact preceding authority reference. Genesis has none.
+    pub predecessor: Option<AuthorityRefV1>,
+    /// Transition that produced this generation selection.
+    pub action: GenerationAuthorityActionV1,
+    /// Artifact-generation identity selected by this authority transition.
+    pub generation: ArtifactGenerationIdentityV1,
+    /// Immutable writer-fence witness.
+    pub writer_fence_sha256: [u8; 32],
+    /// Immutable source-checkpoint witness.
+    pub source_checkpoint_sha256: [u8; 32],
+    /// Canonical document-set witness.
+    pub document_set_sha256: [u8; 32],
+    /// Exact vector, lexical, ANN, and metadata component receipts.
+    pub components: GenerationComponentReceiptsV1,
+    /// SHA-256 self-seal over every preceding field.
+    pub self_seal_sha256: [u8; 32],
+}
+
+impl ActivationManifestV1 {
+    /// Construct and self-seal a canonical immutable activation manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when a field or predecessor relation is invalid.
+    pub fn new(
+        authority_sequence: u64,
+        predecessor: Option<AuthorityRefV1>,
+        action: GenerationAuthorityActionV1,
+        generation: ArtifactGenerationIdentityV1,
+        writer_fence_sha256: [u8; 32],
+        source_checkpoint_sha256: [u8; 32],
+        document_set_sha256: [u8; 32],
+        components: GenerationComponentReceiptsV1,
+    ) -> Result<Self, GenerationAuthorityErrorV1> {
+        let mut manifest = Self {
+            schema_version: GENERATION_AUTHORITY_SCHEMA_V1,
+            authority_sequence,
+            predecessor,
+            action,
+            generation,
+            writer_fence_sha256,
+            source_checkpoint_sha256,
+            document_set_sha256,
+            components,
+            self_seal_sha256: [0; 32],
+        };
+        manifest.validate_unsealed()?;
+        manifest.self_seal_sha256 = manifest.computed_self_seal();
+        Ok(manifest)
+    }
+
+    /// Validate every field and the self-seal without performing I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for an invalid field, broken predecessor relation,
+    /// or mismatched self-seal.
+    pub fn validate(&self) -> Result<(), GenerationAuthorityErrorV1> {
+        self.validate_unsealed()?;
+        // ubs:ignore — the self-seal is public immutable-integrity evidence, not a secret.
+        if self.self_seal_sha256 != self.computed_self_seal() {
+            return Err(GenerationAuthorityErrorV1::ManifestSelfSealMismatch);
+        }
+        Ok(())
+    }
+
+    /// Canonical bytes excluding the self-seal field.
+    #[must_use]
+    pub fn canonical_unsealed_bytes(&self) -> Vec<u8> {
+        let mut encoder = CanonicalEncoder::new(b"frankensearch.activation-manifest.v1");
+        encoder.u16(self.schema_version);
+        encoder.u64(self.authority_sequence);
+        encoder.u8(self.action.tag());
+        encoder.option(self.predecessor.as_ref(), |predecessor, encoder| {
+            encoder.u16(predecessor.schema_version);
+            encoder.u64(predecessor.sequence);
+            encoder.bytes(&predecessor.object_id);
+            encoder.u64(predecessor.manifest_len);
+            encoder.bytes(&predecessor.manifest_sha256);
+            encoder.option(predecessor.predecessor.as_ref(), |ancestor, encoder| {
+                encoder.bytes(ancestor);
+            });
+        });
+        encoder.u16(self.generation.schema_version);
+        encoder.u64(self.generation.sequence);
+        encoder.bytes(&self.generation.nonce);
+        encoder.bytes(&self.writer_fence_sha256);
+        encoder.bytes(&self.source_checkpoint_sha256);
+        encoder.bytes(&self.document_set_sha256);
+        self.components.encode(&mut encoder);
+        encoder.finish()
+    }
+
+    /// Canonical bytes including the validated self-seal.
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = self.canonical_unsealed_bytes();
+        bytes.extend_from_slice(&self.self_seal_sha256);
+        bytes
+    }
+
+    /// Parse, validate, and re-encode one bounded canonical activation
+    /// manifest. The input must match [`Self::canonical_bytes`] byte-for-byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for truncated, extended, future, malformed, or
+    /// non-canonical manifest bytes without allocating based on input lengths.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, GenerationAuthorityErrorV1> {
+        if bytes.len() < 32 || bytes.len() > GENERATION_ACTIVATION_MANIFEST_MAX_BYTES_V1 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "activation_manifest.canonical_bytes",
+            });
+        }
+        let unsealed_len = bytes.len() - 32;
+        let (unsealed, seal) = bytes.split_at(unsealed_len);
+        let mut decoder = CanonicalDecoder::new(unsealed);
+        if decoder.bytes("activation_manifest.domain", 64)?
+            != b"frankensearch.activation-manifest.v1"
+        {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "activation_manifest.domain",
+            });
+        }
+        let schema_version = decoder.u16("activation_manifest.schema_version")?;
+        let authority_sequence = decoder.u64("activation_manifest.authority_sequence")?;
+        let action = match decoder.u8("activation_manifest.action")? {
+            1 => GenerationAuthorityActionV1::Activate,
+            2 => GenerationAuthorityActionV1::Rollback,
+            3 => GenerationAuthorityActionV1::Repair,
+            4 => GenerationAuthorityActionV1::Migrate,
+            _ => {
+                return Err(GenerationAuthorityErrorV1::InvalidField {
+                    field: "activation_manifest.action",
+                });
+            }
+        };
+        let predecessor = match decoder.u8("activation_manifest.predecessor.present")? {
+            0 => None,
+            1 => Some(AuthorityRefV1 {
+                schema_version: decoder.u16("activation_manifest.predecessor.schema_version")?,
+                sequence: decoder.u64("activation_manifest.predecessor.sequence")?,
+                object_id: decoder.fixed_bytes("activation_manifest.predecessor.object_id")?,
+                manifest_len: decoder.u64("activation_manifest.predecessor.manifest_len")?,
+                manifest_sha256: decoder
+                    .fixed_bytes("activation_manifest.predecessor.manifest_sha256")?,
+                predecessor: match decoder.u8("activation_manifest.predecessor.ancestor.present")? {
+                    0 => None,
+                    1 => Some(decoder.fixed_bytes("activation_manifest.predecessor.ancestor")?),
+                    _ => {
+                        return Err(GenerationAuthorityErrorV1::InvalidField {
+                            field: "activation_manifest.predecessor.ancestor.present",
+                        });
+                    }
+                },
+            }),
+            _ => {
+                return Err(GenerationAuthorityErrorV1::InvalidField {
+                    field: "activation_manifest.predecessor.present",
+                });
+            }
+        };
+        let generation = ArtifactGenerationIdentityV1 {
+            schema_version: decoder.u16("activation_manifest.generation.schema_version")?,
+            sequence: decoder.u64("activation_manifest.generation.sequence")?,
+            nonce: decoder.fixed_bytes("activation_manifest.generation.nonce")?,
+        };
+        let writer_fence_sha256 = decoder.fixed_bytes("activation_manifest.writer_fence_sha256")?;
+        let source_checkpoint_sha256 =
+            decoder.fixed_bytes("activation_manifest.source_checkpoint_sha256")?;
+        let document_set_sha256 = decoder.fixed_bytes("activation_manifest.document_set_sha256")?;
+        let components = GenerationComponentReceiptsV1 {
+            vector: decoder.component("activation_manifest.components.vector")?,
+            lexical: decoder.component("activation_manifest.components.lexical")?,
+            ann: decoder.component("activation_manifest.components.ann")?,
+            metadata: decoder.component("activation_manifest.components.metadata")?,
+        };
+        decoder.finish()?;
+        let mut self_seal_sha256 = [0_u8; 32];
+        self_seal_sha256.copy_from_slice(seal);
+        let manifest = Self {
+            schema_version,
+            authority_sequence,
+            predecessor,
+            action,
+            generation,
+            writer_fence_sha256,
+            source_checkpoint_sha256,
+            document_set_sha256,
+            components,
+            self_seal_sha256,
+        };
+        manifest.validate()?;
+        if !manifest.canonical_bytes().eq(bytes) {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "activation_manifest.canonical_bytes",
+            });
+        }
+        Ok(manifest)
+    }
+
+    /// Exact length and SHA-256 used by the external [`AuthorityRefV1`].
+    #[must_use]
+    pub fn object_receipt(&self) -> (u64, [u8; 32]) {
+        let bytes = self.canonical_bytes();
+        (
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            Sha256::digest(bytes).into(),
+        )
+    }
+
+    fn validate_unsealed(&self) -> Result<(), GenerationAuthorityErrorV1> {
+        if self.schema_version != GENERATION_AUTHORITY_SCHEMA_V1 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "activation_manifest.schema_version",
+            });
+        }
+        if self.authority_sequence == 0 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "activation_manifest.authority_sequence",
+            });
+        }
+        match (self.authority_sequence, self.predecessor) {
+            (1, None) => {}
+            (1, Some(_)) => {
+                return Err(GenerationAuthorityErrorV1::InvalidField {
+                    field: "activation_manifest.predecessor",
+                });
+            }
+            (_, None) => {
+                return Err(GenerationAuthorityErrorV1::InvalidField {
+                    field: "activation_manifest.predecessor",
+                });
+            }
+            (sequence, Some(predecessor)) => {
+                predecessor.validate()?;
+                if predecessor.sequence.checked_add(1) != Some(sequence) {
+                    return Err(GenerationAuthorityErrorV1::BrokenPredecessorLink);
+                }
+            }
+        }
+        self.generation
+            .validate()
+            .map_err(|_| GenerationAuthorityErrorV1::InvalidField {
+                field: "activation_manifest.generation",
+            })?;
+        for (field, digest) in [
+            (
+                "activation_manifest.writer_fence_sha256",
+                self.writer_fence_sha256,
+            ),
+            (
+                "activation_manifest.source_checkpoint_sha256",
+                self.source_checkpoint_sha256,
+            ),
+            (
+                "activation_manifest.document_set_sha256",
+                self.document_set_sha256,
+            ),
+        ] {
+            // ubs:ignore — component digests are public immutable-integrity identities.
+            if digest == [0; 32] {
+                return Err(GenerationAuthorityErrorV1::InvalidField { field });
+            }
+        }
+        self.components.validate()
+    }
+
+    fn computed_self_seal(&self) -> [u8; 32] {
+        Sha256::digest(self.canonical_unsealed_bytes()).into()
+    }
+}
+
+/// Verify that an immutable activation manifest is the exact object named by
+/// one authority reference.
+///
+/// The caller supplies bytes/object storage outside this pure helper. This
+/// check binds the authority sequence, predecessor fingerprint, exact object
+/// length, and exact object digest before a consumer can select the manifest.
+///
+/// # Errors
+///
+/// Returns a typed error for malformed inputs or any reference/manifest
+/// mismatch. It never falls back to a different manifest.
+pub fn verify_authority_manifest_reference_v1(
+    authority: &AuthorityRefV1,
+    manifest: &ActivationManifestV1,
+) -> Result<(), GenerationAuthorityErrorV1> {
+    authority.validate()?;
+    manifest.validate()?;
+    // ubs:ignore — authority sequence/predecessor fingerprints are public integrity identities.
+    if authority.sequence != manifest.authority_sequence
+        || authority.predecessor
+            != manifest
+                .predecessor
+                .map(|predecessor| predecessor.fingerprint())
+    {
+        return Err(GenerationAuthorityErrorV1::ManifestReferenceMismatch);
+    }
+    let (manifest_len, manifest_sha256) = manifest.object_receipt();
+    // ubs:ignore — manifest lengths and digests are public immutable object identities.
+    if authority.manifest_len != manifest_len || authority.manifest_sha256 != manifest_sha256 {
+        return Err(GenerationAuthorityErrorV1::ManifestReferenceMismatch);
+    }
+    Ok(())
 }
 
 /// One immutable, role-tagged artifact participating in a vector space.
@@ -343,6 +1964,7 @@ impl EmbeddingSpaceIdentityV1 {
             }
             (EmbeddingSpaceKindV1::HashControl, Some(profile)) => {
                 profile.validate()?;
+                // ubs:ignore — manifest fingerprints are public compatibility identities, not secrets.
                 if self.artifact_manifest_fingerprint != profile.fingerprint() {
                     return Err(identity_error(
                         "artifact_manifest_fingerprint",
@@ -928,6 +2550,466 @@ pub struct FrozenEmbeddingIdentityBundleV1 {
     pub fingerprint: String,
 }
 
+/// Why producer compatibility could not be established.
+///
+/// Variants deliberately carry no caller-controlled text. Callers may log the
+/// stable variant name together with bounded witness fingerprints without ever
+/// exposing conformance inputs, vectors, model paths, or policy material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+pub enum ProducerCompatibilityErrorV1 {
+    /// The reference bundle failed its complete identity validation.
+    #[error("reference embedding identity is invalid")]
+    InvalidReferenceIdentity,
+    /// The candidate bundle failed its complete identity validation.
+    #[error("candidate embedding identity is invalid")]
+    InvalidCandidateIdentity,
+    /// The bundles describe different mathematical embedding spaces.
+    #[error("producer comparison crossed mathematical embedding spaces")]
+    SpaceMismatch,
+    /// Exact producer identity did not match, so certified evidence is required.
+    #[error("foreign producer requires an explicit conformance certificate")]
+    CertificateRequired,
+    /// The certified path was invoked for an already-exact producer.
+    #[error("foreign-producer certificate is forbidden for an exact producer")]
+    CertificateForbiddenForExactProducer,
+    /// The ordered fixture or one of its exact vector sets was malformed.
+    #[error("golden conformance fixture is malformed")]
+    GoldenFixtureInvalid,
+    /// Reference and candidate outputs or their embedded certificates differ.
+    #[error("golden conformance vectors do not match exactly")]
+    GoldenVectorMismatch,
+    /// The raw certificate has an unknown schema or malformed field.
+    #[error("foreign-producer certificate is malformed")]
+    CertificateMalformed,
+    /// The canonical raw certificate does not match the independently pinned digest.
+    #[error("foreign-producer certificate fingerprint is not trusted")]
+    CertificateFingerprintMismatch,
+    /// The certificate names a policy other than the independently pinned policy.
+    #[error("foreign-producer certificate policy does not match trusted policy")]
+    PolicyMismatch,
+    /// One or both direction-sensitive producer bindings are wrong.
+    #[error("foreign-producer certificate does not bind the exact producer pair")]
+    ProducerBindingMismatch,
+    /// The certificate does not bind the independently verified golden fixture.
+    #[error("foreign-producer certificate does not bind the trusted fixture")]
+    FixtureBindingMismatch,
+    /// The certificate is not active yet at the trusted evaluation time.
+    #[error("foreign-producer certificate is not yet valid")]
+    CertificateNotYetValid,
+    /// The certificate is expired at the trusted evaluation time.
+    #[error("foreign-producer certificate is expired")]
+    CertificateExpired,
+    /// The certificate revision is outside the trusted policy window.
+    #[error("foreign-producer certificate revision is outside trusted policy")]
+    CertificateRevisionOutsidePolicy,
+}
+
+/// Authority-free fixture receipt derived from both producers' actual outputs.
+///
+/// This type is intentionally serializable but not deserializable. Untrusted
+/// bytes can never regain the authority established by executing both producers
+/// over the same ordered inputs and comparing their exact `f32` output bits.
+///
+/// ```compile_fail
+/// use frankensearch_core::generation::VerifiedGoldenConformanceManifestV1;
+/// let _: VerifiedGoldenConformanceManifestV1 = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct VerifiedGoldenConformanceManifestV1 {
+    certificate: GoldenVectorCertificateV1,
+    canonical_bytes: Vec<u8>,
+    fingerprint: String,
+}
+
+/// Raw, non-authoritative certificate claiming that two distinct producers are
+/// bit-exact on one verified fixture.
+///
+/// Deserialization only recovers an untrusted claim. The sole authority-bearing
+/// promotion path is
+/// [`EmbeddingIdentityBundleV1::verify_certified_foreign_producer_with`], which
+/// compares every field with independently trusted identity, policy, time, and
+/// fixture state.
+///
+/// Raw certificate bytes alone cannot become either trust context or witness:
+///
+/// ```compile_fail
+/// use frankensearch_core::generation::{
+///     ForeignProducerConformanceCertificateV1, ProducerCompatibilityWitnessV1,
+///     TrustedProducerConformanceContextV1,
+/// };
+/// let raw: ForeignProducerConformanceCertificateV1 = serde_json::from_str("{}").unwrap();
+/// let _: TrustedProducerConformanceContextV1<'_> = raw.clone().into();
+/// let _: ProducerCompatibilityWitnessV1 = raw.into();
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForeignProducerConformanceCertificateV1 {
+    schema_version: u16,
+    reference_producer_fingerprint: String,
+    candidate_producer_fingerprint: String,
+    space_fingerprint: String,
+    golden_fixture_fingerprint: String,
+    policy_fingerprint: String,
+    certificate_revision: u64,
+    not_before_unix_seconds: u64,
+    expires_at_unix_seconds: u64,
+}
+
+/// Independently sourced authority for validating one raw foreign-producer
+/// certificate.
+///
+/// The pinned certificate and policy fingerprints, evaluation time, revision
+/// window, and verified fixture must come from retained owners or sealed local
+/// policy. Never populate this context from the certificate being validated.
+/// This type is intentionally neither serializable nor deserializable.
+///
+/// ```compile_fail
+/// use frankensearch_core::generation::TrustedProducerConformanceContextV1;
+/// let _: TrustedProducerConformanceContextV1<'_> = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct TrustedProducerConformanceContextV1<'a> {
+    policy_fingerprint: &'a str,
+    certificate_fingerprint: &'a str,
+    fixture: &'a VerifiedGoldenConformanceManifestV1,
+    evaluation_time_unix_seconds: u64,
+    minimum_certificate_revision: u64,
+    maximum_certificate_revision: u64,
+}
+
+/// How an opaque producer-compatibility witness was established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProducerCompatibilityKindV1 {
+    /// Both validated bundles carry the exact same producer identity.
+    Exact,
+    /// A distinct producer was promoted through an independently trusted certificate.
+    Certified,
+}
+
+/// Opaque proof that one candidate producer is admissible relative to one
+/// reference producer.
+///
+/// Fields are private and the type is not deserializable, so a caller cannot
+/// manufacture runtime authority from JSON or plausible digest strings.
+///
+/// ```compile_fail
+/// use frankensearch_core::generation::ProducerCompatibilityWitnessV1;
+/// let _: ProducerCompatibilityWitnessV1 = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct ProducerCompatibilityWitnessV1 {
+    kind: ProducerCompatibilityKindV1,
+    space_fingerprint: String,
+    reference_producer_fingerprint: String,
+    candidate_producer_fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    certificate_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    golden_fixture_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    certificate_revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at_unix_seconds: Option<u64>,
+}
+
+impl VerifiedGoldenConformanceManifestV1 {
+    /// Execute the fixture comparison boundary over already-produced exact vectors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProducerCompatibilityErrorV1::GoldenFixtureInvalid`] for malformed
+    /// corpus/vector shapes, or [`ProducerCompatibilityErrorV1::GoldenVectorMismatch`]
+    /// when the producers differ in any ordered input, shape, or exact `f32` bit.
+    pub fn from_exact_pair_f32(
+        texts: &[&str],
+        reference_vectors: &[Vec<f32>],
+        candidate_vectors: &[Vec<f32>],
+    ) -> Result<Self, ProducerCompatibilityErrorV1> {
+        let reference = GoldenVectorCertificateV1::from_exact_f32(texts, reference_vectors)
+            .map_err(|_| ProducerCompatibilityErrorV1::GoldenFixtureInvalid)?;
+        let candidate = GoldenVectorCertificateV1::from_exact_f32(texts, candidate_vectors)
+            .map_err(|_| ProducerCompatibilityErrorV1::GoldenFixtureInvalid)?;
+        if reference != candidate {
+            return Err(ProducerCompatibilityErrorV1::GoldenVectorMismatch);
+        }
+        let canonical_bytes = Self::canonical_bytes_for(&reference);
+        Ok(Self {
+            certificate: reference,
+            fingerprint: sha256_hex(&canonical_bytes),
+            canonical_bytes,
+        })
+    }
+
+    /// Exact common golden-vector certificate produced by the fixture run.
+    #[must_use]
+    pub const fn certificate(&self) -> &GoldenVectorCertificateV1 {
+        &self.certificate
+    }
+
+    /// Domain-separated SHA-256 of the frozen fixture manifest.
+    #[must_use]
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    /// Exact canonical bytes bound by [`Self::fingerprint`].
+    #[must_use]
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+
+    fn canonical_bytes_for(certificate: &GoldenVectorCertificateV1) -> Vec<u8> {
+        let mut encoder =
+            CanonicalEncoder::new(b"frankensearch.verified-golden-conformance-manifest.v1");
+        certificate.encode(&mut encoder);
+        encoder.finish()
+    }
+
+    fn validate(&self) -> Result<(), ProducerCompatibilityErrorV1> {
+        self.certificate
+            .validate()
+            .map_err(|_| ProducerCompatibilityErrorV1::GoldenFixtureInvalid)?;
+        let canonical_bytes = Self::canonical_bytes_for(&self.certificate);
+        // ubs:ignore — these canonical certificate bytes are public integrity evidence, not secrets.
+        if self.canonical_bytes != canonical_bytes
+            // ubs:ignore — this fingerprint is public certificate-integrity evidence, not a secret.
+            || self.fingerprint != sha256_hex(&canonical_bytes)
+        {
+            return Err(ProducerCompatibilityErrorV1::GoldenFixtureInvalid);
+        }
+        Ok(())
+    }
+}
+
+impl ForeignProducerConformanceCertificateV1 {
+    /// Create an authority-free raw receipt for a verified producer pair.
+    ///
+    /// The returned value remains untrusted until promoted against a
+    /// [`TrustedProducerConformanceContextV1`] that independently pins its
+    /// canonical fingerprint. Computing that fingerprint from this returned
+    /// value and immediately feeding it back as the supposed independent pin is
+    /// self-assertion, not certification.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed producer-compatibility error for invalid identities,
+    /// cross-space or exact-producer use, fixture disagreement, malformed policy,
+    /// zero revision, or an empty validity interval.
+    pub fn new_untrusted_receipt_from_verified_pair(
+        reference: &EmbeddingIdentityBundleV1,
+        candidate: &EmbeddingIdentityBundleV1,
+        fixture: &VerifiedGoldenConformanceManifestV1,
+        policy_fingerprint: &str,
+        certificate_revision: u64,
+        not_before_unix_seconds: u64,
+        expires_at_unix_seconds: u64,
+    ) -> Result<Self, ProducerCompatibilityErrorV1> {
+        validate_reference_and_candidate(reference, candidate)?;
+        // ubs:ignore — embedding-space fingerprints are public compatibility identities.
+        if reference.space.fingerprint() != candidate.space.fingerprint() {
+            return Err(ProducerCompatibilityErrorV1::SpaceMismatch);
+        }
+        let reference_producer_fingerprint = reference.producer.fingerprint();
+        let candidate_producer_fingerprint = candidate.producer.fingerprint();
+        if reference_producer_fingerprint == candidate_producer_fingerprint {
+            return Err(ProducerCompatibilityErrorV1::CertificateForbiddenForExactProducer);
+        }
+        fixture.validate()?;
+        if fixture.certificate != reference.producer.golden_vectors
+            || fixture.certificate != candidate.producer.golden_vectors
+        {
+            return Err(ProducerCompatibilityErrorV1::GoldenVectorMismatch);
+        }
+        if validate_sha256(
+            "producer_conformance.policy_fingerprint",
+            policy_fingerprint,
+        )
+        .is_err()
+            || certificate_revision == 0
+            || not_before_unix_seconds >= expires_at_unix_seconds
+        {
+            return Err(ProducerCompatibilityErrorV1::CertificateMalformed);
+        }
+        Ok(Self {
+            schema_version: FOREIGN_PRODUCER_CONFORMANCE_CERTIFICATE_SCHEMA_V1,
+            reference_producer_fingerprint,
+            candidate_producer_fingerprint,
+            space_fingerprint: reference.space.fingerprint(),
+            golden_fixture_fingerprint: fixture.fingerprint.clone(),
+            policy_fingerprint: policy_fingerprint.to_owned(),
+            certificate_revision,
+            not_before_unix_seconds,
+            expires_at_unix_seconds,
+        })
+    }
+
+    /// Domain-separated canonical bytes for policy pinning.
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut encoder =
+            CanonicalEncoder::new(b"frankensearch.foreign-producer-conformance-certificate.v1");
+        encoder.u16(self.schema_version);
+        encoder.text(&self.reference_producer_fingerprint);
+        encoder.text(&self.candidate_producer_fingerprint);
+        encoder.text(&self.space_fingerprint);
+        encoder.text(&self.golden_fixture_fingerprint);
+        encoder.text(&self.policy_fingerprint);
+        encoder.u64(self.certificate_revision);
+        encoder.u64(self.not_before_unix_seconds);
+        encoder.u64(self.expires_at_unix_seconds);
+        encoder.finish()
+    }
+
+    /// Lowercase SHA-256 of [`Self::canonical_bytes`].
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        sha256_hex(&self.canonical_bytes())
+    }
+
+    /// Certificate revision bound by the canonical fingerprint.
+    #[must_use]
+    pub const fn certificate_revision(&self) -> u64 {
+        self.certificate_revision
+    }
+
+    /// Exclusive expiry bound in Unix seconds.
+    #[must_use]
+    pub const fn expires_at_unix_seconds(&self) -> u64 {
+        self.expires_at_unix_seconds
+    }
+
+    fn validate(&self) -> Result<(), ProducerCompatibilityErrorV1> {
+        if self.schema_version != FOREIGN_PRODUCER_CONFORMANCE_CERTIFICATE_SCHEMA_V1
+            || self.certificate_revision == 0
+            || self.not_before_unix_seconds >= self.expires_at_unix_seconds
+        {
+            return Err(ProducerCompatibilityErrorV1::CertificateMalformed);
+        }
+        for (field, fingerprint) in [
+            (
+                "producer_conformance.reference_producer_fingerprint",
+                &self.reference_producer_fingerprint,
+            ),
+            (
+                "producer_conformance.candidate_producer_fingerprint",
+                &self.candidate_producer_fingerprint,
+            ),
+            (
+                "producer_conformance.space_fingerprint",
+                &self.space_fingerprint,
+            ),
+            (
+                "producer_conformance.golden_fixture_fingerprint",
+                &self.golden_fixture_fingerprint,
+            ),
+            (
+                "producer_conformance.policy_fingerprint",
+                &self.policy_fingerprint,
+            ),
+        ] {
+            if validate_sha256(field, fingerprint).is_err() {
+                return Err(ProducerCompatibilityErrorV1::CertificateMalformed);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'a> TrustedProducerConformanceContextV1<'a> {
+    /// Bind independently trusted policy, certificate, fixture, time, and revision state.
+    ///
+    /// The C1 foundation deliberately provides no production policy registry or
+    /// consumer. Applications must source these pins from an owner-controlled
+    /// channel independent of the raw certificate; this constructor does not
+    /// authenticate caller authority and must never be populated from fields or
+    /// digests learned only from the certificate under review.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProducerCompatibilityErrorV1::CertificateMalformed`] for malformed
+    /// pinned digests or an invalid revision window, and propagates fixture defects.
+    pub fn from_independent_policy(
+        policy_fingerprint: &'a str,
+        certificate_fingerprint: &'a str,
+        fixture: &'a VerifiedGoldenConformanceManifestV1,
+        evaluation_time_unix_seconds: u64,
+        minimum_certificate_revision: u64,
+        maximum_certificate_revision: u64,
+    ) -> Result<Self, ProducerCompatibilityErrorV1> {
+        if validate_sha256(
+            "trusted_producer_conformance.policy_fingerprint",
+            policy_fingerprint,
+        )
+        .is_err()
+            || validate_sha256(
+                "trusted_producer_conformance.certificate_fingerprint",
+                certificate_fingerprint,
+            )
+            .is_err()
+            || minimum_certificate_revision == 0
+            || minimum_certificate_revision > maximum_certificate_revision
+        {
+            return Err(ProducerCompatibilityErrorV1::CertificateMalformed);
+        }
+        fixture.validate()?;
+        Ok(Self {
+            policy_fingerprint,
+            certificate_fingerprint,
+            fixture,
+            evaluation_time_unix_seconds,
+            minimum_certificate_revision,
+            maximum_certificate_revision,
+        })
+    }
+}
+
+impl ProducerCompatibilityWitnessV1 {
+    /// Exact versus explicitly certified producer compatibility.
+    #[must_use]
+    pub const fn kind(&self) -> ProducerCompatibilityKindV1 {
+        self.kind
+    }
+
+    /// Mathematical space shared by the producer pair.
+    #[must_use]
+    pub fn space_fingerprint(&self) -> &str {
+        &self.space_fingerprint
+    }
+
+    /// Reference producer bound into the witness.
+    #[must_use]
+    pub fn reference_producer_fingerprint(&self) -> &str {
+        &self.reference_producer_fingerprint
+    }
+
+    /// Candidate producer bound into the witness.
+    #[must_use]
+    pub fn candidate_producer_fingerprint(&self) -> &str {
+        &self.candidate_producer_fingerprint
+    }
+
+    /// Canonical certificate fingerprint for certified witnesses.
+    #[must_use]
+    pub fn certificate_fingerprint(&self) -> Option<&str> {
+        self.certificate_fingerprint.as_deref()
+    }
+}
+
+fn validate_reference_and_candidate(
+    reference: &EmbeddingIdentityBundleV1,
+    candidate: &EmbeddingIdentityBundleV1,
+) -> Result<(), ProducerCompatibilityErrorV1> {
+    reference
+        .validate()
+        .map_err(|_| ProducerCompatibilityErrorV1::InvalidReferenceIdentity)?;
+    candidate
+        .validate()
+        .map_err(|_| ProducerCompatibilityErrorV1::InvalidCandidateIdentity)
+}
+
 impl EmbeddingIdentityBundleV1 {
     /// Validate every component and all cross-component bindings.
     ///
@@ -1007,17 +3089,128 @@ impl EmbeddingIdentityBundleV1 {
         sha256_hex(&self.canonical_bytes())
     }
 
-    /// Whether two validated producers may intentionally share one mathematical
-    /// space under the same explicit golden-vector certificate.
+    /// Prove that a candidate carries the exact same producer identity.
     ///
-    /// Backend names, display identifiers, dimensions, or artifact filenames
-    /// alone never establish compatibility. Invalid bundles are incompatible.
-    #[must_use]
-    pub fn is_conformance_compatible_with(&self, other: &Self) -> bool {
-        self.validate().is_ok()
-            && other.validate().is_ok()
-            && self.space.fingerprint() == other.space.fingerprint()
-            && self.producer.golden_vectors == other.producer.golden_vectors
+    /// Storage identity is deliberately excluded: the same producer may persist
+    /// an identical mathematical space in a different physical encoding. A
+    /// same-space producer with any implementation, protocol, numeric, provenance,
+    /// or golden-certificate drift must use the explicitly certified path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a closed [`ProducerCompatibilityErrorV1`] when either bundle is
+    /// invalid, the mathematical spaces differ, or the producer fingerprints are
+    /// not identical.
+    pub fn verify_exact_producer_with(
+        &self,
+        candidate: &Self,
+    ) -> Result<ProducerCompatibilityWitnessV1, ProducerCompatibilityErrorV1> {
+        validate_reference_and_candidate(self, candidate)?;
+        let space_fingerprint = self.space.fingerprint();
+        // ubs:ignore — embedding-space fingerprints are public compatibility identities.
+        if space_fingerprint != candidate.space.fingerprint() {
+            return Err(ProducerCompatibilityErrorV1::SpaceMismatch);
+        }
+        let reference_producer_fingerprint = self.producer.fingerprint();
+        let candidate_producer_fingerprint = candidate.producer.fingerprint();
+        if reference_producer_fingerprint != candidate_producer_fingerprint {
+            return Err(ProducerCompatibilityErrorV1::CertificateRequired);
+        }
+        Ok(ProducerCompatibilityWitnessV1 {
+            kind: ProducerCompatibilityKindV1::Exact,
+            space_fingerprint,
+            reference_producer_fingerprint,
+            candidate_producer_fingerprint,
+            certificate_fingerprint: None,
+            policy_fingerprint: None,
+            golden_fixture_fingerprint: None,
+            certificate_revision: None,
+            expires_at_unix_seconds: None,
+        })
+    }
+
+    /// Prove that a distinct producer is admissible under an explicitly trusted
+    /// conformance certificate.
+    ///
+    /// The certificate is direction-sensitive and binds the exact producer pair,
+    /// mathematical space, independently executed golden fixture, policy,
+    /// revision, and validity interval. The trusted context must independently
+    /// pin the certificate's canonical fingerprint; copying fields from the raw
+    /// certificate into the context does not establish a trustworthy boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns a closed [`ProducerCompatibilityErrorV1`] for invalid identities,
+    /// cross-space use, exact-producer misuse, malformed or untrusted certificate
+    /// state, binding drift, fixture disagreement, expiry, or revision-policy
+    /// violations.
+    pub fn verify_certified_foreign_producer_with(
+        &self,
+        candidate: &Self,
+        certificate: &ForeignProducerConformanceCertificateV1,
+        trusted: TrustedProducerConformanceContextV1<'_>,
+    ) -> Result<ProducerCompatibilityWitnessV1, ProducerCompatibilityErrorV1> {
+        validate_reference_and_candidate(self, candidate)?;
+        let space_fingerprint = self.space.fingerprint();
+        // ubs:ignore — space fingerprints are public compatibility identities, not secrets.
+        if space_fingerprint != candidate.space.fingerprint() {
+            return Err(ProducerCompatibilityErrorV1::SpaceMismatch);
+        }
+        let reference_producer_fingerprint = self.producer.fingerprint();
+        let candidate_producer_fingerprint = candidate.producer.fingerprint();
+        if reference_producer_fingerprint == candidate_producer_fingerprint {
+            return Err(ProducerCompatibilityErrorV1::CertificateForbiddenForExactProducer);
+        }
+
+        certificate.validate()?;
+        trusted.fixture.validate()?;
+        let certificate_fingerprint = certificate.fingerprint();
+        // ubs:ignore — certificate fingerprints are public integrity identities, not authenticators.
+        if certificate_fingerprint != trusted.certificate_fingerprint {
+            return Err(ProducerCompatibilityErrorV1::CertificateFingerprintMismatch);
+        }
+        // ubs:ignore — policy fingerprints are public conformance identities, not secrets.
+        if certificate.policy_fingerprint != trusted.policy_fingerprint {
+            return Err(ProducerCompatibilityErrorV1::PolicyMismatch);
+        }
+        if certificate.reference_producer_fingerprint != reference_producer_fingerprint
+            || certificate.candidate_producer_fingerprint != candidate_producer_fingerprint
+            || certificate.space_fingerprint != space_fingerprint
+        {
+            return Err(ProducerCompatibilityErrorV1::ProducerBindingMismatch);
+        }
+        // ubs:ignore — fixture fingerprints are public conformance identities, not secrets.
+        if certificate.golden_fixture_fingerprint != trusted.fixture.fingerprint
+            // ubs:ignore — golden-vector certificates are public conformance evidence.
+            || trusted.fixture.certificate != self.producer.golden_vectors
+            // ubs:ignore — golden-vector certificates are public conformance evidence.
+            || trusted.fixture.certificate != candidate.producer.golden_vectors
+        {
+            return Err(ProducerCompatibilityErrorV1::FixtureBindingMismatch);
+        }
+        if certificate.certificate_revision < trusted.minimum_certificate_revision
+            || certificate.certificate_revision > trusted.maximum_certificate_revision
+        {
+            return Err(ProducerCompatibilityErrorV1::CertificateRevisionOutsidePolicy);
+        }
+        if trusted.evaluation_time_unix_seconds < certificate.not_before_unix_seconds {
+            return Err(ProducerCompatibilityErrorV1::CertificateNotYetValid);
+        }
+        if trusted.evaluation_time_unix_seconds >= certificate.expires_at_unix_seconds {
+            return Err(ProducerCompatibilityErrorV1::CertificateExpired);
+        }
+
+        Ok(ProducerCompatibilityWitnessV1 {
+            kind: ProducerCompatibilityKindV1::Certified,
+            space_fingerprint,
+            reference_producer_fingerprint,
+            candidate_producer_fingerprint,
+            certificate_fingerprint: Some(certificate_fingerprint),
+            policy_fingerprint: Some(certificate.policy_fingerprint.clone()),
+            golden_fixture_fingerprint: Some(certificate.golden_fixture_fingerprint.clone()),
+            certificate_revision: Some(certificate.certificate_revision),
+            expires_at_unix_seconds: Some(certificate.expires_at_unix_seconds),
+        })
     }
 
     /// Validate and freeze the exact bytes that persistence must store.
@@ -1171,6 +3364,7 @@ impl FrozenEmbeddingIdentityBundleV1 {
         self.identity.validate()?;
         validate_sha256("frozen_bundle.fingerprint", &self.fingerprint)?;
         let canonical_bytes = self.identity.canonical_bytes();
+        // ubs:ignore — these canonical authority bytes are public integrity evidence.
         if self.canonical_bytes != canonical_bytes {
             return Err(identity_error(
                 "frozen_bundle.canonical_bytes",
@@ -1179,6 +3373,7 @@ impl FrozenEmbeddingIdentityBundleV1 {
             ));
         }
         let fingerprint = sha256_hex(&canonical_bytes);
+        // ubs:ignore — this fingerprint is public authority-integrity evidence, not a secret.
         if self.fingerprint != fingerprint {
             return Err(identity_error(
                 "frozen_bundle.fingerprint",
@@ -1250,6 +3445,102 @@ impl CanonicalEncoder {
 
     fn finish(self) -> Vec<u8> {
         self.bytes
+    }
+}
+
+/// Bounds-first reader for the fixed subset of canonical fields used by the
+/// activation-manifest codec. It never allocates from a decoded length.
+struct CanonicalDecoder<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> CanonicalDecoder<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn u8(&mut self, field: &'static str) -> Result<u8, GenerationAuthorityErrorV1> {
+        Ok(self.take(1, field)?[0])
+    }
+
+    fn u16(&mut self, field: &'static str) -> Result<u16, GenerationAuthorityErrorV1> {
+        Ok(u16::from_be_bytes(self.array(field)?))
+    }
+
+    fn u64(&mut self, field: &'static str) -> Result<u64, GenerationAuthorityErrorV1> {
+        Ok(u64::from_be_bytes(self.array(field)?))
+    }
+
+    fn array<const N: usize>(
+        &mut self,
+        field: &'static str,
+    ) -> Result<[u8; N], GenerationAuthorityErrorV1> {
+        let mut result = [0_u8; N];
+        result.copy_from_slice(self.take(N, field)?);
+        Ok(result)
+    }
+
+    fn fixed_bytes<const N: usize>(
+        &mut self,
+        field: &'static str,
+    ) -> Result<[u8; N], GenerationAuthorityErrorV1> {
+        let bytes = self.bytes(field, N)?;
+        if bytes.len() != N {
+            return Err(GenerationAuthorityErrorV1::InvalidField { field });
+        }
+        let mut result = [0_u8; N];
+        result.copy_from_slice(bytes);
+        Ok(result)
+    }
+
+    fn bytes(
+        &mut self,
+        field: &'static str,
+        maximum_len: usize,
+    ) -> Result<&'a [u8], GenerationAuthorityErrorV1> {
+        let length = usize::try_from(self.u64(field)?)
+            .map_err(|_| GenerationAuthorityErrorV1::InvalidField { field })?;
+        if length > maximum_len {
+            return Err(GenerationAuthorityErrorV1::InvalidField { field });
+        }
+        self.take(length, field)
+    }
+
+    fn component(
+        &mut self,
+        field: &'static str,
+    ) -> Result<GenerationComponentReceiptV1, GenerationAuthorityErrorV1> {
+        let byte_len = self.u64(field)?;
+        let sha256 = self.fixed_bytes(field)?;
+        Ok(GenerationComponentReceiptV1 { byte_len, sha256 })
+    }
+
+    fn finish(self) -> Result<(), GenerationAuthorityErrorV1> {
+        if self.offset == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "activation_manifest.canonical_bytes",
+            })
+        }
+    }
+
+    fn take(
+        &mut self,
+        len: usize,
+        field: &'static str,
+    ) -> Result<&'a [u8], GenerationAuthorityErrorV1> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or(GenerationAuthorityErrorV1::InvalidField { field })?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(GenerationAuthorityErrorV1::InvalidField { field })?;
+        self.offset = end;
+        Ok(value)
     }
 }
 
@@ -1936,6 +4227,998 @@ fn check_document_count_consistency(m: &GenerationManifest, f: &mut Vec<Validati
 mod tests {
     use super::*;
 
+    fn authority_reference(sequence: u64, predecessor: Option<[u8; 32]>) -> AuthorityRefV1 {
+        AuthorityRefV1::new(
+            sequence,
+            [u8::try_from(sequence).expect("small test sequence"); 16],
+            4_096 + sequence,
+            [u8::try_from(sequence + 16).expect("small test digest"); 32],
+            predecessor,
+        )
+        .expect("valid test authority reference")
+    }
+
+    fn authority_slot(slot_index: u8, authority: AuthorityRefV1) -> AuthoritySlotV1 {
+        AuthoritySlotV1 {
+            slot_index,
+            root_id: [0x5a; 16],
+            authority,
+        }
+    }
+
+    fn lock_frame(kind: GenerationLockFrameKindV1) -> GenerationLockFrameV1 {
+        GenerationLockFrameV1::new(kind, [0x71; 16], [0x72; 16], [0x73; 16], 1, [0x74; 32])
+            .expect("valid test lock frame")
+    }
+
+    fn authority_lock(
+        kind: GenerationLockFrameKindV1,
+        authority: AuthorityRefV1,
+    ) -> GenerationLockFrameV1 {
+        GenerationLockFrameV1::new(
+            kind,
+            [0x5a; 16],
+            [0x72; 16],
+            [0x73; 16],
+            1,
+            authority.fingerprint(),
+        )
+        .expect("valid authority-bound test lock frame")
+    }
+
+    fn component_receipts() -> GenerationComponentReceiptsV1 {
+        GenerationComponentReceiptsV1 {
+            vector: GenerationComponentReceiptV1 {
+                byte_len: 101,
+                sha256: [0x11; 32],
+            },
+            lexical: GenerationComponentReceiptV1 {
+                byte_len: 102,
+                sha256: [0x12; 32],
+            },
+            ann: GenerationComponentReceiptV1 {
+                byte_len: 103,
+                sha256: [0x13; 32],
+            },
+            metadata: GenerationComponentReceiptV1 {
+                byte_len: 104,
+                sha256: [0x14; 32],
+            },
+        }
+    }
+
+    fn activation_manifest(
+        authority_sequence: u64,
+        predecessor: Option<AuthorityRefV1>,
+    ) -> ActivationManifestV1 {
+        ActivationManifestV1::new(
+            authority_sequence,
+            predecessor,
+            GenerationAuthorityActionV1::Activate,
+            ArtifactGenerationIdentityV1::new(7, [0x21; 16]).expect("test generation"),
+            [0x31; 32],
+            [0x32; 32],
+            [0x33; 32],
+            component_receipts(),
+        )
+        .expect("valid activation manifest")
+    }
+
+    #[test]
+    fn authority_slot_round_trips_and_authenticates_every_byte() {
+        let authority = authority_reference(1, None);
+        let slot = authority_slot(0, authority);
+        let bytes = slot.encode().expect("encode slot");
+        let decoded =
+            AuthoritySlotV1::from_authenticated_bytes(&bytes, 0, [0x5a; 16]).expect("decode slot");
+        assert_eq!(decoded, slot);
+
+        let mut tampered = bytes;
+        tampered[200] ^= 1;
+        assert_eq!(
+            AuthoritySlotV1::from_authenticated_bytes(&tampered, 0, [0x5a; 16]),
+            Err(GenerationAuthorityErrorV1::ChecksumMismatch),
+            "a byte outside the structured header must still be authenticated"
+        );
+    }
+
+    #[test]
+    fn authority_slot_rejects_every_single_byte_mutation() {
+        let encoded = authority_slot(0, authority_reference(1, None))
+            .encode()
+            .expect("encode slot");
+        for byte_index in 0..GENERATION_AUTHORITY_SLOT_BYTES_V1 {
+            let mut mutated = encoded;
+            mutated[byte_index] ^= 0x80;
+            assert!(
+                AuthoritySlotV1::from_authenticated_bytes(&mutated, 0, [0x5a; 16]).is_err(),
+                "single-byte mutation at offset {byte_index} must never decode"
+            );
+        }
+    }
+
+    #[test]
+    fn authority_slot_rejects_recomputed_noncanonical_padding_and_copied_slot() {
+        let slot = authority_slot(0, authority_reference(1, None));
+        let mut noncanonical = slot.encode().expect("encode slot");
+        noncanonical[200] = 1;
+        let digest = Sha256::digest(&noncanonical[..AUTHORITY_SLOT_BODY_BYTES]);
+        noncanonical[AUTHORITY_SLOT_BODY_BYTES..].copy_from_slice(&digest);
+        assert_eq!(
+            AuthoritySlotV1::from_authenticated_bytes(&noncanonical, 0, [0x5a; 16]),
+            Err(GenerationAuthorityErrorV1::NonCanonicalPadding),
+            "a valid checksum does not permit noncanonical bytes"
+        );
+        assert_eq!(
+            AuthoritySlotV1::from_authenticated_bytes(
+                &slot.encode().expect("encode slot"),
+                1,
+                [0x5a; 16],
+            ),
+            Err(GenerationAuthorityErrorV1::SlotIndexMismatch),
+            "a frame copied between physical slots must fail closed"
+        );
+    }
+
+    #[test]
+    fn fixed_authority_frames_reject_resealed_future_schemas() {
+        let slot = authority_slot(0, authority_reference(1, None));
+        let mut future_slot = slot.encode().expect("encode authority slot");
+        future_slot[8..10].copy_from_slice(&(GENERATION_AUTHORITY_SCHEMA_V1 + 1).to_be_bytes());
+        let slot_digest = Sha256::digest(&future_slot[..AUTHORITY_SLOT_BODY_BYTES]);
+        future_slot[AUTHORITY_SLOT_BODY_BYTES..].copy_from_slice(&slot_digest);
+        assert_eq!(
+            AuthoritySlotV1::from_authenticated_bytes(&future_slot, 0, [0x5a; 16]),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_slot.header"
+            }),
+            "a future AUTHORITY frame is rejected even with a valid checksum"
+        );
+
+        let mut future_lock = lock_frame(GenerationLockFrameKindV1::Owner)
+            .encode()
+            .expect("encode owner lock frame");
+        future_lock[8..10].copy_from_slice(&(GENERATION_AUTHORITY_SCHEMA_V1 + 1).to_be_bytes());
+        let lock_digest = Sha256::digest(&future_lock[..LOCK_FRAME_BODY_BYTES]);
+        future_lock[LOCK_FRAME_BODY_BYTES..].copy_from_slice(&lock_digest);
+        assert_eq!(
+            GenerationLockFrameV1::from_authenticated_bytes(&future_lock, [0x71; 16]),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "generation_lock.header"
+            }),
+            "a future LOCK frame is rejected even with a valid checksum"
+        );
+    }
+
+    #[test]
+    fn lock_owner_and_attempt_frames_are_distinct_authenticated_contracts() {
+        let owner = lock_frame(GenerationLockFrameKindV1::Owner);
+        let owner_bytes = owner.encode().expect("encode owner lock frame");
+        assert_eq!(
+            GenerationLockFrameV1::from_authenticated_bytes(&owner_bytes, [0x71; 16])
+                .expect("decode owner lock frame"),
+            owner
+        );
+
+        let attempt = lock_frame(GenerationLockFrameKindV1::Attempt);
+        assert_ne!(
+            attempt.encode().expect("encode attempt lock frame"),
+            owner_bytes,
+            "an attempt must never serialize as an owner record"
+        );
+
+        let mut tampered = owner_bytes;
+        tampered[300] ^= 1;
+        assert_eq!(
+            GenerationLockFrameV1::from_authenticated_bytes(&tampered, [0x71; 16]),
+            Err(GenerationAuthorityErrorV1::ChecksumMismatch),
+            "padding bytes remain authenticated"
+        );
+        assert_eq!(
+            GenerationLockFrameV1::from_authenticated_bytes(&owner_bytes, [0x75; 16]),
+            Err(GenerationAuthorityErrorV1::RootMismatch),
+            "a lock frame copied across roots must fail closed"
+        );
+    }
+
+    #[test]
+    fn lock_frame_rejects_every_single_byte_mutation() {
+        let encoded = lock_frame(GenerationLockFrameKindV1::Owner)
+            .encode()
+            .expect("encode owner lock frame");
+        for byte_index in 0..GENERATION_LOCK_FRAME_BYTES_V1 {
+            let mut mutated = encoded;
+            mutated[byte_index] ^= 0x80;
+            assert!(
+                GenerationLockFrameV1::from_authenticated_bytes(&mutated, [0x71; 16]).is_err(),
+                "single-byte mutation at offset {byte_index} must never decode"
+            );
+        }
+    }
+
+    #[test]
+    fn lock_aware_resolver_requires_owner_agreement_and_attempt_reconciliation() {
+        let genesis = authority_reference(1, None);
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        let first = authority_slot(1, genesis);
+        let second = authority_slot(0, successor);
+        let owner = authority_lock(GenerationLockFrameKindV1::Owner, successor);
+        assert_eq!(
+            resolve_authority_slots_with_locks_v1(Some(first), Some(second), Some(owner), None),
+            Ok(Some(second)),
+            "a matching owner attests the resolved committed head"
+        );
+
+        let attempt = authority_lock(GenerationLockFrameKindV1::Attempt, successor);
+        assert_eq!(
+            resolve_authority_slots_with_locks_v1(
+                Some(first),
+                Some(second),
+                Some(owner),
+                Some(attempt),
+            ),
+            Err(GenerationAuthorityErrorV1::UnresolvedAttempt),
+            "an authenticated attempt blocks fallback until publisher reconciliation"
+        );
+
+        let wrong_authority = GenerationLockFrameV1::new(
+            GenerationLockFrameKindV1::Owner,
+            [0x5a; 16],
+            [0x72; 16],
+            [0x73; 16],
+            1,
+            [0x91; 32],
+        )
+        .expect("well-formed mismatched owner lock");
+        assert_eq!(
+            resolve_authority_slots_with_locks_v1(
+                Some(first),
+                Some(second),
+                Some(wrong_authority),
+                None,
+            ),
+            Err(GenerationAuthorityErrorV1::LockAuthorityMismatch),
+            "a valid lock for another authority must not select this head"
+        );
+    }
+
+    #[test]
+    fn lock_aware_resolver_rejects_wrong_roles_and_cross_root_evidence() {
+        let genesis = authority_reference(1, None);
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        let first = authority_slot(1, genesis);
+        let second = authority_slot(0, successor);
+        let owner = authority_lock(GenerationLockFrameKindV1::Owner, successor);
+        assert_eq!(
+            resolve_authority_slots_with_locks_v1(Some(first), Some(second), None, Some(owner)),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "generation_lock.attempt.kind"
+            }),
+            "owner frames cannot be reinterpreted as unresolved attempts"
+        );
+
+        let foreign_attempt = GenerationLockFrameV1::new(
+            GenerationLockFrameKindV1::Attempt,
+            [0x6b; 16],
+            [0x72; 16],
+            [0x73; 16],
+            1,
+            successor.fingerprint(),
+        )
+        .expect("well-formed foreign-root attempt");
+        assert_eq!(
+            resolve_authority_slots_with_locks_v1(
+                Some(first),
+                Some(second),
+                None,
+                Some(foreign_attempt),
+            ),
+            Err(GenerationAuthorityErrorV1::LockRootMismatch),
+            "attempt evidence from another root cannot block or select this authority"
+        );
+    }
+
+    #[test]
+    fn authority_resolver_requires_an_exact_consecutive_predecessor() {
+        let first = authority_reference(1, None);
+        let second = authority_reference(2, Some(first.fingerprint()));
+        let resolved = resolve_authority_slots_v1(
+            Some(authority_slot(1, first)),
+            Some(authority_slot(0, second)),
+        )
+        .expect("linked authority slots resolve")
+        .expect("at least one authority");
+        assert_eq!(resolved.authority, second);
+
+        let unlinked = authority_reference(2, Some([0x11; 32]));
+        assert_eq!(
+            resolve_authority_slots_v1(
+                Some(authority_slot(1, first)),
+                Some(authority_slot(0, unlinked)),
+            ),
+            Err(GenerationAuthorityErrorV1::BrokenPredecessorLink),
+            "a newer authority without the exact predecessor fingerprint is not selectable"
+        );
+    }
+
+    #[test]
+    fn authority_resolver_rejects_non_genesis_slot_parity_violation() {
+        let genesis = authority_reference(1, None);
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        assert_eq!(
+            resolve_authority_slots_v1(
+                Some(authority_slot(0, genesis)),
+                Some(authority_slot(1, successor)),
+            ),
+            Err(GenerationAuthorityErrorV1::SlotSequenceParity),
+            "a non-genesis authority copied into the opposite physical slot must fail"
+        );
+    }
+
+    #[test]
+    fn authority_resolver_rejects_repeated_physical_slots_and_lone_parity_tears() {
+        let genesis = authority_reference(1, None);
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        assert_eq!(
+            resolve_authority_slots_v1(
+                Some(authority_slot(0, genesis)),
+                Some(authority_slot(0, successor)),
+            ),
+            Err(GenerationAuthorityErrorV1::DuplicatePhysicalSlot),
+            "two inputs claiming one physical slot cannot represent a recoverable pair"
+        );
+        assert_eq!(
+            resolve_authority_slots_v1(Some(authority_slot(1, successor)), None),
+            Err(GenerationAuthorityErrorV1::SlotSequenceParity),
+            "one surviving non-genesis slot must still bind its publication parity"
+        );
+        assert_eq!(
+            resolve_authority_slots_v1(
+                Some(authority_slot(0, successor)),
+                Some(authority_slot(1, genesis)),
+            ),
+            Ok(Some(authority_slot(0, successor))),
+            "resolver input order never changes the selected consecutive head"
+        );
+    }
+
+    #[test]
+    fn authority_resolver_accepts_consecutive_heads_across_slot_orientations() {
+        let mut older = authority_reference(1, None);
+        let mut older_slot_index = 1;
+        for sequence in 2..=32 {
+            let object_byte = u8::try_from(sequence).expect("bounded test sequence");
+            let newer = AuthorityRefV1::new(
+                sequence,
+                [object_byte; 16],
+                4_096 + sequence,
+                [object_byte.wrapping_add(16); 32],
+                Some(older.fingerprint()),
+            )
+            .expect("consecutive authority reference");
+            let newer_slot_index = u8::try_from(sequence & 1).expect("slot parity fits u8");
+            let older_slot = authority_slot(older_slot_index, older);
+            let newer_slot = authority_slot(newer_slot_index, newer);
+            assert_eq!(
+                resolve_authority_slots_v1(Some(older_slot), Some(newer_slot)),
+                Ok(Some(newer_slot)),
+                "sequence {sequence} resolves in old/new input order"
+            );
+            assert_eq!(
+                resolve_authority_slots_v1(Some(newer_slot), Some(older_slot)),
+                Ok(Some(newer_slot)),
+                "sequence {sequence} resolves in new/old input order"
+            );
+            older = newer;
+            older_slot_index = newer_slot_index;
+        }
+    }
+
+    #[test]
+    fn raw_authority_frame_resolver_preserves_corruption_as_an_error() {
+        let genesis = authority_reference(1, None);
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        let first = authority_slot(0, successor)
+            .encode()
+            .expect("encode successor frame");
+        let second = authority_slot(1, genesis)
+            .encode()
+            .expect("encode genesis frame");
+        assert_eq!(
+            resolve_authority_slot_frames_v1(Some(&first), Some(&second), [0x5a; 16]),
+            Ok(Some(authority_slot(0, successor))),
+            "two valid raw physical frames resolve their linked head"
+        );
+        assert_eq!(
+            resolve_authority_slot_frames_v1(Some(&first), None, [0x5a; 16]),
+            Ok(Some(authority_slot(0, successor))),
+            "only a genuinely absent second frame permits first-slot survival"
+        );
+
+        let mut corrupt_second = second;
+        corrupt_second[200] ^= 1;
+        assert_eq!(
+            resolve_authority_slot_frames_v1(Some(&first), Some(&corrupt_second), [0x5a; 16]),
+            Err(GenerationAuthorityErrorV1::ChecksumMismatch),
+            "a present corrupt frame must not be silently treated as absent"
+        );
+    }
+
+    #[test]
+    fn raw_authority_frame_resolver_rejects_length_and_order_tears() {
+        let genesis = authority_reference(1, None);
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        let first = authority_slot(0, successor)
+            .encode()
+            .expect("encode successor frame");
+        let second = authority_slot(1, genesis)
+            .encode()
+            .expect("encode genesis frame");
+
+        assert_eq!(
+            resolve_authority_slot_frames_v1(Some(&first[..first.len() - 1]), None, [0x5a; 16]),
+            Err(GenerationAuthorityErrorV1::InvalidSlotLength),
+            "a truncated present frame is not one-slot survival"
+        );
+        let mut extended = first.to_vec();
+        extended.push(0);
+        assert_eq!(
+            resolve_authority_slot_frames_v1(Some(&extended), None, [0x5a; 16]),
+            Err(GenerationAuthorityErrorV1::InvalidSlotLength),
+            "an extended present frame is not one-slot survival"
+        );
+        assert_eq!(
+            resolve_authority_slot_frames_v1(Some(&second), Some(&first), [0x5a; 16]),
+            Err(GenerationAuthorityErrorV1::SlotIndexMismatch),
+            "reordered physical frames cannot swap old and new authorities"
+        );
+    }
+
+    #[test]
+    fn authority_floor_resolver_rejects_stale_forked_and_gapped_heads() {
+        let genesis = authority_reference(1, None);
+        let floor = AuthorityFloorV1::new([0x5a; 16], genesis).expect("valid authority floor");
+        assert_eq!(
+            resolve_authority_slots_at_floor_v1(Some(authority_slot(0, genesis)), None, floor),
+            Ok(authority_slot(0, genesis)),
+            "the exact retained authority is selectable"
+        );
+
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        assert_eq!(
+            resolve_authority_slots_at_floor_v1(Some(authority_slot(0, successor)), None, floor),
+            Ok(authority_slot(0, successor)),
+            "the immediate predecessor-linked successor is selectable"
+        );
+
+        let fork = AuthorityRefV1::new(1, [0x91; 16], 4_097, [0x92; 32], None)
+            .expect("well-formed forked authority");
+        assert_eq!(
+            resolve_authority_slots_at_floor_v1(Some(authority_slot(1, fork)), None, floor),
+            Err(GenerationAuthorityErrorV1::EqualSequenceFork),
+            "equal floor sequence with another immutable object is a fork"
+        );
+
+        let gap = AuthorityRefV1::new(3, [0x93; 16], 4_099, [0x94; 32], Some([0x95; 32]))
+            .expect("well-formed but unprovable authority gap");
+        assert_eq!(
+            resolve_authority_slots_at_floor_v1(Some(authority_slot(1, gap)), None, floor),
+            Err(GenerationAuthorityErrorV1::BrokenPredecessorLink),
+            "a head beyond the immediate anchored successor requires more evidence"
+        );
+
+        let mut foreign_root = authority_slot(0, successor);
+        foreign_root.root_id = [0x96; 16];
+        assert_eq!(
+            resolve_authority_slots_at_floor_v1(Some(foreign_root), None, floor),
+            Err(GenerationAuthorityErrorV1::RootMismatch),
+            "an externally retained floor cannot be replayed across roots"
+        );
+    }
+
+    #[test]
+    fn required_external_profile_never_silently_downgrades_to_local() {
+        let genesis = authority_reference(1, None);
+        let slot = authority_slot(0, genesis);
+        assert_eq!(
+            resolve_authority_slots_with_profile_v1(
+                Some(slot),
+                None,
+                None,
+                None,
+                GenerationRootSecurityProfileV1::RequiredExternal,
+                None,
+            ),
+            Err(GenerationAuthorityErrorV1::ExternalFloorRequired),
+            "a valid local authority alone is insufficient for required-external admission"
+        );
+
+        let floor = AuthorityFloorV1::new([0x5a; 16], genesis).expect("valid external floor");
+        assert_eq!(
+            resolve_authority_slots_with_profile_v1(
+                Some(slot),
+                None,
+                None,
+                None,
+                GenerationRootSecurityProfileV1::RequiredExternal,
+                Some(floor),
+            ),
+            Ok(Some(slot)),
+            "the exact retained external authority admits the root"
+        );
+    }
+
+    #[test]
+    fn local_and_inspection_profiles_keep_lock_reconciliation_mandatory() {
+        let genesis = authority_reference(1, None);
+        let slot = authority_slot(0, genesis);
+        let attempt = authority_lock(GenerationLockFrameKindV1::Attempt, genesis);
+        for profile in [
+            GenerationRootSecurityProfileV1::CooperativeLocal,
+            GenerationRootSecurityProfileV1::ReadOnlyUnanchored,
+        ] {
+            assert_eq!(
+                resolve_authority_slots_with_profile_v1(
+                    Some(slot),
+                    None,
+                    None,
+                    Some(attempt),
+                    profile,
+                    None,
+                ),
+                Err(GenerationAuthorityErrorV1::UnresolvedAttempt),
+                "{profile:?} cannot bypass an unresolved publication attempt"
+            );
+        }
+    }
+
+    #[test]
+    fn root_security_profiles_explicitly_separate_mutation_authority() {
+        assert!(GenerationRootSecurityProfileV1::RequiredExternal.permits_mutation());
+        assert!(GenerationRootSecurityProfileV1::CooperativeLocal.permits_mutation());
+        assert!(!GenerationRootSecurityProfileV1::ReadOnlyUnanchored.permits_mutation());
+        assert_eq!(
+            GenerationRootSecurityProfileV1::ReadOnlyUnanchored.require_mutation_authorized(),
+            Err(GenerationAuthorityErrorV1::ReadOnlyProfile),
+            "inspection-only admission cannot be reused for mutation"
+        );
+    }
+
+    #[test]
+    fn in_memory_anti_rollback_floor_is_exact_monotone_and_idempotent() {
+        let store = InMemoryAntiRollbackFloorStoreV1::new();
+        let genesis = authority_reference(1, None);
+        let genesis_floor =
+            AuthorityFloorV1::new([0x5a; 16], genesis).expect("valid genesis floor");
+        let first = store
+            .compare_and_advance(None, genesis_floor, [0x41; 16])
+            .expect("first floor advance");
+        assert_eq!(first.cas_version, 1);
+        assert_eq!(store.load([0x5a; 16]), Ok(Some(first)));
+        assert_eq!(
+            store.compare_and_advance(None, genesis_floor, [0x41; 16]),
+            Ok(first),
+            "repeating the exact request returns its original receipt"
+        );
+
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        let successor_floor =
+            AuthorityFloorV1::new([0x5a; 16], successor).expect("valid successor floor");
+        let second = store
+            .compare_and_advance(Some(first), successor_floor, [0x42; 16])
+            .expect("monotone successor advance");
+        assert_eq!(second.cas_version, 2);
+        assert_eq!(store.load([0x5a; 16]), Ok(Some(second)));
+
+        assert_eq!(
+            store.compare_and_advance(Some(first), successor_floor, [0x43; 16]),
+            Err(GenerationAuthorityErrorV1::FloorCompareAndAdvanceConflict),
+            "a stale exact CAS receipt cannot overwrite a newer floor"
+        );
+        assert_eq!(
+            store.compare_and_advance(Some(second), genesis_floor, [0x44; 16]),
+            Err(GenerationAuthorityErrorV1::FloorSequenceRegression),
+            "a valid older authority cannot roll the retained floor backward"
+        );
+        assert_eq!(
+            store.compare_and_advance(Some(second), successor_floor, [0x41; 16]),
+            Err(GenerationAuthorityErrorV1::FloorIdempotencyConflict),
+            "a completed idempotency key cannot be rebound to another CAS"
+        );
+        assert_eq!(store.load([0x5a; 16]), Ok(Some(second)));
+    }
+
+    #[test]
+    fn in_memory_anti_rollback_floor_requires_genesis_and_exact_successor_linkage() {
+        let store = InMemoryAntiRollbackFloorStoreV1::new();
+        let root_id = [0x5a; 16];
+        let fabricated_prior = authority_reference(1, None);
+        let unanchored_successor = AuthorityFloorV1::new(
+            root_id,
+            authority_reference(2, Some(fabricated_prior.fingerprint())),
+        )
+        .expect("self-consistent non-genesis authority is structurally valid");
+        assert_eq!(
+            store.compare_and_advance(None, unanchored_successor, [0x45; 16]),
+            Err(GenerationAuthorityErrorV1::BrokenPredecessorLink),
+            "an unanchored root cannot claim an unobserved predecessor"
+        );
+
+        let genesis = authority_reference(1, None);
+        let first = store
+            .compare_and_advance(
+                None,
+                AuthorityFloorV1::new(root_id, genesis).expect("valid genesis floor"),
+                [0x46; 16],
+            )
+            .expect("genesis advance must succeed");
+
+        let skipped =
+            AuthorityFloorV1::new(root_id, authority_reference(3, Some(genesis.fingerprint())))
+                .expect("self-consistent skipped authority is structurally valid");
+        assert_eq!(
+            store.compare_and_advance(Some(first), skipped, [0x47; 16]),
+            Err(GenerationAuthorityErrorV1::BrokenPredecessorLink),
+            "a floor CAS cannot skip an unobserved authority sequence"
+        );
+
+        let wrong_predecessor = AuthorityFloorV1::new(
+            root_id,
+            AuthorityRefV1::new(2, [0x91; 16], 4_098, [0x92; 32], Some([0x93; 32]))
+                .expect("wrongly linked successor remains structurally valid"),
+        )
+        .expect("floor validation defers predecessor identity to CAS state");
+        assert_eq!(
+            store.compare_and_advance(Some(first), wrong_predecessor, [0x48; 16]),
+            Err(GenerationAuthorityErrorV1::BrokenPredecessorLink),
+            "a successor must bind the exact retained authority fingerprint"
+        );
+        assert_eq!(store.load(root_id), Ok(Some(first)));
+    }
+
+    #[test]
+    fn in_memory_anti_rollback_floor_reports_terminal_authority_exhaustion() {
+        let store = InMemoryAntiRollbackFloorStoreV1::new();
+        let root_id = [0x5a; 16];
+        let terminal =
+            AuthorityRefV1::new(u64::MAX, [0x81; 16], 4_096, [0x82; 32], Some([0x83; 32]))
+                .expect("terminal authority remains structurally valid");
+        let current = AntiRollbackFloorRecordV1::new(
+            AuthorityFloorV1::new(root_id, terminal).expect("valid terminal floor"),
+            7,
+        )
+        .expect("valid terminal record");
+        store
+            .state
+            .lock()
+            .expect("test reference store mutex must be available")
+            .records
+            .insert(root_id, current);
+
+        assert_eq!(
+            store.compare_and_advance(
+                Some(current),
+                AuthorityFloorV1::new(root_id, terminal).expect("valid terminal floor"),
+                [0x49; 16],
+            ),
+            Err(GenerationAuthorityErrorV1::SequenceExhausted),
+            "terminal authority cannot be reinterpreted as a stale or wrapped advance"
+        );
+        assert_eq!(store.load(root_id), Ok(Some(current)));
+    }
+
+    #[test]
+    fn in_memory_anti_rollback_floor_rejects_invalid_root_and_request_identity() {
+        let store = InMemoryAntiRollbackFloorStoreV1::new();
+        let authority = authority_reference(1, None);
+        let floor = AuthorityFloorV1::new([0x5a; 16], authority).expect("valid floor");
+        assert_eq!(
+            store.load([0; 16]),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.root_id"
+            })
+        );
+        assert_eq!(
+            store.compare_and_advance(None, floor, [0; 16]),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.idempotency_key"
+            })
+        );
+        assert_eq!(store.load([0x5a; 16]), Ok(None));
+    }
+
+    #[test]
+    fn in_memory_anti_rollback_floor_allows_exactly_one_same_base_publisher() {
+        let store = std::sync::Arc::new(InMemoryAntiRollbackFloorStoreV1::new());
+        let genesis = authority_reference(1, None);
+        let floor = AuthorityFloorV1::new([0x5a; 16], genesis).expect("valid floor");
+        let results = std::thread::scope(|scope| {
+            let handles = (1..=8)
+                .map(|key_byte| {
+                    let store = std::sync::Arc::clone(&store);
+                    scope.spawn(move || store.compare_and_advance(None, floor, [key_byte; 16]))
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("publisher thread must not panic"))
+                .collect::<Vec<_>>()
+        });
+        let successful = results
+            .into_iter()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        assert_eq!(successful.len(), 1, "exactly one empty-base CAS may win");
+        assert_eq!(successful[0].cas_version, 1);
+        assert_eq!(store.load([0x5a; 16]), Ok(Some(successful[0])));
+    }
+
+    #[test]
+    fn authority_reference_fingerprint_uses_its_full_domain_separator() {
+        let genesis = authority_reference(1, None);
+        let bytes = genesis.canonical_bytes();
+        assert_eq!(&bytes[..9], b"FSAUTHREF");
+        assert_eq!(bytes.len(), 108);
+        assert_ne!(genesis.fingerprint(), [0; 32]);
+    }
+
+    #[test]
+    fn authority_reference_codec_round_trips_and_rejects_noncanonical_forms() {
+        let genesis = authority_reference(1, None);
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        assert_eq!(
+            AuthorityRefV1::from_canonical_bytes(&successor.canonical_bytes())
+                .expect("decode successor authority reference"),
+            successor
+        );
+
+        let mut noncanonical_genesis = genesis.canonical_bytes();
+        noncanonical_genesis[76] = 1;
+        assert_eq!(
+            AuthorityRefV1::from_canonical_bytes(&noncanonical_genesis),
+            Err(GenerationAuthorityErrorV1::NonCanonicalPadding),
+            "absent predecessors have a single all-zero representation"
+        );
+
+        let mut future_schema = successor.canonical_bytes();
+        future_schema[9..11].copy_from_slice(&(GENERATION_AUTHORITY_SCHEMA_V1 + 1).to_be_bytes());
+        assert_eq!(
+            AuthorityRefV1::from_canonical_bytes(&future_schema),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.schema_version"
+            }),
+            "a self-consistent but unknown authority schema fails closed"
+        );
+        assert!(
+            AuthorityRefV1::from_canonical_bytes(&successor.canonical_bytes()[..99]).is_err(),
+            "truncated authority references never decode"
+        );
+    }
+
+    #[test]
+    fn authority_reference_never_rolls_over_its_sequence() {
+        assert_eq!(authority_reference(1, None).next_sequence(), Ok(2));
+        let terminal =
+            AuthorityRefV1::new(u64::MAX, [0x81; 16], 4_096, [0x82; 32], Some([0x83; 32]))
+                .expect("terminal authority reference remains decodable");
+        assert_eq!(
+            terminal.next_sequence(),
+            Err(GenerationAuthorityErrorV1::SequenceExhausted),
+            "terminal authority state must not wrap into an earlier generation"
+        );
+    }
+
+    #[test]
+    fn authority_resolver_accepts_only_duplicate_genesis() {
+        let genesis = authority_reference(1, None);
+        assert_eq!(
+            resolve_authority_slots_v1(
+                Some(authority_slot(0, genesis)),
+                Some(authority_slot(1, genesis)),
+            ),
+            Ok(Some(authority_slot(0, genesis)))
+        );
+
+        let second = authority_reference(2, Some(genesis.fingerprint()));
+        assert_eq!(
+            resolve_authority_slots_v1(
+                Some(authority_slot(0, second)),
+                Some(authority_slot(1, second)),
+            ),
+            Err(GenerationAuthorityErrorV1::NonGenesisDuplicate)
+        );
+    }
+
+    #[test]
+    fn authority_resolver_rejects_forks_gaps_and_mixed_roots_but_keeps_one_slot_survival() {
+        let genesis = authority_reference(1, None);
+        assert_eq!(
+            resolve_authority_slots_v1(Some(authority_slot(0, genesis)), None),
+            Ok(Some(authority_slot(0, genesis))),
+            "one authenticated surviving slot remains selectable"
+        );
+
+        let fork = AuthorityRefV1::new(1, [0x61; 16], 4_097, [0x62; 32], None)
+            .expect("valid conflicting genesis-shaped reference");
+        assert_eq!(
+            resolve_authority_slots_v1(
+                Some(authority_slot(0, genesis)),
+                Some(authority_slot(1, fork)),
+            ),
+            Err(GenerationAuthorityErrorV1::EqualSequenceFork),
+            "equal sequence with distinct identities is a fork, never a tie-break"
+        );
+
+        let skipped = AuthorityRefV1::new(3, [0x63; 16], 4_099, [0x64; 32], Some([0x65; 32]))
+            .expect("well-formed but nonconsecutive authority reference");
+        assert_eq!(
+            resolve_authority_slots_v1(
+                Some(authority_slot(0, genesis)),
+                Some(authority_slot(1, skipped)),
+            ),
+            Err(GenerationAuthorityErrorV1::BrokenPredecessorLink),
+            "a structurally credible gap must not silently select the newest slot"
+        );
+
+        let mut other_root = authority_slot(1, genesis);
+        other_root.root_id = [0x66; 16];
+        assert_eq!(
+            resolve_authority_slots_v1(Some(authority_slot(0, genesis)), Some(other_root)),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_slot.pair"
+            }),
+            "two slots from different roots cannot be combined"
+        );
+    }
+
+    #[test]
+    fn activation_manifest_self_seals_all_component_and_transition_witnesses() {
+        let manifest = activation_manifest(1, None);
+        manifest.validate().expect("self-sealed manifest validates");
+        let receipt = manifest.object_receipt();
+        assert!(receipt.0 > 0);
+        assert_ne!(receipt.1, [0; 32]);
+
+        let mut substituted = manifest.clone();
+        substituted.components.metadata.sha256[0] ^= 1;
+        assert_eq!(
+            substituted.validate(),
+            Err(GenerationAuthorityErrorV1::ManifestSelfSealMismatch),
+            "a component substitution must invalidate the activation-manifest self-seal"
+        );
+    }
+
+    #[test]
+    fn activation_manifest_codec_round_trips_and_rejects_noncanonical_boundaries() {
+        let manifest = activation_manifest(1, None);
+        let bytes = manifest.canonical_bytes();
+        assert_eq!(
+            ActivationManifestV1::from_canonical_bytes(&bytes).expect("canonical decode"),
+            manifest,
+            "canonical decode must reproduce the exact structured manifest"
+        );
+
+        let mut extended = bytes.clone();
+        extended.push(0);
+        assert!(
+            ActivationManifestV1::from_canonical_bytes(&extended).is_err(),
+            "trailing bytes must not become a second representation"
+        );
+        assert!(
+            ActivationManifestV1::from_canonical_bytes(&bytes[..bytes.len() - 1]).is_err(),
+            "a truncated self-seal must fail before selecting the manifest"
+        );
+        let oversized = vec![0; GENERATION_ACTIVATION_MANIFEST_MAX_BYTES_V1 + 1];
+        assert_eq!(
+            ActivationManifestV1::from_canonical_bytes(&oversized),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "activation_manifest.canonical_bytes"
+            }),
+            "the manifest ceiling is enforced before decode"
+        );
+
+        let mut future = manifest;
+        future.schema_version = GENERATION_AUTHORITY_SCHEMA_V1 + 1;
+        future.self_seal_sha256 = future.computed_self_seal();
+        assert_eq!(
+            ActivationManifestV1::from_canonical_bytes(&future.canonical_bytes()),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "activation_manifest.schema_version"
+            }),
+            "a self-consistent future schema still fails closed"
+        );
+    }
+
+    #[test]
+    fn activation_manifest_rejects_every_single_byte_mutation() {
+        let encoded = activation_manifest(1, None).canonical_bytes();
+        for byte_index in 0..encoded.len() {
+            let mut mutated = encoded.clone();
+            mutated[byte_index] ^= 0x80;
+            assert!(
+                ActivationManifestV1::from_canonical_bytes(&mutated).is_err(),
+                "single-byte mutation at offset {byte_index} must never decode"
+            );
+        }
+    }
+
+    #[test]
+    fn activation_manifest_requires_the_exact_preceding_authority_sequence() {
+        let genesis = activation_manifest(1, None);
+        let (manifest_len, manifest_sha256) = genesis.object_receipt();
+        let predecessor = AuthorityRefV1::new(1, [0x41; 16], manifest_len, manifest_sha256, None)
+            .expect("genesis authority reference");
+        let successor = activation_manifest(2, Some(predecessor));
+        successor
+            .validate()
+            .expect("consecutive predecessor validates");
+
+        assert_eq!(
+            ActivationManifestV1::new(
+                3,
+                Some(predecessor),
+                GenerationAuthorityActionV1::Activate,
+                ArtifactGenerationIdentityV1::new(7, [0x21; 16]).expect("test generation"),
+                [0x31; 32],
+                [0x32; 32],
+                [0x33; 32],
+                component_receipts(),
+            ),
+            Err(GenerationAuthorityErrorV1::BrokenPredecessorLink),
+            "an activation manifest may not skip an authority sequence"
+        );
+    }
+
+    #[test]
+    fn rollback_uses_a_new_authority_without_reusing_artifact_identity() {
+        let genesis = activation_manifest(1, None);
+        let (genesis_len, genesis_sha256) = genesis.object_receipt();
+        let first = AuthorityRefV1::new(1, [0x41; 16], genesis_len, genesis_sha256, None)
+            .expect("first authority reference");
+        let second = AuthorityRefV1::new(
+            2,
+            [0x42; 16],
+            genesis_len,
+            genesis_sha256,
+            Some(first.fingerprint()),
+        )
+        .expect("second authority reference");
+        let rollback = ActivationManifestV1::new(
+            3,
+            Some(second),
+            GenerationAuthorityActionV1::Rollback,
+            ArtifactGenerationIdentityV1::new(7, [0x21; 16]).expect("reselected generation"),
+            [0x31; 32],
+            [0x32; 32],
+            [0x33; 32],
+            component_receipts(),
+        )
+        .expect("higher-authority rollback is canonical");
+        assert_eq!(rollback.authority_sequence, 3);
+        assert_eq!(rollback.generation.sequence, 7);
+        assert_eq!(rollback.action, GenerationAuthorityActionV1::Rollback);
+        rollback.validate().expect("rollback self-seal validates");
+    }
+
+    #[test]
+    fn authority_reference_requires_the_exact_self_sealed_manifest_object() {
+        let manifest = activation_manifest(1, None);
+        let (manifest_len, manifest_sha256) = manifest.object_receipt();
+        let authority = AuthorityRefV1::new(1, [0x51; 16], manifest_len, manifest_sha256, None)
+            .expect("authority names test manifest");
+        verify_authority_manifest_reference_v1(&authority, &manifest)
+            .expect("exact authority manifest binding");
+
+        let wrong_length =
+            AuthorityRefV1::new(1, [0x51; 16], manifest_len + 1, manifest_sha256, None)
+                .expect("otherwise valid authority reference");
+        assert_eq!(
+            verify_authority_manifest_reference_v1(&wrong_length, &manifest),
+            Err(GenerationAuthorityErrorV1::ManifestReferenceMismatch),
+            "a length-mismatched external object must not be selected"
+        );
+    }
+
     fn sample_embedder() -> EmbedderRevision {
         let mut identity = EmbeddingIdentityBundleV1::explicit_test_model("potion-128M", 256);
         identity.storage.format = "fsvi-v2".to_owned();
@@ -1967,6 +5250,39 @@ mod tests {
         identity.producer.space_fingerprint = identity.space.fingerprint();
         identity.validate().expect("sample semantic identity");
         identity
+    }
+
+    fn sample_foreign_producer_pair() -> (
+        EmbeddingIdentityBundleV1,
+        EmbeddingIdentityBundleV1,
+        VerifiedGoldenConformanceManifestV1,
+    ) {
+        let texts = ["query: alpha", "document: beta"];
+        let vectors = vec![
+            vec![0.0, -0.0, 1.0, -1.0, 0.25, 0.5, 0.75, 1.25],
+            vec![2.0, 1.5, 1.0, 0.5, 0.0, -0.5, -1.0, -1.5],
+        ];
+        let fixture =
+            VerifiedGoldenConformanceManifestV1::from_exact_pair_f32(&texts, &vectors, &vectors)
+                .expect("exact fixture");
+
+        let mut reference = sample_semantic_identity();
+        reference.producer.golden_vectors = fixture.certificate().clone();
+        reference.validate().expect("reference identity");
+
+        let mut candidate = reference.clone();
+        candidate.producer.backend = "alternate-native-kernel".to_owned();
+        candidate.producer.implementation_revision = "alternate-implementation-v2".to_owned();
+        candidate.producer.protocol_revision = "alternate-protocol-v3".to_owned();
+        candidate.producer.numeric_profile = "deterministic-f32-alternate-v1".to_owned();
+        candidate.producer.provenance_manifest_fingerprint = "6".repeat(64);
+        candidate.validate().expect("candidate identity");
+        assert_ne!(
+            reference.producer.fingerprint(),
+            candidate.producer.fingerprint()
+        );
+
+        (reference, candidate, fixture)
     }
 
     #[test]
@@ -2049,6 +5365,544 @@ mod tests {
 
         let inconsistent = vec![vec![1.0, 2.0], vec![3.0]];
         assert!(GoldenVectorCertificateV1::from_exact_f32(&texts[..2], &inconsistent).is_err());
+    }
+
+    #[test]
+    fn exact_producer_witness_allows_storage_drift_but_rejects_foreign_producers() {
+        let (reference, foreign, _) = sample_foreign_producer_pair();
+        assert_eq!(
+            reference.verify_exact_producer_with(&foreign),
+            Err(ProducerCompatibilityErrorV1::CertificateRequired)
+        );
+
+        let mut alternate_storage = reference.clone();
+        alternate_storage.storage.format = "fsvi-v2".to_owned();
+        alternate_storage.storage.quantization = QuantizationFormat::F16;
+        alternate_storage.storage.endianness = "little-endian".to_owned();
+        alternate_storage
+            .validate()
+            .expect("valid alternate storage");
+        assert_ne!(reference.fingerprint(), alternate_storage.fingerprint());
+
+        let witness = reference
+            .verify_exact_producer_with(&alternate_storage)
+            .expect("exact producer remains compatible across storage encodings");
+        assert_eq!(witness.kind(), ProducerCompatibilityKindV1::Exact);
+        assert_eq!(
+            witness.reference_producer_fingerprint(),
+            witness.candidate_producer_fingerprint()
+        );
+        assert!(witness.certificate_fingerprint().is_none());
+    }
+
+    #[test]
+    fn certified_foreign_producer_requires_pinned_directional_evidence() {
+        let (reference, candidate, fixture) = sample_foreign_producer_pair();
+        let policy_fingerprint = "9".repeat(64);
+        let certificate =
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &reference,
+                &candidate,
+                &fixture,
+                &policy_fingerprint,
+                7,
+                100,
+                200,
+            )
+            .expect("certificate receipt");
+        let certificate_fingerprint = certificate.fingerprint();
+        let trusted = TrustedProducerConformanceContextV1::from_independent_policy(
+            &policy_fingerprint,
+            &certificate_fingerprint,
+            &fixture,
+            150,
+            7,
+            7,
+        )
+        .expect("trusted context");
+
+        let witness = reference
+            .verify_certified_foreign_producer_with(&candidate, &certificate, trusted)
+            .expect("trusted foreign producer");
+        assert_eq!(witness.kind(), ProducerCompatibilityKindV1::Certified);
+        assert_eq!(
+            witness.certificate_fingerprint(),
+            Some(certificate_fingerprint.as_str())
+        );
+        assert_eq!(
+            witness.reference_producer_fingerprint(),
+            reference.producer.fingerprint()
+        );
+        assert_eq!(
+            witness.candidate_producer_fingerprint(),
+            candidate.producer.fingerprint()
+        );
+
+        let serialized = serde_json::to_string(&witness).expect("serialize opaque witness");
+        assert!(!serialized.contains("alternate-native-kernel"));
+        assert!(!serialized.contains("query: alpha"));
+        assert!(!serialized.contains("document: beta"));
+        assert!(!serialized.contains("canonical_bytes"));
+    }
+
+    #[test]
+    fn every_foreign_certificate_field_is_bound_by_the_pinned_fingerprint() {
+        let (reference, candidate, fixture) = sample_foreign_producer_pair();
+        let policy_fingerprint = "9".repeat(64);
+        let certificate =
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &reference,
+                &candidate,
+                &fixture,
+                &policy_fingerprint,
+                7,
+                100,
+                200,
+            )
+            .unwrap();
+        let pinned_fingerprint = certificate.fingerprint();
+
+        let mut unknown_schema = certificate.clone();
+        unknown_schema.schema_version += 1;
+        let mut changed_reference = certificate.clone();
+        changed_reference.reference_producer_fingerprint = "a".repeat(64);
+        let mut changed_candidate = certificate.clone();
+        changed_candidate.candidate_producer_fingerprint = "b".repeat(64);
+        let mut changed_space = certificate.clone();
+        changed_space.space_fingerprint = "c".repeat(64);
+        let mut changed_fixture = certificate.clone();
+        changed_fixture.golden_fixture_fingerprint = "d".repeat(64);
+        let mut changed_policy = certificate.clone();
+        changed_policy.policy_fingerprint = "e".repeat(64);
+        let mut changed_revision = certificate.clone();
+        changed_revision.certificate_revision += 1;
+        let mut changed_start = certificate.clone();
+        changed_start.not_before_unix_seconds += 1;
+        let mut changed_expiry = certificate.clone();
+        changed_expiry.expires_at_unix_seconds -= 1;
+
+        let malformed_context = TrustedProducerConformanceContextV1::from_independent_policy(
+            &policy_fingerprint,
+            &pinned_fingerprint,
+            &fixture,
+            150,
+            1,
+            u64::MAX,
+        )
+        .unwrap();
+        assert_eq!(
+            reference.verify_certified_foreign_producer_with(
+                &candidate,
+                &unknown_schema,
+                malformed_context,
+            ),
+            Err(ProducerCompatibilityErrorV1::CertificateMalformed)
+        );
+
+        for (label, mutated) in [
+            ("reference producer", changed_reference),
+            ("candidate producer", changed_candidate),
+            ("space", changed_space),
+            ("fixture", changed_fixture),
+            ("policy", changed_policy),
+            ("revision", changed_revision),
+            ("not-before", changed_start),
+            ("expiry", changed_expiry),
+        ] {
+            let trusted = TrustedProducerConformanceContextV1::from_independent_policy(
+                &policy_fingerprint,
+                &pinned_fingerprint,
+                &fixture,
+                150,
+                1,
+                u64::MAX,
+            )
+            .unwrap();
+            assert_eq!(
+                reference.verify_certified_foreign_producer_with(&candidate, &mutated, trusted,),
+                Err(ProducerCompatibilityErrorV1::CertificateFingerprintMismatch),
+                "mutated {label} must invalidate the pinned certificate"
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_certificate_rejects_policy_pair_fixture_and_bundle_substitution() {
+        let (reference, candidate, fixture) = sample_foreign_producer_pair();
+        let policy_fingerprint = "9".repeat(64);
+        let certificate =
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &reference,
+                &candidate,
+                &fixture,
+                &policy_fingerprint,
+                7,
+                100,
+                200,
+            )
+            .unwrap();
+
+        let mut wrong_policy = certificate.clone();
+        wrong_policy.policy_fingerprint = "8".repeat(64);
+        let wrong_policy_fingerprint = wrong_policy.fingerprint();
+        let trusted = TrustedProducerConformanceContextV1::from_independent_policy(
+            &policy_fingerprint,
+            &wrong_policy_fingerprint,
+            &fixture,
+            150,
+            7,
+            7,
+        )
+        .unwrap();
+        assert_eq!(
+            reference.verify_certified_foreign_producer_with(&candidate, &wrong_policy, trusted,),
+            Err(ProducerCompatibilityErrorV1::PolicyMismatch)
+        );
+
+        let swapped =
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &candidate,
+                &reference,
+                &fixture,
+                &policy_fingerprint,
+                7,
+                100,
+                200,
+            )
+            .unwrap();
+        let swapped_fingerprint = swapped.fingerprint();
+        let trusted = TrustedProducerConformanceContextV1::from_independent_policy(
+            &policy_fingerprint,
+            &swapped_fingerprint,
+            &fixture,
+            150,
+            7,
+            7,
+        )
+        .unwrap();
+        assert_eq!(
+            reference.verify_certified_foreign_producer_with(&candidate, &swapped, trusted),
+            Err(ProducerCompatibilityErrorV1::ProducerBindingMismatch)
+        );
+
+        for (label, reference_slot, substituted_fingerprint) in [
+            (
+                "reference storage fingerprint",
+                true,
+                reference.storage.fingerprint(),
+            ),
+            (
+                "candidate storage fingerprint",
+                false,
+                candidate.storage.fingerprint(),
+            ),
+            (
+                "reference full-bundle fingerprint",
+                true,
+                reference.fingerprint(),
+            ),
+            (
+                "candidate full-bundle fingerprint",
+                false,
+                candidate.fingerprint(),
+            ),
+        ] {
+            let mut substitution = certificate.clone();
+            if reference_slot {
+                substitution.reference_producer_fingerprint = substituted_fingerprint;
+            } else {
+                substitution.candidate_producer_fingerprint = substituted_fingerprint;
+            }
+            let substitution_fingerprint = substitution.fingerprint();
+            let trusted = TrustedProducerConformanceContextV1::from_independent_policy(
+                &policy_fingerprint,
+                &substitution_fingerprint,
+                &fixture,
+                150,
+                7,
+                7,
+            )
+            .unwrap();
+            assert_eq!(
+                reference.verify_certified_foreign_producer_with(
+                    &candidate,
+                    &substitution,
+                    trusted,
+                ),
+                Err(ProducerCompatibilityErrorV1::ProducerBindingMismatch),
+                "{label} must never stand in for a producer fingerprint"
+            );
+        }
+
+        let mut fixture_substitution = certificate.clone();
+        fixture_substitution.golden_fixture_fingerprint = "a".repeat(64);
+        let fixture_substitution_fingerprint = fixture_substitution.fingerprint();
+        let trusted = TrustedProducerConformanceContextV1::from_independent_policy(
+            &policy_fingerprint,
+            &fixture_substitution_fingerprint,
+            &fixture,
+            150,
+            7,
+            7,
+        )
+        .unwrap();
+        assert_eq!(
+            reference.verify_certified_foreign_producer_with(
+                &candidate,
+                &fixture_substitution,
+                trusted,
+            ),
+            Err(ProducerCompatibilityErrorV1::FixtureBindingMismatch)
+        );
+
+        let mut fabricated_candidate = candidate.clone();
+        fabricated_candidate.producer.golden_vectors.vectors_sha256 = "f".repeat(64);
+        fabricated_candidate.validate().unwrap();
+        assert_eq!(
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &reference,
+                &fabricated_candidate,
+                &fixture,
+                &policy_fingerprint,
+                7,
+                100,
+                200,
+            ),
+            Err(ProducerCompatibilityErrorV1::GoldenVectorMismatch)
+        );
+
+        let mut fabricated_reference = reference.clone();
+        let mut fabricated_candidate = candidate;
+        fabricated_reference.producer.golden_vectors.vectors_sha256 = "e".repeat(64);
+        fabricated_candidate.producer.golden_vectors.vectors_sha256 = "e".repeat(64);
+        fabricated_reference.validate().unwrap();
+        fabricated_candidate.validate().unwrap();
+        assert_eq!(
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &fabricated_reference,
+                &fabricated_candidate,
+                &fixture,
+                &policy_fingerprint,
+                7,
+                100,
+                200,
+            ),
+            Err(ProducerCompatibilityErrorV1::GoldenVectorMismatch),
+            "two matching self-asserted summaries cannot replace the independently executed fixture"
+        );
+    }
+
+    #[test]
+    fn foreign_certificate_enforces_time_revision_and_full_width_boundaries() {
+        let (reference, candidate, fixture) = sample_foreign_producer_pair();
+        let policy_fingerprint = "9".repeat(64);
+        let certificate =
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &reference,
+                &candidate,
+                &fixture,
+                &policy_fingerprint,
+                7,
+                100,
+                200,
+            )
+            .unwrap();
+        let certificate_fingerprint = certificate.fingerprint();
+
+        for (time, expected) in [
+            (
+                99,
+                Err(ProducerCompatibilityErrorV1::CertificateNotYetValid),
+            ),
+            (100, Ok(ProducerCompatibilityKindV1::Certified)),
+            (199, Ok(ProducerCompatibilityKindV1::Certified)),
+            (200, Err(ProducerCompatibilityErrorV1::CertificateExpired)),
+        ] {
+            let trusted = TrustedProducerConformanceContextV1::from_independent_policy(
+                &policy_fingerprint,
+                &certificate_fingerprint,
+                &fixture,
+                time,
+                7,
+                7,
+            )
+            .unwrap();
+            let observed = reference
+                .verify_certified_foreign_producer_with(&candidate, &certificate, trusted)
+                .map(|witness| witness.kind());
+            assert_eq!(observed, expected, "evaluation time {time}");
+        }
+
+        for (minimum_revision, maximum_revision) in [(8, 8), (1, 6)] {
+            let trusted = TrustedProducerConformanceContextV1::from_independent_policy(
+                &policy_fingerprint,
+                &certificate_fingerprint,
+                &fixture,
+                150,
+                minimum_revision,
+                maximum_revision,
+            )
+            .unwrap();
+            assert_eq!(
+                reference
+                    .verify_certified_foreign_producer_with(&candidate, &certificate, trusted,),
+                Err(ProducerCompatibilityErrorV1::CertificateRevisionOutsidePolicy)
+            );
+        }
+
+        let full_width =
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &reference,
+                &candidate,
+                &fixture,
+                &policy_fingerprint,
+                u64::MAX,
+                u64::MAX - 2,
+                u64::MAX,
+            )
+            .unwrap();
+        let full_width_fingerprint = full_width.fingerprint();
+        let trusted = TrustedProducerConformanceContextV1::from_independent_policy(
+            &policy_fingerprint,
+            &full_width_fingerprint,
+            &fixture,
+            u64::MAX - 1,
+            u64::MAX,
+            u64::MAX,
+        )
+        .unwrap();
+        assert_eq!(
+            reference
+                .verify_certified_foreign_producer_with(&candidate, &full_width, trusted)
+                .unwrap()
+                .kind(),
+            ProducerCompatibilityKindV1::Certified
+        );
+    }
+
+    #[test]
+    fn producer_compatibility_rejects_input_tokenizer_and_invalid_identity_drift() {
+        let (reference, candidate, fixture) = sample_foreign_producer_pair();
+        let policy_fingerprint = "9".repeat(64);
+
+        let mut changed_input = candidate.clone();
+        changed_input.input.canonicalization.push_str("-drift");
+        changed_input.space.input_contract_fingerprint = changed_input.input.fingerprint();
+        changed_input.producer.space_fingerprint = changed_input.space.fingerprint();
+        changed_input.validate().unwrap();
+        assert_eq!(
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &reference,
+                &changed_input,
+                &fixture,
+                &policy_fingerprint,
+                7,
+                100,
+                200,
+            ),
+            Err(ProducerCompatibilityErrorV1::SpaceMismatch)
+        );
+
+        let mut changed_tokenizer = candidate.clone();
+        changed_tokenizer.space.tokenizer_fingerprint = "7".repeat(64);
+        changed_tokenizer.producer.space_fingerprint = changed_tokenizer.space.fingerprint();
+        changed_tokenizer.validate().unwrap();
+        assert_eq!(
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &reference,
+                &changed_tokenizer,
+                &fixture,
+                &policy_fingerprint,
+                7,
+                100,
+                200,
+            ),
+            Err(ProducerCompatibilityErrorV1::SpaceMismatch)
+        );
+
+        let mut invalid_reference = reference.clone();
+        invalid_reference.storage.dimension = 0;
+        assert_eq!(
+            invalid_reference.verify_exact_producer_with(&reference),
+            Err(ProducerCompatibilityErrorV1::InvalidReferenceIdentity)
+        );
+        let mut invalid_candidate = candidate;
+        invalid_candidate.storage.dimension = 0;
+        assert_eq!(
+            reference.verify_exact_producer_with(&invalid_candidate),
+            Err(ProducerCompatibilityErrorV1::InvalidCandidateIdentity)
+        );
+    }
+
+    #[test]
+    fn foreign_certificate_and_verified_fixture_fail_closed_on_untrusted_bytes() {
+        let (reference, candidate, fixture) = sample_foreign_producer_pair();
+        let policy_fingerprint = "9".repeat(64);
+        let certificate =
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &reference,
+                &candidate,
+                &fixture,
+                &policy_fingerprint,
+                7,
+                100,
+                200,
+            )
+            .unwrap();
+
+        let mut unknown = serde_json::to_value(&certificate).unwrap();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_owned(), serde_json::json!(true));
+        assert!(
+            serde_json::from_value::<ForeignProducerConformanceCertificateV1>(unknown).is_err()
+        );
+
+        let raw = serde_json::to_string(&certificate).unwrap();
+        let duplicate_schema = raw.replacen('{', "{\"schema_version\":1,", 1);
+        assert!(
+            serde_json::from_str::<ForeignProducerConformanceCertificateV1>(&duplicate_schema)
+                .is_err()
+        );
+
+        let texts = ["query: alpha", "document: beta"];
+        let reference_vectors = vec![
+            vec![0.0, -0.0, 1.0, -1.0, 0.25, 0.5, 0.75, 1.25],
+            vec![2.0, 1.5, 1.0, 0.5, 0.0, -0.5, -1.0, -1.5],
+        ];
+        let mut changed_bits = reference_vectors.clone();
+        changed_bits[0][0] = -0.0;
+        assert_eq!(
+            VerifiedGoldenConformanceManifestV1::from_exact_pair_f32(
+                &texts,
+                &reference_vectors,
+                &changed_bits,
+            ),
+            Err(ProducerCompatibilityErrorV1::GoldenVectorMismatch)
+        );
+
+        let nan_texts = ["NaN payload"];
+        let reference_nan = vec![vec![f32::from_bits(0x7fc0_0041)]];
+        let candidate_nan = vec![vec![f32::from_bits(0x7fc0_0042)]];
+        assert_eq!(
+            VerifiedGoldenConformanceManifestV1::from_exact_pair_f32(
+                &nan_texts,
+                &reference_nan,
+                &candidate_nan,
+            ),
+            Err(ProducerCompatibilityErrorV1::GoldenVectorMismatch),
+            "NaN payload bits are part of exact producer conformance"
+        );
+        let malformed = vec![vec![1.0], vec![]];
+        assert_eq!(
+            VerifiedGoldenConformanceManifestV1::from_exact_pair_f32(
+                &texts,
+                &reference_vectors,
+                &malformed,
+            ),
+            Err(ProducerCompatibilityErrorV1::GoldenFixtureInvalid)
+        );
     }
 
     #[test]
@@ -2379,7 +6233,10 @@ mod tests {
         right.validate().unwrap();
         assert_eq!(left.space.fingerprint(), right.space.fingerprint());
         assert_eq!(left.fingerprint(), right.fingerprint());
-        assert!(left.is_conformance_compatible_with(&right));
+        assert_eq!(
+            left.verify_exact_producer_with(&right).unwrap().kind(),
+            ProducerCompatibilityKindV1::Exact
+        );
 
         let mut duplicate = left;
         duplicate

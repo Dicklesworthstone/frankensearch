@@ -11,10 +11,12 @@ RUN_ID="${FRANKENSEARCH_QG10_RUN_ID:-bd-8nqz.4.2}"
 SELECTED_LANE="all"
 CONTRACT_RELATIVE_PATH="docs/contracts/quill-facade-source-contract-v1.json"
 MAX_LOG_BYTES="${FRANKENSEARCH_QG10_MAX_LOG_BYTES:-5242880}"
-SCHEMA_VERSION="frankensearch-qg10-overlay-receipt-v1"
+SCHEMA_VERSION="frankensearch-qg10-overlay-receipt-v2"
 LANE_SCHEMA_VERSION="frankensearch-qg10-lane-receipt-v1"
 BEHAVIOR_SCHEMA_VERSION="frankensearch-feature-behavior-v2"
 CONTRACT_SCHEMA_VERSION="frankensearch-qg10-source-contract-v1"
+FLIP_AUTHORIZATION_OWNER="bd-3beo"
+SEMANTIC_FOUNDATION_F_DISPOSITION="excluded-post-batch4"
 STATIC_FEATURE_CONTRACT_SHA256="c73adaac35ac307f129d6aedc69f2f676658db518452b41d12dd2e7e84d32ea7"
 STATIC_TARGET_CONTRACT_SHA256="b76b28bd0cb1d87be7d2dd87dfffa1c21d8cdb916c24df34d515d8c38ee46810"
 STATIC_NAMESPACE_CONTRACT_SHA256="7900fff62767788737a6d3807018ca3c1b0541aaaa6929c3aca75ea12bb1254c"
@@ -74,6 +76,10 @@ Environment:
 
 The overlay worktree is intentionally retained for audit. This script never
 removes files or worktrees.
+
+Every aggregate receipt remains fail-closed with flip_authorized=false under
+bd-3beo and excludes semantic foundation F from this pre-Batch4 scope, even
+when the source-workspace matrix is complete and source_receipt_admissible=true.
 USAGE
 }
 
@@ -198,6 +204,562 @@ json_array_from_lines() {
   jq -Rsc 'split("\n") | map(select(length > 0))'
 }
 
+fail_closed_claim_json() {
+  local complete_matrix="$1"
+  local source_receipt_admissible="$2"
+  jq -n \
+    --argjson complete_matrix "$complete_matrix" \
+    --argjson source_receipt_admissible "$source_receipt_admissible" \
+    --arg flip_authorization_owner "$FLIP_AUTHORIZATION_OWNER" \
+    --arg semantic_foundation_f_disposition "$SEMANTIC_FOUNDATION_F_DISPOSITION" \
+    '{
+      complete_matrix: $complete_matrix,
+      source_receipt_admissible: $source_receipt_admissible,
+      source_workspace_only: true,
+      performance_claim: false,
+      registry_or_package_claim: false,
+      registry_or_package_owner: "bd-8nqz.6",
+      flip_authorized: false,
+      flip_authorization_owner: $flip_authorization_owner,
+      semantic_foundation_f_in_scope: false,
+      semantic_foundation_f_disposition: $semantic_foundation_f_disposition
+    }'
+}
+
+test_receipt_envelope_json() {
+  local mode="$1"
+  local selected_lane="$2"
+  local outcome="$3"
+  local base_clean="$4"
+  local overlay_clean="$5"
+  local complete_matrix=false
+  local source_receipt_admissible=false
+  if [[ "$selected_lane" == "all" ]]; then
+    complete_matrix=true
+  fi
+  if [[ \
+    "$mode" == "gate" \
+    && "$selected_lane" == "all" \
+    && "$outcome" == "pass" \
+    && "$base_clean" == true \
+    && "$overlay_clean" == true \
+  ]]; then
+    source_receipt_admissible=true
+  fi
+  local claim_json
+  claim_json="$(fail_closed_claim_json "$complete_matrix" "$source_receipt_admissible")"
+  jq -n \
+    --arg schema "$SCHEMA_VERSION" \
+    --arg mode "$mode" \
+    --arg selected_lane "$selected_lane" \
+    --arg outcome "$outcome" \
+    --argjson base_clean "$base_clean" \
+    --argjson overlay_clean "$overlay_clean" \
+    --argjson claim "$claim_json" \
+    '{
+      schema: $schema,
+      mode: $mode,
+      selected_lane: $selected_lane,
+      outcome: $outcome,
+      candidate: {
+        base_clean: $base_clean,
+        overlay_clean: $overlay_clean
+      },
+      claim: $claim
+    }'
+}
+
+receipt_claim_is_fail_closed() {
+  local receipt_path="$1"
+  local selected_lane
+  selected_lane="$(jq -er '.selected_lane | select(type == "string" and length > 0)' "$receipt_path")" \
+    || return 1
+  if [[ "$selected_lane" != "all" ]] && ! lane_exists "$selected_lane"; then
+    return 1
+  fi
+  jq -e \
+    --arg schema "$SCHEMA_VERSION" \
+    --arg selected_lane "$selected_lane" \
+    --arg flip_authorization_owner "$FLIP_AUTHORIZATION_OWNER" \
+    --arg semantic_foundation_f_disposition "$SEMANTIC_FOUNDATION_F_DISPOSITION" \
+    '.schema == $schema
+      and (.mode == "gate" or .mode == "audit")
+      and .selected_lane == $selected_lane
+      and (.outcome == "pass" or .outcome == "fail")
+      and ((.candidate // {}) | type) == "object"
+      and (.candidate.base_clean | type) == "boolean"
+      and (.candidate.overlay_clean | type) == "boolean"
+      and ((.claim // {}) | type) == "object"
+      and ((.claim // {}) | keys | sort) == ([
+        "complete_matrix",
+        "flip_authorization_owner",
+        "flip_authorized",
+        "performance_claim",
+        "registry_or_package_claim",
+        "registry_or_package_owner",
+        "source_receipt_admissible",
+        "semantic_foundation_f_disposition",
+        "semantic_foundation_f_in_scope",
+        "source_workspace_only"
+      ] | sort)
+      and (.claim.complete_matrix | type) == "boolean"
+      and (.claim.source_receipt_admissible | type) == "boolean"
+      and .claim.complete_matrix == ($selected_lane == "all")
+      and .claim.source_receipt_admissible == (
+        .mode == "gate"
+        and $selected_lane == "all"
+        and .outcome == "pass"
+        and .candidate.base_clean == true
+        and .candidate.overlay_clean == true
+      )
+      and .claim.source_workspace_only == true
+      and .claim.performance_claim == false
+      and .claim.registry_or_package_claim == false
+      and .claim.registry_or_package_owner == "bd-8nqz.6"
+      and .claim.flip_authorized == false
+      and .claim.flip_authorization_owner == $flip_authorization_owner
+      and .claim.semantic_foundation_f_in_scope == false
+      and .claim.semantic_foundation_f_disposition == $semantic_foundation_f_disposition' \
+    "$receipt_path" >/dev/null
+}
+
+receipt_has_source_admissibility() {
+  jq -e '.claim.source_receipt_admissible == true' "$1" >/dev/null
+}
+
+contract_has_reviewed_inventory() {
+  local contract_path="$1"
+  local expected_lane_names
+  expected_lane_names="$(printf '%s\n' "${REQUIRED_LANES[@]}" | LC_ALL=C sort | json_array_from_lines)"
+  jq -e \
+    --argjson expected_lane_names "$expected_lane_names" \
+    '.review_status == "reviewed"
+      and (
+        .reviewed_inventory
+        | [
+            .cargo_lock_sha256,
+            .workspace_manifest_sha256,
+            .facade_manifest_sha256,
+            .toolchain_sha256,
+            .facade_features_sha256,
+            .target_inventory_sha256,
+            .schema_inventory_sha256,
+            .source_publish_order_sha256
+          ]
+        | all(type == "string" and test("^[0-9a-f]{64}$"))
+      )
+      and (
+        [
+          .reviewed_inventory.resolved_features_by_lane,
+          .reviewed_inventory.dependency_packages_by_lane,
+          .reviewed_inventory.public_api_by_lane
+        ]
+        | all(
+            type == "object"
+            and (keys | sort) == $expected_lane_names
+            and ([.[]] | all(type == "string" and test("^[0-9a-f]{64}$")))
+          )
+      )' \
+    "$contract_path" >/dev/null
+}
+
+git_blob_sha256() {
+  local commit_sha="$1"
+  local relative_path="$2"
+  git -C "$TRUSTED_ROOT" show "${commit_sha}:${relative_path}" \
+    | sha256sum \
+    | awk '{print $1}'
+}
+
+public_api_evidence_is_valid() {
+  jq -e '
+    type == "object"
+    and (keys | sort) == ["public_items", "reachable_paths"]
+    and (.reachable_paths | type) == "array"
+    and (.reachable_paths | length) > 0
+    and all(.reachable_paths[];
+      type == "object"
+      and (keys | sort) == ["kind", "path"]
+      and (.kind | type) == "string"
+      and (.path | type) == "string"
+    )
+    and (.public_items | type) == "array"
+    and (.public_items | length) > 0
+    and all(.public_items[];
+      type == "object"
+      and (keys | sort) == [
+        "attrs",
+        "crate_id",
+        "deprecation",
+        "id",
+        "inner",
+        "name"
+      ]
+      and (.id | type) == "string"
+      and (.crate_id | type) == "number"
+      and (.name == null or (.name | type) == "string")
+      and (.attrs | type) == "array"
+      and (.deprecation == null or (.deprecation | type) == "object")
+      and (.inner | type) == "object"
+    )' \
+    "$1" >/dev/null
+}
+
+verify_source_admissible_evidence() {
+  local receipt_dir="$1"
+  local stable_receipt="$2"
+  local trusted_contract="${TRUSTED_ROOT}/${CONTRACT_RELATIVE_PATH}"
+
+  if [[ ! -f "$trusted_contract" ]]; then
+    echo "ERROR [TRUSTED_CONTRACT_MISSING]: '$CONTRACT_RELATIVE_PATH'" >&2
+    return 1
+  fi
+  if ! validate_static_contract "$trusted_contract"; then
+    echo "ERROR [TRUSTED_CONTRACT_INVALID]: source contract failed static validation" >&2
+    return 1
+  fi
+  if ! contract_has_reviewed_inventory "$trusted_contract"; then
+    echo "ERROR [CONTRACT_UNREVIEWED]: source-admissible receipt requires reviewed inventory" >&2
+    return 1
+  fi
+
+  if ! jq -e '
+    (keys | sort) == ([
+      "artifact_bindings",
+      "candidate",
+      "claim",
+      "failure_phase",
+      "lane_receipts",
+      "mode",
+      "outcome",
+      "run_id",
+      "schema",
+      "selected_lane",
+      "validator"
+    ] | sort)
+    and .failure_phase == null
+    and (.run_id | type == "string" and test("^[A-Za-z0-9._-]+$"))
+    and ((.candidate | keys | sort) == ([
+      "base_clean",
+      "base_git_sha",
+      "base_tree_sha",
+      "candidate_tree_sha",
+      "canonical_flip_patch_sha256",
+      "overlay_clean",
+      "synthetic_commit_sha"
+    ] | sort))
+    and (.candidate.base_git_sha | test("^[0-9a-f]{40}$"))
+    and (.candidate.base_tree_sha | test("^[0-9a-f]{40}$"))
+    and (.candidate.canonical_flip_patch_sha256 | test("^[0-9a-f]{64}$"))
+    and (.candidate.candidate_tree_sha | test("^[0-9a-f]{40}$"))
+    and (.candidate.synthetic_commit_sha | test("^[0-9a-f]{40}$"))
+    and ((.validator | keys | sort) == ([
+      "contract_relative_path",
+      "contract_sha256",
+      "trusted_runner_sha256"
+    ] | sort))
+    and (.validator.contract_relative_path | type == "string")
+    and (.validator.contract_sha256 | test("^[0-9a-f]{64}$"))
+    and (.validator.trusted_runner_sha256 | test("^[0-9a-f]{64}$"))' \
+    "$stable_receipt" >/dev/null
+  then
+    echo "ERROR [RECEIPT_IDENTITY_INVALID]: source-admissible identity envelope is malformed" >&2
+    return 1
+  fi
+
+  local base_git_sha base_tree_sha patch_sha256 candidate_tree_sha synthetic_commit_sha
+  base_git_sha="$(jq -r '.candidate.base_git_sha' "$stable_receipt")"
+  base_tree_sha="$(jq -r '.candidate.base_tree_sha' "$stable_receipt")"
+  patch_sha256="$(jq -r '.candidate.canonical_flip_patch_sha256' "$stable_receipt")"
+  candidate_tree_sha="$(jq -r '.candidate.candidate_tree_sha' "$stable_receipt")"
+  synthetic_commit_sha="$(jq -r '.candidate.synthetic_commit_sha' "$stable_receipt")"
+
+  if ! git -C "$TRUSTED_ROOT" cat-file -e "${base_git_sha}^{commit}" \
+    || [[ "$(git -C "$TRUSTED_ROOT" rev-parse "${base_git_sha}^{tree}")" != "$base_tree_sha" ]]
+  then
+    echo "ERROR [BASE_IDENTITY_UNBOUND]: base commit/tree relationship is invalid" >&2
+    return 1
+  fi
+  if ! git -C "$TRUSTED_ROOT" cat-file -e "${candidate_tree_sha}^{tree}" \
+    || ! git -C "$TRUSTED_ROOT" cat-file -e "${synthetic_commit_sha}^{commit}" \
+    || [[ "$(git -C "$TRUSTED_ROOT" rev-parse "${synthetic_commit_sha}^{tree}")" != "$candidate_tree_sha" ]] \
+    || [[ "$(git -C "$TRUSTED_ROOT" rev-parse "${synthetic_commit_sha}^1")" != "$base_git_sha" ]]
+  then
+    echo "ERROR [CANDIDATE_IDENTITY_UNBOUND]: candidate tree/commit/parent relationship is invalid" >&2
+    return 1
+  fi
+  if [[ ! -f "${receipt_dir}/canonical-flip.patch" ]] \
+    || [[ "$(sha256_file "${receipt_dir}/canonical-flip.patch")" != "$patch_sha256" ]]
+  then
+    echo "ERROR [PATCH_IDENTITY_UNBOUND]: canonical patch bytes do not match candidate identity" >&2
+    return 1
+  fi
+  local verification_index recomputed_candidate_tree
+  verification_index="$(mktemp /tmp/frankensearch-qg10-verify-index.XXXXXX)"
+  if ! GIT_INDEX_FILE="$verification_index" \
+    git -C "$TRUSTED_ROOT" read-tree "$base_git_sha" \
+    || ! GIT_INDEX_FILE="$verification_index" \
+      git -C "$TRUSTED_ROOT" apply \
+        --cached \
+        --whitespace=error-all \
+        "${receipt_dir}/canonical-flip.patch"
+  then
+    echo "ERROR [PATCH_REPLAY_FAILED]: canonical patch does not apply to bound base" >&2
+    return 1
+  fi
+  recomputed_candidate_tree="$(
+    GIT_INDEX_FILE="$verification_index" git -C "$TRUSTED_ROOT" write-tree
+  )"
+  if [[ "$recomputed_candidate_tree" != "$candidate_tree_sha" ]]; then
+    echo "ERROR [PATCH_TREE_UNBOUND]: canonical patch does not produce candidate tree" >&2
+    return 1
+  fi
+
+  local expected_runner_sha expected_contract_sha
+  expected_runner_sha="$(sha256_file "${TRUSTED_ROOT}/scripts/check_feature_matrix_overlay.sh")"
+  expected_contract_sha="$(sha256_file "$trusted_contract")"
+  if ! jq -e \
+    --arg contract_relative_path "$CONTRACT_RELATIVE_PATH" \
+    --arg contract_sha256 "$expected_contract_sha" \
+    --arg runner_sha256 "$expected_runner_sha" \
+    '.validator.contract_relative_path == $contract_relative_path
+      and .validator.contract_sha256 == $contract_sha256
+      and .validator.trusted_runner_sha256 == $runner_sha256' \
+    "$stable_receipt" >/dev/null
+  then
+    echo "ERROR [VALIDATOR_IDENTITY_UNBOUND]: trusted runner or contract identity drifted" >&2
+    return 1
+  fi
+  if [[ "$(git_blob_sha256 "$synthetic_commit_sha" "$CONTRACT_RELATIVE_PATH")" != "$expected_contract_sha" ]]; then
+    echo "ERROR [CANDIDATE_CONTRACT_UNBOUND]: candidate tree does not contain trusted contract bytes" >&2
+    return 1
+  fi
+
+  local expected_lane_names actual_lane_names required_lane_count
+  expected_lane_names="$(printf '%s\n' "${REQUIRED_LANES[@]}" | LC_ALL=C sort)"
+  actual_lane_names="$(jq -r '.lane_receipts[].lane' "$stable_receipt" | LC_ALL=C sort)"
+  required_lane_count="${#REQUIRED_LANES[@]}"
+  if [[ "$actual_lane_names" != "$expected_lane_names" ]]; then
+    echo "ERROR [LANE_RECEIPT_CENSUS_INVALID]: source-admissible receipt lacks the exact lane set" >&2
+    return 1
+  fi
+  if ! jq -e \
+    --arg schema "$LANE_SCHEMA_VERSION" \
+    --arg base_git_sha "$base_git_sha" \
+    --arg patch_sha256 "$patch_sha256" \
+    --arg candidate_tree_sha "$candidate_tree_sha" \
+    --argjson required_lane_count "$required_lane_count" \
+    '.lane_receipts
+      | type == "array"
+      and length == $required_lane_count
+      and (map(.lane) | unique | length) == $required_lane_count
+      and all(.[];
+        .schema == $schema
+        and .outcome == "pass"
+        and .failure_phase == null
+        and .candidate.base_git_sha == $base_git_sha
+        and .candidate.canonical_flip_patch_sha256 == $patch_sha256
+        and .candidate.candidate_tree_sha == $candidate_tree_sha
+        and (.contract | type) == "object"
+        and (.observed.resolved_features | type) == "array"
+        and (.observed.dependency_packages | type) == "array"
+        and (.observed.public_api_sha256 | test("^[0-9a-f]{64}$"))
+        and (.observed.runtime | type) == "object"
+        and (.logs | type) == "array"
+      )' \
+    "$stable_receipt" >/dev/null
+  then
+    echo "ERROR [LANE_RECEIPT_EVIDENCE_INVALID]: source-admissible lane evidence is incomplete" >&2
+    return 1
+  fi
+
+  local expected_artifacts actual_artifacts lane_name
+  expected_artifacts="$({
+    printf '%s\n' \
+      canonical-flip.patch \
+      facade-features.json \
+      facade-targets.json \
+      observed-contract-values.json \
+      schema-inventory.json \
+      source-workspace-publish-order.json
+    for lane_name in "${REQUIRED_LANES[@]}"; do
+      printf 'lane-%s/public-api.json\n' "$lane_name"
+      printf 'qg10-lane-%s.json\n' "$lane_name"
+    done
+  } | LC_ALL=C sort)"
+  actual_artifacts="$(jq -r '.artifact_bindings[].file' "$stable_receipt" | LC_ALL=C sort)"
+  if [[ "$actual_artifacts" != "$expected_artifacts" ]]; then
+    echo "ERROR [ARTIFACT_BINDING_CENSUS_INVALID]: source-admissible binding set is incomplete or excessive" >&2
+    return 1
+  fi
+
+  local observed_contract="${receipt_dir}/observed-contract-values.json"
+  if ! cmp -s \
+    <(jq -S '.reviewed_inventory' "$trusted_contract") \
+    <(jq -S . "$observed_contract")
+  then
+    echo "ERROR [REVIEWED_INVENTORY_UNBOUND]: observed values differ from reviewed contract" >&2
+    return 1
+  fi
+
+  local inventory_field inventory_file
+  while IFS=$'\t' read -r inventory_field inventory_file; do
+    if [[ "$(canonical_json_hash "${receipt_dir}/${inventory_file}")" \
+      != "$(jq -r ".${inventory_field}" "$observed_contract")" ]]
+    then
+      echo "ERROR [GLOBAL_INVENTORY_UNBOUND]: '$inventory_file' does not match observed hash" >&2
+      return 1
+    fi
+  done <<'INVENTORY_FILES'
+facade_features_sha256	facade-features.json
+target_inventory_sha256	facade-targets.json
+schema_inventory_sha256	schema-inventory.json
+source_publish_order_sha256	source-workspace-publish-order.json
+INVENTORY_FILES
+
+  if ! cmp -s \
+    <(jq -S '.required_facade_features' "$trusted_contract") \
+    <(jq -S . "${receipt_dir}/facade-features.json") \
+    || ! cmp -s \
+      <(jq -S '.required_facade_targets' "$trusted_contract") \
+      <(jq -S . "${receipt_dir}/facade-targets.json")
+  then
+    echo "ERROR [FACADE_CENSUS_UNBOUND]: facade feature or target census differs" >&2
+    return 1
+  fi
+  if ! source_publish_order_passes \
+    "${receipt_dir}/source-workspace-publish-order.json"
+  then
+    echo "ERROR [SOURCE_ORDER_UNBOUND]: reviewed source order is invalid" >&2
+    return 1
+  fi
+
+  local candidate_file_hash expected_file_hash
+  while IFS=$'\t' read -r inventory_field inventory_file; do
+    candidate_file_hash="$(git_blob_sha256 "$synthetic_commit_sha" "$inventory_file")"
+    expected_file_hash="$(jq -r ".${inventory_field}" "$observed_contract")"
+    if [[ "$candidate_file_hash" != "$expected_file_hash" ]]; then
+      echo "ERROR [CANDIDATE_FILE_UNBOUND]: '$inventory_file' differs from reviewed inventory" >&2
+      return 1
+    fi
+  done <<'CANDIDATE_FILES'
+cargo_lock_sha256	Cargo.lock
+workspace_manifest_sha256	Cargo.toml
+facade_manifest_sha256	frankensearch/Cargo.toml
+toolchain_sha256	rust-toolchain.toml
+CANDIDATE_FILES
+
+  local lane_receipt_path public_api_path expected_public_api_sha expected_lane_contract
+  local expected_backend expected_selection
+  local actual_resolved_sha actual_dependency_sha reviewed_resolved_sha
+  local reviewed_dependency_sha reviewed_public_api_sha
+  local expected_lane_logs actual_lane_logs
+  for lane_name in "${REQUIRED_LANES[@]}"; do
+    lane_receipt_path="${receipt_dir}/qg10-lane-${lane_name}.json"
+    public_api_path="${receipt_dir}/lane-${lane_name}/public-api.json"
+    expected_lane_logs="$(printf 'lane-%s/%s\n' \
+      "$lane_name" metadata.log \
+      "$lane_name" dependencies.log \
+      "$lane_name" check-all-targets.log \
+      "$lane_name" doctest.log \
+      "$lane_name" runtime-behavior.log \
+      "$lane_name" rustdoc-json.log \
+      | LC_ALL=C sort)"
+    actual_lane_logs="$(jq -r '.logs[].file' "$lane_receipt_path" | LC_ALL=C sort)"
+    if [[ "$actual_lane_logs" != "$expected_lane_logs" ]] \
+      || [[ "$(jq '.logs | map(.file) | unique | length' "$lane_receipt_path")" != "6" ]]
+    then
+      echo "ERROR [LANE_LOG_CENSUS_INVALID]: lane '$lane_name' lacks exact execution logs" >&2
+      return 1
+    fi
+    if ! public_api_evidence_is_valid "$public_api_path"; then
+      echo "ERROR [PUBLIC_API_EVIDENCE_INVALID]: lane '$lane_name' has empty or malformed public API evidence" >&2
+      return 1
+    fi
+    expected_public_api_sha="$(jq -r '.observed.public_api_sha256' "$lane_receipt_path")"
+    if [[ "$(canonical_json_hash "$public_api_path")" != "$expected_public_api_sha" ]]; then
+      echo "ERROR [PUBLIC_API_UNBOUND]: lane '$lane_name' public API hash differs" >&2
+      return 1
+    fi
+    actual_resolved_sha="$(
+      jq -c '.observed.resolved_features' "$lane_receipt_path" \
+        | sha256sum \
+        | awk '{print $1}'
+    )"
+    actual_dependency_sha="$(
+      jq -c '.observed.dependency_packages' "$lane_receipt_path" \
+        | sha256sum \
+        | awk '{print $1}'
+    )"
+    reviewed_resolved_sha="$(jq -r \
+      --arg lane "$lane_name" \
+      '.resolved_features_by_lane[$lane]' \
+      "$observed_contract")"
+    reviewed_dependency_sha="$(jq -r \
+      --arg lane "$lane_name" \
+      '.dependency_packages_by_lane[$lane]' \
+      "$observed_contract")"
+    reviewed_public_api_sha="$(jq -r \
+      --arg lane "$lane_name" \
+      '.public_api_by_lane[$lane]' \
+      "$observed_contract")"
+    if [[ "$actual_resolved_sha" != "$reviewed_resolved_sha" ]] \
+      || [[ "$actual_dependency_sha" != "$reviewed_dependency_sha" ]] \
+      || [[ "$expected_public_api_sha" != "$reviewed_public_api_sha" ]]
+    then
+      echo "ERROR [LANE_INVENTORY_UNBOUND]: lane '$lane_name' differs from reviewed inventory" >&2
+      return 1
+    fi
+    if ! jq -e \
+      --arg lane "$lane_name" \
+      --slurpfile receipt "$lane_receipt_path" \
+      '($receipt[0].observed.dependency_packages) as $packages
+        | (.required_lanes[] | select(.name == $lane)) as $contract
+        | all($contract.required_packages[]; . as $required | $packages | index($required) != null)
+        and all(
+          $contract.forbidden_package_prefixes[];
+          . as $prefix
+          | $packages
+          | all(.[]; . != $prefix and (startswith($prefix + "-") | not))
+        )' \
+      "$trusted_contract" >/dev/null
+    then
+      echo "ERROR [DEPENDENCY_EVIDENCE_UNBOUND]: lane '$lane_name' violates dependency contract" >&2
+      return 1
+    fi
+    expected_lane_contract="$(lane_contract_json "$trusted_contract" "$lane_name")"
+    if ! jq -e --argjson expected "$expected_lane_contract" '.contract == $expected' \
+      "$lane_receipt_path" >/dev/null
+    then
+      echo "ERROR [LANE_CONTRACT_UNBOUND]: lane '$lane_name' contract differs" >&2
+      return 1
+    fi
+    expected_backend="$(jq -r \
+      --arg lane "$lane_name" \
+      '.required_lanes[] | select(.name == $lane) | .expected_lexical_backend' \
+      "$trusted_contract")"
+    expected_selection="$(jq -r \
+      --arg lane "$lane_name" \
+      '.required_lanes[] | select(.name == $lane) | .expected_selected_backend' \
+      "$trusted_contract")"
+    if ! jq -e \
+      --arg schema "$BEHAVIOR_SCHEMA_VERSION" \
+      --arg lane "$lane_name" \
+      --arg backend "$expected_backend" \
+      --arg selected "$expected_selection" \
+      '.observed.runtime.schema == $schema
+        and .observed.runtime.lane == $lane
+        and .observed.runtime.status == "pass"
+        and .observed.runtime.observations.lexical_backend == $backend
+        and .observed.runtime.observations.selected_backend == $selected' \
+      "$lane_receipt_path" >/dev/null
+    then
+      echo "ERROR [RUNTIME_EVIDENCE_UNBOUND]: lane '$lane_name' runtime observation differs" >&2
+      return 1
+    fi
+  done
+}
+
 selected_lanes() {
   if [[ "$SELECTED_LANE" == "all" ]]; then
     printf '%s\n' "${REQUIRED_LANES[@]}"
@@ -248,12 +810,28 @@ validate_static_contract() {
   if ! jq -e \
     --arg schema "$CONTRACT_SCHEMA_VERSION" \
     --arg generator "scripts/check_feature_matrix_overlay.sh" \
+    --arg flip_authorization_owner "$FLIP_AUTHORIZATION_OWNER" \
+    --arg semantic_foundation_f_disposition "$SEMANTIC_FOUNDATION_F_DISPOSITION" \
     '.schema == $schema
       and .generator == $generator
       and .claim_scope.kind == "source-workspace-only"
+      and (.claim_scope | keys | sort) == ([
+        "flip_authorization_owner",
+        "flip_authorized",
+        "kind",
+        "performance_claim",
+        "registry_or_package_claim",
+        "registry_or_package_owner",
+        "semantic_foundation_f_disposition",
+        "semantic_foundation_f_in_scope"
+      ] | sort)
       and .claim_scope.performance_claim == false
       and .claim_scope.registry_or_package_claim == false
-      and .claim_scope.registry_or_package_owner == "bd-8nqz.6"' \
+      and .claim_scope.registry_or_package_owner == "bd-8nqz.6"
+      and .claim_scope.flip_authorized == false
+      and .claim_scope.flip_authorization_owner == $flip_authorization_owner
+      and .claim_scope.semantic_foundation_f_in_scope == false
+      and .claim_scope.semantic_foundation_f_disposition == $semantic_foundation_f_disposition' \
     "$contract_path" >/dev/null
   then
     echo "ERROR [CONTRACT_HEADER_INVALID]: source contract header/scope is not exact" >&2
@@ -534,6 +1112,16 @@ materialize_overlay() {
     return 1
   fi
   OVERLAY_CLEAN=true
+  local artifact_patch="${ARTIFACT_DIR}/canonical-flip.patch"
+  if [[ -e "$artifact_patch" ]]; then
+    echo "ERROR [PATCH_ARTIFACT_EXISTS]: refusing stale canonical patch artifact" >&2
+    return 2
+  fi
+  cp "$PATCH_PATH" "$artifact_patch"
+  if [[ "$(sha256_file "$artifact_patch")" != "$PATCH_SHA256" ]]; then
+    echo "ERROR [PATCH_ARTIFACT_DRIFT]: copied canonical patch bytes changed" >&2
+    return 1
+  fi
   CONTRACT_FILE="${OVERLAY_ROOT}/${CONTRACT_RELATIVE_PATH}"
   if [[ ! -f "$CONTRACT_FILE" ]]; then
     echo "ERROR [CONTRACT_MISSING]: candidate lacks '$CONTRACT_RELATIVE_PATH'" >&2
@@ -1299,15 +1887,21 @@ write_final_receipt() {
     local bindings="[]"
     while IFS= read -r bound_file; do
       [[ -z "$bound_file" ]] && continue
+      local bound_relative_path="${bound_file#"${ARTIFACT_DIR}/"}"
+      if [[ "$bound_relative_path" == "$bound_file" ]]; then
+        echo "ERROR [ARTIFACT_BINDING_OUTSIDE_ROOT]: '$bound_file'" >&2
+        return 1
+      fi
       bindings="$(
         jq -cn \
           --argjson prior "$bindings" \
-          --arg file "$(basename "$bound_file")" \
+          --arg file "$bound_relative_path" \
           --arg sha256 "$(sha256_file "$bound_file")" \
           '$prior + [{file: $file, sha256: $sha256}]'
       )"
     done < <({
       printf '%s\n' \
+        "${ARTIFACT_DIR}/canonical-flip.patch" \
         "${ARTIFACT_DIR}/facade-features.json" \
         "${ARTIFACT_DIR}/facade-targets.json" \
         "${ARTIFACT_DIR}/schema-inventory.json" \
@@ -1315,8 +1909,11 @@ write_final_receipt() {
         "${ARTIFACT_DIR}/observed-contract-values.json"
       local lane_name
       while IFS= read -r lane_name; do
-        [[ -n "$lane_name" ]] \
-          && printf '%s\n' "${ARTIFACT_DIR}/qg10-lane-${lane_name}.json"
+        if [[ -n "$lane_name" ]]; then
+          printf '%s\n' \
+            "${ARTIFACT_DIR}/qg10-lane-${lane_name}.json" \
+            "${ARTIFACT_DIR}/lane-${lane_name}/public-api.json"
+        fi
       done < <(selected_lanes)
     } | while IFS= read -r candidate_file; do
       [[ -f "$candidate_file" ]] && printf '%s\n' "$candidate_file"
@@ -1325,7 +1922,7 @@ write_final_receipt() {
   )"
 
   local complete_matrix=false
-  local release_admissible=false
+  local source_receipt_admissible=false
   if [[ "$SELECTED_LANE" == "all" ]]; then
     complete_matrix=true
   fi
@@ -1336,8 +1933,10 @@ write_final_receipt() {
     && "$BASE_CLEAN" == true \
     && "$OVERLAY_CLEAN" == true \
   ]]; then
-    release_admissible=true
+    source_receipt_admissible=true
   fi
+  local claim_json
+  claim_json="$(fail_closed_claim_json "$complete_matrix" "$source_receipt_admissible")"
 
   local receipt_path="${ARTIFACT_DIR}/qg10-overlay-receipt.json"
   jq -n \
@@ -1357,8 +1956,7 @@ write_final_receipt() {
     --arg contract_sha256 "$contract_sha256" \
     --argjson base_clean "$BASE_CLEAN" \
     --argjson overlay_clean "$OVERLAY_CLEAN" \
-    --argjson complete_matrix "$complete_matrix" \
-    --argjson release_admissible "$release_admissible" \
+    --argjson claim "$claim_json" \
     --argjson lane_receipts "$lane_receipts_json" \
     --argjson artifact_bindings "$artifact_bindings_json" \
     '{
@@ -1382,14 +1980,7 @@ write_final_receipt() {
         contract_relative_path: $contract_relative_path,
         contract_sha256: $contract_sha256
       },
-      claim: {
-        complete_matrix: $complete_matrix,
-        release_admissible: $release_admissible,
-        source_workspace_only: true,
-        performance_claim: false,
-        registry_or_package_claim: false,
-        registry_or_package_owner: "bd-8nqz.6"
-      },
+      claim: $claim,
       lane_receipts: $lane_receipts,
       artifact_bindings: $artifact_bindings
     }' >"$receipt_path"
@@ -1413,6 +2004,42 @@ verify_receipt_directory() {
   fi
   if ! jq -e --arg schema "$SCHEMA_VERSION" '.schema == $schema' "$stable_receipt" >/dev/null; then
     echo "ERROR [RECEIPT_SCHEMA_INVALID]: stable receipt schema mismatch" >&2
+    return 1
+  fi
+  if ! receipt_claim_is_fail_closed "$stable_receipt"; then
+    echo "ERROR [RECEIPT_CLAIM_INVALID]: fail-closed claim mismatch" >&2
+    return 1
+  fi
+  if ! jq -e '
+    (.artifact_bindings | type) == "array"
+    and all(.artifact_bindings[];
+      type == "object"
+      and (keys | sort) == ["file", "sha256"]
+      and (.file | type == "string" and length > 0)
+      and (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+    )
+    and (.artifact_bindings | map(.file) | unique | length)
+      == (.artifact_bindings | length)
+    and (.lane_receipts | type) == "array"
+    and all(.lane_receipts[];
+      type == "object"
+      and .schema == "frankensearch-qg10-lane-receipt-v1"
+      and (.lane | type == "string" and length > 0)
+      and (.outcome == "pass" or .outcome == "fail")
+      and (.failure_phase == null or (.failure_phase | type) == "string")
+      and (.logs | type) == "array"
+      and all(.logs[];
+        type == "object"
+        and (keys | sort) == ["file", "sha256"]
+        and (.file | type == "string" and length > 0)
+        and (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+      )
+    )
+    and (.lane_receipts | map(.lane) | unique | length)
+      == (.lane_receipts | length)' \
+    "$stable_receipt" >/dev/null
+  then
+    echo "ERROR [RECEIPT_EVIDENCE_SCHEMA_INVALID]: artifact or lane evidence is malformed" >&2
     return 1
   fi
 
@@ -1465,6 +2092,10 @@ verify_receipt_directory() {
         return 1
         ;;
     esac
+    if ! lane_exists "$lane_name"; then
+      echo "ERROR [LANE_RECEIPT_UNKNOWN]: '$lane_name'" >&2
+      return 1
+    fi
     lane_path="${receipt_dir}/qg10-lane-${lane_name}.json"
     if [[ ! -f "$lane_path" ]]; then
       echo "ERROR [LANE_RECEIPT_MISSING]: '$lane_name'" >&2
@@ -1474,6 +2105,13 @@ verify_receipt_directory() {
     lane_addressed_path="${receipt_dir}/qg10-lane-${lane_name}.${lane_sha}.json"
     if [[ ! -f "$lane_addressed_path" ]] || ! cmp -s "$lane_path" "$lane_addressed_path"; then
       echo "ERROR [LANE_RECEIPT_ADDRESS_DRIFT]: '$lane_name'" >&2
+      return 1
+    fi
+    if ! cmp -s \
+      <(jq -S -c . "$lane_path") \
+      <(jq -S -c . <<<"$lane_receipt")
+    then
+      echo "ERROR [LANE_RECEIPT_EMBEDDED_DRIFT]: '$lane_name'" >&2
       return 1
     fi
     while IFS=$'\t' read -r lane_log expected_sha; do
@@ -1489,6 +2127,12 @@ verify_receipt_directory() {
     done < <(jq -r '.logs[] | [.file, .sha256] | @tsv' <<<"$lane_receipt")
   done < <(jq -c '.lane_receipts[]' "$stable_receipt")
 
+  if receipt_has_source_admissibility "$stable_receipt"; then
+    if ! verify_source_admissible_evidence "$receipt_dir" "$stable_receipt"; then
+      return 1
+    fi
+  fi
+
   echo "[qg10] receipt verification PASS"
 }
 
@@ -1497,6 +2141,127 @@ run_self_test() {
   self_test_root="$(mktemp -d /tmp/frankensearch-qg10-overlay-self-test.XXXXXX)"
   local contract_path="${TRUSTED_ROOT}/docs/contracts/quill-facade-source-contract-v1.json"
   validate_static_contract "$contract_path"
+
+  local authorized_contract="${self_test_root}/authorized-contract.json"
+  jq '.claim_scope.flip_authorized = true' "$contract_path" >"$authorized_contract"
+  if validate_static_contract "$authorized_contract" >/dev/null 2>&1; then
+    echo "ERROR [SELF_TEST_FALSE_PASS]: flip-authorized source contract was accepted" >&2
+    return 1
+  fi
+
+  local missing_semantic_scope_contract="${self_test_root}/missing-semantic-scope-contract.json"
+  jq 'del(.claim_scope.semantic_foundation_f_in_scope)' \
+    "$contract_path" >"$missing_semantic_scope_contract"
+  if validate_static_contract "$missing_semantic_scope_contract" >/dev/null 2>&1; then
+    echo "ERROR [SELF_TEST_FALSE_PASS]: omitted semantic-F scope was accepted" >&2
+    return 1
+  fi
+
+  local unknown_claim_scope_contract="${self_test_root}/unknown-claim-scope-contract.json"
+  jq '.claim_scope.unreviewed_authority = false' \
+    "$contract_path" >"$unknown_claim_scope_contract"
+  if validate_static_contract "$unknown_claim_scope_contract" >/dev/null 2>&1; then
+    echo "ERROR [SELF_TEST_FALSE_PASS]: unknown claim-scope authority was accepted" >&2
+    return 1
+  fi
+
+  local test_envelope_json
+  test_envelope_json="$(test_receipt_envelope_json audit semantic fail false false)"
+  local valid_claim_receipt="${self_test_root}/valid-claim-receipt.json"
+  jq -n --argjson envelope "$test_envelope_json" '$envelope' >"$valid_claim_receipt"
+  receipt_claim_is_fail_closed "$valid_claim_receipt"
+
+  local release_envelope_json release_claim_receipt
+  release_envelope_json="$(test_receipt_envelope_json gate all pass true true)"
+  release_claim_receipt="${self_test_root}/release-claim-receipt.json"
+  jq -n --argjson envelope "$release_envelope_json" '$envelope' \
+    >"$release_claim_receipt"
+  receipt_claim_is_fail_closed "$release_claim_receipt"
+  if ! jq -e \
+    '.claim.source_receipt_admissible == true and .claim.flip_authorized == false' \
+    "$release_claim_receipt" >/dev/null
+  then
+    echo "ERROR [SELF_TEST_CLAIM_COUPLING]: release scope implied flip authority" >&2
+    return 1
+  fi
+
+  local mismatched_context_receipt
+  for mismatched_context_receipt in \
+    mode \
+    selected-lane \
+    outcome \
+    base-clean \
+    overlay-clean
+  do
+    local context_mutation
+    case "$mismatched_context_receipt" in
+      mode) context_mutation='.mode = "audit"' ;;
+      selected-lane) context_mutation='.selected_lane = "semantic"' ;;
+      outcome) context_mutation='.outcome = "fail"' ;;
+      base-clean) context_mutation='.candidate.base_clean = false' ;;
+      overlay-clean) context_mutation='.candidate.overlay_clean = false' ;;
+    esac
+    local mismatched_context_path="${self_test_root}/mismatched-${mismatched_context_receipt}.json"
+    jq "$context_mutation" "$release_claim_receipt" >"$mismatched_context_path"
+    if receipt_claim_is_fail_closed "$mismatched_context_path"; then
+      echo "ERROR [SELF_TEST_FALSE_PASS]: '$mismatched_context_receipt' claim context mismatch was accepted" >&2
+      return 1
+    fi
+  done
+
+  local partial_complete_receipt="${self_test_root}/partial-complete-receipt.json"
+  jq '.claim.complete_matrix = true' "$valid_claim_receipt" >"$partial_complete_receipt"
+  if receipt_claim_is_fail_closed "$partial_complete_receipt"; then
+    echo "ERROR [SELF_TEST_FALSE_PASS]: partial lane claimed a complete matrix" >&2
+    return 1
+  fi
+
+  local unknown_lane_receipt="${self_test_root}/unknown-lane-receipt.json"
+  jq '.selected_lane = "not-a-real-lane"' "$valid_claim_receipt" >"$unknown_lane_receipt"
+  if receipt_claim_is_fail_closed "$unknown_lane_receipt"; then
+    echo "ERROR [SELF_TEST_FALSE_PASS]: unknown selected lane was accepted" >&2
+    return 1
+  fi
+
+  local legacy_claim_receipt="${self_test_root}/legacy-claim-receipt.json"
+  jq '.schema = "frankensearch-qg10-overlay-receipt-v1"' \
+    "$valid_claim_receipt" >"$legacy_claim_receipt"
+  if receipt_claim_is_fail_closed "$legacy_claim_receipt"; then
+    echo "ERROR [SELF_TEST_FALSE_PASS]: legacy aggregate receipt schema was accepted" >&2
+    return 1
+  fi
+
+  local authorized_receipt="${self_test_root}/authorized-receipt.json"
+  jq '.claim.flip_authorized = true' \
+    "$valid_claim_receipt" >"$authorized_receipt"
+  if receipt_claim_is_fail_closed "$authorized_receipt"; then
+    echo "ERROR [SELF_TEST_FALSE_PASS]: flip-authorized receipt was accepted" >&2
+    return 1
+  fi
+
+  local omitted_authority_receipt="${self_test_root}/omitted-authority-receipt.json"
+  jq 'del(.claim.flip_authorization_owner)' \
+    "$valid_claim_receipt" >"$omitted_authority_receipt"
+  if receipt_claim_is_fail_closed "$omitted_authority_receipt"; then
+    echo "ERROR [SELF_TEST_FALSE_PASS]: omitted flip authority was accepted" >&2
+    return 1
+  fi
+
+  local semantic_claim_receipt="${self_test_root}/semantic-claim-receipt.json"
+  jq '.claim.semantic_foundation_f_in_scope = true' \
+    "$valid_claim_receipt" >"$semantic_claim_receipt"
+  if receipt_claim_is_fail_closed "$semantic_claim_receipt"; then
+    echo "ERROR [SELF_TEST_FALSE_PASS]: semantic-F claim was accepted" >&2
+    return 1
+  fi
+
+  local unknown_claim_receipt="${self_test_root}/unknown-claim-receipt.json"
+  jq '.claim.unreviewed_authority = false' \
+    "$valid_claim_receipt" >"$unknown_claim_receipt"
+  if receipt_claim_is_fail_closed "$unknown_claim_receipt"; then
+    echo "ERROR [SELF_TEST_FALSE_PASS]: unknown receipt authority was accepted" >&2
+    return 1
+  fi
 
   local missing_lane_contract="${self_test_root}/missing-lane.json"
   jq 'del(.required_lanes[0])' "$contract_path" >"$missing_lane_contract"
@@ -1624,6 +2389,382 @@ run_self_test() {
   BASE_CLEAN=false
   OVERLAY_CLEAN=false
 
+  local admissible_root="${self_test_root}/source-admissible-trusted"
+  local admissible_receipts="${self_test_root}/source-admissible-receipts"
+  mkdir -p \
+    "${admissible_root}/docs/contracts" \
+    "${admissible_root}/frankensearch" \
+    "${admissible_root}/scripts" \
+    "$admissible_receipts"
+  cp "${saved_trusted_root}/scripts/check_feature_matrix_overlay.sh" \
+    "${admissible_root}/scripts/check_feature_matrix_overlay.sh"
+  printf '[self-test]\n' >"${admissible_root}/Cargo.lock"
+  printf '[workspace]\n' >"${admissible_root}/Cargo.toml"
+  printf '[package]\nname = "frankensearch"\n' \
+    >"${admissible_root}/frankensearch/Cargo.toml"
+  printf 'channel = "nightly"\n' >"${admissible_root}/rust-toolchain.toml"
+  printf 'base\n' >"${admissible_root}/candidate-marker.txt"
+
+  jq -S '.required_facade_features' "$contract_path" \
+    >"${admissible_receipts}/facade-features.json"
+  jq -S '.required_facade_targets' "$contract_path" \
+    >"${admissible_receipts}/facade-targets.json"
+  jq -n '[]' >"${admissible_receipts}/schema-inventory.json"
+  cp "$valid_order" \
+    "${admissible_receipts}/source-workspace-publish-order.json"
+
+  local reviewed_resolved_map="{}"
+  local reviewed_dependency_map="{}"
+  local reviewed_public_api_map="{}"
+  local admissible_lane resolved_fixture dependency_fixture public_api_fixture
+  for admissible_lane in "${REQUIRED_LANES[@]}"; do
+    mkdir -p "${admissible_receipts}/lane-${admissible_lane}"
+    resolved_fixture="${admissible_receipts}/lane-${admissible_lane}/resolved-features.json"
+    dependency_fixture="${admissible_receipts}/lane-${admissible_lane}/dependency-packages.json"
+    public_api_fixture="${admissible_receipts}/lane-${admissible_lane}/public-api.json"
+    jq -S \
+      --arg lane "$admissible_lane" \
+      '.required_lanes[] | select(.name == $lane) | .requested_features | sort' \
+      "$contract_path" >"$resolved_fixture"
+    jq -S \
+      --arg lane "$admissible_lane" \
+      '.required_lanes[] | select(.name == $lane) | .required_packages | sort' \
+      "$contract_path" >"$dependency_fixture"
+    jq -n -S '{
+      reachable_paths: [
+        {path: "frankensearch::SelfTest", kind: "struct"}
+      ],
+      public_items: [
+        {
+          id: "0",
+          crate_id: 0,
+          name: "SelfTest",
+          attrs: [],
+          deprecation: null,
+          inner: {struct: {}}
+        }
+      ]
+    }' >"$public_api_fixture"
+    reviewed_resolved_map="$(jq -cn \
+      --argjson prior "$reviewed_resolved_map" \
+      --arg lane "$admissible_lane" \
+      --arg sha256 "$(jq -c . "$resolved_fixture" | sha256sum | awk '{print $1}')" \
+      '$prior + {($lane): $sha256}')"
+    reviewed_dependency_map="$(jq -cn \
+      --argjson prior "$reviewed_dependency_map" \
+      --arg lane "$admissible_lane" \
+      --arg sha256 "$(jq -c . "$dependency_fixture" | sha256sum | awk '{print $1}')" \
+      '$prior + {($lane): $sha256}')"
+    reviewed_public_api_map="$(jq -cn \
+      --argjson prior "$reviewed_public_api_map" \
+      --arg lane "$admissible_lane" \
+      --arg sha256 "$(canonical_json_hash "$public_api_fixture")" \
+      '$prior + {($lane): $sha256}')"
+  done
+
+  local reviewed_contract="${admissible_root}/${CONTRACT_RELATIVE_PATH}"
+  jq \
+    --arg cargo_lock_sha256 "$(sha256_file "${admissible_root}/Cargo.lock")" \
+    --arg workspace_manifest_sha256 "$(sha256_file "${admissible_root}/Cargo.toml")" \
+    --arg facade_manifest_sha256 "$(sha256_file "${admissible_root}/frankensearch/Cargo.toml")" \
+    --arg toolchain_sha256 "$(sha256_file "${admissible_root}/rust-toolchain.toml")" \
+    --arg facade_features_sha256 "$(canonical_json_hash "${admissible_receipts}/facade-features.json")" \
+    --arg target_inventory_sha256 "$(canonical_json_hash "${admissible_receipts}/facade-targets.json")" \
+    --arg schema_inventory_sha256 "$(canonical_json_hash "${admissible_receipts}/schema-inventory.json")" \
+    --arg source_publish_order_sha256 "$(canonical_json_hash "${admissible_receipts}/source-workspace-publish-order.json")" \
+    --argjson resolved_features_by_lane "$reviewed_resolved_map" \
+    --argjson dependency_packages_by_lane "$reviewed_dependency_map" \
+    --argjson public_api_by_lane "$reviewed_public_api_map" \
+    '.review_status = "reviewed"
+      | .reviewed_inventory = {
+          cargo_lock_sha256: $cargo_lock_sha256,
+          workspace_manifest_sha256: $workspace_manifest_sha256,
+          facade_manifest_sha256: $facade_manifest_sha256,
+          toolchain_sha256: $toolchain_sha256,
+          facade_features_sha256: $facade_features_sha256,
+          target_inventory_sha256: $target_inventory_sha256,
+          schema_inventory_sha256: $schema_inventory_sha256,
+          source_publish_order_sha256: $source_publish_order_sha256,
+          resolved_features_by_lane: $resolved_features_by_lane,
+          dependency_packages_by_lane: $dependency_packages_by_lane,
+          public_api_by_lane: $public_api_by_lane
+        }' \
+    "$contract_path" >"$reviewed_contract"
+  jq -S '.reviewed_inventory' "$reviewed_contract" \
+    >"${admissible_receipts}/observed-contract-values.json"
+
+  git -C "$admissible_root" init -q
+  git -C "$admissible_root" config user.name "QG10 Admissible Self Test"
+  git -C "$admissible_root" config user.email "qg10-admissible@invalid.example"
+  git -C "$admissible_root" add .
+  git -C "$admissible_root" commit -q -m "admissible self-test base"
+  local admissible_base_sha admissible_base_tree admissible_candidate_sha
+  local admissible_candidate_tree admissible_patch_sha
+  admissible_base_sha="$(git -C "$admissible_root" rev-parse HEAD)"
+  admissible_base_tree="$(git -C "$admissible_root" rev-parse 'HEAD^{tree}')"
+  printf 'candidate\n' >"${admissible_root}/candidate-marker.txt"
+  git -C "$admissible_root" diff --binary -- candidate-marker.txt \
+    >"${admissible_receipts}/canonical-flip.patch"
+  admissible_patch_sha="$(sha256_file "${admissible_receipts}/canonical-flip.patch")"
+  git -C "$admissible_root" add candidate-marker.txt
+  git -C "$admissible_root" commit -q -m "admissible self-test candidate"
+  admissible_candidate_sha="$(git -C "$admissible_root" rev-parse HEAD)"
+  admissible_candidate_tree="$(git -C "$admissible_root" rev-parse 'HEAD^{tree}')"
+
+  local admissible_lane_paths=()
+  local expected_backend expected_selection lane_contract public_api_sha
+  local admissible_logs admissible_log_name admissible_log_path
+  for admissible_lane in "${REQUIRED_LANES[@]}"; do
+    resolved_fixture="${admissible_receipts}/lane-${admissible_lane}/resolved-features.json"
+    dependency_fixture="${admissible_receipts}/lane-${admissible_lane}/dependency-packages.json"
+    public_api_fixture="${admissible_receipts}/lane-${admissible_lane}/public-api.json"
+    expected_backend="$(jq -r \
+      --arg lane "$admissible_lane" \
+      '.required_lanes[] | select(.name == $lane) | .expected_lexical_backend' \
+      "$reviewed_contract")"
+    expected_selection="$(jq -r \
+      --arg lane "$admissible_lane" \
+      '.required_lanes[] | select(.name == $lane) | .expected_selected_backend' \
+      "$reviewed_contract")"
+    lane_contract="$(lane_contract_json "$reviewed_contract" "$admissible_lane")"
+    public_api_sha="$(canonical_json_hash "$public_api_fixture")"
+    admissible_logs="[]"
+    for admissible_log_name in \
+      metadata.log \
+      dependencies.log \
+      check-all-targets.log \
+      doctest.log \
+      runtime-behavior.log \
+      rustdoc-json.log
+    do
+      admissible_log_path="lane-${admissible_lane}/${admissible_log_name}"
+      printf 'source-admissible self-test: %s %s\n' \
+        "$admissible_lane" \
+        "$admissible_log_name" \
+        >"${admissible_receipts}/${admissible_log_path}"
+      admissible_logs="$(jq -cn \
+        --argjson prior "$admissible_logs" \
+        --arg file "$admissible_log_path" \
+        --arg sha256 "$(sha256_file "${admissible_receipts}/${admissible_log_path}")" \
+        '$prior + [{file: $file, sha256: $sha256}]')"
+    done
+    local admissible_lane_receipt="${admissible_receipts}/qg10-lane-${admissible_lane}.json"
+    jq -n \
+      --arg schema "$LANE_SCHEMA_VERSION" \
+      --arg lane "$admissible_lane" \
+      --arg base_git_sha "$admissible_base_sha" \
+      --arg patch_sha256 "$admissible_patch_sha" \
+      --arg candidate_tree_sha "$admissible_candidate_tree" \
+      --arg behavior_schema "$BEHAVIOR_SCHEMA_VERSION" \
+      --arg backend "$expected_backend" \
+      --arg selected "$expected_selection" \
+      --arg public_api_sha256 "$public_api_sha" \
+      --argjson contract "$lane_contract" \
+      --argjson logs "$admissible_logs" \
+      --slurpfile resolved "$resolved_fixture" \
+      --slurpfile dependencies "$dependency_fixture" \
+      '{
+        schema: $schema,
+        lane: $lane,
+        outcome: "pass",
+        failure_phase: null,
+        candidate: {
+          base_git_sha: $base_git_sha,
+          canonical_flip_patch_sha256: $patch_sha256,
+          candidate_tree_sha: $candidate_tree_sha
+        },
+        contract: $contract,
+        observed: {
+          resolved_features: $resolved[0],
+          dependency_packages: $dependencies[0],
+          public_api_sha256: $public_api_sha256,
+          runtime: {
+            schema: $behavior_schema,
+            lane: $lane,
+            status: "pass",
+            observations: {
+              lexical_backend: $backend,
+              selected_backend: $selected
+            }
+          }
+        },
+        logs: $logs
+      }' >"$admissible_lane_receipt"
+    content_address_file "$admissible_lane_receipt" \
+      "qg10-lane-${admissible_lane}" >/dev/null
+    admissible_lane_paths+=("$admissible_lane_receipt")
+  done
+
+  local admissible_bindings="[]"
+  local admissible_relative_path
+  local admissible_artifact_paths=(
+    canonical-flip.patch
+    facade-features.json
+    facade-targets.json
+    observed-contract-values.json
+    schema-inventory.json
+    source-workspace-publish-order.json
+  )
+  for admissible_lane in "${REQUIRED_LANES[@]}"; do
+    admissible_artifact_paths+=(
+      "lane-${admissible_lane}/public-api.json"
+      "qg10-lane-${admissible_lane}.json"
+    )
+  done
+  for admissible_relative_path in "${admissible_artifact_paths[@]}"; do
+    admissible_bindings="$(jq -cn \
+      --argjson prior "$admissible_bindings" \
+      --arg file "$admissible_relative_path" \
+      --arg sha256 "$(sha256_file "${admissible_receipts}/${admissible_relative_path}")" \
+      '$prior + [{file: $file, sha256: $sha256}]')"
+  done
+
+  local admissible_lane_receipts_json admissible_receipt
+  admissible_lane_receipts_json="$(jq -s '.' "${admissible_lane_paths[@]}")"
+  admissible_receipt="${admissible_receipts}/qg10-overlay-receipt.json"
+  jq -n \
+    --argjson envelope "$release_envelope_json" \
+    --arg base_git_sha "$admissible_base_sha" \
+    --arg base_tree_sha "$admissible_base_tree" \
+    --arg patch_sha256 "$admissible_patch_sha" \
+    --arg candidate_tree_sha "$admissible_candidate_tree" \
+    --arg synthetic_commit_sha "$admissible_candidate_sha" \
+    --arg runner_sha256 "$(sha256_file "${admissible_root}/scripts/check_feature_matrix_overlay.sh")" \
+    --arg contract_relative_path "$CONTRACT_RELATIVE_PATH" \
+    --arg contract_sha256 "$(sha256_file "$reviewed_contract")" \
+    --argjson lane_receipts "$admissible_lane_receipts_json" \
+    --argjson artifact_bindings "$admissible_bindings" \
+    '$envelope + {
+      run_id: "source-admissible-self-test",
+      failure_phase: null,
+      candidate: ($envelope.candidate + {
+        base_git_sha: $base_git_sha,
+        base_tree_sha: $base_tree_sha,
+        canonical_flip_patch_sha256: $patch_sha256,
+        candidate_tree_sha: $candidate_tree_sha,
+        synthetic_commit_sha: $synthetic_commit_sha
+      }),
+      validator: {
+        trusted_runner_sha256: $runner_sha256,
+        contract_relative_path: $contract_relative_path,
+        contract_sha256: $contract_sha256
+      },
+      lane_receipts: $lane_receipts,
+      artifact_bindings: $artifact_bindings
+    }' >"$admissible_receipt"
+  content_address_file "$admissible_receipt" "qg10-overlay-receipt" >/dev/null
+
+  TRUSTED_ROOT="$admissible_root"
+  verify_receipt_directory "$admissible_receipts" >/dev/null
+  local empty_evidence_receipt="${self_test_root}/empty-admissible-receipt.json"
+  local empty_evidence_log="${self_test_root}/empty-admissible-receipt.log"
+  jq '.lane_receipts = [] | .artifact_bindings = []' \
+    "$admissible_receipt" >"$empty_evidence_receipt"
+  if verify_source_admissible_evidence \
+    "$admissible_receipts" \
+    "$empty_evidence_receipt" >"$empty_evidence_log" 2>&1
+  then
+    echo "ERROR [SELF_TEST_FALSE_PASS]: empty source-admissible evidence was accepted" >&2
+    return 1
+  fi
+  if ! rg -F -q 'ERROR [LANE_RECEIPT_CENSUS_INVALID]' "$empty_evidence_log"; then
+    echo "ERROR [SELF_TEST_WRONG_FAILURE]: empty evidence did not reach lane-census guard" >&2
+    return 1
+  fi
+  local runner_tamper_receipt="${self_test_root}/runner-tamper-receipt.json"
+  jq '.validator.trusted_runner_sha256 = ("0" * 64)' \
+    "$admissible_receipt" >"$runner_tamper_receipt"
+  if verify_source_admissible_evidence \
+    "$admissible_receipts" \
+    "$runner_tamper_receipt" >/dev/null 2>&1
+  then
+    echo "ERROR [SELF_TEST_FALSE_PASS]: untrusted runner identity was accepted" >&2
+    return 1
+  fi
+
+  local invalid_public_dir="${self_test_root}/invalid-public-api-receipts"
+  local invalid_public_log="${self_test_root}/invalid-public-api-receipts.log"
+  mkdir -p "$invalid_public_dir"
+  for admissible_relative_path in \
+    canonical-flip.patch \
+    facade-features.json \
+    facade-targets.json \
+    observed-contract-values.json \
+    schema-inventory.json \
+    source-workspace-publish-order.json
+  do
+    cp "${admissible_receipts}/${admissible_relative_path}" \
+      "${invalid_public_dir}/${admissible_relative_path}"
+  done
+  for admissible_lane in "${REQUIRED_LANES[@]}"; do
+    mkdir -p "${invalid_public_dir}/lane-${admissible_lane}"
+    for admissible_log_name in \
+      metadata.log \
+      dependencies.log \
+      check-all-targets.log \
+      doctest.log \
+      runtime-behavior.log \
+      rustdoc-json.log
+    do
+      cp \
+        "${admissible_receipts}/lane-${admissible_lane}/${admissible_log_name}" \
+        "${invalid_public_dir}/lane-${admissible_lane}/${admissible_log_name}"
+    done
+    if [[ "$admissible_lane" == "no-default" ]]; then
+      jq '.reachable_paths = []' \
+        "${admissible_receipts}/lane-${admissible_lane}/public-api.json" \
+        >"${invalid_public_dir}/lane-${admissible_lane}/public-api.json"
+      continue
+    fi
+    cp "${admissible_receipts}/lane-${admissible_lane}/public-api.json" \
+      "${invalid_public_dir}/lane-${admissible_lane}/public-api.json"
+    local copied_lane_receipt="${admissible_receipts}/qg10-lane-${admissible_lane}.json"
+    local copied_lane_sha
+    copied_lane_sha="$(sha256_file "$copied_lane_receipt")"
+    cp "$copied_lane_receipt" \
+      "${invalid_public_dir}/qg10-lane-${admissible_lane}.json"
+    cp "${admissible_receipts}/qg10-lane-${admissible_lane}.${copied_lane_sha}.json" \
+      "${invalid_public_dir}/qg10-lane-${admissible_lane}.${copied_lane_sha}.json"
+  done
+  local invalid_public_sha invalid_lane_receipt invalid_lane_sha
+  invalid_public_sha="$(canonical_json_hash \
+    "${invalid_public_dir}/lane-no-default/public-api.json")"
+  invalid_lane_receipt="${invalid_public_dir}/qg10-lane-no-default.json"
+  jq --arg public_api_sha256 "$invalid_public_sha" \
+    '.observed.public_api_sha256 = $public_api_sha256' \
+    "${admissible_receipts}/qg10-lane-no-default.json" \
+    >"$invalid_lane_receipt"
+  content_address_file "$invalid_lane_receipt" "qg10-lane-no-default" >/dev/null
+  invalid_lane_sha="$(sha256_file "$invalid_lane_receipt")"
+  local invalid_public_receipt="${invalid_public_dir}/qg10-overlay-receipt.json"
+  jq \
+    --arg public_api_sha256 "$(sha256_file \
+      "${invalid_public_dir}/lane-no-default/public-api.json")" \
+    --arg lane_receipt_sha256 "$invalid_lane_sha" \
+    --slurpfile replacement_lane "$invalid_lane_receipt" \
+    '(.lane_receipts[] | select(.lane == "no-default")) = $replacement_lane[0]
+      | .artifact_bindings |= map(
+          if .file == "lane-no-default/public-api.json"
+          then .sha256 = $public_api_sha256
+          elif .file == "qg10-lane-no-default.json"
+          then .sha256 = $lane_receipt_sha256
+          else .
+          end
+        )' \
+    "$admissible_receipt" >"$invalid_public_receipt"
+  content_address_file "$invalid_public_receipt" "qg10-overlay-receipt" >/dev/null
+  if verify_receipt_directory "$invalid_public_dir" \
+    >"$invalid_public_log" 2>&1
+  then
+    echo "ERROR [SELF_TEST_FALSE_PASS]: empty public API evidence was accepted" >&2
+    return 1
+  fi
+  if ! rg -F -q 'ERROR [PUBLIC_API_EVIDENCE_INVALID]' "$invalid_public_log"; then
+    echo "ERROR [SELF_TEST_WRONG_FAILURE]: empty public API did not reach semantic guard" >&2
+    return 1
+  fi
+  TRUSTED_ROOT="$saved_trusted_root"
+
   local receipt_dir="${self_test_root}/receipt-positive"
   mkdir -p "${receipt_dir}/lane-self-test"
   printf 'bound artifact\n' >"${receipt_dir}/bound.json"
@@ -1633,23 +2774,24 @@ run_self_test() {
     --arg log_sha256 "$(sha256_file "${receipt_dir}/lane-self-test/probe.log")" \
     '{
       schema: $schema,
-      lane: "self-test",
+      lane: "semantic",
+      outcome: "fail",
+      failure_phase: "self-test",
       logs: [{file: "lane-self-test/probe.log", sha256: $log_sha256}]
-    }' >"${receipt_dir}/qg10-lane-self-test.json"
+    }' >"${receipt_dir}/qg10-lane-semantic.json"
   content_address_file \
-    "${receipt_dir}/qg10-lane-self-test.json" \
-    "qg10-lane-self-test" >/dev/null
+    "${receipt_dir}/qg10-lane-semantic.json" \
+    "qg10-lane-semantic" >/dev/null
   jq -n \
-    --arg schema "$SCHEMA_VERSION" \
+    --argjson envelope "$test_envelope_json" \
     --arg bound_sha256 "$(sha256_file "${receipt_dir}/bound.json")" \
-    --arg lane_sha256 "$(sha256_file "${receipt_dir}/qg10-lane-self-test.json")" \
-    --slurpfile lane "${receipt_dir}/qg10-lane-self-test.json" \
-    '{
-      schema: $schema,
+    --arg lane_sha256 "$(sha256_file "${receipt_dir}/qg10-lane-semantic.json")" \
+    --slurpfile lane "${receipt_dir}/qg10-lane-semantic.json" \
+    '$envelope + {
       lane_receipts: $lane,
       artifact_bindings: [
         {file: "bound.json", sha256: $bound_sha256},
-        {file: "qg10-lane-self-test.json", sha256: $lane_sha256}
+        {file: "qg10-lane-semantic.json", sha256: $lane_sha256}
       ]
     }' >"${receipt_dir}/qg10-overlay-receipt.json"
   content_address_file \
@@ -1666,10 +2808,9 @@ run_self_test() {
   mkdir -p "$artifact_tamper_dir"
   printf 'bound artifact\n' >"${artifact_tamper_dir}/bound.json"
   jq -n \
-    --arg schema "$SCHEMA_VERSION" \
+    --argjson envelope "$test_envelope_json" \
     --arg sha256 "$(sha256_file "${artifact_tamper_dir}/bound.json")" \
-    '{
-      schema: $schema,
+    '$envelope + {
       lane_receipts: [],
       artifact_bindings: [{file: "bound.json", sha256: $sha256}]
     }' >"${artifact_tamper_dir}/qg10-overlay-receipt.json"
@@ -1687,10 +2828,9 @@ run_self_test() {
   mkdir -p "$manifest_tamper_dir"
   printf 'bound artifact\n' >"${manifest_tamper_dir}/bound.json"
   jq -n \
-    --arg schema "$SCHEMA_VERSION" \
+    --argjson envelope "$test_envelope_json" \
     --arg sha256 "$(sha256_file "${manifest_tamper_dir}/bound.json")" \
-    '{
-      schema: $schema,
+    '$envelope + {
       lane_receipts: [],
       artifact_bindings: [{file: "bound.json", sha256: $sha256}]
     }' >"${manifest_tamper_dir}/qg10-overlay-receipt.json"

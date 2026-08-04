@@ -9,6 +9,9 @@ cd /path/to/monorepo
 fsfs index .
 ```
 
+The initial command is intentionally one-shot and exits after sealing the
+generation. Watch mode starts only in the explicit next step.
+
 ## 2) Start watch mode
 
 ```bash

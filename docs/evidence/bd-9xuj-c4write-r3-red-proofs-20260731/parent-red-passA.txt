@@ -1,0 +1,84 @@
+== PARENT-RED pass A @ 7095b1da60fe84f6dbd39a4bdc5ada4329580c90 (pipefail; wrapper: RCH_DISABLE=1, canonical CARGO_TARGET_DIR) ==
+== cmd: cargo test -p frankensearch-index --lib -- two_tier::tests::finish_propagates_wal_removal_failure two_tier::tests::crash_after_rename_state ==
+    Updating crates.io index
+    Updating git repository `https://github.com/Dicklesworthstone/hnswlib-rs`
+    Updating git repository `https://github.com/Dicklesworthstone/frankentorch`
+     Locking 631 packages to latest Rust 1.95 compatible versions
+      Adding compact_str v0.9.1 (available: v0.10.0)
+      Adding fastembed v5.17.2 (available: v5.17.4)
+      Adding ftui-backend v0.2.1 (available: v0.5.0)
+      Adding ftui-core v0.2.1 (available: v0.5.0)
+      Adding ftui-extras v0.2.1 (available: v0.5.0)
+      Adding ftui-layout v0.2.1 (available: v0.5.1)
+      Adding ftui-render v0.2.1 (available: v0.5.0)
+      Adding ftui-style v0.2.1 (available: v0.5.0)
+      Adding ftui-text v0.2.1 (available: v0.5.0)
+      Adding ftui-tty v0.2.1 (available: v0.5.0)
+      Adding ftui-widgets v0.2.1 (available: v0.5.0)
+      Adding generic-array v0.14.7 (available: v0.14.9)
+      Adding jsonschema v0.46.10 (available: v0.49.2)
+      Adding ort v2.0.0-rc.12 (available: v2.0.0-rc.13)
+      Adding ort-sys v2.0.0-rc.12 (available: v2.0.0-rc.13)
+      Adding pdf-extract v0.10.0 (available: v0.12.0)
+      Adding safetensors v0.7.0 (available: v0.8.0)
+      Adding sysinfo v0.38.4 (available: v0.39.6)
+   Compiling frankensearch-index v0.2.1 (/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/c4r3-parent-worktree/crates/frankensearch-index)
+   Compiling frankensearch-core v0.2.1 (/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/c4r3-parent-worktree/crates/frankensearch-core)
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1268:28
+     |
+1268 |         acc0 += w8::<0>(s).mul_widen(w8::<0>(q));
+     |                            ^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1269:28
+     |
+1269 |         acc1 += w8::<8>(s).mul_widen(w8::<8>(q));
+     |                            ^^^^^^^^^
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1270:29
+     |
+1270 |         acc2 += w8::<16>(s).mul_widen(w8::<16>(q));
+     |                             ^^^^^^^^^
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1271:29
+     |
+1271 |         acc3 += w8::<24>(s).mul_widen(w8::<24>(q));
+     |                             ^^^^^^^^^
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1279:46
+     |
+1279 |         sum += i16x8::from(s.map(i16::from)).mul_widen(i16x8::from(q.map(i16::from)));
+     |                                              ^^^^^^^^^
+
+warning: `frankensearch-index` (lib test) generated 5 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4m 07s
+     Running unittests src/lib.rs (/data/projects/frankensearch/target/debug/deps/frankensearch_index-2c91718fdb066ad9)
+
+running 2 tests
+test two_tier::tests::finish_propagates_wal_removal_failure_without_publishing_replacement ... FAILED
+test two_tier::tests::crash_after_rename_state_is_pinned_and_unconstructable_through_finish ... ok
+
+failures:
+
+---- two_tier::tests::finish_propagates_wal_removal_failure_without_publishing_replacement stdout ----
+
+thread 'two_tier::tests::finish_propagates_wal_removal_failure_without_publishing_replacement' (2992892) panicked at crates/frankensearch-index/src/two_tier.rs:5888:9:
+assertion `left == right` failed: the replacement must NOT be published when WAL retirement fails: the old canonical main must be byte-identical
+  left: [70, 83, 86, 73, 1, 0, 9, 0, 102, 97, 115, 116, 45, 116, 105, 101, 114, 0, 0, 4, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 128, 0, 0, 0, 0, 0, 0, 0, 9, 199, 157, 167, 106, 91, 220, 203, 173, 118, 19, 3, 0, 0, 0, 0, 7, 0, 0, 0, 110, 101, 119, 45, 100, 111, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 60, 0, 0]
+ right: [70, 83, 86, 73, 1, 0, 4, 0, 116, 101, 115, 116, 0, 0, 4, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 128, 0, 0, 0, 0, 0, 0, 0, 56, 40, 33, 213, 73, 207, 2, 27, 51, 103, 61, 200, 0, 0, 0, 0, 7, 0, 0, 0, 111, 108, 100, 45, 100, 111, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 60, 0, 0, 0, 0, 0, 0]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    two_tier::tests::finish_propagates_wal_removal_failure_without_publishing_replacement
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 539 filtered out; finished in 0.44s
+
+error: test failed, to rerun pass `-p frankensearch-index --lib`
+EXIT_STATUS=101

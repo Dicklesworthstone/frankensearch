@@ -16,7 +16,7 @@
 //!   ids in precisely the order the dictionary serializer needs.
 //! - Budget accounting ([`TermInterner::bytes_used`]) that feeds the shard
 //!   flush trigger (`QuillConfig::scribe_shard_budget_bytes`).
-//! - [`FrankensearchTokenizer`]: the allocation-reusing scalar reference for
+//! - [`FrankensearchTokenizer`]: the allocation-reusing portable-SIMD path for
 //!   the shipping `SimpleTokenizer + LowerCaser` semantics.
 //! - [`CassAnalyzer`]: the native CASS hyphen/CJK analyzer family plus the
 //!   matching edge-prefix and bounded-preview helpers.
@@ -45,6 +45,7 @@ use std::ops::Range;
 use frankensearch_core::DocId;
 use rayon::prelude::*;
 use thiserror::Error;
+use wide::u8x32;
 
 use crate::contract::fieldnorm_to_id;
 use crate::delta::DeltaSnapshot;
@@ -99,6 +100,37 @@ pub struct AnalyzedToken {
     pub position_length: usize,
 }
 
+/// Borrowed normalized token emitted directly into an ingest consumer.
+///
+/// The default tokenizer uses the original input slice when an ASCII token is
+/// already lowercase, and its retained scratch only when normalization changes
+/// bytes. The view is valid only for the duration of the sink call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnalyzedTokenRef<'a> {
+    /// Normalized token text.
+    pub text: &'a str,
+    /// Logical token position, starting at zero.
+    pub position: u32,
+    /// Source byte offset of the first token byte.
+    pub offset_from: usize,
+    /// Source byte offset immediately after the token.
+    pub offset_to: usize,
+    /// Position span. The default analyzer always emits one.
+    pub position_length: usize,
+}
+
+impl<'a> From<&'a AnalyzedToken> for AnalyzedTokenRef<'a> {
+    fn from(token: &'a AnalyzedToken) -> Self {
+        Self {
+            text: token.text.as_str(),
+            position: token.position,
+            offset_from: token.offset_from,
+            offset_to: token.offset_to,
+            position_length: token.position_length,
+        }
+    }
+}
+
 /// Allocation-free callback surface shared by scalar and future SIMD/CASS
 /// analyzer families.
 ///
@@ -119,6 +151,20 @@ pub trait TokenAnalyzer: sealed::Sealed {
     ///
     /// Callers invoke this only for kinds accepted by [`Self::supports`].
     fn analyze(&mut self, analyzer: AnalyzerKind, text: &str, sink: &mut dyn FnMut(&AnalyzedToken));
+
+    /// Analyze directly into a consumer that does not require owned token text.
+    ///
+    /// The default bridge preserves custom analyzer behavior. Analyzer
+    /// families with a borrowed fast path override this method so unchanged
+    /// input bytes can flow straight into the term interner.
+    fn analyze_borrowed(
+        &mut self,
+        analyzer: AnalyzerKind,
+        text: &str,
+        sink: &mut dyn for<'token> FnMut(AnalyzedTokenRef<'token>),
+    ) {
+        self.analyze(analyzer, text, &mut |token| sink(token.into()));
+    }
 
     /// Retained analyzer scratch included in RSS/reuse diagnostics.
     fn bytes_reserved(&self) -> usize {
@@ -195,6 +241,41 @@ pub fn analyze_admitted<A: TokenAnalyzer + ?Sized>(
     Ok(report)
 }
 
+/// Analyze directly into a borrowed consumer and apply the global term limit.
+///
+/// This is the ingest form of [`analyze_admitted`]. It preserves the same
+/// report and position-gap semantics while allowing unchanged normalized text
+/// to bypass analyzer-owned string construction.
+fn analyze_admitted_borrowed<A: TokenAnalyzer + ?Sized>(
+    analyzer: &mut A,
+    analyzer_kind: AnalyzerKind,
+    text: &str,
+    sink: &mut dyn for<'token> FnMut(AnalyzedTokenRef<'token>),
+) -> Result<AnalysisReport, UnsupportedAnalysis> {
+    if !analyzer.supports(analyzer_kind) {
+        return Err(UnsupportedAnalysis {
+            analyzer: analyzer_kind,
+        });
+    }
+    let mut report = AnalysisReport::default();
+    analyzer.analyze_borrowed(analyzer_kind, text, &mut |token| {
+        report.raw_tokens += 1;
+        if token.text.len() > MAX_TERM_BYTES {
+            report.oversized_tokens += 1;
+            tracing::warn!(
+                token_bytes = token.text.len(),
+                max_token_bytes = MAX_TERM_BYTES,
+                position = token.position,
+                "Quill dropped an oversized analyzed token"
+            );
+            return;
+        }
+        report.admitted_tokens += 1;
+        sink(token);
+    });
+    Ok(report)
+}
+
 /// Default implementation of the shipping frankensearch analyzer.
 ///
 /// This fuses Tantivy's `SimpleTokenizer` and `LowerCaser`: split on
@@ -203,14 +284,13 @@ pub fn analyze_admitted<A: TokenAnalyzer + ?Sized>(
 /// enforce [`MAX_TERM_BYTES`]; admission belongs to document/query consumers
 /// so a dropped document token retains its position gap.
 ///
-/// Token boundaries are found by a SWAR (SIMD-within-a-register) byte
-/// classifier that visits eight ASCII bytes per 64-bit word
-/// ([`skip_separators`]/[`scan_token_end`]), falling back to the scalar
-/// char-walk for the span around each non-ASCII byte. The emitted stream is
-/// byte-parity-identical to [`analyze_default_scalar_reference`] — the retained
-/// scalar oracle — which the `swar_default_matches_scalar_reference_*` tests and
-/// the `tokenizer_simd_ab` bench pin (bd-quill-e1-scribe-bejd.1). No
-/// `core::arch` intrinsics are used; the quill crate root is
+/// Token boundaries are found by a one-pass 32-byte portable SIMD classifier,
+/// falling back to the scalar char-walk only at non-ASCII scalars and the short
+/// tail. `wide` lowers the same safe code to the available SSE2/AVX2, NEON, or
+/// wasm SIMD implementation without exposing architecture intrinsics here. The
+/// emitted stream is byte-parity-identical to
+/// [`analyze_default_scalar_reference`] — the retained scalar oracle — which
+/// the tokenizer parity tests pin. The quill crate root remains
 /// `#![forbid(unsafe_code)]`.
 #[derive(Debug, Clone, Default)]
 pub struct FrankensearchTokenizer {
@@ -219,11 +299,8 @@ pub struct FrankensearchTokenizer {
 
 impl sealed::Sealed for FrankensearchTokenizer {}
 
-/// Boundary-mask candidate retained only for the same-binary admission probe
-/// and exact-parity tests.
-///
-/// The shipping [`FrankensearchTokenizer`] remains the existing two-pass SWAR
-/// implementation until measurement admits this lever.
+/// Legacy one-pass 8-byte SWAR comparison retained for exact-parity tests and
+/// the same-binary tokenizer microbenchmark.
 #[cfg(any(test, feature = "bench-internals"))]
 #[derive(Debug, Clone, Default)]
 pub struct BoundaryMaskTokenizer {
@@ -262,11 +339,35 @@ fn next_token_position(position: u32) -> u32 {
 }
 
 /// Bytes classified per 64-bit SWAR word.
+#[cfg(any(test, feature = "bench-internals"))]
 const SWAR_LANES: usize = 8;
 /// SWAR broadcast of the byte `0x01` into every lane.
+#[cfg(any(test, feature = "bench-internals"))]
 const SWAR_ONES: u64 = 0x0101_0101_0101_0101;
 /// SWAR broadcast of the byte `0x80` (per-lane high bit) into every lane.
+#[cfg(any(test, feature = "bench-internals"))]
 const SWAR_HIGH: u64 = 0x8080_8080_8080_8080;
+
+/// Bytes classified by the portable SIMD tokenizer in one pass.
+const SIMD_TOKENIZER_LANES: usize = 32;
+
+/// Return bit `lane` for ASCII alphanumeric and non-ASCII bytes in one chunk.
+///
+/// The caller guarantees that the complete 32-byte chunk is in bounds. A local
+/// array keeps the load safe and lets `wide` select the best portable vector
+/// representation for the compilation target.
+#[inline]
+fn simd_tokenizer_masks(bytes: &[u8], at: usize) -> (u32, u32) {
+    let mut chunk = [0_u8; SIMD_TOKENIZER_LANES];
+    chunk.copy_from_slice(&bytes[at..at + SIMD_TOKENIZER_LANES]);
+    let lanes = u8x32::new(chunk);
+    let digits = lanes.simd_ge(b'0') & lanes.simd_le(b'9');
+    let uppercase = lanes.simd_ge(b'A') & lanes.simd_le(b'Z');
+    let lowercase = lanes.simd_ge(b'a') & lanes.simd_le(b'z');
+    let alphanumeric = (digits | uppercase | lowercase).to_bitmask();
+    let non_ascii = lanes.simd_ge(0x80).to_bitmask();
+    (alphanumeric, non_ascii)
+}
 
 /// Per-lane marker (`0x80` in the lane) where `lo <= byte <= hi`.
 ///
@@ -280,6 +381,7 @@ const SWAR_HIGH: u64 = 0x8080_8080_8080_8080;
 /// every caller pairs this with an explicit high-bit test so a non-ASCII lane
 /// terminates the span before its marker is consulted.
 #[inline]
+#[cfg(any(test, feature = "bench-internals"))]
 const fn swar_range_mark(word: u64, lo: u64, hi: u64) -> u64 {
     let guarded = word | SWAR_HIGH;
     // 0x80 in each lane whose byte is >= lo.
@@ -296,6 +398,7 @@ const fn swar_range_mark(word: u64, lo: u64, hi: u64) -> u64 {
 /// [`tokenizer_is_alphanumeric`] for ASCII scalar values. See
 /// [`swar_range_mark`] for the non-ASCII lane caveat.
 #[inline]
+#[cfg(any(test, feature = "bench-internals"))]
 const fn swar_ascii_alnum_mark(word: u64) -> u64 {
     swar_range_mark(word, b'0' as u64, b'9' as u64)
         | swar_range_mark(word, b'A' as u64, b'Z' as u64)
@@ -305,88 +408,11 @@ const fn swar_ascii_alnum_mark(word: u64) -> u64 {
 /// Load the eight bytes at `at` as a little-endian word so lane 0 is the byte at
 /// the lowest offset. The caller guarantees `at + SWAR_LANES <= bytes.len()`.
 #[inline]
+#[cfg(any(test, feature = "bench-internals"))]
 fn swar_load(bytes: &[u8], at: usize) -> u64 {
     let mut lanes = [0_u8; SWAR_LANES];
     lanes.copy_from_slice(&bytes[at..at + SWAR_LANES]);
     u64::from_le_bytes(lanes)
-}
-
-/// Advance past separators and return the byte offset of the first byte that
-/// begins an alphanumeric token, or `text.len()` when the remainder holds none.
-///
-/// The SWAR fast path classifies eight ASCII bytes per word; the first
-/// non-ASCII byte (always a UTF-8 leading byte because every earlier byte was
-/// ASCII) hands off to [`tokenizer_next_char`] so Unicode alphanumeric
-/// classification stays byte-parity-exact with the scalar reference.
-#[inline]
-fn skip_separators(text: &str, from: usize) -> usize {
-    let bytes = text.as_bytes();
-    let len = bytes.len();
-    let mut cursor = from;
-    loop {
-        while cursor + SWAR_LANES <= len {
-            let word = swar_load(bytes, cursor);
-            // Stop at the first ASCII-alnum lane or the first non-ASCII byte.
-            let stop = swar_ascii_alnum_mark(word) | (word & SWAR_HIGH);
-            if stop == 0 {
-                cursor += SWAR_LANES;
-                continue;
-            }
-            let at = cursor + (stop.trailing_zeros() as usize) / SWAR_LANES;
-            if bytes[at] < 0x80 {
-                return at;
-            }
-            cursor = at;
-            break;
-        }
-        match tokenizer_next_char(text, cursor) {
-            None => return len,
-            Some((ch, next)) => {
-                if tokenizer_is_alphanumeric(ch) {
-                    return cursor;
-                }
-                cursor = next;
-            }
-        }
-    }
-}
-
-/// Given a token starting at `from` (an alphanumeric char boundary), return the
-/// exclusive end offset of the maximal alphanumeric run and whether every byte
-/// in it is ASCII (which selects the [`str::make_ascii_lowercase`] fast path).
-#[inline]
-fn scan_token_end(text: &str, from: usize) -> (usize, bool) {
-    let bytes = text.as_bytes();
-    let len = bytes.len();
-    let mut cursor = from;
-    let mut all_ascii = true;
-    loop {
-        while cursor + SWAR_LANES <= len {
-            let word = swar_load(bytes, cursor);
-            // Stop at the first ASCII separator lane or the first non-ASCII byte.
-            let stop = (swar_ascii_alnum_mark(word) ^ SWAR_HIGH) | (word & SWAR_HIGH);
-            if stop == 0 {
-                cursor += SWAR_LANES;
-                continue;
-            }
-            let at = cursor + (stop.trailing_zeros() as usize) / SWAR_LANES;
-            if bytes[at] < 0x80 {
-                return (at, all_ascii);
-            }
-            cursor = at;
-            break;
-        }
-        match tokenizer_next_char(text, cursor) {
-            None => return (len, all_ascii),
-            Some((ch, next)) => {
-                if !tokenizer_is_alphanumeric(ch) {
-                    return (cursor, all_ascii);
-                }
-                all_ascii &= ch.is_ascii();
-                cursor = next;
-            }
-        }
-    }
 }
 
 #[cfg(any(test, feature = "bench-internals"))]
@@ -519,6 +545,45 @@ impl TokenAnalyzer for BoundaryMaskTokenizer {
     }
 }
 
+#[inline]
+fn emit_normalized_token(
+    scratch: &mut String,
+    source: &str,
+    all_ascii: bool,
+    position: u32,
+    offset_from: usize,
+    offset_to: usize,
+    sink: &mut dyn for<'token> FnMut(AnalyzedTokenRef<'token>),
+) {
+    if all_ascii && !source.as_bytes().iter().any(u8::is_ascii_uppercase) {
+        sink(AnalyzedTokenRef {
+            text: source,
+            position,
+            offset_from,
+            offset_to,
+            position_length: 1,
+        });
+        return;
+    }
+
+    scratch.clear();
+    if all_ascii {
+        scratch.push_str(source);
+        scratch.make_ascii_lowercase();
+    } else {
+        for source_char in source.chars() {
+            scratch.extend(source_char.to_lowercase());
+        }
+    }
+    sink(AnalyzedTokenRef {
+        text: scratch.as_str(),
+        position,
+        offset_from,
+        offset_to,
+        position_length: 1,
+    });
+}
+
 impl TokenAnalyzer for FrankensearchTokenizer {
     fn supports(&self, analyzer: AnalyzerKind) -> bool {
         analyzer == AnalyzerKind::FrankensearchDefault
@@ -530,36 +595,124 @@ impl TokenAnalyzer for FrankensearchTokenizer {
         text: &str,
         sink: &mut dyn FnMut(&AnalyzedToken),
     ) {
+        let mut token = AnalyzedToken::default();
+        self.analyze_borrowed(analyzer, text, &mut |borrowed| {
+            token.text.clear();
+            token.text.push_str(borrowed.text);
+            token.position = borrowed.position;
+            token.offset_from = borrowed.offset_from;
+            token.offset_to = borrowed.offset_to;
+            token.position_length = borrowed.position_length;
+            sink(&token);
+        });
+    }
+
+    fn analyze_borrowed(
+        &mut self,
+        analyzer: AnalyzerKind,
+        text: &str,
+        sink: &mut dyn for<'token> FnMut(AnalyzedTokenRef<'token>),
+    ) {
         debug_assert_eq!(analyzer, AnalyzerKind::FrankensearchDefault);
+        const NO_TOKEN: usize = usize::MAX;
+        let bytes = text.as_bytes();
         let len = text.len();
         let mut cursor = 0;
         let mut position = 0_u32;
+        let mut offset_from = NO_TOKEN;
+        let mut all_ascii = true;
 
         while cursor < len {
-            let offset_from = skip_separators(text, cursor);
-            if offset_from >= len {
-                break;
-            }
-            let (offset_to, all_ascii) = scan_token_end(text, offset_from);
+            if cursor + SIMD_TOKENIZER_LANES <= len {
+                let (alphanumeric, non_ascii) = simd_tokenizer_masks(bytes, cursor);
+                let ascii_lanes = if non_ascii == 0 {
+                    SIMD_TOKENIZER_LANES
+                } else {
+                    non_ascii.trailing_zeros() as usize
+                };
+                if ascii_lanes != 0 {
+                    let valid = if ascii_lanes == SIMD_TOKENIZER_LANES {
+                        u32::MAX
+                    } else {
+                        (1_u32 << ascii_lanes) - 1
+                    };
+                    let alphanumeric = alphanumeric & valid;
+                    let prior_lane = u32::from(offset_from != NO_TOKEN);
+                    let mut transitions =
+                        (alphanumeric ^ ((alphanumeric << 1) | prior_lane)) & valid;
+                    while transitions != 0 {
+                        let lane = transitions.trailing_zeros() as usize;
+                        let lane_mark = 1_u32 << lane;
+                        let at = cursor + lane;
+                        transitions &= !lane_mark;
 
-            self.token.text.clear();
-            let source = &text[offset_from..offset_to];
-            if all_ascii {
-                self.token.text.push_str(source);
-                self.token.text.make_ascii_lowercase();
-            } else {
-                for source_char in source.chars() {
-                    self.token.text.extend(source_char.to_lowercase());
+                        if alphanumeric & lane_mark != 0 {
+                            debug_assert_eq!(offset_from, NO_TOKEN);
+                            offset_from = at;
+                            all_ascii = true;
+                        } else {
+                            debug_assert_ne!(offset_from, NO_TOKEN);
+                            let source = &text[offset_from..at];
+                            emit_normalized_token(
+                                &mut self.token.text,
+                                source,
+                                all_ascii,
+                                position,
+                                offset_from,
+                                at,
+                                sink,
+                            );
+
+                            position = next_token_position(position);
+                            offset_from = NO_TOKEN;
+                        }
+                    }
+                    cursor += ascii_lanes;
+                    if ascii_lanes == SIMD_TOKENIZER_LANES {
+                        continue;
+                    }
                 }
             }
-            self.token.position = position;
-            self.token.offset_from = offset_from;
-            self.token.offset_to = offset_to;
-            self.token.position_length = 1;
-            sink(&self.token);
 
-            position = next_token_position(position);
-            cursor = offset_to;
+            let Some((ch, next)) = tokenizer_next_char(text, cursor) else {
+                break;
+            };
+            if tokenizer_is_alphanumeric(ch) {
+                if offset_from == NO_TOKEN {
+                    offset_from = cursor;
+                    all_ascii = ch.is_ascii();
+                } else {
+                    all_ascii &= ch.is_ascii();
+                }
+            } else if offset_from != NO_TOKEN {
+                let source = &text[offset_from..cursor];
+                emit_normalized_token(
+                    &mut self.token.text,
+                    source,
+                    all_ascii,
+                    position,
+                    offset_from,
+                    cursor,
+                    sink,
+                );
+
+                position = next_token_position(position);
+                offset_from = NO_TOKEN;
+            }
+            cursor = next;
+        }
+
+        if offset_from != NO_TOKEN {
+            let source = &text[offset_from..len];
+            emit_normalized_token(
+                &mut self.token.text,
+                source,
+                all_ascii,
+                position,
+                offset_from,
+                len,
+                sink,
+            );
         }
     }
 
@@ -929,12 +1082,48 @@ pub struct ArenaSpan {
 /// Not a general allocator: append-only between resets, no per-item free.
 /// [`reset`](Self::reset) retains every standard chunk at full capacity so a
 /// steady-state flush cycle performs zero global allocations.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ByteArena {
     chunks: Vec<Vec<u8>>,
     chunk_size: usize,
     /// Index of the chunk currently accepting writes.
     active: usize,
+    /// Running sum of every chunk's capacity, so [`Self::bytes_reserved`] is
+    /// O(1) instead of re-summing every chunk per call. This is the sibling of
+    /// `TermInterner::running_bytes_used` (bd-w4j5) on the *reserved* path,
+    /// which that fix left as an O(chunks) scan. Exact rather than
+    /// approximate: `push` only ever grows capacity by appending a whole new
+    /// chunk (the `needs_new` guard means `extend_from_slice` always fits an
+    /// existing chunk).
+    ///
+    /// Every site that changes chunk capacity must maintain this, and there
+    /// are exactly four: the three `chunks.push` calls in [`Self::push`]
+    /// (oversized chunk, lazy first chunk, next standard chunk) and the
+    /// `retain` in [`Self::reset`], which drops chunks and therefore
+    /// recomputes. The `debug_assert_eq!` in [`Self::bytes_reserved`] is the
+    /// backstop that catches a missed site.
+    running_bytes_reserved: usize,
+}
+
+/// Hand-written so the running counter is recomputed rather than copied.
+///
+/// `Vec::clone` allocates exactly `len`, so a cloned chunk's capacity is not
+/// the source chunk's — a derived `Clone` would carry the source's
+/// `running_bytes_reserved` onto containers that reserve a different amount
+/// and `bytes_reserved` would report the wrong number for the rest of the
+/// clone's life. Cloning is off the hot path (it is not per document), so the
+/// O(chunks) recompute here costs nothing that matters.
+impl Clone for ByteArena {
+    fn clone(&self) -> Self {
+        let chunks = self.chunks.clone();
+        let running_bytes_reserved = chunks.iter().map(Vec::capacity).sum();
+        Self {
+            chunks,
+            chunk_size: self.chunk_size,
+            active: self.active,
+            running_bytes_reserved,
+        }
+    }
 }
 
 impl ByteArena {
@@ -943,10 +1132,13 @@ impl ByteArena {
     #[must_use]
     pub fn with_chunk_size(chunk_size: usize) -> Self {
         let chunk_size = chunk_size.max(4096);
+        // Chunks are allocated lazily on first `push`, so nothing is reserved
+        // yet and the running counter starts at zero.
         Self {
-            chunks: vec![Vec::with_capacity(chunk_size)],
+            chunks: Vec::new(),
             chunk_size,
             active: 0,
+            running_bytes_reserved: 0,
         }
     }
 
@@ -963,6 +1155,8 @@ impl ByteArena {
         if bytes.len() > self.chunk_size {
             let mut chunk = Vec::with_capacity(bytes.len());
             chunk.extend_from_slice(bytes);
+            self.running_bytes_reserved =
+                self.running_bytes_reserved.saturating_add(chunk.capacity());
             self.chunks.push(chunk);
             let idx = self.chunks.len() - 1;
             return ArenaSpan {
@@ -970,6 +1164,16 @@ impl ByteArena {
                 offset: 0,
                 len: u32::try_from(bytes.len()).expect("arena span exceeds u32"),
             };
+        }
+        if self.chunks.is_empty() {
+            // Lazy first chunk: this is a capacity change like any other, so it
+            // must be folded into the running counter or `bytes_reserved` would
+            // report 0 for a non-empty arena.
+            let chunk = Vec::with_capacity(self.chunk_size);
+            self.running_bytes_reserved =
+                self.running_bytes_reserved.saturating_add(chunk.capacity());
+            self.chunks.push(chunk);
+            self.active = 0;
         }
         let needs_new = {
             let chunk = &self.chunks[self.active];
@@ -983,7 +1187,10 @@ impl ByteArena {
                 next += 1;
             }
             if next == self.chunks.len() {
-                self.chunks.push(Vec::with_capacity(self.chunk_size));
+                let chunk = Vec::with_capacity(self.chunk_size);
+                self.running_bytes_reserved =
+                    self.running_bytes_reserved.saturating_add(chunk.capacity());
+                self.chunks.push(chunk);
             }
             self.active = next;
         }
@@ -1020,7 +1227,12 @@ impl ByteArena {
     /// figure reported in flush-cycle tracing.
     #[must_use]
     pub fn bytes_reserved(&self) -> usize {
-        self.chunks.iter().map(Vec::capacity).sum()
+        debug_assert_eq!(
+            self.running_bytes_reserved,
+            self.chunks.iter().map(Vec::capacity).sum::<usize>(),
+            "arena running reserved drifted from the chunk capacity sum"
+        );
+        self.running_bytes_reserved
     }
 
     /// Number of chunks (soak tests assert this stabilizes across cycles).
@@ -1034,9 +1246,12 @@ impl ByteArena {
     /// retaining them would ratchet RSS on pathological inputs).
     pub fn reset(&mut self) {
         self.chunks.retain(|c| c.capacity() == self.chunk_size);
-        if self.chunks.is_empty() {
-            self.chunks.push(Vec::with_capacity(self.chunk_size));
-        }
+        // `retain` drops the dedicated oversized chunks, so recompute rather
+        // than track the deletions. Reset is once per flush cycle, not per
+        // document, so an O(chunks) pass here is off the hot path — and
+        // skipping it would leave `running_bytes_reserved` counting capacity
+        // that was just freed, permanently over-reporting reserved bytes.
+        self.running_bytes_reserved = self.chunks.iter().map(Vec::capacity).sum();
         for chunk in &mut self.chunks {
             chunk.clear();
         }
@@ -1202,6 +1417,11 @@ impl TermInterner<ahash::RandomState> {
     pub fn new() -> Self {
         Self::with_hasher(ahash::RandomState::new())
     }
+
+    #[must_use]
+    pub(crate) fn with_arena_chunk_size(arena_chunk_size: usize) -> Self {
+        Self::with_hasher_and_arena_chunk_size(ahash::RandomState::new(), arena_chunk_size)
+    }
 }
 
 impl Default for TermInterner<ahash::RandomState> {
@@ -1213,8 +1433,12 @@ impl Default for TermInterner<ahash::RandomState> {
 impl<S: BuildHasher> TermInterner<S> {
     #[must_use]
     pub fn with_hasher(hasher: S) -> Self {
+        Self::with_hasher_and_arena_chunk_size(hasher, DEFAULT_ARENA_CHUNK_BYTES)
+    }
+
+    fn with_hasher_and_arena_chunk_size(hasher: S, arena_chunk_size: usize) -> Self {
         Self {
-            arena: ByteArena::default(),
+            arena: ByteArena::with_chunk_size(arena_chunk_size),
             spans: Vec::new(),
             buckets: HashMap::default(),
             hasher,
@@ -1372,7 +1596,10 @@ impl<S: BuildHasher> TermInterner<S> {
 
     /// Ids sorted by composite key bytes — exactly the on-disk TERMDICT order
     /// (FSLX §5.1: the BE field prefix makes byte order equal (field, term)
-    /// order). Called once per flush; cost is the sort, not paid per token.
+    /// order). Called once per flush. Large buckets use an in-place MSD radix
+    /// partition so shared prefixes are inspected once per byte instead of by
+    /// every comparison; small buckets finish with the comparison sorter to
+    /// avoid clearing a 257-way histogram for a handful of ids.
     ///
     /// # Panics
     /// Panics if the id space exceeds `u32` (unreachable; see [`Self::intern`]).
@@ -1380,8 +1607,81 @@ impl<S: BuildHasher> TermInterner<S> {
     pub fn sorted_ids(&self) -> Vec<u32> {
         let mut ids: Vec<u32> =
             (0..u32::try_from(self.spans.len()).expect("term id space exceeds u32")).collect();
-        ids.sort_unstable_by(|a, b| self.composite_key(*a).cmp(self.composite_key(*b)));
+        self.sort_ids_msd(&mut ids);
         ids
+    }
+
+    fn sort_ids_msd(&self, ids: &mut [u32]) {
+        const RADIX: usize = 257;
+        const SMALL_BUCKET: usize = 24;
+
+        if ids.len() < 2 {
+            return;
+        }
+
+        let mut pending = Vec::with_capacity(64);
+        pending.push((0_usize, ids.len(), 0_usize));
+        let mut counts = [0_usize; RADIX];
+        let mut starts = [0_usize; RADIX];
+        let mut next = [0_usize; RADIX];
+
+        while let Some((lo, hi, depth)) = pending.pop() {
+            if hi - lo <= SMALL_BUCKET {
+                ids[lo..hi]
+                    .sort_unstable_by(|a, b| self.composite_key(*a).cmp(self.composite_key(*b)));
+                continue;
+            }
+
+            counts.fill(0);
+            for &id in &ids[lo..hi] {
+                let digit = self
+                    .composite_key(id)
+                    .get(depth)
+                    .map_or(0, |byte| usize::from(*byte) + 1);
+                counts[digit] += 1;
+            }
+
+            let mut cursor = lo;
+            for bucket in 0..RADIX {
+                starts[bucket] = cursor;
+                next[bucket] = cursor;
+                cursor += counts[bucket];
+            }
+            debug_assert_eq!(cursor, hi);
+
+            // American-flag partitioning: every swap fills one destination
+            // slot, so the pass is linear and needs no second id array.
+            for bucket in 0..RADIX {
+                let end = starts[bucket] + counts[bucket];
+                while next[bucket] < end {
+                    let source = next[bucket];
+                    let id = ids[source];
+                    let destination_bucket = self
+                        .composite_key(id)
+                        .get(depth)
+                        .map_or(0, |byte| usize::from(*byte) + 1);
+                    if destination_bucket == bucket {
+                        next[bucket] += 1;
+                    } else {
+                        let destination = next[destination_bucket];
+                        debug_assert!(
+                            destination < starts[destination_bucket] + counts[destination_bucket]
+                        );
+                        ids.swap(source, destination);
+                        next[destination_bucket] += 1;
+                    }
+                }
+            }
+
+            // Bucket zero is the end-of-key sentinel and is already final.
+            // Push in reverse so low-byte buckets are processed first, keeping
+            // the traversal deterministic even though the partition is not.
+            for bucket in (1..RADIX).rev() {
+                if counts[bucket] > 1 {
+                    pending.push((starts[bucket], starts[bucket] + counts[bucket], depth + 1));
+                }
+            }
+        }
     }
 
     /// Approximate live bytes held, for the shard flush trigger.
@@ -2005,6 +2305,24 @@ impl ColumnarAccumulator<FrankensearchTokenizer> {
     pub fn new(schema: SchemaDescriptor) -> Result<Self, QuillError> {
         Self::with_analyzer(schema, FrankensearchTokenizer::default())
     }
+
+    /// Create an empty accumulator whose term arena is sized for one bounded
+    /// shared-nothing worker rather than the scalar one-mebibyte default.
+    ///
+    /// Logical accounting and flush boundaries are independent of arena
+    /// capacity. This constructor lets the caller share scalar arena slack
+    /// across a wide parallel generation, subject to `ByteArena`'s 4 KiB
+    /// per-arena floor.
+    pub(crate) fn with_arena_chunk_size(
+        schema: SchemaDescriptor,
+        arena_chunk_size: usize,
+    ) -> Result<Self, QuillError> {
+        Self::with_analyzer_and_arena_chunk_size(
+            schema,
+            FrankensearchTokenizer::default(),
+            arena_chunk_size,
+        )
+    }
 }
 
 impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
@@ -2021,6 +2339,14 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
     /// dense-ID and field-shape invariants, or [`QuillError::Resource`] when
     /// the injected family does not implement every requested analyzer.
     pub fn with_analyzer(schema: SchemaDescriptor, analyzer: A) -> Result<Self, QuillError> {
+        Self::with_analyzer_and_arena_chunk_size(schema, analyzer, DEFAULT_ARENA_CHUNK_BYTES)
+    }
+
+    fn with_analyzer_and_arena_chunk_size(
+        schema: SchemaDescriptor,
+        analyzer: A,
+        arena_chunk_size: usize,
+    ) -> Result<Self, QuillError> {
         schema.validate()?;
         if let Some((field, requested)) = schema.fields.iter().find_map(|field| {
             let FieldKind::Text {
@@ -2067,7 +2393,7 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
             .collect();
         Ok(Self {
             schema,
-            terms: TermInterner::new(),
+            terms: TermInterner::with_arena_chunk_size(arena_chunk_size),
             fields,
             numeric_fields,
             stored_fields,
@@ -2433,7 +2759,7 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
                         let _tokenize_timer =
                             crate::tracing_conventions::StageTimer::new(&tokenize_span);
                         let _tokenize_entered = tokenize_span.enter();
-                        let report = analyze_admitted(
+                        let report = analyze_admitted_borrowed(
                             &mut self.analyzer,
                             analyzer,
                             value.text,
@@ -4636,9 +4962,33 @@ pub struct DocIdAllocator {
     leases: Vec<Option<ShardLease>>,
     grants: Vec<LeaseGrant>,
     open: bool,
+    trace_grants: bool,
 }
 
 impl DocIdAllocator {
+    pub(crate) fn speculative_clone(&self) -> Self {
+        Self {
+            shard_count: self.shard_count,
+            next_block_base: self.next_block_base,
+            open_gap_burned: self.open_gap_burned,
+            grant_seq: self.grant_seq,
+            leases: self.leases.clone(),
+            grants: self.grants.clone(),
+            open: self.open,
+            trace_grants: false,
+        }
+    }
+
+    pub(crate) fn commit_speculative_grants(&mut self, prior_grant_count: usize) {
+        debug_assert!(prior_grant_count <= self.grants.len());
+        self.trace_grants = true;
+        if let Some(committed) = self.grants.get(prior_grant_count..) {
+            for grant in committed {
+                Self::trace_grant(*grant);
+            }
+        }
+    }
+
     /// Open a session allocator at the manifest's persisted watermark.
     ///
     /// A watermark that is not lease-block-aligned is aligned *up* to the next
@@ -4662,6 +5012,7 @@ impl DocIdAllocator {
             leases: vec![None; shard_count],
             grants: Vec::new(),
             open: true,
+            trace_grants: true,
         })
     }
 
@@ -4815,6 +5166,13 @@ impl DocIdAllocator {
             next_ord: 0,
         });
         self.grants.push(grant);
+        if self.trace_grants {
+            Self::trace_grant(grant);
+        }
+        Ok(())
+    }
+
+    fn trace_grant(grant: LeaseGrant) {
         tracing::trace!(
             target: crate::tracing_conventions::TARGET,
             phase = "scribe.docid_lease_grant",
@@ -4823,7 +5181,6 @@ impl DocIdAllocator {
             lease_base = grant.base_docid,
             "docid lease granted"
         );
-        Ok(())
     }
 }
 
@@ -5219,6 +5576,33 @@ mod tests {
             tokens.push(token.clone());
         });
         tokens
+    }
+
+    #[test]
+    fn borrowed_default_reuses_normalized_input_and_scratches_changed_tokens() {
+        let text = "lowercase123 MIXED ÜBER";
+        let input_start = text.as_ptr() as usize;
+        let input_end = input_start + text.len();
+        let mut analyzer = FrankensearchTokenizer::default();
+        let mut observed = Vec::new();
+        analyzer.analyze_borrowed(AnalyzerKind::FrankensearchDefault, text, &mut |token| {
+            let token_start = token.text.as_ptr() as usize;
+            observed.push((
+                token.text.to_owned(),
+                token.offset_from,
+                token.offset_to,
+                (input_start..input_end).contains(&token_start),
+            ));
+        });
+
+        assert_eq!(
+            observed,
+            vec![
+                ("lowercase123".to_owned(), 0, 12, true),
+                ("mixed".to_owned(), 13, 18, false),
+                ("über".to_owned(), 19, 24, false),
+            ]
+        );
     }
 
     fn boundary_mask_tokens(text: &str) -> Vec<AnalyzedToken> {
@@ -6740,6 +7124,30 @@ mod tests {
     }
 
     #[test]
+    fn msd_sorted_ids_match_comparison_oracle_on_shared_prefixes() {
+        let mut interner = TermInterner::new();
+        let mut rng = DeterministicRng(0x6d73_642d_7465_726d);
+        for ordinal in (0_u32..4_096).rev() {
+            let field_ord = u16::try_from(rng.choose(513)).expect("bounded field ordinal");
+            let mut term = vec![b'a'; rng.choose(96)];
+            term.extend_from_slice(&rng.next().to_be_bytes());
+            term.extend_from_slice(&ordinal.to_be_bytes());
+            interner.intern(field_ord, &term);
+        }
+        interner.intern(0, b"");
+        interner.intern(0, b"a");
+        interner.intern(0, b"a\0");
+        interner.intern(u16::MAX, b"\xff");
+
+        let actual = interner.sorted_ids();
+        let mut expected =
+            (0..u32::try_from(interner.len()).expect("bounded term count")).collect::<Vec<_>>();
+        expected
+            .sort_unstable_by(|a, b| interner.composite_key(*a).cmp(interner.composite_key(*b)));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn collision_path_verifies_bytes() {
         // Every key collides: correctness must come from byte verification.
         let mut interner: TermInterner<ConstBuild> =
@@ -6934,6 +7342,23 @@ mod tests {
             prev <= term_bytes_total.max(DEFAULT_ARENA_CHUNK_BYTES) * 10,
             "accounting should not wildly overestimate: {prev} vs {term_bytes_total}"
         );
+    }
+
+    #[test]
+    fn empty_arena_reserves_nothing_until_first_write() {
+        let mut arena = ByteArena::with_chunk_size(DEFAULT_ARENA_CHUNK_BYTES);
+        assert_eq!(arena.bytes_used(), 0);
+        assert_eq!(arena.bytes_reserved(), 0);
+        assert_eq!(arena.chunk_count(), 0);
+
+        arena.reset();
+        assert_eq!(arena.bytes_reserved(), 0);
+        assert_eq!(arena.chunk_count(), 0);
+
+        let span = arena.push(b"first-term");
+        assert_eq!(arena.resolve(span), b"first-term");
+        assert_eq!(arena.bytes_reserved(), DEFAULT_ARENA_CHUNK_BYTES);
+        assert_eq!(arena.chunk_count(), 1);
     }
 
     #[test]

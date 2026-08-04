@@ -8297,3 +8297,450 @@ on CV.
   were added during hostile review. Full narrative and consolidated raw rows:
   `docs/evidence/e8h/p8-retry-local-qg2-span-inline-20260730.md` and
   `docs/evidence/e8h/p8-retry-local-qg2-span-inline-raw-20260730.json`.
+
+## 2026-07-30 — KEEP (BANKED; push gated on the user ruling `bd-s1rc1-ubs-user-ruling-gate-82rpt`): Quill `EncodedSegment` per-commit deep-clone elimination via `Arc<Vec<u8>>` byte backing (`bd-s1rc1`, REBASE pass at tip `504fa185`)
+
+- **Comparison class: SELF-SPEEDUP (maintenance).** Both arms are
+  frankensearch (Quill); no incumbent arm anywhere in this evidence.
+- **Claim class: MEMORY/MECHANISM.** Allocation censuses (valgrind-3.25.1
+  DHAT, load-insensitive); explicitly NOT a latency/throughput claim; zero
+  wall-clock measurements in this pass.
+- **Lever:** `EncodedSegment.bytes` became `Arc<Vec<u8>>`;
+  `impl AsRef<[u8]> for EncodedSegment`; new `SegmentReader::from_encoded`
+  retains the shared backing through the existing
+  `SegmentReader<B: AsRef<[u8]>>` generic; `RecoveredSegment::bind_owned`
+  switched to it; `into_bytes` is
+  `Arc::try_unwrap(...).unwrap_or_else(|arc| (*arc).clone())` so unique
+  owners stay zero-copy. `sections` stays a plain Vec.
+  `publish_owned_segments` signature unchanged; index.rs functionally
+  untouched — its clone sites collapse by type effect. Blessed design
+  FoggyPrairie #6267/#6255 + MossyPine refinement, followed exactly.
+  Rebased from base `3684b147` onto tip `504fa185` via `git apply --3way`:
+  all hunks applied cleanly (segment.rs base blob identical; keeper.rs and
+  index.rs hunks context-shifted only, train changes preserved, no
+  semantic redesign).
+- **Exact mechanism claim:** the payload-site allocation family — program
+  points whose stacks contain a `(to_vec|clone)<u8>` byte-copy frame
+  reached through `EncodedSegment`'s derive-Clone (`clone (segment.rs:NNN)`)
+  — drops to **0 bytes / 0 pps** on the lever arm at both scales
+  (`dhat_family.py` v2, mutation selftest 4/4 PASS).
+- **Executing ELFs (both arms built from tip `504fa185`,
+  `--profile release-perf --features perf-harness`, frame pointers on):**
+  - BEFORE (pristine tip) ELF sha256: `39c4ecabd787e3ca4f4fdcd62c5af3381bf1309362c8937324b1182fe7c74ab4`
+  - AFTER (lever) ELF sha256: `40de3a53a6886af16096f608556b04fc868e3cf730a297c1c27ca8b397187311`
+- **DHAT 50k (memory child, 1 thread, positions on):** v2 payload-site
+  87,884,436 bytes (2 pps) → **0 bytes (0 pps)**; total allocated
+  1,171,626,962 → 1,085,915,139 (−7.32%). Against the banked 3684-era
+  baseline (88,280,448 payload bytes) the lever is likewise 0.
+- **DHAT 200k:** v2 payload-site 353,951,118 bytes (2 pps) → **0 (0 pps)**;
+  payload bytes/doc 1,769.8 → 0; total 7,275,372,547 → 6,906,437,248
+  (−5.07%). Child peak 1,052,307,456 → 1,028,395,008 (observation only).
+- **Byte identity (tip-built probe, 2 ELFs × 2 runs, 10 artifacts each):**
+  all four per-run SHA-256 manifests byte-identical; combined-manifest
+  canonical digest
+  `8678387786cb0cbc1e8473bba34641393f7bd57016adc32d89d60f598211b98a` —
+  identical to the REV 3 overlay digest, so neither the tip train nor the
+  lever changed a single emitted byte.
+- **Behavior proofs (tests land with the patch, all green):**
+  pre-publication cancellation retains the pending seal and retries
+  losslessly (aborted attempt, not a publisher failure); a REAL typed
+  MANIFEST-write permission failure on a read-only Keeper directory
+  retains the pending seal (`segment_installed == true`, same `Arc`) and a
+  retry publishes losslessly advancing exactly one generation
+  (`#[cfg(unix)]`); old snapshots keep pointer-stable byte backing across
+  successor publications; unique-owner `into_bytes` is pointer-identical
+  zero-copy.
+- **Gates at tip:** check/clippy/fmt/tests all strict EXIT_STATUS=0;
+  clippy warning sets EMPTY on both arms (diff empty); 490 lib tests
+  (489 passed, 1 ignored) + 3 integration + 2 doctests, 0 failed.
+- **UBS three-file census (v5.3.7), honest state:** raw exit 1 on BOTH
+  arms (inherited pre-existing findings). Pristine tip 310 critical /
+  4,879 warning / 981 info; lever 310 / 5,055 / 988. **Zero new criticals**
+  — the two net-new test `panic!` sites from the REV 3 patch were
+  converted to typed expect-style assertions in this pass (−2 vs the REV 3
+  patch state); `panic!(` counts per file are identical across arms.
+  Warning +176 / info +7 are the `.expect()` density of ~390 added
+  TEST-only lines, same finding classes both arms.
+- **Timing:** intentionally EMPTY in this row class; any timing claim
+  requires the separate same-worker interleaved paired A/B and its own
+  ledger discipline.
+- **Status:** BANKED — commit prepared in a detached worktree at base
+  `504fa185`, NOT pushed; push awaits the user ruling gate
+  (`bd-s1rc1-ubs-user-ruling-gate-82rpt`). Full narrative:
+  `docs/evidence/e8h/p5-s1rc1-arc-backing-rebase-20260730.md`.
+
+## 2026-07-30 — SURVEY: QG-1 current-producer `trj` width sweep — Tantivy directionally stops scaling at 2 workers; no QG claim (`bd-h6eh`, MaroonJay)
+
+**Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
+Clean source
+`544ffeb19b519d2e6c849f68334a3eabefb3573a` ran Quill and pinned Tantivy
+side-by-side in the same self-reporting `release-perf` ELF,
+`e0dc6ba3c3c651e25e5693c12e053c1f77e829f38aac603f692266d8e7306ba1`
+(78,029,032 bytes). The binary was built strictly remotely by RCH job
+`j-29953680971137050` from an exact clean base with no overlay and copied
+back for execution; no local Cargo build ran.
+
+The exclusive `trj-booking` sweep ran from `2026-07-30T03:48:36Z` through
+`08:35:49Z`, and release message `6747` was posted at `08:36:03Z`. The host
+was `threadripperje`, a 64-core/128-thread Threadripper PRO 5995WX with one
+NUMA node and affinity `0-127`. Each of the nine xlarge positions-on rows
+used one million identical deterministic documents, one excluded warmup, ten
+paired blocks, and both independent same-invocation A/A controls. Every row
+seals 33 observations per engine and proves observed worker-pool
+`min == max == requested` for Quill and Tantivy.
+
+| observed workers | Quill docs/s | Tantivy docs/s | Quill/Tantivy bootstrap median-CI | independent-null admission |
+|---:|---:|---:|---:|---|
+| 1 | 33,381.135 | 133,744.012 | `0.249111 [0.245709, 0.256117]` | both valid; clears 2x floor |
+| 2 | 35,254.033 | 194,518.425 | `(0.181479 [0.175571, 0.192343])` | UNSCORED: Tantivy width, dispersion, order, drift |
+| 4 | 33,548.584 | 163,632.892 | `(0.203995 [0.199033, 0.212938])` | UNSCORED: Tantivy center, width, dispersion, drift |
+| 8 | 33,896.044 | 149,192.426 | `(0.226381 [0.221486, 0.233467])` | UNSCORED: Tantivy drift |
+| 16 | 29,464.768 | 129,896.195 | `(0.226288 [0.214720, 0.234257])` | UNSCORED: Tantivy drift |
+| 32 | 25,293.486 | 127,936.433 | `(0.197659 [0.183384, 0.210235])` | UNSCORED: Quill center |
+| 64 | 25,029.379 | 124,060.934 | `0.201267 [0.198519, 0.206829]` | both valid; clears 2x floor |
+| 96 | 26,665.837 | 114,905.833 | `0.232032 [0.225772, 0.236904]` | both valid; clears 2x floor |
+| 128 | 26,125.237 | 111,044.317 | `(0.230974 [0.221999, 0.241340])` | UNSCORED: Tantivy order |
+
+CV decided no row. For the three both-null-valid cells, effect distances
+`0.750889`, `0.798733`, and `0.767968` exceed their required 2x worst-null
+floors `0.059010`, `0.109911`, and `0.111533`.
+
+Tantivy's raw median peaks at two observed workers (`1.4544x` its one-worker
+throughput), then declines monotonically through 128 (`0.8303x`). Its
+two-worker lower median CI is above the four-worker upper median CI, but both
+rows have invalid Tantivy nulls. Thus **two workers is a directional scaling
+stop, not a certified breakpoint**. Quill rises only `1.0561x` at two,
+remains approximately flat through eight, and falls below one-worker
+throughput from 16 onward.
+
+**Decision: DIAGNOSTIC DIRECTION / NO QG-1 CLAIM / NO PROMOTION.** This
+single xlarge positions-on tranche is an incomplete gate selection; every
+artifact has `laws_attested=false`, so even the three admissible cell effects
+remain partial-gate `no_decision`. Raw Quill/Tantivy medians span
+`0.181479x` to `0.249111x`, meaning Tantivy remains 4.0x to 5.5x faster.
+The 5-10x-faster indexing target is decisively unmet. Search was not measured,
+so this row makes no search-speed claim.
+
+The 74 retained source/build/host/lifecycle artifacts and full adjudication
+are under
+`.bench-history/attempts/2026-07-30/QG-1/trj-thread-sweep-r10-20260730T0346Z/`.
+Do not blind-resample the unchanged route. Retry after a counted ingest
+mechanism change—preferably one that materially reduces the already measured
+8.1587x copy bytes/document—then require the same exact-ELF incumbent,
+independent nulls, bootstrap median-CI plus 2x floor, observed worker
+witnesses, complete normative matrix, and immediate reproduction. Never gate
+on CV.
+
+## 2026-07-31 — SURVEY (STRUCTURAL / NO-CLAIM): QG-1 continuous/receipted Threadripper sweep — Tantivy raw throughput peaks at width 4 (`bd-h6eh`, BlackThrush)
+
+- **Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
+  Pinned Tantivy ran beside Quill in every same-process, same-invocation
+  comparison. The measured source was
+  `ccc37c8e611cd313201108ffe9260376a977b4bd`; exact ELF SHA-256
+  `53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637`
+  was self-reported from inside the process and matched all nine terminal
+  row receipts. The build used `rch exec --base ccc37c8e... --clean-overlay
+  --no-overlay`, selected `ovh-b`, and synchronized zero overlay files.
+- **Machine/workload:** every row ran on `threadripperje`, boot
+  `b107a2c6-9fac-40df-a637-c3a772b0ad57`, AMD Ryzen Threadripper PRO
+  5995WX 64-Cores / 128 logical CPUs. Deterministic one-million-document
+  `bulk/xlarge`, positions on, one excluded warmup, ten paired blocks,
+  continuous timing, work receipts on. Every width exited 0 with 66/66
+  receipts, zero H1/H2 wall mismatches, zero terminal failures, matching
+  evidence identity, and equal final H1/H2 walls. A later integrity audit
+  invalidated the CPU-derived receipt fields as described below.
+- **Corrected null law:** effect median-CI excludes 1;
+  `abs(effect_median - 1) > 2 * max(T/T null half-width, Q/Q null
+  half-width)`; and both A/A null medians are within 2% of 1. CV is
+  provenance only.
+
+| requested | Quill docs/s | Tantivy docs/s | Q/T median [95% CI] | corrected null | observed Quill workers med | observed Tantivy index / all workers med |
+|---:|---:|---:|---:|---|---:|---:|
+| 1 | 35,551.521 | 71,930.065 | `0.499882 [0.487438, 0.511549]` | PASS | 1 | 2 / 8 |
+| 2 | 36,505.685 | 116,424.790 | `0.312842 [0.306422, 0.321050]` | FAIL: T/T center | 2 | 4 / 12 |
+| 4 | 37,270.193 | 132,936.059 | `0.277612 [0.273338, 0.284961]` | FAIL: T/T center | 4 | 8 / 19 |
+| 8 | 35,409.346 | 126,257.903 | `0.281265 [0.269878, 0.286662]` | PASS | 8 | 16 / 31 |
+| 16 | 33,473.596 | 117,564.256 | `0.285757 [0.270176, 0.300316]` | FAIL: T/T center | 16 | 32 / 54 |
+| 32 | 25,712.146 | 109,380.264 | `0.230809 [0.210160, 0.254111]` | FAIL: T/T center | 32 | 64 / 102 |
+| 64 | 22,417.172 | 89,304.888 | `0.248270 [0.233913, 0.269171]` | PASS | 64 | 128 / 198 |
+| 96 | 24,465.701 | 64,092.430 | `0.382646 [0.344567, 0.413863]` | PASS | 96 | 192 / 295 |
+| 128 | 22,408.810 | 79,804.620 | `0.275095 [0.267489, 0.311525]` | FAIL: T/T center | 128 | 256 / 392 |
+
+- **Receipt invalidation:** the measured collector floored observed process
+  CPU to the sampled role sum when non-atomic `/proc` reads disagreed, and
+  did not retain the original process value. All 594 process-CPU,
+  active-equivalent, role/unattributed-CPU, and positive-tick rows are
+  **CONTAMINATED / VOID FOR INFERENCE**. The previously published
+  `4.639 -> 9.132` active-equivalent claim and "productive-concurrency
+  ceiling" interpretation are retracted. Raw bytes remain unchanged.
+- **Actual observed workers:** the surviving census columns are membership,
+  not activity. Quill instantiated exactly the requested total
+  caller-plus-Rayon topology; Tantivy instantiated exactly two index workers
+  per requested thread plus support workers. The full min/median/max census
+  and host/boot identity for every row are in the evidence card.
+
+**Status: STRUCTURAL / NO-CLAIM.** Tantivy reaches `1.619x` width-1
+throughput at width 2 and a `1.848x` raw apex at width 4. Relative to that
+apex, widths 8/16/32/64/96/128 deliver
+`0.950x/0.884x/0.823x/0.672x/0.482x/0.600x`. Its observed throughput scaling
+stops at requested width 4 while the observed worker census continues to
+expand. That locates the widening-overhead regime but cannot distinguish
+contention, coordination, memory, or another per-worker cost. This is not a
+QG verdict: every row has `laws_attested=false`, the normative selection is
+incomplete, and the sequential null blocks are disjoint from the effect
+block without an effect order/drift gate. QG-1 remains inactive and the
+unmeasured placeholder remains authoritative.
+
+Raw bundle:
+`.bench-history/attempts/qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z/`;
+aggregate SHA-256
+`a1d4323d69d5c587ecefa99f85032615659f45d22b2f56ee3d77606995058e68`.
+Full card:
+`docs/evidence/e8h/qg1-trj-thread-sweep-20260731.md`.
+
+**Retry predicate:** use the repaired collector that never rewrites process
+CPU and never clips measured-call totals; run the complete normative 74-cell
+bundle and its immediate same-ELF reproduction. Interleave null and effect
+blocks or explicitly gate effect order/drift, ratchet-bind continuous timing
+and work-receipt modes, and retain exact host, executable, wall, and worker-
+census receipts. Do not activate QG-1, label a PASS/MISS, or gate on CV from
+this tranche.
+
+## 2026-08-01 — KEEP: Quill phrase position runs decode once — 21.85x self-speedup at 100k (`bd-qg6-phrase-position-decode-once-zcxk3`, YellowSparrow)
+
+- **Comparison class: SELF-SPEEDUP.** The keep decision compares Quill before
+  and after one narrow phrase-position decode lever. This is maintenance
+  evidence only. It does **not** activate QG-6, change a ratchet, authorize the
+  default-engine flip, or establish Quill/Tantivy parity.
+- **Exact source identities:** control
+  `0ed5be9d67afcb8ead092801cf7fb564062e3a8c`; production candidate
+  `11c42096aee1dc4d1c3ec77f22d8270e297942e0`; test-only landing head
+  `bd800c41c1146775e9cfee87a432b9b92e3e4b5d`. The second commit changes only
+  how the independent-block-seam regression constructs its fixture, so the
+  executing production candidate is exactly `11c42096`.
+- **Lever:** the old owned phrase materializer called `positions_for_ordinal`
+  for every posting. Each call restarted a POSITIONS reader at that ordinal's
+  block boundary, consumed every preceding run in the block, then decoded the
+  target run into a new row, producing triangular rescans across ordinals. The
+  candidate instead traverses paired postings/positions once; its transactional
+  owned decode advances the reader after success, and a consumed marker prevents
+  `next`/forward `advance` from consuming that just-decoded run again. Immutable
+  replay, unpositioned callers, typed corruption, fuel checkpoints, and public
+  cursor contracts are unchanged.
+- **Machine and execution:** strict-remote RCH job
+  `j-29956918973825140` on `vmi1152480`, reported CPU `AMD EPYC Processor
+  (with IBPB)`, `x86_64-linux`, 10 available CPUs, and
+  `RAYON_NUM_THREADS=1`. This VPS is a diagnostic machine class, not the Apple
+  Silicon or high-core-count AMD reference hardware required for campaign
+  promotion.
+- **First executing ELF:** SHA-256
+  `115546e8aa9ef52c8dbf0b923b26d22e6856b66847c67ba3e0a9ada91776e35b`,
+  built with `release-perf` (`opt-level=3`, thin LTO, one codegen unit). One
+  process linked both exact Quill revisions under distinct crate names plus a
+  runtime-asserted linked incumbent Tantivy v0.26.1; its linked-version receipt
+  reported `index_format v7`.
+- **Workload and schedule:** pinned `SyntheticCorpus` seed
+  `0x5155494c4c504552`, 100,000 documents, vocabulary 8,192, Zipf S1.1,
+  maximum document size 4,096 bytes, four quoted two-term phrase queries,
+  top-10, and 15 rounds per query. Every invocation received a unique
+  whitespace suffix. Each round rotated the interleaved order of control A,
+  candidate, control B, and Tantivy. Control B/control A is the same-invocation
+  A/A null. Point estimates are empirical medians of per-round paired ratios;
+  95% CIs are ordinary deterministic 10,000-resample percentile-bootstrap
+  intervals over those ratios. The pooled CI is non-hierarchical across all 60
+  individual samples. Build times (not part of the query verdict) were
+  4,672.642 ms control, 5,057.470 ms candidate, and 3,332.090 ms Tantivy.
+- **Absolute p50 latency (ms):**
+
+  | phrase | control A | candidate | control B | Tantivy |
+  |---|---:|---:|---:|---:|
+  | `term00001 term00002` | 1,145.747 | 67.126 | 1,181.914 | 19.445 |
+  | `term00002 term00003` | 1,172.588 | 54.246 | 1,206.178 | 13.166 |
+  | `term00003 term00004` | 1,171.324 | 42.822 | 1,143.068 | 9.947 |
+  | `term00005 term00006` | 891.350 | 32.655 | 879.318 | 6.998 |
+
+- **Per-query candidate/control ratios:** 0.057525
+  [0.055690, 0.062253], 0.047089 [0.045087, 0.050173], 0.035988
+  [0.034311, 0.039159], and 0.038863 [0.034104, 0.053112]. The executing
+  harness emitted `null_contains_one=true` and
+  `effect_ci_below_null_ci=true` for all four query groups.
+- **Pooled result (60 paired samples per arm):** candidate/control latency
+  median **0.045774 [0.040337, 0.050173]**, p5-p95
+  [0.032413, 0.079339], or **21.85x faster** at the median. The pooled
+  control-B/control-A null is **1.006872 [0.993514, 1.022058]**. The effect
+  and null intervals are disjoint by an order of magnitude.
+- **Cache and parity receipts:** all 188 expected Quill lookups were observed
+  as misses; hits, disabled lookups, and not-checked lookups were all zero.
+  Candidate and control returned identical ordered top-10 document IDs on
+  every warmup and timed query. Tantivy returned the same ordered IDs for all
+  four groups and every timed round.
+- **Incumbent disclosure:** candidate/Tantivy latency remains **4.233582
+  [3.872581, 4.584200]** pooled, so the optimized Quill phrase path is still
+  about 4.23x slower than genuine linked Tantivy on this slice. That honest
+  remaining gap is why this is a self-speedup keep, not a QG-6 result.
+- **Immediate same-worker reproduction:** strict-remote job
+  `j-29956918973825151` repeated the exact source identities, harness command,
+  100,000-document corpus, four queries, 15-round rotation, cache busting,
+  `RAYON_NUM_THREADS=1`, and linked-incumbent contract on the same
+  `vmi1152480` worker/machine/10-CPU environment. Its freshly rebuilt ELF was
+  `6cd356a50fc1c13f53cbf6c280ee4463879b5f45dd147e6fe17c9e81004249bc`;
+  the linked-version receipt again reported `tantivy v0.26.1, index_format
+  v7`. The exact Cargo harness command was `cargo run --profile release-perf
+  --manifest-path .scratch/qg6-phrase-paired-20260801/Cargo.toml -- --count
+  100000 --rounds 15`. The first invocation's individual sample rows were not
+  persisted; its preserved summaries are recorded above. The reproduction's
+  complete printed meta, build, arm-summary, ratio, decision, and cache
+  receipts are preserved field-for-field below, with tabs normalized to spaces
+  for Markdown (individual timed sample rows are not repeated):
+
+  ```text
+  meta control_sha 0ed5be9d67afcb8ead092801cf7fb564062e3a8c
+  meta candidate_production_sha 11c42096aee1dc4d1c3ec77f22d8270e297942e0
+  meta executable_sha256 6cd356a50fc1c13f53cbf6c280ee4463879b5f45dd147e6fe17c9e81004249bc
+  meta linked_tantivy tantivy v0.26.1, index_format v7
+  meta target x86_64-linux
+  meta cpu_model AMD EPYC Processor (with IBPB)
+  meta available_parallelism 10
+  meta document_count 100000
+  meta rounds 15
+  meta rayon_num_threads 1
+  build control_ms 4337.662
+  build candidate_ms 5079.036
+  build tantivy_ms 3456.113
+  summary arm=control_a group=0 p50_ns=1258495149 p95_ns=1419278695 p99_ns=1464172399 min_ns=1134408700 max_ns=1464172399
+  summary arm=control_a group=1 p50_ns=1254801018 p95_ns=1394705389 p99_ns=1420186890 min_ns=1164052133 max_ns=1420186890
+  summary arm=control_a group=2 p50_ns=1242328560 p95_ns=1389834932 p99_ns=1550805198 min_ns=1143976012 max_ns=1550805198
+  summary arm=control_a group=3 p50_ns=988994721 p95_ns=1151737175 p99_ns=1238715184 min_ns=878825556 max_ns=1238715184
+  summary arm=candidate group=0 p50_ns=71128938 p95_ns=93324621 p99_ns=122224773 min_ns=61117971 max_ns=122224773
+  summary arm=candidate group=1 p50_ns=53347017 p95_ns=84031005 p99_ns=110009415 min_ns=40729283 max_ns=110009415
+  summary arm=candidate group=2 p50_ns=46398525 p95_ns=70822270 p99_ns=149666063 min_ns=34790480 max_ns=149666063
+  summary arm=candidate group=3 p50_ns=31883135 p95_ns=55573515 p99_ns=58119880 min_ns=25699855 max_ns=58119880
+  summary arm=control_b group=0 p50_ns=1203624574 p95_ns=1306503174 p99_ns=1415108931 min_ns=1102336308 max_ns=1415108931
+  summary arm=control_b group=1 p50_ns=1273286638 p95_ns=1372801162 p99_ns=1392402493 min_ns=1167128022 max_ns=1392402493
+  summary arm=control_b group=2 p50_ns=1225399086 p95_ns=1323728609 p99_ns=1366154381 min_ns=1094601672 max_ns=1366154381
+  summary arm=control_b group=3 p50_ns=1004213114 p95_ns=1150162066 p99_ns=1450400639 min_ns=896221978 max_ns=1450400639
+  summary arm=tantivy group=0 p50_ns=18715433 p95_ns=34365346 p99_ns=38733798 min_ns=16267414 max_ns=38733798
+  summary arm=tantivy group=1 p50_ns=13345076 p95_ns=32697359 p99_ns=68694620 min_ns=11588718 max_ns=68694620
+  summary arm=tantivy group=2 p50_ns=10958488 p95_ns=15548221 p99_ns=16288504 min_ns=8737787 max_ns=16288504
+  summary arm=tantivy group=3 p50_ns=7045374 p95_ns=15258209 p99_ns=56699526 min_ns=6306743 max_ns=56699526
+  ratio group=0 control_a_over_control_b=1.045588 control_over_candidate=17.307440 candidate_over_tantivy=3.800550 tantivy_order_matches=true
+  paired metric=candidate_over_control group=0 median=0.055443 ci95_low=0.051695 ci95_high=0.060854 p5=0.048564 p95=0.077584
+  paired metric=control_b_over_control_a_null group=0 median=0.940039 ci95_low=0.910137 ci95_high=1.000911 p5=0.852693 p95=1.014395
+  paired metric=candidate_over_tantivy group=0 median=3.489711 ci95_low=3.024344 ci95_high=4.332849 p5=1.843907 p95=5.736906
+  decision group=0 null_contains_one=true effect_ci_below_null_ci=true
+  ratio group=1 control_a_over_control_b=0.985482 control_over_candidate=23.694742 candidate_over_tantivy=3.997506 tantivy_order_matches=true
+  paired metric=candidate_over_control group=1 median=0.043965 ci95_low=0.041013 ci95_high=0.047925 p5=0.039172 p95=0.059169
+  paired metric=control_b_over_control_a_null group=1 median=1.018600 ci95_low=0.985977 ci95_high=1.047439 p5=0.927661 p95=1.100103
+  paired metric=candidate_over_tantivy group=1 median=4.008068 ci95_low=3.625796 ci95_high=4.584589 p5=3.052008 p95=5.123871
+  decision group=1 null_contains_one=true effect_ci_below_null_ci=true
+  ratio group=2 control_a_over_control_b=1.013815 control_over_candidate=26.592738 candidate_over_tantivy=4.234026 tantivy_order_matches=true
+  paired metric=candidate_over_control group=2 median=0.036190 ci95_low=0.033721 ci95_high=0.043726 p5=0.028918 p95=0.061909
+  paired metric=control_b_over_control_a_null group=2 median=0.958571 ci95_low=0.917245 ci95_high=1.048972 p5=0.853575 p95=1.097350
+  paired metric=candidate_over_tantivy group=2 median=4.326269 ci95_low=3.472104 ci95_high=5.150850 p5=2.964191 p95=5.667976
+  decision group=2 null_contains_one=true effect_ci_below_null_ci=true
+  ratio group=3 control_a_over_control_b=0.984845 control_over_candidate=31.258028 candidate_over_tantivy=4.525400 tantivy_order_matches=true
+  paired metric=candidate_over_control group=3 median=0.032978 ci95_low=0.030363 ci95_high=0.033793 p5=0.028258 p95=0.050934
+  paired metric=control_b_over_control_a_null group=3 median=0.998632 ci95_low=0.971421 ci95_high=1.085658 p5=0.894977 p95=1.173358
+  paired metric=candidate_over_tantivy group=3 median=4.097719 ci95_low=2.785226 ci95_high=4.879725 p5=2.089573 p95=7.312987
+  decision group=3 null_contains_one=true effect_ci_below_null_ci=true
+  paired metric=candidate_over_control group=pooled median=0.043616 ci95_low=0.038855 ci95_high=0.047925 p5=0.028435 p95=0.077584
+  paired metric=control_b_over_control_a_null group=pooled median=0.995678 ci95_low=0.957449 ci95_high=1.009403 p5=0.852693 p95=1.176434
+  paired metric=candidate_over_tantivy group=pooled median=4.022228 ci95_low=3.625796 ci95_high=4.326269 p5=1.843907 p95=6.707800
+  decision group=pooled null_contains_one=true effect_ci_below_null_ci=true
+  cache_receipt expected_misses=188 observed_misses=188 hits=0 disabled=0 not_checked=0
+  ```
+
+  This independent invocation reproduces the first run without pooling:
+  candidate/control is **0.043616 [0.038855, 0.047925]**, or **22.93x
+  faster**; the A/A null is **0.995678 [0.957449, 1.009403]**; and
+  candidate/Tantivy is **4.022228 [3.625796, 4.326269]**. Every per-query
+  and pooled decision receipt is true, all 188 Quill lookups are attested
+  misses, all other cache states are zero, and ordered candidate/control and
+  Tantivy document-ID parity holds. This confirms the self-speedup direction
+  and magnitude while independently confirming the roughly 4x incumbent gap;
+  it does not upgrade the comparison class, activate QG-6, change a ratchet,
+  or authorize the engine flip.
+- **Correctness and landing gates:** hostile peer review passed. Strict-remote
+  exact-head validation passed 512 runnable Quill unit tests (one scale test
+  ignored), 3 cancellation integration tests, and 2 doctests; workspace
+  `cargo check --workspace --all-targets` and workspace Clippy with
+  `-D warnings` passed. `cargo fmt --all -- --check` and `git diff --check`
+  passed. UBS scanned both changed Rust files with exit 0 and zero critical
+  findings; its warning/info census is inherited whole-file heuristic output,
+  not newly introduced findings.
+- **Decision: KEEP.** The production seam is unchanged after measurement.
+  QG-6 still requires its complete normative query-class matrix, reference
+  hardware, all gate receipts, and an independently admissible campaign
+  artifact; none is claimed here.
+
+## 2026-08-03 — CORRECTION: FSVI 4-bit two-pass is not an externally fastest primitive (`bd-retract-fastest-lossless-superlative-3ush8`)
+
+The historical self-comparison descriptions at rows 825, 827, and 828 use
+unbounded “fastest lossless” language. They compare only repository-local
+arms and do not establish an external ranking. The independently measured
+same-invocation conversion card reports the equal-thread candidate/incumbent
+ratio as **1.5790** against a third-party BLAS-class exact scan, above the
+null p95 of **1.4825**: 4-bit is decidably slower in that comparison. The
+4-bit path did return the same top-k as the full-precision arm on the card's
+32/32 clustered-fixture check; that bounded losslessness result remains
+separate from any speed ranking. See
+[`fsvi-4bit-vs-incumbent-20260731.md`](evidence/fsvi-4bit-vs-incumbent-20260731.md)
+and the corresponding negative-evidence entry for full provenance. The public
+CHANGELOG therefore carries no fastest or external-performance claim for this
+primitive.
+
+## 2026-08-03 — CORRECTION: hostless FSVI int8/4-bit self ratios are historical, not portable (`bd-fourbit-self-ratio-not-portable-1eqce`)
+
+Rows 817, 825, 826, 827, and 828 retain their original raw timing values, but
+they do not name an executing host, CPU/core topology, or executing ELF hash.
+They are therefore historical `SELF-SPEEDUP / MAINTENANCE` observations only;
+their 1.94x, 2.56x, 3.22x, 3.09x, and 2.36x multipliers must not be read as
+portable ratios or used for a current performance, target-distance, or product
+claim. The missing original host cannot be reconstructed from the rows, so no
+host is inferred or backfilled here.
+
+The later strict-remote conversion card measured the row-825/827-style
+candidate-versus-flat context at 1.05x on worker vmi1152480 (10-core AMD EPYC)
+with a self-reported ELF, while explicitly documenting that this single host
+cannot establish a replacement range. This is evidence that the historical
+multipliers are host-conditional, not a remeasurement of their unknown source
+host. See [`fsvi-4bit-vs-incumbent-20260731.md`](evidence/fsvi-4bit-vs-incumbent-20260731.md)
+and [`claim-coverage-audit-20260730.md`](evidence/claim-coverage-audit-20260730.md).
+
+**Retry predicate:** obtain two admissible strict-remote hosts with distinct
+core topologies; on each, run the same-invocation self-comparison with an
+admissible null and self-reported host, CPU, observed threads, and ELF SHA-256.
+Only then may a bounded host-conditional range be published. Until then these
+rows remain retained history, not current cross-host evidence.
+
+## 2026-08-03 — CORRECTION: QG-1 TRJ width sweep is structurally invalid / diagnostic only (`bd-qg1-invalid-sweep-quarantine-h4sqj`)
+
+The retained historical sweep committed as `193d2e3f` (with clean-source
+reference `544ffeb19b519d2e6c849f68334a3eabefb3573a` and historical ELF
+digest reference `e0dc6ba3c3c651e25e5693c12e053c1f77e829f38aac603f692266d8e7306ba1`)
+is **STRUCTURALLY INVALID / DIAGNOSTIC ONLY**. The raw commit tree and all
+named historical files remain preserved; this correction neither removes nor
+rewrites them. The abbreviated `e0dc6ba3` Git object is not present in this
+checkout, so it is retained only as a historical digest reference, not
+re-verified provenance.
+
+No throughput magnitude, scaling breakpoint, target-distance, fastest-
+incumbent screen, or gate-activation conclusion may be derived from this
+sweep. Corpus generation occurred between timed calls, letting Tantivy
+background work escape the measured interval while Quill remained
+synchronous. Configured pool width was substituted for observed work. The
+selection also lacks complete manifest coverage, admissible nulls,
+machine-class proof, matched work-unit and byte-count facts, terminal
+quiescence, and complete source/ELF provenance. Historical directional prose
+about a two-worker Tantivy stop and all ratio tables are therefore withdrawn
+as evidence, not reinterpreted as a weaker performance result.
+
+The current authoritative state is
+`.bench-history/QG-1.v7.unmeasured.latest.json`. Historical v3 artifacts are
+read-only diagnostics and cannot masquerade as v5 evidence or a v7 ratchet
+baseline; an unattested or partial selection remains no-claim. A retry must
+use a fresh-process, exact-operation, complete normative matrix with corpus
+generation outside every timed interval; retained matched work-unit,
+byte-count, terminal-quiescence, source, ELF, host, and actual-concurrency
+facts; genuine pinned-incumbent screening; and valid same-invocation A/A
+controls before any new QG-1 decision is considered.

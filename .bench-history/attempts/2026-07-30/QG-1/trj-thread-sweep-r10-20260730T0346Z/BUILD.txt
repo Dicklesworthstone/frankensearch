@@ -1,0 +1,18 @@
+schema=frankensearch-qg1-direct-elf-build-receipt-v1
+source_revision=544ffeb19b519d2e6c849f68334a3eabefb3573a
+source_tree=659e7152e667329952975baabda10a60ab5675a4
+builder_host=vmi1264463
+builder_address=38.242.209.154
+builder_toolchain=nightly-2026-07-20
+builder_rustc=rustc 1.99.0-nightly (9f36de775 2026-07-19)
+cargo_lock_sha256=393f80fd462ed19fd4c0b6ad4174aa3580bdff53d2999d610d3098f728800022
+build_profile=release-perf
+cargo_features=perf-harness,tantivy-oracle
+build_job=j-29953680971137050
+build_command=RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec --base 544ffeb19b519d2e6c849f68334a3eabefb3573a --clean-overlay --no-overlay -- cargo build --profile release-perf -p frankensearch-quill-gauntlet --features perf-harness,tantivy-oracle --bench perf_matrix
+executing_elf_sha256=e0dc6ba3c3c651e25e5693c12e053c1f77e829f38aac603f692266d8e7306ba1
+executing_elf_bytes=78029032
+oracle=tantivy-0.26.1-index-format-v7
+oracle_revision=062a5e5b2d41653b1c8b07888eda1a765e421f49
+measurement_host=threadripperje
+run_window=qg1-trj-exclusive-current-fullsweep-544ffeb1-20260730T0346Z

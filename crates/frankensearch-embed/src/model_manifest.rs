@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1295,6 +1295,12 @@ pub struct ModelManifest {
     pub download_size_bytes: u64,
 }
 
+/// Canonical identity used to bind a verification receipt to one production manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FrozenVerificationManifest {
+    fingerprint: String,
+}
+
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde requires &T signature
 const fn is_zero_u64(value: &u64) -> bool {
     *value == 0
@@ -1823,6 +1829,40 @@ impl ModelManifest {
         self.has_verified_checksums() && self.has_pinned_revision()
     }
 
+    /// Freeze the complete validated download manifest into one stable identity digest.
+    ///
+    /// The canonical payload includes every serialized manifest field, including the
+    /// pinned revision and every file name, size, URL, and SHA-256. Any manifest evolution
+    /// therefore invalidates an earlier verification receipt even when the logical ID is
+    /// unchanged.
+    fn freeze_verification_manifest(&self) -> SearchResult<FrozenVerificationManifest> {
+        self.validate()?;
+        if !self.is_production_ready() {
+            return Err(invalid_manifest_field(
+                "production_ready",
+                &self.id,
+                "cached verification requires a pinned revision and SHA-256 for every file",
+            ));
+        }
+        let serialized = serde_json::to_vec(self).map_err(|_| {
+            invalid_manifest_field(
+                "manifest_fingerprint",
+                &self.id,
+                "failed to serialize the validated manifest for canonical verification",
+            )
+        })?;
+        let mut canonical = Vec::with_capacity(serialized.len().saturating_add(64));
+        append_frozen_bytes(
+            &mut canonical,
+            b"frankensearch.model-download-verification-manifest.v1",
+        );
+        canonical.extend_from_slice(&MANIFEST_SCHEMA_VERSION.to_be_bytes());
+        append_frozen_bytes(&mut canonical, &serialized);
+        Ok(FrozenVerificationManifest {
+            fingerprint: sha256_hex_bytes(&canonical),
+        })
+    }
+
     /// Sum of expected bytes for all files.
     #[must_use]
     pub fn total_size_bytes(&self) -> u64 {
@@ -1975,7 +2015,7 @@ impl ModelManifest {
         staged_dir: &Path,
         destination_dir: &Path,
     ) -> SearchResult<Option<PathBuf>> {
-        self.verify_dir(staged_dir)?;
+        verify_dir_and_record(self, staged_dir)?;
         sync_registered_artifacts(staged_dir, self.files.iter().map(|file| file.name.as_str()))?;
         promote_atomically(staged_dir, destination_dir)
     }
@@ -2581,17 +2621,38 @@ pub fn verify_file_sha256(
 /// Name of the verification marker file within a model directory.
 const VERIFIED_MARKER_FILE: &str = ".verified";
 
+/// Schema version for the verification receipt itself.
+///
+/// This is intentionally independent from [`MANIFEST_SCHEMA_VERSION`]. Older binaries
+/// compare their marker field to the manifest schema, so using a distinct value also
+/// makes a newly written fingerprint-bound receipt fail closed after a binary downgrade.
+pub const VERIFICATION_MARKER_SCHEMA_VERSION: u32 = 1;
+
 /// Lightweight filesystem fingerprint for one verified model file.
 ///
 /// This is intentionally cheap to read and compare:
 /// - file size (bytes)
 /// - last-modified timestamp (unix nanos)
+/// - creation timestamp when the platform exposes it
+/// - platform file identity and change timestamp on Unix
+///
+/// These fields detect ordinary replacement and mutation without re-hashing large
+/// model artifacts on every process start. They are not an authenticated defense
+/// against an attacker who can rewrite both the model bytes and this user-owned
+/// receipt; that threat requires an OS-backed trust root such as fs-verity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileVerificationState {
     /// File size in bytes.
     pub size_bytes: u64,
     /// Last-modified timestamp since unix epoch (nanoseconds).
     pub modified_unix_nanos: u64,
+    /// Creation timestamp since unix epoch (nanoseconds), when available.
+    pub created_unix_nanos: Option<u64>,
+    /// Stable platform file identity, when available.
+    pub platform_file_id: Option<String>,
+    /// Platform change timestamp, when available.
+    pub platform_change_stamp: Option<String>,
 }
 
 fn capture_file_verification_state(path: &Path) -> Option<FileVerificationState> {
@@ -2606,9 +2667,35 @@ fn capture_file_verification_state(path: &Path) -> Option<FileVerificationState>
         .ok()?
         .as_nanos();
     let modified_unix_nanos = u64::try_from(modified).ok()?;
+    let created_unix_nanos = metadata
+        .created()
+        .ok()
+        .and_then(|created| created.duration_since(UNIX_EPOCH).ok())
+        .and_then(|created| u64::try_from(created.as_nanos()).ok());
+    #[cfg(unix)]
+    let (platform_file_id, platform_change_stamp) = {
+        use std::os::unix::fs::MetadataExt as _;
+        (
+            Some(format!(
+                "unix-dev={};ino={}",
+                metadata.dev(),
+                metadata.ino()
+            )),
+            Some(format!(
+                "unix-ctime={};nsec={}",
+                metadata.ctime(),
+                metadata.ctime_nsec()
+            )),
+        )
+    };
+    #[cfg(not(unix))]
+    let (platform_file_id, platform_change_stamp) = (None, None);
     Some(FileVerificationState {
         size_bytes: metadata.len(),
         modified_unix_nanos,
+        created_unix_nanos,
+        platform_file_id,
+        platform_change_stamp,
     })
 }
 
@@ -2705,18 +2792,21 @@ fn is_windows_reserved_path_component(component: &str) -> bool {
         .is_some_and(|suffix| matches!(suffix.as_bytes(), &[b'1'..=b'9']))
 }
 
-/// Cached verification result stored as a small JSON file alongside model files.
+/// Cached verification receipt stored as a small JSON file alongside model files.
 ///
 /// When a model directory passes SHA-256 verification, a `.verified` marker is written
-/// containing the manifest ID, schema version, and lightweight file fingerprints
-/// captured at verification time. Subsequent loads check whether the marker is still
-/// valid (all fingerprints unchanged) and skip re-hashing when it is.
+/// containing the exact frozen production-manifest fingerprint and lightweight file
+/// fingerprints captured at verification time. Subsequent loads may skip re-hashing
+/// only when both the manifest identity and every file state remain unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerificationMarker {
     /// Manifest identifier that was verified against.
     pub manifest_id: String,
     /// Manifest schema version at time of verification.
     pub schema_version: u32,
+    /// SHA-256 of the complete canonical production manifest.
+    pub manifest_fingerprint: String,
     /// Unix timestamp (seconds) when verification was performed.
     pub verified_at: u64,
     /// Per-file lightweight fingerprint at verification time, keyed by file name.
@@ -2724,24 +2814,19 @@ pub struct VerificationMarker {
 }
 
 impl VerificationMarker {
-    /// Create a new marker for a successfully verified model directory.
-    fn new_for(manifest: &ModelManifest, model_dir: &Path) -> Self {
+    /// Create a receipt from file states captured around a successful full hash pass.
+    fn from_verified_states(
+        manifest: &ModelManifest,
+        manifest_fingerprint: String,
+        file_states: BTreeMap<String, FileVerificationState>,
+    ) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-
-        let mut file_states = BTreeMap::new();
-        for file in &manifest.files {
-            if let Ok(path) = resolve_model_file_path(model_dir, &file.name)
-                && let Some(state) = capture_file_verification_state(&path)
-            {
-                file_states.insert(file.name.clone(), state);
-            }
-        }
-
         Self {
             manifest_id: manifest.id.clone(),
-            schema_version: MANIFEST_SCHEMA_VERSION,
+            schema_version: VERIFICATION_MARKER_SCHEMA_VERSION,
+            manifest_fingerprint,
             verified_at: now,
             file_states,
         }
@@ -2750,11 +2835,18 @@ impl VerificationMarker {
     /// Check whether this cached marker is still valid for the given manifest and directory.
     ///
     /// Returns `true` when:
-    /// 1. The manifest ID matches.
-    /// 2. The schema version matches.
+    /// 1. The manifest is production-ready and its frozen fingerprint matches.
+    /// 2. The manifest ID and schema version match.
     /// 3. No model file metadata fingerprint has changed since verification.
     fn is_valid_for(&self, manifest: &ModelManifest, model_dir: &Path) -> bool {
-        if self.manifest_id != manifest.id || self.schema_version != MANIFEST_SCHEMA_VERSION {
+        let Ok(frozen) = manifest.freeze_verification_manifest() else {
+            return false;
+        };
+        if self.manifest_id != manifest.id
+            || self.schema_version != VERIFICATION_MARKER_SCHEMA_VERSION
+            || self.manifest_fingerprint != frozen.fingerprint
+            || self.file_states.len() != manifest.files.len()
+        {
             return false;
         }
 
@@ -2777,26 +2869,99 @@ impl VerificationMarker {
     }
 }
 
-/// Write a `.verified` marker after successful verification of a model directory.
-///
-/// The marker is best-effort: failures to write are logged but do not propagate errors.
-pub fn write_verification_marker(manifest: &ModelManifest, model_dir: &Path) {
-    let marker = VerificationMarker::new_for(manifest, model_dir);
-    let Ok(json) = serde_json::to_string_pretty(&marker) else {
-        return;
-    };
-    let _ = (|| -> std::io::Result<()> {
-        let mut file = File::create(model_dir.join(VERIFIED_MARKER_FILE))?;
-        std::io::Write::write_all(&mut file, json.as_bytes())?;
-        file.sync_all()?;
-        Ok(())
-    })();
+fn capture_manifest_file_states(
+    manifest: &ModelManifest,
+    model_dir: &Path,
+) -> SearchResult<BTreeMap<String, FileVerificationState>> {
+    let mut file_states = BTreeMap::new();
+    for file in &manifest.files {
+        let path = resolve_model_file_path(model_dir, &file.name)?;
+        let state =
+            capture_file_verification_state(&path).ok_or_else(|| SearchError::ModelNotFound {
+                name: format!("{}:{}", manifest.id, file.name),
+            })?;
+        file_states.insert(file.name.clone(), state);
+    }
+    Ok(file_states)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_AFTER_FULL_HASH_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn after_full_hash_boundary() {
+    #[cfg(test)]
+    TEST_AFTER_FULL_HASH_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+fn write_verification_marker_atomic(
+    marker: &VerificationMarker,
+    model_dir: &Path,
+) -> SearchResult<()> {
+    let encoded =
+        serde_json::to_vec_pretty(marker).map_err(|source| SearchError::SubsystemError {
+            subsystem: "model_verification_receipt",
+            source: Box::new(source),
+        })?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".verified.")
+        .suffix(".tmp")
+        .tempfile_in(model_dir)
+        .map_err(SearchError::from)?;
+    temporary.write_all(&encoded).map_err(SearchError::from)?;
+    temporary.as_file().sync_all().map_err(SearchError::from)?;
+
+    let current_states = capture_manifest_file_states_from_names(
+        marker.file_states.keys().map(String::as_str),
+        model_dir,
+    )?;
+    if current_states != marker.file_states {
+        return Err(model_changed_during_verification(model_dir));
+    }
+
+    temporary
+        .persist(model_dir.join(VERIFIED_MARKER_FILE))
+        .map_err(|error| SearchError::from(error.error))?;
+    sync_directory(model_dir)
+}
+
+fn capture_manifest_file_states_from_names<'a>(
+    file_names: impl IntoIterator<Item = &'a str>,
+    model_dir: &Path,
+) -> SearchResult<BTreeMap<String, FileVerificationState>> {
+    let mut file_states = BTreeMap::new();
+    for file_name in file_names {
+        let path = resolve_model_file_path(model_dir, file_name)?;
+        let state =
+            capture_file_verification_state(&path).ok_or_else(|| SearchError::ModelNotFound {
+                name: file_name.to_owned(),
+            })?;
+        file_states.insert(file_name.to_owned(), state);
+    }
+    Ok(file_states)
+}
+
+fn model_changed_during_verification(model_dir: &Path) -> SearchError {
+    SearchError::HashMismatch {
+        path: model_dir.to_path_buf(),
+        expected: "stable file identity and metadata across full SHA-256 verification".to_owned(),
+        actual: "model file state changed while verification was in progress".to_owned(),
+    }
 }
 
 /// Check whether a valid verification marker exists for the given manifest and directory.
 ///
-/// Returns `true` when a `.verified` file exists, parses correctly, and all file mtimes
-/// match. In that case, the caller can skip full SHA-256 re-verification.
+/// Returns `true` when a `.verified` file exists, parses as the current complete schema,
+/// matches the exact frozen production manifest, and all recorded file states match.
+///
+/// The marker is a same-user performance receipt, not an authenticated artifact. Explicit
+/// verification and every bundled write/promotion still perform full SHA-256 verification.
 #[must_use]
 pub fn is_verification_cached(manifest: &ModelManifest, model_dir: &Path) -> bool {
     let path = model_dir.join(VERIFIED_MARKER_FILE);
@@ -2809,29 +2974,58 @@ pub fn is_verification_cached(manifest: &ModelManifest, model_dir: &Path) -> boo
     marker.is_valid_for(manifest, model_dir)
 }
 
-/// Verify a model directory, using cached results when available.
+/// Verify a model directory, using a valid cached receipt when available.
 ///
-/// If a valid `.verified` marker exists (matching manifest ID, schema version, and
-/// file mtimes), verification succeeds immediately without re-hashing. Otherwise,
-/// full SHA-256 verification is performed via [`ModelManifest::verify_dir`], and
-/// on success a new marker is written for future loads.
+/// If a valid `.verified` receipt exists (matching the exact frozen production manifest
+/// and all file states), verification succeeds immediately without re-hashing. Otherwise,
+/// full SHA-256 verification is performed via [`ModelManifest::verify_dir`] for this
+/// invocation without mutating the cache. Non-production manifests are never admitted to
+/// the cached path.
 ///
 /// # Errors
 ///
-/// Returns `SearchError` when the manifest has verified checksums and full
-/// verification fails (hash mismatch, missing files, etc.).
+/// Returns `SearchError` when the manifest is not production-ready or full verification
+/// fails (hash mismatch, missing files, etc.).
 pub fn verify_dir_cached(manifest: &ModelManifest, model_dir: &Path) -> SearchResult<()> {
-    if !manifest.has_verified_checksums() {
-        return Ok(());
-    }
+    manifest.freeze_verification_manifest()?;
 
     if is_verification_cached(manifest, model_dir) {
         return Ok(());
     }
 
+    manifest.verify_dir(model_dir)
+}
+
+/// Perform full SHA-256 verification and atomically record a cache receipt.
+///
+/// This is the only receipt-minting API. It captures every registered file's state before
+/// hashing, performs full size-and-SHA verification, then refuses publication if any file
+/// identity or metadata changed during verification. The receipt file is synced and
+/// atomically renamed before its directory is synced.
+///
+/// External callers cannot bypass the hash pass with a raw marker writer:
+///
+/// ```compile_fail
+/// use frankensearch_embed::write_verification_marker;
+/// ```
+///
+/// # Errors
+///
+/// Returns `SearchError` when the manifest is not production-ready, any registered file
+/// fails full verification, a file changes during verification, or durable receipt
+/// publication fails.
+pub fn verify_dir_and_record(manifest: &ModelManifest, model_dir: &Path) -> SearchResult<()> {
+    let frozen = manifest.freeze_verification_manifest()?;
+    let before = capture_manifest_file_states(manifest, model_dir)?;
     manifest.verify_dir(model_dir)?;
-    write_verification_marker(manifest, model_dir);
-    Ok(())
+    after_full_hash_boundary();
+    let after = capture_manifest_file_states(manifest, model_dir)?;
+    if before != after {
+        return Err(model_changed_during_verification(model_dir));
+    }
+
+    let marker = VerificationMarker::from_verified_states(manifest, frozen.fingerprint, after);
+    write_verification_marker_atomic(&marker, model_dir)
 }
 
 fn sync_registered_artifacts<'a>(
@@ -3067,6 +3261,11 @@ fn to_hex_lowercase(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankensearch_core::generation::{
+        ForeignProducerConformanceCertificateV1, ProducerCompatibilityErrorV1,
+        ProducerCompatibilityKindV1, TrustedProducerConformanceContextV1,
+        VerifiedGoldenConformanceManifestV1,
+    };
     use std::io::Write;
 
     fn write_temp_file(path: &Path, bytes: &[u8]) {
@@ -3149,8 +3348,19 @@ mod tests {
     }
 
     #[test]
-    fn compatible_producers_share_only_the_space_contract() {
-        let left = sample_artifact_manifest();
+    fn foreign_producers_require_explicit_trusted_conformance_certificates() {
+        let conformance_texts = ["query: alpha", "document: beta"];
+        let conformance_vectors = vec![vec![0.0, -0.0, 1.0], vec![0.5, -0.5, 0.25]];
+        let fixture = VerifiedGoldenConformanceManifestV1::from_exact_pair_f32(
+            &conformance_texts,
+            &conformance_vectors,
+            &conformance_vectors,
+        )
+        .unwrap();
+        let policy_fingerprint = "9".repeat(64);
+
+        let mut left = sample_artifact_manifest();
+        left.execution.golden_vectors = fixture.certificate().clone();
         let left_manifest_fingerprint = left.freeze().unwrap().fingerprint;
         let left_identity = left
             .identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
@@ -3179,7 +3389,42 @@ mod tests {
             left_identity.space.fingerprint(),
             right_identity.space.fingerprint()
         );
-        assert!(left_identity.is_conformance_compatible_with(&right_identity));
+        assert_eq!(
+            left_identity.verify_exact_producer_with(&right_identity),
+            Err(ProducerCompatibilityErrorV1::CertificateRequired)
+        );
+        let right_certificate =
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &left_identity,
+                &right_identity,
+                &fixture,
+                &policy_fingerprint,
+                1,
+                100,
+                200,
+            )
+            .unwrap();
+        let right_certificate_fingerprint = right_certificate.fingerprint();
+        let trusted = TrustedProducerConformanceContextV1::from_independent_policy(
+            &policy_fingerprint,
+            &right_certificate_fingerprint,
+            &fixture,
+            150,
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            left_identity
+                .verify_certified_foreign_producer_with(
+                    &right_identity,
+                    &right_certificate,
+                    trusted,
+                )
+                .unwrap()
+                .kind(),
+            ProducerCompatibilityKindV1::Certified
+        );
         assert_ne!(
             left_identity.producer.fingerprint(),
             right_identity.producer.fingerprint()
@@ -3213,9 +3458,42 @@ mod tests {
             left_identity.producer.fingerprint(),
             redistributed_identity.producer.fingerprint()
         );
-        assert!(
-            left_identity.is_conformance_compatible_with(&redistributed_identity),
-            "distribution metadata may differ when space and explicit conformance stay exact"
+        assert_eq!(
+            left_identity.verify_exact_producer_with(&redistributed_identity),
+            Err(ProducerCompatibilityErrorV1::CertificateRequired)
+        );
+        let redistributed_certificate =
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &left_identity,
+                &redistributed_identity,
+                &fixture,
+                &policy_fingerprint,
+                2,
+                100,
+                200,
+            )
+            .unwrap();
+        let redistributed_certificate_fingerprint = redistributed_certificate.fingerprint();
+        let trusted = TrustedProducerConformanceContextV1::from_independent_policy(
+            &policy_fingerprint,
+            &redistributed_certificate_fingerprint,
+            &fixture,
+            150,
+            2,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            left_identity
+                .verify_certified_foreign_producer_with(
+                    &redistributed_identity,
+                    &redistributed_certificate,
+                    trusted,
+                )
+                .unwrap()
+                .kind(),
+            ProducerCompatibilityKindV1::Certified,
+            "distribution metadata may differ only with explicit trusted evidence"
         );
 
         let mut nonconformant = right.clone();
@@ -3227,7 +3505,18 @@ mod tests {
             left_identity.space.fingerprint(),
             nonconformant_identity.space.fingerprint()
         );
-        assert!(!left_identity.is_conformance_compatible_with(&nonconformant_identity));
+        assert_eq!(
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &left_identity,
+                &nonconformant_identity,
+                &fixture,
+                &policy_fingerprint,
+                3,
+                100,
+                200,
+            ),
+            Err(ProducerCompatibilityErrorV1::GoldenVectorMismatch)
+        );
 
         let mut changed_semantics = right;
         changed_semantics.execution.pooling.push_str("-drift");
@@ -4455,7 +4744,7 @@ mod tests {
             display_name: None,
             description: None,
             repo: "owner/repo".to_owned(),
-            revision: "abc".to_owned(),
+            revision: "a".repeat(40),
             files: vec![ModelFile {
                 name: "model.bin".to_owned(),
                 sha256: hash,
@@ -4495,7 +4784,7 @@ mod tests {
             display_name: None,
             description: None,
             repo: "owner/repo".to_owned(),
-            revision: "abc".to_owned(),
+            revision: "a".repeat(40),
             files: vec![ModelFile {
                 name: "model.bin".to_owned(),
                 sha256: hash,
@@ -4529,7 +4818,7 @@ mod tests {
             display_name: None,
             description: None,
             repo: "owner/repo".to_owned(),
-            revision: "abc".to_owned(),
+            revision: "a".repeat(40),
             files: vec![ModelFile {
                 name: "model.bin".to_owned(),
                 sha256: to_hex_lowercase(&Sha256::digest(b"new model")),
@@ -4993,7 +5282,7 @@ mod tests {
         ModelManifest {
             id: "test-model".to_owned(),
             repo: "test/repo".to_owned(),
-            revision: "abc".to_owned(),
+            revision: "a".repeat(40),
             files: vec![ModelFile {
                 name: file_name.to_owned(),
                 sha256: sha,
@@ -5017,11 +5306,12 @@ mod tests {
         let manifest = make_test_manifest("model.bin", content);
         write_temp_file(&tmp.path().join("model.bin"), content);
 
-        let marker = VerificationMarker::new_for(&manifest, tmp.path());
-        let json = serde_json::to_string_pretty(&marker).unwrap();
+        verify_dir_and_record(&manifest, tmp.path()).unwrap();
+        let json = std::fs::read_to_string(tmp.path().join(VERIFIED_MARKER_FILE)).unwrap();
         let restored: VerificationMarker = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.manifest_id, "test-model");
-        assert_eq!(restored.schema_version, MANIFEST_SCHEMA_VERSION);
+        assert_eq!(restored.schema_version, VERIFICATION_MARKER_SCHEMA_VERSION);
+        assert_eq!(restored.manifest_fingerprint.len(), 64);
         let state = restored.file_states.get("model.bin").unwrap();
         assert_eq!(state.size_bytes, u64::try_from(content.len()).unwrap());
         assert!(state.modified_unix_nanos > 0);
@@ -5035,7 +5325,7 @@ mod tests {
         write_temp_file(&tmp.path().join("model.bin"), content);
 
         assert!(!is_verification_cached(&manifest, tmp.path()));
-        write_verification_marker(&manifest, tmp.path());
+        verify_dir_and_record(&manifest, tmp.path()).unwrap();
         assert!(is_verification_cached(&manifest, tmp.path()));
     }
 
@@ -5046,7 +5336,7 @@ mod tests {
         let manifest = make_test_manifest("model.bin", content);
         write_temp_file(&tmp.path().join("model.bin"), content);
 
-        write_verification_marker(&manifest, tmp.path());
+        verify_dir_and_record(&manifest, tmp.path()).unwrap();
         let mut changed = manifest;
         changed.id = "different-model".to_owned();
         assert!(!is_verification_cached(&changed, tmp.path()));
@@ -5060,7 +5350,7 @@ mod tests {
         write_temp_file(&tmp.path().join("model.bin"), content);
 
         // Write marker, then tamper with the recorded file state.
-        write_verification_marker(&manifest, tmp.path());
+        verify_dir_and_record(&manifest, tmp.path()).unwrap();
         assert!(is_verification_cached(&manifest, tmp.path()));
 
         let marker_path = tmp.path().join(VERIFIED_MARKER_FILE);
@@ -5072,6 +5362,9 @@ mod tests {
             FileVerificationState {
                 size_bytes: 1,
                 modified_unix_nanos: 1,
+                created_unix_nanos: None,
+                platform_file_id: None,
+                platform_change_stamp: None,
             },
         );
         let tampered = serde_json::to_string_pretty(&marker).unwrap();
@@ -5081,7 +5374,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_dir_cached_writes_marker_on_success() {
+    fn verify_dir_cached_is_observational_on_uncached_success() {
         let tmp = tempfile::tempdir().unwrap();
         let content = b"model data for verify";
         let manifest = make_test_manifest("model.bin", content);
@@ -5089,8 +5382,10 @@ mod tests {
 
         assert!(!tmp.path().join(VERIFIED_MARKER_FILE).exists());
         verify_dir_cached(&manifest, tmp.path()).unwrap();
-        assert!(tmp.path().join(VERIFIED_MARKER_FILE).exists());
-        assert!(is_verification_cached(&manifest, tmp.path()));
+        assert!(
+            !tmp.path().join(VERIFIED_MARKER_FILE).exists(),
+            "observational verification must not mint a receipt"
+        );
     }
 
     #[test]
@@ -5100,15 +5395,229 @@ mod tests {
         let manifest = make_test_manifest("model.bin", content);
         write_temp_file(&tmp.path().join("model.bin"), content);
 
-        // First call: full verification + writes marker
-        verify_dir_cached(&manifest, tmp.path()).unwrap();
+        // The authority-bearing operation performs the full hash and mints the receipt.
+        verify_dir_and_record(&manifest, tmp.path()).unwrap();
 
-        // Second call: should succeed from cache (no rehash)
+        // The consumer operation may then admit the unchanged receipt.
         verify_dir_cached(&manifest, tmp.path()).unwrap();
     }
 
     #[test]
-    fn verify_dir_cached_skips_when_no_verified_checksums() {
+    fn verification_cache_miss_when_same_id_revision_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = b"revision-bound model data";
+        let manifest = make_test_manifest("model.bin", content);
+        write_temp_file(&tmp.path().join("model.bin"), content);
+
+        verify_dir_and_record(&manifest, tmp.path()).unwrap();
+        assert!(is_verification_cached(&manifest, tmp.path()));
+
+        let mut changed = manifest;
+        changed.revision = "b".repeat(40);
+        assert!(
+            !is_verification_cached(&changed, tmp.path()),
+            "same-ID revision evolution must invalidate the old receipt"
+        );
+    }
+
+    #[test]
+    fn verification_cache_miss_when_same_id_sha_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = b"checksum-bound model data";
+        let manifest = make_test_manifest("model.bin", content);
+        write_temp_file(&tmp.path().join("model.bin"), content);
+
+        verify_dir_and_record(&manifest, tmp.path()).unwrap();
+        assert!(is_verification_cached(&manifest, tmp.path()));
+
+        let mut changed = manifest;
+        changed.files[0].sha256 = "b".repeat(64);
+        assert!(
+            !is_verification_cached(&changed, tmp.path()),
+            "same-ID checksum evolution must invalidate the old receipt"
+        );
+    }
+
+    #[test]
+    fn verification_cache_rejects_legacy_marker_without_manifest_fingerprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = b"legacy marker model data";
+        let manifest = make_test_manifest("model.bin", content);
+        let path = tmp.path().join("model.bin");
+        write_temp_file(&path, content);
+        let state = capture_file_verification_state(&path).unwrap();
+        let legacy = serde_json::json!({
+            "manifest_id": manifest.id,
+            "schema_version": MANIFEST_SCHEMA_VERSION,
+            "verified_at": 1,
+            "file_states": {
+                "model.bin": {
+                    "size_bytes": state.size_bytes,
+                    "modified_unix_nanos": state.modified_unix_nanos
+                }
+            }
+        });
+        std::fs::write(
+            tmp.path().join(VERIFIED_MARKER_FILE),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            !is_verification_cached(&manifest, tmp.path()),
+            "pre-fingerprint markers must fail closed"
+        );
+    }
+
+    #[test]
+    fn verification_cache_rejects_partial_current_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = b"partial marker model data";
+        let manifest = make_test_manifest("model.bin", content);
+        write_temp_file(&tmp.path().join("model.bin"), content);
+
+        verify_dir_and_record(&manifest, tmp.path()).unwrap();
+        let marker_path = tmp.path().join(VERIFIED_MARKER_FILE);
+        let raw = std::fs::read_to_string(&marker_path).unwrap();
+        let mut marker: VerificationMarker = serde_json::from_str(&raw).unwrap();
+        marker.file_states.clear();
+        std::fs::write(&marker_path, serde_json::to_vec_pretty(&marker).unwrap()).unwrap();
+
+        assert!(
+            !is_verification_cached(&manifest, tmp.path()),
+            "a current-schema receipt missing any manifest file state must fail closed"
+        );
+    }
+
+    #[test]
+    fn verification_cache_rejects_unknown_marker_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = b"unknown marker field model data";
+        let manifest = make_test_manifest("model.bin", content);
+        write_temp_file(&tmp.path().join("model.bin"), content);
+
+        verify_dir_and_record(&manifest, tmp.path()).unwrap();
+        let marker_path = tmp.path().join(VERIFIED_MARKER_FILE);
+        let raw = std::fs::read_to_string(&marker_path).unwrap();
+        let mut marker: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        marker.as_object_mut().unwrap().insert(
+            "unrecognized_trust_claim".to_owned(),
+            serde_json::json!(true),
+        );
+        std::fs::write(&marker_path, serde_json::to_vec_pretty(&marker).unwrap()).unwrap();
+
+        assert!(
+            !is_verification_cached(&manifest, tmp.path()),
+            "receipts with unknown trust claims must fail closed"
+        );
+    }
+
+    #[test]
+    fn full_verify_and_record_rejects_corrupt_bytes_without_minting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = make_test_manifest("model.bin", b"registered bytes");
+        write_temp_file(&tmp.path().join("model.bin"), b"corrupted bytes!");
+
+        let error = verify_dir_and_record(&manifest, tmp.path()).unwrap_err();
+        assert!(matches!(error, SearchError::HashMismatch { .. }));
+        assert!(
+            !tmp.path().join(VERIFIED_MARKER_FILE).exists(),
+            "failed full verification must never mint a receipt"
+        );
+    }
+
+    #[test]
+    fn full_verify_and_record_rejects_mutation_after_hash_before_receipt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = b"stable registered bytes";
+        let manifest = make_test_manifest("model.bin", content);
+        let model_path = tmp.path().join("model.bin");
+        write_temp_file(&model_path, content);
+
+        TEST_AFTER_FULL_HASH_HOOK.with(|slot| {
+            assert!(slot.borrow().is_none());
+            slot.replace(Some(Box::new(move || {
+                std::fs::write(model_path, b"changed after the full hash completed").unwrap();
+            })));
+        });
+
+        let error = verify_dir_and_record(&manifest, tmp.path()).unwrap_err();
+        assert!(matches!(error, SearchError::HashMismatch { .. }));
+        assert!(
+            !tmp.path().join(VERIFIED_MARKER_FILE).exists(),
+            "a hash-vs-metadata race must fail before receipt publication"
+        );
+    }
+
+    #[test]
+    fn verified_promotion_publishes_model_and_receipt_together() {
+        let parent = tempfile::tempdir().unwrap();
+        let staged = tempfile::tempdir_in(parent.path()).unwrap();
+        let content = b"atomically promoted model bytes";
+        let manifest = make_test_manifest("model.bin", content);
+        write_temp_file(&staged.path().join("model.bin"), content);
+        let destination = parent.path().join("published-model");
+
+        manifest
+            .promote_verified_installation(staged.path(), &destination)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(destination.join("model.bin")).unwrap(),
+            content
+        );
+        assert!(destination.join(VERIFIED_MARKER_FILE).is_file());
+        assert!(is_verification_cached(&manifest, &destination));
+    }
+
+    #[test]
+    fn partial_receipt_never_prevents_full_rehash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = b"partial receipt bytes";
+        let manifest = make_test_manifest("model.bin", content);
+        let model_path = tmp.path().join("model.bin");
+        write_temp_file(&model_path, content);
+        verify_dir_and_record(&manifest, tmp.path()).unwrap();
+
+        let marker_path = tmp.path().join(VERIFIED_MARKER_FILE);
+        let raw = std::fs::read_to_string(&marker_path).unwrap();
+        let mut marker: VerificationMarker = serde_json::from_str(&raw).unwrap();
+        marker.file_states.clear();
+        std::fs::write(&marker_path, serde_json::to_vec_pretty(&marker).unwrap()).unwrap();
+        std::fs::write(model_path, b"corrupt partial bytes").unwrap();
+
+        assert!(
+            matches!(
+                verify_dir_cached(&manifest, tmp.path()),
+                Err(SearchError::HashMismatch { .. })
+            ),
+            "a partial receipt must fall through to full SHA verification"
+        );
+    }
+
+    #[test]
+    fn built_in_verification_manifest_fingerprints_are_golden() {
+        let potion = ModelManifest::potion_128m()
+            .freeze_verification_manifest()
+            .unwrap()
+            .fingerprint;
+        let minilm = ModelManifest::minilm_v2()
+            .freeze_verification_manifest()
+            .unwrap()
+            .fingerprint;
+
+        assert_eq!(
+            potion,
+            "32b58266fc633cf0e95c05d80bcb9c8f943786bb9e83aed6676eba8311b779e9"
+        );
+        assert_eq!(
+            minilm,
+            "5a563a081f9d3febe93302339766bb9ef314e170c8579a33c500f18fdcbe3f8e"
+        );
+    }
+
+    #[test]
+    fn verify_dir_cached_rejects_non_production_manifest() {
         let tmp = tempfile::tempdir().unwrap();
         let manifest = ModelManifest {
             id: "test".to_owned(),
@@ -5128,7 +5637,11 @@ mod tests {
             description: None,
             download_size_bytes: 0,
         };
-        // Should not error even though file doesn't exist — skips verification
-        verify_dir_cached(&manifest, tmp.path()).unwrap();
+        let error = verify_dir_cached(&manifest, tmp.path()).unwrap_err();
+        assert!(
+            matches!(error, SearchError::InvalidConfig { .. }),
+            "placeholder manifests must never receive cached admission: {error}"
+        );
+        assert!(!tmp.path().join(VERIFIED_MARKER_FILE).exists());
     }
 }

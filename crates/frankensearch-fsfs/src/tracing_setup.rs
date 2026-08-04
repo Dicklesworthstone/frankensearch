@@ -11,6 +11,9 @@
 //! 3. CLI flags (`-v` → debug, `-q` → error)
 //! 4. Default level: `warn`
 
+use std::collections::HashMap;
+use std::ffi::OsString;
+
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
@@ -99,17 +102,15 @@ pub fn init_subscriber(verbosity: Verbosity, no_color: bool) {
 /// Build an `EnvFilter` respecting the priority chain:
 /// `FRANKENSEARCH_LOG` > `RUST_LOG` > CLI verbosity default.
 fn build_env_filter(verbosity: Verbosity) -> EnvFilter {
-    // Try FRANKENSEARCH_LOG first (project-specific).
-    // If the value is unparseable, fall through to RUST_LOG / default
-    // rather than failing hard.
-    if let Ok(directives) = std::env::var("FRANKENSEARCH_LOG")
-        && let Ok(filter) = EnvFilter::try_new(&directives)
-    {
-        return filter;
+    let resolution = resolve_log_filter(
+        std::env::var_os("FRANKENSEARCH_LOG"),
+        std::env::var_os("RUST_LOG"),
+        verbosity,
+    );
+    if let Some(diagnostic) = resolution.diagnostic.as_deref() {
+        eprintln!("fsfs: {diagnostic}");
     }
-
-    // Try RUST_LOG (standard ecosystem convention).
-    if let Ok(filter) = EnvFilter::try_from_default_env() {
+    if let Ok(filter) = EnvFilter::try_new(&resolution.directives) {
         return filter;
     }
 
@@ -128,6 +129,77 @@ fn build_env_filter(verbosity: Verbosity) -> EnvFilter {
     };
 
     EnvFilter::try_new(&directive).unwrap_or_else(|_| EnvFilter::new(level.as_str()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFilterSource {
+    FrankensearchLog,
+    RustLog,
+    Fallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogFilterResolution {
+    pub source: LogFilterSource,
+    pub directives: String,
+    pub diagnostic: Option<&'static str>,
+}
+
+#[must_use]
+pub fn resolve_log_filter(
+    project: Option<OsString>,
+    rust: Option<OsString>,
+    verbosity: Verbosity,
+) -> LogFilterResolution {
+    if let Some(project) = project {
+        if let Some(value) = project.to_str()
+            && !value.trim().is_empty()
+            && EnvFilter::try_new(value).is_ok()
+        {
+            return LogFilterResolution {
+                source: LogFilterSource::FrankensearchLog,
+                directives: value.to_owned(),
+                diagnostic: None,
+            };
+        }
+        return LogFilterResolution {
+            source: LogFilterSource::FrankensearchLog,
+            directives: "warn".to_owned(),
+            diagnostic: Some(
+                "FRANKENSEARCH_LOG is invalid; using safe WARN without RUST_LOG fallback",
+            ),
+        };
+    }
+    if let Some(rust) = rust
+        && let Some(value) = rust.to_str()
+        && EnvFilter::try_new(value).is_ok()
+    {
+        return LogFilterResolution {
+            source: LogFilterSource::RustLog,
+            directives: value.to_owned(),
+            diagnostic: None,
+        };
+    }
+    LogFilterResolution {
+        source: LogFilterSource::Fallback,
+        directives: verbosity.default_level().to_string(),
+        diagnostic: None,
+    }
+}
+
+#[must_use]
+pub fn current_unicode_environment() -> HashMap<String, String> {
+    unicode_environment_from(std::env::vars_os())
+}
+
+fn unicode_environment_from<I>(variables: I) -> HashMap<String, String>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    variables
+        .into_iter()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -167,6 +239,61 @@ mod tests {
         let _filter = build_env_filter(Verbosity::Normal);
         let _filter = build_env_filter(Verbosity::Verbose);
         let _filter = build_env_filter(Verbosity::Quiet);
+    }
+
+    #[test]
+    fn invalid_project_log_is_authoritative_and_never_falls_through() {
+        let resolution = resolve_log_filter(
+            Some(OsString::from("not a valid [ directive")),
+            Some(OsString::from("trace")),
+            Verbosity::Verbose,
+        );
+        assert_eq!(resolution.source, LogFilterSource::FrankensearchLog);
+        assert_eq!(resolution.directives, "warn");
+        assert!(resolution.diagnostic.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_project_log_is_safe_warn_without_rust_log_fallback() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let resolution = resolve_log_filter(
+            Some(OsString::from_vec(vec![0xff])),
+            Some(OsString::from("trace")),
+            Verbosity::Verbose,
+        );
+        assert_eq!(resolution.source, LogFilterSource::FrankensearchLog);
+        assert_eq!(resolution.directives, "warn");
+        assert!(resolution.diagnostic.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unicode_environment_projection_skips_non_unicode_keys_and_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let environment = unicode_environment_from([
+            (OsString::from("FSFS_VALID"), OsString::from("present")),
+            (
+                OsString::from_vec(vec![b'F', 0xff]),
+                OsString::from("ignored-key"),
+            ),
+            (
+                OsString::from("FSFS_INVALID_VALUE"),
+                OsString::from_vec(vec![0xff]),
+            ),
+        ]);
+
+        assert_eq!(
+            environment.get("FSFS_VALID").map(String::as_str),
+            Some("present")
+        );
+        assert!(
+            !environment.contains_key("FSFS_INVALID_VALUE"),
+            "a non-Unicode value must be omitted instead of panicking or being lossy-decoded"
+        );
+        assert_eq!(environment.len(), 1);
     }
 
     // Note: init_subscriber can only be called once per process, so we test

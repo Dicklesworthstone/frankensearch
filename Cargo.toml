@@ -49,7 +49,7 @@ frankensearch-fusion = { version = "0.2.1", path = "crates/frankensearch-fusion"
 frankensearch-rerank = { version = "0.2.2", path = "crates/frankensearch-rerank" }
 frankensearch-storage = { version = "0.2.0", path = "crates/frankensearch-storage" }
 frankensearch-durability = { version = "0.2.0", path = "crates/frankensearch-durability", default-features = false }
-frankensearch-fsfs = { version = "1.3.0", path = "crates/frankensearch-fsfs" }
+frankensearch-fsfs = { version = "1.4.3", path = "crates/frankensearch-fsfs" }
 frankensearch-tui = { version = "0.2.0", path = "crates/frankensearch-tui" }
 frankensearch-ops = { version = "0.2.0", path = "crates/frankensearch-ops" }
 frankensearch-quill = { version = "0.2.1", path = "crates/frankensearch-quill" }
@@ -76,6 +76,15 @@ frankensearch-quill = { version = "0.2.1", path = "crates/frankensearch-quill" }
 asupersync = { version = ">=0.3.10, <0.4", default-features = false, features = ["proc-macros"] }
 arc-swap = "=1.9.2"
 
+# Descriptor-relative generation-root admission. Keep the syscall surface
+# explicit so unsupported targets compile without pulling platform code in.
+rustix = { version = "=1.1.4", default-features = false, features = [
+    "std",
+    "fs",
+    "process",
+    "thread",
+] }
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -97,7 +106,10 @@ bytemuck = "1"
 
 # SIMD and f16 quantization (unconditional for frankensearch-index)
 half = "2.4"
-wide = "1.1.1"
+# Floor 1.6.0 is load-bearing: simd.rs/in_memory.rs call `widening_mul`, which only
+# exists in wide >= 1.6.0 (1.5.0 has only the pre-rename `mul_widen`). A lower floor
+# lets a consumer's stale lockfile resolve 1.1.1-1.5.0 and fail mid-compile (bd-efe5y).
+wide = "1.6.0"
 
 # Memory-mapped I/O
 memmap2 = "0.9"

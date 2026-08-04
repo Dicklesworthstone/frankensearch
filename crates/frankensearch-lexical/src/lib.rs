@@ -4,6 +4,9 @@
 //! including schema creation, document indexing, BM25 query parsing,
 //! and search result ranking.
 //!
+//! The crate version constant is part of gauntlet dependency provenance: it
+//! identifies the concrete lexical wrapper compiled around Tantivy.
+//!
 //! # Schema
 //!
 //! | Field | Tantivy Options | Source |
@@ -15,6 +18,9 @@
 //!
 //! The `content` and `title` fields are searched with BM25 scoring.
 //! Title matches receive a 2× boost via `QueryParser::set_field_boost`.
+
+/// Exact `frankensearch-lexical` crate version compiled into this adapter.
+pub const FRANKENSEARCH_LEXICAL_CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod cass_compat;
 pub mod quill_contract;
@@ -307,6 +313,45 @@ fn collector_invocations() -> (u64, u64) {
 }
 
 /// Execute a pre-built Tantivy query with offset pagination.
+/// Execute a Tantivy collector search behind a panic guard.
+///
+/// The pinned Tantivy 0.26.1 scorer stack contains at least one panic
+/// reachable from ordinary user input: a negated phrase whose exact sequence
+/// is absent seeks a terminated docset in `PhraseScorer` (bd-nqeb4, found by
+/// the bd-bsjw structure-aware campaign). A search engine must degrade, not
+/// abort the host process, so the execution boundary converts an engine
+/// panic into the same typed error surface as an engine `Err`. The searcher
+/// is an immutable snapshot, so the unwind leaves no poisoned state behind.
+fn search_guarded<C: tantivy::collector::Collector>(
+    searcher: &Searcher,
+    query: &dyn tantivy::query::Query,
+    collector: &C,
+) -> SearchResult<C::Fruit> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        searcher.search(query, collector)
+    })) {
+        Ok(result) => result.map_err(|error| SearchError::SubsystemError {
+            subsystem: "tantivy",
+            source: Box::new(error),
+        }),
+        Err(panic) => {
+            let detail = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic payload");
+            warn!(
+                panic = detail,
+                "tantivy panicked during query execution; degrading to a typed error (bd-nqeb4)"
+            );
+            Err(SearchError::SubsystemError {
+                subsystem: "tantivy",
+                source: format!("tantivy panicked during query execution: {detail}").into(),
+            })
+        }
+    }
+}
+
 ///
 /// This helper centralizes error mapping and result-shape normalization so
 /// downstream callers can keep custom query construction while reusing the
@@ -326,33 +371,23 @@ pub fn execute_query_with_offset(
     COUNTED_COLLECTOR_INVOCATIONS.set(COUNTED_COLLECTOR_INVOCATIONS.get().saturating_add(1));
 
     if limit == 0 {
-        let total_count =
-            searcher
-                .search(query, &Count)
-                .map_err(|e| SearchError::SubsystemError {
-                    subsystem: "tantivy",
-                    source: Box::new(e),
-                })?;
+        let total_count = search_guarded(searcher, query, &Count)?;
         return Ok(LexicalSearchResult {
             hits: Vec::new(),
             total_count,
         });
     }
 
-    let (top_docs, total_count) = searcher
-        .search(
-            query,
-            &(
-                TopDocs::with_limit(limit)
-                    .and_offset(offset)
-                    .order_by_score(),
-                Count,
-            ),
-        )
-        .map_err(|e| SearchError::SubsystemError {
-            subsystem: "tantivy",
-            source: Box::new(e),
-        })?;
+    let (top_docs, total_count) = search_guarded(
+        searcher,
+        query,
+        &(
+            TopDocs::with_limit(limit)
+                .and_offset(offset)
+                .order_by_score(),
+            Count,
+        ),
+    )?;
 
     let hits = top_docs
         .into_iter()
@@ -390,17 +425,13 @@ pub fn execute_top_k(
     #[cfg(test)]
     TOP_K_COLLECTOR_INVOCATIONS.set(TOP_K_COLLECTOR_INVOCATIONS.get().saturating_add(1));
 
-    let top_docs = searcher
-        .search(
-            query,
-            &TopDocs::with_limit(limit)
-                .and_offset(offset)
-                .order_by_score(),
-        )
-        .map_err(|e| SearchError::SubsystemError {
-            subsystem: "tantivy",
-            source: Box::new(e),
-        })?;
+    let top_docs = search_guarded(
+        searcher,
+        query,
+        &TopDocs::with_limit(limit)
+            .and_offset(offset)
+            .order_by_score(),
+    )?;
 
     Ok(top_docs
         .into_iter()
@@ -689,6 +720,23 @@ pub struct BenchmarkWriterJoinReceipt {
     pub writer_rearmed: bool,
 }
 
+/// Ordered searchable-segment geometry from the pinned Tantivy oracle.
+///
+/// This conformance-only receipt preserves Tantivy's native `segment_ord`
+/// assignment as well as physical and live document counts. It is absent from
+/// normal shipping builds.
+#[cfg(feature = "tantivy-oracle")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OracleSegmentLayout {
+    /// Native Tantivy segment ordinal used in `DocAddress` tie-breaking.
+    pub segment_ord: u32,
+    /// Physical document cardinality, including deleted rows.
+    pub max_doc: u32,
+    /// Live document cardinality.
+    pub num_docs: u32,
+}
+
 /// A Tantivy-backed full-text search index implementing [`LexicalSearch`].
 ///
 /// Thread-safe for concurrent reads. Writes are serialized internally via
@@ -853,6 +901,57 @@ impl TantivyIndex {
             WRITER_HEAP_BYTES,
             Some(1),
         )
+    }
+
+    /// Disable automatic merging for an exact oracle segment-topology proof.
+    ///
+    /// This method is intentionally separate from the benchmark-only helper:
+    /// conformance fixtures use Tantivy's shipping indexing path but must keep
+    /// explicit commit boundaries observable for native `DocAddress` ties.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed cancellation or writer-lock error.
+    #[cfg(feature = "tantivy-oracle")]
+    #[doc(hidden)]
+    pub async fn oracle_disable_auto_merge(&self, cx: &Cx) -> SearchResult<()> {
+        let writer = self
+            .writer
+            .lock(cx)
+            .await
+            .map_err(|error| Self::map_writer_lock_error("tantivy.oracle_no_merge", error))?;
+        writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+        Ok(())
+    }
+
+    /// Return searchable oracle segments in native `segment_ord` order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-config error if a segment ordinal cannot fit
+    /// Tantivy's public address type.
+    #[cfg(feature = "tantivy-oracle")]
+    #[doc(hidden)]
+    pub fn oracle_segment_layout(&self) -> SearchResult<Vec<OracleSegmentLayout>> {
+        self.reader
+            .searcher()
+            .segment_readers()
+            .iter()
+            .enumerate()
+            .map(|(segment_ord, segment)| {
+                let segment_ord =
+                    u32::try_from(segment_ord).map_err(|_| SearchError::InvalidConfig {
+                        field: "tantivy.segment_ord".to_owned(),
+                        value: segment_ord.to_string(),
+                        reason: "segment ordinal must fit in u32".to_owned(),
+                    })?;
+                Ok(OracleSegmentLayout {
+                    segment_ord,
+                    max_doc: segment.max_doc(),
+                    num_docs: segment.num_docs(),
+                })
+            })
+            .collect()
     }
 
     /// Create an in-memory index with an explicit writer heap budget.
@@ -2013,24 +2112,18 @@ impl TantivyIndex {
             // Every clause is an exact lookup on the unique `id` field. Hydration
             // consumes neither BM25 scores nor hit order, so asking Tantivy to
             // score and heap-sort these documents is pure overhead.
-            searcher
-                .search(&query, &DocSetCollector)
-                .map_err(|error| SearchError::SubsystemError {
-                    subsystem: "tantivy",
-                    source: Box::new(error),
-                })?
+            search_guarded(&searcher, &query, &DocSetCollector)?
                 .into_iter()
                 .collect()
         } else {
-            searcher
-                .search(&query, &TopDocs::with_limit(limit).order_by_score())
-                .map_err(|error| SearchError::SubsystemError {
-                    subsystem: "tantivy",
-                    source: Box::new(error),
-                })?
-                .into_iter()
-                .map(|(_, doc_address)| doc_address)
-                .collect()
+            search_guarded(
+                &searcher,
+                &query,
+                &TopDocs::with_limit(limit).order_by_score(),
+            )?
+            .into_iter()
+            .map(|(_, doc_address)| doc_address)
+            .collect()
         };
 
         for doc_address in doc_addresses {
@@ -2095,12 +2188,11 @@ impl LexicalSearch for TantivyIndex {
             let parsed = self.parse_query_lenient(query);
 
             let searcher = self.reader.searcher();
-            let top_docs = searcher
-                .search(&*parsed, &TopDocs::with_limit(limit).order_by_score())
-                .map_err(|e| SearchError::SubsystemError {
-                    subsystem: "tantivy",
-                    source: Box::new(e),
-                })?;
+            let top_docs = search_guarded(
+                &searcher,
+                &*parsed,
+                &TopDocs::with_limit(limit).order_by_score(),
+            )?;
 
             debug!(hits = top_docs.len(), "tantivy BM25 search completed");
 
@@ -2634,6 +2726,126 @@ mod tests {
     fn open_nonexistent_returns_error() {
         let result = TantivyIndex::open(Path::new("/nonexistent/tantivy_index_xyz"));
         assert!(result.is_err());
+    }
+
+    /// Pins the ORACLE's behavior for stacked unary prefixes (`NOT -x`,
+    /// `NOT NOT x`), which sit OUTSIDE the contract grammar's single-prefix
+    /// fragment rule (`docs/contracts/quill-language-contract.md` §"fragment").
+    /// The pinned Tantivy 0.26.1 parser is the normative behavior for such
+    /// sequences; Quill's lowering must reproduce whatever this test observes
+    /// (bd-251nt — found by the bd-bsjw structure-aware campaign).
+    #[test]
+    fn stacked_negation_prefixes_pin_oracle_semantics() {
+        run_with_cx(|cx| async move {
+            let docs = vec![
+                IndexableDocument::new("doc-a", "alpha need"),
+                IndexableDocument::new("doc-b", "alpha other"),
+                IndexableDocument::new("doc-c", "need only"),
+                IndexableDocument::new("doc-d", "plain filler"),
+            ];
+            let idx = TantivyIndex::in_memory().expect("create");
+            idx.index_documents(&cx, &docs).await.expect("index");
+            idx.commit(&cx).await.expect("commit");
+
+            let observe = |query: &str| {
+                let mut ids = idx
+                    .search_doc_ids(&cx, query, 10)
+                    .expect("search")
+                    .into_iter()
+                    .map(|hit| hit.doc_id)
+                    .collect::<Vec<_>>();
+                ids.sort_unstable();
+                ids
+            };
+
+            assert_eq!(
+                observe("NOT -need"),
+                vec!["doc-b".to_owned(), "doc-d".to_owned()],
+                "oracle collapses NOT + '-' to a single exclusion of `need`"
+            );
+            assert_eq!(
+                observe("NOT NOT need"),
+                vec![
+                    "doc-a".to_owned(),
+                    "doc-b".to_owned(),
+                    "doc-c".to_owned(),
+                    "doc-d".to_owned(),
+                ],
+                "oracle treats NOT NOT as a lenient-parse match-all, NOT as \
+                 logical double negation"
+            );
+            assert_eq!(
+                observe("alpha NOT -need"),
+                vec!["doc-b".to_owned()],
+                "oracle: alpha-docs minus need-docs"
+            );
+
+            // In-GROUP stacked prefixes (bd-bsjw finding 4): an unboosted
+            // group keeps the top-level collapse, but a BOOST on the group
+            // changes membership — the oracle's strict parse of the boosted
+            // group with stacked prefixes fails and the lenient fallback
+            // DROPS the negations entirely, leaving only the positive terms.
+            assert_eq!(
+                observe("(alpha NOT -need)"),
+                vec!["doc-b".to_owned()],
+                "unboosted group keeps the stacked-prefix collapse"
+            );
+            assert_eq!(
+                observe("(alpha NOT -need)^2"),
+                vec!["doc-a".to_owned(), "doc-b".to_owned()],
+                "a boost on the group makes the oracle drop the negations \
+                 (lenient-parse fallback), changing MEMBERSHIP"
+            );
+            assert_eq!(
+                observe("(alpha NOT need)^2"),
+                vec!["doc-a".to_owned(), "doc-b".to_owned()],
+                "the boosted-group fallback drops PLAIN NOT as well — the \
+                 whole negation family loses its exclusions under a group \
+                 boost"
+            );
+        });
+    }
+
+    /// Tantivy 0.26.1's `PhraseScorer` panics on an illegal post-termination
+    /// seek when a NEGATED PHRASE rides beside a positive term — found by the
+    /// bd-bsjw structure-aware campaign (`generic NOT "indexes Parser or
+    /// minimal"`). Quill executes the same shape without incident. The
+    /// shipping execution boundary converts the upstream panic into a typed
+    /// degradation instead of aborting the host process, and the index stays
+    /// fully usable afterwards (bd-nqeb4). When the pinned oracle is upgraded
+    /// past the upstream defect, the typed-error assertion here fails —
+    /// making the fix visible instead of silently shifting the target.
+    #[test]
+    fn oracle_negated_phrase_beside_term_degrades_typed_instead_of_panicking() {
+        run_with_cx(|cx| async move {
+            let docs = vec![
+                IndexableDocument::new("doc-a", "alpha need only"),
+                IndexableDocument::new("doc-b", "alpha other"),
+                IndexableDocument::new("doc-c", "need only"),
+            ];
+            let idx = TantivyIndex::in_memory().expect("create");
+            idx.index_documents(&cx, &docs).await.expect("index");
+            idx.commit(&cx).await.expect("commit");
+            // The phrase's terms exist but the SEQUENCE does not, so the
+            // phrase docset terminates immediately — the precondition for the
+            // upstream illegal seek.
+            let error = idx
+                .search_doc_ids(&cx, "alpha NOT \"only need\"", 10)
+                .expect_err("upstream PhraseScorer defect must surface as a typed error");
+            assert!(
+                error
+                    .to_string()
+                    .contains("panicked during query execution"),
+                "degradation must name the panic boundary: {error}"
+            );
+
+            // The availability property: the same index keeps serving ordinary
+            // queries after the guarded failure.
+            let survivors = idx
+                .search_doc_ids(&cx, "alpha", 10)
+                .expect("index must remain fully usable after a guarded panic");
+            assert_eq!(survivors.len(), 2);
+        });
     }
 
     #[test]

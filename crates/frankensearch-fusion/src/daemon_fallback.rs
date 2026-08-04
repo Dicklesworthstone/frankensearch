@@ -535,7 +535,9 @@ impl DaemonFallbackEmbedder {
         let response = match operation {
             DaemonOperationV1::Handshake => self.daemon.handshake_attested(&challenge),
             DaemonOperationV1::Health => self.daemon.health_attested(&challenge),
-            DaemonOperationV1::Embed | DaemonOperationV1::EmbedBatch => {
+            DaemonOperationV1::Embed
+            | DaemonOperationV1::EmbedBatch
+            | DaemonOperationV1::Rerank => {
                 return Err(DaemonEmbeddingAttemptError::Unverifiable);
             }
         }
@@ -1006,15 +1008,28 @@ fn encode_lower_hex(bytes: &[u8]) -> String {
     output
 }
 
+/// Producer-authentication state for a verified rerank channel.
+struct VerifiedRerankChannel {
+    expected_connection: DaemonConnectionIdentityV1,
+    verifier: PinnedDaemonVerifierV1,
+}
+
 /// Reranker wrapper that uses the daemon when available and falls back to a local reranker.
 pub struct DaemonFallbackReranker {
     daemon: Arc<dyn DaemonClient>,
     fallback: Option<Arc<dyn SyncRerank>>,
     config: DaemonRetryConfig,
     state: Mutex<DaemonState>,
+    verified: Option<VerifiedRerankChannel>,
 }
 
 impl DaemonFallbackReranker {
+    /// Construct an UNAUTHENTICATED reranker (bd-5vult): scores are consumed
+    /// from the raw `DaemonClient::rerank` primitive with shape validation but
+    /// no producer proof, so any process that can bind the daemon endpoint
+    /// controls result ordering. [`Self::trust_level`] reports
+    /// [`DaemonTrustLevelV1::AssumedRemote`] to keep the asymmetry loud; use
+    /// [`Self::new_verified`] wherever the embedder side is verified.
     #[must_use]
     pub fn new(
         daemon: Arc<dyn DaemonClient>,
@@ -1026,7 +1041,99 @@ impl DaemonFallbackReranker {
             fallback,
             config,
             state: Mutex::new(DaemonState::new()),
+            verified: None,
         }
+    }
+
+    /// Construct a reranker whose every accepted daemon response is
+    /// producer-authenticated, mirroring
+    /// [`DaemonFallbackEmbedder::new_verified`]: each attempt sends a fresh
+    /// nonce challenge over `DaemonOperationV1::Rerank` and rejects any
+    /// response whose envelope fails `validate_against` + HMAC
+    /// authentication. Unlike the embedder constructor this does not probe
+    /// handshake/health at build time — the reranker holds no channel state
+    /// beyond the per-response proof, and every response is independently
+    /// authenticated.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UnverifiableRemoteSpace` for an invalid connection identity,
+    /// a verifier/key mismatch, or a zero retry budget.
+    pub fn new_verified(
+        daemon: Arc<dyn DaemonClient>,
+        fallback: Option<Arc<dyn SyncRerank>>,
+        config: DaemonRetryConfig,
+        expected_connection: DaemonConnectionIdentityV1,
+        verifier: PinnedDaemonVerifierV1,
+    ) -> SearchResult<Self> {
+        expected_connection
+            .validate()
+            .map_err(|_| unverifiable_daemon_space(&expected_connection, "invalid connection"))?;
+        verifier.validate_for(&expected_connection)?;
+        if config.max_attempts == 0 {
+            return Err(unverifiable_daemon_space(
+                &expected_connection,
+                "daemon retry attempts must be non-zero",
+            ));
+        }
+        Ok(Self {
+            daemon,
+            fallback,
+            config,
+            state: Mutex::new(DaemonState::new()),
+            verified: Some(VerifiedRerankChannel {
+                expected_connection,
+                verifier,
+            }),
+        })
+    }
+
+    /// Explicit trust label: [`DaemonTrustLevelV1::VerifiedRemote`] when
+    /// constructed via [`Self::new_verified`], otherwise
+    /// [`DaemonTrustLevelV1::AssumedRemote`].
+    #[must_use]
+    pub const fn trust_level(&self) -> DaemonTrustLevelV1 {
+        if self.verified.is_some() {
+            DaemonTrustLevelV1::VerifiedRemote
+        } else {
+            DaemonTrustLevelV1::AssumedRemote
+        }
+    }
+
+    /// One authenticated rerank attempt: fresh nonce challenge over the
+    /// ordered `[query, documents..]` inputs, then envelope validation and
+    /// HMAC authentication before any score is released.
+    fn attempt_verified_rerank(
+        channel: &VerifiedRerankChannel,
+        daemon: &dyn DaemonClient,
+        query: &str,
+        documents: &[&str],
+    ) -> Result<Vec<f32>, DaemonError> {
+        let mut inputs = Vec::with_capacity(documents.len() + 1);
+        inputs.push(query);
+        inputs.extend_from_slice(documents);
+        let nonce = fresh_daemon_nonce().map_err(|_| DaemonError::UnverifiableRemoteSpace)?;
+        let challenge = DaemonChallengeV1::for_inputs(
+            nonce,
+            DaemonOperationV1::Rerank,
+            &inputs,
+            &channel.expected_connection,
+        )?;
+        let response = daemon.rerank_attested(query, documents, &challenge)?;
+        response.attestation.validate_against(
+            &challenge,
+            &channel.expected_connection,
+            &response.vectors,
+        )?;
+        response
+            .attestation
+            .authenticate_hmac_sha256(&channel.verifier.secret_key)?;
+        let mut vectors = response.vectors;
+        let scores = vectors.pop().ok_or(DaemonError::UnverifiableRemoteSpace)?;
+        if !vectors.is_empty() {
+            return Err(DaemonError::UnverifiableRemoteSpace);
+        }
+        Ok(scores)
     }
 
     fn log_fallback(&self, request_id: &str, retries: u32, reason: &str) {
@@ -1073,7 +1180,13 @@ impl DaemonFallbackReranker {
                 max_attempts = self.config.max_attempts,
                 "Attempting daemon rerank"
             );
-            match self.daemon.rerank(query, documents, request_id) {
+            let attempt = self.verified.as_ref().map_or_else(
+                || self.daemon.rerank(query, documents, request_id),
+                |channel| {
+                    Self::attempt_verified_rerank(channel, self.daemon.as_ref(), query, documents)
+                },
+            );
+            match attempt {
                 Ok(scores) => {
                     lock_state(&self.state).record_success();
                     return Ok(scores);
@@ -1120,6 +1233,31 @@ impl DaemonFallbackReranker {
             backoff: false,
         })
     }
+
+    /// Reject a structurally invalid daemon rerank response before any score
+    /// is attributed to a document.
+    ///
+    /// `Vec<f32>` carries no length invariant on the wire: a daemon that caps
+    /// its batch or truncates on a partial read returns a score prefix, and a
+    /// positional zip would assign `0.0` to every document past it — sinking
+    /// them to the bottom of a "successful" rerank with no error. Non-finite
+    /// scores poison downstream ordering the same way. Both are daemon
+    /// contract violations, so they take the existing failed-call fallback
+    /// path as `InvalidInput`.
+    fn validate_rerank_shape(scores: &[f32], expected: usize) -> Result<(), DaemonError> {
+        if scores.len() != expected {
+            return Err(DaemonError::InvalidInput(format!(
+                "daemon rerank returned {} scores for {expected} documents",
+                scores.len()
+            )));
+        }
+        if let Some(index) = scores.iter().position(|score| !score.is_finite()) {
+            return Err(DaemonError::InvalidInput(format!(
+                "daemon rerank returned a non-finite score at index {index}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl SyncRerank for DaemonFallbackReranker {
@@ -1131,13 +1269,26 @@ impl SyncRerank for DaemonFallbackReranker {
         let texts: Vec<&str> = documents.iter().map(|doc| doc.text.as_str()).collect();
         let request_id = next_request_id();
 
-        match self.try_rerank(&request_id, query, &texts) {
+        let outcome = self
+            .try_rerank(&request_id, query, &texts)
+            .and_then(
+                |scores| match Self::validate_rerank_shape(&scores, documents.len()) {
+                    Ok(()) => Ok(scores),
+                    Err(error) => Err(DaemonFailure {
+                        error,
+                        attempts: 1,
+                        backoff: false,
+                    }),
+                },
+            );
+        match outcome {
             Ok(scores) => Ok(documents
                 .iter()
+                .zip(scores)
                 .enumerate()
-                .map(|(index, doc)| RerankScore {
+                .map(|(index, (doc, score))| RerankScore {
                     doc_id: doc.doc_id.clone(),
-                    score: scores.get(index).copied().unwrap_or(0.0),
+                    score,
                     original_rank: index,
                     raw_logit: None,
                 })
@@ -1147,6 +1298,18 @@ impl SyncRerank for DaemonFallbackReranker {
                     return Err(SearchError::Cancelled {
                         phase: "daemon.rerank".to_owned(),
                         reason: "daemon operation cancelled".to_owned(),
+                    });
+                }
+                // A failed producer proof is an authentication event, not an
+                // availability event: falling back would mask an active
+                // endpoint takeover, so it hard-errors (parity with the
+                // embedder's attestation-failure handling).
+                if self.verified.is_some()
+                    && matches!(&failure.error, DaemonError::UnverifiableRemoteSpace)
+                {
+                    return Err(SearchError::UnverifiableRemoteSpace {
+                        producer: "<redacted-daemon-producer>".to_owned(),
+                        reason: "daemon rerank response failed producer authentication".to_owned(),
                     });
                 }
                 let retries = failure.attempts.saturating_sub(1);
@@ -1280,6 +1443,124 @@ mod tests {
 
         fn model_name(&self) -> &str {
             self.id
+        }
+    }
+
+    /// Daemon fixture whose rerank call succeeds with a caller-chosen score
+    /// vector, so tests can exercise arity/finiteness violations on the Ok
+    /// path.
+    struct ShapedRerankDaemon {
+        scores: Vec<f32>,
+        raw_calls: AtomicUsize,
+    }
+
+    impl ShapedRerankDaemon {
+        fn new(scores: Vec<f32>) -> Self {
+            Self {
+                scores,
+                raw_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl DaemonClient for ShapedRerankDaemon {
+        fn id(&self) -> &str {
+            "shaped-rerank-daemon"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn embed(&self, _text: &str, _request_id: &str) -> Result<Vec<f32>, DaemonError> {
+            Err(DaemonError::Unavailable(
+                "shaped rerank fixture has no embedder".to_string(),
+            ))
+        }
+
+        fn embed_batch(
+            &self,
+            _texts: &[&str],
+            _request_id: &str,
+        ) -> Result<Vec<Vec<f32>>, DaemonError> {
+            Err(DaemonError::Unavailable(
+                "shaped rerank fixture has no embedder".to_string(),
+            ))
+        }
+
+        fn rerank(
+            &self,
+            _query: &str,
+            _documents: &[&str],
+            _request_id: &str,
+        ) -> Result<Vec<f32>, DaemonError> {
+            self.raw_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self.scores.clone())
+        }
+    }
+
+    /// Daemon fixture that signs exact rerank envelopes, with optional
+    /// post-signing score tampering to exercise client-side rejection.
+    struct AttestedRerankDaemon {
+        connection: DaemonConnectionIdentityV1,
+        scores: Vec<f32>,
+        tamper_scores: bool,
+        raw_calls: AtomicUsize,
+    }
+
+    impl DaemonClient for AttestedRerankDaemon {
+        fn id(&self) -> &str {
+            "attested-rerank-daemon"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn rerank_attested(
+            &self,
+            _query: &str,
+            _documents: &[&str],
+            challenge: &DaemonChallengeV1,
+        ) -> Result<AttestedDaemonEmbeddingResponseV1, DaemonError> {
+            let mut response = AttestedDaemonEmbeddingResponseV1::signed(
+                challenge.clone(),
+                self.connection.clone(),
+                vec![self.scores.clone()],
+                TEST_KEY,
+            )?;
+            if self.tamper_scores {
+                response.vectors[0][0] += 1.0;
+            }
+            Ok(response)
+        }
+
+        fn embed(&self, _text: &str, _request_id: &str) -> Result<Vec<f32>, DaemonError> {
+            Err(DaemonError::Unavailable(
+                "attested rerank fixture has no embedder".to_string(),
+            ))
+        }
+
+        fn embed_batch(
+            &self,
+            _texts: &[&str],
+            _request_id: &str,
+        ) -> Result<Vec<Vec<f32>>, DaemonError> {
+            Err(DaemonError::Unavailable(
+                "attested rerank fixture has no embedder".to_string(),
+            ))
+        }
+
+        fn rerank(
+            &self,
+            _query: &str,
+            _documents: &[&str],
+            _request_id: &str,
+        ) -> Result<Vec<f32>, DaemonError> {
+            self.raw_calls.fetch_add(1, Ordering::Relaxed);
+            Err(DaemonError::Unavailable(
+                "verified path must never touch the raw primitive".to_string(),
+            ))
         }
     }
 
@@ -1738,6 +2019,9 @@ mod tests {
                         .unwrap();
                         WireResponse::Embedding(signed)
                     }
+                    DaemonOperationV1::Rerank => {
+                        panic!("tcp gateway fixture serves no rerank operation")
+                    }
                 };
                 stream
                     .write_all(&serde_json::to_vec(&response).unwrap())
@@ -2114,6 +2398,187 @@ mod tests {
         assert_eq!(result[0].doc_id, "a");
         assert_eq!(result[0].score, 10.0);
         assert_eq!(daemon.raw_calls.load(Ordering::Relaxed), 1);
+    }
+
+    fn rerank_docs() -> Vec<RerankDocument> {
+        vec![
+            RerankDocument {
+                doc_id: "a".to_string(),
+                text: "doc a".to_string(),
+            },
+            RerankDocument {
+                doc_id: "b".to_string(),
+                text: "doc b".to_string(),
+            },
+        ]
+    }
+
+    fn shaped_reranker(
+        scores: Vec<f32>,
+        fallback: Option<Arc<dyn SyncRerank>>,
+    ) -> (Arc<ShapedRerankDaemon>, DaemonFallbackReranker) {
+        let daemon = Arc::new(ShapedRerankDaemon::new(scores));
+        let reranker = DaemonFallbackReranker::new(
+            daemon.clone(),
+            fallback,
+            DaemonRetryConfig {
+                max_attempts: 1,
+                ..DaemonRetryConfig::default()
+            },
+        );
+        (daemon, reranker)
+    }
+
+    #[test]
+    fn reranker_uses_daemon_scores_when_shape_is_valid() {
+        let fallback: Arc<dyn SyncRerank> = Arc::new(ConstReranker {
+            id: "fallback-reranker",
+        });
+        let (daemon, reranker) = shaped_reranker(vec![0.25, 0.75], Some(fallback));
+        let result = reranker.rerank_sync("query", &rerank_docs()).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].score, 0.25);
+        assert_eq!(result[1].score, 0.75);
+        assert_eq!(daemon.raw_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn reranker_falls_back_when_daemon_returns_score_prefix() {
+        let fallback: Arc<dyn SyncRerank> = Arc::new(ConstReranker {
+            id: "fallback-reranker",
+        });
+        let (daemon, reranker) = shaped_reranker(vec![0.9], Some(fallback));
+        let result = reranker.rerank_sync("query", &rerank_docs()).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[0].score, 10.0,
+            "fallback scores expected, not the daemon prefix"
+        );
+        assert_eq!(
+            result[1].score, 9.0,
+            "fallback scores expected, not a silent 0.0 pad"
+        );
+        assert_eq!(daemon.raw_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn reranker_falls_back_when_daemon_returns_extra_scores() {
+        let fallback: Arc<dyn SyncRerank> = Arc::new(ConstReranker {
+            id: "fallback-reranker",
+        });
+        let (_daemon, reranker) = shaped_reranker(vec![0.1, 0.2, 0.3], Some(fallback));
+        let result = reranker.rerank_sync("query", &rerank_docs()).unwrap();
+        assert_eq!(result[0].score, 10.0);
+        assert_eq!(result[1].score, 9.0);
+    }
+
+    #[test]
+    fn reranker_falls_back_when_daemon_returns_non_finite_score() {
+        let fallback: Arc<dyn SyncRerank> = Arc::new(ConstReranker {
+            id: "fallback-reranker",
+        });
+        let (_daemon, reranker) = shaped_reranker(vec![0.5, f32::NAN], Some(fallback));
+        let result = reranker.rerank_sync("query", &rerank_docs()).unwrap();
+        assert_eq!(result[0].score, 10.0);
+        assert_eq!(result[1].score, 9.0);
+    }
+
+    #[test]
+    fn reranker_surfaces_shape_violation_when_no_fallback_exists() {
+        let (_daemon, reranker) = shaped_reranker(vec![0.9], None);
+        let result = reranker.rerank_sync("query", &rerank_docs());
+        assert!(
+            result.is_err(),
+            "a short daemon response must never zero-pad into a successful rerank"
+        );
+    }
+
+    fn verified_reranker(
+        daemon: Arc<dyn DaemonClient>,
+        connection: DaemonConnectionIdentityV1,
+        fallback: Option<Arc<dyn SyncRerank>>,
+    ) -> DaemonFallbackReranker {
+        DaemonFallbackReranker::new_verified(
+            daemon,
+            fallback,
+            DaemonRetryConfig {
+                max_attempts: 1,
+                ..DaemonRetryConfig::default()
+            },
+            connection,
+            verifier(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn verified_reranker_accepts_exact_signed_scores() {
+        let connection = test_connection("fixture-space");
+        let daemon = Arc::new(AttestedRerankDaemon {
+            connection: connection.clone(),
+            scores: vec![0.25, 0.75],
+            tamper_scores: false,
+            raw_calls: AtomicUsize::new(0),
+        });
+        let fallback: Arc<dyn SyncRerank> = Arc::new(ConstReranker {
+            id: "fallback-reranker",
+        });
+        let reranker = verified_reranker(daemon.clone(), connection, Some(fallback));
+        assert_eq!(reranker.trust_level(), DaemonTrustLevelV1::VerifiedRemote);
+        let result = reranker.rerank_sync("query", &rerank_docs()).unwrap();
+        assert_eq!(result[0].score, 0.25);
+        assert_eq!(result[1].score, 0.75);
+        assert_eq!(
+            daemon.raw_calls.load(Ordering::Relaxed),
+            0,
+            "verified path must never touch the raw primitive"
+        );
+    }
+
+    #[test]
+    fn verified_reranker_rejects_tampered_scores_without_fallback() {
+        let connection = test_connection("fixture-space");
+        let daemon = Arc::new(AttestedRerankDaemon {
+            connection: connection.clone(),
+            scores: vec![0.25, 0.75],
+            tamper_scores: true,
+            raw_calls: AtomicUsize::new(0),
+        });
+        let fallback: Arc<dyn SyncRerank> = Arc::new(ConstReranker {
+            id: "fallback-reranker",
+        });
+        let reranker = verified_reranker(daemon, connection, Some(fallback));
+        let result = reranker.rerank_sync("query", &rerank_docs());
+        assert!(
+            matches!(result, Err(SearchError::UnverifiableRemoteSpace { .. })),
+            "tampered scores must hard-error, not fall back: {result:?}"
+        );
+    }
+
+    #[test]
+    fn raw_only_client_is_ineligible_for_verified_rerank() {
+        let connection = test_connection("fixture-space");
+        let daemon = Arc::new(ShapedRerankDaemon::new(vec![0.9, 0.1]));
+        let fallback: Arc<dyn SyncRerank> = Arc::new(ConstReranker {
+            id: "fallback-reranker",
+        });
+        let reranker = verified_reranker(daemon.clone(), connection, Some(fallback));
+        let result = reranker.rerank_sync("query", &rerank_docs());
+        assert!(
+            matches!(result, Err(SearchError::UnverifiableRemoteSpace { .. })),
+            "the fail-closed rerank_attested default must reject raw-only clients: {result:?}"
+        );
+        assert_eq!(
+            daemon.raw_calls.load(Ordering::Relaxed),
+            0,
+            "verified path must never touch the raw primitive"
+        );
+    }
+
+    #[test]
+    fn unverified_reranker_reports_assumed_trust() {
+        let (_daemon, reranker) = shaped_reranker(vec![0.5, 0.5], None);
+        assert_eq!(reranker.trust_level(), DaemonTrustLevelV1::AssumedRemote);
     }
 
     #[test]

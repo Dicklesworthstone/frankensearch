@@ -4,25 +4,27 @@
 //! [`crate::searcher::TwoTierSearcher`] but operates on precomputed query
 //! embeddings and fully in-memory indices.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 // The per-query `&str`-keyed score maps + `seen` dedup set are `.get()`/`.insert()`
 // probed only (never iterated for output), so `ahash` is bit-identical to std and
 // ~2× faster than SipHash on short doc_ids (`sync_hash_ab` bench: 0.44–0.51 across
-// n=30..300), matching the sibling fusion paths (`rrf.rs`, `blend.rs`). `rank_map`
-// below stays std `HashMap` — it feeds `blend::compute_rank_changes_with_maps`.
+// n=30..300), matching the sibling fusion paths (`rrf.rs`, `blend.rs`).
 use ahash::{AHashMap, AHashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use frankensearch_core::explanation::{
+    ExplainedSource, ExplanationPhase, HitExplanation, RankMovement, ScoreComponent,
+};
 use frankensearch_core::filter::SearchFilter;
 use frankensearch_core::{
-    FusedHit, PhaseMetrics, RankChanges, ScoreSource, ScoredResult, SearchError, SearchPhase,
-    SearchResult, TwoTierConfig, TwoTierMetrics, VectorHit, ZeroSignalReason,
+    FusedHit, PhaseMetrics, ScoreSource, ScoredResult, SearchError, SearchPhase, SearchResult,
+    TwoTierConfig, TwoTierMetrics, VectorHit, ZeroSignalReason,
 };
 use frankensearch_index::{InMemoryTwoTierIndex, SearchParams};
 
-use crate::blend::{blend_two_tier_aligned_vector_index, compute_rank_changes_with_maps};
+use crate::blend::{blend_two_tier_aligned_vector_index, compute_rank_changes};
 use crate::normalize::{AdaptiveNqcDenseWeight, NqcDenseWeight, nqc_cv_iter};
 use crate::rrf::{RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy};
 
@@ -462,11 +464,34 @@ impl SyncTwoTierSearcher {
         } else {
             Vec::new()
         };
+        // Match the async progressive contract: zero requested results is a
+        // successful no-op, not a request to scan the corpus and discard the
+        // candidate pool afterwards (bd-k3089).
+        if k == 0 {
+            return Ok(SyncSearchOutcome {
+                phases,
+                final_results: Vec::new(),
+                metrics,
+            });
+        }
+        if query_vec.iter().all(|&value| value == 0.0) {
+            metrics.zero_signal = Some(ZeroSignalReason::ZeroNormQuery);
+            return Ok(SyncSearchOutcome {
+                phases,
+                final_results: Vec::new(),
+                metrics,
+            });
+        }
         let fetch = candidate_count(k, 0, self.config.candidate_multiplier.max(1)).max(k);
 
         let phase1_started = Instant::now();
         let fast_hits = self.search_fast_hits(query_vec, fetch, filter)?;
-        metrics.phase1_vectors_searched = fast_hits.len();
+        // `phase1_vectors_searched` is diagnostic work accounting, not the
+        // bounded candidate-pool size. The fast-tier search evaluates the
+        // complete index before returning its top-k pool, matching the async
+        // searcher's metric contract and `TwoTierMetrics` documentation.
+        let phase1_vectors_searched = self.index.doc_count();
+        metrics.phase1_vectors_searched = phase1_vectors_searched;
         metrics.semantic_candidates = fast_hits.len();
         // Typed zero-signal classification (bd-tqhc): an empty semantic lane
         // must carry why. Lazy — the non-empty path pays nothing.
@@ -493,7 +518,16 @@ impl SyncTwoTierSearcher {
                 self.effective_semantic_weight(lexical)
             });
         let initial_results = lexical_hits.as_ref().map_or_else(
-            || vector_hits_to_scored_results(&fast_hits, k, ScoreSource::SemanticFast, None, None),
+            || {
+                vector_hits_to_scored_results(
+                    &fast_hits,
+                    k,
+                    ScoreSource::SemanticFast,
+                    None,
+                    None,
+                    &self.config,
+                )
+            },
             |lexical| {
                 fused_hits_to_scored_results(
                     fuse_by_strategy(
@@ -512,6 +546,7 @@ impl SyncTwoTierSearcher {
                         },
                     ),
                     k,
+                    &self.config,
                 )
             },
         );
@@ -528,7 +563,7 @@ impl SyncTwoTierSearcher {
                 latency: phase1_latency,
                 metrics: PhaseMetrics {
                     embedder_id: "sync-fast-query".to_owned(),
-                    vectors_searched: fast_hits.len(),
+                    vectors_searched: phase1_vectors_searched,
                     lexical_candidates: metrics.lexical_candidates,
                     fused_count: initial_results.len(),
                 },
@@ -536,8 +571,11 @@ impl SyncTwoTierSearcher {
         }
 
         if self.config.fast_only || !self.index.has_quality_index() {
+            // Same vocabulary as the async searcher (searcher.rs) — the two
+            // sides share one skip_reason contract; "fast_only" is the string
+            // the fsfs surfaces document (bd-k3089 parity suite pins this).
             metrics.skip_reason = Some(if self.config.fast_only {
-                "fast_only_enabled".to_owned()
+                "fast_only".to_owned()
             } else {
                 "quality_index_unavailable".to_owned()
             });
@@ -586,7 +624,13 @@ impl SyncTwoTierSearcher {
         metrics.quality_search_ms = ms(phase2_started.elapsed());
         metrics.quality_embed_ms = 0.0;
 
-        let refined_results = if let Some(lexical) = lexical_hits.as_ref() {
+        // Keep this diagnostic on the full phase candidate pools, not only
+        // the displayed top-k. The async searcher uses the same definition;
+        // truncating here made identical searches report different stable /
+        // promoted / demoted counts whenever `k < fetch` (bd-k3089).
+        let rank_changes = compute_rank_changes(&fast_hits, &blended);
+
+        let mut refined_results = if let Some(lexical) = lexical_hits.as_ref() {
             fused_hits_to_scored_results(
                 fuse_by_strategy(
                     self.config.fusion_strategy,
@@ -604,6 +648,7 @@ impl SyncTwoTierSearcher {
                     },
                 ),
                 k,
+                &self.config,
             )
         } else {
             unique_vector_hits_to_scored_results_aligned_owned(
@@ -615,7 +660,61 @@ impl SyncTwoTierSearcher {
             )
         };
 
-        let rank_changes = compute_rank_changes_for_scored(&initial_results, &refined_results);
+        // Re-fusion ranks on blended semantic scores, but `fast_score` and
+        // `quality_score` are evidence fields: they must retain the raw
+        // per-tier values. The async searcher restores this provenance after
+        // lexical re-fusion; leaving the blended score in `fast_score` here
+        // made the two APIs report different evidence for identical hits.
+        let aligned_scores = AlignedScoreLookup::new(&fast_hits, &quality_scores);
+        for result in &mut refined_results {
+            if let Some(index) = result.index
+                && let Some((fast_score, quality_score)) = aligned_scores.get(index)
+            {
+                result.fast_score = Some(fast_score);
+                result.quality_score = quality_score;
+            }
+        }
+
+        if self.config.explain {
+            // Async refinement measures semantic-only movement against the
+            // full Phase-1 candidate pool, while lexical re-fusion measures
+            // against the displayed fused order. Mirroring that distinction
+            // keeps promoted candidates explainable even when they were below
+            // the initial top-k display cutoff.
+            let initial_ranks = if lexical_hits.is_some() {
+                initial_results
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, result)| (result.doc_id.as_str(), rank))
+                    .collect::<AHashMap<_, _>>()
+            } else {
+                fast_hits
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, hit)| (hit.doc_id.as_str(), rank))
+                    .collect::<AHashMap<_, _>>()
+            };
+            let (fast_min, fast_max) = finite_score_bounds(fast_hits.iter().map(|hit| hit.score));
+            let (quality_min, quality_max) =
+                finite_score_bounds(quality_scores.iter().flatten().copied());
+            let quality_weight = saturating_f64_to_f32(self.config.quality_weight);
+            for (rank, result) in refined_results.iter_mut().enumerate() {
+                result.explanation = Some(Box::new(build_refined_explanation(
+                    result.score,
+                    rank,
+                    result.doc_id.as_str(),
+                    result.fast_score,
+                    result.quality_score,
+                    &initial_ranks,
+                    fast_min,
+                    fast_max,
+                    quality_min,
+                    quality_max,
+                    quality_weight,
+                )));
+            }
+        }
+
         metrics.rank_changes = rank_changes.clone();
         metrics.phase2_total_ms = ms(phase2_started.elapsed());
         metrics.kendall_tau = None;
@@ -787,6 +886,96 @@ fn saturating_f64_to_f32(value: f64) -> f32 {
     value.clamp(f64::from(f32::MIN), f64::from(f32::MAX)) as f32
 }
 
+fn finite_score_bounds(scores: impl IntoIterator<Item = f32>) -> (f32, f32) {
+    scores
+        .into_iter()
+        .filter(|score| score.is_finite())
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), score| {
+            (min.min(score), max.max(score))
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_refined_explanation(
+    final_score: f32,
+    rank: usize,
+    doc_id: &str,
+    fast_score: Option<f32>,
+    quality_score: Option<f32>,
+    initial_ranks: &AHashMap<&str, usize>,
+    fast_min: f32,
+    fast_max: f32,
+    quality_min: f32,
+    quality_max: f32,
+    quality_weight: f32,
+) -> HitExplanation {
+    let normalize = |score: f32, min: f32, max: f32| {
+        if !score.is_finite() {
+            return 0.0;
+        }
+        let range = max - min;
+        if range > 0.01 {
+            f64::from(((score - min) / range).clamp(0.0, 1.0))
+        } else {
+            f64::from(score.clamp(0.0, 1.0))
+        }
+    };
+    let mut components = Vec::with_capacity(2);
+    if let Some(score) = fast_score {
+        components.push(ScoreComponent {
+            source: ExplainedSource::SemanticFast {
+                embedder: "sync-fast-query".to_owned(),
+                cosine_sim: f64::from(score),
+            },
+            raw_score: f64::from(score),
+            normalized_score: normalize(score, fast_min, fast_max),
+            rrf_contribution: 0.0,
+            weight: 1.0 - f64::from(quality_weight),
+        });
+    }
+    if let Some(score) = quality_score {
+        components.push(ScoreComponent {
+            source: ExplainedSource::SemanticQuality {
+                embedder: "sync-quality-query".to_owned(),
+                cosine_sim: f64::from(score),
+            },
+            raw_score: f64::from(score),
+            normalized_score: normalize(score, quality_min, quality_max),
+            rrf_contribution: 0.0,
+            weight: f64::from(quality_weight),
+        });
+    }
+    let rank_movement = initial_ranks.get(doc_id).map(|&initial_rank| {
+        let refined_rank = i64::try_from(rank).unwrap_or(i64::MAX);
+        let initial_rank_i64 = i64::try_from(initial_rank).unwrap_or(i64::MAX);
+        let delta_i64 = refined_rank - initial_rank_i64;
+        let delta = i32::try_from(delta_i64).unwrap_or_else(|_| {
+            if delta_i64.is_negative() {
+                i32::MIN
+            } else {
+                i32::MAX
+            }
+        });
+        let reason = match delta.cmp(&0) {
+            std::cmp::Ordering::Less => "promoted",
+            std::cmp::Ordering::Greater => "demoted",
+            std::cmp::Ordering::Equal => "stable",
+        };
+        RankMovement {
+            initial_rank,
+            refined_rank: rank,
+            delta,
+            reason: reason.to_owned(),
+        }
+    });
+    HitExplanation {
+        final_score: f64::from(final_score),
+        components,
+        phase: ExplanationPhase::Refined,
+        rank_movement,
+    }
+}
+
 fn filter_lexical_hits(
     hits: Vec<ScoredResult>,
     filter: Option<&dyn SearchFilter>,
@@ -799,25 +988,76 @@ fn filter_lexical_hits(
         .collect()
 }
 
-fn fused_hits_to_scored_results(hits: Vec<FusedHit>, k: usize) -> Vec<ScoredResult> {
+fn fused_hits_to_scored_results(
+    hits: Vec<FusedHit>,
+    k: usize,
+    config: &TwoTierConfig,
+) -> Vec<ScoredResult> {
     // Take the `rrf_fuse` result by value and move each `doc_id` into the
     // `ScoredResult` instead of cloning it; the `FusedHit`s are a fresh
     // temporary here, so there is no need to keep them alive.
     hits.into_iter()
         .take(k)
-        .map(|hit| ScoredResult {
-            doc_id: hit.doc_id,
-            score: saturating_f64_to_f32(hit.rrf_score),
-            source: ScoreSource::Hybrid,
-            index: hit.semantic_index,
-            fast_score: hit.semantic_score,
-            quality_score: None,
-            lexical_score: hit.lexical_score,
-            rerank_score: None,
-            explanation: None,
-            metadata: None,
+        .map(|hit| {
+            let score = saturating_f64_to_f32(hit.rrf_score);
+            let explanation = config.explain.then(|| {
+                let mut components = Vec::with_capacity(2);
+                if let (Some(rank), Some(raw_score)) = (hit.lexical_rank, hit.lexical_score) {
+                    components.push(ScoreComponent {
+                        source: ExplainedSource::LexicalBm25 {
+                            matched_terms: Vec::new(),
+                            tf: 0.0,
+                            idf: 0.0,
+                        },
+                        raw_score: f64::from(raw_score),
+                        normalized_score: f64::from(raw_score),
+                        rrf_contribution: rrf_rank_contribution(config.rrf_k, rank),
+                        weight: 1.0,
+                    });
+                }
+                if let (Some(rank), Some(raw_score)) = (hit.semantic_rank, hit.semantic_score) {
+                    components.push(ScoreComponent {
+                        source: ExplainedSource::SemanticFast {
+                            embedder: "sync-fast-query".to_owned(),
+                            cosine_sim: f64::from(raw_score),
+                        },
+                        raw_score: f64::from(raw_score),
+                        normalized_score: f64::from(raw_score),
+                        rrf_contribution: rrf_rank_contribution(config.rrf_k, rank),
+                        weight: 1.0,
+                    });
+                }
+                Box::new(HitExplanation {
+                    final_score: f64::from(score),
+                    components,
+                    phase: ExplanationPhase::Initial,
+                    rank_movement: None,
+                })
+            });
+            ScoredResult {
+                doc_id: hit.doc_id,
+                score,
+                source: ScoreSource::Hybrid,
+                index: hit.semantic_index,
+                fast_score: hit.semantic_score,
+                quality_score: None,
+                lexical_score: hit.lexical_score,
+                rerank_score: None,
+                explanation,
+                metadata: None,
+            }
         })
         .collect()
+}
+
+fn rrf_rank_contribution(rrf_k: f64, rank: usize) -> f64 {
+    let rank = u32::try_from(rank).unwrap_or(u32::MAX);
+    let rrf_k = if rrf_k.is_finite() && rrf_k >= 0.0 {
+        rrf_k
+    } else {
+        60.0
+    };
+    1.0 / (rrf_k + f64::from(rank) + 1.0)
 }
 
 fn vector_hits_to_scored_results(
@@ -826,6 +1066,7 @@ fn vector_hits_to_scored_results(
     source: ScoreSource,
     fast_scores: Option<&AHashMap<&str, f32>>,
     quality_scores: Option<&AHashMap<&str, f32>>,
+    config: &TwoTierConfig,
 ) -> Vec<ScoredResult> {
     let mut seen = AHashSet::with_capacity(hits.len());
     hits.iter()
@@ -839,6 +1080,23 @@ fn vector_hits_to_scored_results(
             let quality_score = quality_scores
                 .and_then(|scores| scores.get(hit.doc_id.as_str()))
                 .copied();
+            let explanation = config.explain.then(|| {
+                Box::new(HitExplanation {
+                    final_score: f64::from(hit.score),
+                    components: vec![ScoreComponent {
+                        source: ExplainedSource::SemanticFast {
+                            embedder: "sync-fast-query".to_owned(),
+                            cosine_sim: f64::from(hit.score),
+                        },
+                        raw_score: f64::from(hit.score),
+                        normalized_score: f64::from(hit.score),
+                        rrf_contribution: 0.0,
+                        weight: 1.0,
+                    }],
+                    phase: ExplanationPhase::Initial,
+                    rank_movement: None,
+                })
+            });
             ScoredResult {
                 doc_id: hit.doc_id.clone(),
                 score: hit.score,
@@ -848,7 +1106,7 @@ fn vector_hits_to_scored_results(
                 quality_score,
                 lexical_score: None,
                 rerank_score: None,
-                explanation: None,
+                explanation,
                 metadata: None,
             }
         })
@@ -951,30 +1209,6 @@ fn unique_vector_hits_to_scored_results_aligned_owned(
             }
         })
         .collect()
-}
-
-fn compute_rank_changes_for_scored(
-    initial: &[ScoredResult],
-    refined: &[ScoredResult],
-) -> RankChanges {
-    // Build the doc_id → rank maps directly from the `ScoredResult` slices.
-    // `build_borrowed_rank_map` only ever reads `doc_id` (rank = enumerate index;
-    // it ignores `VectorHit::index`/`score`), so the previous code allocated two
-    // throwaway `Vec<VectorHit>` and cloned every `doc_id` into them per query for
-    // nothing. Borrowing `doc_id.as_str()` straight from the input drops those two
-    // Vec allocations + 2·N `String` clones on the sync hybrid path. First-occurrence
-    // wins (`entry().or_insert`), identical to `build_borrowed_rank_map`, so the
-    // resulting maps — and the `RankChanges` — are unchanged.
-    fn rank_map(hits: &[ScoredResult]) -> HashMap<&str, usize> {
-        let mut ranks = HashMap::with_capacity(hits.len());
-        for (rank, hit) in hits.iter().enumerate() {
-            ranks.entry(hit.doc_id.as_str()).or_insert(rank);
-        }
-        ranks
-    }
-    let initial_map = rank_map(initial);
-    let refined_map = rank_map(refined);
-    compute_rank_changes_with_maps(&initial_map, &refined_map)
 }
 
 #[cfg(test)]

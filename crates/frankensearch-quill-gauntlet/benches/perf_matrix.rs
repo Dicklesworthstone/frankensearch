@@ -1,7 +1,7 @@
 //! Same-binary Quill/Tantivy performance matrix for QG-1 through QG-10.
 //!
 //! The default invocation is deliberately a one-cell smoke slice. A release
-//! evidence run selects one gate (and optionally one fixture substring), then
+//! evidence run selects one gate (and optionally one exact canonical fixture), then
 //! lets Criterion self-cap that slice while this harness also emits the raw
 //! per-gate JSON and human table required by the E0.6 manifests.
 //!
@@ -14,7 +14,9 @@
 //!     --features perf-harness --profile release-perf --bench perf_matrix
 //! ```
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::hint::black_box;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -31,7 +33,7 @@ use frankensearch_lexical::{BenchmarkWriterJoinReceipt, SnippetConfig, TantivyIn
 use frankensearch_quill::scribe::{FrankensearchTokenizer, TokenAnalyzer};
 use frankensearch_quill::{
     Analyzer, CompactionPolicy, DEFAULT_SCHEMA, FieldDescriptor, FieldKind, QuillConfig,
-    QuillIndex, SchemaDescriptor, SegmentStatsProvider,
+    QuillIndex, SchemaDescriptor,
 };
 use frankensearch_quill_gauntlet::{
     BuildIdentity, ColdCacheEvidence, ComparatorConfig, ComparisonStatus, CorpusIdentity,
@@ -51,7 +53,7 @@ use frankensearch_quill_gauntlet::{
     compare_observations, estimate_paired_experiment, machine_fingerprint, oracle_version_contract,
     peak_rss_bytes, perf_manifest_contract_sha256, seeded_balanced_pair_order, validate_matrix,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const MANIFEST: &str = include_str!("../../../docs/contracts/quill-perf-gates.toml");
@@ -67,6 +69,44 @@ const SMOKE_SEGMENTS: usize = 4;
 // true rank mismatch from a native-order substitution inside a large BM25 tie.
 const QG6_TIE_EXPANSION_LIMIT: usize = 1_000_000;
 const QG6_TIMED_SEARCHES_PER_SAMPLE: usize = 128;
+const QG1_CORPUS_GENERATOR_REVISION: &str = "frankensearch-quill-qg1-synthetic-corpus-v1";
+const QG1_TERMINAL_QUERY: &str = "singleton";
+const QG1_TERMINAL_DOCUMENT_ID: &str = "synthetic-00000002";
+const QG1_TERMINAL_NO_CLAIM_CODE: &str = "qg1.terminal_fact_unproved";
+const QG1_TIMING_DIAGNOSTIC_NO_CLAIM_CODE: &str = "qg1.continuous_timing_unbound_diagnostic";
+// Frozen by a strict-remote full replay on 2026-07-31. The retired per-shard
+// all-count replay generated 4,222,000 documents and took 326,401 ms in the
+// unoptimized audit binary. Each full-scale producer now validates only the
+// selected count against these full-universe pins; H4 requires assembled
+// coverage of every Applicable/Required canonical cell before admitting a claim.
+const QG1_FULL_PREFIX_IDENTITY_PINS: [(u64, &str, &str); 4] = [
+    (
+        500,
+        "16b56b9704cfd2234a3fa8ca9fcfce1c935dd8ebd3f20c820e3212a684a7aeb1",
+        "59188638fb211394e8c1c3d98a28a2cf3790400de1f229a5c6e1b10b100ee5a8",
+    ),
+    (
+        5_000,
+        "4886e04bb07825b130f3ad24801738759cc9d6e63af5adb663cab94a45155e0f",
+        "72d977c424bc2f1ab1b08b4fc210dcff7dfd9139100ca59f741759be9856d4fb",
+    ),
+    (
+        50_000,
+        "a4cdb819886a56944316cf726237eb4d1216e243e2fdea94b5a08c5bddd266a0",
+        "21f76704040e4f2f2cd4d1a0f2c3e261bbb5ca5e86f9e23edca6ed718ec98cfd",
+    ),
+    (
+        1_000_000,
+        "0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70",
+        "b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76",
+    ),
+];
+
+/// Wire-stable producer diagnostic accepted by the H4 assembler only when the
+/// retained source artifact is an actual proper subset of the runnable gate.
+pub const QG1_PARTIAL_SHARD_NO_CLAIM_CODE: &str = "qg1.partial_shard";
+const QG1_PARTIAL_SHARD_NO_CLAIM_DETAIL: &str = "the invocation retained one immutable partial QG-1 shard; this source artifact cannot \
+     support a publication or ratchet claim until exact disjoint assembly proves full coverage";
 
 #[derive(Deserialize)]
 struct GateManifest {
@@ -75,16 +115,59 @@ struct GateManifest {
 
 #[derive(Deserialize)]
 struct GateManifestEntry {
+    name: String,
+    fixture: String,
+    target: String,
+    activated: bool,
+}
+
+#[derive(Deserialize)]
+struct Qg6Manifest {
+    gate: BTreeMap<String, Qg6ManifestEntry>,
+}
+
+#[derive(Deserialize)]
+struct Qg6ManifestEntry {
     queries_per_class: Option<usize>,
 }
 
 fn qg6_queries_per_class(manifest: &str) -> Result<usize, String> {
-    let manifest = toml::from_str::<GateManifest>(manifest).map_err(|error| error.to_string())?;
+    let manifest = toml::from_str::<Qg6Manifest>(manifest).map_err(|error| error.to_string())?;
     manifest
         .gate
         .get("QG-6")
         .and_then(|gate| gate.queries_per_class)
         .ok_or_else(|| "gate.QG-6.queries_per_class is missing".to_owned())
+}
+
+fn validate_manifest_gate_contract(manifest: &str) -> Result<(), String> {
+    let manifest = toml::from_str::<GateManifest>(manifest).map_err(|error| error.to_string())?;
+    for gate in PerfGate::ALL {
+        let label = gate.label();
+        let policy = manifest
+            .gate
+            .get(label)
+            .ok_or_else(|| format!("manifest is missing gate.{label}"))?;
+        for (field, value) in [
+            ("name", policy.name.as_str()),
+            ("fixture", policy.fixture.as_str()),
+            ("target", policy.target.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("manifest gate.{label}.{field} is empty"));
+            }
+        }
+        let _activated = policy.activated;
+    }
+    for label in manifest.gate.keys() {
+        if !PerfGate::ALL
+            .iter()
+            .any(|gate| gate.label() == label.as_str())
+        {
+            return Err(format!("manifest defines unexpected gate.{label}"));
+        }
+    }
+    Ok(())
 }
 
 fn validate_qg6_queries_per_class(manifest: &str) -> Result<(), String> {
@@ -102,15 +185,91 @@ fn validate_qg6_queries_per_class(manifest: &str) -> Result<(), String> {
 static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LIFECYCLE_RECEIPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LIFECYCLE_RECEIPTS: OnceLock<Mutex<Vec<serde_json::Value>>> = OnceLock::new();
+static QG1_CONTINUOUS_TIMING_COUNTER: AtomicU64 = AtomicU64::new(0);
+static QG1_CONTINUOUS_TIMING_RECEIPTS: OnceLock<Mutex<Vec<Qg1ContinuousTimingRecord>>> =
+    OnceLock::new();
 static CONCURRENCY_OBSERVATIONS: OnceLock<
     Mutex<BTreeMap<(String, String), ConcurrencyAccumulator>>,
 > = OnceLock::new();
+static COLD_CACHE_OBSERVATIONS: OnceLock<Mutex<BTreeMap<String, ColdCacheAccumulator>>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone, Copy)]
 struct ConcurrencyAccumulator {
     count: usize,
     min: usize,
     max: usize,
+}
+
+/// Aggregate the per-arm cache-eviction witnesses before admitting a QG-9 cell.
+#[derive(Debug, Clone, Copy, Default)]
+struct ColdCacheAccumulator {
+    quill_successes: usize,
+    quill_failures: usize,
+    tantivy_successes: usize,
+    tantivy_failures: usize,
+}
+
+fn record_cold_cache_eviction(
+    spec: &PerfCellSpec,
+    arm: EngineArm,
+    eviction: Result<usize, String>,
+) {
+    let cell_id = format!("{}/{}/{}", spec.gate, spec.fixture, spec.metric);
+    let mut observations = COLD_CACHE_OBSERVATIONS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("lock cold-cache observations");
+    let entry = observations.entry(cell_id).or_default();
+    let (successes, failures) = match arm {
+        EngineArm::Quill => (&mut entry.quill_successes, &mut entry.quill_failures),
+        EngineArm::Tantivy => (&mut entry.tantivy_successes, &mut entry.tantivy_failures),
+    };
+    match eviction {
+        Ok(file_count) => {
+            assert!(
+                file_count > 0,
+                "QG-9 cache eviction accepted an empty index"
+            );
+            *successes = successes.saturating_add(1);
+        }
+        Err(error) => {
+            eprintln!(
+                "[quill-qg9-cold-cache] arm={} eviction_unverified={error}",
+                arm.label()
+            );
+            *failures = failures.saturating_add(1);
+        }
+    }
+}
+
+fn cold_cache_evidence(accumulator: ColdCacheAccumulator) -> ColdCacheEvidence {
+    let verified = accumulator.quill_successes > 0
+        && accumulator.tantivy_successes > 0
+        && accumulator.quill_failures == 0
+        && accumulator.tantivy_failures == 0;
+    let procedure = if verified {
+        "fresh child process; successful posix_fadvise(POSIX_FADV_DONTNEED) on every regular index file before each open"
+    } else {
+        "fresh child process used, but at least one arm lacked a successful posix_fadvise(POSIX_FADV_DONTNEED) eviction witness"
+    };
+    ColdCacheEvidence {
+        procedure: procedure.to_owned(),
+        verified,
+    }
+}
+
+fn take_cold_cache_evidence(spec: &PerfCellSpec) -> Option<ColdCacheEvidence> {
+    (spec.gate == PerfGate::Qg9).then(|| {
+        let cell_id = format!("{}/{}/{}", spec.gate, spec.fixture, spec.metric);
+        let accumulator = COLD_CACHE_OBSERVATIONS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("lock cold-cache observations")
+            .remove(&cell_id)
+            .expect("missing QG-9 cold-cache eviction witness");
+        cold_cache_evidence(accumulator)
+    })
 }
 
 fn record_concurrency(spec: &PerfCellSpec, arm: EngineArm, observed_threads: usize) {
@@ -491,7 +650,8 @@ fn verify_runner_claim(name: &str, supplied: &str, expected: &str) -> Result<(),
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 enum EngineArm {
     Quill,
     Tantivy,
@@ -504,6 +664,410 @@ impl EngineArm {
             Self::Tantivy => "tantivy",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Qg1ProducerCoverage {
+    EngineIndexingLifecycle,
+    TokenizerOnlyDiagnosticNoEngineLifecycle,
+}
+
+impl Qg1ProducerCoverage {
+    const fn admits_engine_lifecycle_receipt(self) -> bool {
+        matches!(self, Self::EngineIndexingLifecycle)
+    }
+}
+
+fn qg1_producer_coverage(spec: &PerfCellSpec) -> Option<Qg1ProducerCoverage> {
+    if spec.gate != PerfGate::Qg1 {
+        return None;
+    }
+    match spec.metric.as_str() {
+        "docs_per_second" => Some(Qg1ProducerCoverage::EngineIndexingLifecycle),
+        "tokenize_docs_per_second" => {
+            Some(Qg1ProducerCoverage::TokenizerOnlyDiagnosticNoEngineLifecycle)
+        }
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum Qg1TerminalFact {
+    Proven { proof: &'static str },
+    NoClaim { code: &'static str, detail: String },
+}
+
+impl Qg1TerminalFact {
+    const fn proven(proof: &'static str) -> Self {
+        Self::Proven { proof }
+    }
+
+    fn no_claim(detail: impl Into<String>) -> Self {
+        Self::NoClaim {
+            code: QG1_TERMINAL_NO_CLAIM_CODE,
+            detail: detail.into(),
+        }
+    }
+
+    fn no_claim_detail(&self) -> Option<&str> {
+        match self {
+            Self::Proven { .. } => None,
+            Self::NoClaim { detail, .. } => Some(detail),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Qg1BatchTiming {
+    document_start: u64,
+    document_count: u64,
+    generation_started_ns: u64,
+    generation_completed_ns: Option<u64>,
+    feed_completed_ns: Option<u64>,
+    visibility_commit_completed_ns: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Qg1ContinuousTimingReceipt {
+    producer_coverage: Qg1ProducerCoverage,
+    arm: EngineArm,
+    document_count: u64,
+    interval_started_ns: u64,
+    corpus_constructed_ns: u64,
+    batches: Vec<Qg1BatchTiming>,
+    quill_publication_generation_delta: Option<u64>,
+    terminal_commit_completed_ns: u64,
+    post_commit_join_completed_ns: Option<u64>,
+    terminal_search_attempt_completed_ns: u64,
+    terminal_idle_join_completed_ns: Option<u64>,
+    terminal_quiescence_completed_ns: u64,
+    interval_ended_ns: u64,
+    terminal_searchability: Qg1TerminalFact,
+    terminal_quiescence: Qg1TerminalFact,
+}
+
+impl Qg1ContinuousTimingReceipt {
+    fn validate(&self) -> Result<(), String> {
+        if !self.producer_coverage.admits_engine_lifecycle_receipt() {
+            return Err(
+                "QG-1 tokenizer-only diagnostics cannot attest engine terminal/quiescence facts"
+                    .to_owned(),
+            );
+        }
+        if self.interval_started_ns != 0 {
+            return Err("QG-1 continuous interval must begin at offset zero".to_owned());
+        }
+        if self.document_count <= 2 {
+            return Err("QG-1 terminal sentinel requires at least three documents".to_owned());
+        }
+        if self.batches.is_empty() {
+            return Err("QG-1 continuous interval contains no generated/feed batches".to_owned());
+        }
+
+        let mut cursor = self.corpus_constructed_ns;
+        let mut next_document = 0_u64;
+        for batch in &self.batches {
+            if batch.document_start != next_document || batch.document_count == 0 {
+                return Err("QG-1 batch coverage is not contiguous and positive".to_owned());
+            }
+            let generated = batch.generation_completed_ns.ok_or_else(|| {
+                "QG-1 batch is missing its generation-complete boundary".to_owned()
+            })?;
+            let fed = batch
+                .feed_completed_ns
+                .ok_or_else(|| "QG-1 batch is missing its feed-complete boundary".to_owned())?;
+            if batch.generation_started_ns < cursor
+                || generated < batch.generation_started_ns
+                || fed < generated
+            {
+                return Err(
+                    "QG-1 generation/feed phases escape monotonic interval order".to_owned(),
+                );
+            }
+            cursor = fed;
+            if let Some(committed) = batch.visibility_commit_completed_ns {
+                if committed < cursor {
+                    return Err("QG-1 visibility commit completed before its batch feed".to_owned());
+                }
+                cursor = committed;
+            }
+            next_document = next_document
+                .checked_add(batch.document_count)
+                .ok_or_else(|| "QG-1 batch document coverage overflowed".to_owned())?;
+        }
+        if next_document != self.document_count {
+            return Err(format!(
+                "QG-1 batches cover {next_document} documents instead of {}",
+                self.document_count
+            ));
+        }
+        if self.terminal_commit_completed_ns < cursor {
+            return Err("QG-1 terminal commit escaped the batch interval".to_owned());
+        }
+        cursor = self.terminal_commit_completed_ns;
+        if let Some(joined) = self.post_commit_join_completed_ns {
+            if joined < cursor {
+                return Err("QG-1 post-commit join preceded terminal commit".to_owned());
+            }
+            cursor = joined;
+        }
+        if self.terminal_search_attempt_completed_ns < cursor {
+            return Err("QG-1 terminal search preceded commit/merge quiescence".to_owned());
+        }
+        cursor = self.terminal_search_attempt_completed_ns;
+        if let Some(joined) = self.terminal_idle_join_completed_ns {
+            if joined < cursor {
+                return Err("QG-1 terminal idle-writer join preceded searchability".to_owned());
+            }
+            cursor = joined;
+        }
+        if self.terminal_quiescence_completed_ns < cursor
+            || self.interval_ended_ns < self.terminal_quiescence_completed_ns
+        {
+            return Err("QG-1 terminal quiescence escaped the continuous interval".to_owned());
+        }
+        match self.arm {
+            EngineArm::Quill => {
+                if self.post_commit_join_completed_ns.is_some()
+                    || self.terminal_idle_join_completed_ns.is_some()
+                    || self.quill_publication_generation_delta.is_none()
+                {
+                    return Err(
+                        "QG-1 Quill receipt names an impossible external worker-join lifecycle"
+                            .to_owned(),
+                    );
+                }
+            }
+            EngineArm::Tantivy => {
+                if self.post_commit_join_completed_ns.is_none()
+                    || self.terminal_idle_join_completed_ns.is_none()
+                    || self.quill_publication_generation_delta.is_some()
+                {
+                    return Err(
+                        "QG-1 Tantivy receipt lacks its post-commit and terminal joins".to_owned(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn no_claim_details(&self) -> impl Iterator<Item = &str> {
+        [
+            self.terminal_searchability.no_claim_detail(),
+            self.terminal_quiescence.no_claim_detail(),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
+struct Qg1ContinuousInterval {
+    origin: Instant,
+    arm: EngineArm,
+    document_count: u64,
+    corpus_constructed_ns: Option<u64>,
+    batches: Vec<Qg1BatchTiming>,
+    terminal_commit_completed_ns: Option<u64>,
+    post_commit_join_completed_ns: Option<u64>,
+    terminal_search_attempt_completed_ns: Option<u64>,
+    terminal_idle_join_completed_ns: Option<u64>,
+    terminal_quiescence_completed_ns: Option<u64>,
+}
+
+impl Qg1ContinuousInterval {
+    fn start(arm: EngineArm, document_count: u64) -> Self {
+        assert!(
+            document_count > 2,
+            "QG-1 continuous sample requires its immutable terminal sentinel"
+        );
+        Self {
+            origin: Instant::now(),
+            arm,
+            document_count,
+            corpus_constructed_ns: None,
+            batches: Vec::new(),
+            terminal_commit_completed_ns: None,
+            post_commit_join_completed_ns: None,
+            terminal_search_attempt_completed_ns: None,
+            terminal_idle_join_completed_ns: None,
+            terminal_quiescence_completed_ns: None,
+        }
+    }
+
+    fn elapsed_ns(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    fn mark_corpus_constructed(&mut self) {
+        assert!(
+            self.corpus_constructed_ns
+                .replace(self.elapsed_ns())
+                .is_none(),
+            "QG-1 corpus construction boundary repeated"
+        );
+    }
+
+    fn begin_batch(&mut self, document_start: u64, document_count: u64) -> u64 {
+        let generation_started_ns = self.elapsed_ns();
+        self.batches.push(Qg1BatchTiming {
+            document_start,
+            document_count,
+            generation_started_ns,
+            generation_completed_ns: None,
+            feed_completed_ns: None,
+            visibility_commit_completed_ns: None,
+        });
+        generation_started_ns
+    }
+
+    fn mark_batch_generated(&mut self) -> u64 {
+        let completed = self.elapsed_ns();
+        let batch = self
+            .batches
+            .last_mut()
+            .expect("QG-1 generation completion requires an active batch");
+        assert!(
+            batch.generation_completed_ns.replace(completed).is_none(),
+            "QG-1 batch generation boundary repeated"
+        );
+        completed
+    }
+
+    fn mark_batch_fed(&mut self) {
+        let completed = self.elapsed_ns();
+        let batch = self
+            .batches
+            .last_mut()
+            .expect("QG-1 feed completion requires an active batch");
+        assert!(
+            batch.feed_completed_ns.replace(completed).is_none(),
+            "QG-1 batch feed boundary repeated"
+        );
+    }
+
+    fn mark_visibility_commit(&mut self) {
+        let completed = self.elapsed_ns();
+        let batch = self
+            .batches
+            .last_mut()
+            .expect("QG-1 visibility commit requires an active batch");
+        assert!(
+            batch
+                .visibility_commit_completed_ns
+                .replace(completed)
+                .is_none(),
+            "QG-1 batch visibility-commit boundary repeated"
+        );
+    }
+
+    fn mark_terminal_commit(&mut self) {
+        let completed = self.elapsed_ns();
+        assert!(
+            self.terminal_commit_completed_ns
+                .replace(completed)
+                .is_none(),
+            "QG-1 terminal commit boundary repeated"
+        );
+    }
+
+    fn mark_post_commit_join(&mut self) {
+        let completed = self.elapsed_ns();
+        assert!(
+            self.post_commit_join_completed_ns
+                .replace(completed)
+                .is_none(),
+            "QG-1 post-commit join boundary repeated"
+        );
+    }
+
+    fn mark_terminal_search_attempt(&mut self) {
+        let completed = self.elapsed_ns();
+        assert!(
+            self.terminal_search_attempt_completed_ns
+                .replace(completed)
+                .is_none(),
+            "QG-1 terminal search boundary repeated"
+        );
+    }
+
+    fn mark_terminal_idle_join(&mut self) {
+        let completed = self.elapsed_ns();
+        assert!(
+            self.terminal_idle_join_completed_ns
+                .replace(completed)
+                .is_none(),
+            "QG-1 terminal idle-writer join boundary repeated"
+        );
+    }
+
+    fn mark_terminal_quiescence(&mut self) {
+        let completed = self.elapsed_ns();
+        assert!(
+            self.terminal_quiescence_completed_ns
+                .replace(completed)
+                .is_none(),
+            "QG-1 terminal quiescence boundary repeated"
+        );
+    }
+
+    fn finish(
+        self,
+        quill_publication_generation_delta: Option<u64>,
+        terminal_searchability: Qg1TerminalFact,
+        terminal_quiescence: Qg1TerminalFact,
+    ) -> (Duration, Qg1ContinuousTimingReceipt) {
+        let elapsed = self.origin.elapsed();
+        let interval_ended_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        let receipt = Qg1ContinuousTimingReceipt {
+            producer_coverage: Qg1ProducerCoverage::EngineIndexingLifecycle,
+            arm: self.arm,
+            document_count: self.document_count,
+            interval_started_ns: 0,
+            corpus_constructed_ns: self
+                .corpus_constructed_ns
+                .expect("QG-1 continuous interval includes corpus construction"),
+            batches: self.batches,
+            quill_publication_generation_delta,
+            terminal_commit_completed_ns: self
+                .terminal_commit_completed_ns
+                .expect("QG-1 continuous interval includes terminal commit"),
+            post_commit_join_completed_ns: self.post_commit_join_completed_ns,
+            terminal_search_attempt_completed_ns: self
+                .terminal_search_attempt_completed_ns
+                .expect("QG-1 continuous interval includes terminal search"),
+            terminal_idle_join_completed_ns: self.terminal_idle_join_completed_ns,
+            terminal_quiescence_completed_ns: self
+                .terminal_quiescence_completed_ns
+                .expect("QG-1 continuous interval includes terminal quiescence"),
+            interval_ended_ns,
+            terminal_searchability,
+            terminal_quiescence,
+        };
+        receipt
+            .validate()
+            .expect("invalid QG-1 continuous timing receipt");
+        (elapsed, receipt)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Qg1ContinuousTimingRecord {
+    schema_version: &'static str,
+    admission_status: &'static str,
+    admission_no_claim_code: &'static str,
+    admission_no_claim_detail: &'static str,
+    run_id: String,
+    sequence: u64,
+    gate: String,
+    fixture: String,
+    metric: String,
+    writer_threads: usize,
+    writer_heap_bytes: usize,
+    #[serde(flatten)]
+    timing: Qg1ContinuousTimingReceipt,
 }
 
 enum PreparedQueryArm {
@@ -535,6 +1099,7 @@ struct PreparedQg1Prefix {
     manifest: CorpusManifest,
     manifest_sha256: String,
     indexed_content_sha256: String,
+    content_bytes: u64,
 }
 
 struct PreparedQg1Corpus {
@@ -551,16 +1116,20 @@ fn hash_qg1_indexed_bytes(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
-fn qg1_indexed_content_sha256(documents: &[IndexableDocument]) -> String {
+fn qg1_indexed_content_sha256<I, D>(
+    expected_document_count: u64,
+    documents: I,
+) -> Result<String, String>
+where
+    I: IntoIterator<Item = D>,
+    D: Borrow<IndexableDocument>,
+{
     let mut hasher = Sha256::new();
     hasher.update(b"frankensearch-quill-qg1-indexable-documents-v1\0");
-    hasher.update(
-        u64::try_from(documents.len())
-            .expect("QG-1 indexed document count fits u64")
-            .to_le_bytes(),
-    );
-    let mut metadata = Vec::new();
+    hasher.update(expected_document_count.to_le_bytes());
+    let mut observed_document_count = 0_u64;
     for document in documents {
+        let document = document.borrow();
         hash_qg1_indexed_bytes(&mut hasher, document.id.as_bytes());
         match &document.title {
             Some(title) => {
@@ -571,24 +1140,35 @@ fn qg1_indexed_content_sha256(documents: &[IndexableDocument]) -> String {
         }
         hash_qg1_indexed_bytes(&mut hasher, document.content.as_bytes());
 
-        metadata.extend(document.metadata.iter());
-        metadata.sort_unstable_by(|(left_key, left_value), (right_key, right_value)| {
-            left_key
-                .cmp(right_key)
-                .then_with(|| left_value.cmp(right_value))
-        });
         hasher.update(
-            u64::try_from(metadata.len())
+            u64::try_from(document.metadata.len())
                 .expect("QG-1 indexed metadata count fits u64")
                 .to_le_bytes(),
         );
-        for (key, value) in &metadata {
+        let mut previous_metadata = None;
+        for _ in 0..document.metadata.len() {
+            let (key, value) = document
+                .metadata
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .filter(|entry| previous_metadata.is_none_or(|previous| *entry > previous))
+                .min()
+                .expect("QG-1 indexed metadata cardinality is stable while hashing");
             hash_qg1_indexed_bytes(&mut hasher, key.as_bytes());
             hash_qg1_indexed_bytes(&mut hasher, value.as_bytes());
+            previous_metadata = Some((key, value));
         }
-        metadata.clear();
+        observed_document_count = observed_document_count
+            .checked_add(1)
+            .ok_or_else(|| "QG-1 indexed document count overflowed".to_owned())?;
     }
-    lower_hex(&hasher.finalize())
+    if observed_document_count != expected_document_count {
+        return Err(format!(
+            "QG-1 indexed content observed {observed_document_count} documents but expected \
+             {expected_document_count}"
+        ));
+    }
+    Ok(lower_hex(&hasher.finalize()))
 }
 
 impl PreparedQg1Corpus {
@@ -665,12 +1245,25 @@ impl PreparedQg1Corpus {
                 let indexed_documents = documents
                     .get(..prefix_len)
                     .expect("prepared QG-1 corpus prefix is within the largest corpus");
+                let content_bytes = indexed_documents.iter().fold(0_u64, |total, document| {
+                    total
+                        .checked_add(
+                            u64::try_from(document.content.len())
+                                .expect("QG-1 document content length fits u64"),
+                        )
+                        .expect("QG-1 corpus content-byte count fits u64")
+                });
                 (
                     count,
                     PreparedQg1Prefix {
                         manifest,
                         manifest_sha256,
-                        indexed_content_sha256: qg1_indexed_content_sha256(indexed_documents),
+                        indexed_content_sha256: qg1_indexed_content_sha256(
+                            count,
+                            indexed_documents.iter(),
+                        )
+                        .expect("hash prepared QG-1 indexed content"),
+                        content_bytes,
                     },
                 )
             })
@@ -724,7 +1317,8 @@ impl PreparedQg1Corpus {
         if observed_manifest_sha256 != prefix.manifest_sha256 {
             return Err("QG-1 prepared manifest identity changed after replay verification".into());
         }
-        let observed_indexed_content_sha256 = qg1_indexed_content_sha256(indexed_documents);
+        let observed_indexed_content_sha256 =
+            qg1_indexed_content_sha256(document_count, indexed_documents.iter())?;
         if observed_indexed_content_sha256 != prefix.indexed_content_sha256 {
             return Err("QG-1 prepared indexed content changed after verification".into());
         }
@@ -915,6 +1509,90 @@ fn flush_tantivy_lifecycle_receipts(output_dir: &Path) {
         lower_hex(&Sha256::digest(&payload)),
         display_path(&path),
     );
+}
+
+fn emit_qg1_continuous_timing_receipt(spec: &PerfCellSpec, timing: Qg1ContinuousTimingReceipt) {
+    let sequence = QG1_CONTINUOUS_TIMING_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let run_id =
+        std::env::var("QUILL_PERF_RUN_ID").unwrap_or_else(|_| "unidentified-run".to_owned());
+    let record = Qg1ContinuousTimingRecord {
+        schema_version: "quill-qg1-continuous-timing-v1",
+        admission_status: "no_claim",
+        admission_no_claim_code: QG1_TIMING_DIAGNOSTIC_NO_CLAIM_CODE,
+        admission_no_claim_detail: "diagnostic phase trace is not bound into PerfRawSample or the \
+                                    H2 assembler and cannot independently support a QG-1 claim",
+        run_id,
+        sequence,
+        gate: spec.gate.to_string(),
+        fixture: spec.fixture.clone(),
+        metric: spec.metric.clone(),
+        writer_threads: spec.threads.unwrap_or(1),
+        writer_heap_bytes: spec.writer_heap_bytes.unwrap_or(50_000_000),
+        timing,
+    };
+    QG1_CONTINUOUS_TIMING_RECEIPTS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("lock QG-1 continuous timing receipts")
+        .push(record);
+}
+
+fn flush_qg1_continuous_timing_receipts(output_dir: &Path) {
+    let Some(receipts) = QG1_CONTINUOUS_TIMING_RECEIPTS.get() else {
+        return;
+    };
+    let (payload, receipt_count) = {
+        let receipts = receipts
+            .lock()
+            .expect("lock QG-1 continuous timing receipts for flush");
+        if receipts.is_empty() {
+            return;
+        }
+        let mut payload = Vec::new();
+        for row in receipts.iter() {
+            serde_json::to_writer(&mut payload, row)
+                .expect("serialize QG-1 continuous timing receipt");
+            payload.push(b'\n');
+        }
+        (payload, receipts.len())
+    };
+    std::fs::create_dir_all(output_dir).expect("create QG-1 timing receipt directory");
+    let path = output_dir.join("qg1-continuous-timing-diagnostic.jsonl");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .expect("open QG-1 continuous timing receipt");
+    file.write_all(&payload)
+        .expect("write QG-1 continuous timing receipts");
+    eprintln!(
+        "[qg1-continuous-timing] admission_status=no_claim admission_code={} receipts={} \
+         sha256={} path={}",
+        QG1_TIMING_DIAGNOSTIC_NO_CLAIM_CODE,
+        receipt_count,
+        lower_hex(&Sha256::digest(&payload)),
+        display_path(&path),
+    );
+}
+
+fn qg1_terminal_no_claim_detail() -> Option<String> {
+    let receipts = QG1_CONTINUOUS_TIMING_RECEIPTS.get()?;
+    let details = {
+        let receipts = receipts
+            .lock()
+            .expect("lock QG-1 continuous timing receipts for terminal facts");
+        receipts
+            .iter()
+            .flat_map(|record| record.timing.no_claim_details())
+            .map(ToOwned::to_owned)
+            .collect::<BTreeSet<_>>()
+    };
+    (!details.is_empty()).then(|| {
+        format!(
+            "one or more QG-1 samples retained an unproved terminal fact: {}",
+            details.into_iter().collect::<Vec<_>>().join("; ")
+        )
+    })
 }
 
 fn fence_tantivy_lifecycle(
@@ -1161,9 +1839,236 @@ fn commit<E: LexicalWrite>(context: &BenchContext, index: &E) -> Duration {
     timer.elapsed()
 }
 
+fn feed_qg1_generated_batches<E: LexicalWrite>(
+    context: &BenchContext,
+    index: &E,
+    document_count: u64,
+    manual_visibility_commit_cadence: Option<Duration>,
+    interval: &mut Qg1ContinuousInterval,
+) -> usize {
+    let corpus = corpus_for(document_count);
+    interval.mark_corpus_constructed();
+    let cadence_ns = manual_visibility_commit_cadence
+        .map(|cadence| u64::try_from(cadence.as_nanos()).unwrap_or(u64::MAX));
+    let mut unpublished_since_ns = None;
+    let mut periodic_commits = 0_usize;
+    let mut start = 0_u64;
+    while start < document_count {
+        let remaining = document_count - start;
+        let count = usize::try_from(remaining.min(context.scale.batch_documents() as u64))
+            .expect("bounded QG-1 batch count");
+        let count_u64 = u64::try_from(count).expect("QG-1 batch count fits u64");
+        interval.begin_batch(start, count_u64);
+        let documents = generated_batch(&corpus, start, count, None);
+        let generated_ns = interval.mark_batch_generated();
+        if cadence_ns.is_some() {
+            unpublished_since_ns.get_or_insert(generated_ns);
+        }
+        context.runtime.block_on(async {
+            index
+                .index_documents(&context.cx, &documents)
+                .await
+                .expect("QG-1 continuous index batch");
+        });
+        interval.mark_batch_fed();
+        if cadence_ns.is_some_and(|cadence| {
+            interval
+                .elapsed_ns()
+                .saturating_sub(unpublished_since_ns.expect("QG-1 unpublished boundary"))
+                >= cadence
+        }) {
+            context.runtime.block_on(async {
+                index
+                    .commit(&context.cx)
+                    .await
+                    .expect("QG-1 continuous visibility commit");
+            });
+            interval.mark_visibility_commit();
+            periodic_commits = periodic_commits.saturating_add(1);
+            unpublished_since_ns = None;
+        }
+        start = start.saturating_add(count_u64);
+    }
+    periodic_commits
+}
+
+fn qg1_terminal_commit<E: LexicalWrite>(
+    context: &BenchContext,
+    index: &E,
+    interval: &mut Qg1ContinuousInterval,
+) {
+    context.runtime.block_on(async {
+        index
+            .commit(&context.cx)
+            .await
+            .expect("QG-1 continuous terminal commit");
+    });
+    interval.mark_terminal_commit();
+}
+
+fn qg1_terminal_searchability<E: LexicalRead>(
+    context: &BenchContext,
+    index: &E,
+) -> Qg1TerminalFact {
+    match context
+        .runtime
+        .block_on(index.search(&context.cx, QG1_TERMINAL_QUERY, 3))
+    {
+        Ok(results) => {
+            let document_ids = results
+                .into_iter()
+                .map(|result| String::from(result.doc_id))
+                .collect::<Vec<_>>();
+            let fact = if document_ids == [QG1_TERMINAL_DOCUMENT_ID] {
+                Qg1TerminalFact::proven("exact_immutable_sentinel_visible")
+            } else {
+                Qg1TerminalFact::no_claim(format!(
+                    "terminal query {QG1_TERMINAL_QUERY:?} returned {document_ids:?} instead of \
+                     [{QG1_TERMINAL_DOCUMENT_ID:?}]"
+                ))
+            };
+            black_box(document_ids);
+            fact
+        }
+        Err(error) => Qg1TerminalFact::no_claim(format!(
+            "terminal query {QG1_TERMINAL_QUERY:?} failed: {error}"
+        )),
+    }
+}
+
+fn qg1_tantivy_quiescence_fact(
+    post_commit: &BenchmarkWriterJoinReceipt,
+    terminal_idle: &BenchmarkWriterJoinReceipt,
+) -> Qg1TerminalFact {
+    let post_join_segments = post_commit.searchable_segments_after;
+    let terminal_join_segments_before = terminal_idle.searchable_segments_before;
+    let terminal_join_segments_after = terminal_idle.searchable_segments_after;
+    if post_commit.writer_rearmed
+        && !terminal_idle.writer_rearmed
+        && post_join_segments > 0
+        && terminal_join_segments_before == post_join_segments
+        && terminal_join_segments_after == terminal_join_segments_before
+    {
+        Qg1TerminalFact::proven("post_commit_join_search_then_unchanged_terminal_idle_join")
+    } else {
+        Qg1TerminalFact::no_claim(format!(
+            "Tantivy terminal lifecycle did not prove stable post-join searchable segments: \
+             post_commit=({},{},rearmed={}) terminal_idle=({},{},rearmed={})",
+            post_commit.searchable_segments_before,
+            post_commit.searchable_segments_after,
+            post_commit.writer_rearmed,
+            terminal_idle.searchable_segments_before,
+            terminal_idle.searchable_segments_after,
+            terminal_idle.writer_rearmed,
+        ))
+    }
+}
+
+fn qg1_bulk_metric_continuous(
+    context: &BenchContext,
+    spec: &PerfCellSpec,
+    arm: EngineArm,
+    count: u64,
+) -> f64 {
+    assert_eq!(
+        qg1_producer_coverage(spec),
+        Some(Qg1ProducerCoverage::EngineIndexingLifecycle),
+        "continuous QG-1 engine lifecycle is reserved for docs_per_second indexing arms"
+    );
+    let elapsed = match arm {
+        EngineArm::Quill => {
+            let index = quill_in_memory(spec);
+            let generation_before = index.snapshot().loaded_manifest().manifest.generation;
+            let mut interval = Qg1ContinuousInterval::start(arm, count);
+            let periodic_commit_calls =
+                feed_qg1_generated_batches(context, &index, count, None, &mut interval);
+            let generation_before_terminal = index.snapshot().loaded_manifest().manifest.generation;
+            qg1_terminal_commit(context, &index, &mut interval);
+            let terminal_searchability = qg1_terminal_searchability(context, &index);
+            interval.mark_terminal_search_attempt();
+            interval.mark_terminal_quiescence();
+            let generation_delta = generation_before_terminal.saturating_sub(generation_before);
+            let (elapsed, receipt) = interval.finish(
+                Some(generation_delta),
+                terminal_searchability,
+                Qg1TerminalFact::proven("awaited_quill_inline_publication_and_tier_merges"),
+            );
+            emit_qg1_continuous_timing_receipt(spec, receipt);
+            eprintln!(
+                "[qg-commit-parity] gate={} fixture={} arm=quill cadence_ms={} \
+                 explicit_periodic_commit_calls={} automatic_publication_generation_delta={} \
+                 terminal_commit_calls=1 \
+                 post_commit_join_calls=0 terminal_search_calls=1 terminal_idle_join_calls=0 \
+                 durability=in_memory continuous_elapsed_ns={}",
+                spec.gate,
+                spec.fixture,
+                quill_config(spec).max_visibility_lag_ms,
+                periodic_commit_calls,
+                generation_delta,
+                elapsed.as_nanos(),
+            );
+            elapsed
+        }
+        EngineArm::Tantivy => {
+            let index = tantivy_in_memory(spec);
+            let observed_threads = index
+                .benchmark_materialized_writer_threads()
+                .expect("QG-1 Tantivy arm uses the benchmark writer constructor");
+            record_concurrency(spec, arm, observed_threads);
+            let mut interval = Qg1ContinuousInterval::start(arm, count);
+            let periodic_commits = feed_qg1_generated_batches(
+                context,
+                &index,
+                count,
+                Some(Duration::from_millis(
+                    quill_config(spec).max_visibility_lag_ms,
+                )),
+                &mut interval,
+            );
+            qg1_terminal_commit(context, &index, &mut interval);
+            let (index, post_commit_receipt) = index
+                .benchmark_join_workers_and_rearm(
+                    spec.writer_heap_bytes.unwrap_or(50_000_000),
+                    spec.threads.unwrap_or(1),
+                )
+                .expect("join QG-1 Tantivy workers after terminal commit and rearm for search");
+            interval.mark_post_commit_join();
+            let terminal_searchability = qg1_terminal_searchability(context, &index);
+            interval.mark_terminal_search_attempt();
+            let terminal_idle_receipt = index
+                .benchmark_join_workers()
+                .expect("join QG-1 Tantivy idle terminal writer without rearming");
+            interval.mark_terminal_idle_join();
+            let terminal_quiescence =
+                qg1_tantivy_quiescence_fact(&post_commit_receipt, &terminal_idle_receipt);
+            interval.mark_terminal_quiescence();
+            let (elapsed, receipt) =
+                interval.finish(None, terminal_searchability, terminal_quiescence);
+            emit_tantivy_lifecycle_receipt(spec, "qg1_post_commit_join", &post_commit_receipt);
+            emit_tantivy_lifecycle_receipt(spec, "qg1_terminal_idle_join", &terminal_idle_receipt);
+            emit_qg1_continuous_timing_receipt(spec, receipt);
+            eprintln!(
+                "[qg-commit-parity] gate={} fixture={} arm=tantivy cadence_ms={} \
+                 explicit_periodic_commit_calls={periodic_commits} terminal_commit_calls=1 \
+                 post_commit_join_calls=1 terminal_search_calls=1 terminal_idle_join_calls=1 \
+                 durability=in_memory continuous_elapsed_ns={}",
+                spec.gate,
+                spec.fixture,
+                quill_config(spec).max_visibility_lag_ms,
+                elapsed.as_nanos(),
+            );
+            elapsed
+        }
+    };
+    count as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE)
+}
+
 fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
     let requested = spec.document_count.expect("bulk document count");
     let count = context.scale.document_count(requested);
+    if spec.gate == PerfGate::Qg1 {
+        return qg1_bulk_metric_continuous(context, spec, arm, count);
+    }
     let prepared_qg1_documents = (spec.gate == PerfGate::Qg1).then(|| context.qg1_prefix(count).1);
     let generated_corpus = (spec.gate != PerfGate::Qg1).then(|| corpus_for(count));
     let elapsed = match arm {
@@ -1271,9 +2176,9 @@ fn tokenize_metric(context: &BenchContext, spec: &PerfCellSpec) -> f64 {
         .scale
         .document_count(spec.document_count.expect("tokenize document count"));
     assert_eq!(
-        spec.gate,
-        PerfGate::Qg1,
-        "prepared tokenizer corpus is reserved for QG-1"
+        qg1_producer_coverage(spec),
+        Some(Qg1ProducerCoverage::TokenizerOnlyDiagnosticNoEngineLifecycle),
+        "prepared tokenizer timing is a QG-1 diagnostic without engine lifecycle proof"
     );
     let (_, documents) = context.qg1_prefix(count);
     let mut tokenizer = FrankensearchTokenizer::default();
@@ -1511,6 +2416,108 @@ fn fresh_process_search(
     );
     black_box(output.stdout);
     timer.elapsed()
+}
+
+fn collect_regular_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = fs::read_dir(path)
+        .map_err(|error| format!("read QG-9 index directory {}: {error}", path.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "read QG-9 index directory entry under {}: {error}",
+                path.display()
+            )
+        })?;
+        let file_type = entry.file_type().map_err(|error| {
+            format!(
+                "inspect QG-9 index entry {}: {error}",
+                entry.path().display()
+            )
+        })?;
+        if file_type.is_dir() {
+            collect_regular_files(&entry.path(), files)?;
+        } else if file_type.is_file() {
+            files.push(entry.path());
+        }
+    }
+    Ok(())
+}
+
+/// Request a per-index-file cold page cache without evicting unrelated workloads.
+///
+/// QG-9 never treats this advisory as proved unless both engine arms succeed on
+/// every sampled fixture. The timed open itself is then performed by a fresh
+/// executable, so no reader state from the producer process survives.
+fn evict_index_file_cache(path: &Path) -> Result<usize, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut files = Vec::new();
+        collect_regular_files(path, &mut files)?;
+        files.sort();
+        if files.is_empty() {
+            return Err(format!(
+                "QG-9 index {} has no regular files",
+                path.display()
+            ));
+        }
+        for file_path in &files {
+            let file = fs::File::open(file_path).map_err(|error| {
+                format!(
+                    "open QG-9 index file {} for cache eviction: {error}",
+                    file_path.display()
+                )
+            })?;
+            rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed).map_err(|error| {
+                format!(
+                    "posix_fadvise(POSIX_FADV_DONTNEED) for QG-9 index file {}: {error}",
+                    file_path.display()
+                )
+            })?;
+        }
+        Ok(files.len())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Err("QG-9 has no registered per-file cold-cache eviction method for this OS".to_owned())
+    }
+}
+
+fn fresh_process_open(path: &Path, spec: &PerfCellSpec, arm: EngineArm) -> Duration {
+    let output = Command::new(std::env::current_exe().expect("QG benchmark executable"))
+        .env("QUILL_PERF_CHILD_MODE", "open")
+        .env("QUILL_PERF_CHILD_ENGINE", arm.label())
+        .env("QUILL_PERF_CHILD_PATH", path)
+        .env(
+            "QUILL_PERF_CHILD_HEAP",
+            spec.writer_heap_bytes.unwrap_or(50_000_000).to_string(),
+        )
+        .env(
+            "QUILL_PERF_CHILD_THREADS",
+            spec.threads.unwrap_or(1).to_string(),
+        )
+        .env(
+            "QUILL_PERF_CHILD_POSITIONS",
+            spec.positions
+                .unwrap_or(PositionMode::On)
+                .enabled()
+                .to_string(),
+        )
+        .output()
+        .expect("spawn fresh-process QG-9 reader");
+    assert!(
+        output.status.success(),
+        "fresh-process QG-9 reader failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("QG-9 child output UTF-8");
+    let nanos = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("quill-perf-child\\t"))
+        .expect("QG-9 child open measurement")
+        .parse::<u64>()
+        .expect("QG-9 child open measurement nanoseconds");
+    Duration::from_nanos(nanos)
 }
 
 fn commit_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
@@ -1881,14 +2888,9 @@ fn cold_open_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm)
             let _ = index_batches(context, &index, &corpus, count, None);
             let _ = commit(context, &index);
             drop(index);
-            let timer = Instant::now();
-            black_box(
-                context
-                    .runtime
-                    .block_on(QuillIndex::open(&context.cx, &path, quill_config(spec)))
-                    .expect("cold-open Quill"),
-            );
-            timer.elapsed()
+            let eviction = evict_index_file_cache(&path);
+            record_cold_cache_eviction(spec, arm, eviction);
+            fresh_process_open(&path, spec, arm)
         }
         EngineArm::Tantivy => {
             let path = scratch_path("qg9-tantivy");
@@ -1896,17 +2898,9 @@ fn cold_open_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm)
             let _ = index_batches(context, &index, &corpus, count, None);
             let _ = commit(context, &index);
             drop(index);
-            let timer = Instant::now();
-            black_box(
-                TantivyIndex::open_with_benchmark_config(
-                    &path,
-                    spec.writer_heap_bytes.unwrap_or(50_000_000),
-                    spec.threads.unwrap_or(1),
-                    spec.positions.unwrap_or(PositionMode::On).enabled(),
-                )
-                .expect("cold-open pinned Tantivy"),
-            );
-            timer.elapsed()
+            let eviction = evict_index_file_cache(&path);
+            record_cold_cache_eviction(spec, arm, eviction);
+            fresh_process_open(&path, spec, arm)
         }
     };
     elapsed.as_secs_f64() * 1_000.0
@@ -2016,6 +3010,21 @@ fn operation_scope(spec: &PerfCellSpec) -> PerfOperationScope {
     }
 }
 
+fn raw_sample_work(context: &BenchContext, spec: &PerfCellSpec) -> (Option<u64>, Option<u64>) {
+    if qg1_producer_coverage(spec).is_none() {
+        return (None, None);
+    }
+    let document_count = context
+        .scale
+        .document_count(spec.document_count.expect("QG-1 throughput document count"));
+    let content_bytes = context.qg1_prefix(document_count).0.content_bytes;
+    assert!(
+        content_bytes > 0,
+        "QG-1 throughput sample requires positive immutable content bytes"
+    );
+    (Some(document_count), Some(content_bytes))
+}
+
 fn fixture_seed(fixture: &str) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in fixture.bytes() {
@@ -2036,99 +3045,205 @@ struct StreamPlan<'a> {
     query_override: Option<&'a str>,
 }
 
-/// Measure one paired raw-sample stream with a seeded balanced randomized
-/// first-arm schedule, warmup separation, and monotonic per-sample intervals.
-fn paired_raw_stream(
-    context: &BenchContext,
-    spec: &PerfCellSpec,
-    evidence: &EvidenceContext,
-    scope: &PerfOperationScope,
+/// Round-stepping executor for one paired raw-sample stream with a seeded
+/// balanced randomized first-arm schedule, warmup separation, and monotonic
+/// per-sample intervals.
+///
+/// bd-yo5by: the A/A null floor bounds the A/B effect, so both must sample the
+/// same time window. Construction runs the warmup; `run_round` executes exactly
+/// one seeded block, letting `collect_cell` interleave several streams in time
+/// while every per-stream schedule, block id, and sample id stays identical to
+/// the previous serial layout.
+struct PairedStreamRunner<'a> {
+    context: &'a BenchContext,
+    spec: &'a PerfCellSpec,
+    evidence: &'a EvidenceContext,
+    scope: &'a PerfOperationScope,
     origin: Instant,
-    plan: &StreamPlan<'_>,
-) -> Vec<PerfRawSample> {
-    let order = seeded_balanced_pair_order(plan.rounds, plan.seed).expect("paired order schedule");
-    for _ in 0..evidence.policy.warmup_rounds {
-        let _ = black_box(measure_metric_with_query(
-            context,
-            spec,
-            plan.control,
-            plan.query_override,
-        ));
-        let _ = black_box(measure_metric_with_query(
-            context,
-            spec,
-            plan.treatment,
-            plan.query_override,
-        ));
-    }
-    let mut samples = Vec::with_capacity(plan.rounds * 2);
-    for (round, first_arm) in order.into_iter().enumerate() {
-        let round_index = u64::try_from(round).expect("round fits u64");
-        let block_id = plan.block_id_base + round_index;
-        let control_sample_id = plan.sample_id_base + round_index * 2;
-        let treatment_sample_id = control_sample_id + 1;
-        let control_first = first_arm == PerfSampleArm::Control;
-        let run_arm = |engine: EngineArm,
-                       sample_arm: PerfSampleArm,
-                       sample_order: PerfSampleOrder,
-                       sample_id: u64| {
-            let started_ns = u64::try_from(origin.elapsed().as_nanos()).expect("monotonic ns");
-            let value = black_box(measure_metric_with_query(
+    plan: StreamPlan<'a>,
+    order: Vec<PerfSampleArm>,
+    work_units: Option<u64>,
+    byte_count: Option<u64>,
+    samples: Vec<PerfRawSample>,
+}
+
+impl<'a> PairedStreamRunner<'a> {
+    fn new(
+        context: &'a BenchContext,
+        spec: &'a PerfCellSpec,
+        evidence: &'a EvidenceContext,
+        scope: &'a PerfOperationScope,
+        origin: Instant,
+        plan: StreamPlan<'a>,
+    ) -> Self {
+        let order =
+            seeded_balanced_pair_order(plan.rounds, plan.seed).expect("paired order schedule");
+        let (work_units, byte_count) = raw_sample_work(context, spec);
+        for _ in 0..evidence.policy.warmup_rounds {
+            let _ = black_box(measure_metric_with_query(
                 context,
                 spec,
-                engine,
+                plan.control,
                 plan.query_override,
             ));
-            let mut ended_ns = u64::try_from(origin.elapsed().as_nanos()).expect("monotonic ns");
-            if ended_ns <= started_ns {
-                ended_ns = started_ns + 1;
-            }
-            PerfRawSample {
-                block_id,
-                sample_id,
-                arm: sample_arm,
-                order: sample_order,
-                phase: PerfSamplePhase::Measurement,
-                scope: scope.clone(),
-                provenance: evidence.sample_provenance.clone(),
-                started_ns,
-                ended_ns,
-                work_units: None,
-                byte_count: None,
-                observed_value: Some(value),
-                group_id: plan.group_id,
-                qg6_sample_binding: None,
-            }
-        };
-        if control_first {
-            samples.push(run_arm(
-                plan.control,
-                PerfSampleArm::Control,
-                PerfSampleOrder::First,
-                control_sample_id,
-            ));
-            samples.push(run_arm(
+            let _ = black_box(measure_metric_with_query(
+                context,
+                spec,
                 plan.treatment,
-                PerfSampleArm::Treatment,
-                PerfSampleOrder::Second,
-                treatment_sample_id,
-            ));
-        } else {
-            samples.push(run_arm(
-                plan.treatment,
-                PerfSampleArm::Treatment,
-                PerfSampleOrder::First,
-                treatment_sample_id,
-            ));
-            samples.push(run_arm(
-                plan.control,
-                PerfSampleArm::Control,
-                PerfSampleOrder::Second,
-                control_sample_id,
+                plan.query_override,
             ));
         }
+        let samples = Vec::with_capacity(plan.rounds * 2);
+        Self {
+            context,
+            spec,
+            evidence,
+            scope,
+            origin,
+            plan,
+            order,
+            work_units,
+            byte_count,
+            samples,
+        }
     }
-    samples
+
+    fn run_round(&mut self, round: usize) {
+        let round_index = u64::try_from(round).expect("round fits u64");
+        let block_id = self.plan.block_id_base + round_index;
+        let control_sample_id = self.plan.sample_id_base + round_index * 2;
+        let treatment_sample_id = control_sample_id + 1;
+        if self.order[round] == PerfSampleArm::Control {
+            let first = self.execute(
+                self.plan.control,
+                PerfSampleArm::Control,
+                PerfSampleOrder::First,
+                block_id,
+                control_sample_id,
+            );
+            self.samples.push(first);
+            let second = self.execute(
+                self.plan.treatment,
+                PerfSampleArm::Treatment,
+                PerfSampleOrder::Second,
+                block_id,
+                treatment_sample_id,
+            );
+            self.samples.push(second);
+        } else {
+            let first = self.execute(
+                self.plan.treatment,
+                PerfSampleArm::Treatment,
+                PerfSampleOrder::First,
+                block_id,
+                treatment_sample_id,
+            );
+            self.samples.push(first);
+            let second = self.execute(
+                self.plan.control,
+                PerfSampleArm::Control,
+                PerfSampleOrder::Second,
+                block_id,
+                control_sample_id,
+            );
+            self.samples.push(second);
+        }
+    }
+
+    fn execute(
+        &self,
+        engine: EngineArm,
+        sample_arm: PerfSampleArm,
+        sample_order: PerfSampleOrder,
+        block_id: u64,
+        sample_id: u64,
+    ) -> PerfRawSample {
+        let started_ns = u64::try_from(self.origin.elapsed().as_nanos()).expect("monotonic ns");
+        let value = black_box(measure_metric_with_query(
+            self.context,
+            self.spec,
+            engine,
+            self.plan.query_override,
+        ));
+        let mut ended_ns = u64::try_from(self.origin.elapsed().as_nanos()).expect("monotonic ns");
+        if ended_ns <= started_ns {
+            ended_ns = started_ns + 1;
+        }
+        PerfRawSample {
+            block_id,
+            sample_id,
+            arm: sample_arm,
+            order: sample_order,
+            phase: PerfSamplePhase::Measurement,
+            scope: self.scope.clone(),
+            provenance: self.evidence.sample_provenance.clone(),
+            started_ns,
+            ended_ns,
+            work_units: self.work_units,
+            byte_count: self.byte_count,
+            observed_value: Some(value),
+            group_id: self.plan.group_id,
+            qg6_sample_binding: None,
+        }
+    }
+
+    fn into_samples(self) -> Vec<PerfRawSample> {
+        self.samples
+    }
+}
+
+/// Which stream executes its next block, in seeded per-round order (bd-yo5by).
+#[derive(Clone, Copy)]
+enum StreamSlot {
+    OracleNull,
+    TreatmentNull,
+    Effect,
+}
+
+/// Deterministic per-round permutation of the three stream slots so no stream
+/// systematically runs first or last within a round (a fixed intra-round order
+/// would reintroduce the carryover asymmetry the interleave exists to spread).
+fn interleaved_stream_order(seed: u64, round: usize) -> [StreamSlot; 3] {
+    const PERMUTATIONS: [[StreamSlot; 3]; 6] = [
+        [
+            StreamSlot::OracleNull,
+            StreamSlot::TreatmentNull,
+            StreamSlot::Effect,
+        ],
+        [
+            StreamSlot::OracleNull,
+            StreamSlot::Effect,
+            StreamSlot::TreatmentNull,
+        ],
+        [
+            StreamSlot::TreatmentNull,
+            StreamSlot::OracleNull,
+            StreamSlot::Effect,
+        ],
+        [
+            StreamSlot::TreatmentNull,
+            StreamSlot::Effect,
+            StreamSlot::OracleNull,
+        ],
+        [
+            StreamSlot::Effect,
+            StreamSlot::OracleNull,
+            StreamSlot::TreatmentNull,
+        ],
+        [
+            StreamSlot::Effect,
+            StreamSlot::TreatmentNull,
+            StreamSlot::OracleNull,
+        ],
+    ];
+    let round_index = u64::try_from(round).expect("round fits u64");
+    let mut mixed = seed ^ 0x9e37_79b9_7f4a_7c15 ^ round_index.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    mixed ^= mixed >> 30;
+    mixed = mixed.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    mixed ^= mixed >> 27;
+    mixed = mixed.wrapping_mul(0x94d0_49bb_1331_11eb);
+    mixed ^= mixed >> 31;
+    PERMUTATIONS[usize::try_from(mixed % 6).expect("permutation index")]
 }
 
 fn arm_values(samples: &[PerfRawSample], arm: PerfSampleArm) -> Vec<f64> {
@@ -2894,9 +4009,12 @@ fn collect_cell(
     let cell_seed = evidence.config.bootstrap_seed ^ fixture_seed(&spec.fixture);
 
     // Every non-query gate establishes its A/A floor through the exact paired
-    // routine before measuring the Quill/Tantivy claim. QG-6 uses the prepared
-    // four-arm runner so setup is impossible inside timed samples and null/
-    // effect blocks are interleaved.
+    // routine. QG-6 uses the prepared four-arm runner so setup is impossible
+    // inside timed samples. For every other gate the null and effect streams
+    // are interleaved round-by-round under one seeded schedule (bd-yo5by): a
+    // null band sampled in an earlier, quieter phase says nothing about the
+    // noise DURING the effect measurement, so the streams must share the
+    // measurement window.
     let (
         oracle_null_samples,
         treatment_null_samples,
@@ -2914,13 +4032,13 @@ fn collect_cell(
             Some(semantic_contract),
         )
     } else {
-        let oracle_null = paired_raw_stream(
+        let mut oracle_null = PairedStreamRunner::new(
             context,
             spec,
             evidence,
             &scope,
             origin,
-            &StreamPlan {
+            StreamPlan {
                 control: EngineArm::Tantivy,
                 treatment: EngineArm::Tantivy,
                 rounds: runs,
@@ -2931,14 +4049,14 @@ fn collect_cell(
                 query_override: None,
             },
         );
-        let treatment_null = (spec.gate == PerfGate::Qg1).then(|| {
-            paired_raw_stream(
+        let mut treatment_null = (spec.gate == PerfGate::Qg1).then(|| {
+            PairedStreamRunner::new(
                 context,
                 spec,
                 evidence,
                 &scope,
                 origin,
-                &StreamPlan {
+                StreamPlan {
                     control: EngineArm::Quill,
                     treatment: EngineArm::Quill,
                     rounds: runs,
@@ -2950,13 +4068,13 @@ fn collect_cell(
                 },
             )
         });
-        let effect = paired_raw_stream(
+        let mut effect = PairedStreamRunner::new(
             context,
             spec,
             evidence,
             &scope,
             origin,
-            &StreamPlan {
+            StreamPlan {
                 control: EngineArm::Tantivy,
                 treatment: EngineArm::Quill,
                 rounds: runs,
@@ -2967,7 +4085,26 @@ fn collect_cell(
                 query_override: None,
             },
         );
-        (oracle_null, treatment_null, effect, None, None)
+        for round in 0..runs {
+            for slot in interleaved_stream_order(cell_seed, round) {
+                match slot {
+                    StreamSlot::OracleNull => oracle_null.run_round(round),
+                    StreamSlot::TreatmentNull => {
+                        if let Some(runner) = treatment_null.as_mut() {
+                            runner.run_round(round);
+                        }
+                    }
+                    StreamSlot::Effect => effect.run_round(round),
+                }
+            }
+        }
+        (
+            oracle_null.into_samples(),
+            treatment_null.map(PairedStreamRunner::into_samples),
+            effect.into_samples(),
+            None,
+            None,
+        )
     };
 
     let quill_distribution =
@@ -3033,11 +4170,7 @@ fn collect_cell(
             .expect("treatment-arm null estimator rejected harness-produced streams")
     });
     let is_tokenizer_null = spec.metric == "tokenize_docs_per_second";
-    let cold_cache = (spec.gate == PerfGate::Qg9).then(|| ColdCacheEvidence {
-        procedure: "same-process index drop and reopen; the OS page cache is not dropped"
-            .to_owned(),
-        verified: false,
-    });
+    let cold_cache = take_cold_cache_evidence(spec);
     let mut cell = EvidenceCell::evaluate(
         EvidenceCellSpec {
             gate: spec.gate,
@@ -3163,7 +4296,7 @@ fn selected_cells(
             ));
         }
 
-        let matches_filter = fixture_filter.is_none_or(|needle| spec.fixture.contains(needle));
+        let matches_filter = fixture_filter.is_none_or(|fixture| spec.fixture == fixture);
         if fixture_filter.is_some() && matches_filter {
             filter_matched = true;
         }
@@ -3260,6 +4393,26 @@ fn gate_selection_complete(
     !expected.is_empty() && actual == expected && actual.len() == selected.len()
 }
 
+fn partial_shard_no_claim(
+    gate: PerfGate,
+    selection_complete: bool,
+) -> Option<(&'static str, &'static str)> {
+    if selection_complete {
+        None
+    } else if gate == PerfGate::Qg1 {
+        Some((
+            QG1_PARTIAL_SHARD_NO_CLAIM_CODE,
+            QG1_PARTIAL_SHARD_NO_CLAIM_DETAIL,
+        ))
+    } else {
+        Some((
+            "evidence.incomplete_gate_selection",
+            "the invocation selected only part of the normative gate; durable pre-admission \
+             evidence cannot support a publication or ratchet claim",
+        ))
+    }
+}
+
 fn git_revision(scale: MatrixScale) -> String {
     if let Ok(revision) = std::env::var("QUILL_PERF_GIT_REV")
         && !revision.trim().is_empty()
@@ -3287,7 +4440,20 @@ fn manifest_sha256() -> String {
     perf_manifest_contract_sha256(MANIFEST)
 }
 
-fn corpus_manifest_hash(context: &BenchContext, cells: &[PerfCellSpec]) -> Result<String, String> {
+type Qg1PrefixIdentityMap = BTreeMap<u64, (String, String)>;
+
+fn qg1_effective_counts(scale: MatrixScale, cells: &[PerfCellSpec]) -> BTreeSet<u64> {
+    cells
+        .iter()
+        .filter(|cell| cell.gate == PerfGate::Qg1)
+        .map(|cell| scale.document_count(cell.document_count.unwrap_or_default()))
+        .collect()
+}
+
+fn prepared_qg1_prefix_identities(
+    context: &BenchContext,
+    cells: &[PerfCellSpec],
+) -> Result<Qg1PrefixIdentityMap, String> {
     let qg1_counts = cells
         .iter()
         .filter(|cell| cell.gate == PerfGate::Qg1)
@@ -3297,7 +4463,7 @@ fn corpus_manifest_hash(context: &BenchContext, cells: &[PerfCellSpec]) -> Resul
                 .document_count(cell.document_count.unwrap_or_default())
         })
         .collect::<BTreeSet<_>>();
-    let qg1_identities = qg1_counts
+    qg1_counts
         .into_iter()
         .map(|document_count| {
             let prepared = context
@@ -3314,18 +4480,139 @@ fn corpus_manifest_hash(context: &BenchContext, cells: &[PerfCellSpec]) -> Resul
                 ),
             ))
         })
-        .collect::<Result<BTreeMap<_, _>, String>>()?;
+        .collect::<Result<_, String>>()
+}
+
+fn replay_qg1_prefix_identities(
+    scale: MatrixScale,
+    cells: &[PerfCellSpec],
+) -> Result<Qg1PrefixIdentityMap, String> {
+    qg1_effective_counts(scale, cells)
+        .into_iter()
+        .map(|document_count| {
+            let corpus = corpus_for(document_count);
+            let manifest = corpus
+                .manifest()
+                .map_err(|error| format!("build authoritative QG-1 corpus manifest: {error}"))?;
+            manifest
+                .verify_documents(corpus.iter())
+                .map_err(|error| format!("replay authoritative QG-1 corpus manifest: {error}"))?;
+            let manifest_sha256 = manifest
+                .manifest_hash()
+                .map_err(|error| format!("hash authoritative QG-1 corpus manifest: {error}"))?;
+            let indexed_content_sha256 = qg1_indexed_content_sha256(
+                document_count,
+                corpus.iter().map(IndexableDocument::from),
+            )?;
+            Ok((document_count, (manifest_sha256, indexed_content_sha256)))
+        })
+        .collect()
+}
+
+fn frozen_qg1_full_prefix_identities(
+    canonical_cells: &[PerfCellSpec],
+) -> Result<Qg1PrefixIdentityMap, String> {
+    let expected_counts = qg1_effective_counts(MatrixScale::Full, canonical_cells);
+    let mut identities = BTreeMap::new();
+    for (document_count, manifest_sha256, indexed_content_sha256) in QG1_FULL_PREFIX_IDENTITY_PINS {
+        let is_lower_sha256 = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        };
+        if !is_lower_sha256(manifest_sha256) || !is_lower_sha256(indexed_content_sha256) {
+            return Err(format!(
+                "frozen QG-1 prefix {document_count} has a malformed identity pin"
+            ));
+        }
+        if identities
+            .insert(
+                document_count,
+                (
+                    manifest_sha256.to_owned(),
+                    indexed_content_sha256.to_owned(),
+                ),
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "frozen QG-1 prefix identity repeats document count {document_count}"
+            ));
+        }
+    }
+    let pinned_counts = identities.keys().copied().collect::<BTreeSet<_>>();
+    if pinned_counts != expected_counts {
+        return Err(format!(
+            "frozen QG-1 prefix counts {pinned_counts:?} differ from canonical counts \
+             {expected_counts:?}"
+        ));
+    }
+    Ok(identities)
+}
+
+fn validate_selected_qg1_prefixes(
+    context: &BenchContext,
+    selected: &[PerfCellSpec],
+    authoritative: &Qg1PrefixIdentityMap,
+) -> Result<(), String> {
+    let selected_identities = prepared_qg1_prefix_identities(context, selected)?;
+    for (document_count, selected_identity) in selected_identities {
+        let authoritative_identity = authoritative.get(&document_count).ok_or_else(|| {
+            format!(
+                "selected QG-1 corpus prefix {document_count} is absent from the authoritative \
+                 full-corpus identity"
+            )
+        })?;
+        if &selected_identity != authoritative_identity {
+            return Err(format!(
+                "selected QG-1 corpus prefix {document_count} differs from the authoritative \
+                 full-corpus identity"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn hash_corpus_identity_cells(
+    scale: MatrixScale,
+    cells: &[PerfCellSpec],
+    qg1_identities: &Qg1PrefixIdentityMap,
+) -> Result<String, String> {
+    let has_qg1 = cells.iter().any(|cell| cell.gate == PerfGate::Qg1);
 
     let mut hasher = Sha256::new();
+    if has_qg1 {
+        hasher.update(b"frankensearch-quill-qg1-full-corpus-identity-v1\0");
+        hasher.update(PerfMatrixSpec::QG1_CANONICAL_SHA256.as_bytes());
+        hasher.update(
+            u64::try_from(cells.len())
+                .map_err(|_| "QG-1 corpus identity cell count is not representable".to_owned())?
+                .to_le_bytes(),
+        );
+    }
     for cell in cells {
         let requested = cell.document_count.unwrap_or_default();
-        let effective = context.scale.document_count(requested);
-        hasher.update(cell.fixture.as_bytes());
+        let effective = scale.document_count(requested);
+        if has_qg1 {
+            hasher.update(b"\0corpus-identity-cell-v1\0");
+            hash_qg1_indexed_bytes(&mut hasher, cell.fixture.as_bytes());
+        } else {
+            // Preserve the established identity contract for every non-QG-1
+            // gate; this framing revision belongs only to QG-1's new frozen
+            // full-universe identity domain.
+            hasher.update(cell.fixture.as_bytes());
+        }
         hasher.update(effective.to_le_bytes());
         hasher.update(CORPUS_SEED.to_le_bytes());
         hasher.update(VOCABULARY_SIZE.to_le_bytes());
         hasher.update(MAX_DOCUMENT_BYTES.to_le_bytes());
         if cell.gate == PerfGate::Qg1 {
+            let cell_contract_sha256 = cell
+                .contract_sha256()
+                .map_err(|error| format!("hash authoritative QG-1 cell contract: {error}"))?;
+            hasher.update(b"\0canonical-qg1-cell-contract-v1\0");
+            hasher.update(cell_contract_sha256.as_bytes());
             let (manifest_sha256, indexed_content_sha256) = qg1_identities
                 .get(&effective)
                 .ok_or_else(|| format!("QG-1 corpus identity {effective} was not verified"))?;
@@ -3336,6 +4623,45 @@ fn corpus_manifest_hash(context: &BenchContext, cells: &[PerfCellSpec]) -> Resul
         }
     }
     Ok(lower_hex(&hasher.finalize()))
+}
+
+fn corpus_manifest_hash(context: &BenchContext, cells: &[PerfCellSpec]) -> Result<String, String> {
+    let qg1_identities = prepared_qg1_prefix_identities(context, cells)?;
+    hash_corpus_identity_cells(context.scale, cells, &qg1_identities)
+}
+
+fn authoritative_qg1_corpus_identity(
+    context: &BenchContext,
+    matrix: &PerfMatrixSpec,
+    selected: &[PerfCellSpec],
+) -> Result<(String, Vec<PerfCellSpec>), String> {
+    let canonical_sha256 = matrix
+        .gate_contract_sha256(PerfGate::Qg1)
+        .map_err(|error| format!("hash canonical QG-1 matrix: {error}"))?;
+    if canonical_sha256 != PerfMatrixSpec::QG1_CANONICAL_SHA256 {
+        return Err(format!(
+            "canonical QG-1 matrix identity {canonical_sha256} differs from frozen identity {}",
+            PerfMatrixSpec::QG1_CANONICAL_SHA256
+        ));
+    }
+    let canonical_cells = matrix
+        .for_gate(PerfGate::Qg1)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    if selected.is_empty() || selected.iter().any(|cell| cell.gate != PerfGate::Qg1) {
+        return Err("authoritative QG-1 identity requires a nonempty QG-1 selection".to_owned());
+    }
+
+    let authoritative = if context.scale.is_full() {
+        frozen_qg1_full_prefix_identities(&canonical_cells)?
+    } else {
+        replay_qg1_prefix_identities(context.scale, &canonical_cells)?
+    };
+    validate_selected_qg1_prefixes(context, selected, &authoritative)?;
+    let corpus_sha256 =
+        hash_corpus_identity_cells(context.scale, &canonical_cells, &authoritative)?;
+    Ok((corpus_sha256, canonical_cells))
 }
 
 fn lower_hex(bytes: &[u8]) -> String {
@@ -3463,6 +4789,7 @@ fn corpus_identity(
     cells: &[PerfCellSpec],
     corpus_hash: &str,
 ) -> CorpusIdentity {
+    let qg1_native_identity = cells.iter().all(|cell| cell.gate == PerfGate::Qg1);
     let document_count = cells
         .iter()
         .map(|cell| {
@@ -3472,10 +4799,10 @@ fn corpus_identity(
         })
         .max()
         .unwrap_or_default();
-    let query_set_sha256 = Some(
+    let query_set_sha256 = (!qg1_native_identity).then(|| {
         Qg6QuerySpec::normative_manifest_sha256()
-            .expect("frozen 80-query manifest validates before evidence identity"),
-    );
+            .expect("frozen 80-query manifest validates before evidence identity")
+    });
     CorpusIdentity {
         corpus_sha256: corpus_hash.to_owned(),
         query_set_sha256,
@@ -3483,7 +4810,11 @@ fn corpus_identity(
         document_count,
         content_bytes: None,
         generator_seed: CORPUS_SEED,
-        generator_revision: Qg6QuerySpec::normative_corpus_generator_revision().to_owned(),
+        generator_revision: if qg1_native_identity {
+            QG1_CORPUS_GENERATOR_REVISION.to_owned()
+        } else {
+            Qg6QuerySpec::normative_corpus_generator_revision().to_owned()
+        },
     }
 }
 
@@ -3605,8 +4936,14 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
     let run_id = std::env::var("QUILL_PERF_RUN_ID")
         .unwrap_or_else(|_| format!("manual-pass-{}", std::process::id()));
     let manifest_hash = manifest_sha256();
-    let corpus_hash = corpus_manifest_hash(&context, &selected_specs)
-        .expect("verify exact prepared QG-1 corpus identity");
+    let corpus_hash = if runner.plan.binding().gate == PerfGate::Qg1 {
+        authoritative_qg1_corpus_identity(&context, &matrix, &selected_specs)
+            .expect("verify authoritative immutable full QG-1 corpus identity")
+            .0
+    } else {
+        corpus_manifest_hash(&context, &selected_specs)
+            .expect("verify exact selected corpus identity")
+    };
     let bootstrap_seed = std::env::var("QUILL_PERF_BOOTSTRAP_SEED")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -3629,7 +4966,11 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
         },
     };
     let configured_widths = configured_engine_widths(&selected);
-    let mut machine = MachineIdentity::capture(configured_widths.iter().copied());
+    let mut machine = MachineIdentity::capture(
+        runner.execution_capacity,
+        runner.max_exercised_cell_width,
+        configured_widths.iter().copied(),
+    );
     eprintln!(
         "[quill-perf-execution-provenance] {}",
         serde_json::to_string(&machine.execution).expect("serialize execution provenance")
@@ -3657,6 +4998,7 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
     }
     machine.finish();
     flush_tantivy_lifecycle_receipts(&output_dir);
+    flush_qg1_continuous_timing_receipts(&output_dir);
 
     let provenance = EvidenceProvenance {
         run_id: run_id.clone(),
@@ -3677,16 +5019,27 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
             cells,
         )
         .expect("assemble QG evidence artifact");
-        if !selection_complete {
-            artifact.force_no_claim(
-                "evidence.incomplete_gate_selection",
-                "the invocation selected only part of the normative gate; durable pre-admission \
-                 evidence cannot support a publication or ratchet claim",
-            );
+        let selection_no_claim = partial_shard_no_claim(gate, selection_complete);
+        let terminal_no_claim = (gate == PerfGate::Qg1)
+            .then(qg1_terminal_no_claim_detail)
+            .flatten();
+        match (selection_no_claim, terminal_no_claim) {
+            (Some((code, detail)), Some(terminal_detail)) => {
+                artifact.force_no_claim(code, format!("{detail}; additionally, {terminal_detail}"));
+            }
+            (Some((code, detail)), None) => artifact.force_no_claim(code, detail),
+            (None, Some(detail)) => artifact.force_no_claim(QG1_TERMINAL_NO_CLAIM_CODE, detail),
+            (None, None) => {}
         }
         let paths = artifact
             .write_atomic(&output_dir)
             .expect("write QG evidence artifact");
+        let reloaded = PerfEvidenceArtifact::load_verified(&paths.json)
+            .expect("reload and verify persisted QG evidence artifact");
+        assert_eq!(
+            reloaded, artifact,
+            "persisted QG evidence artifact must reload as the exact sealed source object"
+        );
         eprintln!(
             "[quill-evidence] gate={gate} status={} ratchet_admissible={} json={} table={}",
             artifact.gate_status,
@@ -3806,6 +5159,39 @@ fn run_search_child() {
     println!("quill-perf-child\t{}", doc_ids.len());
 }
 
+fn run_open_child() {
+    let arm = child_engine();
+    let path = PathBuf::from(
+        std::env::var_os("QUILL_PERF_CHILD_PATH").expect("missing QUILL_PERF_CHILD_PATH"),
+    );
+    let heap = child_env::<usize>("QUILL_PERF_CHILD_HEAP");
+    let threads = child_env::<usize>("QUILL_PERF_CHILD_THREADS");
+    let positions = child_env::<bool>("QUILL_PERF_CHILD_POSITIONS");
+    let context = BenchContext::new(MatrixScale::from_env());
+    let timer = Instant::now();
+    match arm {
+        EngineArm::Quill => {
+            black_box(
+                context
+                    .runtime
+                    .block_on(QuillIndex::open(
+                        &context.cx,
+                        &path,
+                        pinned_quill_config(heap, threads),
+                    ))
+                    .expect("fresh-process QG-9 Quill open"),
+            );
+        }
+        EngineArm::Tantivy => {
+            black_box(
+                TantivyIndex::open_with_benchmark_config(&path, heap, threads, positions)
+                    .expect("fresh-process QG-9 pinned Tantivy open"),
+            );
+        }
+    };
+    println!("quill-perf-child\t{}", timer.elapsed().as_nanos());
+}
+
 fn run_memory_child() {
     let arm = child_engine();
     let count = child_env::<u64>("QUILL_PERF_CHILD_COUNT");
@@ -3825,7 +5211,26 @@ fn run_memory_child() {
             };
             let _ = index_batches(&context, &index, &corpus, count, None);
             let _ = commit(&context, &index);
-            let bytes = index.segment_stats().managed_disk_bytes;
+            // bd-enf6z: managed_disk_bytes short-circuits to 0 when the keeper
+            // has no directory, so the in-memory Quill arm reported 0 index
+            // bytes while the Tantivy arm reported real file lengths — a
+            // structural bias in Quill's favor. The manifest's per-segment
+            // file_len records the exact FSLX byte image and is populated for
+            // in-memory indexes too.
+            let bytes: u64 = index
+                .snapshot()
+                .loaded_manifest()
+                .manifest
+                .segments
+                .iter()
+                .map(|segment| segment.file_len)
+                .sum();
+            assert!(
+                bytes > 0,
+                "QG-7 Quill arm measured a zero-byte index footprint for a \
+                 committed non-empty corpus; the footprint seam is broken \
+                 (bd-enf6z would regress)"
+            );
             let rss = peak_rss_bytes().unwrap_or_default();
             println!("quill-perf-child\t{rss}\t{bytes}");
             return;
@@ -3848,6 +5253,7 @@ fn run_memory_child() {
 fn run_child_mode() -> bool {
     match std::env::var("QUILL_PERF_CHILD_MODE").as_deref() {
         Ok("search") => run_search_child(),
+        Ok("open") => run_open_child(),
         Ok("memory") => run_memory_child(),
         Ok(mode) => panic!("unknown QUILL_PERF_CHILD_MODE {mode:?}"),
         Err(_) => return false,
@@ -3866,7 +5272,8 @@ fn run_child_mode() -> bool {
 ///
 /// A manifest pin alone cannot catch that — it describes what Cargo resolved,
 /// not what the process linked. So this asserts both: the pinned contract
-/// (version, checksum, lexical package + git revision, `tantivy = "=0.26.1"`)
+/// (version, registry source, checksum, lexical package + audited contract
+/// revision, `tantivy = "=0.26.1"`)
 /// *and* the version string the linked Tantivy reports about itself at run
 /// time. Printed so it lands in the evidence log beside the ratios.
 fn assert_incumbent_is_genuine_tantivy() -> String {
@@ -3883,16 +5290,37 @@ fn assert_incumbent_is_genuine_tantivy() -> String {
     );
     eprintln!(
         "[quill-perf-oracle] incumbent=tantivy linked_runtime={linked} contract_version={} \
-         lexical={}@{} lexical_git={}",
+         source={} checksum={} lexical={}@{} lexical_contract_audit={}",
         contract.tantivy_version,
+        contract.tantivy_source,
+        contract.tantivy_checksum_sha256,
         contract.lexical_package,
         contract.lexical_package_version,
-        contract.lexical_git_revision,
+        contract.lexical_contract_audit_revision,
     );
     linked.to_owned()
 }
 
 fn main() {
+    validate_manifest_gate_contract(MANIFEST)
+        .expect("normative QG manifest has a complete, closed policy set");
+    #[cfg(test)]
+    if std::env::var_os("QUILL_PERF_H1_PRODUCER_SELF_CHECK").is_some() {
+        tests::assert_qg1_continuous_interval_contract();
+        tests::assert_qg1_real_terminal_visibility_contract();
+        tests::assert_qg1_raw_sample_work_contract();
+        tests::assert_qg1_disjoint_partial_shard_contract();
+        tests::assert_corpus_identity_fixture_framing();
+        tests::assert_non_qg1_corpus_identity_preserves_legacy_hash();
+        tests::assert_qg9_cache_evidence_contract();
+        tests::assert_qg9_cache_eviction_file_discovery();
+        tests::assert_qg9_cache_eviction_request();
+        tests::assert_manifest_gate_contract();
+        eprintln!(
+            "[quill-perf-self-check] H1 immutable producer and continuous-timing contracts passed"
+        );
+        return;
+    }
     if run_child_mode() {
         return;
     }
@@ -3906,6 +5334,348 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    pub fn assert_qg9_cache_evidence_contract() {
+        let quill_only = super::ColdCacheAccumulator {
+            quill_successes: 1,
+            ..super::ColdCacheAccumulator::default()
+        };
+        assert!(
+            !super::cold_cache_evidence(quill_only).verified,
+            "one arm cannot prove a comparative cold-open row"
+        );
+
+        let failed_tantivy = super::ColdCacheAccumulator {
+            quill_successes: 1,
+            tantivy_successes: 1,
+            tantivy_failures: 1,
+            ..super::ColdCacheAccumulator::default()
+        };
+        assert!(
+            !super::cold_cache_evidence(failed_tantivy).verified,
+            "an eviction failure must keep QG-9 at NoDecision"
+        );
+
+        let verified = super::cold_cache_evidence(super::ColdCacheAccumulator {
+            quill_successes: 1,
+            tantivy_successes: 1,
+            ..super::ColdCacheAccumulator::default()
+        });
+        assert!(verified.verified);
+        assert!(verified.procedure.contains("fresh child process"));
+        assert!(verified.procedure.contains("POSIX_FADV_DONTNEED"));
+    }
+
+    #[test]
+    fn qg9_cache_evidence_requires_a_clean_eviction_witness_from_both_arms() {
+        assert_qg9_cache_evidence_contract();
+    }
+
+    pub fn assert_qg9_cache_eviction_file_discovery() {
+        let fixture = tempfile::tempdir().expect("QG-9 fixture directory");
+        let nested = fixture.path().join("segments");
+        std::fs::create_dir(&nested).expect("nested QG-9 fixture directory");
+        std::fs::write(fixture.path().join("meta.json"), b"metadata")
+            .expect("write QG-9 metadata fixture");
+        std::fs::write(nested.join("segment.fslx"), b"segment")
+            .expect("write QG-9 segment fixture");
+
+        let mut files = Vec::new();
+        super::collect_regular_files(fixture.path(), &mut files)
+            .expect("discover QG-9 regular index files");
+        files.sort();
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|path| path.is_file()));
+        assert!(files.iter().any(|path| path.ends_with("meta.json")));
+        assert!(files.iter().any(|path| path.ends_with("segment.fslx")));
+    }
+
+    #[test]
+    fn qg9_cache_eviction_discovers_nested_regular_files_without_treating_dirs_as_files() {
+        assert_qg9_cache_eviction_file_discovery();
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn assert_qg9_cache_eviction_request() {
+        let fixture = tempfile::tempdir().expect("QG-9 cache-eviction fixture directory");
+        std::fs::write(fixture.path().join("segment.fslx"), b"segment")
+            .expect("write QG-9 cache-eviction fixture");
+        assert_eq!(
+            super::evict_index_file_cache(fixture.path())
+                .expect("QG-9 Linux cache eviction request must succeed"),
+            1,
+            "QG-9 must request eviction for every regular index file"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn assert_qg9_cache_eviction_request() {}
+
+    #[test]
+    fn qg9_linux_cache_eviction_request_is_real() {
+        assert_qg9_cache_eviction_request();
+    }
+
+    fn hostile_tantivy_continuous_receipt() -> super::Qg1ContinuousTimingReceipt {
+        super::Qg1ContinuousTimingReceipt {
+            producer_coverage: super::Qg1ProducerCoverage::EngineIndexingLifecycle,
+            arm: super::EngineArm::Tantivy,
+            document_count: 20,
+            interval_started_ns: 0,
+            corpus_constructed_ns: 3,
+            batches: vec![
+                super::Qg1BatchTiming {
+                    document_start: 0,
+                    document_count: 10,
+                    generation_started_ns: 5,
+                    generation_completed_ns: Some(15),
+                    feed_completed_ns: Some(25),
+                    visibility_commit_completed_ns: None,
+                },
+                super::Qg1BatchTiming {
+                    document_start: 10,
+                    document_count: 10,
+                    generation_started_ns: 40,
+                    generation_completed_ns: Some(50),
+                    feed_completed_ns: Some(65),
+                    visibility_commit_completed_ns: Some(75),
+                },
+            ],
+            quill_publication_generation_delta: None,
+            terminal_commit_completed_ns: 100,
+            post_commit_join_completed_ns: Some(125),
+            terminal_search_attempt_completed_ns: 140,
+            terminal_idle_join_completed_ns: Some(155),
+            terminal_quiescence_completed_ns: 160,
+            interval_ended_ns: 170,
+            terminal_searchability: super::Qg1TerminalFact::proven(
+                "exact_immutable_sentinel_visible",
+            ),
+            terminal_quiescence: super::Qg1TerminalFact::proven(
+                "post_commit_join_search_then_unchanged_terminal_idle_join",
+            ),
+        }
+    }
+
+    pub fn assert_qg1_continuous_interval_contract() {
+        let receipt = hostile_tantivy_continuous_receipt();
+        receipt
+            .validate()
+            .expect("hostile timeline is one valid continuous interval");
+
+        // This control is deliberately generous to the retired implementation:
+        // it sums every feed/commit/join/search call represented in the hostile
+        // timeline. It still loses corpus construction, both generation phases,
+        // and every gap between calls, exactly the undercount caused by adding
+        // independent `Instant::elapsed()` results.
+        let old_summed_call_ns = (25 - 15)
+            + (65 - 50)
+            + (75 - 65)
+            + (100 - 90)
+            + (125 - 100)
+            + (140 - 125)
+            + (155 - 140);
+        assert_eq!(old_summed_call_ns, 100);
+        assert_eq!(receipt.interval_ended_ns, 170);
+        assert!(
+            old_summed_call_ns < receipt.interval_ended_ns,
+            "summing individually timed calls must not masquerade as continuous wall time"
+        );
+
+        let assert_escape_rejected = |mutated: super::Qg1ContinuousTimingReceipt| {
+            assert!(
+                mutated.validate().is_err(),
+                "a lifecycle phase outside the interval must invalidate the receipt"
+            );
+        };
+        let mut generation_escape = receipt.clone();
+        generation_escape.batches[0].generation_started_ns = 171;
+        assert_escape_rejected(generation_escape);
+        let mut feed_escape = receipt.clone();
+        feed_escape.batches[1].feed_completed_ns = Some(171);
+        assert_escape_rejected(feed_escape);
+        let mut commit_escape = receipt.clone();
+        commit_escape.terminal_commit_completed_ns = 69;
+        assert_escape_rejected(commit_escape);
+        let mut post_commit_join_escape = receipt.clone();
+        post_commit_join_escape.post_commit_join_completed_ns = Some(99);
+        assert_escape_rejected(post_commit_join_escape);
+        let mut search_escape = receipt.clone();
+        search_escape.terminal_search_attempt_completed_ns = 124;
+        assert_escape_rejected(search_escape);
+        let mut terminal_join_escape = receipt.clone();
+        terminal_join_escape.terminal_idle_join_completed_ns = Some(139);
+        assert_escape_rejected(terminal_join_escape);
+        let mut quiescence_escape = receipt.clone();
+        quiescence_escape.interval_ended_ns = 159;
+        assert_escape_rejected(quiescence_escape);
+        let mut tokenizer_false_claim = receipt.clone();
+        tokenizer_false_claim.producer_coverage =
+            super::Qg1ProducerCoverage::TokenizerOnlyDiagnosticNoEngineLifecycle;
+        assert_escape_rejected(tokenizer_false_claim);
+
+        let mut unproved = receipt;
+        unproved.terminal_searchability = super::Qg1TerminalFact::no_claim(
+            "hostile terminal search intentionally lacks an exact sentinel",
+        );
+        unproved
+            .validate()
+            .expect("an unproved fact remains structurally typed rather than fabricated");
+        assert_eq!(
+            unproved.no_claim_details().collect::<Vec<_>>(),
+            ["hostile terminal search intentionally lacks an exact sentinel"]
+        );
+        let encoded = serde_json::to_string(&unproved).expect("serialize typed NoClaim receipt");
+        assert!(encoded.contains("\"status\":\"no_claim\""));
+        assert!(encoded.contains(super::QG1_TERMINAL_NO_CLAIM_CODE));
+    }
+
+    #[test]
+    fn qg1_continuous_interval_rejects_summed_call_undercount_and_phase_escape() {
+        assert_qg1_continuous_interval_contract();
+    }
+
+    pub fn assert_qg1_real_terminal_visibility_contract() {
+        use frankensearch_quill_gauntlet::{PerfGate, PerfMatrixSpec};
+
+        let spec = PerfMatrixSpec::complete()
+            .for_gate(PerfGate::Qg1)
+            .into_iter()
+            .filter(|spec| spec.metric == "docs_per_second" && spec.threads == Some(1))
+            .min_by_key(|spec| spec.document_count)
+            .expect("smallest canonical single-thread QG-1 indexing cell")
+            .clone();
+        assert_eq!(
+            spec.document_count,
+            Some(500),
+            "real terminal test must stay on the smallest normative QG-1 corpus"
+        );
+        let context = super::BenchContext::for_selected(
+            super::MatrixScale::Smoke,
+            std::slice::from_ref(&spec),
+        );
+        let first_sequence =
+            super::QG1_CONTINUOUS_TIMING_COUNTER.load(std::sync::atomic::Ordering::Relaxed);
+        for arm in [super::EngineArm::Quill, super::EngineArm::Tantivy] {
+            let throughput = super::bulk_metric(&context, &spec, arm);
+            assert!(
+                throughput.is_finite() && throughput > 0.0,
+                "real {arm:?} terminal sample must return positive finite throughput"
+            );
+        }
+
+        let receipts = {
+            let receipts = super::QG1_CONTINUOUS_TIMING_RECEIPTS
+                .get()
+                .expect("real QG-1 terminal samples emitted diagnostic receipts")
+                .lock()
+                .expect("lock real QG-1 terminal receipts");
+            receipts
+                .iter()
+                .filter(|record| {
+                    record.sequence >= first_sequence && record.fixture == spec.fixture
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for arm in [super::EngineArm::Quill, super::EngineArm::Tantivy] {
+            let record = receipts
+                .iter()
+                .find(|record| {
+                    record.sequence >= first_sequence
+                        && record.fixture == spec.fixture
+                        && record.timing.arm == arm
+                })
+                .expect("missing real engine terminal timing receipt");
+            record
+                .timing
+                .validate()
+                .expect("invalid real engine timing receipt");
+            assert!(matches!(
+                &record.timing.terminal_searchability,
+                super::Qg1TerminalFact::Proven {
+                    proof: "exact_immutable_sentinel_visible"
+                }
+            ));
+            assert!(matches!(
+                &record.timing.terminal_quiescence,
+                super::Qg1TerminalFact::Proven { .. }
+            ));
+            assert_eq!(record.admission_status, "no_claim");
+            assert_eq!(
+                record.admission_no_claim_code,
+                super::QG1_TIMING_DIAGNOSTIC_NO_CLAIM_CODE
+            );
+            assert_eq!(
+                record.timing.producer_coverage,
+                super::Qg1ProducerCoverage::EngineIndexingLifecycle
+            );
+        }
+    }
+
+    #[test]
+    fn qg1_smallest_real_fixture_is_terminally_visible_for_both_engines() {
+        assert_qg1_real_terminal_visibility_contract();
+    }
+
+    pub fn assert_qg1_raw_sample_work_contract() {
+        use frankensearch_quill_gauntlet::{PerfGate, PerfMatrixSpec};
+
+        let mut qg1 = PerfMatrixSpec::complete()
+            .for_gate(PerfGate::Qg1)
+            .into_iter()
+            .find(|spec| spec.metric == "docs_per_second")
+            .expect("canonical QG-1 indexing cell")
+            .clone();
+        qg1.document_count = Some(12);
+        let context = super::BenchContext::for_selected(super::MatrixScale::Full, &[qg1.clone()]);
+        let quill_work = super::raw_sample_work(&context, &qg1);
+        let tantivy_work = super::raw_sample_work(&context, &qg1);
+        assert_eq!(quill_work, tantivy_work, "paired arms require equal work");
+        let (work_units, byte_count) = quill_work;
+        assert_eq!(work_units, Some(12));
+        let expected_bytes = context
+            .qg1_prefix(12)
+            .1
+            .iter()
+            .map(|document| {
+                u64::try_from(document.content.len()).expect("test content length fits u64")
+            })
+            .sum::<u64>();
+        assert_eq!(byte_count, Some(expected_bytes));
+        assert!(expected_bytes > 0);
+
+        let mut tokenizer = PerfMatrixSpec::complete()
+            .for_gate(PerfGate::Qg1)
+            .into_iter()
+            .find(|spec| spec.metric == "tokenize_docs_per_second")
+            .expect("canonical QG-1 tokenizer diagnostic")
+            .clone();
+        tokenizer.document_count = Some(12);
+        assert_eq!(
+            super::qg1_producer_coverage(&tokenizer),
+            Some(super::Qg1ProducerCoverage::TokenizerOnlyDiagnosticNoEngineLifecycle)
+        );
+        assert_eq!(
+            super::raw_sample_work(&context, &tokenizer),
+            quill_work,
+            "tokenizer diagnostics retain exact work metadata without engine lifecycle proof"
+        );
+        assert!(
+            !super::qg1_producer_coverage(&tokenizer)
+                .expect("typed QG-1 tokenizer coverage")
+                .admits_engine_lifecycle_receipt()
+        );
+
+        let mut non_qg1 = qg1;
+        non_qg1.gate = PerfGate::Qg2;
+        assert_eq!(super::raw_sample_work(&context, &non_qg1), (None, None));
+    }
+
+    #[test]
+    fn qg1_throughput_raw_samples_bind_equal_work_and_content_bytes() {
+        assert_qg1_raw_sample_work_contract();
+    }
+
     #[test]
     fn runner_profile_parsers_accept_only_closed_canonical_ids() {
         use frankensearch_quill_gauntlet::{ExecutionProfileId, HardwareClassId};
@@ -4142,15 +5912,15 @@ mod tests {
             &matrix,
             &context,
             super::MatrixScale::Full,
-            Some("bulk/tiny/1/"),
+            Some("bulk/tiny/1/positions_on"),
         )
         .expect("runnable partial selection");
-        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered.len(), 1);
         assert!(!super::gate_selection_complete(
             &context,
             &filtered,
             super::MatrixScale::Full,
-            Some("bulk/tiny/1/")
+            Some("bulk/tiny/1/positions_on")
         ));
 
         assert!(
@@ -4158,7 +5928,18 @@ mod tests {
                 &matrix,
                 &context,
                 super::MatrixScale::Full,
-                Some("bulk/tiny/16/"),
+                Some("bulk/tiny/1/"),
+            )
+            .expect_err("fixture prefixes must not select a fuzzy shard")
+            .contains("matched no canonical")
+        );
+
+        assert!(
+            super::selected_cells(
+                &matrix,
+                &context,
+                super::MatrixScale::Full,
+                Some("bulk/tiny/16/positions_on"),
             )
             .expect_err("explicit NA fixture filter must fail")
             .contains("non-applicable")
@@ -4173,6 +5954,272 @@ mod tests {
             .expect_err("unknown fixture filter must fail")
             .contains("matched no canonical")
         );
+    }
+
+    pub fn assert_qg1_disjoint_partial_shard_contract() {
+        use frankensearch_quill_gauntlet::{
+            ExecutionProfileId, HardwareClassId, MachineClassRegistry, MachineProfileKey, PerfGate,
+            PerfMatrixSpec,
+        };
+
+        let matrix = PerfMatrixSpec::complete();
+        let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
+        let profile = MachineProfileKey::new(
+            HardwareClassId::TrjZen35995wx,
+            ExecutionProfileId::Physical64,
+        )
+        .expect("canonical physical-64 profile");
+        let plan = matrix
+            .applicability_plan(&registry, profile, PerfGate::Qg1)
+            .expect("canonical physical-64 QG-1 plan");
+        let execution_capacity = plan
+            .execution_capacity
+            .expect("physical-64 profile has typed capacity");
+        let max_exercised_cell_width = plan
+            .max_exercised_cell_width
+            .expect("physical-64 QG-1 plan has a maximum width");
+        let claims = super::RunnerPlanClaims {
+            gate: PerfGate::Qg1,
+            hardware_class: HardwareClassId::TrjZen35995wx,
+            execution_profile: ExecutionProfileId::Physical64,
+            execution_capacity,
+            max_exercised_cell_width,
+            rayon_num_threads: execution_capacity,
+            applicability_plan_schema_version: plan.binding().schema_version.clone(),
+            applicability_plan_sha256: plan.binding().applicability_plan_sha256.clone(),
+            gate_matrix_contract_sha256: plan.binding().gate_matrix_contract_sha256.clone(),
+            profile_contract_sha256: plan.binding().profile_contract_sha256.clone(),
+            registry_schema_version: plan.binding().registry_schema_version.clone(),
+            registry_sha256: plan.binding().registry_sha256.clone(),
+        };
+        let runner = super::RunnerApplicabilityContext::reconstruct(&matrix, &claims)
+            .expect("exact physical-64 applicability plan");
+        let full = super::selected_cells(&matrix, &runner, super::MatrixScale::Full, None)
+            .expect("complete physical-64 QG-1 selection");
+        assert!(super::gate_selection_complete(
+            &runner,
+            &full,
+            super::MatrixScale::Full,
+            None
+        ));
+        assert!(
+            super::selected_cells(&matrix, &runner, super::MatrixScale::Full, Some("bulk/"),)
+                .expect_err("fixture prefixes must not select a fuzzy shard")
+                .contains("matched no canonical")
+        );
+
+        let expected_ordinals = full
+            .iter()
+            .map(|cell| cell.ordinal)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut shard_ordinals = std::collections::BTreeSet::new();
+        let mut identity_probe_shards: Vec<Vec<super::PlannedPerfCell>> = Vec::new();
+        for planned in &full {
+            let shard = super::selected_cells(
+                &matrix,
+                &runner,
+                super::MatrixScale::Full,
+                Some(planned.spec.fixture.as_str()),
+            )
+            .expect("exact runnable fixture forms one real partial shard");
+            assert_eq!(shard.len(), 1, "fixture filters must be disjoint");
+            assert!(
+                !super::gate_selection_complete(
+                    &runner,
+                    &shard,
+                    super::MatrixScale::Full,
+                    Some(planned.spec.fixture.as_str()),
+                ),
+                "no individual shard may become ratchet-admissible"
+            );
+            let (code, detail) = super::partial_shard_no_claim(PerfGate::Qg1, false)
+                .expect("partial QG-1 shard has an explicit NoClaim");
+            assert_eq!(code, super::QG1_PARTIAL_SHARD_NO_CLAIM_CODE);
+            assert!(!detail.is_empty());
+            assert!(shard_ordinals.insert(shard[0].ordinal));
+            if identity_probe_shards.is_empty()
+                || (identity_probe_shards.len() == 1
+                    && identity_probe_shards[0][0].spec.document_count
+                        != shard[0].spec.document_count)
+            {
+                identity_probe_shards.push(shard);
+            }
+        }
+        assert_eq!(
+            shard_ordinals, expected_ordinals,
+            "the disjoint NoClaim shards collectively cover the runnable full gate"
+        );
+        assert!(
+            super::partial_shard_no_claim(PerfGate::Qg1, true).is_none(),
+            "only a single complete invocation may omit the partial-shard NoClaim"
+        );
+        assert_eq!(
+            identity_probe_shards.len(),
+            2,
+            "hostile identity probes require two shards with distinct measured corpus sizes"
+        );
+
+        let first_specs = identity_probe_shards[0]
+            .iter()
+            .map(|cell| cell.spec.clone())
+            .collect::<Vec<_>>();
+        let second_specs = identity_probe_shards[1]
+            .iter()
+            .map(|cell| cell.spec.clone())
+            .collect::<Vec<_>>();
+        let first_context =
+            super::BenchContext::for_selected(super::MatrixScale::Full, &first_specs);
+        let second_context =
+            super::BenchContext::for_selected(super::MatrixScale::Full, &second_specs);
+        let (first_authoritative_hash, first_authoritative_specs) =
+            super::authoritative_qg1_corpus_identity(&first_context, &matrix, &first_specs)
+                .expect("first shard binds the authoritative corpus");
+        let (second_authoritative_hash, second_authoritative_specs) =
+            super::authoritative_qg1_corpus_identity(&second_context, &matrix, &second_specs)
+                .expect("second shard binds the authoritative corpus");
+        assert_eq!(
+            first_authoritative_specs.len(),
+            matrix.for_gate(PerfGate::Qg1).len()
+        );
+        assert_eq!(first_authoritative_specs, second_authoritative_specs);
+        assert_eq!(
+            first_authoritative_hash, second_authoritative_hash,
+            "runtime shard selection must not alter the full-corpus identity"
+        );
+        let first_qg1_identity =
+            super::corpus_identity(&first_context, &first_specs, &first_authoritative_hash);
+        let second_qg1_identity =
+            super::corpus_identity(&second_context, &second_specs, &second_authoritative_hash);
+        assert_eq!(
+            first_qg1_identity.corpus_sha256, second_qg1_identity.corpus_sha256,
+            "disjoint shards must retain the same immutable full-corpus-universe seal"
+        );
+        assert_eq!(
+            first_qg1_identity.document_count,
+            first_specs[0]
+                .document_count
+                .expect("first shard has a measured document count")
+        );
+        assert_eq!(
+            second_qg1_identity.document_count,
+            second_specs[0]
+                .document_count
+                .expect("second shard has a measured document count")
+        );
+        assert_ne!(
+            first_qg1_identity.document_count, second_qg1_identity.document_count,
+            "shared full-corpus identity must not erase distinct shard-local measured counts"
+        );
+        assert_eq!(
+            first_qg1_identity.generator_revision,
+            super::QG1_CORPUS_GENERATOR_REVISION
+        );
+        assert_eq!(first_qg1_identity.query_set_sha256, None);
+
+        let first_selected_only_hash = super::corpus_manifest_hash(&first_context, &first_specs)
+            .expect("hash first selected-only control");
+        let second_selected_only_hash = super::corpus_manifest_hash(&second_context, &second_specs)
+            .expect("hash second selected-only control");
+        assert_ne!(
+            first_selected_only_hash, second_selected_only_hash,
+            "hostile control proves selected-spec hashing would split the corpus identity"
+        );
+        assert_ne!(first_authoritative_hash, first_selected_only_hash);
+        assert_ne!(second_authoritative_hash, second_selected_only_hash);
+
+        let mut position_mutated_matrix = matrix.clone();
+        position_mutated_matrix
+            .cells
+            .iter_mut()
+            .find(|cell| cell.gate == PerfGate::Qg1)
+            .expect("canonical QG-1 cell")
+            .positions = Some(frankensearch_quill_gauntlet::PositionMode::Off);
+        assert!(
+            super::authoritative_qg1_corpus_identity(
+                &first_context,
+                &position_mutated_matrix,
+                &first_specs,
+            )
+            .expect_err("position-contract mutation must change the authoritative identity")
+            .contains("differs from frozen identity")
+        );
+    }
+
+    #[test]
+    fn qg1_disjoint_partial_shards_share_full_corpus_identity_and_stay_no_claim() {
+        assert_qg1_disjoint_partial_shard_contract();
+    }
+
+    pub fn assert_corpus_identity_fixture_framing() {
+        use sha2::{Digest, Sha256};
+
+        let mut left_unframed = b"a".to_vec();
+        left_unframed.extend_from_slice(b"bc");
+        let mut right_unframed = b"ab".to_vec();
+        right_unframed.extend_from_slice(b"c");
+        assert_eq!(
+            left_unframed, right_unframed,
+            "hostile variable-field control must collide without boundary framing"
+        );
+
+        let framed_hash = |fixture: &[u8], following_field: &[u8]| {
+            let mut hasher = Sha256::new();
+            hasher.update(b"corpus-identity-framing-test-v1\0");
+            super::hash_qg1_indexed_bytes(&mut hasher, fixture);
+            hasher.update(following_field);
+            super::lower_hex(&hasher.finalize())
+        };
+        assert_ne!(
+            framed_hash(b"a", b"bc"),
+            framed_hash(b"ab", b"c"),
+            "length-prefixed fixture framing must separate the hostile preimages"
+        );
+    }
+
+    #[test]
+    fn corpus_identity_length_prefixes_variable_fixture_text() {
+        assert_corpus_identity_fixture_framing();
+    }
+
+    pub fn assert_non_qg1_corpus_identity_preserves_legacy_hash() {
+        use frankensearch_quill_gauntlet::{PerfGate, PerfMatrixSpec};
+        use sha2::{Digest, Sha256};
+
+        let representative = PerfMatrixSpec::complete()
+            .for_gate(PerfGate::Qg6)
+            .into_iter()
+            .next()
+            .expect("canonical QG-6 cell")
+            .clone();
+        let cells = [representative];
+        let mut legacy = Sha256::new();
+        for cell in &cells {
+            legacy.update(cell.fixture.as_bytes());
+            legacy.update(
+                super::MatrixScale::Full
+                    .document_count(cell.document_count.unwrap_or_default())
+                    .to_le_bytes(),
+            );
+            legacy.update(super::CORPUS_SEED.to_le_bytes());
+            legacy.update(super::VOCABULARY_SIZE.to_le_bytes());
+            legacy.update(super::MAX_DOCUMENT_BYTES.to_le_bytes());
+        }
+        let expected = super::lower_hex(&legacy.finalize());
+        let actual = super::hash_corpus_identity_cells(
+            super::MatrixScale::Full,
+            &cells,
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("hash representative non-QG-1 corpus identity");
+        assert_eq!(
+            actual, expected,
+            "the QG-1 identity revision must not alter a non-QG-1 corpus hash"
+        );
+    }
+
+    #[test]
+    fn non_qg1_corpus_identity_preserves_legacy_hash() {
+        assert_non_qg1_corpus_identity_preserves_legacy_hash();
     }
 
     #[test]
@@ -4386,6 +6433,47 @@ mod tests {
                 "[gate.QG-6]\nqueries_per_class = \"sixteen\"\n",
             )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn normative_manifest_gate_contract_is_complete_and_closed() {
+        assert_manifest_gate_contract();
+    }
+
+    pub fn assert_manifest_gate_contract() {
+        super::validate_manifest_gate_contract(super::MANIFEST)
+            .expect("normative manifest has every required QG policy");
+
+        let missing = super::MANIFEST.replacen("[gate.QG-10]", "[omitted.QG-10]", 1);
+        let missing_error = super::validate_manifest_gate_contract(&missing)
+            .expect_err("missing QG policy must fail closed");
+        assert!(
+            missing_error.contains("missing gate.QG-10"),
+            "unexpected missing-gate error: {missing_error}"
+        );
+
+        let extra = format!(
+            "{}\n[gate.QG-11]\nname = \"extra\"\nfixture = \"extra\"\ntarget = \"extra\"\nactivated = false\n",
+            super::MANIFEST
+        );
+        let extra_error = super::validate_manifest_gate_contract(&extra)
+            .expect_err("extra QG policy must fail closed");
+        assert!(
+            extra_error.contains("unexpected gate.QG-11"),
+            "unexpected extra-gate error: {extra_error}"
+        );
+
+        let empty_target = super::MANIFEST.replacen(
+            "target = \"open() <= 50ms (manifest + lazy sections) vs oracle reader open\"",
+            "target = \" \"",
+            1,
+        );
+        let target_error = super::validate_manifest_gate_contract(&empty_target)
+            .expect_err("empty QG target must fail closed");
+        assert!(
+            target_error.contains("gate.QG-9.target is empty"),
+            "unexpected empty-target error: {target_error}"
         );
     }
 }

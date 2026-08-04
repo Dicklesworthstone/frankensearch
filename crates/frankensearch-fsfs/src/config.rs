@@ -1811,6 +1811,12 @@ fn resolve_pressure_profile(
     cli_overrides: ProfileSourceOverrides,
     warnings: &mut Vec<ConfigWarning>,
 ) -> PressureProfileResolution {
+    // A pressure profile grants or denies the capability to run background
+    // indexing; it does not itself request a long-lived watcher. Preserve the
+    // command/config intent that was resolved before applying the capability
+    // contract, then clamp that intent below when the selected profile or a
+    // hard pause forbids background work.
+    let requested_watch_mode = config.indexing.watch_mode;
     let contract = config.pressure.profile.contract();
     let mut effective = contract.to_effective_settings();
     let mut overrides = Vec::new();
@@ -1905,7 +1911,7 @@ fn resolve_pressure_profile(
     }
 
     config.search.fast_only = !effective.quality_enabled;
-    config.indexing.watch_mode = effective.allow_background_indexing;
+    config.indexing.watch_mode = requested_watch_mode && effective.allow_background_indexing;
 
     let diagnostics_reason_code = if conflict_detected {
         "profile.resolution.conflict"
@@ -3394,6 +3400,68 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn performance_profile_grants_background_capability_without_requesting_watch_mode() {
+        let result = load_from_str(
+            None,
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("load default performance profile");
+
+        assert!(
+            result
+                .pressure_profile_resolution
+                .effective
+                .allow_background_indexing,
+            "the performance profile should retain the capability for explicit watch commands"
+        );
+        assert!(
+            !result.config.indexing.watch_mode,
+            "profile capability alone must not turn a one-shot index request into a watcher"
+        );
+    }
+
+    #[test]
+    fn performance_profile_honors_an_explicit_watch_request() {
+        let cli = CliOverrides {
+            allow_background_indexing: Some(true),
+            ..CliOverrides::default()
+        };
+        let result = load_from_str(None, None, &HashMap::new(), &cli, home())
+            .expect("load explicit performance watch request");
+
+        assert!(result.config.indexing.watch_mode);
+        assert!(
+            result
+                .pressure_profile_resolution
+                .effective
+                .allow_background_indexing
+        );
+    }
+
+    #[test]
+    fn strict_profile_clamps_an_explicit_watch_request() {
+        let cli = CliOverrides {
+            profile: Some(super::PressureProfile::Strict),
+            allow_background_indexing: Some(true),
+            ..CliOverrides::default()
+        };
+        let result = load_from_str(None, None, &HashMap::new(), &cli, home())
+            .expect("load strict watch request");
+
+        assert!(!result.config.indexing.watch_mode);
+        assert!(
+            !result
+                .pressure_profile_resolution
+                .effective
+                .allow_background_indexing
+        );
+        assert!(result.pressure_profile_resolution.conflict_detected);
     }
 
     #[test]

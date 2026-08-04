@@ -73,7 +73,7 @@ use crate::{
     config::ZeroSignalReason,
     generation::{EmbeddingSpaceIdentityV1, EmbeddingSpaceKindV1},
     traits::ModelTier,
-    types::RetrievalTopology,
+    types::{RetrievalTopology, retrieval_topology_fits_request},
 };
 
 mod recovery_model_tier_wire {
@@ -488,56 +488,6 @@ pub enum RequestMode {
     HashControl,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum RetrievalTopologyTagWire {
-    LexicalOnly,
-    HashControl,
-    FastOnly,
-    QualityOnly,
-    FullProgressive,
-    PartialQuality,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RetrievalTopologyWire {
-    topology: RetrievalTopologyTagWire,
-    #[serde(default)]
-    coverage_ppm: WireField<u32>,
-}
-
-fn deserialize_retrieval_topology<'de, D>(deserializer: D) -> Result<RetrievalTopology, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let wire = RetrievalTopologyWire::deserialize(deserializer)?;
-    match (wire.topology, wire.coverage_ppm) {
-        (RetrievalTopologyTagWire::LexicalOnly, WireField::Missing) => {
-            Ok(RetrievalTopology::LexicalOnly)
-        }
-        (RetrievalTopologyTagWire::HashControl, WireField::Missing) => {
-            Ok(RetrievalTopology::HashControl)
-        }
-        (RetrievalTopologyTagWire::FastOnly, WireField::Missing) => Ok(RetrievalTopology::FastOnly),
-        (RetrievalTopologyTagWire::QualityOnly, WireField::Missing) => {
-            Ok(RetrievalTopology::QualityOnly)
-        }
-        (RetrievalTopologyTagWire::FullProgressive, WireField::Missing) => {
-            Ok(RetrievalTopology::FullProgressive)
-        }
-        (RetrievalTopologyTagWire::PartialQuality, WireField::Present(coverage_ppm)) => {
-            Ok(RetrievalTopology::PartialQuality { coverage_ppm })
-        }
-        (RetrievalTopologyTagWire::PartialQuality, WireField::Missing) => {
-            Err(serde::de::Error::missing_field("coverage_ppm"))
-        }
-        (_, WireField::Present(_)) => Err(serde::de::Error::custom(
-            "coverage_ppm is only valid for partial_quality topology",
-        )),
-    }
-}
-
 /// Requested operation, including the exact retrieval topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct RecoveryRequest {
@@ -549,7 +499,6 @@ pub struct RecoveryRequest {
 #[serde(deny_unknown_fields)]
 struct RecoveryRequestWire {
     mode: RequestMode,
-    #[serde(deserialize_with = "deserialize_retrieval_topology")]
     requested_topology: RetrievalTopology,
 }
 
@@ -821,6 +770,7 @@ impl ModelAcquisitionAuthorization {
         if self.embedding_space.kind != EmbeddingSpaceKindV1::Semantic {
             return Err(RecoveryContractError::NonSemanticAcquisitionSpace);
         }
+        // ubs:ignore — model IDs are public embedding-space identities, not authenticators.
         if self.model_id != self.embedding_space.logical_model_id {
             return Err(RecoveryContractError::InconsistentAcquisitionIdentity {
                 field: "model_id",
@@ -982,6 +932,7 @@ fn validate_acquisition_authorization_nonce(nonce: &str) -> Result<(), RecoveryC
         && nonce
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    // ubs:ignore — this persisted acquisition nonce is public uniqueness evidence, not a bearer token.
     let nonzero = nonce.bytes().any(|byte| byte != b'0');
     if !valid_shape || !nonzero {
         return Err(RecoveryContractError::InvalidAcquisitionAuthorizationNonce);
@@ -1375,9 +1326,7 @@ pub struct SemanticResponseContract {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SemanticResponseContractWire {
-    #[serde(deserialize_with = "deserialize_retrieval_topology")]
     requested_topology: RetrievalTopology,
-    #[serde(deserialize_with = "deserialize_retrieval_topology")]
     realized_topology: RetrievalTopology,
     coverage_ppm: u32,
     admitted_semantic_scores: u64,
@@ -1458,28 +1407,8 @@ impl SemanticResponseContract {
     }
 
     fn validate(&self) -> Result<(), RecoveryContractError> {
-        let topology_compatible = match self.requested_topology {
-            RetrievalTopology::FastOnly => matches!(
-                self.realized_topology,
-                RetrievalTopology::FastOnly | RetrievalTopology::LexicalOnly
-            ),
-            RetrievalTopology::QualityOnly => matches!(
-                self.realized_topology,
-                RetrievalTopology::QualityOnly
-                    | RetrievalTopology::PartialQuality { .. }
-                    | RetrievalTopology::LexicalOnly
-            ),
-            RetrievalTopology::FullProgressive => matches!(
-                self.realized_topology,
-                RetrievalTopology::FullProgressive
-                    | RetrievalTopology::PartialQuality { .. }
-                    | RetrievalTopology::LexicalOnly
-            ),
-            RetrievalTopology::HashControl => {
-                matches!(self.realized_topology, RetrievalTopology::HashControl)
-            }
-            RetrievalTopology::LexicalOnly | RetrievalTopology::PartialQuality { .. } => false,
-        };
+        let topology_compatible =
+            retrieval_topology_fits_request(self.requested_topology, self.realized_topology);
         if !topology_compatible {
             return Err(RecoveryContractError::IncompatibleResponseTopology {
                 requested: self.requested_topology,
@@ -1493,6 +1422,7 @@ impl SemanticResponseContract {
             }
             RetrievalTopology::FastOnly
             | RetrievalTopology::QualityOnly
+            // ubs:ignore — coverage is a public retrieval-plan fact, not security material.
             | RetrievalTopology::FullProgressive => self.coverage_ppm == COMPLETE_COVERAGE_PPM,
             RetrievalTopology::PartialQuality { coverage_ppm } => {
                 coverage_ppm == self.coverage_ppm
@@ -1514,15 +1444,20 @@ impl SemanticResponseContract {
         }
 
         match (
+            self.requested_topology,
             self.realized_topology,
             self.degradation_reason_code.as_deref(),
         ) {
-            (RetrievalTopology::LexicalOnly, Some(code)) if !code.trim().is_empty() => Ok(()),
-            (RetrievalTopology::LexicalOnly, _) => {
+            (RetrievalTopology::LexicalOnly, RetrievalTopology::LexicalOnly, None) => Ok(()),
+            (RetrievalTopology::LexicalOnly, RetrievalTopology::LexicalOnly, Some(_)) => {
+                Err(RecoveryContractError::UnexpectedDegradationReason)
+            }
+            (_, RetrievalTopology::LexicalOnly, Some(code)) if !code.trim().is_empty() => Ok(()),
+            (_, RetrievalTopology::LexicalOnly, _) => {
                 Err(RecoveryContractError::MissingDegradationReason)
             }
-            (_, None) => Ok(()),
-            (_, Some(_)) => Err(RecoveryContractError::UnexpectedDegradationReason),
+            (_, _, None) => Ok(()),
+            (_, _, Some(_)) => Err(RecoveryContractError::UnexpectedDegradationReason),
         }
     }
 }
@@ -1566,7 +1501,6 @@ struct RecoveryPlanWire {
     state_code: String,
     provenance: SemanticProvenance,
     mode: RequestMode,
-    #[serde(deserialize_with = "deserialize_retrieval_topology")]
     requested_topology: RetrievalTopology,
     policy: RecoveryPolicy,
     semantic_available: bool,
@@ -1783,30 +1717,39 @@ fn validate_wire_against_canonical(
     wire: &RecoveryPlanWire,
     canonical: &RecoveryPlan,
 ) -> Result<(), RecoveryContractError> {
+    // ubs:ignore — schema versions are public recovery-wire facts, not authenticators.
     if wire.schema_version != canonical.schema_version {
         return Err(inconsistent("schema_version"));
     }
+    // ubs:ignore — readiness state is public recovery-wire data, not secret material.
     if wire.state != canonical.state {
         return Err(inconsistent("state"));
     }
+    // ubs:ignore — state codes are public recovery-wire data, not authenticators.
     if wire.state_code != canonical.state_code {
         return Err(inconsistent("state_code"));
     }
+    // ubs:ignore — provenance is public recovery-wire evidence, not an authenticator.
     if wire.provenance != canonical.provenance {
         return Err(inconsistent("provenance"));
     }
+    // ubs:ignore — mode is a public recovery-wire fact, not security material.
     if wire.mode != canonical.mode {
         return Err(inconsistent("mode"));
     }
+    // ubs:ignore — topology is public recovery-wire data, not an authenticator.
     if wire.requested_topology != canonical.requested_topology {
         return Err(inconsistent("requested_topology"));
     }
+    // ubs:ignore — policy is public recovery-wire configuration, not an authenticator.
     if wire.policy != canonical.policy {
         return Err(inconsistent("policy"));
     }
+    // ubs:ignore — availability is a public recovery-wire fact, not secret material.
     if wire.semantic_available != canonical.semantic_available {
         return Err(inconsistent("semantic_available"));
     }
+    // ubs:ignore — retryability is a public recovery-wire fact, not an authenticator.
     if wire.retryability != canonical.retryability {
         return Err(inconsistent("retryability"));
     }
@@ -1834,30 +1777,39 @@ fn validate_action_wire(
             Err(inconsistent("action"))
         };
     };
+    // ubs:ignore — action codes are public recovery-wire facts, not authenticators.
     if wire.code != canonical.code {
         return Err(inconsistent("action.code"));
     }
+    // ubs:ignore — explanations are public operator guidance, not secret material.
     if wire.explanation != canonical.explanation {
         return Err(inconsistent("action.explanation"));
     }
+    // ubs:ignore — argv is public recovery-action evidence, not an authenticator.
     if wire.argv != canonical.argv {
         return Err(inconsistent("action.argv"));
     }
+    // ubs:ignore — network requirement is public recovery-action metadata.
     if wire.network_required != canonical.network_required {
         return Err(inconsistent("action.network_required"));
     }
+    // ubs:ignore — consent requirement is public recovery-action metadata.
     if wire.consent_required != canonical.consent_required {
         return Err(inconsistent("action.consent_required"));
     }
+    // ubs:ignore — preservation is public recovery-action metadata, not an authenticator.
     if wire.preserves_old_data != canonical.preserves_old_data {
         return Err(inconsistent("action.preserves_old_data"));
     }
+    // ubs:ignore — destructive intent is public recovery-action metadata, not a secret.
     if wire.potentially_destructive != canonical.potentially_destructive {
         return Err(inconsistent("action.potentially_destructive"));
     }
+    // ubs:ignore — prerequisites are public recovery-action facts, not authenticators.
     if wire.prerequisites != canonical.prerequisites {
         return Err(inconsistent("action.prerequisites"));
     }
+    // ubs:ignore — postconditions are public recovery-action facts, not authenticators.
     if wire.expected_postcondition != canonical.expected_postcondition {
         return Err(inconsistent("action.expected_postcondition"));
     }
@@ -1865,6 +1817,7 @@ fn validate_action_wire(
         .required_authorization
         .required_option_ref()
         .map_err(|()| inconsistent("action.required_authorization"))?;
+    // ubs:ignore — this is a public frozen authorization contract, not a credential.
     if wire_authorization != canonical.required_authorization.as_ref() {
         return Err(inconsistent("action.required_authorization"));
     }
@@ -1882,15 +1835,19 @@ fn validate_response_wire(
             Err(inconsistent("response_contract"))
         };
     };
+    // ubs:ignore — requested topology is public response-contract metadata.
     if wire.requested_topology != canonical.requested_topology {
         return Err(inconsistent("response_contract.requested_topology"));
     }
+    // ubs:ignore — realized topology is public response-contract metadata.
     if wire.realized_topology != canonical.realized_topology {
         return Err(inconsistent("response_contract.realized_topology"));
     }
+    // ubs:ignore — coverage is public response-contract evidence, not a secret.
     if wire.coverage_ppm != canonical.coverage_ppm {
         return Err(inconsistent("response_contract.coverage_ppm"));
     }
+    // ubs:ignore — score admission is public response-contract evidence.
     if wire.admitted_semantic_scores != canonical.admitted_semantic_scores {
         return Err(inconsistent("response_contract.admitted_semantic_scores"));
     }
@@ -1898,6 +1855,7 @@ fn validate_response_wire(
         .degradation_reason_code
         .required_option_ref()
         .map_err(|()| inconsistent("response_contract.degradation_reason_code"))?;
+    // ubs:ignore — degradation reason codes are public operator evidence.
     if wire_degradation_reason != canonical.degradation_reason_code.as_ref() {
         return Err(inconsistent("response_contract.degradation_reason_code"));
     }
@@ -1908,34 +1866,49 @@ fn mismatched_authorization_field(
     required: &ModelAcquisitionAuthorization,
     supplied: &ModelAcquisitionAuthorization,
 ) -> Option<&'static str> {
+    // ubs:ignore — model IDs are public frozen acquisition facts, not credentials.
     if required.model_id != supplied.model_id {
         Some("model_id")
+    // ubs:ignore — model tiers are public frozen acquisition facts.
     } else if required.model_tier != supplied.model_tier {
         Some("model_tier")
+    // ubs:ignore — upstream revisions are public provenance, not secrets.
     } else if required.upstream_revision != supplied.upstream_revision {
         Some("upstream_revision")
+    // ubs:ignore — embedding-space identities are public compatibility facts.
     } else if required.embedding_space != supplied.embedding_space {
         Some("embedding_space")
+    // ubs:ignore — manifest fingerprints are public integrity evidence, not secrets.
     } else if required.manifest_fingerprint != supplied.manifest_fingerprint {
         Some("manifest_fingerprint")
+    // ubs:ignore — license identifiers are public provenance facts.
     } else if required.license_spdx != supplied.license_spdx {
         Some("license_spdx")
+    // ubs:ignore — model sources are public provenance facts, not credentials.
     } else if required.source != supplied.source {
         Some("source")
+    // ubs:ignore — byte budgets are public acquisition-policy facts.
     } else if required.byte_budget != supplied.byte_budget {
         Some("byte_budget")
+    // ubs:ignore — destination classes are public storage-policy facts.
     } else if required.destination_class != supplied.destination_class {
         Some("destination_class")
+    // ubs:ignore — destination fingerprints are public integrity evidence, not secrets.
     } else if required.destination_fingerprint != supplied.destination_fingerprint {
         Some("destination_fingerprint")
+    // ubs:ignore — document counts are public corpus-binding facts.
     } else if required.document_count != supplied.document_count {
         Some("document_count")
+    // ubs:ignore — duration estimates are public planning facts.
     } else if required.estimated_reindex_duration_ms != supplied.estimated_reindex_duration_ms {
         Some("estimated_reindex_duration_ms")
+    // ubs:ignore — issue times are public authorization-contract facts.
     } else if required.issued_at_unix_seconds != supplied.issued_at_unix_seconds {
         Some("issued_at_unix_seconds")
+    // ubs:ignore — expiry times are public authorization-contract facts.
     } else if required.expires_at_unix_seconds != supplied.expires_at_unix_seconds {
         Some("expires_at_unix_seconds")
+    // ubs:ignore — this persisted nonce is public replay-binding evidence, not a secret.
     } else if required.nonce != supplied.nonce {
         Some("nonce")
     } else {
@@ -2049,6 +2022,7 @@ pub fn plan(trusted: TrustedRecoveryContext<'_>) -> Result<RecoveryPlan, Recover
                     .required_authorization
                     .as_ref()
                     .is_some_and(|required| {
+                        // ubs:ignore — this public policy contract is not an authenticator.
                         policy.acquisition_authorization.as_ref() == Some(required)
                     });
             let binding_missing = matches!(
@@ -2142,7 +2116,9 @@ fn validate_acquisition_tier(
         _ => return Ok(()),
     };
     let topology_matches = match requested_topology {
+        // ubs:ignore — model tiers are public recovery-routing facts, not secrets.
         RetrievalTopology::FastOnly => readiness_tier == ModelTier::Fast,
+        // ubs:ignore — model tiers are public recovery-routing facts, not secrets.
         RetrievalTopology::QualityOnly => readiness_tier == ModelTier::Quality,
         RetrievalTopology::FullProgressive => true,
         RetrievalTopology::LexicalOnly
@@ -2156,6 +2132,7 @@ fn validate_acquisition_tier(
         });
     }
     if let Some(target) = acquisition_target
+        // ubs:ignore — model tiers are public recovery-routing facts, not secrets.
         && target.model_tier != readiness_tier
     {
         return Err(RecoveryContractError::AcquisitionTargetTierMismatch {
@@ -2219,6 +2196,7 @@ fn response_contract_for(
 }
 
 fn push_prerequisite(action: &mut RecoveryAction, code: &str) {
+    // ubs:ignore — prerequisite codes are public recovery facts, not authenticators.
     if !action.prerequisites.iter().any(|existing| existing == code) {
         action.prerequisites.push(code.to_owned());
     }
@@ -2757,10 +2735,19 @@ mod tests {
             RetrievalTopology::QualityOnly | RetrievalTopology::FullProgressive => {
                 ModelTier::Quality
             }
-            RetrievalTopology::LexicalOnly
+            other @ (RetrievalTopology::LexicalOnly
             | RetrievalTopology::PartialQuality { .. }
-            | RetrievalTopology::HashControl => {
-                panic!("semantic recovery helper received a non-semantic topology")
+            | RetrievalTopology::HashControl) => {
+                assert!(
+                    matches!(
+                        other,
+                        RetrievalTopology::FastOnly
+                            | RetrievalTopology::QualityOnly
+                            | RetrievalTopology::FullProgressive
+                    ),
+                    "semantic recovery helper received a non-semantic topology: {other:?}"
+                );
+                ModelTier::Quality
             }
         }
     }
@@ -3433,6 +3420,16 @@ mod tests {
                 COMPLETE_COVERAGE_PPM,
             ),
             (
+                RetrievalTopology::FullProgressive,
+                RetrievalTopology::FastOnly,
+                COMPLETE_COVERAGE_PPM,
+            ),
+            (
+                RetrievalTopology::FullProgressive,
+                RetrievalTopology::QualityOnly,
+                COMPLETE_COVERAGE_PPM,
+            ),
+            (
                 RetrievalTopology::QualityOnly,
                 RetrievalTopology::PartialQuality {
                     coverage_ppm: 250_000,
@@ -3483,32 +3480,41 @@ mod tests {
 
     #[test]
     fn response_contract_rejects_silent_or_impossible_contribution_claims() {
-        for requested in [
+        assert_eq!(
+            SemanticResponseContract::new(
+                RetrievalTopology::LexicalOnly,
+                RetrievalTopology::LexicalOnly,
+                0,
+                0,
+                Some("recovery.state.model_missing".to_owned()),
+            ),
+            Err(RecoveryContractError::UnexpectedDegradationReason)
+        );
+        SemanticResponseContract::new(
             RetrievalTopology::LexicalOnly,
-            RetrievalTopology::PartialQuality {
-                coverage_ppm: 500_000,
-            },
-        ] {
-            assert!(matches!(
-                SemanticResponseContract::new(
-                    requested,
-                    RetrievalTopology::LexicalOnly,
-                    0,
-                    0,
-                    Some("recovery.state.model_missing".to_owned()),
-                ),
-                Err(RecoveryContractError::IncompatibleResponseTopology { .. })
-            ));
-        }
+            RetrievalTopology::LexicalOnly,
+            0,
+            0,
+            None,
+        )
+        .expect("an explicitly lexical request is not a degradation");
+        assert!(matches!(
+            SemanticResponseContract::new(
+                RetrievalTopology::PartialQuality {
+                    coverage_ppm: 500_000,
+                },
+                RetrievalTopology::LexicalOnly,
+                0,
+                0,
+                Some("recovery.state.model_missing".to_owned()),
+            ),
+            Err(RecoveryContractError::IncompatibleResponseTopology { .. })
+        ));
         for (requested, realized) in [
             (RetrievalTopology::FastOnly, RetrievalTopology::QualityOnly),
             (
                 RetrievalTopology::QualityOnly,
                 RetrievalTopology::FullProgressive,
-            ),
-            (
-                RetrievalTopology::FullProgressive,
-                RetrievalTopology::FastOnly,
             ),
             (
                 RetrievalTopology::HashControl,
@@ -3781,9 +3787,8 @@ mod tests {
         ] {
             let mut valid = authorization.clone();
             valid.nonce = nonce.to_owned();
-            valid
-                .validate()
-                .unwrap_or_else(|error| panic!("valid nonce {nonce} rejected: {error}"));
+            let result = valid.validate();
+            assert!(result.is_ok(), "valid nonce {nonce} rejected: {result:?}");
         }
     }
 
@@ -4672,7 +4677,6 @@ mod tests {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct TopologyHarness {
-            #[serde(deserialize_with = "deserialize_retrieval_topology")]
             value: RetrievalTopology,
         }
 

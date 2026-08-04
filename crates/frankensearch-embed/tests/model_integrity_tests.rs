@@ -9,10 +9,10 @@
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 
+use frankensearch_embed::model_manifest::VERIFICATION_MARKER_SCHEMA_VERSION;
 use frankensearch_embed::{
-    MANIFEST_SCHEMA_VERSION, ModelFile, ModelManifest, PLACEHOLDER_VERIFY_AFTER_DOWNLOAD,
-    VerificationMarker, is_verification_cached, verify_dir_cached, verify_file_sha256,
-    write_verification_marker,
+    ModelFile, ModelManifest, PLACEHOLDER_VERIFY_AFTER_DOWNLOAD, VerificationMarker,
+    is_verification_cached, verify_dir_and_record, verify_dir_cached, verify_file_sha256,
 };
 
 // ---------------------------------------------------------------------------
@@ -38,7 +38,7 @@ fn make_manifest(file_name: &str, content: &[u8]) -> ModelManifest {
     ModelManifest {
         id: "integrity-test-model".to_owned(),
         repo: "test/integrity".to_owned(),
-        revision: "abc123".to_owned(),
+        revision: "a".repeat(40),
         files: vec![ModelFile {
             name: file_name.to_owned(),
             sha256: sha256_hex(content),
@@ -212,7 +212,7 @@ fn verification_marker_roundtrip_preserves_fields() {
     let manifest = make_manifest("model.bin", content);
     std::fs::write(tmp.path().join("model.bin"), content).unwrap();
 
-    write_verification_marker(&manifest, tmp.path());
+    verify_dir_and_record(&manifest, tmp.path()).unwrap();
 
     let marker_path = tmp.path().join(".verified");
     assert!(marker_path.exists(), ".verified marker should be created");
@@ -221,7 +221,12 @@ fn verification_marker_roundtrip_preserves_fields() {
     let marker: VerificationMarker = serde_json::from_str(&raw).unwrap();
 
     assert_eq!(marker.manifest_id, "integrity-test-model");
-    assert_eq!(marker.schema_version, MANIFEST_SCHEMA_VERSION);
+    assert_eq!(marker.schema_version, VERIFICATION_MARKER_SCHEMA_VERSION);
+    assert_eq!(
+        marker.manifest_fingerprint.len(),
+        64,
+        "marker must bind the complete frozen production manifest"
+    );
     assert!(
         marker.file_states.contains_key("model.bin"),
         "marker should record file mtime"
@@ -244,7 +249,7 @@ fn verification_cache_hit_after_writing_marker() {
         "should not be cached before marker written"
     );
 
-    write_verification_marker(&manifest, tmp.path());
+    verify_dir_and_record(&manifest, tmp.path()).unwrap();
 
     assert!(
         is_verification_cached(&manifest, tmp.path()),
@@ -259,7 +264,7 @@ fn verification_cache_miss_with_different_manifest_id() {
     let manifest = make_manifest("model.bin", content);
     std::fs::write(tmp.path().join("model.bin"), content).unwrap();
 
-    write_verification_marker(&manifest, tmp.path());
+    verify_dir_and_record(&manifest, tmp.path()).unwrap();
 
     // Create a different manifest with a different ID.
     let mut different = manifest;
@@ -278,7 +283,7 @@ fn verification_cache_miss_when_file_mtime_tampered() {
     let manifest = make_manifest("model.bin", content);
     std::fs::write(tmp.path().join("model.bin"), content).unwrap();
 
-    write_verification_marker(&manifest, tmp.path());
+    verify_dir_and_record(&manifest, tmp.path()).unwrap();
     assert!(is_verification_cached(&manifest, tmp.path()));
 
     // Tamper with the recorded mtime in the marker.
@@ -302,7 +307,7 @@ fn verification_cache_miss_when_marker_is_corrupt_json() {
     let manifest = make_manifest("model.bin", content);
     std::fs::write(tmp.path().join("model.bin"), content).unwrap();
 
-    write_verification_marker(&manifest, tmp.path());
+    verify_dir_and_record(&manifest, tmp.path()).unwrap();
 
     // Overwrite the marker with invalid JSON.
     std::fs::write(tmp.path().join(".verified"), "NOT VALID JSON {{{{").unwrap();
@@ -331,7 +336,7 @@ fn verification_cache_miss_when_marker_file_missing() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn verify_dir_cached_creates_marker_on_first_call() {
+fn verify_dir_cached_is_observational_on_first_call() {
     let tmp = tempfile::tempdir().unwrap();
     let content = b"verify dir cached e2e";
     let manifest = make_manifest("model.bin", content);
@@ -343,8 +348,8 @@ fn verify_dir_cached_creates_marker_on_first_call() {
     verify_dir_cached(&manifest, tmp.path()).unwrap();
 
     assert!(
-        marker_path.exists(),
-        "first call should create .verified marker"
+        !marker_path.exists(),
+        "observational verification must not create a .verified receipt"
     );
 }
 
@@ -355,10 +360,10 @@ fn verify_dir_cached_succeeds_from_cache_on_second_call() {
     let manifest = make_manifest("model.bin", content);
     std::fs::write(tmp.path().join("model.bin"), content).unwrap();
 
-    // First call: full verification.
-    verify_dir_cached(&manifest, tmp.path()).unwrap();
+    // The authority-bearing path performs full verification and records a receipt.
+    verify_dir_and_record(&manifest, tmp.path()).unwrap();
 
-    // Second call: should succeed from cache (no re-hashing).
+    // The observational consumer may then use that receipt.
     verify_dir_cached(&manifest, tmp.path()).unwrap();
 
     // The marker should still exist.
@@ -366,7 +371,7 @@ fn verify_dir_cached_succeeds_from_cache_on_second_call() {
 }
 
 #[test]
-fn verify_dir_cached_skips_for_placeholder_checksums() {
+fn verify_dir_cached_rejects_placeholder_checksums() {
     let tmp = tempfile::tempdir().unwrap();
     let manifest = ModelManifest {
         id: "placeholder-test".to_owned(),
@@ -387,13 +392,12 @@ fn verify_dir_cached_skips_for_placeholder_checksums() {
         download_size_bytes: 0,
     };
 
-    // Should succeed (skips verification) even though the file doesn't exist.
     let result = verify_dir_cached(&manifest, tmp.path());
     assert!(
-        result.is_ok(),
-        "placeholder checksums should cause verification to be skipped: {:?}",
-        result.err()
+        result.is_err(),
+        "placeholder manifests must never receive cached admission"
     );
+    assert!(!tmp.path().join(".verified").exists());
 }
 
 #[test]
@@ -425,7 +429,7 @@ fn verify_dir_cached_checks_all_files_in_manifest() {
     let manifest = ModelManifest {
         id: "multi-file-test".to_owned(),
         repo: "test/multi".to_owned(),
-        revision: "v1".to_owned(),
+        revision: "a".repeat(40),
         files: vec![
             ModelFile {
                 name: "a.bin".to_owned(),
@@ -469,7 +473,7 @@ fn verify_dir_cached_fails_when_one_of_multiple_files_corrupt() {
     let manifest = ModelManifest {
         id: "multi-file-corrupt".to_owned(),
         repo: "test/multi".to_owned(),
-        revision: "v1".to_owned(),
+        revision: "a".repeat(40),
         files: vec![
             ModelFile {
                 name: "a.bin".to_owned(),

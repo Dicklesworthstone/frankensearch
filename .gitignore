@@ -2,7 +2,6 @@
 /target/
 **/target/
 **/*.rs.bk
-Cargo.lock
 
 # IDE
 .idea/
@@ -153,3 +152,7 @@ repro_*.rs
 
 # Beads recovery scratch (machine-local, never tracked)
 .beads/.br_recovery/
+
+# Janitor-skill run artifacts (machine-local audit trails, never tracked)
+.stash_janitor_workspace/
+.worktree_branch_rationalization_workspace/

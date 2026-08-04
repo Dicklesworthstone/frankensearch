@@ -19,18 +19,27 @@ The gauntlet's comparator auto-classifies against §2's classes; anything it can
 
 ## 1. Machine contract and review workflow
 
-The v1 machine contract is
-[`schemas/quill-divergence-register-v1.schema.json`](../../schemas/quill-divergence-register-v1.schema.json).
+The current v2 machine contract is
+[`schemas/quill-divergence-register-v2.schema.json`](../../schemas/quill-divergence-register-v2.schema.json).
 Its synthetic schema-conformance fixture is
-[`crates/frankensearch-quill-gauntlet/fixtures/divergence-register-v1.json`](../../crates/frankensearch-quill-gauntlet/fixtures/divergence-register-v1.json).
+[`crates/frankensearch-quill-gauntlet/fixtures/divergence-register-v2.json`](../../crates/frankensearch-quill-gauntlet/fixtures/divergence-register-v2.json).
 That fixture proves the format; it is **not** a production campaign register
-and must never be cited as live mismatch evidence.
+and must never be cited as live mismatch evidence. The historical
+[`v1 schema`](../../schemas/quill-divergence-register-v1.schema.json) and
+[`v1 fixture`](../../crates/frankensearch-quill-gauntlet/fixtures/divergence-register-v1.json)
+remain unchanged for archival decoding tests only. A v1 ledger is explicitly
+nonadmissible: it cannot produce a ledger hash, census, append-only successor
+proof, review table, or flip-ready claim.
 
 `DivergenceRegisterLedger` is the typed implementation. One immutable event
 stream retains:
 
-- exact first-seen gauntlet object address plus SHA-256 integrity digest, and
-  engine, corpus, query, and generator revisions;
+- the exact first-recorded gauntlet witness case and object address as
+  `{scheme: "frankensearch-quill-gauntlet/artifact-object/v7/sha256", object_schema_version: 7, digest: <64 lowercase hex>}`;
+- canonical producer-build identity SHA-256, oracle dependency-contract
+  SHA-256, historical lexical-contract audit revision, corpus and query
+  manifest SHA-256s, query-suite source kind, and query-source identity
+  SHA-256;
 - minimized fixture identity, replay test, mismatch signatures, root cause,
   expected/observed behavior, consumer impact, and hashed redacted diagnostics;
 - reviewed `accepted`, `fixed`, or `blocking` dispositions;
@@ -45,6 +54,62 @@ resulting JSON remains internally valid. Corrected observation evidence also
 requires a later disposition event, preventing an old review from silently
 blessing new evidence.
 
+Schema v2 deliberately removes v1's separate subject/oracle Git revisions.
+Those fields could describe historical source snapshots but could not identify
+the executable that produced an object or the exact dependency contract used
+by its oracle. The producer-build and oracle-dependency digests are opaque,
+domain-separated SHA-256 identities owned by their respective gauntlet
+contracts; the lexical audit revision is retained only as historical contract
+provenance. A v2 observation carrying the old 16-hex XXH3 address or the old
+revision pair fails closed, as does a v1 record carrying the v2 shape.
+
+There are deliberately two validation levels. `DivergenceRegisterLedger::validate`
+checks the self-contained v2 shape, append-only history, review policy, and
+canonical field bounds. It cannot authenticate an externally named object.
+Evidence admission additionally requires
+`validate_against_artifact_objects`, which first runs each `ArtifactObject`'s
+stored-evidence integrity contract and then compares the complete closed
+binding: object schema version, hash-domain scheme, object digest,
+producer-build identity, oracle-dependency identity, lexical-contract audit
+revision, corpus/query manifests, query-suite source kind and identity,
+first-recorded case ID, rank class, divergence class, and mismatch signatures.
+Every observation event, including superseded history, must bind to the object
+it actually references. A multi-class object must be covered exactly; a
+missing, extra, duplicate, or substituted class/signature claim fails.
+Corrections for the same divergence may repeat the same claim, but a second
+divergence ID may not claim it. Stored-evidence validation is used rather than
+current-producer validation so an authentic historical v7 object does not age
+out when the compiled producer or oracle revision advances.
+
+The first-recorded campaign case and the minimized regression fixture are
+deliberately separate identities: minimization may produce a new fixture ID.
+`validate_fixture_content_witnesses` proves only exact byte availability and
+SHA-256 equality for those minimized fixtures. It rejects missing, extra,
+duplicate, or same-ID/different-hash witnesses. A content hash is not evidence
+that the named regression test exists, replayed, or passed.
+
+Both v2 case/fixture identifiers retain the gauntlet's 1,024-byte
+query-identifier budget and are canonical printable ASCII with no leading or
+trailing spaces. Rust's byte limits and JSON Schema's character limits are
+therefore identical rather than silently disagreeing on multibyte input. The
+archived v1 decoder preserves its historical Unicode/byte bounds exactly.
+
+There is intentionally **no public terminal-census or flip-ready API** in v2.
+The only census is a private, test-only structural projection over raw
+signature slices, explicitly nonadmissible because callers could omit or
+cherry-pick campaign results. Terminal admission remains unavailable until
+report v7 exposes a store-verified, complete campaign matrix that derives both
+ordinary and lexical mismatches and carries typed regression/pass/replay and
+class-specific retirement receipts. Lexical mismatches are fix-only and can
+never be waived through a Divergence Register class.
+
+The seeded prediction policy is frozen and domain-hashed as
+`quill-divergence-predictions-v1`; its ordered required set is
+`ScoreEpsilon`, `TieOrder`, `SnippetWindow`, `GlobExpansionLimit`,
+`StatsSemantics`, and `OversizedQueryToken`. A shape-valid `Retired` event is
+archival state, not terminal proof; absent a future typed class-specific report
+receipt it remains unresolved.
+
 The campaign workflow is:
 
 1. Append an observation as soon as a mismatch is emitted. Raw rank, snippet,
@@ -54,13 +119,12 @@ The campaign workflow is:
    test. An accept names an equivalence law, rationale, and reviewer independent
    of the observation author. An unresolved mismatch names an owning bead and
    remains an explicit blocker.
-3. Append prediction revisions when a seeded class is forced or formally
-   retired. A declaration is permitted during an active campaign, but prevents
-   a terminal census.
-4. Run the mismatch census over the sorted unique signatures emitted by the
-   required campaigns. Missing signatures, a reappearance after `fixed`, active
-   blockers, and unresolved predictions all make `flip_ready = false`;
-   `require_terminal_census` fails closed on the same state.
+3. Append prediction revisions when a seeded class is forced or has an
+   archival retirement proposal. `Declared` and unverified `Retired` states
+   remain unresolved.
+4. Bind every observation event to its store-verified v7 object and validate
+   the exact multi-class signature coverage. Independently validate every
+   minimized fixture's bytes. Neither check is a terminal release claim.
 5. Run source-sensitive canaries before commit. Diagnostics carry only a
    lowercase SHA-256 digest and a canonical `<redacted:...>` marker. The
    generated review table is derived from validated active events and never
@@ -87,8 +151,9 @@ links, and disposition-specific proof described above.
 ```
 
 The E6.8 bead remains open until the production ledger is populated from every
-required campaign and two consecutive independent nightly receipts (different
-fixed seeds and worker receipts) report no new or unclassified divergence.
+required campaign, report v7 supplies the missing verified terminal evidence,
+and two consecutive independent nightly receipts (different fixed seeds and
+worker receipts) report no new or unclassified divergence.
 
 ## 2. Divergence classes (taxonomy)
 
@@ -115,6 +180,7 @@ These are the classes the plan *predicts*; each becomes a numbered DIV entry whe
 - `TieOrder` on synthetic corpora with duplicated documents.
 - `SnippetWindow` on documents where two windows have equal term coverage.
 - `GlobExpansionLimit` on >limit-term dictionaries with `Complex` patterns.
+- `StatsSemantics` on delete/delta/sealed field-stat transitions.
 - ~~A dedicated class for score-neutral oversized query-token normalization~~ — landed as `OversizedQueryToken` with the G1 comparator class and executable Boolean-shape proof (`bd-quill-e0-contracts-j53p.8`, DIV-004).
 
 ## 4. Entries
@@ -181,6 +247,17 @@ These are the classes the plan *predicts*; each becomes a numbered DIV entry whe
 - Decision: fix completed 2026-07-27 (bead: `bd-basic-field-tf-parity-y8cb`; source commit: `d95f1614130a3dc71ef7b63f828b009a68ca3ac0`)
 - Resolution: query lowering now carries the schema record option into `TermScorer`. One effective-frequency policy clamps `Basic` to presence tf=1 for exhaustive scoring, cached term maxima, current block maxima, MaxScore/WAND, grouped execution, and Delta cursors; `WithFreqs` and `WithFreqsAndPositions` retain raw tf. The strict-remote nightly lane ran as RCH job `29949672659354095` on `hz2` with test-binary SHA-256 `0b840262a38e6e0f9de2bff499b264c3280b1ec6aadb9bcb485e0aa0c5d54a8b`, clean subject/oracle provenance, and zero mismatches in all eight default/CASS generated/repository first/replay reports. Generated corpus/query hashes were `24f68d1c24610581ada06ecfcda9d8e3b61a82502b16b10fbb788d2600a68358` / `933af603feec3950a7ed6e974b97bf82e51321195b5a89efd1f74771029063f6`; the complete 40-path repository hashes were `86e29bd008426ec1f793d6756347e6c60af4c9bf44fba75955b7745a768ccde6` / `23c7989a12b8f34f897b55700d6540755d371d7197de31a33d7bedff7338d93c`. First/replay report/reservation SHA-256 pairs were CASS generated `7754bd26269a7b4d47c2001b9960a8fa392d26e0994aabd5be9ef696ecddaebe` / `ea2de990f8f28d4b7a609a6f542d765b870ae387b4a1347c012448e15a616cdc`, CASS repository `cf30c92dfee1546664ec9b157a31ae65bc9541151071415af93de1a0be89a26b` / `8938c10a7aa211f514dff2e7bf6d6d8b36635748a9b97337b49e75c7b2b24a64`, default generated `88318f329f883b2dae32b9ee905aeed93973597225eb437999852eae764df9e1` / `9a09710bc60bcb097cbca5ed6dd21479d5581c6f4aa8fd901e130047252d7748`, and default repository `d5aaedcb79cb0299b95d77bb9e62bdee8e2b737a77ed9e6f004aeeebc8851c53` / `b1c4f91d851cd47ce8afbe895287136f12b67c70e178cbecd01ddcecc3098df9`.
 - Reviewer: not required for a fix decision
+
+### DIV-007: fused multi-field term scoring diverges from oracle summation association at ULP scale
+
+- Class: `ScoreEpsilon` (typed reason `SummationAssociation`, bound ≤ 2 ULP — ULP-based, not the relative-1e-4 form; reason added by owner ruling on bd-55mvg)
+- First seen: 2026-08-02 · bd-bsjw structure-aware campaign round 4 (bd-55mvg); reproduced at eight leaves, depth-1 grouping, pure Should, no boosts, no negation
+- Root cause: Quill's Term scorer fuses each unfielded term's `[content, 2.0×title]` expansion into a single summed contribution per term; the pinned oracle expands every unfielded term into a two-clause boolean and accumulates 2N interleaved clause outputs. The f32 summation *association* differs, so scores diverge by 1–2 ULP as leaf count grows. Envelope members: (a) ≥8-leaf pure-disjunctive shapes — 1–2 ULP `RankMismatch` on identical docs (reproduced bit pairs `0x415583bd`/`bc`, `0x41673288`/`87`, `0x4121c1e0`/`de`, `0x41addfb9`/`ba`); (b) a single top-level leaf boost over the multi-field expansion (1 ULP); (c) mixed-occur nesting that the Should-flatten (`0b9fad3b`) cannot splice (1–2 ULP). Pure-disjunctive spliceable shapes are bit-exact under the flatten and stay OUTSIDE this class.
+- Consumer impact: result *sets* are identical; only rank order within ULP-adjacent score pairs can flip. No membership change belongs to this class. (The oracle's lenient-parse fallback silently DROPS every negation inside a boosted group — a *membership* divergence that classifies as `OracleBug`, never as `ScoreEpsilon`.)
+- Owner ruling (2026-08-03, delegated to SandyGrove, recorded in mail thread `bd-55mvg`): keep Quill's fused scorer; adopt this bounded tolerance class rather than mirroring the oracle's interleaved per-field accumulation, which would surrender the fused-loop optimization on exactly the QG-6 query-latency axis. The comparator's default config REMAINS zero-tolerance; campaign lanes covering composite shapes opt in with the typed reason.
+- Fixture: the four reproduced score-bit pairs above (bd-55mvg bead body); comparator typed-reason implementation and the generator unfence (groups, boosts, in-group negation except the bd-nqeb4 oracle-crash shape) tracked on bd-55mvg — blocked on active gauntlet file leases at ruling time.
+- Decision: accept (owner ruling; bounded)
+- Reviewer: SandyGrove (author of record for the ruling) · second-agent sign-off requested from LilacSquirrel (campaign author) via mail thread `bd-55mvg`
 
 ---
 

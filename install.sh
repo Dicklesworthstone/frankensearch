@@ -14,6 +14,9 @@
 #   --system           Install to /usr/local/bin (requires sudo)
 #   --easy-mode        Auto-update PATH in shell rc files
 #   --verify           Run self-test after install
+#   --force            Reinstall even when the resolved version is already present
+#   --offline          Never touch the network; requires --version and a local
+#                      --artifact-url plus --checksum
 #   --from-source      Build from source instead of downloading binary
 #   --lite             Force the model-free source profile (~15MB binary)
 #   --quiet            Suppress non-error output
@@ -21,10 +24,10 @@
 #
 # Build profiles:
 #   Full release artifacts embed ML models for zero-config semantic search.
-#   Cargo and source-build defaults are model-free (~15MB); they can acquire
-#   and verify model files but cannot execute Model2Vec or FastEmbed.
-#   Use --lite to force the explicit --no-default-features source lane.
-#   Downloaded files alone do not add those compiled capabilities.
+#   Cargo and source-build defaults compile Model2Vec + FastEmbed loaders but
+#   acquire the pinned model bytes separately with `fsfs download-models`.
+#   Use --lite to force the explicit model-free --no-default-features lane;
+#   downloaded files alone cannot add loaders to that stripped binary.
 #   Equivalent to: cargo build --release -p frankensearch-fsfs --no-default-features
 #
 set -euo pipefail
@@ -42,12 +45,25 @@ QUIET=0
 VERIFY=0
 FROM_SOURCE=0
 LITE=0
+FORCE=0
+OFFLINE=0
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
-LOCK_FILE="/tmp/fsfs-install.lock"
+LOCK_FILE="${FSFS_INSTALL_LOCK_FILE:-/tmp/fsfs-install.lock}"
 SYSTEM=0
 NO_GUM=0
+NO_COLOR_MODE=0
+if [ -n "${NO_COLOR:-}" ]; then
+  NO_COLOR_MODE=1
+fi
+
+# Preflight free-space floors (MB). The destination only holds the binary; the
+# staging area holds the downloaded archive plus its extraction, or the whole
+# source checkout and its Cargo target directory.
+MIN_DEST_MB="${FSFS_INSTALL_MIN_DEST_MB:-128}"
+MIN_STAGE_ARTIFACT_MB="${FSFS_INSTALL_MIN_STAGE_ARTIFACT_MB:-512}"
+MIN_STAGE_SOURCE_MB="${FSFS_INSTALL_MIN_STAGE_SOURCE_MB:-2048}"
 
 # Detect gum for fancy output (https://github.com/charmbracelet/gum)
 HAS_GUM=0
@@ -59,7 +75,9 @@ log() { [ "$QUIET" -eq 1 ] && return 0; echo -e "$@"; }
 
 info() {
   [ "$QUIET" -eq 1 ] && return 0
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+  if [ "$NO_COLOR_MODE" -eq 1 ]; then
+    printf '%s\n' "→ $*"
+  elif [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     gum style --foreground 39 "→ $*"
   else
     echo -e "\033[0;34m→\033[0m $*"
@@ -67,7 +85,10 @@ info() {
 }
 
 ok() {
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+  [ "$QUIET" -eq 1 ] && return 0
+  if [ "$NO_COLOR_MODE" -eq 1 ]; then
+    printf '%s\n' "✓ $*"
+  elif [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     gum style --foreground 42 "✓ $*"
   else
     echo -e "\033[0;32m✓\033[0m $*"
@@ -75,25 +96,592 @@ ok() {
 }
 
 warn() {
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+  [ "$QUIET" -eq 1 ] && return 0
+  if [ "$NO_COLOR_MODE" -eq 1 ]; then
+    printf '%s\n' "⚠ $*"
+  elif [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     gum style --foreground 214 "⚠ $*"
   else
     echo -e "\033[1;33m⚠\033[0m $*"
   fi
 }
 
+# Errors always go to stderr regardless of renderer: --quiet suppresses routine
+# output but a caller piping stdout must never receive a failure message as data.
 err() {
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style --foreground 196 "✗ $*"
+  if [ "$NO_COLOR_MODE" -eq 1 ]; then
+    printf '%s\n' "✗ $*" >&2
+  elif [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+    gum style --foreground 196 "✗ $*" >&2
   else
-    echo -e "\033[0;31m✗\033[0m $*"
+    echo -e "\033[0;31m✗\033[0m $*" >&2
   fi
 }
+
+validate_sha256() {
+  local checksum="${1:-}"
+  [ "${#checksum}" -eq 64 ] || return 1
+  case "$checksum" in
+    *[![:xdigit:]]*) return 1 ;;
+  esac
+}
+
+checksum_from_manifest() {
+  local manifest="$1" artifact="$2"
+  [ -f "$manifest" ] || return 1
+  awk -v artifact="$artifact" '
+    length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/ {
+      filename = $2
+      sub(/^\*/, "", filename)
+      if (filename == artifact) {
+        print tolower($1)
+        exit
+      }
+    }
+  ' "$manifest"
+}
+
+checksum_from_sidecar() {
+  local sidecar="$1"
+  [ -f "$sidecar" ] || return 1
+  awk '
+    length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/ {
+      print tolower($1)
+      exit
+    }
+  ' "$sidecar"
+}
+
+verify_archive_checksum() {
+  local archive="$1" expected="$2" tool_mode="${3:-auto}" actual=""
+  local actual_normalized="" expected_normalized=""
+  if ! validate_sha256 "$expected"; then
+    err "Release checksum must be exactly 64 hexadecimal characters"
+    return 1
+  fi
+
+  case "$tool_mode" in
+    auto)
+      if command -v sha256sum >/dev/null 2>&1; then
+        actual=$(sha256sum -- "$archive" | awk '{print $1}')
+      elif command -v shasum >/dev/null 2>&1; then
+        actual=$(shasum -a 256 -- "$archive" | awk '{print $1}')
+      else
+        err "No SHA-256 verifier found (need sha256sum or shasum); refusing to install an unverified artifact"
+        return 1
+      fi
+      ;;
+    none)
+      # Used only by the non-networked contract test entrypoint below.
+      err "No SHA-256 verifier found (need sha256sum or shasum); refusing to install an unverified artifact"
+      return 1
+      ;;
+    *)
+      err "Unknown checksum tool mode: $tool_mode"
+      return 1
+      ;;
+  esac
+
+  actual_normalized=$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')
+  expected_normalized=$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')
+  if ! validate_sha256 "$actual" || [ "$actual_normalized" != "$expected_normalized" ]; then
+    err "release.package.checksum_failed: Checksum mismatch for $(basename "$archive")"
+    return 1
+  fi
+}
+
+# --- Signature policy --------------------------------------------------------
+# Signing is optional, so an absent sidecar is a deterministic warning rather
+# than a hard failure. A signature that is present and does not verify is a
+# verification failure and MUST abort before the destination is replaced.
+verify_archive_signature() {
+  local archive="$1"
+  local signature="${archive}.sig"
+  local certificate="${archive}.pem"
+  local cosign_bin="${FSFS_INSTALL_COSIGN:-cosign}"
+
+  if [ ! -f "$signature" ] || [ ! -f "$certificate" ]; then
+    warn "install.verify.signature_missing: no .sig/.pem sidecar accompanies $(basename "$archive"); the archive is checksum-verified but unsigned"
+    return 0
+  fi
+
+  if ! command -v "$cosign_bin" >/dev/null 2>&1; then
+    warn "install.verify.signature_unverifiable: $(basename "$archive") is signed but ${cosign_bin} is not installed; the signature was not checked"
+    return 0
+  fi
+
+  if "$cosign_bin" verify-blob \
+    --signature "$signature" \
+    --certificate "$certificate" \
+    "$archive" >/dev/null 2>&1; then
+    ok "Signature verified for $(basename "$archive")"
+    return 0
+  fi
+
+  err "install.verify.signature_invalid: signature verification failed for $(basename "$archive")"
+  err "The existing fsfs installation was not replaced."
+  return 1
+}
+
+# --- Upgrade path ------------------------------------------------------------
+extract_semver() {
+  local text="${1:-}"
+  if [[ "$text" =~ ([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+    printf '%s.%s.%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+  fi
+}
+
+# Prints older | same | newer describing $1 relative to $2.
+compare_semver() {
+  local left right l1 l2 l3 r1 r2 r3
+  left=$(extract_semver "$1")
+  right=$(extract_semver "$2")
+  if [ -z "$left" ] || [ -z "$right" ]; then
+    printf '%s\n' "unknown"
+    return 0
+  fi
+  IFS=. read -r l1 l2 l3 <<<"$left"
+  IFS=. read -r r1 r2 r3 <<<"$right"
+  local index
+  for index in 1 2 3; do
+    local lv rv
+    case "$index" in
+      1) lv="$l1"; rv="$r1" ;;
+      2) lv="$l2"; rv="$r2" ;;
+      *) lv="$l3"; rv="$r3" ;;
+    esac
+    if [ "$lv" -lt "$rv" ]; then
+      printf '%s\n' "older"
+      return 0
+    fi
+    if [ "$lv" -gt "$rv" ]; then
+      printf '%s\n' "newer"
+      return 0
+    fi
+  done
+  printf '%s\n' "same"
+}
+
+# Classifies the transition from an installed version string to the resolved
+# target: fresh | same | upgrade | downgrade | unknown.
+classify_upgrade_path() {
+  local installed_text="${1:-}" target_version="${2:-}"
+  if [ -z "$installed_text" ]; then
+    printf '%s\n' "fresh"
+    return 0
+  fi
+  case "$(compare_semver "$installed_text" "$target_version")" in
+    older) printf '%s\n' "upgrade" ;;
+    newer) printf '%s\n' "downgrade" ;;
+    same) printf '%s\n' "same" ;;
+    *) printf '%s\n' "unknown" ;;
+  esac
+}
+
+# --- Rollback ----------------------------------------------------------------
+# Post-install validation runs against the replaced destination, so the
+# incumbent is copied aside first and restored if that validation fails.
+back_up_incumbent() {
+  local destination_binary="$1" backup_path="$2"
+  [ -f "$destination_binary" ] || return 0
+  cp -p "$destination_binary" "$backup_path" 2>/dev/null || {
+    warn "Could not stage a rollback copy of $destination_binary; a failed post-install check will not be able to restore it"
+    return 0
+  }
+  info "Staged a rollback copy of the previous ${BINARY_NAME}"
+}
+
+roll_back_incumbent() {
+  local backup_path="$1" destination_binary="$2" reason="$3"
+  if [ ! -f "$backup_path" ]; then
+    err "upgrade.apply.rollback_triggered: $reason; no previous ${BINARY_NAME} was available to restore"
+    return 1
+  fi
+  if install_binary "$backup_path" "$destination_binary"; then
+    err "upgrade.apply.rollback_triggered: $reason; the previous ${BINARY_NAME} has been restored"
+    return 0
+  fi
+  err "upgrade.apply.rollback_triggered: $reason; restoring the previous ${BINARY_NAME} also failed"
+  return 1
+}
+
+install_route() {
+  local explicit_lite="$1" full_artifact_available="$2" target="${3:-}"
+  if [ "$explicit_lite" -eq 1 ]; then
+    printf '%s\n' "source-lite"
+  elif [ "$target" = "x86_64-apple-darwin" ]; then
+    printf '%s\n' "unsupported-semantic"
+  elif [ "$full_artifact_available" -eq 1 ]; then
+    printf '%s\n' "artifact-full"
+  else
+    printf '%s\n' "source-default"
+  fi
+}
+
+fail_unsupported_semantic_platform() {
+  local target="$1"
+  err "unsupported_platform: the ordinary semantic fsfs profile is not available for ${target}"
+  err "The pinned ONNX Runtime distribution has no Intel macOS binary, so a default source fallback would fail."
+  err "Use install.sh --lite for an explicit model-free build, or install the semantic profile on Apple Silicon or Linux."
+  return 78
+}
+
+# --- Preflight ---------------------------------------------------------------
+# Every check below runs before the destination is touched, so a rejected
+# preflight always leaves the incumbent installation in place.
+
+# Free megabytes on the filesystem that would hold $1, resolved through the
+# nearest existing ancestor because the destination may not exist yet.
+available_mb() {
+  local path="$1" parent="" avail_kb=""
+  [ -n "$path" ] || return 1
+  while [ ! -e "$path" ]; do
+    parent=$(dirname "$path")
+    [ "$parent" = "$path" ] && break
+    path="$parent"
+  done
+  [ -e "$path" ] || return 1
+  # -P -k is the POSIX portable form; GNU and BSD df agree on field 4 = available.
+  avail_kb=$(df -P -k "$path" 2>/dev/null | awk 'NR==2 {print $4}') || return 1
+  case "$avail_kb" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s\n' "$((avail_kb / 1024))"
+}
+
+check_disk_floor() {
+  local path="$1" floor_mb="$2" label="$3" avail_mb=""
+  if ! avail_mb=$(available_mb "$path"); then
+    warn "Free space for $label ($path) is not measurable on this system; continuing without a floor check"
+    return 0
+  fi
+  if [ "$avail_mb" -lt "$floor_mb" ]; then
+    err "install.preflight.disk_space_low: $label ($path) has ${avail_mb}MB free but needs at least ${floor_mb}MB"
+    err "Free space or select a larger volume, then rerun. The existing fsfs installation was not replaced."
+    return 1
+  fi
+  info "Preflight: $label has ${avail_mb}MB free (floor ${floor_mb}MB)"
+}
+
+check_dest_writable() {
+  local dest="$1"
+  local probe="$dest"
+  if [ "$SYSTEM" -eq 1 ]; then
+    info "Preflight: --system install writes through sudo; skipping unprivileged write check"
+    return 0
+  fi
+  local parent
+  while [ ! -e "$probe" ]; do
+    parent=$(dirname "$probe")
+    [ "$parent" = "$probe" ] && break
+    probe="$parent"
+  done
+  if [ ! -e "$probe" ]; then
+    err "install.preflight.dest_unwritable: no existing ancestor of $dest could be resolved"
+    return 1
+  fi
+  if [ ! -d "$probe" ]; then
+    err "install.preflight.dest_unwritable: $probe exists but is not a directory"
+    return 1
+  fi
+  if [ ! -w "$probe" ]; then
+    err "install.preflight.dest_unwritable: $probe is not writable by the current user"
+    err "Choose another --dest, fix the permissions, or rerun with --system to install through sudo."
+    return 1
+  fi
+  info "Preflight: destination $dest is writable"
+}
+
+# Classifies whatever already occupies the destination path. Purely
+# observational: it never writes and never removes the incumbent.
+detect_existing_install() {
+  local dest_binary="$1" resolved_version="$2" existing_version=""
+  if [ ! -e "$dest_binary" ]; then
+    printf '%s\n' "fresh"
+    return 0
+  fi
+  if [ ! -x "$dest_binary" ]; then
+    printf '%s\n' "unreadable"
+    return 0
+  fi
+  if ! existing_version=$("$dest_binary" version 2>/dev/null | head -n 1); then
+    printf '%s\n' "unreadable"
+    return 0
+  fi
+  if [ -z "$existing_version" ]; then
+    printf '%s\n' "unreadable"
+    return 0
+  fi
+  case "$existing_version" in
+    *"${resolved_version#v}"*) printf '%s\n' "same-version" ;;
+    *) printf '%s\n' "different-version" ;;
+  esac
+}
+
+# --offline forbids every network access, so the inputs that would otherwise be
+# fetched must have been supplied explicitly.
+check_offline_preconditions() {
+  local offline="$1" version="$2" from_source="$3" artifact_url="$4" checksum="$5"
+  [ "$offline" -eq 1 ] || return 0
+  if [ -z "$version" ]; then
+    err "install.preflight.offline_version_required: --offline needs an explicit --version vX.Y.Z because latest-release resolution queries GitHub"
+    return 1
+  fi
+  if [ "$from_source" -eq 1 ]; then
+    err "install.preflight.offline_source_unavailable: --offline cannot build from source; the source route clones the repository and fetches crates"
+    return 1
+  fi
+  case "$artifact_url" in
+    '')
+      err "install.preflight.offline_artifact_required: --offline needs --artifact-url pointing at a locally available archive"
+      return 1
+      ;;
+    http://*|https://*|ftp://*)
+      err "install.preflight.offline_artifact_required: --artifact-url $artifact_url is a network URL; --offline needs a local path or file:// URL"
+      return 1
+      ;;
+  esac
+  if [ -z "$checksum" ]; then
+    err "install.preflight.offline_checksum_required: --offline needs an explicit --checksum because the release checksum manifest cannot be fetched"
+    return 1
+  fi
+  info "Preflight: offline inputs are complete"
+}
+
+# Reachability is reported, not enforced: an unreachable release endpoint is
+# recoverable through the documented source-build fallback.
+check_release_endpoint_reachable() {
+  local url="$1"
+  if [ "$OFFLINE" -eq 1 ]; then
+    info "Preflight: --offline set; skipping release endpoint reachability probe"
+    return 0
+  fi
+  if curl -fsS --connect-timeout 10 --max-time 20 -o /dev/null -I "$url" >/dev/null 2>&1; then
+    info "Preflight: release endpoint is reachable"
+    return 0
+  fi
+  warn "install.preflight.release_endpoint_unreachable: $url did not respond; the installer will fall back to the loader-capable source build if the download fails"
+  return 0
+}
+
+install_binary() {
+  local source_binary="$1" destination_binary="$2"
+  if [ "$SYSTEM" -eq 1 ]; then
+    sudo install -m 0755 "$source_binary" "$destination_binary"
+  else
+    install -m 0755 "$source_binary" "$destination_binary"
+  fi
+}
+
+provision_default_semantic_models() {
+  local staged_binary="$1"
+
+  info "Provisioning the registered semantic model artifacts..."
+  if ! "$staged_binary" download-models; then
+    err "Semantic model provisioning failed. The existing fsfs installation was not replaced."
+    return 1
+  fi
+
+  if ! "$staged_binary" download-models --verify; then
+    err "Semantic model verification failed. The existing fsfs installation was not replaced."
+    return 1
+  fi
+
+  ok "Registered semantic model artifacts are present and verified."
+}
+
+verify_staged_binary() {
+  local staged_binary="$1" version_output=""
+
+  if version_output="$("$staged_binary" version 2>&1)" && [ -n "$version_output" ]; then
+    ok "Staged binary verification passed: $version_output"
+    return 0
+  fi
+
+  if version_output="$("$staged_binary" --version 2>&1)" && [ -n "$version_output" ]; then
+    ok "Staged binary verification passed (--version): $version_output"
+    return 0
+  fi
+
+  err "Staged binary failed version checks. The existing fsfs installation was not replaced."
+  return 1
+}
+
+usage() {
+  cat <<EOFU
+Usage: install.sh [--version vX.Y.Z] [--dest DIR] [--system] [--easy-mode] [--verify] \\
+                  [--artifact-url URL] [--checksum HEX] [--checksum-url URL] \\
+                  [--force] [--offline] [--from-source] [--lite] [--quiet] [--no-gum]
+
+Options:
+  --version vX.Y.Z   Install specific version (default: latest)
+  --dest DIR         Install to DIR (default: ~/.local/bin)
+  --system           Install to /usr/local/bin (requires sudo)
+  --easy-mode        Auto-update PATH in shell rc files
+  --verify           Run self-test after install
+  --artifact-url URL Install from an explicit archive URL or local path
+  --checksum HEX     Expected SHA-256 of the archive (64 hex characters)
+  --checksum-url URL Fetch the expected SHA-256 from URL instead of the release
+  --force            Reinstall even when the resolved version is already present
+  --offline          Never touch the network; requires --version plus a local
+                     --artifact-url and --checksum
+  --from-source      Build from source instead of downloading binary
+  --lite             Force the model-free source profile (~15MB).
+                     Implies --from-source; the Cargo default is loader-capable.
+  --quiet            Suppress non-error output
+  --no-gum           Disable gum formatting even if available
+EOFU
+}
+
+# An unrecognized flag is rejected rather than ignored: silently dropping a
+# mistyped --lite would install a different profile than the operator asked for.
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --version) [ "$#" -ge 2 ] || { err "--version requires a value"; return 2; }; VERSION="$2"; shift 2;;
+      --dest) [ "$#" -ge 2 ] || { err "--dest requires a value"; return 2; }; DEST="$2"; shift 2;;
+      --system) SYSTEM=1; DEST="/usr/local/bin"; shift;;
+      --easy-mode) EASY=1; shift;;
+      --verify) VERIFY=1; shift;;
+      --artifact-url) [ "$#" -ge 2 ] || { err "--artifact-url requires a value"; return 2; }; ARTIFACT_URL="$2"; shift 2;;
+      --checksum) [ "$#" -ge 2 ] || { err "--checksum requires a value"; return 2; }; CHECKSUM="$2"; shift 2;;
+      --checksum-url) [ "$#" -ge 2 ] || { err "--checksum-url requires a value"; return 2; }; CHECKSUM_URL="$2"; shift 2;;
+      --force) FORCE=1; shift;;
+      --offline) OFFLINE=1; shift;;
+      --from-source) FROM_SOURCE=1; shift;;
+      --lite) LITE=1; FROM_SOURCE=1; shift;;
+      --quiet|-q) QUIET=1; shift;;
+      --no-gum) NO_GUM=1; shift;;
+      -h|--help) usage; return 10;;
+      *)
+        err "Unknown installer argument: $1"
+        err "Run install.sh --help for the supported flags. Nothing was installed or replaced."
+        return 2
+        ;;
+    esac
+  done
+}
+
+run_installer_contract_test() {
+  local action="${1:-}"
+  case "$action" in
+    checksum)
+      [ "$#" -ge 3 ] || { err "contract checksum requires ARCHIVE EXPECTED [TOOL_MODE]"; return 2; }
+      verify_archive_checksum "$2" "$3" "${4:-auto}"
+      ;;
+    manifest)
+      [ "$#" -eq 3 ] || { err "contract manifest requires MANIFEST ARTIFACT"; return 2; }
+      local resolved
+      resolved=$(checksum_from_manifest "$2" "$3")
+      validate_sha256 "$resolved" || {
+        err "Checksum for $3 is absent from the release manifest"
+        return 1
+      }
+      printf '%s\n' "$resolved"
+      ;;
+    sidecar)
+      [ "$#" -eq 2 ] || { err "contract sidecar requires SIDECAR"; return 2; }
+      local resolved
+      resolved=$(checksum_from_sidecar "$2")
+      validate_sha256 "$resolved" || {
+        err "Checksum sidecar is absent or malformed: $2"
+        return 1
+      }
+      printf '%s\n' "$resolved"
+      ;;
+    route)
+      [ "$#" -eq 3 ] || [ "$#" -eq 4 ] || {
+        err "contract route requires EXPLICIT_LITE FULL_ARTIFACT_AVAILABLE [TARGET]"
+        return 2
+      }
+      install_route "$2" "$3" "${4:-}"
+      ;;
+    unsupported)
+      [ "$#" -eq 2 ] || { err "contract unsupported requires TARGET"; return 2; }
+      fail_unsupported_semantic_platform "$2"
+      ;;
+    provision)
+      [ "$#" -eq 2 ] || { err "contract provision requires STAGED_BINARY"; return 2; }
+      provision_default_semantic_models "$2"
+      ;;
+    verify-staged)
+      [ "$#" -eq 2 ] || { err "contract verify-staged requires STAGED_BINARY"; return 2; }
+      verify_staged_binary "$2"
+      ;;
+    output-mode)
+      [ "$#" -eq 2 ] || { err "contract output-mode requires QUIET"; return 2; }
+      QUIET="$2"
+      HAS_GUM=0
+      NO_GUM=1
+      info "info-output"
+      ok "ok-output"
+      warn "warn-output"
+      err "error-output"
+      ;;
+    install-built)
+      [ "$#" -eq 3 ] || { err "contract install-built requires SOURCE DESTINATION"; return 2; }
+      SYSTEM=0
+      install_binary "$2" "$3"
+      ;;
+    args)
+      shift
+      parse_args "$@" || return $?
+      printf 'version=%s dest=%s system=%s easy=%s verify=%s force=%s offline=%s from_source=%s lite=%s quiet=%s no_gum=%s artifact_url=%s checksum=%s\n' \
+        "$VERSION" "$DEST" "$SYSTEM" "$EASY" "$VERIFY" "$FORCE" "$OFFLINE" \
+        "$FROM_SOURCE" "$LITE" "$QUIET" "$NO_GUM" "$ARTIFACT_URL" "$CHECKSUM"
+      ;;
+    disk-floor)
+      [ "$#" -eq 4 ] || { err "contract disk-floor requires PATH FLOOR_MB LABEL"; return 2; }
+      check_disk_floor "$2" "$3" "$4"
+      ;;
+    dest-writable)
+      [ "$#" -eq 2 ] || [ "$#" -eq 3 ] || { err "contract dest-writable requires DEST [SYSTEM]"; return 2; }
+      SYSTEM="${3:-0}"
+      check_dest_writable "$2"
+      ;;
+    existing-install)
+      [ "$#" -eq 3 ] || { err "contract existing-install requires DEST_BINARY VERSION"; return 2; }
+      detect_existing_install "$2" "$3"
+      ;;
+    signature)
+      [ "$#" -eq 2 ] || { err "contract signature requires ARCHIVE"; return 2; }
+      verify_archive_signature "$2"
+      ;;
+    upgrade-path)
+      [ "$#" -eq 3 ] || { err "contract upgrade-path requires INSTALLED_TEXT TARGET_VERSION"; return 2; }
+      classify_upgrade_path "$2" "$3"
+      ;;
+    rollback)
+      [ "$#" -eq 4 ] || { err "contract rollback requires BACKUP DESTINATION REASON"; return 2; }
+      SYSTEM=0
+      roll_back_incumbent "$2" "$3" "$4"
+      ;;
+    offline-preconditions)
+      [ "$#" -eq 6 ] || {
+        err "contract offline-preconditions requires OFFLINE VERSION FROM_SOURCE ARTIFACT_URL CHECKSUM"
+        return 2
+      }
+      check_offline_preconditions "$2" "$3" "$4" "$5" "$6"
+      ;;
+    *)
+      err "Unknown installer contract test: $action"
+      return 2
+      ;;
+  esac
+}
+
+# This non-networked test seam exercises the same routing and checksum
+# functions as production without acquiring the installer lock or writing to
+# the destination. It is intentionally unavailable unless the checker opts in.
+if [ "${FSFS_INSTALL_CONTRACT_TEST:-0}" = "1" ]; then
+  run_installer_contract_test "$@"
+  exit $?
+fi
 
 run_with_spinner() {
   local title="$1"
   shift
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
+  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ] && [ "$NO_COLOR_MODE" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
     gum spin --spinner dot --title "$title" -- "$@"
   else
     info "$title"
@@ -175,47 +763,19 @@ ensure_rust() {
   rustup component add rustfmt clippy || true
 }
 
-usage() {
-  cat <<EOFU
-Usage: install.sh [--version vX.Y.Z] [--dest DIR] [--system] [--easy-mode] [--verify] \\
-                  [--artifact-url URL] [--checksum HEX] [--checksum-url URL] [--quiet] [--no-gum]
-
-Options:
-  --version vX.Y.Z   Install specific version (default: latest)
-  --dest DIR         Install to DIR (default: ~/.local/bin)
-  --system           Install to /usr/local/bin (requires sudo)
-  --easy-mode        Auto-update PATH in shell rc files
-  --verify           Run self-test after install
-  --from-source      Build from source instead of downloading binary
-  --lite             Force the model-free source profile (~15MB).
-                     Implies --from-source; model-free is also the Cargo default.
-  --quiet            Suppress non-error output
-  --no-gum           Disable gum formatting even if available
-EOFU
-}
-
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --version) VERSION="$2"; shift 2;;
-    --dest) DEST="$2"; shift 2;;
-    --system) SYSTEM=1; DEST="/usr/local/bin"; shift;;
-    --easy-mode) EASY=1; shift;;
-    --verify) VERIFY=1; shift;;
-    --artifact-url) ARTIFACT_URL="$2"; shift 2;;
-    --checksum) CHECKSUM="$2"; shift 2;;
-    --checksum-url) CHECKSUM_URL="$2"; shift 2;;
-    --from-source) FROM_SOURCE=1; shift;;
-    --lite) LITE=1; FROM_SOURCE=1; shift;;
-    --quiet|-q) QUIET=1; shift;;
-    --no-gum) NO_GUM=1; shift;;
-    -h|--help) usage; exit 0;;
-    *) shift;;
-  esac
-done
+PARSE_STATUS=0
+parse_args "$@" || PARSE_STATUS=$?
+case "$PARSE_STATUS" in
+  0) ;;
+  10) exit 0;;             # --help
+  *) exit "$PARSE_STATUS";;
+esac
 
 # Show header
 if [ "$QUIET" -eq 0 ]; then
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+  if [ "$NO_COLOR_MODE" -eq 1 ]; then
+    printf '\nfsfs installer\nTwo-tier hybrid local search\n\n'
+  elif [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     gum style \
       --border rounded \
       --border-foreground 39 \
@@ -233,9 +793,6 @@ if [ "$QUIET" -eq 0 ]; then
   fi
 fi
 
-resolve_version
-
-mkdir -p "$DEST"
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)
 case "$ARCH" in
@@ -254,9 +811,80 @@ case "${OS}-${ARCH}" in
   *) :;;
 esac
 
+if [ "$LITE" -eq 0 ] && [ "$TARGET" = "x86_64-apple-darwin" ]; then
+  fail_unsupported_semantic_platform "$TARGET"
+  exit $?
+fi
+
+# Offline inputs are validated before anything reaches for the network.
+check_offline_preconditions "$OFFLINE" "$VERSION" "$FROM_SOURCE" "$ARTIFACT_URL" "$CHECKSUM" || exit 1
+
+# Version lookup may use the network. Unsupported ordinary profiles are
+# rejected above before any release lookup, artifact probe, or filesystem
+# installation mutation. Intel macOS remains available only through --lite.
+resolve_version
+
+# Remaining preflight. Every check below is observational, so a rejection here
+# leaves any existing installation exactly as it was.
+check_dest_writable "$DEST" || exit 1
+check_disk_floor "$DEST" "$MIN_DEST_MB" "install destination" || exit 1
+
+STAGE_ROOT="${TMPDIR:-/tmp}"
+if [ "$FROM_SOURCE" -eq 1 ] || [ -z "$TARGET" ]; then
+  check_disk_floor "$STAGE_ROOT" "$MIN_STAGE_SOURCE_MB" "source build staging area" || exit 1
+else
+  check_disk_floor "$STAGE_ROOT" "$MIN_STAGE_ARTIFACT_MB" "artifact staging area" || exit 1
+fi
+
+EXISTING_STATE=$(detect_existing_install "$DEST/${BINARY_NAME}" "$VERSION")
+case "$EXISTING_STATE" in
+  fresh)
+    info "Preflight: no existing ${BINARY_NAME} at $DEST"
+    ;;
+  same-version)
+    if [ "$FORCE" -eq 0 ]; then
+      ok "${BINARY_NAME} ${VERSION} is already installed at $DEST/${BINARY_NAME}; pass --force to reinstall"
+      exit 0
+    fi
+    info "Preflight: ${VERSION} already installed; --force requested, reinstalling"
+    ;;
+  different-version)
+    INSTALLED_VERSION_TEXT=$("$DEST/${BINARY_NAME}" version 2>/dev/null | head -n 1 || true)
+    case "$(classify_upgrade_path "$INSTALLED_VERSION_TEXT" "$VERSION")" in
+      downgrade)
+        if [ "$FORCE" -eq 0 ]; then
+          err "upgrade.apply.unsupported_path: $DEST/${BINARY_NAME} reports '${INSTALLED_VERSION_TEXT}', which is newer than the requested ${VERSION}"
+          err "Downgrades are outside the supported N-1/N-2 upgrade window. Pass --force to install ${VERSION} anyway."
+          err "The existing fsfs installation was not replaced."
+          exit 1
+        fi
+        warn "Preflight: installing ${VERSION} over the newer '${INSTALLED_VERSION_TEXT}' because --force was requested"
+        ;;
+      unknown)
+        warn "Preflight: could not compare '${INSTALLED_VERSION_TEXT}' with ${VERSION}; proceeding as a replacement"
+        ;;
+      *)
+        info "Preflight: upgrading the existing ${BINARY_NAME} at $DEST to ${VERSION}"
+        ;;
+    esac
+    ;;
+  *)
+    warn "An existing $DEST/${BINARY_NAME} did not report a version; it will be replaced only after the new binary verifies"
+    ;;
+esac
+
+if [ "$FROM_SOURCE" -eq 0 ]; then
+  case "$ARTIFACT_URL" in
+    http://*|https://*) check_release_endpoint_reachable "$ARTIFACT_URL" ;;
+    '') check_release_endpoint_reachable "https://github.com/${OWNER}/${REPO}/releases" ;;
+    *) info "Preflight: installing from the local artifact $ARTIFACT_URL" ;;
+  esac
+fi
+
+mkdir -p "$DEST"
+
 # Build artifact filename and download URL.
 # dsr artifact naming: fsfs-${version_bare}-${target_triple}.${ext}
-# Also try versionless: fsfs-${target_triple}.${ext}
 VERSION_BARE="${VERSION#v}"  # strip leading v for artifact naming
 TAR=""
 URL=""
@@ -308,6 +936,31 @@ download_with_progress() {
   local url="$1" dest="$2" label="${3:-Downloading}"
   local size_bytes="" size_human=""
 
+  # A local path or file:// URL is copied rather than fetched, which is what
+  # makes --offline installs possible from a pre-staged archive.
+  case "$url" in
+    file://*)
+      local local_path="${url#file://}"
+      if [ ! -f "$local_path" ]; then
+        err "Local artifact not found: $local_path"
+        return 1
+      fi
+      info "$label (local artifact)"
+      cp -- "$local_path" "$dest"
+      return 0
+      ;;
+    *://*) : ;;
+    *)
+      if [ ! -f "$url" ]; then
+        err "Local artifact not found: $url"
+        return 1
+      fi
+      info "$label (local artifact)"
+      cp -- "$url" "$dest"
+      return 0
+      ;;
+  esac
+
   # Probe content-length for a helpful pre-download message
   if size_bytes=$(curl -fsSL --connect-timeout 10 --max-time 15 -I "$url" 2>/dev/null \
         | grep -i '^content-length:' | awk '{print $2}' | tr -d '\r'); then
@@ -322,7 +975,7 @@ download_with_progress() {
     fi
   fi
 
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
+  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ] && [ "$NO_COLOR_MODE" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
     # ── gum: rich styled output ──
     if [ -n "$size_human" ]; then
       gum style --foreground 39 "$(printf '↓ %s  %s  (%s)' "$label" "$(gum style --faint --italic "$(basename "$url")")" \
@@ -334,7 +987,7 @@ download_with_progress() {
     if ! curl -fL --progress-bar --connect-timeout 30 --max-time 1800 "$url" -o "$dest"; then
       return 1
     fi
-  elif [ -t 1 ] && [ "$QUIET" -eq 0 ]; then
+  elif [ -t 1 ] && [ "$NO_COLOR_MODE" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
     # ── Interactive terminal: styled ANSI progress ──
     if [ -n "$size_human" ]; then
       printf '\033[1;36m↓\033[0m %s \033[2m%s\033[0m  \033[1;35m%s\033[0m\n' \
@@ -357,30 +1010,26 @@ download_with_progress() {
 
 if [ "$FROM_SOURCE" -eq 0 ]; then
   if ! download_with_progress "$URL" "$TMP/$TAR" "Downloading ${BINARY_NAME} ${VERSION}"; then
-    # Try versionless artifact name as fallback
-    FALLBACK_TAR="${BINARY_NAME}-${TARGET}.${EXT}"
-    FALLBACK_URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${FALLBACK_TAR}"
-    warn "Primary download failed; trying fallback artifact..."
-    if ! download_with_progress "$FALLBACK_URL" "$TMP/$FALLBACK_TAR" "Downloading fallback artifact"; then
-      # Full Linux artifacts are large and may not be published for every
-      # release. Prefer a published lite binary before falling back to a slow
-      # source build.
-      LITE_TAR="fsfs-lite-${VERSION_BARE}-${TARGET}.${EXT}"
-      LITE_URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${LITE_TAR}"
-      warn "Fallback artifact failed; trying lite release artifact..."
-      if [ -n "$TARGET" ] && download_with_progress "$LITE_URL" "$TMP/$LITE_TAR" "Downloading lite artifact"; then
-        TAR="$LITE_TAR"
-        URL="$LITE_URL"
-        LITE=1
-        warn "Installed model-free artifact; semantic execution requires a full release or an embedded-models-capable rebuild"
-      else
-        warn "Artifact download failed; falling back to build-from-source"
-        FROM_SOURCE=1
-      fi
-    else
-      TAR="$FALLBACK_TAR"
-      URL="$FALLBACK_URL"
+    if [ "$OFFLINE" -eq 1 ]; then
+      err "The offline artifact could not be staged and --offline forbids the source-build fallback."
+      err "The existing fsfs installation was not replaced."
+      exit 1
     fi
+    ROUTE=$(install_route "$LITE" 0 "$TARGET")
+    case "$ROUTE" in
+      source-default)
+        warn "Full artifact download failed; building the loader-capable default from source"
+        FROM_SOURCE=1
+        ;;
+      unsupported-semantic)
+        fail_unsupported_semantic_platform "$TARGET"
+        exit $?
+        ;;
+      *)
+        err "Internal installer routing error: expected source-default or unsupported-semantic, got $ROUTE"
+        exit 1
+        ;;
+    esac
   fi
 fi
 
@@ -404,13 +1053,12 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   # successful compile followed by a spurious "Build failed" because the
   # binary lands in an unexpected location.
   if [ "$LITE" -eq 1 ]; then
-    info "Building lite variant (no embedded models)"
+    info "Building lite variant (semantic model loaders disabled)"
     (cd "$TMP/src" && unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_BUILD_TARGET && cargo build --release -p frankensearch-fsfs --no-default-features)
   else
-    info "Building default model-free variant (no embedded models)"
+    info "Building default semantic-loader variant (model bytes acquired separately)"
     (cd "$TMP/src" && unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_BUILD_TARGET && cargo build --release -p frankensearch-fsfs)
   fi
-  LITE=1
   BIN="$TMP/src/target/release/${BINARY_NAME}"
   if [ ! -x "$BIN" ]; then
     # Fallback: search for the binary in case a .cargo/config.toml or other
@@ -425,24 +1073,41 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
       exit 1
     fi
   fi
-  if [ "$SYSTEM" -eq 1 ]; then
-    sudo install -m 0755 "$BIN" "$DEST/${BINARY_NAME}"
-  else
-    install -m 0755 "$BIN" "$DEST/${BINARY_NAME}"
+  if [ "$LITE" -eq 0 ]; then
+    if ! provision_default_semantic_models "$BIN"; then
+      exit 1
+    fi
   fi
+  if [ "$VERIFY" -eq 1 ]; then
+    if ! verify_staged_binary "$BIN"; then
+      exit 1
+    fi
+  fi
+
+  ROLLBACK_BACKUP="$TMP/${BINARY_NAME}.incumbent"
+  back_up_incumbent "$DEST/${BINARY_NAME}" "$ROLLBACK_BACKUP"
+  install_binary "$BIN" "$DEST/${BINARY_NAME}"
   ok "Installed to $DEST/${BINARY_NAME} (source build)"
   maybe_add_path
   if [ "$VERIFY" -eq 1 ]; then
     if ! SELF_TEST_OUTPUT=$("$DEST/${BINARY_NAME}" version 2>&1); then
       err "Self-test failed: $SELF_TEST_OUTPUT"
+      roll_back_incumbent "$ROLLBACK_BACKUP" "$DEST/${BINARY_NAME}" "post-install validation failed" || true
       exit 1
     fi
     ok "Self-test complete: $SELF_TEST_OUTPUT"
   fi
   if [ "$LITE" -eq 1 ]; then
     info "Model-free build: Model2Vec and FastEmbed execution are not compiled."
-    info "Use a full release artifact, or provision verified inputs and rebuild with:"
-    info "  cargo build --release -p frankensearch-fsfs --no-default-features --features embedded-models"
+    info "Install the standard build for semantic retrieval; downloaded files alone cannot activate this lite binary."
+  else
+    info "Semantic loaders installed. Provision and verify the registered models with:"
+    info "  ${BINARY_NAME} download-models potion-multilingual-128m"
+    info "  ${BINARY_NAME} download-models all-minilm-l6-v2"
+    info "  ${BINARY_NAME} download-models potion-multilingual-128m --verify"
+    info "  ${BINARY_NAME} download-models all-minilm-l6-v2 --verify"
+    info "  ${BINARY_NAME} index /path/to/files"
+    info "  ${BINARY_NAME} search \"your query\""
   fi
   ok "Done. Binary at: $DEST/${BINARY_NAME}"
   exit 0
@@ -458,34 +1123,38 @@ if [ -z "$CHECKSUM" ]; then
   info "Fetching checksum from ${CHECKSUM_URL}"
   CHECKSUM_FILE="$TMP/SHA256SUMS"
   if curl -fsSL --connect-timeout 30 --max-time 60 "$CHECKSUM_URL" -o "$CHECKSUM_FILE"; then
-    CHECKSUM=$(grep "  ${TAR}\$" "$CHECKSUM_FILE" 2>/dev/null | awk '{print $1}')
-    if [ -z "$CHECKSUM" ]; then
-      CHECKSUM=$(grep " ${TAR}\$" "$CHECKSUM_FILE" 2>/dev/null | awk '{print $1}')
-    fi
+    CHECKSUM=$(checksum_from_manifest "$CHECKSUM_FILE" "$TAR" || true)
   fi
   if [ -z "$CHECKSUM" ] && [ "$CHECKSUM_URL_DEFAULTED" -eq 1 ]; then
     SIDECAR_CHECKSUM_URL="${URL}.sha256"
     info "Fetching checksum sidecar from ${SIDECAR_CHECKSUM_URL}"
     if curl -fsSL --connect-timeout 30 --max-time 60 "$SIDECAR_CHECKSUM_URL" -o "$CHECKSUM_FILE"; then
-      CHECKSUM=$(awk 'NF >= 1 && $1 ~ /^[0-9a-fA-F]{64}$/ { print $1; exit }' "$CHECKSUM_FILE")
+      CHECKSUM=$(checksum_from_sidecar "$CHECKSUM_FILE" || true)
     fi
   fi
   if [ -z "$CHECKSUM" ]; then
-    warn "Checksum for ${TAR} not found; skipping verification"
-    CHECKSUM="SKIP"
+    err "Checksum for ${TAR} is unavailable; refusing to install an unverified artifact"
+    exit 1
   fi
 fi
 
-if [ "$CHECKSUM" != "SKIP" ]; then
-  if command -v sha256sum >/dev/null 2>&1; then
-    echo "$CHECKSUM  $TMP/$TAR" | sha256sum -c - || { err "Checksum mismatch"; exit 1; }
-    ok "Checksum verified"
-  elif command -v shasum >/dev/null 2>&1; then
-    echo "$CHECKSUM  $TMP/$TAR" | shasum -a 256 -c - || { err "Checksum mismatch"; exit 1; }
-    ok "Checksum verified"
-  else
-    warn "No sha256sum or shasum found; skipping checksum verification"
-  fi
+verify_archive_checksum "$TMP/$TAR" "$CHECKSUM" || exit 1
+ok "Checksum verified"
+
+# Signing is optional, so the sidecars are staged best-effort next to the
+# archive; verify_archive_signature decides what their absence means.
+if [ "$VERIFY" -eq 1 ]; then
+  for SIGNATURE_EXT in sig pem; do
+    case "$URL" in
+      file://*) cp -- "${URL#file://}.${SIGNATURE_EXT}" "$TMP/$TAR.${SIGNATURE_EXT}" 2>/dev/null || true ;;
+      *://*)
+        curl -fsSL --connect-timeout 15 --max-time 60 "${URL}.${SIGNATURE_EXT}" \
+          -o "$TMP/$TAR.${SIGNATURE_EXT}" 2>/dev/null || true
+        ;;
+      *) cp -- "${URL}.${SIGNATURE_EXT}" "$TMP/$TAR.${SIGNATURE_EXT}" 2>/dev/null || true ;;
+    esac
+  done
+  verify_archive_signature "$TMP/$TAR" || exit 1
 fi
 
 # Extract
@@ -504,23 +1173,47 @@ if [ ! -x "$BIN" ]; then
 fi
 [ -x "$BIN" ] || { err "Binary not found in archive"; exit 1; }
 
-if [ "$SYSTEM" -eq 1 ]; then
-  sudo install -m 0755 "$BIN" "$DEST/${BINARY_NAME}"
-else
-  install -m 0755 "$BIN" "$DEST/${BINARY_NAME}"
+if [ "$LITE" -eq 0 ]; then
+  if ! provision_default_semantic_models "$BIN"; then
+    exit 1
+  fi
 fi
+
+if [ "$VERIFY" -eq 1 ]; then
+  if ! verify_staged_binary "$BIN"; then
+    exit 1
+  fi
+fi
+
+ROLLBACK_BACKUP="$TMP/${BINARY_NAME}.incumbent"
+back_up_incumbent "$DEST/${BINARY_NAME}" "$ROLLBACK_BACKUP"
+install_binary "$BIN" "$DEST/${BINARY_NAME}"
 ok "Installed to $DEST/${BINARY_NAME}"
 maybe_add_path
 
 if [ "$VERIFY" -eq 1 ]; then
   if ! SELF_TEST_OUTPUT=$("$DEST/${BINARY_NAME}" version 2>&1); then
     err "Self-test failed: $SELF_TEST_OUTPUT"
+    roll_back_incumbent "$ROLLBACK_BACKUP" "$DEST/${BINARY_NAME}" "post-install validation failed" || true
     exit 1
   fi
   ok "Self-test complete: $SELF_TEST_OUTPUT"
 fi
 
-if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+if [ "$QUIET" -eq 0 ]; then
+if [ "$NO_COLOR_MODE" -eq 1 ]; then
+  printf '\nInstallation complete!\n'
+  printf 'Binary: %s\n' "$DEST/${BINARY_NAME}"
+  printf 'Version: %s\n\n' "$VERSION"
+  printf '%s\n' 'Quick start:'
+  printf '%s\n' '  fsfs download-models potion-multilingual-128m'
+  printf '%s\n' '  fsfs download-models all-minilm-l6-v2'
+  printf '%s\n' '  fsfs download-models potion-multilingual-128m --verify'
+  printf '%s\n' '  fsfs download-models all-minilm-l6-v2 --verify'
+  printf '%s\n' '  fsfs index /path/to/files   Index a directory'
+  printf '%s\n' '  fsfs search "your query"    Search your index'
+  printf '%s\n\n' '  fsfs                        Interactive TUI'
+elif [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
   echo ""
   gum style \
     --border rounded \
@@ -533,6 +1226,10 @@ if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     "$(gum style --foreground 245 "Version: $(gum style --bold "${VERSION}")")" \
     "" \
     "$(gum style --foreground 39 --bold 'Quick start:')" \
+    "$(gum style --foreground 245 '  fsfs download-models potion-multilingual-128m')" \
+    "$(gum style --foreground 245 '  fsfs download-models all-minilm-l6-v2')" \
+    "$(gum style --foreground 245 '  fsfs download-models potion-multilingual-128m --verify')" \
+    "$(gum style --foreground 245 '  fsfs download-models all-minilm-l6-v2 --verify')" \
     "$(gum style --foreground 245 '  fsfs index /path/to/files   Index a directory')" \
     "$(gum style --foreground 245 '  fsfs search "your query"    Search your index')" \
     "$(gum style --foreground 245 '  fsfs                        Interactive TUI')"
@@ -553,9 +1250,14 @@ else
   echo -e "  \033[1;32m│\033[0m  Version: \033[1m${VERSION}\033[0m$(printf '%*s' "$VPAD" '')\033[1;32m│\033[0m"
   echo -e "  \033[1;32m│\033[0m                                         \033[1;32m│\033[0m"
   echo -e "  \033[1;32m│\033[0m  \033[1;36mQuick start:\033[0m                          \033[1;32m│\033[0m"
+  echo -e "  \033[1;32m│\033[0m  \033[0;90m$ fsfs download-models potion-multilingual-128m\033[0m"
+  echo -e "  \033[1;32m│\033[0m  \033[0;90m$ fsfs download-models all-minilm-l6-v2\033[0m"
+  echo -e "  \033[1;32m│\033[0m  \033[0;90m$ fsfs download-models potion-multilingual-128m --verify\033[0m"
+  echo -e "  \033[1;32m│\033[0m  \033[0;90m$ fsfs download-models all-minilm-l6-v2 --verify\033[0m"
   echo -e "  \033[1;32m│\033[0m  \033[0;90m$ fsfs index /path/to/files\033[0m           \033[1;32m│\033[0m"
   echo -e "  \033[1;32m│\033[0m  \033[0;90m$ fsfs search \"your query\"\033[0m            \033[1;32m│\033[0m"
   echo -e "  \033[1;32m│\033[0m  \033[0;90m$ fsfs\033[0m  \033[2m(interactive TUI)\033[0m          \033[1;32m│\033[0m"
   echo -e "  \033[1;32m╰─────────────────────────────────────────╯\033[0m"
   echo ""
+fi
 fi

@@ -12,8 +12,9 @@
 //! change. Format v5 records the exact
 //! generation directory and basename selected during atomic publication, so no
 //! save truncates the pair named by installed metadata. A persistent advisory
-//! save lock and durable in-generation READY receipt serialize writers and let
-//! publication retries reuse complete generations without deleting them.
+//! save lock and durable in-generation READY receipt serialize writers, let
+//! publication retries reuse complete generations, and reclaim generations
+//! superseded by a successful metadata publication.
 //! Format v6 attests the native graph's point and layer topology, invalidating
 //! graphs produced by `hnsw_rs` versions that could misfile reverse edges.
 //! Legacy sidecars and any load failure fall back to the
@@ -632,6 +633,7 @@ impl HnswIndex {
             sync_hnsw_directory(parent)?;
             let metadata_bytes = serialize_hnsw_metadata(&meta)?;
             publish_metadata(path, parent, &metadata_bytes)?;
+            gc_superseded_hnsw_generations(parent, &requested_basename, &meta)?;
             return Ok(());
         }
 
@@ -641,8 +643,18 @@ impl HnswIndex {
         // behaviors. Metadata remains the sole commit point.
         let generation_prefix =
             hnsw_generation_prefix(&requested_basename, self.vector_fingerprint);
-        let generation = tempfile::Builder::new()
-            .prefix(&generation_prefix)
+        let mut generation_builder = tempfile::Builder::new();
+        generation_builder.prefix(&generation_prefix);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            // Tempfile defaults to a private 0700 directory. Published ANN
+            // generations must instead inherit the caller's umask, just like
+            // the FSVI artifact in the same parent directory.
+            generation_builder.permissions(std::fs::Permissions::from_mode(0o777));
+        }
+        let generation = generation_builder
             .tempdir_in(parent)
             .map_err(SearchError::Io)?;
         let dumped_basename = self
@@ -692,6 +704,7 @@ impl HnswIndex {
 
         let metadata_bytes = serialize_hnsw_metadata(&meta)?;
         publish_metadata(path, parent, &metadata_bytes)?;
+        gc_superseded_hnsw_generations(parent, &requested_basename, &meta)?;
 
         Ok(())
     }
@@ -2345,8 +2358,68 @@ fn publish_hnsw_metadata(path: &Path, parent: &Path, bytes: &[u8]) -> SearchResu
     sync_hnsw_directory(parent)
 }
 
+/// Remove stale native HNSW generations after metadata has durably selected a
+/// replacement.
+///
+/// The save lock is held by the caller for the complete publication and
+/// cleanup sequence.  A failed or interrupted metadata publication never
+/// reaches this function, preserving READY generations for a retry.  Only
+/// sibling directories in this metadata role's private generation namespace
+/// are eligible; symlinks and unrelated filesystem entries are left intact.
+fn gc_superseded_hnsw_generations(
+    parent: &Path,
+    requested_basename: &str,
+    published_metadata: &HnswMeta,
+) -> SearchResult<()> {
+    let retained_generation = published_metadata
+        .sidecar_generation
+        .as_deref()
+        .ok_or_else(|| ann_corrupted(parent, "published HNSW metadata has no generation"))?;
+    let generation_prefix = format!(".{requested_basename}.generation-");
+
+    for entry in std::fs::read_dir(parent).map_err(SearchError::Io)? {
+        let entry = entry.map_err(SearchError::Io)?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if file_name == retained_generation || !file_name.starts_with(&generation_prefix) {
+            continue;
+        }
+
+        let file_type = entry.file_type().map_err(SearchError::Io)?;
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+
+        std::fs::remove_dir_all(entry.path()).map_err(|error| {
+            SearchError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to remove superseded HNSW generation '{}': {error}",
+                    entry.path().display()
+                ),
+            ))
+        })?;
+    }
+
+    sync_hnsw_directory(parent)
+}
+
 fn install_hnsw_metadata(path: &Path, parent: &Path, bytes: &[u8]) -> SearchResult<()> {
-    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(SearchError::Io)?;
+    let mut temporary_builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Keep the atomically persisted metadata consistent with ordinary
+        // index files: 0666 constrained by the deployment's umask, rather
+        // than tempfile's private 0600 default.
+        temporary_builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    let mut temporary = temporary_builder
+        .tempfile_in(parent)
+        .map_err(SearchError::Io)?;
     temporary.write_all(bytes).map_err(SearchError::Io)?;
     temporary.as_file().sync_all().map_err(SearchError::Io)?;
     temporary.persist(path).map_err(|error| {
@@ -5120,19 +5193,8 @@ mod tests {
             .sidecar_generation
             .as_deref()
             .expect("original generation");
-        let original_basename = original_meta
-            .sidecar_basename
-            .as_deref()
-            .expect("original basename");
         let destination_parent = destination.parent().expect("destination parent");
         let original_sidecar_parent = destination_parent.join(original_generation);
-        let original_graph_path =
-            original_sidecar_parent.join(format!("{original_basename}.hnsw.graph"));
-        let original_data_path =
-            original_sidecar_parent.join(format!("{original_basename}.hnsw.data"));
-        let original_graph = std::fs::read(&original_graph_path).expect("original graph bytes");
-        let original_data = std::fs::read(&original_data_path).expect("original data bytes");
-
         // Load a graph over the same IDs/count/dimension but different vectors.
         // hnsw_rs marks every loaded graph as mmap-backed. Saving this value
         // over occupied metadata must publish a fresh generation without
@@ -5192,15 +5254,14 @@ mod tests {
                 .join(format!("{published}.hnsw.data"))
                 .is_file()
         );
-        assert_eq!(
-            std::fs::read(&original_graph_path).expect("retained original graph"),
-            original_graph,
-            "resave must not truncate the graph named by old metadata"
+        assert!(
+            !original_sidecar_parent.exists(),
+            "a successfully published replacement must reclaim its superseded generation"
         );
         assert_eq!(
-            std::fs::read(&original_data_path).expect("retained original data"),
-            original_data,
-            "resave must not truncate the data named by old metadata"
+            ready_generation_paths(&destination, changed_loaded.vector_fingerprint),
+            vec![published_parent.clone()],
+            "the published metadata generation must be the only retained generation for this vector state"
         );
 
         let native = HnswIndex::try_load_native_graph(&destination, &meta, &changed_source)
@@ -5216,6 +5277,122 @@ mod tests {
             .knn_search(&[1.0, 0.0], 1, HNSW_DEFAULT_EF_SEARCH)
             .expect("search reloaded graph");
         assert_eq!(reloaded_hits[0].doc_id, "doc-0001");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generation_gc_never_follows_or_removes_a_generation_named_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temporary generation root");
+        let parent = root.path().join("ann");
+        std::fs::create_dir(&parent).expect("create ANN parent");
+        let retained_generation = ".vector.fast.generation-0000000000000001-retained";
+        std::fs::create_dir(parent.join(retained_generation)).expect("create retained generation");
+
+        let external = root.path().join("external");
+        std::fs::create_dir(&external).expect("create external directory");
+        let external_sentinel = external.join("must-survive");
+        std::fs::write(&external_sentinel, b"outside generation namespace")
+            .expect("write external sentinel");
+        let linked_generation = ".vector.fast.generation-0000000000000002-link";
+        let linked_path = parent.join(linked_generation);
+        symlink(&external, &linked_path)
+            .expect("link external directory into generation namespace");
+
+        let metadata = HnswMeta {
+            format_version: HNSW_META_FORMAT_CURRENT,
+            doc_ids: Vec::new(),
+            config: HnswConfig::default(),
+            dimension: 0,
+            vector_fingerprint: 0,
+            sidecar_generation: Some(retained_generation.to_owned()),
+            sidecar_basename: Some("vector.fast".to_owned()),
+        };
+        gc_superseded_hnsw_generations(&parent, "vector.fast", &metadata)
+            .expect("GC must skip generation-named symlinks");
+
+        assert!(parent.join(retained_generation).is_dir());
+        assert!(
+            std::fs::symlink_metadata(&linked_path)
+                .expect("inspect generation-named symlink")
+                .file_type()
+                .is_symlink(),
+            "GC must not remove a symlink merely because its name matches the generation prefix"
+        );
+        assert!(
+            external_sentinel.is_file(),
+            "GC must not traverse into the target of a generation-named symlink"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_publication_honors_umask_for_metadata_and_generation_artifacts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temporary ANN root");
+        let source_path = root.path().join("source.fsvi");
+        let source = write_index(&source_path, &[vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]])
+            .expect("write source index");
+        let ann = HnswIndex::build_from_vector_index(&source, HnswConfig::default())
+            .expect("build native ANN");
+        let metadata_path = root.path().join("vector.fast.hnsw");
+        ann.save(&metadata_path).expect("save native ANN");
+
+        let source_mode = std::fs::metadata(&source_path)
+            .expect("inspect source index")
+            .permissions()
+            .mode()
+            & 0o666;
+        let metadata_mode = std::fs::metadata(&metadata_path)
+            .expect("inspect HNSW metadata")
+            .permissions()
+            .mode()
+            & 0o666;
+        assert_eq!(
+            metadata_mode, source_mode,
+            "persisted HNSW metadata must retain the parent deployment's umask policy"
+        );
+
+        let metadata: HnswMeta =
+            serde_json::from_slice(&std::fs::read(&metadata_path).expect("read HNSW metadata"))
+                .expect("parse HNSW metadata");
+        let generation = root.path().join(
+            metadata
+                .sidecar_generation
+                .as_deref()
+                .expect("metadata must name its generation"),
+        );
+        let generation_mode = std::fs::metadata(&generation)
+            .expect("inspect HNSW generation")
+            .permissions()
+            .mode()
+            & 0o666;
+        assert_eq!(
+            generation_mode, source_mode,
+            "published generation data permissions must retain the parent deployment's umask policy"
+        );
+        let basename = metadata
+            .sidecar_basename
+            .as_deref()
+            .expect("metadata must name its native sidecars");
+        for path in [
+            generation.join(format!("{basename}.hnsw.graph")),
+            generation.join(format!("{basename}.hnsw.data")),
+            generation.join(HNSW_GENERATION_RECEIPT_FILENAME),
+        ] {
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("inspect generation artifact")
+                    .permissions()
+                    .mode()
+                    & 0o666,
+                source_mode,
+                "generation artifact '{}' must retain the parent deployment's umask policy",
+                path.display()
+            );
+        }
     }
 
     #[test]

@@ -10,14 +10,17 @@
 //! subject used by the G1a default-syntax campaign.
 
 mod artifact;
+mod campaign_contract;
 mod comparator;
 mod engine;
 mod generator;
 mod local_perf_runner;
 mod machine_class_registry;
 mod perf;
+mod perf_assembly;
 mod perf_evidence;
 mod perf_ratchet;
+mod qg2_contract;
 mod qg6_prepared;
 mod runner;
 mod version_contract;
@@ -27,13 +30,36 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 pub use artifact::{
-    ArtifactLexicalContractEvidence, ArtifactObject, ArtifactStore, CANONICALIZATION_VERSION,
-    CampaignArtifactContext, OBJECT_SCHEMA_VERSION, PreparedArtifact, RUN_MANIFEST_SCHEMA_VERSION,
-    RunManifest,
+    ArtifactExecutionRole, ArtifactLexicalContractEvidence, ArtifactObject,
+    ArtifactOracleDependency, ArtifactStore, ArtifactTrustCeiling, CANONICALIZATION_VERSION,
+    CampaignArtifactContext, GauntletProducerBuildIdentity, GauntletProducerSourceVerification,
+    IntegrityCheckedCampaign, OBJECT_SCHEMA_VERSION, PreparedArtifact, RUN_MANIFEST_SCHEMA_VERSION,
+    RunManifest, SerializedSchemaDisposition, classify_artifact_object_schema,
+    classify_campaign_report_schema, pinned_campaign_report_v7,
 };
+pub use campaign_contract::{
+    BuiltInEvidenceBindingV1, CampaignCellEvidenceV1, CampaignCellKeyV1, CampaignContractModeV1,
+    CampaignContractValueError, CampaignCorpusV1, CampaignEvidenceRole, CampaignExecutionProfileV1,
+    CampaignHardwareClassV1, CampaignMachineProfileV1, CampaignNightV1, CampaignProfileV1,
+    CampaignReplayV1, CampaignSeedBundleV1, CampaignSeedScheduleV1, CampaignSeedSlotV1,
+    CampaignSha256V1, CampaignTopologyV1, REPLACEMENT_COMPLETENESS_EXPECTED_CELL_COUNT,
+    REPLACEMENT_COMPLETENESS_POLICY_SCHEMA_VERSION, ReplacementCompletenessError,
+    ReplacementCompletenessPolicyV1, UnexpectedCampaignCellReasonV1, frozen_replacement_cell_keys,
+    frozen_replacement_completeness_policy, frozen_replacement_seed_bundle,
+    frozen_replacement_seed_schedule, replacement_completeness_policy_sha256,
+    validate_replacement_completeness,
+};
+#[cfg(feature = "tantivy-oracle")]
+pub use comparator::observe_tantivy_cass_profile;
 pub use comparator::{
-    AstDifference, AstLoweringKind, ComparatorConfig, ComparisonReport, ComparisonStatus,
-    CountState, Divergence, DivergenceClass, EngineObservation,
+    AstDifference, AstLoweringKind, CASS_LEXICAL_PROFILE_OBSERVATION_SCHEMA_VERSION,
+    CassLexicalProfileComparison, CassLexicalProfileContext, CassLexicalProfileObservation,
+    CassLexicalProfileOutcome, CassLexicalProfileProvenance, CassLexicalProfileSuccess,
+    CassProfileAuthority, CassProfileDiagnosticKind, CassProfileDiagnosticObservation,
+    CassProfileField, CassProfileFilters, CassProfileMismatch, CassProfileMismatchClass,
+    CassProfileNotExposedReason, CassProfileRankedHit, CassProfileRequest, CassProfileSourceFilter,
+    CassProfileTieMember, CassProfileTokenKind, CassProfileTokenObservation, ComparatorConfig,
+    ComparisonReport, ComparisonStatus, CountState, Divergence, DivergenceClass, EngineObservation,
     LEXICAL_CONTRACT_BUNDLE_SCHEMA_VERSION, LEXICAL_CONTRACT_COMPARISON_SCHEMA_VERSION,
     LEXICAL_OBSERVATION_SCHEMA_VERSION, LexicalBackendIdentity, LexicalBoundary,
     LexicalComparisonReport, LexicalComparisonStatus, LexicalContractBundle,
@@ -47,15 +73,20 @@ pub use comparator::{
     LexicalObservationContext, LexicalObservationOutcome, LexicalObservationSupplement,
     LexicalObserved, LexicalProbeCoverage, LexicalQueryClass, LexicalScoreSource,
     LexicalSideCoverage, LexicalWaivedDifference, LexicalWaiverTarget, LexicalWinnerOrigin,
-    LexicalWinnerProjection, MAX_LEXICAL_DOC_ID_BYTES, MAX_LEXICAL_ERROR_SOURCE_DEPTH,
-    MAX_LEXICAL_HIGHLIGHT_SPANS_PER_HIT, MAX_LEXICAL_OBSERVATION_HITS, MAX_LEXICAL_QUERY_BYTES,
-    MAX_LEXICAL_SENSITIVE_PAYLOAD_BYTES, NativeTieKey, QUILL_CANCELLATION_RECEIPT_SCHEMA_VERSION,
-    QuillCancellationCheckpoint, QuillCancellationEvidenceOrigin, QuillCancellationObservation,
-    QuillCancellationReceipt, QuillCancellationReceiptBody, RankClass, RankedHit, SCORE_EPSILON,
-    ScoreEpsilonReason, SensitiveValueObservation, compare_lexical_contracts,
+    LexicalWinnerProjection, MAX_CASS_PROFILE_DIAGNOSTICS, MAX_CASS_PROFILE_DOCUMENT_ID_BYTES,
+    MAX_CASS_PROFILE_FETCH_HITS, MAX_CASS_PROFILE_FILTER_BYTES,
+    MAX_CASS_PROFILE_FILTER_VALUE_BYTES, MAX_CASS_PROFILE_FILTER_VALUES, MAX_CASS_PROFILE_TOKENS,
+    MAX_LEXICAL_DOC_ID_BYTES, MAX_LEXICAL_ERROR_SOURCE_DEPTH, MAX_LEXICAL_HIGHLIGHT_SPANS_PER_HIT,
+    MAX_LEXICAL_OBSERVATION_HITS, MAX_LEXICAL_QUERY_BYTES, MAX_LEXICAL_SENSITIVE_PAYLOAD_BYTES,
+    NativeTieKey, QUILL_CANCELLATION_RECEIPT_SCHEMA_VERSION, QuillCancellationCheckpoint,
+    QuillCancellationEvidenceOrigin, QuillCancellationObservation, QuillCancellationReceipt,
+    QuillCancellationReceiptBody, RankClass, RankedHit, SCORE_EPSILON, ScoreEpsilonReason,
+    SensitiveValueObservation, compare_cass_lexical_profiles, compare_lexical_contracts,
     compare_lexical_observations, compare_observations, observe_lexical_outcome,
-    observe_live_quill_cancellation_receipt,
+    observe_live_quill_cancellation_receipt, observe_quill_cass_profile,
 };
+#[cfg(feature = "fuzz-harness")]
+pub use engine::scalar_g1a_fuzz_pair;
 pub use engine::{
     CASS_TANTIVY_ORACLE_CONFIG_HASH, ComparisonMode, DifferentialCase, DifferentialCaseMetadata,
     DifferentialHarness, EngineDescriptor, EngineFamily, EnginePairIdentity, GauntletEngine,
@@ -77,8 +108,11 @@ pub use generator::{
     SyntheticCorpusSpec, UnicodeLane, XLARGE_DOCUMENT_COUNT, ZipfExponent,
 };
 pub use local_perf_runner::{
-    LocalPerfRunConfig, LocalPerfRunError, LocalPerfRunOutput, local_perf_producer_contract_json,
-    run_local_perf_command,
+    LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION, LocalPerfAttemptOutcome, LocalPerfAttemptReceipt,
+    LocalPerfInternalLifecycleGaps, LocalPerfInternalLifecycleUnavailable,
+    LocalPerfProcessLifecycle, LocalPerfRetryPredicate, LocalPerfRunConfig, LocalPerfRunError,
+    LocalPerfRunOutput, LocalPerfRunSelection, LocalPerfUnsupportedControl,
+    local_perf_producer_contract_json, run_local_perf_command, run_selected_local_perf_command,
 };
 pub use machine_class_registry::{
     DefaultFlipDisposition, ExecutionCapacitySemantics, ExecutionProfileId, HardwareClassId,
@@ -108,6 +142,20 @@ pub use perf::{
     peak_rss_bytes, perf_manifest_contract_sha256, perf_writer_heap_bytes,
     seeded_balanced_pair_order, validate_matrix,
 };
+pub use perf_assembly::{
+    PERF_ASSEMBLY_ENGINE_LIFECYCLE_NO_CLAIM_CODE, PERF_ASSEMBLY_MAX_ARTIFACT_BYTES,
+    PERF_ASSEMBLY_MAX_RECEIPT_BYTES, PERF_ASSEMBLY_MAX_RETRY_PREDICATE_BYTES,
+    PERF_ASSEMBLY_MAX_SHARDS, PERF_ASSEMBLY_PARTIAL_SHARD_NO_CLAIM_CODE,
+    PERF_ASSEMBLY_PARTIAL_SHARD_NO_CLAIM_DETAIL, PERF_ASSEMBLY_PROCESS_TREE_NO_CLAIM_CODE,
+    PERF_EVIDENCE_ASSEMBLY_MATRIX_SCHEMA_VERSION, PERF_EVIDENCE_ASSEMBLY_SCHEMA_VERSION,
+    PERF_EVIDENCE_SEMANTIC_CELL_SET_SCHEMA_VERSION, PerfAssemblyMachineIdentity,
+    PerfAssemblyProcessReceipt, PerfEvidenceAssemblyArtifact, PerfEvidenceAssemblyCompatibility,
+    PerfEvidenceAssemblyCompleteness, PerfEvidenceAssemblyCounts, PerfEvidenceAssemblyError,
+    PerfEvidenceAssemblyFailedAttempt, PerfEvidenceAssemblyMatrixCell,
+    PerfEvidenceAssemblyMatrixManifest, PerfEvidenceAssemblyNoClaimCell,
+    PerfEvidenceAssemblyNoClaimSource, PerfEvidenceAssemblyReadiness, PerfEvidenceAssemblySource,
+    PerfEvidenceCellSource, PerfEvidenceSemanticCellSetSeal, VerifiedLocalPerfAttemptBundle,
+};
 pub use perf_evidence::{
     AbsoluteRelativeReconciliation, BuildIdentity, ColdCacheEvidence, CorpusIdentity,
     EVIDENCE_MAX_REASON_MESSAGE_BYTES, EVIDENCE_MAX_REASONS, EngineConcurrencyObservation,
@@ -120,10 +168,18 @@ pub use perf_evidence::{
     load_legacy_gate_artifact_v3, required_estimand,
 };
 pub use perf_ratchet::{
-    PERF_MAX_REGRESSION_PCT, PERF_MAX_REPRODUCTION_DELTA_PCT, PERF_RATCHET_SCHEMA_VERSION,
-    PERF_REGRESSION_ROBUST_Z, PerfCellComparison, PerfEvidenceFile, PerfGateDecision,
-    PerfRatchetEvaluation, PerfRatchetMode, PerfRatchetReason, PerfRatchetRequest,
-    evaluate_perf_ratchet, is_explicit_bootstrap, is_explicit_bootstrap_for,
+    PERF_HISTORY_POINTER_SCHEMA_VERSION, PERF_MAX_REGRESSION_PCT, PERF_MAX_REPRODUCTION_DELTA_PCT,
+    PERF_RATCHET_SCHEMA_VERSION, PERF_REGRESSION_ROBUST_Z, PerfCellComparison, PerfEvidenceFile,
+    PerfGateDecision, PerfRatchetEvaluation, PerfRatchetMode, PerfRatchetReason,
+    PerfRatchetRequest, evaluate_perf_ratchet, is_explicit_bootstrap, is_explicit_bootstrap_for,
+};
+pub use qg2_contract::{
+    QG2_CANONICAL_CONTRACT, QG2_CONTRACT_REPORT_SCHEMA_VERSION, QG2_LOGICAL_SURFACE_COUNT,
+    QG2_PHYSICAL_LOCATOR_COUNT, QG2_SENTINEL_COUNT, Qg2CommitBoundary, Qg2ComparatorContract,
+    Qg2ContractDivergence, Qg2ContractReport, Qg2ContractStatus, Qg2DurabilityScope,
+    Qg2ExcludedOperation, Qg2PreservedValueReceipt, Qg2SentinelSummary, Qg2SourceNonregression,
+    Qg2StaleHistoryDisposition, Qg2StaleHistoryReceipt, Qg2StorageTopology, Qg2SurfaceReceipt,
+    Qg2TimingEnd, Qg2TimingStart, Qg2TopologySummary, validate_qg2_contract,
 };
 pub use qg6_prepared::{
     Qg6ArmLifecycle, Qg6ArmRole, Qg6Comparison, Qg6ExperimentIdentity, Qg6FourArmResultReceipts,
@@ -135,21 +191,27 @@ pub use qg6_prepared::{
 };
 pub use runner::{
     CAMPAIGN_REPORT_SCHEMA_VERSION, CASS_ANALYZER_CONTRACT_PREIMAGE, CASS_SCHEMA_CONTRACT_PREIMAGE,
-    CampaignCaseResult, CampaignConfig, CampaignContractMode, CampaignDisposition, CampaignFuture,
-    CampaignLexicalCaseSummary, CampaignLexicalCoverageSummary, CampaignProvenance, CampaignReport,
-    CampaignSelection, DEFAULT_ANALYZER_CONTRACT_HASH, DEFAULT_ANALYZER_CONTRACT_PREIMAGE,
+    CampaignCaseReason, CampaignCaseResult, CampaignConfig, CampaignContractMode,
+    CampaignDisposition, CampaignFuture, CampaignLexicalCaseSummary,
+    CampaignLexicalCoverageSummary, CampaignProvenance, CampaignReport, CampaignSelection,
+    DEFAULT_ANALYZER_CONTRACT_HASH, DEFAULT_ANALYZER_CONTRACT_PREIMAGE,
     DEFAULT_SCHEMA_CONTRACT_HASH, DEFAULT_SCHEMA_CONTRACT_PREIMAGE, DEFAULT_SHRINK_FUEL,
+    DIVERGENCE_PREDICTION_POLICY_PREIMAGE, DIVERGENCE_PREDICTION_POLICY_VERSION,
     DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION, DIVERGENCE_REGISTER_REDACTION_POLICY_VERSION,
-    DifferentialCampaignEngine, DifferentialCampaignRunner, DivergenceCensus,
-    DivergenceClassCensus, DivergenceDisposition, DivergenceDispositionEvent,
-    DivergenceFixtureEvidence, DivergenceObservationEvent, DivergencePredictionEvent,
-    DivergenceRegisterDecision, DivergenceRegisterEntry, DivergenceRegisterEvent,
-    DivergenceRegisterEventHeader, DivergenceRegisterLedger, DivergenceRegistry,
-    DivergenceRevisionSet, EngineIndexReceipt, GeneratedCorpusReplay, LexicalMismatchGroup,
-    LexicalSideCoverageCounts, MismatchGroup, PredictedDivergenceState, ProbeCoverageCounts,
-    QueryClassSummary, RedactedDivergenceDiagnostic, SCALAR_G1A_SCHEMA_CONTRACT_PREIMAGE,
-    SemanticContract, ShadowDivergenceRecord, ShrinkDriver, ShrinkEngineFactory, ShrinkError,
-    ShrinkRequest, ShrunkReproduction, SuspectedLayer, TriageConfidence, TriageVerdict,
+    DifferentialCampaignEngine, DifferentialCampaignRunner, DivergenceArtifactObjectHash,
+    DivergenceArtifactObjectHashScheme, DivergenceDisposition, DivergenceDispositionEvent,
+    DivergenceFixtureContentWitness, DivergenceFixtureEvidence, DivergenceObservationEvent,
+    DivergencePredictionEvent, DivergenceRegisterDecision, DivergenceRegisterEntry,
+    DivergenceRegisterEvent, DivergenceRegisterEventHeader, DivergenceRegisterLedger,
+    DivergenceRegistry, DivergenceRevisionSet, EngineIndexReceipt, GeneratedCorpusReplay,
+    LexicalMismatchGroup, LexicalSideCoverageCounts, METAMORPHIC_LAW_REGISTRY_SCHEMA_VERSION,
+    MetamorphicLawApplicability, MetamorphicLawApplicabilityEntry, MetamorphicLawDescriptor,
+    MetamorphicLawOutcome, MetamorphicLawRegistry, MetamorphicLawResult, MetamorphicLawScope,
+    MetamorphicLawSummary, MetamorphicSkipReason, MismatchGroup, PredictedDivergenceState,
+    ProbeCoverageCounts, QueryClassSummary, RedactedDivergenceDiagnostic,
+    SCALAR_G1A_SCHEMA_CONTRACT_PREIMAGE, SemanticContract, ShadowDivergenceRecord, ShrinkDriver,
+    ShrinkEngineFactory, ShrinkError, ShrinkRequest, ShrunkReproduction, SuspectedLayer,
+    TriageConfidence, TriageVerdict, divergence_prediction_policy_sha256,
     persist_shrunk_reproduction,
 };
 pub use version_contract::{

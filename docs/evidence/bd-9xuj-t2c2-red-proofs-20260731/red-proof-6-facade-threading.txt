@@ -1,0 +1,10 @@
+RED PROOF 6: IndexBuilder::build fast-identity threading DISABLED (identity() result dropped, set_fast_identity never called)
+mutation applied to frankensearch/src/index_builder.rs at commit e5693265b11c31cb98ba4864a6fa8ff21524a643
+expected RED: build_threads_typed_identity_into_persisted_headers
+test index_builder::tests::build_threads_typed_identity_into_persisted_headers ... FAILED
+thread 'index_builder::tests::build_threads_typed_identity_into_persisted_headers' (2766222) panicked at frankensearch/src/index_builder.rs:1417:13:
+assertion `left == right` failed: the fast header must carry the identity's immutable revision, which only exists if build threaded the typed identity through
+  left: ""
+ right: "explicit-test-v1"
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.04s
+EXIT_STATUS=101

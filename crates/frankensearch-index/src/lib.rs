@@ -45,6 +45,7 @@
 #[cfg(unix)]
 pub mod fd_acl;
 pub mod file_identity;
+pub mod generation_root;
 #[cfg(feature = "ann")]
 pub mod hnsw;
 pub mod in_memory;
@@ -54,6 +55,7 @@ pub mod native_hnsw;
 pub mod quantization;
 pub mod recall_certificate;
 mod repro_soft_delete_rollback;
+mod repro_wal_shadow_bug;
 mod repro_wal_truncation;
 pub mod search;
 pub mod simd;
@@ -555,23 +557,13 @@ pub struct FsviSnapshotRejected {
     pub detail: String,
 }
 
-/// Why owner-backed ANN is unavailable in this API slice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FsviAnnDisabledReason {
-    /// Existing HNSW APIs accept a mutable/path-opened [`VectorIndex`] and
-    /// therefore cannot prove that graph validation consumed this owner's
-    /// exact byte image.
-    OwnerBoundAdapterUnavailable,
-}
-
 /// Typed ANN disposition for one immutable FSVI owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "status", content = "reason")]
+#[serde(rename_all = "snake_case", tag = "status")]
 pub enum FsviAnnAdmission {
-    /// ANN must not load or rebuild; callers must use the owner's exact-search
-    /// path until an owner-bound graph receipt and adapter are available.
-    Disabled(FsviAnnDisabledReason),
+    /// [`crate::native_hnsw::ValidatedNativeHnsw`] builds and loads only from
+    /// this retained owner and binds the graph receipt to its exact witness.
+    Enabled,
 }
 
 /// Why a recognized artifact must be rebuilt rather than adopted or relabeled.
@@ -690,6 +682,13 @@ pub struct VectorMetadata {
     pub quantization: Quantization,
     /// Compaction generation counter (0-255) used for stale WAL detection.
     pub compaction_gen: u8,
+    /// Shared publication identity of a multi-tier install (bd-miio8).
+    ///
+    /// Every tier published by one `TwoTierIndexBuilder::finish` carries the
+    /// same non-zero nonce; a mismatch at open time means the pair is a
+    /// mixed-generation survivor of a crash between tier installs. Zero is
+    /// the legacy value (pre-nonce files and single-tier writers).
+    pub publication_nonce: u16,
     /// Number of records in the index.
     pub record_count: usize,
     /// Byte offset to the aligned vector slab.
@@ -1312,11 +1311,10 @@ impl ValidatedFsviBytes {
         ValidatedFsviRowSource { owner: self }
     }
 
-    /// ANN is explicitly disabled until HNSW load/rebuild accepts this sealed
-    /// owner and binds its graph receipt to this exact witness.
+    /// Owner-bound native HNSW can build or load only against this exact owner.
     #[must_use]
     pub const fn ann_admission(&self) -> FsviAnnAdmission {
-        FsviAnnAdmission::Disabled(FsviAnnDisabledReason::OwnerBoundAdapterUnavailable)
+        FsviAnnAdmission::Enabled
     }
 
     /// Exact top-k search over the owned image.
@@ -1808,6 +1806,11 @@ impl VectorIndex {
     /// The exact validated identity and full-width generation are required
     /// before any writer is returned.
     ///
+    /// The writer starts at publication nonce 0 (single-tier). Every tier of
+    /// one multi-tier v2 publication must be stamped with the same non-zero
+    /// nonce via [`VectorIndexWriter::with_publication_nonce`] (bd-miio8), or
+    /// the pair reads 0 == 0 and is exempt from the mixed-generation check.
+    ///
     /// # Errors
     ///
     /// Returns [`SearchError::InvalidConfig`] if the binding is invalid.
@@ -1834,6 +1837,7 @@ impl VectorIndex {
             dimension: binding.dimension,
             quantization: binding.quantization,
             compaction_gen: 0,
+            publication_nonce: 0,
             records: Vec::new(),
             identity_v2: Some(binding),
         })
@@ -1854,10 +1858,23 @@ impl VectorIndex {
     pub fn replace_with_empty(
         path: &Path,
         embedder_id: &str,
+        embedder_revision: &str,
         dimension: usize,
     ) -> SearchResult<Self> {
+        let replacement_gen = if path.exists() {
+            next_generation(Self::peek_compaction_gen(path)?)
+        } else {
+            1
+        };
         let replacement_path = temporary_output_path(path);
-        let writer = Self::create(&replacement_path, embedder_id, dimension)?;
+        let writer = Self::create_with_revision(
+            &replacement_path,
+            embedder_id,
+            embedder_revision,
+            dimension,
+            Quantization::F16,
+        )?
+        .with_generation(replacement_gen);
         writer.finish()?;
         Self::install_replacement(path, &replacement_path)
     }
@@ -1890,11 +1907,35 @@ impl VectorIndex {
                 reason: "replacement generation must not have a live WAL".to_owned(),
             });
         }
+        let replacement_gen = replacement.metadata.compaction_gen;
         drop(replacement);
 
-        let wal_path = wal::wal_path_for(path);
-        wal::remove_wal(&wal_path)?;
-        sync_parent_directory(&wal_path)?;
+        // A two-resource commit (main file + WAL sidecar) cannot be made safe
+        // by rename ordering alone: removing the WAL before the rename opens a
+        // crash window that destroys acknowledged records of the SURVIVING
+        // generation, and removing it after opens one where the stale sidecar
+        // is adopted by the replacement. The generation byte is the authority
+        // that closes both: the replacement must carry
+        // next_generation(destination), so the rename atomically installs the
+        // new data AND invalidates the old sidecar (whose records bind to the
+        // superseded generation), letting WAL removal happen safely after.
+        if path.exists() {
+            let destination_gen = Self::peek_compaction_gen(path)?;
+            let required = next_generation(destination_gen);
+            if replacement_gen != required {
+                return Err(SearchError::InvalidConfig {
+                    field: "replacement_path".to_owned(),
+                    value: replacement_path.display().to_string(),
+                    reason: format!(
+                        "replacement compaction generation {replacement_gen} must be \
+                         next_generation(destination {destination_gen}) = {required}; build \
+                         the replacement with with_generation(next_generation(\
+                         VectorIndex::peek_compaction_gen(destination)?)) so the rename \
+                         atomically invalidates any surviving destination WAL"
+                    ),
+                });
+            }
+        }
 
         let temporary = tempfile::TempPath::try_from_path(replacement_path.to_path_buf())?;
         if let Err(error) = temporary.persist(path) {
@@ -1903,7 +1944,58 @@ impl VectorIndex {
             return Err(SearchError::Io(error));
         }
         sync_parent_directory(path)?;
+
+        // The stale sidecar is already invalid (generation mismatch); remove
+        // it so a healthy install leaves no residue. On failure, open() below
+        // and every future open reject and clean it anyway.
+        let wal_path = wal::wal_path_for(path);
+        if let Err(error) = wal::remove_wal(&wal_path) {
+            tracing::warn!(
+                path = %wal_path.display(),
+                error = %error,
+                "superseded WAL sidecar could not be removed after install; \
+                 open() will reject it by generation"
+            );
+        } else {
+            sync_parent_directory(&wal_path)?;
+        }
         Self::open(path)
+    }
+
+    /// Read the on-disk compaction generation of a published FSVI without
+    /// opening it — no WAL adoption, trailer truncation, or sidecar cleanup
+    /// side effects. Shares [`Self::open`]'s v1 header domain (the mutable
+    /// generation surface [`Self::install_replacement`] operates on).
+    ///
+    /// # Errors
+    ///
+    /// Returns the same header corruption/version errors as [`Self::open`].
+    pub fn peek_compaction_gen(path: &Path) -> SearchResult<u8> {
+        Ok(Self::peek_header_metadata(path)?.compaction_gen)
+    }
+
+    /// Read the on-disk publication nonce of a published FSVI without opening
+    /// it, with the same side-effect-free contract as
+    /// [`Self::peek_compaction_gen`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same header corruption/version errors as [`Self::open`].
+    pub fn peek_publication_nonce(path: &Path) -> SearchResult<u16> {
+        Ok(Self::peek_header_metadata(path)?.publication_nonce)
+    }
+
+    fn peek_header_metadata(path: &Path) -> SearchResult<VectorMetadata> {
+        use std::io::Read;
+        // The variable-length header (two u16-length strings + fixed fields +
+        // CRC) cannot exceed 256 KiB, so this prefix always suffices.
+        let file = File::open(path).map_err(SearchError::Io)?;
+        let mut data = Vec::new();
+        file.take(256 * 1024)
+            .read_to_end(&mut data)
+            .map_err(SearchError::Io)?;
+        let (metadata, _header_len) = parse_header(path, &data)?;
+        Ok(metadata)
     }
 
     /// Create a writer with explicit embedder revision and quantization.
@@ -1941,6 +2033,7 @@ impl VectorIndex {
             dimension,
             quantization,
             compaction_gen: 1,
+            publication_nonce: 0,
             records: Vec::new(),
             identity_v2: None,
         })
@@ -1974,6 +2067,13 @@ impl VectorIndex {
     #[must_use]
     pub const fn quantization(&self) -> Quantization {
         self.metadata.quantization
+    }
+
+    /// Shared publication identity of a multi-tier install; zero on legacy
+    /// and single-tier files (bd-miio8).
+    #[must_use]
+    pub const fn publication_nonce(&self) -> u16 {
+        self.metadata.publication_nonce
     }
 
     /// Full parsed metadata.
@@ -2706,6 +2806,7 @@ impl VectorIndex {
             self.dimension(),
             self.quantization(),
             new_gen,
+            self.metadata.publication_nonce,
             record_count,
             0,
         )?;
@@ -2755,6 +2856,7 @@ impl VectorIndex {
                     self.dimension(),
                     self.quantization(),
                     new_gen,
+                    self.metadata.publication_nonce,
                     record_count,
                     vectors_offset,
                 )?;
@@ -2858,6 +2960,12 @@ impl VectorIndex {
         // So we need to update self.wal_entries from reloaded.
         self.wal_entries = reloaded.wal_entries;
         self.wal_config = config;
+        // The lazy int8/4-bit slabs quantized the PRE-rewrite vector region;
+        // carrying them across the swap scores pass-1 candidates from rows
+        // that no longer exist (or reads past a shrunken slab). Reset so the
+        // next two-pass search re-quantizes the new region (bd-0ho5p).
+        self.vectors_i8 = OnceLock::new();
+        self.vectors_nibbles = OnceLock::new();
 
         Ok(())
     }
@@ -3331,6 +3439,7 @@ pub struct VectorIndexWriter {
     dimension: usize,
     quantization: Quantization,
     compaction_gen: u8,
+    publication_nonce: u16,
     records: Vec<PendingRecord>,
     identity_v2: Option<FsviV2IdentityBinding>,
 }
@@ -3458,9 +3567,25 @@ impl VectorIndexWriter {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub(crate) const fn with_generation(mut self, generation: u8) -> Self {
+    /// Override the compaction generation this writer stamps into the header.
+    ///
+    /// Required when the finished file will be handed to
+    /// [`VectorIndex::install_replacement`] over an existing destination: pass
+    /// `next_generation(VectorIndex::peek_compaction_gen(destination)?)` so
+    /// the install's rename atomically invalidates any surviving destination
+    /// WAL sidecar.
+    #[must_use]
+    pub const fn with_generation(mut self, generation: u8) -> Self {
         self.compaction_gen = generation;
+        self
+    }
+
+    /// Stamp the shared publication identity of a multi-tier install
+    /// (bd-miio8). Every tier of one publication must carry the same non-zero
+    /// nonce so a crash between per-tier installs is detectable at open time.
+    #[must_use]
+    pub const fn with_publication_nonce(mut self, publication_nonce: u16) -> Self {
+        self.publication_nonce = publication_nonce;
         self
     }
 
@@ -3561,6 +3686,7 @@ impl VectorIndexWriter {
                 self.dimension,
                 self.quantization,
                 self.compaction_gen,
+                self.publication_nonce,
                 record_count,
                 0,
             )?
@@ -3608,6 +3734,7 @@ impl VectorIndexWriter {
                 self.dimension,
                 self.quantization,
                 self.compaction_gen,
+                self.publication_nonce,
                 record_count,
                 vectors_offset,
             )?;
@@ -3677,6 +3804,7 @@ impl VectorIndexWriter {
                 })?;
                 let header = build_v2_header(
                     binding,
+                    self.publication_nonce,
                     record_count,
                     vectors_offset,
                     docset_digest,
@@ -3693,15 +3821,42 @@ impl VectorIndexWriter {
                 file.write_all(&header)?;
             }
             file.sync_all()?;
-            if self.identity_v2.is_some() {
+            // Publication over an existing WAL sidecar is refused for EVERY
+            // format version, not just v2. A fresh v1 generation restarts at
+            // compaction_gen 1, so next_generation(1) collides with the
+            // previous generation's sidecar binding and open() would adopt the
+            // stale WAL wholesale: deleted documents resurrect and the WAL
+            // shadow suppresses the freshly rebuilt main-slab winners
+            // (bd-cnby1). Removing the sidecar here instead is not crash-safe
+            // in either order (before the rename it destroys acknowledged
+            // writes of the still-live old generation; after, a crash between
+            // rename and removal re-opens the adoption window), so the only
+            // sound contract is refusal: in-place replacement goes through
+            // install_replacement, which carries the destination generation
+            // forward and supersedes the sidecar under a real authority.
+            {
                 let wal_path = wal::wal_path_for(&self.path);
                 match fs::symlink_metadata(&wal_path) {
                     Ok(_) => {
+                        let (field, reason) = if self.identity_v2.is_some() {
+                            (
+                                "fsvi_v2.wal_sidecar",
+                                "identity-complete v2 publication refuses a target with any existing WAL sidecar",
+                            )
+                        } else {
+                            (
+                                "wal_sidecar",
+                                "publication refuses a target with an existing WAL sidecar: a fresh generation \
+                                 would collide with the sidecar's generation binding and silently adopt stale \
+                                 entries (deleted documents resurrect); replace an existing index via \
+                                 install_replacement, or remove the sidecar explicitly if discarding its \
+                                 pending writes is intended",
+                            )
+                        };
                         return Err(SearchError::InvalidConfig {
-                            field: "fsvi_v2.wal_sidecar".to_owned(),
+                            field: field.to_owned(),
                             value: wal_path.display().to_string(),
-                            reason: "identity-complete v2 publication refuses a target with any existing WAL sidecar"
-                                .to_owned(),
+                            reason: reason.to_owned(),
                         });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -3796,10 +3951,11 @@ fn parse_header(path: &Path, data: &[u8]) -> SearchResult<(VectorMetadata, usize
     let quantization_byte = read_array::<1>(path, data, &mut cursor, "quantization")?[0];
     let quantization = Quantization::from_wire(quantization_byte, path)?;
 
-    // Use first reserved byte for compaction generation
+    // Reserved bytes: [0] compaction generation, [1..3] publication nonce
+    // (little-endian u16; zero on pre-nonce files).
     let reserved = read_array::<3>(path, data, &mut cursor, "reserved")?;
     let compaction_gen = reserved[0];
-    // reserved[1..2] remain unused
+    let publication_nonce = u16::from_le_bytes([reserved[1], reserved[2]]);
 
     let record_count_u64 =
         u64::from_le_bytes(read_array::<8>(path, data, &mut cursor, "record_count")?);
@@ -3825,6 +3981,7 @@ fn parse_header(path: &Path, data: &[u8]) -> SearchResult<(VectorMetadata, usize
             dimension,
             quantization,
             compaction_gen,
+            publication_nonce,
             record_count,
             vectors_offset,
             identity_v2: None,
@@ -3970,12 +4127,16 @@ fn parse_v2_header(path: &Path, data: &[u8]) -> SearchResult<(VectorMetadata, us
         path,
     )?;
     let flags = read_array::<1>(path, header, &mut cursor, "header_flags")?[0];
-    let reserved = u16::from_le_bytes(read_array::<2>(path, header, &mut cursor, "reserved")?);
-    if flags != 0 || reserved != 0 {
-        return Err(index_corrupted(
-            path,
-            "v2 header flags and reserved fields must be zero",
-        ));
+    // Formerly a reserved-zero u16; now the cross-tier publication nonce
+    // (bd-miio8), zero on single-tier and pre-nonce v2 files.
+    let publication_nonce = u16::from_le_bytes(read_array::<2>(
+        path,
+        header,
+        &mut cursor,
+        "publication_nonce",
+    )?);
+    if flags != 0 {
+        return Err(index_corrupted(path, "v2 header flags must be zero"));
     }
     let dimension_u32 =
         u32::from_le_bytes(read_array::<4>(path, header, &mut cursor, "dimension")?);
@@ -4198,6 +4359,10 @@ fn parse_v2_header(path: &Path, data: &[u8]) -> SearchResult<(VectorMetadata, us
             dimension,
             quantization,
             compaction_gen: 0,
+            // Cross-tier publication nonce from the v2 header's nonce slot
+            // (bd-miio8): binds the fast/quality tiers of one staged v2
+            // publication; zero on single-tier and pre-nonce files.
+            publication_nonce,
             record_count,
             vectors_offset,
             identity_v2: Some(FsviV2IdentityMetadata {
@@ -5297,6 +5462,7 @@ fn fsvi_v2_header_len(binding: &FsviV2IdentityBinding) -> SearchResult<usize> {
 
 fn build_v2_header(
     binding: &FsviV2IdentityBinding,
+    publication_nonce: u16,
     record_count: usize,
     vectors_offset: u64,
     ordered_docset_digest: [u8; SHA256_BYTES],
@@ -5323,7 +5489,10 @@ fn build_v2_header(
     header.extend_from_slice(&FSVI_V2_IDENTITY_BINDING_SCHEMA.to_le_bytes());
     header.push(binding.quantization as u8);
     header.push(0);
-    header.extend_from_slice(&0_u16.to_le_bytes());
+    // Cross-tier publication nonce (bd-miio8), mirroring the v1 reserved
+    // bytes: every tier of one multi-tier v2 publication carries the same
+    // non-zero value; zero marks a single-tier or pre-nonce file.
+    header.extend_from_slice(&publication_nonce.to_le_bytes());
     header.extend_from_slice(&dimension_u32.to_le_bytes());
     header.extend_from_slice(&record_count_u64.to_le_bytes());
     header.extend_from_slice(&vectors_offset.to_le_bytes());
@@ -5395,6 +5564,7 @@ fn build_header_prefix(
     dimension: usize,
     quantization: Quantization,
     compaction_gen: u8,
+    publication_nonce: u16,
     record_count: usize,
     vectors_offset: u64,
 ) -> SearchResult<Vec<u8>> {
@@ -5438,7 +5608,7 @@ fn build_header_prefix(
     out.extend_from_slice(&dimension_u32.to_le_bytes());
     out.push(quantization as u8);
     out.push(compaction_gen);
-    out.extend_from_slice(&[0_u8; 2]);
+    out.extend_from_slice(&publication_nonce.to_le_bytes());
     out.extend_from_slice(&record_count_u64.to_le_bytes());
     out.extend_from_slice(&vectors_offset.to_le_bytes());
     Ok(out)
@@ -5790,8 +5960,27 @@ const fn is_tombstoned_flags(flags: u16) -> bool {
     flags & RECORD_FLAG_TOMBSTONE != 0
 }
 
-const fn next_generation(current: u8) -> u8 {
+/// Successor in the wrapping compaction-generation sequence.
+///
+/// Zero is reserved for legacy/identity-v2 writers, so the wrap skips it. A
+/// WAL sidecar binds to main generation `G` iff its own tag equals
+/// `next_generation(G)`; a replacement built with
+/// `next_generation(destination)` therefore atomically invalidates the
+/// destination's sidecar at install time.
+#[must_use]
+pub const fn next_generation(current: u8) -> u8 {
     if current == 255 { 1 } else { current + 1 }
+}
+
+/// Successor in the wrapping publication-nonce sequence (bd-miio8).
+///
+/// Zero is reserved for legacy/single-tier files, so the wrap skips it.
+/// Choosing the successor of the destination pair's current nonce guarantees
+/// successive multi-tier publications never share an identity, which is what
+/// makes a crash between per-tier installs detectable at open time.
+#[must_use]
+pub const fn next_publication_nonce(current: u16) -> u16 {
+    if current == u16::MAX { 1 } else { current + 1 }
 }
 
 #[cfg(test)]
@@ -6109,10 +6298,7 @@ mod tests {
         assert_eq!(index.bytes.as_ref(), before_bytes.as_slice());
         assert_eq!(index.witness(), &before_witness);
 
-        assert_eq!(
-            index.ann_admission(),
-            FsviAnnAdmission::Disabled(FsviAnnDisabledReason::OwnerBoundAdapterUnavailable)
-        );
+        assert_eq!(index.ann_admission(), FsviAnnAdmission::Enabled);
         assert!(!wal::wal_path_for(&path).exists());
     }
 
@@ -6234,6 +6420,345 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn sealed_owner_survives_in_place_same_size_path_rewrite() {
+        let directory = tempfile::tempdir().expect("private publication directory");
+        let path = directory.path().join("current.fsvi");
+        let replacement_path = directory.path().join("replacement.fsvi");
+        let binding = fsvi_v2_binding("same-size-rewrite", 4, Quantization::F16, 22, 0x82);
+
+        let mut original = VectorIndex::create_v2(&path, binding.clone()).expect("original writer");
+        original
+            .write_record("doc-alpha", &[1.0, 0.0, 0.0, 0.0])
+            .expect("original alpha");
+        original
+            .write_record("doc-beta", &[0.0, 1.0, 0.0, 0.0])
+            .expect("original beta");
+        original.finish().expect("finish original");
+        let owner =
+            ValidatedFsviBytes::open_published(&path, &binding).expect("admit original owner");
+        let expected_witness = owner.witness().clone();
+        let expected_hits = owner
+            .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+            .expect("search original");
+
+        let mut replacement =
+            VectorIndex::create_v2(&replacement_path, binding.clone()).expect("replacement writer");
+        replacement
+            .write_record("doc-alpha", &[0.0, 1.0, 0.0, 0.0])
+            .expect("replacement alpha");
+        replacement
+            .write_record("doc-beta", &[1.0, 0.0, 0.0, 0.0])
+            .expect("replacement beta");
+        replacement.finish().expect("finish replacement");
+
+        let replacement_bytes = fs::read(&replacement_path).expect("read replacement bytes");
+        let original_identity =
+            stable_file_identity(&fs::symlink_metadata(&path).expect("original metadata"));
+        assert_eq!(
+            usize::try_from(original_identity.size).expect("original length fits"),
+            replacement_bytes.len(),
+            "fixture must exercise an in-place rewrite at the exact old length"
+        );
+        fs::write(&path, &replacement_bytes).expect("rewrite original pathname in place");
+        assert_eq!(
+            stable_file_identity(&fs::symlink_metadata(&path).expect("rewritten metadata")).inode,
+            original_identity.inode,
+            "same-size rewrite must retain the pathname inode rather than rename a replacement"
+        );
+
+        assert_eq!(owner.witness(), &expected_witness);
+        let observed_hits = owner
+            .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+            .expect("search retained owner");
+        assert_eq!(observed_hits.len(), expected_hits.len());
+        for (observed, expected) in observed_hits.iter().zip(&expected_hits) {
+            assert_eq!(observed.index, expected.index);
+            assert_eq!(observed.doc_id, expected.doc_id);
+            assert_eq!(observed.score.to_bits(), expected.score.to_bits());
+        }
+
+        assert!(matches!(
+            ValidatedFsviBytes::reopen_exact(&path, &binding, &expected_witness),
+            Err(FsviAdmissionError::SnapshotRejected(FsviSnapshotRejected {
+                reason: FsviSnapshotRejectionReason::WitnessMismatch,
+                ..
+            }))
+        ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn sealed_owner_survives_post_admission_hardlink_and_fresh_open_rejects_alias() {
+        let directory = tempfile::tempdir().expect("private publication directory");
+        let path = directory.path().join("current.fsvi");
+        let hardlink_path = directory.path().join("post-admission-alias.fsvi");
+        let binding = fsvi_v2_binding("post-admission-hardlink", 4, Quantization::F16, 24, 0x84);
+
+        let mut writer = VectorIndex::create_v2(&path, binding.clone()).expect("original writer");
+        writer
+            .write_record("doc-alpha", &[1.0, 0.0, 0.0, 0.0])
+            .expect("original alpha");
+        writer
+            .write_record("doc-beta", &[0.0, 1.0, 0.0, 0.0])
+            .expect("original beta");
+        writer.finish().expect("finish original");
+
+        let owner =
+            ValidatedFsviBytes::open_published(&path, &binding).expect("admit original owner");
+        let expected_witness = owner.witness().clone();
+        let expected_hits = owner
+            .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+            .expect("search original");
+        let expected_rows: Vec<(String, Vec<u8>, FsviRecordFlags)> = (0..owner.record_count())
+            .map(|index| {
+                let row = owner.row(index).expect("original row");
+                (
+                    row.doc_id().to_owned(),
+                    row.vector_bytes().to_vec(),
+                    row.flags(),
+                )
+            })
+            .collect();
+
+        fs::hard_link(&path, &hardlink_path).expect("create post-admission hardlink alias");
+        assert_snapshot_rejection(
+            ValidatedFsviBytes::open_published(&path, &binding),
+            FsviSnapshotRejectionReason::HardLinked,
+        );
+        assert_snapshot_rejection(
+            ValidatedFsviBytes::open_published(&hardlink_path, &binding),
+            FsviSnapshotRejectionReason::HardLinked,
+        );
+
+        assert_eq!(owner.witness(), &expected_witness);
+        assert_eq!(
+            owner
+                .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+                .expect("search retained owner after hardlink alias"),
+            expected_hits
+        );
+        let observed_rows: Vec<(String, Vec<u8>, FsviRecordFlags)> = (0..owner.record_count())
+            .map(|index| {
+                let row = owner.row(index).expect("retained owner row");
+                (
+                    row.doc_id().to_owned(),
+                    row.vector_bytes().to_vec(),
+                    row.flags(),
+                )
+            })
+            .collect();
+        assert_eq!(observed_rows, expected_rows);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn sealed_owner_survives_post_admission_wal_sidecar_and_fresh_open_rejects_it() {
+        let directory = tempfile::tempdir().expect("private publication directory");
+        let path = directory.path().join("current.fsvi");
+        let binding = fsvi_v2_binding("post-admission-wal", 4, Quantization::F16, 25, 0x85);
+
+        let mut writer = VectorIndex::create_v2(&path, binding.clone()).expect("original writer");
+        writer
+            .write_record("doc-alpha", &[1.0, 0.0, 0.0, 0.0])
+            .expect("original alpha");
+        writer
+            .write_record("doc-beta", &[0.0, 1.0, 0.0, 0.0])
+            .expect("original beta");
+        writer.finish().expect("finish original");
+
+        let owner =
+            ValidatedFsviBytes::open_published(&path, &binding).expect("admit original owner");
+        let expected_witness = owner.witness().clone();
+        let expected_hits = owner
+            .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+            .expect("search original");
+        let expected_rows: Vec<(String, Vec<u8>, FsviRecordFlags)> = (0..owner.record_count())
+            .map(|index| {
+                let row = owner.row(index).expect("original row");
+                (
+                    row.doc_id().to_owned(),
+                    row.vector_bytes().to_vec(),
+                    row.flags(),
+                )
+            })
+            .collect();
+
+        let wal_path = wal::wal_path_for(&path);
+        fs::write(&wal_path, []).expect("introduce post-admission empty WAL sidecar");
+        assert_snapshot_rejection(
+            ValidatedFsviBytes::open_published(&path, &binding),
+            FsviSnapshotRejectionReason::PublishedWalPresent,
+        );
+
+        assert_eq!(owner.witness(), &expected_witness);
+        assert_eq!(
+            owner
+                .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+                .expect("search retained owner after WAL sidecar"),
+            expected_hits
+        );
+        let observed_rows: Vec<(String, Vec<u8>, FsviRecordFlags)> = (0..owner.record_count())
+            .map(|index| {
+                let row = owner.row(index).expect("retained owner row");
+                (
+                    row.doc_id().to_owned(),
+                    row.vector_bytes().to_vec(),
+                    row.flags(),
+                )
+            })
+            .collect();
+        assert_eq!(observed_rows, expected_rows);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn sealed_owner_survives_post_admission_symlink_substitution() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("private publication directory");
+        let path = directory.path().join("current.fsvi");
+        let retained_path = directory.path().join("retained-original.fsvi");
+        let binding = fsvi_v2_binding("post-admission-symlink", 4, Quantization::F16, 26, 0x86);
+
+        let mut writer = VectorIndex::create_v2(&path, binding.clone()).expect("original writer");
+        writer
+            .write_record("doc-alpha", &[1.0, 0.0, 0.0, 0.0])
+            .expect("original alpha");
+        writer
+            .write_record("doc-beta", &[0.0, 1.0, 0.0, 0.0])
+            .expect("original beta");
+        writer.finish().expect("finish original");
+
+        let owner =
+            ValidatedFsviBytes::open_published(&path, &binding).expect("admit original owner");
+        let expected_witness = owner.witness().clone();
+        let expected_hits = owner
+            .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+            .expect("search original");
+        let expected_rows: Vec<(String, Vec<u8>, FsviRecordFlags)> = (0..owner.record_count())
+            .map(|index| {
+                let row = owner.row(index).expect("original row");
+                (
+                    row.doc_id().to_owned(),
+                    row.vector_bytes().to_vec(),
+                    row.flags(),
+                )
+            })
+            .collect();
+
+        fs::rename(&path, &retained_path).expect("retain admitted pathname target");
+        symlink(&retained_path, &path).expect("substitute admitted pathname with symlink");
+        assert_snapshot_rejection(
+            ValidatedFsviBytes::open_published(&path, &binding),
+            FsviSnapshotRejectionReason::SymbolicLink,
+        );
+
+        assert_eq!(owner.witness(), &expected_witness);
+        assert_eq!(
+            owner
+                .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+                .expect("search retained owner after symlink substitution"),
+            expected_hits
+        );
+        let observed_rows: Vec<(String, Vec<u8>, FsviRecordFlags)> = (0..owner.record_count())
+            .map(|index| {
+                let row = owner.row(index).expect("retained owner row");
+                (
+                    row.doc_id().to_owned(),
+                    row.vector_bytes().to_vec(),
+                    row.flags(),
+                )
+            })
+            .collect();
+        assert_eq!(observed_rows, expected_rows);
+    }
+
+    #[test]
+    fn sealed_owner_survives_path_truncation_and_extension_after_admission() {
+        let directory = tempfile::tempdir().expect("private publication directory");
+        let path = directory.path().join("current.fsvi");
+        let binding = fsvi_v2_binding("length-mutation", 4, Quantization::F16, 23, 0x83);
+
+        let mut writer = VectorIndex::create_v2(&path, binding.clone()).expect("original writer");
+        writer
+            .write_record("doc-alpha", &[1.0, 0.0, 0.0, 0.0])
+            .expect("original alpha");
+        writer
+            .write_record("doc-beta", &[0.0, 1.0, 0.0, 0.0])
+            .expect("original beta");
+        writer.finish().expect("finish original");
+
+        let owner =
+            ValidatedFsviBytes::open_published(&path, &binding).expect("admit original owner");
+        let expected_witness = owner.witness().clone();
+        let expected_hits = owner
+            .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+            .expect("search original");
+        let expected_rows: Vec<(String, Vec<u8>, FsviRecordFlags)> = (0..owner.record_count())
+            .map(|index| {
+                let row = owner.row(index).expect("original row");
+                (
+                    row.doc_id().to_owned(),
+                    row.vector_bytes().to_vec(),
+                    row.flags(),
+                )
+            })
+            .collect();
+        let original_bytes = owner.bytes.to_vec();
+
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open path for truncation")
+            .set_len(0)
+            .expect("truncate admitted pathname");
+        assert!(
+            ValidatedFsviBytes::open_published(&path, &binding).is_err(),
+            "a truncated pathname must never be admitted as the retained owner"
+        );
+        assert_eq!(owner.witness(), &expected_witness);
+        assert_eq!(
+            owner
+                .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+                .expect("search retained owner after truncation"),
+            expected_hits
+        );
+
+        fs::write(&path, &original_bytes).expect("restore original pathname bytes");
+        let mut extended = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open path for extension");
+        extended
+            .write_all(b"unexpected-trailing-bytes")
+            .expect("extend admitted pathname");
+        extended.sync_all().expect("sync extension");
+        assert!(
+            ValidatedFsviBytes::open_published(&path, &binding).is_err(),
+            "a length-extended pathname must never be admitted as the retained owner"
+        );
+        assert_eq!(owner.witness(), &expected_witness);
+        let observed_rows: Vec<(String, Vec<u8>, FsviRecordFlags)> = (0..owner.record_count())
+            .map(|index| {
+                let row = owner.row(index).expect("retained owner row");
+                (
+                    row.doc_id().to_owned(),
+                    row.vector_bytes().to_vec(),
+                    row.flags(),
+                )
+            })
+            .collect();
+        assert_eq!(observed_rows, expected_rows);
+        assert_eq!(
+            owner
+                .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+                .expect("search retained owner after extension"),
+            expected_hits
+        );
+    }
+
     #[test]
     fn same_display_strings_and_dimension_cannot_cross_open_distinct_identity_bundles() {
         let path_a = temp_index_path("v2-same-display-identity-a");
@@ -6319,10 +6844,7 @@ mod tests {
         expected_docset.update(b"live-result");
         let expected_docset: [u8; SHA256_BYTES] = expected_docset.finalize().into();
         assert_eq!(owner.witness().ordered_live_docset_digest, expected_docset);
-        assert_eq!(
-            owner.ann_admission(),
-            FsviAnnAdmission::Disabled(FsviAnnDisabledReason::OwnerBoundAdapterUnavailable)
-        );
+        assert_eq!(owner.ann_admission(), FsviAnnAdmission::Enabled);
     }
 
     #[test]
@@ -6650,6 +7172,93 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn published_open_rejects_aliased_wal_entries_without_mutating_targets() {
+        use std::os::unix::fs::symlink;
+
+        for (alias_kind, symbolic_alias) in [("symlink", true), ("hardlink", false)] {
+            let directory = tempfile::tempdir().expect("private aliased WAL publication directory");
+            let path = directory.path().join(format!("{alias_kind}.fsvi"));
+            let backing_path = directory.path().join(format!("{alias_kind}-wal-backing"));
+            let binding = fsvi_v2_binding(
+                &format!("v2-published-{alias_kind}-wal"),
+                4,
+                Quantization::F16,
+                54,
+                0xae,
+            );
+            VectorIndex::create_v2(&path, binding.clone())
+                .expect("aliased WAL publication writer")
+                .finish()
+                .expect("finish aliased WAL publication fixture");
+            fs::write(&backing_path, b"aliased-wal-bytes").expect("write alias backing bytes");
+            let wal_path = wal::wal_path_for(&path);
+            if symbolic_alias {
+                symlink(&backing_path, &wal_path).expect("create WAL symlink");
+            } else {
+                fs::hard_link(&backing_path, &wal_path).expect("create WAL hardlink");
+            }
+
+            let index_before = stable_file_identity(
+                &fs::symlink_metadata(&path).expect("index metadata before rejection"),
+            );
+            let wal_bytes_before = fs::read(&wal_path).expect("read aliased WAL before rejection");
+            let backing_bytes_before =
+                fs::read(&backing_path).expect("read alias backing before rejection");
+            let wal_before = stable_file_identity(
+                &fs::symlink_metadata(&wal_path).expect("WAL metadata before rejection"),
+            );
+            let backing_before = stable_file_identity(
+                &fs::symlink_metadata(&backing_path).expect("backing metadata before rejection"),
+            );
+            let entries_before = directory_entry_names(directory.path());
+            let parent_before = stable_file_identity(
+                &fs::symlink_metadata(directory.path()).expect("parent metadata before rejection"),
+            );
+
+            assert_snapshot_rejection(
+                ValidatedFsviBytes::open_published(&path, &binding),
+                FsviSnapshotRejectionReason::PublishedWalPresent,
+            );
+
+            assert_eq!(
+                stable_file_identity(
+                    &fs::symlink_metadata(&path).expect("index metadata after rejection"),
+                ),
+                index_before
+            );
+            assert_eq!(
+                stable_file_identity(
+                    &fs::symlink_metadata(&wal_path).expect("WAL metadata after rejection"),
+                ),
+                wal_before
+            );
+            assert_eq!(
+                stable_file_identity(
+                    &fs::symlink_metadata(&backing_path).expect("backing metadata after rejection"),
+                ),
+                backing_before
+            );
+            assert_eq!(directory_entry_names(directory.path()), entries_before);
+            assert_eq!(
+                stable_file_identity(
+                    &fs::symlink_metadata(directory.path())
+                        .expect("parent metadata after rejection"),
+                ),
+                parent_before
+            );
+            assert_eq!(
+                fs::read(&wal_path).expect("read aliased WAL after rejection"),
+                wal_bytes_before
+            );
+            assert_eq!(
+                fs::read(&backing_path).expect("read alias backing after rejection"),
+                backing_bytes_before
+            );
+        }
+    }
+
     #[test]
     fn fsvi_v2_inspection_distinguishes_reindex_upgrade_and_corruption() {
         let legacy_path = temp_index_path("v2-inspect-legacy");
@@ -6784,6 +7393,41 @@ mod tests {
         refresh_v2_header_crc(&mut canonical_mutation);
         fs::write(&canonical_path, canonical_mutation).expect("write canonical mutation");
         assert_inspection_corrupted(&canonical_path);
+    }
+
+    #[test]
+    fn fsvi_v2_magic_version_and_crc_mutations_fail_closed() {
+        let binding = fsvi_v2_binding("v2-magic-version-crc", 4, Quantization::F16, 55, 0xaf);
+        let (source_path, expected) = write_v2_fixture("v2-magic-version-crc-source", binding);
+        let source = fs::read(&source_path).expect("read source v2");
+        let header_size = usize::try_from(u32::from_le_bytes(
+            source[6..10].try_into().expect("header size"),
+        ))
+        .expect("header size fits");
+
+        let magic_path = temp_index_path("v2-magic-corruption");
+        let mut magic = source.clone();
+        magic[0] ^= 0x01;
+        fs::write(&magic_path, magic).expect("write magic mutation");
+        assert_owned_admission_corrupted(&magic_path, &expected);
+
+        let version_path = temp_index_path("v2-version-upgrade");
+        let mut version = source.clone();
+        version[4..6].copy_from_slice(&(FSVI_V2_VERSION + 1).to_le_bytes());
+        fs::write(&version_path, version).expect("write future-version mutation");
+        assert!(matches!(
+            admit_owned_v2_fixture(&version_path, &expected),
+            Err(FsviAdmissionError::UpgradeRequired(FsviUpgradeRequired {
+                found_version,
+                supported_version: FSVI_V2_VERSION,
+            })) if found_version == FSVI_V2_VERSION + 1
+        ));
+
+        let crc_path = temp_index_path("v2-header-crc-corruption");
+        let mut crc = source;
+        crc[header_size - 1] ^= 0x01;
+        fs::write(&crc_path, crc).expect("write header CRC mutation");
+        assert_owned_admission_corrupted(&crc_path, &expected);
     }
 
     #[test]
@@ -6943,6 +7587,205 @@ mod tests {
                 sidecar_before
             );
         }
+    }
+
+    #[test]
+    fn fsvi_v2_owner_rejects_invalid_utf8_and_resealed_duplicate_document_ids() {
+        let binding = fsvi_v2_binding(
+            "v2-record-identity-corruption",
+            4,
+            Quantization::F16,
+            11,
+            0x66,
+        );
+        let path = temp_index_path("v2-record-identity-corruption");
+        let mut writer = VectorIndex::create_v2(&path, binding.clone()).expect("create v2 fixture");
+        writer
+            .write_record("aa-owner", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write first equal-length id");
+        writer
+            .write_record("bb-owner", &[0.0, 1.0, 0.0, 0.0])
+            .expect("write second equal-length id");
+        writer.finish().expect("finish v2 fixture");
+
+        let source = fs::read(&path).expect("read fixture bytes");
+        let header_size = usize::try_from(u32::from_le_bytes(
+            source[6..10].try_into().expect("header size"),
+        ))
+        .expect("header size fits");
+        let strings_offset = header_size + (2 * RECORD_SIZE_BYTES);
+        let first_record = header_size;
+        let second_record = first_record + RECORD_SIZE_BYTES;
+        let first_id_offset = usize::try_from(u32::from_le_bytes(
+            source[first_record + 8..first_record + 12]
+                .try_into()
+                .expect("first id offset"),
+        ))
+        .expect("first id offset fits");
+        let second_id_offset = usize::try_from(u32::from_le_bytes(
+            source[second_record + 8..second_record + 12]
+                .try_into()
+                .expect("second id offset"),
+        ))
+        .expect("second id offset fits");
+        let first_id_len = usize::from(u16::from_le_bytes(
+            source[first_record + 12..first_record + 14]
+                .try_into()
+                .expect("first id length"),
+        ));
+        let second_id_len = usize::from(u16::from_le_bytes(
+            source[second_record + 12..second_record + 14]
+                .try_into()
+                .expect("second id length"),
+        ));
+        assert_eq!(
+            first_id_len, second_id_len,
+            "fixture must make a duplicate-ID mutation preserve the string layout"
+        );
+
+        let mut invalid_utf8 = source.clone();
+        invalid_utf8[strings_offset + first_id_offset] = 0xff;
+        assert!(matches!(
+            ValidatedFsviBytes::from_arc(Arc::<[u8]>::from(invalid_utf8), &binding),
+            Err(FsviAdmissionError::Index(
+                SearchError::IndexCorrupted { .. }
+            ))
+        ));
+
+        let mut duplicate = source;
+        let first_id = duplicate
+            [strings_offset + first_id_offset..strings_offset + first_id_offset + first_id_len]
+            .to_vec();
+        duplicate
+            [strings_offset + second_id_offset..strings_offset + second_id_offset + second_id_len]
+            .copy_from_slice(&first_id);
+        duplicate[second_record..second_record + 8]
+            .copy_from_slice(&fnv1a_hash(&first_id).to_le_bytes());
+
+        let mut docset_hasher = Sha256::new();
+        update_digest_domain(&mut docset_hasher, ORDERED_DOCSET_DIGEST_DOMAIN);
+        docset_hasher.update(2_u64.to_be_bytes());
+        for record_offset in [first_record, second_record] {
+            let id_offset = usize::try_from(u32::from_le_bytes(
+                duplicate[record_offset + 8..record_offset + 12]
+                    .try_into()
+                    .expect("duplicate id offset"),
+            ))
+            .expect("duplicate id offset fits");
+            let id_len = usize::from(u16::from_le_bytes(
+                duplicate[record_offset + 12..record_offset + 14]
+                    .try_into()
+                    .expect("duplicate id length"),
+            ));
+            docset_hasher.update(u64::try_from(id_len).expect("id length fits").to_be_bytes());
+            docset_hasher.update(
+                &duplicate[strings_offset + id_offset..strings_offset + id_offset + id_len],
+            );
+        }
+        let duplicate_docset_digest: [u8; SHA256_BYTES] = docset_hasher.finalize().into();
+        duplicate[FSVI_V2_DOCSET_DIGEST_OFFSET..FSVI_V2_DOCSET_DIGEST_OFFSET + SHA256_BYTES]
+            .copy_from_slice(&duplicate_docset_digest);
+        refresh_v2_header_crc(&mut duplicate);
+        assert_eq!(
+            &duplicate[FSVI_V2_DOCSET_DIGEST_OFFSET..FSVI_V2_DOCSET_DIGEST_OFFSET + SHA256_BYTES],
+            duplicate_docset_digest.as_slice(),
+            "fixture must preserve both the ordered docset digest and header CRC"
+        );
+
+        assert!(matches!(
+            ValidatedFsviBytes::from_arc(Arc::<[u8]>::from(duplicate), &binding),
+            Err(FsviAdmissionError::Index(
+                SearchError::IndexCorrupted { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn fsvi_v2_owner_rejects_resealed_noncanonical_document_id_order() {
+        let binding = fsvi_v2_binding("v2-record-order-corruption", 4, Quantization::F16, 12, 0x67);
+        let path = temp_index_path("v2-record-order-corruption");
+        let mut writer = VectorIndex::create_v2(&path, binding.clone()).expect("create v2 fixture");
+        writer
+            .write_record("aa-order", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write first equal-length id");
+        writer
+            .write_record("bb-order", &[0.0, 1.0, 0.0, 0.0])
+            .expect("write second equal-length id");
+        writer.finish().expect("finish v2 fixture");
+
+        let mut bytes = fs::read(&path).expect("read fixture bytes");
+        let header_size = usize::try_from(u32::from_le_bytes(
+            bytes[6..10].try_into().expect("header size"),
+        ))
+        .expect("header size fits");
+        let records_offset = header_size;
+        let strings_offset = header_size + (2 * RECORD_SIZE_BYTES);
+        let first_record = records_offset;
+        let second_record = first_record + RECORD_SIZE_BYTES;
+        let first_id_offset = usize::try_from(u32::from_le_bytes(
+            bytes[first_record + 8..first_record + 12]
+                .try_into()
+                .expect("first id offset"),
+        ))
+        .expect("first id offset fits");
+        let second_id_offset = usize::try_from(u32::from_le_bytes(
+            bytes[second_record + 8..second_record + 12]
+                .try_into()
+                .expect("second id offset"),
+        ))
+        .expect("second id offset fits");
+        let first_id_len = usize::from(u16::from_le_bytes(
+            bytes[first_record + 12..first_record + 14]
+                .try_into()
+                .expect("first id length"),
+        ));
+        let second_id_len = usize::from(u16::from_le_bytes(
+            bytes[second_record + 12..second_record + 14]
+                .try_into()
+                .expect("second id length"),
+        ));
+        assert_eq!(
+            first_id_len, second_id_len,
+            "fixture needs equal-length ids"
+        );
+
+        let first_id = bytes
+            [strings_offset + first_id_offset..strings_offset + first_id_offset + first_id_len]
+            .to_vec();
+        let second_id = bytes
+            [strings_offset + second_id_offset..strings_offset + second_id_offset + second_id_len]
+            .to_vec();
+        bytes[strings_offset + first_id_offset..strings_offset + first_id_offset + first_id_len]
+            .copy_from_slice(&second_id);
+        bytes[strings_offset + second_id_offset..strings_offset + second_id_offset + second_id_len]
+            .copy_from_slice(&first_id);
+        bytes[first_record..first_record + 8]
+            .copy_from_slice(&fnv1a_hash(&second_id).to_le_bytes());
+        bytes[second_record..second_record + 8]
+            .copy_from_slice(&fnv1a_hash(&first_id).to_le_bytes());
+
+        let mut docset_hasher = Sha256::new();
+        update_digest_domain(&mut docset_hasher, ORDERED_DOCSET_DIGEST_DOMAIN);
+        docset_hasher.update(2_u64.to_be_bytes());
+        for (id_offset, id_len) in [
+            (first_id_offset, first_id_len),
+            (second_id_offset, second_id_len),
+        ] {
+            docset_hasher.update(u64::try_from(id_len).expect("id length fits").to_be_bytes());
+            docset_hasher
+                .update(&bytes[strings_offset + id_offset..strings_offset + id_offset + id_len]);
+        }
+        let docset_digest: [u8; SHA256_BYTES] = docset_hasher.finalize().into();
+        bytes[FSVI_V2_DOCSET_DIGEST_OFFSET..FSVI_V2_DOCSET_DIGEST_OFFSET + SHA256_BYTES]
+            .copy_from_slice(&docset_digest);
+        refresh_v2_header_crc(&mut bytes);
+
+        assert!(matches!(
+            ValidatedFsviBytes::from_arc(Arc::<[u8]>::from(bytes), &binding),
+            Err(FsviAdmissionError::Index(
+                SearchError::IndexCorrupted { .. }
+            ))
+        ));
     }
 
     #[test]
@@ -7933,6 +8776,95 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// The lazy int8/4-bit slabs quantize the main-vector region at first
+    /// two-pass search. `vacuum()`/`compact()` swap that region via
+    /// `rewrite_index`; a slab surviving the swap scores pass-1 candidates
+    /// from rows that no longer exist (bd-0ho5p). One-hot vectors on unique
+    /// axes make the misalignment loud: pass-1 over a stale slab can never
+    /// surface the probe target after rows shift.
+    #[test]
+    fn vacuum_and_compact_invalidate_lazy_quantization_slabs() {
+        let dim = 16;
+        let path = temp_index_path("quant-slab-invalidate");
+        let mut writer = VectorIndex::create(&path, "fnv1a-384", dim).expect("writer");
+        for i in 0..12 {
+            let mut vector = vec![0.0f32; dim];
+            vector[i] = 1.0;
+            writer
+                .write_record(&format!("doc-{i:02}"), &vector)
+                .expect("write");
+        }
+        writer.finish().expect("finish");
+
+        let mut index = VectorIndex::open(&path).expect("open");
+        let first = index.doc_id_at(0).expect("row 0").to_string();
+        let target = index.doc_id_at(11).expect("row 11").to_string();
+        let target_axis: usize = target
+            .strip_prefix("doc-")
+            .expect("doc prefix")
+            .parse()
+            .expect("axis");
+        let mut probe = vec![0.0f32; dim];
+        probe[target_axis] = 1.0;
+
+        let pre_i8 = index
+            .search_top_k_int8_two_pass(&probe, 1, 1)
+            .expect("pre-vacuum int8");
+        assert_eq!(pre_i8[0].doc_id, target);
+        let pre_4bit = index
+            .search_top_k_4bit_two_pass(&probe, 1, 1)
+            .expect("pre-vacuum 4bit");
+        assert_eq!(pre_4bit[0].doc_id, target);
+
+        index.soft_delete(&first).expect("delete row 0");
+        index.vacuum().expect("vacuum");
+
+        let post_i8 = index
+            .search_top_k_int8_two_pass(&probe, 1, 1)
+            .expect("post-vacuum int8");
+        assert_eq!(
+            post_i8[0].doc_id, target,
+            "int8 slab served stale pre-vacuum rows"
+        );
+        assert!(post_i8[0].score > 0.9);
+        let post_4bit = index
+            .search_top_k_4bit_two_pass(&probe, 1, 1)
+            .expect("post-vacuum 4bit");
+        assert_eq!(
+            post_4bit[0].doc_id, target,
+            "4-bit slab served stale pre-vacuum rows"
+        );
+        assert!(post_4bit[0].score > 0.9);
+
+        // Same class through compact(): grow the index by one WAL resident so
+        // the rewritten region is larger than the cached slabs.
+        let mut extra = vec![0.0f32; dim];
+        extra[12] = 1.0;
+        index.append("doc-zz", &extra).expect("append doc-zz");
+        index.compact().expect("compact");
+
+        let target_after = index
+            .search_top_k_int8_two_pass(&probe, 1, 1)
+            .expect("post-compact int8");
+        assert_eq!(
+            target_after[0].doc_id, target,
+            "int8 slab survived compact()"
+        );
+        assert!(target_after[0].score > 0.9);
+        let mut zz_probe = vec![0.0f32; dim];
+        zz_probe[12] = 1.0;
+        let zz_hits = index
+            .search_top_k_4bit_two_pass(&zz_probe, 1, 1)
+            .expect("post-compact 4bit");
+        assert_eq!(
+            zz_hits[0].doc_id, "doc-zz",
+            "4-bit slab survived compact() and cannot see the merged WAL resident"
+        );
+        assert!(zz_hits[0].score > 0.9);
+
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn soft_delete_and_search_interleaving_has_no_corruption() {
         use std::collections::HashSet;
@@ -8350,6 +9282,182 @@ mod tests {
         std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
+    /// bd-cnby1: a v1 rebuild via bare create+finish over an existing index
+    /// must be REFUSED while that index's WAL sidecar is present. Before the
+    /// fix, finish() published the fresh generation beside the old sidecar;
+    /// the fresh compaction_gen restarts at 1, next_generation(1) matches the
+    /// old sidecar's binding, and the next open() adopted every stale WAL
+    /// entry: deleted documents resurrected and the WAL shadow suppressed the
+    /// freshly rebuilt main-slab vectors.
+    #[test]
+    fn v1_rebuild_over_existing_wal_sidecar_is_refused_not_adopted() {
+        let path = temp_index_path("v1-rebuild-wal-adoption");
+        let mut writer = VectorIndex::create(&path, "old", 4).expect("writer");
+        writer
+            .write_record("kept-doc", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write old main");
+        writer.finish().expect("finish old main");
+        let mut old = VectorIndex::open(&path).expect("open old generation");
+        old.append("deleted-doc", &[0.0, 1.0, 0.0, 0.0])
+            .expect("append WAL record that the rebuild intends to drop");
+        drop(old);
+
+        // Operator intent: rebuild the corpus WITHOUT "deleted-doc".
+        let mut rebuild = VectorIndex::create(&path, "old", 4).expect("rebuild writer");
+        rebuild
+            .write_record("kept-doc", &[0.9, 0.1, 0.0, 0.0])
+            .expect("write rebuilt record");
+        let refusal = rebuild.finish();
+        let Err(SearchError::InvalidConfig { field, reason, .. }) = refusal else {
+            panic!(
+                "v1 finish() over an existing WAL sidecar must refuse publication, \
+                 got {refusal:?}"
+            );
+        };
+        assert_eq!(field, "wal_sidecar");
+        assert!(
+            reason.contains("install_replacement"),
+            "refusal must route the caller to the safe replacement path: {reason}"
+        );
+
+        // The refused publication must leave the old generation fully intact —
+        // main slab AND its acknowledged WAL record.
+        let survivor = VectorIndex::open(&path).expect("old generation survives refusal");
+        assert_eq!(survivor.record_count(), 1);
+        assert_eq!(
+            survivor.wal_record_count(),
+            1,
+            "acknowledged WAL record must survive a refused rebuild"
+        );
+        drop(survivor);
+
+        // The safe route succeeds and does NOT resurrect the dropped doc.
+        let replacement_path = path.with_extension("replacement");
+        let destination_gen =
+            VectorIndex::peek_compaction_gen(&path).expect("peek destination generation");
+        let mut replacement_writer = VectorIndex::create(&replacement_path, "old", 4)
+            .expect("replacement writer")
+            .with_generation(next_generation(destination_gen));
+        replacement_writer
+            .write_record("kept-doc", &[0.9, 0.1, 0.0, 0.0])
+            .expect("write rebuilt record via safe route");
+        replacement_writer
+            .finish()
+            .expect("replacement path has no sidecar, publication proceeds");
+        let installed = VectorIndex::install_replacement(&path, &replacement_path)
+            .expect("carried-generation install");
+        assert_eq!(installed.record_count(), 1);
+        assert_eq!(
+            installed.wal_record_count(),
+            0,
+            "the dropped document's WAL entry must not be adopted by the rebuild"
+        );
+        let live = installed.live_doc_ids().expect("live ids");
+        assert!(live.contains("kept-doc"));
+        assert!(
+            !live.contains("deleted-doc"),
+            "bd-cnby1: the deliberately dropped document must stay dropped"
+        );
+        drop(installed);
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&replacement_path).ok();
+        std::fs::remove_file(wal::wal_path_for(&path)).ok();
+    }
+
+    /// A replacement whose compaction generation collides with the
+    /// destination's must be refused outright: installing it would require
+    /// destroying the destination's acknowledged WAL BEFORE the rename, and a
+    /// crash in that window loses acknowledged records of the SURVIVING
+    /// generation (bd-zhjv8 finding 2).
+    #[test]
+    fn install_replacement_refuses_generation_collision_and_preserves_destination_wal() {
+        let path = temp_index_path("install-gen-collision");
+        let mut writer = VectorIndex::create(&path, "old", 4).expect("writer");
+        writer
+            .write_record("main-old", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write old main");
+        writer.finish().expect("finish old main");
+        let mut old = VectorIndex::open(&path).expect("open old generation");
+        old.append("wal-acknowledged", &[0.0, 1.0, 0.0, 0.0])
+            .expect("append acknowledged WAL record");
+        drop(old);
+
+        let replacement_path = path.with_extension("replacement");
+        let replacement_writer =
+            VectorIndex::create(&replacement_path, "new", 4).expect("replacement writer");
+        replacement_writer.finish().expect("finish replacement");
+
+        assert!(
+            VectorIndex::install_replacement(&path, &replacement_path).is_err(),
+            "a generation-colliding replacement must be refused, never installed by \
+             destroying the destination's acknowledged WAL first"
+        );
+        let survivor = VectorIndex::open(&path).expect("destination must survive intact");
+        assert_eq!(survivor.record_count(), 1);
+        assert_eq!(
+            survivor.wal_record_count(),
+            1,
+            "acknowledged WAL record must survive a refused install"
+        );
+        drop(survivor);
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&replacement_path).ok();
+        std::fs::remove_file(wal::wal_path_for(&path)).ok();
+    }
+
+    /// The correct-by-construction path: a replacement built with the
+    /// carried-forward generation installs cleanly, and the destination's
+    /// surviving sidecar is superseded — never adopted — because its records
+    /// bind to the replaced generation.
+    #[test]
+    fn install_replacement_with_carried_generation_supersedes_stale_wal() {
+        let path = temp_index_path("install-gen-carried");
+        let mut writer = VectorIndex::create(&path, "old", 4).expect("writer");
+        writer
+            .write_record("main-old", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write old main");
+        writer.finish().expect("finish old main");
+        let mut old = VectorIndex::open(&path).expect("open old generation");
+        old.append("wal-old", &[0.0, 1.0, 0.0, 0.0])
+            .expect("append old WAL");
+        drop(old);
+
+        let replacement_path = path.with_extension("replacement");
+        let destination_gen =
+            VectorIndex::peek_compaction_gen(&path).expect("peek destination generation");
+        let mut replacement_writer = VectorIndex::create(&replacement_path, "new", 4)
+            .expect("replacement writer")
+            .with_generation(next_generation(destination_gen));
+        replacement_writer
+            .write_record("main-new", &[0.0, 0.0, 1.0, 0.0])
+            .expect("write replacement record");
+        replacement_writer.finish().expect("finish replacement");
+
+        let installed = VectorIndex::install_replacement(&path, &replacement_path)
+            .expect("carried-generation replacement installs");
+        assert_eq!(installed.record_count(), 1);
+        assert_eq!(
+            installed.wal_record_count(),
+            0,
+            "the superseded sidecar must never be adopted"
+        );
+        assert!(
+            installed
+                .live_doc_ids()
+                .expect("live ids")
+                .contains("main-new")
+        );
+        drop(installed);
+        assert!(
+            !wal::wal_path_for(&path).exists(),
+            "a healthy install leaves no sidecar residue"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn replace_with_empty_cannot_resurrect_previous_wal_entries() {
         let path = temp_index_path("wal-replace-empty");
@@ -8366,7 +9474,7 @@ mod tests {
         drop(old);
 
         assert!(
-            VectorIndex::replace_with_empty(&path, "invalid", 0).is_err(),
+            VectorIndex::replace_with_empty(&path, "invalid", "", 0).is_err(),
             "replacement validation must fail before touching the old generation"
         );
         let intact = VectorIndex::open(&path).expect("reopen generation after rejected replace");
@@ -8374,9 +9482,10 @@ mod tests {
         assert_eq!(intact.wal_record_count(), 1);
         drop(intact);
 
-        let replacement =
-            VectorIndex::replace_with_empty(&path, "new", 4).expect("replace generation");
+        let replacement = VectorIndex::replace_with_empty(&path, "new", "rev-next", 4)
+            .expect("replace generation");
         assert_eq!(replacement.embedder_id(), "new");
+        assert_eq!(replacement.embedder_revision(), "rev-next");
         assert_eq!(replacement.record_count(), 0);
         assert_eq!(replacement.wal_record_count(), 0);
         assert!(!wal::wal_path_for(&path).exists());
@@ -8973,6 +10082,7 @@ mod tests {
             dimension: 256,
             quantization: Quantization::F16,
             compaction_gen: 0,
+            publication_nonce: 0,
             record_count: 100,
             vectors_offset: 1024,
             identity_v2: None,
@@ -9585,9 +10695,16 @@ mod tests {
         // Close index to flush everything
         drop(index);
 
-        // Manually create the "post-compaction" main index that includes both A and B.
+        // Manually create the "post-compaction" main index that includes both
+        // A and B. It is built at a side path and renamed over `path` exactly
+        // the way compact() publishes — writer::finish() itself now refuses to
+        // publish beside a live WAL sidecar (the bd-cnby1 guard), so the
+        // crash state must be constructed at the filesystem level, which is
+        // also where the real crash window lives (between compact()'s rename
+        // and its WAL removal).
+        let staged_path = path.with_extension("compacted");
         let mut compact_writer =
-            VectorIndex::create_with_revision(&path, "test", "v1", dim, Quantization::F16)
+            VectorIndex::create_with_revision(&staged_path, "test", "v1", dim, Quantization::F16)
                 .unwrap()
                 .with_generation(2); // Simulate correct compaction increment
         compact_writer
@@ -9596,7 +10713,8 @@ mod tests {
         compact_writer
             .write_record("doc-B", &[0.0, 1.0, 0.0, 0.0])
             .unwrap();
-        compact_writer.finish().unwrap(); // Overwrites `path` with new index containing A and B.
+        compact_writer.finish().unwrap();
+        fs::rename(&staged_path, &path).unwrap(); // Publish over `path`; the old WAL survives untouched.
 
         // Restore the WAL file (because `finish` doesn't touch it, but we need to ensure it exists and has doc-B)
         // Actually, `finish` overwrites `path`. The WAL file is at `path.wal`.

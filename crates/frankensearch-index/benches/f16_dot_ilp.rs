@@ -26,15 +26,23 @@
     clippy::unreadable_literal
 )]
 
+#[cfg(target_arch = "x86_64")]
 use std::hint::black_box;
+#[cfg(target_arch = "x86_64")]
 use std::time::Duration;
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+#[cfg(target_arch = "x86_64")]
+use criterion::BenchmarkId;
+use criterion::{Criterion, criterion_group, criterion_main};
+#[cfg(target_arch = "x86_64")]
 use half::f16;
 
+#[cfg(target_arch = "x86_64")]
 const DIM: usize = 384;
+#[cfg(target_arch = "x86_64")]
 const N: usize = 4096;
 
+#[cfg(target_arch = "x86_64")]
 fn xorshift(s: &mut u64) -> f32 {
     *s ^= *s << 13;
     *s ^= *s >> 7;
@@ -44,6 +52,7 @@ fn xorshift(s: &mut u64) -> f32 {
     u.mul_add(2.0, -1.0)
 }
 
+#[cfg(target_arch = "x86_64")]
 fn build_corpus(n: usize, dim: usize, seed: u64) -> Vec<u8> {
     let mut s = seed;
     let mut bytes = Vec::with_capacity(n * dim * 2);
@@ -137,6 +146,7 @@ unsafe fn dot_f16_4acc(stored_bytes: &[u8], query: &[f32]) -> f32 {
     result
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(clippy::needless_pass_by_ref_mut))]
 fn bench(c: &mut Criterion) {
     #[cfg(target_arch = "x86_64")]
     if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("f16c")) {
@@ -145,8 +155,8 @@ fn bench(c: &mut Criterion) {
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
+        let _ = c;
         eprintln!("f16_dot_ilp: non-x86_64; skipping");
-        return;
     }
     #[cfg(target_arch = "x86_64")]
     bench_x86(c);

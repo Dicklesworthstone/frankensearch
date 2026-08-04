@@ -115,15 +115,29 @@ pub use fingerprint::{
     DEFAULT_SEMANTIC_CHANGE_THRESHOLD, DocumentFingerprint, SIGNIFICANT_CHAR_COUNT_CHANGE_THRESHOLD,
 };
 pub use generation::{
-    ActivationInvariant, CommitRange, EMBEDDING_INPUT_CONTRACT_SCHEMA_V1,
+    ANTI_ROLLBACK_FLOOR_SCHEMA_V1, ActivationInvariant, ActivationManifestV1,
+    AntiRollbackFloorRecordV1, ArtifactGenerationIdentityV1, AuthorityFloorV1, AuthorityRefV1,
+    AuthoritySlotV1, CommitRange, EMBEDDING_INPUT_CONTRACT_SCHEMA_V1,
     EMBEDDING_PRODUCER_ATTESTATION_SCHEMA_V1, EMBEDDING_SPACE_IDENTITY_SCHEMA_V1, EmbedderRevision,
     EmbedderTierTag, EmbeddingArtifactIdentityV1, EmbeddingIdentityBundleV1,
     EmbeddingInputContractV1, EmbeddingProducerAttestationV1, EmbeddingProjectionV1,
-    EmbeddingSpaceIdentityV1, EmbeddingSpaceKindV1, FrozenEmbeddingIdentityBundleV1,
-    GenerationManifest, GoldenVectorCertificateV1, HashControlProfileV1, InvariantKind,
-    LexicalArtifact, MANIFEST_SCHEMA_VERSION, QuantizationFormat, RepairDescriptor,
-    VECTOR_STORAGE_IDENTITY_SCHEMA_V1, ValidationFinding, ValidationResult, VectorArtifact,
-    VectorStorageIdentityV1, compute_manifest_hash, require_valid, validate_manifest,
+    EmbeddingSpaceIdentityV1, EmbeddingSpaceKindV1,
+    FOREIGN_PRODUCER_CONFORMANCE_CERTIFICATE_SCHEMA_V1, ForeignProducerConformanceCertificateV1,
+    FrozenEmbeddingIdentityBundleV1, GENERATION_ACTIVATION_MANIFEST_MAX_BYTES_V1,
+    GENERATION_AUTHORITY_SCHEMA_V1, GENERATION_AUTHORITY_SLOT_BYTES_V1,
+    GENERATION_LOCK_FRAME_BYTES_V1, GenerationAuthorityActionV1, GenerationAuthorityErrorV1,
+    GenerationComponentReceiptV1, GenerationComponentReceiptsV1, GenerationLockFrameKindV1,
+    GenerationLockFrameV1, GenerationManifest, GenerationRootSecurityProfileV1,
+    GoldenVectorCertificateV1, HashControlProfileV1, InMemoryAntiRollbackFloorStoreV1,
+    InvariantKind, LexicalArtifact, MANIFEST_SCHEMA_VERSION, ProducerCompatibilityErrorV1,
+    ProducerCompatibilityKindV1, ProducerCompatibilityWitnessV1, QuantizationFormat,
+    RepairDescriptor, TrustedProducerConformanceContextV1, VECTOR_STORAGE_IDENTITY_SCHEMA_V1,
+    ValidationFinding, ValidationResult, VectorArtifact, VectorStorageIdentityV1,
+    VerifiedGoldenConformanceManifestV1, compute_manifest_hash, require_valid,
+    resolve_authority_slot_frames_v1, resolve_authority_slots_at_floor_v1,
+    resolve_authority_slots_v1, resolve_authority_slots_with_locks_v1,
+    resolve_authority_slots_with_profile_v1, validate_manifest,
+    verify_authority_manifest_reference_v1,
 };
 pub use graph::{DocumentGraph, EdgeType, GraphDocId, GraphEdge};
 pub use host_adapter::{
@@ -180,7 +194,14 @@ pub use traits::{
     cosine_similarity, l2_normalize, truncate_embedding,
 };
 pub use types::{
-    BoundQueryEmbedding, DocId, EmbeddingMetrics, FusedHit, IndexMetrics, IndexableDocument,
-    PhaseMetrics, RankChanges, RetrievalTopology, ScoreSource, ScoredResult, SearchMetrics,
-    SearchMode, SearchPhase, TieredQueryEmbeddings, VectorHit,
+    BoundQueryEmbedding, CoverageBasisV1, CoverageCountsV1, CoverageRelationV1, CoverageScopeV1,
+    CoverageTierV1, CoverageUnknownReasonV1, CoverageUnverifiedReasonV1, CoverageWitnessV1,
+    CrossScopeCoverageEvidenceV1, CrossTierUniverseEvidenceV1, DerivedRetrievalTopologyV1, DocId,
+    EmbeddingMetrics, FusedHit, IndexMetrics, IndexableDocument, PhaseMetrics, RankChanges,
+    RealizedTierCoverageV1, RetrievalIntentV1, RetrievalTopology, ScoreSource, ScoredResult,
+    SearchMetrics, SearchMode, SearchPhase, SpaceIdentityAdmission,
+    TIER_COVERAGE_SCHEMA_VERSION_V1, TierCoveragePairV1, TierCoverageRealizationV1,
+    TierCoverageRequestV1, TierCoverageV1, TieredQueryEmbeddings, TrustedTierCoverageContextV1,
+    UntrustedDerivedRetrievalTopologyV1, UntrustedTierCoveragePairV1, UntrustedTierCoverageV1,
+    VectorHit, retrieval_topology_fits_request,
 };
