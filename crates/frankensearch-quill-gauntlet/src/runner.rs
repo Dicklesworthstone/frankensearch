@@ -1967,26 +1967,6 @@ impl DivergenceRegisterLedger {
         self.validate_for_schema(DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION)
     }
 
-    /// Check relational integrity between every observation and its built-in
-    /// gauntlet object witness.
-    ///
-    /// Each supplied [`ArtifactObject`] is validated by its owning artifact
-    /// contract before this method compares the exact object schema/hash
-    /// domain, digest, producer-build identity, oracle dependency identity,
-    /// and lexical-contract audit revision. Every observation event,
-    /// including superseded history, must have a matching artifact witness.
-    /// Call [`Self::validate`] alone only for structural inspection.
-    ///
-    /// # Errors
-    ///
-    /// This is an integrity-only join. Raw objects can reproduce their own
-    /// claims, so this method never authenticates a producer, admits evidence,
-    /// or authorizes a replacement. F0 must instead consume an externally
-    /// authenticated receipt chain built from [`crate::IntegrityCheckedCampaign`].
-    ///
-    /// Returns an error for a structurally invalid ledger, an invalid or
-    /// duplicate artifact, a missing first-recorded artifact, or any well-formed
-    /// but substituted artifact/producer/oracle identity.
     /// Mint an observation event directly from the campaign artifact that
     /// witnessed the divergence (bd-quill-e6-gauntlet-scale-rm3q.8).
     ///
@@ -2108,6 +2088,26 @@ impl DivergenceRegisterLedger {
         Ok(observation)
     }
 
+    /// Check relational integrity between every observation and its built-in
+    /// gauntlet object witness.
+    ///
+    /// Each supplied [`ArtifactObject`] is validated by its owning artifact
+    /// contract before this method compares the exact object schema/hash
+    /// domain, digest, producer-build identity, oracle dependency identity,
+    /// and lexical-contract audit revision. Every observation event,
+    /// including superseded history, must have a matching artifact witness.
+    /// Call [`Self::validate`] alone only for structural inspection.
+    ///
+    /// # Errors
+    ///
+    /// This is an integrity-only join. Raw objects can reproduce their own
+    /// claims, so this method never authenticates a producer, admits evidence,
+    /// or authorizes a replacement. F0 must instead consume an externally
+    /// authenticated receipt chain built from [`crate::IntegrityCheckedCampaign`].
+    ///
+    /// Returns an error for a structurally invalid ledger, an invalid or
+    /// duplicate artifact, a missing first-recorded artifact, or any well-formed
+    /// but substituted artifact/producer/oracle identity.
     pub fn validate_relational_integrity_against_artifact_objects(
         &self,
         artifacts: &[ArtifactObject],
