@@ -101,11 +101,33 @@ pub const FIXTURE_CORPUS: &[(&str, &str)] = &[
     // "quill"/"lexical" probes so the pagination expectations above are
     // untouched; its own probe term is "escaping".
     (MARKUP_DOC_ID, MARKUP_DOC_BODY),
+    // Multi-byte content for the UTF-8 window boundary dimension. Its probe
+    // term is "unicode"; the surrounding text is deliberately CJK and
+    // combining-accent heavy so a byte-indexed snippet window would split a
+    // character here.
+    (UTF8_DOC_ID, UTF8_DOC_BODY),
 ];
 
 /// Exact live document count of [`FIXTURE_CORPUS`], asserted rather than
 /// derived from `.len()` so a fixture edit has to be deliberate.
-pub const FIXTURE_DOC_COUNT: usize = 5;
+pub const FIXTURE_DOC_COUNT: usize = 6;
+
+/// Document id whose body exercises UTF-8 window boundaries.
+pub const UTF8_DOC_ID: &str = "doc-utf8";
+/// Multi-byte body. Every non-ASCII run is longer than one byte, so a snippet
+/// window that counted BYTES without respecting character boundaries would
+/// cut inside a scalar value and surface `U+FFFD`.
+pub const UTF8_DOC_BODY: &str =
+    "unicode 日本語テキスト ünïcödé combining é and 🦀 emoji tail padding padding padding";
+
+/// The query-length cap both engines document.
+///
+/// Tantivy keeps its `MAX_QUERY_LENGTH` private and truncates silently;
+/// Quill exports it and additionally emits a `QueryDiagnosticKind::Truncated`
+/// diagnostic. The VALUE agrees at 10,000, and the value is all the
+/// independent expectation needs — the divergence in whether truncation is
+/// REPORTED is recorded by the witness rather than asserted away.
+pub const SHARED_MAX_QUERY_LENGTH: usize = 10_000;
 
 /// One hand-derived expectation. Every field is a claim about what any correct
 /// BM25 engine must produce for [`FIXTURE_CORPUS`]; none of it is copied from
@@ -377,7 +399,22 @@ pub const FIXTURE_ENRICHMENT_EXPECTATIONS: &[EnrichmentExpectationV1] = &[
         highlighted_term: "escaping",
         expected_metadata_pairs: &[],
     },
+    // UTF-8 window boundaries. The snippet for this document is additionally
+    // adjudicated by `adjudicate_utf8_window`.
+    EnrichmentExpectationV1 {
+        query: "unicode",
+        limit: 10,
+        highlight_prefix: "<b>",
+        highlight_postfix: "</b>",
+        expected_query_type_code: "simple",
+        subject_doc: UTF8_DOC_ID,
+        highlighted_term: "unicode",
+        expected_metadata_pairs: &[],
+    },
 ];
+
+/// The multi-byte token that must survive a snippet window intact.
+pub const UTF8_INTACT_TOKEN: &str = "日本語テキスト";
 
 /// Adjudicate one ENRICHED observation against its committed expectation.
 ///
@@ -482,6 +519,143 @@ pub fn adjudicate_enrichment(
         offset: 0,
         oracle_failures: failures,
     }
+}
+
+/// Adjudicate the UTF-8 window-boundary contract for one enriched snippet.
+///
+/// The property is engine-neutral and independently derivable: a snippet is a
+/// window over the document's text, so it must consist of WHOLE Unicode
+/// scalar values. A byte-indexed window that cut mid-character would surface
+/// `U+FFFD`, and one that silently dropped the partial character would lose
+/// text the document contains.
+///
+/// Rust's `String` type guarantees the bytes are valid UTF-8, so validity
+/// alone proves nothing here — the assertion is about REPLACEMENT characters
+/// and about the multi-byte token surviving intact.
+#[must_use]
+pub fn adjudicate_utf8_window(
+    observation: &NativeEnrichedObservationV1,
+    subject_doc: &str,
+    intact_multibyte_token: &str,
+) -> NativeVerdictV1 {
+    let mut failures = Vec::new();
+    match observation
+        .hits
+        .iter()
+        .find(|hit| hit.doc_id == subject_doc)
+        .and_then(|hit| hit.snippet.as_deref())
+    {
+        Some(snippet) => {
+            if snippet.contains('\u{FFFD}') {
+                failures.push(
+                    "snippet contains U+FFFD, so the window cut inside a scalar value".to_owned(),
+                );
+            }
+            // A window that ends mid-token would drop part of the multi-byte
+            // run; requiring the whole token proves the boundary was respected
+            // rather than merely that the result re-encoded cleanly.
+            if !snippet.contains(intact_multibyte_token) {
+                failures.push(format!(
+                    "snippet does not carry {intact_multibyte_token:?} intact: {snippet:?}"
+                ));
+            }
+        }
+        None => failures.push(format!("no snippet rendered for {subject_doc}")),
+    }
+    NativeVerdictV1 {
+        engine: observation.engine,
+        query: observation.query.clone(),
+        offset: 0,
+        oracle_failures: failures,
+    }
+}
+
+/// Adjudicate deterministic long-query truncation.
+///
+/// The independent property, derivable from the documented cap alone: a query
+/// longer than [`SHARED_MAX_QUERY_LENGTH`] must behave EXACTLY like its
+/// first-`SHARED_MAX_QUERY_LENGTH`-character prefix. That is checkable without
+/// knowing either engine's internals, and it is strictly stronger than "does
+/// not error" — an engine that truncated at a byte offset, or truncated
+/// nondeterministically, or rejected the query outright, all fail it.
+///
+/// `over_length` and `prefix` must be observations of the same corpus through
+/// the same engine.
+#[must_use]
+pub fn adjudicate_truncation_determinism(
+    over_length: &NativeObservationV1,
+    prefix: &NativeObservationV1,
+) -> NativeVerdictV1 {
+    let mut failures = Vec::new();
+    if over_length.engine != prefix.engine {
+        failures.push("truncation determinism compares one engine against itself".to_owned());
+    }
+    if over_length.page_doc_ids != prefix.page_doc_ids {
+        failures.push(format!(
+            "over-length page {:?} != truncated-prefix page {:?}",
+            over_length.page_doc_ids, prefix.page_doc_ids
+        ));
+    }
+    if over_length.total != prefix.total {
+        failures.push(format!(
+            "over-length total {} != truncated-prefix total {}",
+            over_length.total, prefix.total
+        ));
+    }
+    if over_length.page_score_bits != prefix.page_score_bits {
+        failures.push(
+            "over-length scores differ from the truncated prefix bit-for-bit; truncation is not \
+             deterministic"
+                .to_owned(),
+        );
+    }
+    NativeVerdictV1 {
+        engine: over_length.engine,
+        query: "<over-length>".to_owned(),
+        offset: 0,
+        oracle_failures: failures,
+    }
+}
+
+/// Build the over-length probe query, the prefix it must behave like, and the
+/// document that must be EXCLUDED because its term falls beyond the cut.
+///
+/// # Why the terms are placed rather than appended
+///
+/// A probe made only of non-matching padding proves determinism but not the
+/// CUT POINT: an engine that truncated at 5,000 characters would pass it,
+/// because the one matching term sat at the head and survived any prefix.
+/// This probe therefore straddles the boundary:
+///
+/// - `"lexical"` sits JUST INSIDE the first [`SHARED_MAX_QUERY_LENGTH`]
+///   characters, so an engine cutting early would drop it and change the page;
+/// - `"escaping"` sits JUST BEYOND it, so an engine cutting late (or not at
+///   all) would pick up `doc-markup` and change the page the other way.
+///
+/// Both failure directions are therefore observable, which is what makes this
+/// a boundary test rather than a determinism test.
+#[must_use]
+pub fn truncation_probe_queries() -> (String, String, &'static str) {
+    let padding = "zzz ";
+    let inside_term = "lexical ";
+    let beyond_term = "escaping ";
+
+    // Fill to just short of the cap, leaving room for the inside term.
+    let mut long = String::new();
+    while long.chars().count() + inside_term.chars().count() < SHARED_MAX_QUERY_LENGTH {
+        long.push_str(padding);
+    }
+    long.push_str(inside_term);
+    debug_assert!(long.chars().count() <= SHARED_MAX_QUERY_LENGTH);
+
+    // Pad past the cap, then place the term that must NOT survive.
+    while long.chars().count() < SHARED_MAX_QUERY_LENGTH + 8 {
+        long.push_str(padding);
+    }
+    long.push_str(beyond_term);
+
+    let prefix: String = long.chars().take(SHARED_MAX_QUERY_LENGTH).collect();
+    (long, prefix, MARKUP_DOC_ID)
 }
 
 /// Whether two engines agree on the enriched facts.

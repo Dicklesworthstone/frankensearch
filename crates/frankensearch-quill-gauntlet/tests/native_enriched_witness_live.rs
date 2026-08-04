@@ -14,8 +14,10 @@
 use frankensearch_core::IndexableDocument;
 use frankensearch_quill::{QuillConfig, QuillIndex};
 use frankensearch_quill_gauntlet::native_enriched_witness::{
-    FIXTURE_CORPUS, FIXTURE_ENRICHMENT_EXPECTATIONS, FIXTURE_EXPECTATIONS, FIXTURE_METADATA,
-    adjudicate, adjudicate_enrichment, observe_quill, observe_quill_enrichment,
+    EnrichedExpectationV1, FIXTURE_CORPUS, FIXTURE_ENRICHMENT_EXPECTATIONS, FIXTURE_EXPECTATIONS,
+    FIXTURE_METADATA, UTF8_DOC_ID, UTF8_INTACT_TOKEN, adjudicate, adjudicate_enrichment,
+    adjudicate_truncation_determinism, adjudicate_utf8_window, observe_quill,
+    observe_quill_enrichment, truncation_probe_queries,
 };
 
 /// Build the committed corpus in a real Quill index.
@@ -133,6 +135,70 @@ fn the_committed_enrichment_expectations_hold_against_real_quill() {
     });
 }
 
+/// bd-8nqz.4.1: the UTF-8 window boundary and deterministic long-query
+/// truncation dimensions, against real Quill.
+#[test]
+fn utf8_windows_and_long_query_truncation_hold_against_real_quill() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let dir = tempfile::tempdir().expect("witness tempdir");
+        let index = build_quill(&cx, dir.path()).await;
+
+        // UTF-8: the snippet window must consist of whole scalar values.
+        let utf8_row = FIXTURE_ENRICHMENT_EXPECTATIONS
+            .iter()
+            .find(|row| row.subject_doc == UTF8_DOC_ID)
+            .expect("utf8 enrichment row");
+        let observed = observe_quill_enrichment(&cx, &index, utf8_row).expect("observe utf8");
+        let verdict = adjudicate_utf8_window(&observed, UTF8_DOC_ID, UTF8_INTACT_TOKEN);
+        assert!(
+            verdict.passed(),
+            "UTF-8 window boundary violated: {:?} (hits {:?})",
+            verdict.oracle_failures,
+            observed.hits
+        );
+
+        // Truncation: an over-length query must behave exactly like its
+        // first-MAX_QUERY_LENGTH-character prefix.
+        let (long, prefix, excluded_doc) = truncation_probe_queries();
+        let row = |query: &str| EnrichedExpectationV1 {
+            query: Box::leak(query.to_owned().into_boxed_str()),
+            limit: 10,
+            offset: 0,
+            matching_docs: &[],
+            total: 0,
+            unambiguous_top: None,
+        };
+        let long_row = row(&long);
+        let prefix_row = row(&prefix);
+        let long_observed = observe_quill(&cx, &index, &long_row).expect("observe long query");
+        let prefix_observed = observe_quill(&cx, &index, &prefix_row).expect("observe prefix");
+        let verdict = adjudicate_truncation_determinism(&long_observed, &prefix_observed);
+        assert!(
+            verdict.passed(),
+            "long-query truncation is not deterministic: {:?}",
+            verdict.oracle_failures
+        );
+        // Both directions of the boundary, so this is a CUT-POINT test and
+        // not merely a determinism test.
+        assert!(
+            prefix_observed
+                .page_doc_ids
+                .iter()
+                .any(|id| id == "doc-beta"),
+            "the term just INSIDE the cap must survive truncation; got {:?}",
+            prefix_observed.page_doc_ids
+        );
+        assert!(
+            !long_observed
+                .page_doc_ids
+                .iter()
+                .any(|id| id == excluded_doc),
+            "the term just BEYOND the cap must be truncated away, but {excluded_doc} matched: {:?}",
+            long_observed.page_doc_ids
+        );
+    });
+}
+
 /// The same committed expectations must hold against the REAL Tantivy
 /// incumbent. Running both arms against ONE independent oracle is what makes
 /// a common-mode defect visible: neither engine is the other's reference.
@@ -180,6 +246,58 @@ fn the_committed_expectations_hold_against_real_tantivy() {
             "the committed enrichment expectations do not describe the shipping Tantivy \
              engine:\n{}",
             enrichment_failures.join("\n")
+        );
+
+        // UTF-8 window boundaries, same oracle as the Quill arm.
+        let utf8_row = FIXTURE_ENRICHMENT_EXPECTATIONS
+            .iter()
+            .find(|row| row.subject_doc == UTF8_DOC_ID)
+            .expect("utf8 enrichment row");
+        let utf8_observed =
+            observe_tantivy_enrichment(&cx, &index, utf8_row).expect("observe utf8");
+        let utf8_verdict = adjudicate_utf8_window(&utf8_observed, UTF8_DOC_ID, UTF8_INTACT_TOKEN);
+        assert!(
+            utf8_verdict.passed(),
+            "Tantivy UTF-8 window boundary violated: {:?} (hits {:?})",
+            utf8_verdict.oracle_failures,
+            utf8_observed.hits
+        );
+
+        // Deterministic long-query truncation, with the cut point observable
+        // in both directions.
+        let (long, prefix, excluded_doc) = truncation_probe_queries();
+        let row = |query: &str| EnrichedExpectationV1 {
+            query: Box::leak(query.to_owned().into_boxed_str()),
+            limit: 10,
+            offset: 0,
+            matching_docs: &[],
+            total: 0,
+            unambiguous_top: None,
+        };
+        let long_observed = observe_tantivy(&cx, &index, &row(&long)).expect("observe long query");
+        let prefix_observed = observe_tantivy(&cx, &index, &row(&prefix)).expect("observe prefix");
+        let truncation_verdict =
+            adjudicate_truncation_determinism(&long_observed, &prefix_observed);
+        assert!(
+            truncation_verdict.passed(),
+            "Tantivy long-query truncation is not deterministic: {:?}",
+            truncation_verdict.oracle_failures
+        );
+        assert!(
+            prefix_observed
+                .page_doc_ids
+                .iter()
+                .any(|id| id == "doc-beta"),
+            "the term just INSIDE the cap must survive truncation; got {:?}",
+            prefix_observed.page_doc_ids
+        );
+        assert!(
+            !long_observed
+                .page_doc_ids
+                .iter()
+                .any(|id| id == excluded_doc),
+            "the term just BEYOND the cap must be truncated away, but {excluded_doc} matched: {:?}",
+            long_observed.page_doc_ids
         );
 
         let mut failures = Vec::new();
