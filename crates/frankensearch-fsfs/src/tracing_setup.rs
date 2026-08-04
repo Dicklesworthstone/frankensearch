@@ -107,7 +107,7 @@ fn build_env_filter(verbosity: Verbosity) -> EnvFilter {
         std::env::var_os("RUST_LOG"),
         verbosity,
     );
-    if let Some(diagnostic) = resolution.diagnostic.as_deref() {
+    if let Some(diagnostic) = resolution.diagnostic {
         eprintln!("fsfs: {diagnostic}");
     }
     if let Ok(filter) = EnvFilter::try_new(&resolution.directives) {
