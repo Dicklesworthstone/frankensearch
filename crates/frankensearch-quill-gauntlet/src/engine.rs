@@ -2752,7 +2752,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::comparator::{ComparisonStatus, DivergenceClass, RankClass};
+    use crate::comparator::{ComparisonStatus, RankClass};
 
     const E55_ID_FIELD: u16 = 0;
     const E55_CONTENT_FIELD: u16 = 1;

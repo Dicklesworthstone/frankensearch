@@ -3290,7 +3290,7 @@ mod tests {
 
         // Precise: a CI 0.0007% wide sitting entirely above 1.0, median 0.02%
         // off identity. The retired clause quarantined this.
-        let precise = null_cell(1.0002, 1.000201, 1.000208);
+        let precise = null_cell(1.0002, 1.000_201, 1.000_208);
         assert!(
             !(precise.distribution.median_ci95_low <= 1.0
                 && 1.0 <= precise.distribution.median_ci95_high),

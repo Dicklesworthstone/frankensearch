@@ -1224,7 +1224,7 @@ const ARTIFACTSTORE_V4_BUILD_SNAPSHOT_HASH_DOMAIN: &[u8] =
     b"frankensearch.artifactstore.v4.build\0";
 const MAX_ARTIFACTSTORE_V4_BUILD_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Immutable Source-to-Build link for an ArtifactStore v4 receipt chain.
+/// Immutable Source-to-Build link for an `ArtifactStore` v4 receipt chain.
 ///
 /// This is deliberately separate from the legacy `CampaignReport` identity:
 /// a report may reference the chain, but cannot substitute for either v4
@@ -1267,7 +1267,7 @@ impl ArtifactStoreV4SourceBuildBinding {
     }
 }
 
-/// Two immutable snapshots that form the first two ArtifactStore v4 objects.
+/// Two immutable snapshots that form the first two `ArtifactStore` v4 objects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactStoreV4SourceBuildSnapshots {
     source: ArtifactStoreV4SourceSnapshot,
@@ -3873,7 +3873,7 @@ mod tests {
                 relative_path: "Cargo.lock".to_owned(),
                 kind: ArtifactStoreV4SourceEntryKind::File,
                 inclusion_reasons: source_reasons.clone(),
-                mode: 0o100644,
+                mode: 0o100_644,
                 byte_len: 42,
                 sha256: file_hash,
                 symlink_target: None,
@@ -3883,7 +3883,7 @@ mod tests {
                 relative_path: "crates/current".to_owned(),
                 kind: ArtifactStoreV4SourceEntryKind::Symlink,
                 inclusion_reasons: vec![ArtifactStoreV4SourceInclusionReason::PathDependency],
-                mode: 0o120777,
+                mode: 0o120_777,
                 byte_len: 18,
                 sha256: link_hash,
                 symlink_target: Some("../Cargo.lock".to_owned()),
@@ -3935,7 +3935,7 @@ mod tests {
                 relative_path: "../Cargo.toml".to_owned(),
                 kind: ArtifactStoreV4SourceEntryKind::File,
                 inclusion_reasons: vec![ArtifactStoreV4SourceInclusionReason::Tracked],
-                mode: 0o100644,
+                mode: 0o100_644,
                 byte_len: 1,
                 sha256: hash.clone(),
                 symlink_target: None,
@@ -3948,7 +3948,7 @@ mod tests {
                 relative_path: "current".to_owned(),
                 kind: ArtifactStoreV4SourceEntryKind::Symlink,
                 inclusion_reasons: vec![ArtifactStoreV4SourceInclusionReason::PathDependency],
-                mode: 0o120777,
+                mode: 0o120_777,
                 byte_len: 0,
                 sha256: hash,
                 symlink_target: None,
@@ -4011,7 +4011,7 @@ mod tests {
 
         std::fs::set_permissions(
             root.path().join("Cargo.lock"),
-            std::fs::Permissions::from_mode(0o100600),
+            std::fs::Permissions::from_mode(0o100_600),
         )
         .expect("change source-file mode");
         let mode_mutated =
@@ -4144,7 +4144,7 @@ mod tests {
             relative_path: "Cargo.lock".to_owned(),
             kind: ArtifactStoreV4SourceEntryKind::File,
             inclusion_reasons: vec![ArtifactStoreV4SourceInclusionReason::CargoLock],
-            mode: 0o100644,
+            mode: 0o100_644,
             byte_len: 5,
             sha256: lower_hex(&Sha256::digest(b"lock\n")),
             symlink_target: None,
@@ -4186,7 +4186,7 @@ mod tests {
                 relative_path: "Cargo.toml".to_owned(),
                 kind: ArtifactStoreV4SourceEntryKind::File,
                 inclusion_reasons: vec![ArtifactStoreV4SourceInclusionReason::CargoConfig],
-                mode: 0o100644,
+                mode: 0o100_644,
                 byte_len: 9,
                 sha256: lower_hex(&Sha256::digest(b"[package]")),
                 symlink_target: None,

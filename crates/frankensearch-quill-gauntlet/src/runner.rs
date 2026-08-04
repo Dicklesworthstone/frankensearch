@@ -3164,7 +3164,7 @@ pub struct CampaignReport {
     pub execution_role: ArtifactExecutionRole,
     #[serde(default)]
     pub producer_build_identity: GauntletProducerBuildIdentity,
-    /// Optional reference to the separately persisted ArtifactStore v4
+    /// Optional reference to the separately persisted `ArtifactStore` v4
     /// Source-to-Build chain. This reference does not raise the v7 report's
     /// integrity-only trust ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4660,7 +4660,7 @@ impl DifferentialCampaignRunner {
         })
     }
 
-    /// Attach a distinct ArtifactStore v4 Source-to-Build chain for this
+    /// Attach a distinct `ArtifactStore` v4 Source-to-Build chain for this
     /// campaign. The chain is persisted before run reservation and its two
     /// immutable identities are bound into both reservation and report.
     ///
@@ -14843,7 +14843,7 @@ mod tests {
                 inclusion_reasons: vec![
                     crate::artifact::ArtifactStoreV4SourceInclusionReason::CargoLock,
                 ],
-                mode: 0o100644,
+                mode: 0o100_644,
                 byte_len: 5,
                 sha256: sha256_bytes(b"lock\n"),
                 symlink_target: None,
