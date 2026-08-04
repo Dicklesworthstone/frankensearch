@@ -856,8 +856,14 @@ async fn open_lexical_reader(cx: &Cx, dir: &Path) -> SearchResult<Option<Arc<dyn
     })?;
     match layout {
         LexicalLayout::Empty => return Ok(None),
-        LexicalLayout::DirectQuill
-        |
+        // NOTE: deliberately two arms, not an or-pattern — `pointer` is only
+        // bound in the BlueGreen variant, so `DirectQuill | BlueGreen {..} if
+        // pointer.engine() == ...` fails E0408 (pointer not bound in all
+        // patterns).
+        LexicalLayout::DirectQuill => {
+            let index = RootBoundQuillSearchIndex::open(cx, dir, QuillConfig::default()).await?;
+            Ok(Some(Arc::new(index)))
+        }
         LexicalLayout::BlueGreen { ref pointer, .. }
             if pointer.engine() == BlueGreenEngine::Quill =>
         {
@@ -873,7 +879,7 @@ async fn open_lexical_reader(cx: &Cx, dir: &Path) -> SearchResult<Option<Arc<dyn
         LexicalLayout::BlueGreen { ref pointer, .. }
             if pointer.engine() == BlueGreenEngine::Tantivy =>
         {
-            let index = TantivyIndex::open(pointer.engine_dir(dir))?;
+            let index = TantivyIndex::open(&pointer.engine_dir(dir))?;
             Ok(Some(Arc::new(index)))
         }
         ref layout => {
