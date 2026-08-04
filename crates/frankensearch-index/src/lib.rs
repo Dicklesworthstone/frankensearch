@@ -745,10 +745,16 @@ impl VectorIndexData {
                     .flush_range(offset, bytes.len())
                     .map_err(SearchError::Io)
             }
-            Self::ReadOnly(_) | Self::Immutable(_) => Err(SearchError::InvalidConfig {
+            Self::ReadOnly(_) => Err(SearchError::InvalidConfig {
                 field: "fsvi.writer_lock".to_owned(),
                 value: "read-only mapping".to_owned(),
                 reason: "mutating a published FSVI requires VectorIndex::open_writer and its retained exclusive writer lock".to_owned(),
+            }),
+            Self::Immutable(_) => Err(SearchError::InvalidConfig {
+                field: "fsvi_v2.mutation".to_owned(),
+                value: "immutable-owned-image".to_owned(),
+                reason: "FSVI v2 artifacts are immutable; create a new generation instead"
+                    .to_owned(),
             }),
         }
     }
@@ -775,8 +781,8 @@ impl Deref for VectorIndexData {
 /// unsafe.
 #[derive(Debug)]
 enum FsviMapLock {
-    Shared { _file: File },
-    Exclusive { _file: File },
+    Shared { file: File },
+    Exclusive { file: File },
 }
 
 impl FsviMapLock {
@@ -1687,6 +1693,12 @@ impl VectorIndex {
     /// OS lock for as long as its mapping can expose bytes, preventing a
     /// cooperating writer from creating a writable map until every reader has
     /// dropped its handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::IndexNotFound` for a missing artifact,
+    /// `SearchError::IndexCorrupted` for invalid bytes, or a typed
+    /// `fsvi.map_lock` refusal when a cooperating writer is live.
     pub fn open_read_only(path: &Path) -> SearchResult<Self> {
         Self::open_with_lock(path, false)
     }
@@ -1726,19 +1738,19 @@ impl VectorIndex {
         };
         let map_lock = if writer {
             file.try_lock()
-                .map_err(|error| map_lock_error(path, "exclusive writer", error.into()))?;
-            FsviMapLock::Exclusive { _file: file }
+                .map_err(|error| map_lock_error(path, "exclusive writer", &error))?;
+            FsviMapLock::Exclusive { file }
         } else {
             file.try_lock_shared()
-                .map_err(|error| map_lock_error(path, "shared reader", error.into()))?;
-            FsviMapLock::Shared { _file: file }
+                .map_err(|error| map_lock_error(path, "shared reader", &error))?;
+            FsviMapLock::Shared { file }
         };
         let data = match &map_lock {
-            FsviMapLock::Exclusive { _file } => VectorIndexData::Mutable(unsafe {
-                MmapMut::map_mut(_file).map_err(SearchError::Io)?
+            FsviMapLock::Exclusive { file } => VectorIndexData::Mutable(unsafe {
+                MmapMut::map_mut(file).map_err(SearchError::Io)?
             }),
-            FsviMapLock::Shared { _file } => {
-                VectorIndexData::ReadOnly(unsafe { Mmap::map(_file).map_err(SearchError::Io)? })
+            FsviMapLock::Shared { file } => {
+                VectorIndexData::ReadOnly(unsafe { Mmap::map(file).map_err(SearchError::Io)? })
             }
         };
         let (metadata, header_len) = parse_header(path, &data)?;
@@ -6005,7 +6017,11 @@ pub(crate) fn sync_parent_directory(path: &Path) -> SearchResult<()> {
     Ok(())
 }
 
-fn map_lock_error(path: &Path, requested_access: &str, error: std::io::Error) -> SearchError {
+fn map_lock_error(
+    path: &Path,
+    requested_access: &str,
+    error: &dyn std::fmt::Display,
+) -> SearchError {
     SearchError::InvalidConfig {
         field: "fsvi.map_lock".to_owned(),
         value: path.display().to_string(),
@@ -9320,26 +9336,39 @@ mod tests {
             return;
         }
 
-        // The failed update must not have destroyed the old vector — in
-        // the live handle NOR in the durable state a fresh open sees.
-        for (label, snapshot) in [
-            ("live handle", &mut index),
-            ("fresh open", &mut VectorIndex::open(&path).expect("reopen")),
-        ] {
-            let hits = snapshot
-                .search_top_k(&[1.0, 0.0, 0.0, 0.0], 10, None)
-                .expect("search");
-            assert_eq!(
-                hits.len(),
-                1,
-                "{label}: old vector must survive a failed update"
-            );
-            assert_eq!(hits[0].doc_id, "doc-x", "{label}");
-            assert!(
-                !snapshot.is_deleted(0),
-                "{label}: the main-slab record must not be tombstoned by a failed update"
-            );
-        }
+        // The failed update must not have destroyed the old vector in the
+        // live handle or in a later read-only map. The writer map is dropped
+        // before opening that reader: the retained exclusive lock forbids
+        // concurrent published readers while a mutation handle is live.
+        let hits = index
+            .search_top_k(&[1.0, 0.0, 0.0, 0.0], 10, None)
+            .expect("live search");
+        assert_eq!(
+            hits.len(),
+            1,
+            "live handle: old vector must survive a failed update"
+        );
+        assert_eq!(hits[0].doc_id, "doc-x", "live handle");
+        assert!(
+            !index.is_deleted(0),
+            "live handle: the main-slab record must not be tombstoned by a failed update"
+        );
+        drop(index);
+
+        let reader = VectorIndex::open_read_only(&path).expect("reopen");
+        let hits = reader
+            .search_top_k(&[1.0, 0.0, 0.0, 0.0], 10, None)
+            .expect("reader search");
+        assert_eq!(
+            hits.len(),
+            1,
+            "fresh reader: old vector must survive a failed update"
+        );
+        assert_eq!(hits[0].doc_id, "doc-x", "fresh reader");
+        assert!(
+            !reader.is_deleted(0),
+            "fresh reader: the main-slab record must not be tombstoned by a failed update"
+        );
     }
 
     #[test]

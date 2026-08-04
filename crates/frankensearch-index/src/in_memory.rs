@@ -294,9 +294,9 @@ impl InMemoryVectorIndex {
     ///
     /// # Errors
     ///
-    /// Returns errors from [`VectorIndex::open`] or vector decoding failures.
+    /// Returns errors from [`VectorIndex::open_read_only`] or vector decoding failures.
     pub fn from_fsvi(path: &Path) -> SearchResult<Self> {
-        let index = VectorIndex::open(path)?;
+        let index = VectorIndex::open_read_only(path)?;
         Self::from_open_index(&index)
     }
 
@@ -1694,7 +1694,7 @@ mod tests {
         }
         writer.finish().unwrap();
 
-        let file_index = crate::VectorIndex::open(&path).unwrap();
+        let file_index = crate::VectorIndex::open_read_only(&path).unwrap();
         let memory_index = InMemoryVectorIndex::from_fsvi(&path).unwrap();
         assert_eq!(memory_index.record_count(), docs);
         assert_eq!(memory_index.dimension(), dim);

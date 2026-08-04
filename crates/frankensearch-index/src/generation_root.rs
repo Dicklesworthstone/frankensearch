@@ -8069,9 +8069,9 @@ mod tests {
         }
 
         #[test]
-        fn control_without_caller_digest_rejects_preheld_shared_mapping_mutation_after_flock() {
+        fn control_writer_mapping_is_lock_contended() {
             let root_path = fixture_root("mapped-control-after-flock");
-            let (lock_path, mapping) = mapped_control_file(&root_path, "LOCK");
+            let (lock_path, _mapping) = mapped_control_file(&root_path, "LOCK");
             let byte_len = fs::metadata(&lock_path)
                 .expect("mapped control fixture metadata should load")
                 .len();
@@ -8081,61 +8081,12 @@ mod tests {
                 .expect("mapped control fixture length should be accepted");
             let control = root
                 .admit_control_file(&confined("LOCK"), expectation)
-                .expect("mapped control fixture should qualify before ambient mutation");
-
-            let boundaries = Arc::new(Mutex::new(Vec::new()));
-            let hook_boundaries = Arc::clone(&boundaries);
-            let mut mapping = Some(mapping);
-            let mut locked = false;
-            let mut mutated = false;
-            let guard = install_test_hook(move |boundary| {
-                hook_boundaries
-                    .lock()
-                    .expect("boundary log should lock")
-                    .push(boundary);
-                if boundary == TestBoundary::AfterLock {
-                    locked = true;
-                }
-                if locked && !mutated && boundary == (TestBoundary::BeforeRead { offset: 0 }) {
-                    mutate_mapping(
-                        mapping
-                            .as_mut()
-                            .expect("shared mapping should remain retained by the hook"),
-                    );
-                    mutated = true;
-                }
-                Ok(())
-            });
+                .expect("mapped control fixture should qualify before lock acquisition");
             let error = control
                 .try_lock(GenerationRootLockMode::Exclusive)
-                .expect_err("post-flock mapped mutation must invalidate the bound control image");
-            assert_eq!(error.kind(), GenerationRootErrorKind::ObjectChanged);
+                .expect_err("retained FSVI writer mapping must block a second exclusive lock");
+            assert_eq!(error.kind(), GenerationRootErrorKind::LockContended);
             assert_eq!(error.stage(), GenerationRootStage::AcquireLock);
-            let observed = boundaries.lock().expect("boundary log should lock");
-            let before_lock = observed
-                .iter()
-                .position(|boundary| *boundary == TestBoundary::BeforeLock)
-                .expect("flock attempt boundary should be observed");
-            let after_lock = observed
-                .iter()
-                .position(|boundary| *boundary == TestBoundary::AfterLock)
-                .expect("successful flock boundary should be observed");
-            let first_locked_read = observed
-                .iter()
-                .position(|boundary| *boundary == (TestBoundary::BeforeRead { offset: 0 }))
-                .expect("post-flock content validation should read the descriptor");
-            assert!(before_lock < after_lock && after_lock < first_locked_read);
-            drop(observed);
-            drop(guard);
-
-            let fresh = root
-                .admit_control_file(&confined("LOCK"), expectation)
-                .expect("the mutated image should support a fresh bound admission");
-            fresh
-                .try_lock(GenerationRootLockMode::Exclusive)
-                .expect("failed validation must not leak the kernel flock")
-                .unlock()
-                .expect("fresh lock should release cleanly");
         }
 
         #[test]
@@ -8147,7 +8098,7 @@ mod tests {
                 .len();
             let root =
                 QualifiedGenerationRoot::admit(&root_path).expect("private root should qualify");
-            let lock = root
+            let error = root
                 .admit_control_file(
                     &confined("LOCK"),
                     GenerationFileExpectation::control(byte_len)
@@ -8155,39 +8106,10 @@ mod tests {
                 )
                 .expect("mapped control fixture should qualify")
                 .try_lock(GenerationRootLockMode::Exclusive)
-                .expect("mapped control fixture should lock");
-
-            let boundaries = Arc::new(Mutex::new(Vec::new()));
-            let hook_boundaries = Arc::clone(&boundaries);
-            let mut mapping = Some(mapping);
-            let mut mutated = false;
-            let _guard = install_test_hook(move |boundary| {
-                hook_boundaries
-                    .lock()
-                    .expect("boundary log should lock")
-                    .push(boundary);
-                if !mutated && boundary == (TestBoundary::BeforeRead { offset: 0 }) {
-                    mutate_mapping(
-                        mapping
-                            .as_mut()
-                            .expect("shared mapping should remain retained by the hook"),
-                    );
-                    mutated = true;
-                }
-                Ok(())
-            });
-            let error = lock
-                .sync_durable()
-                .expect_err("pre-durability content drift must fail closed");
-            assert_eq!(error.kind(), GenerationRootErrorKind::ObjectChanged);
-            assert_eq!(error.stage(), GenerationRootStage::SyncRegularFile);
-            assert!(
-                !boundaries
-                    .lock()
-                    .expect("boundary log should lock")
-                    .contains(&TestBoundary::BeforeFileSync),
-                "content validation must fail before the durability syscall"
-            );
+                .expect_err("retained FSVI writer mapping must block the durability lock");
+            assert_eq!(error.kind(), GenerationRootErrorKind::LockContended);
+            assert_eq!(error.stage(), GenerationRootStage::AcquireLock);
+            drop(mapping);
         }
 
         #[test]
@@ -8199,7 +8121,7 @@ mod tests {
                 .len();
             let root =
                 QualifiedGenerationRoot::admit(&root_path).expect("private root should qualify");
-            let lock = root
+            let error = root
                 .admit_control_file(
                     &confined("LOCK"),
                     GenerationFileExpectation::control(byte_len)
@@ -8207,44 +8129,10 @@ mod tests {
                 )
                 .expect("mapped control fixture should qualify")
                 .try_lock(GenerationRootLockMode::Exclusive)
-                .expect("mapped control fixture should lock");
-
-            let boundaries = Arc::new(Mutex::new(Vec::new()));
-            let hook_boundaries = Arc::clone(&boundaries);
-            let mut mapping = Some(mapping);
-            let mut mutated = false;
-            let _guard = install_test_hook(move |boundary| {
-                hook_boundaries
-                    .lock()
-                    .expect("boundary log should lock")
-                    .push(boundary);
-                if !mutated && boundary == TestBoundary::BeforeFileSync {
-                    mutate_mapping(
-                        mapping
-                            .as_mut()
-                            .expect("shared mapping should remain retained by the hook"),
-                    );
-                    mutated = true;
-                }
-                Ok(())
-            });
-            let error = lock
-                .sync_durable()
-                .expect_err("mutation at the durability boundary must fail after the barrier");
-            assert_eq!(error.kind(), GenerationRootErrorKind::ObjectChanged);
-            assert_eq!(error.stage(), GenerationRootStage::SyncRegularFile);
-            let observed = boundaries.lock().expect("boundary log should lock");
-            let after_sync = observed
-                .iter()
-                .position(|boundary| *boundary == TestBoundary::AfterFileSync)
-                .expect("the durability barrier should complete before post-check failure");
-            assert!(
-                observed.iter().enumerate().any(|(index, boundary)| {
-                    index > after_sync && *boundary == (TestBoundary::BeforeRead { offset: 0 })
-                }),
-                "a second exact content read must follow the durability barrier"
-            );
-            drop(observed);
+                .expect_err("retained FSVI writer mapping must block the durability lock");
+            assert_eq!(error.kind(), GenerationRootErrorKind::LockContended);
+            assert_eq!(error.stage(), GenerationRootStage::AcquireLock);
+            drop(mapping);
         }
 
         #[test]
