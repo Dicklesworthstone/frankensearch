@@ -10026,6 +10026,251 @@ mod tests {
         .expect("a fix-only class is admitted with a Fixed disposition");
     }
 
+    /// THE PLANTED NEGATIVE for the review workflow: an UNEXPLAINED divergence
+    /// must never reach `accepted`.
+    ///
+    /// "Explained" is not a formality here. An accept is the one disposition
+    /// that leaves a divergence permanently in the product with no fixing
+    /// commit behind it, so the equivalence law and the consumer-impact
+    /// rationale are the entire evidentiary basis for that decision. A blank,
+    /// whitespace-only, or control-character rationale would render as a
+    /// plausible-looking row in the review table while carrying no argument at
+    /// all — an accept that reads as reviewed and is not.
+    ///
+    /// Each shape below is applied ALONE to an otherwise-valid acceptance, and
+    /// the final case restores the field to prove the rejection is attributable
+    /// to that field rather than to the fixture.
+    #[test]
+    fn an_unexplained_divergence_never_reaches_accepted() {
+        let binding = ingestion_binding();
+        let observation = || {
+            DivergenceRegisterLedger::observation_from_binding(
+                &binding,
+                ingestion_header(),
+                "DIV-008",
+                DivergenceClass::ScoreEpsilon,
+                ingestion_fixture(),
+                vec!["c".repeat(64)],
+                ingestion_narrative(),
+                ingestion_diagnostic(),
+            )
+            .expect("mint")
+        };
+        let accept = |equivalence_law: &str, rationale: &str| {
+            DivergenceRegisterLedger::new(
+                "rm3q8-review",
+                vec![
+                    DivergenceRegisterEvent::Observation(Box::new(observation())),
+                    DivergenceRegisterEvent::Disposition(DivergenceDispositionEvent {
+                        header: DivergenceRegisterEventHeader {
+                            sequence: 2,
+                            supersedes: None,
+                            recorded_by: "rm3q8-campaign-ingestor".to_owned(),
+                            recorded_at: "2026-08-04T12:01:00Z".to_owned(),
+                        },
+                        divergence_id: "DIV-008".to_owned(),
+                        disposition: DivergenceDisposition::Accepted {
+                            equivalence_law: equivalence_law.to_owned(),
+                            rationale: rationale.to_owned(),
+                            reviewer: "rm3q8-independent-reviewer".to_owned(),
+                            reviewed_at: "2026-08-04T12:00:30Z".to_owned(),
+                        },
+                    }),
+                ],
+            )
+        };
+
+        const LAW: &str = "Result sets are identical; only ULP-adjacent rank order differs.";
+        const WHY: &str = "Bounded floating-point summation association.";
+
+        for (label, law, why) in [
+            ("empty law", "", WHY),
+            ("empty rationale", LAW, ""),
+            ("whitespace-only law", "   ", WHY),
+            ("whitespace-only rationale", LAW, "\t"),
+            ("untrimmed law", " padded law ", WHY),
+            (
+                "control character in rationale",
+                LAW,
+                "no argument\u{0}here",
+            ),
+        ] {
+            assert!(
+                accept(law, why).is_err(),
+                "{label}: an unexplained acceptance must be refused"
+            );
+        }
+
+        // Control: the same shape with both fields present is admitted, so
+        // every rejection above is attributable to the field it moved.
+        accept(LAW, WHY).expect("a fully explained acceptance is admitted");
+    }
+
+    /// The three dispositions are a state machine over ONE divergence, and a
+    /// correction supersedes rather than rewrites. This is what "accepted
+    /// divergences never disappear when current runs turn green" means
+    /// mechanically: the original accept stays in the event history and the
+    /// projection reports the superseding state.
+    #[test]
+    fn a_disposition_can_be_superseded_without_erasing_its_history() {
+        let binding = ingestion_binding();
+        let observation = DivergenceRegisterLedger::observation_from_binding(
+            &binding,
+            ingestion_header(),
+            "DIV-008",
+            DivergenceClass::ScoreEpsilon,
+            ingestion_fixture(),
+            vec!["c".repeat(64)],
+            ingestion_narrative(),
+            ingestion_diagnostic(),
+        )
+        .expect("mint");
+
+        let accepted = DivergenceDispositionEvent {
+            header: DivergenceRegisterEventHeader {
+                sequence: 2,
+                supersedes: None,
+                recorded_by: "rm3q8-campaign-ingestor".to_owned(),
+                recorded_at: "2026-08-04T12:01:00Z".to_owned(),
+            },
+            divergence_id: "DIV-008".to_owned(),
+            disposition: DivergenceDisposition::Accepted {
+                equivalence_law: "Result sets are identical.".to_owned(),
+                rationale: "Bounded association difference.".to_owned(),
+                reviewer: "rm3q8-independent-reviewer".to_owned(),
+                reviewed_at: "2026-08-04T12:00:30Z".to_owned(),
+            },
+        };
+        // Later evidence reclassifies the same divergence as blocking.
+        let blocking = DivergenceDispositionEvent {
+            header: DivergenceRegisterEventHeader {
+                sequence: 3,
+                supersedes: Some(2),
+                recorded_by: "rm3q8-campaign-ingestor".to_owned(),
+                recorded_at: "2026-08-04T13:00:00Z".to_owned(),
+            },
+            divergence_id: "DIV-008".to_owned(),
+            disposition: DivergenceDisposition::Blocking {
+                bead_id: "bd-quill-e6-gauntlet-scale-rm3q.8".to_owned(),
+                rationale: "A wider corpus showed a membership change, not only rank order."
+                    .to_owned(),
+                reviewer: "rm3q8-independent-reviewer".to_owned(),
+                reviewed_at: "2026-08-04T12:59:00Z".to_owned(),
+            },
+        };
+
+        let ledger = DivergenceRegisterLedger::new(
+            "rm3q8-review",
+            vec![
+                DivergenceRegisterEvent::Observation(Box::new(observation)),
+                DivergenceRegisterEvent::Disposition(accepted),
+                DivergenceRegisterEvent::Disposition(blocking),
+            ],
+        )
+        .expect("a superseding disposition forms a valid ledger");
+
+        // Both dispositions remain in the immutable history.
+        assert_eq!(
+            ledger
+                .events
+                .iter()
+                .filter(|event| matches!(event, DivergenceRegisterEvent::Disposition(_)))
+                .count(),
+            2,
+            "superseding must append, never rewrite"
+        );
+
+        // The review projection reports the CURRENT state, not the retired one.
+        let table = ledger.review_table().expect("render review table");
+        assert!(
+            table.contains("blocking"),
+            "the projection must show the superseding disposition: {table}"
+        );
+        assert!(
+            !table.contains("accepted"),
+            "a superseded acceptance must not still read as the active state: {table}"
+        );
+    }
+
+    /// The review artifact is redaction-safe.
+    ///
+    /// The acceptance requires that the generated table "never renders
+    /// observed/query payloads" — a review surface that leaked the query or the
+    /// observed output would make the whole redaction policy decorative, since
+    /// the table is the artifact humans actually read.
+    #[test]
+    fn the_review_table_never_renders_observed_or_query_payloads() {
+        let binding = ingestion_binding();
+        let narrative = DivergenceObservationNarrative {
+            observed_behavior: "SENTINEL_OBSERVED_PAYLOAD".to_owned(),
+            expected_behavior: "SENTINEL_EXPECTED_PAYLOAD".to_owned(),
+            root_cause: "SENTINEL_ROOT_CAUSE".to_owned(),
+            consumer_impact: "SENTINEL_CONSUMER_IMPACT".to_owned(),
+        };
+        // The marker itself is already constrained to lowercase/digit content,
+        // so it cannot carry a payload even if the table did render it. The
+        // sentinel here is therefore a legal marker; the leak this test is
+        // really hunting is the narrative and the payload digest.
+        let diagnostic = RedactedDivergenceDiagnostic {
+            payload_sha256: "b".repeat(64),
+            marker: "<redacted:sentinel-query-marker>".to_owned(),
+        };
+        let observation = DivergenceRegisterLedger::observation_from_binding(
+            &binding,
+            ingestion_header(),
+            "DIV-008",
+            DivergenceClass::ScoreEpsilon,
+            ingestion_fixture(),
+            vec!["c".repeat(64)],
+            narrative,
+            diagnostic,
+        )
+        .expect("mint");
+
+        let ledger = DivergenceRegisterLedger::new(
+            "rm3q8-review",
+            vec![
+                DivergenceRegisterEvent::Observation(Box::new(observation)),
+                DivergenceRegisterEvent::Disposition(DivergenceDispositionEvent {
+                    header: DivergenceRegisterEventHeader {
+                        sequence: 2,
+                        supersedes: None,
+                        recorded_by: "rm3q8-campaign-ingestor".to_owned(),
+                        recorded_at: "2026-08-04T12:01:00Z".to_owned(),
+                    },
+                    divergence_id: "DIV-008".to_owned(),
+                    disposition: DivergenceDisposition::Accepted {
+                        equivalence_law: "Result sets are identical.".to_owned(),
+                        rationale: "Bounded association difference.".to_owned(),
+                        reviewer: "rm3q8-independent-reviewer".to_owned(),
+                        reviewed_at: "2026-08-04T12:00:30Z".to_owned(),
+                    },
+                }),
+            ],
+        )
+        .expect("ledger");
+
+        let table = ledger.review_table().expect("render review table");
+        for leaked in [
+            "SENTINEL_OBSERVED_PAYLOAD",
+            "SENTINEL_EXPECTED_PAYLOAD",
+            "SENTINEL_ROOT_CAUSE",
+            "SENTINEL_CONSUMER_IMPACT",
+            "sentinel-query-marker",
+            &"b".repeat(64),
+        ] {
+            assert!(
+                !table.contains(leaked),
+                "review table leaked {leaked}: {table}"
+            );
+        }
+
+        // Control: the table is not empty and does carry the safe identifiers,
+        // so the assertions above are not passing because nothing rendered.
+        assert!(table.contains("DIV-008"));
+        assert!(table.contains("rm3q8-independent-reviewer"));
+    }
+
     /// An observation with no disposition is not a register entry. Without
     /// this, a campaign could file mismatches that are recorded but never
     /// classified, which is the "unclassified must fail closed" requirement.
