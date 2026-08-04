@@ -3,9 +3,32 @@
 use std::sync::Arc;
 
 use frankensearch_core::filter::SearchFilter;
+use frankensearch_core::generation::EmbeddingIdentityBundleV1;
+use frankensearch_core::types::{BoundQueryEmbedding, TieredQueryEmbeddings};
 use frankensearch_core::{ScoreSource, SearchError, SearchPhase, TwoTierConfig};
 use frankensearch_fusion::SyncTwoTierSearcher;
 use frankensearch_index::{InMemoryTwoTierIndex, InMemoryVectorIndex, SearchParams};
+
+/// Bind a hand-built fixture vector to an explicitly synthetic identity.
+///
+/// These vectors are written by hand, so a synthetic identity is the truthful
+/// one — `explicit_test_model` exists precisely so that fact travels with the
+/// values instead of being fabricated into a model name.
+fn bound(vector: Vec<f32>) -> BoundQueryEmbedding {
+    let dimension = u32::try_from(vector.len()).expect("fixture dimension fits u32");
+    BoundQueryEmbedding::new(
+        vector,
+        EmbeddingIdentityBundleV1::explicit_test_model("sync-integration-fixture", dimension),
+    )
+    .expect("synthetic fixture query binds")
+}
+
+/// Both tiers of these fixture indexes are built from vectors of the same
+/// synthetic space, so one bundle describes both arms truthfully. A real
+/// two-model pair would bind two different bundles here.
+fn tiered(vector: Vec<f32>) -> TieredQueryEmbeddings {
+    TieredQueryEmbeddings::progressive(bound(vector.clone()), bound(vector))
+}
 
 fn normalize(values: Vec<f32>) -> Vec<f32> {
     let norm = values.iter().map(|v| v * v).sum::<f32>().sqrt();
@@ -111,7 +134,7 @@ fn clustered_sync_index(
 fn search_collect_returns_progressive_metrics() {
     let searcher = SyncTwoTierSearcher::new(rank_flip_index(), TwoTierConfig::default());
     let (results, metrics) = searcher
-        .search_collect(&normalize(vec![1.0, 0.0]), 3)
+        .search_collect(&tiered(normalize(vec![1.0, 0.0])), 3)
         .expect("search collect");
 
     assert_eq!(results.len(), 3);
@@ -124,7 +147,7 @@ fn search_collect_returns_progressive_metrics() {
 fn search_iter_yields_initial_then_refined() {
     let searcher = SyncTwoTierSearcher::new(rank_flip_index(), TwoTierConfig::default());
     let phases = searcher
-        .search_iter(&normalize(vec![1.0, 0.0]), 3)
+        .search_iter(&tiered(normalize(vec![1.0, 0.0])), 3)
         .collect::<Vec<_>>();
 
     assert_eq!(phases.len(), 2);
@@ -153,11 +176,11 @@ fn default_fourbit_fetch_matches_explicit_exact_on_clustered_fixture() {
         .with_search_params(SearchParams::default());
 
     for query_idx in 0..12 {
-        let query = clustered_vector(
+        let query = tiered(clustered_vector(
             &centroids,
             query_idx % CLUSTERS,
             0xdead_0000 + u64::try_from(query_idx).expect("query index fits u64"),
-        );
+        ));
         let (approx_results, _) = approximate
             .search_collect(&query, K)
             .expect("approximate search");
@@ -182,13 +205,13 @@ fn fast_only_mode_skips_phase_two() {
     };
     let searcher = SyncTwoTierSearcher::new(rank_flip_index(), config);
     let phases = searcher
-        .search_iter(&normalize(vec![1.0, 0.0]), 3)
+        .search_iter(&tiered(normalize(vec![1.0, 0.0])), 3)
         .collect::<Vec<_>>();
 
     assert_eq!(phases.len(), 1);
     assert!(matches!(phases[0], SearchPhase::Initial { .. }));
     let (_, metrics) = searcher
-        .search_collect(&normalize(vec![1.0, 0.0]), 3)
+        .search_collect(&tiered(normalize(vec![1.0, 0.0])), 3)
         .expect("search collect");
     assert_eq!(metrics.skip_reason.as_deref(), Some("fast_only"));
 }
@@ -207,14 +230,14 @@ fn search_filter_is_applied_to_results() {
 
     let searcher = SyncTwoTierSearcher::new(rank_flip_index(), TwoTierConfig::default());
     let (results, _) = searcher
-        .search_collect_with_filter(&normalize(vec![1.0, 0.0]), 3, Some(&ExcludeA))
+        .search_collect_with_filter(&tiered(normalize(vec![1.0, 0.0])), 3, Some(&ExcludeA))
         .expect("filtered search");
     assert!(results.iter().all(|result| result.doc_id != "a"));
 }
 
 #[test]
 fn quality_weight_controls_refined_ranking() {
-    let query = normalize(vec![1.0, 0.0]);
+    let query = tiered(normalize(vec![1.0, 0.0]));
     let fast_only_blend = SyncTwoTierSearcher::new(
         rank_flip_index(),
         TwoTierConfig {
@@ -245,7 +268,7 @@ fn quality_weight_controls_refined_ranking() {
 
 #[test]
 fn candidate_multiplier_changes_refinement_recall() {
-    let query = normalize(vec![1.0, 0.0]);
+    let query = tiered(normalize(vec![1.0, 0.0]));
     let strict_budget = SyncTwoTierSearcher::new(
         rank_flip_index(),
         TwoTierConfig {
@@ -286,7 +309,7 @@ fn empty_index_is_graceful() {
     let searcher = SyncTwoTierSearcher::new(empty_two_tier, TwoTierConfig::default());
 
     let (results, metrics) = searcher
-        .search_collect(&normalize(vec![1.0, 0.0]), 5)
+        .search_collect(&tiered(normalize(vec![1.0, 0.0])), 5)
         .expect("empty search");
     assert!(results.is_empty());
     assert_eq!(metrics.phase1_vectors_searched, 0);
@@ -299,7 +322,14 @@ fn empty_index_is_graceful() {
 #[test]
 fn dimension_mismatch_is_reported_by_iterator() {
     let searcher = SyncTwoTierSearcher::new(rank_flip_index(), TwoTierConfig::default());
-    let phases = searcher.search_iter(&[], 3).collect::<Vec<_>>();
+    // A width the index does not have. This used to be `&[]`, which the typed
+    // surface cannot express; a 3-wide query in its own coherent 3-dimensional
+    // space is the same test with a vector that actually exists. The fixture
+    // index carries no space identity, so admission passes and the mismatch
+    // surfaces where it always did — at the scan.
+    let phases = searcher
+        .search_iter(&tiered(vec![1.0, 0.0, 0.0]), 3)
+        .collect::<Vec<_>>();
 
     assert_eq!(phases.len(), 1);
     assert!(matches!(
@@ -317,7 +347,7 @@ fn concurrent_search_collect_is_thread_safe() {
         rank_flip_index(),
         TwoTierConfig::default(),
     ));
-    let query = normalize(vec![1.0, 0.0]);
+    let query = tiered(normalize(vec![1.0, 0.0]));
 
     let mut handles = Vec::new();
     for _ in 0..8 {

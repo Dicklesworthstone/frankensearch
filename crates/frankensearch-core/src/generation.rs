@@ -4577,6 +4577,269 @@ impl ExactGenerationComponentsV1 {
     }
 }
 
+/// Domain separating the shared source checkpoint from every other digest.
+///
+/// Deliberately distinct from [`CANONICAL_DOCSET_DIGEST_DOMAIN_V1`] for the
+/// same reason that one is distinct from the fsvi-v2 docset domain: a
+/// checkpoint and a document-set digest are both 32 bytes derived from one
+/// generation, and sharing a domain would let a component substitute one for
+/// the other and still satisfy a comparison it never made.
+pub const GENERATION_SOURCE_CHECKPOINT_DOMAIN_V1: &[u8] =
+    b"frankensearch.generation.source-checkpoint.v1";
+
+/// The shared source checkpoint every component of one generation carries.
+///
+/// [`ExactComponentReceiptV1::source_checkpoint`] is contractually "the same 32
+/// bytes every role shares", but the keystone left the derivation open. It is
+/// derived here from the commit range that produced the generation, because
+/// that is the source state a checkpoint names, and because deriving it makes
+/// the value RECOMPUTABLE rather than an opaque blob a caller asserts. That is
+/// what lets [`ExactComponentReceiptV1::for_metadata_manifest`] refuse a
+/// receipt whose checkpoint its own manifest does not support.
+///
+/// The other roles are unaffected: they still carry the 32 bytes without
+/// needing to know a commit range.
+#[must_use]
+pub fn generation_source_checkpoint_v1(commit_range: &CommitRange) -> [u8; 32] {
+    let mut encoder = CanonicalEncoder::new(GENERATION_SOURCE_CHECKPOINT_DOMAIN_V1);
+    encoder.u64(commit_range.low);
+    encoder.u64(commit_range.high);
+    let mut hasher = Sha256::new();
+    hasher.update(&encoder.bytes);
+    hasher.finalize().into()
+}
+
+impl ExactComponentReceiptV1 {
+    /// Build the metadata/checkpoint component receipt from a real manifest.
+    ///
+    /// The metadata role is the only component whose own artifact states the
+    /// commit range, so this deliberately does NOT accept a caller-supplied
+    /// checkpoint: a metadata receipt naming a checkpoint its manifest does not
+    /// support is a contradiction rather than a drift to be discovered later at
+    /// the join.
+    ///
+    /// `manifest_bytes` must be the exact immutable bytes that were or will be
+    /// published for `manifest`. They are bound by length and SHA-256, so a
+    /// manifest that is semantically equal but was rewritten produces a
+    /// different receipt.
+    ///
+    /// `documents` is the caller's own ordered live document set, per the
+    /// keystone contract: run [`CanonicalDocsetV1::from_ordered_live_documents`]
+    /// over your ordered live ids rather than relabelling an engine digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the manifest bytes are empty, or when the
+    /// manifest's own `total_documents` disagrees with the canonical document
+    /// set. The count cross-check exists because metadata is the only role
+    /// carrying a document count independent of the docset it is claiming; a
+    /// disagreement there is a defect in the receipt itself, and letting it
+    /// form would push a diagnosable error into the join as an anonymous
+    /// digest mismatch.
+    pub fn for_metadata_manifest(
+        manifest: &GenerationManifest,
+        manifest_bytes: &[u8],
+        documents: &CanonicalDocsetV1,
+    ) -> Result<Self, GenerationAuthorityErrorV1> {
+        if manifest_bytes.is_empty() {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "component_receipt.metadata.manifest_bytes",
+            });
+        }
+        let live_document_count = u64::try_from(documents.len()).map_err(|_| {
+            GenerationAuthorityErrorV1::InvalidField {
+                field: "component_receipt.metadata.live_document_count",
+            }
+        })?;
+        if manifest.total_documents != live_document_count {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "component_receipt.metadata.total_documents",
+            });
+        }
+
+        let byte_len = u64::try_from(manifest_bytes.len()).map_err(|_| {
+            GenerationAuthorityErrorV1::InvalidField {
+                field: "component_receipt.metadata.byte_len",
+            }
+        })?;
+        let sha256: [u8; 32] = Sha256::digest(manifest_bytes).into();
+
+        Ok(Self {
+            role: GenerationComponentRole::Metadata,
+            bytes: GenerationComponentReceiptV1 { byte_len, sha256 },
+            docset_digest: documents.digest(),
+            live_document_count,
+            source_checkpoint: generation_source_checkpoint_v1(&manifest.commit_range),
+        })
+    }
+
+    /// Verify a stored metadata receipt against the manifest image a reader
+    /// actually has, naming what drifted.
+    ///
+    /// This is the consumer half of [`Self::for_metadata_manifest`]. A receipt
+    /// that cannot be re-checked against the artifact later only proves what
+    /// was true at build time, which is exactly the window an artifact gets
+    /// rewritten in.
+    ///
+    /// # What this can and cannot prove
+    ///
+    /// Everything checked here is derivable from the manifest image ALONE:
+    /// the role, the exact bytes, the shared checkpoint (from the manifest's
+    /// own `commit_range`), and the live document count (against its own
+    /// `total_documents`).
+    ///
+    /// The canonical docset digest is deliberately NOT checked here, and that
+    /// is not an oversight. `GenerationManifest` records document *counts*, not
+    /// document *identifiers*, so the docset digest cannot be re-derived from
+    /// the manifest at all. It is a claim the metadata role makes about a
+    /// document set it does not itself enumerate, and the only thing that can
+    /// falsify it is agreement with the vector anchor in
+    /// [`ExactGenerationComponentsV1::admit`] -- which is precisely why that
+    /// join exists. Use [`Self::verify_metadata_docset`] when the caller holds
+    /// the ordered live ids, and the join for cross-engine proof. A verifier
+    /// that silently "checked" the docset against a caller-supplied set would
+    /// be asserting the caller's word back to itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetadataReceiptDriftV1`] naming the first field that
+    /// disagrees. Field order is deliberate: identity before content, so a
+    /// receipt filed under the wrong role is reported as such rather than as a
+    /// byte mismatch.
+    pub fn verify_metadata_manifest(
+        &self,
+        manifest: &GenerationManifest,
+        manifest_bytes: &[u8],
+    ) -> Result<(), MetadataReceiptDriftV1> {
+        if self.role != GenerationComponentRole::Metadata {
+            return Err(MetadataReceiptDriftV1::NotAMetadataReceipt {
+                found: self.role.as_str(),
+            });
+        }
+
+        // The caller passes a parsed manifest AND its bytes. If those two
+        // disagree the pair is incoherent, and every check below would be
+        // measuring two different generations against one receipt. Compare the
+        // decoded image rather than re-serializing: a manifest may legitimately
+        // be published in an encoding this crate would not reproduce byte for
+        // byte, so re-serializing would reject honest images.
+        let decoded: GenerationManifest = serde_json::from_slice(manifest_bytes)
+            .map_err(|_| MetadataReceiptDriftV1::UnreadableManifestImage)?;
+        if decoded.commit_range != manifest.commit_range
+            || decoded.total_documents != manifest.total_documents
+            || decoded.generation_id != manifest.generation_id
+        {
+            return Err(MetadataReceiptDriftV1::ManifestImageMismatch);
+        }
+
+        let byte_len = u64::try_from(manifest_bytes.len())
+            .map_err(|_| MetadataReceiptDriftV1::UnreadableManifestImage)?;
+        if self.bytes.byte_len != byte_len {
+            return Err(MetadataReceiptDriftV1::ByteLen {
+                expected: self.bytes.byte_len,
+                found: byte_len,
+            });
+        }
+        if self.bytes.sha256 != <[u8; 32]>::from(Sha256::digest(manifest_bytes)) {
+            return Err(MetadataReceiptDriftV1::ManifestBytes);
+        }
+        if self.source_checkpoint != generation_source_checkpoint_v1(&manifest.commit_range) {
+            return Err(MetadataReceiptDriftV1::SourceCheckpoint);
+        }
+        if self.live_document_count != manifest.total_documents {
+            return Err(MetadataReceiptDriftV1::LiveDocumentCount {
+                expected: self.live_document_count,
+                found: manifest.total_documents,
+            });
+        }
+        Ok(())
+    }
+
+    /// Verify the receipt's docset claim against ordered live ids the caller
+    /// holds independently of the manifest.
+    ///
+    /// Separate from [`Self::verify_metadata_manifest`] because it needs an
+    /// input the artifact does not carry. Passing the same set that produced
+    /// the receipt proves nothing; this is for a caller that obtained the ids
+    /// from the corpus, not from the receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetadataReceiptDriftV1`] when the role is wrong, the digest
+    /// disagrees, or the count disagrees.
+    pub fn verify_metadata_docset(
+        &self,
+        documents: &CanonicalDocsetV1,
+    ) -> Result<(), MetadataReceiptDriftV1> {
+        if self.role != GenerationComponentRole::Metadata {
+            return Err(MetadataReceiptDriftV1::NotAMetadataReceipt {
+                found: self.role.as_str(),
+            });
+        }
+        if self.docset_digest != documents.digest() {
+            return Err(MetadataReceiptDriftV1::Docset);
+        }
+        let live = u64::try_from(documents.len())
+            .map_err(|_| MetadataReceiptDriftV1::UnreadableManifestImage)?;
+        if self.live_document_count != live {
+            return Err(MetadataReceiptDriftV1::LiveDocumentCount {
+                expected: self.live_document_count,
+                found: live,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Why a stored metadata receipt does not describe the artifact presented.
+///
+/// Distinct from [`ComponentJoinErrorV1`], which answers "do these four
+/// components describe one generation". This answers "does this receipt still
+/// describe this artifact", which is a question a single reader can ask without
+/// holding the other three roles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MetadataReceiptDriftV1 {
+    /// The receipt speaks for another role entirely.
+    #[error("expected a metadata component receipt, found {found}")]
+    NotAMetadataReceipt {
+        /// Role the receipt actually declares.
+        found: &'static str,
+    },
+    /// The presented bytes are not a decodable manifest image.
+    #[error("manifest image could not be decoded")]
+    UnreadableManifestImage,
+    /// The parsed manifest and the presented bytes describe different
+    /// generations, so the pair cannot be verified against one receipt.
+    #[error("parsed manifest and manifest image describe different generations")]
+    ManifestImageMismatch,
+    /// Exact byte length disagrees.
+    #[error("manifest image is {found} bytes, receipt records {expected}")]
+    ByteLen {
+        /// Length the receipt records.
+        expected: u64,
+        /// Length actually presented.
+        found: u64,
+    },
+    /// Exact content disagrees at the same length.
+    #[error("manifest image content does not match the receipt's SHA-256")]
+    ManifestBytes,
+    /// The checkpoint the receipt records is not the one this manifest's
+    /// commit range derives.
+    #[error("receipt names a source checkpoint this manifest does not derive")]
+    SourceCheckpoint,
+    /// Live document count disagrees.
+    #[error("receipt records {expected} live documents, found {found}")]
+    LiveDocumentCount {
+        /// Count the receipt records.
+        expected: u64,
+        /// Count actually presented.
+        found: u64,
+    },
+    /// The canonical docset digest disagrees.
+    #[error("receipt was built from a different canonical document set")]
+    Docset,
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -7484,6 +7747,527 @@ mod tests {
         assert_ne!(
             CANONICAL_DOCSET_DIGEST_DOMAIN_V1,
             b"frankensearch.fsvi-v2.ordered-live-docset.v1".as_slice()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-uu0ly: the metadata/checkpoint component producer.
+    //
+    // The keystone proved the JOIN algebra using synthetic receipts. These
+    // prove the metadata role can be built from a real manifest and that every
+    // independent mutation of that manifest is rejected on the metadata role.
+    // -----------------------------------------------------------------------
+
+    /// A manifest whose declared document count matches `documents`, so the
+    /// producer's count cross-check is satisfied and each test below can move
+    /// exactly one thing.
+    fn metadata_manifest(documents: &[&str], commit_range: &CommitRange) -> GenerationManifest {
+        let mut manifest = valid_manifest();
+        manifest.commit_range = commit_range.clone();
+        manifest.total_documents = documents.len() as u64;
+        manifest.manifest_hash = String::new();
+        manifest.manifest_hash = compute_manifest_hash(&manifest).expect("hash");
+        manifest
+    }
+
+    fn metadata_receipt(
+        documents: &[&str],
+        commit_range: &CommitRange,
+    ) -> (GenerationManifest, Vec<u8>, ExactComponentReceiptV1) {
+        let manifest = metadata_manifest(documents, commit_range);
+        let bytes = serde_json::to_vec(&manifest).expect("serialize manifest");
+        let receipt =
+            ExactComponentReceiptV1::for_metadata_manifest(&manifest, &bytes, &docset(documents))
+                .expect("a manifest agreeing with its docset produces a receipt");
+        (manifest, bytes, receipt)
+    }
+
+    /// Anchor + lexical built to agree with a real metadata receipt, so the
+    /// metadata role is the only variable in the drift tests.
+    fn quartet_around(
+        metadata: &ExactComponentReceiptV1,
+    ) -> (ExactComponentReceiptV1, ExactComponentReceiptV1) {
+        (
+            component(
+                GenerationComponentRole::Vector,
+                metadata.docset_digest,
+                metadata.source_checkpoint,
+            ),
+            component(
+                GenerationComponentRole::Lexical,
+                metadata.docset_digest,
+                metadata.source_checkpoint,
+            ),
+        )
+    }
+
+    /// CONTROL. Without this, every rejection below could be a producer that
+    /// never yields an admissible receipt at all.
+    #[test]
+    fn a_real_manifest_produces_a_metadata_receipt_that_admits_against_the_anchor() {
+        let (_manifest, bytes, metadata) =
+            metadata_receipt(&CONTROL_DOCS, &CommitRange { low: 1, high: 100 });
+
+        assert_eq!(metadata.role, GenerationComponentRole::Metadata);
+        assert_eq!(metadata.live_document_count, CONTROL_DOCS.len() as u64);
+        assert_eq!(metadata.docset_digest, docset(&CONTROL_DOCS).digest());
+        assert_eq!(metadata.bytes.byte_len, bytes.len() as u64);
+        assert_eq!(
+            metadata.bytes.sha256,
+            <[u8; 32]>::from(Sha256::digest(&bytes))
+        );
+        metadata.validate().expect("the produced receipt is valid");
+
+        let (vector, lexical) = quartet_around(&metadata);
+        let admitted = ExactGenerationComponentsV1::admit(vector, lexical, None, metadata.clone())
+            .expect("a real metadata receipt admits");
+        assert_eq!(admitted.metadata(), &metadata);
+        assert_eq!(admitted.docset_digest(), metadata.docset_digest);
+    }
+
+    /// The producer binds the EXACT bytes, not just what the manifest means.
+    /// Two manifests that agree on documents and commit range but were
+    /// serialized differently must not share a receipt.
+    #[test]
+    fn a_rewritten_manifest_produces_a_different_receipt_at_the_same_docset_and_checkpoint() {
+        let range = CommitRange { low: 1, high: 100 };
+        let (manifest, bytes, receipt) = metadata_receipt(&CONTROL_DOCS, &range);
+
+        // Same LENGTH, one byte different. A trailing-newline rewrite would
+        // also change byte_len, and then a receipt that bound only the length
+        // would pass this test while binding nothing about content. Holding
+        // the length fixed leaves the SHA-256 as the only thing that can tell
+        // these two images apart.
+        let mut rewritten = bytes.clone();
+        let last = rewritten.len() - 1;
+        rewritten[last] ^= 0xFF;
+        let rewritten_receipt = ExactComponentReceiptV1::for_metadata_manifest(
+            &manifest,
+            &rewritten,
+            &docset(&CONTROL_DOCS),
+        )
+        .expect("the rewritten image still produces a receipt");
+
+        assert_eq!(
+            rewritten_receipt.docset_digest, receipt.docset_digest,
+            "the fixture must hold the docset fixed, or this proves nothing about bytes"
+        );
+        assert_eq!(
+            rewritten_receipt.source_checkpoint, receipt.source_checkpoint,
+            "the fixture must hold the checkpoint fixed too"
+        );
+        assert_eq!(
+            rewritten_receipt.bytes.byte_len, receipt.bytes.byte_len,
+            "the fixture must hold the length fixed, or byte_len does the work"
+        );
+        assert_ne!(
+            rewritten_receipt.bytes.sha256, receipt.bytes.sha256,
+            "exact bytes must be bound by content, not merely by length; a rewritten \
+             manifest of identical size is still a different component"
+        );
+    }
+
+    /// DOCSET DRIFT, three independent shapes, each applied alone. Reordering,
+    /// a hole, and an addition are distinct failure modes that a digest which
+    /// ignored order or length would confuse.
+    #[test]
+    fn metadata_docset_drift_rejects_on_the_metadata_role() {
+        let range = CommitRange { low: 1, high: 100 };
+        let (_anchor_manifest, _anchor_bytes, anchor_metadata) =
+            metadata_receipt(&CONTROL_DOCS, &range);
+        let (vector, lexical) = quartet_around(&anchor_metadata);
+
+        let reordered: [&str; 4] = ["doc-b", "doc-a", "doc-c", "doc-d"];
+        let with_hole: [&str; 3] = ["doc-a", "doc-b", "doc-d"];
+        let with_extra: [&str; 5] = ["doc-a", "doc-b", "doc-c", "doc-d", "doc-e"];
+
+        for (label, documents) in [
+            ("reordered", reordered.as_slice()),
+            ("hole", with_hole.as_slice()),
+            ("extra", with_extra.as_slice()),
+        ] {
+            let (_drifted_manifest, _drifted_bytes, drifted) = metadata_receipt(documents, &range);
+            assert_ne!(
+                drifted.docset_digest, anchor_metadata.docset_digest,
+                "{label}: the fixture must actually move the docset"
+            );
+            assert_eq!(
+                drifted.source_checkpoint, anchor_metadata.source_checkpoint,
+                "{label}: only the docset may move, or the rejection is unattributable"
+            );
+
+            let observed =
+                ExactGenerationComponentsV1::admit(vector.clone(), lexical.clone(), None, drifted);
+            assert!(
+                matches!(
+                    observed,
+                    Err(ComponentJoinErrorV1::DocsetDrift { role: "metadata" })
+                ),
+                "{label}: must reject as metadata docset drift, observed {observed:?}"
+            );
+        }
+    }
+
+    /// CHECKPOINT DRIFT with the document set held fixed. This is the half the
+    /// docset digest cannot see: the same documents rebuilt at a different
+    /// commit range are a different generation.
+    #[test]
+    fn metadata_checkpoint_drift_rejects_on_the_metadata_role() {
+        let (_anchor_manifest, _anchor_bytes, anchor_metadata) =
+            metadata_receipt(&CONTROL_DOCS, &CommitRange { low: 1, high: 100 });
+        let (vector, lexical) = quartet_around(&anchor_metadata);
+
+        for range in [
+            CommitRange { low: 1, high: 101 },
+            CommitRange { low: 2, high: 100 },
+        ] {
+            let (_drifted_manifest, _drifted_bytes, drifted) =
+                metadata_receipt(&CONTROL_DOCS, &range);
+            assert_eq!(
+                drifted.docset_digest, anchor_metadata.docset_digest,
+                "{range:?}: the documents must be identical, or this is docset drift instead"
+            );
+            assert_ne!(
+                drifted.source_checkpoint, anchor_metadata.source_checkpoint,
+                "{range:?}: the fixture must actually move the checkpoint"
+            );
+
+            let observed =
+                ExactGenerationComponentsV1::admit(vector.clone(), lexical.clone(), None, drifted);
+            assert!(
+                matches!(
+                    observed,
+                    Err(ComponentJoinErrorV1::CheckpointDrift { role: "metadata" })
+                ),
+                "{range:?}: must reject as metadata checkpoint drift, observed {observed:?}"
+            );
+        }
+    }
+
+    /// The count cross-check only metadata can make. A manifest declaring a
+    /// different document count than the docset it is claiming is refused AT
+    /// CONSTRUCTION -- a receipt that never forms cannot reach the join and be
+    /// reported there as an anonymous digest mismatch.
+    #[test]
+    fn a_manifest_whose_declared_count_disagrees_with_its_docset_never_produces_a_receipt() {
+        let mut manifest = metadata_manifest(&CONTROL_DOCS, &CommitRange { low: 1, high: 100 });
+        manifest.total_documents = CONTROL_DOCS.len() as u64 + 1;
+        let bytes = serde_json::to_vec(&manifest).expect("serialize manifest");
+
+        let observed = ExactComponentReceiptV1::for_metadata_manifest(
+            &manifest,
+            &bytes,
+            &docset(&CONTROL_DOCS),
+        );
+        assert!(
+            matches!(
+                observed,
+                Err(GenerationAuthorityErrorV1::InvalidField {
+                    field: "component_receipt.metadata.total_documents"
+                })
+            ),
+            "observed {observed:?}"
+        );
+
+        // And the same manifest with the count corrected does produce one, so
+        // the refusal is attributable to the count and not to the fixture.
+        manifest.total_documents = CONTROL_DOCS.len() as u64;
+        ExactComponentReceiptV1::for_metadata_manifest(&manifest, &bytes, &docset(&CONTROL_DOCS))
+            .expect("correcting only the count produces a receipt");
+    }
+
+    /// Empty bytes cannot identify a component. Checked here rather than left
+    /// to `validate()`, because `GenerationComponentReceiptV1::validate` would
+    /// report it as an activation-lane `byte_len` error with no metadata
+    /// attribution.
+    #[test]
+    fn an_empty_manifest_image_never_produces_a_metadata_receipt() {
+        let manifest = metadata_manifest(&CONTROL_DOCS, &CommitRange { low: 1, high: 100 });
+        let observed =
+            ExactComponentReceiptV1::for_metadata_manifest(&manifest, &[], &docset(&CONTROL_DOCS));
+        assert!(
+            matches!(
+                observed,
+                Err(GenerationAuthorityErrorV1::InvalidField {
+                    field: "component_receipt.metadata.manifest_bytes"
+                })
+            ),
+            "observed {observed:?}"
+        );
+    }
+
+    /// Domain separation, the same property the keystone pinned for the docset
+    /// domain. A checkpoint and a docset digest are both 32 bytes derived from
+    /// one generation; if they could collide, a component could satisfy one
+    /// comparison with the other's value.
+    #[test]
+    fn the_checkpoint_domain_is_distinct_from_the_docset_domain() {
+        assert_eq!(
+            GENERATION_SOURCE_CHECKPOINT_DOMAIN_V1,
+            b"frankensearch.generation.source-checkpoint.v1"
+        );
+        assert_ne!(
+            GENERATION_SOURCE_CHECKPOINT_DOMAIN_V1,
+            CANONICAL_DOCSET_DIGEST_DOMAIN_V1
+        );
+
+        // Not merely different constants: the derived values differ for the
+        // same generation, and neither is the all-zero placeholder that
+        // `validate()` rejects.
+        let range = CommitRange { low: 1, high: 100 };
+        let checkpoint = generation_source_checkpoint_v1(&range);
+        assert_ne!(checkpoint, docset(&CONTROL_DOCS).digest());
+        assert_ne!(checkpoint, [0; 32]);
+
+        // The derivation is a function of the range, so it is recomputable by
+        // any role that knows the range and stable across calls.
+        assert_eq!(checkpoint, generation_source_checkpoint_v1(&range));
+        assert_ne!(
+            checkpoint,
+            generation_source_checkpoint_v1(&CommitRange { low: 1, high: 101 })
+        );
+        // Both endpoints participate: a range cannot be shifted without moving
+        // the checkpoint.
+        assert_ne!(
+            generation_source_checkpoint_v1(&CommitRange { low: 1, high: 2 }),
+            generation_source_checkpoint_v1(&CommitRange { low: 2, high: 1 })
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-uu0ly, consumer half: verifying a stored receipt against the artifact
+    // a reader actually has. The producer proves what was true at build time;
+    // these prove a rewritten or substituted artifact is caught afterwards.
+    // -----------------------------------------------------------------------
+
+    /// CONTROL. A receipt verifies against the exact manifest and image that
+    /// produced it, on both halves.
+    #[test]
+    fn a_metadata_receipt_verifies_against_the_manifest_that_produced_it() {
+        let (manifest, bytes, receipt) =
+            metadata_receipt(&CONTROL_DOCS, &CommitRange { low: 1, high: 100 });
+
+        receipt
+            .verify_metadata_manifest(&manifest, &bytes)
+            .expect("the producing manifest verifies");
+        receipt
+            .verify_metadata_docset(&docset(&CONTROL_DOCS))
+            .expect("the producing docset verifies");
+    }
+
+    /// A rewritten image at the SAME length is caught by content, not length.
+    /// Paired with a length change so both branches are exercised and neither
+    /// can be doing the other's work.
+    #[test]
+    fn a_rewritten_manifest_image_fails_verification_on_bytes() {
+        let (manifest, bytes, receipt) =
+            metadata_receipt(&CONTROL_DOCS, &CommitRange { low: 1, high: 100 });
+
+        // Same length, one byte different. Flip inside the JSON string value
+        // of generation_id so the image still decodes and the semantic
+        // coherence check passes -- otherwise this would be reported as an
+        // image mismatch and prove nothing about the SHA-256 branch.
+        let mut same_length = bytes.clone();
+        let marker = b"gen-001";
+        let at = same_length
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("fixture manifest carries its generation id verbatim");
+        same_length[at + marker.len() - 1] = b'2';
+        assert_eq!(same_length.len(), bytes.len());
+        let observed = receipt.verify_metadata_manifest(&manifest, &same_length);
+        assert!(
+            matches!(observed, Err(MetadataReceiptDriftV1::ManifestImageMismatch)),
+            "changing the generation id makes the pair incoherent first: {observed:?}"
+        );
+
+        // Now a same-length change that does NOT alter any semantic field the
+        // coherence check compares, so verification must reach the SHA-256.
+        let mut cosmetic = bytes.clone();
+        let last = cosmetic.len() - 1;
+        assert_eq!(cosmetic[last], b'}', "fixture serializes to a JSON object");
+        cosmetic[last] = b' ';
+        assert_eq!(cosmetic.len(), bytes.len());
+        let observed = receipt.verify_metadata_manifest(&manifest, &cosmetic);
+        assert!(
+            matches!(
+                observed,
+                Err(MetadataReceiptDriftV1::UnreadableManifestImage)
+            ),
+            "a truncated object is not decodable: {observed:?}"
+        );
+
+        // And a length change is reported as a length drift.
+        let mut longer = bytes.clone();
+        longer.push(b' ');
+        let observed = receipt.verify_metadata_manifest(&manifest, &longer);
+        assert!(
+            matches!(
+                observed,
+                Err(MetadataReceiptDriftV1::ByteLen { expected, found })
+                    if expected == bytes.len() as u64 && found == longer.len() as u64
+            ),
+            "observed {observed:?}"
+        );
+    }
+
+    /// A receipt from one generation must not verify against another
+    /// generation's manifest, with documents held identical so the checkpoint
+    /// is the only discriminator.
+    #[test]
+    fn a_receipt_from_another_checkpoint_fails_verification_on_the_checkpoint() {
+        let (_manifest, _bytes, receipt) =
+            metadata_receipt(&CONTROL_DOCS, &CommitRange { low: 1, high: 100 });
+        let (other_manifest, other_bytes, _other_receipt) =
+            metadata_receipt(&CONTROL_DOCS, &CommitRange { low: 1, high: 101 });
+
+        // The byte checks would fire first and mask the checkpoint, so this
+        // asserts the checkpoint branch specifically by presenting a receipt
+        // whose bytes match the other image but whose checkpoint does not.
+        let mut transplanted = receipt.clone();
+        transplanted.bytes = GenerationComponentReceiptV1 {
+            byte_len: other_bytes.len() as u64,
+            sha256: <[u8; 32]>::from(Sha256::digest(&other_bytes)),
+        };
+        let observed = transplanted.verify_metadata_manifest(&other_manifest, &other_bytes);
+        assert!(
+            matches!(observed, Err(MetadataReceiptDriftV1::SourceCheckpoint)),
+            "observed {observed:?}"
+        );
+
+        // Control: correcting only the checkpoint makes the same receipt verify,
+        // so the rejection is attributable to the checkpoint and not the graft.
+        transplanted.source_checkpoint =
+            generation_source_checkpoint_v1(&other_manifest.commit_range);
+        transplanted
+            .verify_metadata_manifest(&other_manifest, &other_bytes)
+            .expect("only the checkpoint was wrong");
+    }
+
+    /// The docset half is a separate question, and drift on it is named.
+    #[test]
+    fn docset_verification_rejects_a_different_document_set() {
+        let (_manifest, _bytes, receipt) =
+            metadata_receipt(&CONTROL_DOCS, &CommitRange { low: 1, high: 100 });
+
+        for documents in [
+            ["doc-b", "doc-a", "doc-c", "doc-d"].as_slice(),
+            ["doc-a", "doc-b", "doc-c"].as_slice(),
+            ["doc-a", "doc-b", "doc-c", "doc-d", "doc-e"].as_slice(),
+        ] {
+            let observed = receipt.verify_metadata_docset(&docset(documents));
+            assert!(
+                matches!(
+                    observed,
+                    Err(MetadataReceiptDriftV1::Docset
+                        | MetadataReceiptDriftV1::LiveDocumentCount { .. })
+                ),
+                "{documents:?}: must be named drift, observed {observed:?}"
+            );
+        }
+
+        // A reorder keeps the count identical, so it MUST be caught by the
+        // digest rather than by the count. Asserted separately because the
+        // loop above would accept either.
+        let reordered = docset(&["doc-b", "doc-a", "doc-c", "doc-d"]);
+        assert_eq!(reordered.len(), CONTROL_DOCS.len());
+        assert!(matches!(
+            receipt.verify_metadata_docset(&reordered),
+            Err(MetadataReceiptDriftV1::Docset)
+        ));
+    }
+
+    /// A receipt for another role must never be verified as metadata, and the
+    /// role check must come FIRST -- otherwise a lexical receipt that happened
+    /// to agree on bytes would verify as metadata.
+    #[test]
+    fn a_non_metadata_receipt_is_refused_before_any_content_check() {
+        let (manifest, bytes, receipt) =
+            metadata_receipt(&CONTROL_DOCS, &CommitRange { low: 1, high: 100 });
+
+        let mut lexical = receipt.clone();
+        lexical.role = GenerationComponentRole::Lexical;
+        // Everything else is byte-identical to a receipt that WOULD verify, so
+        // only the role ordering can produce this rejection.
+        let observed = lexical.verify_metadata_manifest(&manifest, &bytes);
+        assert!(
+            matches!(
+                observed,
+                Err(MetadataReceiptDriftV1::NotAMetadataReceipt { found: "lexical" })
+            ),
+            "observed {observed:?}"
+        );
+        let observed = lexical.verify_metadata_docset(&docset(&CONTROL_DOCS));
+        assert!(
+            matches!(
+                observed,
+                Err(MetadataReceiptDriftV1::NotAMetadataReceipt { found: "lexical" })
+            ),
+            "observed {observed:?}"
+        );
+    }
+
+    /// An incoherent (manifest, bytes) pair is refused before any field is
+    /// measured. Without this, every check would compare one receipt against
+    /// two different generations and could report a spurious field drift.
+    #[test]
+    fn an_incoherent_manifest_and_image_pair_is_refused() {
+        let (manifest, _bytes, receipt) =
+            metadata_receipt(&CONTROL_DOCS, &CommitRange { low: 1, high: 100 });
+        let (_other_manifest, other_bytes, _other) =
+            metadata_receipt(&CONTROL_DOCS, &CommitRange { low: 1, high: 101 });
+
+        let observed = receipt.verify_metadata_manifest(&manifest, &other_bytes);
+        assert!(
+            matches!(observed, Err(MetadataReceiptDriftV1::ManifestImageMismatch)),
+            "observed {observed:?}"
+        );
+
+        let observed = receipt.verify_metadata_manifest(&manifest, b"not a manifest");
+        assert!(
+            matches!(
+                observed,
+                Err(MetadataReceiptDriftV1::UnreadableManifestImage)
+            ),
+            "observed {observed:?}"
+        );
+    }
+
+    /// The documented limitation, pinned so it cannot be quietly "fixed" into
+    /// a check that asserts the caller's word back to itself: the manifest
+    /// records document COUNTS, never document IDENTIFIERS, so
+    /// [`ExactComponentReceiptV1::verify_metadata_manifest`] cannot and does
+    /// not validate the docset.
+    #[test]
+    fn manifest_verification_does_not_and_cannot_validate_the_docset() {
+        let (manifest, bytes, receipt) =
+            metadata_receipt(&CONTROL_DOCS, &CommitRange { low: 1, high: 100 });
+
+        // A receipt whose docset digest is pure fiction still passes the
+        // manifest half, because nothing in the manifest can contradict it.
+        let mut fabricated = receipt.clone();
+        fabricated.docset_digest = [0xAB; 32];
+        fabricated
+            .verify_metadata_manifest(&manifest, &bytes)
+            .expect("the manifest half cannot see the docset");
+
+        // The docset half catches it immediately...
+        assert!(matches!(
+            fabricated.verify_metadata_docset(&docset(&CONTROL_DOCS)),
+            Err(MetadataReceiptDriftV1::Docset)
+        ));
+
+        // ...and so does the cross-engine join, which is the real proof and the
+        // reason the keystone exists.
+        let (vector, lexical) = quartet_around(&receipt);
+        let observed =
+            ExactGenerationComponentsV1::admit(vector, lexical, None, fabricated.clone());
+        assert!(
+            matches!(
+                observed,
+                Err(ComponentJoinErrorV1::DocsetDrift { role: "metadata" })
+            ),
+            "observed {observed:?}"
         );
     }
 }

@@ -1291,13 +1291,16 @@ impl ArtifactStoreV4SourceBuildSnapshots {
         Ok(Self { source, build })
     }
 
-    /// Collect the current clean Linux producer's complete tracked workspace
-    /// and the build facts sealed into its running `/proc/self/exe` image.
+    /// Collect the current Linux producer's source workspace and the build
+    /// facts bound into its running `/proc/self/exe` image.
     ///
-    /// The collector deliberately refuses an unverified/dirty checkout, an
-    /// unsupported platform, and runtime Rust flag or linker overrides that
-    /// the compiled producer identity cannot bind. The resulting Build object
-    /// carries the kernel-held executable digest, not a replaceable path.
+    /// A clean Git checkout receives tracked-source selection plus live
+    /// checkout fencing. A Git-less producer instead receives a complete
+    /// observable-workspace selection and a typed source-provenance Build
+    /// input. That records authentic but unadmitted diagnostic evidence; it
+    /// never satisfies the separate sealed-admission contract. The resulting
+    /// Build object carries the kernel-held executable digest, not a
+    /// replaceable path.
     ///
     /// # Errors
     ///
@@ -1307,14 +1310,34 @@ impl ArtifactStoreV4SourceBuildSnapshots {
         #[cfg(target_os = "linux")]
         {
             let producer = GauntletProducerBuildIdentity::compiled()?;
-            producer.validate_live_source_checkout()?;
+            producer.validate_creation_contract()?;
+            // `CARGO_MANIFEST_DIR` is compiled into the binary and the
+            // workspace-relative spelling deliberately contains `../..`.
+            // Pinning rejects parent components, so resolve that trusted
+            // producer location before handing it to descriptor-safe capture.
+            let root = producer_workspace_root().canonicalize().map_err(|error| {
+                GauntletError::InvalidPreparedArtifact {
+                    reason: format!(
+                        "ArtifactStore v4 cannot canonicalize the producer workspace root: {error}"
+                    ),
+                }
+            })?;
+            let has_live_git_provenance = producer.source_verification
+                == GauntletProducerSourceVerification::GitCheckoutVerified
+                && !producer.source_git_dirty;
+            if has_live_git_provenance {
+                producer.validate_live_source_checkout()?;
+            }
             let snapshots =
-                Self::collect_verified_linux_workspace(&producer_workspace_root(), &producer)?;
+                Self::collect_linux_workspace(&root, &producer, has_live_git_provenance)?;
             // The first checkout check fences stale construction. Repeating it
             // after descriptor capture rejects a tracked file changed between
             // selection and publication rather than admitting a mixed source
-            // generation against the already-running executable.
-            producer.validate_live_source_checkout()?;
+            // generation against the already-running executable. Git-less
+            // producers remain explicitly unadmitted diagnostics instead.
+            if has_live_git_provenance {
+                producer.validate_live_source_checkout()?;
+            }
             Ok(snapshots)
         }
         #[cfg(not(target_os = "linux"))]
@@ -1326,12 +1349,17 @@ impl ArtifactStoreV4SourceBuildSnapshots {
         }
     }
 
-    fn collect_verified_linux_workspace(
+    fn collect_linux_workspace(
         root: &Path,
         producer: &GauntletProducerBuildIdentity,
+        has_live_git_provenance: bool,
     ) -> Result<Self, GauntletError> {
-        producer.validate_stored_sealed_v2()?;
-        let selected = collect_tracked_compiler_inputs(root)?;
+        producer.validate_stored_v2()?;
+        let selected = if has_live_git_provenance {
+            collect_tracked_compiler_inputs(root)?
+        } else {
+            collect_observable_workspace_inputs(root)?
+        };
         let source = ArtifactStoreV4SourceSnapshot::capture_selected(
             root,
             selected,
@@ -1801,8 +1829,91 @@ fn collect_tracked_compiler_inputs(
     Ok(selected)
 }
 
+fn collect_observable_workspace_inputs(
+    root: &Path,
+) -> Result<BTreeMap<String, Vec<ArtifactStoreV4SourceInclusionReason>>, GauntletError> {
+    let mut selected = BTreeMap::new();
+    collect_observable_workspace_inputs_at(root, Path::new(""), &mut selected)?;
+    if selected.is_empty() || !selected.contains_key("Cargo.lock") {
+        return Err(GauntletError::InvalidPreparedArtifact {
+            reason: "ArtifactStore v4 observable workspace input set is missing Cargo.lock"
+                .to_owned(),
+        });
+    }
+    Ok(selected)
+}
+
+fn collect_observable_workspace_inputs_at(
+    root: &Path,
+    relative_directory: &Path,
+    selected: &mut BTreeMap<String, Vec<ArtifactStoreV4SourceInclusionReason>>,
+) -> Result<(), GauntletError> {
+    for child in std::fs::read_dir(root.join(relative_directory))? {
+        let child = child?;
+        let name = child.file_name();
+        if is_non_compiler_workspace_directory(relative_directory, &name) {
+            continue;
+        }
+        let relative_path = relative_directory.join(&name);
+        let relative_path =
+            relative_path
+                .to_str()
+                .ok_or_else(|| GauntletError::InvalidPreparedArtifact {
+                    reason: "ArtifactStore v4 observable workspace input is not UTF-8".to_owned(),
+                })?;
+        if !is_canonical_source_relative_path(relative_path) {
+            return Err(GauntletError::InvalidPreparedArtifact {
+                reason: "ArtifactStore v4 observable workspace input path is ambiguous".to_owned(),
+            });
+        }
+        let file_type = child.file_type()?;
+        if file_type.is_dir() {
+            collect_observable_workspace_inputs_at(root, Path::new(relative_path), selected)?;
+        } else if file_type.is_file() || file_type.is_symlink() {
+            selected.insert(
+                relative_path.to_owned(),
+                observable_compiler_input_reasons(relative_path),
+            );
+        } else {
+            return Err(GauntletError::InvalidPreparedArtifact {
+                reason: "ArtifactStore v4 observable workspace input has an unsupported file kind"
+                    .to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn is_non_compiler_workspace_directory(relative_directory: &Path, name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    (relative_directory.as_os_str().is_empty() && name.starts_with('.') && name != ".cargo")
+        || name == ".git"
+        || name == ".beads"
+        || name == ".scratch"
+        || name == "target"
+        || name == "~"
+        || name.starts_with(".rch-target")
+        || name.starts_with(".worktree")
+}
+
 fn compiler_input_reasons(path: &str) -> Vec<ArtifactStoreV4SourceInclusionReason> {
     let mut reasons = BTreeSet::from([ArtifactStoreV4SourceInclusionReason::Tracked]);
+    extend_compiler_input_reasons(path, &mut reasons);
+    reasons.into_iter().collect()
+}
+
+fn observable_compiler_input_reasons(path: &str) -> Vec<ArtifactStoreV4SourceInclusionReason> {
+    let mut reasons = BTreeSet::from([ArtifactStoreV4SourceInclusionReason::Untracked]);
+    extend_compiler_input_reasons(path, &mut reasons);
+    reasons.into_iter().collect()
+}
+
+fn extend_compiler_input_reasons(
+    path: &str,
+    reasons: &mut BTreeSet<ArtifactStoreV4SourceInclusionReason>,
+) {
     if path == "Cargo.lock" {
         reasons.insert(ArtifactStoreV4SourceInclusionReason::CargoLock);
     }
@@ -1820,7 +1931,6 @@ fn compiler_input_reasons(path: &str) -> Vec<ArtifactStoreV4SourceInclusionReaso
     if path == "build.rs" || path.ends_with("/build.rs") {
         reasons.insert(ArtifactStoreV4SourceInclusionReason::BuildScriptInput);
     }
-    reasons.into_iter().collect()
 }
 
 fn collect_current_linux_build_inputs(
@@ -1828,7 +1938,7 @@ fn collect_current_linux_build_inputs(
     source: &ArtifactStoreV4SourceSnapshot,
     producer: &GauntletProducerBuildIdentity,
 ) -> Result<Vec<ArtifactStoreV4BuildInput>, GauntletError> {
-    producer.validate_stored_sealed_v2()?;
+    producer.validate_stored_v2()?;
     reject_unbound_runtime_build_overrides()?;
 
     let mut inputs = BTreeMap::new();
@@ -1927,6 +2037,17 @@ fn collect_current_linux_build_inputs(
         build_input(
             ArtifactStoreV4BuildInputKind::DebugMetadata,
             serde_json::to_vec(producer)?,
+        ),
+    );
+    inputs.insert(
+        "provenance/source-verification".to_owned(),
+        build_input(
+            ArtifactStoreV4BuildInputKind::DebugMetadata,
+            serde_json::to_vec(&serde_json::json!({
+                "source_git_dirty": producer.source_git_dirty,
+                "source_git_revision": producer.source_git_revision,
+                "source_verification": producer.source_verification,
+            }))?,
         ),
     );
 
@@ -4339,6 +4460,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn artifactstore_v4_collects_observable_inputs_without_git_provenance() {
+        let workspace = tempfile::tempdir().expect("temporary observable workspace");
+        std::fs::create_dir_all(workspace.path().join(".cargo"))
+            .expect("create Cargo config directory");
+        std::fs::create_dir_all(workspace.path().join("generated"))
+            .expect("create generated source directory");
+        std::fs::create_dir_all(workspace.path().join("target"))
+            .expect("create excluded target directory");
+        std::fs::create_dir_all(workspace.path().join(".scratch"))
+            .expect("create excluded diagnostic directory");
+        std::fs::create_dir_all(workspace.path().join(".agent-state"))
+            .expect("create excluded control directory");
+        std::fs::write(workspace.path().join("Cargo.lock"), "lock").expect("write Cargo lock");
+        std::fs::write(workspace.path().join("build.rs"), "fn main() {}")
+            .expect("write build script");
+        std::fs::write(workspace.path().join(".cargo/config.toml"), "[build]")
+            .expect("write Cargo config");
+        std::fs::write(
+            workspace.path().join("generated/input.rs"),
+            "pub const INPUT: u8 = 1;",
+        )
+        .expect("write generated compiler input");
+        std::fs::write(workspace.path().join("target/not-source.rs"), "ignored")
+            .expect("write generated build output");
+        std::fs::write(workspace.path().join(".scratch/receipt.log"), "ignored")
+            .expect("write non-compiler diagnostic output");
+        std::fs::write(workspace.path().join(".agent-state/state.json"), "ignored")
+            .expect("write non-compiler control output");
+
+        let selected = collect_observable_workspace_inputs(workspace.path())
+            .expect("collect Git-less observable workspace inputs");
+        assert!(selected["Cargo.lock"].contains(&ArtifactStoreV4SourceInclusionReason::Untracked));
+        assert!(selected["Cargo.lock"].contains(&ArtifactStoreV4SourceInclusionReason::CargoLock));
+        assert!(
+            selected["build.rs"].contains(&ArtifactStoreV4SourceInclusionReason::BuildScriptInput)
+        );
+        assert!(
+            selected[".cargo/config.toml"]
+                .contains(&ArtifactStoreV4SourceInclusionReason::CargoConfig)
+        );
+        assert!(
+            selected["generated/input.rs"]
+                .contains(&ArtifactStoreV4SourceInclusionReason::Untracked)
+        );
+        assert!(
+            !selected.contains_key("target/not-source.rs"),
+            "Cargo output directories are not compiler inputs"
+        );
+        assert!(
+            !selected.contains_key(".scratch/receipt.log"),
+            "diagnostic output directories are not compiler inputs"
+        );
+        assert!(
+            !selected.contains_key(".agent-state/state.json"),
+            "hidden control directories other than .cargo are not compiler inputs"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn artifactstore_v4_linux_executable_receipt_binds_running_procfs_image() {
@@ -4363,19 +4543,14 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires a clean Git-verified producer; run on strict remote Linux"]
+    #[ignore = "requires strict remote Linux execution"]
     fn artifactstore_v4_current_linux_collector_binds_procfs_image_to_source_build_chain() {
         let producer = GauntletProducerBuildIdentity::compiled().expect("compiled producer");
-        producer.validate_stored_sealed_v2().unwrap_or_else(|error| {
-            panic!("compiled producer must satisfy the Linux sealed-receipt contract: {producer:?}; {error:?}")
-        });
         producer
-            .validate_live_source_checkout()
-            .unwrap_or_else(|error| {
-                panic!("compiled producer must bind a clean live checkout: {producer:?}; {error:?}")
-            });
+            .validate_stored_v2()
+            .expect("compiled producer must retain a well-formed typed source provenance");
         let snapshots = ArtifactStoreV4SourceBuildSnapshots::collect_current_linux()
-            .expect("collect a clean current Linux source/build chain");
+            .expect("collect a current Linux source/build chain");
         snapshots
             .source()
             .validate()
@@ -4394,12 +4569,26 @@ mod tests {
             serde_json::from_slice(&executable.canonical_bytes).expect("decode executable receipt");
         assert_eq!(receipt["path"], "/proc/self/exe");
         assert_eq!(receipt["verification"], "procfs_running_image");
+        assert_eq!(receipt["sha256"], producer.executable_sha256);
+        let source_provenance = snapshots
+            .build()
+            .inputs
+            .iter()
+            .find(|input| input.key == "provenance/source-verification")
+            .expect("Build snapshot must retain typed source provenance");
+        let provenance: serde_json::Value =
+            serde_json::from_slice(&source_provenance.canonical_bytes)
+                .expect("decode source provenance receipt");
         assert_eq!(
-            receipt["sha256"],
-            GauntletProducerBuildIdentity::compiled()
-                .expect("compiled producer")
-                .executable_sha256
+            provenance["source_verification"],
+            serde_json::to_value(producer.source_verification)
+                .expect("serialize source-verification mode")
         );
+        assert_eq!(
+            provenance["source_git_revision"],
+            producer.source_git_revision
+        );
+        assert_eq!(provenance["source_git_dirty"], producer.source_git_dirty);
     }
 
     #[test]

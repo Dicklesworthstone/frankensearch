@@ -813,16 +813,33 @@ mod feature_matrix_smoke {
     #[test]
     fn lexical_lane_behavior() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = lexical::QuillIndex::in_memory(lexical::QuillConfig::default())
-                .expect("create lexical Quill index");
+            let dir = tempfile::tempdir().expect("lexical Quill feature tempdir");
+            let index = lexical::QuillIndex::create(
+                &cx,
+                dir.path(),
+                lexical::QuillConfig {
+                    bulk_load_mode: true,
+                    deterministic_ingest: true,
+                    max_ingest_shards: 1,
+                    ..lexical::QuillConfig::default()
+                },
+            )
+            .await
+            .expect("create lexical Quill index");
             index
-                .index_document(
+                .index_documents(
                     &cx,
-                    &IndexableDocument::new("doc-lexical", "lexical feature uses quill"),
+                    &[IndexableDocument::new(
+                        "doc-lexical",
+                        "lexical feature uses quill",
+                    )],
                 )
                 .await
                 .expect("index lexical Quill document");
-            index.commit(&cx).await.expect("commit lexical Quill index");
+            index
+                .finish_bulk_load(&cx)
+                .await
+                .expect("finalize lexical Quill index");
             let hits = index
                 .search_results(&cx, "lexical", 5)
                 .expect("search lexical Quill index");
@@ -909,6 +926,189 @@ mod feature_matrix_smoke {
             &serde_json::json!({
                 "documents": documents.len(),
                 "segments": index.segment_count(),
+            }),
+        );
+    }
+
+    // --- bd-8nqz.5: CASS lexical compatibility receipt for the Quill flip ---
+
+    /// The cass-compat lane must resolve Tantivy IN and Quill OUT.
+    ///
+    /// This is the negative half of the bead's acceptance and nothing asserted
+    /// it before: `cargo check --features cass-compat` proves the lane
+    /// COMPILES, never that Quill stayed out of the resolved graph. Because
+    /// the facade's `quill` feature is the only thing that pulls
+    /// `dep:frankensearch-quill`, its absence here is exactly "Quill is not in
+    /// this lane's dependency graph".
+    ///
+    /// Deliberately asserted on the LANE, not as a `compile_error!` on the
+    /// feature pair: the contract permits cass-compat together with Quill when
+    /// a consumer independently requests Quill, so forbidding the combination
+    /// outright would be stricter than the contract and would break that
+    /// consumer.
+    #[cfg(all(feature = "cass-compat", not(feature = "quill")))]
+    #[test]
+    fn cass_compat_lane_resolves_tantivy_and_excludes_quill() {
+        assert!(
+            cfg!(feature = "lexical-tantivy"),
+            "cass-compat must pull the Tantivy compatibility lane"
+        );
+        assert!(
+            !cfg!(feature = "quill"),
+            "cass-compat alone must not pull Quill into the resolved graph"
+        );
+        // The explicit namespace the contract requires CASS to import through
+        // must still resolve after the d117ce1f flip and the 327d264a trait split.
+        assert_eq!(
+            lexical_tantivy::CASS_SCHEMA_VERSION,
+            cass_compat::CASS_SCHEMA_VERSION,
+            "the lexical_tantivy namespace must expose the same schema-v8 identity as cass_compat"
+        );
+        emit_evidence(
+            "cass-compat",
+            "lane_excludes_quill",
+            &serde_json::json!({
+                "lexical_tantivy": cfg!(feature = "lexical-tantivy"),
+                "quill": cfg!(feature = "quill"),
+                "cass_schema_version": cass_compat::CASS_SCHEMA_VERSION,
+            }),
+        );
+    }
+
+    /// Full schema-v8 lifecycle on the REAL cass-compat surface.
+    ///
+    /// The pre-existing lane test covers create/ingest/commit only; the bead
+    /// requires create/ingest/commit/reopen/merge/query/restart. The two flip
+    /// commits touched these seams directly — d117ce1f repointed the `lexical`
+    /// feature at Quill and 327d264a removed the combined `LexicalSearch`
+    /// trait — so a lane that merely compiles proves nothing about whether a
+    /// foreign CASS index still round-trips.
+    ///
+    /// Every step drives `cass_compat::CassTantivyIndex` itself. No fixture
+    /// stand-in: the query goes through the real CASS boolean parser and
+    /// returns real ranked hits, and the restart arm reopens the same on-disk
+    /// path in a fresh index handle.
+    #[cfg(feature = "cass-compat")]
+    #[test]
+    fn cass_compat_schema_v8_survives_reopen_merge_query_and_restart() {
+        let dir = tempfile::tempdir().expect("CASS lifecycle tempdir");
+        let document = |source_id: &str, msg_idx: u64, content: &str| cass_compat::CassDocument {
+            agent: "TopazCat".to_owned(),
+            workspace: Some("frankensearch".to_owned()),
+            workspace_original: Some("/data/projects/frankensearch".to_owned()),
+            source_path: "fixtures/cass-lifecycle.jsonl".to_owned(),
+            msg_idx,
+            created_at: Some(1_753_307_200 + i64::try_from(msg_idx).expect("msg_idx fits i64")),
+            title: Some("CASS lifecycle".to_owned()),
+            content: content.to_owned(),
+            source_id: source_id.to_owned(),
+            origin_kind: "test".to_owned(),
+            origin_host: Some("ci".to_owned()),
+            conversation_id: Some(11),
+        };
+
+        // CREATE + INGEST + COMMIT.
+        let mut index =
+            cass_compat::CassTantivyIndex::open_or_create(dir.path()).expect("create CASS index");
+        index
+            .add_cass_documents(&[document(
+                "lifecycle-1",
+                1,
+                "quill flip compatibility receipt",
+            )])
+            .expect("ingest first CASS batch");
+        index.commit().expect("commit first CASS batch");
+        let segments_after_first = index.segment_count();
+        assert!(segments_after_first >= 1);
+
+        // REOPEN: drop the handle and open the same path again.
+        drop(index);
+        let mut reopened = cass_compat::CassTantivyIndex::open_or_create(dir.path())
+            .expect("reopen the committed CASS index");
+        assert!(
+            cass_compat::cass_schema_hash_matches(cass_compat::CASS_SCHEMA_HASH),
+            "reopened index must still match the schema-v8 hash"
+        );
+
+        // MERGE: a second committed batch, then a real force_merge. Asserting
+        // the segment count actually collapses is what proves the merge ran,
+        // rather than merely reading merge_status back.
+        reopened
+            .add_cass_documents(&[document("lifecycle-2", 2, "second batch tantivy interop")])
+            .expect("ingest second CASS batch");
+        reopened.commit().expect("commit second CASS batch");
+        let segments_before_merge = reopened.segment_count();
+        assert!(
+            segments_before_merge > segments_after_first,
+            "a second committed batch must add a segment, observed {segments_before_merge}"
+        );
+        reopened.force_merge().expect("force merge the CASS index");
+        let segments_after_merge = reopened.segment_count();
+        assert!(
+            segments_after_merge < segments_before_merge,
+            "force_merge must collapse segments: {segments_before_merge} -> {segments_after_merge}"
+        );
+        assert_eq!(
+            reopened.merge_status().segment_count,
+            segments_after_merge,
+            "merge status must report the post-merge segment count"
+        );
+
+        // QUERY through the real CASS reader and schema — the same
+        // cass_open_search_reader / cass_fields_from_schema surface a CASS
+        // consumer uses, not a facade convenience wrapper.
+        let index_dir = cass_compat::cass_index_dir(dir.path()).expect("resolve CASS index dir");
+        let search_one = |needle: &str| -> (usize, usize) {
+            let (reader, fields) =
+                cass_compat::cass_open_search_reader(&index_dir, tantivy::ReloadPolicy::Manual)
+                    .expect("open the CASS search reader");
+            let searcher = reader.searcher();
+            let live = searcher.num_docs();
+            let query = tantivy::query::TermQuery::new(
+                tantivy::Term::from_field_text(fields.content, needle),
+                tantivy::schema::IndexRecordOption::WithFreqs,
+            );
+            let hits = searcher
+                .search(&query, &tantivy::collector::Count)
+                .expect("run the CASS term query");
+            (hits, usize::try_from(live).expect("live docs fit usize"))
+        };
+
+        let (hits_before_restart, live_before_restart) = search_one("compatibility");
+        assert_eq!(
+            hits_before_restart, 1,
+            "the CASS query path must find exactly the matching document"
+        );
+        assert_eq!(
+            live_before_restart, 2,
+            "both committed documents must be live after the merge"
+        );
+
+        // RESTART: drop every handle, then reopen the same on-disk path.
+        drop(reopened);
+        let restarted = cass_compat::CassTantivyIndex::open_or_create(dir.path())
+            .expect("restart against the committed CASS index");
+        let (hits_after_restart, live_after_restart) = search_one("compatibility");
+        assert_eq!(
+            hits_after_restart, hits_before_restart,
+            "restart must preserve the CASS query result"
+        );
+        assert_eq!(
+            live_after_restart, live_before_restart,
+            "restart must preserve the live document count"
+        );
+
+        emit_evidence(
+            "cass-compat",
+            "schema_v8_lifecycle",
+            &serde_json::json!({
+                "segments_after_first": segments_after_first,
+                "segments_before_merge": segments_before_merge,
+                "segments_after_merge": segments_after_merge,
+                "segments_after_restart": restarted.segment_count(),
+                "query_hits": hits_after_restart,
+                "live_docs": live_after_restart,
+                "schema_version": cass_compat::CASS_SCHEMA_VERSION,
             }),
         );
     }

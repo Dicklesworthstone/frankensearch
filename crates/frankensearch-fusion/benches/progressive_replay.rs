@@ -22,8 +22,24 @@ use std::time::Instant;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use frankensearch_core::TwoTierConfig;
+use frankensearch_core::generation::EmbeddingIdentityBundleV1;
+use frankensearch_core::types::{BoundQueryEmbedding, TieredQueryEmbeddings};
 use frankensearch_fusion::SyncTwoTierSearcher;
 use frankensearch_index::{InMemoryTwoTierIndex, InMemoryVectorIndex};
+
+/// Bind a synthetic bench vector to an explicitly synthetic identity, for both
+/// tiers (this bench builds both from the same generated space).
+fn tiered_query(vector: &[f32]) -> TieredQueryEmbeddings {
+    let dimension = u32::try_from(vector.len()).expect("bench dimension fits u32");
+    let bind = || {
+        BoundQueryEmbedding::new(
+            vector.to_vec(),
+            EmbeddingIdentityBundleV1::explicit_test_model("bench-fixture", dimension),
+        )
+        .expect("bench query binds")
+    };
+    TieredQueryEmbeddings::progressive(bind(), bind())
+}
 
 const N: usize = 20_000;
 const DIM: usize = 384;
@@ -116,8 +132,16 @@ fn bench_progressive_replay(c: &mut Criterion) {
     let index = Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)));
     let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default());
 
-    let queries: Vec<Vec<f32>> = (0..QUERIES)
-        .map(|q| make_vector(&centroids, q % CLUSTERS, 0xdead_0000 + q as u64))
+    // Bound ONCE, outside every timed region: binding a query to its identity
+    // is setup, not part of the search being measured.
+    let queries: Vec<TieredQueryEmbeddings> = (0..QUERIES)
+        .map(|q| {
+            tiered_query(&make_vector(
+                &centroids,
+                q % CLUSTERS,
+                0xdead_0000 + q as u64,
+            ))
+        })
         .collect();
     let order = zipf_query_order(0xa11ce);
 

@@ -15,10 +15,31 @@
 use std::sync::Arc;
 
 use frankensearch_core::explanation::{ExplainedSource, HitExplanation};
+use frankensearch_core::generation::EmbeddingIdentityBundleV1;
 use frankensearch_core::traits::{LexicalRead, SearchFuture};
+use frankensearch_core::types::{BoundQueryEmbedding, TieredQueryEmbeddings};
 use frankensearch_core::{
     Cx, Embedder, ModelCategory, ScoredResult, SearchPhase, TwoTierConfig, TwoTierMetrics,
 };
+
+/// Bind a parity-suite query vector to an explicitly synthetic identity, for
+/// both tiers.
+///
+/// The parity corpora build fast and quality vectors in the same synthetic
+/// space, so one bundle describes both arms truthfully — which is also what
+/// keeps this suite comparing the two searchers rather than comparing one
+/// searcher against an identity refusal.
+fn tiered_query(query_vec: &[f32]) -> TieredQueryEmbeddings {
+    let dimension = u32::try_from(query_vec.len()).expect("parity dimension fits u32");
+    let bind = || {
+        BoundQueryEmbedding::new(
+            query_vec.to_vec(),
+            EmbeddingIdentityBundleV1::explicit_test_model("parity-fixture", dimension),
+        )
+        .expect("parity fixture query binds")
+    };
+    TieredQueryEmbeddings::progressive(bind(), bind())
+}
 use frankensearch_fusion::{SyncLexicalSearch, SyncTwoTierSearcher, TwoTierSearcher};
 use frankensearch_index::{InMemoryTwoTierIndex, InMemoryVectorIndex, TwoTierIndex};
 
@@ -268,7 +289,7 @@ fn run_sync_with_quality_index(
 ) -> (Vec<ScoredResult>, TwoTierMetrics) {
     let searcher = SyncTwoTierSearcher::new(sync_index(with_quality), config.clone());
     searcher
-        .search_collect(query_vec, k)
+        .search_collect(&tiered_query(query_vec), k)
         .expect("sync search_collect")
 }
 
@@ -322,7 +343,7 @@ fn seeded_sync_search(
         Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality))),
         config.clone(),
     )
-    .search_collect(query, k)
+    .search_collect(&tiered_query(query), k)
     .expect("seeded sync search_collect")
 }
 
@@ -426,7 +447,7 @@ fn run_sync_with_lexical(
         .with_lexical(Arc::new(StaticLexical {
             hits: lexical_hits(),
         }))
-        .search_collect(query_vec, k)
+        .search_collect(&tiered_query(query_vec), k)
         .expect("sync lexical search_collect")
 }
 
@@ -456,7 +477,7 @@ fn phase_snapshots(
     config: TwoTierConfig,
 ) -> ParitySnapshots {
     let sync = SyncTwoTierSearcher::new(sync_index(with_quality), config.clone())
-        .search_iter(query_vec, 4)
+        .search_iter(&tiered_query(query_vec), 4)
         .map(|phase| (phase_label(&phase), phase_results(&phase).to_vec()))
         .collect();
     let index = async_index("phase-snapshots", with_quality);
@@ -493,7 +514,7 @@ fn lexical_phase_snapshots(query_vec: &[f32], config: TwoTierConfig) -> ParitySn
         .with_lexical(Arc::new(StaticLexical {
             hits: lexical_hits(),
         }))
-        .search_iter(query_vec, 3)
+        .search_iter(&tiered_query(query_vec), 3)
         .map(|phase| (phase_label(&phase), phase_results(&phase).to_vec()))
         .collect();
     let index = async_index("lexical-phase-snapshots", true);
@@ -535,7 +556,7 @@ fn phase_labels(
     config: TwoTierConfig,
 ) -> (Vec<&'static str>, Vec<&'static str>) {
     let sync = SyncTwoTierSearcher::new(sync_index(with_quality), config.clone())
-        .search_iter(query_vec, 4)
+        .search_iter(&tiered_query(query_vec), 4)
         .map(|phase| phase_label(&phase))
         .collect();
     let index = async_index("quality-index-phase", with_quality);

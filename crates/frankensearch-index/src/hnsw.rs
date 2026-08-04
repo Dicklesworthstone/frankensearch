@@ -223,6 +223,12 @@ struct HnswGenerationReceipt {
     config: HnswConfig,
     graph: HnswSidecarDigest,
     data: HnswSidecarDigest,
+    /// Source FSVI generation identity this generation was dumped from
+    /// (`bd-21zyj`). Absent in receipts written before identity binding, and
+    /// absent for a legacy v1 source with no identity. Absence never matches
+    /// a bound graph: see [`HnswSourceIdentityV1::admits`].
+    #[serde(default)]
+    source_identity: Option<HnswSourceIdentityV1>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +243,8 @@ struct ValidatedHnswGeneration {
     generation: String,
     basename: String,
     graph: PathBuf,
+    /// Identity recorded in the generation's own receipt (`bd-21zyj`).
+    source_identity: Option<HnswSourceIdentityV1>,
 }
 
 /// How an HNSW load obtained its in-memory graph.
@@ -788,6 +796,7 @@ impl HnswIndex {
             vector_fingerprint: self.vector_fingerprint,
             dimension: self.dimension,
             config: self.config,
+            source_identity: self.source_identity.clone(),
             graph: fingerprint_hnsw_sidecar(&graph_path)?,
             data: fingerprint_hnsw_sidecar(&data_path)?,
         };
@@ -2155,6 +2164,31 @@ fn reusable_hnsw_generation(
         return Ok(None);
     };
 
+    // PUBLICATION-TIME IDENTITY RE-VALIDATION (bd-21zyj). Everything the
+    // receipt validator just checked is CONTENT — doc-id fingerprint, vector
+    // fingerprint, dimension, params. A READY generation left on disk by a
+    // DIFFERENT published FSVI generation can match every one of them, because
+    // two generations may hold byte-identical live vectors under identical doc
+    // ids (a re-publication carries a new nonce; a model revision bump moves
+    // the space fingerprint without moving a vector). Adopting it here would
+    // publish metadata that names THIS graph's identity while pointing at that
+    // other generation's directory — an identity claim the bytes do not
+    // support. Re-validate before reuse, failing closed in both directions
+    // exactly as the load path does.
+    if !HnswSourceIdentityV1::admits(
+        validated.source_identity.as_ref(),
+        index.source_identity.as_ref(),
+    ) {
+        tracing::debug!(
+            path = %metadata_path.display(),
+            generation = %generation_path.display(),
+            receipt_bound = validated.source_identity.is_some(),
+            graph_bound = index.source_identity.is_some(),
+            "ignoring HNSW READY generation dumped from a different source generation"
+        );
+        return Ok(None);
+    }
+
     // Byte identity alone is not enough: a complete pair can still be
     // semantically unreadable after a native-format change or a faulty dump.
     // Republishing such a receipt would make every fallback rebuild select the
@@ -2269,6 +2303,7 @@ fn validate_hnsw_generation_receipt(
     Ok(Some(ValidatedHnswGeneration {
         generation: generation_name,
         basename,
+        source_identity: receipt.source_identity.clone(),
         graph,
     }))
 }
@@ -6216,5 +6251,118 @@ mod tests {
         let (_, disposition) =
             HnswIndex::load_with_disposition(&metadata_path, &source).expect("load legacy sidecar");
         assert_eq!(disposition, HnswLoadDisposition::Native);
+    }
+
+    /// Publication-time identity re-validation (bd-21zyj).
+    ///
+    /// Planted negative: a READY generation left on disk by a DIFFERENT
+    /// published FSVI generation whose content is indistinguishable from this
+    /// graph's. The test asserts the receipt agrees on doc-id fingerprint,
+    /// vector fingerprint, dimension and params — every field the reuse
+    /// validator checks — so the content guard provably cannot separate them.
+    /// Only the source generation identity differs. Without the identity gate
+    /// `save()` adopts that directory and publishes metadata naming THIS
+    /// graph's identity while pointing at the other generation's bytes.
+    #[test]
+    fn save_refuses_to_reuse_a_ready_generation_from_another_source_generation() {
+        let (owner_a, owner_b) = identity_bound_pair();
+
+        // Generation B publishes first and is then abandoned mid-publication,
+        // leaving a durable READY generation on disk.
+        let metadata_path = temp_path("bd21zyj-sidecar", "hnsw");
+        let ann_b = HnswIndex::build_from_vector_index(&owner_b.index, HnswConfig::default())
+            .expect("build from generation b");
+        ann_b
+            .save_with_metadata_publisher(&metadata_path, reject_hnsw_metadata_publish)
+            .expect_err("retain an unpublished READY generation from generation b");
+        let leftover = ready_generation_paths(&metadata_path, ann_b.vector_fingerprint);
+        assert_eq!(
+            leftover.len(),
+            1,
+            "generation b must leave exactly one READY generation"
+        );
+        let leftover_name = leftover[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("leftover generation name")
+            .to_owned();
+
+        // Generation A's graph. Every CONTENT field the reuse validator checks
+        // is identical, which is what makes this a planted negative rather
+        // than an ordinary mismatch.
+        let ann_a = HnswIndex::build_from_vector_index(&owner_a.index, HnswConfig::default())
+            .expect("build from generation a");
+        assert_eq!(
+            ann_a.vector_fingerprint, ann_b.vector_fingerprint,
+            "the planted negative requires an identical vector fingerprint"
+        );
+        assert_eq!(
+            ann_a.doc_ids, ann_b.doc_ids,
+            "and an identical ordered doc set"
+        );
+        assert_eq!(ann_a.dimension, ann_b.dimension);
+        assert_eq!(ann_a.config, ann_b.config);
+        let receipt: HnswGenerationReceipt = serde_json::from_slice(
+            &std::fs::read(leftover[0].join(HNSW_GENERATION_RECEIPT_FILENAME))
+                .expect("read leftover receipt"),
+        )
+        .expect("parse leftover receipt");
+        assert_eq!(
+            receipt.doc_ids_fingerprint,
+            fingerprint_doc_ids(&ann_a.doc_ids)
+        );
+        assert_eq!(receipt.vector_fingerprint, ann_a.vector_fingerprint);
+        assert_eq!(receipt.dimension, ann_a.dimension);
+        assert_eq!(receipt.config, ann_a.config);
+        // ...and only the identity differs.
+        assert_ne!(receipt.source_identity, ann_a.source_identity);
+        assert!(receipt.source_identity.is_some() && ann_a.source_identity.is_some());
+
+        ann_a.save(&metadata_path).expect("publish generation a");
+        let published: HnswMeta = serde_json::from_slice(
+            &std::fs::read(&metadata_path).expect("read published metadata"),
+        )
+        .expect("parse published metadata");
+        assert_ne!(
+            published.sidecar_generation.as_deref(),
+            Some(leftover_name.as_str()),
+            "publication must not adopt a READY generation dumped from another source generation"
+        );
+        assert_eq!(
+            published.source_identity, ann_a.source_identity,
+            "the published metadata must name the identity its bytes actually came from"
+        );
+    }
+
+    /// Control: a leftover READY generation from the SAME source generation is
+    /// still reused, so the gate refuses foreign generations rather than
+    /// disabling reuse altogether.
+    #[test]
+    fn save_still_reuses_a_ready_generation_from_the_same_source_generation() {
+        let (owner_a, _) = identity_bound_pair();
+        let metadata_path = temp_path("bd21zyj-control", "hnsw");
+        let ann = HnswIndex::build_from_vector_index(&owner_a.index, HnswConfig::default())
+            .expect("build from generation a");
+        ann.save_with_metadata_publisher(&metadata_path, reject_hnsw_metadata_publish)
+            .expect_err("retain an unpublished READY generation");
+        let leftover = ready_generation_paths(&metadata_path, ann.vector_fingerprint);
+        assert_eq!(leftover.len(), 1);
+        let leftover_name = leftover[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("generation name")
+            .to_owned();
+
+        ann.save(&metadata_path)
+            .expect("publish reusing the retained generation");
+        let published: HnswMeta = serde_json::from_slice(
+            &std::fs::read(&metadata_path).expect("read published metadata"),
+        )
+        .expect("parse published metadata");
+        assert_eq!(
+            published.sidecar_generation.as_deref(),
+            Some(leftover_name.as_str()),
+            "a same-generation READY directory must still be reused"
+        );
     }
 }

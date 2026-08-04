@@ -31,14 +31,15 @@ use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::explanation::{
     ExplainedSource, ExplanationPhase, HitExplanation, RankMovement, ScoreComponent,
 };
+use frankensearch_core::generation::ProducerCompatibilityErrorV1;
 use frankensearch_core::host_adapter::{AdapterLifecycleEvent, HostAdapter};
 use frankensearch_core::query_class::QueryClass;
 use frankensearch_core::traits::{
     Embedder, LexicalHydrationContext, LexicalRead, ModelCategory, Reranker,
 };
 use frankensearch_core::types::{
-    EmbeddingMetrics, PhaseMetrics, ScoreSource, ScoredResult, SearchMetrics, SearchMode,
-    SearchPhase, VectorHit,
+    BoundQueryEmbedding, EmbeddingMetrics, PhaseMetrics, ScoreSource, ScoredResult, SearchMetrics,
+    SearchMode, SearchPhase, TieredQueryEmbeddings, VectorHit,
 };
 use frankensearch_core::{
     EmbedderTier, EmbeddingCollectorSample, EmbeddingStage, EmbeddingStatus, LifecycleSeverity,
@@ -47,12 +48,12 @@ use frankensearch_core::{
     TelemetryCorrelation, TelemetryEnvelope, TelemetryEvent, TelemetryInstance,
 };
 use frankensearch_embed::CachedEmbedder;
-use frankensearch_index::{SearchParams, TwoTierIndex};
+use frankensearch_index::{FsviV2IdentityBinding, SearchParams, TwoTierIndex};
 
 use crate::adaptive::{AdaptiveFusion, SignalSource};
 use crate::blend::{
-    blend_two_tier_aligned_vector_index, build_borrowed_rank_map, compute_rank_changes_with_maps,
-    kendall_tau_with_refined_rank,
+    blend_two_tier, blend_two_tier_aligned_vector_index, build_borrowed_rank_map,
+    compute_rank_changes_with_maps, kendall_tau_with_refined_rank,
 };
 use crate::calibration::CalibratorConfig;
 use crate::circuit_breaker::{CircuitBreaker, QualityOutcome};
@@ -74,6 +75,35 @@ struct NormalizedExclusions {
     phrases: Vec<String>,
 }
 
+/// Whether this searcher's vectors may be touched by this query at all
+/// (bd-core-vector-space-search-guard-ctzo C1).
+///
+/// Decided ONCE, before the query is embedded and therefore before any
+/// vector byte, ANN graph node, or embedding cache entry is read. That
+/// ordering is the point: the identity facts this decision needs — the
+/// embedder's own bundle and the binding each tier was admitted under — are
+/// both available with no inference work done, so a query in the wrong space
+/// costs one fingerprint comparison instead of an embed plus a full scan
+/// that returns confident nonsense.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticAdmission {
+    /// Every tier this query will consult is an admitted FSVI v2 owner whose
+    /// retained identity the configured embedder provably produces.
+    OwnerBacked {
+        /// The quality tier is also owner-backed and its embedder joins.
+        /// `false` when no quality tier is retained or no quality embedder is
+        /// configured — the query is then admitted for the fast tier alone.
+        quality: bool,
+    },
+    /// This index retains no admitted owner: a v1 or path-opened artifact,
+    /// which carries no space identity to join against. Typed and named
+    /// rather than silently treated as "compatible": every canonical
+    /// production index on disk today is still v1, so this is the ordinary
+    /// case and it must stay searchable, but a caller that thinks it is
+    /// running under identity enforcement is entitled to know it is not.
+    LegacyUnidentified,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CpuJiffiesSnapshot {
     process_jiffies: u64,
@@ -91,6 +121,63 @@ fn scaled_budget(base_candidates: usize, multiplier: f32) -> usize {
     }
     let scaled = (base_candidates as f32 * multiplier).ceil() as usize;
     scaled.max(1)
+}
+
+/// Join one configured embedder against the identity its tier was admitted
+/// under, with no vector in hand (bd-ctzo C1).
+///
+/// The refusal field names are deliberately the SAME ones
+/// [`TwoTierIndex::activate_owner_backed_search`] uses for the post-embed
+/// join, because they are the same two failures: the query's space is not the
+/// index's space, or its producer is not the index's producer. A caller that
+/// greps for `query_embedding.fast.space_identity` finds both.
+fn admit_tier_embedder(
+    embedder: &dyn Embedder,
+    binding: &FsviV2IdentityBinding,
+    tier: &str,
+) -> SearchResult<()> {
+    let query_identity = embedder
+        .identity()
+        .map_err(|error| SearchError::InvalidConfig {
+            field: format!("search_activation.{tier}.embedder_identity"),
+            value: embedder.id().to_owned(),
+            reason: format!(
+                "the {tier} tier is an admitted FSVI v2 artifact, so its vectors may only be \
+             searched by an embedder that declares a complete immutable identity; this one \
+             does not ({error})"
+            ),
+        })?;
+    match binding
+        .frozen_identity()
+        .identity
+        .verify_exact_producer_with(query_identity)
+    {
+        Ok(_) => Ok(()),
+        Err(ProducerCompatibilityErrorV1::SpaceMismatch) => Err(SearchError::InvalidConfig {
+            field: format!("query_embedding.{tier}.space_identity"),
+            value: query_identity.space.fingerprint(),
+            reason: format!(
+                "the configured {tier} embedder produces a different embedding space than the \
+                 {tier} index was written in; matching dimensions do not make two spaces \
+                 comparable, and this index must be reindexed with this embedder before it \
+                 can serve its queries"
+            ),
+        }),
+        // Every remaining variant is a refusal here, including
+        // `CertificateRequired` -- the certified-compatible pairing that
+        // `verify_producer_conformance` reports as comparison-grade telemetry
+        // and that activation likewise refuses. Listing them as one arm keeps
+        // a future variant refused by default instead of admitted by omission.
+        Err(error) => Err(SearchError::InvalidConfig {
+            field: format!("search_activation.{tier}.producer_conformance"),
+            value: query_identity.producer.fingerprint(),
+            reason: format!(
+                "the configured {tier} embedder is not the producer this index's vectors were \
+                 written by ({error}); a certified-compatible pairing is comparison-grade \
+                 telemetry and never an admission basis"
+            ),
+        }),
+    }
 }
 
 fn is_shipped_hash_embedder(embedder: &dyn Embedder) -> bool {
@@ -184,6 +271,22 @@ struct RefinementPools {
     /// Lexical pool after exclusion filtering. `None` when no lexical
     /// subsystem is configured; `Some` (possibly empty) when one answered.
     lexical: Option<Vec<ScoredResult>>,
+}
+
+/// What the quality tier contributed to a refinement (bd-ctzo C2).
+///
+/// The two variants are not two encodings of one thing — they answer
+/// different questions. `Retrieved` is the quality tier's OWN top-k, which can
+/// name documents the fast tier never selected. `RescoredFastPool` can only
+/// ever re-rank documents the fast tier already chose, so a relevant document
+/// outside the fast pool is invisible to it. The second remains the path for
+/// legacy artifacts, where there is no admitted quality owner to retrieve
+/// from.
+enum QualityPool {
+    /// The quality owner's own top-k for this query.
+    Retrieved(Vec<VectorHit>),
+    /// Quality scores aligned positionally to the fast pool.
+    RescoredFastPool(Vec<Option<f32>>),
 }
 
 /// Phase-1 fused results plus the refinement pools when refinement is
@@ -664,6 +767,61 @@ impl TwoTierSearcher {
         }
     }
 
+    /// Decide whether this query may touch this index's vectors, before it is
+    /// embedded (bd-ctzo C1).
+    ///
+    /// The join is between two things that exist before any inference runs:
+    /// the identity bundle the configured embedder declares, and the binding
+    /// each tier was ADMITTED under and now retains
+    /// ([`TwoTierIndex::fast_admitted_binding`]). It applies the same
+    /// bd-9xuj admission law
+    /// ([`EmbeddingIdentityBundleV1::verify_exact_producer_with`]) that
+    /// [`TwoTierIndex::activate_owner_backed_search`] applies to the bound
+    /// query afterwards, so a query this method admits cannot be refused
+    /// later for an identity reason, and one it refuses never reaches an
+    /// embedder at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] naming the tier and contract
+    /// field when a tier is owner-backed and its embedder is not identity-
+    /// aware, produces a different embedding space, or is a different
+    /// producer than the one that wrote the index — including the
+    /// certified-compatible case, which is comparison-grade telemetry and
+    /// never an admission basis.
+    fn admit_semantic_query(&self) -> SearchResult<SemanticAdmission> {
+        let Some(fast_binding) = self.index.fast_admitted_binding() else {
+            if self.index.quality_admitted_binding().is_some() {
+                return Err(SearchError::InvalidConfig {
+                    field: "search_activation.mixed_admission".to_owned(),
+                    value: "quality".to_owned(),
+                    reason: "this index retains an admitted quality owner but a legacy fast \
+                             tier; a half-attested pair has no coherent identity to search \
+                             under and requires a reindex"
+                        .to_owned(),
+                });
+            }
+            return Ok(SemanticAdmission::LegacyUnidentified);
+        };
+        admit_tier_embedder(self.fast_embedder.as_ref(), fast_binding, "fast")?;
+        // The quality tier is admitted only when BOTH halves are present. A
+        // configured quality embedder with no retained quality owner is not
+        // an error — `should_run_quality` already keeps such a search on the
+        // Initial phase — and a retained quality owner with no configured
+        // embedder is simply never consulted.
+        let quality = match (
+            self.quality_embedder.as_ref(),
+            self.index.quality_admitted_binding(),
+        ) {
+            (Some(embedder), Some(binding)) => {
+                admit_tier_embedder(embedder.as_ref(), binding, "quality")?;
+                true
+            }
+            _ => false,
+        };
+        Ok(SemanticAdmission::OwnerBacked { quality })
+    }
+
     /// Set the host adapter used to receive canonical telemetry envelopes.
     #[must_use]
     pub fn with_host_adapter(mut self, host_adapter: Arc<dyn HostAdapter>) -> Self {
@@ -805,6 +963,23 @@ impl TwoTierSearcher {
         let query_class = QueryClass::classify(semantic_query);
         metrics.query_class = Some(query_class);
         metrics.fast_embedder_id = Some(self.fast_embedder.id().to_owned());
+
+        // bd-ctzo C1: the identity join happens HERE -- before the fast
+        // embedder is invoked, before any embedding cache is consulted, and
+        // before a single vector or ANN node is read. A refusal therefore
+        // costs a fingerprint comparison, and the work it would have
+        // authorized never starts.
+        let admission = self.admit_semantic_query()?;
+        match admission {
+            SemanticAdmission::OwnerBacked { quality } => tracing::debug!(
+                quality_owner_backed = quality,
+                "query admitted against retained per-tier index identity"
+            ),
+            SemanticAdmission::LegacyUnidentified => tracing::debug!(
+                "index retains no admitted FSVI v2 owner; searching a legacy-unidentified \
+                 artifact with no space identity to join against"
+            ),
+        }
         let telemetry_root_request_id = self
             .host_adapter
             .as_ref()
@@ -934,6 +1109,7 @@ impl TwoTierSearcher {
                 &initial_hits,
                 refinement_pools.as_ref(),
                 &text_fn,
+                admission,
                 &mut metrics,
                 telemetry_root_request_id.as_deref(),
                 telemetry_initial_event_id.clone(),
@@ -1760,6 +1936,7 @@ impl TwoTierSearcher {
         initial_results: &[ScoredResult],
         pools: Option<&RefinementPools>,
         _text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+        admission: SemanticAdmission,
         metrics: &mut TwoTierMetrics,
         root_request_id: Option<&str>,
         parent_event_id: Option<String>,
@@ -1880,37 +2057,138 @@ impl TwoTierSearcher {
         // power for non-idempotent calibrators (TemperatureScaling, PlattScaling,
         // IsotonicRegression).
 
-        let mut quality_scores = self
-            .index
-            .quality_scores_for_hits(&quality_vec, &fast_hits)?;
+        // bd-ctzo C2: RETRIEVE from the quality tier, do not rescore the fast
+        // pool.
+        //
+        // `quality_scores_for_hits(&quality_vec, &fast_hits)` scores exactly
+        // the documents the FAST tier already selected. Its own comment above
+        // claims quality "can promote candidates that never reached the
+        // Initial top-k", and within the retained pool that is true — but a
+        // document the fast tier ranked below `k * candidate_multiplier`, or
+        // does not contain at all, is unreachable no matter what the quality
+        // tier thinks of it. That is the anti-pattern C2 forbids, and it was
+        // the production path.
+        //
+        // When the quality tier is an admitted owner, the query is instead
+        // embedded, bound, and used to search the quality owner directly; the
+        // two pools are then unioned by canonical doc_id in the blend. The
+        // fast pool is NOT re-retrieved through the activation: phase 1's pool
+        // already went through ANN candidate retrieval, score calibration,
+        // negation filtering and the dense-score corrections, and
+        // `ActivatedTierSearch::search_fast` reproduces none of that. Union
+        // here therefore means "phase 1's real fast pool ∪ the quality owner's
+        // own top-k", which is strictly more than either arm alone.
+        let quality_budget = fast_hits.len().max(k);
+        let quality_pool = match admission {
+            SemanticAdmission::OwnerBacked { quality: true } => {
+                // The PRF-expanded vector stays inside this space by
+                // construction: it is a convex mix of this query and vectors
+                // read out of this very index, so binding it to the quality
+                // embedder's identity states exactly what is true of it.
+                let bound = BoundQueryEmbedding::new(
+                    quality_vec.clone(),
+                    quality_embedder.identity()?.clone(),
+                )?;
+                let embeddings = TieredQueryEmbeddings::quality_only(bound);
+                let activated = self.index.activate_owner_backed_search(&embeddings)?;
+                QualityPool::Retrieved(activated.search_quality(quality_budget)?)
+            }
+            SemanticAdmission::OwnerBacked { quality: false }
+            | SemanticAdmission::LegacyUnidentified => QualityPool::RescoredFastPool(
+                self.index
+                    .quality_scores_for_hits(&quality_vec, &fast_hits)?,
+            ),
+        };
         metrics.quality_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
-        // Calibrate the quality scores in aligned form. The quality tier is a
-        // re-scored subset of `fast_hits` (same doc_ids/index) and calibration is
-        // a pure per-element score transform, so we calibrate the aligned
-        // `Vec<Option<f32>>` directly instead of materializing a `Vec<VectorHit>`
-        // that clones one `String` doc_id per quality hit — those doc_ids are only
-        // ever read as `&str` (by the blend and the `quality_scores_by_doc` map).
-        // Docs with `None` are left out so the blend uses their fast-only score
-        // without penalty. Reuse the owned aligned vector returned by the index:
-        // the previous collect allocated and copied every slot immediately after
-        // receiving ownership. The default no-calibrator path now skips the pass
-        // entirely; configured calibrators still visit each present score in the
-        // same order and apply the identical scalar transform.
+        // Calibration is a pure per-element score transform, so it is applied
+        // in whichever shape the pool arrived in — never by converting between
+        // them.
+        //
+        // On the rescored path that shape is the aligned `Vec<Option<f32>>`
+        // the index returned: the quality tier there IS a re-scored subset of
+        // `fast_hits` (same doc_ids, same indices), so materializing a
+        // `Vec<VectorHit>` would clone one `String` doc_id per hit for values
+        // that are only ever read as `&str`. Docs left `None` blend at their
+        // fast-only score without penalty.
+        //
+        // On the retrieved path the pool is the quality owner's own hits and
+        // carries doc_ids the fast pool may not have at all, so there is
+        // nothing to align to and each hit's score is transformed in place.
+        //
+        // The default no-calibrator path skips both entirely.
+        let mut quality_pool = quality_pool;
         if self.score_calibrator.is_some() {
-            for score in quality_scores.iter_mut().flatten() {
-                *score = self.calibrate_score(*score);
+            match &mut quality_pool {
+                QualityPool::RescoredFastPool(scores) => {
+                    for score in scores.iter_mut().flatten() {
+                        *score = self.calibrate_score(*score);
+                    }
+                }
+                QualityPool::Retrieved(hits) => {
+                    for hit in hits.iter_mut() {
+                        hit.score = self.calibrate_score(hit.score);
+                    }
+                }
             }
         }
-        let quality_count = quality_scores.iter().filter(|s| s.is_some()).count();
-        metrics.incomplete_embeddings = fast_hits.len() - quality_count;
-        metrics.phase2_vectors_searched = quality_count;
+        let quality_pool = quality_pool;
+
+        // Quality evidence, keyed by canonical document identity so the two
+        // pools can disagree about which documents exist at all.
+        let quality_scores_by_doc: AHashMap<&str, f32> = match &quality_pool {
+            QualityPool::RescoredFastPool(scores) => fast_hits
+                .iter()
+                .zip(scores.iter())
+                .filter_map(|(hit, score)| score.map(|s| (hit.doc_id.as_str(), s)))
+                .collect(),
+            QualityPool::Retrieved(hits) => hits
+                .iter()
+                .map(|hit| (hit.doc_id.as_str(), hit.score))
+                .collect(),
+        };
+        // "Incomplete" means a fast candidate the quality tier had nothing to
+        // say about — under retrieval that is a fast document the quality
+        // top-k did not reach, which is a real and different fact from "the
+        // quality tier has no vector for it".
+        metrics.incomplete_embeddings = fast_hits
+            .iter()
+            .filter(|hit| !quality_scores_by_doc.contains_key(hit.doc_id.as_str()))
+            .count();
+        metrics.phase2_vectors_searched = quality_scores_by_doc.len();
 
         // Blend fast + quality scores.
         let blend_start = Instant::now();
         let blend_factor = self.effective_blend_factor(query_class);
-        let blended =
-            blend_two_tier_aligned_vector_index(&fast_hits, &quality_scores, blend_factor);
+        let blended = match &quality_pool {
+            QualityPool::RescoredFastPool(scores) => {
+                blend_two_tier_aligned_vector_index(&fast_hits, scores, blend_factor)
+            }
+            // The union blend: a document in both tiers blends, a fast-only
+            // document keeps its fast score, and a QUALITY-ONLY document keeps
+            // its quality score instead of being dropped. That last case is
+            // the whole behaviour change — it is the document the rescoring
+            // path could never return.
+            QualityPool::Retrieved(hits) => {
+                let mut blended = blend_two_tier(&fast_hits, hits, blend_factor);
+                let fast_indices: AHashMap<&str, u32> = fast_hits
+                    .iter()
+                    .map(|hit| (hit.doc_id.as_str(), hit.index))
+                    .collect();
+                // `VectorHit::index` is a FAST-tier row ordinal everywhere
+                // downstream (the hubness table is indexed by it). A
+                // quality-only document has no fast row, so it carries the
+                // established "no index" sentinel rather than a quality row
+                // ordinal that would silently read as a fast one.
+                for hit in &mut blended {
+                    hit.index = fast_indices
+                        .get(hit.doc_id.as_str())
+                        .copied()
+                        .unwrap_or(u32::MAX);
+                }
+                blended
+            }
+        };
         metrics.blend_ms = blend_start.elapsed().as_secs_f64() * 1000.0;
 
         // Compute rank changes (initial vs refined).
@@ -1939,11 +2217,6 @@ impl TwoTierSearcher {
         let fast_scores_by_doc: AHashMap<&str, f32> = fast_hits
             .iter()
             .map(|hit| (hit.doc_id.as_str(), hit.score))
-            .collect();
-        let quality_scores_by_doc: AHashMap<&str, f32> = fast_hits
-            .iter()
-            .zip(quality_scores.iter())
-            .filter_map(|(hit, score)| score.map(|s| (hit.doc_id.as_str(), s)))
             .collect();
 
         // Convert blended to scored results.
@@ -3347,6 +3620,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
+    use frankensearch_core::generation::{
+        ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
+    };
     use frankensearch_core::traits::{MetricsExporter, ModelCategory, SearchFuture};
     use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, SearchMetrics};
     use frankensearch_core::{
@@ -4003,6 +4279,446 @@ mod tests {
                 .expect("add quality record");
         }
         Arc::new(builder.finish().expect("finish index"))
+    }
+
+    // ─── Owner-backed activation fixtures (bd-ctzo) ─────────────────────
+
+    /// An embedder that declares a complete immutable identity AND counts
+    /// every inference it is asked for.
+    ///
+    /// The count is the instrument: the whole claim of C1 is that a query in
+    /// the wrong space is refused BEFORE any work, and "before" is only
+    /// observable if the work is countable. A refusal that still embedded
+    /// would leave this at 1.
+    struct IdentityCountingEmbedder {
+        id: &'static str,
+        identity: EmbeddingIdentityBundleV1,
+        vector: Vec<f32>,
+        embeds: Arc<AtomicU64>,
+    }
+
+    impl IdentityCountingEmbedder {
+        fn new(id: &'static str, identity: EmbeddingIdentityBundleV1, vector: Vec<f32>) -> Self {
+            Self {
+                id,
+                identity,
+                vector,
+                embeds: Arc::new(AtomicU64::new(0)),
+            }
+        }
+
+        fn embed_count(&self) -> u64 {
+            self.embeds.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Embedder for IdentityCountingEmbedder {
+        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            self.embeds.fetch_add(1, Ordering::Relaxed);
+            let vector = self.vector.clone();
+            Box::pin(async move { Ok(vector) })
+        }
+
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            Ok(&self.identity)
+        }
+
+        fn dimension(&self) -> usize {
+            self.vector.len()
+        }
+
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn model_name(&self) -> &str {
+            self.id
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
+    /// The in-process f32 storage variant an embedder must declare.
+    fn in_memory_identity(model_id: &str, dimension: u32) -> EmbeddingIdentityBundleV1 {
+        let mut identity = EmbeddingIdentityBundleV1::explicit_test_model(model_id, dimension);
+        "in-memory-f32".clone_into(&mut identity.storage.format);
+        identity.storage.quantization = QuantizationFormat::F32;
+        "native-f32-values".clone_into(&mut identity.storage.endianness);
+        identity
+    }
+
+    /// The persisted fsvi-v2 variant of the SAME mathematical space. Query and
+    /// artifact bundles can never be byte-equal — one is in-process f32, the
+    /// other little-endian f16 on disk — which is exactly why the join is on
+    /// the space and the producer, not on the whole bundle.
+    fn artifact_binding(model_id: &str, dimension: u32, sequence: u64) -> FsviV2IdentityBinding {
+        let mut artifact = EmbeddingIdentityBundleV1::explicit_test_model(model_id, dimension);
+        "fsvi-v2".clone_into(&mut artifact.storage.format);
+        artifact.storage.quantization = QuantizationFormat::F16;
+        "little-endian".clone_into(&mut artifact.storage.endianness);
+        FsviV2IdentityBinding::new(
+            ArtifactGenerationIdentityV1::new(sequence, [0x5c; 16]).expect("test generation"),
+            artifact.freeze().expect("freeze artifact identity"),
+        )
+        .expect("valid FSVI v2 binding")
+    }
+
+    fn owner_backed_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "frankensearch-ctzo-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn write_v2_tier(
+        path: &std::path::Path,
+        binding: &FsviV2IdentityBinding,
+        rows: &[(&str, &[f32])],
+    ) {
+        let mut writer = frankensearch_index::VectorIndex::create_v2(path, binding.clone())
+            .expect("create_v2 fixture");
+        for (doc_id, vector) in rows {
+            writer.write_record(doc_id, vector).expect("write v2 row");
+        }
+        writer.finish().expect("finish v2 fixture");
+    }
+
+    /// A fast-only index opened through exact FSVI v2 admission, so it retains
+    /// both the sealed owner and the binding it was admitted under.
+    fn owner_backed_index(
+        dir: &std::path::Path,
+        binding: &FsviV2IdentityBinding,
+    ) -> Arc<TwoTierIndex> {
+        let fast_path = dir.join("vector.fast.idx");
+        write_v2_tier(
+            &fast_path,
+            binding,
+            &[
+                ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+                ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+            ],
+        );
+        Arc::new(
+            TwoTierIndex::open_admitted_v2_with_paths(
+                &frankensearch_index::TwoTierIndexPaths::new(&fast_path),
+                TwoTierConfig::default(),
+                binding,
+                None,
+            )
+            .expect("admit the fast tier"),
+        )
+    }
+
+    /// bd-ctzo C1: an owner-backed index refuses a query from a different
+    /// embedding space BEFORE the embedder runs, and admits and serves the
+    /// query from the space it was actually written in.
+    ///
+    /// The positive control and the refusal share one fixture and differ in
+    /// exactly one thing: which model produced the query embedder. Without
+    /// this guard the refused case is the dangerous one — same dimension, so
+    /// every vector API accepts it, and the search returns confident
+    /// nonsense.
+    #[test]
+    fn owner_backed_index_refuses_a_foreign_space_before_embedding() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = owner_backed_dir("foreign-space");
+            let binding = artifact_binding("ctzo-searcher-model", 4, 17);
+            let index = owner_backed_index(&dir, &binding);
+
+            // Positive control: the embedder that produced this index.
+            let matching = Arc::new(IdentityCountingEmbedder::new(
+                "matching",
+                in_memory_identity("ctzo-searcher-model", 4),
+                vec![1.0, 0.0, 0.0, 0.0],
+            ));
+            let searcher = TwoTierSearcher::new(
+                Arc::clone(&index),
+                Arc::clone(&matching) as Arc<dyn Embedder>,
+                TwoTierConfig::default(),
+            );
+            let mut results = Vec::new();
+            searcher
+                .search(
+                    &cx,
+                    "query",
+                    2,
+                    |_| None,
+                    |phase| {
+                        if let SearchPhase::Initial { results: hits, .. } = phase {
+                            results = hits;
+                        }
+                    },
+                )
+                .await
+                .expect("the producing embedder is admitted");
+            assert_eq!(results.first().map(|r| r.doc_id.as_str()), Some("doc-a"));
+            assert_eq!(
+                matching.embed_count(),
+                1,
+                "an admitted query must actually embed"
+            );
+
+            // Same dimension, different space: refused, and NOTHING ran.
+            let foreign = Arc::new(IdentityCountingEmbedder::new(
+                "foreign",
+                in_memory_identity("a-different-model", 4),
+                vec![1.0, 0.0, 0.0, 0.0],
+            ));
+            let searcher = TwoTierSearcher::new(
+                index,
+                Arc::clone(&foreign) as Arc<dyn Embedder>,
+                TwoTierConfig::default(),
+            );
+            let error = searcher
+                .search(&cx, "query", 2, |_| None, |_| {})
+                .await
+                .expect_err("a foreign embedding space must be refused");
+            assert!(
+                matches!(
+                    error,
+                    SearchError::InvalidConfig { ref field, .. }
+                        if field == "query_embedding.fast.space_identity"
+                ),
+                "got {error:?}"
+            );
+            assert_eq!(
+                foreign.embed_count(),
+                0,
+                "the refusal must precede the embedder, not follow it"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// bd-ctzo C1: a certified-compatible foreign producer is comparison-grade
+    /// telemetry and never an admission basis, so it is refused here too —
+    /// again before any inference.
+    #[test]
+    fn owner_backed_index_refuses_a_certified_compatible_producer_before_embedding() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = owner_backed_dir("compatible-producer");
+            let binding = artifact_binding("ctzo-producer-model", 4, 23);
+            let index = owner_backed_index(&dir, &binding);
+
+            let mut compatible = in_memory_identity("ctzo-producer-model", 4);
+            "a-different-implementation".clone_into(&mut compatible.producer.backend);
+            let reference = in_memory_identity("ctzo-producer-model", 4);
+            assert_eq!(
+                compatible.space.fingerprint(),
+                reference.space.fingerprint(),
+                "the fixture is only meaningful while the SPACE is unchanged"
+            );
+            assert_ne!(
+                compatible.producer.fingerprint(),
+                reference.producer.fingerprint(),
+                "the fixture is only meaningful while the PRODUCER differs"
+            );
+            assert_eq!(
+                compatible.producer.golden_vectors, reference.producer.golden_vectors,
+                "the fixture is only meaningful while both producers are certified compatible"
+            );
+
+            let embedder = Arc::new(IdentityCountingEmbedder::new(
+                "compatible",
+                compatible,
+                vec![1.0, 0.0, 0.0, 0.0],
+            ));
+            let searcher = TwoTierSearcher::new(
+                index,
+                Arc::clone(&embedder) as Arc<dyn Embedder>,
+                TwoTierConfig::default(),
+            );
+            let error = searcher
+                .search(&cx, "query", 2, |_| None, |_| {})
+                .await
+                .expect_err("a certified-compatible producer must be refused");
+            assert!(
+                matches!(
+                    error,
+                    SearchError::InvalidConfig { ref field, .. }
+                        if field == "search_activation.fast.producer_conformance"
+                ),
+                "got {error:?}"
+            );
+            assert_eq!(embedder.embed_count(), 0, "refused before any inference");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// bd-ctzo C1: the legacy path must survive. Every canonical production
+    /// index on disk today is a v1 artifact that retains no owner and carries
+    /// no space identity, and an embedder that declares no identity bundle is
+    /// still a legal `Embedder`. Neither may be turned into a refusal by this
+    /// guard — the guard binds only where there is an admitted identity to
+    /// bind to.
+    #[test]
+    fn legacy_unidentified_index_stays_searchable_without_any_identity() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            assert!(
+                index.fast_admitted_binding().is_none(),
+                "the fixture is only meaningful while the index is legacy-unidentified"
+            );
+            // StubEmbedder deliberately does not implement `identity()`.
+            let embedder = Arc::new(StubEmbedder::new("stub-fast", 4));
+            let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
+            let mut initial = Vec::new();
+            searcher
+                .search(
+                    &cx,
+                    "query",
+                    3,
+                    |_| None,
+                    |phase| {
+                        if let SearchPhase::Initial { results, .. } = phase {
+                            initial = results;
+                        }
+                    },
+                )
+                .await
+                .expect("a legacy index stays searchable");
+            assert!(
+                !initial.is_empty(),
+                "the legacy lane must still return results"
+            );
+        });
+    }
+
+    /// A two-tier index opened through exact FSVI v2 admission where the
+    /// QUALITY tier holds a document the FAST tier does not contain at all.
+    fn owner_backed_two_tier_index(
+        dir: &std::path::Path,
+        fast_binding: &FsviV2IdentityBinding,
+        quality_binding: &FsviV2IdentityBinding,
+    ) -> Arc<TwoTierIndex> {
+        let fast_path = dir.join("vector.fast.idx");
+        let quality_path = dir.join("vector.quality.idx");
+        write_v2_tier(
+            &fast_path,
+            fast_binding,
+            &[
+                ("doc-near", &[1.0, 0.0, 0.0, 0.0]),
+                ("doc-far", &[0.0, 0.0, 1.0, 0.0]),
+            ],
+        );
+        write_v2_tier(
+            &quality_path,
+            quality_binding,
+            &[
+                ("doc-near", &[0.0, 0.0, 1.0, 0.0]),
+                ("doc-far", &[0.0, 0.0, 0.5, 0.0]),
+                ("doc-quality-only", &[0.0, 1.0, 0.0, 0.0]),
+            ],
+        );
+        Arc::new(
+            TwoTierIndex::open_admitted_v2_with_paths(
+                &frankensearch_index::TwoTierIndexPaths::new(&fast_path)
+                    .with_quality_index(&quality_path),
+                TwoTierConfig::default(),
+                fast_binding,
+                Some(quality_binding),
+            )
+            .expect("admit both tiers"),
+        )
+    }
+
+    /// bd-ctzo C2, on the REAL async orchestration: the refined phase must
+    /// RETRIEVE from the quality tier, not rescore the fast pool.
+    ///
+    /// `doc-quality-only` exists in the quality tier and NOWHERE in the fast
+    /// tier, so no ranking, re-ranking, promotion or blend over a
+    /// fast-selected pool can ever produce it. Its presence in the refined
+    /// results is therefore a direct observation of independent retrieval, and
+    /// its absence is the exact failure mode
+    /// `quality_scores_for_hits(&quality_vec, &fast_hits)` had in production.
+    /// The fast-pool assertion below keeps the fixture honest: if a later
+    /// change put the document into the fast tier, this test would start
+    /// passing for the wrong reason, and that assertion fails first.
+    #[test]
+    fn refined_phase_retrieves_from_the_quality_tier_not_the_fast_pool() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = owner_backed_dir("quality-retrieval");
+            let fast_binding = artifact_binding("ctzo-refine-fast", 4, 31);
+            let quality_binding = artifact_binding("ctzo-refine-quality", 4, 31);
+            let index = owner_backed_two_tier_index(&dir, &fast_binding, &quality_binding);
+
+            let fast = Arc::new(IdentityCountingEmbedder::new(
+                "fast",
+                in_memory_identity("ctzo-refine-fast", 4),
+                vec![1.0, 0.0, 0.0, 0.0],
+            ));
+            let quality = Arc::new(IdentityCountingEmbedder::new(
+                "quality",
+                in_memory_identity("ctzo-refine-quality", 4),
+                vec![0.0, 1.0, 0.0, 0.0],
+            ));
+            let searcher =
+                TwoTierSearcher::new(index, fast as Arc<dyn Embedder>, TwoTierConfig::default())
+                    .with_quality_embedder(quality as Arc<dyn Embedder>);
+
+            let mut initial: Vec<String> = Vec::new();
+            let mut refined: Vec<String> = Vec::new();
+            let mut quality_only_index: Option<Option<u32>> = None;
+            searcher
+                .search(
+                    &cx,
+                    "query",
+                    3,
+                    |_| None,
+                    |phase| match phase {
+                        SearchPhase::Initial { results, .. } => {
+                            initial = results.iter().map(|r| r.doc_id.to_string()).collect();
+                        }
+                        SearchPhase::Refined { results, .. }
+                        | SearchPhase::Reranked { results, .. } => {
+                            refined = results.iter().map(|r| r.doc_id.to_string()).collect();
+                            quality_only_index = results
+                                .iter()
+                                .find(|r| r.doc_id == "doc-quality-only")
+                                .map(|r| r.index);
+                        }
+                        SearchPhase::RefinementFailed { error, .. } => {
+                            panic!("refinement must not fail: {error}")
+                        }
+                    },
+                )
+                .await
+                .expect("both tiers are admitted and their embedders join");
+
+            assert!(
+                !initial.contains(&"doc-quality-only".to_owned()),
+                "the fixture is only meaningful while the fast tier cannot reach \
+                 doc-quality-only, got {initial:?}"
+            );
+            assert!(
+                refined.contains(&"doc-quality-only".to_owned()),
+                "the refined phase must reach a document the fast tier does not contain; \
+                 got {refined:?}"
+            );
+            // A document with no fast row must not carry a QUALITY row ordinal
+            // in the field everything downstream reads as a fast-tier index.
+            assert_eq!(
+                quality_only_index,
+                Some(None),
+                "a quality-only document has no fast-tier row and must say so"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     // ─── Tests ──────────────────────────────────────────────────────────
