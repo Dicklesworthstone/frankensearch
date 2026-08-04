@@ -713,7 +713,7 @@ impl MetamorphicLawRegistry {
                     "e6.3-three-term-and-associativity-v1",
                     "three distinct unboosted positive scalar AND operands, regrouped only",
                     "total lexical observation",
-                    "rank exact or tie order only",
+                    "rank exact, tie order, or the reviewed two-ULP DIV-007 summation-association envelope",
                     "tie_order",
                     "e63-three-term-and-associativity-positive",
                     "e63-three-term-and-associativity-mixed-operator",
