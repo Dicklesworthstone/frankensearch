@@ -70,6 +70,7 @@ const INSIDE_TABLE_DETAIL: &str = "vectors_offset points inside the record table
 const TABLE_SIZE_OVERFLOW_DETAIL: &str = "record table size overflow";
 const TABLE_OFFSET_OVERFLOW_DETAIL: &str = "record table offset overflow";
 const SLAB_END_OVERFLOW_DETAIL: &str = "vector slab end overflow";
+const SLAB_SIZE_OVERFLOW_DETAIL: &str = "vector slab size overflow";
 const HASH_DETAIL: &str = "v2 document hash mismatch";
 const CONTIGUOUS_DETAIL: &str = "v2 document strings must be contiguous in record order";
 const EMPTY_ID_DETAIL: &str = "v2 document ids must not be empty";
@@ -84,6 +85,30 @@ fn temp_dir() -> PathBuf {
 
 fn temp_index_path(name: &str) -> PathBuf {
     temp_dir().join(format!("{name}-{}.fsvi", std::process::id()))
+}
+
+/// A wide-dimension fixture, needed to reach the slab-SIZE product overflow.
+fn wide_fixture(name: &str, dimension: usize) -> (FsviV2IdentityBinding, Vec<u8>) {
+    let path = temp_index_path(name);
+    let identity = binding(
+        "v2-corruption-matrix-wide",
+        u32::try_from(dimension).expect("dimension fits u32"),
+        22,
+        0xc2,
+    );
+    let mut writer =
+        VectorIndex::create_v2(&path, identity.clone()).expect("create wide v2 fixture writer");
+    for record in 0..2_usize {
+        let mut vector = vec![0.0_f32; dimension];
+        vector[record % dimension] = 1.0;
+        writer
+            .write_record(&format!("doc-{record:04}"), &vector)
+            .expect("write wide fixture record");
+    }
+    writer.finish().expect("finish wide v2 fixture");
+    let bytes = std::fs::read(&path).expect("read wide v2 fixture");
+    let _ = std::fs::remove_file(&path);
+    (identity, bytes)
 }
 
 fn binding(model_id: &str, dimension: u32, sequence: u64, nonce: u8) -> FsviV2IdentityBinding {
@@ -466,4 +491,56 @@ fn a_truncated_document_id_that_passes_every_structural_check_is_still_rejected(
     // Control: the same fixture without the forgery admits, so the rejection
     // above is the forgery and not the fixture.
     assert_admitted(source, &expected, "silent-forgery control");
+}
+
+/// The slab-SIZE product overflow — `record_count * dimension *
+/// bytes_per_element` — which the narrow fixture cannot reach.
+///
+/// With dimension 4 the slab product is `record_count * 8`, strictly smaller
+/// than the `record_count * 16` record-table product evaluated first, so any
+/// record count that overflows the slab overflows the table first and this
+/// branch is dead. A wide dimension inverts that ordering. I had reported this
+/// cell as needing an in-crate unit test against the private validator; it does
+/// not, and the residual is withdrawn rather than left standing.
+#[test]
+fn vector_slab_size_product_overflow_fails_closed() {
+    const DIMENSION: usize = 4096;
+    let (expected, source) = wide_fixture("layout-slab-size-overflow", DIMENSION);
+
+    // Chosen so the record table product and offset both stay in range while
+    // the slab product does not.
+    let record_count: u64 = 1 << 55;
+    let vectors_offset: u64 = 1 << 60;
+    assert!(
+        record_count
+            .checked_mul(RECORD_SIZE_BYTES as u64)
+            .is_some_and(|table| table.checked_add(header_size(&source) as u64).is_some()),
+        "the record table product and offset must stay in range"
+    );
+    assert_eq!(vectors_offset % VECTOR_ALIGN_BYTES, 0);
+    assert!(
+        vectors_offset > record_count * RECORD_SIZE_BYTES as u64,
+        "vectors_offset must sit above the record table or an earlier check fires"
+    );
+    assert!(
+        record_count
+            .checked_mul(DIMENSION as u64)
+            .and_then(|product| product.checked_mul(2))
+            .is_none(),
+        "the fixture must actually make the slab product overflow"
+    );
+
+    let mut mutated = source;
+    mutated[RECORD_COUNT_OFFSET..RECORD_COUNT_OFFSET + 8]
+        .copy_from_slice(&record_count.to_le_bytes());
+    mutated[VECTORS_OFFSET_OFFSET..VECTORS_OFFSET_OFFSET + 8]
+        .copy_from_slice(&vectors_offset.to_le_bytes());
+    refresh_header_crc(&mut mutated);
+    assert!(header_crc_is_valid(&mutated));
+    assert_rejected(
+        mutated,
+        &expected,
+        "vector slab size overflow",
+        SLAB_SIZE_OVERFLOW_DETAIL,
+    );
 }
