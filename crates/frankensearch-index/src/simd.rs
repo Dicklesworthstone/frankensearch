@@ -739,7 +739,7 @@ pub fn dot_product_f32_bytes_f32_generic(stored_bytes: &[u8], query: &[f32]) -> 
 ///
 /// This is the candidate **pass-1 kernel** for an int8 ADC two-pass scan (`bd-b5wl`):
 /// quantized vectors are 1 byte/elem (half the bandwidth of f16) and the multiply
-/// accumulates in integer lanes. `i16::mul_widen` keeps every product in full i32
+/// accumulates in integer lanes. `i16x8::widening_mul` keeps every product in full i32
 /// precision, so the only overflow bound is the i32 accumulator (a 512-dim dot of
 /// ±127 values peaks at ~8.3M, far below `i32::MAX`) — exact for any realistic dim.
 ///
