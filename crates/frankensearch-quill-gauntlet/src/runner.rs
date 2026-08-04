@@ -14834,6 +14834,98 @@ mod tests {
     }
 
     #[test]
+    fn runner_persists_v4_source_build_binding_before_campaign_reservation() {
+        let fixture = make_fixture();
+        let source = crate::artifact::ArtifactStoreV4SourceSnapshot::new(vec![
+            crate::artifact::ArtifactStoreV4SourceEntry {
+                relative_path: "Cargo.lock".to_owned(),
+                kind: crate::artifact::ArtifactStoreV4SourceEntryKind::File,
+                inclusion_reasons: vec![
+                    crate::artifact::ArtifactStoreV4SourceInclusionReason::CargoLock,
+                ],
+                mode: 0o100644,
+                byte_len: 5,
+                sha256: sha256_bytes(b"lock\n"),
+                symlink_target: None,
+                resolved_target_path: None,
+            },
+        ])
+        .expect("construct source snapshot");
+        let build = crate::artifact::ArtifactStoreV4BuildSnapshot::new(
+            source.identity_sha256.clone(),
+            vec![crate::artifact::ArtifactStoreV4BuildInput {
+                key: "Cargo.lock".to_owned(),
+                kind: crate::artifact::ArtifactStoreV4BuildInputKind::CargoLock,
+                canonical_bytes: b"lock\n".to_vec(),
+                sha256: sha256_bytes(b"lock\n"),
+            }],
+        )
+        .expect("construct Build snapshot");
+        let snapshots =
+            ArtifactStoreV4SourceBuildSnapshots::new(source, build).expect("bind Source to Build");
+        let expected_snapshots = snapshots.clone();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("gauntlet");
+        let mut subject = ScriptedEngine::new(subject_descriptor(), BTreeMap::new());
+        let mut oracle = ScriptedEngine::new(oracle_descriptor(), BTreeMap::new());
+        let campaign = runner(
+            &root,
+            CampaignSelection::CaseIds {
+                ids: vec!["term".to_owned()],
+            },
+            DivergenceRegistry::default(),
+        )
+        .with_v4_source_build_snapshots(snapshots)
+        .expect("attach v4 Source-to-Build chain");
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let _temp = temp;
+            let report = campaign
+                .run(
+                    &cx,
+                    "v4-source-build-binding",
+                    &mut subject,
+                    &mut oracle,
+                    &fixture.documents,
+                    &fixture.corpus_manifest,
+                    &fixture.query_suite,
+                )
+                .await
+                .expect("campaign report");
+            let binding = report
+                .v4_source_build_binding
+                .as_ref()
+                .expect("report must carry the persisted v4 binding");
+            assert_eq!(
+                ArtifactStore::new(&root)
+                    .load_v4_source_build_snapshots(binding)
+                    .expect("reload persisted Source-to-Build chain"),
+                expected_snapshots
+            );
+            let reservation_bytes =
+                std::fs::read(root.join("campaigns/v4-source-build-binding/reservation.json"))
+                    .expect("stored campaign reservation");
+            let reservation: serde_json::Value =
+                serde_json::from_slice(&reservation_bytes).expect("decode reservation");
+            assert_eq!(
+                reservation["v4_source_build_binding"]["source_identity_sha256"],
+                binding.source_identity_sha256
+            );
+            assert_eq!(
+                reservation["v4_source_build_binding"]["build_identity_sha256"],
+                binding.build_identity_sha256
+            );
+            assert_eq!(
+                ArtifactStore::new(&root)
+                    .load_integrity_checked_campaign("v4-source-build-binding")
+                    .expect("integrity replay with v4 binding")
+                    .report(),
+                &report
+            );
+        });
+    }
+
+    #[test]
     fn runner_preserves_rich_cases_and_persists_one_object_per_query() {
         let fixture = make_fixture();
         let corpus_hash = fixture.corpus_hash.clone();
