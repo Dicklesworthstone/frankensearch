@@ -267,6 +267,147 @@ fn the_typed_capability_refusal_and_its_positionful_control_hold_against_real_qu
     });
 }
 
+/// bd-8nqz.4.1 slice 8: assemble a receipt from a run that really drove BOTH
+/// engines, then verify it replays.
+///
+/// Every earlier live test adjudicates observations as they are produced. This
+/// one closes the loop: the observations become a receipt, the receipt is
+/// serialized, and the serialized bytes are loaded back through
+/// `load_canonical`, which re-derives the manifests, the engine identities, the
+/// producer identity and every verdict. A receipt that could not survive its
+/// own round trip would be a record of nothing.
+#[cfg(feature = "tantivy-oracle")]
+#[test]
+fn a_both_engines_receipt_assembles_and_replays_against_real_engines() {
+    use frankensearch_core::traits::LexicalWrite;
+    use frankensearch_lexical::TantivyIndex;
+    use frankensearch_quill_gauntlet::native_enriched_witness::{
+        CapabilitySchemaArmV1, NativeEngineV1, NativeEnrichedReceiptV1, NativeEnrichedRunV1,
+        observe_quill_capabilities, observe_quill_enrichments, observe_quill_pages,
+        observe_tantivy_enrichments, observe_tantivy_pages,
+    };
+
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let dir = tempfile::tempdir().expect("witness tempdir");
+        let quill = build_quill(&cx, dir.path()).await;
+
+        let tantivy_dir = tempfile::tempdir().expect("witness tempdir");
+        let tantivy =
+            TantivyIndex::create(tantivy_dir.path()).expect("create the witness Tantivy index");
+        for document in fixture_documents() {
+            tantivy
+                .index_document(&cx, &document)
+                .await
+                .expect("index a witness fixture document");
+        }
+        tantivy.commit(&cx).await.expect("commit the Tantivy index");
+
+        // The capability table spans two schema arms and is Quill-only.
+        let mut capability_arms = Vec::new();
+        for arm in [
+            CapabilitySchemaArmV1::Positionless,
+            CapabilitySchemaArmV1::Positioned,
+        ] {
+            let index = QuillIndex::in_memory_with_schema(
+                arm.schema(),
+                QuillConfig {
+                    deterministic_ingest: true,
+                    max_ingest_shards: 1,
+                    ..QuillConfig::default()
+                },
+            )
+            .expect("build the witness capability index for this schema arm");
+            index
+                .index_documents(&cx, &fixture_documents())
+                .await
+                .expect("index the witness corpus into this schema arm");
+            index
+                .commit(&cx)
+                .await
+                .expect("commit the witness corpus in this schema arm");
+            capability_arms.push(index);
+        }
+
+        let mut observations = observe_quill_pages(&cx, &quill).expect("Quill pages");
+        observations.extend(observe_tantivy_pages(&cx, &tantivy).expect("Tantivy pages"));
+        let mut enriched_observations =
+            observe_quill_enrichments(&cx, &quill).expect("Quill enrichments");
+        enriched_observations
+            .extend(observe_tantivy_enrichments(&cx, &tantivy).expect("Tantivy enrichments"));
+
+        let run = NativeEnrichedRunV1 {
+            observations,
+            enriched_observations,
+            capability_outcomes: observe_quill_capabilities(
+                &cx,
+                &capability_arms[0],
+                &capability_arms[1],
+            ),
+            both_engines_observed: true,
+        };
+        let receipt =
+            NativeEnrichedReceiptV1::assemble_for_this_build(&run).expect("assemble the receipt");
+
+        // The receipt records what BOTH shipping engines actually did, and
+        // every verdict was derived from the committed tables, not supplied.
+        assert!(receipt.both_engines_observed);
+        assert_eq!(receipt.engine_identities.len(), 2);
+        // THE GUARD THIS BEAD EXISTS FOR: `engine_identities.len() == 2` is
+        // derived from the FEATURE set, not from what was actually driven, and
+        // the row counts are satisfied by any two runs. Driving Quill twice —
+        // the failure mode the facade `lexical` alias makes easy since
+        // bd-8nqz.4.2 flipped it to Quill — would satisfy both and report
+        // itself as cross-engine coverage. Only these assertions see it.
+        for engine in [NativeEngineV1::Quill, NativeEngineV1::Tantivy] {
+            assert!(
+                receipt
+                    .observations
+                    .iter()
+                    .any(|observation| observation.engine == engine),
+                "the receipt claims both engines but carries no {engine:?} page observation"
+            );
+            assert!(
+                receipt
+                    .enriched_observations
+                    .iter()
+                    .any(|observation| observation.engine == engine),
+                "the receipt claims both engines but carries no {engine:?} enriched observation"
+            );
+        }
+        assert!(
+            receipt.all_verdicts_passed(),
+            "both shipping engines must satisfy every committed expectation: {:?}",
+            receipt
+                .verdicts
+                .iter()
+                .filter(|verdict| !verdict.passed())
+                .collect::<Vec<_>>()
+        );
+
+        // Round trip through the canonical loader.
+        let address = receipt.receipt_hash().expect("address");
+        let bytes = serde_json::to_vec(&receipt).expect("canonical body");
+        let verified = NativeEnrichedReceiptV1::load_canonical(&bytes, &address)
+            .expect("a receipt this build produced must replay in this build");
+        assert_eq!(verified.receipt(), &receipt);
+        assert!(!verified.authorizes_replacement());
+
+        // Admissibility is a SEPARATE question, and in a shared working tree
+        // the honest answer is no. Asserting the reason rather than the
+        // outcome keeps this from silently becoming a green "it passed".
+        match verified.require_release_admissible() {
+            Ok(()) => assert!(
+                !receipt.producer.source_git_dirty,
+                "a dirty producer must never be admissible"
+            ),
+            Err(error) => assert!(
+                error.to_string().contains("dirty"),
+                "the only expected inadmissibility here is a dirty tree, got {error}"
+            ),
+        }
+    });
+}
+
 /// The same committed expectations must hold against the REAL Tantivy
 /// incumbent. Running both arms against ONE independent oracle is what makes
 /// a common-mode defect visible: neither engine is the other's reference.

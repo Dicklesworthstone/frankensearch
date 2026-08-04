@@ -1782,6 +1782,96 @@ pub fn derive_engine_identities() -> Result<Vec<NativeEngineIdentityV1>, Gauntle
     Ok(identities)
 }
 
+/// Drive every committed paginated row through one real Quill index.
+///
+/// # Errors
+///
+/// Propagates typed Quill query failures.
+pub fn observe_quill_pages(
+    cx: &Cx,
+    index: &frankensearch_quill::QuillIndex,
+) -> Result<Vec<NativeObservationV1>, GauntletError> {
+    FIXTURE_EXPECTATIONS
+        .iter()
+        .map(|row| observe_quill(cx, index, row))
+        .collect()
+}
+
+/// Drive every committed enrichment row through one real Quill index.
+///
+/// # Errors
+///
+/// Propagates typed Quill snippet/query failures.
+pub fn observe_quill_enrichments(
+    cx: &Cx,
+    index: &frankensearch_quill::QuillIndex,
+) -> Result<Vec<NativeEnrichedObservationV1>, GauntletError> {
+    FIXTURE_ENRICHMENT_EXPECTATIONS
+        .iter()
+        .map(|row| observe_quill_enrichment(cx, index, row))
+        .collect()
+}
+
+/// Drive every committed capability row through the two schema arms.
+///
+/// Takes both indices because the table spans them: the refusal is only
+/// attributable if the same corpus is served by the positioned arm, so a
+/// single-index probe could not produce this table.
+#[must_use]
+pub fn observe_quill_capabilities(
+    cx: &Cx,
+    positionless: &frankensearch_quill::QuillIndex,
+    positioned: &frankensearch_quill::QuillIndex,
+) -> Vec<CapabilityProbeRecordV1> {
+    FIXTURE_CAPABILITY_EXPECTATIONS
+        .iter()
+        .map(|row| CapabilityProbeRecordV1 {
+            label: row.label.to_owned(),
+            outcome: probe_quill_capability(
+                cx,
+                match row.arm {
+                    CapabilitySchemaArmV1::Positionless => positionless,
+                    CapabilitySchemaArmV1::Positioned => positioned,
+                },
+                row.query,
+                10,
+            ),
+        })
+        .collect()
+}
+
+/// Drive every committed paginated row through one real Tantivy index.
+///
+/// # Errors
+///
+/// Propagates typed Tantivy query failures.
+#[cfg(feature = "tantivy-oracle")]
+pub fn observe_tantivy_pages(
+    cx: &Cx,
+    index: &frankensearch_lexical::TantivyIndex,
+) -> Result<Vec<NativeObservationV1>, GauntletError> {
+    FIXTURE_EXPECTATIONS
+        .iter()
+        .map(|row| observe_tantivy(cx, index, row))
+        .collect()
+}
+
+/// Drive every committed enrichment row through one real Tantivy index.
+///
+/// # Errors
+///
+/// Propagates typed Tantivy snippet/query failures.
+#[cfg(feature = "tantivy-oracle")]
+pub fn observe_tantivy_enrichments(
+    cx: &Cx,
+    index: &frankensearch_lexical::TantivyIndex,
+) -> Result<Vec<NativeEnrichedObservationV1>, GauntletError> {
+    FIXTURE_ENRICHMENT_EXPECTATIONS
+        .iter()
+        .map(|row| observe_tantivy_enrichment(cx, index, row))
+        .collect()
+}
+
 /// Recompute every verdict from the committed tables.
 ///
 /// This is the function that makes a stored verdict worthless as a claim: a
@@ -1917,6 +2007,32 @@ impl NativeEnrichedReceiptV1 {
         candidate: AcceptedCandidateBindingV1,
     ) -> Result<Self, GauntletError> {
         Self::assemble_with_producer(run, candidate, GauntletProducerBuildIdentity::compiled()?)
+    }
+
+    /// Assemble a receipt whose candidate binding is THIS build.
+    ///
+    /// Used when the witness runs on the candidate itself rather than
+    /// adjudicating a stored campaign report. The revision cannot be invented:
+    /// it is read from the same build-sealed identity that becomes the
+    /// receipt's producer, so the binding is a statement about the running
+    /// binary, not a claim about some other tree.
+    ///
+    /// This does NOT replace [`AcceptedCandidateBindingV1::from_campaign_report`].
+    /// Self-binding says "this binary produced this evidence"; only the
+    /// campaign-report path says "this candidate was ACCEPTED", and only a
+    /// clean producer clears
+    /// [`VerifiedNativeEnrichedReceiptV1::require_release_admissible`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates producer-identity, coverage and adjudication failures.
+    pub fn assemble_for_this_build(run: &NativeEnrichedRunV1) -> Result<Self, GauntletError> {
+        let producer = GauntletProducerBuildIdentity::compiled()?;
+        let candidate = AcceptedCandidateBindingV1 {
+            candidate_source_revision: producer.source_git_revision.clone(),
+            contract_mode: crate::campaign_contract::CampaignContractModeV1::CoreLexicalV3,
+        };
+        Self::assemble_with_producer(run, candidate, producer)
     }
 
     /// Assemble against an explicitly supplied producer identity.
@@ -3694,10 +3810,9 @@ mod tests {
         let original = one_bit.observations[0].page_score_bits[0];
         one_bit.observations[0].page_score_bits[0] = original ^ 1;
         assert_eq!(
-            one_bit.observations[0].page_score_bits[0].count_ones() as i32
-                - original.count_ones() as i32,
+            (one_bit.observations[0].page_score_bits[0] ^ original).count_ones(),
             1,
-            "the mutation must really be a single bit"
+            "the mutation must really differ in exactly one bit"
         );
         // The independent oracle cannot see it — proving the address is what
         // does the work here, not a recomputation.
