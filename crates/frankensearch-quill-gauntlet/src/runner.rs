@@ -12534,6 +12534,8 @@ mod tests {
         cx: &Cx,
         fixture: &Fixture,
     ) -> (crate::engine::QuillSubject, crate::engine::TantivyOracle) {
+        use frankensearch_core::LexicalWrite;
+
         let mut subject = crate::engine::QuillSubject::in_memory(union_horizon_quill_config())
             .expect("fresh tombstoned UNION_HORIZON Quill subject");
         let mut oracle = crate::engine::TantivyOracle::in_memory_scalar_g1a()
@@ -13448,6 +13450,8 @@ mod tests {
         layout: UnionHorizonSegmentLayout,
         proof_kind: UnionHorizonProofKind,
     ) -> UnionHorizonProof {
+        use frankensearch_core::LexicalWrite;
+
         let build_identity = union_horizon_validated_build_identity();
         let oracle_dependency = union_horizon_oracle_dependency_identity();
         let config = union_horizon_quill_config();

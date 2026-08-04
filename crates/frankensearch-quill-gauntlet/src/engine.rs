@@ -2324,7 +2324,10 @@ pub async fn scalar_g1a_fuzz_pair(
     cx: &Cx,
     documents: &[frankensearch_core::IndexableDocument],
 ) -> Result<(QuillSubject, TantivyOracle), GauntletError> {
-    use frankensearch_core::LexicalRead;
+    // The write-side trait, not `LexicalRead`: this constructor only indexes
+    // and commits. The original import named the read trait, which is why this
+    // `fuzz-harness`-gated function had never compiled (bd-jt7b2).
+    use frankensearch_core::LexicalWrite;
 
     let config = QuillConfig {
         deterministic_ingest: true,

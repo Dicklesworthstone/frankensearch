@@ -216,30 +216,44 @@ fn record_cold_cache_eviction(
     eviction: Result<usize, String>,
 ) {
     let cell_id = format!("{}/{}/{}", spec.gate, spec.fixture, spec.metric);
-    let mut observations = COLD_CACHE_OBSERVATIONS
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        .expect("lock cold-cache observations");
-    let entry = observations.entry(cell_id).or_default();
-    let (successes, failures) = match arm {
-        EngineArm::Quill => (&mut entry.quill_successes, &mut entry.quill_failures),
-        EngineArm::Tantivy => (&mut entry.tantivy_successes, &mut entry.tantivy_failures),
-    };
-    match eviction {
+    // Classify (and report) BEFORE taking the lock: the assertion and the
+    // stderr write do not need the mutex, and holding it across them is the
+    // contention clippy::significant_drop_tightening is pointing at.
+    let succeeded = match eviction {
         Ok(file_count) => {
             assert!(
                 file_count > 0,
                 "QG-9 cache eviction accepted an empty index"
             );
-            *successes = successes.saturating_add(1);
+            true
         }
         Err(error) => {
             eprintln!(
                 "[quill-qg9-cold-cache] arm={} eviction_unverified={error}",
                 arm.label()
             );
-            *failures = failures.saturating_add(1);
+            false
         }
+    };
+    let mut observations = COLD_CACHE_OBSERVATIONS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("lock cold-cache observations");
+    record_cold_cache_outcome(observations.entry(cell_id).or_default(), arm, succeeded);
+}
+
+/// Apply one classified eviction witness to its per-cell accumulator.
+///
+/// Split out so the mutex guard above spans exactly one statement.
+fn record_cold_cache_outcome(entry: &mut ColdCacheAccumulator, arm: EngineArm, succeeded: bool) {
+    let (successes, failures) = match arm {
+        EngineArm::Quill => (&mut entry.quill_successes, &mut entry.quill_failures),
+        EngineArm::Tantivy => (&mut entry.tantivy_successes, &mut entry.tantivy_failures),
+    };
+    if succeeded {
+        *successes = successes.saturating_add(1);
+    } else {
+        *failures = failures.saturating_add(1);
     }
 }
 
@@ -5188,7 +5202,7 @@ fn run_open_child() {
                     .expect("fresh-process QG-9 pinned Tantivy open"),
             );
         }
-    };
+    }
     println!("quill-perf-child\t{}", timer.elapsed().as_nanos());
 }
 
