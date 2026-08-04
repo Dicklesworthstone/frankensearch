@@ -432,6 +432,59 @@ pub fn evaluate_perf_ratchet(request: PerfRatchetRequest<'_>) -> PerfRatchetEval
     evaluate_perf_ratchet_inner(request, state, require_current_evidence)
 }
 
+/// The append-only quarantine register, embedded at build time.
+///
+/// bd-h4sqj: embedding rather than reading a path is deliberate. The register
+/// travels with the binary, so a structurally invalid sweep cannot be admitted
+/// by pointing the tool at some other `.bench-history` directory — a refusal
+/// that can be sidestepped by changing the working directory is not a refusal.
+/// The cost is that appending a record needs a rebuild to take effect, which for
+/// an append-only, git-versioned evidence register is the correct propagation
+/// path anyway. This mirrors how the QG sentinels are already embedded here.
+const EMBEDDED_QUARANTINE_REGISTER: &str = include_str!("../../../.bench-history/QUARANTINE.jsonl");
+
+/// Refuse promotion of evidence measured at a structurally invalid revision.
+///
+/// INTEGRITY IS NOT ADMISSIBILITY. An artifact from a quarantined sweep passes
+/// every check above this one: its bytes verify, its seal matches, and its
+/// summaries recompute from their own raw samples. That is precisely why the
+/// quarantine has to be a separate screen — nothing else in this function can
+/// see the defect, because the defect is in how the numbers were produced, not
+/// in the artifact that records them.
+///
+/// The refusal is `fatal` rather than `quarantine` on purpose.
+/// [`PerfGateDecision::Quarantine`] means evidence is "noisy, incomplete,
+/// incompatible, or still provisional" — a state a rerun can leave. A
+/// structurally invalid sweep never leaves it: re-measuring reproduces the same
+/// invalid shape, so inviting a retry would be misleading. `fatal` yields
+/// [`PerfGateDecision::Block`], and matches this file's convention that `fatal`
+/// carries contract violations while `block` carries measurement outcomes.
+fn reject_quarantined_revision(
+    role: &str,
+    evidence: &PerfEvidenceArtifact,
+    state: &mut DecisionState,
+) {
+    match crate::perf_evidence::PerfQuarantineRegister::from_jsonl(EMBEDDED_QUARANTINE_REGISTER) {
+        Ok(register) => {
+            if let Err(error) = register.screen(evidence) {
+                state.fatal(
+                    "perf.ratchet.quarantined_revision",
+                    format!("{role} {error}"),
+                );
+            }
+        }
+        Err(error) => {
+            // A register that will not parse must never read as "nothing is
+            // quarantined". Failing closed here means a malformed register
+            // blocks promotion instead of silently disarming the screen.
+            state.fatal(
+                "perf.ratchet.quarantine_register_unusable",
+                format!("embedded quarantine register cannot be read: {error}"),
+            );
+        }
+    }
+}
+
 fn validate_machine_profile_promotion(
     request: &PerfRatchetRequest<'_>,
     plan: &PerfApplicabilityPlan,
@@ -586,6 +639,9 @@ fn validate_machine_profile_promotion(
             );
             continue;
         }
+        // Screened immediately after integrity, because a quarantined artifact
+        // passes that check: it is intact evidence of an invalid measurement.
+        reject_quarantined_revision(role, evidence, state);
         let Some(bound_identity) = evidence.machine_class.identity() else {
             state.quarantine(
                 "perf.ratchet.machine_identity_unverified",
@@ -4097,6 +4153,75 @@ mod tests {
             ["qg6.tail_protocol_not_implemented"],
             "strict-tail QG-6 evidence reached another adjudication path: {result:#?}"
         );
+    }
+
+    /// bd-h4sqj: the whole point of the quarantine. This artifact is INTACT —
+    /// it was assembled and bound by the same helper every other promotion test
+    /// uses, so it verifies, seals, and recomputes. Only its measured revision
+    /// belongs to the structurally invalid 193d2e3f sweep, and that alone must
+    /// block promotion.
+    #[test]
+    fn evidence_measured_at_a_quarantined_revision_blocks_promotion() {
+        let (_artifact, mut evidence) = qg6_complete_pair("baseline", [[1.0; 3]; 4]);
+        evidence.provenance.build.git_revision =
+            "193d2e3fa1b2c3d4e5f60718293a4b5c6d7e8f90".to_owned();
+
+        let mut state = DecisionState::default();
+        reject_quarantined_revision("baseline", &evidence, &mut state);
+
+        assert_eq!(
+            state.decision(),
+            PerfGateDecision::Block,
+            "a quarantined revision must BLOCK, not merely quarantine: Quarantine means \
+             'rerun may help', and re-measuring a structurally invalid sweep reproduces the \
+             same invalid shape"
+        );
+        assert!(
+            state.reasons.iter().any(|reason| {
+                reason.code == "perf.ratchet.quarantined_revision"
+                    && reason.message.contains("baseline")
+            }),
+            "the refusal must name its role and reason: {:#?}",
+            state.reasons
+        );
+    }
+
+    /// The screen must DISCRIMINATE. Asserting only the refusal above would
+    /// still pass if the quarantine degenerated into blocking every artifact,
+    /// which would take the whole ratchet offline while looking like coverage.
+    #[test]
+    fn evidence_from_an_unquarantined_revision_is_not_blocked_by_the_quarantine_screen() {
+        let (_artifact, evidence) = qg6_complete_pair("baseline", [[1.0; 3]; 4]);
+        let mut state = DecisionState::default();
+        reject_quarantined_revision("baseline", &evidence, &mut state);
+
+        assert_eq!(
+            state.decision(),
+            PerfGateDecision::Allow,
+            "an unquarantined revision must pass the quarantine screen untouched: {:#?}",
+            state.reasons
+        );
+    }
+
+    /// Guards the `include_str!` wiring itself. If the register path breaks, the
+    /// file is emptied, or a record is dropped, the screen would silently admit
+    /// the sweep it exists to refuse — so the embedded bytes are asserted to
+    /// still cover every named revision.
+    #[test]
+    fn the_embedded_quarantine_register_covers_every_named_sweep_revision() {
+        let register =
+            crate::perf_evidence::PerfQuarantineRegister::from_jsonl(EMBEDDED_QUARANTINE_REGISTER)
+                .expect("the embedded quarantine register must parse");
+        for revision in [
+            "193d2e3fa1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "544ffeb0112233445566778899aabbccddeeff00",
+            "e0dc6ba3ffeeddccbbaa99887766554433221100",
+        ] {
+            assert!(
+                register.quarantine_of(revision).is_some(),
+                "{revision} must remain quarantined by the embedded register"
+            );
+        }
     }
 
     #[test]
