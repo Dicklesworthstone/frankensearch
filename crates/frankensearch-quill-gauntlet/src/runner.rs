@@ -9952,6 +9952,79 @@ mod tests {
         ledger.validate().expect("the ledger is structurally valid");
     }
 
+    /// An auto-class observation can never claim its own artifact witness.
+    ///
+    /// `TieOrder` and `ScoreEpsilon` are bounded accept-by-class policies
+    /// (`is_auto_class`), and every join filters them out: the per-fixture
+    /// registry refuses them, `classify_case` never marks them register
+    /// divergences, and `validate_against_artifact_binding` requires at least
+    /// one artifact signature of the observation's OWN class before it will
+    /// admit the join. An auto-class observation therefore has nothing to
+    /// match, no matter what evidence its artifact carries.
+    ///
+    /// This is why DIV-007 cannot be ingested even from a clean checkout with a
+    /// genuinely minted artifact: the constraint is the class, not the
+    /// evidence, and no amount of campaign work changes it. Recorded as an
+    /// executable fact so the next owner does not rediscover it by building the
+    /// campaign lane first — or, worse, at the flip gate.
+    ///
+    /// The control moves ONLY the class, so the rejection is attributable to
+    /// the auto-class rule rather than to the binding, the fixture, or the
+    /// signature.
+    #[test]
+    fn an_auto_class_observation_can_never_claim_its_artifact_witness() {
+        let mut binding = ingestion_binding();
+        binding.divergences = vec![
+            Divergence {
+                class: DivergenceClass::OversizedQueryToken,
+                pointer: "/comparison/subject/ast_differences/0".to_owned(),
+                oracle: "admitted the oversized token".to_owned(),
+                subject: "lowered the oversized token to MatchNone".to_owned(),
+            },
+            Divergence {
+                class: DivergenceClass::ScoreEpsilon,
+                pointer: "/comparison/subject/hits/0".to_owned(),
+                oracle: "0x415583bd".to_owned(),
+                subject: "0x415583bc".to_owned(),
+            },
+        ];
+
+        let mint = |class, divergence: &Divergence| {
+            DivergenceRegisterLedger::observation_from_binding(
+                &binding,
+                ingestion_header(),
+                "DIV-008",
+                class,
+                ingestion_fixture(),
+                vec![mismatch_signature(binding.rank_class, divergence)],
+                ingestion_narrative(),
+                ingestion_diagnostic(),
+            )
+            .expect("a well-formed binding mints an observation")
+        };
+
+        // Control: a registrable class claims its own artifact mismatch and
+        // joins, so the binding and signature are known-good.
+        mint(
+            DivergenceClass::OversizedQueryToken,
+            &binding.divergences[0],
+        )
+        .validate_against_artifact_binding(&binding)
+        .expect("a registrable class joins the artifact that witnessed it");
+
+        // Planted negative: same binding, same shape, only the class moved to
+        // the auto class the artifact also genuinely carries.
+        let error = mint(DivergenceClass::ScoreEpsilon, &binding.divergences[1])
+            .validate_against_artifact_binding(&binding)
+            .expect_err("an auto-class observation must not join an artifact witness");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its integrity-checked ArtifactObject evidence"),
+            "the refusal must name the artifact-evidence join, not some earlier check: {error}"
+        );
+    }
+
     /// The review workflow has teeth against a REAL minted entry, not only the
     /// synthetic contract fixture. Three independent rejections, each with the
     /// mutation applied alone.
