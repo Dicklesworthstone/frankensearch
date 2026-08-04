@@ -31,6 +31,7 @@ use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::explanation::{
     ExplainedSource, ExplanationPhase, HitExplanation, RankMovement, ScoreComponent,
 };
+use frankensearch_core::generation::ProducerCompatibilityErrorV1;
 use frankensearch_core::host_adapter::{AdapterLifecycleEvent, HostAdapter};
 use frankensearch_core::query_class::QueryClass;
 use frankensearch_core::traits::{
@@ -46,7 +47,6 @@ use frankensearch_core::{
     RuntimeMetricsCollector, SearchCollectorSample, SearchEventPhase, SearchStreamHealth,
     TelemetryCorrelation, TelemetryEnvelope, TelemetryEvent, TelemetryInstance,
 };
-use frankensearch_core::generation::ProducerCompatibilityErrorV1;
 use frankensearch_embed::CachedEmbedder;
 use frankensearch_index::{FsviV2IdentityBinding, SearchParams, TwoTierIndex};
 
@@ -136,15 +136,17 @@ fn admit_tier_embedder(
     binding: &FsviV2IdentityBinding,
     tier: &str,
 ) -> SearchResult<()> {
-    let query_identity = embedder.identity().map_err(|error| SearchError::InvalidConfig {
-        field: format!("search_activation.{tier}.embedder_identity"),
-        value: embedder.id().to_owned(),
-        reason: format!(
-            "the {tier} tier is an admitted FSVI v2 artifact, so its vectors may only be \
+    let query_identity = embedder
+        .identity()
+        .map_err(|error| SearchError::InvalidConfig {
+            field: format!("search_activation.{tier}.embedder_identity"),
+            value: embedder.id().to_owned(),
+            reason: format!(
+                "the {tier} tier is an admitted FSVI v2 artifact, so its vectors may only be \
              searched by an embedder that declares a complete immutable identity; this one \
              does not ({error})"
-        ),
-    })?;
+            ),
+        })?;
     match binding
         .frozen_identity()
         .identity
@@ -4266,7 +4268,11 @@ mod tests {
         dir
     }
 
-    fn write_v2_tier(path: &std::path::Path, binding: &FsviV2IdentityBinding, rows: &[(&str, &[f32])]) {
+    fn write_v2_tier(
+        path: &std::path::Path,
+        binding: &FsviV2IdentityBinding,
+        rows: &[(&str, &[f32])],
+    ) {
         let mut writer = frankensearch_index::VectorIndex::create_v2(path, binding.clone())
             .expect("create_v2 fixture");
         for (doc_id, vector) in rows {
@@ -4277,7 +4283,10 @@ mod tests {
 
     /// A fast-only index opened through exact FSVI v2 admission, so it retains
     /// both the sealed owner and the binding it was admitted under.
-    fn owner_backed_index(dir: &std::path::Path, binding: &FsviV2IdentityBinding) -> Arc<TwoTierIndex> {
+    fn owner_backed_index(
+        dir: &std::path::Path,
+        binding: &FsviV2IdentityBinding,
+    ) -> Arc<TwoTierIndex> {
         let fast_path = dir.join("vector.fast.idx");
         write_v2_tier(
             &fast_path,
@@ -4327,11 +4336,17 @@ mod tests {
             );
             let mut results = Vec::new();
             searcher
-                .search(&cx, "query", 2, |_| None, |phase| {
-                    if let SearchPhase::Initial { results: hits, .. } = phase {
-                        results = hits;
-                    }
-                })
+                .search(
+                    &cx,
+                    "query",
+                    2,
+                    |_| None,
+                    |phase| {
+                        if let SearchPhase::Initial { results: hits, .. } = phase {
+                            results = hits;
+                        }
+                    },
+                )
                 .await
                 .expect("the producing embedder is admitted");
             assert_eq!(results.first().map(|r| r.doc_id.as_str()), Some("doc-a"));
@@ -4446,15 +4461,20 @@ mod tests {
             );
             // StubEmbedder deliberately does not implement `identity()`.
             let embedder = Arc::new(StubEmbedder::new("stub-fast", 4));
-            let searcher =
-                TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
+            let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
             let mut initial = Vec::new();
             searcher
-                .search(&cx, "query", 3, |_| None, |phase| {
-                    if let SearchPhase::Initial { results, .. } = phase {
-                        initial = results;
-                    }
-                })
+                .search(
+                    &cx,
+                    "query",
+                    3,
+                    |_| None,
+                    |phase| {
+                        if let SearchPhase::Initial { results, .. } = phase {
+                            initial = results;
+                        }
+                    },
+                )
                 .await
                 .expect("a legacy index stays searchable");
             assert!(
