@@ -425,6 +425,18 @@ jobs:
         timeout-minutes: 10
         run: cargo test -p frankensearch-quill-gauntlet --features perf-harness e63_ -- --test-threads=4
 
+      # The three index-maintenance families do not match the `e63_` filter --
+      # they live in `metamorphic_maintenance_laws::` and are named after the
+      # law, not the prefix. Their registry descriptors declare `Applies`, so
+      # they must actually execute in CI; without this step the lane above
+      # would report a green E6.3 campaign while merge, reopen/recovery, and
+      # tombstone/compaction never ran. Separate step because cargo takes ONE
+      # positional filter.
+      - name: Quill E6.3 index-maintenance families (bd-quill-e6.3)
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 15
+        run: "cargo test -p frankensearch-quill-gauntlet --features perf-harness metamorphic_maintenance_laws:: -- --test-threads=4"
+
       - name: Bind job-scoped Salej artifact lane
         id: salej_lane
         if: always() && matrix.os == 'ubuntu-latest'
