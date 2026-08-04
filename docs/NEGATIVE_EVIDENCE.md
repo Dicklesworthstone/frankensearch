@@ -11116,6 +11116,8 @@ variance collapses and a real ~1.09× median can clear the floor repeatably. Sel
 replaces the 44.54%-self-time `dot_i8_i8_avx2` frame (cod's `perf`), so the Amdahl ceiling is fixed and
 real; only the measurement is blocked. No production behaviour changed; all builds/benches remote.
 
+Verdict: REJECT — classification only (bd-g2pxg, for the bd-z4lqq fail-closed verdict rule); nothing above is altered. This row already states its own verdict in prose — "a REJECT of the scan-level speedup claim on this substrate, not of the kernel" — but on a line the gate does not read as a decision line. Evidence for the REJECT contract: run 2's same-invocation tight alternating-round A/A null 0.9972 [0.9651, 1.0706] contains that run's A/B median 0.9821 [0.9544, 1.0211]. Resurrection class VALID-AB (a recorded A/A null with the effect inside it), so the refusal to ship stands and the row is not VOID; the retry predicate above remains the way to reopen it.
+
 ### 2026-07-10 — cc_fse — REJECTED: FMA in the f16 flat-scan dot buys nothing — the kernel is `cvtph2ps`-DECODE-bound, not FP-port-bound (fma/ORIG median 1.0351, inside the null floor)
 
 **Profile-first was blocked**, so this is measure-the-lever with a strong prior. The f16 flat scan
@@ -13077,6 +13079,8 @@ A/B). **CONCLUSION: the autonomously-completable work on this feature is DONE** 
 `NqcDenseWeight`, no-kernel-change mechanism, latency-neutrality, end-to-end composition test — all landed/tested/
 proven). The one remaining step is a product-gated integration (sample source + opt-in wiring + A/B), precisely
 scoped here. Handing off — further autonomous increments on this feature would be premature hot-path churn.
+
+Verdict: ROUTE-NEXT — classification only (bd-g2pxg, for the bd-z4lqq fail-closed verdict rule); nothing above is altered. This row ran no A/B and proposed nothing for the default path: it establishes where the injection attaches, states that the substantive remainder is the cv-sample source, and hands off. It is a scoping/route-next row, not a verdict on a lever, so no null control or comparison class applies to it.
 
 ### 2026-07-12 — Codex — FINAL HOLD: FSFS one-lookup hybrid merge remains inside the higher-inner remote null floor
 
@@ -16554,6 +16558,8 @@ decisive cells so compile + measurement fit inside the 1800s window, capture
 `activated = true`. Do not raise the global `build_timeout_sec`; that file is
 shared by 11 repos and lengthening leases starves the Lane M measurement window.
 
+Verdict: REJECT — classification only (bd-g2pxg, for the bd-z4lqq fail-closed verdict rule); nothing above is altered. The candidate misses this gate's own >=3.0x target by roughly an order of magnitude: incumbent ratio 0.1297 at bulk/medium/8/positions_on, range 0.1066-0.1725 across medium, recorded beside the named actual legacy incumbent in one invocation with the same-invocation Tantivy/Tantivy A/A null 0.9945 [0.9336, 1.0790]. The A/B intervals sit far outside that null, so this is a measured loss that stands on its own evidence rather than an undecidable run. The heading's PROVISIONAL scope is unchanged: the gate remains inactive and this row asserts no activation.
+
 ### 2026-07-28 — QG-2 MISS (gate inactive): single-thread Quill indexing reaches 0.1087x Tantivy 0.26.1 (`bd-h6eh`, FoggySquirrel)
 
 **Comparison class: INCUMBENT.** This is a competitive gate measurement, not a
@@ -16595,6 +16601,8 @@ gap, and a candidate reduces whole-operation cycles or instructions per
 document by at least 10x without changing indexed bytes or query results.
 Then repeat the full same-ELF, same-invocation A/A+A/B median-CI gate against
 Tantivy 0.26.1.
+
+Verdict: REJECT — classification only (bd-g2pxg, for the bd-z4lqq fail-closed verdict rule); nothing above is altered. Quill/Tantivy paired median 0.108698 [0.107024, 0.111538] against a >=1.5x target, recorded side-by-side with the same-invocation Tantivy/Tantivy A/A null 0.993436 [0.980159, 1.019927], whose interval contains 1.0 and passes every predeclared null law. The effect interval lies far outside that null, so the MISS is decidable and the loss stands. The gate remains inactive.
 
 ### 2026-07-28 — QG-2 reproduction hold: the valid rerun misses the predeclared 2% agreement bound (`bd-h6eh`, FoggySquirrel)
 
@@ -17540,6 +17548,8 @@ interpreting any A/B magnitude, and require the full normative matrix plus an
 immediate same-ELF reproduction before activation. Never weaken a null law,
 select a favorable row, or gate on CV.
 
+Verdict: REJECT — classification only (bd-g2pxg, for the bd-z4lqq fail-closed verdict rule); nothing above is altered. Both scoreable widths miss against the named actual legacy incumbent: 1 thread 0.256083 [0.250163, 0.258549] and 96 threads 0.236489 [0.233668, 0.239445], each recorded in the same invocation as its own A/A controls (Tantivy/Tantivy 1.009191 [0.973456, 1.036773] at 1 thread and 0.982554 [0.956492, 1.026133] at 96 threads). Both effect intervals sit far outside their nulls, so the absence of a high-thread advantage is a decidable measured loss.
+
 ### 2026-07-29 — Hand-written canonical encoder is no-ship after a contaminated adverse diagnostic (`bd-e8h-w2-canonical-encode-si8mk`, YellowSparrow)
 
 **Comparison class: SELF-SPEEDUP diagnostic; no incumbent or QG claim.**
@@ -18361,3 +18371,5 @@ effect blocks or bind effect order/drift explicitly; ratchet-bind continuous
 timing and work-receipt modes; preserve exact host, executable, wall, and
 worker-census receipts. Do not promote a partial slice, weaken the
 null-center law, or gate on CV.
+
+Verdict: HOLD — classification only (bd-g2pxg, for the bd-z4lqq fail-closed verdict rule); nothing above is altered. The row advances no result in either direction, as its own heading says: widths 2, 4, 16, 32, and 128 fail the corrected null gate because their Tantivy null medians drift outside 2% of 1, and a later receipt-integrity audit invalidated every CPU-derived activity field. The widths that do pass the null gate are recorded above but are not advanced as a claim here, so this row is a quarantined no-claim sweep rather than a verdict on a lever.
