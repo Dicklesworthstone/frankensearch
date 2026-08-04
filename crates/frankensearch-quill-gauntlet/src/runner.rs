@@ -1272,6 +1272,26 @@ pub struct DivergenceArtifactObjectHash {
     pub digest: String,
 }
 
+/// The prose an artifact cannot supply about a divergence it witnessed.
+///
+/// Separated from the identity fields deliberately. Everything in
+/// [`DivergenceRegisterLedger::observation_from_artifact`] is either read from
+/// the artifact or passed in here, and nothing in here can affect whether the
+/// observation joins to its witness. That split is the point: a reviewer can
+/// rewrite every word of this without touching a single identity claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DivergenceObservationNarrative {
+    /// What the subject engine did.
+    pub observed_behavior: String,
+    /// What the oracle did instead.
+    pub expected_behavior: String,
+    /// The precise mechanism, with file or section references.
+    pub root_cause: String,
+    /// What a frankensearch consumer could observe; "none observable" needs
+    /// justification.
+    pub consumer_impact: String,
+}
+
 /// One observed mismatch, including its first-recorded witness evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1967,6 +1987,127 @@ impl DivergenceRegisterLedger {
     /// Returns an error for a structurally invalid ledger, an invalid or
     /// duplicate artifact, a missing first-recorded artifact, or any well-formed
     /// but substituted artifact/producer/oracle identity.
+    /// Mint an observation event directly from the campaign artifact that
+    /// witnessed the divergence (bd-quill-e6-gauntlet-scale-rm3q.8).
+    ///
+    /// This is the typed ingestion contract every campaign is required to have.
+    /// It exists because the alternative — a human reading an artifact and
+    /// typing its hashes into a register entry — is what produced the current
+    /// state of this register: seven divergences documented in Markdown prose,
+    /// of which zero could be ingested, because the identity fields were
+    /// transcribed as narrative instead of carried as data. DIV-001 through
+    /// DIV-005 record their fixtures as bare test-function names; DIV-006
+    /// records real hashes but no retained artifact object; DIV-007's own entry
+    /// says its fixture work was blocked. None of them can be reconstructed
+    /// after the fact, because a first-seen artifact that was never stored
+    /// cannot be re-derived from a description of it.
+    ///
+    /// So every identity field here is READ FROM the artifact's own
+    /// [`ArtifactDivergenceBinding`] rather than accepted from the caller. A
+    /// caller supplies only what the artifact genuinely does not know: who
+    /// recorded the event, when, the prose describing the mismatch, and the
+    /// minimized fixture's own digest. The revision set and the witness address
+    /// cannot be wrong, because there is no parameter through which to make
+    /// them wrong.
+    ///
+    /// The result is validated as a standalone observation before it is
+    /// returned, so a malformed ingestion fails at the campaign that produced
+    /// it rather than at whoever later tries to append it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the artifact cannot yield a divergence binding,
+    /// when its hash scheme is not the v7 address this schema admits, or when
+    /// the assembled observation fails its own validation.
+    pub fn observation_from_artifact(
+        artifact: &ArtifactObject,
+        header: DivergenceRegisterEventHeader,
+        divergence_id: impl Into<String>,
+        class: DivergenceClass,
+        fixture: DivergenceFixtureEvidence,
+        mismatch_signatures: Vec<String>,
+        narrative: DivergenceObservationNarrative,
+        diagnostic: RedactedDivergenceDiagnostic,
+    ) -> Result<DivergenceObservationEvent, GauntletError> {
+        Self::observation_from_binding(
+            &artifact.divergence_binding()?,
+            header,
+            divergence_id,
+            class,
+            fixture,
+            mismatch_signatures,
+            narrative,
+            diagnostic,
+        )
+    }
+
+    /// Mint an observation from an already-extracted artifact binding.
+    ///
+    /// [`Self::observation_from_artifact`] is the entry point campaigns use;
+    /// this is the same logic over a binding that has already been obtained.
+    /// It is separate because extracting a binding requires sealed built-in
+    /// integrity — a Git-verified producer and a kernel-held executable image —
+    /// which a unit test cannot and should not fake. Splitting here lets the
+    /// identity-carrying behaviour be tested directly on a real binding value
+    /// without weakening that gate for the artifact path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the binding does not use the v7 artifact-object
+    /// hash scheme, or when the assembled observation fails validation.
+    pub fn observation_from_binding(
+        binding: &ArtifactDivergenceBinding,
+        header: DivergenceRegisterEventHeader,
+        divergence_id: impl Into<String>,
+        class: DivergenceClass,
+        fixture: DivergenceFixtureEvidence,
+        mismatch_signatures: Vec<String>,
+        narrative: DivergenceObservationNarrative,
+        diagnostic: RedactedDivergenceDiagnostic,
+    ) -> Result<DivergenceObservationEvent, GauntletError> {
+        if binding.object_hash_scheme != crate::artifact::OBJECT_HASH_SCHEME_V7_SHA256 {
+            return Err(campaign_error(
+                "divergence ingestion requires the v7 artifact-object hash scheme",
+            ));
+        }
+
+        let observation = DivergenceObservationEvent {
+            header,
+            divergence_id: divergence_id.into(),
+            class,
+            first_recorded_witness_case_id: Some(binding.fixture_id.clone()),
+            first_recorded_witness_artifact_object: Some(DivergenceArtifactObjectHash {
+                scheme: DivergenceArtifactObjectHashScheme::ArtifactObjectV7Sha256,
+                object_schema_version: binding.object_schema_version,
+                digest: binding.object_hash.clone(),
+            }),
+            first_seen_artifact_object_hash: None,
+            first_seen_artifact_sha256: None,
+            revisions: DivergenceRevisionSet::CurrentV2 {
+                producer_build_identity_sha256: binding.producer_identity_sha256.clone(),
+                oracle_dependency_contract_sha256: binding
+                    .oracle_dependency_identity_sha256
+                    .clone(),
+                oracle_lexical_contract_audit_revision: binding
+                    .oracle_lexical_contract_audit_revision
+                    .clone(),
+                corpus_manifest_sha256: binding.corpus_manifest_sha256.clone(),
+                query_manifest_sha256: binding.query_manifest_sha256.clone(),
+                query_suite_source: binding.query_suite_source,
+                query_source_identity_sha256: binding.query_source_identity_sha256.clone(),
+            },
+            fixture,
+            mismatch_signatures,
+            observed_behavior: narrative.observed_behavior,
+            expected_behavior: narrative.expected_behavior,
+            root_cause: narrative.root_cause,
+            consumer_impact: narrative.consumer_impact,
+            diagnostic,
+        };
+        observation.validate(DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION)?;
+        Ok(observation)
+    }
+
     pub fn validate_relational_integrity_against_artifact_objects(
         &self,
         artifacts: &[ArtifactObject],
@@ -9604,6 +9745,311 @@ mod tests {
         assert!(
             serde_json::from_value::<DivergenceRegistry>(unknown_registry).is_err(),
             "registry decoder must reject unknown nested entry fields",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-quill-e6-gauntlet-scale-rm3q.8: the typed ingestion contract.
+    //
+    // Every DIV entry in the Markdown register was hand-transcribed, and that
+    // is exactly why none of them can be ingested: the identity fields were
+    // written as narrative rather than carried as data. These pin that the
+    // ingestion path reads identity from the artifact, so the same failure
+    // cannot recur for DIV-008 onward.
+    // -----------------------------------------------------------------------
+
+    /// A real binding value with the shape `divergence_binding()` produces.
+    ///
+    /// Extracting one from an artifact requires sealed built-in integrity — a
+    /// Git-verified producer and a kernel-held executable image — which a unit
+    /// test cannot obtain and must not fake. The binding is the entire input
+    /// to minting, so testing over a binding tests the whole contract; what it
+    /// does not cover is the extraction gate, which
+    /// `validate_stored_builtin_integrity` owns and enforces on its own.
+    fn ingestion_binding() -> ArtifactDivergenceBinding {
+        ArtifactDivergenceBinding {
+            object_schema_version: crate::artifact::OBJECT_SCHEMA_VERSION,
+            object_hash_scheme: crate::artifact::OBJECT_HASH_SCHEME_V7_SHA256,
+            object_hash: "1".repeat(64),
+            producer_identity_sha256: "2".repeat(64),
+            oracle_dependency_identity_sha256: "3".repeat(64),
+            oracle_lexical_contract_audit_revision: "4".repeat(40),
+            corpus_manifest_sha256: "5".repeat(64),
+            query_manifest_sha256: "6".repeat(64),
+            query_suite_source: QuerySuiteSource::Generated,
+            query_source_identity_sha256: "7".repeat(64),
+            fixture_id: "rm3q8-ingestion-case".to_owned(),
+            rank_class: RankClass::RankExact,
+            divergences: Vec::new(),
+        }
+    }
+
+    fn ingestion_narrative() -> DivergenceObservationNarrative {
+        DivergenceObservationNarrative {
+            observed_behavior: "The subject returned a different top hit.".to_owned(),
+            expected_behavior: "The oracle retained its ranking.".to_owned(),
+            root_cause: "Scoring divergence in the fused multi-field expansion.".to_owned(),
+            consumer_impact: "Rank order can differ for one query shape.".to_owned(),
+        }
+    }
+
+    fn ingestion_fixture() -> DivergenceFixtureEvidence {
+        DivergenceFixtureEvidence {
+            fixture_id: "rm3q8-ingestion-witness".to_owned(),
+            fixture_sha256: "a".repeat(64),
+            regression_test: "runner::tests::an_observation_minted_from_an_artifact_carries_that_artifacts_identity"
+                .to_owned(),
+            minimized: true,
+        }
+    }
+
+    fn ingestion_header() -> DivergenceRegisterEventHeader {
+        DivergenceRegisterEventHeader {
+            sequence: 1,
+            supersedes: None,
+            recorded_by: "rm3q8-campaign-ingestor".to_owned(),
+            recorded_at: "2026-08-04T12:00:00Z".to_owned(),
+        }
+    }
+
+    fn ingestion_diagnostic() -> RedactedDivergenceDiagnostic {
+        RedactedDivergenceDiagnostic {
+            payload_sha256: "b".repeat(64),
+            marker: "<redacted:campaign-query>".to_owned(),
+        }
+    }
+
+    /// The identity fields come from the ARTIFACT, not from the caller. There
+    /// is no parameter through which a caller could name a different producer,
+    /// oracle, corpus, or query manifest, which is what makes a transcription
+    /// error structurally impossible rather than merely discouraged.
+    #[test]
+    fn an_observation_minted_from_an_artifact_carries_that_artifacts_identity() {
+        let binding = ingestion_binding();
+
+        let observation = DivergenceRegisterLedger::observation_from_binding(
+            &binding,
+            ingestion_header(),
+            "DIV-008",
+            DivergenceClass::ScoreEpsilon,
+            ingestion_fixture(),
+            vec!["c".repeat(64)],
+            ingestion_narrative(),
+            ingestion_diagnostic(),
+        )
+        .expect("a real artifact mints an observation");
+
+        let address = observation
+            .first_recorded_witness_artifact_object
+            .as_ref()
+            .expect("v2 observations carry an artifact-object witness");
+        assert_eq!(address.digest, binding.object_hash);
+        assert_eq!(address.object_schema_version, binding.object_schema_version);
+        assert_eq!(
+            observation.first_recorded_witness_case_id.as_deref(),
+            Some(binding.fixture_id.as_str())
+        );
+
+        let DivergenceRevisionSet::CurrentV2 {
+            producer_build_identity_sha256,
+            oracle_dependency_contract_sha256,
+            corpus_manifest_sha256,
+            query_manifest_sha256,
+            query_source_identity_sha256,
+            ..
+        } = &observation.revisions
+        else {
+            panic!("ingestion must emit the current v2 revision set");
+        };
+        assert_eq!(
+            producer_build_identity_sha256,
+            &binding.producer_identity_sha256
+        );
+        assert_eq!(
+            oracle_dependency_contract_sha256,
+            &binding.oracle_dependency_identity_sha256
+        );
+        assert_eq!(corpus_manifest_sha256, &binding.corpus_manifest_sha256);
+        assert_eq!(query_manifest_sha256, &binding.query_manifest_sha256);
+        assert_eq!(
+            query_source_identity_sha256,
+            &binding.query_source_identity_sha256
+        );
+
+        // The minted observation is admissible on its own terms, so a campaign
+        // learns about a malformed ingestion at the point of production.
+        observation
+            .validate(DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION)
+            .expect("a minted observation is structurally valid");
+    }
+
+    /// A minted observation forms a valid ledger with a reviewed disposition.
+    ///
+    /// NOT covered here, deliberately: the relational join of a minted
+    /// observation against the artifact object that produced it. That needs a
+    /// binding extracted through `divergence_binding()`, which requires sealed
+    /// built-in integrity — a Git-verified producer and a kernel-held running
+    /// executable image — and a unit test cannot obtain one without faking the
+    /// gate. `validate_relational_integrity_against_artifact_objects` owns that
+    /// join and is exercised where a real artifact exists.
+    #[test]
+    fn a_minted_observation_forms_a_valid_reviewed_ledger() {
+        let binding = ingestion_binding();
+        let observation = DivergenceRegisterLedger::observation_from_binding(
+            &binding,
+            ingestion_header(),
+            "DIV-008",
+            DivergenceClass::ScoreEpsilon,
+            ingestion_fixture(),
+            vec!["c".repeat(64)],
+            ingestion_narrative(),
+            ingestion_diagnostic(),
+        )
+        .expect("mint");
+
+        let ledger = DivergenceRegisterLedger::new(
+            "rm3q8-ingestion",
+            vec![
+                DivergenceRegisterEvent::Observation(Box::new(observation)),
+                DivergenceRegisterEvent::Disposition(DivergenceDispositionEvent {
+                    header: DivergenceRegisterEventHeader {
+                        sequence: 2,
+                        supersedes: None,
+                        recorded_by: "rm3q8-campaign-ingestor".to_owned(),
+                        recorded_at: "2026-08-04T12:01:00Z".to_owned(),
+                    },
+                    divergence_id: "DIV-008".to_owned(),
+                    disposition: DivergenceDisposition::Accepted {
+                        equivalence_law:
+                            "Result sets are identical; only ULP-adjacent rank order differs."
+                                .to_owned(),
+                        rationale: "Bounded floating-point summation association.".to_owned(),
+                        reviewer: "rm3q8-independent-reviewer".to_owned(),
+                        reviewed_at: "2026-08-04T12:00:30Z".to_owned(),
+                    },
+                }),
+            ],
+        )
+        .expect("a minted observation with a reviewed disposition forms a valid ledger");
+
+        ledger.validate().expect("the ledger is structurally valid");
+    }
+
+    /// The review workflow has teeth against a REAL minted entry, not only the
+    /// synthetic contract fixture. Three independent rejections, each with the
+    /// mutation applied alone.
+    #[test]
+    fn the_review_workflow_rejects_self_review_and_fix_only_acceptance() {
+        let binding = ingestion_binding();
+        let mint = |class| {
+            DivergenceRegisterLedger::observation_from_binding(
+                &binding,
+                ingestion_header(),
+                "DIV-008",
+                class,
+                ingestion_fixture(),
+                vec!["c".repeat(64)],
+                ingestion_narrative(),
+                ingestion_diagnostic(),
+            )
+            .expect("mint")
+        };
+        let disposition = |kind| {
+            DivergenceRegisterEvent::Disposition(DivergenceDispositionEvent {
+                header: DivergenceRegisterEventHeader {
+                    sequence: 2,
+                    supersedes: None,
+                    recorded_by: "rm3q8-campaign-ingestor".to_owned(),
+                    recorded_at: "2026-08-04T12:01:00Z".to_owned(),
+                },
+                divergence_id: "DIV-008".to_owned(),
+                disposition: kind,
+            })
+        };
+
+        // (i) The reviewer cannot be the recording author.
+        let self_reviewed = DivergenceRegisterLedger::new(
+            "rm3q8-ingestion",
+            vec![
+                DivergenceRegisterEvent::Observation(Box::new(mint(DivergenceClass::ScoreEpsilon))),
+                disposition(DivergenceDisposition::Accepted {
+                    equivalence_law: "Result sets are identical.".to_owned(),
+                    rationale: "Bounded.".to_owned(),
+                    reviewer: "rm3q8-campaign-ingestor".to_owned(),
+                    reviewed_at: "2026-08-04T12:00:30Z".to_owned(),
+                }),
+            ],
+        );
+        assert!(
+            self_reviewed.is_err(),
+            "an author cannot sign off on their own acceptance"
+        );
+
+        // (ii) A fix-only class can never be accepted, however good the
+        // rationale. DIV-006 is exactly this class.
+        let accepted_fix_only = DivergenceRegisterLedger::new(
+            "rm3q8-ingestion",
+            vec![
+                DivergenceRegisterEvent::Observation(Box::new(mint(
+                    DivergenceClass::PostingRecordSemantics,
+                ))),
+                disposition(DivergenceDisposition::Accepted {
+                    equivalence_law: "Presence and frequency agree on this corpus.".to_owned(),
+                    rationale: "Observed only on one field.".to_owned(),
+                    reviewer: "rm3q8-independent-reviewer".to_owned(),
+                    reviewed_at: "2026-08-04T12:00:30Z".to_owned(),
+                }),
+            ],
+        );
+        assert!(
+            accepted_fix_only.is_err(),
+            "PostingRecordSemantics is fix-only and must never be accepted"
+        );
+
+        // (iii) The SAME fix-only class with a Fixed disposition is admitted,
+        // so (ii) is attributable to the acceptance and not to the class.
+        DivergenceRegisterLedger::new(
+            "rm3q8-ingestion",
+            vec![
+                DivergenceRegisterEvent::Observation(Box::new(mint(
+                    DivergenceClass::PostingRecordSemantics,
+                ))),
+                disposition(DivergenceDisposition::Fixed {
+                    fixing_commit: "d95f1614130a3dc71ef7b63f828b009a68ca3ac0".to_owned(),
+                    regression_test: "basic_record_option_clamps_repeated_edge_ngram_frequency"
+                        .to_owned(),
+                    reviewer: "rm3q8-independent-reviewer".to_owned(),
+                    reviewed_at: "2026-08-04T12:00:30Z".to_owned(),
+                }),
+            ],
+        )
+        .expect("a fix-only class is admitted with a Fixed disposition");
+    }
+
+    /// An observation with no disposition is not a register entry. Without
+    /// this, a campaign could file mismatches that are recorded but never
+    /// classified, which is the "unclassified must fail closed" requirement.
+    #[test]
+    fn an_undisposed_minted_observation_fails_closed() {
+        let observation = DivergenceRegisterLedger::observation_from_binding(
+            &ingestion_binding(),
+            ingestion_header(),
+            "DIV-008",
+            DivergenceClass::ScoreEpsilon,
+            ingestion_fixture(),
+            vec!["c".repeat(64)],
+            ingestion_narrative(),
+            ingestion_diagnostic(),
+        )
+        .expect("mint");
+
+        assert!(
+            DivergenceRegisterLedger::new(
+                "rm3q8-ingestion",
+                vec![DivergenceRegisterEvent::Observation(Box::new(observation))],
+            )
+            .is_err(),
+            "an observation with no disposition must not form a valid register"
         );
     }
 

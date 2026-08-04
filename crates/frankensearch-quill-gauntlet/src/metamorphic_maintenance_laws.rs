@@ -154,10 +154,6 @@ mod tests {
         merge_schedule_verdict, reopen_recovery_verdict, tombstone_compaction_verdict,
     };
     use crate::comparator::{Divergence, DivergenceClass};
-    use crate::runner::{
-        MetamorphicLawApplicability, MetamorphicLawApplicabilityEntry, MetamorphicLawScope,
-        MetamorphicSkipReason,
-    };
 
     /// Every class in the taxonomy, so the closed-set tests cannot silently
     /// stop covering a variant that gets added later.
@@ -473,7 +469,8 @@ mod capability_tests {
         );
     }
 
-    /// Default must equal none(): a runner that forgot to declare its limits
+    /// Default must equal [`MaintenanceRunnerCapabilities::none`]: a runner that
+    /// forgot to declare its limits
     /// must not appear fully capable. That failure direction turns an honest
     /// skip into a false pass, which is the whole thing this bead guards.
     #[test]
