@@ -78,8 +78,8 @@ use frankensearch_core::generation::{
     ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
 };
 use frankensearch_core::traits::{Embedder, IdentityBoundEmbedding};
-use frankensearch_core::{BoundQueryEmbedding, SpaceIdentityAdmission};
-use frankensearch_index::two_tier::{FsviTierObservation, observe_tier};
+use frankensearch_core::{BoundQueryEmbedding, SpaceIdentityAdmission, TieredQueryEmbeddings};
+use frankensearch_index::two_tier::{ActivatedTierSearch, FsviTierObservation, observe_tier};
 use frankensearch_index::{
     FsviAdmissionError, FsviV2IdentityBinding, FsviV2IdentityMetadata, TwoTierIndex,
     TwoTierIndexPaths, VECTOR_INDEX_FALLBACK_FILENAME, VECTOR_INDEX_FAST_FILENAME,
@@ -744,6 +744,35 @@ impl StagedIdentityBoundGeneration {
     #[must_use]
     pub fn quality_admitted_owner(&self) -> Option<&ValidatedFsviBytes> {
         self.index.quality_admitted_owner()
+    }
+
+    /// Activate typed owner-backed search over this staged generation
+    /// (bd-core-vector-space-search-guard-ctzo).
+    ///
+    /// This is the production consumption of
+    /// [`TwoTierIndex::activate_owner_backed_search`]: a staged generation is
+    /// the one object that holds all three inputs the activation requires —
+    /// the retained per-tier owners, and the exact bindings each tier was
+    /// written and admitted under. Callers therefore cannot supply a binding
+    /// of their own choosing here; the bindings are the ones this generation
+    /// was proven with.
+    ///
+    /// Every identity join runs before any vector byte is reachable, and the
+    /// returned capability is the only route to a read.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the typed activation refusals, which name the exact tier
+    /// and contract field.
+    pub fn activate_search<'staged, 'query>(
+        &'staged self,
+        embeddings: &'query TieredQueryEmbeddings,
+    ) -> SearchResult<ActivatedTierSearch<'staged, 'query>> {
+        self.index.activate_owner_backed_search(
+            embeddings,
+            Some(&self.fast_binding),
+            self.quality_binding.as_ref(),
+        )
     }
 }
 
@@ -3223,6 +3252,92 @@ mod tests {
             );
             let drained = queue.drain_batch();
             assert_eq!(drained[0].retry_count, 0, "no retry budget consumed");
+        });
+    }
+
+    /// bd-ctzo C5: the typed activation is consumed OUTSIDE the index crate,
+    /// on the one production object that holds all three of its inputs — the
+    /// retained per-tier owners and the exact bindings the generation was
+    /// proven with.
+    ///
+    /// Paired in one test: the staged generation's own producing space
+    /// activates and serves, and a same-dimension foreign space is refused
+    /// before any read.
+    #[test]
+    fn staged_generation_activates_typed_owner_backed_search() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let embedder = Arc::new(StubEmbedder::new("v2-activation-stub", V2_DIM));
+            let (dir, cache, _binding, _fast_path) = v2_canonical_fixture(
+                "v2-ctzo-activation",
+                embedder.identity_bundle(),
+                &[
+                    ("old-1", normalized(V2_DIM, 0.25)),
+                    ("old-2", normalized(V2_DIM, 0.75)),
+                ],
+                7,
+            );
+            let queue = make_queue(100);
+            submit(&queue, "doc-3", "a brand new document");
+            let jobs = queue.drain_batch();
+            let worker = RefreshWorker::new(
+                RefreshWorkerConfig::new(&dir),
+                queue.clone(),
+                embedder.clone(),
+                cache,
+            );
+            let staged = worker
+                .stage_identity_bound_generation(&cx, &jobs)
+                .await
+                .expect("staging must succeed");
+
+            // A query bound in the STAGED GENERATION'S OWN producing space.
+            // Storage is deliberately the in-process f32 contract: a query is
+            // a Vec<f32> and can never carry the artifact's persisted f16
+            // storage identity, which is why activation joins space and
+            // producer rather than whole bundles.
+            let mut query_identity = embedder.identity_bundle().clone();
+            query_identity.storage.quantization = QuantizationFormat::F32;
+            "in-memory-f32".clone_into(&mut query_identity.storage.format);
+            "native-f32-values".clone_into(&mut query_identity.storage.endianness);
+            let query = BoundQueryEmbedding::new(normalized(V2_DIM, 0.25), query_identity)
+                .expect("bind a query in the staged generation's space");
+            let embeddings = TieredQueryEmbeddings::fast_only(query);
+
+            let activated = staged
+                .activate_search(&embeddings)
+                .expect("the generation's own space must activate");
+            let hits = activated.search_fast(1).expect("owner-backed search");
+            assert_eq!(hits.len(), 1, "the activated capability serves reads");
+            assert_eq!(
+                activated
+                    .fast()
+                    .expect("fast tier activated")
+                    .generation_sequence(),
+                staged.fast_binding.generation().sequence,
+                "coverage is read from the retained owner witness"
+            );
+
+            // Same dimension, foreign space: refused before any read.
+            let foreign = Arc::new(StubEmbedder::new("v2-foreign-stub", V2_DIM));
+            let mut foreign_identity = foreign.identity_bundle().clone();
+            foreign_identity.storage.quantization = QuantizationFormat::F32;
+            "in-memory-f32".clone_into(&mut foreign_identity.storage.format);
+            "native-f32-values".clone_into(&mut foreign_identity.storage.endianness);
+            let foreign_query =
+                BoundQueryEmbedding::new(normalized(V2_DIM, 0.25), foreign_identity)
+                    .expect("bind a foreign-space query");
+            let foreign_embeddings = TieredQueryEmbeddings::fast_only(foreign_query);
+            let error = staged
+                .activate_search(&foreign_embeddings)
+                .expect_err("a same-dimension foreign space must be refused");
+            assert!(
+                matches!(
+                    error,
+                    SearchError::InvalidConfig { ref field, .. }
+                        if field == "query_embedding.fast.space_identity"
+                ),
+                "got {error:?}"
+            );
         });
     }
 
