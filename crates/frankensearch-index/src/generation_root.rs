@@ -6648,35 +6648,65 @@ mod tests {
         fn secure_fixture_base() -> &'static Path {
             FIXTURE_BASE
                 .get_or_init(|| {
-                    // bd-54h2l LOW A: this base used to be rooted at $HOME. Its
-                    // name embeds pid + epoch nanos, so every test process minted
-                    // a fresh one and no cleanup path existed — repeated local
-                    // runs accumulated directories in the user's home forever.
-                    // Root it at the platform scratch directory instead
-                    // (`std::env::temp_dir`, which honours TMPDIR): per-run
-                    // isolation is unchanged, but the bases now land where
-                    // scratch space is reclaimed by platform/agent policy rather
-                    // than needing deletion code here.
+                    let home = std::env::var_os("HOME")
+                        .map(PathBuf::from)
+                        .expect("HOME must identify the process-private fixture ancestor");
+                    assert!(home.is_absolute(), "HOME must be an absolute route");
+
+                    // bd-54h2l LOW A: the per-run base still embeds pid + epoch
+                    // nanos (route qualification requires an ancestor chain this
+                    // user owns privately, so these fixtures cannot move to a
+                    // shared scratch root — see the note below), but it now nests
+                    // under ONE stable private parent instead of littering $HOME
+                    // with a fresh top-level entry per test process. Per-run
+                    // isolation is unchanged and no directory is deleted here;
+                    // the sprawl is simply confined to a single, purgeable place.
                     //
-                    // The security properties are preserved, which matters
-                    // because these fixtures back the route-qualification tests
-                    // themselves: creation below stays O_EXCL-style plus mode
-                    // 0700, so a pre-existing or attacker-planted path is never
-                    // adopted — `create` fails with `AlreadyExists` and the next
-                    // attempt takes a different name.
-                    let scratch = std::env::temp_dir();
-                    assert!(
-                        scratch.is_absolute(),
-                        "the scratch directory must be an absolute route"
-                    );
+                    // Rooting these under `std::env::temp_dir()` was tried and
+                    // REVERTED: it fails route qualification with
+                    // `WrongOwner` at component_index 0, because a shared temp
+                    // root is not owned by this user. $HOME is load-bearing.
+                    let parent = home.join(".frankensearch-generation-root-tests");
+                    match DirBuilder::new().mode(0o700).create(&parent) {
+                        Ok(()) => {
+                            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))
+                                .expect("fixture parent mode should be settable");
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                            // Adopting a directory left by an earlier run is
+                            // fine, but only after proving it is still the thing
+                            // we created: a real directory (never a symlink),
+                            // owned by whoever owns HOME, and private.
+                            let existing = fs::symlink_metadata(&parent)
+                                .expect("the retained fixture parent should be stattable");
+                            assert!(
+                                existing.is_dir(),
+                                "the retained fixture parent must be a directory"
+                            );
+                            let home_owner = fs::symlink_metadata(&home)
+                                .expect("HOME should be stattable")
+                                .uid();
+                            assert_eq!(
+                                existing.uid(),
+                                home_owner,
+                                "the retained fixture parent must be owned by the HOME owner"
+                            );
+                            assert_eq!(
+                                existing.permissions().mode() & 0o777,
+                                0o700,
+                                "the retained fixture parent must stay private"
+                            );
+                        }
+                        Err(error) => {
+                            panic!("failed to create the retained fixture parent: {error}")
+                        }
+                    }
                     let epoch_nanos = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map_or(0, |duration| duration.as_nanos());
                     for attempt in 0_u64..64 {
-                        let candidate = scratch.join(format!(
-                            ".frankensearch-generation-root-tests-{}-{epoch_nanos}-{attempt}",
-                            std::process::id()
-                        ));
+                        let candidate =
+                            parent.join(format!("{}-{epoch_nanos}-{attempt}", std::process::id()));
                         match DirBuilder::new().mode(0o700).create(&candidate) {
                             Ok(()) => {
                                 fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700))
