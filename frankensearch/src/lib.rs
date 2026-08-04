@@ -138,7 +138,7 @@
 //! | `hash`       | FNV-1a hash embedder (default, zero dependencies)      |
 //! | `model2vec`  | potion-128M static embedder (fast tier, ~0.57ms)       |
 //! | `fastembed`  | MiniLM-L6-v2 ONNX embedder (quality tier, ~128ms)      |
-//! | `lexical`    | Pre-flip Tantivy BM25 compatibility lane               |
+//! | `lexical`    | Native Quill production lexical backend                |
 //! | `quill`      | Native Quill lexical engine and builder integration     |
 //! | `lexical-tantivy` | Explicit Tantivy oracle/comparator surface       |
 //! | `cass-compat` | External CASS schema-v8 Tantivy-format interoperability |
@@ -199,8 +199,11 @@ pub use frankensearch_fusion as fusion;
 pub use frankensearch_index as index;
 
 #[cfg(feature = "lexical")]
-/// Pre-flip Tantivy lexical backend.
-pub use frankensearch_lexical as lexical;
+/// Native Quill production lexical backend.
+///
+/// Tantivy remains available only from [`lexical_tantivy`] when the explicit
+/// `lexical-tantivy` feature is selected.
+pub use frankensearch_quill as lexical;
 
 #[cfg(feature = "lexical-tantivy")]
 /// Explicit Tantivy-native backend for oracle and foreign-index consumers.
@@ -596,15 +599,45 @@ mod feature_matrix_smoke {
     #[cfg(feature = "hybrid")]
     #[test]
     fn hybrid_lane_behavior() {
-        let dir = tempfile::tempdir().expect("hybrid lexical tempdir");
-        let index = frankensearch_lexical::TantivyIndex::create(dir.path())
-            .expect("create hybrid lexical index");
-        assert_eq!(LexicalRead::doc_count(&index), 0);
-        emit_evidence(
-            "hybrid",
-            "tantivy_lexical_create",
-            &serde_json::json!({"documents": LexicalRead::doc_count(&index)}),
-        );
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().expect("hybrid lexical tempdir");
+            let index = QuillIndex::create(
+                &cx,
+                dir.path(),
+                QuillConfig {
+                    bulk_load_mode: true,
+                    deterministic_ingest: true,
+                    max_ingest_shards: 1,
+                    ..QuillConfig::default()
+                },
+            )
+            .await
+            .expect("create hybrid Quill index");
+            let document = IndexableDocument::new("doc-hybrid", "hybrid quill lexical fixture");
+            index
+                .index_document(&cx, &document)
+                .await
+                .expect("index hybrid Quill document");
+            index
+                .finish_bulk_load(&cx)
+                .await
+                .expect("finalize hybrid Quill index");
+            let hits = index
+                .search_results(&cx, "hybrid", 5)
+                .expect("search hybrid Quill index");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "doc-hybrid");
+            emit_evidence(
+                "hybrid",
+                "quill_lexical_build_search",
+                &serde_json::json!({
+                    "documents": 1,
+                    "hits": hits.len(),
+                    "lexical_backend": "quill",
+                    "selected_backend": "quill",
+                }),
+            );
+        });
     }
 
     #[cfg(feature = "storage")]
@@ -770,6 +803,38 @@ mod feature_matrix_smoke {
                 "quill",
                 "real_index_build_search",
                 &serde_json::json!({"documents": documents.len(), "hits": hits.len()}),
+            );
+        });
+    }
+
+    #[cfg(feature = "lexical")]
+    #[test]
+    fn lexical_lane_behavior_uses_quill() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = lexical::QuillIndex::in_memory(lexical::QuillConfig::default())
+                .expect("create lexical Quill index");
+            index
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("doc-lexical", "lexical feature uses quill"),
+                )
+                .await
+                .expect("index lexical Quill document");
+            index.commit(&cx).await.expect("commit lexical Quill index");
+            let hits = index
+                .search_results(&cx, "lexical", 5)
+                .expect("search lexical Quill index");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "doc-lexical");
+            emit_evidence(
+                "lexical",
+                "quill_index_build_search",
+                &serde_json::json!({
+                    "documents": 1,
+                    "hits": hits.len(),
+                    "lexical_backend": "quill",
+                    "selected_backend": "quill",
+                }),
             );
         });
     }

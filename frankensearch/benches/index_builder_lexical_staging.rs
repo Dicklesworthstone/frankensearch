@@ -3,7 +3,7 @@
 //! Profile and A/B harness for facade `IndexBuilder` lexical staging.
 //!
 //! The baseline profile measures the shipping facade path, including vector writes and the
-//! subsequent Tantivy postings build, while excluding corpus construction and temporary-directory
+//! subsequent Quill postings build, while excluding corpus construction and temporary-directory
 //! creation. It separately measures the deep `IndexableDocument` staging clone so the candidate is
 //! selected from observed cost rather than static inspection.
 //!
@@ -20,10 +20,9 @@ use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use frankensearch::{EmbedderStack, IndexBuilder};
+use frankensearch::{EmbedderStack, IndexBuilder, QuillConfig, QuillSearchIndex};
 use frankensearch_core::traits::{Embedder, ModelCategory, SearchFuture};
 use frankensearch_core::types::IndexableDocument;
-use frankensearch_lexical::TantivyIndex;
 use tempfile::TempDir;
 
 const DOCS: usize = 20_000;
@@ -176,9 +175,16 @@ fn build_index(
     )
 }
 
-fn ranked_snapshot(dir: &TempDir) -> Vec<Vec<(String, u32)>> {
-    let index =
-        TantivyIndex::open(&dir.path().join("lexical")).expect("open lexical benchmark index");
+fn ranked_snapshot(
+    runtime: &asupersync::runtime::Runtime,
+    dir: &TempDir,
+) -> Vec<Vec<(String, u32)>> {
+    let index = runtime.block_on(async {
+        let cx = Cx::for_testing();
+        QuillSearchIndex::open(&cx, dir.path().join("lexical"), QuillConfig::default())
+            .await
+            .expect("open Quill lexical benchmark index")
+    });
     let cx = Cx::for_testing();
     [
         "alpha",
@@ -192,9 +198,9 @@ fn ranked_snapshot(dir: &TempDir) -> Vec<Vec<(String, u32)>> {
     .map(|query| {
         index
             .search_doc_ids(&cx, query, PARITY_K)
-            .expect("run BM25 profile query")
+            .expect("run Quill profile query")
             .into_iter()
-            .map(|hit| (hit.doc_id.to_string(), hit.bm25_score.to_bits()))
+            .map(|hit| (hit.document_id, hit.score.to_bits()))
             .collect()
     })
     .collect()
@@ -318,7 +324,7 @@ fn profile_original(runtime: &asupersync::runtime::Runtime, documents: &[Indexab
         embed_and_stage.push(phases.embed_and_stage);
         post_stage.push(phases.reported_total.saturating_sub(phases.embed_and_stage));
         if round == 0 {
-            first_snapshot = Some(ranked_snapshot(&dir));
+            first_snapshot = Some(ranked_snapshot(runtime, &dir));
         }
         black_box(dir);
     }
@@ -355,8 +361,8 @@ fn verify_parity_and_measure(
 ) {
     let (original_dir, _) = build_index(runtime, documents.to_vec(), StagingMode::OriginalClone);
     let (candidate_dir, _) = build_index(runtime, documents.to_vec(), StagingMode::CandidateMove);
-    let original = ranked_snapshot(&original_dir);
-    let candidate = ranked_snapshot(&candidate_dir);
+    let original = ranked_snapshot(runtime, &original_dir);
+    let candidate = ranked_snapshot(runtime, &candidate_dir);
     let mut exact_raw_order = true;
     let mut exact_tie_aware_rank_ids = true;
     let mut exact_score_bits = true;
