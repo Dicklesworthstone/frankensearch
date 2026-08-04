@@ -1078,7 +1078,9 @@ fn validate_manifest_gate_set(manifest: &toml::Value) -> Result<(), Box<dyn Erro
             .and_then(toml::Value::as_bool)
             .is_none()
         {
-            return Err(format!("manifest gate.{label}.activated is missing or not boolean").into());
+            return Err(
+                format!("manifest gate.{label}.activated is missing or not boolean").into(),
+            );
         }
     }
 
