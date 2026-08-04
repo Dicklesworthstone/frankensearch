@@ -1030,51 +1030,71 @@ mod feature_matrix_smoke {
             "reopened index must still match the schema-v8 hash"
         );
 
-        // MERGE pressure: a second committed batch must add segments, which is
-        // what the merge policy observes.
+        // MERGE: a second committed batch, then a real force_merge. Asserting
+        // the segment count actually collapses is what proves the merge ran,
+        // rather than merely reading merge_status back.
         reopened
             .add_cass_documents(&[document("lifecycle-2", 2, "second batch tantivy interop")])
             .expect("ingest second CASS batch");
         reopened.commit().expect("commit second CASS batch");
-        let merge_status = reopened.merge_status();
-        assert_eq!(
-            merge_status.segment_count,
-            reopened.segment_count(),
-            "merge status must report the live segment count"
-        );
+        let segments_before_merge = reopened.segment_count();
         assert!(
-            reopened.segment_count() >= segments_after_first,
-            "a second committed batch must not lose segments"
+            segments_before_merge > segments_after_first,
+            "a second committed batch must add a segment, observed {segments_before_merge}"
+        );
+        reopened.force_merge().expect("force merge the CASS index");
+        let segments_after_merge = reopened.segment_count();
+        assert!(
+            segments_after_merge < segments_before_merge,
+            "force_merge must collapse segments: {segments_before_merge} -> {segments_after_merge}"
+        );
+        assert_eq!(
+            reopened.merge_status().segment_count,
+            segments_after_merge,
+            "merge status must report the post-merge segment count"
         );
 
-        // QUERY through the real CASS boolean parser.
-        let filters = cass_compat::CassQueryFilters::default();
-        let observation = reopened
-            .cass_oracle_observe_query("compatibility", &filters, 10, 32)
-            .expect("query the reopened CASS index");
+        // QUERY through the real CASS reader and schema — the same
+        // cass_open_search_reader / cass_fields_from_schema surface a CASS
+        // consumer uses, not a facade convenience wrapper.
+        let index_dir = cass_compat::cass_index_dir(dir.path()).expect("resolve CASS index dir");
+        let search_one = |needle: &str| -> (usize, usize) {
+            let (reader, fields) =
+                cass_compat::cass_open_search_reader(&index_dir, tantivy::ReloadPolicy::Manual)
+                    .expect("open the CASS search reader");
+            let searcher = reader.searcher();
+            let live = searcher.num_docs();
+            let query = tantivy::query::TermQuery::new(
+                tantivy::Term::from_field_text(fields.content, needle),
+                tantivy::schema::IndexRecordOption::WithFreqs,
+            );
+            let hits = searcher
+                .search(&query, &tantivy::collector::Count)
+                .expect("run the CASS term query");
+            (hits, usize::try_from(live).expect("live docs fit usize"))
+        };
+
+        let (hits_before_restart, live_before_restart) = search_one("compatibility");
         assert_eq!(
-            observation.total_count, 1,
+            hits_before_restart, 1,
             "the CASS query path must find exactly the matching document"
         );
-        assert!(
-            observation.doc_count >= 2,
-            "both committed documents must be live, observed {}",
-            observation.doc_count
+        assert_eq!(
+            live_before_restart, 2,
+            "both committed documents must be live after the merge"
         );
 
-        // RESTART: a fresh handle on the same path must still serve the query.
+        // RESTART: drop every handle, then reopen the same on-disk path.
         drop(reopened);
         let restarted = cass_compat::CassTantivyIndex::open_or_create(dir.path())
             .expect("restart against the committed CASS index");
-        let after_restart = restarted
-            .cass_oracle_observe_query("compatibility", &filters, 10, 32)
-            .expect("query after restart");
+        let (hits_after_restart, live_after_restart) = search_one("compatibility");
         assert_eq!(
-            after_restart.total_count, observation.total_count,
+            hits_after_restart, hits_before_restart,
             "restart must preserve the CASS query result"
         );
         assert_eq!(
-            after_restart.doc_count, observation.doc_count,
+            live_after_restart, live_before_restart,
             "restart must preserve the live document count"
         );
 
@@ -1083,9 +1103,11 @@ mod feature_matrix_smoke {
             "schema_v8_lifecycle",
             &serde_json::json!({
                 "segments_after_first": segments_after_first,
-                "segments_after_merge_pressure": restarted.segment_count(),
-                "query_total_count": after_restart.total_count,
-                "doc_count": after_restart.doc_count,
+                "segments_before_merge": segments_before_merge,
+                "segments_after_merge": segments_after_merge,
+                "segments_after_restart": restarted.segment_count(),
+                "query_hits": hits_after_restart,
+                "live_docs": live_after_restart,
                 "schema_version": cass_compat::CASS_SCHEMA_VERSION,
             }),
         );
