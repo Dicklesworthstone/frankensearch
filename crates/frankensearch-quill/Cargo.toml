@@ -18,10 +18,10 @@ default = []
 # Quill's dependency graph even when durability is enabled.
 durability = ["dep:frankensearch-durability"]
 # Same-binary A/B helpers are available only to explicit benchmark builds.
-bench-internals = ["frankensearch-core/bench-internals", "dep:sha2"]
+bench-internals = ["frankensearch-core/bench-internals"]
 # Deterministic fault-injection seams used only by method-bound conformance
 # witnesses. Shipping consumers never enable this feature.
-conformance-internals = ["dep:sha2"]
+conformance-internals = []
 # Invocation-local diagnostic profile receipts. This remains separate from
 # benchmark and conformance features so timing builds cannot accidentally link
 # profile instrumentation.
@@ -57,7 +57,7 @@ serde = { workspace = true }
 # Stored metadata stays opaque until result materialization. Durable formats
 # never use serde or serde_json.
 serde_json = { workspace = true }
-sha2 = { workspace = true, optional = true }
+sha2 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.4", features = ["fs", "process"] }

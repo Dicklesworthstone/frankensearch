@@ -23,10 +23,15 @@ use arc_swap::ArcSwap;
 use asupersync::Cx;
 use asupersync::runtime::spawn_blocking;
 use asupersync::sync::{LockError, Mutex, OwnedMutexGuard};
+use frankensearch_core::generation::{
+    CanonicalDocsetV1, ExactComponentReceiptV1, GenerationComponentReceiptV1,
+    GenerationComponentRole,
+};
 use frankensearch_core::{DocId, SearchError};
 #[cfg(feature = "durability")]
 use frankensearch_durability::{FileProtector, FileRecoveryOutcome, FileSourceWitness};
 use frankensearch_index::mapped_file::ReadOnlyMappedFile;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::error::QuillError;
@@ -423,6 +428,12 @@ pub enum ConcatMergeError {
 /// Keeper I/O, recovery, locking, and publication failures.
 #[derive(Debug, Error)]
 pub enum KeeperError {
+    /// An immutable lexical snapshot could not produce or re-open its exact receipt.
+    #[error("Quill exact lexical snapshot receipt rejected: {detail}")]
+    ExactSnapshotReceipt {
+        /// Stable receipt or descriptor diagnosis.
+        detail: String,
+    },
     /// Neither MANIFEST slot exists.
     #[error("Quill index not found at {directory}")]
     IndexNotFound {
@@ -2764,6 +2775,47 @@ pub struct KeeperSnapshot {
     quarantined_segments: Vec<QuarantinedSegment>,
 }
 
+/// Re-openable authority for one immutable Quill lexical snapshot receipt.
+///
+/// The descriptor binds a durable directory, its compile-time schema, the
+/// shared source checkpoint, and the exact receipt observed at capture time.
+/// It deliberately does not consult `CURRENT`, garbage collection, or writer
+/// claims: reopening validates the named lexical state and rejects any changed
+/// component instead of silently following a newer publication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactLexicalSnapshotDescriptor {
+    directory: PathBuf,
+    schema: SchemaDescriptor,
+    source_checkpoint: [u8; 32],
+    receipt: ExactComponentReceiptV1,
+}
+
+impl ExactLexicalSnapshotDescriptor {
+    /// The exact lexical component receipt captured from the immutable snapshot.
+    #[must_use]
+    pub const fn receipt(&self) -> &ExactComponentReceiptV1 {
+        &self.receipt
+    }
+
+    /// Reopen the captured durable snapshot and require its receipt to match.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the directory can no longer be opened as the
+    /// captured snapshot, or when its exact artifact, document set, or source
+    /// checkpoint differs from the descriptor-bound receipt.
+    pub fn reopen(&self) -> Result<KeeperSnapshot, KeeperError> {
+        let snapshot = KeeperSnapshot::open(&self.directory, self.schema)?;
+        let observed = snapshot.exact_lexical_component_receipt(self.source_checkpoint)?;
+        if observed != self.receipt {
+            return Err(KeeperError::ExactSnapshotReceipt {
+                detail: "descriptor reopen observed a different lexical component".to_owned(),
+            });
+        }
+        Ok(snapshot)
+    }
+}
+
 impl KeeperSnapshot {
     fn from_parts(
         directory: Option<PathBuf>,
@@ -2827,6 +2879,117 @@ impl KeeperSnapshot {
             Err(error) if recovery_retryable(&error) => Self::open_once(directory, schema),
             result => result,
         }
+    }
+
+    /// Emit the exact Quill lexical component receipt for this immutable snapshot.
+    ///
+    /// The byte receipt is a domain-separated SHA-256 over the selected
+    /// MANIFEST generation and every retained immutable FSLX image in manifest
+    /// order. The document-set digest independently materializes every live
+    /// IDMAP identity in physical generation order, so a tombstone, a hole, a
+    /// duplicate, or a reordered row cannot be hidden by the component hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an all-zero checkpoint, an invalid document-set
+    /// identity, or arithmetic overflow while framing the exact byte receipt.
+    pub fn exact_lexical_component_receipt(
+        &self,
+        source_checkpoint: [u8; 32],
+    ) -> Result<ExactComponentReceiptV1, KeeperError> {
+        if source_checkpoint == [0; 32] {
+            return Err(KeeperError::ExactSnapshotReceipt {
+                detail: "source checkpoint must not be all zeroes".to_owned(),
+            });
+        }
+
+        let manifest = exact_snapshot_manifest_bytes(self)?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"frankensearch.quill.exact-lexical-snapshot.v1");
+        hash_exact_snapshot_frame(&mut hasher, b"manifest", &manifest)?;
+        let mut byte_len =
+            u64::try_from(manifest.len()).map_err(|_| KeeperError::ExactSnapshotReceipt {
+                detail: "MANIFEST length does not fit the component receipt".to_owned(),
+            })?;
+        let mut document_ids = Vec::new();
+
+        for segment in &self.segments {
+            let manifest = segment.manifest();
+            hasher.update(manifest.segment_id.to_le_bytes());
+            let bytes = segment.reader.source_bytes();
+            hash_exact_snapshot_frame(&mut hasher, b"segment", bytes)?;
+            byte_len = byte_len
+                .checked_add(u64::try_from(bytes.len()).map_err(|_| {
+                    KeeperError::ExactSnapshotReceipt {
+                        detail: "segment length does not fit the component receipt".to_owned(),
+                    }
+                })?)
+                .ok_or_else(|| KeeperError::ExactSnapshotReceipt {
+                    detail: "lexical component byte length overflowed".to_owned(),
+                })?;
+
+            for global_docid in manifest.docid_lo..manifest.docid_hi {
+                let global_docid =
+                    u32::try_from(global_docid).map_err(|_| KeeperError::ExactSnapshotReceipt {
+                        detail: "manifest named a non-u32 Quill document id".to_owned(),
+                    })?;
+                if let Some(document_id) = segment.materialize_document_id(global_docid) {
+                    document_ids.push(document_id.to_string());
+                }
+            }
+        }
+
+        let docset =
+            CanonicalDocsetV1::from_ordered_live_documents(document_ids).map_err(|error| {
+                KeeperError::ExactSnapshotReceipt {
+                    detail: format!("canonical lexical document set was rejected: {error}"),
+                }
+            })?;
+        if u64::try_from(docset.len()).map_err(|_| KeeperError::ExactSnapshotReceipt {
+            detail: "lexical live document count does not fit the component receipt".to_owned(),
+        })? != self.live_doc_count
+        {
+            return Err(KeeperError::ExactSnapshotReceipt {
+                detail: "materialized lexical document count disagrees with snapshot count"
+                    .to_owned(),
+            });
+        }
+
+        Ok(ExactComponentReceiptV1 {
+            role: GenerationComponentRole::Lexical,
+            bytes: GenerationComponentReceiptV1 {
+                byte_len,
+                sha256: hasher.finalize().into(),
+            },
+            docset_digest: docset.digest(),
+            live_document_count: self.live_doc_count,
+            source_checkpoint,
+        })
+    }
+
+    /// Capture a descriptor that can only reopen this exact lexical snapshot.
+    ///
+    /// # Errors
+    ///
+    /// In-memory snapshots have no durable descriptor and are rejected. Durable
+    /// snapshots return a receipt that [`ExactLexicalSnapshotDescriptor::reopen`]
+    /// revalidates rather than following a newer publication.
+    pub fn exact_lexical_snapshot_descriptor(
+        &self,
+        source_checkpoint: [u8; 32],
+    ) -> Result<ExactLexicalSnapshotDescriptor, KeeperError> {
+        let directory =
+            self.directory
+                .clone()
+                .ok_or_else(|| KeeperError::ExactSnapshotReceipt {
+                    detail: "in-memory snapshot has no descriptor-backed reopen path".to_owned(),
+                })?;
+        Ok(ExactLexicalSnapshotDescriptor {
+            directory,
+            schema: self.schema,
+            source_checkpoint,
+            receipt: self.exact_lexical_component_receipt(source_checkpoint)?,
+        })
     }
 
     fn open_once(directory: &Path, schema: SchemaDescriptor) -> Result<Self, KeeperError> {
@@ -13867,6 +14030,88 @@ fn managed_disk_bytes(directory: &Path) -> u64 {
     total
 }
 
+fn hash_exact_snapshot_frame(
+    hasher: &mut Sha256,
+    role: &[u8],
+    bytes: &[u8],
+) -> Result<(), KeeperError> {
+    let role_len = u16::try_from(role.len()).map_err(|_| KeeperError::ExactSnapshotReceipt {
+        detail: "exact lexical snapshot frame role exceeded u16".to_owned(),
+    })?;
+    let byte_len = u64::try_from(bytes.len()).map_err(|_| KeeperError::ExactSnapshotReceipt {
+        detail: "exact lexical snapshot frame length exceeded u64".to_owned(),
+    })?;
+    hasher.update(role_len.to_le_bytes());
+    hasher.update(role);
+    hasher.update(byte_len.to_le_bytes());
+    hasher.update(bytes);
+    Ok(())
+}
+
+fn exact_snapshot_manifest_bytes(snapshot: &KeeperSnapshot) -> Result<Vec<u8>, KeeperError> {
+    let directory =
+        snapshot
+            .directory
+            .as_deref()
+            .ok_or_else(|| KeeperError::ExactSnapshotReceipt {
+                detail: "in-memory snapshot has no immutable MANIFEST descriptor".to_owned(),
+            })?;
+    let name = match snapshot.loaded.source {
+        ManifestSource::Current => "MANIFEST",
+        ManifestSource::PreviousAfterMissingCurrent
+        | ManifestSource::PreviousAfterCorruptCurrent => "MANIFEST.prev",
+        ManifestSource::InMemory => {
+            return Err(KeeperError::ExactSnapshotReceipt {
+                detail: "in-memory snapshot has no immutable MANIFEST descriptor".to_owned(),
+            });
+        }
+    };
+    let path = directory.join(name);
+    let file = open_manifest_slot(&path).map_err(|source| KeeperError::Io {
+        operation: "open exact lexical snapshot manifest",
+        path: path.clone(),
+        source,
+    })?;
+    let byte_len = file.metadata().map_err(|source| KeeperError::Io {
+        operation: "stat exact lexical snapshot manifest",
+        path: path.clone(),
+        source,
+    })?;
+    if byte_len.len() > usize_to_u64(MAX_MANIFEST_BYTES) {
+        return Err(KeeperError::ExactSnapshotReceipt {
+            detail: "selected MANIFEST exceeded the receipt byte limit".to_owned(),
+        });
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(usize::try_from(byte_len.len()).unwrap_or(MAX_MANIFEST_BYTES))
+        .map_err(|error| KeeperError::ExactSnapshotReceipt {
+            detail: format!("could not allocate selected MANIFEST bytes: {error}"),
+        })?;
+    file.take(usize_to_u64(MAX_MANIFEST_BYTES).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|source| KeeperError::Io {
+            operation: "read exact lexical snapshot manifest",
+            path: path.clone(),
+            source,
+        })?;
+    if bytes.len() > MAX_MANIFEST_BYTES {
+        return Err(KeeperError::ExactSnapshotReceipt {
+            detail: "selected MANIFEST exceeded the receipt byte limit while reading".to_owned(),
+        });
+    }
+    let decoded =
+        Manifest::from_bytes(&bytes).map_err(|error| KeeperError::ExactSnapshotReceipt {
+            detail: format!("selected MANIFEST no longer decodes: {error}"),
+        })?;
+    if decoded != snapshot.loaded.manifest {
+        return Err(KeeperError::ExactSnapshotReceipt {
+            detail: "selected MANIFEST changed since the snapshot was opened".to_owned(),
+        });
+    }
+    Ok(bytes)
+}
+
 /// Whether a live writer currently holds `directory`'s LOCK.
 ///
 /// Reads the D1 LOCK record and applies the POSIX `kill(pid, 0)` liveness
@@ -14338,6 +14583,85 @@ mod tests {
     fn write_manifest(path: &Path, manifest: &Manifest) -> TestResult {
         let bytes = manifest.to_bytes()?;
         std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    #[test]
+    fn exact_lexical_snapshot_receipt_binds_docset_checkpoint_and_descriptor_reopen() -> TestResult
+    {
+        let index = tempdir()?;
+        let directory = index.path().to_path_buf();
+        let encoded = encoded_identity_test_segment(
+            0xe1ac_7a1,
+            0,
+            &[Some("receipt-a"), None, Some("receipt-b")],
+        )?;
+        let manifest = durable_test_manifest(2, vec![manifest_segment(&encoded, 1)]);
+        let publish_directory = directory.clone();
+        run_with_test_cx(move |cx| async move {
+            let mut writer = KeeperWriter::create(&cx, &publish_directory, DEFAULT_SCHEMA)
+                .await
+                .map_err(|error| error.to_string())?;
+            let pending = encoded
+                .write_temp(&publish_directory)
+                .map_err(|error| error.to_string())?;
+            writer
+                .publish_segment(&cx, pending)
+                .await
+                .map_err(|error| error.to_string())?;
+            writer
+                .publish(&cx, &manifest)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<(), String>(())
+        })
+        .map_err(io::Error::other)?;
+
+        let snapshot = KeeperSnapshot::open(&directory, DEFAULT_SCHEMA)?;
+        let descriptor = snapshot.exact_lexical_snapshot_descriptor([7; 32])?;
+        let receipt = descriptor.receipt();
+        assert_eq!(receipt.role, GenerationComponentRole::Lexical);
+        assert_eq!(receipt.live_document_count, 2);
+        assert_eq!(receipt.source_checkpoint, [7; 32]);
+        let expected_docset =
+            CanonicalDocsetV1::from_ordered_live_documents(["receipt-a", "receipt-b"])?;
+        assert_eq!(receipt.docset_digest, expected_docset.digest());
+        assert_ne!(receipt.bytes.sha256, [0; 32]);
+
+        let reopened = descriptor.reopen()?;
+        assert_eq!(
+            reopened.exact_lexical_component_receipt([7; 32])?,
+            *receipt,
+            "paired control: descriptor-backed reopen must reproduce every receipt field"
+        );
+        let other_checkpoint = snapshot.exact_lexical_component_receipt([8; 32])?;
+        assert_eq!(other_checkpoint.docset_digest, receipt.docset_digest);
+        assert_eq!(other_checkpoint.bytes, receipt.bytes);
+        assert_ne!(
+            other_checkpoint.source_checkpoint,
+            receipt.source_checkpoint
+        );
+
+        let advance_directory = directory.clone();
+        run_with_test_cx(move |cx| async move {
+            let mut writer = KeeperWriter::open(&cx, &advance_directory, DEFAULT_SCHEMA)
+                .await
+                .map_err(|error| error.to_string())?;
+            let next = writer
+                .snapshot()
+                .next_manifest()
+                .map_err(|error| error.to_string())?;
+            writer
+                .publish(&cx, &next)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<(), String>(())
+        })
+        .map_err(io::Error::other)?;
+        assert!(matches!(
+            descriptor.reopen(),
+            Err(KeeperError::ExactSnapshotReceipt { .. })
+        ));
         Ok(())
     }
 
