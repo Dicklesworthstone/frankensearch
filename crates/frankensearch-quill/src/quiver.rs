@@ -10247,6 +10247,57 @@ impl EncodedStoredMetaSection {
         })
     }
 
+    /// Seal the stored columns of one Scribe accumulator into owned bytes.
+    ///
+    /// Materializes what [`BorrowedStoredMetaSection::encode_accumulator`]
+    /// produces. Prefer the borrowed form on the seal path: it emits the same
+    /// bytes without copying every field blob first (`bd-4xr99`).
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as
+    /// [`BorrowedStoredMetaSection::encode_accumulator`].
+    pub fn encode_accumulator<A: TokenAnalyzer>(
+        docid_lo: u64,
+        docid_hi: u64,
+        lease_docid_base: u64,
+        accumulator: &ColumnarAccumulator<A>,
+    ) -> Result<Self, StoredMetaCodecError> {
+        Ok(BorrowedStoredMetaSection::encode_accumulator(
+            docid_lo,
+            docid_hi,
+            lease_docid_base,
+            accumulator,
+        )?
+        .to_encoded())
+    }
+
+    /// Owned counterpart of
+    /// [`BorrowedStoredMetaSection::encode_accumulator_with_limits`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as
+    /// [`BorrowedStoredMetaSection::encode_accumulator`].
+    pub fn encode_accumulator_with_limits<A: TokenAnalyzer>(
+        docid_lo: u64,
+        docid_hi: u64,
+        lease_docid_base: u64,
+        accumulator: &ColumnarAccumulator<A>,
+        limits: StoredMetaLimits,
+    ) -> Result<Self, StoredMetaCodecError> {
+        Ok(BorrowedStoredMetaSection::encode_accumulator_with_limits(
+            docid_lo,
+            docid_hi,
+            lease_docid_base,
+            accumulator,
+            limits,
+        )?
+        .to_encoded())
+    }
+}
+
+impl<'a> BorrowedStoredMetaSection<'a> {
     /// Seal the stored columns of one Scribe accumulator directly into the
     /// segment's positional global-docid span.
     ///
@@ -10459,12 +10510,31 @@ impl EncodedStoredMetaSection {
 
         let (field_offsets, total_len) =
             stored_meta_layout(&expected_field_ords, span, &blob_lengths, limits)?;
+        // One owned prefix run per field, plus the directory at index 0. Each
+        // field's blob stays borrowed and is emitted straight into the durable
+        // buffer by `write_into`, so a stored byte is copied once per seal
+        // rather than twice (`bd-4xr99`).
+        let mut prefixes: Vec<Vec<u8>> = Vec::new();
+        prefixes
+            .try_reserve_exact(stored_fields.len() + 1)
+            .map_err(|_| StoredMetaCodecError::Allocation {
+                resource: "section prefix runs",
+                bytes: (stored_fields.len() + 1) * std::mem::size_of::<Vec<u8>>(),
+            })?;
+        let mut blobs: Vec<&'a [u8]> = Vec::new();
+        blobs
+            .try_reserve_exact(stored_fields.len())
+            .map_err(|_| StoredMetaCodecError::Allocation {
+                resource: "section blob views",
+                bytes: stored_fields.len() * std::mem::size_of::<&[u8]>(),
+            })?;
+
         let mut bytes = Vec::new();
         bytes
-            .try_reserve_exact(total_len)
+            .try_reserve_exact(expected_field_ords.len() * STORED_META_DIRECTORY_ENTRY_LEN)
             .map_err(|_| StoredMetaCodecError::Allocation {
-                resource: "section bytes",
-                bytes: total_len,
+                resource: "section directory bytes",
+                bytes: expected_field_ords.len() * STORED_META_DIRECTORY_ENTRY_LEN,
             })?;
         for (&field_ord, &offset) in expected_field_ords.iter().zip(&field_offsets) {
             bytes.extend_from_slice(&field_ord.to_le_bytes());
@@ -10472,13 +10542,22 @@ impl EncodedStoredMetaSection {
                 .map_err(|_| StoredMetaCodecError::OffsetUnrepresentable { field_ord, offset })?;
             bytes.extend_from_slice(&offset.to_le_bytes());
         }
+        // Running length of the section emitted so far, which the per-field
+        // `field_offset` assertions below are stated against. The owned writer
+        // read this off `bytes.len()`; the prefixes are separate buffers now,
+        // so it is tracked explicitly and means exactly the same thing.
+        let mut emitted = bytes.len();
+        prefixes.push(bytes);
 
         let presence_len = stored_meta_presence_len(span)?;
         for ((field, &field_offset), &blob_len) in
             stored_fields.iter().zip(&field_offsets).zip(&blob_lengths)
         {
-            debug_assert_eq!(bytes.len(), field_offset);
-            let presence_start = bytes.len();
+            debug_assert_eq!(emitted, field_offset);
+            // Prefix-local: this field's presence bitmap starts at 0 of its own
+            // run, where the owned writer indexed from the section start.
+            let mut bytes = Vec::new();
+            let presence_start = 0_usize;
             let presence_end = presence_start.checked_add(presence_len).ok_or(
                 StoredMetaCodecError::ArithmeticOverflow {
                     field: "presence end",
@@ -10519,26 +10598,35 @@ impl EncodedStoredMetaSection {
             }
             debug_assert_eq!(source_index, document_ords.len());
             debug_assert_eq!(usize::try_from(current_offset).ok(), Some(blob_len));
-            bytes.extend_from_slice(field.blob());
+            emitted = emitted
+                .checked_add(bytes.len())
+                .and_then(|used| used.checked_add(blob_len))
+                .ok_or(StoredMetaCodecError::ArithmeticOverflow {
+                    field: "emitted section length",
+                })?;
+            prefixes.push(bytes);
+            blobs.push(field.blob());
             tracing::debug!(
                 field_ord = field.field_ord(),
                 blob_bytes = blob_len,
                 "encoded Quill STOREDMETA accumulator field blob"
             );
         }
-        debug_assert_eq!(bytes.len(), total_len);
+        debug_assert_eq!(emitted, total_len);
         tracing::debug!(
             field_count = stored_fields.len(),
             blob_bytes = total_blob_bytes,
             section_bytes = total_len,
             "encoded Quill STOREDMETA section from Scribe accumulator"
         );
-        Ok(Self {
-            bytes,
+        Ok(BorrowedStoredMetaSection {
+            prefixes,
+            blobs,
             docid_lo,
             docid_hi,
             field_count: stored_fields.len(),
             blob_bytes: total_blob_bytes,
+            total_len,
         })
     }
 
