@@ -14601,7 +14601,7 @@ mod tests {
         let index = tempdir()?;
         let directory = index.path().to_path_buf();
         let encoded = encoded_identity_test_segment(
-            0xe1ac_7a1,
+            0x0e1a_c7a1,
             0,
             &[Some("receipt-a"), None, Some("receipt-b")],
         )?;

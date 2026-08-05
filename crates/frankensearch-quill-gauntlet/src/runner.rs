@@ -8173,7 +8173,16 @@ pub fn persist_shrunk_reproduction(
 mod tests {
     use std::collections::BTreeSet;
     #[cfg(feature = "tantivy-oracle")]
-    use std::io::{self, Read, Write};
+    use std::io::{self, Write};
+    // `Read` is used ONLY by the UNION_HORIZON executable-hashing probes, which
+    // compile under `all(tantivy-oracle, pruning-conformance)`. Importing it on
+    // `tantivy-oracle` alone made every `-D warnings` lane that does not also
+    // enable `pruning-conformance` red (bd-g1ww8's sibling), while deleting it
+    // outright would have broken `--all-features` — where the probes DO
+    // compile and the trait IS needed. The import now carries exactly the cfg
+    // of its use.
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    use std::io::Read;
     #[cfg(feature = "tantivy-oracle")]
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -18921,7 +18930,7 @@ mod tests {
             pathology: None,
             unicode_lane: crate::generator::UnicodeLane::Ascii,
         };
-        let documents = vec![
+        let documents = [
             document("y8ozo-head", "alphaterm alphaterm alphaterm"),
             document("y8ozo-tail", "zzzuniqueterm"),
         ];
