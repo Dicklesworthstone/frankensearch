@@ -1401,4 +1401,97 @@ mod four_engine_generation_receipts {
             "a reordered live-document set must not produce the anchor's digest"
         );
     }
+
+    /// Slice 2: all four roles, every one of them from a real producer, joined
+    /// by the contract that will admit them in production.
+    ///
+    /// The vector and ANN roles come from one written FSVI image and a graph
+    /// built over that same admitted owner (slice 1). The lexical role comes
+    /// from a Quill index that actually indexed and committed the same
+    /// documents. The metadata role comes from a GenerationManifest and DERIVES
+    /// its checkpoint from the manifest's own commit range rather than
+    /// accepting one, which is the fail-closed property bd-uu0ly chose and
+    /// bd-z4zr3 preserved.
+    ///
+    /// This is the join bd-z4zr3's acceptance asked for and could not build
+    /// from inside one crate: "a four-role join built from the REAL producers
+    /// -- FSVI witness, Quill descriptor, native HNSW receipt, and
+    /// GenerationManifest, over one document set -- admits."
+    #[cfg(feature = "quill")]
+    #[test]
+    fn four_real_producers_admit_as_one_generation() {
+        use frankensearch::quill::{QuillConfig, QuillIndex};
+        use frankensearch_core::LexicalWrite;
+        use frankensearch_core::generation::{
+            CanonicalDocsetV1, ExactComponentReceiptV1, ExactGenerationComponentsV1,
+        };
+        use frankensearch_core::types::IndexableDocument;
+
+        let directory = tempfile::tempdir().expect("7hvtf publication directory");
+        let owner = fsvi_owner(directory.path());
+        let range = CommitRange { low: 1, high: 9 };
+        let checkpoint = SourceCheckpointV1::derive(&range);
+
+        let vector = vector_component_receipt(owner.witness(), DOCUMENTS, checkpoint)
+            .expect("vector receipt from the real FSVI witness");
+        let graph = ValidatedNativeHnsw::build(Arc::clone(&owner), HnswParams::default(), 0x7b_5eed)
+            .expect("native HNSW graph over the admitted owner");
+        let graph_receipt = graph
+            .save(&directory.path().join("current.fshnsw"))
+            .expect("save the graph and mint its receipt");
+        let ann = ann_component_receipt(&graph_receipt, DOCUMENTS, checkpoint)
+            .expect("ANN receipt from the real graph receipt");
+
+        let docset = CanonicalDocsetV1::from_ordered_live_documents(DOCUMENTS)
+            .expect("canonical docset over the shared ordered ids");
+        let manifest = manifest_over(range);
+        let manifest_bytes = serde_json::to_vec(&manifest).expect("serialize the manifest image");
+        let metadata =
+            ExactComponentReceiptV1::for_metadata_manifest(&manifest, &manifest_bytes, &docset)
+                .expect("metadata receipt from the real manifest");
+
+        let quill_directory = directory.path().join("quill");
+        asupersync::test_utils::run_test_with_cx(move |cx| async move {
+            let index = QuillIndex::create(&cx, &quill_directory, QuillConfig::default())
+                .await
+                .expect("create the Quill index");
+            let documents = DOCUMENTS
+                .iter()
+                .map(|id| IndexableDocument {
+                    id: (*id).to_owned(),
+                    content: format!("{id} shares the generation document set"),
+                    title: None,
+                    metadata: std::collections::HashMap::new(),
+                })
+                .collect::<Vec<_>>();
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index the shared document set into Quill");
+            index.commit(&cx).await.expect("commit the Quill segment");
+
+            let lexical = index
+                .keeper_snapshot()
+                .exact_lexical_component_receipt(checkpoint)
+                .expect("lexical receipt from the committed keeper snapshot");
+
+            // Every role independently agrees with the anchor on the document
+            // set, without any of them having been told what the others saw.
+            assert_eq!(lexical.docset_digest, vector.docset_digest);
+            assert_eq!(metadata.docset_digest, vector.docset_digest);
+            assert_eq!(lexical.source_checkpoint, vector.source_checkpoint);
+            assert_eq!(
+                metadata.source_checkpoint, vector.source_checkpoint,
+                "the deriving role must reach the same checkpoint as the accepting ones"
+            );
+
+            ExactGenerationComponentsV1::admit(
+                vector.clone(),
+                lexical.clone(),
+                Some(ann.clone()),
+                metadata.clone(),
+            )
+            .expect("four real producers admit as one generation");
+        });
+    }
 }
