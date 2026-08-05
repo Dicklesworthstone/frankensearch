@@ -4446,11 +4446,16 @@ pub fn load_read_only_campaign_report_v7() -> Result<CampaignReport, GauntletErr
             "retained CampaignReport V7 fixture is not a v7 report",
         ));
     }
-    if report.canonical_bytes_unchecked()? != canonical {
-        return Err(campaign_error(
-            "retained CampaignReport V7 bytes are not the report canonical encoding",
-        ));
-    }
+    // NO DTO ROUND-TRIP CHECK, deliberately (bd-bxya1). A retained generation
+    // is verified from its BYTES, never from a re-encode: v8 added
+    // `oracle_bug_reason` to the stored comparator configuration, so the
+    // current DTO re-encodes a decoded v7 report with a key that generation
+    // never had. Re-encoding could only ever prove that today's shape happens
+    // to match yesterday's, which is exactly what a version bump makes false —
+    // and it proves nothing about the archived bytes. The two checks that
+    // remain are strictly stronger, because both hash the stored bytes: the
+    // sealed fixture digest above, and the domain-separated report identity
+    // below.
     let mut hasher = Sha256::new();
     hasher.update(report_hash_domain(CAMPAIGN_REPORT_V7_SCHEMA_VERSION)?);
     hasher.update(canonical);
@@ -16593,11 +16598,15 @@ mod tests {
     /// The read-only half of the v7 -> v8 report migration (bd-bxya1).
     ///
     /// Two directions, both required. The retained v7 receipt must still LOAD —
-    /// same bytes, same canonical encoding, same v7 address — and it must NOT
-    /// be admissible under the current contract. A migration that only proved
-    /// the first would let a stale generation keep authority; one that only
-    /// proved the second would be indistinguishable from having lost the
-    /// archive.
+    /// same bytes, same sealed fixture digest, same v7 address, all verified
+    /// FROM those bytes — and it must NOT be admissible under the current
+    /// contract. A migration that only proved the first would let a stale
+    /// generation keep authority; one that only proved the second would be
+    /// indistinguishable from having lost the archive.
+    ///
+    /// What "still loads" does NOT include is a DTO round-trip: the current
+    /// shape carries `oracle_bug_reason`, which v7 never did, so re-encoding a
+    /// decoded v7 report cannot reproduce its bytes and must not be asked to.
     #[test]
     fn the_retained_v7_report_still_loads_and_is_refused_for_admission() {
         let archived =
