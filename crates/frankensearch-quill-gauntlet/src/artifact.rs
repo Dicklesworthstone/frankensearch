@@ -13,7 +13,8 @@ use crate::GauntletError;
 use crate::comparator::{
     ComparatorConfig, Divergence, LexicalBoundary, LexicalComparisonStatus,
     LexicalContractComparison, LexicalEngineRole, LexicalExposureContract,
-    LexicalObservationContext, RankClass, compare_observations_stored_v8,
+    LexicalObservationContext, RankClass, compare_observations_stored_v7,
+    compare_observations_stored_v8,
 };
 use crate::engine::{EnginePairIdentity, HarnessRun};
 use crate::generator::{
@@ -25,6 +26,17 @@ use crate::runner::{
     lexical_backend_identity, lexical_query_contract_sha256,
 };
 use crate::version_contract::{OracleVersionContract, oracle_version_contract};
+
+/// Which generation an object is being held to.
+///
+/// `Current` is the admission path. `RetainedV7` exists only so a witness a
+/// committed ledger already recorded stays checkable under the frozen contract
+/// that produced it; it confers no admission and nothing mints it (bd-bxya1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactGeneration {
+    Current,
+    RetainedV7,
+}
 
 const ARTIFACT_OBJECT_V7_SCHEMA_VERSION: u32 = 7;
 /// Current artifact-object generation.
@@ -922,8 +934,48 @@ impl ArtifactObject {
     }
 
     pub(crate) fn validate(&self) -> Result<(), GauntletError> {
-        validate_stored_object_schema(self.object_schema_version)
-            .map_err(|reason| GauntletError::InvalidContract { reason })?;
+        self.validate_as(ArtifactGeneration::Current)
+    }
+
+    /// Validate a RETAINED witness under its own generation (bd-bxya1).
+    ///
+    /// A committed register ledger holds v7 witness addresses, and the v8 bump
+    /// kept those addresses admissible ON PURPOSE — ingestion is a mint and
+    /// takes the current generation only, while an already-recorded join must
+    /// still be checkable or the archive stops being evidence. Every
+    /// structural check below is the same one [`Self::validate`] runs; what
+    /// changes is which generation's frozen contract the stored configuration
+    /// and the report re-derivation are held to.
+    ///
+    /// This grants no admission: `validate_stored_object_schema` still refuses
+    /// v7 everywhere admission is decided, and nothing here mints anything.
+    pub(crate) fn validate_retained_witness(&self) -> Result<(), GauntletError> {
+        self.validate_as(self.retained_generation())
+    }
+
+    const fn retained_generation(&self) -> ArtifactGeneration {
+        if self.object_schema_version == ARTIFACT_OBJECT_V7_SCHEMA_VERSION {
+            ArtifactGeneration::RetainedV7
+        } else {
+            ArtifactGeneration::Current
+        }
+    }
+
+    fn validate_as(&self, generation: ArtifactGeneration) -> Result<(), GauntletError> {
+        match generation {
+            ArtifactGeneration::Current => {
+                validate_stored_object_schema(self.object_schema_version)
+                    .map_err(|reason| GauntletError::InvalidContract { reason })?;
+            }
+            ArtifactGeneration::RetainedV7 => {
+                if self.object_schema_version != ARTIFACT_OBJECT_V7_SCHEMA_VERSION {
+                    return Err(GauntletError::InvalidContract {
+                        reason: "retained-witness validation is only for the v7 generation"
+                            .to_owned(),
+                    });
+                }
+            }
+        }
         if self.trust_ceiling != self.schema_trust_ceiling()? {
             return Err(GauntletError::InvalidContract {
                 reason: "artifact trust ceiling does not match its schema".to_owned(),
@@ -993,7 +1045,14 @@ impl ArtifactObject {
                 });
             }
         }
-        self.comparator_config.validate_stored_v7()?;
+        // The stored configuration is held to ITS OWN generation's frozen
+        // contract: v8 may carry the oracle-blame attribution, v7 may not, and
+        // a v7 configuration that somehow carried one would be refused rather
+        // than silently read as v8 (bd-bxya1).
+        match generation {
+            ArtifactGeneration::Current => self.comparator_config.validate_stored_v8()?,
+            ArtifactGeneration::RetainedV7 => self.comparator_config.validate_stored_v7()?,
+        }
         validate_generated_case_metadata(&self.case)?;
         if self.campaign.is_none()
             && self
@@ -1026,11 +1085,23 @@ impl ArtifactObject {
             &self.comparison.subject,
             &self.comparison.oracle,
         )?;
-        let recomputed = compare_observations_stored_v8(
-            self.comparison.subject.clone(),
-            self.comparison.oracle.clone(),
-            self.comparator_config,
-        )?;
+        // Re-derived under the comparator that produced it. A retained v7
+        // report must reproduce under the FROZEN v7 implementation; asking v8
+        // to reproduce it would be asking a different function for the same
+        // answer, which is exactly what a version boundary means it need not
+        // give.
+        let recomputed = match generation {
+            ArtifactGeneration::Current => compare_observations_stored_v8(
+                self.comparison.subject.clone(),
+                self.comparison.oracle.clone(),
+                self.comparator_config,
+            )?,
+            ArtifactGeneration::RetainedV7 => compare_observations_stored_v7(
+                self.comparison.subject.clone(),
+                self.comparison.oracle.clone(),
+                self.comparator_config,
+            )?,
+        };
         if recomputed != self.comparison {
             return Err(GauntletError::InvalidContract {
                 reason: "artifact comparison report does not match its observations".to_owned(),
@@ -1046,6 +1117,21 @@ impl ArtifactObject {
     /// authority beyond [`ArtifactTrustCeiling::IntegrityOnly`].
     pub(crate) fn validate_stored_builtin_integrity(&self) -> Result<(), GauntletError> {
         self.validate()?;
+        self.stored_builtin_integrity_evidence()
+    }
+
+    /// The same integrity claim, held to the object's OWN generation, for a
+    /// witness a committed ledger already recorded (bd-bxya1).
+    ///
+    /// Only the generation-sensitive half differs: everything below the
+    /// validation call is about the producer and the dependency, neither of
+    /// which the schema bump touched.
+    pub(crate) fn validate_retained_builtin_integrity(&self) -> Result<(), GauntletError> {
+        self.validate_retained_witness()?;
+        self.stored_builtin_integrity_evidence()
+    }
+
+    fn stored_builtin_integrity_evidence(&self) -> Result<(), GauntletError> {
         self.producer_build_identity.validate_stored_sealed_v2()?;
         self.producer_build_identity
             .require_features(&["tantivy_oracle"])?;
@@ -1101,7 +1187,41 @@ impl ArtifactObject {
     /// integrity validation. This intentionally remains usable by a newer
     /// verifier after the original producer or linked dependency has changed.
     pub(crate) fn divergence_binding(&self) -> Result<ArtifactDivergenceBinding, GauntletError> {
-        self.validate_stored_builtin_integrity()?;
+        let address = self.object_hash()?;
+        self.divergence_binding_at(address)
+    }
+
+    /// The same binding, addressed by the caller rather than by re-encoding.
+    ///
+    /// A CURRENT object may address itself: its DTO reproduces its bytes. A
+    /// RETAINED object may not, and that is not a defect to route around —
+    /// `object_hash` documents itself as not an original-byte verifier, and a
+    /// generation bump makes it literally true (v8 added a field v7 never
+    /// wrote). The address of a retained witness therefore has to come from
+    /// the bytes that ARE the evidence, which is what
+    /// [`RetainedArtifactWitness`] carries (bd-bxya1).
+    fn divergence_binding_at(
+        &self,
+        address: String,
+    ) -> Result<ArtifactDivergenceBinding, GauntletError> {
+        // A binding is built for BOTH a fresh mint and a join against a
+        // committed ledger, so it validates under the object's own generation
+        // and names that generation's hash scheme. Refusing a stale generation
+        // is the MINT's job — `observation_from_binding` takes the current
+        // scheme only — and doing it here instead would make every committed
+        // v7 witness unjoinable the moment the generation moved (bd-bxya1).
+        self.validate_retained_builtin_integrity()?;
+        let object_hash_scheme = match self.object_schema_version {
+            ARTIFACT_OBJECT_V7_SCHEMA_VERSION => OBJECT_HASH_SCHEME_V7_SHA256,
+            ARTIFACT_OBJECT_V8_SCHEMA_VERSION => OBJECT_HASH_SCHEME_V8_SHA256,
+            version => {
+                return Err(GauntletError::InvalidContract {
+                    reason: format!(
+                        "artifact object schema version {version} has no divergence hash scheme"
+                    ),
+                });
+            }
+        };
         let ArtifactOracleDependency::BuiltInTantivy { contract } = &self.oracle_dependency else {
             return Err(GauntletError::InvalidContract {
                 reason: "divergence binding requires a built-in Tantivy dependency role".to_owned(),
@@ -1116,8 +1236,8 @@ impl ArtifactObject {
             })?;
         Ok(ArtifactDivergenceBinding {
             object_schema_version: self.object_schema_version,
-            object_hash_scheme: OBJECT_HASH_SCHEME_V8_SHA256,
-            object_hash: self.object_hash()?,
+            object_hash_scheme,
+            object_hash: address,
             producer_identity_sha256: self.producer_build_identity.identity_hash()?,
             oracle_dependency_identity_sha256: contract.identity_sha256()?,
             oracle_lexical_contract_audit_revision: contract
@@ -1131,6 +1251,62 @@ impl ArtifactObject {
             rank_class: self.comparison.rank_class,
             divergences: self.comparison.divergences.clone(),
         })
+    }
+}
+
+/// A witness object a committed register ledger already recorded, addressed by
+/// the BYTES that are the evidence rather than by re-encoding it (bd-bxya1).
+///
+/// THE DEFECT THIS CLOSES. A ledger observation names its witness by content
+/// address. The join re-derived that address from the decoded object, which
+/// worked only while the DTO could reproduce the stored bytes — and a
+/// generation bump is precisely the event that makes it unable to: v8 added
+/// `oracle_bug_reason` to the stored comparator configuration, so every
+/// committed v7 witness stopped joining its own ledger the moment v8 landed.
+/// Re-minting the ledger would have replaced retained evidence rather than
+/// verified it.
+///
+/// The address here is COMPUTED from the bytes, never accepted from a caller,
+/// and the decoded object must still clear the full integrity contract of its
+/// own generation. A caller therefore cannot present bytes under someone
+/// else's address, which is the only forgery this type could otherwise enable.
+#[derive(Debug, Clone)]
+pub struct RetainedArtifactWitness {
+    object: ArtifactObject,
+    address: String,
+}
+
+impl RetainedArtifactWitness {
+    /// Decode and address a retained witness from its stored bytes.
+    ///
+    /// An optional single trailing newline is tolerated, because that is how
+    /// these fixtures are committed; nothing else about the bytes may differ.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bytes do not decode, or if the decoded object
+    /// fails the stored built-in integrity contract of its own generation.
+    pub fn decode(bytes: &[u8]) -> Result<Self, GauntletError> {
+        let canonical = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+        let object: ArtifactObject = serde_json::from_slice(canonical)?;
+        let address = hash_object_bytes(canonical, object.object_schema_version)?;
+        object.validate_retained_builtin_integrity()?;
+        Ok(Self { object, address })
+    }
+
+    /// The address these exact bytes hash to under their own hash domain.
+    #[must_use]
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    #[must_use]
+    pub const fn object(&self) -> &ArtifactObject {
+        &self.object
+    }
+
+    pub(crate) fn divergence_binding(&self) -> Result<ArtifactDivergenceBinding, GauntletError> {
+        self.object.divergence_binding_at(self.address.clone())
     }
 }
 
@@ -1996,6 +2172,215 @@ fn extend_compiler_input_reasons(
     if path == "build.rs" || path.ends_with("/build.rs") {
         reasons.insert(ArtifactStoreV4SourceInclusionReason::BuildScriptInput);
     }
+}
+
+/// One DEPENDENCY build script's execution record, exactly as Cargo reported
+/// it for THIS build.
+///
+/// # Why Cargo's execution record and not the target directory
+///
+/// The obvious collector globs `target/<profile>/build/*/output`. That is wrong
+/// here, and the counts say why: this repo builds every lane into ONE canonical
+/// target dir, which currently holds 210 build directories and 105 `output`
+/// files accumulated across every feature set, profile and agent that has ever
+/// built in it. A glob cannot tell which of those belong to the snapshot's own
+/// build, so it would absorb another lane's output while still calling the
+/// snapshot exact — violating the very acceptance clause it serves, that
+/// ambiguous paths fail closed — and it would drift run to run as peers build.
+/// Cargo's `build-script-executed` stream instead NAMES the units of this
+/// build: the invocation that leaves those 105 stale files behind reports
+/// exactly 31 records.
+///
+/// `cargo build --build-plan` would also have named them, but it is an unstable
+/// flag that has since been REMOVED: cargo 1.99.0-nightly rejects it with
+/// "unexpected argument". `--message-format=json` is the stable route.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactStoreV4DependencyBuildScriptRecord {
+    /// Cargo package id, including source and exact version.
+    pub package_id: String,
+    /// `cargo:rustc-cfg=` emissions, canonically ordered.
+    pub cfgs: Vec<String>,
+    /// `cargo:rustc-env=` emissions as name/value, canonically ordered.
+    pub env: Vec<(String, String)>,
+    /// `cargo:rustc-link-lib=` emissions, canonically ordered.
+    pub linked_libs: Vec<String>,
+    /// `cargo:rustc-link-search=` emissions, canonically ordered.
+    pub linked_paths: Vec<String>,
+    /// Cargo's unit directory NAME, such as `proc-macro2-3b38ca9fc7e78ad2`.
+    ///
+    /// Deliberately NOT the absolute `out_dir`. That path embeds
+    /// `CARGO_TARGET_DIR`, so digesting it would make the snapshot depend on
+    /// WHERE the build ran rather than WHAT was built, and two byte-identical
+    /// builds under different target dirs would disagree. The unit name still
+    /// carries Cargo's own hash over features, profile and dependency
+    /// versions, which is the part that is about the build.
+    pub unit_dir: String,
+}
+
+/// Parse Cargo's `--message-format=json` stream into canonical dependency
+/// build-script records.
+///
+/// # Errors
+///
+/// Fails closed on a malformed line, an absent or empty `package_id`, an
+/// `out_dir` with no unit component, and on a duplicate `(package_id,
+/// unit_dir)` — the same unit reported twice means the stream mixed builds, and
+/// silently keeping either copy is exactly the ambiguity this refuses.
+///
+/// # Why the key is the UNIT and not the package
+///
+/// One package legitimately runs its build script more than once in a single
+/// build, once per unit: a host unit for build-dependency/proc-macro use and a
+/// target unit for normal linkage, with different feature resolution and
+/// different `out_dir`s. The real capture this is tested against proves it —
+/// 31 records over 30 distinct packages, because `serde_core` appears as both
+/// `serde_core-d68a7d95f8797bbf` and `serde_core-79bd93f20e896c8e`. Keying on
+/// `package_id` alone would reject a perfectly ordinary build; that invariant
+/// was written here first and the real Cargo stream refuted it immediately,
+/// which a hand-written fixture would not have.
+pub fn collect_dependency_build_script_records(
+    cargo_json: &str,
+) -> Result<Vec<ArtifactStoreV4DependencyBuildScriptRecord>, GauntletError> {
+    let invalid = |reason: String| GauntletError::InvalidObservation { reason };
+    let mut records: Vec<ArtifactStoreV4DependencyBuildScriptRecord> = Vec::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+
+    for (index, line) in cargo_json.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(line)
+            .map_err(|error| invalid(format!("cargo json line {index} is not JSON: {error}")))?;
+        if value.get("reason").and_then(serde_json::Value::as_str) != Some("build-script-executed")
+        {
+            continue;
+        }
+
+        let package_id = value
+            .get("package_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if package_id.is_empty() {
+            return Err(invalid(format!(
+                "cargo json line {index} reports a build script with no package_id"
+            )));
+        }
+        let out_dir = value
+            .get("out_dir")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let unit_dir = Path::new(out_dir)
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "{package_id} reports an out_dir with no unit component"
+                ))
+            })?
+            .to_owned();
+        if !seen.insert((package_id.clone(), unit_dir.clone())) {
+            return Err(invalid(format!(
+                "duplicate build-script record for {package_id} unit {unit_dir}: \
+                 the stream mixed builds"
+            )));
+        }
+
+        let ordered_strings = |key: &str| -> Vec<String> {
+            let mut collected: Vec<String> = value
+                .get(key)
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            collected.sort();
+            collected
+        };
+        let mut env: Vec<(String, String)> = value
+            .get("env")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let pair = item.as_array()?;
+                        Some((
+                            pair.first()?.as_str()?.to_owned(),
+                            pair.get(1)?.as_str()?.to_owned(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        env.sort();
+
+        records.push(ArtifactStoreV4DependencyBuildScriptRecord {
+            package_id,
+            cfgs: ordered_strings("cfgs"),
+            env,
+            linked_libs: ordered_strings("linked_libs"),
+            linked_paths: ordered_strings("linked_paths"),
+            unit_dir,
+        });
+    }
+
+    records.sort();
+    Ok(records)
+}
+
+/// Canonical digest over the dependency build-script records.
+///
+/// # Errors
+///
+/// Returns [`GauntletError::InvalidObservation`] when the records cannot be
+/// canonically serialized.
+pub fn dependency_build_script_records_sha256(
+    records: &[ArtifactStoreV4DependencyBuildScriptRecord],
+) -> Result<String, GauntletError> {
+    let bytes = serde_json::to_vec(records).map_err(|error| GauntletError::InvalidObservation {
+        reason: format!("could not canonicalize dependency build-script records: {error}"),
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"frankensearch.artifactstore.v4.dependency-build-script.v1\0");
+    hasher.update(&bytes);
+    Ok(lower_hex(&hasher.finalize()))
+}
+
+/// The dependency build-script collection as a Build snapshot input.
+///
+/// Carried as an INPUT of kind [`ArtifactStoreV4BuildInputKind::BuildScriptOutput`]
+/// rather than as a new field on the snapshot: inputs already flow into
+/// `identity_sha256`, so the collection binds the Build identity without a
+/// schema bump, and every retained snapshot keeps addressing exactly as it did.
+///
+/// # Errors
+///
+/// Returns [`GauntletError::InvalidObservation`] when the records cannot be
+/// canonically serialized.
+pub fn dependency_build_script_build_input(
+    records: &[ArtifactStoreV4DependencyBuildScriptRecord],
+) -> Result<ArtifactStoreV4BuildInput, GauntletError> {
+    let canonical_bytes =
+        serde_json::to_vec(records).map_err(|error| GauntletError::InvalidObservation {
+            reason: format!("could not canonicalize dependency build-script records: {error}"),
+        })?;
+    // Keyed alongside the existing narrowed dependency receipt
+    // (`build-script-output/dependency-availability`), which this completes:
+    // that one recorded WHETHER dependency scripts were observable, this one
+    // records WHAT they emitted.
+    Ok(ArtifactStoreV4BuildInput {
+        key: "build-script-output/dependency-execution-records".to_owned(),
+        kind: ArtifactStoreV4BuildInputKind::BuildScriptOutput,
+        sha256: lower_hex(&Sha256::digest(&canonical_bytes)),
+        canonical_bytes,
+    })
 }
 
 /// Every `cargo:rustc-env=` value this crate's build script emits, read back
@@ -4896,6 +5281,154 @@ mod tests {
     /// identical, and the snapshot would then claim exactness it no longer has.
     /// This reads build.rs itself and compares the two sets, so the drift is a
     /// test failure rather than a silently narrowed receipt.
+    /// A REAL capture of Cargo's build-script stream for this crate's own
+    /// build, so the collector is exercised against data Cargo actually
+    /// emitted rather than a hand-written approximation of it.
+    const DEPENDENCY_BUILD_SCRIPT_CAPTURE: &str =
+        include_str!("../fixtures/dependency-build-script-executed-v1.jsonl");
+
+    /// F1 slice: DEPENDENCY build-script output is collected from Cargo's own
+    /// execution record, and the collection is canonical and fail-closed.
+    #[test]
+    fn artifactstore_v4_dependency_build_script_records_are_canonical_and_fail_closed() {
+        let records = collect_dependency_build_script_records(DEPENDENCY_BUILD_SCRIPT_CAPTURE)
+            .expect("the real capture must collect");
+
+        // THE SELECTION PROPERTY, which is the whole reason this reads Cargo's
+        // record instead of the target directory: the shared target dir holds
+        // 105 `output` files from every lane ever built there, and this build
+        // has 31 units. A directory scan cannot tell those apart.
+        assert_eq!(
+            records.len(),
+            31,
+            "the capture must carry exactly this build's units"
+        );
+        assert!(
+            records.windows(2).all(|pair| pair[0] < pair[1]),
+            "records must be canonically ordered and duplicate-free"
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| !record.package_id.is_empty() && !record.unit_dir.is_empty()),
+            "every record must name its package and its unit"
+        );
+        // The unit dir is a NAME, never the absolute out_dir: an absolute path
+        // would bind the snapshot to where the build ran.
+        assert!(
+            records.iter().all(|record| !record.unit_dir.contains('/')),
+            "unit_dir must be a bare name, not a path"
+        );
+
+        // ONE PACKAGE, TWO UNITS is legal and must be ACCEPTED: a host unit for
+        // build-dependency/proc-macro use and a target unit for normal
+        // linkage, with different feature resolution and different out_dirs.
+        // The capture carries 31 records over 30 packages because serde_core
+        // appears twice. Keying identity on package_id alone would reject an
+        // ordinary build -- this collector did exactly that until the real
+        // stream refuted it.
+        let distinct_packages: BTreeSet<&str> = records
+            .iter()
+            .map(|record| record.package_id.as_str())
+            .collect();
+        assert_eq!(
+            distinct_packages.len(),
+            30,
+            "the capture must really contain a dual-unit package, or this proves nothing"
+        );
+
+        // Real emissions are present, so this is not a vacuous parse of empty
+        // arrays: proc-macro2 emits four cfgs in this capture.
+        let proc_macro2 = records
+            .iter()
+            .find(|record| record.package_id.contains("proc-macro2"))
+            .expect("the capture must include proc-macro2");
+        assert!(
+            proc_macro2.cfgs.contains(&"wrap_proc_macro".to_owned()),
+            "a real cfg emission must survive collection: {:?}",
+            proc_macro2.cfgs
+        );
+
+        // Digest is stable across a re-collection of the same bytes.
+        let digest = dependency_build_script_records_sha256(&records).expect("digest");
+        let recollected = collect_dependency_build_script_records(DEPENDENCY_BUILD_SCRIPT_CAPTURE)
+            .expect("re-collect");
+        assert_eq!(
+            digest,
+            dependency_build_script_records_sha256(&recollected).expect("digest"),
+            "collection must be deterministic"
+        );
+
+        // FAIL CLOSED. A duplicated package record means the stream mixed two
+        // builds; keeping either one silently is the ambiguity this refuses.
+        let first_line = DEPENDENCY_BUILD_SCRIPT_CAPTURE
+            .lines()
+            .next()
+            .expect("capture is non-empty");
+        let mixed = format!("{DEPENDENCY_BUILD_SCRIPT_CAPTURE}\n{first_line}");
+        let error = collect_dependency_build_script_records(&mixed)
+            .expect_err("a mixed stream must refuse");
+        assert!(
+            error.to_string().contains("mixed builds"),
+            "a duplicate package must refuse naming the cause, got: {error}"
+        );
+
+        // FAIL CLOSED on a record that names no package.
+        let anonymous =
+            r#"{"reason":"build-script-executed","package_id":"","out_dir":"/t/build/x/out"}"#;
+        assert!(
+            collect_dependency_build_script_records(anonymous).is_err(),
+            "a build script with no package_id must refuse"
+        );
+
+        // A mutated emission changes the digest -- the identity property F1
+        // requires of every compiler-visible input.
+        let mutated = DEPENDENCY_BUILD_SCRIPT_CAPTURE.replace("wrap_proc_macro", "wrap_proc_macr0");
+        let mutated_records =
+            collect_dependency_build_script_records(&mutated).expect("mutated capture collects");
+        assert_ne!(
+            digest,
+            dependency_build_script_records_sha256(&mutated_records).expect("digest"),
+            "a changed cfg emission must change the collection identity"
+        );
+    }
+
+    /// The collection is BOUND INTO the Build snapshot identity, which is what
+    /// makes it part of F1's Source+Build claim rather than a digest sitting
+    /// beside it.
+    #[test]
+    fn artifactstore_v4_dependency_build_scripts_bind_the_build_identity() {
+        let records = collect_dependency_build_script_records(DEPENDENCY_BUILD_SCRIPT_CAPTURE)
+            .expect("the real capture must collect");
+        let input = dependency_build_script_build_input(&records).expect("build input");
+        assert_eq!(input.kind, ArtifactStoreV4BuildInputKind::BuildScriptOutput);
+        assert_eq!(
+            input.sha256,
+            lower_hex(&Sha256::digest(&input.canonical_bytes)),
+            "the input digest must bind its own canonical bytes"
+        );
+
+        let source_identity = "0".repeat(64);
+        let snapshot = ArtifactStoreV4BuildSnapshot::new(source_identity.clone(), vec![input])
+            .expect("snapshot with the dependency collection");
+
+        // MUTATE ONE DEPENDENCY EMISSION -> the Build identity moves. Without
+        // this the collector would be collected and then ignored, which is the
+        // failure mode a digest-beside-the-object always has.
+        let mutated = DEPENDENCY_BUILD_SCRIPT_CAPTURE.replace("wrap_proc_macro", "wrap_proc_macr0");
+        let mutated_records =
+            collect_dependency_build_script_records(&mutated).expect("mutated capture collects");
+        let mutated_snapshot = ArtifactStoreV4BuildSnapshot::new(
+            source_identity,
+            vec![dependency_build_script_build_input(&mutated_records).expect("build input")],
+        )
+        .expect("snapshot with the mutated collection");
+        assert_ne!(
+            snapshot.identity_sha256, mutated_snapshot.identity_sha256,
+            "a dependency build-script emission must change the Build snapshot identity"
+        );
+    }
+
     ///
     /// It runs anywhere — no hardware gate — because it compares source text to
     /// a compiled-in list, not a produced artifact.
@@ -5412,7 +5945,9 @@ mod tests {
             match version {
                 1 | 2 | 3 | 5 => assert!(reason.contains("unauthenticated legacy")),
                 4 => assert!(reason.contains("reserved pre-policy")),
-                6 => assert!(reason.contains("integrity only")),
+                // v7 joined v6 at the integrity ceiling when v8 became the
+                // current generation, and it routes by the same rule.
+                6 | 7 => assert!(reason.contains("integrity only")),
                 _ => unreachable!(),
             }
         }
@@ -5496,7 +6031,7 @@ mod tests {
         // report and artifacts named different generations would be evidence
         // nothing could re-derive.
         assert_eq!(
-            u32::from(crate::runner::CAMPAIGN_REPORT_SCHEMA_VERSION),
+            crate::runner::CAMPAIGN_REPORT_SCHEMA_VERSION,
             OBJECT_SCHEMA_VERSION,
             "the report and artifact-object generations must not drift apart",
         );
@@ -5511,7 +6046,11 @@ mod tests {
             br#"{"schema_version":-1}"#,
             br#"{"schema_version":4294967296}"#,
             br#"{"schema_version":0}"#,
-            br#"{"schema_version":8}"#,
+            // The UNKNOWN-FUTURE probe, which must track the current
+            // generation: 8 is now minted, so 9 is the version nothing may
+            // interpret. Leaving 8 here asserted that the current generation
+            // is unclassifiable, which is how this test broke on the v8 bump.
+            br#"{"schema_version":9}"#,
             br#"{"schema_version":1,"schema_version":7}"#,
         ];
         for bytes in invalid_reports {
@@ -5532,7 +6071,9 @@ mod tests {
             br#"{"object_schema_version":-1}"#,
             br#"{"object_schema_version":4294967296}"#,
             br#"{"object_schema_version":0}"#,
-            br#"{"object_schema_version":8}"#,
+            // The unknown-future probe, tracking the current generation for
+            // the same reason as the report array above.
+            br#"{"object_schema_version":9}"#,
             br#"{"object_schema_version":1,"object_schema_version":7}"#,
         ];
         for bytes in invalid_objects {
@@ -6309,11 +6850,13 @@ mod tests {
     ///
     /// Both directions, because either alone is a different (weaker) claim.
     ///
-    /// FORWARD: the retained v7 golden still decodes, still addresses to its
-    /// own pinned v7 digest under its own hash domain, and still re-derives its
-    /// stored report from its own stored observations under the frozen v7
-    /// comparator. That is what "read-only" has to mean if the archive is to
-    /// stay worth keeping.
+    /// FORWARD: the retained v7 golden still decodes, its STORED BYTES still
+    /// address to its pinned v7 digest under its own hash domain, and it still
+    /// re-derives its stored report from its own stored observations under the
+    /// frozen v7 comparator. That is what "read-only" has to mean if the
+    /// archive is to stay worth keeping. What it does NOT mean is DTO
+    /// round-tripping: the current shape carries a field v7 never had, so a
+    /// retained object is verified from its bytes and never from a re-encode.
     ///
     /// BACKWARD: it is refused for admission, naming its generation, and it
     /// cannot be laundered into the current generation — stamping v8 on v7
@@ -6329,14 +6872,29 @@ mod tests {
             serde_json::from_slice(canonical).expect("the retained v7 object must still decode");
         assert_eq!(object.object_schema_version, 7);
 
-        // Its bytes have not moved, and it still addresses under the v7 domain.
-        assert_eq!(
-            object.canonical_bytes().expect("v7 canonical bytes"),
-            canonical
-        );
+        // Its stored BYTES have not moved and still address under the v7
+        // domain — verified from those bytes, never from a reserialization.
         assert_eq!(
             hash_object_bytes(canonical, 7).expect("registered v7 hash domain"),
             "3ba1751438f70da4dfb41bdce755906602a4b7d3d3fcf499803919c70473c800"
+        );
+        // The current DTO deliberately CANNOT reproduce them: v8 added
+        // `oracle_bug_reason` to the comparator configuration, so re-encoding a
+        // decoded v7 object emits a key its own generation never had. That is
+        // not damage to the archive — it is exactly why v8 is a new generation
+        // rather than a field added inside v7, and it is what `object_hash`
+        // means when it documents itself as not an original-byte verifier. A
+        // retained object is verified from its bytes; only a current object is
+        // verified from its DTO.
+        let reserialized = object.canonical_bytes().expect("v7 reserialization");
+        assert_ne!(reserialized, canonical);
+        assert!(
+            !String::from_utf8_lossy(canonical).contains("oracle_bug_reason"),
+            "the retained v7 bytes predate the v8 comparator input"
+        );
+        assert!(
+            String::from_utf8_lossy(&reserialized).contains("\"oracle_bug_reason\":null"),
+            "the current DTO adds exactly the v8 field, defaulted absent"
         );
 
         // It still re-derives its own report from its own observations under
@@ -6349,34 +6907,58 @@ mod tests {
         .expect("a retained v7 object must replay under the frozen v7 comparator");
         assert_eq!(replayed, object.comparison);
 
-        // And it is not admissible.
+        // And it is not admissible — while STILL being checkable under its own
+        // generation, which is the whole difference between a read-only
+        // archive and a lost one. A committed register ledger holds this
+        // object's address, so it has to stay verifiable without becoming
+        // admissible (bd-bxya1).
         assert!(matches!(
             object.validate(),
             Err(GauntletError::InvalidContract { ref reason })
                 if reason.contains("artifact v7") && reason.contains("read-only")
         ));
+        object
+            .validate_retained_witness()
+            .expect("a retained v7 witness must still validate under its own generation");
         assert_eq!(
             classify_artifact_object_schema(canonical).expect("typed v7 disposition"),
             SerializedSchemaDisposition::LegacyIntegrityCeiling { schema_version: 7 },
         );
 
-        // Restamping the version is not a migration: the address moves and the
-        // bytes are not the v8 golden.
+        // RESTAMPING IS RE-MINTING, NOT LAUNDERING, and the distinction is in
+        // the ADDRESS rather than in the bytes. For this diagnostic sample the
+        // v8 shape's only change is a defaulted field, so re-encoding it at v8
+        // reproduces the v8 golden byte for byte — which is exactly how the v8
+        // fixture was minted from the v7 campaign's evidence, and stating it
+        // here keeps the claim measurable instead of asserting an inequality
+        // the fixtures contradict.
+        //
+        // What restamping cannot do is carry the retained object's IDENTITY
+        // across the boundary: the v8 bytes address under the v8 domain, at the
+        // v8 digest, and can never present the v7 witness address a committed
+        // ledger recorded. Authority travels with the generation, not with the
+        // content.
         let mut restamped = object;
         restamped.object_schema_version = OBJECT_SCHEMA_VERSION;
         let restamped_bytes = restamped
             .canonical_bytes()
             .expect("restamped canonical bytes");
         const V8_GOLDEN: &[u8] = include_bytes!("../fixtures/artifact-object-v8.json");
-        assert_ne!(
+        assert_eq!(
             restamped_bytes,
             V8_GOLDEN
                 .strip_suffix(b"\n")
                 .expect("v8 golden must end in exactly one LF")
         );
+        let restamped_address =
+            hash_object_bytes(&restamped_bytes, OBJECT_SCHEMA_VERSION).expect("v8 hash domain");
+        assert_eq!(
+            restamped_address, "33293fc2e58848027bbbb29e4244ff54dea163bfbba945cc87e7d83ad9370d35",
+            "a re-minted object addresses as the v8 object it now is"
+        );
         assert_ne!(
-            hash_object_bytes(&restamped_bytes, OBJECT_SCHEMA_VERSION).expect("v8 hash domain"),
-            "3ba1751438f70da4dfb41bdce755906602a4b7d3d3fcf499803919c70473c800"
+            restamped_address, "3ba1751438f70da4dfb41bdce755906602a4b7d3d3fcf499803919c70473c800",
+            "and never as the retained v7 witness whose address a ledger may hold"
         );
     }
 
