@@ -27,7 +27,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::GauntletError;
-use crate::campaign_contract::CampaignContractModeV1;
+use crate::campaign_contract::{
+    CampaignCellEvidenceV1, CampaignContractModeV1, validate_replacement_completeness,
+};
 use crate::comparator::QuillCancellationReceipt;
 use crate::native_enriched_witness::{AcceptedCandidateBindingV1, VerifiedNativeEnrichedReceiptV1};
 use crate::runner::CampaignReport;
@@ -104,16 +106,24 @@ pub struct ReplacementEvidenceBundleV1<'evidence> {
     /// of the report's own coverage summary instead of an assertion the caller
     /// makes about itself.
     pub core_lexical_v3: Option<&'evidence CampaignReport>,
-    /// CASS-visible total coverage binding.
+    /// The frozen replacement campaign CELL MATRIX, not a pre-derived binding.
     ///
-    /// ASYMMETRY, STATED RATHER THAN LEFT TO BE DISCOVERED: this slot is still
-    /// a hand-constructible binding, because no derivation for it exists.
-    /// `CampaignLexicalCoverageSummary` has exactly three variants --
-    /// `CoreLexicalV3`, `RankEnvelopeOnly`, `LegacyMissing` -- with no CASS
-    /// variant, and `from_campaign_report` hardcodes `CoreLexicalV3` on
-    /// success. Until bd-8nqz.5 supplies a real producer, this slot is exactly
-    /// as strong as its caller, and no stronger.
-    pub cass_total: Option<&'evidence AcceptedCandidateBindingV1>,
+    /// The CASS-visible total contract has no `CampaignReport` derivation --
+    /// `CampaignLexicalCoverageSummary` has no CASS variant and
+    /// `from_campaign_report` hardcodes `CoreLexicalV3`. Its coverage is
+    /// established a different way: by the frozen campaign matrix, whose
+    /// `CassTotalV1`-profile cells `validate_replacement_completeness` checks
+    /// against the frozen key set, seed bundles, and per-profile required
+    /// contract mode. Taking the cells and validating them here means the
+    /// caller cannot declare CASS coverage any more than it can declare
+    /// core-v3 coverage.
+    ///
+    /// WHAT THIS SLOT DOES NOT DO, stated so the grant is not over-read: cells
+    /// carry no source revision, so unlike the core report and the enriched
+    /// receipt this slot cannot be candidate-bound. It proves the campaign
+    /// matrix is COMPLETE, not that it was run on this candidate. That is the
+    /// same class of limit as bd-drize.
+    pub cass_total: Option<&'evidence [CampaignCellEvidenceV1]>,
     /// Admissible native enriched receipt.
     pub native_enriched: Option<&'evidence VerifiedNativeEnrichedReceiptV1>,
     /// Method-bound cancellation receipt.
@@ -261,20 +271,45 @@ pub fn authorize(
         ReplacementEvidenceSlotV1::CoreLexicalV3Binding,
     )?;
 
-    let cass_total = bundle
+    let cass_cells = bundle
         .cass_total
         .ok_or_else(|| ReplacementEvidenceSlotV1::CassTotalBinding.missing())?;
-    require_binding(
-        cass_total,
-        CampaignContractModeV1::CassTotalV1,
-        candidate,
-        ReplacementEvidenceSlotV1::CassTotalBinding,
-    )?;
+    // DERIVED, never accepted -- the same move slice 3 made for the core slot.
+    // A caller cannot assert CASS coverage; it must present a campaign matrix
+    // that satisfies the frozen completeness policy.
+    validate_replacement_completeness(cass_cells).map_err(|error| {
+        GauntletError::InvalidContract {
+            reason: format!("cass total binding is not a complete frozen campaign matrix: {error}"),
+        }
+    })?;
+    if !cass_cells
+        .iter()
+        .any(|cell| cell.contract_mode() == CampaignContractModeV1::CassTotalV1)
+    {
+        return Err(GauntletError::InvalidContract {
+            reason: "cass total binding carries no CassTotalV1 campaign cell".to_owned(),
+        });
+    }
 
     let cancellation = bundle
         .cancellation
         .ok_or_else(|| ReplacementEvidenceSlotV1::CancellationReceipt.missing())?;
     cancellation.validate()?;
+    // bd-drize. `validate` proves the receipt is a real, replayable, live
+    // cancellation matrix; it cannot prove WHOSE. Until the body carried a
+    // source revision this slot was the only required one with no candidate
+    // binding to check, so a receipt observed from another source tree
+    // satisfied it — measured, not supposed: two candidates produced the same
+    // body_sha256 `9b81b211...` while the enriched address moved beneath it.
+    if cancellation.body.producer_source_revision != candidate {
+        return Err(GauntletError::ManifestMismatch {
+            reason: format!(
+                "{} was produced from {} but the authorization is for {candidate}",
+                ReplacementEvidenceSlotV1::CancellationReceipt.slot_name(),
+                cancellation.body.producer_source_revision
+            ),
+        });
+    }
 
     let divergence_census_sha256 = bundle
         .divergence_census_sha256
@@ -374,11 +409,38 @@ mod tests {
         report
     }
 
-    fn cass_binding(revision: &str) -> AcceptedCandidateBindingV1 {
-        AcceptedCandidateBindingV1 {
-            candidate_source_revision: revision.to_owned(),
-            contract_mode: CampaignContractModeV1::CassTotalV1,
-        }
+    /// The complete frozen campaign matrix, built the way the contract's own
+    /// tests build it: every frozen key, each with the contract mode its
+    /// profile requires and the seed bundle its slot pins.
+    fn cass_cells() -> Vec<CampaignCellEvidenceV1> {
+        crate::campaign_contract::frozen_replacement_cell_keys()
+            .into_iter()
+            .map(|key| {
+                let mode = match key.campaign_profile() {
+                    crate::campaign_contract::CampaignProfileV1::ShippingDefaultCoreV3 => {
+                        CampaignContractModeV1::CoreLexicalV3
+                    }
+                    crate::campaign_contract::CampaignProfileV1::CassTotalV1 => {
+                        CampaignContractModeV1::CassTotalV1
+                    }
+                };
+                let seeds =
+                    crate::campaign_contract::frozen_replacement_seed_bundle(key.seed_slot());
+                CampaignCellEvidenceV1::new(
+                    key,
+                    crate::campaign_contract::CampaignEvidenceRole::BuiltInEvidence(
+                        crate::campaign_contract::BuiltInEvidenceBindingV1::new(
+                            crate::campaign_contract::CampaignSha256V1::parse(&"a".repeat(64))
+                                .expect("strict lower-case hex"),
+                            crate::campaign_contract::CampaignSha256V1::parse(&"b".repeat(64))
+                                .expect("strict lower-case hex"),
+                        ),
+                    ),
+                    mode,
+                    seeds,
+                )
+            })
+            .collect()
     }
 
     /// A bundle complete in every slot EXCEPT the enriched receipt, which no
@@ -388,7 +450,7 @@ mod tests {
     /// further thing.
     fn bundle<'a>(
         core: &'a CampaignReport,
-        cass: &'a AcceptedCandidateBindingV1,
+        cass: &'a [CampaignCellEvidenceV1],
         cancellation: &'a QuillCancellationReceipt,
         candidate: &'a str,
     ) -> ReplacementEvidenceBundleV1<'a> {
@@ -408,19 +470,37 @@ mod tests {
             .to_string()
     }
 
-    async fn cancellation_receipt(cx: &asupersync::Cx) -> QuillCancellationReceipt {
-        crate::comparator::observe_live_quill_cancellation_receipt(cx)
+    /// The LIVE cancellation matrix, re-sealed onto the candidate under test.
+    ///
+    /// The observation is real — every phase is exercised against a live Quill
+    /// index and the re-seal re-runs `validate`, so nothing here can turn a
+    /// broken matrix into an accepted one. Only the producer revision is
+    /// restated, and it has to be: these bundles authorize a HYPOTHETICAL
+    /// candidate (the pinned fixture's producer), while a receipt observed here
+    /// necessarily records the revision THIS test binary was built from. Left
+    /// live, bd-drize's own check would refuse first and mask every refusal
+    /// below — the exact vacuity de006886 repaired in this function, which is
+    /// why the fix ships with this helper rather than after it.
+    async fn cancellation_receipt_for(
+        cx: &asupersync::Cx,
+        candidate: &str,
+    ) -> QuillCancellationReceipt {
+        let observed = crate::comparator::observe_live_quill_cancellation_receipt(cx)
             .await
-            .expect("observe the live Quill cancellation matrix")
+            .expect("observe the live Quill cancellation matrix");
+        let mut body = observed.body;
+        body.producer_source_revision = candidate.to_owned();
+        QuillCancellationReceipt::seal(body)
+            .expect("re-seal the live matrix onto the candidate under test")
     }
 
     #[test]
     fn every_required_slot_is_independently_load_bearing() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let cancellation = cancellation_receipt(&cx).await;
             let core = accepted_report();
             let candidate = core.producer_build_identity.source_git_revision.clone();
-            let cass = cass_binding(&candidate);
+            let cancellation = cancellation_receipt_for(&cx, &candidate).await;
+            let cass = cass_cells();
             let complete = bundle(&core, &cass, &cancellation, &candidate);
 
             let removals: [(ReplacementEvidenceSlotV1, ReplacementEvidenceBundleV1<'_>); 4] = [
@@ -479,14 +559,14 @@ mod tests {
     #[test]
     fn the_real_passed_rank_envelope_report_can_never_authorize() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let cancellation = cancellation_receipt(&cx).await;
             let pinned = pinned_report();
             assert!(
                 pinned.passed,
                 "the fixture must really be a PASSED report, or this test proves nothing"
             );
             let candidate = pinned.producer_build_identity.source_git_revision.clone();
-            let cass = cass_binding(&candidate);
+            let cancellation = cancellation_receipt_for(&cx, &candidate).await;
+            let cass = cass_cells();
 
             let message = refusal(&bundle(&pinned, &cass, &cancellation, &candidate));
             assert!(
@@ -502,12 +582,12 @@ mod tests {
     #[test]
     fn each_report_gate_is_independently_load_bearing() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let cancellation = cancellation_receipt(&cx).await;
             let candidate = accepted_report()
                 .producer_build_identity
                 .source_git_revision
                 .clone();
-            let cass = cass_binding(&candidate);
+            let cancellation = cancellation_receipt_for(&cx, &candidate).await;
+            let cass = cass_cells();
 
             let mut not_passed = accepted_report();
             not_passed.passed = false;
@@ -550,24 +630,20 @@ mod tests {
     #[test]
     fn evidence_from_a_different_candidate_can_never_authorize() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let cancellation = cancellation_receipt(&cx).await;
             let core = accepted_report();
             let candidate = core.producer_build_identity.source_git_revision.clone();
+            let cancellation = cancellation_receipt_for(&cx, &candidate).await;
 
-            // THE STALE-EVIDENCE HOLE: the report is valid and of the right
-            // coverage class, the CASS binding is well formed, and the BUNDLE
-            // still must not authorize because they describe different
-            // candidates. A per-receipt validator cannot see this at all.
-            let stale_cass = cass_binding(OTHER_CANDIDATE);
-            let message = refusal(&bundle(&core, &stale_cass, &cancellation, &candidate));
-            assert!(
-                message.contains(OTHER_CANDIDATE),
-                "a stale CASS binding must refuse naming the mismatch, got: {message}"
-            );
-
-            // And the mirror: an authorization for a candidate the report does
+            // NOTE ON WHAT MOVED: the CASS slot can no longer be candidate-
+            // stale, because it is now a campaign CELL MATRIX and cells carry
+            // no source revision. That is a real limit of this slot, recorded
+            // on the bundle type, not something to fake an assertion about.
+            // Its refusal property is COMPLETENESS, proved separately below.
+            //
+            // THE STALE-EVIDENCE HOLE still applies to the slots that DO carry
+            // a revision: an authorization for a candidate the core report does
             // not describe.
-            let cass = cass_binding(OTHER_CANDIDATE);
+            let cass = cass_cells();
             let message = refusal(&bundle(&core, &cass, &cancellation, OTHER_CANDIDATE));
             assert!(
                 message.contains(&candidate),
@@ -576,13 +652,120 @@ mod tests {
         });
     }
 
+    /// bd-drize, THE SLOT THAT COULD NOT BIND A CANDIDATE.
+    ///
+    /// The receipt below is fully valid — observed live, every phase covered,
+    /// re-sealed so its content address matches its body — and describes a
+    /// DIFFERENT source revision than the one under authorization. Before the
+    /// body carried a producer revision this bundle authorized, because no
+    /// field of the receipt could disagree with the candidate.
+    ///
+    /// The refusal is asserted BY SLOT NAME and by BOTH revisions, not merely
+    /// as "some error": every other slot here binds the candidate correctly, so
+    /// an implementation that refused for an unrelated reason would still turn
+    /// this test green. It is placed after the census check in intent but
+    /// reached before it, so nothing later can be masking the result.
+    #[test]
+    fn a_cancellation_receipt_from_another_source_revision_can_never_authorize() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let core = accepted_report();
+            let candidate = core.producer_build_identity.source_git_revision.clone();
+            let cass = cass_cells();
+            assert_ne!(
+                candidate, OTHER_CANDIDATE,
+                "the two revisions must differ, or this test proves nothing"
+            );
+
+            let foreign = cancellation_receipt_for(&cx, OTHER_CANDIDATE).await;
+            foreign
+                .validate()
+                .expect("the foreign receipt must be VALID: the defect is whose it is, not what");
+
+            let message = refusal(&bundle(&core, &cass, &foreign, &candidate));
+            assert!(
+                message.contains(ReplacementEvidenceSlotV1::CancellationReceipt.slot_name()),
+                "a foreign cancellation receipt must refuse naming that slot, got: {message}"
+            );
+            assert!(
+                message.contains(OTHER_CANDIDATE) && message.contains(&candidate),
+                "the refusal must name the revision it was produced from AND the one under \
+                 authorization, got: {message}"
+            );
+
+            // THE OTHER HALF, or the assertion above would also pass for a
+            // validator that refused every cancellation receipt: the same
+            // matrix, bound to the candidate, gets past this slot and refuses
+            // only for the enriched receipt no unit test can mint.
+            let matching = cancellation_receipt_for(&cx, &candidate).await;
+            let message = refusal(&bundle(&core, &cass, &matching, &candidate));
+            assert!(
+                message.contains(ReplacementEvidenceSlotV1::NativeEnrichedReceipt.slot_name()),
+                "a matching receipt must pass its slot and refuse later, got: {message}"
+            );
+        });
+    }
+
+    /// The binding is read from the BUILD, never from a caller: a live receipt
+    /// observed here names the revision this test binary was compiled from.
+    /// Without this, `observe_live_quill_cancellation_receipt` could grow a
+    /// candidate parameter and every test above would still pass while the
+    /// receipt attested whatever its caller asked for.
+    #[test]
+    fn a_live_cancellation_receipt_names_the_revision_it_was_built_from() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let observed = crate::comparator::observe_live_quill_cancellation_receipt(&cx)
+                .await
+                .expect("observe the live Quill cancellation matrix");
+            let compiled = crate::artifact::GauntletProducerBuildIdentity::compiled()
+                .expect("this binary has a build-sealed producer identity");
+            assert_eq!(
+                observed.body.producer_source_revision, compiled.source_git_revision,
+                "the receipt must name the source revision of the build that produced it"
+            );
+            assert!(
+                is_canonical_git_revision(&observed.body.producer_source_revision),
+                "the bound revision must be a canonical lowercase 40-hex git revision"
+            );
+        });
+    }
+
+    /// The CASS slot's own refusal property: an INCOMPLETE frozen matrix
+    /// cannot authorize. This is what replaced "the caller declared CASS
+    /// coverage" -- the caller must now present a matrix that satisfies the
+    /// frozen completeness policy, and dropping any single cell refuses.
+    #[test]
+    fn an_incomplete_cass_campaign_matrix_can_never_authorize() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let core = accepted_report();
+            let candidate = core.producer_build_identity.source_git_revision.clone();
+            let cancellation = cancellation_receipt_for(&cx, &candidate).await;
+
+            let complete = cass_cells();
+            assert!(
+                complete
+                    .iter()
+                    .any(|cell| cell.contract_mode() == CampaignContractModeV1::CassTotalV1),
+                "the frozen matrix must really contain a CassTotalV1 cell, or this proves nothing"
+            );
+
+            // Drop exactly one cell.
+            let mut incomplete = complete.clone();
+            incomplete.pop();
+            let message = refusal(&bundle(&core, &incomplete, &cancellation, &candidate));
+            assert!(
+                message.contains("complete frozen campaign matrix"),
+                "an incomplete CASS matrix must refuse by completeness, got: {message}"
+            );
+        });
+    }
+
     #[test]
     fn a_non_canonical_candidate_and_census_digest_are_refused() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let cancellation = cancellation_receipt(&cx).await;
             let core = accepted_report();
             let candidate = core.producer_build_identity.source_git_revision.clone();
-            let cass = cass_binding(&candidate);
+            let cancellation = cancellation_receipt_for(&cx, &candidate).await;
+            let cass = cass_cells();
 
             let short_candidate = ReplacementEvidenceBundleV1 {
                 candidate_source_revision: "702dee9a",
