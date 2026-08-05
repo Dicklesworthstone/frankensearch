@@ -232,7 +232,7 @@ pub use runner::{
     SCALAR_G1A_SCHEMA_CONTRACT_PREIMAGE, SemanticContract, ShadowDivergenceRecord, ShrinkDriver,
     ShrinkEngineFactory, ShrinkError, ShrinkRequest, ShrunkReproduction, SuspectedLayer,
     TriageConfidence, TriageVerdict, divergence_prediction_policy_sha256,
-    persist_shrunk_reproduction,
+    load_pinned_campaign_report_v7, persist_shrunk_reproduction,
 };
 pub use version_contract::{
     InternalDifferentialFixture, OracleVersionContract, Q1Fixture, Q1FixtureCatalog,

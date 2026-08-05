@@ -69,6 +69,31 @@ fn fixture_documents() -> Vec<IndexableDocument> {
         .collect()
 }
 
+/// The provenance a repaired campaign report carries. Only the SHAPE matters
+/// here: `from_campaign_report` requires provenance to be present, and the
+/// witness's own gates already prove each provenance axis separately.
+fn baseline_campaign_provenance() -> frankensearch_quill_gauntlet::CampaignProvenance {
+    frankensearch_quill_gauntlet::CampaignProvenance {
+        producer_build_identity_sha256: "0".repeat(64),
+        cargo_lock_sha256: "1".repeat(64),
+        rustc_version_verbose: "rustc 0.0.0 (authorization baseline)".to_owned(),
+        rust_toolchain_channel: "nightly-0000-00-00".to_owned(),
+        unicode_version: "0.0.0".to_owned(),
+        unicode_normalization_version: "0.0.0".to_owned(),
+        unicode_normalization_table_version: "0.0.0".to_owned(),
+        query_generator_id: "authorization-baseline".to_owned(),
+        query_generator_schema_version: 1,
+        query_seed: 0,
+        query_source_identity_sha256: "2".repeat(64),
+        query_profile_sha256: "3".repeat(64),
+        analyzer_contract_hash: "4".repeat(64),
+        schema_contract_hash: "5".repeat(64),
+        corpus_manifest_hash: "6".repeat(64),
+        query_manifest_hash: "7".repeat(64),
+        corpus_seed: None,
+    }
+}
+
 /// Every committed expectation must hold against the REAL native Quill
 /// paginated API — exact count, offset pagination, ordering and all.
 #[test]
@@ -584,7 +609,8 @@ fn an_inadmissible_enriched_receipt_can_never_authorize_a_replacement() {
         ReplacementEvidenceBundleV1, authorize,
     };
     use frankensearch_quill_gauntlet::{
-        CampaignContractModeV1, observe_live_quill_cancellation_receipt,
+        CampaignContractModeV1, CampaignLexicalCoverageSummary, LexicalSideCoverageCounts,
+        SemanticContract, load_pinned_campaign_report_v7, observe_live_quill_cancellation_receipt,
     };
 
     asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -639,10 +665,21 @@ fn an_inadmissible_enriched_receipt_can_never_authorize_a_replacement() {
         // EVERY OTHER SLOT IS PRESENT AND VALID, which is what makes this a
         // test of admissibility rather than of slot presence.
         let candidate = receipt.producer.source_git_revision.clone();
-        let core = AcceptedCandidateBindingV1 {
-            candidate_source_revision: candidate.clone(),
-            contract_mode: CampaignContractModeV1::CoreLexicalV3,
+        // The core slot takes the REPORT and derives its binding, so the
+        // coverage class cannot be asserted by this test either. The pinned
+        // fixture is repaired along exactly the axes from_campaign_report
+        // gates, and its producer revision is overridden to the candidate this
+        // run actually observed.
+        let mut core = load_pinned_campaign_report_v7().expect("pinned V7 campaign report");
+        core.lexical_coverage = CampaignLexicalCoverageSummary::CoreLexicalV3 {
+            subject: Box::new(LexicalSideCoverageCounts::default()),
+            oracle: Box::new(LexicalSideCoverageCounts::default()),
+            admissible: true,
         };
+        core.semantic_contract = SemanticContract::shipping_default();
+        core.provenance = Some(baseline_campaign_provenance());
+        core.producer_build_identity.source_git_dirty = false;
+        core.producer_build_identity.source_git_revision = candidate.clone();
         let cass = AcceptedCandidateBindingV1 {
             candidate_source_revision: candidate.clone(),
             contract_mode: CampaignContractModeV1::CassTotalV1,
@@ -710,7 +747,8 @@ fn a_complete_admissible_bundle_authorizes_and_emits_its_grant() {
         ReplacementEvidenceBundleV1, authorize,
     };
     use frankensearch_quill_gauntlet::{
-        CampaignContractModeV1, observe_live_quill_cancellation_receipt,
+        CampaignContractModeV1, CampaignLexicalCoverageSummary, LexicalSideCoverageCounts,
+        SemanticContract, load_pinned_campaign_report_v7, observe_live_quill_cancellation_receipt,
     };
 
     asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -778,10 +816,21 @@ fn a_complete_admissible_bundle_authorizes_and_emits_its_grant() {
             .expect("a receipt this build produced must load");
 
         let candidate = receipt.producer.source_git_revision.clone();
-        let core = AcceptedCandidateBindingV1 {
-            candidate_source_revision: candidate.clone(),
-            contract_mode: CampaignContractModeV1::CoreLexicalV3,
+        // The core slot takes the REPORT and derives its binding, so the
+        // coverage class cannot be asserted by this test either. The pinned
+        // fixture is repaired along exactly the axes from_campaign_report
+        // gates, and its producer revision is overridden to the candidate this
+        // run actually observed.
+        let mut core = load_pinned_campaign_report_v7().expect("pinned V7 campaign report");
+        core.lexical_coverage = CampaignLexicalCoverageSummary::CoreLexicalV3 {
+            subject: Box::new(LexicalSideCoverageCounts::default()),
+            oracle: Box::new(LexicalSideCoverageCounts::default()),
+            admissible: true,
         };
+        core.semantic_contract = SemanticContract::shipping_default();
+        core.provenance = Some(baseline_campaign_provenance());
+        core.producer_build_identity.source_git_dirty = false;
+        core.producer_build_identity.source_git_revision = candidate.clone();
         let cass = AcceptedCandidateBindingV1 {
             candidate_source_revision: candidate.clone(),
             contract_mode: CampaignContractModeV1::CassTotalV1,

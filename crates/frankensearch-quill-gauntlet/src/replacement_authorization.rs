@@ -30,6 +30,7 @@ use crate::GauntletError;
 use crate::campaign_contract::CampaignContractModeV1;
 use crate::comparator::QuillCancellationReceipt;
 use crate::native_enriched_witness::{AcceptedCandidateBindingV1, VerifiedNativeEnrichedReceiptV1};
+use crate::runner::CampaignReport;
 
 /// Stable schema identity for a terminal replacement authorization.
 pub const REPLACEMENT_AUTHORIZATION_SCHEMA_VERSION: &str = "quill-replacement-authorization-v1";
@@ -94,9 +95,24 @@ impl ReplacementEvidenceSlotV1 {
 pub struct ReplacementEvidenceBundleV1<'evidence> {
     /// Canonical 40-hex candidate revision every slot must bind.
     pub candidate_source_revision: &'evidence str,
-    /// Core Lexical V3 coverage binding.
-    pub core_lexical_v3: Option<&'evidence AcceptedCandidateBindingV1>,
+    /// The core-v3 campaign REPORT, not a pre-derived binding.
+    ///
+    /// Taking the report is the whole point: [`AcceptedCandidateBindingV1`] is
+    /// a public struct with public fields, so a caller handed a binding slot
+    /// could simply declare `CoreLexicalV3` coverage with no campaign behind
+    /// it. Deriving the binding here makes the coverage class a fact read out
+    /// of the report's own coverage summary instead of an assertion the caller
+    /// makes about itself.
+    pub core_lexical_v3: Option<&'evidence CampaignReport>,
     /// CASS-visible total coverage binding.
+    ///
+    /// ASYMMETRY, STATED RATHER THAN LEFT TO BE DISCOVERED: this slot is still
+    /// a hand-constructible binding, because no derivation for it exists.
+    /// `CampaignLexicalCoverageSummary` has exactly three variants --
+    /// `CoreLexicalV3`, `RankEnvelopeOnly`, `LegacyMissing` -- with no CASS
+    /// variant, and `from_campaign_report` hardcodes `CoreLexicalV3` on
+    /// success. Until bd-8nqz.5 supplies a real producer, this slot is exactly
+    /// as strong as its caller, and no stronger.
     pub cass_total: Option<&'evidence AcceptedCandidateBindingV1>,
     /// Admissible native enriched receipt.
     pub native_enriched: Option<&'evidence VerifiedNativeEnrichedReceiptV1>,
@@ -229,11 +245,17 @@ pub fn authorize(
     // instead, and the fail-closed tests would all pass for the wrong reason.
     // That is not hypothetical -- it is exactly what the first version of this
     // function did, and its own tests caught it.
-    let core_lexical_v3 = bundle
+    let core_report = bundle
         .core_lexical_v3
         .ok_or_else(|| ReplacementEvidenceSlotV1::CoreLexicalV3Binding.missing())?;
+    // DERIVED, never accepted. from_campaign_report fails closed on seven
+    // independent gates -- not passed, core-v3-but-inadmissible, rank-envelope
+    // only, no declared coverage scope, non-shipping semantic contract, absent
+    // provenance, and a dirty or non-canonical producer revision -- so the
+    // coverage class cannot be asserted into existence by the caller.
+    let core_lexical_v3 = AcceptedCandidateBindingV1::from_campaign_report(core_report)?;
     require_binding(
-        core_lexical_v3,
+        &core_lexical_v3,
         CampaignContractModeV1::CoreLexicalV3,
         candidate,
         ReplacementEvidenceSlotV1::CoreLexicalV3Binding,
@@ -303,29 +325,75 @@ pub fn authorize(
 mod tests {
     use super::*;
 
-    const CANDIDATE: &str = "702dee9a96a5963f96c4f670edb05f090eb9bec5";
     const OTHER_CANDIDATE: &str = "5eb995d524705ef8b17834e9ce005125179b9af2";
     const CENSUS: &str = "9d283b3445b042ac24f2c1d9d65af62c416acc1af4acdad8cca74d0aa70dde31";
 
-    fn binding(mode: CampaignContractModeV1, revision: &str) -> AcceptedCandidateBindingV1 {
+    fn baseline_provenance() -> crate::runner::CampaignProvenance {
+        crate::runner::CampaignProvenance {
+            producer_build_identity_sha256: "0".repeat(64),
+            cargo_lock_sha256: "1".repeat(64),
+            rustc_version_verbose: "rustc 0.0.0 (authorization baseline)".to_owned(),
+            rust_toolchain_channel: "nightly-0000-00-00".to_owned(),
+            unicode_version: "0.0.0".to_owned(),
+            unicode_normalization_version: "0.0.0".to_owned(),
+            unicode_normalization_table_version: "0.0.0".to_owned(),
+            query_generator_id: "authorization-baseline".to_owned(),
+            query_generator_schema_version: 1,
+            query_seed: 0,
+            query_source_identity_sha256: "2".repeat(64),
+            query_profile_sha256: "3".repeat(64),
+            analyzer_contract_hash: "4".repeat(64),
+            schema_contract_hash: "5".repeat(64),
+            corpus_manifest_hash: "6".repeat(64),
+            query_manifest_hash: "7".repeat(64),
+            corpus_seed: None,
+        }
+    }
+
+    /// THE REAL PINNED ARTIFACT, untouched. It is `passed: true` and
+    /// rank-envelope-only, which is exactly the object the acceptance says can
+    /// never authorize.
+    fn pinned_report() -> CampaignReport {
+        crate::runner::load_pinned_campaign_report_v7().expect("the pinned V7 campaign report")
+    }
+
+    /// The pinned fixture repaired along every axis `from_campaign_report`
+    /// gates. Repairing the REAL report rather than hand-building one keeps the
+    /// positive case honest: if the gates change, this stops satisfying them
+    /// and the tests fail loudly instead of drifting.
+    fn accepted_report() -> CampaignReport {
+        let mut report = pinned_report();
+        report.lexical_coverage = crate::runner::CampaignLexicalCoverageSummary::CoreLexicalV3 {
+            subject: Box::new(crate::runner::LexicalSideCoverageCounts::default()),
+            oracle: Box::new(crate::runner::LexicalSideCoverageCounts::default()),
+            admissible: true,
+        };
+        report.semantic_contract = crate::runner::SemanticContract::shipping_default();
+        report.provenance = Some(baseline_provenance());
+        report.producer_build_identity.source_git_dirty = false;
+        report
+    }
+
+    fn cass_binding(revision: &str) -> AcceptedCandidateBindingV1 {
         AcceptedCandidateBindingV1 {
             candidate_source_revision: revision.to_owned(),
-            contract_mode: mode,
+            contract_mode: CampaignContractModeV1::CassTotalV1,
         }
     }
 
     /// A bundle complete in every slot EXCEPT the enriched receipt, which no
-    /// unit test can mint: it requires a live both-engines run from a clean
-    /// checkout. Every refusal below is therefore proved against a bundle whose
-    /// only other absence is that one slot, and each test removes or corrupts
-    /// exactly one further thing.
+    /// unit test can mint: it needs a live both-engines run from a clean
+    /// checkout. Every refusal below is proved against a bundle whose only
+    /// other absence is that one slot, and each test changes exactly one
+    /// further thing.
     fn bundle<'a>(
-        core: &'a AcceptedCandidateBindingV1,
+        core: &'a CampaignReport,
         cass: &'a AcceptedCandidateBindingV1,
         cancellation: &'a QuillCancellationReceipt,
+        candidate: &'a str,
     ) -> ReplacementEvidenceBundleV1<'a> {
         ReplacementEvidenceBundleV1 {
-            candidate_source_revision: CANDIDATE,
+            candidate_source_revision: candidate,
             core_lexical_v3: Some(core),
             cass_total: Some(cass),
             native_enriched: None,
@@ -340,20 +408,21 @@ mod tests {
             .to_string()
     }
 
+    async fn cancellation_receipt(cx: &asupersync::Cx) -> QuillCancellationReceipt {
+        crate::comparator::observe_live_quill_cancellation_receipt(cx)
+            .await
+            .expect("observe the live Quill cancellation matrix")
+    }
+
     #[test]
     fn every_required_slot_is_independently_load_bearing() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let cancellation = crate::comparator::observe_live_quill_cancellation_receipt(&cx)
-                .await
-                .expect("observe the live Quill cancellation matrix");
-            let core = binding(CampaignContractModeV1::CoreLexicalV3, CANDIDATE);
-            let cass = binding(CampaignContractModeV1::CassTotalV1, CANDIDATE);
-            let complete = bundle(&core, &cass, &cancellation);
+            let cancellation = cancellation_receipt(&cx).await;
+            let core = accepted_report();
+            let candidate = core.producer_build_identity.source_git_revision.clone();
+            let cass = cass_binding(&candidate);
+            let complete = bundle(&core, &cass, &cancellation, &candidate);
 
-            // Each slot emptied ALONE must refuse BY NAME. Asserting the name
-            // rather than "some error" is what keeps this from passing for an
-            // unrelated reason -- exactly what an early admissibility check
-            // would have caused in this dirty working tree.
             let removals: [(ReplacementEvidenceSlotV1, ReplacementEvidenceBundleV1<'_>); 4] = [
                 (
                     ReplacementEvidenceSlotV1::CoreLexicalV3Binding,
@@ -392,7 +461,6 @@ mod tests {
                 );
             }
 
-            // The enriched slot, absent in `complete` itself.
             let message = refusal(&complete);
             assert!(
                 message.contains(ReplacementEvidenceSlotV1::NativeEnrichedReceipt.slot_name()),
@@ -401,31 +469,80 @@ mod tests {
         });
     }
 
+    /// THE ACCEPTANCE CLAUSE, PROVED AGAINST THE REAL ARTIFACT rather than a
+    /// straw man: "a generic passed `CampaignReport` or rank-envelope-only
+    /// coverage can never authorize the flip". The only committed report in
+    /// this repository passed its own campaign, and the aggregator refuses it.
+    ///
+    /// Before slice 3 this was unprovable here, because the caller handed over
+    /// a pre-derived binding and could simply declare core-v3 coverage.
     #[test]
-    fn rank_envelope_only_and_generic_coverage_can_never_authorize() {
+    fn the_real_passed_rank_envelope_report_can_never_authorize() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let cancellation = crate::comparator::observe_live_quill_cancellation_receipt(&cx)
-                .await
-                .expect("observe the live Quill cancellation matrix");
-            let cass = binding(CampaignContractModeV1::CassTotalV1, CANDIDATE);
-
-            // The acceptance names RankEnvelopeOnly explicitly.
-            let rank_only = binding(CampaignContractModeV1::RankEnvelopeOnly, CANDIDATE);
-            let message = refusal(&bundle(&rank_only, &cass, &cancellation));
+            let cancellation = cancellation_receipt(&cx).await;
+            let pinned = pinned_report();
             assert!(
-                message.contains("RankEnvelopeOnly") && message.contains("never authorize"),
-                "rank-envelope-only coverage must refuse by class, got: {message}"
+                pinned.passed,
+                "the fixture must really be a PASSED report, or this test proves nothing"
+            );
+            let candidate = pinned.producer_build_identity.source_git_revision.clone();
+            let cass = cass_binding(&candidate);
+
+            let message = refusal(&bundle(&pinned, &cass, &cancellation, &candidate));
+            assert!(
+                message.contains("rank-envelope"),
+                "a passed rank-envelope-only report must refuse by coverage, got: {message}"
+            );
+        });
+    }
+
+    /// Each gate `from_campaign_report` owns is separately load-bearing, proved
+    /// by breaking the repaired report one axis at a time. Without this, a
+    /// single surviving gate could carry all of them.
+    #[test]
+    fn each_report_gate_is_independently_load_bearing() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let cancellation = cancellation_receipt(&cx).await;
+            let candidate = accepted_report()
+                .producer_build_identity
+                .source_git_revision
+                .clone();
+            let cass = cass_binding(&candidate);
+
+            let mut not_passed = accepted_report();
+            not_passed.passed = false;
+            assert!(
+                refusal(&bundle(&not_passed, &cass, &cancellation, &candidate))
+                    .contains("did not pass"),
+                "a failed campaign must refuse"
             );
 
-            // The subtler one: a REAL, sufficient coverage class in the WRONG
-            // slot. CassTotalV1 is legitimate evidence and still cannot stand
-            // in for core-v3 coverage, so a validator that merely checked
-            // "is this a good binding?" would wrongly accept it.
-            let misfiled = binding(CampaignContractModeV1::CassTotalV1, CANDIDATE);
-            let message = refusal(&bundle(&misfiled, &cass, &cancellation));
+            let mut dirty = accepted_report();
+            dirty.producer_build_identity.source_git_dirty = true;
             assert!(
-                message.contains("CassTotalV1") && message.contains("never authorize"),
-                "a valid binding in the wrong slot must refuse, got: {message}"
+                refusal(&bundle(&dirty, &cass, &cancellation, &candidate)).contains("dirty"),
+                "a dirty-produced report must refuse"
+            );
+
+            let mut no_provenance = accepted_report();
+            no_provenance.provenance = None;
+            assert!(
+                refusal(&bundle(&no_provenance, &cass, &cancellation, &candidate))
+                    .contains("provenance"),
+                "a provenance-free report must refuse"
+            );
+
+            let mut inadmissible = accepted_report();
+            inadmissible.lexical_coverage =
+                crate::runner::CampaignLexicalCoverageSummary::CoreLexicalV3 {
+                    subject: Box::new(crate::runner::LexicalSideCoverageCounts::default()),
+                    oracle: Box::new(crate::runner::LexicalSideCoverageCounts::default()),
+                    admissible: false,
+                };
+            assert!(
+                refusal(&bundle(&inadmissible, &cass, &cancellation, &candidate))
+                    .contains("not admissible"),
+                "core-v3 coverage that is not admissible must refuse"
             );
         });
     }
@@ -433,28 +550,28 @@ mod tests {
     #[test]
     fn evidence_from_a_different_candidate_can_never_authorize() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let cancellation = crate::comparator::observe_live_quill_cancellation_receipt(&cx)
-                .await
-                .expect("observe the live Quill cancellation matrix");
-            let core = binding(CampaignContractModeV1::CoreLexicalV3, CANDIDATE);
-            let cass = binding(CampaignContractModeV1::CassTotalV1, CANDIDATE);
+            let cancellation = cancellation_receipt(&cx).await;
+            let core = accepted_report();
+            let candidate = core.producer_build_identity.source_git_revision.clone();
 
-            // THE STALE-EVIDENCE HOLE: every individual binding is internally
-            // valid and of the right coverage class, and the BUNDLE still must
-            // not authorize, because the two describe different candidates. A
-            // per-receipt validator cannot see this at all.
-            let stale_core = binding(CampaignContractModeV1::CoreLexicalV3, OTHER_CANDIDATE);
-            let message = refusal(&bundle(&stale_core, &cass, &cancellation));
-            assert!(
-                message.contains(OTHER_CANDIDATE) && message.contains(CANDIDATE),
-                "a stale core binding must refuse naming both revisions, got: {message}"
-            );
-
-            let stale_cass = binding(CampaignContractModeV1::CassTotalV1, OTHER_CANDIDATE);
-            let message = refusal(&bundle(&core, &stale_cass, &cancellation));
+            // THE STALE-EVIDENCE HOLE: the report is valid and of the right
+            // coverage class, the CASS binding is well formed, and the BUNDLE
+            // still must not authorize because they describe different
+            // candidates. A per-receipt validator cannot see this at all.
+            let stale_cass = cass_binding(OTHER_CANDIDATE);
+            let message = refusal(&bundle(&core, &stale_cass, &cancellation, &candidate));
             assert!(
                 message.contains(OTHER_CANDIDATE),
                 "a stale CASS binding must refuse naming the mismatch, got: {message}"
+            );
+
+            // And the mirror: an authorization for a candidate the report does
+            // not describe.
+            let cass = cass_binding(OTHER_CANDIDATE);
+            let message = refusal(&bundle(&core, &cass, &cancellation, OTHER_CANDIDATE));
+            assert!(
+                message.contains(&candidate),
+                "a report from another candidate must refuse naming it, got: {message}"
             );
         });
     }
@@ -462,15 +579,14 @@ mod tests {
     #[test]
     fn a_non_canonical_candidate_and_census_digest_are_refused() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let cancellation = crate::comparator::observe_live_quill_cancellation_receipt(&cx)
-                .await
-                .expect("observe the live Quill cancellation matrix");
-            let core = binding(CampaignContractModeV1::CoreLexicalV3, CANDIDATE);
-            let cass = binding(CampaignContractModeV1::CassTotalV1, CANDIDATE);
+            let cancellation = cancellation_receipt(&cx).await;
+            let core = accepted_report();
+            let candidate = core.producer_build_identity.source_git_revision.clone();
+            let cass = cass_binding(&candidate);
 
             let short_candidate = ReplacementEvidenceBundleV1 {
                 candidate_source_revision: "702dee9a",
-                ..bundle(&core, &cass, &cancellation)
+                ..bundle(&core, &cass, &cancellation, &candidate)
             };
             assert!(
                 refusal(&short_candidate).contains("40-hex"),
@@ -479,7 +595,7 @@ mod tests {
 
             let bad_census = ReplacementEvidenceBundleV1 {
                 divergence_census_sha256: Some("not-a-digest"),
-                ..bundle(&core, &cass, &cancellation)
+                ..bundle(&core, &cass, &cancellation, &candidate)
             };
             assert!(
                 refusal(&bad_census).contains("64-hex"),
