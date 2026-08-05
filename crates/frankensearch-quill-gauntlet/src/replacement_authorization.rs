@@ -27,10 +27,12 @@
 use serde::{Deserialize, Serialize};
 
 use crate::GauntletError;
-use crate::campaign_contract::CampaignContractModeV1;
+use crate::campaign_contract::{
+    CampaignCellEvidenceV1, CampaignContractModeV1, validate_replacement_completeness,
+};
 use crate::comparator::QuillCancellationReceipt;
 use crate::native_enriched_witness::{AcceptedCandidateBindingV1, VerifiedNativeEnrichedReceiptV1};
-use crate::runner::CampaignReport;
+use crate::runner::{CampaignReport, DivergenceRegisterLedger};
 
 /// Stable schema identity for a terminal replacement authorization.
 pub const REPLACEMENT_AUTHORIZATION_SCHEMA_VERSION: &str = "quill-replacement-authorization-v1";
@@ -104,22 +106,119 @@ pub struct ReplacementEvidenceBundleV1<'evidence> {
     /// of the report's own coverage summary instead of an assertion the caller
     /// makes about itself.
     pub core_lexical_v3: Option<&'evidence CampaignReport>,
-    /// CASS-visible total coverage binding.
+    /// The frozen replacement campaign CELL MATRIX, not a pre-derived binding.
     ///
-    /// ASYMMETRY, STATED RATHER THAN LEFT TO BE DISCOVERED: this slot is still
-    /// a hand-constructible binding, because no derivation for it exists.
-    /// `CampaignLexicalCoverageSummary` has exactly three variants --
-    /// `CoreLexicalV3`, `RankEnvelopeOnly`, `LegacyMissing` -- with no CASS
-    /// variant, and `from_campaign_report` hardcodes `CoreLexicalV3` on
-    /// success. Until bd-8nqz.5 supplies a real producer, this slot is exactly
-    /// as strong as its caller, and no stronger.
-    pub cass_total: Option<&'evidence AcceptedCandidateBindingV1>,
+    /// The CASS-visible total contract has no `CampaignReport` derivation --
+    /// `CampaignLexicalCoverageSummary` has no CASS variant and
+    /// `from_campaign_report` hardcodes `CoreLexicalV3`. Its coverage is
+    /// established a different way: by the frozen campaign matrix, whose
+    /// `CassTotalV1`-profile cells `validate_replacement_completeness` checks
+    /// against the frozen key set, seed bundles, and per-profile required
+    /// contract mode. Taking the cells and validating them here means the
+    /// caller cannot declare CASS coverage any more than it can declare
+    /// core-v3 coverage.
+    ///
+    /// WHAT THIS SLOT DOES NOT DO, stated so the grant is not over-read: cells
+    /// carry no source revision, so unlike the core report and the enriched
+    /// receipt this slot cannot be candidate-bound. It proves the campaign
+    /// matrix is COMPLETE, not that it was run on this candidate. That is the
+    /// same class of limit as bd-drize.
+    pub cass_total: Option<&'evidence [CampaignCellEvidenceV1]>,
     /// Admissible native enriched receipt.
     pub native_enriched: Option<&'evidence VerifiedNativeEnrichedReceiptV1>,
     /// Method-bound cancellation receipt.
     pub cancellation: Option<&'evidence QuillCancellationReceipt>,
-    /// Lowercase 64-hex digest of the accepted divergence census snapshot.
-    pub divergence_census_sha256: Option<&'evidence str>,
+    /// The divergence census LEDGER, not a digest of one.
+    ///
+    /// This slot previously took a `&str` digest and checked only that it was
+    /// lowercase 64-hex, so any well-formed hex string satisfied it — and every
+    /// grant harvested before bd-lvhfh passed a digest of nothing. A slot
+    /// satisfiable by a constant is a missing receipt that reports as present.
+    /// Taking the ledger applies the same derive-never-accept doctrine the
+    /// core-v3 slot got in d3668b3c and the CASS slot got in e075a370: the
+    /// digest is computed here, from a ledger that must first validate, and
+    /// must equal the REGISTERED census state.
+    pub divergence_census: Option<&'evidence DivergenceRegisterLedger>,
+}
+
+/// Why a slot that SATISFIED its own contract still could not be tied to the
+/// candidate revision (bd-s1xrl).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplacementSlotUnboundReasonV1 {
+    /// The evidence carries no source revision anywhere in its shape, so there
+    /// is nothing to compare the candidate against. The frozen campaign matrix
+    /// is this: its cells prove COMPLETENESS, and completeness is not currency.
+    EvidenceCarriesNoSourceRevision,
+    /// The evidence is a bare digest with no producer that binds it to a
+    /// revision. The divergence census snapshot is this.
+    DigestHasNoProducer,
+}
+
+/// How strongly one required slot was tied to the candidate revision.
+///
+/// This distinction is the whole point of the record: "the slot was satisfied"
+/// and "the slot was satisfied BY THIS CANDIDATE" are different claims, and
+/// before bd-s1xrl a granted authorization stated only the first while looking
+/// like it stated both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "binding")]
+pub enum ReplacementSlotBindingV1 {
+    /// The slot's evidence names a source revision and [`authorize`] compared
+    /// it against the candidate, so a mismatch refuses by this slot's name.
+    CandidateBound,
+    /// The slot's own contract was satisfied and nothing ties it to THIS
+    /// candidate. Evidence of this class from an older candidate satisfies the
+    /// slot exactly as well as evidence from the one being authorized.
+    ContractOnly {
+        /// Why the binding could not be made.
+        reason: ReplacementSlotUnboundReasonV1,
+    },
+}
+
+/// One slot's entry in a granted authorization's binding record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplacementSlotBindingRecordV1 {
+    /// The required slot this entry describes.
+    pub slot: ReplacementEvidenceSlotV1,
+    /// What [`authorize`] was able to prove about it.
+    pub binding: ReplacementSlotBindingV1,
+}
+
+/// The binding strength of each required slot, as a fact about the evidence
+/// SHAPE rather than about any particular bundle.
+///
+/// Written as a `match` on the closed slot set on purpose: adding a slot will
+/// not compile until its binding strength is decided, which is the correct cost
+/// for widening what the flip rests on. Three slots are `CandidateBound`
+/// because `authorize` really does compare a revision for each -- the core
+/// report's producer revision, the enriched receipt's candidate AND producer,
+/// and (since bd-drize) the cancellation receipt's producer revision. The other
+/// two carry no revision to compare.
+/// The record every grant carries, built once so the production path and the
+/// tests that pin its invariants cannot drift apart.
+fn slot_binding_record()
+-> [ReplacementSlotBindingRecordV1; ReplacementEvidenceSlotV1::REQUIRED.len()] {
+    ReplacementEvidenceSlotV1::REQUIRED.map(|slot| ReplacementSlotBindingRecordV1 {
+        slot,
+        binding: slot_binding_strength(slot),
+    })
+}
+
+const fn slot_binding_strength(slot: ReplacementEvidenceSlotV1) -> ReplacementSlotBindingV1 {
+    match slot {
+        ReplacementEvidenceSlotV1::CoreLexicalV3Binding
+        | ReplacementEvidenceSlotV1::NativeEnrichedReceipt
+        | ReplacementEvidenceSlotV1::CancellationReceipt => {
+            ReplacementSlotBindingV1::CandidateBound
+        }
+        ReplacementEvidenceSlotV1::CassTotalBinding => ReplacementSlotBindingV1::ContractOnly {
+            reason: ReplacementSlotUnboundReasonV1::EvidenceCarriesNoSourceRevision,
+        },
+        ReplacementEvidenceSlotV1::DivergenceCensus => ReplacementSlotBindingV1::ContractOnly {
+            reason: ReplacementSlotUnboundReasonV1::DigestHasNoProducer,
+        },
+    }
 }
 
 /// The seal that makes a granted authorization unforgeable INSIDE this crate
@@ -157,6 +256,21 @@ pub struct ReplacementAuthorizationV1 {
     pub cancellation_engine_revision: String,
     /// Accepted divergence census snapshot digest.
     pub divergence_census_sha256: String,
+    /// What this grant actually proved about EACH required slot (bd-s1xrl).
+    ///
+    /// Serialized, and deliberately so. The two limits it records were
+    /// previously stated only in doc comments on the bundle's fields, and doc
+    /// comments do not travel with the artifact — this type is `Serialize`
+    /// precisely so it can be read somewhere the source is not. A reader that
+    /// sees one `candidate_source_revision` and five satisfied slots would
+    /// otherwise have no way to learn that two of the five were never checked
+    /// against that revision at all.
+    ///
+    /// In `ReplacementEvidenceSlotV1::REQUIRED` order and the same length, so
+    /// the record cannot omit a slot: an omitted slot is exactly the unstated
+    /// limit this field exists to remove, and here it is a compile error rather
+    /// than a test.
+    pub slot_bindings: [ReplacementSlotBindingRecordV1; ReplacementEvidenceSlotV1::REQUIRED.len()],
     /// Unconstructible from outside this module. Skipped on the wire: the seal
     /// is an in-process construction proof, and serializing it would suggest a
     /// reader could verify authorization from bytes alone, which it cannot.
@@ -166,10 +280,61 @@ pub struct ReplacementAuthorizationV1 {
 
 impl ReplacementAuthorizationV1 {
     /// This type, and only this type, may authorize the lexical replacement.
+    ///
+    /// It does NOT mean every slot was tied to the candidate revision. Read
+    /// [`Self::every_slot_is_candidate_bound`] for that; it answers `false`
+    /// today, and the reason is in [`Self::slot_bindings`].
     #[must_use]
     pub const fn authorizes_replacement(&self) -> bool {
         true
     }
+
+    /// Whether EVERY required slot's evidence was tied to this candidate.
+    ///
+    /// `false` today: the frozen campaign matrix and the divergence census
+    /// carry no source revision, so their slots are satisfied without being
+    /// bound. Exposed as a question a caller can ask rather than a paragraph a
+    /// caller must read, so a consumer that needs a fully-bound grant can
+    /// refuse one instead of discovering the asymmetry later. The day either
+    /// slot grows a producer that stamps a revision, this starts answering
+    /// `true` and [`slot_binding_strength`] must change with it.
+    #[must_use]
+    pub fn every_slot_is_candidate_bound(&self) -> bool {
+        self.slot_bindings
+            .iter()
+            .all(|record| record.binding == ReplacementSlotBindingV1::CandidateBound)
+    }
+
+    /// What this grant proved about one required slot.
+    #[must_use]
+    pub fn binding_for(&self, slot: ReplacementEvidenceSlotV1) -> ReplacementSlotBindingV1 {
+        self.slot_bindings
+            .iter()
+            .find(|record| record.slot == slot)
+            .map_or_else(|| slot_binding_strength(slot), |record| record.binding)
+    }
+}
+
+/// The committed Divergence Register state a grant must be about.
+///
+/// Compiled in rather than read at runtime: a census loaded from a path the
+/// caller chooses is a census the caller controls, which is the hole this
+/// replaces rather than relocates.
+const REGISTERED_DIVERGENCE_CENSUS: &str =
+    include_str!("../fixtures/divergence-register-v2-live.json");
+
+/// Digest of the registered census, derived from the committed ledger.
+///
+/// # Errors
+///
+/// Returns an error when the committed census does not parse or does not
+/// validate — a state in which no authorization should be issued at all.
+fn registered_divergence_census_sha256() -> Result<String, GauntletError> {
+    let ledger: DivergenceRegisterLedger = serde_json::from_str(REGISTERED_DIVERGENCE_CENSUS)
+        .map_err(|error| GauntletError::InvalidContract {
+            reason: format!("the registered divergence census does not parse: {error}"),
+        })?;
+    ledger.ledger_hash()
 }
 
 fn is_canonical_git_revision(value: &str) -> bool {
@@ -179,12 +344,11 @@ fn is_canonical_git_revision(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn is_lower_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
+// `is_lower_sha256` lived here to shape-check a caller-supplied census digest.
+// bd-lvhfh removed that parameter: the census is now derived from the
+// registered ledger and compared against the registered digest, so there is no
+// free-form digest left to shape-check. Deleted rather than `#[allow]`ed —
+// a helper kept alive by an allow is a claim that something still validates.
 
 fn require_binding(
     binding: &AcceptedCandidateBindingV1,
@@ -261,27 +425,59 @@ pub fn authorize(
         ReplacementEvidenceSlotV1::CoreLexicalV3Binding,
     )?;
 
-    let cass_total = bundle
+    let cass_cells = bundle
         .cass_total
         .ok_or_else(|| ReplacementEvidenceSlotV1::CassTotalBinding.missing())?;
-    require_binding(
-        cass_total,
-        CampaignContractModeV1::CassTotalV1,
-        candidate,
-        ReplacementEvidenceSlotV1::CassTotalBinding,
-    )?;
+    // DERIVED, never accepted -- the same move slice 3 made for the core slot.
+    // A caller cannot assert CASS coverage; it must present a campaign matrix
+    // that satisfies the frozen completeness policy.
+    validate_replacement_completeness(cass_cells).map_err(|error| {
+        GauntletError::InvalidContract {
+            reason: format!("cass total binding is not a complete frozen campaign matrix: {error}"),
+        }
+    })?;
+    if !cass_cells
+        .iter()
+        .any(|cell| cell.contract_mode() == CampaignContractModeV1::CassTotalV1)
+    {
+        return Err(GauntletError::InvalidContract {
+            reason: "cass total binding carries no CassTotalV1 campaign cell".to_owned(),
+        });
+    }
 
     let cancellation = bundle
         .cancellation
         .ok_or_else(|| ReplacementEvidenceSlotV1::CancellationReceipt.missing())?;
     cancellation.validate()?;
+    // bd-drize. `validate` proves the receipt is a real, replayable, live
+    // cancellation matrix; it cannot prove WHOSE. Until the body carried a
+    // source revision this slot was the only required one with no candidate
+    // binding to check, so a receipt observed from another source tree
+    // satisfied it — measured, not supposed: two candidates produced the same
+    // body_sha256 `9b81b211...` while the enriched address moved beneath it.
+    if cancellation.body.producer_source_revision != candidate {
+        return Err(GauntletError::ManifestMismatch {
+            reason: format!(
+                "{} was produced from {} but the authorization is for {candidate}",
+                ReplacementEvidenceSlotV1::CancellationReceipt.slot_name(),
+                cancellation.body.producer_source_revision
+            ),
+        });
+    }
 
-    let divergence_census_sha256 = bundle
-        .divergence_census_sha256
+    let census_ledger = bundle
+        .divergence_census
         .ok_or_else(|| ReplacementEvidenceSlotV1::DivergenceCensus.missing())?;
-    if !is_lower_sha256(divergence_census_sha256) {
-        return Err(GauntletError::InvalidContract {
-            reason: "divergence census digest must be a lowercase 64-hex sha256".to_owned(),
+    // DERIVED, never accepted. ledger_hash() validates the ledger before
+    // hashing it, so a malformed census cannot reach the comparison at all.
+    let divergence_census_sha256 = census_ledger.ledger_hash()?;
+    let registered = registered_divergence_census_sha256()?;
+    if divergence_census_sha256 != registered {
+        return Err(GauntletError::ManifestMismatch {
+            reason: format!(
+                "divergence census {divergence_census_sha256} is not the registered census \
+                 {registered}"
+            ),
         });
     }
 
@@ -316,7 +512,11 @@ pub fn authorize(
         native_enriched_receipt_address: native_enriched.address().to_owned(),
         cancellation_body_sha256: cancellation.body_sha256.clone(),
         cancellation_engine_revision: cancellation.body.engine_revision.clone(),
-        divergence_census_sha256: divergence_census_sha256.to_owned(),
+        divergence_census_sha256,
+        // Derived from the closed slot set, never from the bundle: the record
+        // describes what THIS FUNCTION checked above, so a caller cannot
+        // present a bundle that claims stronger binding than the code performs.
+        slot_bindings: slot_binding_record(),
         sealed: AuthorizationSeal,
     })
 }
@@ -326,7 +526,23 @@ mod tests {
     use super::*;
 
     const OTHER_CANDIDATE: &str = "5eb995d524705ef8b17834e9ce005125179b9af2";
-    const CENSUS: &str = "9d283b3445b042ac24f2c1d9d65af62c416acc1af4acdad8cca74d0aa70dde31";
+    /// The registered census, parsed from the same committed ledger the gate
+    /// derives its expected digest from.
+    fn registered_census() -> DivergenceRegisterLedger {
+        serde_json::from_str(REGISTERED_DIVERGENCE_CENSUS).expect("the registered census parses")
+    }
+
+    /// A census that is WELL FORMED and validates, but is not the registered
+    /// state: one extra character of prose in its register id.
+    ///
+    /// This is the planted negative bd-lvhfh exists for. Under the old slot it
+    /// was unrepresentable — the slot took a digest, so a forgery was simply a
+    /// different 64-hex string and every one of them passed.
+    fn forged_census() -> DivergenceRegisterLedger {
+        let mut ledger = registered_census();
+        ledger.register_id.push('x');
+        ledger
+    }
 
     fn baseline_provenance() -> crate::runner::CampaignProvenance {
         crate::runner::CampaignProvenance {
@@ -374,11 +590,38 @@ mod tests {
         report
     }
 
-    fn cass_binding(revision: &str) -> AcceptedCandidateBindingV1 {
-        AcceptedCandidateBindingV1 {
-            candidate_source_revision: revision.to_owned(),
-            contract_mode: CampaignContractModeV1::CassTotalV1,
-        }
+    /// The complete frozen campaign matrix, built the way the contract's own
+    /// tests build it: every frozen key, each with the contract mode its
+    /// profile requires and the seed bundle its slot pins.
+    fn cass_cells() -> Vec<CampaignCellEvidenceV1> {
+        crate::campaign_contract::frozen_replacement_cell_keys()
+            .into_iter()
+            .map(|key| {
+                let mode = match key.campaign_profile() {
+                    crate::campaign_contract::CampaignProfileV1::ShippingDefaultCoreV3 => {
+                        CampaignContractModeV1::CoreLexicalV3
+                    }
+                    crate::campaign_contract::CampaignProfileV1::CassTotalV1 => {
+                        CampaignContractModeV1::CassTotalV1
+                    }
+                };
+                let seeds =
+                    crate::campaign_contract::frozen_replacement_seed_bundle(key.seed_slot());
+                CampaignCellEvidenceV1::new(
+                    key,
+                    crate::campaign_contract::CampaignEvidenceRole::BuiltInEvidence(
+                        crate::campaign_contract::BuiltInEvidenceBindingV1::new(
+                            crate::campaign_contract::CampaignSha256V1::parse(&"a".repeat(64))
+                                .expect("strict lower-case hex"),
+                            crate::campaign_contract::CampaignSha256V1::parse(&"b".repeat(64))
+                                .expect("strict lower-case hex"),
+                        ),
+                    ),
+                    mode,
+                    seeds,
+                )
+            })
+            .collect()
     }
 
     /// A bundle complete in every slot EXCEPT the enriched receipt, which no
@@ -388,9 +631,10 @@ mod tests {
     /// further thing.
     fn bundle<'a>(
         core: &'a CampaignReport,
-        cass: &'a AcceptedCandidateBindingV1,
+        cass: &'a [CampaignCellEvidenceV1],
         cancellation: &'a QuillCancellationReceipt,
         candidate: &'a str,
+        census: &'a DivergenceRegisterLedger,
     ) -> ReplacementEvidenceBundleV1<'a> {
         ReplacementEvidenceBundleV1 {
             candidate_source_revision: candidate,
@@ -398,7 +642,7 @@ mod tests {
             cass_total: Some(cass),
             native_enriched: None,
             cancellation: Some(cancellation),
-            divergence_census_sha256: Some(CENSUS),
+            divergence_census: Some(census),
         }
     }
 
@@ -408,20 +652,39 @@ mod tests {
             .to_string()
     }
 
-    async fn cancellation_receipt(cx: &asupersync::Cx) -> QuillCancellationReceipt {
-        crate::comparator::observe_live_quill_cancellation_receipt(cx)
+    /// The LIVE cancellation matrix, re-sealed onto the candidate under test.
+    ///
+    /// The observation is real — every phase is exercised against a live Quill
+    /// index and the re-seal re-runs `validate`, so nothing here can turn a
+    /// broken matrix into an accepted one. Only the producer revision is
+    /// restated, and it has to be: these bundles authorize a HYPOTHETICAL
+    /// candidate (the pinned fixture's producer), while a receipt observed here
+    /// necessarily records the revision THIS test binary was built from. Left
+    /// live, bd-drize's own check would refuse first and mask every refusal
+    /// below — the exact vacuity de006886 repaired in this function, which is
+    /// why the fix ships with this helper rather than after it.
+    async fn cancellation_receipt_for(
+        cx: &asupersync::Cx,
+        candidate: &str,
+    ) -> QuillCancellationReceipt {
+        let observed = crate::comparator::observe_live_quill_cancellation_receipt(cx)
             .await
-            .expect("observe the live Quill cancellation matrix")
+            .expect("observe the live Quill cancellation matrix");
+        let mut body = observed.body;
+        body.producer_source_revision = candidate.to_owned();
+        QuillCancellationReceipt::seal(body)
+            .expect("re-seal the live matrix onto the candidate under test")
     }
 
     #[test]
     fn every_required_slot_is_independently_load_bearing() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let cancellation = cancellation_receipt(&cx).await;
             let core = accepted_report();
             let candidate = core.producer_build_identity.source_git_revision.clone();
-            let cass = cass_binding(&candidate);
-            let complete = bundle(&core, &cass, &cancellation, &candidate);
+            let cancellation = cancellation_receipt_for(&cx, &candidate).await;
+            let cass = cass_cells();
+            let census = registered_census();
+            let complete = bundle(&core, &cass, &cancellation, &candidate, &census);
 
             let removals: [(ReplacementEvidenceSlotV1, ReplacementEvidenceBundleV1<'_>); 4] = [
                 (
@@ -448,7 +711,7 @@ mod tests {
                 (
                     ReplacementEvidenceSlotV1::DivergenceCensus,
                     ReplacementEvidenceBundleV1 {
-                        divergence_census_sha256: None,
+                        divergence_census: None,
                         ..complete
                     },
                 ),
@@ -479,16 +742,17 @@ mod tests {
     #[test]
     fn the_real_passed_rank_envelope_report_can_never_authorize() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let cancellation = cancellation_receipt(&cx).await;
             let pinned = pinned_report();
             assert!(
                 pinned.passed,
                 "the fixture must really be a PASSED report, or this test proves nothing"
             );
             let candidate = pinned.producer_build_identity.source_git_revision.clone();
-            let cass = cass_binding(&candidate);
+            let cancellation = cancellation_receipt_for(&cx, &candidate).await;
+            let cass = cass_cells();
+            let census = registered_census();
 
-            let message = refusal(&bundle(&pinned, &cass, &cancellation, &candidate));
+            let message = refusal(&bundle(&pinned, &cass, &cancellation, &candidate, &census));
             assert!(
                 message.contains("rank-envelope"),
                 "a passed rank-envelope-only report must refuse by coverage, got: {message}"
@@ -502,33 +766,47 @@ mod tests {
     #[test]
     fn each_report_gate_is_independently_load_bearing() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let cancellation = cancellation_receipt(&cx).await;
             let candidate = accepted_report()
                 .producer_build_identity
                 .source_git_revision
                 .clone();
-            let cass = cass_binding(&candidate);
+            let cancellation = cancellation_receipt_for(&cx, &candidate).await;
+            let cass = cass_cells();
+            let census = registered_census();
 
             let mut not_passed = accepted_report();
             not_passed.passed = false;
             assert!(
-                refusal(&bundle(&not_passed, &cass, &cancellation, &candidate))
-                    .contains("did not pass"),
+                refusal(&bundle(
+                    &not_passed,
+                    &cass,
+                    &cancellation,
+                    &candidate,
+                    &census
+                ))
+                .contains("did not pass"),
                 "a failed campaign must refuse"
             );
 
             let mut dirty = accepted_report();
             dirty.producer_build_identity.source_git_dirty = true;
             assert!(
-                refusal(&bundle(&dirty, &cass, &cancellation, &candidate)).contains("dirty"),
+                refusal(&bundle(&dirty, &cass, &cancellation, &candidate, &census))
+                    .contains("dirty"),
                 "a dirty-produced report must refuse"
             );
 
             let mut no_provenance = accepted_report();
             no_provenance.provenance = None;
             assert!(
-                refusal(&bundle(&no_provenance, &cass, &cancellation, &candidate))
-                    .contains("provenance"),
+                refusal(&bundle(
+                    &no_provenance,
+                    &cass,
+                    &cancellation,
+                    &candidate,
+                    &census
+                ))
+                .contains("provenance"),
                 "a provenance-free report must refuse"
             );
 
@@ -540,8 +818,14 @@ mod tests {
                     admissible: false,
                 };
             assert!(
-                refusal(&bundle(&inadmissible, &cass, &cancellation, &candidate))
-                    .contains("not admissible"),
+                refusal(&bundle(
+                    &inadmissible,
+                    &cass,
+                    &cancellation,
+                    &candidate,
+                    &census
+                ))
+                .contains("not admissible"),
                 "core-v3 coverage that is not admissible must refuse"
             );
         });
@@ -550,25 +834,28 @@ mod tests {
     #[test]
     fn evidence_from_a_different_candidate_can_never_authorize() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let cancellation = cancellation_receipt(&cx).await;
             let core = accepted_report();
             let candidate = core.producer_build_identity.source_git_revision.clone();
+            let cancellation = cancellation_receipt_for(&cx, &candidate).await;
 
-            // THE STALE-EVIDENCE HOLE: the report is valid and of the right
-            // coverage class, the CASS binding is well formed, and the BUNDLE
-            // still must not authorize because they describe different
-            // candidates. A per-receipt validator cannot see this at all.
-            let stale_cass = cass_binding(OTHER_CANDIDATE);
-            let message = refusal(&bundle(&core, &stale_cass, &cancellation, &candidate));
-            assert!(
-                message.contains(OTHER_CANDIDATE),
-                "a stale CASS binding must refuse naming the mismatch, got: {message}"
-            );
-
-            // And the mirror: an authorization for a candidate the report does
+            // NOTE ON WHAT MOVED: the CASS slot can no longer be candidate-
+            // stale, because it is now a campaign CELL MATRIX and cells carry
+            // no source revision. That is a real limit of this slot, recorded
+            // on the bundle type, not something to fake an assertion about.
+            // Its refusal property is COMPLETENESS, proved separately below.
+            //
+            // THE STALE-EVIDENCE HOLE still applies to the slots that DO carry
+            // a revision: an authorization for a candidate the core report does
             // not describe.
-            let cass = cass_binding(OTHER_CANDIDATE);
-            let message = refusal(&bundle(&core, &cass, &cancellation, OTHER_CANDIDATE));
+            let cass = cass_cells();
+            let census = registered_census();
+            let message = refusal(&bundle(
+                &core,
+                &cass,
+                &cancellation,
+                OTHER_CANDIDATE,
+                &census,
+            ));
             assert!(
                 message.contains(&candidate),
                 "a report from another candidate must refuse naming it, got: {message}"
@@ -576,30 +863,370 @@ mod tests {
         });
     }
 
+    /// bd-drize, THE SLOT THAT COULD NOT BIND A CANDIDATE.
+    ///
+    /// The receipt below is fully valid — observed live, every phase covered,
+    /// re-sealed so its content address matches its body — and describes a
+    /// DIFFERENT source revision than the one under authorization. Before the
+    /// body carried a producer revision this bundle authorized, because no
+    /// field of the receipt could disagree with the candidate.
+    ///
+    /// bd-s1xrl N1. The record covers the closed slot set exactly once each and
+    /// states the two limits by name.
+    ///
+    /// Omission is a compile error rather than a test failure — the field is an
+    /// array over `REQUIRED` — which is the stronger guarantee, so what this
+    /// pins is the part the type cannot: that no slot appears twice, that the
+    /// three bound slots really are the three `authorize` compares a revision
+    /// for, and that the two unbound ones carry the reason they are unbound
+    /// rather than a generic absence.
+    #[test]
+    fn the_binding_record_covers_every_required_slot_once_and_names_both_limits() {
+        let record = slot_binding_record();
+        for slot in ReplacementEvidenceSlotV1::REQUIRED {
+            let recorded = record.iter().filter(|entry| entry.slot == slot).count();
+            assert_eq!(
+                recorded, 1,
+                "{slot:?} appears {recorded} times; a duplicate means some required slot is \
+                 unrecorded while the array length still checks out"
+            );
+        }
+
+        for slot in [
+            ReplacementEvidenceSlotV1::CoreLexicalV3Binding,
+            ReplacementEvidenceSlotV1::NativeEnrichedReceipt,
+            ReplacementEvidenceSlotV1::CancellationReceipt,
+        ] {
+            assert_eq!(
+                slot_binding_strength(slot),
+                ReplacementSlotBindingV1::CandidateBound,
+                "{slot:?} is compared against the candidate and must say so"
+            );
+        }
+        assert_eq!(
+            slot_binding_strength(ReplacementEvidenceSlotV1::CassTotalBinding),
+            ReplacementSlotBindingV1::ContractOnly {
+                reason: ReplacementSlotUnboundReasonV1::EvidenceCarriesNoSourceRevision
+            }
+        );
+        assert_eq!(
+            slot_binding_strength(ReplacementEvidenceSlotV1::DivergenceCensus),
+            ReplacementSlotBindingV1::ContractOnly {
+                reason: ReplacementSlotUnboundReasonV1::DigestHasNoProducer
+            }
+        );
+    }
+
+    /// The accessor answers the question the record exists to make askable, and
+    /// answers it `false` today. A consumer that needs a fully-bound grant can
+    /// therefore refuse one rather than discover the asymmetry downstream.
+    #[test]
+    fn a_grant_reports_that_not_every_slot_is_candidate_bound() {
+        let grant = ReplacementAuthorizationV1 {
+            schema_version: REPLACEMENT_AUTHORIZATION_SCHEMA_VERSION.to_owned(),
+            candidate_source_revision: OTHER_CANDIDATE.to_owned(),
+            native_enriched_receipt_address: "a".repeat(64),
+            cancellation_body_sha256: "b".repeat(64),
+            cancellation_engine_revision: "quill-engine-131073".to_owned(),
+            divergence_census_sha256: registered_divergence_census_sha256()
+                .expect("registered census digest"),
+            slot_bindings: slot_binding_record(),
+            sealed: AuthorizationSeal,
+        };
+
+        assert!(grant.authorizes_replacement());
+        assert!(
+            !grant.every_slot_is_candidate_bound(),
+            "two slots carry no source revision, so this cannot be true yet"
+        );
+        assert_eq!(
+            grant.binding_for(ReplacementEvidenceSlotV1::CancellationReceipt),
+            ReplacementSlotBindingV1::CandidateBound
+        );
+        assert_eq!(
+            grant.binding_for(ReplacementEvidenceSlotV1::CassTotalBinding),
+            ReplacementSlotBindingV1::ContractOnly {
+                reason: ReplacementSlotUnboundReasonV1::EvidenceCarriesNoSourceRevision
+            }
+        );
+
+        // The record travels with the artifact, which is the entire point.
+        let encoded = serde_json::to_string(&grant).expect("a grant serializes");
+        assert!(encoded.contains("slot_bindings"), "{encoded}");
+        assert!(encoded.contains("contract_only"), "{encoded}");
+        assert!(
+            encoded.contains("evidence_carries_no_source_revision"),
+            "{encoded}"
+        );
+    }
+
+    /// bd-s1xrl N3. EVERY `CandidateBound` LABEL IS BACKED BY A REFUSAL.
+    ///
+    /// A label nobody can falsify is decoration. For each slot the record calls
+    /// `CandidateBound` and a unit test can mint, rebinding that slot's evidence
+    /// to another revision must make `authorize` refuse BY THAT SLOT'S NAME.
+    ///
+    /// THE ENRICHED SLOT IS THE STATED ASYMMETRY: it is also `CandidateBound`
+    /// and `authorize` compares both its candidate and its producer revision,
+    /// but no unit test can mint one — it requires a live both-engines run from
+    /// a clean checkout — so that leg is covered by the live integration lane
+    /// (`tests/native_enriched_witness_live.rs`) and not here. Saying so is the
+    /// point; a test that quietly skipped it would leave the strongest slot the
+    /// least proved.
+    #[test]
+    fn every_candidate_bound_slot_is_backed_by_a_refusal() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let cells = cass_cells();
+            let census = registered_census();
+            let core = accepted_report();
+            let candidate = core.producer_build_identity.source_git_revision.clone();
+
+            for slot in ReplacementEvidenceSlotV1::REQUIRED {
+                if slot_binding_strength(slot) != ReplacementSlotBindingV1::CandidateBound {
+                    continue;
+                }
+                let message = match slot {
+                    ReplacementEvidenceSlotV1::CoreLexicalV3Binding => {
+                        let mut stale = accepted_report();
+                        stale.producer_build_identity.source_git_revision =
+                            OTHER_CANDIDATE.to_owned();
+                        let cancellation = cancellation_receipt_for(&cx, &candidate).await;
+                        refusal(&bundle(&stale, &cells, &cancellation, &candidate, &census))
+                    }
+                    ReplacementEvidenceSlotV1::CancellationReceipt => {
+                        let foreign = cancellation_receipt_for(&cx, OTHER_CANDIDATE).await;
+                        refusal(&bundle(&core, &cells, &foreign, &candidate, &census))
+                    }
+                    // Covered by the live lane; see this test's doc comment.
+                    ReplacementEvidenceSlotV1::NativeEnrichedReceipt => continue,
+                    ReplacementEvidenceSlotV1::CassTotalBinding
+                    | ReplacementEvidenceSlotV1::DivergenceCensus => {
+                        unreachable!("{slot:?} is ContractOnly and cannot reach this arm")
+                    }
+                };
+                assert!(
+                    message.contains(slot.slot_name()),
+                    "{slot:?} is labelled CandidateBound but rebinding it did not refuse by \
+                     its own name, got: {message}"
+                );
+                assert!(
+                    message.contains(OTHER_CANDIDATE),
+                    "{slot:?}'s refusal must name the foreign revision, got: {message}"
+                );
+            }
+        });
+    }
+
+    /// bd-s1xrl N2. THE `ContractOnly` LABEL IS OBSERVED, NOT DECLARED.
+    ///
+    /// One unchanged frozen campaign matrix satisfies its slot under two
+    /// DIFFERENT candidates. Both bundles differ only in the candidate — the
+    /// core report's producer revision and the cancellation receipt are rebound
+    /// to each — and both reach the enriched slot, which means both got PAST
+    /// the CASS slot. That is what "satisfied but not bound" means, stated as a
+    /// behaviour rather than as a doc comment.
+    ///
+    /// Asserting that neither refusal NAMES the CASS slot is the load-bearing
+    /// half: a test that only checked "both refuse" would pass just as happily
+    /// if the CASS slot rejected both for a reason of its own.
+    ///
+    /// This is a tripwire, not a freeze. If the cells ever grow a source
+    /// revision and start discriminating, this test goes red and
+    /// `slot_binding_strength` must be updated in the same change — which is
+    /// precisely the coupling the grant's record exists to force.
+    #[test]
+    fn one_cass_matrix_satisfies_its_slot_under_two_different_candidates() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let cells = cass_cells();
+
+            let first_core = accepted_report();
+            let first_candidate = first_core
+                .producer_build_identity
+                .source_git_revision
+                .clone();
+            let mut second_core = accepted_report();
+            second_core.producer_build_identity.source_git_revision = OTHER_CANDIDATE.to_owned();
+            assert_ne!(
+                first_candidate, OTHER_CANDIDATE,
+                "the two candidates must differ, or this test proves nothing"
+            );
+
+            let first_cancellation = cancellation_receipt_for(&cx, &first_candidate).await;
+            let second_cancellation = cancellation_receipt_for(&cx, OTHER_CANDIDATE).await;
+
+            for (label, core, cancellation, candidate) in [
+                (
+                    "first",
+                    &first_core,
+                    &first_cancellation,
+                    first_candidate.as_str(),
+                ),
+                (
+                    "second",
+                    &second_core,
+                    &second_cancellation,
+                    OTHER_CANDIDATE,
+                ),
+            ] {
+                let message = refusal(&bundle(
+                    core,
+                    &cells,
+                    cancellation,
+                    candidate,
+                    &registered_census(),
+                ));
+                assert!(
+                    message.contains(ReplacementEvidenceSlotV1::NativeEnrichedReceipt.slot_name()),
+                    "the {label} candidate must reach the enriched slot, got: {message}"
+                );
+                assert!(
+                    !message.contains(ReplacementEvidenceSlotV1::CassTotalBinding.slot_name()),
+                    "the {label} candidate must not be refused by the CASS slot, got: {message}"
+                );
+            }
+        });
+    }
+
+    /// The refusal is asserted BY SLOT NAME and by BOTH revisions, not merely
+    /// as "some error": every other slot here binds the candidate correctly, so
+    /// an implementation that refused for an unrelated reason would still turn
+    /// this test green. It is placed after the census check in intent but
+    /// reached before it, so nothing later can be masking the result.
+    #[test]
+    fn a_cancellation_receipt_from_another_source_revision_can_never_authorize() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let core = accepted_report();
+            let candidate = core.producer_build_identity.source_git_revision.clone();
+            let cass = cass_cells();
+            let census = registered_census();
+            assert_ne!(
+                candidate, OTHER_CANDIDATE,
+                "the two revisions must differ, or this test proves nothing"
+            );
+
+            let foreign = cancellation_receipt_for(&cx, OTHER_CANDIDATE).await;
+            foreign
+                .validate()
+                .expect("the foreign receipt must be VALID: the defect is whose it is, not what");
+
+            let message = refusal(&bundle(&core, &cass, &foreign, &candidate, &census));
+            assert!(
+                message.contains(ReplacementEvidenceSlotV1::CancellationReceipt.slot_name()),
+                "a foreign cancellation receipt must refuse naming that slot, got: {message}"
+            );
+            assert!(
+                message.contains(OTHER_CANDIDATE) && message.contains(&candidate),
+                "the refusal must name the revision it was produced from AND the one under \
+                 authorization, got: {message}"
+            );
+
+            // THE OTHER HALF, or the assertion above would also pass for a
+            // validator that refused every cancellation receipt: the same
+            // matrix, bound to the candidate, gets past this slot and refuses
+            // only for the enriched receipt no unit test can mint.
+            let matching = cancellation_receipt_for(&cx, &candidate).await;
+            let message = refusal(&bundle(&core, &cass, &matching, &candidate, &census));
+            assert!(
+                message.contains(ReplacementEvidenceSlotV1::NativeEnrichedReceipt.slot_name()),
+                "a matching receipt must pass its slot and refuse later, got: {message}"
+            );
+        });
+    }
+
+    /// The binding is read from the BUILD, never from a caller: a live receipt
+    /// observed here names the revision this test binary was compiled from.
+    /// Without this, `observe_live_quill_cancellation_receipt` could grow a
+    /// candidate parameter and every test above would still pass while the
+    /// receipt attested whatever its caller asked for.
+    #[test]
+    fn a_live_cancellation_receipt_names_the_revision_it_was_built_from() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let observed = crate::comparator::observe_live_quill_cancellation_receipt(&cx)
+                .await
+                .expect("observe the live Quill cancellation matrix");
+            let compiled = crate::artifact::GauntletProducerBuildIdentity::compiled()
+                .expect("this binary has a build-sealed producer identity");
+            assert_eq!(
+                observed.body.producer_source_revision, compiled.source_git_revision,
+                "the receipt must name the source revision of the build that produced it"
+            );
+            assert!(
+                is_canonical_git_revision(&observed.body.producer_source_revision),
+                "the bound revision must be a canonical lowercase 40-hex git revision"
+            );
+        });
+    }
+
+    /// The CASS slot's own refusal property: an INCOMPLETE frozen matrix
+    /// cannot authorize. This is what replaced "the caller declared CASS
+    /// coverage" -- the caller must now present a matrix that satisfies the
+    /// frozen completeness policy, and dropping any single cell refuses.
+    #[test]
+    fn an_incomplete_cass_campaign_matrix_can_never_authorize() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let core = accepted_report();
+            let candidate = core.producer_build_identity.source_git_revision.clone();
+            let cancellation = cancellation_receipt_for(&cx, &candidate).await;
+
+            let census = registered_census();
+            let complete = cass_cells();
+            assert!(
+                complete
+                    .iter()
+                    .any(|cell| cell.contract_mode() == CampaignContractModeV1::CassTotalV1),
+                "the frozen matrix must really contain a CassTotalV1 cell, or this proves nothing"
+            );
+
+            // Drop exactly one cell.
+            let mut incomplete = complete.clone();
+            incomplete.pop();
+            let message = refusal(&bundle(
+                &core,
+                &incomplete,
+                &cancellation,
+                &candidate,
+                &census,
+            ));
+            assert!(
+                message.contains("complete frozen campaign matrix"),
+                "an incomplete CASS matrix must refuse by completeness, got: {message}"
+            );
+        });
+    }
+
     #[test]
     fn a_non_canonical_candidate_and_census_digest_are_refused() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let cancellation = cancellation_receipt(&cx).await;
             let core = accepted_report();
             let candidate = core.producer_build_identity.source_git_revision.clone();
-            let cass = cass_binding(&candidate);
+            let cancellation = cancellation_receipt_for(&cx, &candidate).await;
+            let cass = cass_cells();
+            let census = registered_census();
 
             let short_candidate = ReplacementEvidenceBundleV1 {
                 candidate_source_revision: "702dee9a",
-                ..bundle(&core, &cass, &cancellation, &candidate)
+                ..bundle(&core, &cass, &cancellation, &candidate, &census)
             };
             assert!(
                 refusal(&short_candidate).contains("40-hex"),
                 "an abbreviated candidate revision must refuse"
             );
 
-            let bad_census = ReplacementEvidenceBundleV1 {
-                divergence_census_sha256: Some("not-a-digest"),
-                ..bundle(&core, &cass, &cancellation, &candidate)
+            // THE PLANTED NEGATIVE bd-lvhfh EXISTS FOR: a census that is WELL
+            // FORMED and validates, but is not the registered state. Under the
+            // old slot this was unrepresentable -- the slot took a digest, so
+            // a forgery was just a different 64-hex string and every one of
+            // them passed. The forged ledger must refuse, and must refuse by
+            // naming the mismatch rather than by failing to parse.
+            let forged = forged_census();
+            let forged_bundle = ReplacementEvidenceBundleV1 {
+                divergence_census: Some(&forged),
+                ..bundle(&core, &cass, &cancellation, &candidate, &census)
             };
+            let message = refusal(&forged_bundle);
             assert!(
-                refusal(&bad_census).contains("64-hex"),
-                "a malformed divergence census digest must refuse"
+                message.contains("is not the registered census"),
+                "a forged census must refuse against the registered state, got: {message}"
             );
         });
     }

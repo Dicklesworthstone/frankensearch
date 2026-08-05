@@ -3230,6 +3230,14 @@ mod tests {
             ),
             // Stacked negators lower to one exclusion.
             ("alpha NOT -beta AND gamma", "alpha (-beta +gamma)"),
+            // bd-iiidv: an ALL-NEGATIVE chain normalises too, in either operand
+            // order, and the normal form carries no `AND` -- which is why the
+            // repair already covered this shape while the register recorded it
+            // as agreement. There is no `+` to add: every operand is excluded,
+            // and the complement anchoring is the parser's job, not this
+            // rewrite's.
+            ("NOT beta AND NOT gamma", "-beta -gamma"),
+            ("NOT gamma AND NOT beta", "-gamma -beta"),
         ] {
             assert_eq!(
                 repair_negated_conjunction(query).as_ref(),
@@ -3414,6 +3422,129 @@ mod tests {
                 ids(&["p1", "p2", "p3"]),
                 "the explicit grouping is answered correctly by BOTH roles, which \
                  is what attributes the defect to the implicit lowering"
+            );
+        });
+    }
+
+    /// bd-iiidv: an ALL-NEGATIVE conjunction is DIV-010's defect too, and the
+    /// register said it was agreement.
+    ///
+    /// The Divergence Register's DIV-010 entry claimed `NOT alpha AND NOT beta`
+    /// "still returns nothing on both, because an exclusion-only conjunction
+    /// has no positive term — that is agreement, not a defect, and is pinned so
+    /// a later change cannot silently turn it into match-all". Measured, it is
+    /// not agreement and there was no such pin. This is the pin.
+    ///
+    /// The claim is wrong twice over. An all-negative ROOT does not match
+    /// nothing — both engines give it complement semantics for every spelling
+    /// that carries no explicit `AND` — and the `AND` spelling does not agree:
+    /// the pinned oracle empties it while the declared reading, Quill and the
+    /// repaired shipping path all return the complement.
+    ///
+    /// It is the SAME mechanism as the rest of DIV-010, not a new one: an
+    /// explicit `AND` whose operand is a negation lowers to a positive-less
+    /// boolean that matches nothing and empties the conjunction. That is why
+    /// `repair_negated_conjunction` already fixes it — the normal form carries
+    /// no `AND` — and why the fix needed no new repair, only this proof that it
+    /// covers the shape.
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn an_all_negative_conjunction_is_complement_on_shipping_and_empty_on_the_oracle() {
+        run_with_cx(|cx| async move {
+            let index = TantivyIndex::in_memory().expect("bd-iiidv index");
+            index
+                .index_documents(
+                    &cx,
+                    &[
+                        IndexableDocument::new("p1", "alpha beta"),
+                        IndexableDocument::new("p2", "alpha gamma"),
+                        IndexableDocument::new("p3", "delta gamma"),
+                        IndexableDocument::new("p4", "epsilon"),
+                    ],
+                )
+                .await
+                .expect("index bd-iiidv documents");
+            index.commit(&cx).await.expect("commit bd-iiidv documents");
+
+            let shipping = |query: &'static str| {
+                let index = &index;
+                let cx = &cx;
+                async move {
+                    let mut ids = index
+                        .search(cx, query, 10)
+                        .await
+                        .expect("bd-iiidv search")
+                        .into_iter()
+                        .map(|hit| hit.doc_id)
+                        .collect::<Vec<_>>();
+                    ids.sort();
+                    ids
+                }
+            };
+            let oracle = |query: &'static str| {
+                let index = &index;
+                let cx = &cx;
+                async move {
+                    let mut ids = index
+                        .oracle_observe_query(cx, query, 10, 64, &SnippetConfig::default())
+                        .expect("bd-iiidv oracle observation")
+                        .hits
+                        .into_iter()
+                        .map(|hit| hit.doc_id)
+                        .collect::<Vec<_>>();
+                    ids.sort();
+                    ids
+                }
+            };
+
+            // THE DEFECT, in both operand orders. `p4` is the only document
+            // matching neither term, so the complement is exactly `[p4]` and an
+            // empty answer is not "no positive term" -- it is the conjunct
+            // being emptied.
+            for query in ["NOT beta AND NOT gamma", "NOT gamma AND NOT beta"] {
+                assert_eq!(
+                    oracle(query).await,
+                    Vec::<String>::new(),
+                    "the pinned oracle must still empty an all-negative conjunction: {query}"
+                );
+                assert_eq!(
+                    shipping(query).await,
+                    vec!["p4".to_owned()],
+                    "the shipping path must answer the complement: {query}"
+                );
+            }
+
+            // THE ATTRIBUTION, and the refutation of the "agreement" claim in
+            // one measurement: the SAME oracle answers every spelling of the
+            // same intent that carries no explicit `AND` with the complement.
+            // An engine that gives an all-negative root complement semantics
+            // whenever the conjunction is spelled another way is mislowering
+            // the `AND` form, not asserting that exclusion-only matches
+            // nothing.
+            for query in ["NOT beta NOT gamma", "-beta -gamma", "NOT beta -gamma"] {
+                assert_eq!(
+                    oracle(query).await,
+                    vec!["p4".to_owned()],
+                    "the oracle gives an all-negative root complement semantics here: {query}"
+                );
+                assert_eq!(
+                    shipping(query).await,
+                    vec!["p4".to_owned()],
+                    "and the shipping path agrees, so these spellings are not divergent: {query}"
+                );
+            }
+
+            // NOT match-all, which is the failure the register's own sentence
+            // was worried about: a single negation still excludes, and the
+            // complement of a term that matches nothing is still bounded by the
+            // corpus.
+            assert_eq!(
+                shipping("NOT beta").await,
+                vec!["p2".to_owned(), "p3".to_owned(), "p4".to_owned()]
+            );
+            assert_eq!(
+                oracle("NOT beta").await,
+                vec!["p2".to_owned(), "p3".to_owned(), "p4".to_owned()]
             );
         });
     }

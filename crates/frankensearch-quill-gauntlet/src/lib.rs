@@ -48,14 +48,17 @@ use thiserror::Error;
 pub use artifact::{
     ArtifactExecutionRole, ArtifactLexicalContractEvidence, ArtifactObject,
     ArtifactOracleDependency, ArtifactStore, ArtifactStoreV4BuildInput,
-    ArtifactStoreV4BuildInputKind, ArtifactStoreV4BuildSnapshot, ArtifactStoreV4SourceBuildBinding,
+    ArtifactStoreV4BuildInputKind, ArtifactStoreV4BuildSnapshot,
+    ArtifactStoreV4DependencyBuildScriptRecord, ArtifactStoreV4SourceBuildBinding,
     ArtifactStoreV4SourceBuildSnapshots, ArtifactStoreV4SourceEntry,
     ArtifactStoreV4SourceEntryKind, ArtifactStoreV4SourceInclusionReason,
     ArtifactStoreV4SourceSnapshot, ArtifactTrustCeiling, CANONICALIZATION_VERSION,
     CampaignArtifactContext, GauntletProducerBuildIdentity, GauntletProducerSourceVerification,
     IntegrityCheckedCampaign, OBJECT_SCHEMA_VERSION, PreparedArtifact, RUN_MANIFEST_SCHEMA_VERSION,
     RunManifest, SerializedSchemaDisposition, classify_artifact_object_schema,
-    classify_campaign_report_schema, pinned_campaign_report_v8,
+    classify_campaign_report_schema, collect_dependency_build_script_records,
+    dependency_build_script_build_input, dependency_build_script_records_sha256,
+    pinned_campaign_report_v8,
 };
 pub use campaign_contract::{
     BuiltInEvidenceBindingV1, CampaignCellEvidenceV1, CampaignCellKeyV1, CampaignContractModeV1,
@@ -102,7 +105,8 @@ pub use comparator::{
     QuillCancellationEvidenceOrigin, QuillCancellationObservation, QuillCancellationReceipt,
     QuillCancellationReceiptBody, RankClass, RankedHit, SCORE_EPSILON, ScoreEpsilonReason,
     SensitiveValueObservation, compare_cass_lexical_profiles, compare_lexical_contracts,
-    compare_lexical_observations, compare_observations, observe_lexical_outcome,
+    compare_lexical_observations, compare_observations, compare_observations_stored_v7,
+    compare_observations_stored_v8, observe_lexical_outcome,
     observe_live_quill_cancellation_receipt, observe_quill_cass_profile,
 };
 #[cfg(feature = "fuzz-harness")]

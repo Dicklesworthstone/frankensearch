@@ -23,14 +23,15 @@ use crate::artifact::{
     ArtifactObject, ArtifactOracleDependency, ArtifactStore, ArtifactStoreV4SourceBuildBinding,
     ArtifactStoreV4SourceBuildSnapshots, ArtifactTrustCeiling, CampaignArtifactContext,
     GauntletProducerBuildIdentity, OBJECT_HASH_SCHEME_V7_SHA256, OBJECT_HASH_SCHEME_V8_SHA256,
+    RetainedArtifactWitness,
 };
 use crate::comparator::{
     ComparatorConfig, ComparisonReport, ComparisonStatus, Divergence, DivergenceClass,
     EngineObservation, LexicalBackendIdentity, LexicalComparisonStatus,
     LexicalContractBuildContext, LexicalEngineRole, LexicalFieldMismatch, LexicalMismatchClass,
-    LexicalProbeCoverage, LexicalSideCoverage, RankClass, compare_lexical_contracts,
-    compare_observations, lexical_mismatches_are_the_classified_rank_divergence,
-    observe_live_lexical_contract,
+    LexicalProbeCoverage, LexicalSideCoverage, OracleBugReason, RankClass,
+    compare_lexical_contracts, compare_observations,
+    lexical_mismatches_are_the_classified_rank_divergence, observe_live_lexical_contract,
 };
 #[cfg(any(test, feature = "tantivy-oracle"))]
 use crate::engine::BuiltInEngineProfile;
@@ -2021,6 +2022,36 @@ impl DivergencePredictionEvent {
     }
 }
 
+/// One observation's artifact witness, addressed the only way that particular
+/// witness can honestly be addressed.
+///
+/// A register holding more than one divergence holds witnesses from more than
+/// one generation, and those are not the same kind of value (bd-dxedq). A
+/// CURRENT object reproduces its own bytes and may address itself by
+/// re-encoding. A RETAINED one from an earlier generation may not, because the
+/// current DTO writes fields its generation never had — re-encoding a v7
+/// witness under the v8 shape addresses it to something the committed ledger
+/// never recorded, which is exactly what broke every committed join at the v8
+/// bump (bd-bxya1). Both forms have to be presentable to ONE join, or the first
+/// register that spans a generation boundary becomes unjoinable.
+#[derive(Debug, Clone, Copy)]
+pub enum DivergenceWitness<'witness> {
+    /// A witness minted in this run, addressed by re-encoding it.
+    Current(&'witness ArtifactObject),
+    /// A witness a committed ledger already recorded, addressed from the BYTES
+    /// that are the evidence rather than from a re-encode of them.
+    Retained(&'witness RetainedArtifactWitness),
+}
+
+impl DivergenceWitness<'_> {
+    fn divergence_binding(&self) -> Result<ArtifactDivergenceBinding, GauntletError> {
+        match self {
+            Self::Current(object) => object.divergence_binding(),
+            Self::Retained(witness) => witness.divergence_binding(),
+        }
+    }
+}
+
 impl DivergenceRegisterLedger {
     /// Construct and validate an append-only register ledger.
     ///
@@ -2218,12 +2249,17 @@ impl DivergenceRegisterLedger {
     /// Check relational integrity between every observation and its built-in
     /// gauntlet object witness.
     ///
-    /// Each supplied [`ArtifactObject`] is validated by its owning artifact
-    /// contract before this method compares the exact object schema/hash
-    /// domain, digest, producer-build identity, oracle dependency identity,
-    /// and lexical-contract audit revision. Every observation event,
-    /// including superseded history, must have a matching artifact witness.
-    /// Call [`Self::validate`] alone only for structural inspection.
+    /// Each supplied witness is validated by its owning artifact contract
+    /// before this method compares the exact object schema/hash domain, digest,
+    /// producer-build identity, oracle dependency identity, and
+    /// lexical-contract audit revision. Every observation event, including
+    /// superseded history, must have a matching artifact witness. Call
+    /// [`Self::validate`] alone only for structural inspection.
+    ///
+    /// THE SLICE IS THE POINT (bd-dxedq). A register with N observations needs
+    /// N witnesses, and the direction that matters is that every OBSERVATION
+    /// has one — an unreferenced witness is refused just as loudly, so a caller
+    /// cannot pad the set until the join succeeds.
     ///
     /// # Errors
     ///
@@ -2235,16 +2271,26 @@ impl DivergenceRegisterLedger {
     /// Returns an error for a structurally invalid ledger, an invalid or
     /// duplicate artifact, a missing first-recorded artifact, or any well-formed
     /// but substituted artifact/producer/oracle identity.
-    pub fn validate_relational_integrity_against_artifact_objects(
+    pub fn validate_relational_integrity_against_witnesses(
         &self,
-        artifacts: &[ArtifactObject],
+        witnesses: &[DivergenceWitness<'_>],
+    ) -> Result<(), GauntletError> {
+        let bindings = witnesses
+            .iter()
+            .map(DivergenceWitness::divergence_binding)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.validate_relational_integrity_against_bindings(&bindings)
+    }
+
+    fn validate_relational_integrity_against_bindings(
+        &self,
+        witness_bindings: &[ArtifactDivergenceBinding],
     ) -> Result<(), GauntletError> {
         self.validate()?;
         let mut bindings = BTreeMap::<String, ArtifactDivergenceBinding>::new();
-        for artifact in artifacts {
-            let binding = artifact.divergence_binding()?;
+        for binding in witness_bindings {
             if bindings
-                .insert(binding.object_hash.clone(), binding)
+                .insert(binding.object_hash.clone(), binding.clone())
                 .is_some()
             {
                 return Err(campaign_error(
@@ -4446,11 +4492,16 @@ pub fn load_read_only_campaign_report_v7() -> Result<CampaignReport, GauntletErr
             "retained CampaignReport V7 fixture is not a v7 report",
         ));
     }
-    if report.canonical_bytes_unchecked()? != canonical {
-        return Err(campaign_error(
-            "retained CampaignReport V7 bytes are not the report canonical encoding",
-        ));
-    }
+    // NO DTO ROUND-TRIP CHECK, deliberately (bd-bxya1). A retained generation
+    // is verified from its BYTES, never from a re-encode: v8 added
+    // `oracle_bug_reason` to the stored comparator configuration, so the
+    // current DTO re-encodes a decoded v7 report with a key that generation
+    // never had. Re-encoding could only ever prove that today's shape happens
+    // to match yesterday's, which is exactly what a version bump makes false —
+    // and it proves nothing about the archived bytes. The two checks that
+    // remain are strictly stronger, because both hash the stored bytes: the
+    // sealed fixture digest above, and the domain-separated report identity
+    // below.
     let mut hasher = Sha256::new();
     hasher.update(report_hash_domain(CAMPAIGN_REPORT_V7_SCHEMA_VERSION)?);
     hasher.update(canonical);
@@ -4557,10 +4608,28 @@ impl<'a> CampaignEvidenceValidator<'a> {
             query: (*query).clone(),
             registered_divergence: registered_divergence.clone(),
         };
+        // bd-bxya1: the per-case comparator configuration is RE-DERIVED here,
+        // never accepted. A stored oracle-blame attribution is only admissible
+        // if this verifier, holding the query and re-running the lane's own
+        // configuration over the artifact's own observations, reaches the same
+        // decision — so a fabricated attribution in a stored artifact is
+        // refused even though `object.validate()` can re-derive the report the
+        // fabrication produces. Deriving in BOTH directions also means a lane
+        // that silently skipped an attribution it owed cannot pass either.
+        let unattributed = compare_observations(
+            object.comparison.subject.clone(),
+            object.comparison.oracle.clone(),
+            self.report.config.comparator_config,
+        )?;
+        let expected_comparator_config = case_comparator_config(
+            self.report.config.comparator_config,
+            &query.query,
+            &unattributed,
+        );
         if object.oracle_dependency() != &self.report.oracle_dependency
             || object.engines != self.report.engines
             || object.case != expected_case
-            || object.comparator_config != self.report.config.comparator_config
+            || object.comparator_config != expected_comparator_config
             || object.campaign.as_ref() != Some(&expected_context)
             || result.disposition != disposition
             || result.reason != reason
@@ -5729,18 +5798,31 @@ impl DifferentialCampaignRunner {
                 );
             }
         };
-        // bd-bxya1: the production wiring STOPS HERE, deliberately. Calling
-        // `reclassify_oracle_blamed_lowering` at this point produces a
-        // comparison the artifact cannot store: `ArtifactObject` re-derives its
-        // report from its own observations and refuses a mismatch
-        // ("artifact comparison report does not match its observations"), which
-        // is a correct integrity check and not one to route around. Emitting
-        // the class from production therefore requires the attribution to be an
-        // input to the comparator — a stored typed reason on `ComparatorConfig`,
-        // the way `score_epsilon_reason` already is — and
-        // `compare_observations_validated_v7` is frozen: "Semantic changes
-        // require a new object/report schema and a separate implementation."
-        // That decision is recorded on bd-bxya1 rather than taken here.
+        // bd-bxya1: attribute oracle blame HERE, where the query is in scope,
+        // and re-derive the comparison from the per-case configuration rather
+        // than editing the one already built. `ArtifactObject` re-derives its
+        // stored report from its own stored observations, so a post-hoc edit
+        // makes the artifact unstorable ("artifact comparison report does not
+        // match its observations"); an input the artifact also stores
+        // re-derives exactly. Everything downstream — mismatch signatures, the
+        // campaign classification, the retained object — therefore sees one
+        // consistent class.
+        let (comparison, comparator_config) = match attribute_case_comparison(
+            self.config.comparator_config,
+            &query.query,
+            comparison,
+        ) {
+            Ok(attributed) => attributed,
+            Err(error) => {
+                return infrastructure_case(
+                    query,
+                    query_class,
+                    self.config.contract_mode,
+                    CampaignCaseReason::ComparisonFailed,
+                    error.to_string(),
+                );
+            }
+        };
         let mismatch_text_bytes = match mismatches.preflight(&comparison, &query.id) {
             Ok(text_bytes) => text_bytes,
             Err(error) => {
@@ -5788,7 +5870,7 @@ impl DifferentialCampaignRunner {
             producer_build_identity: producer_build_identity.clone(),
             engines: engines.clone(),
             case: evidence_case,
-            comparator_config: self.config.comparator_config,
+            comparator_config,
             comparison,
         };
         let context = CampaignArtifactContext {
@@ -5956,10 +6038,6 @@ fn lexical_case_summary(
     }
 }
 
-/// `#[cfg(test)]` until the frozen-v7 decision on bd-bxya1 lands: the gate is
-/// built and exercised, but nothing in production can call it yet, and saying
-/// so is honest where an `allow(dead_code)` would not be.
-///
 /// Whether a query carries the DIV-009 shape: a parenthesized group that
 /// contains a negation AND carries a boost (bd-bxya1).
 ///
@@ -5973,7 +6051,6 @@ fn lexical_case_summary(
 /// `oracle_blame_gate_fires_exactly_where_the_shipping_repair_does` pins the two
 /// against each other by OBSERVATION rather than by mirrored code, so they
 /// cannot drift apart silently.
-#[cfg(test)]
 fn query_carries_boosted_group_negation(query: &str) -> bool {
     if !query.contains(")^") {
         return false;
@@ -6131,7 +6208,6 @@ fn quill_agrees_with_the_repaired_shipping_path(
 ///    correctly withheld. A subject-side defect on the same query shape shows
 ///    the opposite containment and is refused — that is the load-bearing
 ///    planted negative this bead requires.
-#[cfg(test)]
 fn oracle_blamed_lowering_defect(query: &str, comparison: &ComparisonReport) -> bool {
     if !query_carries_boosted_group_negation(query) {
         return false;
@@ -6164,56 +6240,56 @@ fn oracle_blamed_lowering_defect(query: &str, comparison: &ComparisonReport) -> 
     oracle_ids.len() > subject_ids.len() && subject_ids.is_subset(&oracle_ids)
 }
 
-/// Relabel an oracle-blamed lowering defect to [`DivergenceClass::OracleBug`]
-/// on the PRODUCTION comparison path (bd-bxya1).
+/// The reviewed oracle-blame attribution a case's own evidence earns, if any
+/// (bd-bxya1).
 ///
-/// Runs immediately after the comparison is built, so the mismatch signatures,
-/// the campaign classification, and the retained artifact object all agree on
-/// the class. Before this existed, the only producer of `OracleBug` was a
-/// test-side helper that mutated a comparison after the fact, so the class was
-/// fully plumbed and never emitted by anything shipping.
-#[cfg(test)]
-fn reclassify_oracle_blamed_lowering(query: &str, comparison: &mut ComparisonReport) -> bool {
-    if !oracle_blamed_lowering_defect(query, comparison) {
-        return false;
-    }
-    comparison
-        .divergences
-        .retain(|divergence| divergence.class != DivergenceClass::RankMismatch);
-    comparison.divergences.push(Divergence {
-        class: DivergenceClass::OracleBug,
-        pointer: "/comparison/subject/ast_differences/boosted_group_negation".to_owned(),
-        oracle: "pinned oracle re-nested boosted-group negation as a positive alternative"
-            .to_owned(),
-        subject: "Quill retained boosted-group negation".to_owned(),
-    });
-    comparison.status = if comparison
-        .divergences
-        .iter()
-        .any(|divergence| is_failure_class(divergence.class))
-    {
-        ComparisonStatus::Failed
-    } else {
-        ComparisonStatus::Classified
-    };
-    comparison.first_divergence = comparison
-        .divergences
-        .first()
-        .map(|divergence| divergence.pointer.clone());
-    true
+/// This is the ONE producer of [`OracleBugReason`] and therefore the one
+/// producer of [`DivergenceClass::OracleBug`] on any production path. It runs
+/// where the query is in scope and takes the comparison the campaign's own
+/// comparator configuration produced — the UNATTRIBUTED one — because the
+/// symptom gate is stated over the raw class.
+pub fn oracle_blame_attribution(
+    query: &str,
+    comparison: &ComparisonReport,
+) -> Option<OracleBugReason> {
+    oracle_blamed_lowering_defect(query, comparison)
+        .then_some(OracleBugReason::BoostedGroupNegationLowering)
 }
 
-/// Divergence classes that make a comparison a raw failure.
-#[cfg(test)]
-const fn is_failure_class(class: DivergenceClass) -> bool {
-    matches!(
-        class,
-        DivergenceClass::RankMismatch
-            | DivergenceClass::SnippetMismatch
-            | DivergenceClass::CountMismatch
-            | DivergenceClass::DocumentCountMismatch
-            | DivergenceClass::PostingRecordSemantics
-    )
+/// The per-case comparator configuration: the lane's configuration plus any
+/// blame the case's own evidence earns (bd-bxya1).
+///
+/// Attribution is an INPUT to the comparator rather than an edit of its output,
+/// so the retained artifact re-derives the identical report from the identical
+/// observations. `comparison` must be the report produced by `base`; passing an
+/// already-attributed report yields `base`, because an `OracleBug` divergence
+/// does not satisfy the symptom gate.
+pub fn case_comparator_config(
+    base: ComparatorConfig,
+    query: &str,
+    comparison: &ComparisonReport,
+) -> ComparatorConfig {
+    oracle_blame_attribution(query, comparison)
+        .map_or(base, |reason| base.with_oracle_bug_reason(reason))
+}
+
+/// Re-derive one case's comparison under the configuration its own evidence
+/// earns, returning both so the caller stores exactly what it classified.
+pub fn attribute_case_comparison(
+    base: ComparatorConfig,
+    query: &str,
+    comparison: ComparisonReport,
+) -> Result<(ComparisonReport, ComparatorConfig), GauntletError> {
+    let config = case_comparator_config(base, query, &comparison);
+    if config == base {
+        return Ok((comparison, base));
+    }
+    let attributed = compare_observations(
+        comparison.subject.clone(),
+        comparison.oracle.clone(),
+        config,
+    )?;
+    Ok((attributed, config))
 }
 
 fn classify_case(
@@ -6304,22 +6380,10 @@ fn classify_case_with_lexical(
     classify_case(query, comparison, registry)
 }
 
+/// One taxonomy, one place: the comparator owns the class and therefore owns
+/// which classes are bounded accept-by-class policies.
 fn is_auto_class(class: DivergenceClass) -> bool {
-    match class {
-        DivergenceClass::TieOrder | DivergenceClass::ScoreEpsilon => true,
-        DivergenceClass::RankMismatch
-        | DivergenceClass::SnippetMismatch
-        | DivergenceClass::SnippetWindow
-        | DivergenceClass::CountMismatch
-        | DivergenceClass::DocumentCountMismatch
-        | DivergenceClass::GlobExpansionLimit
-        | DivergenceClass::QueryCanonicalization
-        | DivergenceClass::OracleBug
-        | DivergenceClass::StatsSemantics
-        | DivergenceClass::PostingRecordSemantics
-        | DivergenceClass::UnicodeEdge
-        | DivergenceClass::OversizedQueryToken => false,
-    }
+    class.is_auto()
 }
 
 fn query_class(query: &GeneratedQueryCase) -> String {
@@ -10403,8 +10467,8 @@ mod tests {
     /// binding extracted through `divergence_binding()`, which requires sealed
     /// built-in integrity — a Git-verified producer and a kernel-held running
     /// executable image — and a unit test cannot obtain one without faking the
-    /// gate. `validate_relational_integrity_against_artifact_objects` owns that
-    /// join and is exercised where a real artifact exists.
+    /// gate. `validate_relational_integrity_against_witnesses` owns that join
+    /// and is exercised where a real artifact exists.
     #[test]
     fn a_minted_observation_forms_a_valid_reviewed_ledger() {
         let binding = ingestion_binding();
@@ -16578,11 +16642,15 @@ mod tests {
     /// The read-only half of the v7 -> v8 report migration (bd-bxya1).
     ///
     /// Two directions, both required. The retained v7 receipt must still LOAD —
-    /// same bytes, same canonical encoding, same v7 address — and it must NOT
-    /// be admissible under the current contract. A migration that only proved
-    /// the first would let a stale generation keep authority; one that only
-    /// proved the second would be indistinguishable from having lost the
-    /// archive.
+    /// same bytes, same sealed fixture digest, same v7 address, all verified
+    /// FROM those bytes — and it must NOT be admissible under the current
+    /// contract. A migration that only proved the first would let a stale
+    /// generation keep authority; one that only proved the second would be
+    /// indistinguishable from having lost the archive.
+    ///
+    /// What "still loads" does NOT include is a DTO round-trip: the current
+    /// shape carries `oracle_bug_reason`, which v7 never did, so re-encoding a
+    /// decoded v7 report cannot reproduce its bytes and must not be asked to.
     #[test]
     fn the_retained_v7_report_still_loads_and_is_refused_for_admission() {
         let archived =
@@ -19779,23 +19847,21 @@ mod tests {
             }
         }
 
-        /// bd-bxya1 retired this probe's hand reclassification: it now calls
-        /// the PRODUCTION path, so the probe measures what campaigns emit
-        /// rather than a parallel implementation that could drift from it.
+        /// bd-bxya1 retired this probe's hand reclassification ENTIRELY: the
+        /// harness itself now attributes oracle blame, so the probe reads the
+        /// class off the run it already has instead of computing one. There is
+        /// no longer a probe-side implementation that could drift from what
+        /// campaigns emit, because there is no probe-side implementation.
         ///
-        /// The one behavioural difference is deliberate. The production gate
-        /// additionally requires the ORACLE to be the over-returning side,
-        /// which is what attributes blame; this probe's fixtures satisfy that,
-        /// and any that stop satisfying it SHOULD stop being reclassified.
-        fn classify_boosted_group_negation_oracle_bug(
-            query: &str,
-            comparison: &mut ComparisonReport,
-        ) -> bool {
-            let reclassified = super::reclassify_oracle_blamed_lowering(query, comparison);
-            if reclassified {
-                comparison.score_epsilon_reason = None;
-            }
-            reclassified
+        /// The production gate additionally requires the ORACLE to be the
+        /// over-returning side, which is what attributes blame; a case that
+        /// stops satisfying that SHOULD stop being reclassified, and the
+        /// score-only residual below is exactly such a case.
+        fn carries_oracle_bug_class(comparison: &ComparisonReport) -> bool {
+            comparison
+                .divergences
+                .iter()
+                .any(|divergence| divergence.class == DivergenceClass::OracleBug)
         }
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -19909,7 +19975,7 @@ mod tests {
                             corpus_hash: Some(corpus_hash.clone()),
                         },
                     };
-                    let mut run = harness
+                    let run = harness
                         .run(&cx, &subject, &oracle, &case)
                         .await
                         .unwrap_or_else(|error| {
@@ -19918,8 +19984,14 @@ mod tests {
                                  query={query:?} failed to execute: {error}"
                             )
                         });
-                    if classify_boosted_group_negation_oracle_bug(&query, &mut run.comparison) {
+                    if carries_oracle_bug_class(&run.comparison) {
                         boosted_group_oracle_bug_cases += 1;
+                        assert_eq!(
+                            run.comparator_config.oracle_bug_reason,
+                            Some(OracleBugReason::BoostedGroupNegationLowering),
+                            "an emitted OracleBug must be re-derivable from the stored \
+                             configuration: seed={seed:#x} ordinal={ordinal} query={query:?}"
+                        );
                     }
                     if run.comparison.rank_class == RankClass::ScoreEpsilon {
                         assert_eq!(
@@ -20105,7 +20177,7 @@ mod tests {
                     corpus_hash: Some(corpus_hash.clone()),
                 },
             };
-            let mut boosted_group_negation_run = harness
+            let boosted_group_negation_run = harness
                 .run(&cx, &subject, &oracle, &boosted_group_negation_case)
                 .await
                 .unwrap_or_else(|error| {
@@ -20113,21 +20185,42 @@ mod tests {
                         "boosted-group negation probe failed: query={boosted_group_negation_query:?}: {error}"
                     )
                 });
+            // WITHOUT the attribution this is a raw membership failure, and the
+            // same observations still say so: re-deriving under the lane's
+            // unattributed configuration is what proves the attribution — not
+            // some other change — is what moved the class (bd-bxya1).
+            let unattributed = compare_observations(
+                boosted_group_negation_run.comparison.subject.clone(),
+                boosted_group_negation_run.comparison.oracle.clone(),
+                ComparatorConfig::default()
+                    .with_score_epsilon_reason(ScoreEpsilonReason::SummationAssociation),
+            )
+            .expect("unattributed re-derivation of the boosted-group negation observations");
             assert!(
-                boosted_group_negation_run
-                    .comparison
+                unattributed
                     .divergences
                     .iter()
                     .any(|divergence| divergence.class == DivergenceClass::RankMismatch),
                 "the pinned oracle fallback must make the raw membership divergence visible: {:#?}",
-                boosted_group_negation_run.comparison.divergences
+                unattributed.divergences
+            );
+            assert_eq!(
+                unattributed.status,
+                ComparisonStatus::Failed,
+                "the unattributed shape is a raw failure; that is what the attribution answers"
             );
             assert!(
-                classify_boosted_group_negation_oracle_bug(
-                    &boosted_group_negation_query,
-                    &mut boosted_group_negation_run.comparison,
-                ),
-                "the known boosted-group negation shape must route to OracleBug"
+                carries_oracle_bug_class(&boosted_group_negation_run.comparison),
+                "the known boosted-group negation shape must route to OracleBug on the \
+                 production path: {:#?}",
+                boosted_group_negation_run.comparison.divergences
+            );
+            assert_eq!(
+                boosted_group_negation_run
+                    .comparator_config
+                    .oracle_bug_reason,
+                Some(OracleBugReason::BoostedGroupNegationLowering),
+                "the emitted class must be re-derivable from the stored configuration"
             );
             assert_eq!(
                 boosted_group_negation_run.comparison.status,
@@ -20537,12 +20630,13 @@ mod tests {
     const E68_CONTROL_CASE_ID: &str = "e68-div007-control";
     /// The case that must STILL fail closed after bd-gx7n4 (bd-73ok3).
     ///
-    /// A negation inside a BOOSTED group: the pinned oracle's lenient-parse
-    /// fallback silently drops the negation, so the two engines disagree about
-    /// which documents MATCH. The register documents this as an `OracleBug`
-    /// membership divergence that "never" classifies as `ScoreEpsilon`, and the
-    /// campaign lane -- which does not run the bsjw probe's manual
-    /// reclassification -- sees it as a raw `RankMismatch`.
+    /// A negation inside a BOOSTED group: the pinned oracle re-nests it as a
+    /// positive alternative, so the two engines disagree about which documents
+    /// MATCH. The register documents this as an `OracleBug` membership
+    /// divergence that never classifies as `ScoreEpsilon`, and since bd-bxya1
+    /// the campaign lane emits that class itself — the blame is a stored
+    /// comparator INPUT the artifact re-derives, not a reclassification anyone
+    /// applies afterwards.
     ///
     /// It is deliberately a MEMBERSHIP divergence rather than another score
     /// one: it proves the lane's new tolerance is specific to the reviewed
@@ -20558,10 +20652,22 @@ mod tests {
     /// same lane, different mechanism (membership, not summation association).
     #[cfg(feature = "tantivy-oracle")]
     const E68_REFUSAL_DIVERGENCE_ID: &str = "DIV-009";
-    /// The bead a fresh mint of the membership refusal blocks against: the
-    /// oracle-lowering defect's own bead, not DIV-008's and not bd-nqeb4's.
+    /// The independent reviewer of DIV-009's acceptance.
+    ///
+    /// `DivergenceDisposition::validate` requires the reviewer to differ from
+    /// the observation's `recorded_by`, which is the whole point: the agent
+    /// that observed a divergence may not also certify it. This names the owner
+    /// ruling of 2026-08-05 recorded on `bd-f20ye`, not the recording pane.
     #[cfg(feature = "tantivy-oracle")]
-    const E68_REFUSAL_BLOCKING_BEAD: &str = "bd-f20ye";
+    const E68_REFUSAL_REVIEWER: &str =
+        "Dicklesworthstone (owner ruling of 2026-08-05, recorded on bd-f20ye)";
+    /// When DIV-009's acceptance was ruled — the owner ruling's own date, not
+    /// the hour the observation was recorded, which is a day earlier.
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_REFUSAL_REVIEWED_AT: &str = "2026-08-05T00:00:00Z";
+    /// The law the acceptance rests on, stated so the record carries it.
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_REFUSAL_EQUIVALENCE_LAW: &str = "a boost is a score multiplier and must not change boolean membership: for any group G and finite boost b, the document SET matched by (G)^b equals the set matched by (G). Quill satisfies this law; the pinned oracle does not, which is what attributes the divergence to the oracle.";
     #[cfg(feature = "tantivy-oracle")]
     const E68_WITNESS_DIVERGENCE_ID: &str = "DIV-008";
     #[cfg(feature = "tantivy-oracle")]
@@ -20577,12 +20683,83 @@ mod tests {
     const E68_LIVE_LEDGER_FIXTURE: &str = "fixtures/divergence-register-v2-live.json";
     #[cfg(feature = "tantivy-oracle")]
     const E68_LIVE_WITNESS_FIXTURE: &str = "fixtures/artifact-object-v7-div007-live.json";
+    /// DIV-009's witness, committed beside DIV-008's (bd-dxedq).
+    ///
+    /// A SECOND constant rather than a widened first one: these are two
+    /// different objects from two different generations, and the committed
+    /// register now names both. The register cannot join without this file --
+    /// every observation needs its own witness -- so committing it is part of
+    /// committing the two-witness register, not a convenience.
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_REFUSAL_WITNESS_FIXTURE: &str = "fixtures/artifact-object-v8-div009-live.json";
     /// Domain separation for the minimized-fixture digest recorded with the
     /// observation. Re-derivable from the committed inputs, so the digest is a
     /// checkable claim rather than an opaque constant.
     #[cfg(feature = "tantivy-oracle")]
     const E68_MINIMIZED_FIXTURE_DOMAIN: &[u8] =
         b"frankensearch-quill-gauntlet/e68-minimized-fixture/v1";
+
+    /// DIV-010's PRIMARY shape, observed LIVE (bd-h46f1).
+    ///
+    /// `A AND NOT B` lowers, in the pinned oracle, to a conjunction whose
+    /// second `Must` operand is a boolean holding only a `MustNot` clause. It
+    /// has no positive term, matches nothing, and empties the whole
+    /// conjunction, so the oracle returns NOTHING while Quill returns the
+    /// documents the query asks for. That is the entry's own first measurement,
+    /// and it is deliberately the one minted here rather than bd-8a2a8's
+    /// `A NOT B AND C` ordering, for a reason worth recording: a mismatch
+    /// SIGNATURE commits to the mismatch shape, and the dropped-conjunct
+    /// ordering produces `rank:hit:hit` at `hits/0` — the same shape DIV-008
+    /// already holds active, which one ledger cannot carry twice. The emptied
+    /// form's signature is a length disagreement and is its own shape.
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_AND_NOT_CASE_ID: &str = "e68-negated-conjunction-refusal";
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_AND_NOT_QUERY: &str = "small AND NOT bounds";
+    /// The same operands WITHOUT the explicit `AND`, committed beside it
+    /// because it is the ATTRIBUTION and not a convenience.
+    ///
+    /// The pinned oracle answers this with the exact set Quill returns for the
+    /// `AND` spelling, so it already agrees with the declared reading when the
+    /// conjunction is written the other way — which isolates the `AND` keyword
+    /// as the trigger and makes the implicit lowering the defect rather than a
+    /// different semantics. It is `Exact` in the same run, on the same corpus,
+    /// with the same operands.
+    ///
+    /// It is NOT sufficient to mint an accepted `OracleBug`, and that is stated
+    /// rather than papered over: `oracle_blame_attribution` is a pure function
+    /// of ONE case's query and its own comparison, and this evidence lives in a
+    /// different case, so the DIV-010 artifact cannot re-derive it (bd-4oiwf).
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_AND_NOT_CONTROL_CASE_ID: &str = "e68-negated-conjunction-explicit";
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_AND_NOT_CONTROL_QUERY: &str = "small NOT bounds";
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_AND_NOT_DIVERGENCE_ID: &str = "DIV-010";
+    /// The bead DIV-010's machine record BLOCKS on, and why it blocks rather
+    /// than recording the reviewed accept the prose entry carries.
+    ///
+    /// The class the lane emits for this shape is a raw `RankMismatch`, and
+    /// `DivergenceDisposition::validate` refuses acceptance for every raw
+    /// failure class. Earning the semantic class needs an attribution the
+    /// artifact can re-derive, and the only evidence that attributes this
+    /// shape — the explicit-grouping control above — is in another case. So the
+    /// machine records what it can prove: observed, and blocked on the bead
+    /// that owns making it acceptable.
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_AND_NOT_BLOCKING_BEAD: &str = "bd-4oiwf";
+    /// DIV-010's witness, committed as the register's third (bd-h46f1).
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_AND_NOT_WITNESS_FIXTURE: &str = "fixtures/artifact-object-v8-div010-live.json";
+    /// A non-truncating limit for the DIV-010 pair.
+    ///
+    /// Both engines return more than the suite's default 20 for these queries,
+    /// and comparing two CAPPED lists measures where each ranking cut rather
+    /// than which documents matched. This divergence is a MEMBERSHIP one, so
+    /// the observation has to be untruncated or it is measuring the wrong
+    /// thing.
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_AND_NOT_LIMIT: u64 = 512;
 
     /// The campaign fixture the E6.8 witness is minted from: the shared Core100
     /// corpus every default-profile campaign already uses, and an explicit
@@ -20598,18 +20775,19 @@ mod tests {
             .manifest(crate::generator::SharedCorpusView::Core100)
             .expect("shared corpus manifest");
         let corpus_hash = corpus_manifest.manifest_hash().expect("corpus hash");
-        let case = |id: &str, query: &str| GeneratedQueryCase {
+        let case_at = |id: &str, query: &str, limit: u64| GeneratedQueryCase {
             id: id.to_owned(),
             syntax: QuerySyntax::Default,
             query_kind: GeneratedQueryKind::Boolean,
             query: query.to_owned(),
-            limit: 20,
+            limit,
             offset: 0,
             count_requested: false,
             filters: crate::generator::GeneratedQueryFilters::default(),
             expected_divergence: None,
             source: "runner.rs E6.8 live-ingestion witness".to_owned(),
         };
+        let case = |id: &str, query: &str| case_at(id, query, 20);
         let query_suite = GeneratedQuerySuite::from_cases(
             QueryGeneratorSpec {
                 seed: 0x6538_0007,
@@ -20621,6 +20799,12 @@ mod tests {
                 case(E68_WITNESS_CASE_ID, E68_WITNESS_QUERY),
                 case(E68_CONTROL_CASE_ID, E68_WITNESS_CONTROL_QUERY),
                 case(E68_REFUSAL_CASE_ID, E68_REFUSAL_QUERY),
+                case_at(E68_AND_NOT_CASE_ID, E68_AND_NOT_QUERY, E68_AND_NOT_LIMIT),
+                case_at(
+                    E68_AND_NOT_CONTROL_CASE_ID,
+                    E68_AND_NOT_CONTROL_QUERY,
+                    E68_AND_NOT_LIMIT,
+                ),
             ],
         )
         .expect("E6.8 witness query suite");
@@ -20653,6 +20837,135 @@ mod tests {
         lower_hex(&hasher.finalize())
     }
 
+    /// Seed an append for ONE divergence: the base register's events with that
+    /// divergence's own prior events dropped, and the sequence its freshly
+    /// minted observation takes.
+    ///
+    /// THE MINT APPENDS, IT DOES NOT REPLACE (bd-dxedq). These helpers used to
+    /// build a standalone two-event ledger, so the register a mint produced
+    /// held its own witness and nothing else -- which is why the committed
+    /// register carried DIV-008 alone while DIV-009's reviewed accept sat in a
+    /// mint nobody merged. One register has to carry every witness, or the
+    /// enforced ledger and the prose register describe different worlds.
+    ///
+    /// Re-mintable by construction: any previously appended events for THIS
+    /// divergence are dropped before the freshly minted ones are appended,
+    /// rather than accumulating duplicates -- which the validator would refuse
+    /// anyway, since two active observations of one divergence collide on their
+    /// mismatch signature. At the revision the committed register was minted
+    /// from, that re-derives byte-identical events (every timestamp in this
+    /// path is fixed for exactly that reason); at any LATER revision it does
+    /// not, and cannot, because the producer build identity is part of the
+    /// evidence and has moved. See the baseline in [`e68_finish_append`].
+    ///
+    /// Taking a BASE rather than reading the committed file lets mints chain:
+    /// DIV-010 appends to the ledger DIV-009 just appended to, so one run mints
+    /// one register carrying every witness it observed.
+    #[cfg(feature = "tantivy-oracle")]
+    fn e68_append_base(
+        base: &DivergenceRegisterLedger,
+        divergence_id: &str,
+    ) -> (Vec<DivergenceRegisterEvent>, u64) {
+        let events = base
+            .events
+            .iter()
+            .filter(|event| match event {
+                DivergenceRegisterEvent::Observation(observation) => {
+                    observation.divergence_id != divergence_id
+                }
+                DivergenceRegisterEvent::Disposition(disposition) => {
+                    disposition.divergence_id != divergence_id
+                }
+                DivergenceRegisterEvent::Prediction(_) => true,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let observation_sequence =
+            u64::try_from(events.len()).expect("register length fits u64") + 1;
+        (events, observation_sequence)
+    }
+
+    /// The committed register with EVERY divergence this run re-mints removed,
+    /// which is the only base a live chain can append to (bd-h46f1).
+    ///
+    /// A single mint may drop its own prior events and re-append them, because
+    /// they are the register's tail. Two mints cannot each do that: once
+    /// DIV-010 is committed at sequences 6-7, DIV-009's committed events are no
+    /// longer the tail, and dropping them alone leaves the sequence gap
+    /// `1,2,3,6,7` that `DivergenceRegisterLedger::new` correctly refuses. The
+    /// chain therefore strips ALL of them at once and re-appends in order.
+    ///
+    /// That refusal is the tail constraint doing its job rather than a
+    /// limitation worked around: excising events from the MIDDLE of a register
+    /// is the shape a real history rewrite takes, and the only reason this is
+    /// allowed to do it is that every removed event is re-derived and appended
+    /// again in the same breath.
+    #[cfg(feature = "tantivy-oracle")]
+    fn e68_base_without(
+        committed: &DivergenceRegisterLedger,
+        divergence_ids: &[&str],
+    ) -> DivergenceRegisterLedger {
+        let events = committed
+            .events
+            .iter()
+            .filter(|event| match event {
+                DivergenceRegisterEvent::Observation(observation) => {
+                    !divergence_ids.contains(&observation.divergence_id.as_str())
+                }
+                DivergenceRegisterEvent::Disposition(disposition) => {
+                    !divergence_ids.contains(&disposition.divergence_id.as_str())
+                }
+                DivergenceRegisterEvent::Prediction(_) => true,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        DivergenceRegisterLedger::new(E68_LIVE_REGISTER_ID, events).expect(
+            "the committed register minus the divergences this run re-mints must itself be a valid \
+             ledger",
+        )
+    }
+
+    /// Assemble an appended register and PROVE the append.
+    ///
+    /// THE BASELINE IS THE BASE REGISTER MINUS THIS DIVERGENCE'S OWN PRIOR
+    /// EVENTS, and the choice is measured rather than convenient.
+    ///
+    /// The property worth proving is that a mint cannot drop or edit ANOTHER
+    /// witness's history -- that is the failure a hand-merged register would
+    /// produce, and it is refused here rather than at review. Proving it
+    /// against the committed file INCLUDING this divergence's own events proves
+    /// something else, and something that is false by construction after the
+    /// first commit: a re-mint carries the CURRENT producer build identity, so
+    /// at any revision later than the one the register was minted from, freshly
+    /// minted events differ from the committed ones in their producer identity
+    /// and witness address, and the successor check reads that as a history
+    /// rewrite. It would redden the mint test at every commit after the
+    /// register landed, which is not a gate holding -- it is a gate that can
+    /// only be satisfied by never moving.
+    ///
+    /// Nothing is relaxed by scoping it: `new()` refuses a baseline whose
+    /// sequences are not contiguous, so this divergence's prior events must be
+    /// the TAIL of the register. A mint that tried to excise events from the
+    /// middle -- the shape a real history rewrite takes -- fails to assemble a
+    /// baseline at all.
+    #[cfg(feature = "tantivy-oracle")]
+    fn e68_finish_append(
+        retained: Vec<DivergenceRegisterEvent>,
+        minted: Vec<DivergenceRegisterEvent>,
+    ) -> DivergenceRegisterLedger {
+        let baseline = DivergenceRegisterLedger::new(E68_LIVE_REGISTER_ID, retained.clone()).expect(
+            "the base register minus this divergence's own events must itself be a valid ledger",
+        );
+        let mut events = retained;
+        events.extend(minted);
+        let ledger = DivergenceRegisterLedger::new(E68_LIVE_REGISTER_ID, events)
+            .expect("the ingested ledger must satisfy the v2 contract");
+        ledger
+            .validate_append_only_successor(&baseline)
+            .expect("the minted register must only APPEND to the other witnesses' history");
+        ledger
+    }
+
     /// Assemble the E6.8 register ledger from one integrity-checked witness.
     ///
     /// Every identity field comes from the artifact through
@@ -20660,6 +20973,7 @@ mod tests {
     /// substitute a revision, a manifest, or the witness address.
     #[cfg(feature = "tantivy-oracle")]
     fn e68_ingest_witness(
+        base: &DivergenceRegisterLedger,
         object: &ArtifactObject,
         fixture_sha256: String,
     ) -> (DivergenceRegisterLedger, Vec<String>) {
@@ -20678,6 +20992,19 @@ mod tests {
             !mismatch_signatures.is_empty(),
             "the ingested object must carry at least one raw mismatch signature"
         );
+        // The class recorded below is READ OUT of the artifact, not asserted by
+        // this function: every non-auto divergence in the witness must be the
+        // OracleBug class the campaign attributed, or the mint fails rather
+        // than recording a class its own evidence does not carry (bd-bxya1).
+        assert!(
+            binding
+                .divergences
+                .iter()
+                .filter(|divergence| !is_auto_class(divergence.class))
+                .all(|divergence| divergence.class == DivergenceClass::OracleBug),
+            "the DIV-009 witness must carry the attributed OracleBug class: {:#?}",
+            binding.divergences
+        );
 
         let mut diagnostic_hasher = Sha256::new();
         for divergence in &binding.divergences {
@@ -20693,22 +21020,25 @@ mod tests {
             marker: "<redacted:e68-live-lane-rank-mismatch>".to_owned(),
         };
 
+        let (events, observation_sequence) = e68_append_base(base, E68_REFUSAL_DIVERGENCE_ID);
+
         let observation = DivergenceRegisterLedger::observation_from_artifact(
             object,
             DivergenceRegisterEventHeader {
-                sequence: 1,
+                sequence: observation_sequence,
                 supersedes: None,
                 recorded_by: E68_RECORDED_BY.to_owned(),
                 recorded_at: E68_RECORDED_AT.to_owned(),
             },
             E68_REFUSAL_DIVERGENCE_ID,
-            // Still the raw class, because that is what the lane still emits:
-            // bd-bxya1 built and tested the oracle-blame gate but could not
-            // wire it into production without extending the frozen v7
-            // comparator contract. When that ruling lands this becomes
-            // `OracleBug` and the disposition below becomes the reviewed
-            // Accepted, which the validator refuses for a raw failure class.
-            DivergenceClass::RankMismatch,
+            // The SEMANTIC class the lane now emits (bd-bxya1). This is not a
+            // relabelling of the record: the artifact this observation is
+            // ingested from carries `OracleBug` itself, because the campaign
+            // stored the reviewed attribution as a comparator INPUT and the
+            // object re-derives the same report from the same observations.
+            // The assertion above refuses to mint if the artifact ever stops
+            // saying so, rather than letting this constant carry the claim.
+            DivergenceClass::OracleBug,
             DivergenceFixtureEvidence {
                 fixture_id: E68_REFUSAL_CASE_ID.to_owned(),
                 fixture_sha256,
@@ -20726,10 +21056,10 @@ mod tests {
                     "the same document set from both engines; a negation inside a boosted group excludes exactly what it names."
                         .to_owned(),
                 root_cause:
-                    "an oracle-side LOWERING defect, not a Quill scoring one and not a parse recovery: the MustNot clause survives parsing, but boosting the group nests it as its own boolean and attaches that as a positive alternative, so the group stops excluding (bd-f20ye). Quill lowers it correctly. Because membership differs, this is a raw RankMismatch and cannot be an auto class -- the lane's reviewed summation-association tolerance covers score bits on identical document sets and deliberately does not reach here."
+                    "an oracle-side LOWERING defect, not a Quill scoring one and not a parse recovery: the MustNot clause survives parsing, but boosting the group nests it as its own boolean and attaches that as a positive alternative, so the group stops excluding (bd-f20ye). Quill lowers it correctly. Membership differs, so no score-tolerance class can ever cover it -- the lane's reviewed summation-association tolerance covers score bits on identical document sets and deliberately does not reach here. The class recorded is OracleBug because the blame was PROVED on three independent pieces of evidence: the query shape, the membership symptom, and the side -- the oracle returned a strict superset of the subject's documents, which is the failure-to-exclude this defect produces (bd-bxya1)."
                         .to_owned(),
                 consumer_impact:
-                    "result SETS differ, which is the class of divergence a consumer notices first. It fails closed as unclassified in the default-profile lane, and the register is the only place a decision about it can be recorded."
+                    "result SETS differ, which is the class of divergence a consumer notices first. The campaign case still fails closed -- it carries no per-fixture register row and its total lexical contract still mismatches -- so attribution decides who is at fault, not whether the case passes."
                         .to_owned(),
             },
             diagnostic,
@@ -20738,37 +21068,188 @@ mod tests {
 
         let disposition = DivergenceDispositionEvent {
             header: DivergenceRegisterEventHeader {
-                sequence: 2,
+                sequence: observation_sequence + 1,
                 supersedes: None,
                 recorded_by: E68_RECORDED_BY.to_owned(),
                 recorded_at: E68_RECORDED_AT.to_owned(),
             },
             divergence_id: E68_REFUSAL_DIVERGENCE_ID.to_owned(),
-            // BLOCKING, still, and the reason is recorded rather than papered
-            // over: the owner ruling of 2026-08-05 ACCEPTED this divergence,
-            // but `DivergenceDisposition::validate` refuses acceptance for a
-            // raw failure class, and the lane cannot yet emit the semantic
-            // `OracleBug` class (bd-bxya1). The reviewed decision and the
-            // machine record therefore still disagree, which is exactly the
-            // difference bd-f20ye's close said would have to be stated.
-            disposition: DivergenceDisposition::Blocking {
-                bead_id: E68_REFUSAL_BLOCKING_BEAD.to_owned(),
+            // ACCEPTED, which the machine record can finally say (bd-bxya1).
+            // The owner ruling of 2026-08-05 accepted this divergence, and the
+            // ledger recorded BLOCKING anyway because the lane emitted a raw
+            // `RankMismatch` and `DivergenceDisposition::validate` refuses
+            // acceptance for a raw failure class. The lane now emits the
+            // semantic `OracleBug` class the attribution earns, so the reviewed
+            // decision and the machine record agree without the validator being
+            // weakened: acceptance still refuses every raw failure class, and
+            // this one is no longer raw because its blame was PROVED, not
+            // asserted.
+            disposition: DivergenceDisposition::Accepted {
+                equivalence_law: E68_REFUSAL_EQUIVALENCE_LAW.to_owned(),
                 rationale:
-                    "accepted by owner ruling on 2026-08-05, but the machine record cannot say so yet: the lane emits this as a raw RankMismatch and no acceptance may bless a raw failure class. It stays blocking until the campaign can emit the OracleBug class the attribution earns (bd-bxya1)."
+                    "the pinned oracle is a comparator, not a semantics authority. A boost is a score multiplier; a boost that changes boolean MEMBERSHIP is a defect by any reading, and `(a NOT b)^2` returning documents the query excluded is user-facing wrong. frankensearch-lexical's SHIPPING path repairs the shape while `oracle_observe_*` stays bit-faithful to Tantivy 0.26.1, defects included, so Quill is still measured against an unmoved target."
+                        .to_owned(),
+                reviewer: E68_REFUSAL_REVIEWER.to_owned(),
+                reviewed_at: E68_REFUSAL_REVIEWED_AT.to_owned(),
+            },
+        };
+
+        let ledger = e68_finish_append(
+            events,
+            vec![
+                DivergenceRegisterEvent::Observation(Box::new(observation)),
+                DivergenceRegisterEvent::Disposition(disposition),
+            ],
+        );
+        (ledger, mismatch_signatures)
+    }
+
+    /// Append DIV-010's live witness, recorded BLOCKING (bd-h46f1).
+    ///
+    /// WHY BLOCKING, WHEN THE PROSE ENTRY SAYS ACCEPT. The lane emits a raw
+    /// `RankMismatch` for this shape and `DivergenceDisposition::validate`
+    /// refuses acceptance for every raw failure class. Earning the semantic
+    /// `OracleBug` class the way DIV-009 did needs an attribution the ARTIFACT
+    /// can re-derive, and this shape's attribution cannot be derived from one
+    /// case:
+    ///
+    /// - DIV-009's third gate is the SIDE — the oracle returns a strict
+    ///   SUPERSET, the failure-to-exclude its defect produces, and a
+    ///   subject-side defect shows the opposite containment and is refused.
+    ///   DIV-010 inverts the direction: the oracle DROPS a conjunct, so it
+    ///   under-returns. Measured on this corpus, `NOT release AND NOT bounds`
+    ///   wears the identical shape, the identical symptom and the identical
+    ///   containment (79 subject hits against 0) and is NOT this divergence, so
+    ///   a pure gate admitting DIV-010 would launder it (bd-iiidv).
+    /// - The evidence that DOES attribute this shape is the explicit-grouping
+    ///   control, `E68_AND_NOT_CONTROL_CASE_ID`, which the pinned oracle
+    ///   answers with the exact set Quill returns for the implicit form. It
+    ///   lives in a different case, so the DIV-010 artifact cannot re-derive
+    ///   it, and bd-bxya1's design rests on the verifier re-deriving the
+    ///   attribution rather than trusting a stored claim.
+    /// - The structural alternative is closed too: `ORACLE_LOWERING_UNOBSERVABLE`
+    ///   records that the pinned parser emits no structured recovery
+    ///   diagnostics, so there is no oracle-side AST to gate on.
+    ///
+    /// So the machine records what it can prove — observed, and blocked on
+    /// `bd-4oiwf`, which owns the attribution that would let a superseding
+    /// ACCEPTED disposition be appended. That is exactly the route DIV-008
+    /// took from blocking to fixed at sequence 3, and it is the register
+    /// working rather than the register being weakened: a blocking disposition
+    /// needs no independent reviewer precisely because it grants nothing.
+    #[cfg(feature = "tantivy-oracle")]
+    fn e68_ingest_and_not_witness(
+        base: &DivergenceRegisterLedger,
+        object: &ArtifactObject,
+        fixture_sha256: String,
+    ) -> (DivergenceRegisterLedger, Vec<String>) {
+        let binding = object
+            .divergence_binding()
+            .expect("the witness object must yield a sealed divergence binding");
+        let mut mismatch_signatures = binding
+            .divergences
+            .iter()
+            .filter(|divergence| !is_auto_class(divergence.class))
+            .map(|divergence| mismatch_signature(binding.rank_class, divergence))
+            .collect::<Vec<_>>();
+        mismatch_signatures.sort();
+        mismatch_signatures.dedup();
+        assert!(
+            !mismatch_signatures.is_empty(),
+            "the ingested object must carry at least one raw mismatch signature"
+        );
+        // The class is READ OUT of the artifact, not asserted here. It must be
+        // the RAW RankMismatch: if the lane ever started attributing this shape
+        // without this mint being taught how, the mint fails rather than
+        // recording a class its own evidence does not carry.
+        assert!(
+            binding
+                .divergences
+                .iter()
+                .filter(|divergence| !is_auto_class(divergence.class))
+                .all(|divergence| divergence.class == DivergenceClass::RankMismatch),
+            "the DIV-010 witness must carry the raw RankMismatch class: {:#?}",
+            binding.divergences
+        );
+
+        let mut diagnostic_hasher = Sha256::new();
+        for divergence in &binding.divergences {
+            diagnostic_hasher.update(divergence.pointer.as_bytes());
+            diagnostic_hasher.update([0_u8]);
+            diagnostic_hasher.update(divergence.oracle.as_bytes());
+            diagnostic_hasher.update([0_u8]);
+            diagnostic_hasher.update(divergence.subject.as_bytes());
+            diagnostic_hasher.update([0_u8]);
+        }
+        let diagnostic = RedactedDivergenceDiagnostic {
+            payload_sha256: lower_hex(&diagnostic_hasher.finalize()),
+            marker: "<redacted:e68-live-lane-negated-conjunction>".to_owned(),
+        };
+
+        let (events, observation_sequence) = e68_append_base(base, E68_AND_NOT_DIVERGENCE_ID);
+
+        let observation = DivergenceRegisterLedger::observation_from_artifact(
+            object,
+            DivergenceRegisterEventHeader {
+                sequence: observation_sequence,
+                supersedes: None,
+                recorded_by: E68_RECORDED_BY.to_owned(),
+                recorded_at: E68_RECORDED_AT.to_owned(),
+            },
+            E68_AND_NOT_DIVERGENCE_ID,
+            DivergenceClass::RankMismatch,
+            DivergenceFixtureEvidence {
+                fixture_id: E68_AND_NOT_CASE_ID.to_owned(),
+                fixture_sha256,
+                regression_test:
+                    "runner::tests::live_default_profile_campaign_ingests_its_unclassified_divergence"
+                        .to_owned(),
+                minimized: true,
+            },
+            mismatch_signatures.clone(),
+            DivergenceObservationNarrative {
+                observed_behavior:
+                    "the two engines disagree about which documents MATCH a conjunction that carries a negation: the pinned oracle returns NOTHING at all, while the subject returns the documents the query asks for."
+                        .to_owned(),
+                expected_behavior:
+                    "the same document set from both engines; a negation inside an explicit conjunction excludes what it names rather than emptying the conjunction."
+                        .to_owned(),
+                root_cause:
+                    "an oracle-side LOWERING defect in tantivy 0.26.1: `A AND NOT B` lowers to a conjunction whose second Must operand is a boolean holding only a MustNot clause, which has no positive term, matches nothing, and empties whatever it is conjoined with. Quill lowers it correctly since bd-quill-shipping-conformance-parse-split-w7bsu, and frankensearch-lexical's SHIPPING path repairs it while every oracle_observe_* caller stays bit-faithful to the defect. The blame is ATTRIBUTED BY A CONTROL, not by this record: the same oracle answers the same operands spelled without the explicit AND with the exact document set the subject returns, which isolates the AND keyword as the trigger. That control is a SEPARATE campaign case, which is why this observation carries the raw class rather than the semantic one (bd-4oiwf)."
+                        .to_owned(),
+                consumer_impact:
+                    "result SETS differ and the difference is silent: the most common negation spelling returns NOTHING, with no error and no warning, for a query the user reasonably expects to work. The campaign case fails closed -- it carries no per-fixture register row and its total lexical contract still mismatches."
+                        .to_owned(),
+            },
+            diagnostic,
+        )
+        .expect("live campaign observation must ingest from its own artifact");
+
+        let disposition = DivergenceDispositionEvent {
+            header: DivergenceRegisterEventHeader {
+                sequence: observation_sequence + 1,
+                supersedes: None,
+                recorded_by: E68_RECORDED_BY.to_owned(),
+                recorded_at: E68_RECORDED_AT.to_owned(),
+            },
+            divergence_id: E68_AND_NOT_DIVERGENCE_ID.to_owned(),
+            disposition: DivergenceDisposition::Blocking {
+                bead_id: E68_AND_NOT_BLOCKING_BEAD.to_owned(),
+                rationale:
+                    "the register's prose entry records a reviewed ACCEPT for this divergence, and the machine cannot record one yet. The lane emits a raw RankMismatch, and acceptance refuses every raw failure class; the semantic class would have to be earned by an attribution the artifact re-derives, and this shape's attribution is the explicitly-grouped control in a DIFFERENT case. A containment-direction gate like DIV-009's is measurably unsafe here -- an unrelated exclusion-only conjunction wears the same shape, symptom and containment. It blocks until bd-4oiwf carries that control into the artifact; moving it off blocking additionally requires an independent reviewer, which this row's own prose says it does not have."
                         .to_owned(),
                 reviewer: E68_RECORDED_BY.to_owned(),
                 reviewed_at: E68_RECORDED_AT.to_owned(),
             },
         };
 
-        let ledger = DivergenceRegisterLedger::new(
-            E68_LIVE_REGISTER_ID,
+        let ledger = e68_finish_append(
+            events,
             vec![
                 DivergenceRegisterEvent::Observation(Box::new(observation)),
                 DivergenceRegisterEvent::Disposition(disposition),
             ],
-        )
-        .expect("the ingested ledger must satisfy the v2 contract");
+        );
         (ledger, mismatch_signatures)
     }
 
@@ -20836,10 +21317,11 @@ mod tests {
         // the divergence is a membership RankMismatch, and the ORACLE returned
         // the document the subject correctly excluded.
         let mut admitted = report(&["p2"], &["p1", "p2"], &[DivergenceClass::RankMismatch]);
-        assert!(
-            reclassify_oracle_blamed_lowering("(alpha NOT beta)^2", &mut admitted),
-            "the measured oracle defect must reclassify on the production path"
-        );
+        let reason = oracle_blame_attribution("(alpha NOT beta)^2", &admitted)
+            .expect("the measured oracle defect must attribute on the production path");
+        assert_eq!(reason, OracleBugReason::BoostedGroupNegationLowering);
+        crate::comparator::apply_oracle_bug_attribution(reason, &mut admitted)
+            .expect("the gate's verdict must satisfy the comparator's own observation checks");
         assert_eq!(
             admitted
                 .divergences
@@ -20853,10 +21335,23 @@ mod tests {
         // NEGATIVE 1 — THE LOAD-BEARING ONE: same shape, same symptom, but the
         // SUBJECT is the over-returning side. That is a Quill defect and must
         // never be relabelled as an oracle bug.
+        //
+        // Refused TWICE, independently: the gate declines to attribute, and the
+        // comparator refuses the attribution even when a configuration asserts
+        // it. The second lock is what makes a hand-written or fabricated stored
+        // reason unable to launder a subject-side defect.
         let mut subject_side = report(&["p1", "p2"], &["p2"], &[DivergenceClass::RankMismatch]);
         assert!(
-            !reclassify_oracle_blamed_lowering("(alpha NOT beta)^2", &mut subject_side),
-            "a SUBJECT-side membership defect must never reclassify as OracleBug"
+            oracle_blame_attribution("(alpha NOT beta)^2", &subject_side).is_none(),
+            "a SUBJECT-side membership defect must never attribute as OracleBug"
+        );
+        assert!(
+            crate::comparator::apply_oracle_bug_attribution(
+                OracleBugReason::BoostedGroupNegationLowering,
+                &mut subject_side,
+            )
+            .is_err(),
+            "a claimed attribution its own observations refute must be refused"
         );
         assert_eq!(
             subject_side.divergences[0].class,
@@ -20866,32 +21361,32 @@ mod tests {
 
         // NEGATIVE 2: the symptom without the structural shape. This is the
         // case a symptom-only implementation would wrongly admit.
-        let mut no_shape = report(&["p2"], &["p1", "p2"], &[DivergenceClass::RankMismatch]);
+        let no_shape = report(&["p2"], &["p1", "p2"], &[DivergenceClass::RankMismatch]);
         assert!(
-            !reclassify_oracle_blamed_lowering("alpha NOT beta", &mut no_shape),
+            oracle_blame_attribution("alpha NOT beta", &no_shape).is_none(),
             "an unboosted negation carries no oracle-blame evidence"
         );
 
         // NEGATIVE 3: the shape with a boost but no negation inside the group.
-        let mut no_negation = report(&["p2"], &["p1", "p2"], &[DivergenceClass::RankMismatch]);
+        let no_negation = report(&["p2"], &["p1", "p2"], &[DivergenceClass::RankMismatch]);
         assert!(
-            !reclassify_oracle_blamed_lowering("(alpha OR beta)^2", &mut no_negation),
+            oracle_blame_attribution("(alpha OR beta)^2", &no_negation).is_none(),
             "a boosted group without a negation is not this defect"
         );
 
         // NEGATIVE 4: identical membership. The oracle did not over-return, so
         // nothing attributes blame — this is the residual the bsjw probe
         // tolerates explicitly rather than relabelling.
-        let mut score_only = report(&["p1"], &["p1"], &[DivergenceClass::RankMismatch]);
+        let score_only = report(&["p1"], &["p1"], &[DivergenceClass::RankMismatch]);
         assert!(
-            !reclassify_oracle_blamed_lowering("(alpha NOT beta)^2", &mut score_only),
+            oracle_blame_attribution("(alpha NOT beta)^2", &score_only).is_none(),
             "identical document sets cannot attribute blame to either engine"
         );
 
         // NEGATIVE 5: the right shape and side, but a different symptom class.
-        let mut wrong_class = report(&["p2"], &["p1", "p2"], &[DivergenceClass::CountMismatch]);
+        let wrong_class = report(&["p2"], &["p1", "p2"], &[DivergenceClass::CountMismatch]);
         assert!(
-            !reclassify_oracle_blamed_lowering("(alpha NOT beta)^2", &mut wrong_class),
+            oracle_blame_attribution("(alpha NOT beta)^2", &wrong_class).is_none(),
             "only a membership RankMismatch is this defect's symptom"
         );
 
@@ -21312,9 +21807,19 @@ mod tests {
             // score mechanism classify in this lane; it must NOT have made the
             // lane tolerant in general. A negation inside a boosted group is a
             // MEMBERSHIP divergence -- the engines disagree about which
-            // documents match -- so it is a raw failure class no auto-class
-            // covers, and it still fails closed in the same suite, in the same
-            // run, under the same enveloped comparator.
+            // documents match -- and it still fails closed in the same suite,
+            // in the same run, under the same enveloped comparator.
+            //
+            // WHAT bd-bxya1 CHANGED, and what it deliberately did not. The lane
+            // now attributes this shape to the ORACLE and emits the semantic
+            // `OracleBug` class, so the register can accept it and the machine
+            // mint below can say so. The case still fails closed, for two
+            // reasons that are both correct and are stated rather than fixed by
+            // widening anything: it carries no per-fixture register row
+            // (`expected_divergence` is None), and the total lexical contract
+            // still mismatches -- the lexical axis defers only to a reviewed
+            // SCORE envelope, never to a membership class. Attribution earns a
+            // divergence a decidable class; it does not earn a case a pass.
             let refusal = report
                 .cases
                 .iter()
@@ -21323,7 +21828,8 @@ mod tests {
             assert_eq!(
                 refusal.disposition,
                 CampaignDisposition::Unclassified,
-                "a membership divergence must still fail closed after the score envelope opt-in \
+                "an unregistered membership divergence must still fail closed after the score \
+                 envelope opt-in and after oracle-blame attribution \
                  (reason={:?} diagnostic={:?})",
                 refusal.reason,
                 refusal.diagnostic
@@ -21346,58 +21852,316 @@ mod tests {
             // therefore still demonstrated on production evidence, by the same
             // run, on a divergence that genuinely needs a register decision.
             let object = load_campaign_case_object(&root, refusal);
+            // ACCEPTANCE 1 (bd-bxya1), on production evidence and with NO
+            // test-side mutation: the retained artifact carries the `OracleBug`
+            // class, carries the stored attribution that produced it, and
+            // re-derives that exact report from its own observations --
+            // `validate()` re-runs the v8 comparator over the stored evidence
+            // and refuses any report it cannot reproduce, which is precisely
+            // what a post-hoc reclassification could never satisfy.
+            object
+                .validate()
+                .expect("the attributed campaign object must re-derive its own report");
+            assert_eq!(
+                object.comparator_config.oracle_bug_reason,
+                Some(OracleBugReason::BoostedGroupNegationLowering),
+                "the campaign must store the attribution as a comparator input"
+            );
+            assert!(
+                object
+                    .comparison
+                    .divergences
+                    .iter()
+                    .filter(|divergence| !is_auto_class(divergence.class))
+                    .all(|divergence| divergence.class == DivergenceClass::OracleBug),
+                "the default-profile lane must emit OracleBug for the DIV-009 shape: {:#?}",
+                object.comparison.divergences
+            );
+            assert_eq!(
+                object.comparison.status,
+                ComparisonStatus::Classified,
+                "an attributed oracle bug is a classified comparison, not a raw failure"
+            );
+            // DIV-010'S LIVE WITNESS, and the control that attributes it
+            // (bd-h46f1). This is the shape the register documented and could
+            // never ingest: an explicit `AND` beside a negation, where the
+            // pinned oracle drops the whole conjunct. It is observed at a
+            // NON-TRUNCATING limit, because comparing two capped lists measures
+            // where each ranking cut rather than which documents matched, and
+            // this is a MEMBERSHIP divergence.
+            let and_not = report
+                .cases
+                .iter()
+                .find(|case| case.case_id == E68_AND_NOT_CASE_ID)
+                .expect("negated-conjunction case is selected by the campaign");
+            assert_eq!(
+                and_not.disposition,
+                CampaignDisposition::Unclassified,
+                "DIV-010's shape must still fail closed (reason={:?} diagnostic={:?})",
+                and_not.reason,
+                and_not.diagnostic
+            );
+            assert_eq!(and_not.rank_class, Some(RankClass::RankMismatch));
+            assert!(
+                and_not.registered_divergence.is_none(),
+                "the negated conjunction is unregistered per fixture; that is what fails it closed"
+            );
+            // THE CONTROL IS THE ATTRIBUTION, and it is exact in the SAME run.
+            // The oracle answers the same operands spelled WITHOUT the explicit
+            // `AND` with the set Quill returns for the `AND` form, so it
+            // already agrees with the declared reading when the conjunction is
+            // written the other way -- which isolates the keyword as the
+            // trigger and makes the lowering the defect rather than a different
+            // semantics. Same operands, same corpus, no divergence.
+            let and_not_control = report
+                .cases
+                .iter()
+                .find(|case| case.case_id == E68_AND_NOT_CONTROL_CASE_ID)
+                .expect("explicit-grouping control is selected by the campaign");
+            assert_eq!(
+                and_not_control.disposition,
+                CampaignDisposition::Exact,
+                "the explicitly grouped form must be bit-exact on both engines, or it attributes \
+                 nothing (reason={:?})",
+                and_not_control.reason
+            );
+
+            let and_not_object = load_campaign_case_object(&root, and_not);
+            and_not_object
+                .validate()
+                .expect("the campaign object must re-derive its own report");
+            // NOTHING WAS LAUNDERED, asserted rather than assumed. DIV-009's
+            // attribution gate must NOT fire for this shape: it is scoped to a
+            // boosted group containing a negation, and the containment here
+            // runs the other way -- the oracle UNDER-returns. The mint below
+            // therefore records the raw class and a BLOCKING disposition, and
+            // this pair of assertions is what would catch a future gate that
+            // quietly widened to admit it.
+            assert_eq!(
+                and_not_object.comparator_config.oracle_bug_reason, None,
+                "DIV-010's shape must carry no stored oracle-blame attribution"
+            );
+            assert!(
+                oracle_blame_attribution(&and_not_object.case.query, &and_not_object.comparison)
+                    .is_none(),
+                "the oracle-blame gate must decline DIV-010's shape; earning its semantic class \
+                 needs the explicit-form control the artifact cannot re-derive (bd-4oiwf)"
+            );
+            let and_not_subject: BTreeSet<&str> = and_not_object
+                .comparison
+                .subject
+                .hits
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect();
+            let and_not_oracle: BTreeSet<&str> = and_not_object
+                .comparison
+                .oracle
+                .hits
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect();
+            assert!(
+                and_not_oracle.is_empty() && !and_not_subject.is_empty(),
+                "the oracle must return NOTHING on DIV-010's shape -- an emptied conjunction, not \
+                 a failure to exclude: subject={} oracle={}",
+                and_not_subject.len(),
+                and_not_oracle.len()
+            );
+
+            let committed_register = DivergenceRegisterLedger::decode_json(
+                &std::fs::read(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(E68_LIVE_LEDGER_FIXTURE),
+                )
+                .expect("committed live divergence register"),
+            )
+            .expect("the committed register must decode and validate before anything appends");
+            // THE LIVE CHAIN RE-MINTS BOTH, so it starts from the committed
+            // register with BOTH removed. Dropping only DIV-009's events would
+            // leave the sequence gap `1,2,3,6,7` once DIV-010 is committed
+            // after it, and the ledger correctly refuses that -- see
+            // `e68_base_without`.
+            let live_base = e68_base_without(
+                &committed_register,
+                &[E68_REFUSAL_DIVERGENCE_ID, E68_AND_NOT_DIVERGENCE_ID],
+            );
             let (ledger, mismatch_signatures) = e68_ingest_witness(
+                &live_base,
                 &object,
                 e68_minimized_fixture_sha256(&fixture, E68_REFUSAL_CASE_ID),
             );
-            ledger
-                .validate_relational_integrity_against_artifact_objects(std::slice::from_ref(
-                    &object,
-                ))
-                .expect("the ingested observation must join to its own witness object");
-
-            // The witness signature is the one the campaign itself emitted.
-            assert!(
-                report
-                    .mismatches
-                    .iter()
-                    .any(|group| mismatch_signatures.contains(&group.signature)),
-                "the ingested signature must be the campaign's own emitted mismatch"
+            // THE MINTS CHAIN: DIV-010 appends to the ledger DIV-009 just
+            // appended to, so ONE run mints ONE register carrying every witness
+            // it observed, and each append proves itself against the history it
+            // did not mint.
+            let (ledger, and_not_signatures) = e68_ingest_and_not_witness(
+                &ledger,
+                &and_not_object,
+                e68_minimized_fixture_sha256(&fixture, E68_AND_NOT_CASE_ID),
             );
+            // THE JOIN TAKES EVERY OBSERVATION'S WITNESS (bd-dxedq). The mint
+            // appends to the committed register, so the minted ledger carries
+            // DIV-008's observation too, and a register with N observations
+            // needs N witnesses. DIV-008's is the committed v7 object addressed
+            // from its stored BYTES; DIV-009's and DIV-010's are live v8
+            // objects this run just produced, which can address themselves by
+            // re-encoding. Passing only the live ones is what reddened the
+            // first attempt at this change, and it reddened LOUDLY -- the
+            // missing witness is named.
+            let committed_witness = crate::artifact::RetainedArtifactWitness::decode(
+                &std::fs::read(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(E68_LIVE_WITNESS_FIXTURE),
+                )
+                .expect("committed live witness object"),
+            )
+            .expect("committed witness object must decode and address");
+            ledger
+                .validate_relational_integrity_against_witnesses(&[
+                    DivergenceWitness::Current(&object),
+                    DivergenceWitness::Current(&and_not_object),
+                    DivergenceWitness::Retained(&committed_witness),
+                ])
+                .expect("every observation in the minted register must join to its own witness");
+            // DIV-010 IS RECORDED, AND RECORDED AS WHAT IT IS. The prose entry
+            // carries a reviewed accept; the machine carries an observation and
+            // a BLOCKING disposition, because the class is raw and the
+            // attribution that would earn the semantic class is in another case
+            // (bd-4oiwf). Asserting the disposition KIND here is what stops a
+            // later edit from quietly upgrading it without the evidence.
+            assert!(
+                ledger.events.iter().any(|event| matches!(
+                    event,
+                    DivergenceRegisterEvent::Disposition(disposition)
+                        if disposition.divergence_id == E68_AND_NOT_DIVERGENCE_ID
+                            && matches!(
+                                disposition.disposition,
+                                DivergenceDisposition::Blocking { .. }
+                            )
+                )),
+                "DIV-010's mint must record BLOCKING, not an accept it cannot prove"
+            );
+            // ACCEPTANCE 4 (bd-bxya1): DIV-009's machine mint and its reviewed
+            // accept now AGREE. The ledger validates on assembly, and
+            // `DivergenceDisposition::validate` still refuses acceptance for
+            // every raw failure class -- nothing was weakened to get here; the
+            // class changed because the blame was proved.
+            assert!(
+                ledger.events.iter().any(|event| matches!(
+                    event,
+                    DivergenceRegisterEvent::Disposition(disposition)
+                        if disposition.divergence_id == E68_REFUSAL_DIVERGENCE_ID
+                            && matches!(
+                                disposition.disposition,
+                                DivergenceDisposition::Accepted { .. }
+                            )
+                )),
+                "the DIV-009 mint must record the reviewed acceptance"
+            );
+
+            // Every ingested signature is one the campaign itself emitted.
+            for signature in mismatch_signatures.iter().chain(&and_not_signatures) {
+                assert!(
+                    report
+                        .mismatches
+                        .iter()
+                        .any(|group| &group.signature == signature),
+                    "the ingested signature must be the campaign's own emitted mismatch"
+                );
+            }
+
+            // THE REGISTER THIS RUN OFFERS FOR COMMITTING IS NOT THE ONE IT
+            // JUST MINTED, and the difference is the append-only doctrine
+            // (bd-h46f1).
+            //
+            // Every re-mint re-derives its observations under the CURRENT
+            // producer build identity, so the chain above legitimately carries
+            // a DIV-009 observation that differs from the committed one in its
+            // witness address. Committing that would rewrite sequences 4 and 5
+            // — exactly the history rewrite this register exists to make
+            // impossible, and it would strand the committed DIV-009 witness
+            // whose bytes the committed observation names.
+            //
+            // So what gets written is the committed register plus only what it
+            // does not already carry, and the append is PROVED against the
+            // committed file itself rather than against a filtered baseline.
+            // Once a divergence is committed, its events and its witness are
+            // final; a correction would have to arrive as a SUPERSEDING event,
+            // which is a decision someone makes, not a side effect of running
+            // the mint again.
+            let already_committed = |divergence_id: &str| {
+                committed_register.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        DivergenceRegisterEvent::Observation(observation)
+                            if observation.divergence_id == divergence_id
+                    )
+                })
+            };
+            let landable = if already_committed(E68_AND_NOT_DIVERGENCE_ID) {
+                committed_register.clone()
+            } else {
+                e68_ingest_and_not_witness(
+                    &committed_register,
+                    &and_not_object,
+                    e68_minimized_fixture_sha256(&fixture, E68_AND_NOT_CASE_ID),
+                )
+                .0
+            };
+            landable
+                .validate_append_only_successor(&committed_register)
+                .expect(
+                    "the register offered for committing must only APPEND to the committed one",
+                );
 
             if let Some(mint) = mint_root {
                 let ledger_path = mint.join("divergence-register-v2-live.json");
                 std::fs::write(
                     &ledger_path,
-                    serde_json::to_vec_pretty(&ledger).expect("serialize ingested ledger"),
+                    serde_json::to_vec_pretty(&landable).expect("serialize ingested ledger"),
                 )
                 .expect("write ingested ledger");
                 eprintln!("E68_LEDGER_PATH={}", ledger_path.display());
-                eprintln!(
-                    "E68_WITNESS_OBJECT_PATH={}",
+                let object_path = |case: &CampaignCaseResult| {
                     mint.join("objects")
                         .join(format!(
                             "{}.json",
-                            refusal.artifact_hash.as_deref().unwrap_or_default()
+                            case.artifact_hash.as_deref().unwrap_or_default()
                         ))
                         .display()
-                );
+                        .to_string()
+                };
+                // The DIV-009 object is this run's RE-MINT, printed for
+                // inspection: it is not what the committed register names, and
+                // committing it would strand the witness the committed
+                // observation addresses. Only a witness for a divergence the
+                // committed register does not yet carry is landable.
+                eprintln!("E68_REMINTED_DIV009_OBJECT_PATH={}", object_path(refusal));
+                eprintln!("E68_AND_NOT_WITNESS_OBJECT_PATH={}", object_path(and_not));
                 eprintln!(
                     "E68_LEDGER_HASH={}",
-                    ledger.ledger_hash().expect("ingested ledger hash")
+                    landable.ledger_hash().expect("ingested ledger hash")
                 );
             }
         });
     }
 
     /// bd-quill-e6-gauntlet-scale-rm3q.8: the COMMITTED production register and
-    /// its committed witness must remain valid, mutually bound, and free of
+    /// its committed witnesses must remain valid, mutually bound, and free of
     /// plaintext — on any checkout, clean or dirty, since a stored seal is
     /// evidence about the producer that minted it, not about the reader.
     ///
     /// This is the register selfcheck that outlives the mint: the mint proves a
     /// live mismatch CAN be ingested, this proves the ingested record still
-    /// says what it said, still joins to its witness, and still redacts.
+    /// says what it said, still joins to its witnesses, and still redacts.
+    ///
+    /// TWO WITNESSES SINCE bd-dxedq, and the second one is why this test
+    /// changed shape. The committed register carries DIV-008 and DIV-009, so it
+    /// spans a generation boundary: DIV-008's witness is a v7 object and
+    /// DIV-009's is v8. Both are read as RETAINED evidence — addressed from
+    /// their committed bytes — including the one that could still address
+    /// itself today. That is deliberate. A witness stops being able to
+    /// re-encode itself at the NEXT schema bump, not at the one that already
+    /// happened, and this test must not be the thing that discovers it.
     #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn committed_live_divergence_register_joins_its_witness_and_stays_redacted() {
@@ -21411,43 +22175,109 @@ mod tests {
             .validate()
             .expect("committed live register must satisfy the current v2 contract");
 
-        let object: ArtifactObject = serde_json::from_slice(
-            &std::fs::read(crate_root.join(E68_LIVE_WITNESS_FIXTURE))
-                .expect("committed live witness object"),
-        )
-        .expect("committed witness object must decode");
+        // ADDRESSED FROM ITS BYTES, not by re-encoding it (bd-bxya1). DIV-008's
+        // witness is a v7 object and the current DTO writes a field v7 never
+        // had, so a re-encode addresses to something the committed ledger never
+        // recorded. The bytes are the evidence; the address is computed from
+        // them, and each object still has to clear the integrity contract of
+        // its own generation before it can stand as a witness at all.
+        let retained = |fixture_path: &str| {
+            crate::artifact::RetainedArtifactWitness::decode(
+                &std::fs::read(crate_root.join(fixture_path))
+                    .expect("committed live witness object"),
+            )
+            .expect("committed witness object must decode and address")
+        };
+        let witnesses = [
+            retained(E68_LIVE_WITNESS_FIXTURE),
+            retained(E68_REFUSAL_WITNESS_FIXTURE),
+            retained(E68_AND_NOT_WITNESS_FIXTURE),
+        ];
+        // EVERY OBSERVATION, ITS OWN WITNESS. The join refuses in both
+        // directions — an observation without a witness and a witness no
+        // observation references — so this cannot be satisfied by padding the
+        // set, and dropping either fixture reddens here by name.
         ledger
-            .validate_relational_integrity_against_artifact_objects(std::slice::from_ref(&object))
-            .expect("committed register must join to its committed witness");
+            .validate_relational_integrity_against_witnesses(
+                &witnesses
+                    .iter()
+                    .map(DivergenceWitness::Retained)
+                    .collect::<Vec<_>>(),
+            )
+            .expect("committed register must join to its committed witnesses");
 
-        // The recorded minimized-fixture digest is re-derived, not trusted.
-        let fixture = make_e68_witness_fixture();
-        let expected_fixture_sha256 = e68_minimized_fixture_sha256(&fixture, E68_WITNESS_CASE_ID);
-        let observation = ledger
+        let observation_for = |divergence_id: &str| {
+            ledger
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    DivergenceRegisterEvent::Observation(observation)
+                        if observation.divergence_id == divergence_id =>
+                    {
+                        Some(observation)
+                    }
+                    DivergenceRegisterEvent::Observation(_)
+                    | DivergenceRegisterEvent::Disposition(_)
+                    | DivergenceRegisterEvent::Prediction(_) => None,
+                })
+                .unwrap_or_else(|| panic!("committed register holds {divergence_id}"))
+        };
+        let dispositions_for = |divergence_id: &str| {
+            ledger
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    DivergenceRegisterEvent::Disposition(disposition)
+                        if disposition.divergence_id == divergence_id =>
+                    {
+                        Some(disposition)
+                    }
+                    DivergenceRegisterEvent::Disposition(_)
+                    | DivergenceRegisterEvent::Observation(_)
+                    | DivergenceRegisterEvent::Prediction(_) => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // THE CENSUS THIS REGISTER IS, stated exactly. The terminal
+        // authorization hashes this ledger, so what it holds IS the flip's
+        // divergence-census evidence; a reader must not have to count events to
+        // learn which divergences that covers.
+        let registered = ledger
             .events
             .iter()
-            .find_map(|event| match event {
-                DivergenceRegisterEvent::Observation(observation) => Some(observation),
+            .filter_map(|event| match event {
+                DivergenceRegisterEvent::Observation(observation) => {
+                    Some(observation.divergence_id.clone())
+                }
                 DivergenceRegisterEvent::Disposition(_)
                 | DivergenceRegisterEvent::Prediction(_) => None,
             })
-            .expect("committed register holds an observation");
-        assert_eq!(observation.divergence_id, E68_WITNESS_DIVERGENCE_ID);
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            registered,
+            BTreeSet::from([
+                E68_WITNESS_DIVERGENCE_ID.to_owned(),
+                E68_REFUSAL_DIVERGENCE_ID.to_owned(),
+                E68_AND_NOT_DIVERGENCE_ID.to_owned(),
+            ]),
+            "the enforced census covers exactly the divergences whose witnesses are committed"
+        );
+
+        // The recorded minimized-fixture digests are re-derived, not trusted.
+        let fixture = make_e68_witness_fixture();
+        let observation = observation_for(E68_WITNESS_DIVERGENCE_ID);
         assert_eq!(observation.class, DivergenceClass::RankMismatch);
         assert_eq!(
-            observation.fixture.fixture_sha256, expected_fixture_sha256,
+            observation.fixture.fixture_sha256,
+            e68_minimized_fixture_sha256(&fixture, E68_WITNESS_CASE_ID),
             "the recorded minimized fixture no longer hashes to the committed case"
         );
 
         // A raw failure class may only block or be fixed, never be accepted.
-        let disposition = ledger
-            .events
-            .iter()
-            .find_map(|event| match event {
-                DivergenceRegisterEvent::Disposition(disposition) => Some(disposition),
-                DivergenceRegisterEvent::Observation(_)
-                | DivergenceRegisterEvent::Prediction(_) => None,
-            })
+        let div008_dispositions = dispositions_for(E68_WITNESS_DIVERGENCE_ID);
+        let disposition = div008_dispositions
+            .first()
             .expect("committed register holds a disposition");
         match &disposition.disposition {
             DivergenceDisposition::Blocking { bead_id, .. } => {
@@ -21458,15 +22288,97 @@ mod tests {
             }
         }
 
-        // Redaction: neither the witness query nor any corpus document content
-        // may appear in the committed ledger bytes.
+        // DIV-009, WHICH IS THE POINT OF bd-dxedq: the prose register and the
+        // enforced ledger now say the same thing about it. The class is the
+        // attributed `OracleBug` the lane emits, and the disposition is the
+        // reviewed ACCEPT the owner ruled — which the ledger can only hold
+        // because the class is no longer raw and the reviewer is not the
+        // observer. Both are asserted here rather than left to
+        // `DivergenceDisposition::validate`, so a future edit that weakened
+        // that validator would still redden this test.
+        let refusal = observation_for(E68_REFUSAL_DIVERGENCE_ID);
+        assert_eq!(refusal.class, DivergenceClass::OracleBug);
+        assert_eq!(
+            refusal.fixture.fixture_sha256,
+            e68_minimized_fixture_sha256(&fixture, E68_REFUSAL_CASE_ID),
+            "the recorded minimized fixture no longer hashes to the committed refusal case"
+        );
+        let div009_dispositions = dispositions_for(E68_REFUSAL_DIVERGENCE_ID);
+        let [accepted] = div009_dispositions.as_slice() else {
+            panic!(
+                "DIV-009 carries exactly one disposition, not {}",
+                div009_dispositions.len()
+            )
+        };
+        match &accepted.disposition {
+            DivergenceDisposition::Accepted {
+                equivalence_law,
+                reviewer,
+                ..
+            } => {
+                assert_eq!(equivalence_law, E68_REFUSAL_EQUIVALENCE_LAW);
+                assert_eq!(reviewer, E68_REFUSAL_REVIEWER);
+                assert_ne!(
+                    reviewer.as_str(),
+                    refusal.header.recorded_by.as_str(),
+                    "an accept certified by its own observer is the forgery this register exists \
+                     to refuse"
+                );
+            }
+            DivergenceDisposition::Blocking { .. } | DivergenceDisposition::Fixed { .. } => {
+                panic!("DIV-009's committed disposition is the reviewed accept")
+            }
+        }
+
+        // DIV-010, RECORDED AS WHAT THE MACHINE CAN PROVE (bd-h46f1). Its prose
+        // entry carries a reviewed accept; the ledger carries a raw
+        // `RankMismatch` observation and a BLOCKING disposition, because
+        // acceptance refuses every raw failure class and the attribution that
+        // would earn the semantic class lives in a different campaign case
+        // (bd-4oiwf). Asserting the kind here is what stops a later edit from
+        // upgrading the record without the evidence that upgrade requires.
+        let and_not = observation_for(E68_AND_NOT_DIVERGENCE_ID);
+        assert_eq!(and_not.class, DivergenceClass::RankMismatch);
+        assert_eq!(
+            and_not.fixture.fixture_sha256,
+            e68_minimized_fixture_sha256(&fixture, E68_AND_NOT_CASE_ID),
+            "the recorded minimized fixture no longer hashes to the committed negated-conjunction \
+             case"
+        );
+        let and_not_dispositions = dispositions_for(E68_AND_NOT_DIVERGENCE_ID);
+        let [blocked] = and_not_dispositions.as_slice() else {
+            panic!(
+                "DIV-010 carries exactly one disposition, not {}",
+                and_not_dispositions.len()
+            )
+        };
+        match &blocked.disposition {
+            DivergenceDisposition::Blocking { bead_id, .. } => {
+                assert_eq!(bead_id, E68_AND_NOT_BLOCKING_BEAD);
+            }
+            DivergenceDisposition::Accepted { .. } | DivergenceDisposition::Fixed { .. } => {
+                panic!(
+                    "DIV-010's machine record is BLOCKING; an accept here would be one the \
+                     validator's own rules cannot support"
+                )
+            }
+        }
+
+        // Redaction: no witness query and no corpus document content may appear
+        // in the committed ledger bytes.
         let corpus_canary = fixture
             .documents
             .first()
             .map(|document| document.content.clone())
             .expect("Core100 corpus is non-empty");
         ledger
-            .validate_redaction_canaries(&[E68_WITNESS_QUERY, corpus_canary.as_str()])
+            .validate_redaction_canaries(&[
+                E68_WITNESS_QUERY,
+                E68_REFUSAL_QUERY,
+                E68_AND_NOT_QUERY,
+                E68_AND_NOT_CONTROL_QUERY,
+                corpus_canary.as_str(),
+            ])
             .expect("committed register must not leak query or corpus plaintext");
     }
 

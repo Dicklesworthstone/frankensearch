@@ -897,6 +897,181 @@ mod feature_matrix_smoke {
         );
     }
 
+    /// bd-8nqz.4: the PUBLIC FIELD INVENTORY of the two lexical hit surfaces,
+    /// with every Quill/Tantivy difference explicitly reviewed.
+    ///
+    /// The acceptance requires that the public field/serde inventory has "no
+    /// unreviewed Quill/Tantivy gap". The engine-neutral facade alias
+    /// `LexicalHit` IS Quill's `QuillSnippetHit`, while `lexical_tantivy`
+    /// keeps Tantivy's own `LexicalHit`, so a consumer migrating between them
+    /// meets four real differences. Leaving them undocumented is exactly the
+    /// "unreviewed gap" this clause forbids.
+    ///
+    /// # What actually enforces this
+    ///
+    /// The EXHAUSTIVE DESTRUCTURING below, not the table. Neither pattern uses
+    /// `..`, so adding or removing a field on either engine's hit type makes
+    /// this test fail to COMPILE until someone updates the inventory and
+    /// classifies the change. A runtime key-set comparison would only catch a
+    /// field that changed its serialized name, and would silently pass a newly
+    /// added one on whichever engine the test happened not to serialize.
+    #[cfg(all(feature = "lexical", feature = "lexical-tantivy"))]
+    #[test]
+    fn the_public_lexical_hit_inventory_has_no_unreviewed_gap() {
+        /// (quill field, tantivy field, reviewed correspondence).
+        const INVENTORY: &[(&str, &str, &str)] = &[
+            (
+                "document_id",
+                "doc_id",
+                "RENAMED. A source-compatibility break for any consumer moving \
+                 off the Tantivy type; the facade exposes Quill's spelling.",
+            ),
+            (
+                "score",
+                "bm25_score",
+                "RENAMED. Same value class (exhaustive BM25), different name; \
+                 the facade exposes Quill's spelling.",
+            ),
+            (
+                "rank",
+                "rank",
+                "IDENTICAL. Zero-based, usize, both engines.",
+            ),
+            (
+                "snippet",
+                "snippet",
+                "IDENTICAL SHAPE. Option<String> on both, and both preserve \
+                 None as distinct from Some(\"\").",
+            ),
+            (
+                "query_type",
+                "query_type",
+                "SAME NAME, TWO INDEPENDENTLY DEFINED ENUMS. \
+                 frankensearch_quill::QueryExplanation and \
+                 frankensearch_lexical::QueryExplanation are separate types \
+                 with no From/Into between them. Their variant sets agree \
+                 TODAY by coincidence, not by contract, so they must never be \
+                 compared by type equality.",
+            ),
+            (
+                "metadata",
+                "metadata",
+                "SAME NAME, DIFFERENT REPRESENTATION. Quill wraps in \
+                 Option<Arc<Value>>, Tantivy uses Option<Value>. Serde output \
+                 is identical; the difference is a source-compatibility one \
+                 for callers that name the type.",
+            ),
+        ];
+
+        // Quill side. No `..`: a new field breaks this build.
+        let quill_hit = LexicalHit {
+            document_id: "doc-alpha".to_owned(),
+            score: 1.5,
+            rank: 0,
+            snippet: Some("<b>alpha</b>".to_owned()),
+            query_type: quill::QueryExplanation::Simple,
+            metadata: None,
+        };
+        let LexicalHit {
+            document_id,
+            score,
+            rank,
+            snippet,
+            query_type,
+            metadata,
+        } = quill_hit;
+        let quill_fields = [
+            ("document_id", !document_id.is_empty()),
+            ("score", score > 0.0),
+            ("rank", rank == 0),
+            ("snippet", snippet.is_some()),
+            ("query_type", query_type == quill::QueryExplanation::Simple),
+            ("metadata", metadata.is_none()),
+        ];
+
+        // Tantivy side. Same discipline, its own spelling.
+        let tantivy_hit = lexical_tantivy::LexicalHit {
+            doc_id: "doc-alpha".to_owned(),
+            bm25_score: 1.5,
+            rank: 0,
+            snippet: Some("<b>alpha</b>".to_owned()),
+            query_type: lexical_tantivy::QueryExplanation::Simple,
+            metadata: None,
+        };
+        let lexical_tantivy::LexicalHit {
+            doc_id,
+            bm25_score,
+            rank: tantivy_rank,
+            snippet: tantivy_snippet,
+            query_type: tantivy_query_type,
+            metadata: tantivy_metadata,
+        } = tantivy_hit;
+        let tantivy_fields = [
+            ("doc_id", !doc_id.is_empty()),
+            ("bm25_score", bm25_score > 0.0),
+            ("rank", tantivy_rank == 0),
+            ("snippet", tantivy_snippet.is_some()),
+            (
+                "query_type",
+                tantivy_query_type == lexical_tantivy::QueryExplanation::Simple,
+            ),
+            ("metadata", tantivy_metadata.is_none()),
+        ];
+
+        // The inventory must cover EXACTLY the destructured fields on both
+        // sides -- no entry without a field, no field without an entry.
+        assert_eq!(
+            INVENTORY.len(),
+            quill_fields.len(),
+            "every Quill field must have exactly one inventory entry"
+        );
+        assert_eq!(
+            INVENTORY.len(),
+            tantivy_fields.len(),
+            "every Tantivy field must have exactly one inventory entry"
+        );
+        for (index, (quill_name, tantivy_name, review)) in INVENTORY.iter().enumerate() {
+            assert_eq!(
+                *quill_name, quill_fields[index].0,
+                "inventory row {index} does not name the Quill field it reviews"
+            );
+            assert_eq!(
+                *tantivy_name, tantivy_fields[index].0,
+                "inventory row {index} does not name the Tantivy field it reviews"
+            );
+            assert!(
+                quill_fields[index].1 && tantivy_fields[index].1,
+                "inventory row {index} names a field whose value was not actually observed"
+            );
+            assert!(
+                !review.trim().is_empty(),
+                "field {quill_name} has no recorded review"
+            );
+        }
+
+        // The four real gaps, asserted rather than merely described, so the
+        // table cannot drift into claiming a correspondence that stopped
+        // being true.
+        assert_ne!(
+            INVENTORY[0].0, INVENTORY[0].1,
+            "document_id/doc_id must remain recorded as a rename"
+        );
+        assert_ne!(
+            INVENTORY[1].0, INVENTORY[1].1,
+            "score/bm25_score must remain recorded as a rename"
+        );
+
+        emit_evidence(
+            "both",
+            "public_lexical_hit_inventory",
+            &serde_json::json!({
+                "fields_reviewed": INVENTORY.len(),
+                "renamed": [[INVENTORY[0].0, INVENTORY[0].1], [INVENTORY[1].0, INVENTORY[1].1]],
+                "same_name_different_type": ["query_type", "metadata"],
+            }),
+        );
+    }
+
     #[cfg(feature = "lexical-tantivy")]
     #[test]
     fn lexical_tantivy_lane_behavior() {

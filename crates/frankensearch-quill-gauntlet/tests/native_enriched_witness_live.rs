@@ -94,6 +94,34 @@ fn baseline_campaign_provenance() -> frankensearch_quill_gauntlet::CampaignProve
     }
 }
 
+/// The complete frozen replacement campaign matrix.
+///
+/// bd-8nqz.4 slice 7: the CASS coverage slot takes CELLS and validates them
+/// against the frozen completeness policy, so this builds the real matrix
+/// rather than declaring a coverage class.
+fn frozen_cass_cells() -> Vec<frankensearch_quill_gauntlet::CampaignCellEvidenceV1> {
+    use frankensearch_quill_gauntlet::{
+        BuiltInEvidenceBindingV1, CampaignCellEvidenceV1, CampaignContractModeV1,
+        CampaignEvidenceRole, CampaignProfileV1, CampaignSha256V1, frozen_replacement_cell_keys,
+        frozen_replacement_seed_bundle,
+    };
+    frozen_replacement_cell_keys()
+        .into_iter()
+        .map(|key| {
+            let mode = match key.campaign_profile() {
+                CampaignProfileV1::ShippingDefaultCoreV3 => CampaignContractModeV1::CoreLexicalV3,
+                CampaignProfileV1::CassTotalV1 => CampaignContractModeV1::CassTotalV1,
+            };
+            let seeds = frozen_replacement_seed_bundle(key.seed_slot());
+            let role = CampaignEvidenceRole::BuiltInEvidence(BuiltInEvidenceBindingV1::new(
+                CampaignSha256V1::parse(&"a".repeat(64)).expect("strict lower-case hex"),
+                CampaignSha256V1::parse(&"b".repeat(64)).expect("strict lower-case hex"),
+            ));
+            CampaignCellEvidenceV1::new(key, role, mode, seeds)
+        })
+        .collect()
+}
+
 /// Every committed expectation must hold against the REAL native Quill
 /// paginated API — exact count, offset pagination, ordering and all.
 #[test]
@@ -601,16 +629,15 @@ fn the_committed_expectations_hold_against_real_tantivy() {
 #[test]
 fn an_inadmissible_enriched_receipt_can_never_authorize_a_replacement() {
     use frankensearch_quill_gauntlet::native_enriched_witness::{
-        AcceptedCandidateBindingV1, CapabilitySchemaArmV1, NativeEnrichedReceiptV1,
-        NativeEnrichedRunV1, observe_quill_capabilities, observe_quill_enrichments,
-        observe_quill_pages,
+        CapabilitySchemaArmV1, NativeEnrichedReceiptV1, NativeEnrichedRunV1,
+        observe_quill_capabilities, observe_quill_enrichments, observe_quill_pages,
     };
     use frankensearch_quill_gauntlet::replacement_authorization::{
         ReplacementEvidenceBundleV1, authorize,
     };
     use frankensearch_quill_gauntlet::{
-        CampaignContractModeV1, CampaignLexicalCoverageSummary, LexicalSideCoverageCounts,
-        SemanticContract, load_pinned_campaign_report_v8, observe_live_quill_cancellation_receipt,
+        CampaignLexicalCoverageSummary, LexicalSideCoverageCounts, SemanticContract,
+        load_pinned_campaign_report_v8, observe_live_quill_cancellation_receipt,
     };
 
     asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -680,14 +707,13 @@ fn an_inadmissible_enriched_receipt_can_never_authorize_a_replacement() {
         core.provenance = Some(baseline_campaign_provenance());
         core.producer_build_identity.source_git_dirty = false;
         core.producer_build_identity.source_git_revision = candidate.clone();
-        let cass = AcceptedCandidateBindingV1 {
-            candidate_source_revision: candidate.clone(),
-            contract_mode: CampaignContractModeV1::CassTotalV1,
-        };
+        let cass = frozen_cass_cells();
         let cancellation = observe_live_quill_cancellation_receipt(&cx)
             .await
             .expect("observe the live Quill cancellation matrix");
-        let census = "0".repeat(64);
+        let census: frankensearch_quill_gauntlet::DivergenceRegisterLedger =
+            serde_json::from_str(include_str!("../fixtures/divergence-register-v2-live.json"))
+                .expect("the registered divergence census parses");
 
         let bundle = ReplacementEvidenceBundleV1 {
             candidate_source_revision: &candidate,
@@ -695,7 +721,7 @@ fn an_inadmissible_enriched_receipt_can_never_authorize_a_replacement() {
             cass_total: Some(&cass),
             native_enriched: Some(&verified),
             cancellation: Some(&cancellation),
-            divergence_census_sha256: Some(&census),
+            divergence_census: Some(&census),
         };
 
         let error = authorize(&bundle)
@@ -739,16 +765,16 @@ fn a_complete_admissible_bundle_authorizes_and_emits_its_grant() {
     use frankensearch_core::traits::LexicalWrite;
     use frankensearch_lexical::TantivyIndex;
     use frankensearch_quill_gauntlet::native_enriched_witness::{
-        AcceptedCandidateBindingV1, CapabilitySchemaArmV1, NativeEnrichedReceiptV1,
-        NativeEnrichedRunV1, observe_quill_capabilities, observe_quill_enrichments,
-        observe_quill_pages, observe_tantivy_enrichments, observe_tantivy_pages,
+        CapabilitySchemaArmV1, NativeEnrichedReceiptV1, NativeEnrichedRunV1,
+        observe_quill_capabilities, observe_quill_enrichments, observe_quill_pages,
+        observe_tantivy_enrichments, observe_tantivy_pages,
     };
     use frankensearch_quill_gauntlet::replacement_authorization::{
         ReplacementEvidenceBundleV1, authorize,
     };
     use frankensearch_quill_gauntlet::{
-        CampaignContractModeV1, CampaignLexicalCoverageSummary, LexicalSideCoverageCounts,
-        SemanticContract, load_pinned_campaign_report_v8, observe_live_quill_cancellation_receipt,
+        CampaignLexicalCoverageSummary, LexicalSideCoverageCounts, SemanticContract,
+        load_pinned_campaign_report_v8, observe_live_quill_cancellation_receipt,
     };
 
     asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -831,14 +857,13 @@ fn a_complete_admissible_bundle_authorizes_and_emits_its_grant() {
         core.provenance = Some(baseline_campaign_provenance());
         core.producer_build_identity.source_git_dirty = false;
         core.producer_build_identity.source_git_revision = candidate.clone();
-        let cass = AcceptedCandidateBindingV1 {
-            candidate_source_revision: candidate.clone(),
-            contract_mode: CampaignContractModeV1::CassTotalV1,
-        };
+        let cass = frozen_cass_cells();
         let cancellation = observe_live_quill_cancellation_receipt(&cx)
             .await
             .expect("observe the live Quill cancellation matrix");
-        let census = "0".repeat(64);
+        let census: frankensearch_quill_gauntlet::DivergenceRegisterLedger =
+            serde_json::from_str(include_str!("../fixtures/divergence-register-v2-live.json"))
+                .expect("the registered divergence census parses");
 
         let bundle = ReplacementEvidenceBundleV1 {
             candidate_source_revision: &candidate,
@@ -846,7 +871,7 @@ fn a_complete_admissible_bundle_authorizes_and_emits_its_grant() {
             cass_total: Some(&cass),
             native_enriched: Some(&verified),
             cancellation: Some(&cancellation),
-            divergence_census_sha256: Some(&census),
+            divergence_census: Some(&census),
         };
 
         let granted = authorize(&bundle);

@@ -71,14 +71,21 @@ There are deliberately two validation levels. `DivergenceRegisterLedger::validat
 checks the self-contained v2 shape, append-only history, review policy, and
 canonical field bounds. It cannot authenticate an externally named object.
 Evidence admission additionally requires
-`validate_against_artifact_objects`, which first runs each `ArtifactObject`'s
-stored-evidence integrity contract and then compares the complete closed
-binding: object schema version, hash-domain scheme, object digest,
+`validate_relational_integrity_against_witnesses`, which first runs each
+witness's stored-evidence integrity contract and then compares the complete
+closed binding: object schema version, hash-domain scheme, object digest,
 producer-build identity, oracle-dependency identity, lexical-contract audit
 revision, corpus/query manifests, query-suite source kind and identity,
 first-recorded case ID, rank class, divergence class, and mismatch signatures.
 Every observation event, including superseded history, must bind to the object
-it actually references. A multi-class object must be covered exactly; a
+it actually references, so a register carrying N observations is joinable only
+against N witnesses — one per observation, with an unreferenced witness refused
+just as loudly as a missing one (bd-dxedq). A witness is presented as
+`DivergenceWitness::Current` when it can reproduce its own bytes, or
+`DivergenceWitness::Retained` when it is committed evidence addressed FROM
+those bytes; a register that spans a generation boundary needs both forms in
+one join, which is why the live register carries a v7 witness for DIV-008 and a
+v8 witness for DIV-009. A multi-class object must be covered exactly; a
 missing, extra, duplicate, or substituted class/signature claim fails.
 Corrections for the same divergence may repeat the same claim, but a second
 divergence ID may not claim it. Stored-evidence validation is used rather than
@@ -189,6 +196,27 @@ These are the classes the plan *predicts*; each becomes a numbered DIV entry whe
 
 ## 4. Entries
 
+**WHICH OF THESE ENTRIES THE MACHINE ENFORCES** (bd-dxedq). The entries below are rendered
+identically, and they are not equally binding. Only an entry with events in the committed ledger
+[`fixtures/divergence-register-v2-live.json`](../../crates/frankensearch-quill-gauntlet/fixtures/divergence-register-v2-live.json)
+is governed by `DivergenceRegisterLedger` — its class, its witness address, its revision set and
+its reviewer are checked by code, and its accept had to satisfy
+`DivergenceDisposition::validate`. Everything else on this page is an assertion in prose that
+nothing verifies.
+
+| Entry | Machine state |
+| --- | --- |
+| DIV-008 | **ENFORCED** — observation seq 1, blocking seq 2, `fixed` seq 3 (supersedes 2) |
+| DIV-009 | **ENFORCED** — observation seq 4, reviewed `accepted` seq 5 |
+| DIV-010 | **ENFORCED, AND THE MACHINE SAYS SOMETHING THE PROSE DOES NOT** — observation seq 6, `blocking` seq 7 on `bd-4oiwf`. The decision below is an **accept**; the ledger cannot record one, because the lane emits a raw `RankMismatch` and acceptance refuses every raw failure class. See the entry's machine-record bullet |
+| DIV-001 … DIV-007 | **PROSE-ONLY** — recorded before the typed ingestion contract existed; their first-seen artifacts were never retained, so they cannot be reconstructed after the fact |
+
+A prose-only entry is not thereby wrong — DIV-001 through DIV-007 all cite regression tests that
+exist and pass. It is *unverified by the mechanism this page describes*, and the point of the table
+is that a reader can tell the difference without reading the ledger. DIV-010 is the third state and
+the most important one to render honestly: enforced, and enforced at a *weaker* disposition than the
+row claims.
+
 ### DIV-001: standalone CASS negation loses complement semantics
 
 - Class: `QueryCanonicalization`
@@ -275,10 +303,14 @@ not this row. This row is the human projection of it.
 
 - Class: `RankMismatch` (raw failure class — it may be fixed or blocked, never accepted)
 - Machine record: `crates/frankensearch-quill-gauntlet/fixtures/divergence-register-v2-live.json`
-  (register `quill-e6-divergence-register-live`, ledger SHA-256
-  `b36c47186f47f119bc9469c75b852c0025282be9c96e5a5d58ee7e60498d2e3b` after the sequence-3
-  disposition below; `6dfd9d1c7d9d07bbc261e1703c2bc1bc61b536adea5d17fd5daf9bd9b0ba276d` at
-  sequence 2, when this row was first written)
+  (register `quill-e6-divergence-register-live`, sequences 1–3). The ledger SHA-256 is a property of
+  the whole register, not of this entry, and it moves whenever ANY divergence appends: it is
+  `e846f1cac0ba5c191db5889a8436b86e909ea2b16928885a3495ec953fe80ef0` since DIV-009 was appended at
+  sequences 4–5 (bd-dxedq); it was `b36c47186f47f119bc9469c75b852c0025282be9c96e5a5d58ee7e60498d2e3b`
+  after the sequence-3 disposition below, and
+  `6dfd9d1c7d9d07bbc261e1703c2bc1bc61b536adea5d17fd5daf9bd9b0ba276d` at sequence 2, when this row was
+  first written. DIV-008's own three events are byte-unchanged across all three hashes, which is what
+  `validate_append_only_successor` proves at every mint.
 - First seen: 2026-08-04 · live default-profile oracle-differential campaign, run `e68-live-ingestion`,
   minted from a clean checkout at `4efe400cc80f55e85079400a7c54674116ab6f98`. Retained v7 witness object
   `65b1e4e89a3d1a2cc2202634fa448c397a48376fab90afb9a89390dfd823e763`, committed at
@@ -327,10 +359,17 @@ not this row. This row is the human projection of it.
   unparseable diagnostic, wrong reason's envelope). The pre-existing
   `runner::tests::three_clause_or_diverges_at_one_ulp_without_the_div007_envelope` is unchanged and
   still pins both halves of the bd-55mvg ruling.
-- Reviewer for the fix: `BlueOriole`. No independent reviewer is claimed and none is required —
-  `DivergenceDisposition::validate` enforces `reviewer != recorded_by` only for **accepted**, which
-  is precisely the decision this record does NOT make. Acceptance was never available here: the
-  observation's class is the raw `RankMismatch` and a raw failure class can never be accepted.
+- Reviewer for the fix: `BlueOriole`, and independent review **is** required here. This line
+  previously read "no independent reviewer is claimed and none is required —
+  `DivergenceDisposition::validate` enforces `reviewer != recorded_by` only for **accepted**".
+  That was true when written and `e2d992e8` made it false the same day, holding a `Fixed`
+  disposition to the same fresh-eyes rule as an `Accepted` one. The rule is measured against the
+  OBSERVER, not against whoever recorded the disposition, and this record satisfies it: the
+  observation was recorded by `Claude-pane12` and the fix reviewed by `BlueOriole`. Verified
+  rather than asserted — the committed ledger validates today, and mutating either identity onto
+  the other is refused (bd-rm3q.8 adversarial pass, probes 2 and 3). What remains true from the
+  old sentence is the second half: acceptance was never available here, because the observation's
+  class is the raw `RankMismatch` and a raw failure class can never be accepted.
 - Reviewer: recorded and blocked by `Claude-pane12`. No independent review is claimed, and none is
   required to block: `DivergenceDisposition::validate` enforces an independent reviewer only for
   acceptance, which is exactly the decision that needs one.
@@ -342,8 +381,10 @@ not this row. This row is the human projection of it.
 
 ### DIV-009: boosting a group changes its boolean meaning when the group negates (shipping path repaired, oracle pinned)
 
-- Class: `RankMismatch` (MEMBERSHIP — the engines disagree about which documents match, so no
-  score-tolerance class can ever cover it)
+- Class: `OracleBug` (MEMBERSHIP — the engines disagree about which documents match, so no
+  score-tolerance class can ever cover it; the blame is ATTRIBUTED, not asserted — see the machine
+  record below). Recorded as a raw `RankMismatch` until bd-bxya1, because nothing in production
+  could emit the semantic class.
 - First seen: 2026-08-04 · probing for a divergence the default-profile lane still refuses after
   bd-gx7n4 opened it to the DIV-007 score envelope (bd-73ok3)
 - Root cause: an ORACLE-side lowering defect in tantivy 0.26.1, with the conformance direction
@@ -394,12 +435,37 @@ not this row. This row is the human projection of it.
   disabling the repair reddens "the shipping path must not return a document the query excluded";
   leaking the repair into `oracle_observe_page` reddens "the oracle page surface must reproduce the
   defect, not the repair". Neither direction can regress silently.
-- Machine record: minted on demand by the E6.8 lane rather than committed, and that mint still
-  records **blocking** — `DivergenceDisposition::Accepted` refuses a raw failure class by design, and
-  the lane observes this as a `RankMismatch` because it does not run the `OracleBug` reclassification
-  the bsjw probe applies. The accept above is the reviewed decision; teaching the default-profile lane
-  to classify this shape as `OracleBug` (with its per-fixture registry row) is the follow-up that
-  would let the two records agree, and is named here rather than left to be discovered.
+- Machine record: `crates/frankensearch-quill-gauntlet/fixtures/divergence-register-v2-live.json`
+  (register `quill-e6-divergence-register-live`, observation seq 4 and reviewed `accepted` seq 5;
+  ledger SHA-256 `e846f1cac0ba5c191db5889a8436b86e909ea2b16928885a3495ec953fe80ef0`, which is also
+  the census the terminal authorization compares against). COMMITTED since bd-dxedq — it was minted
+  on demand and merged by nobody until then, so the ledger held DIV-008 alone while this row read as
+  though it were governed. The mint now APPENDS to the committed register and proves the append with
+  `validate_append_only_successor`, so DIV-008's history cannot be dropped or edited by a re-mint.
+  Minted from a clean checkout at `0c4f9545e438ced7b824296bdda2782424c06a48`, run
+  `e68-live-ingestion`, case `e68-oracle-bug-refusal` (minimized-inputs SHA-256
+  `22cc1023a3f57aa6816aa88423d8f4d9fac2086abeeb2d5f6ad50e33afda0048`, re-derived by the selfcheck
+  rather than trusted); mismatch signature
+  `f708f094b609cf06c3a3d177ef8093db134c08c707914800cd185834040d1b05`; v8 witness object
+  `85aecfb9f7aef2aaa51bbf27b5d7ab8410397c1794c75aa03023316974be2636`, committed at
+  `crates/frankensearch-quill-gauntlet/fixtures/artifact-object-v8-div009-live.json`. The mint
+  records **accepted**, agreeing with the reviewed decision above (bd-bxya1). What changed is the
+  class, not the validator: `DivergenceDisposition::Accepted` still refuses every raw failure class, and this
+  divergence is no longer raw because the campaign ATTRIBUTES it. The attribution is a stored
+  comparator INPUT — `ComparatorConfig::oracle_bug_reason`, part of the artifact/report v8 shape — so
+  the retained artifact re-derives the identical `OracleBug` report from its own observations, and
+  the campaign verifier re-derives the attribution independently from the query rather than accepting
+  the stored one. It is gated on three independent pieces of evidence, all required: the query SHAPE
+  (a boosted group containing a negation, not a register row's opinion), the SYMPTOM (a membership
+  `RankMismatch`), and the SIDE (the oracle returned a strict superset of the subject's documents,
+  which is what attributes blame). Six planted negatives, each refused alone against an admitting
+  control, pin the gate — the load-bearing one being a subject-side defect wearing the same shape and
+  symptom, which is refused twice: the gate declines to attribute it, and the comparator refuses the
+  attribution even when a configuration asserts it.
+- What attribution does NOT buy: the campaign case still fails closed. It carries no per-fixture
+  register row, and the total lexical contract still mismatches — the lexical axis defers only to a
+  reviewed SCORE envelope and deliberately never to a membership class. Attribution earns the
+  divergence a decidable class; it does not earn the case a pass.
 - Reviewer: owner ruling of 2026-08-05, recorded by `Claude-pane12`. Distinct from `bd-nqeb4`, which
   is a `PhraseScorer` panic on a negated absent phrase — different shape, different failure mode.
 
@@ -425,9 +491,40 @@ not this row. This row is the human projection of it.
   `alpha NOT beta` → `[p2]` on both; `alpha -beta` → `[p2]` on both;
   `alpha AND NOT beta` → `[p2]` on Quill and on the lexical SHIPPING path, `[]` on the
   `oracle_observe_*` surface; `(alpha AND NOT beta)` and `(alpha AND NOT beta)^2` behave the same
-  way. `NOT beta AND alpha` is repaired by the same change. `NOT alpha AND NOT beta` still returns
+  way. `NOT beta AND alpha` is repaired by the same change.
+- **RETRACTED 2026-08-05 (`bd-iiidv`): this entry claimed `NOT alpha AND NOT beta` "still returns
   nothing on both, because an exclusion-only conjunction has no positive term — that is agreement,
-  not a defect, and is pinned so a later change cannot silently turn it into match-all.
+  not a defect, and is pinned so a later change cannot silently turn it into match-all". That was
+  wrong twice over, and there was no such pin.** The sentence is retracted rather than deleted,
+  because it is what a reader checking whether this shape was covered would have relied on.
+  Measured on the gauntlet's Core100 fixture at a non-truncating limit, and on the four-document
+  lexical fixture:
+  - `NOT release AND NOT small` → **59** documents on Quill, **0** on the `oracle_observe_*`
+    surface. Not agreement.
+  - 59 is exactly the declared complement, `|Core100| − |release ∪ small|` = 100 − 41, and *not*
+    the complement of one operand (79). The operand pair is deliberately non-nested so those two
+    readings differ: `NOT release AND NOT bounds` cannot discriminate them, because `bounds` matches
+    one document and it is inside `release`. Quill honours BOTH exclusions.
+  - The same oracle answers every spelling of the same intent that carries no explicit `AND` with
+    that same complement: `NOT release NOT small` → 59 vs 59, `-release -small` → 59 vs 59, both
+    `Exact`. An all-negative root therefore does **not** match nothing — it has complement
+    semantics on both engines — and the `AND` spelling is the only one that diverges.
+  - `NOT small AND NOT release` diverges identically, so it is not an operand-order artifact.
+  - The shipping path was never affected, and it is covered TWICE over — measured, because the
+    first version of the new pin passed with `repair_negated_conjunction` disabled and was
+    therefore vacuous. `repair_negated_conjunction` normalises `NOT beta AND NOT gamma` →
+    `-beta -gamma`, and `repair_and_not` independently deletes the `AND` before the `NOT`, giving
+    `NOT beta NOT gamma`; either alone leaves `frankensearch-lexical`'s public search surface
+    answering the complement, and only disabling BOTH reddens the pin, at `[]` against `["p4"]`.
+    There was no shipping-side gap to fix; what was missing was the proof, now pinned by
+    `frankensearch_lexical::tests::an_all_negative_conjunction_is_complement_on_shipping_and_empty_on_the_oracle`
+    and by two normal-form cases in
+    `a_negated_conjunction_normalises_to_explicit_occurrences`.
+  - It is **this divergence, not a fourth one**: an explicit `AND` whose operand is a negation
+    lowers to a positive-less boolean that empties the conjunction, which is the root cause stated
+    above. The all-negative form is that mechanism with both operands negated, repaired by the same
+    repair, and it needs no separate register entry or witness. The machine record's existing
+    DIV-010 observation covers it.
 - EXTENDED 2026-08-04 by `bd-8a2a8`, same root cause, same decision, one more ORDERING. When the
   conjunction is not the whole query — `A NOT B AND C` — the declared grammar reads it as
   `A OR (C AND NOT B)` (`quill-language-contract.md`: "default join := OR; explicit AND has
@@ -488,15 +585,51 @@ not this row. This row is the human projection of it.
   still reproduce the tantivy 0.26.1 defect" (both run as red proofs under `bd-eeq0q`); on the Quill
   side, the exclusion-only and leading-`NOT` cases are pinned beside the repaired forms so a broader
   change to negative handling cannot pass by loosening them.
-- Machine record: no committed ledger event. This shape has not been observed by a live campaign
-  artifact, so there is nothing to ingest yet, and the same constraint DIV-009 records applies when
-  one appears — `DivergenceDisposition::Accepted` refuses a raw failure class, and the
-  default-profile lane emits `RankMismatch` without the `OracleBug` reclassification. The reviewed
-  accept above is the decision; making the machine record agree is the same named follow-up DIV-009
-  carries, and this entry does not claim it is done.
+- Machine record: `crates/frankensearch-quill-gauntlet/fixtures/divergence-register-v2-live.json`
+  (observation seq 6, `blocking` seq 7 on `bd-4oiwf`; ledger SHA-256
+  `3db7452268fab30b2cc26411e938df3fd237ba2acdbc87ba225be38ac6f148fa`). Minted from a clean checkout
+  at `db6d336c`, run `e68-live-ingestion`, from campaign case `e68-negated-conjunction-refusal`
+  (`small AND NOT bounds`, observed at a non-truncating limit of 512 — the oracle returns NOTHING,
+  the subject returns the documents the query asks for); v8 witness object
+  `46176fa8c9f7911eea852bc4089740323322f1be95c4563329d5c6dec29dd0f9`, committed at
+  `crates/frankensearch-quill-gauntlet/fixtures/artifact-object-v8-div010-live.json` (bd-h46f1).
+- **THE MACHINE RECORD IS `blocking`, AND THE DECISION ABOVE IS `accept`.** That gap is deliberate
+  and is the honest state, not an oversight. The lane emits a raw `RankMismatch` for this shape and
+  `DivergenceDisposition::validate` refuses acceptance for every raw failure class. Earning the
+  semantic class the way DIV-009 did requires an attribution the ARTIFACT can re-derive, and this
+  shape has none available:
+  - DIV-009's third gate is the SIDE — the oracle returns a strict SUPERSET, the failure-to-exclude
+    its defect produces — and a subject-side defect shows the opposite containment and is refused.
+    DIV-010 inverts the direction, and the inversion is measurably NOT discriminating:
+    `NOT release AND NOT bounds` wears the identical shape, symptom and containment on this corpus
+    (79 subject hits against 0) and is not a *separately registrable* divergence — `bd-iiidv`
+    measured it as this same mechanism with both operands negated, and the Measured bullet's
+    "agreement, not a defect" claim about it is retracted above. A pure gate admitting DIV-010
+    would still launder any subject-side defect wearing that triple.
+  - The evidence that DOES attribute this shape is the control case
+    `e68-negated-conjunction-explicit` (`small NOT bounds`), which is `Exact` in the same run: the
+    same oracle answers the same operands spelled without the explicit `AND` with the exact set the
+    subject returns, isolating the keyword as the trigger. It lives in a DIFFERENT campaign case, so
+    the DIV-010 artifact cannot re-derive it, and bd-bxya1's design rests on the verifier
+    re-deriving attribution rather than trusting a stored claim.
+  - The structural alternative is closed: `ORACLE_LOWERING_UNOBSERVABLE` records, as a binding
+    condition of the D1(c) ruling, that the pinned parser emits no structured recovery diagnostics,
+    so there is no oracle-side AST to gate on.
+  `bd-4oiwf` owns carrying that control into the artifact. Moving this row off `blocking`
+  additionally requires the independent reviewer the Reviewer line below says it does not have.
+- Which SHAPE is minted, and why it is not the other one: the bd-8a2a8 ordering (`A NOT B AND C`,
+  where the conjunct is dropped and the result is merely shorter) was tried first and the mint
+  REFUSED it — `one active mismatch signature cannot belong to multiple divergences`. A signature
+  commits to the mismatch SHAPE, and that ordering produces `rank:hit:hit` at `hits/0`, which is the
+  shape DIV-008 already holds active. DIV-008's own note predicted this collision for DIV-006 and
+  called it a census-design constraint; it is now a measured one. The emptied form is this entry's
+  own first measurement and its signature is a length disagreement, so one ledger carries both.
 - Reviewer: recorded by `BlueOriole` under the owner routing of 2026-08-05 that directed this repair.
   No independent reviewer is claimed; an `accept` normally wants fresh eyes, and this row should be
-  read as reviewed-by-one until a second agent signs it off.
+  read as reviewed-by-one until a second agent signs it off. The ledger's `blocking` disposition at
+  sequence 7 is self-reviewed by its recorder, which is legal precisely because blocking grants
+  nothing — `DivergenceDisposition::validate` enforces an independent reviewer only for acceptance,
+  which is the decision that needs one.
 
 ---
 
