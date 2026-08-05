@@ -20699,6 +20699,68 @@ mod tests {
     const E68_MINIMIZED_FIXTURE_DOMAIN: &[u8] =
         b"frankensearch-quill-gauntlet/e68-minimized-fixture/v1";
 
+    /// DIV-010's PRIMARY shape, observed LIVE (bd-h46f1).
+    ///
+    /// `A AND NOT B` lowers, in the pinned oracle, to a conjunction whose
+    /// second `Must` operand is a boolean holding only a `MustNot` clause. It
+    /// has no positive term, matches nothing, and empties the whole
+    /// conjunction, so the oracle returns NOTHING while Quill returns the
+    /// documents the query asks for. That is the entry's own first measurement,
+    /// and it is deliberately the one minted here rather than bd-8a2a8's
+    /// `A NOT B AND C` ordering, for a reason worth recording: a mismatch
+    /// SIGNATURE commits to the mismatch shape, and the dropped-conjunct
+    /// ordering produces `rank:hit:hit` at `hits/0` — the same shape DIV-008
+    /// already holds active, which one ledger cannot carry twice. The emptied
+    /// form's signature is a length disagreement and is its own shape.
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_AND_NOT_CASE_ID: &str = "e68-negated-conjunction-refusal";
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_AND_NOT_QUERY: &str = "small AND NOT bounds";
+    /// The same operands WITHOUT the explicit `AND`, committed beside it
+    /// because it is the ATTRIBUTION and not a convenience.
+    ///
+    /// The pinned oracle answers this with the exact set Quill returns for the
+    /// `AND` spelling, so it already agrees with the declared reading when the
+    /// conjunction is written the other way — which isolates the `AND` keyword
+    /// as the trigger and makes the implicit lowering the defect rather than a
+    /// different semantics. It is `Exact` in the same run, on the same corpus,
+    /// with the same operands.
+    ///
+    /// It is NOT sufficient to mint an accepted `OracleBug`, and that is stated
+    /// rather than papered over: `oracle_blame_attribution` is a pure function
+    /// of ONE case's query and its own comparison, and this evidence lives in a
+    /// different case, so the DIV-010 artifact cannot re-derive it (bd-4oiwf).
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_AND_NOT_CONTROL_CASE_ID: &str = "e68-negated-conjunction-explicit";
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_AND_NOT_CONTROL_QUERY: &str = "small NOT bounds";
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_AND_NOT_DIVERGENCE_ID: &str = "DIV-010";
+    /// The bead DIV-010's machine record BLOCKS on, and why it blocks rather
+    /// than recording the reviewed accept the prose entry carries.
+    ///
+    /// The class the lane emits for this shape is a raw `RankMismatch`, and
+    /// `DivergenceDisposition::validate` refuses acceptance for every raw
+    /// failure class. Earning the semantic class needs an attribution the
+    /// artifact can re-derive, and the only evidence that attributes this
+    /// shape — the explicit-grouping control above — is in another case. So the
+    /// machine records what it can prove: observed, and blocked on the bead
+    /// that owns making it acceptable.
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_AND_NOT_BLOCKING_BEAD: &str = "bd-4oiwf";
+    /// DIV-010's witness, committed as the register's third (bd-h46f1).
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_AND_NOT_WITNESS_FIXTURE: &str = "fixtures/artifact-object-v8-div010-live.json";
+    /// A non-truncating limit for the DIV-010 pair.
+    ///
+    /// Both engines return more than the suite's default 20 for these queries,
+    /// and comparing two CAPPED lists measures where each ranking cut rather
+    /// than which documents matched. This divergence is a MEMBERSHIP one, so
+    /// the observation has to be untruncated or it is measuring the wrong
+    /// thing.
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_AND_NOT_LIMIT: u64 = 512;
+
     /// The campaign fixture the E6.8 witness is minted from: the shared Core100
     /// corpus every default-profile campaign already uses, and an explicit
     /// two-case suite holding the pinned witness query and its bit-exact
@@ -20713,18 +20775,19 @@ mod tests {
             .manifest(crate::generator::SharedCorpusView::Core100)
             .expect("shared corpus manifest");
         let corpus_hash = corpus_manifest.manifest_hash().expect("corpus hash");
-        let case = |id: &str, query: &str| GeneratedQueryCase {
+        let case_at = |id: &str, query: &str, limit: u64| GeneratedQueryCase {
             id: id.to_owned(),
             syntax: QuerySyntax::Default,
             query_kind: GeneratedQueryKind::Boolean,
             query: query.to_owned(),
-            limit: 20,
+            limit,
             offset: 0,
             count_requested: false,
             filters: crate::generator::GeneratedQueryFilters::default(),
             expected_divergence: None,
             source: "runner.rs E6.8 live-ingestion witness".to_owned(),
         };
+        let case = |id: &str, query: &str| case_at(id, query, 20);
         let query_suite = GeneratedQuerySuite::from_cases(
             QueryGeneratorSpec {
                 seed: 0x6538_0007,
@@ -20736,6 +20799,12 @@ mod tests {
                 case(E68_WITNESS_CASE_ID, E68_WITNESS_QUERY),
                 case(E68_CONTROL_CASE_ID, E68_WITNESS_CONTROL_QUERY),
                 case(E68_REFUSAL_CASE_ID, E68_REFUSAL_QUERY),
+                case_at(E68_AND_NOT_CASE_ID, E68_AND_NOT_QUERY, E68_AND_NOT_LIMIT),
+                case_at(
+                    E68_AND_NOT_CONTROL_CASE_ID,
+                    E68_AND_NOT_CONTROL_QUERY,
+                    E68_AND_NOT_LIMIT,
+                ),
             ],
         )
         .expect("E6.8 witness query suite");
@@ -20768,6 +20837,95 @@ mod tests {
         lower_hex(&hasher.finalize())
     }
 
+    /// Seed an append for ONE divergence: the base register's events with that
+    /// divergence's own prior events dropped, and the sequence its freshly
+    /// minted observation takes.
+    ///
+    /// THE MINT APPENDS, IT DOES NOT REPLACE (bd-dxedq). These helpers used to
+    /// build a standalone two-event ledger, so the register a mint produced
+    /// held its own witness and nothing else -- which is why the committed
+    /// register carried DIV-008 alone while DIV-009's reviewed accept sat in a
+    /// mint nobody merged. One register has to carry every witness, or the
+    /// enforced ledger and the prose register describe different worlds.
+    ///
+    /// Re-mintable by construction: any previously appended events for THIS
+    /// divergence are dropped before the freshly minted ones are appended,
+    /// rather than accumulating duplicates -- which the validator would refuse
+    /// anyway, since two active observations of one divergence collide on their
+    /// mismatch signature. At the revision the committed register was minted
+    /// from, that re-derives byte-identical events (every timestamp in this
+    /// path is fixed for exactly that reason); at any LATER revision it does
+    /// not, and cannot, because the producer build identity is part of the
+    /// evidence and has moved. See the baseline in [`e68_finish_append`].
+    ///
+    /// Taking a BASE rather than reading the committed file lets mints chain:
+    /// DIV-010 appends to the ledger DIV-009 just appended to, so one run mints
+    /// one register carrying every witness it observed.
+    #[cfg(feature = "tantivy-oracle")]
+    fn e68_append_base(
+        base: &DivergenceRegisterLedger,
+        divergence_id: &str,
+    ) -> (Vec<DivergenceRegisterEvent>, u64) {
+        let events = base
+            .events
+            .iter()
+            .filter(|event| match event {
+                DivergenceRegisterEvent::Observation(observation) => {
+                    observation.divergence_id != divergence_id
+                }
+                DivergenceRegisterEvent::Disposition(disposition) => {
+                    disposition.divergence_id != divergence_id
+                }
+                DivergenceRegisterEvent::Prediction(_) => true,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let observation_sequence =
+            u64::try_from(events.len()).expect("register length fits u64") + 1;
+        (events, observation_sequence)
+    }
+
+    /// Assemble an appended register and PROVE the append.
+    ///
+    /// THE BASELINE IS THE BASE REGISTER MINUS THIS DIVERGENCE'S OWN PRIOR
+    /// EVENTS, and the choice is measured rather than convenient.
+    ///
+    /// The property worth proving is that a mint cannot drop or edit ANOTHER
+    /// witness's history -- that is the failure a hand-merged register would
+    /// produce, and it is refused here rather than at review. Proving it
+    /// against the committed file INCLUDING this divergence's own events proves
+    /// something else, and something that is false by construction after the
+    /// first commit: a re-mint carries the CURRENT producer build identity, so
+    /// at any revision later than the one the register was minted from, freshly
+    /// minted events differ from the committed ones in their producer identity
+    /// and witness address, and the successor check reads that as a history
+    /// rewrite. It would redden the mint test at every commit after the
+    /// register landed, which is not a gate holding -- it is a gate that can
+    /// only be satisfied by never moving.
+    ///
+    /// Nothing is relaxed by scoping it: `new()` refuses a baseline whose
+    /// sequences are not contiguous, so this divergence's prior events must be
+    /// the TAIL of the register. A mint that tried to excise events from the
+    /// middle -- the shape a real history rewrite takes -- fails to assemble a
+    /// baseline at all.
+    #[cfg(feature = "tantivy-oracle")]
+    fn e68_finish_append(
+        retained: Vec<DivergenceRegisterEvent>,
+        minted: Vec<DivergenceRegisterEvent>,
+    ) -> DivergenceRegisterLedger {
+        let baseline = DivergenceRegisterLedger::new(E68_LIVE_REGISTER_ID, retained.clone()).expect(
+            "the base register minus this divergence's own events must itself be a valid ledger",
+        );
+        let mut events = retained;
+        events.extend(minted);
+        let ledger = DivergenceRegisterLedger::new(E68_LIVE_REGISTER_ID, events)
+            .expect("the ingested ledger must satisfy the v2 contract");
+        ledger
+            .validate_append_only_successor(&baseline)
+            .expect("the minted register must only APPEND to the other witnesses' history");
+        ledger
+    }
+
     /// Assemble the E6.8 register ledger from one integrity-checked witness.
     ///
     /// Every identity field comes from the artifact through
@@ -20775,6 +20933,7 @@ mod tests {
     /// substitute a revision, a manifest, or the witness address.
     #[cfg(feature = "tantivy-oracle")]
     fn e68_ingest_witness(
+        base: &DivergenceRegisterLedger,
         object: &ArtifactObject,
         fixture_sha256: String,
     ) -> (DivergenceRegisterLedger, Vec<String>) {
@@ -20821,46 +20980,7 @@ mod tests {
             marker: "<redacted:e68-live-lane-rank-mismatch>".to_owned(),
         };
 
-        // THE MINT APPENDS, IT DOES NOT REPLACE (bd-dxedq). This helper used to
-        // build a standalone two-event ledger, so the register it produced held
-        // this witness and nothing else -- which is why the committed register
-        // carried DIV-008 alone while DIV-009's reviewed accept sat in a mint
-        // nobody merged. One register has to carry both, or the enforced ledger
-        // and the prose register describe different worlds.
-        //
-        // Re-mintable by construction: any previously appended events for THIS
-        // divergence are dropped before the freshly minted ones are appended,
-        // rather than accumulating duplicates -- which the validator would
-        // refuse anyway, since two active observations of one divergence
-        // collide on their mismatch signature. At the revision the committed
-        // register was minted from, that re-derives byte-identical events
-        // (every timestamp in this path is fixed for exactly that reason); at
-        // any LATER revision it does not, and cannot, because the producer
-        // build identity is part of the evidence and has moved. See the
-        // baseline the successor check uses below.
-        let committed_register = DivergenceRegisterLedger::decode_json(
-            &std::fs::read(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(E68_LIVE_LEDGER_FIXTURE),
-            )
-            .expect("committed live divergence register"),
-        )
-        .expect("the committed register must decode and validate before anything appends to it");
-        let mut events = committed_register
-            .events
-            .iter()
-            .filter(|event| match event {
-                DivergenceRegisterEvent::Observation(observation) => {
-                    observation.divergence_id != E68_REFUSAL_DIVERGENCE_ID
-                }
-                DivergenceRegisterEvent::Disposition(disposition) => {
-                    disposition.divergence_id != E68_REFUSAL_DIVERGENCE_ID
-                }
-                DivergenceRegisterEvent::Prediction(_) => true,
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let observation_sequence =
-            u64::try_from(events.len()).expect("register length fits u64") + 1;
+        let (events, observation_sequence) = e68_append_base(base, E68_REFUSAL_DIVERGENCE_ID);
 
         let observation = DivergenceRegisterLedger::observation_from_artifact(
             object,
@@ -20934,41 +21054,162 @@ mod tests {
             },
         };
 
-        // THE BASELINE IS THE COMMITTED REGISTER MINUS THIS DIVERGENCE'S OWN
-        // PRIOR EVENTS, and the choice is measured rather than convenient.
-        //
-        // The property worth proving is that a mint cannot drop or edit ANOTHER
-        // witness's history -- that is the failure a hand-merged register would
-        // produce, and it is refused here rather than at review. Proving it
-        // against the committed file INCLUDING this divergence's own events
-        // proves something else, and something that is false by construction
-        // after the first commit: a re-mint carries the CURRENT producer build
-        // identity, so at any revision later than the one the register was
-        // minted from, freshly minted events differ from the committed ones in
-        // their producer identity and witness address, and the successor check
-        // reads that as a history rewrite. It would redden this test at every
-        // commit after the register landed, which is not a gate holding -- it
-        // is a gate that can only be satisfied by never moving.
-        //
-        // Nothing is relaxed by scoping it: `new()` below still refuses a
-        // baseline whose sequences are not contiguous, so this divergence's
-        // prior events must be the TAIL of the register. A mint that tried to
-        // excise events from the middle -- the shape a real history rewrite
-        // takes -- fails to assemble a baseline at all.
-        let baseline = DivergenceRegisterLedger::new(E68_LIVE_REGISTER_ID, events.clone()).expect(
-            "the committed register minus this divergence's own events must itself be a valid \
-             ledger",
+        let ledger = e68_finish_append(
+            events,
+            vec![
+                DivergenceRegisterEvent::Observation(Box::new(observation)),
+                DivergenceRegisterEvent::Disposition(disposition),
+            ],
         );
-        events.push(DivergenceRegisterEvent::Observation(Box::new(observation)));
-        events.push(DivergenceRegisterEvent::Disposition(disposition));
-        let ledger = DivergenceRegisterLedger::new(E68_LIVE_REGISTER_ID, events)
-            .expect("the ingested ledger must satisfy the v2 contract");
-        // The append is PROVED, not assumed: the successor check refuses any
-        // rewrite of what was already recorded, so a mint that quietly dropped
-        // or edited the other witness's history fails here rather than landing.
-        ledger
-            .validate_append_only_successor(&baseline)
-            .expect("the minted register must only APPEND to the other witnesses' history");
+        (ledger, mismatch_signatures)
+    }
+
+    /// Append DIV-010's live witness, recorded BLOCKING (bd-h46f1).
+    ///
+    /// WHY BLOCKING, WHEN THE PROSE ENTRY SAYS ACCEPT. The lane emits a raw
+    /// `RankMismatch` for this shape and `DivergenceDisposition::validate`
+    /// refuses acceptance for every raw failure class. Earning the semantic
+    /// `OracleBug` class the way DIV-009 did needs an attribution the ARTIFACT
+    /// can re-derive, and this shape's attribution cannot be derived from one
+    /// case:
+    ///
+    /// - DIV-009's third gate is the SIDE — the oracle returns a strict
+    ///   SUPERSET, the failure-to-exclude its defect produces, and a
+    ///   subject-side defect shows the opposite containment and is refused.
+    ///   DIV-010 inverts the direction: the oracle DROPS a conjunct, so it
+    ///   under-returns. Measured on this corpus, `NOT release AND NOT bounds`
+    ///   wears the identical shape, the identical symptom and the identical
+    ///   containment (79 subject hits against 0) and is NOT this divergence, so
+    ///   a pure gate admitting DIV-010 would launder it (bd-iiidv).
+    /// - The evidence that DOES attribute this shape is the explicit-grouping
+    ///   control, `E68_AND_NOT_CONTROL_CASE_ID`, which the pinned oracle
+    ///   answers with the exact set Quill returns for the implicit form. It
+    ///   lives in a different case, so the DIV-010 artifact cannot re-derive
+    ///   it, and bd-bxya1's design rests on the verifier re-deriving the
+    ///   attribution rather than trusting a stored claim.
+    /// - The structural alternative is closed too: `ORACLE_LOWERING_UNOBSERVABLE`
+    ///   records that the pinned parser emits no structured recovery
+    ///   diagnostics, so there is no oracle-side AST to gate on.
+    ///
+    /// So the machine records what it can prove — observed, and blocked on
+    /// `bd-4oiwf`, which owns the attribution that would let a superseding
+    /// ACCEPTED disposition be appended. That is exactly the route DIV-008
+    /// took from blocking to fixed at sequence 3, and it is the register
+    /// working rather than the register being weakened: a blocking disposition
+    /// needs no independent reviewer precisely because it grants nothing.
+    #[cfg(feature = "tantivy-oracle")]
+    fn e68_ingest_and_not_witness(
+        base: &DivergenceRegisterLedger,
+        object: &ArtifactObject,
+        fixture_sha256: String,
+    ) -> (DivergenceRegisterLedger, Vec<String>) {
+        let binding = object
+            .divergence_binding()
+            .expect("the witness object must yield a sealed divergence binding");
+        let mut mismatch_signatures = binding
+            .divergences
+            .iter()
+            .filter(|divergence| !is_auto_class(divergence.class))
+            .map(|divergence| mismatch_signature(binding.rank_class, divergence))
+            .collect::<Vec<_>>();
+        mismatch_signatures.sort();
+        mismatch_signatures.dedup();
+        assert!(
+            !mismatch_signatures.is_empty(),
+            "the ingested object must carry at least one raw mismatch signature"
+        );
+        // The class is READ OUT of the artifact, not asserted here. It must be
+        // the RAW RankMismatch: if the lane ever started attributing this shape
+        // without this mint being taught how, the mint fails rather than
+        // recording a class its own evidence does not carry.
+        assert!(
+            binding
+                .divergences
+                .iter()
+                .filter(|divergence| !is_auto_class(divergence.class))
+                .all(|divergence| divergence.class == DivergenceClass::RankMismatch),
+            "the DIV-010 witness must carry the raw RankMismatch class: {:#?}",
+            binding.divergences
+        );
+
+        let mut diagnostic_hasher = Sha256::new();
+        for divergence in &binding.divergences {
+            diagnostic_hasher.update(divergence.pointer.as_bytes());
+            diagnostic_hasher.update([0_u8]);
+            diagnostic_hasher.update(divergence.oracle.as_bytes());
+            diagnostic_hasher.update([0_u8]);
+            diagnostic_hasher.update(divergence.subject.as_bytes());
+            diagnostic_hasher.update([0_u8]);
+        }
+        let diagnostic = RedactedDivergenceDiagnostic {
+            payload_sha256: lower_hex(&diagnostic_hasher.finalize()),
+            marker: "<redacted:e68-live-lane-negated-conjunction>".to_owned(),
+        };
+
+        let (events, observation_sequence) = e68_append_base(base, E68_AND_NOT_DIVERGENCE_ID);
+
+        let observation = DivergenceRegisterLedger::observation_from_artifact(
+            object,
+            DivergenceRegisterEventHeader {
+                sequence: observation_sequence,
+                supersedes: None,
+                recorded_by: E68_RECORDED_BY.to_owned(),
+                recorded_at: E68_RECORDED_AT.to_owned(),
+            },
+            E68_AND_NOT_DIVERGENCE_ID,
+            DivergenceClass::RankMismatch,
+            DivergenceFixtureEvidence {
+                fixture_id: E68_AND_NOT_CASE_ID.to_owned(),
+                fixture_sha256,
+                regression_test:
+                    "runner::tests::live_default_profile_campaign_ingests_its_unclassified_divergence"
+                        .to_owned(),
+                minimized: true,
+            },
+            mismatch_signatures.clone(),
+            DivergenceObservationNarrative {
+                observed_behavior:
+                    "the two engines disagree about which documents MATCH a conjunction that carries a negation: the pinned oracle returns NOTHING at all, while the subject returns the documents the query asks for."
+                        .to_owned(),
+                expected_behavior:
+                    "the same document set from both engines; a negation inside an explicit conjunction excludes what it names rather than emptying the conjunction."
+                        .to_owned(),
+                root_cause:
+                    "an oracle-side LOWERING defect in tantivy 0.26.1: `A AND NOT B` lowers to a conjunction whose second Must operand is a boolean holding only a MustNot clause, which has no positive term, matches nothing, and empties whatever it is conjoined with. Quill lowers it correctly since bd-quill-shipping-conformance-parse-split-w7bsu, and frankensearch-lexical's SHIPPING path repairs it while every oracle_observe_* caller stays bit-faithful to the defect. The blame is ATTRIBUTED BY A CONTROL, not by this record: the same oracle answers the same operands spelled without the explicit AND with the exact document set the subject returns, which isolates the AND keyword as the trigger. That control is a SEPARATE campaign case, which is why this observation carries the raw class rather than the semantic one (bd-4oiwf)."
+                        .to_owned(),
+                consumer_impact:
+                    "result SETS differ and the difference is silent: the most common negation spelling returns NOTHING, with no error and no warning, for a query the user reasonably expects to work. The campaign case fails closed -- it carries no per-fixture register row and its total lexical contract still mismatches."
+                        .to_owned(),
+            },
+            diagnostic,
+        )
+        .expect("live campaign observation must ingest from its own artifact");
+
+        let disposition = DivergenceDispositionEvent {
+            header: DivergenceRegisterEventHeader {
+                sequence: observation_sequence + 1,
+                supersedes: None,
+                recorded_by: E68_RECORDED_BY.to_owned(),
+                recorded_at: E68_RECORDED_AT.to_owned(),
+            },
+            divergence_id: E68_AND_NOT_DIVERGENCE_ID.to_owned(),
+            disposition: DivergenceDisposition::Blocking {
+                bead_id: E68_AND_NOT_BLOCKING_BEAD.to_owned(),
+                rationale:
+                    "the register's prose entry records a reviewed ACCEPT for this divergence, and the machine cannot record one yet. The lane emits a raw RankMismatch, and acceptance refuses every raw failure class; the semantic class would have to be earned by an attribution the artifact re-derives, and this shape's attribution is the explicitly-grouped control in a DIFFERENT case. A containment-direction gate like DIV-009's is measurably unsafe here -- an unrelated exclusion-only conjunction wears the same shape, symptom and containment. It blocks until bd-4oiwf carries that control into the artifact; moving it off blocking additionally requires an independent reviewer, which this row's own prose says it does not have."
+                        .to_owned(),
+                reviewer: E68_RECORDED_BY.to_owned(),
+                reviewed_at: E68_RECORDED_AT.to_owned(),
+            },
+        };
+
+        let ledger = e68_finish_append(
+            events,
+            vec![
+                DivergenceRegisterEvent::Observation(Box::new(observation)),
+                DivergenceRegisterEvent::Disposition(disposition),
+            ],
+        );
         (ledger, mismatch_signatures)
     }
 
@@ -21601,18 +21842,123 @@ mod tests {
                 ComparisonStatus::Classified,
                 "an attributed oracle bug is a classified comparison, not a raw failure"
             );
+            // DIV-010'S LIVE WITNESS, and the control that attributes it
+            // (bd-h46f1). This is the shape the register documented and could
+            // never ingest: an explicit `AND` beside a negation, where the
+            // pinned oracle drops the whole conjunct. It is observed at a
+            // NON-TRUNCATING limit, because comparing two capped lists measures
+            // where each ranking cut rather than which documents matched, and
+            // this is a MEMBERSHIP divergence.
+            let and_not = report
+                .cases
+                .iter()
+                .find(|case| case.case_id == E68_AND_NOT_CASE_ID)
+                .expect("negated-conjunction case is selected by the campaign");
+            assert_eq!(
+                and_not.disposition,
+                CampaignDisposition::Unclassified,
+                "DIV-010's shape must still fail closed (reason={:?} diagnostic={:?})",
+                and_not.reason,
+                and_not.diagnostic
+            );
+            assert_eq!(and_not.rank_class, Some(RankClass::RankMismatch));
+            assert!(
+                and_not.registered_divergence.is_none(),
+                "the negated conjunction is unregistered per fixture; that is what fails it closed"
+            );
+            // THE CONTROL IS THE ATTRIBUTION, and it is exact in the SAME run.
+            // The oracle answers the same operands spelled WITHOUT the explicit
+            // `AND` with the set Quill returns for the `AND` form, so it
+            // already agrees with the declared reading when the conjunction is
+            // written the other way -- which isolates the keyword as the
+            // trigger and makes the lowering the defect rather than a different
+            // semantics. Same operands, same corpus, no divergence.
+            let and_not_control = report
+                .cases
+                .iter()
+                .find(|case| case.case_id == E68_AND_NOT_CONTROL_CASE_ID)
+                .expect("explicit-grouping control is selected by the campaign");
+            assert_eq!(
+                and_not_control.disposition,
+                CampaignDisposition::Exact,
+                "the explicitly grouped form must be bit-exact on both engines, or it attributes \
+                 nothing (reason={:?})",
+                and_not_control.reason
+            );
+
+            let and_not_object = load_campaign_case_object(&root, and_not);
+            and_not_object
+                .validate()
+                .expect("the campaign object must re-derive its own report");
+            // NOTHING WAS LAUNDERED, asserted rather than assumed. DIV-009's
+            // attribution gate must NOT fire for this shape: it is scoped to a
+            // boosted group containing a negation, and the containment here
+            // runs the other way -- the oracle UNDER-returns. The mint below
+            // therefore records the raw class and a BLOCKING disposition, and
+            // this pair of assertions is what would catch a future gate that
+            // quietly widened to admit it.
+            assert_eq!(
+                and_not_object.comparator_config.oracle_bug_reason, None,
+                "DIV-010's shape must carry no stored oracle-blame attribution"
+            );
+            assert!(
+                oracle_blame_attribution(&and_not_object.case.query, &and_not_object.comparison)
+                    .is_none(),
+                "the oracle-blame gate must decline DIV-010's shape; earning its semantic class \
+                 needs the explicit-form control the artifact cannot re-derive (bd-4oiwf)"
+            );
+            let and_not_subject: BTreeSet<&str> = and_not_object
+                .comparison
+                .subject
+                .hits
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect();
+            let and_not_oracle: BTreeSet<&str> = and_not_object
+                .comparison
+                .oracle
+                .hits
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect();
+            assert!(
+                and_not_oracle.is_empty() && !and_not_subject.is_empty(),
+                "the oracle must return NOTHING on DIV-010's shape -- an emptied conjunction, not \
+                 a failure to exclude: subject={} oracle={}",
+                and_not_subject.len(),
+                and_not_oracle.len()
+            );
+
+            let committed_register = DivergenceRegisterLedger::decode_json(
+                &std::fs::read(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(E68_LIVE_LEDGER_FIXTURE),
+                )
+                .expect("committed live divergence register"),
+            )
+            .expect("the committed register must decode and validate before anything appends");
             let (ledger, mismatch_signatures) = e68_ingest_witness(
+                &committed_register,
                 &object,
                 e68_minimized_fixture_sha256(&fixture, E68_REFUSAL_CASE_ID),
+            );
+            // THE MINTS CHAIN: DIV-010 appends to the ledger DIV-009 just
+            // appended to, so ONE run mints ONE register carrying every witness
+            // it observed, and each append proves itself against the history it
+            // did not mint.
+            let (ledger, and_not_signatures) = e68_ingest_and_not_witness(
+                &ledger,
+                &and_not_object,
+                e68_minimized_fixture_sha256(&fixture, E68_AND_NOT_CASE_ID),
             );
             // THE JOIN TAKES EVERY OBSERVATION'S WITNESS (bd-dxedq). The mint
             // appends to the committed register, so the minted ledger carries
             // DIV-008's observation too, and a register with N observations
             // needs N witnesses. DIV-008's is the committed v7 object addressed
-            // from its stored BYTES; DIV-009's is the live v8 object this run
-            // just produced, which can address itself by re-encoding. Passing
-            // only the live one is what reddened the first attempt at this
-            // change, and it reddened LOUDLY -- the missing witness is named.
+            // from its stored BYTES; DIV-009's and DIV-010's are live v8
+            // objects this run just produced, which can address themselves by
+            // re-encoding. Passing only the live ones is what reddened the
+            // first attempt at this change, and it reddened LOUDLY -- the
+            // missing witness is named.
             let committed_witness = crate::artifact::RetainedArtifactWitness::decode(
                 &std::fs::read(
                     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(E68_LIVE_WITNESS_FIXTURE),
@@ -21623,9 +21969,28 @@ mod tests {
             ledger
                 .validate_relational_integrity_against_witnesses(&[
                     DivergenceWitness::Current(&object),
+                    DivergenceWitness::Current(&and_not_object),
                     DivergenceWitness::Retained(&committed_witness),
                 ])
                 .expect("every observation in the minted register must join to its own witness");
+            // DIV-010 IS RECORDED, AND RECORDED AS WHAT IT IS. The prose entry
+            // carries a reviewed accept; the machine carries an observation and
+            // a BLOCKING disposition, because the class is raw and the
+            // attribution that would earn the semantic class is in another case
+            // (bd-4oiwf). Asserting the disposition KIND here is what stops a
+            // later edit from quietly upgrading it without the evidence.
+            assert!(
+                ledger.events.iter().any(|event| matches!(
+                    event,
+                    DivergenceRegisterEvent::Disposition(disposition)
+                        if disposition.divergence_id == E68_AND_NOT_DIVERGENCE_ID
+                            && matches!(
+                                disposition.disposition,
+                                DivergenceDisposition::Blocking { .. }
+                            )
+                )),
+                "DIV-010's mint must record BLOCKING, not an accept it cannot prove"
+            );
             // ACCEPTANCE 4 (bd-bxya1): DIV-009's machine mint and its reviewed
             // accept now AGREE. The ledger validates on assembly, and
             // `DivergenceDisposition::validate` still refuses acceptance for
@@ -21644,35 +22009,88 @@ mod tests {
                 "the DIV-009 mint must record the reviewed acceptance"
             );
 
-            // The witness signature is the one the campaign itself emitted.
-            assert!(
-                report
-                    .mismatches
-                    .iter()
-                    .any(|group| mismatch_signatures.contains(&group.signature)),
-                "the ingested signature must be the campaign's own emitted mismatch"
-            );
+            // Every ingested signature is one the campaign itself emitted.
+            for signature in mismatch_signatures.iter().chain(&and_not_signatures) {
+                assert!(
+                    report
+                        .mismatches
+                        .iter()
+                        .any(|group| &group.signature == signature),
+                    "the ingested signature must be the campaign's own emitted mismatch"
+                );
+            }
+
+            // THE REGISTER THIS RUN OFFERS FOR COMMITTING IS NOT THE ONE IT
+            // JUST MINTED, and the difference is the append-only doctrine
+            // (bd-h46f1).
+            //
+            // Every re-mint re-derives its observations under the CURRENT
+            // producer build identity, so the chain above legitimately carries
+            // a DIV-009 observation that differs from the committed one in its
+            // witness address. Committing that would rewrite sequences 4 and 5
+            // — exactly the history rewrite this register exists to make
+            // impossible, and it would strand the committed DIV-009 witness
+            // whose bytes the committed observation names.
+            //
+            // So what gets written is the committed register plus only what it
+            // does not already carry, and the append is PROVED against the
+            // committed file itself rather than against a filtered baseline.
+            // Once a divergence is committed, its events and its witness are
+            // final; a correction would have to arrive as a SUPERSEDING event,
+            // which is a decision someone makes, not a side effect of running
+            // the mint again.
+            let already_committed = |divergence_id: &str| {
+                committed_register.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        DivergenceRegisterEvent::Observation(observation)
+                            if observation.divergence_id == divergence_id
+                    )
+                })
+            };
+            let landable = if already_committed(E68_AND_NOT_DIVERGENCE_ID) {
+                committed_register.clone()
+            } else {
+                e68_ingest_and_not_witness(
+                    &committed_register,
+                    &and_not_object,
+                    e68_minimized_fixture_sha256(&fixture, E68_AND_NOT_CASE_ID),
+                )
+                .0
+            };
+            landable
+                .validate_append_only_successor(&committed_register)
+                .expect(
+                    "the register offered for committing must only APPEND to the committed one",
+                );
 
             if let Some(mint) = mint_root {
                 let ledger_path = mint.join("divergence-register-v2-live.json");
                 std::fs::write(
                     &ledger_path,
-                    serde_json::to_vec_pretty(&ledger).expect("serialize ingested ledger"),
+                    serde_json::to_vec_pretty(&landable).expect("serialize ingested ledger"),
                 )
                 .expect("write ingested ledger");
                 eprintln!("E68_LEDGER_PATH={}", ledger_path.display());
-                eprintln!(
-                    "E68_WITNESS_OBJECT_PATH={}",
+                let object_path = |case: &CampaignCaseResult| {
                     mint.join("objects")
                         .join(format!(
                             "{}.json",
-                            refusal.artifact_hash.as_deref().unwrap_or_default()
+                            case.artifact_hash.as_deref().unwrap_or_default()
                         ))
                         .display()
-                );
+                        .to_string()
+                };
+                // The DIV-009 object is this run's RE-MINT, printed for
+                // inspection: it is not what the committed register names, and
+                // committing it would strand the witness the committed
+                // observation addresses. Only a witness for a divergence the
+                // committed register does not yet carry is landable.
+                eprintln!("E68_REMINTED_DIV009_OBJECT_PATH={}", object_path(refusal));
+                eprintln!("E68_AND_NOT_WITNESS_OBJECT_PATH={}", object_path(and_not));
                 eprintln!(
                     "E68_LEDGER_HASH={}",
-                    ledger.ledger_hash().expect("ingested ledger hash")
+                    landable.ledger_hash().expect("ingested ledger hash")
                 );
             }
         });
@@ -21724,6 +22142,7 @@ mod tests {
         let witnesses = [
             retained(E68_LIVE_WITNESS_FIXTURE),
             retained(E68_REFUSAL_WITNESS_FIXTURE),
+            retained(E68_AND_NOT_WITNESS_FIXTURE),
         ];
         // EVERY OBSERVATION, ITS OWN WITNESS. The join refuses in both
         // directions — an observation without a witness and a witness no
@@ -21791,6 +22210,7 @@ mod tests {
             BTreeSet::from([
                 E68_WITNESS_DIVERGENCE_ID.to_owned(),
                 E68_REFUSAL_DIVERGENCE_ID.to_owned(),
+                E68_AND_NOT_DIVERGENCE_ID.to_owned(),
             ]),
             "the enforced census covers exactly the divergences whose witnesses are committed"
         );
@@ -21861,8 +22281,42 @@ mod tests {
             }
         }
 
-        // Redaction: neither witness query nor any corpus document content may
-        // appear in the committed ledger bytes.
+        // DIV-010, RECORDED AS WHAT THE MACHINE CAN PROVE (bd-h46f1). Its prose
+        // entry carries a reviewed accept; the ledger carries a raw
+        // `RankMismatch` observation and a BLOCKING disposition, because
+        // acceptance refuses every raw failure class and the attribution that
+        // would earn the semantic class lives in a different campaign case
+        // (bd-4oiwf). Asserting the kind here is what stops a later edit from
+        // upgrading the record without the evidence that upgrade requires.
+        let and_not = observation_for(E68_AND_NOT_DIVERGENCE_ID);
+        assert_eq!(and_not.class, DivergenceClass::RankMismatch);
+        assert_eq!(
+            and_not.fixture.fixture_sha256,
+            e68_minimized_fixture_sha256(&fixture, E68_AND_NOT_CASE_ID),
+            "the recorded minimized fixture no longer hashes to the committed negated-conjunction \
+             case"
+        );
+        let and_not_dispositions = dispositions_for(E68_AND_NOT_DIVERGENCE_ID);
+        let [blocked] = and_not_dispositions.as_slice() else {
+            panic!(
+                "DIV-010 carries exactly one disposition, not {}",
+                and_not_dispositions.len()
+            )
+        };
+        match &blocked.disposition {
+            DivergenceDisposition::Blocking { bead_id, .. } => {
+                assert_eq!(bead_id, E68_AND_NOT_BLOCKING_BEAD);
+            }
+            DivergenceDisposition::Accepted { .. } | DivergenceDisposition::Fixed { .. } => {
+                panic!(
+                    "DIV-010's machine record is BLOCKING; an accept here would be one the \
+                     validator's own rules cannot support"
+                )
+            }
+        }
+
+        // Redaction: no witness query and no corpus document content may appear
+        // in the committed ledger bytes.
         let corpus_canary = fixture
             .documents
             .first()
@@ -21872,6 +22326,8 @@ mod tests {
             .validate_redaction_canaries(&[
                 E68_WITNESS_QUERY,
                 E68_REFUSAL_QUERY,
+                E68_AND_NOT_QUERY,
+                E68_AND_NOT_CONTROL_QUERY,
                 corpus_canary.as_str(),
             ])
             .expect("committed register must not leak query or corpus plaintext");
