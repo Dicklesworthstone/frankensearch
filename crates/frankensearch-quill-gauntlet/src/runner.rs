@@ -2022,6 +2022,36 @@ impl DivergencePredictionEvent {
     }
 }
 
+/// One observation's artifact witness, addressed the only way that particular
+/// witness can honestly be addressed.
+///
+/// A register holding more than one divergence holds witnesses from more than
+/// one generation, and those are not the same kind of value (bd-dxedq). A
+/// CURRENT object reproduces its own bytes and may address itself by
+/// re-encoding. A RETAINED one from an earlier generation may not, because the
+/// current DTO writes fields its generation never had — re-encoding a v7
+/// witness under the v8 shape addresses it to something the committed ledger
+/// never recorded, which is exactly what broke every committed join at the v8
+/// bump (bd-bxya1). Both forms have to be presentable to ONE join, or the first
+/// register that spans a generation boundary becomes unjoinable.
+#[derive(Debug, Clone, Copy)]
+pub enum DivergenceWitness<'witness> {
+    /// A witness minted in this run, addressed by re-encoding it.
+    Current(&'witness ArtifactObject),
+    /// A witness a committed ledger already recorded, addressed from the BYTES
+    /// that are the evidence rather than from a re-encode of them.
+    Retained(&'witness RetainedArtifactWitness),
+}
+
+impl DivergenceWitness<'_> {
+    fn divergence_binding(&self) -> Result<ArtifactDivergenceBinding, GauntletError> {
+        match self {
+            Self::Current(object) => object.divergence_binding(),
+            Self::Retained(witness) => witness.divergence_binding(),
+        }
+    }
+}
+
 impl DivergenceRegisterLedger {
     /// Construct and validate an append-only register ledger.
     ///
@@ -2219,12 +2249,17 @@ impl DivergenceRegisterLedger {
     /// Check relational integrity between every observation and its built-in
     /// gauntlet object witness.
     ///
-    /// Each supplied [`ArtifactObject`] is validated by its owning artifact
-    /// contract before this method compares the exact object schema/hash
-    /// domain, digest, producer-build identity, oracle dependency identity,
-    /// and lexical-contract audit revision. Every observation event,
-    /// including superseded history, must have a matching artifact witness.
-    /// Call [`Self::validate`] alone only for structural inspection.
+    /// Each supplied witness is validated by its owning artifact contract
+    /// before this method compares the exact object schema/hash domain, digest,
+    /// producer-build identity, oracle dependency identity, and
+    /// lexical-contract audit revision. Every observation event, including
+    /// superseded history, must have a matching artifact witness. Call
+    /// [`Self::validate`] alone only for structural inspection.
+    ///
+    /// THE SLICE IS THE POINT (bd-dxedq). A register with N observations needs
+    /// N witnesses, and the direction that matters is that every OBSERVATION
+    /// has one — an unreferenced witness is refused just as loudly, so a caller
+    /// cannot pad the set until the join succeeds.
     ///
     /// # Errors
     ///
@@ -2236,36 +2271,13 @@ impl DivergenceRegisterLedger {
     /// Returns an error for a structurally invalid ledger, an invalid or
     /// duplicate artifact, a missing first-recorded artifact, or any well-formed
     /// but substituted artifact/producer/oracle identity.
-    pub fn validate_relational_integrity_against_artifact_objects(
+    pub fn validate_relational_integrity_against_witnesses(
         &self,
-        artifacts: &[ArtifactObject],
-    ) -> Result<(), GauntletError> {
-        let bindings = artifacts
-            .iter()
-            .map(ArtifactObject::divergence_binding)
-            .collect::<Result<Vec<_>, _>>()?;
-        self.validate_relational_integrity_against_bindings(&bindings)
-    }
-
-    /// The same join for witnesses a committed ledger already recorded, which
-    /// carry their address from their stored BYTES (bd-bxya1).
-    ///
-    /// A current object can address itself by re-encoding; a retained one from
-    /// an earlier generation cannot, because the current DTO writes fields its
-    /// generation never had. Verifying such a witness by re-encoding it was
-    /// what broke every committed v7 join at the v8 bump.
-    ///
-    /// # Errors
-    ///
-    /// The same conditions as
-    /// [`Self::validate_relational_integrity_against_artifact_objects`].
-    pub fn validate_relational_integrity_against_retained_witnesses(
-        &self,
-        witnesses: &[RetainedArtifactWitness],
+        witnesses: &[DivergenceWitness<'_>],
     ) -> Result<(), GauntletError> {
         let bindings = witnesses
             .iter()
-            .map(RetainedArtifactWitness::divergence_binding)
+            .map(DivergenceWitness::divergence_binding)
             .collect::<Result<Vec<_>, _>>()?;
         self.validate_relational_integrity_against_bindings(&bindings)
     }
@@ -10455,8 +10467,8 @@ mod tests {
     /// binding extracted through `divergence_binding()`, which requires sealed
     /// built-in integrity — a Git-verified producer and a kernel-held running
     /// executable image — and a unit test cannot obtain one without faking the
-    /// gate. `validate_relational_integrity_against_artifact_objects` owns that
-    /// join and is exercised where a real artifact exists.
+    /// gate. `validate_relational_integrity_against_witnesses` owns that join
+    /// and is exercised where a real artifact exists.
     #[test]
     fn a_minted_observation_forms_a_valid_reviewed_ledger() {
         let binding = ingestion_binding();
@@ -20671,6 +20683,15 @@ mod tests {
     const E68_LIVE_LEDGER_FIXTURE: &str = "fixtures/divergence-register-v2-live.json";
     #[cfg(feature = "tantivy-oracle")]
     const E68_LIVE_WITNESS_FIXTURE: &str = "fixtures/artifact-object-v7-div007-live.json";
+    /// DIV-009's witness, committed beside DIV-008's (bd-dxedq).
+    ///
+    /// A SECOND constant rather than a widened first one: these are two
+    /// different objects from two different generations, and the committed
+    /// register now names both. The register cannot join without this file --
+    /// every observation needs its own witness -- so committing it is part of
+    /// committing the two-witness register, not a convenience.
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_REFUSAL_WITNESS_FIXTURE: &str = "fixtures/artifact-object-v8-div009-live.json";
     /// Domain separation for the minimized-fixture digest recorded with the
     /// observation. Re-derivable from the committed inputs, so the digest is a
     /// checkable claim rather than an opaque constant.
@@ -20800,10 +20821,47 @@ mod tests {
             marker: "<redacted:e68-live-lane-rank-mismatch>".to_owned(),
         };
 
+        // THE MINT APPENDS, IT DOES NOT REPLACE (bd-dxedq). This helper used to
+        // build a standalone two-event ledger, so the register it produced held
+        // this witness and nothing else -- which is why the committed register
+        // carried DIV-008 alone while DIV-009's reviewed accept sat in a mint
+        // nobody merged. One register has to carry both, or the enforced ledger
+        // and the prose register describe different worlds.
+        //
+        // Idempotent by construction: any previously appended events for THIS
+        // divergence are dropped before the freshly minted ones are appended,
+        // so a re-mint re-derives byte-identical events (every timestamp here
+        // is fixed) rather than accumulating duplicates -- which the validator
+        // would refuse anyway, since two active observations of one divergence
+        // collide on their mismatch signature.
+        let committed_register = DivergenceRegisterLedger::decode_json(
+            &std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(E68_LIVE_LEDGER_FIXTURE),
+            )
+            .expect("committed live divergence register"),
+        )
+        .expect("the committed register must decode and validate before anything appends to it");
+        let mut events = committed_register
+            .events
+            .iter()
+            .filter(|event| match event {
+                DivergenceRegisterEvent::Observation(observation) => {
+                    observation.divergence_id != E68_REFUSAL_DIVERGENCE_ID
+                }
+                DivergenceRegisterEvent::Disposition(disposition) => {
+                    disposition.divergence_id != E68_REFUSAL_DIVERGENCE_ID
+                }
+                DivergenceRegisterEvent::Prediction(_) => true,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let observation_sequence =
+            u64::try_from(events.len()).expect("register length fits u64") + 1;
+
         let observation = DivergenceRegisterLedger::observation_from_artifact(
             object,
             DivergenceRegisterEventHeader {
-                sequence: 1,
+                sequence: observation_sequence,
                 supersedes: None,
                 recorded_by: E68_RECORDED_BY.to_owned(),
                 recorded_at: E68_RECORDED_AT.to_owned(),
@@ -20846,7 +20904,7 @@ mod tests {
 
         let disposition = DivergenceDispositionEvent {
             header: DivergenceRegisterEventHeader {
-                sequence: 2,
+                sequence: observation_sequence + 1,
                 supersedes: None,
                 recorded_by: E68_RECORDED_BY.to_owned(),
                 recorded_at: E68_RECORDED_AT.to_owned(),
@@ -20872,14 +20930,16 @@ mod tests {
             },
         };
 
-        let ledger = DivergenceRegisterLedger::new(
-            E68_LIVE_REGISTER_ID,
-            vec![
-                DivergenceRegisterEvent::Observation(Box::new(observation)),
-                DivergenceRegisterEvent::Disposition(disposition),
-            ],
-        )
-        .expect("the ingested ledger must satisfy the v2 contract");
+        events.push(DivergenceRegisterEvent::Observation(Box::new(observation)));
+        events.push(DivergenceRegisterEvent::Disposition(disposition));
+        let ledger = DivergenceRegisterLedger::new(E68_LIVE_REGISTER_ID, events)
+            .expect("the ingested ledger must satisfy the v2 contract");
+        // The append is PROVED, not assumed: the successor check refuses any
+        // rewrite of what was already recorded, so a mint that quietly dropped
+        // or edited the other witness's history fails here rather than landing.
+        ledger
+            .validate_append_only_successor(&committed_register)
+            .expect("the minted register must only APPEND to the committed one");
         (ledger, mismatch_signatures)
     }
 
@@ -21516,11 +21576,27 @@ mod tests {
                 &object,
                 e68_minimized_fixture_sha256(&fixture, E68_REFUSAL_CASE_ID),
             );
+            // THE JOIN TAKES EVERY OBSERVATION'S WITNESS (bd-dxedq). The mint
+            // appends to the committed register, so the minted ledger carries
+            // DIV-008's observation too, and a register with N observations
+            // needs N witnesses. DIV-008's is the committed v7 object addressed
+            // from its stored BYTES; DIV-009's is the live v8 object this run
+            // just produced, which can address itself by re-encoding. Passing
+            // only the live one is what reddened the first attempt at this
+            // change, and it reddened LOUDLY -- the missing witness is named.
+            let committed_witness = crate::artifact::RetainedArtifactWitness::decode(
+                &std::fs::read(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(E68_LIVE_WITNESS_FIXTURE),
+                )
+                .expect("committed live witness object"),
+            )
+            .expect("committed witness object must decode and address");
             ledger
-                .validate_relational_integrity_against_artifact_objects(std::slice::from_ref(
-                    &object,
-                ))
-                .expect("the ingested observation must join to its own witness object");
+                .validate_relational_integrity_against_witnesses(&[
+                    DivergenceWitness::Current(&object),
+                    DivergenceWitness::Retained(&committed_witness),
+                ])
+                .expect("every observation in the minted register must join to its own witness");
             // ACCEPTANCE 4 (bd-bxya1): DIV-009's machine mint and its reviewed
             // accept now AGREE. The ledger validates on assembly, and
             // `DivergenceDisposition::validate` still refuses acceptance for
@@ -21574,13 +21650,22 @@ mod tests {
     }
 
     /// bd-quill-e6-gauntlet-scale-rm3q.8: the COMMITTED production register and
-    /// its committed witness must remain valid, mutually bound, and free of
+    /// its committed witnesses must remain valid, mutually bound, and free of
     /// plaintext — on any checkout, clean or dirty, since a stored seal is
     /// evidence about the producer that minted it, not about the reader.
     ///
     /// This is the register selfcheck that outlives the mint: the mint proves a
     /// live mismatch CAN be ingested, this proves the ingested record still
-    /// says what it said, still joins to its witness, and still redacts.
+    /// says what it said, still joins to its witnesses, and still redacts.
+    ///
+    /// TWO WITNESSES SINCE bd-dxedq, and the second one is why this test
+    /// changed shape. The committed register carries DIV-008 and DIV-009, so it
+    /// spans a generation boundary: DIV-008's witness is a v7 object and
+    /// DIV-009's is v8. Both are read as RETAINED evidence — addressed from
+    /// their committed bytes — including the one that could still address
+    /// itself today. That is deliberate. A witness stops being able to
+    /// re-encode itself at the NEXT schema bump, not at the one that already
+    /// happened, and this test must not be the thing that discovers it.
     #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn committed_live_divergence_register_joins_its_witness_and_stays_redacted() {
@@ -21594,51 +21679,107 @@ mod tests {
             .validate()
             .expect("committed live register must satisfy the current v2 contract");
 
-        // ADDRESSED FROM ITS BYTES, not by re-encoding it (bd-bxya1). This
+        // ADDRESSED FROM ITS BYTES, not by re-encoding it (bd-bxya1). DIV-008's
         // witness is a v7 object and the current DTO writes a field v7 never
         // had, so a re-encode addresses to something the committed ledger never
         // recorded. The bytes are the evidence; the address is computed from
-        // them, and the object still has to clear the integrity contract of its
-        // own generation before it can stand as a witness at all.
-        let witness = crate::artifact::RetainedArtifactWitness::decode(
-            &std::fs::read(crate_root.join(E68_LIVE_WITNESS_FIXTURE))
-                .expect("committed live witness object"),
-        )
-        .expect("committed witness object must decode and address");
+        // them, and each object still has to clear the integrity contract of
+        // its own generation before it can stand as a witness at all.
+        let retained = |fixture_path: &str| {
+            crate::artifact::RetainedArtifactWitness::decode(
+                &std::fs::read(crate_root.join(fixture_path))
+                    .expect("committed live witness object"),
+            )
+            .expect("committed witness object must decode and address")
+        };
+        let witnesses = [
+            retained(E68_LIVE_WITNESS_FIXTURE),
+            retained(E68_REFUSAL_WITNESS_FIXTURE),
+        ];
+        // EVERY OBSERVATION, ITS OWN WITNESS. The join refuses in both
+        // directions — an observation without a witness and a witness no
+        // observation references — so this cannot be satisfied by padding the
+        // set, and dropping either fixture reddens here by name.
         ledger
-            .validate_relational_integrity_against_retained_witnesses(std::slice::from_ref(
-                &witness,
-            ))
-            .expect("committed register must join to its committed witness");
+            .validate_relational_integrity_against_witnesses(
+                &witnesses
+                    .iter()
+                    .map(DivergenceWitness::Retained)
+                    .collect::<Vec<_>>(),
+            )
+            .expect("committed register must join to its committed witnesses");
 
-        // The recorded minimized-fixture digest is re-derived, not trusted.
-        let fixture = make_e68_witness_fixture();
-        let expected_fixture_sha256 = e68_minimized_fixture_sha256(&fixture, E68_WITNESS_CASE_ID);
-        let observation = ledger
+        let observation_for = |divergence_id: &str| {
+            ledger
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    DivergenceRegisterEvent::Observation(observation)
+                        if observation.divergence_id == divergence_id =>
+                    {
+                        Some(observation)
+                    }
+                    DivergenceRegisterEvent::Observation(_)
+                    | DivergenceRegisterEvent::Disposition(_)
+                    | DivergenceRegisterEvent::Prediction(_) => None,
+                })
+                .unwrap_or_else(|| panic!("committed register holds {divergence_id}"))
+        };
+        let dispositions_for = |divergence_id: &str| {
+            ledger
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    DivergenceRegisterEvent::Disposition(disposition)
+                        if disposition.divergence_id == divergence_id =>
+                    {
+                        Some(disposition)
+                    }
+                    DivergenceRegisterEvent::Disposition(_)
+                    | DivergenceRegisterEvent::Observation(_)
+                    | DivergenceRegisterEvent::Prediction(_) => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // THE CENSUS THIS REGISTER IS, stated exactly. The terminal
+        // authorization hashes this ledger, so what it holds IS the flip's
+        // divergence-census evidence; a reader must not have to count events to
+        // learn which divergences that covers.
+        let registered = ledger
             .events
             .iter()
-            .find_map(|event| match event {
-                DivergenceRegisterEvent::Observation(observation) => Some(observation),
+            .filter_map(|event| match event {
+                DivergenceRegisterEvent::Observation(observation) => {
+                    Some(observation.divergence_id.clone())
+                }
                 DivergenceRegisterEvent::Disposition(_)
                 | DivergenceRegisterEvent::Prediction(_) => None,
             })
-            .expect("committed register holds an observation");
-        assert_eq!(observation.divergence_id, E68_WITNESS_DIVERGENCE_ID);
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            registered,
+            BTreeSet::from([
+                E68_WITNESS_DIVERGENCE_ID.to_owned(),
+                E68_REFUSAL_DIVERGENCE_ID.to_owned(),
+            ]),
+            "the enforced census covers exactly the divergences whose witnesses are committed"
+        );
+
+        // The recorded minimized-fixture digests are re-derived, not trusted.
+        let fixture = make_e68_witness_fixture();
+        let observation = observation_for(E68_WITNESS_DIVERGENCE_ID);
         assert_eq!(observation.class, DivergenceClass::RankMismatch);
         assert_eq!(
-            observation.fixture.fixture_sha256, expected_fixture_sha256,
+            observation.fixture.fixture_sha256,
+            e68_minimized_fixture_sha256(&fixture, E68_WITNESS_CASE_ID),
             "the recorded minimized fixture no longer hashes to the committed case"
         );
 
         // A raw failure class may only block or be fixed, never be accepted.
-        let disposition = ledger
-            .events
-            .iter()
-            .find_map(|event| match event {
-                DivergenceRegisterEvent::Disposition(disposition) => Some(disposition),
-                DivergenceRegisterEvent::Observation(_)
-                | DivergenceRegisterEvent::Prediction(_) => None,
-            })
+        let div008_dispositions = dispositions_for(E68_WITNESS_DIVERGENCE_ID);
+        let disposition = div008_dispositions
+            .first()
             .expect("committed register holds a disposition");
         match &disposition.disposition {
             DivergenceDisposition::Blocking { bead_id, .. } => {
@@ -21649,15 +21790,61 @@ mod tests {
             }
         }
 
-        // Redaction: neither the witness query nor any corpus document content
-        // may appear in the committed ledger bytes.
+        // DIV-009, WHICH IS THE POINT OF bd-dxedq: the prose register and the
+        // enforced ledger now say the same thing about it. The class is the
+        // attributed `OracleBug` the lane emits, and the disposition is the
+        // reviewed ACCEPT the owner ruled — which the ledger can only hold
+        // because the class is no longer raw and the reviewer is not the
+        // observer. Both are asserted here rather than left to
+        // `DivergenceDisposition::validate`, so a future edit that weakened
+        // that validator would still redden this test.
+        let refusal = observation_for(E68_REFUSAL_DIVERGENCE_ID);
+        assert_eq!(refusal.class, DivergenceClass::OracleBug);
+        assert_eq!(
+            refusal.fixture.fixture_sha256,
+            e68_minimized_fixture_sha256(&fixture, E68_REFUSAL_CASE_ID),
+            "the recorded minimized fixture no longer hashes to the committed refusal case"
+        );
+        let div009_dispositions = dispositions_for(E68_REFUSAL_DIVERGENCE_ID);
+        let [accepted] = div009_dispositions.as_slice() else {
+            panic!(
+                "DIV-009 carries exactly one disposition, not {}",
+                div009_dispositions.len()
+            )
+        };
+        match &accepted.disposition {
+            DivergenceDisposition::Accepted {
+                equivalence_law,
+                reviewer,
+                ..
+            } => {
+                assert_eq!(equivalence_law, E68_REFUSAL_EQUIVALENCE_LAW);
+                assert_eq!(reviewer, E68_REFUSAL_REVIEWER);
+                assert_ne!(
+                    reviewer.as_str(),
+                    refusal.header.recorded_by.as_str(),
+                    "an accept certified by its own observer is the forgery this register exists \
+                     to refuse"
+                );
+            }
+            DivergenceDisposition::Blocking { .. } | DivergenceDisposition::Fixed { .. } => {
+                panic!("DIV-009's committed disposition is the reviewed accept")
+            }
+        }
+
+        // Redaction: neither witness query nor any corpus document content may
+        // appear in the committed ledger bytes.
         let corpus_canary = fixture
             .documents
             .first()
             .map(|document| document.content.clone())
             .expect("Core100 corpus is non-empty");
         ledger
-            .validate_redaction_canaries(&[E68_WITNESS_QUERY, corpus_canary.as_str()])
+            .validate_redaction_canaries(&[
+                E68_WITNESS_QUERY,
+                E68_REFUSAL_QUERY,
+                corpus_canary.as_str(),
+            ])
             .expect("committed register must not leak query or corpus plaintext");
     }
 
