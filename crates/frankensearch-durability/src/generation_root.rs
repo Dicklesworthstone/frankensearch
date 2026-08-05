@@ -404,7 +404,10 @@ fn file_witness(
         device: stat.st_dev,
         inode: stat.st_ino,
         mode: stat.st_mode,
-        links: stat.st_nlink,
+        // `st_nlink` is `u64` on glibc/x86_64 but `u32` on some musl targets
+        // (aarch64-unknown-linux-musl), so widen explicitly rather than
+        // relying on the platform-specific width matching the witness field.
+        links: u64::from(stat.st_nlink),
         uid: stat.st_uid,
         gid: stat.st_gid,
         size,
