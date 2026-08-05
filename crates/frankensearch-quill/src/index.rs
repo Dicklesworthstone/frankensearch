@@ -19,7 +19,7 @@ use std::sync::Mutex as StdMutex;
 // with either feature enabled.
 #[cfg(any(test, feature = "conformance-internals", feature = "profile-internals"))]
 use std::sync::atomic::AtomicBool;
-#[cfg(feature = "conformance-internals")]
+#[cfg(any(test, feature = "conformance-internals"))]
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "pruning-conformance")]
@@ -3915,15 +3915,37 @@ struct RootBoundQuillReaderState {
 #[cfg(test)]
 #[derive(Default)]
 struct RootRefreshPause {
-    enabled: AtomicBool,
+    /// Which refresh stage to park at; `STAGE_NONE` disables the seam.
+    stage: AtomicU8,
     arrived: AtomicBool,
     release: AtomicBool,
 }
 
 #[cfg(test)]
 impl RootRefreshPause {
-    async fn wait_before_swap(&self) {
-        if !self.enabled.load(Ordering::Acquire) {
+    /// The refresh has not reached a paused stage.
+    const STAGE_NONE: u8 = 0;
+    /// Between the two layout-inspection cancellation checks, i.e. while the
+    /// blocking `inspect_lexical_layout` result is in hand but nothing has been
+    /// opened yet. This is the OPEN window.
+    const STAGE_INSPECTION: u8 = 1;
+    /// After the replacement engine directory has been opened and before its
+    /// generation is read, i.e. the VALIDATE window. A reader exists here but
+    /// is not installed, so cancelling must drop it.
+    const STAGE_VALIDATION: u8 = 2;
+    /// Immediately before the `ArcSwap` store. The SWAP window.
+    const STAGE_SWAP: u8 = 3;
+
+    /// Park the refresh at `stage` until the paired canceller releases it.
+    ///
+    /// Cancellation windows are otherwise a race: a test that merely requests
+    /// cancellation and hopes the refresh has reached the interesting
+    /// checkpoint proves nothing on the runs where it has not. Parking makes
+    /// the window deterministic, so the `LabRuntime` schedule that follows is
+    /// reproducible rather than lucky.
+    async fn wait_at(&self, stage: u8) {
+        let armed = self.stage.load(Ordering::Acquire);
+        if armed == Self::STAGE_NONE || armed != stage {
             return;
         }
         self.arrived.store(true, Ordering::Release);
@@ -9477,7 +9499,14 @@ impl RootBoundQuillSearchIndex {
     /// active engine directory is rejected.
     pub async fn refresh(&self, cx: &Cx) -> Result<bool, QuillIndexError> {
         check_cancel(cx, "root-bound reader refresh")?;
-        let replacement = Self::open_state(cx, &self.lexical_root, &self.config).await?;
+        let replacement = Self::open_state_inner(
+            cx,
+            &self.lexical_root,
+            &self.config,
+            #[cfg(test)]
+            Some(self.refresh_pause.as_ref()),
+        )
+        .await?;
         self.install_validated_replacement(cx, replacement).await
     }
 
@@ -9492,7 +9521,9 @@ impl RootBoundQuillSearchIndex {
         replacement: RootBoundQuillReaderState,
     ) -> Result<bool, QuillIndexError> {
         #[cfg(test)]
-        self.refresh_pause.wait_before_swap().await;
+        self.refresh_pause
+            .wait_at(RootRefreshPause::STAGE_SWAP)
+            .await;
 
         check_cancel(cx, "root-bound reader refresh swap")?;
         let current = self.state.load_full();
@@ -9521,9 +9552,35 @@ impl RootBoundQuillSearchIndex {
         lexical_root: &Path,
         config: &QuillConfig,
     ) -> Result<RootBoundQuillReaderState, QuillIndexError> {
+        Self::open_state_inner(
+            cx,
+            lexical_root,
+            config,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    /// `open_state` with the test-only cancellation-window seam threaded in.
+    ///
+    /// The seam is a parameter rather than shared state because `open_state`
+    /// is called both by `open` — where there is no reader to retain and no
+    /// window worth parking in — and by `refresh`, which is the path whose
+    /// cancellation behaviour the acceptance names.
+    async fn open_state_inner(
+        cx: &Cx,
+        lexical_root: &Path,
+        config: &QuillConfig,
+        #[cfg(test)] pause: Option<&RootRefreshPause>,
+    ) -> Result<RootBoundQuillReaderState, QuillIndexError> {
         check_cancel(cx, "root-bound reader layout inspection")?;
         let root_for_inspection = lexical_root.to_path_buf();
         let layout = spawn_blocking(move || inspect_lexical_layout(&root_for_inspection)).await?;
+        #[cfg(test)]
+        if let Some(pause) = pause {
+            pause.wait_at(RootRefreshPause::STAGE_INSPECTION).await;
+        }
         check_cancel(cx, "root-bound reader layout inspection")?;
 
         let (active_path, pointer) = match layout {
@@ -9564,6 +9621,10 @@ impl RootBoundQuillSearchIndex {
 
         let reader =
             Arc::new(QuillSearchIndex::open(cx, active_path.clone(), config.clone()).await?);
+        #[cfg(test)]
+        if let Some(pause) = pause {
+            pause.wait_at(RootRefreshPause::STAGE_VALIDATION).await;
+        }
         check_cancel(cx, "root-bound reader validation")?;
         let generation = reader.keeper_generation();
         Ok(RootBoundQuillReaderState {
@@ -13351,7 +13412,8 @@ mod tests {
             (reader, replacement)
         });
         let pause = Arc::clone(&reader.refresh_pause);
-        pause.enabled.store(true, Ordering::Release);
+        pause.stage
+            .store(RootRefreshPause::STAGE_SWAP, Ordering::Release);
         let refresh_cx = Arc::new(Cx::for_testing());
         let cancelled = Arc::new(AtomicBool::new(false));
 
@@ -13415,6 +13477,149 @@ mod tests {
                     .is_empty()
             );
         });
+    }
+
+    /// Park a real `refresh` at one cancellation window, cancel it there under
+    /// a deterministic `LabRuntime` schedule, and prove the old reader survives.
+    ///
+    /// bd-8nqz.2's acceptance names "cancellation at every open/validate/swap
+    /// stage". The swap window had a test; the other two did not, and the
+    /// difference matters because they fail differently: the OPEN window has
+    /// no replacement reader in hand, while the VALIDATE window is holding a
+    /// fully opened `QuillSearchIndex` that must be dropped rather than
+    /// installed. A cancellation that leaked at either point would leave the
+    /// reader serving a generation nobody asked for, which is precisely the
+    /// failure this bead exists to make impossible.
+    ///
+    /// The pause is what makes this a proof rather than a race: the refresh
+    /// task parks AT the window, the canceller waits for it to arrive, and only
+    /// then requests cancellation. Without it the canceller can win before the
+    /// refresh reaches the checkpoint and the test passes without ever
+    /// exercising the window it names.
+    fn assert_cancel_at_stage_retains_old_reader(seed: u64, stage: u8, expected_phase: &'static str) {
+        let root = tempfile::tempdir().expect("root-bound cancellation directory");
+        let lexical_root = root.path().to_path_buf();
+        let setup_cx = Cx::for_testing();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 4)
+            .build()
+            .expect("build root-bound cancellation runtime");
+
+        let reader = runtime.block_on(async {
+            create_root_generation(&setup_cx, &lexical_root, "quill-v1", "old", "old token").await;
+            publish_current(&lexical_root, &root_pointer("quill-v1"))
+                .expect("publish first root generation");
+            let reader =
+                RootBoundQuillSearchIndex::open(&setup_cx, &lexical_root, deterministic_config())
+                    .await
+                    .expect("open root-bound reader");
+            // The replacement is published on disk, so a refresh that ran to
+            // completion WOULD swap. That is what makes the retained old
+            // generation below evidence of cancellation rather than of there
+            // being nothing to move to.
+            create_root_generation(&setup_cx, &lexical_root, "quill-v2", "new", "new token").await;
+            publish_current(&lexical_root, &root_pointer("quill-v2"))
+                .expect("publish replacement root generation");
+            reader
+        });
+
+        let pause = Arc::clone(&reader.refresh_pause);
+        pause.stage.store(stage, Ordering::Release);
+        let refresh_cx = Arc::new(Cx::for_testing());
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        let mut lab = LabRuntime::new(LabConfig::new(seed).max_steps(100_000));
+        let region = lab.state.create_root_region(Budget::INFINITE);
+        let refresh_reader = reader.clone();
+        let refresh_context = Arc::clone(&refresh_cx);
+        let refresh_cancelled = Arc::clone(&cancelled);
+        let (refresh, _) = lab
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                let outcome = refresh_reader.refresh(refresh_context.as_ref()).await;
+                assert!(
+                    matches!(outcome, Err(QuillIndexError::Cancelled { phase }) if phase == expected_phase),
+                    "refresh cancelled at {expected_phase} must report that phase, got {outcome:?}"
+                );
+                refresh_cancelled.store(true, Ordering::SeqCst);
+            })
+            .expect("create root-bound refresh task");
+
+        let cancel_context = Arc::clone(&refresh_cx);
+        let cancel_pause = Arc::clone(&pause);
+        let (cancel_task, _) = lab
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                while !cancel_pause.arrived.load(Ordering::Acquire) {
+                    yield_now().await;
+                }
+                cancel_context.set_cancel_requested(true);
+                cancel_pause.release.store(true, Ordering::Release);
+            })
+            .expect("create root-bound cancellation task");
+
+        lab.scheduler.lock().schedule(refresh, 0);
+        lab.scheduler.lock().schedule(cancel_task, 0);
+        let report = lab.run_until_quiescent_with_report();
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "the refresh task must have observed cancellation at {expected_phase}"
+        );
+        assert!(
+            pause.arrived.load(Ordering::Acquire),
+            "the refresh must actually have REACHED the {expected_phase} window; a test that \
+             cancels before the window proves nothing about it"
+        );
+        assert!(report.quiescent, "root-bound refresh schedule must quiesce");
+        assert!(
+            report.oracle_report.all_passed(),
+            "root-bound refresh oracles must pass"
+        );
+        assert!(report.invariant_violations.is_empty());
+
+        runtime.block_on(async {
+            assert_eq!(
+                reader.active_path(),
+                lexical_root.join("quill-v1"),
+                "a cancelled refresh must leave the old engine directory pinned"
+            );
+            assert_eq!(
+                LexicalRead::search(&reader, &setup_cx, "old", 10)
+                    .await
+                    .expect("old reader remains usable after cancellation")[0]
+                    .doc_id,
+                "old"
+            );
+            assert!(
+                LexicalRead::search(&reader, &setup_cx, "new", 10)
+                    .await
+                    .expect("cancelled refresh leaves old generation active")
+                    .is_empty(),
+                "the replacement generation must not be observable after a cancelled refresh"
+            );
+        });
+    }
+
+    /// OPEN window: cancelled while holding only the inspected layout.
+    #[test]
+    fn labruntime_cancel_during_root_bound_open_retains_the_old_reader() {
+        assert_cancel_at_stage_retains_old_reader(
+            0x8a02_0003,
+            RootRefreshPause::STAGE_INSPECTION,
+            "root-bound reader layout inspection",
+        );
+    }
+
+    /// VALIDATE window: cancelled while holding a fully opened replacement
+    /// reader that has not been installed. The opened index must be dropped,
+    /// not swapped in.
+    #[test]
+    fn labruntime_cancel_during_root_bound_validation_retains_the_old_reader() {
+        assert_cancel_at_stage_retains_old_reader(
+            0x8a02_0004,
+            RootRefreshPause::STAGE_VALIDATION,
+            "root-bound reader validation",
+        );
     }
 
     #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
