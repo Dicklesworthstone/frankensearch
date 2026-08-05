@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use tracing::info;
 
 use crate::GauntletError;
+use crate::artifact::GauntletProducerBuildIdentity;
 
 pub const SCORE_EPSILON: f32 = 0.0001;
 /// Stable schema identifier for the complete public lexical result envelope.
@@ -35,8 +36,16 @@ pub const CASS_LEXICAL_PROFILE_OBSERVATION_SCHEMA_VERSION: &str =
     "cass-lexical-layer-a-observation-v2";
 /// Stable schema identifier for the live, method-bound Quill cancellation
 /// receipt owned by bd-fjpu.
+///
+/// v3 adds `producer_source_revision` (bd-drize). The body is
+/// `deny_unknown_fields` and the field is required, so a v2 receipt cannot
+/// deserialize into this shape; bumping states that rather than letting a
+/// stale receipt fail with a field-level parse error that reads like
+/// corruption. No v2 receipt is persisted anywhere in this repository -- the
+/// receipt is observed live -- so nothing is being migrated, only renamed
+/// truthfully.
 pub const QUILL_CANCELLATION_RECEIPT_SCHEMA_VERSION: &str =
-    "quill-cancellation-contract-receipt-v2";
+    "quill-cancellation-contract-receipt-v3";
 /// Maximum number of hits admitted into one lexical observation artifact.
 pub const MAX_LEXICAL_OBSERVATION_HITS: usize = 100_000;
 /// Maximum UTF-8 byte length of a consumer-visible document identifier.
@@ -987,7 +996,32 @@ pub struct QuillCancellationObservation {
 pub struct QuillCancellationReceiptBody {
     pub schema_version: String,
     pub origin: QuillCancellationEvidenceOrigin,
+    /// Engine VERSION, not a source identity: `quill-engine-<CURRENT_ENGINE_VERSION>`.
+    ///
+    /// It moves when the engine's declared version moves, which is not when the
+    /// source tree moves, so it can never say WHICH revision was observed.
     pub engine_revision: String,
+    /// Source revision of the build that produced this receipt (bd-drize).
+    ///
+    /// Every other field of this body is a pure function of the fixture and the
+    /// engine's API surface, so before this field existed a receipt was
+    /// byte-identical across two different candidate revisions. bd-8nqz.4
+    /// slice 3 measured exactly that: harvesting the terminal grant from two
+    /// candidates moved the enriched receipt's address `cce35327...` ->
+    /// `71f728f8...` while this receipt's `body_sha256` stayed at
+    /// `9b81b211...`. A slot whose evidence cannot distinguish candidates
+    /// cannot bind one, so the cancellation slot could be satisfied by a
+    /// receipt observed from a different source tree entirely.
+    ///
+    /// It is taken from the build-sealed producer identity, never from a caller
+    /// argument: a caller-supplied revision would let the holder name whatever
+    /// candidate it wanted, which is the forgery the enriched receipt's
+    /// private-field design already refuses. DIRTINESS IS DELIBERATELY NOT
+    /// JUDGED HERE -- a dirty producer still has a canonical HEAD revision, and
+    /// whether the producing checkout was clean is the enriched receipt's
+    /// admissibility question, checked last in `authorize` precisely because it
+    /// is the one answer a working tree cannot guarantee.
+    pub producer_source_revision: String,
     pub corpus_sha256: String,
     pub query_sha256: String,
     pub observations: Vec<QuillCancellationObservation>,
@@ -1031,6 +1065,7 @@ impl QuillCancellationReceipt {
             || self.body.origin != QuillCancellationEvidenceOrigin::LiveQuillPublicMethod
             || self.body.engine_revision.trim().is_empty()
             || self.body.engine_revision.len() > 256
+            || !is_canonical_git_revision(&self.body.producer_source_revision)
             || !is_lower_sha256(&self.body.corpus_sha256)
             || !is_lower_sha256(&self.body.query_sha256)
             || self.body.observations.len() != QuillCancellationCheckpoint::REQUIRED.len()
@@ -1878,10 +1913,15 @@ pub async fn observe_live_quill_cancellation_receipt(
         true,
     ));
 
+    // The revision is READ FROM THE BUILD, not from a parameter: this function
+    // takes no candidate argument and must not grow one, or the receipt would
+    // attest whatever revision its caller asked for (bd-drize).
+    let producer_source_revision = GauntletProducerBuildIdentity::compiled()?.source_git_revision;
     QuillCancellationReceipt::seal(QuillCancellationReceiptBody {
         schema_version: QUILL_CANCELLATION_RECEIPT_SCHEMA_VERSION.to_owned(),
         origin: QuillCancellationEvidenceOrigin::LiveQuillPublicMethod,
         engine_revision: format!("quill-engine-{CURRENT_ENGINE_VERSION}"),
+        producer_source_revision,
         corpus_sha256,
         query_sha256,
         observations,
@@ -5053,6 +5093,17 @@ fn lower_hex(bytes: &[u8]) -> String {
 
 fn is_lower_sha256(value: &str) -> bool {
     value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// A canonical lowercase 40-hex git revision, the same shape `engine.rs`,
+/// `native_enriched_witness.rs` and `replacement_authorization.rs` each require
+/// of a source identity. Kept module-local like those three rather than shared,
+/// so no module's identity contract can be widened by editing another's.
+fn is_canonical_git_revision(value: &str) -> bool {
+    value.len() == 40
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -9005,6 +9056,19 @@ mod tests {
                 body.observations[4].keeper_generation_after_replay = body.observations[4]
                     .keeper_generation_after_replay
                     .saturating_add(1);
+            });
+            // bd-drize: the bound source revision is part of the sealed body,
+            // so a malformed one cannot seal, and a well-formed one cannot be
+            // swapped after sealing without breaking the content address.
+            assert_cancellation_receipt_body_tamper_rejected(&receipt, |body| {
+                body.producer_source_revision = "not-a-revision".to_owned();
+            });
+            assert_cancellation_receipt_body_tamper_rejected(&receipt, |body| {
+                body.producer_source_revision.truncate(7);
+            });
+            assert_cancellation_receipt_tamper_rejected(&receipt, |tampered| {
+                tampered.body.producer_source_revision =
+                    "5eb995d524705ef8b17834e9ce005125179b9af2".to_owned();
             });
         });
     }
