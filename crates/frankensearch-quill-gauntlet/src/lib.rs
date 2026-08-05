@@ -37,6 +37,7 @@ mod perf_evidence;
 mod perf_ratchet;
 mod qg2_contract;
 mod qg6_prepared;
+pub mod replacement_authorization;
 mod runner;
 mod version_contract;
 
