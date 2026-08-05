@@ -55,7 +55,7 @@ pub use artifact::{
     CampaignArtifactContext, GauntletProducerBuildIdentity, GauntletProducerSourceVerification,
     IntegrityCheckedCampaign, OBJECT_SCHEMA_VERSION, PreparedArtifact, RUN_MANIFEST_SCHEMA_VERSION,
     RunManifest, SerializedSchemaDisposition, classify_artifact_object_schema,
-    classify_campaign_report_schema, pinned_campaign_report_v7,
+    classify_campaign_report_schema, pinned_campaign_report_v8,
 };
 pub use campaign_contract::{
     BuiltInEvidenceBindingV1, CampaignCellEvidenceV1, CampaignCellKeyV1, CampaignContractModeV1,
@@ -232,7 +232,7 @@ pub use runner::{
     SCALAR_G1A_SCHEMA_CONTRACT_PREIMAGE, SemanticContract, ShadowDivergenceRecord, ShrinkDriver,
     ShrinkEngineFactory, ShrinkError, ShrinkRequest, ShrunkReproduction, SuspectedLayer,
     TriageConfidence, TriageVerdict, divergence_prediction_policy_sha256,
-    load_pinned_campaign_report_v7, persist_shrunk_reproduction,
+    load_pinned_campaign_report_v8, load_read_only_campaign_report_v7, persist_shrunk_reproduction,
 };
 pub use version_contract::{
     InternalDifferentialFixture, OracleVersionContract, Q1Fixture, Q1FixtureCatalog,

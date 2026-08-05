@@ -13,7 +13,7 @@ use crate::GauntletError;
 use crate::comparator::{
     ComparatorConfig, Divergence, LexicalBoundary, LexicalComparisonStatus,
     LexicalContractComparison, LexicalEngineRole, LexicalExposureContract,
-    LexicalObservationContext, RankClass, compare_observations_stored_v7,
+    LexicalObservationContext, RankClass, compare_observations_stored_v8,
 };
 use crate::engine::{EnginePairIdentity, HarnessRun};
 use crate::generator::{
@@ -27,11 +27,27 @@ use crate::runner::{
 use crate::version_contract::{OracleVersionContract, oracle_version_contract};
 
 const ARTIFACT_OBJECT_V7_SCHEMA_VERSION: u32 = 7;
-pub const OBJECT_SCHEMA_VERSION: u32 = ARTIFACT_OBJECT_V7_SCHEMA_VERSION;
-const ARTIFACT_OBJECT_V7_CANONICALIZATION_VERSION: u32 = 1;
-pub const CANONICALIZATION_VERSION: u32 = ARTIFACT_OBJECT_V7_CANONICALIZATION_VERSION;
+/// Current artifact-object generation.
+///
+/// v8 exists because the v7 comparator is frozen ("Semantic changes require a
+/// new object/report schema and a separate implementation") and the
+/// oracle-blame attribution bd-bxya1 needs has to be a stored INPUT to the
+/// comparator rather than an edit of its output. v7 objects are read-only from
+/// here: they still classify, still address under their own hash domain, and
+/// still re-derive their stored report under the frozen v7 comparator, but they
+/// are not admissible evidence and nothing mints them.
+const ARTIFACT_OBJECT_V8_SCHEMA_VERSION: u32 = 8;
+pub const OBJECT_SCHEMA_VERSION: u32 = ARTIFACT_OBJECT_V8_SCHEMA_VERSION;
+/// Canonicalization is UNCHANGED across the v7 -> v8 boundary: the same JSON
+/// canonical form addresses both generations, and only the object schema and
+/// its hash domain move. Stated as its own constant so a future canonical-form
+/// change cannot ride along on a schema bump unnoticed.
+const ARTIFACT_OBJECT_V8_CANONICALIZATION_VERSION: u32 = 1;
+pub const CANONICALIZATION_VERSION: u32 = ARTIFACT_OBJECT_V8_CANONICALIZATION_VERSION;
 pub const OBJECT_HASH_SCHEME_V7_SHA256: &str =
     "frankensearch-quill-gauntlet/artifact-object/v7/sha256";
+pub const OBJECT_HASH_SCHEME_V8_SHA256: &str =
+    "frankensearch-quill-gauntlet/artifact-object/v8/sha256";
 /// Current mutable run-manifest schema.
 ///
 /// Version 2 pins the referenced current object address to domain-separated
@@ -43,6 +59,7 @@ const HASH_DOMAIN_V3: &[u8] = b"frankensearch-quill-gauntlet:artifact-object:v3\
 const HASH_DOMAIN_V5: &[u8] = b"frankensearch-quill-gauntlet:artifact-object:v5\0";
 const HASH_DOMAIN_V6: &[u8] = b"frankensearch-quill-gauntlet:artifact-object:v6\0";
 const HASH_DOMAIN_V7: &[u8] = b"frankensearch-quill-gauntlet:artifact-object:v7\0";
+const HASH_DOMAIN_V8: &[u8] = b"frankensearch-quill-gauntlet:artifact-object:v8\0";
 const PRODUCER_BUILD_IDENTITY_V2_HASH_DOMAIN: &[u8] =
     b"frankensearch-quill-gauntlet:producer-build-identity:v2\0";
 const PRODUCER_BUILD_IDENTITY_V2_SCHEMA_VERSION: u32 = 2;
@@ -790,7 +807,9 @@ impl ArtifactObject {
             4 => Err(GauntletError::InvalidContract {
                 reason: "reserved pre-policy artifact v4 has no trust classification".to_owned(),
             }),
-            6 | ARTIFACT_OBJECT_V7_SCHEMA_VERSION => Ok(ArtifactTrustCeiling::IntegrityOnly),
+            6 | ARTIFACT_OBJECT_V7_SCHEMA_VERSION | ARTIFACT_OBJECT_V8_SCHEMA_VERSION => {
+                Ok(ArtifactTrustCeiling::IntegrityOnly)
+            }
             schema_version => Err(GauntletError::InvalidContract {
                 reason: format!(
                     "artifact object schema version {schema_version} has no trust classification"
@@ -910,7 +929,7 @@ impl ArtifactObject {
                 reason: "artifact trust ceiling does not match its schema".to_owned(),
             });
         }
-        if self.canonicalization_version != ARTIFACT_OBJECT_V7_CANONICALIZATION_VERSION {
+        if self.canonicalization_version != ARTIFACT_OBJECT_V8_CANONICALIZATION_VERSION {
             return Err(GauntletError::InvalidContract {
                 reason: "artifact canonicalization contract is invalid".to_owned(),
             });
@@ -1007,7 +1026,7 @@ impl ArtifactObject {
             &self.comparison.subject,
             &self.comparison.oracle,
         )?;
-        let recomputed = compare_observations_stored_v7(
+        let recomputed = compare_observations_stored_v8(
             self.comparison.subject.clone(),
             self.comparison.oracle.clone(),
             self.comparator_config,
@@ -1097,7 +1116,7 @@ impl ArtifactObject {
             })?;
         Ok(ArtifactDivergenceBinding {
             object_schema_version: self.object_schema_version,
-            object_hash_scheme: OBJECT_HASH_SCHEME_V7_SHA256,
+            object_hash_scheme: OBJECT_HASH_SCHEME_V8_SHA256,
             object_hash: self.object_hash()?,
             producer_identity_sha256: self.producer_build_identity.identity_hash()?,
             oracle_dependency_identity_sha256: contract.identity_sha256()?,
@@ -2557,7 +2576,7 @@ impl IntegrityCheckedCampaign {
     }
 }
 
-/// Load the immutable `CampaignReport` V7 replay receipt shipped with this crate.
+/// Load the immutable `CampaignReport` V8 replay receipt shipped with this crate.
 ///
 /// This diagnostic receipt is read from compiled-in bytes, rather than
 /// regenerated from the caller's checkout. The loader checks both the fixture
@@ -2566,9 +2585,9 @@ impl IntegrityCheckedCampaign {
 /// # Errors
 ///
 /// Returns an error if the embedded bytes, their canonical JSON encoding, or
-/// their `CampaignReport` V7 identity do not match the pinned receipt.
-pub fn pinned_campaign_report_v7() -> Result<IntegrityCheckedCampaign, GauntletError> {
-    let report = crate::runner::load_pinned_campaign_report_v7()?;
+/// their `CampaignReport` V8 identity do not match the pinned receipt.
+pub fn pinned_campaign_report_v8() -> Result<IntegrityCheckedCampaign, GauntletError> {
+    let report = crate::runner::load_pinned_campaign_report_v8()?;
     report.validate_contract()?;
     Ok(IntegrityCheckedCampaign { report })
 }
@@ -3451,6 +3470,12 @@ fn hash_object_bytes(bytes: &[u8], schema_version: u32) -> Result<String, Gauntl
             hasher.update(bytes);
             Ok(lower_hex(&hasher.finalize()))
         }
+        8 => {
+            let mut hasher = Sha256::new();
+            hasher.update(HASH_DOMAIN_V8);
+            hasher.update(bytes);
+            Ok(lower_hex(&hasher.finalize()))
+        }
         _ => Err(GauntletError::InvalidContract {
             reason: format!(
                 "artifact object schema version {schema_version} has no registered hash domain"
@@ -3461,7 +3486,7 @@ fn hash_object_bytes(bytes: &[u8], schema_version: u32) -> Result<String, Gauntl
 
 fn validate_stored_object_schema(schema_version: u32) -> Result<(), String> {
     match schema_version {
-        ARTIFACT_OBJECT_V7_SCHEMA_VERSION => Ok(()),
+        ARTIFACT_OBJECT_V8_SCHEMA_VERSION => Ok(()),
         1..=3 => Err(format!(
             "legacy artifact v{schema_version} lacks the current total lexical contract and is non-admissible; rerun the campaign"
         )),
@@ -3475,6 +3500,10 @@ fn validate_stored_object_schema(schema_version: u32) -> Result<(), String> {
         ),
         6 => Err(
             "artifact v6 provides self-consistency integrity only and no durable role/admission authority; rerun with the current contract"
+                .to_owned(),
+        ),
+        ARTIFACT_OBJECT_V7_SCHEMA_VERSION => Err(
+            "artifact v7 predates the stored oracle-blame comparator input and is read-only integrity evidence; rerun under the current contract"
                 .to_owned(),
         ),
         _ => Err(format!(
@@ -3504,10 +3533,10 @@ pub fn classify_campaign_report_schema(
             Ok(SerializedSchemaDisposition::UnauthenticatedLegacy { schema_version })
         }
         schema_version @ 4 => Ok(SerializedSchemaDisposition::ReservedRejected { schema_version }),
-        schema_version @ 6 => {
+        schema_version @ (6 | crate::runner::CAMPAIGN_REPORT_V7_SCHEMA_VERSION) => {
             Ok(SerializedSchemaDisposition::LegacyIntegrityCeiling { schema_version })
         }
-        schema_version @ crate::runner::CAMPAIGN_REPORT_V7_SCHEMA_VERSION => {
+        schema_version @ crate::runner::CAMPAIGN_REPORT_V8_SCHEMA_VERSION => {
             Ok(SerializedSchemaDisposition::CurrentIntegrityContractCandidate { schema_version })
         }
         schema_version => Err(GauntletError::InvalidPreparedArtifact {
@@ -3536,10 +3565,10 @@ pub fn classify_artifact_object_schema(
             Ok(SerializedSchemaDisposition::UnauthenticatedLegacy { schema_version })
         }
         schema_version @ 4 => Ok(SerializedSchemaDisposition::ReservedRejected { schema_version }),
-        schema_version @ 6 => {
+        schema_version @ (6 | ARTIFACT_OBJECT_V7_SCHEMA_VERSION) => {
             Ok(SerializedSchemaDisposition::LegacyIntegrityCeiling { schema_version })
         }
-        schema_version @ ARTIFACT_OBJECT_V7_SCHEMA_VERSION => {
+        schema_version @ ARTIFACT_OBJECT_V8_SCHEMA_VERSION => {
             Ok(SerializedSchemaDisposition::CurrentIntegrityContractCandidate { schema_version })
         }
         schema_version => Err(GauntletError::InvalidPreparedArtifact {
@@ -5339,7 +5368,7 @@ mod tests {
         // Campaign reports never had committed golden-byte fixtures. These
         // deliberately minimal probes exercise the duplicate-safe outer schema
         // envelope without pretending to be complete historical reports.
-        let historical_reports: [(&[u8], SerializedSchemaDisposition); 6] = [
+        let historical_reports: [(&[u8], SerializedSchemaDisposition); 7] = [
             (
             br#"{"schema_version":1,"run_id":"historical-v1","engines":{}}"#,
                 SerializedSchemaDisposition::UnauthenticatedLegacy { schema_version: 1 },
@@ -5363,6 +5392,10 @@ mod tests {
             (
             br#"{"schema_version":6,"run_id":"integrity-only-v6","admission":"built_in_evidence"}"#,
                 SerializedSchemaDisposition::LegacyIntegrityCeiling { schema_version: 6 },
+            ),
+            (
+            br#"{"schema_version":7,"run_id":"integrity-only-v7","admission":"built_in_evidence"}"#,
+                SerializedSchemaDisposition::LegacyIntegrityCeiling { schema_version: 7 },
             ),
         ];
         for (bytes, expected) in historical_reports {
@@ -5446,18 +5479,26 @@ mod tests {
         );
         assert_eq!(
             crate::runner::CAMPAIGN_REPORT_SCHEMA_VERSION,
-            crate::runner::CAMPAIGN_REPORT_V7_SCHEMA_VERSION,
-            "creation alias must not drift from the explicitly routed v7 generation",
+            crate::runner::CAMPAIGN_REPORT_V8_SCHEMA_VERSION,
+            "creation alias must not drift from the explicitly routed v8 generation",
         );
         assert_eq!(
-            classify_campaign_report_schema(br#"{"schema_version":7}"#)
+            classify_campaign_report_schema(br#"{"schema_version":8}"#)
                 .expect("current report candidate"),
-            SerializedSchemaDisposition::CurrentIntegrityContractCandidate { schema_version: 7 },
+            SerializedSchemaDisposition::CurrentIntegrityContractCandidate { schema_version: 8 },
         );
         assert_eq!(
-            classify_artifact_object_schema(br#"{"object_schema_version":7}"#)
+            classify_artifact_object_schema(br#"{"object_schema_version":8}"#)
                 .expect("current object candidate"),
-            SerializedSchemaDisposition::CurrentIntegrityContractCandidate { schema_version: 7 },
+            SerializedSchemaDisposition::CurrentIntegrityContractCandidate { schema_version: 8 },
+        );
+        // The report and object generations move together. A campaign whose
+        // report and artifacts named different generations would be evidence
+        // nothing could re-derive.
+        assert_eq!(
+            u32::from(crate::runner::CAMPAIGN_REPORT_SCHEMA_VERSION),
+            OBJECT_SCHEMA_VERSION,
+            "the report and artifact-object generations must not drift apart",
         );
 
         let invalid_reports: [&[u8]; 11] = [
@@ -6250,17 +6291,92 @@ mod tests {
         let mut object = sample_object();
         bind_producer_identity(&mut object, golden_producer_build_identity());
         let canonical = object.canonical_bytes().unwrap();
-        let golden_with_newline = include_bytes!("../fixtures/artifact-object-v7.json");
+        let golden_with_newline = include_bytes!("../fixtures/artifact-object-v8.json");
         let golden = golden_with_newline
             .strip_suffix(b"\n")
             .expect("golden fixture must end in exactly one LF");
         assert_eq!(
             object.object_hash().unwrap(),
-            "3ba1751438f70da4dfb41bdce755906602a4b7d3d3fcf499803919c70473c800"
+            "33293fc2e58848027bbbb29e4244ff54dea163bfbba945cc87e7d83ad9370d35"
         );
         assert_eq!(
             std::str::from_utf8(&canonical).expect("canonical object UTF-8"),
             std::str::from_utf8(golden).expect("golden object UTF-8")
+        );
+    }
+
+    /// The read-only half of the v7 -> v8 object migration (bd-bxya1).
+    ///
+    /// Both directions, because either alone is a different (weaker) claim.
+    ///
+    /// FORWARD: the retained v7 golden still decodes, still addresses to its
+    /// own pinned v7 digest under its own hash domain, and still re-derives its
+    /// stored report from its own stored observations under the frozen v7
+    /// comparator. That is what "read-only" has to mean if the archive is to
+    /// stay worth keeping.
+    ///
+    /// BACKWARD: it is refused for admission, naming its generation, and it
+    /// cannot be laundered into the current generation — stamping v8 on v7
+    /// bytes changes the address, so the substituted object does not match the
+    /// v8 golden and never addresses like it.
+    #[test]
+    fn the_retained_v7_object_still_loads_and_is_refused_for_admission() {
+        const RETAINED_V7: &[u8] = include_bytes!("../fixtures/artifact-object-v7.json");
+        let canonical = RETAINED_V7
+            .strip_suffix(b"\n")
+            .expect("retained v7 golden must end in exactly one LF");
+        let object: ArtifactObject =
+            serde_json::from_slice(canonical).expect("the retained v7 object must still decode");
+        assert_eq!(object.object_schema_version, 7);
+
+        // Its bytes have not moved, and it still addresses under the v7 domain.
+        assert_eq!(
+            object.canonical_bytes_unchecked().expect("v7 canonical bytes"),
+            canonical
+        );
+        assert_eq!(
+            hash_object_bytes(canonical, 7).expect("registered v7 hash domain"),
+            "3ba1751438f70da4dfb41bdce755906602a4b7d3d3fcf499803919c70473c800"
+        );
+
+        // It still re-derives its own report from its own observations under
+        // the frozen v7 comparator.
+        let replayed = crate::comparator::compare_observations_stored_v7(
+            object.comparison.subject.clone(),
+            object.comparison.oracle.clone(),
+            object.comparator_config,
+        )
+        .expect("a retained v7 object must replay under the frozen v7 comparator");
+        assert_eq!(replayed, object.comparison);
+
+        // And it is not admissible.
+        assert!(matches!(
+            object.validate(),
+            Err(GauntletError::InvalidContract { ref reason })
+                if reason.contains("artifact v7") && reason.contains("read-only")
+        ));
+        assert_eq!(
+            classify_artifact_object_schema(canonical).expect("typed v7 disposition"),
+            SerializedSchemaDisposition::LegacyIntegrityCeiling { schema_version: 7 },
+        );
+
+        // Restamping the version is not a migration: the address moves and the
+        // bytes are not the v8 golden.
+        let mut restamped = object;
+        restamped.object_schema_version = OBJECT_SCHEMA_VERSION;
+        let restamped_bytes = restamped
+            .canonical_bytes_unchecked()
+            .expect("restamped canonical bytes");
+        const V8_GOLDEN: &[u8] = include_bytes!("../fixtures/artifact-object-v8.json");
+        assert_ne!(
+            restamped_bytes,
+            V8_GOLDEN
+                .strip_suffix(b"\n")
+                .expect("v8 golden must end in exactly one LF")
+        );
+        assert_ne!(
+            hash_object_bytes(&restamped_bytes, OBJECT_SCHEMA_VERSION).expect("v8 hash domain"),
+            "3ba1751438f70da4dfb41bdce755906602a4b7d3d3fcf499803919c70473c800"
         );
     }
 

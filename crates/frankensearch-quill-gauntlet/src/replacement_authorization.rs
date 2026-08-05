@@ -354,7 +354,7 @@ mod tests {
     /// rank-envelope-only, which is exactly the object the acceptance says can
     /// never authorize.
     fn pinned_report() -> CampaignReport {
-        crate::runner::load_pinned_campaign_report_v7().expect("the pinned V7 campaign report")
+        crate::runner::load_pinned_campaign_report_v8().expect("the pinned V8 campaign report")
     }
 
     /// The pinned fixture repaired along every axis `from_campaign_report`

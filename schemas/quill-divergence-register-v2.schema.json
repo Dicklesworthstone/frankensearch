@@ -91,11 +91,32 @@
       "required": ["scheme", "object_schema_version", "digest"],
       "properties": {
         "scheme": {
-          "const": "frankensearch-quill-gauntlet/artifact-object/v7/sha256"
+          "enum": [
+            "frankensearch-quill-gauntlet/artifact-object/v7/sha256",
+            "frankensearch-quill-gauntlet/artifact-object/v8/sha256"
+          ]
         },
-        "object_schema_version": { "const": 7 },
+        "object_schema_version": { "enum": [7, 8] },
         "digest": { "$ref": "#/$defs/sha256" }
-      }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "scheme": {
+              "const": "frankensearch-quill-gauntlet/artifact-object/v7/sha256"
+            },
+            "object_schema_version": { "const": 7 }
+          }
+        },
+        {
+          "properties": {
+            "scheme": {
+              "const": "frankensearch-quill-gauntlet/artifact-object/v8/sha256"
+            },
+            "object_schema_version": { "const": 8 }
+          }
+        }
+      ]
     },
     "revision_set": {
       "type": "object",

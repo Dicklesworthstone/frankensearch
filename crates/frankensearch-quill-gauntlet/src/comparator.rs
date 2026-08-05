@@ -7025,12 +7025,36 @@ pub enum ScoreEpsilonReason {
     SummationAssociation,
 }
 
+/// Reviewed reason that attributes a membership divergence to the ORACLE.
+///
+/// This is an INPUT to the v8 comparator, not an edit of its output, and that
+/// is the whole point: `ArtifactObject` re-derives its stored report from its
+/// own stored observations, so an attribution applied after the fact makes the
+/// artifact unstorable. Carrying the decision in the stored configuration lets
+/// the identical report be re-derived from the identical evidence (bd-bxya1).
+///
+/// The reason is deliberately not evidence by itself. Whoever sets it must
+/// have proved the oracle is the failing side; the runner's three-gate blame
+/// test does that, and nothing else may set it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OracleBugReason {
+    /// The pinned oracle re-nests a boosted group's negation as a positive
+    /// alternative, so it fails to EXCLUDE and over-returns (DIV-009).
+    BoostedGroupNegationLowering,
+}
+
 /// Comparator configuration encoded without JSON floating-point ambiguity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComparatorConfig {
     pub score_epsilon_bits: u32,
     pub score_epsilon_reason: Option<ScoreEpsilonReason>,
+    /// Stored oracle-blame attribution. Part of the v8 object shape; a v7
+    /// object never carried it, which is why v8 exists at all. `default` keeps
+    /// historical fixtures decodable for their read-only canaries.
+    #[serde(default)]
+    pub oracle_bug_reason: Option<OracleBugReason>,
 }
 
 impl Default for ComparatorConfig {
@@ -7038,12 +7062,16 @@ impl Default for ComparatorConfig {
         Self {
             score_epsilon_bits: 0.0001_f32.to_bits(),
             score_epsilon_reason: None,
+            oracle_bug_reason: None,
         }
     }
 }
 
 impl ComparatorConfig {
     const V7_SCORE_EPSILON_BITS: u32 = 0.0001_f32.to_bits();
+    /// The pinned epsilon is UNCHANGED across the v7 -> v8 boundary. Named
+    /// separately so a later epsilon move cannot ride along on this bump.
+    const V8_SCORE_EPSILON_BITS: u32 = Self::V7_SCORE_EPSILON_BITS;
 
     /// Construct a comparator configuration.
     ///
@@ -7060,6 +7088,7 @@ impl ComparatorConfig {
         Ok(Self {
             score_epsilon_bits: score_epsilon.to_bits(),
             score_epsilon_reason: None,
+            oracle_bug_reason: None,
         })
     }
 
@@ -7076,8 +7105,8 @@ impl ComparatorConfig {
     }
 
     pub(crate) fn validate_contract(self) -> Result<(), GauntletError> {
-        self.validate_stored_v7()?;
-        if SCORE_EPSILON.to_bits() != Self::V7_SCORE_EPSILON_BITS {
+        self.validate_stored_v8()?;
+        if SCORE_EPSILON.to_bits() != Self::V8_SCORE_EPSILON_BITS {
             return Err(GauntletError::InvalidComparatorConfig {
                 reason: "current comparator epsilon changed without a schema-version bump"
                     .to_owned(),
@@ -7086,12 +7115,32 @@ impl ComparatorConfig {
         Ok(())
     }
 
+    /// Validate the frozen v7 stored configuration contract.
+    ///
+    /// v7 has no oracle-blame input, so a configuration carrying one is not a
+    /// v7 configuration and is refused here rather than silently ignored.
     pub(crate) fn validate_stored_v7(self) -> Result<(), GauntletError> {
+        if self.oracle_bug_reason.is_some() {
+            return Err(GauntletError::InvalidComparatorConfig {
+                reason: "stored v7 comparator configuration cannot carry an oracle-blame reason"
+                    .to_owned(),
+            });
+        }
         if self.score_epsilon_bits == Self::V7_SCORE_EPSILON_BITS {
             Ok(())
         } else {
             Err(GauntletError::InvalidComparatorConfig {
                 reason: "stored v7 score epsilon is outside its frozen contract".to_owned(),
+            })
+        }
+    }
+
+    pub(crate) fn validate_stored_v8(self) -> Result<(), GauntletError> {
+        if self.score_epsilon_bits == Self::V8_SCORE_EPSILON_BITS {
+            Ok(())
+        } else {
+            Err(GauntletError::InvalidComparatorConfig {
+                reason: "stored v8 score epsilon is outside its frozen contract".to_owned(),
             })
         }
     }
@@ -7202,17 +7251,61 @@ pub fn compare_observations(
     config: ComparatorConfig,
 ) -> Result<ComparisonReport, GauntletError> {
     config.validate_contract()?;
-    // Current creation is v7 today. A future comparator must add a new
-    // versioned implementation instead of modifying the frozen v7 path.
-    compare_observations_validated_v7(subject, oracle, config)
+    // Current creation is v8. A future comparator must add a new versioned
+    // implementation instead of modifying a frozen path.
+    compare_observations_validated_v8(subject, oracle, config)
 }
 
+/// Re-derive a stored v7 report from its own stored observations.
+///
+/// v7 objects are read-only from the v8 bump onward: they are not admissible
+/// evidence and nothing mints them, but an archived v7 artifact must still
+/// reproduce its own report or it was never self-consistent. That is what this
+/// entry point is for, and it is the frozen v7 path unchanged.
+///
+/// # Errors
+///
+/// Returns an error for an invalid stored v7 configuration or invalid
+/// observations.
 pub fn compare_observations_stored_v7(
     subject: EngineObservation,
     oracle: EngineObservation,
     config: ComparatorConfig,
 ) -> Result<ComparisonReport, GauntletError> {
     config.validate_stored_v7()?;
+    compare_observations_validated_v7(subject, oracle, config)
+}
+
+/// Re-derive a stored v8 report from its own stored observations.
+///
+/// # Errors
+///
+/// Returns an error for an invalid stored v8 configuration or invalid
+/// observations.
+pub fn compare_observations_stored_v8(
+    subject: EngineObservation,
+    oracle: EngineObservation,
+    config: ComparatorConfig,
+) -> Result<ComparisonReport, GauntletError> {
+    config.validate_stored_v8()?;
+    compare_observations_validated_v8(subject, oracle, config)
+}
+
+/// Artifact/report-v8 comparator implementation.
+///
+/// v8 is v7's classification plus one stored input: the reviewed oracle-blame
+/// attribution. The v7 body is REUSED rather than copied — the freeze forbids
+/// changing what v7 computes, not reading it — and v8 then applies whatever the
+/// stored configuration attributes. A configuration with no attribution is
+/// therefore bit-identical to v7 by construction, which is what makes the
+/// version bump provable on its own.
+///
+/// The attribution step lands in the wiring commit; until then this is v7.
+fn compare_observations_validated_v8(
+    subject: EngineObservation,
+    oracle: EngineObservation,
+    config: ComparatorConfig,
+) -> Result<ComparisonReport, GauntletError> {
     compare_observations_validated_v7(subject, oracle, config)
 }
 

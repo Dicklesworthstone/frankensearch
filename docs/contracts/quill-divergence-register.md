@@ -35,7 +35,11 @@ proof, review table, or flip-ready claim.
 stream retains:
 
 - the exact first-recorded gauntlet witness case and object address as
-  `{scheme: "frankensearch-quill-gauntlet/artifact-object/v7/sha256", object_schema_version: 7, digest: <64 lowercase hex>}`;
+  `{scheme: "frankensearch-quill-gauntlet/artifact-object/v<N>/sha256", object_schema_version: <N>, digest: <64 lowercase hex>}`.
+  Two generations are admitted, `N` in `{7, 8}`, and the scheme pins the version — a v7 scheme
+  carrying `object_schema_version: 8`, or the reverse, is refused. v7 addresses are RETAINED, not
+  reissued: the witnesses already in the ledger keep them and their bytes are unchanged, while a
+  fresh mint records a v8 address (bd-bxya1);
 - canonical producer-build identity SHA-256, oracle dependency-contract
   SHA-256, historical lexical-contract audit revision, corpus and query
   manifest SHA-256s, query-suite source kind, and query-source identity

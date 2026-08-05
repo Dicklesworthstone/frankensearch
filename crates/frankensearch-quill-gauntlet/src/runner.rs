@@ -22,7 +22,7 @@ use crate::artifact::{
     ArtifactDivergenceBinding, ArtifactExecutionRole, ArtifactLexicalContractEvidence,
     ArtifactObject, ArtifactOracleDependency, ArtifactStore, ArtifactStoreV4SourceBuildBinding,
     ArtifactStoreV4SourceBuildSnapshots, ArtifactTrustCeiling, CampaignArtifactContext,
-    GauntletProducerBuildIdentity, OBJECT_HASH_SCHEME_V7_SHA256,
+    GauntletProducerBuildIdentity, OBJECT_HASH_SCHEME_V7_SHA256, OBJECT_HASH_SCHEME_V8_SHA256,
 };
 use crate::comparator::{
     ComparatorConfig, ComparisonReport, ComparisonStatus, Divergence, DivergenceClass,
@@ -54,7 +54,10 @@ use crate::version_contract::oracle_version_contract;
 
 /// Schema version for deterministic campaign reports.
 pub const CAMPAIGN_REPORT_V7_SCHEMA_VERSION: u32 = 7;
-pub const CAMPAIGN_REPORT_SCHEMA_VERSION: u32 = CAMPAIGN_REPORT_V7_SCHEMA_VERSION;
+/// Current campaign-report generation, moved in lockstep with the artifact
+/// object it references (bd-bxya1). v7 reports are read-only from here.
+pub const CAMPAIGN_REPORT_V8_SCHEMA_VERSION: u32 = 8;
+pub const CAMPAIGN_REPORT_SCHEMA_VERSION: u32 = CAMPAIGN_REPORT_V8_SCHEMA_VERSION;
 /// Schema version for the append-only machine-readable Divergence Register.
 pub const DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION: u32 = 2;
 const LEGACY_DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION_V1: u32 = 1;
@@ -87,12 +90,29 @@ const LEXICAL_MISMATCH_SIGNATURE_DOMAIN: &[u8] =
 const LEXICAL_QUERY_CONTRACT_DOMAIN: &[u8] = b"frankensearch/quill/lexical-query-contract/v1\0";
 const LEXICAL_INDEX_IDENTITY_DOMAIN: &[u8] = b"frankensearch/quill/lexical-index-identity/v1\0";
 const CAMPAIGN_REPORT_V7_HASH_DOMAIN: &[u8] = b"frankensearch/quill/campaign-report/v7\0";
+const CAMPAIGN_REPORT_V8_HASH_DOMAIN: &[u8] = b"frankensearch/quill/campaign-report/v8\0";
+/// The v7 receipt, retained BYTE-IDENTICAL as read-only archive evidence.
+///
+/// Its address is still checkable under the v7 domain and its bytes have not
+/// moved; it is simply no longer admissible, the same way artifact v7 is.
 const PINNED_CAMPAIGN_REPORT_V7_BYTES: &[u8] =
     include_bytes!("../fixtures/campaign-report-v7.json");
 const PINNED_CAMPAIGN_REPORT_V7_FIXTURE_SHA256: &str =
     "62cf2484d04949589f8954ff661f2a2b8b633e3c6bda261d706355ea3060042d";
 const PINNED_CAMPAIGN_REPORT_V7_REPORT_SHA256: &str =
     "339ea20afd54901894b14243b92f57b687559b2806a9c837c313359ce9dbfb57";
+/// The current receipt: the v7 campaign's own evidence, re-encoded at v8.
+///
+/// Nothing about the campaign it records changed — the same cases, the same
+/// observations, the same dispositions — and it re-validates from its own
+/// contents under the current contract. What moved is the schema version and
+/// the comparator configuration's shape, which is exactly what the v8 bump is.
+const PINNED_CAMPAIGN_REPORT_V8_BYTES: &[u8] =
+    include_bytes!("../fixtures/campaign-report-v8.json");
+const PINNED_CAMPAIGN_REPORT_V8_FIXTURE_SHA256: &str =
+    "f8f34d86142cc6a004e157325c0277858643a0998673c7a583377fc5af02e52d";
+const PINNED_CAMPAIGN_REPORT_V8_REPORT_SHA256: &str =
+    "3e492706ccdc3f697ae3be57c7c6eb605cf8ac976d7ae045897a0ddce6d64850";
 const DIVERGENCE_REGISTRY_HASH_DOMAIN: &[u8] = b"frankensearch/quill/divergence-registry/v1\0";
 const DIVERGENCE_REGISTER_LEDGER_HASH_DOMAIN: &[u8] =
     b"frankensearch/quill/divergence-register-ledger/v2\0";
@@ -105,6 +125,7 @@ const MAX_DIVERGENCE_REVIEWER_BYTES: usize = 1_024;
 const MAX_DIVERGENCE_REGISTRY_TEXT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DIVERGENCE_REGISTER_MARKER_BYTES: usize = 256;
 const DIVERGENCE_ARTIFACT_OBJECT_SCHEMA_VERSION_V7: u32 = 7;
+const DIVERGENCE_ARTIFACT_OBJECT_SCHEMA_VERSION_V8: u32 = 8;
 const MAX_CAMPAIGN_POINTER_BYTES: usize = 1024 * 1024;
 const MAX_MISMATCH_GROUPS: usize = MAX_QUERY_CASES;
 const MAX_MISMATCH_TEXT_BYTES: usize = 64 * 1024 * 1024;
@@ -1313,11 +1334,18 @@ pub struct RedactedDivergenceDiagnostic {
     pub marker: String,
 }
 
-/// Exact domain-separated hash scheme admitted by Divergence Register v2.
+/// Exact domain-separated hash schemes admitted by Divergence Register v2.
+///
+/// Two generations are admitted, not one: the committed v7 witnesses stay
+/// byte-identical and keep addressing under their own domain, while a fresh
+/// mint records a v8 address. Each scheme pins exactly one object schema
+/// version — a v7 scheme carrying a v8 version, or the reverse, is refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DivergenceArtifactObjectHashScheme {
     #[serde(rename = "frankensearch-quill-gauntlet/artifact-object/v7/sha256")]
     ArtifactObjectV7Sha256,
+    #[serde(rename = "frankensearch-quill-gauntlet/artifact-object/v8/sha256")]
+    ArtifactObjectV8Sha256,
 }
 
 /// Typed content address of the exact first-recorded gauntlet witness object.
@@ -1643,12 +1671,24 @@ impl DivergenceArtifactObjectHashScheme {
     const fn as_str(self) -> &'static str {
         match self {
             Self::ArtifactObjectV7Sha256 => OBJECT_HASH_SCHEME_V7_SHA256,
+            Self::ArtifactObjectV8Sha256 => OBJECT_HASH_SCHEME_V8_SHA256,
+        }
+    }
+
+    /// The one object schema version this scheme may address.
+    const fn object_schema_version(self) -> u32 {
+        match self {
+            Self::ArtifactObjectV7Sha256 => DIVERGENCE_ARTIFACT_OBJECT_SCHEMA_VERSION_V7,
+            Self::ArtifactObjectV8Sha256 => DIVERGENCE_ARTIFACT_OBJECT_SCHEMA_VERSION_V8,
         }
     }
 }
 
 impl DivergenceArtifactObjectHash {
     /// Construct a v7 artifact identity from a lowercase SHA-256 digest.
+    ///
+    /// Read-only: v7 witnesses already in the committed ledger keep this
+    /// address. Nothing mints a v7 object any more.
     ///
     /// # Errors
     ///
@@ -1664,13 +1704,29 @@ impl DivergenceArtifactObjectHash {
         Ok(identity)
     }
 
+    /// Construct a current v8 artifact identity from a lowercase SHA-256
+    /// digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `digest` is not exactly 64 lowercase hexadecimal
+    /// characters.
+    pub fn v8_sha256(digest: impl Into<String>) -> Result<Self, GauntletError> {
+        let identity = Self {
+            scheme: DivergenceArtifactObjectHashScheme::ArtifactObjectV8Sha256,
+            object_schema_version: DIVERGENCE_ARTIFACT_OBJECT_SCHEMA_VERSION_V8,
+            digest: digest.into(),
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
     fn validate(&self) -> Result<(), GauntletError> {
-        if self.scheme.as_str() != OBJECT_HASH_SCHEME_V7_SHA256
-            || self.object_schema_version != DIVERGENCE_ARTIFACT_OBJECT_SCHEMA_VERSION_V7
+        if self.object_schema_version != self.scheme.object_schema_version()
             || !is_lower_sha256(&self.digest)
         {
             return Err(campaign_error(
-                "divergence artifact identity must be an exact v7 object-domain SHA-256 address",
+                "divergence artifact identity must be an exact object-domain SHA-256 address whose schema version matches its scheme",
             ));
         }
         Ok(())
@@ -2102,8 +2158,10 @@ impl DivergenceRegisterLedger {
     ///
     /// # Errors
     ///
-    /// Returns an error when the binding does not use the v7 artifact-object
-    /// hash scheme, or when the assembled observation fails validation.
+    /// Returns an error when the binding does not use the current v8
+    /// artifact-object hash scheme, or when the assembled observation fails
+    /// validation. Ingestion is a MINT, so it admits only the current
+    /// generation; the ledger still carries the v7 addresses already recorded.
     pub fn observation_from_binding(
         binding: &ArtifactDivergenceBinding,
         header: DivergenceRegisterEventHeader,
@@ -2114,9 +2172,9 @@ impl DivergenceRegisterLedger {
         narrative: DivergenceObservationNarrative,
         diagnostic: RedactedDivergenceDiagnostic,
     ) -> Result<DivergenceObservationEvent, GauntletError> {
-        if binding.object_hash_scheme != crate::artifact::OBJECT_HASH_SCHEME_V7_SHA256 {
+        if binding.object_hash_scheme != crate::artifact::OBJECT_HASH_SCHEME_V8_SHA256 {
             return Err(campaign_error(
-                "divergence ingestion requires the v7 artifact-object hash scheme",
+                "divergence ingestion requires the current v8 artifact-object hash scheme",
             ));
         }
 
@@ -2126,7 +2184,7 @@ impl DivergenceRegisterLedger {
             class,
             first_recorded_witness_case_id: Some(binding.fixture_id.clone()),
             first_recorded_witness_artifact_object: Some(DivergenceArtifactObjectHash {
-                scheme: DivergenceArtifactObjectHashScheme::ArtifactObjectV7Sha256,
+                scheme: DivergenceArtifactObjectHashScheme::ArtifactObjectV8Sha256,
                 object_schema_version: binding.object_schema_version,
                 digest: binding.object_hash.clone(),
             }),
@@ -2928,7 +2986,7 @@ impl Default for CampaignConfig {
 
 impl CampaignConfig {
     fn validate(&self) -> Result<(), GauntletError> {
-        self.validate_stored_v7()?;
+        self.validate_stored_v8()?;
         self.comparator_config.validate_contract()?;
         if u64::from(MAX_DOCUMENT_BYTES) != 2 * 1024 * 1024 || MAX_SNIPPET_CHARS != 1_000_000 {
             return Err(campaign_error(
@@ -2938,21 +2996,23 @@ impl CampaignConfig {
         Ok(())
     }
 
-    fn validate_stored_v7(&self) -> Result<(), GauntletError> {
-        const V7_MAX_DOCUMENT_BYTES: u64 = 2 * 1024 * 1024;
-        const V7_MAX_INDEX_BATCH_BYTES: u64 = V7_MAX_DOCUMENT_BYTES * 512;
-        const V7_MAX_SNIPPET_CHARS: u64 = 1_000_000;
+    /// The bounded campaign limits are UNCHANGED across the v7 -> v8 boundary;
+    /// only the comparator configuration's shape moved.
+    fn validate_stored_v8(&self) -> Result<(), GauntletError> {
+        const V8_MAX_DOCUMENT_BYTES: u64 = 2 * 1024 * 1024;
+        const V8_MAX_INDEX_BATCH_BYTES: u64 = V8_MAX_DOCUMENT_BYTES * 512;
+        const V8_MAX_SNIPPET_CHARS: u64 = 1_000_000;
 
-        self.comparator_config.validate_stored_v7()?;
+        self.comparator_config.validate_stored_v8()?;
         let confidence = f64::from_bits(self.posterior_confidence_bits);
         if self.index_batch_size == 0
             || self.index_batch_size > 100_000
             || self.index_batch_max_bytes == 0
-            || self.index_batch_max_bytes > V7_MAX_INDEX_BATCH_BYTES
+            || self.index_batch_max_bytes > V8_MAX_INDEX_BATCH_BYTES
             || self.tie_expansion_limit > 100_000
             || self
                 .snippet_max_chars
-                .is_some_and(|value| value > V7_MAX_SNIPPET_CHARS)
+                .is_some_and(|value| value > V8_MAX_SNIPPET_CHARS)
             || !confidence.is_finite()
             || !(0.0 < confidence && confidence < 1.0)
         {
@@ -3948,7 +4008,9 @@ impl CampaignReport {
             4 => Err(campaign_error(
                 "reserved pre-policy campaign report v4 has no trust classification",
             )),
-            6 | CAMPAIGN_REPORT_V7_SCHEMA_VERSION => Ok(ArtifactTrustCeiling::IntegrityOnly),
+            6 | CAMPAIGN_REPORT_V7_SCHEMA_VERSION | CAMPAIGN_REPORT_V8_SCHEMA_VERSION => {
+                Ok(ArtifactTrustCeiling::IntegrityOnly)
+            }
             schema_version => Err(campaign_error(format!(
                 "campaign report schema version {schema_version} has no trust classification"
             ))),
@@ -3987,7 +4049,12 @@ impl CampaignReport {
                 "campaign report v6 provides self-consistency integrity only, not admission authority; rerun under the current contract",
             ));
         }
-        if self.schema_version != CAMPAIGN_REPORT_V7_SCHEMA_VERSION {
+        if self.schema_version == CAMPAIGN_REPORT_V7_SCHEMA_VERSION {
+            return Err(campaign_error(
+                "campaign report v7 predates the stored oracle-blame comparator input and is read-only integrity evidence; rerun under the current contract",
+            ));
+        }
+        if self.schema_version != CAMPAIGN_REPORT_V8_SCHEMA_VERSION {
             return Err(campaign_error("campaign report schema version is invalid"));
         }
         if self.trust_ceiling != self.schema_trust_ceiling()? {
@@ -4001,7 +4068,7 @@ impl CampaignReport {
             ));
         }
         self.semantic_contract.validate()?;
-        self.config.validate_stored_v7()?;
+        self.config.validate_stored_v8()?;
         self.divergence_registry.validate()?;
         self.producer_build_identity.validate_stored_v2()?;
         if let Some(binding) = &self.v4_source_build_binding {
@@ -4275,7 +4342,7 @@ impl CampaignReport {
     /// Returns an error if validation or serialization fails.
     pub fn report_hash(&self) -> Result<String, GauntletError> {
         let mut hasher = Sha256::new();
-        hasher.update(CAMPAIGN_REPORT_V7_HASH_DOMAIN);
+        hasher.update(report_hash_domain(self.schema_version)?);
         hasher.update(self.canonical_bytes()?);
         Ok(lower_hex(&hasher.finalize()))
     }
@@ -4284,49 +4351,112 @@ impl CampaignReport {
     #[cfg(all(test, feature = "tantivy-oracle"))]
     pub(crate) fn report_hash_unchecked_fixture(&self) -> Result<String, GauntletError> {
         let mut hasher = Sha256::new();
-        hasher.update(CAMPAIGN_REPORT_V7_HASH_DOMAIN);
+        hasher.update(report_hash_domain(self.schema_version)?);
         hasher.update(self.canonical_bytes_unchecked()?);
         Ok(lower_hex(&hasher.finalize()))
     }
 }
 
-/// Load the immutable stored `CampaignReport` V7 historical fixture.
+/// Domain separation for the report address, keyed by the report's own
+/// generation so a v7 receipt and a v8 receipt can never collide.
+fn report_hash_domain(schema_version: u32) -> Result<&'static [u8], GauntletError> {
+    match schema_version {
+        CAMPAIGN_REPORT_V7_SCHEMA_VERSION => Ok(CAMPAIGN_REPORT_V7_HASH_DOMAIN),
+        CAMPAIGN_REPORT_V8_SCHEMA_VERSION => Ok(CAMPAIGN_REPORT_V8_HASH_DOMAIN),
+        schema_version => Err(campaign_error(format!(
+            "campaign report schema version {schema_version} has no registered hash domain"
+        ))),
+    }
+}
+
+/// Load the immutable stored `CampaignReport` V8 historical fixture.
 ///
 /// The fixture is a diagnostic receipt, not a live-build template. Its exact
 /// canonical payload has one terminal LF in source control; the report bytes
 /// intentionally exclude that presentation LF.
 ///
+/// It records the same campaign the retained v7 receipt does — same cases,
+/// same observations, same dispositions — re-encoded at the current schema.
+/// Nothing was re-measured, and nothing needed to be: the classification a v8
+/// comparator produces with no oracle-blame attribution is v7's by
+/// construction. See [`load_read_only_campaign_report_v7`] for the archive
+/// half.
+///
 /// # Errors
 ///
 /// Returns an error if the checked-in bytes, canonical report encoding, or
 /// domain-separated report identity differs from the pinned historical object.
-pub fn load_pinned_campaign_report_v7() -> Result<CampaignReport, GauntletError> {
-    load_pinned_campaign_report_v7_bytes(PINNED_CAMPAIGN_REPORT_V7_BYTES)
+pub fn load_pinned_campaign_report_v8() -> Result<CampaignReport, GauntletError> {
+    load_pinned_campaign_report_v8_bytes(PINNED_CAMPAIGN_REPORT_V8_BYTES)
 }
 
-fn load_pinned_campaign_report_v7_bytes(bytes: &[u8]) -> Result<CampaignReport, GauntletError> {
+fn load_pinned_campaign_report_v8_bytes(bytes: &[u8]) -> Result<CampaignReport, GauntletError> {
     let canonical = bytes.strip_suffix(b"\n").ok_or_else(|| {
-        campaign_error("pinned CampaignReport V7 fixture must end in exactly one LF")
+        campaign_error("pinned CampaignReport V8 fixture must end in exactly one LF")
     })?;
     if canonical.ends_with(b"\n") {
         return Err(campaign_error(
-            "pinned CampaignReport V7 fixture must not contain multiple terminal LFs",
+            "pinned CampaignReport V8 fixture must not contain multiple terminal LFs",
         ));
     }
-    if lower_hex(&Sha256::digest(bytes)) != PINNED_CAMPAIGN_REPORT_V7_FIXTURE_SHA256 {
+    if lower_hex(&Sha256::digest(bytes)) != PINNED_CAMPAIGN_REPORT_V8_FIXTURE_SHA256 {
         return Err(campaign_error(
-            "pinned CampaignReport V7 fixture bytes differ from their sealed SHA-256",
+            "pinned CampaignReport V8 fixture bytes differ from their sealed SHA-256",
         ));
     }
     let report = serde_json::from_slice::<CampaignReport>(canonical)?;
     if report.canonical_bytes()? != canonical {
         return Err(campaign_error(
-            "pinned CampaignReport V7 bytes are not the report canonical encoding",
+            "pinned CampaignReport V8 bytes are not the report canonical encoding",
         ));
     }
-    if report.report_hash()? != PINNED_CAMPAIGN_REPORT_V7_REPORT_SHA256 {
+    if report.report_hash()? != PINNED_CAMPAIGN_REPORT_V8_REPORT_SHA256 {
         return Err(campaign_error(
-            "pinned CampaignReport V7 report identity differs from its sealed SHA-256",
+            "pinned CampaignReport V8 report identity differs from its sealed SHA-256",
+        ));
+    }
+    Ok(report)
+}
+
+/// Prove the retained v7 receipt is still exactly the bytes it always was.
+///
+/// This is the read-only half of the v7 -> v8 migration: the archived receipt
+/// still decodes, still canonicalizes to its own committed bytes, and still
+/// addresses under its own v7 domain — while [`CampaignReport::validate_contract`]
+/// refuses it for admission. A loader that granted admission would make "read
+/// only" a comment rather than a property.
+///
+/// # Errors
+///
+/// Returns an error if the retained bytes, their canonical encoding, or their
+/// v7 identity have moved.
+pub fn load_read_only_campaign_report_v7() -> Result<CampaignReport, GauntletError> {
+    let bytes = PINNED_CAMPAIGN_REPORT_V7_BYTES;
+    let canonical = bytes.strip_suffix(b"\n").ok_or_else(|| {
+        campaign_error("retained CampaignReport V7 fixture must end in exactly one LF")
+    })?;
+    if lower_hex(&Sha256::digest(bytes)) != PINNED_CAMPAIGN_REPORT_V7_FIXTURE_SHA256 {
+        return Err(campaign_error(
+            "retained CampaignReport V7 fixture bytes differ from their sealed SHA-256",
+        ));
+    }
+    let report = serde_json::from_slice::<CampaignReport>(canonical)?;
+    if report.schema_version != CAMPAIGN_REPORT_V7_SCHEMA_VERSION {
+        return Err(campaign_error(
+            "retained CampaignReport V7 fixture is not a v7 report",
+        ));
+    }
+    if report.canonical_bytes_unchecked()? != canonical {
+        return Err(campaign_error(
+            "retained CampaignReport V7 bytes are not the report canonical encoding",
+        ));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(report_hash_domain(CAMPAIGN_REPORT_V7_SCHEMA_VERSION)?);
+    hasher.update(canonical);
+    if lower_hex(&hasher.finalize()) != PINNED_CAMPAIGN_REPORT_V7_REPORT_SHA256 {
+        return Err(campaign_error(
+            "retained CampaignReport V7 identity differs from its sealed SHA-256",
         ));
     }
     Ok(report)
@@ -10152,7 +10282,7 @@ mod tests {
     fn ingestion_binding() -> ArtifactDivergenceBinding {
         ArtifactDivergenceBinding {
             object_schema_version: crate::artifact::OBJECT_SCHEMA_VERSION,
-            object_hash_scheme: crate::artifact::OBJECT_HASH_SCHEME_V7_SHA256,
+            object_hash_scheme: crate::artifact::OBJECT_HASH_SCHEME_V8_SHA256,
             object_hash: "1".repeat(64),
             producer_identity_sha256: "2".repeat(64),
             oracle_dependency_identity_sha256: "3".repeat(64),
@@ -16424,15 +16554,15 @@ mod tests {
     }
 
     #[test]
-    fn pinned_campaign_report_v7_is_exact_and_rejects_regeneration() {
-        let report = crate::artifact::pinned_campaign_report_v7()
-            .expect("load pinned CampaignReport V7")
+    fn pinned_campaign_report_v8_is_exact_and_rejects_regeneration() {
+        let report = crate::artifact::pinned_campaign_report_v8()
+            .expect("load pinned CampaignReport V8")
             .report()
             .clone();
-        assert_eq!(report.schema_version, CAMPAIGN_REPORT_V7_SCHEMA_VERSION);
+        assert_eq!(report.schema_version, CAMPAIGN_REPORT_V8_SCHEMA_VERSION);
         assert_eq!(
             report.report_hash().expect("pinned report hash"),
-            PINNED_CAMPAIGN_REPORT_V7_REPORT_SHA256
+            PINNED_CAMPAIGN_REPORT_V8_REPORT_SHA256
         );
 
         let mut regenerated = report.canonical_bytes().expect("pinned canonical report");
@@ -16440,8 +16570,45 @@ mod tests {
         let mut altered_fixture = regenerated;
         altered_fixture.push(b'\n');
         assert!(
-            load_pinned_campaign_report_v7_bytes(&altered_fixture).is_err(),
+            load_pinned_campaign_report_v8_bytes(&altered_fixture).is_err(),
             "a regenerated or otherwise mismatched report must not replace the pinned fixture"
+        );
+    }
+
+    /// The read-only half of the v7 -> v8 report migration (bd-bxya1).
+    ///
+    /// Two directions, both required. The retained v7 receipt must still LOAD —
+    /// same bytes, same canonical encoding, same v7 address — and it must NOT
+    /// be admissible under the current contract. A migration that only proved
+    /// the first would let a stale generation keep authority; one that only
+    /// proved the second would be indistinguishable from having lost the
+    /// archive.
+    #[test]
+    fn the_retained_v7_report_still_loads_and_is_refused_for_admission() {
+        let archived =
+            load_read_only_campaign_report_v7().expect("the retained v7 receipt must still load");
+        assert_eq!(archived.schema_version, CAMPAIGN_REPORT_V7_SCHEMA_VERSION);
+
+        let error = archived
+            .validate_contract()
+            .expect_err("a v7 report must not be admissible under the v8 contract");
+        let GauntletError::InvalidCampaign { reason } = error else {
+            panic!("a stale report generation must fail as an invalid campaign");
+        };
+        assert!(
+            reason.contains("v7") && reason.contains("read-only"),
+            "the refusal must name the generation and its read-only status: {reason}"
+        );
+
+        // The two generations address under different domains, so a v7 receipt
+        // can never be mistaken for the v8 one even at identical content.
+        assert_ne!(
+            PINNED_CAMPAIGN_REPORT_V7_REPORT_SHA256,
+            PINNED_CAMPAIGN_REPORT_V8_REPORT_SHA256
+        );
+        assert_ne!(
+            report_hash_domain(CAMPAIGN_REPORT_V7_SCHEMA_VERSION).expect("v7 domain"),
+            report_hash_domain(CAMPAIGN_REPORT_V8_SCHEMA_VERSION).expect("v8 domain")
         );
     }
 

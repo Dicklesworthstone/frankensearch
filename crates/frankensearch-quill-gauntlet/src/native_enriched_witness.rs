@@ -3363,8 +3363,8 @@ mod tests {
 
     /// The pinned fixture repaired along every axis the witness gates.
     fn accepted_candidate_report() -> crate::runner::CampaignReport {
-        let mut report = crate::runner::load_pinned_campaign_report_v7()
-            .expect("the pinned V7 campaign report fixture");
+        let mut report = crate::runner::load_pinned_campaign_report_v8()
+            .expect("the pinned V8 campaign report fixture");
         report.lexical_coverage = crate::runner::CampaignLexicalCoverageSummary::CoreLexicalV3 {
             subject: Box::new(crate::runner::LexicalSideCoverageCounts::default()),
             oracle: Box::new(crate::runner::LexicalSideCoverageCounts::default()),
@@ -3383,8 +3383,8 @@ mod tests {
     /// rather than a hand-built straw man.
     #[test]
     fn the_real_pinned_campaign_report_is_rejected_although_it_passed() {
-        let report = crate::runner::load_pinned_campaign_report_v7()
-            .expect("the pinned V7 campaign report fixture");
+        let report = crate::runner::load_pinned_campaign_report_v8()
+            .expect("the pinned V8 campaign report fixture");
         assert!(
             report.passed,
             "the fixture must really be a PASSED report, or this test proves nothing"

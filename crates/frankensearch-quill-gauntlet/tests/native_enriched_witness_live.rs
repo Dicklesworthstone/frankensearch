@@ -610,7 +610,7 @@ fn an_inadmissible_enriched_receipt_can_never_authorize_a_replacement() {
     };
     use frankensearch_quill_gauntlet::{
         CampaignContractModeV1, CampaignLexicalCoverageSummary, LexicalSideCoverageCounts,
-        SemanticContract, load_pinned_campaign_report_v7, observe_live_quill_cancellation_receipt,
+        SemanticContract, load_pinned_campaign_report_v8, observe_live_quill_cancellation_receipt,
     };
 
     asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -670,7 +670,7 @@ fn an_inadmissible_enriched_receipt_can_never_authorize_a_replacement() {
         // fixture is repaired along exactly the axes from_campaign_report
         // gates, and its producer revision is overridden to the candidate this
         // run actually observed.
-        let mut core = load_pinned_campaign_report_v7().expect("pinned V7 campaign report");
+        let mut core = load_pinned_campaign_report_v8().expect("pinned V8 campaign report");
         core.lexical_coverage = CampaignLexicalCoverageSummary::CoreLexicalV3 {
             subject: Box::new(LexicalSideCoverageCounts::default()),
             oracle: Box::new(LexicalSideCoverageCounts::default()),
@@ -748,7 +748,7 @@ fn a_complete_admissible_bundle_authorizes_and_emits_its_grant() {
     };
     use frankensearch_quill_gauntlet::{
         CampaignContractModeV1, CampaignLexicalCoverageSummary, LexicalSideCoverageCounts,
-        SemanticContract, load_pinned_campaign_report_v7, observe_live_quill_cancellation_receipt,
+        SemanticContract, load_pinned_campaign_report_v8, observe_live_quill_cancellation_receipt,
     };
 
     asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -821,7 +821,7 @@ fn a_complete_admissible_bundle_authorizes_and_emits_its_grant() {
         // fixture is repaired along exactly the axes from_campaign_report
         // gates, and its producer revision is overridden to the candidate this
         // run actually observed.
-        let mut core = load_pinned_campaign_report_v7().expect("pinned V7 campaign report");
+        let mut core = load_pinned_campaign_report_v8().expect("pinned V8 campaign report");
         core.lexical_coverage = CampaignLexicalCoverageSummary::CoreLexicalV3 {
             subject: Box::new(LexicalSideCoverageCounts::default()),
             oracle: Box::new(LexicalSideCoverageCounts::default()),
