@@ -2303,10 +2303,14 @@ impl Grammar {
     fn parse_and(&mut self, depth: usize) -> Option<ParsedNode> {
         let mut nodes = Vec::new();
         let mut syntactic_operands = 1;
-        if let Some(mut node) = self.parse_unary(depth) {
-            if node.from_not && matches!(self.peek(), Some(LexToken::And(_))) {
-                wrap_not_for_and(&mut node);
-            }
+        // bd-quill-shipping-conformance-parse-split-w7bsu: a `NOT` operand of
+        // an explicit `AND` keeps the `MustNot` occurrence `parse_unary` gave
+        // it, so `NOT A AND B` lowers to `[(MustNot, A), (Must, B)]` and means
+        // "B but not A". It previously went through `wrap_not_for_and`, which
+        // re-wrapped it as a POSITIVE clause holding only a `MustNot` — a
+        // clause with no positive term, which matches nothing and emptied the
+        // whole conjunction. See the repair note on `parse_and` below.
+        if let Some(node) = self.parse_unary(depth) {
             nodes.push(node);
         }
         let mut explicit_and = false;
@@ -2321,10 +2325,7 @@ impl Grammar {
             }
             explicit_and = true;
             syntactic_operands += 1;
-            if let Some(mut node) = self.parse_unary(depth) {
-                if node.from_not {
-                    wrap_not_for_and(&mut node);
-                }
+            if let Some(node) = self.parse_unary(depth) {
                 nodes.push(node);
             }
         }
@@ -3024,17 +3025,18 @@ fn wrap_direct_negative_or_operand(node: &mut ParsedNode) {
     node.dedup_key = negative_boolean_dedup_key(dedup_key);
 }
 
-fn wrap_not_for_and(node: &mut ParsedNode) {
-    let dedup_key = take_syntax_key(&mut node.dedup_key);
-    let query = std::mem::replace(&mut node.query, Query::Empty);
-    node.query = Query::Boolean {
-        clauses: vec![BooleanClause::new(Occur::MustNot, query)],
-        operator: None,
-    };
-    node.occur = None;
-    node.from_not = false;
-    node.dedup_key = negative_boolean_dedup_key(dedup_key);
-}
+// `wrap_not_for_and` was REMOVED by
+// bd-quill-shipping-conformance-parse-split-w7bsu. It used to re-wrap a `NOT`
+// operand of an explicit `AND` into a positive clause holding only a `MustNot`,
+// mirroring tantivy 0.26.1's lowering of `A AND NOT B`. That lowering is the
+// defect bd-eeq0q measured: a clause with no positive term matches nothing, so
+// the entire conjunction came back empty. `combine_boolean` already honours
+// `node.occur`, and `parse_unary` already sets `MustNot` for a `NOT` operand,
+// so deleting the wrapper is the whole repair.
+//
+// `wrap_direct_negative_or_operand` is deliberately NOT removed: it handles the
+// `OR` side, where a bare negative operand really does need wrapping so it
+// cannot become a positive alternative.
 
 fn negative_boolean_dedup_key(child: SyntaxKey) -> SyntaxKey {
     SyntaxKey::Boolean(vec![(Some(Occur::MustNot), child)])

@@ -15805,22 +15805,29 @@ mod tests {
         });
     }
 
-    /// bd-eeq0q: Quill SHARES the oracle's `A AND NOT B` lowering, measured.
+    /// bd-quill-shipping-conformance-parse-split-w7bsu: Quill answers
+    /// `A AND NOT B` correctly, and now DIVERGES from the pinned oracle.
     ///
-    /// This pin is the reason the bd-eeq0q repair could land on the lexical
-    /// crate's shipping path WITHOUT a Divergence Register entry. The bead
-    /// posed the fork explicitly: if Quill returned `p2` here, repairing the
-    /// oracle's shipping side alone would have created a live cross-engine
-    /// MEMBERSHIP divergence. It does not — `wrap_not_for_and` (query.rs)
-    /// deliberately mirrors the same lowering, so both engines agree and no
-    /// Quill-versus-oracle comparison moves.
+    /// THE TRIPWIRE FIRED AS DESIGNED. This test previously asserted the
+    /// opposite — that Quill shared tantivy 0.26.1's lowering and returned
+    /// nothing — and its message said that the day Quill's path was repaired,
+    /// whoever did it "must register the divergence they have just created
+    /// rather than discover it in a campaign". That is what happened: removing
+    /// `wrap_not_for_and` (query.rs) turned this red, and DIV-010 was written
+    /// before the change landed.
     ///
-    /// It is therefore also the tripwire for the follow-up. The day Quill's
-    /// shipping path is repaired too, this test goes red and whoever does it
-    /// must register the divergence they have just created rather than
-    /// discover it in a campaign.
+    /// The assertions are inverted rather than deleted so the arc stays legible:
+    /// bd-eeq0q measured the agreement and could therefore repair the oracle's
+    /// SHIPPING path without a register entry; this bead broke the agreement
+    /// deliberately and paid for it with one.
+    ///
+    /// Quill is the measured SUBJECT and the gauntlet observes it through
+    /// `search_paginated`, the same public surface users call — so unlike
+    /// `frankensearch-lexical`, there is no second role here to keep
+    /// bit-faithful, and no shipping/conformance split to build. Repairing the
+    /// one path IS the repair.
     #[test]
-    fn quill_shares_the_oracle_and_not_lowering_so_no_divergence_exists_yet() {
+    fn quill_answers_and_not_correctly_and_diverges_from_the_pinned_oracle() {
         run_with_cx(|cx| async move {
             let index = QuillIndex::in_memory(deterministic_config()).expect("bd-eeq0q index");
             for (id, content) in [("p1", "alpha beta"), ("p2", "alpha gamma")] {
@@ -15847,24 +15854,40 @@ mod tests {
                 }
             };
 
-            // The spellings Quill already gets right.
+            // The spellings Quill always got right, unchanged by the repair.
             assert_eq!(ids("alpha NOT beta").await, vec!["p2".to_owned()]);
             assert_eq!(ids("alpha -beta").await, vec!["p2".to_owned()]);
 
-            // The shared defect. If any of these becomes ["p2"], Quill's
-            // shipping path has been repaired and a Divergence Register entry
-            // is now REQUIRED before the gauntlet meets this shape.
+            // Every AND-NOT spelling now means "must alpha, must not beta".
             for query in [
                 "alpha AND NOT beta",
                 "(alpha AND NOT beta)",
                 "(alpha AND NOT beta)^2",
+                "alpha AND NOT beta AND NOT delta",
             ] {
-                assert!(
-                    ids(query).await.is_empty(),
-                    "{query:?} changed on Quill; the oracle still returns nothing, so this is now \
-                     a cross-engine membership divergence and needs a register entry (bd-eeq0q)"
+                assert_eq!(
+                    ids(query).await,
+                    vec!["p2".to_owned()],
+                    "{query:?} must return A-minus-B on Quill"
                 );
             }
+
+            // The leading-NOT form is repaired by the same deletion: it used to
+            // go through the same wrapper from `parse_and`'s first operand.
+            assert_eq!(
+                ids("NOT beta AND alpha").await,
+                vec!["p2".to_owned()],
+                "a leading NOT under an explicit AND must exclude, not empty the conjunction"
+            );
+
+            // A purely negative conjunction still has no positive term to match,
+            // which is the same answer the oracle gives and is not part of this
+            // repair. Pinned so a later change to the OR/negative handling
+            // cannot silently turn exclusion-only queries into match-all.
+            assert!(
+                ids("NOT alpha AND NOT beta").await.is_empty(),
+                "an exclusion-only conjunction must still match nothing"
+            );
         });
     }
 

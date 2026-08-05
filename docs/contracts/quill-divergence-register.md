@@ -399,6 +399,70 @@ not this row. This row is the human projection of it.
 - Reviewer: owner ruling of 2026-08-05, recorded by `Claude-pane12`. Distinct from `bd-nqeb4`, which
   is a `PhraseScorer` panic on a negated absent phrase — different shape, different failure mode.
 
+### DIV-010: `A AND NOT B` matches nothing in tantivy 0.26.1; Quill now answers it correctly
+
+- Class: `RankMismatch` (MEMBERSHIP — the engines disagree about which documents match, so no
+  score-tolerance class can cover it)
+- First seen: 2026-08-05 · found while implementing bd-f20ye's shipping repair, filed as `bd-eeq0q`,
+  and made a DIVERGENCE by `bd-quill-shipping-conformance-parse-split-w7bsu`
+- Root cause: `A AND NOT B` lowers to
+  `Bool{[(Must, A), (Must, Bool{[(MustNot, B)], msm: 0})], msm: 0}`. The second `Must` operand is a
+  boolean holding only a `MustNot` clause, so it has no positive term, matches nothing, and empties
+  the whole conjunction. The same engine answers `A NOT B` and `A -B` correctly, so this is an
+  inconsistency inside one query language rather than a defensible reading of `AND NOT`.
+- THE ORDER OF EVENTS MATTERS, because it is what makes this entry honest. When `bd-eeq0q` measured
+  the shape, BOTH engines returned nothing: Quill's `wrap_not_for_and` (quill `query.rs`)
+  deliberately mirrored the oracle's lowering. There was therefore NO divergence, and no register
+  entry was due — `bd-eeq0q` repaired only `frankensearch-lexical`'s shipping path and left the
+  agreement pinned by a tripwire test. This bead then repaired Quill on purpose, which BROKE that
+  agreement and created the divergence recorded here. The entry is the price of the second repair,
+  not a discovery.
+- Measured, two documents `p1="alpha beta"`, `p2="alpha gamma"`:
+  `alpha NOT beta` → `[p2]` on both; `alpha -beta` → `[p2]` on both;
+  `alpha AND NOT beta` → `[p2]` on Quill and on the lexical SHIPPING path, `[]` on the
+  `oracle_observe_*` surface; `(alpha AND NOT beta)` and `(alpha AND NOT beta)^2` behave the same
+  way. `NOT beta AND alpha` is repaired by the same change. `NOT alpha AND NOT beta` still returns
+  nothing on both, because an exclusion-only conjunction has no positive term — that is agreement,
+  not a defect, and is pinned so a later change cannot silently turn it into match-all.
+- Consumer impact: before this repair, the most common negation spelling silently returned NOTHING on
+  both backends — no error, no warning, just an empty result for a query the user reasonably expects
+  to work. That is worse than a crash because nothing reports it. After it, both backends answer
+  correctly and only the pinned comparator retains the defect.
+- Fixture: executable regressions
+  `frankensearch_quill::index::tests::quill_answers_and_not_correctly_and_diverges_from_the_pinned_oracle`
+  (the former tripwire, inverted rather than deleted, so the arc from agreement to divergence stays
+  legible) and
+  `frankensearch_lexical::tests::and_not_returns_a_minus_b_on_shipping_while_the_oracle_stays_bit_faithful`
+  (shipping repaired, oracle surface still defective, quoted literal untouched).
+- Decision: **accept** — same equivalence law as DIV-009, which is the direct precedent.
+- Equivalence law and rationale: the oracle is a pinned **comparator**, not a semantics authority.
+  Quill is the measured SUBJECT and the gauntlet observes it through `search_paginated`, the same
+  public surface users call, so Quill has exactly ONE role and there is no shipping/conformance split
+  to build in it — a split would make the gauntlet measure something users never run, which is the
+  inverse of the fidelity it exists to provide. Repairing the one path is therefore both the
+  user-facing fix and the deliberate divergence. `frankensearch-lexical` keeps its two roles: its
+  shipping path is repaired (`repair_and_not`) and every `oracle_observe_*` caller stays bit-faithful
+  to Tantivy 0.26.1, so Quill continues to be measured against an unmoved target.
+- Scope of the divergence, stated exactly: Quill's `parse_and` no longer re-wraps a `NOT` operand of
+  an explicit `AND` into a positive clause; `wrap_not_for_and` is deleted and
+  `wrap_direct_negative_or_operand` is deliberately retained, because the `OR` side genuinely needs
+  that wrapping so a bare negative operand cannot become a positive alternative. No other shape moves:
+  the full `frankensearch-quill` lib suite is 560 passed / 0 failed across the change.
+- Enforced by planted negatives in BOTH directions: on the lexical side, disabling `repair_and_not`
+  reddens the shipping assertion and leaking it into `oracle_observe_query` reddens "the oracle must
+  still reproduce the tantivy 0.26.1 defect" (both run as red proofs under `bd-eeq0q`); on the Quill
+  side, the exclusion-only and leading-`NOT` cases are pinned beside the repaired forms so a broader
+  change to negative handling cannot pass by loosening them.
+- Machine record: no committed ledger event. This shape has not been observed by a live campaign
+  artifact, so there is nothing to ingest yet, and the same constraint DIV-009 records applies when
+  one appears — `DivergenceDisposition::Accepted` refuses a raw failure class, and the
+  default-profile lane emits `RankMismatch` without the `OracleBug` reclassification. The reviewed
+  accept above is the decision; making the machine record agree is the same named follow-up DIV-009
+  carries, and this entry does not claim it is done.
+- Reviewer: recorded by `BlueOriole` under the owner routing of 2026-08-05 that directed this repair.
+  No independent reviewer is claimed; an `accept` normally wants fresh eyes, and this row should be
+  read as reviewed-by-one until a second agent signs it off.
+
 ---
 
 *Cross-references: comparator classes implemented in the gauntlet kernel (bead e0.5); auto-triage feeding this ledger (bd-quill-duel-shrinker); statistical gates consuming per-class pass rates (bead e6.6); G2 exit requires this register complete over two consecutive nightly runs (bead e6.8).*
