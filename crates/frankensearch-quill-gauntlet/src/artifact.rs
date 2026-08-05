@@ -6331,7 +6331,7 @@ mod tests {
 
         // Its bytes have not moved, and it still addresses under the v7 domain.
         assert_eq!(
-            object.canonical_bytes_unchecked().expect("v7 canonical bytes"),
+            object.canonical_bytes().expect("v7 canonical bytes"),
             canonical
         );
         assert_eq!(
@@ -6365,7 +6365,7 @@ mod tests {
         let mut restamped = object;
         restamped.object_schema_version = OBJECT_SCHEMA_VERSION;
         let restamped_bytes = restamped
-            .canonical_bytes_unchecked()
+            .canonical_bytes()
             .expect("restamped canonical bytes");
         const V8_GOLDEN: &[u8] = include_bytes!("../fixtures/artifact-object-v8.json");
         assert_ne!(
