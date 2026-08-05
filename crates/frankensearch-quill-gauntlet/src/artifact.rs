@@ -963,8 +963,10 @@ impl ArtifactObject {
 
     fn validate_as(&self, generation: ArtifactGeneration) -> Result<(), GauntletError> {
         match generation {
-            ArtifactGeneration::Current => validate_stored_object_schema(self.object_schema_version)
-                .map_err(|reason| GauntletError::InvalidContract { reason })?,
+            ArtifactGeneration::Current => {
+                validate_stored_object_schema(self.object_schema_version)
+                    .map_err(|reason| GauntletError::InvalidContract { reason })?
+            }
             ArtifactGeneration::RetainedV7 => {
                 if self.object_schema_version != ARTIFACT_OBJECT_V7_SCHEMA_VERSION {
                     return Err(GauntletError::InvalidContract {
@@ -2349,6 +2351,36 @@ pub fn dependency_build_script_records_sha256(
     hasher.update(b"frankensearch.artifactstore.v4.dependency-build-script.v1\0");
     hasher.update(&bytes);
     Ok(lower_hex(&hasher.finalize()))
+}
+
+/// The dependency build-script collection as a Build snapshot input.
+///
+/// Carried as an INPUT of kind [`ArtifactStoreV4BuildInputKind::BuildScriptOutput`]
+/// rather than as a new field on the snapshot: inputs already flow into
+/// `identity_sha256`, so the collection binds the Build identity without a
+/// schema bump, and every retained snapshot keeps addressing exactly as it did.
+///
+/// # Errors
+///
+/// Returns [`GauntletError::InvalidObservation`] when the records cannot be
+/// canonically serialized.
+pub fn dependency_build_script_build_input(
+    records: &[ArtifactStoreV4DependencyBuildScriptRecord],
+) -> Result<ArtifactStoreV4BuildInput, GauntletError> {
+    let canonical_bytes =
+        serde_json::to_vec(records).map_err(|error| GauntletError::InvalidObservation {
+            reason: format!("could not canonicalize dependency build-script records: {error}"),
+        })?;
+    // Keyed alongside the existing narrowed dependency receipt
+    // (`build-script-output/dependency-availability`), which this completes:
+    // that one recorded WHETHER dependency scripts were observable, this one
+    // records WHAT they emitted.
+    Ok(ArtifactStoreV4BuildInput {
+        key: "build-script-output/dependency-execution-records".to_owned(),
+        kind: ArtifactStoreV4BuildInputKind::BuildScriptOutput,
+        sha256: lower_hex(&Sha256::digest(&canonical_bytes)),
+        canonical_bytes,
+    })
 }
 
 /// Every `cargo:rustc-env=` value this crate's build script emits, read back
@@ -5361,6 +5393,42 @@ mod tests {
         );
     }
 
+    /// The collection is BOUND INTO the Build snapshot identity, which is what
+    /// makes it part of F1's Source+Build claim rather than a digest sitting
+    /// beside it.
+    #[test]
+    fn artifactstore_v4_dependency_build_scripts_bind_the_build_identity() {
+        let records = collect_dependency_build_script_records(DEPENDENCY_BUILD_SCRIPT_CAPTURE)
+            .expect("the real capture must collect");
+        let input = dependency_build_script_build_input(&records).expect("build input");
+        assert_eq!(input.kind, ArtifactStoreV4BuildInputKind::BuildScriptOutput);
+        assert_eq!(
+            input.sha256,
+            lower_hex(&Sha256::digest(&input.canonical_bytes)),
+            "the input digest must bind its own canonical bytes"
+        );
+
+        let source_identity = "0".repeat(64);
+        let snapshot = ArtifactStoreV4BuildSnapshot::new(source_identity.clone(), vec![input])
+            .expect("snapshot with the dependency collection");
+
+        // MUTATE ONE DEPENDENCY EMISSION -> the Build identity moves. Without
+        // this the collector would be collected and then ignored, which is the
+        // failure mode a digest-beside-the-object always has.
+        let mutated = DEPENDENCY_BUILD_SCRIPT_CAPTURE.replace("wrap_proc_macro", "wrap_proc_macr0");
+        let mutated_records =
+            collect_dependency_build_script_records(&mutated).expect("mutated capture collects");
+        let mutated_snapshot = ArtifactStoreV4BuildSnapshot::new(
+            source_identity,
+            vec![dependency_build_script_build_input(&mutated_records).expect("build input")],
+        )
+        .expect("snapshot with the mutated collection");
+        assert_ne!(
+            snapshot.identity_sha256, mutated_snapshot.identity_sha256,
+            "a dependency build-script emission must change the Build snapshot identity"
+        );
+    }
+
     ///
     /// It runs anywhere — no hardware gate — because it compares source text to
     /// a compiled-in list, not a produced artifact.
@@ -6885,8 +6953,7 @@ mod tests {
         let restamped_address =
             hash_object_bytes(&restamped_bytes, OBJECT_SCHEMA_VERSION).expect("v8 hash domain");
         assert_eq!(
-            restamped_address,
-            "33293fc2e58848027bbbb29e4244ff54dea163bfbba945cc87e7d83ad9370d35",
+            restamped_address, "33293fc2e58848027bbbb29e4244ff54dea163bfbba945cc87e7d83ad9370d35",
             "a re-minted object addresses as the v8 object it now is"
         );
         assert_ne!(

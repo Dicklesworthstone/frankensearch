@@ -48,14 +48,17 @@ use thiserror::Error;
 pub use artifact::{
     ArtifactExecutionRole, ArtifactLexicalContractEvidence, ArtifactObject,
     ArtifactOracleDependency, ArtifactStore, ArtifactStoreV4BuildInput,
-    ArtifactStoreV4BuildInputKind, ArtifactStoreV4BuildSnapshot, ArtifactStoreV4SourceBuildBinding,
+    ArtifactStoreV4BuildInputKind, ArtifactStoreV4BuildSnapshot,
+    ArtifactStoreV4DependencyBuildScriptRecord, ArtifactStoreV4SourceBuildBinding,
     ArtifactStoreV4SourceBuildSnapshots, ArtifactStoreV4SourceEntry,
     ArtifactStoreV4SourceEntryKind, ArtifactStoreV4SourceInclusionReason,
     ArtifactStoreV4SourceSnapshot, ArtifactTrustCeiling, CANONICALIZATION_VERSION,
     CampaignArtifactContext, GauntletProducerBuildIdentity, GauntletProducerSourceVerification,
     IntegrityCheckedCampaign, OBJECT_SCHEMA_VERSION, PreparedArtifact, RUN_MANIFEST_SCHEMA_VERSION,
     RunManifest, SerializedSchemaDisposition, classify_artifact_object_schema,
-    classify_campaign_report_schema, pinned_campaign_report_v8,
+    classify_campaign_report_schema, collect_dependency_build_script_records,
+    dependency_build_script_build_input, dependency_build_script_records_sha256,
+    pinned_campaign_report_v8,
 };
 pub use campaign_contract::{
     BuiltInEvidenceBindingV1, CampaignCellEvidenceV1, CampaignCellKeyV1, CampaignContractModeV1,
