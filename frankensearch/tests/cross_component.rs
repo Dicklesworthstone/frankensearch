@@ -1289,3 +1289,116 @@ fn io_error_converts_to_search_error() {
     assert!(matches!(search_err, SearchError::Io(_)));
     assert!(search_err.to_string().contains("access denied"));
 }
+
+// ==== Four-engine composite generation receipts (bd-7hvtf) ====
+//
+// bd-z4zr3's acceptance says the join must be proven "from the REAL producers
+// -- FSVI witness, Quill descriptor, native HNSW receipt, and
+// GenerationManifest, over one document set", and notes that every join test in
+// the tree instead pairs real receipts with hand-built stand-ins for the other
+// roles, "which is exactly why the split went unnoticed". This module removes
+// the stand-ins one role at a time.
+//
+// SLICE 1 (this commit): the two roles that share one physical artifact. The
+// ANN graph is built from the SAME Arc<ValidatedFsviBytes> the vector receipt
+// witnesses, so agreement between them is a real property of one image rather
+// than a coincidence between two fixtures.
+//
+// This slice does NOT call ExactGenerationComponentsV1::admit -- that takes all
+// four roles and lexical is not Optional, so the join and its per-role drift
+// controls arrive with the Quill and metadata roles in slice 2.
+#[cfg(feature = "ann")]
+mod four_engine_generation_receipts {
+    use std::sync::Arc;
+
+    use frankensearch::index::exact_component_adapters::{
+        ann_component_receipt, vector_component_receipt,
+    };
+    use frankensearch::index::native_hnsw::{HnswParams, ValidatedNativeHnsw};
+    use frankensearch::index::{FsviV2IdentityBinding, ValidatedFsviBytes, VectorIndex};
+    use frankensearch_core::generation::{
+        ArtifactGenerationIdentityV1, CommitRange, EmbeddingIdentityBundleV1, QuantizationFormat,
+        SourceCheckpointV1,
+    };
+
+    /// One ordered document set, shared by every role.
+    ///
+    /// The identifiers sort in insertion order on purpose: the docset digest is
+    /// order-sensitive, so an engine that reordered live documents must not be
+    /// able to agree with the anchor by accident.
+    const DOCUMENTS: [&str; 3] = ["doc-alpha", "doc-beta", "doc-gamma"];
+
+    const VECTORS: [[f32; 4]; 3] = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ];
+
+    fn binding(sequence: u64, nonce: u8) -> FsviV2IdentityBinding {
+        let mut identity = EmbeddingIdentityBundleV1::explicit_test_model("7hvtf-model", 4);
+        identity.storage.format.clear();
+        identity.storage.format.push_str("fsvi-v2");
+        identity.storage.quantization = QuantizationFormat::F16;
+        identity.storage.endianness.clear();
+        identity.storage.endianness.push_str("little-endian");
+        let generation = ArtifactGenerationIdentityV1::new(sequence, [nonce; 16])
+            .expect("valid 7hvtf generation identity");
+        FsviV2IdentityBinding::new(generation, identity.freeze().expect("frozen identity"))
+            .expect("valid 7hvtf FSVI v2 binding")
+    }
+
+    /// Write and admit a real FSVI v2 image over the shared document set.
+    fn fsvi_owner(directory: &std::path::Path) -> Arc<ValidatedFsviBytes> {
+        let path = directory.join("current.fsvi");
+        let bound = binding(7, 0x7b);
+        let mut writer = VectorIndex::create_v2(&path, bound.clone()).expect("FSVI v2 writer");
+        for (id, vector) in DOCUMENTS.iter().zip(VECTORS.iter()) {
+            writer.write_record(id, vector).expect("write FSVI record");
+        }
+        writer.finish().expect("seal the FSVI image");
+        Arc::new(ValidatedFsviBytes::open_published(&path, &bound).expect("admit the sealed image"))
+    }
+
+    #[test]
+    fn the_vector_and_ann_roles_agree_because_they_witness_one_image() {
+        let directory = tempfile::tempdir().expect("7hvtf publication directory");
+        let owner = fsvi_owner(directory.path());
+        let checkpoint = SourceCheckpointV1::derive(&CommitRange { low: 1, high: 9 });
+
+        let vector = vector_component_receipt(owner.witness(), DOCUMENTS, checkpoint)
+            .expect("vector receipt from the real FSVI witness");
+
+        let graph =
+            ValidatedNativeHnsw::build(Arc::clone(&owner), HnswParams::default(), 0x7b_5eed)
+                .expect("native HNSW graph over the admitted owner");
+        let graph_receipt = graph
+            .save(&directory.path().join("current.fshnsw"))
+            .expect("save the graph and mint its receipt");
+        let ann = ann_component_receipt(&graph_receipt, DOCUMENTS, checkpoint)
+            .expect("ANN receipt from the real graph receipt");
+
+        assert_eq!(
+            vector.docset_digest, ann.docset_digest,
+            "two roles over one image and one ordered docset must agree on the digest"
+        );
+        assert_eq!(vector.source_checkpoint, ann.source_checkpoint);
+        assert_ne!(
+            vector.bytes.sha256, ann.bytes.sha256,
+            "the ANN component's identity is its own graph file, not the FSVI image -- binding it \
+             to the image would make a rebuilt graph indistinguishable from an unchanged one"
+        );
+
+        // Control: the digest agreement above is order-sensitive, so it cannot
+        // be an artefact of both roles hashing "the same three names in any
+        // order". Reversing the live document order for one role alone must
+        // move its digest away from the anchor's.
+        let mut reordered = DOCUMENTS;
+        reordered.reverse();
+        let reordered_ann = ann_component_receipt(&graph_receipt, reordered, checkpoint)
+            .expect("ANN receipt over a reordered docset");
+        assert_ne!(
+            reordered_ann.docset_digest, vector.docset_digest,
+            "a reordered live-document set must not produce the anchor's digest"
+        );
+    }
+}
