@@ -185,6 +185,7 @@ run_compile_lane() {
   echo "[feature-matrix][$lane] $(lane_compile_command "$lane")"
   case "$lane" in
     default) run_cargo check -p frankensearch --all-targets ;;
+    both) run_cargo check -p frankensearch --all-targets --no-default-features --features hash,lexical,lexical-tantivy ;;
     quill) run_cargo check -p frankensearch --lib --no-default-features --features quill ;;
     lexical-tantivy) run_cargo check -p frankensearch --lib --no-default-features --features lexical-tantivy ;;
     cass-compat) run_cargo check -p frankensearch --lib --no-default-features --features cass-compat ;;
@@ -194,6 +195,10 @@ run_compile_lane() {
     durable) run_cargo check -p frankensearch --lib --no-default-features --features durable ;;
     full) run_cargo check -p frankensearch --lib --no-default-features --features full ;;
     full-fts5) run_cargo check -p frankensearch --lib --no-default-features --features full-fts5 ;;
+    # FAIL CLOSED. Without this arm a lane listed in REQUIRED_LANES but never
+    # given a compile arm runs NOTHING and reports success, which is how the
+    # `both` lane shipped as a silent no-op.
+    *) echo "ERROR: feature lane '$lane' has no compile arm" >&2; return 1 ;;
   esac
 }
 
@@ -203,6 +208,7 @@ run_behavior_lane() {
   echo "[feature-matrix][$lane] $(lane_behavior_command "$lane")"
   case "$lane" in
     default) output="$(run_cargo test -p frankensearch --lib feature_matrix_smoke::default_lane_behavior -- --exact --nocapture 2>&1)" ;;
+    both) output="$(run_cargo test -p frankensearch --lib --no-default-features --features hash,lexical,lexical-tantivy feature_matrix_smoke::both_backends_select_deterministically -- --exact --nocapture 2>&1)" ;;
     quill) output="$(run_cargo test -p frankensearch --lib --no-default-features --features quill feature_matrix_smoke::quill_lane_behavior -- --exact --nocapture 2>&1)" ;;
     lexical-tantivy) output="$(run_cargo test -p frankensearch --lib --no-default-features --features lexical-tantivy feature_matrix_smoke::lexical_tantivy_lane_behavior -- --exact --nocapture 2>&1)" ;;
     cass-compat) output="$(run_cargo test -p frankensearch --lib --no-default-features --features cass-compat feature_matrix_smoke::cass_compat_lane_behavior -- --exact --nocapture 2>&1)" ;;
@@ -212,6 +218,9 @@ run_behavior_lane() {
     durable) output="$(run_cargo test -p frankensearch --lib --no-default-features --features durable feature_matrix_smoke::durable_lane_behavior -- --exact --nocapture 2>&1)" ;;
     full) output="$(run_cargo test -p frankensearch --lib --no-default-features --features full feature_matrix_smoke::full_lane_behavior -- --exact --nocapture 2>&1)" ;;
     full-fts5) output="$(run_cargo test -p frankensearch --lib --no-default-features --features full-fts5 feature_matrix_smoke::full_fts5_lane_behavior -- --exact --nocapture 2>&1)" ;;
+    # Same fail-closed reason as the compile case. Here the omission at least
+    # tripped `set -u` on the unset `output`, which is what surfaced the gap.
+    *) echo "ERROR: feature lane '$lane' has no behavior arm" >&2; return 1 ;;
   esac
   printf '%s\n' "$output"
   if [[ "$output" != *"test result: ok. 1 passed; 0 failed;"* ]]; then
