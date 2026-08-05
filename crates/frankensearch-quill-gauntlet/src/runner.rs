@@ -20800,10 +20800,47 @@ mod tests {
             marker: "<redacted:e68-live-lane-rank-mismatch>".to_owned(),
         };
 
+        // THE MINT APPENDS, IT DOES NOT REPLACE (bd-dxedq). This helper used to
+        // build a standalone two-event ledger, so the register it produced held
+        // this witness and nothing else -- which is why the committed register
+        // carried DIV-008 alone while DIV-009's reviewed accept sat in a mint
+        // nobody merged. One register has to carry both, or the enforced ledger
+        // and the prose register describe different worlds.
+        //
+        // Idempotent by construction: any previously appended events for THIS
+        // divergence are dropped before the freshly minted ones are appended,
+        // so a re-mint re-derives byte-identical events (every timestamp here
+        // is fixed) rather than accumulating duplicates -- which the validator
+        // would refuse anyway, since two active observations of one divergence
+        // collide on their mismatch signature.
+        let committed_register = DivergenceRegisterLedger::decode_json(
+            &std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(E68_LIVE_LEDGER_FIXTURE),
+            )
+            .expect("committed live divergence register"),
+        )
+        .expect("the committed register must decode and validate before anything appends to it");
+        let mut events = committed_register
+            .events
+            .iter()
+            .filter(|event| match event {
+                DivergenceRegisterEvent::Observation(observation) => {
+                    observation.divergence_id != E68_REFUSAL_DIVERGENCE_ID
+                }
+                DivergenceRegisterEvent::Disposition(disposition) => {
+                    disposition.divergence_id != E68_REFUSAL_DIVERGENCE_ID
+                }
+                DivergenceRegisterEvent::Prediction(_) => true,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let observation_sequence =
+            u64::try_from(events.len()).expect("register length fits u64") + 1;
+
         let observation = DivergenceRegisterLedger::observation_from_artifact(
             object,
             DivergenceRegisterEventHeader {
-                sequence: 1,
+                sequence: observation_sequence,
                 supersedes: None,
                 recorded_by: E68_RECORDED_BY.to_owned(),
                 recorded_at: E68_RECORDED_AT.to_owned(),
@@ -20846,7 +20883,7 @@ mod tests {
 
         let disposition = DivergenceDispositionEvent {
             header: DivergenceRegisterEventHeader {
-                sequence: 2,
+                sequence: observation_sequence + 1,
                 supersedes: None,
                 recorded_by: E68_RECORDED_BY.to_owned(),
                 recorded_at: E68_RECORDED_AT.to_owned(),
@@ -20872,14 +20909,16 @@ mod tests {
             },
         };
 
-        let ledger = DivergenceRegisterLedger::new(
-            E68_LIVE_REGISTER_ID,
-            vec![
-                DivergenceRegisterEvent::Observation(Box::new(observation)),
-                DivergenceRegisterEvent::Disposition(disposition),
-            ],
-        )
-        .expect("the ingested ledger must satisfy the v2 contract");
+        events.push(DivergenceRegisterEvent::Observation(Box::new(observation)));
+        events.push(DivergenceRegisterEvent::Disposition(disposition));
+        let ledger = DivergenceRegisterLedger::new(E68_LIVE_REGISTER_ID, events)
+            .expect("the ingested ledger must satisfy the v2 contract");
+        // The append is PROVED, not assumed: the successor check refuses any
+        // rewrite of what was already recorded, so a mint that quietly dropped
+        // or edited the other witness's history fails here rather than landing.
+        ledger
+            .validate_append_only_successor(&committed_register)
+            .expect("the minted register must only APPEND to the committed one");
         (ledger, mismatch_signatures)
     }
 
