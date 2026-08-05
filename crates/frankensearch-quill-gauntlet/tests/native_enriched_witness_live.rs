@@ -558,3 +558,132 @@ fn the_committed_expectations_hold_against_real_tantivy() {
         );
     });
 }
+
+/// bd-8nqz.4 slice 2: an INADMISSIBLE enriched receipt can never authorize a
+/// replacement, and the refusal must come from admissibility rather than from
+/// a hole elsewhere in the bundle.
+///
+/// This lives here rather than beside the validator because a REAL
+/// `VerifiedNativeEnrichedReceiptV1` cannot be minted from synthetic parts --
+/// it has a private field and no public constructor, so the only way to hold
+/// one is to assemble a real run and load it canonically. A unit test beside
+/// the validator could only have used a stand-in, which would prove nothing
+/// about the object the flip actually rests on.
+///
+/// The assertion is by REASON and is DETERMINED, not either/or: the expected
+/// refusal is selected by an observable property of the receipt's own
+/// producer, so exactly one outcome is pinned in any given environment.
+#[test]
+fn an_inadmissible_enriched_receipt_can_never_authorize_a_replacement() {
+    use frankensearch_quill_gauntlet::native_enriched_witness::{
+        AcceptedCandidateBindingV1, CapabilitySchemaArmV1, NativeEnrichedReceiptV1,
+        NativeEnrichedRunV1, observe_quill_capabilities, observe_quill_enrichments,
+        observe_quill_pages,
+    };
+    use frankensearch_quill_gauntlet::replacement_authorization::{
+        ReplacementEvidenceBundleV1, authorize,
+    };
+    use frankensearch_quill_gauntlet::{
+        CampaignContractModeV1, observe_live_quill_cancellation_receipt,
+    };
+
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let dir = tempfile::tempdir().expect("witness tempdir");
+        let quill = build_quill(&cx, dir.path()).await;
+
+        let mut capability_arms = Vec::new();
+        for arm in [
+            CapabilitySchemaArmV1::Positionless,
+            CapabilitySchemaArmV1::Positioned,
+        ] {
+            let index = QuillIndex::in_memory_with_schema(
+                arm.schema(),
+                QuillConfig {
+                    deterministic_ingest: true,
+                    max_ingest_shards: 1,
+                    ..QuillConfig::default()
+                },
+            )
+            .expect("build the capability index for this schema arm");
+            index
+                .index_documents(&cx, &fixture_documents())
+                .await
+                .expect("index the witness corpus into this schema arm");
+            index
+                .commit(&cx)
+                .await
+                .expect("commit the witness corpus in this schema arm");
+            capability_arms.push(index);
+        }
+
+        // A Quill-only run: exactly what the default feature lane can observe,
+        // and therefore not release evidence no matter how green it is.
+        let run = NativeEnrichedRunV1 {
+            observations: observe_quill_pages(&cx, &quill).expect("Quill pages"),
+            enriched_observations: observe_quill_enrichments(&cx, &quill)
+                .expect("Quill enrichments"),
+            capability_outcomes: observe_quill_capabilities(
+                &cx,
+                &capability_arms[0],
+                &capability_arms[1],
+            ),
+            both_engines_observed: false,
+        };
+        let receipt =
+            NativeEnrichedReceiptV1::assemble_for_this_build(&run).expect("assemble the receipt");
+        let address = receipt.receipt_hash().expect("address");
+        let bytes = serde_json::to_vec(&receipt).expect("canonical body");
+        let verified = NativeEnrichedReceiptV1::load_canonical(&bytes, &address)
+            .expect("a receipt this build produced must load");
+
+        // EVERY OTHER SLOT IS PRESENT AND VALID, which is what makes this a
+        // test of admissibility rather than of slot presence.
+        let candidate = receipt.producer.source_git_revision.clone();
+        let core = AcceptedCandidateBindingV1 {
+            candidate_source_revision: candidate.clone(),
+            contract_mode: CampaignContractModeV1::CoreLexicalV3,
+        };
+        let cass = AcceptedCandidateBindingV1 {
+            candidate_source_revision: candidate.clone(),
+            contract_mode: CampaignContractModeV1::CassTotalV1,
+        };
+        let cancellation = observe_live_quill_cancellation_receipt(&cx)
+            .await
+            .expect("observe the live Quill cancellation matrix");
+        let census = "0".repeat(64);
+
+        let bundle = ReplacementEvidenceBundleV1 {
+            candidate_source_revision: &candidate,
+            core_lexical_v3: Some(&core),
+            cass_total: Some(&cass),
+            native_enriched: Some(&verified),
+            cancellation: Some(&cancellation),
+            divergence_census_sha256: Some(&census),
+        };
+
+        let error = authorize(&bundle)
+            .expect_err("a single-engine receipt must never authorize a replacement")
+            .to_string();
+
+        if receipt.producer.source_git_dirty {
+            assert!(
+                error.contains("dirty"),
+                "a dirty producer must refuse for provenance, got: {error}"
+            );
+        } else {
+            assert!(
+                error.contains("single-engine"),
+                "a clean single-engine receipt must refuse for coverage, got: {error}"
+            );
+        }
+
+        // In BOTH environments the refusal must be an ADMISSIBILITY refusal.
+        // Without this the test would pass in a tree where some unrelated slot
+        // had quietly become unsatisfiable -- the exact masking defect the
+        // validator's own check ordering was repaired for.
+        assert!(
+            !error.contains("missing required evidence"),
+            "the refusal must come from admissibility, not a missing slot: {error}"
+        );
+    });
+}
