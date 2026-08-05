@@ -29,9 +29,7 @@ use serde::{Deserialize, Serialize};
 use crate::GauntletError;
 use crate::campaign_contract::CampaignContractModeV1;
 use crate::comparator::QuillCancellationReceipt;
-use crate::native_enriched_witness::{
-    AcceptedCandidateBindingV1, VerifiedNativeEnrichedReceiptV1,
-};
+use crate::native_enriched_witness::{AcceptedCandidateBindingV1, VerifiedNativeEnrichedReceiptV1};
 
 /// Stable schema identity for a terminal replacement authorization.
 pub const REPLACEMENT_AUTHORIZATION_SCHEMA_VERSION: &str = "quill-replacement-authorization-v1";
@@ -108,13 +106,27 @@ pub struct ReplacementEvidenceBundleV1<'evidence> {
     pub divergence_census_sha256: Option<&'evidence str>,
 }
 
+/// The seal that makes a granted authorization unforgeable INSIDE this crate
+/// as well as outside it.
+///
+/// A private field of unit type reads as a hand-rolled `#[non_exhaustive]`,
+/// and the two are not interchangeable here: `#[non_exhaustive]` only refuses
+/// literal construction from OTHER crates, so every module of this one — the
+/// runner included — could still mint an authorization it never earned. That
+/// is precisely the forgery this type exists to refuse, so the seal is a named
+/// private type rather than `()`, and the rule is stated instead of being an
+/// artifact of which crate the caller happens to be in (bd-916qm).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AuthorizationSeal;
+
 /// A granted terminal authorization for the Quill lexical replacement.
 ///
-/// The private `sealed` field makes literal construction impossible outside
-/// this module, so the only way to hold this type is to have passed
-/// [`authorize`]. It is deliberately NOT `Deserialize`: a deserializable
-/// authorization could be minted in a text editor, which is exactly the
-/// failure the enriched receipt's private-field design already refuses.
+/// The private [`AuthorizationSeal`] field makes literal construction
+/// impossible outside this module, so the only way to hold this type is to
+/// have passed [`authorize`]. It is deliberately NOT `Deserialize`: a
+/// deserializable authorization could be minted in a text editor, which is
+/// exactly the failure the enriched receipt's private-field design already
+/// refuses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReplacementAuthorizationV1 {
     /// Stable schema identity.
@@ -129,8 +141,11 @@ pub struct ReplacementAuthorizationV1 {
     pub cancellation_engine_revision: String,
     /// Accepted divergence census snapshot digest.
     pub divergence_census_sha256: String,
-    /// Uninhabitable from outside this module.
-    sealed: (),
+    /// Unconstructible from outside this module. Skipped on the wire: the seal
+    /// is an in-process construction proof, and serializing it would suggest a
+    /// reader could verify authorization from bytes alone, which it cannot.
+    #[serde(skip)]
+    sealed: AuthorizationSeal,
 }
 
 impl ReplacementAuthorizationV1 {
@@ -201,35 +216,32 @@ pub fn authorize(
         });
     }
 
-    // PRESENCE FIRST, for every slot, before any content is inspected. The
-    // ordering is load-bearing rather than stylistic: admissibility depends on
-    // whether the producing checkout was clean, so an authorize() that checked
-    // it early would refuse a missing-slot bundle for the WRONG reason in any
-    // dirty working tree, and every fail-closed test would pass vacuously.
-    // Cheap structural facts are checked first; the environment-sensitive
-    // check is last.
+    // EACH SLOT IS VALIDATED COMPLETELY, IN ORDER: presence, then that slot's
+    // own contract, before the next slot is touched. Cheapest and most
+    // structural first; heaviest and most environment-sensitive last.
+    //
+    // The ordering is load-bearing rather than stylistic. The enriched
+    // receipt's admissibility depends on whether the checkout that PRODUCED it
+    // was clean, which no working tree here can guarantee, and the receipt
+    // itself is the one artifact no unit test can mint. Validating it early
+    // would make every other refusal unreachable in practice: a bundle with a
+    // deliberately wrong coverage class would refuse for the missing receipt
+    // instead, and the fail-closed tests would all pass for the wrong reason.
+    // That is not hypothetical -- it is exactly what the first version of this
+    // function did, and its own tests caught it.
     let core_lexical_v3 = bundle
         .core_lexical_v3
         .ok_or_else(|| ReplacementEvidenceSlotV1::CoreLexicalV3Binding.missing())?;
-    let cass_total = bundle
-        .cass_total
-        .ok_or_else(|| ReplacementEvidenceSlotV1::CassTotalBinding.missing())?;
-    let native_enriched = bundle
-        .native_enriched
-        .ok_or_else(|| ReplacementEvidenceSlotV1::NativeEnrichedReceipt.missing())?;
-    let cancellation = bundle
-        .cancellation
-        .ok_or_else(|| ReplacementEvidenceSlotV1::CancellationReceipt.missing())?;
-    let divergence_census_sha256 = bundle
-        .divergence_census_sha256
-        .ok_or_else(|| ReplacementEvidenceSlotV1::DivergenceCensus.missing())?;
-
     require_binding(
         core_lexical_v3,
         CampaignContractModeV1::CoreLexicalV3,
         candidate,
         ReplacementEvidenceSlotV1::CoreLexicalV3Binding,
     )?;
+
+    let cass_total = bundle
+        .cass_total
+        .ok_or_else(|| ReplacementEvidenceSlotV1::CassTotalBinding.missing())?;
     require_binding(
         cass_total,
         CampaignContractModeV1::CassTotalV1,
@@ -237,6 +249,23 @@ pub fn authorize(
         ReplacementEvidenceSlotV1::CassTotalBinding,
     )?;
 
+    let cancellation = bundle
+        .cancellation
+        .ok_or_else(|| ReplacementEvidenceSlotV1::CancellationReceipt.missing())?;
+    cancellation.validate()?;
+
+    let divergence_census_sha256 = bundle
+        .divergence_census_sha256
+        .ok_or_else(|| ReplacementEvidenceSlotV1::DivergenceCensus.missing())?;
+    if !is_lower_sha256(divergence_census_sha256) {
+        return Err(GauntletError::InvalidContract {
+            reason: "divergence census digest must be a lowercase 64-hex sha256".to_owned(),
+        });
+    }
+
+    let native_enriched = bundle
+        .native_enriched
+        .ok_or_else(|| ReplacementEvidenceSlotV1::NativeEnrichedReceipt.missing())?;
     let receipt = native_enriched.receipt();
     if receipt.candidate.candidate_source_revision != candidate {
         return Err(GauntletError::ManifestMismatch {
@@ -255,14 +284,6 @@ pub fn authorize(
         });
     }
 
-    if !is_lower_sha256(divergence_census_sha256) {
-        return Err(GauntletError::InvalidContract {
-            reason: "divergence census digest must be a lowercase 64-hex sha256".to_owned(),
-        });
-    }
-
-    cancellation.validate()?;
-
     // LAST, and deliberately so: this is the only check whose answer depends on
     // the cleanliness of the checkout that produced the evidence.
     native_enriched.require_release_admissible()?;
@@ -274,7 +295,7 @@ pub fn authorize(
         cancellation_body_sha256: cancellation.body_sha256.clone(),
         cancellation_engine_revision: cancellation.body.engine_revision.clone(),
         divergence_census_sha256: divergence_census_sha256.to_owned(),
-        sealed: (),
+        sealed: AuthorizationSeal,
     })
 }
 
@@ -333,25 +354,37 @@ mod tests {
             // rather than "some error" is what keeps this from passing for an
             // unrelated reason -- exactly what an early admissibility check
             // would have caused in this dirty working tree.
-            let cases: [(ReplacementEvidenceSlotV1, ReplacementEvidenceBundleV1<'_>); 4] = [
+            let removals: [(ReplacementEvidenceSlotV1, ReplacementEvidenceBundleV1<'_>); 4] = [
                 (
                     ReplacementEvidenceSlotV1::CoreLexicalV3Binding,
-                    ReplacementEvidenceBundleV1 { core_lexical_v3: None, ..complete },
+                    ReplacementEvidenceBundleV1 {
+                        core_lexical_v3: None,
+                        ..complete
+                    },
                 ),
                 (
                     ReplacementEvidenceSlotV1::CassTotalBinding,
-                    ReplacementEvidenceBundleV1 { cass_total: None, ..complete },
+                    ReplacementEvidenceBundleV1 {
+                        cass_total: None,
+                        ..complete
+                    },
                 ),
                 (
                     ReplacementEvidenceSlotV1::CancellationReceipt,
-                    ReplacementEvidenceBundleV1 { cancellation: None, ..complete },
+                    ReplacementEvidenceBundleV1 {
+                        cancellation: None,
+                        ..complete
+                    },
                 ),
                 (
                     ReplacementEvidenceSlotV1::DivergenceCensus,
-                    ReplacementEvidenceBundleV1 { divergence_census_sha256: None, ..complete },
+                    ReplacementEvidenceBundleV1 {
+                        divergence_census_sha256: None,
+                        ..complete
+                    },
                 ),
             ];
-            for (slot, emptied) in cases {
+            for (slot, emptied) in removals {
                 let message = refusal(&emptied);
                 assert!(
                     message.contains(slot.slot_name()),
