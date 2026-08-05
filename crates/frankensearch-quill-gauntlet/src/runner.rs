@@ -1842,16 +1842,28 @@ impl DivergenceDisposition {
                 reviewer,
                 reviewed_at,
             } => {
+                // The independence rule is the SAME as Accepted's, because the
+                // acceptance criterion binds both: "Accepted and fixed entries
+                // cannot bypass independent review or evidence integrity."
+                // Evidence integrity was already enforced here (a real commit
+                // and a named regression); fresh-eyes review was not, so the
+                // agent who first observed a divergence could also certify its
+                // own fix. Independence is measured against the OBSERVER, not
+                // against whoever recorded the disposition — the reviewer is
+                // the second pair of eyes on the finding, and a fixer writing
+                // up their own review of someone else's finding is exactly the
+                // case this must keep admitting.
                 if !is_git_revision(fixing_commit)
                     || !is_bounded_register_text(
                         regression_test,
                         MAX_DIVERGENCE_REGISTER_PROSE_BYTES,
                     )
                     || !is_bounded_register_text(reviewer, MAX_DIVERGENCE_REVIEWER_BYTES)
+                    || reviewer == &observation.header.recorded_by
                     || !is_utc_timestamp(reviewed_at)
                 {
                     return Err(campaign_error(
-                        "fixed divergence requires a commit, regression test, and review",
+                        "fixed divergence requires a commit, regression test, and independent review",
                     ));
                 }
             }
@@ -10177,6 +10189,35 @@ mod tests {
             ],
         )
         .expect("a fix-only class is admitted with a Fixed disposition");
+
+        // (iv) A FIXED disposition is held to the same fresh-eyes rule as an
+        // accepted one. The acceptance criterion binds both — "Accepted and
+        // fixed entries cannot bypass independent review or evidence
+        // integrity" — and until this landed only Accepted enforced it, so the
+        // agent who observed a divergence could certify its own fix with a
+        // real commit and a real regression test and nothing would object.
+        // (iii) above is the control: the identical Fixed disposition with an
+        // independent reviewer is admitted, so this rejection is attributable
+        // to the reviewer identity alone.
+        let self_reviewed_fix = DivergenceRegisterLedger::new(
+            "rm3q8-ingestion",
+            vec![
+                DivergenceRegisterEvent::Observation(Box::new(mint(
+                    DivergenceClass::PostingRecordSemantics,
+                ))),
+                disposition(DivergenceDisposition::Fixed {
+                    fixing_commit: "d95f1614130a3dc71ef7b63f828b009a68ca3ac0".to_owned(),
+                    regression_test: "basic_record_option_clamps_repeated_edge_ngram_frequency"
+                        .to_owned(),
+                    reviewer: ingestion_header().recorded_by,
+                    reviewed_at: "2026-08-04T12:00:30Z".to_owned(),
+                }),
+            ],
+        );
+        assert!(
+            self_reviewed_fix.is_err(),
+            "the observer of a divergence cannot also be the reviewer of its fix"
+        );
     }
 
     /// THE PLANTED NEGATIVE for the review workflow: an UNEXPLAINED divergence
