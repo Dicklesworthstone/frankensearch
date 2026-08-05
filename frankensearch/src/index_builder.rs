@@ -863,7 +863,7 @@ async fn open_lexical_reader(cx: &Cx, dir: &Path) -> SearchResult<Option<Arc<dyn
         source: Box::new(source),
     })?;
     match layout {
-        LexicalLayout::Empty => return Ok(None),
+        LexicalLayout::Empty => Ok(None),
         // NOTE: deliberately two arms, not an or-pattern — `pointer` is only
         // bound in the BlueGreen variant, so `DirectQuill | BlueGreen {..} if
         // pointer.engine() == ...` is E0408 (pointer not bound in all
@@ -2315,6 +2315,15 @@ mod tests {
             .await
             .unwrap();
             LexicalWrite::commit(&tantivy, &cx).await.unwrap();
+            // Tantivy's IndexWriter holds an exclusive directory lock, so the
+            // rollback generation has to be CLOSED before a reader may open
+            // it. Without this the open below fails LockBusy — which is what
+            // it did, undetected, from the day this test was written: it is
+            // gated on all(quill, lexical-tantivy) and no lane ever enabled
+            // both, so `-p frankensearch --lib open_lexical_reader` reported a
+            // vacuous "ok. 0 passed" in every single-feature selection
+            // (bd-8nqz.2, bd-jt7b2's defect class one layer up).
+            drop(tantivy);
             publish_current(
                 &lexical_root,
                 &CurrentPointer::new(BlueGreenEngine::Tantivy, "tantivy-v1", 0).unwrap(),

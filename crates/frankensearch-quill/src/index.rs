@@ -13412,7 +13412,8 @@ mod tests {
             (reader, replacement)
         });
         let pause = Arc::clone(&reader.refresh_pause);
-        pause.stage
+        pause
+            .stage
             .store(RootRefreshPause::STAGE_SWAP, Ordering::Release);
         let refresh_cx = Arc::new(Cx::for_testing());
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -13496,7 +13497,11 @@ mod tests {
     /// then requests cancellation. Without it the canceller can win before the
     /// refresh reaches the checkpoint and the test passes without ever
     /// exercising the window it names.
-    fn assert_cancel_at_stage_retains_old_reader(seed: u64, stage: u8, expected_phase: &'static str) {
+    fn assert_cancel_at_stage_retains_old_reader(
+        seed: u64,
+        stage: u8,
+        expected_phase: &'static str,
+    ) {
         let root = tempfile::tempdir().expect("root-bound cancellation directory");
         let lexical_root = root.path().to_path_buf();
         let setup_cx = Cx::for_testing();
@@ -13596,6 +13601,171 @@ mod tests {
                     .expect("cancelled refresh leaves old generation active")
                     .is_empty(),
                 "the replacement generation must not be observable after a cancelled refresh"
+            );
+        });
+    }
+
+    /// bd-8nqz.2 TOTAL LAYOUT INSPECTION at the READER boundary.
+    ///
+    /// `inspect_lexical_layout` already classifies all eight states and
+    /// `inspect_lexical_layout_classifies_every_state_without_mutating` pins
+    /// that. What was NOT pinned is the consequence the acceptance actually
+    /// names: "mixed/ambiguous/corrupt layouts failing closed" and "read-only
+    /// open performs zero filesystem writes and acquires no writer lease".
+    /// Classification is an input to that decision, not the decision itself —
+    /// a reader could classify a root as `Mixed` and still go on to open
+    /// something, and the layout test would stay green.
+    ///
+    /// So this walks every state a reader can meet and asserts three things
+    /// per state: the typed outcome, that a refusal's message NAMES the layout
+    /// (an unattributable refusal is not a typed one), and that the refusal
+    /// left the root byte-identical — no `CURRENT` published, no directory
+    /// created, no lease file.
+    ///
+    /// Foreign engines are the interesting half. A `DirectTantivy` root and a
+    /// blue-green root whose `CURRENT` selects Tantivy are both perfectly
+    /// VALID layouts that this reader must nonetheless refuse, because it only
+    /// speaks Quill. Refusing them is not error handling; it is the rollback
+    /// contract — the facade keeps a Tantivy generation openable when
+    /// `lexical-tantivy` is compiled, and it can only do that if the Quill
+    /// reader declines rather than guesses.
+    #[test]
+    fn root_bound_open_refuses_every_foreign_or_damaged_layout_without_writing() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 4)
+            .build()
+            .expect("build total-layout runtime");
+        let cx = Cx::for_testing();
+
+        // A refusal must not leave a trace. Compared before and after the
+        // attempted open, so "no writes" is measured rather than asserted.
+        fn root_fingerprint(root: &Path) -> Vec<(std::ffi::OsString, u64)> {
+            let Ok(entries) = std::fs::read_dir(root) else {
+                return Vec::new();
+            };
+            let mut listing = entries
+                .filter_map(Result::ok)
+                .map(|entry| {
+                    let len = entry.metadata().map(|meta| meta.len()).unwrap_or_default();
+                    (entry.file_name(), len)
+                })
+                .collect::<Vec<_>>();
+            listing.sort();
+            listing
+        }
+
+        runtime.block_on(async {
+            // --- states that must OPEN -------------------------------------
+            let direct = tempfile::tempdir().expect("direct-quill root");
+            let direct_root = direct.path().join("lexical");
+            std::fs::create_dir_all(&direct_root).expect("create direct root");
+            create_root_generation(&cx, direct.path(), "lexical", "d", "direct token").await;
+            RootBoundQuillSearchIndex::open(&cx, &direct_root, deterministic_config())
+                .await
+                .expect("a direct Quill root is readable for migration compatibility");
+
+            let blue = tempfile::tempdir().expect("blue-green root");
+            let blue_root = blue.path().to_path_buf();
+            create_root_generation(&cx, &blue_root, "quill-v1", "b", "blue token").await;
+            publish_current(&blue_root, &root_pointer("quill-v1")).expect("publish CURRENT");
+            RootBoundQuillSearchIndex::open(&cx, &blue_root, deterministic_config())
+                .await
+                .expect("a published Quill blue-green root is readable");
+
+            // --- states that must FAIL CLOSED ------------------------------
+            /// One refused layout: its stable label, and how to build a root
+            /// that classifies as it.
+            type RefusedLayout = (&'static str, Box<dyn Fn(&Path)>);
+            let refusals: Vec<RefusedLayout> = vec![
+                ("empty", Box::new(|_root: &Path| {})),
+                (
+                    "direct-tantivy",
+                    Box::new(|root: &Path| {
+                        std::fs::write(root.join("meta.json"), b"{}").expect("tantivy marker");
+                    }),
+                ),
+                (
+                    "mixed",
+                    Box::new(|root: &Path| {
+                        std::fs::write(root.join("MANIFEST"), b"m").expect("quill marker");
+                        std::fs::write(root.join("meta.json"), b"{}").expect("tantivy marker");
+                    }),
+                ),
+                (
+                    "ambiguous",
+                    Box::new(|root: &Path| {
+                        for name in ["quill-v1", "quill-v2"] {
+                            let child = root.join(name);
+                            std::fs::create_dir_all(&child).expect("candidate child");
+                            std::fs::write(child.join("MANIFEST"), b"m").expect("child marker");
+                        }
+                    }),
+                ),
+            ];
+
+            for (label, build) in refusals {
+                let dir = tempfile::tempdir().expect("refusal root");
+                let root = dir.path().to_path_buf();
+                build(&root);
+                let before = root_fingerprint(&root);
+
+                let error = RootBoundQuillSearchIndex::open(&cx, &root, deterministic_config())
+                    .await
+                    .map(|_| ())
+                    .expect_err(&format!("{label} layout must fail closed"));
+                let rendered = error.to_string();
+                assert!(
+                    rendered.contains(label),
+                    "{label} refusal must name the layout it refused; got {rendered}"
+                );
+                assert_eq!(
+                    root_fingerprint(&root),
+                    before,
+                    "{label} refusal wrote to the root; read-only open must not mutate"
+                );
+                assert!(
+                    !root.join("CURRENT").exists(),
+                    "{label} refusal published a CURRENT pointer"
+                );
+            }
+
+            // A blue-green root whose CURRENT selects a FOREIGN engine is a
+            // valid layout, refused for a different reason than damage: this
+            // reader only speaks Quill, and the Tantivy generation stays
+            // available to the facade's rollback path.
+            let foreign = tempfile::tempdir().expect("foreign-pointer root");
+            let foreign_root = foreign.path().to_path_buf();
+            let tantivy_child = foreign_root.join("tantivy-v1");
+            std::fs::create_dir_all(&tantivy_child).expect("tantivy child");
+            std::fs::write(tantivy_child.join("meta.json"), b"{}").expect("tantivy marker");
+            publish_current(
+                &foreign_root,
+                &CurrentPointer::new(
+                    BlueGreenEngine::Tantivy,
+                    "tantivy-v1",
+                    crate::segment::FSLX_FORMAT_VERSION,
+                )
+                .expect("valid Tantivy pointer"),
+            )
+            .expect("publish foreign CURRENT");
+            let before = root_fingerprint(&foreign_root);
+            let error = RootBoundQuillSearchIndex::open(&cx, &foreign_root, deterministic_config())
+                .await
+                .map(|_| ())
+                .expect_err("a Tantivy CURRENT must not be opened by the Quill reader");
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("only supports Quill"),
+                "a foreign-engine refusal must say so rather than report damage: {rendered}"
+            );
+            assert_eq!(
+                root_fingerprint(&foreign_root),
+                before,
+                "refusing a foreign CURRENT must not mutate the root"
+            );
+            assert!(
+                tantivy_child.join("meta.json").exists(),
+                "the Tantivy generation must survive intact for rollback"
             );
         });
     }
