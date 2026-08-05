@@ -13,7 +13,8 @@ use crate::GauntletError;
 use crate::comparator::{
     ComparatorConfig, Divergence, LexicalBoundary, LexicalComparisonStatus,
     LexicalContractComparison, LexicalEngineRole, LexicalExposureContract,
-    LexicalObservationContext, RankClass, compare_observations_stored_v8,
+    LexicalObservationContext, RankClass, compare_observations_stored_v7,
+    compare_observations_stored_v8,
 };
 use crate::engine::{EnginePairIdentity, HarnessRun};
 use crate::generator::{
@@ -25,6 +26,17 @@ use crate::runner::{
     lexical_backend_identity, lexical_query_contract_sha256,
 };
 use crate::version_contract::{OracleVersionContract, oracle_version_contract};
+
+/// Which generation an object is being held to.
+///
+/// `Current` is the admission path. `RetainedV7` exists only so a witness a
+/// committed ledger already recorded stays checkable under the frozen contract
+/// that produced it; it confers no admission and nothing mints it (bd-bxya1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactGeneration {
+    Current,
+    RetainedV7,
+}
 
 const ARTIFACT_OBJECT_V7_SCHEMA_VERSION: u32 = 7;
 /// Current artifact-object generation.
@@ -922,8 +934,46 @@ impl ArtifactObject {
     }
 
     pub(crate) fn validate(&self) -> Result<(), GauntletError> {
-        validate_stored_object_schema(self.object_schema_version)
-            .map_err(|reason| GauntletError::InvalidContract { reason })?;
+        self.validate_as(ArtifactGeneration::Current)
+    }
+
+    /// Validate a RETAINED witness under its own generation (bd-bxya1).
+    ///
+    /// A committed register ledger holds v7 witness addresses, and the v8 bump
+    /// kept those addresses admissible ON PURPOSE — ingestion is a mint and
+    /// takes the current generation only, while an already-recorded join must
+    /// still be checkable or the archive stops being evidence. Every
+    /// structural check below is the same one [`Self::validate`] runs; what
+    /// changes is which generation's frozen contract the stored configuration
+    /// and the report re-derivation are held to.
+    ///
+    /// This grants no admission: `validate_stored_object_schema` still refuses
+    /// v7 everywhere admission is decided, and nothing here mints anything.
+    pub(crate) fn validate_retained_witness(&self) -> Result<(), GauntletError> {
+        self.validate_as(self.retained_generation())
+    }
+
+    const fn retained_generation(&self) -> ArtifactGeneration {
+        if self.object_schema_version == ARTIFACT_OBJECT_V7_SCHEMA_VERSION {
+            ArtifactGeneration::RetainedV7
+        } else {
+            ArtifactGeneration::Current
+        }
+    }
+
+    fn validate_as(&self, generation: ArtifactGeneration) -> Result<(), GauntletError> {
+        match generation {
+            ArtifactGeneration::Current => validate_stored_object_schema(self.object_schema_version)
+                .map_err(|reason| GauntletError::InvalidContract { reason })?,
+            ArtifactGeneration::RetainedV7 => {
+                if self.object_schema_version != ARTIFACT_OBJECT_V7_SCHEMA_VERSION {
+                    return Err(GauntletError::InvalidContract {
+                        reason: "retained-witness validation is only for the v7 generation"
+                            .to_owned(),
+                    });
+                }
+            }
+        }
         if self.trust_ceiling != self.schema_trust_ceiling()? {
             return Err(GauntletError::InvalidContract {
                 reason: "artifact trust ceiling does not match its schema".to_owned(),
@@ -993,10 +1043,14 @@ impl ArtifactObject {
                 });
             }
         }
-        // v8, not v7: this validates the CURRENT generation, which is the only
-        // one `validate_stored_object_schema` admits above, and a v8 object may
-        // carry the stored oracle-blame attribution v7 refuses (bd-bxya1).
-        self.comparator_config.validate_stored_v8()?;
+        // The stored configuration is held to ITS OWN generation's frozen
+        // contract: v8 may carry the oracle-blame attribution, v7 may not, and
+        // a v7 configuration that somehow carried one would be refused rather
+        // than silently read as v8 (bd-bxya1).
+        match generation {
+            ArtifactGeneration::Current => self.comparator_config.validate_stored_v8()?,
+            ArtifactGeneration::RetainedV7 => self.comparator_config.validate_stored_v7()?,
+        }
         validate_generated_case_metadata(&self.case)?;
         if self.campaign.is_none()
             && self
@@ -1029,11 +1083,23 @@ impl ArtifactObject {
             &self.comparison.subject,
             &self.comparison.oracle,
         )?;
-        let recomputed = compare_observations_stored_v8(
-            self.comparison.subject.clone(),
-            self.comparison.oracle.clone(),
-            self.comparator_config,
-        )?;
+        // Re-derived under the comparator that produced it. A retained v7
+        // report must reproduce under the FROZEN v7 implementation; asking v8
+        // to reproduce it would be asking a different function for the same
+        // answer, which is exactly what a version boundary means it need not
+        // give.
+        let recomputed = match generation {
+            ArtifactGeneration::Current => compare_observations_stored_v8(
+                self.comparison.subject.clone(),
+                self.comparison.oracle.clone(),
+                self.comparator_config,
+            )?,
+            ArtifactGeneration::RetainedV7 => compare_observations_stored_v7(
+                self.comparison.subject.clone(),
+                self.comparison.oracle.clone(),
+                self.comparator_config,
+            )?,
+        };
         if recomputed != self.comparison {
             return Err(GauntletError::InvalidContract {
                 reason: "artifact comparison report does not match its observations".to_owned(),
@@ -1049,6 +1115,21 @@ impl ArtifactObject {
     /// authority beyond [`ArtifactTrustCeiling::IntegrityOnly`].
     pub(crate) fn validate_stored_builtin_integrity(&self) -> Result<(), GauntletError> {
         self.validate()?;
+        self.stored_builtin_integrity_evidence()
+    }
+
+    /// The same integrity claim, held to the object's OWN generation, for a
+    /// witness a committed ledger already recorded (bd-bxya1).
+    ///
+    /// Only the generation-sensitive half differs: everything below the
+    /// validation call is about the producer and the dependency, neither of
+    /// which the schema bump touched.
+    pub(crate) fn validate_retained_builtin_integrity(&self) -> Result<(), GauntletError> {
+        self.validate_retained_witness()?;
+        self.stored_builtin_integrity_evidence()
+    }
+
+    fn stored_builtin_integrity_evidence(&self) -> Result<(), GauntletError> {
         self.producer_build_identity.validate_stored_sealed_v2()?;
         self.producer_build_identity
             .require_features(&["tantivy_oracle"])?;
@@ -1104,7 +1185,41 @@ impl ArtifactObject {
     /// integrity validation. This intentionally remains usable by a newer
     /// verifier after the original producer or linked dependency has changed.
     pub(crate) fn divergence_binding(&self) -> Result<ArtifactDivergenceBinding, GauntletError> {
-        self.validate_stored_builtin_integrity()?;
+        let address = self.object_hash()?;
+        self.divergence_binding_at(address)
+    }
+
+    /// The same binding, addressed by the caller rather than by re-encoding.
+    ///
+    /// A CURRENT object may address itself: its DTO reproduces its bytes. A
+    /// RETAINED object may not, and that is not a defect to route around —
+    /// `object_hash` documents itself as not an original-byte verifier, and a
+    /// generation bump makes it literally true (v8 added a field v7 never
+    /// wrote). The address of a retained witness therefore has to come from
+    /// the bytes that ARE the evidence, which is what
+    /// [`RetainedArtifactWitness`] carries (bd-bxya1).
+    fn divergence_binding_at(
+        &self,
+        address: String,
+    ) -> Result<ArtifactDivergenceBinding, GauntletError> {
+        // A binding is built for BOTH a fresh mint and a join against a
+        // committed ledger, so it validates under the object's own generation
+        // and names that generation's hash scheme. Refusing a stale generation
+        // is the MINT's job — `observation_from_binding` takes the current
+        // scheme only — and doing it here instead would make every committed
+        // v7 witness unjoinable the moment the generation moved (bd-bxya1).
+        self.validate_retained_builtin_integrity()?;
+        let object_hash_scheme = match self.object_schema_version {
+            ARTIFACT_OBJECT_V7_SCHEMA_VERSION => OBJECT_HASH_SCHEME_V7_SHA256,
+            ARTIFACT_OBJECT_V8_SCHEMA_VERSION => OBJECT_HASH_SCHEME_V8_SHA256,
+            version => {
+                return Err(GauntletError::InvalidContract {
+                    reason: format!(
+                        "artifact object schema version {version} has no divergence hash scheme"
+                    ),
+                });
+            }
+        };
         let ArtifactOracleDependency::BuiltInTantivy { contract } = &self.oracle_dependency else {
             return Err(GauntletError::InvalidContract {
                 reason: "divergence binding requires a built-in Tantivy dependency role".to_owned(),
@@ -1119,8 +1234,8 @@ impl ArtifactObject {
             })?;
         Ok(ArtifactDivergenceBinding {
             object_schema_version: self.object_schema_version,
-            object_hash_scheme: OBJECT_HASH_SCHEME_V8_SHA256,
-            object_hash: self.object_hash()?,
+            object_hash_scheme,
+            object_hash: address,
             producer_identity_sha256: self.producer_build_identity.identity_hash()?,
             oracle_dependency_identity_sha256: contract.identity_sha256()?,
             oracle_lexical_contract_audit_revision: contract
@@ -1134,6 +1249,62 @@ impl ArtifactObject {
             rank_class: self.comparison.rank_class,
             divergences: self.comparison.divergences.clone(),
         })
+    }
+}
+
+/// A witness object a committed register ledger already recorded, addressed by
+/// the BYTES that are the evidence rather than by re-encoding it (bd-bxya1).
+///
+/// THE DEFECT THIS CLOSES. A ledger observation names its witness by content
+/// address. The join re-derived that address from the decoded object, which
+/// worked only while the DTO could reproduce the stored bytes — and a
+/// generation bump is precisely the event that makes it unable to: v8 added
+/// `oracle_bug_reason` to the stored comparator configuration, so every
+/// committed v7 witness stopped joining its own ledger the moment v8 landed.
+/// Re-minting the ledger would have replaced retained evidence rather than
+/// verified it.
+///
+/// The address here is COMPUTED from the bytes, never accepted from a caller,
+/// and the decoded object must still clear the full integrity contract of its
+/// own generation. A caller therefore cannot present bytes under someone
+/// else's address, which is the only forgery this type could otherwise enable.
+#[derive(Debug, Clone)]
+pub struct RetainedArtifactWitness {
+    object: ArtifactObject,
+    address: String,
+}
+
+impl RetainedArtifactWitness {
+    /// Decode and address a retained witness from its stored bytes.
+    ///
+    /// An optional single trailing newline is tolerated, because that is how
+    /// these fixtures are committed; nothing else about the bytes may differ.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bytes do not decode, or if the decoded object
+    /// fails the stored built-in integrity contract of its own generation.
+    pub fn decode(bytes: &[u8]) -> Result<Self, GauntletError> {
+        let canonical = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+        let object: ArtifactObject = serde_json::from_slice(canonical)?;
+        let address = hash_object_bytes(canonical, object.object_schema_version)?;
+        object.validate_retained_builtin_integrity()?;
+        Ok(Self { object, address })
+    }
+
+    /// The address these exact bytes hash to under their own hash domain.
+    #[must_use]
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    #[must_use]
+    pub const fn object(&self) -> &ArtifactObject {
+        &self.object
+    }
+
+    pub(crate) fn divergence_binding(&self) -> Result<ArtifactDivergenceBinding, GauntletError> {
+        self.object.divergence_binding_at(self.address.clone())
     }
 }
 
@@ -5516,7 +5687,11 @@ mod tests {
             br#"{"schema_version":-1}"#,
             br#"{"schema_version":4294967296}"#,
             br#"{"schema_version":0}"#,
-            br#"{"schema_version":8}"#,
+            // The UNKNOWN-FUTURE probe, which must track the current
+            // generation: 8 is now minted, so 9 is the version nothing may
+            // interpret. Leaving 8 here asserted that the current generation
+            // is unclassifiable, which is how this test broke on the v8 bump.
+            br#"{"schema_version":9}"#,
             br#"{"schema_version":1,"schema_version":7}"#,
         ];
         for bytes in invalid_reports {
@@ -5537,7 +5712,9 @@ mod tests {
             br#"{"object_schema_version":-1}"#,
             br#"{"object_schema_version":4294967296}"#,
             br#"{"object_schema_version":0}"#,
-            br#"{"object_schema_version":8}"#,
+            // The unknown-future probe, tracking the current generation for
+            // the same reason as the report array above.
+            br#"{"object_schema_version":9}"#,
             br#"{"object_schema_version":1,"object_schema_version":7}"#,
         ];
         for bytes in invalid_objects {
@@ -6371,34 +6548,59 @@ mod tests {
         .expect("a retained v7 object must replay under the frozen v7 comparator");
         assert_eq!(replayed, object.comparison);
 
-        // And it is not admissible.
+        // And it is not admissible — while STILL being checkable under its own
+        // generation, which is the whole difference between a read-only
+        // archive and a lost one. A committed register ledger holds this
+        // object's address, so it has to stay verifiable without becoming
+        // admissible (bd-bxya1).
         assert!(matches!(
             object.validate(),
             Err(GauntletError::InvalidContract { ref reason })
                 if reason.contains("artifact v7") && reason.contains("read-only")
         ));
+        object
+            .validate_retained_witness()
+            .expect("a retained v7 witness must still validate under its own generation");
         assert_eq!(
             classify_artifact_object_schema(canonical).expect("typed v7 disposition"),
             SerializedSchemaDisposition::LegacyIntegrityCeiling { schema_version: 7 },
         );
 
-        // Restamping the version is not a migration: the address moves and the
-        // bytes are not the v8 golden.
+        // RESTAMPING IS RE-MINTING, NOT LAUNDERING, and the distinction is in
+        // the ADDRESS rather than in the bytes. For this diagnostic sample the
+        // v8 shape's only change is a defaulted field, so re-encoding it at v8
+        // reproduces the v8 golden byte for byte — which is exactly how the v8
+        // fixture was minted from the v7 campaign's evidence, and stating it
+        // here keeps the claim measurable instead of asserting an inequality
+        // the fixtures contradict.
+        //
+        // What restamping cannot do is carry the retained object's IDENTITY
+        // across the boundary: the v8 bytes address under the v8 domain, at the
+        // v8 digest, and can never present the v7 witness address a committed
+        // ledger recorded. Authority travels with the generation, not with the
+        // content.
         let mut restamped = object;
         restamped.object_schema_version = OBJECT_SCHEMA_VERSION;
         let restamped_bytes = restamped
             .canonical_bytes()
             .expect("restamped canonical bytes");
         const V8_GOLDEN: &[u8] = include_bytes!("../fixtures/artifact-object-v8.json");
-        assert_ne!(
+        assert_eq!(
             restamped_bytes,
             V8_GOLDEN
                 .strip_suffix(b"\n")
                 .expect("v8 golden must end in exactly one LF")
         );
+        let restamped_address =
+            hash_object_bytes(&restamped_bytes, OBJECT_SCHEMA_VERSION).expect("v8 hash domain");
+        assert_eq!(
+            restamped_address,
+            "33293fc2e58848027bbbb29e4244ff54dea163bfbba945cc87e7d83ad9370d35",
+            "a re-minted object addresses as the v8 object it now is"
+        );
         assert_ne!(
-            hash_object_bytes(&restamped_bytes, OBJECT_SCHEMA_VERSION).expect("v8 hash domain"),
-            "3ba1751438f70da4dfb41bdce755906602a4b7d3d3fcf499803919c70473c800"
+            restamped_address, "3ba1751438f70da4dfb41bdce755906602a4b7d3d3fcf499803919c70473c800",
+            "and never as the retained v7 witness whose address a ledger may hold"
         );
     }
 

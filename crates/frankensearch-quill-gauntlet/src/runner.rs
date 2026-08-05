@@ -23,6 +23,7 @@ use crate::artifact::{
     ArtifactObject, ArtifactOracleDependency, ArtifactStore, ArtifactStoreV4SourceBuildBinding,
     ArtifactStoreV4SourceBuildSnapshots, ArtifactTrustCeiling, CampaignArtifactContext,
     GauntletProducerBuildIdentity, OBJECT_HASH_SCHEME_V7_SHA256, OBJECT_HASH_SCHEME_V8_SHA256,
+    RetainedArtifactWitness,
 };
 use crate::comparator::{
     ComparatorConfig, ComparisonReport, ComparisonStatus, Divergence, DivergenceClass,
@@ -2239,12 +2240,45 @@ impl DivergenceRegisterLedger {
         &self,
         artifacts: &[ArtifactObject],
     ) -> Result<(), GauntletError> {
+        let bindings = artifacts
+            .iter()
+            .map(ArtifactObject::divergence_binding)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.validate_relational_integrity_against_bindings(&bindings)
+    }
+
+    /// The same join for witnesses a committed ledger already recorded, which
+    /// carry their address from their stored BYTES (bd-bxya1).
+    ///
+    /// A current object can address itself by re-encoding; a retained one from
+    /// an earlier generation cannot, because the current DTO writes fields its
+    /// generation never had. Verifying such a witness by re-encoding it was
+    /// what broke every committed v7 join at the v8 bump.
+    ///
+    /// # Errors
+    ///
+    /// The same conditions as
+    /// [`Self::validate_relational_integrity_against_artifact_objects`].
+    pub fn validate_relational_integrity_against_retained_witnesses(
+        &self,
+        witnesses: &[RetainedArtifactWitness],
+    ) -> Result<(), GauntletError> {
+        let bindings = witnesses
+            .iter()
+            .map(RetainedArtifactWitness::divergence_binding)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.validate_relational_integrity_against_bindings(&bindings)
+    }
+
+    fn validate_relational_integrity_against_bindings(
+        &self,
+        witness_bindings: &[ArtifactDivergenceBinding],
+    ) -> Result<(), GauntletError> {
         self.validate()?;
         let mut bindings = BTreeMap::<String, ArtifactDivergenceBinding>::new();
-        for artifact in artifacts {
-            let binding = artifact.divergence_binding()?;
+        for binding in witness_bindings {
             if bindings
-                .insert(binding.object_hash.clone(), binding)
+                .insert(binding.object_hash.clone(), binding.clone())
                 .is_some()
             {
                 return Err(campaign_error(
@@ -21561,13 +21595,21 @@ mod tests {
             .validate()
             .expect("committed live register must satisfy the current v2 contract");
 
-        let object: ArtifactObject = serde_json::from_slice(
+        // ADDRESSED FROM ITS BYTES, not by re-encoding it (bd-bxya1). This
+        // witness is a v7 object and the current DTO writes a field v7 never
+        // had, so a re-encode addresses to something the committed ledger never
+        // recorded. The bytes are the evidence; the address is computed from
+        // them, and the object still has to clear the integrity contract of its
+        // own generation before it can stand as a witness at all.
+        let witness = crate::artifact::RetainedArtifactWitness::decode(
             &std::fs::read(crate_root.join(E68_LIVE_WITNESS_FIXTURE))
                 .expect("committed live witness object"),
         )
-        .expect("committed witness object must decode");
+        .expect("committed witness object must decode and address");
         ledger
-            .validate_relational_integrity_against_artifact_objects(std::slice::from_ref(&object))
+            .validate_relational_integrity_against_retained_witnesses(std::slice::from_ref(
+                &witness,
+            ))
             .expect("committed register must join to its committed witness");
 
         // The recorded minimized-fixture digest is re-derived, not trusted.
