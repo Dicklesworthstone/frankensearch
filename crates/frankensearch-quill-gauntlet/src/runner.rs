@@ -20828,12 +20828,16 @@ mod tests {
         // nobody merged. One register has to carry both, or the enforced ledger
         // and the prose register describe different worlds.
         //
-        // Idempotent by construction: any previously appended events for THIS
+        // Re-mintable by construction: any previously appended events for THIS
         // divergence are dropped before the freshly minted ones are appended,
-        // so a re-mint re-derives byte-identical events (every timestamp here
-        // is fixed) rather than accumulating duplicates -- which the validator
-        // would refuse anyway, since two active observations of one divergence
-        // collide on their mismatch signature.
+        // rather than accumulating duplicates -- which the validator would
+        // refuse anyway, since two active observations of one divergence
+        // collide on their mismatch signature. At the revision the committed
+        // register was minted from, that re-derives byte-identical events
+        // (every timestamp in this path is fixed for exactly that reason); at
+        // any LATER revision it does not, and cannot, because the producer
+        // build identity is part of the evidence and has moved. See the
+        // baseline the successor check uses below.
         let committed_register = DivergenceRegisterLedger::decode_json(
             &std::fs::read(
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(E68_LIVE_LEDGER_FIXTURE),
@@ -20930,6 +20934,31 @@ mod tests {
             },
         };
 
+        // THE BASELINE IS THE COMMITTED REGISTER MINUS THIS DIVERGENCE'S OWN
+        // PRIOR EVENTS, and the choice is measured rather than convenient.
+        //
+        // The property worth proving is that a mint cannot drop or edit ANOTHER
+        // witness's history -- that is the failure a hand-merged register would
+        // produce, and it is refused here rather than at review. Proving it
+        // against the committed file INCLUDING this divergence's own events
+        // proves something else, and something that is false by construction
+        // after the first commit: a re-mint carries the CURRENT producer build
+        // identity, so at any revision later than the one the register was
+        // minted from, freshly minted events differ from the committed ones in
+        // their producer identity and witness address, and the successor check
+        // reads that as a history rewrite. It would redden this test at every
+        // commit after the register landed, which is not a gate holding -- it
+        // is a gate that can only be satisfied by never moving.
+        //
+        // Nothing is relaxed by scoping it: `new()` below still refuses a
+        // baseline whose sequences are not contiguous, so this divergence's
+        // prior events must be the TAIL of the register. A mint that tried to
+        // excise events from the middle -- the shape a real history rewrite
+        // takes -- fails to assemble a baseline at all.
+        let baseline = DivergenceRegisterLedger::new(E68_LIVE_REGISTER_ID, events.clone()).expect(
+            "the committed register minus this divergence's own events must itself be a valid \
+             ledger",
+        );
         events.push(DivergenceRegisterEvent::Observation(Box::new(observation)));
         events.push(DivergenceRegisterEvent::Disposition(disposition));
         let ledger = DivergenceRegisterLedger::new(E68_LIVE_REGISTER_ID, events)
@@ -20938,8 +20967,8 @@ mod tests {
         // rewrite of what was already recorded, so a mint that quietly dropped
         // or edited the other witness's history fails here rather than landing.
         ledger
-            .validate_append_only_successor(&committed_register)
-            .expect("the minted register must only APPEND to the committed one");
+            .validate_append_only_successor(&baseline)
+            .expect("the minted register must only APPEND to the other witnesses' history");
         (ledger, mismatch_signatures)
     }
 
