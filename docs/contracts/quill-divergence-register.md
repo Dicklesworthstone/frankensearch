@@ -71,14 +71,21 @@ There are deliberately two validation levels. `DivergenceRegisterLedger::validat
 checks the self-contained v2 shape, append-only history, review policy, and
 canonical field bounds. It cannot authenticate an externally named object.
 Evidence admission additionally requires
-`validate_against_artifact_objects`, which first runs each `ArtifactObject`'s
-stored-evidence integrity contract and then compares the complete closed
-binding: object schema version, hash-domain scheme, object digest,
+`validate_relational_integrity_against_witnesses`, which first runs each
+witness's stored-evidence integrity contract and then compares the complete
+closed binding: object schema version, hash-domain scheme, object digest,
 producer-build identity, oracle-dependency identity, lexical-contract audit
 revision, corpus/query manifests, query-suite source kind and identity,
 first-recorded case ID, rank class, divergence class, and mismatch signatures.
 Every observation event, including superseded history, must bind to the object
-it actually references. A multi-class object must be covered exactly; a
+it actually references, so a register carrying N observations is joinable only
+against N witnesses — one per observation, with an unreferenced witness refused
+just as loudly as a missing one (bd-dxedq). A witness is presented as
+`DivergenceWitness::Current` when it can reproduce its own bytes, or
+`DivergenceWitness::Retained` when it is committed evidence addressed FROM
+those bytes; a register that spans a generation boundary needs both forms in
+one join, which is why the live register carries a v7 witness for DIV-008 and a
+v8 witness for DIV-009. A multi-class object must be covered exactly; a
 missing, extra, duplicate, or substituted class/signature claim fails.
 Corrections for the same divergence may repeat the same claim, but a second
 divergence ID may not claim it. Stored-evidence validation is used rather than
@@ -189,6 +196,25 @@ These are the classes the plan *predicts*; each becomes a numbered DIV entry whe
 
 ## 4. Entries
 
+**WHICH OF THESE ENTRIES THE MACHINE ENFORCES** (bd-dxedq). The entries below are rendered
+identically, and they are not equally binding. Only an entry with events in the committed ledger
+[`fixtures/divergence-register-v2-live.json`](../../crates/frankensearch-quill-gauntlet/fixtures/divergence-register-v2-live.json)
+is governed by `DivergenceRegisterLedger` — its class, its witness address, its revision set and
+its reviewer are checked by code, and its accept had to satisfy
+`DivergenceDisposition::validate`. Everything else on this page is an assertion in prose that
+nothing verifies.
+
+| Entry | Machine state |
+| --- | --- |
+| DIV-008 | **ENFORCED** — observation seq 1, blocking seq 2, `fixed` seq 3 (supersedes 2) |
+| DIV-009 | **ENFORCED** — observation seq 4, reviewed `accepted` seq 5 |
+| DIV-001 … DIV-007 | **PROSE-ONLY** — recorded before the typed ingestion contract existed; their first-seen artifacts were never retained, so they cannot be reconstructed after the fact |
+| DIV-010 | **PROSE-ONLY** — its accept is *not* in the ledger and would be refused there today: the entry names no reviewer independent of its recorder, and `DivergenceDisposition::validate` refuses exactly that shape. Ingesting it needs a live witness case first, tracked by `bd-h46f1` |
+
+A prose-only entry is not thereby wrong — DIV-001 through DIV-007 and DIV-010 all cite regression
+tests that exist and pass. It is *unverified by the mechanism this page describes*, and the point
+of the table is that a reader can tell the difference without reading the ledger.
+
 ### DIV-001: standalone CASS negation loses complement semantics
 
 - Class: `QueryCanonicalization`
@@ -275,10 +301,14 @@ not this row. This row is the human projection of it.
 
 - Class: `RankMismatch` (raw failure class — it may be fixed or blocked, never accepted)
 - Machine record: `crates/frankensearch-quill-gauntlet/fixtures/divergence-register-v2-live.json`
-  (register `quill-e6-divergence-register-live`, ledger SHA-256
-  `b36c47186f47f119bc9469c75b852c0025282be9c96e5a5d58ee7e60498d2e3b` after the sequence-3
-  disposition below; `6dfd9d1c7d9d07bbc261e1703c2bc1bc61b536adea5d17fd5daf9bd9b0ba276d` at
-  sequence 2, when this row was first written)
+  (register `quill-e6-divergence-register-live`, sequences 1–3). The ledger SHA-256 is a property of
+  the whole register, not of this entry, and it moves whenever ANY divergence appends: it is
+  `e846f1cac0ba5c191db5889a8436b86e909ea2b16928885a3495ec953fe80ef0` since DIV-009 was appended at
+  sequences 4–5 (bd-dxedq); it was `b36c47186f47f119bc9469c75b852c0025282be9c96e5a5d58ee7e60498d2e3b`
+  after the sequence-3 disposition below, and
+  `6dfd9d1c7d9d07bbc261e1703c2bc1bc61b536adea5d17fd5daf9bd9b0ba276d` at sequence 2, when this row was
+  first written. DIV-008's own three events are byte-unchanged across all three hashes, which is what
+  `validate_append_only_successor` proves at every mint.
 - First seen: 2026-08-04 · live default-profile oracle-differential campaign, run `e68-live-ingestion`,
   minted from a clean checkout at `4efe400cc80f55e85079400a7c54674116ab6f98`. Retained v7 witness object
   `65b1e4e89a3d1a2cc2202634fa448c397a48376fab90afb9a89390dfd823e763`, committed at
@@ -403,9 +433,22 @@ not this row. This row is the human projection of it.
   disabling the repair reddens "the shipping path must not return a document the query excluded";
   leaking the repair into `oracle_observe_page` reddens "the oracle page surface must reproduce the
   defect, not the repair". Neither direction can regress silently.
-- Machine record: minted on demand by the E6.8 lane rather than committed, and the mint now records
-  **accepted**, agreeing with the reviewed decision above (bd-bxya1). What changed is the class, not
-  the validator: `DivergenceDisposition::Accepted` still refuses every raw failure class, and this
+- Machine record: `crates/frankensearch-quill-gauntlet/fixtures/divergence-register-v2-live.json`
+  (register `quill-e6-divergence-register-live`, observation seq 4 and reviewed `accepted` seq 5;
+  ledger SHA-256 `e846f1cac0ba5c191db5889a8436b86e909ea2b16928885a3495ec953fe80ef0`, which is also
+  the census the terminal authorization compares against). COMMITTED since bd-dxedq — it was minted
+  on demand and merged by nobody until then, so the ledger held DIV-008 alone while this row read as
+  though it were governed. The mint now APPENDS to the committed register and proves the append with
+  `validate_append_only_successor`, so DIV-008's history cannot be dropped or edited by a re-mint.
+  Minted from a clean checkout at `0c4f9545e438ced7b824296bdda2782424c06a48`, run
+  `e68-live-ingestion`, case `e68-oracle-bug-refusal` (minimized-inputs SHA-256
+  `22cc1023a3f57aa6816aa88423d8f4d9fac2086abeeb2d5f6ad50e33afda0048`, re-derived by the selfcheck
+  rather than trusted); mismatch signature
+  `f708f094b609cf06c3a3d177ef8093db134c08c707914800cd185834040d1b05`; v8 witness object
+  `85aecfb9f7aef2aaa51bbf27b5d7ab8410397c1794c75aa03023316974be2636`, committed at
+  `crates/frankensearch-quill-gauntlet/fixtures/artifact-object-v8-div009-live.json`. The mint
+  records **accepted**, agreeing with the reviewed decision above (bd-bxya1). What changed is the
+  class, not the validator: `DivergenceDisposition::Accepted` still refuses every raw failure class, and this
   divergence is no longer raw because the campaign ATTRIBUTES it. The attribution is a stored
   comparator INPUT — `ComparatorConfig::oracle_bug_reason`, part of the artifact/report v8 shape — so
   the retained artifact re-derives the identical `OracleBug` report from its own observations, and
