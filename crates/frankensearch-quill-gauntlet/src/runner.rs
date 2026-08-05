@@ -20112,10 +20112,15 @@ mod tests {
     /// same lane, different mechanism (membership, not summation association).
     #[cfg(feature = "tantivy-oracle")]
     const E68_REFUSAL_DIVERGENCE_ID: &str = "DIV-009";
-    /// The bead a fresh mint of the membership refusal blocks against. It is
-    /// the oracle-parse defect's own bead, not DIV-008's.
+    /// The bead a fresh mint of the membership refusal blocks against: the
+    /// oracle-parse defect's own bead, not DIV-008's and not bd-nqeb4's.
+    ///
+    /// bd-nqeb4 is a DIFFERENT oracle bug — a PhraseScorer panic on a negated
+    /// absent phrase. Pointing this disposition at it would have been a
+    /// fabricated linkage between two unrelated defects that merely share an
+    /// engine and a `NOT`.
     #[cfg(feature = "tantivy-oracle")]
-    const E68_REFUSAL_BLOCKING_BEAD: &str = "bd-nqeb4";
+    const E68_REFUSAL_BLOCKING_BEAD: &str = "bd-f20ye";
     #[cfg(feature = "tantivy-oracle")]
     const E68_WITNESS_DIVERGENCE_ID: &str = "DIV-008";
     #[cfg(feature = "tantivy-oracle")]

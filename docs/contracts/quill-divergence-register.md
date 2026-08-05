@@ -336,6 +336,35 @@ not this row. This row is the human projection of it.
   ledger holding both active would trip the "one active mismatch signature cannot belong to multiple
   divergences" rule. That is a census-design constraint, not a defect in either entry.
 
+### DIV-009: the oracle's lenient parse drops a negation inside a boosted group
+
+- Class: `RankMismatch` (MEMBERSHIP — the engines disagree about which documents match, so no
+  score-tolerance class can ever cover it)
+- First seen: 2026-08-04 · probing for a divergence the default-profile lane still refuses after
+  bd-gx7n4 opened it to the DIV-007 score envelope (bd-73ok3)
+- Root cause: an ORACLE-side parse defect, with the conformance direction inverted — Quill retains
+  the negation and is correct, the pinned oracle's lenient-parse fallback discards it. DIV-007's
+  entry has always noted this mechanism parenthetically; DIV-009 gives it an id, because the E6.8
+  lane now ingests it and an ingested divergence needs one.
+- Measured with the lane's own enveloped comparator, shared Core100 corpus:
+  `(release NOT release)^2` → `Failed`/`RankMismatch`; `(return NOT return)^2` → the same on a second
+  operand; `(release NOT release)` → `Exact`, so the BOOST is what triggers it; and the reviewed
+  `(release OR require) OR return` → `Classified`/`ScoreEpsilon` in the same run.
+- Consumer impact: result SETS differ — a user query of this shape gets back documents the negation
+  was supposed to exclude. Silent wrong results rather than a crash, which is worse, because nothing
+  reports it. `frankensearch-lexical` is the shipping tantivy lane, so this is not gauntlet-only.
+- Fixture: campaign case `e68-oracle-bug-refusal` in the E6.8 witness suite; executable regression
+  `runner::tests::live_default_profile_campaign_ingests_its_unclassified_divergence`, which asserts
+  it still fails closed in the same run where the reviewed score mechanism classifies.
+- Decision: **blocking** (bead `bd-f20ye`). Distinct from `bd-nqeb4`, which is a PhraseScorer panic
+  on a negated absent phrase — different shape, different failure mode.
+- Machine record: minted on demand by the E6.8 lane rather than committed. DIV-008's committed
+  ledger and artifact remain the historical witness of what that lane did at `4efe400c`, when it was
+  still zero-tolerance; a fresh mint today records DIV-009 instead, because an auto-classified case
+  carries no register-worthy signature and the refusal is the case that can be ingested.
+- Reviewer: recorded and blocked by `Claude-pane12`; no independent review claimed, and none is
+  required to block.
+
 ---
 
 *Cross-references: comparator classes implemented in the gauntlet kernel (bead e0.5); auto-triage feeding this ledger (bd-quill-duel-shrinker); statistical gates consuming per-class pass rates (bead e6.6); G2 exit requires this register complete over two consecutive nightly runs (bead e6.8).*
