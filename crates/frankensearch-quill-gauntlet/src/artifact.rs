@@ -461,13 +461,23 @@ fn producer_workspace_root() -> PathBuf {
 /// caller is a campaign lane living in a `#[cfg(test)] mod tests`, so under
 /// `--lib` there is genuinely no production consumer. Saying so is honest;
 /// exporting it as crate API or silencing dead-code with an allow would not be.
+/// The result is NORMALIZED — no `..` components. `producer_workspace_root`
+/// returns `CARGO_MANIFEST_DIR/../..`, which every caller there canonicalizes
+/// before use; an artifact root is handed to `ArtifactStore`, which refuses a
+/// path containing parent-directory components with `UnsafeStorePath`. Popping
+/// two parents off the manifest directory yields the same directory with no
+/// traversal in it.
 #[cfg(test)]
 pub fn resolve_artifact_root(configured: &Path) -> PathBuf {
     if configured.is_absolute() {
-        configured.to_path_buf()
-    } else {
-        producer_workspace_root().join(configured)
+        return configured.to_path_buf();
     }
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest
+        .parent()
+        .and_then(Path::parent)
+        .expect("the gauntlet crate lives two directories below the workspace root");
+    workspace.join(configured)
 }
 
 fn validate_live_git_checkout(
@@ -4330,6 +4340,19 @@ mod tests {
         assert!(
             resolved.is_absolute(),
             "a resolved artifact root must be absolute: {}",
+            resolved.display()
+        );
+
+        // A resolved root is handed to `ArtifactStore`, which refuses parent
+        // traversal outright. The first version of this fix resolved to
+        // `<pkg>/../../target/...`, which satisfied every other assertion here
+        // and still failed the real lane with `UnsafeStorePath` -- so the
+        // normalization is asserted, not assumed.
+        assert!(
+            !resolved
+                .components()
+                .any(|component| component == std::path::Component::ParentDir),
+            "a resolved artifact root must be normalized; ArtifactStore refuses traversal: {}",
             resolved.display()
         );
 
