@@ -149,6 +149,70 @@
           "reviewed_at": "2026-08-05T00:00:00Z"
         }
       }
+    },
+    {
+      "event_type": "observation",
+      "event": {
+        "header": {
+          "sequence": 6,
+          "supersedes": null,
+          "recorded_by": "Claude-pane12",
+          "recorded_at": "2026-08-04T19:00:00Z"
+        },
+        "divergence_id": "DIV-010",
+        "class": "rank_mismatch",
+        "first_recorded_witness_case_id": "e68-negated-conjunction-refusal",
+        "first_recorded_witness_artifact_object": {
+          "scheme": "frankensearch-quill-gauntlet/artifact-object/v8/sha256",
+          "object_schema_version": 8,
+          "digest": "46176fa8c9f7911eea852bc4089740323322f1be95c4563329d5c6dec29dd0f9"
+        },
+        "revisions": {
+          "producer_build_identity_sha256": "cfaf258aeed192f3a00b52c13ed7210fe24cc7ce73048c7189041a142b78ac07",
+          "oracle_dependency_contract_sha256": "58988c117389e3222fc6c2202d311fc70158ef0e65e069100181be5fd98d3ba3",
+          "oracle_lexical_contract_audit_revision": "062a5e5b2d41653b1c8b07888eda1a765e421f49",
+          "corpus_manifest_sha256": "28640a81dce43433fd33b16b62c265b51ad7e0973466d1f790f688b4441e39c9",
+          "query_manifest_sha256": "4c32ae2095ae1ac409aebf368247f4c577b4d143a7f2cf292bee6a1aec7bf6b9",
+          "query_suite_source": "explicit_cases",
+          "query_source_identity_sha256": "eeeb3f778bfcc990db03f5408add4e398c5ddf8a1d213b30a08fe5900a91d4ee"
+        },
+        "fixture": {
+          "fixture_id": "e68-negated-conjunction-refusal",
+          "fixture_sha256": "47451c5dc2cfa9730753b875d0c9429f34322916203cf446c33dc6c6c17a09a6",
+          "regression_test": "runner::tests::live_default_profile_campaign_ingests_its_unclassified_divergence",
+          "minimized": true
+        },
+        "mismatch_signatures": [
+          "3cb5d0235fc8d81e6e93dd26ef6a918b7a8041782c7e4a318bdb3d5ab52d3978"
+        ],
+        "observed_behavior": "the two engines disagree about which documents MATCH a conjunction that carries a negation: the pinned oracle returns NOTHING at all, while the subject returns the documents the query asks for.",
+        "expected_behavior": "the same document set from both engines; a negation inside an explicit conjunction excludes what it names rather than emptying the conjunction.",
+        "root_cause": "an oracle-side LOWERING defect in tantivy 0.26.1: `A AND NOT B` lowers to a conjunction whose second Must operand is a boolean holding only a MustNot clause, which has no positive term, matches nothing, and empties whatever it is conjoined with. Quill lowers it correctly since bd-quill-shipping-conformance-parse-split-w7bsu, and frankensearch-lexical's SHIPPING path repairs it while every oracle_observe_* caller stays bit-faithful to the defect. The blame is ATTRIBUTED BY A CONTROL, not by this record: the same oracle answers the same operands spelled without the explicit AND with the exact document set the subject returns, which isolates the AND keyword as the trigger. That control is a SEPARATE campaign case, which is why this observation carries the raw class rather than the semantic one (bd-4oiwf).",
+        "consumer_impact": "result SETS differ and the difference is silent: the most common negation spelling returns NOTHING, with no error and no warning, for a query the user reasonably expects to work. The campaign case fails closed -- it carries no per-fixture register row and its total lexical contract still mismatches.",
+        "diagnostic": {
+          "payload_sha256": "a4be5f1cbd59b3518597770f7fb396ddb29dbf85650eeffdea39308fe7335bd0",
+          "marker": "<redacted:e68-live-lane-negated-conjunction>"
+        }
+      }
+    },
+    {
+      "event_type": "disposition",
+      "event": {
+        "header": {
+          "sequence": 7,
+          "supersedes": null,
+          "recorded_by": "Claude-pane12",
+          "recorded_at": "2026-08-04T19:00:00Z"
+        },
+        "divergence_id": "DIV-010",
+        "disposition": {
+          "kind": "blocking",
+          "bead_id": "bd-4oiwf",
+          "rationale": "the register's prose entry records a reviewed ACCEPT for this divergence, and the machine cannot record one yet. The lane emits a raw RankMismatch, and acceptance refuses every raw failure class; the semantic class would have to be earned by an attribution the artifact re-derives, and this shape's attribution is the explicitly-grouped control in a DIFFERENT case. A containment-direction gate like DIV-009's is measurably unsafe here -- an unrelated exclusion-only conjunction wears the same shape, symptom and containment. It blocks until bd-4oiwf carries that control into the artifact; moving it off blocking additionally requires an independent reviewer, which this row's own prose says it does not have.",
+          "reviewer": "Claude-pane12",
+          "reviewed_at": "2026-08-04T19:00:00Z"
+        }
+      }
     }
   ]
 }
