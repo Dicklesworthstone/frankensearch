@@ -327,10 +327,17 @@ not this row. This row is the human projection of it.
   unparseable diagnostic, wrong reason's envelope). The pre-existing
   `runner::tests::three_clause_or_diverges_at_one_ulp_without_the_div007_envelope` is unchanged and
   still pins both halves of the bd-55mvg ruling.
-- Reviewer for the fix: `BlueOriole`. No independent reviewer is claimed and none is required —
-  `DivergenceDisposition::validate` enforces `reviewer != recorded_by` only for **accepted**, which
-  is precisely the decision this record does NOT make. Acceptance was never available here: the
-  observation's class is the raw `RankMismatch` and a raw failure class can never be accepted.
+- Reviewer for the fix: `BlueOriole`, and independent review **is** required here. This line
+  previously read "no independent reviewer is claimed and none is required —
+  `DivergenceDisposition::validate` enforces `reviewer != recorded_by` only for **accepted**".
+  That was true when written and `e2d992e8` made it false the same day, holding a `Fixed`
+  disposition to the same fresh-eyes rule as an `Accepted` one. The rule is measured against the
+  OBSERVER, not against whoever recorded the disposition, and this record satisfies it: the
+  observation was recorded by `Claude-pane12` and the fix reviewed by `BlueOriole`. Verified
+  rather than asserted — the committed ledger validates today, and mutating either identity onto
+  the other is refused (bd-rm3q.8 adversarial pass, probes 2 and 3). What remains true from the
+  old sentence is the second half: acceptance was never available here, because the observation's
+  class is the raw `RankMismatch` and a raw failure class can never be accepted.
 - Reviewer: recorded and blocked by `Claude-pane12`. No independent review is claimed, and none is
   required to block: `DivergenceDisposition::validate` enforces an independent reviewer only for
   acceptance, which is exactly the decision that needs one.
