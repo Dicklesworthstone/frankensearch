@@ -2487,6 +2487,116 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(f);
     }
 
+    /// bd-f20ye: BOOSTING A GROUP CHANGES ITS BOOLEAN MEANING in tantivy
+    /// 0.26.1 whenever the group contains a negation. Pinned, not fixed.
+    ///
+    /// The bead was filed — by me — claiming the lenient-parse fallback "drops"
+    /// the negation, which is what the Divergence Register had said about this
+    /// shape since DIV-007. Probing the parser falsified all of it: nothing is
+    /// dropped, the `MustNot` clause is present in the parsed query, strict and
+    /// lenient parses agree, and `parse_query_lenient` reports NO errors. The
+    /// mechanism is structural.
+    ///
+    /// An unboosted group lowers its negation as a `MustNot` clause OF the
+    /// enclosing boolean, which excludes. A BOOSTED group instead nests the
+    /// negation in its own `BooleanQuery { [(MustNot, ...)], msm: 0 }` and
+    /// attaches THAT as a clause of the outer boolean — so a matcher meaning
+    /// "every document except B" becomes a positive alternative, and the group
+    /// stops meaning what it read as.
+    ///
+    /// Both directions are wrong, which is why this is pinned as behaviour
+    /// rather than reasoned about:
+    ///
+    ///   (alpha NOT beta)        [p2]      correct exclusion
+    ///   (alpha NOT beta)^2      [p1, p2]  the excluded document comes back
+    ///   (alpha AND NOT beta)^2  []        and the AND form loses everything
+    ///
+    /// NOT FIXED HERE, deliberately. `frankensearch-lexical` is simultaneously
+    /// the shipping tantivy backend and the gauntlet's PINNED CONFORMANCE
+    /// ORACLE. Rewriting queries here to restore the intuitive meaning would
+    /// silently move the conformance target that Quill is measured against —
+    /// the exact shape of "weaken the oracle to make the comparison pass". Quill
+    /// executes these shapes correctly, so the divergence is registered
+    /// (DIV-009, blocking on bd-f20ye) and this test exists so that a tantivy
+    /// upgrade which changes the behaviour becomes VISIBLE instead of quietly
+    /// shifting that target. Same posture as bd-nqeb4's `#[should_panic]` pin.
+    #[test]
+    fn boosting_a_group_that_negates_changes_its_meaning_in_the_pinned_oracle() {
+        run_with_cx(|cx| async move {
+            let index = TantivyIndex::in_memory().expect("bd-f20ye index");
+            index
+                .index_documents(
+                    &cx,
+                    &[
+                        IndexableDocument::new("p1", "alpha beta"),
+                        IndexableDocument::new("p2", "alpha gamma"),
+                    ],
+                )
+                .await
+                .expect("index bd-f20ye documents");
+            index.commit(&cx).await.expect("commit bd-f20ye documents");
+
+            let hits = |query: &'static str| {
+                let index = &index;
+                let cx = &cx;
+                async move {
+                    let mut ids = index
+                        .search(cx, query, 10)
+                        .await
+                        .expect("bd-f20ye search")
+                        .into_iter()
+                        .map(|hit| hit.doc_id)
+                        .collect::<Vec<_>>();
+                    ids.sort();
+                    ids
+                }
+            };
+
+            // The negation is NOT dropped and recovery is NOT involved: the
+            // lenient parser reports no errors at all for the broken shape.
+            let (_parsed, errors) = index
+                .query_parser()
+                .parse_query_lenient("(alpha NOT beta)^2");
+            assert!(
+                errors.is_empty(),
+                "bd-f20ye is not a lenient-recovery defect; the parser reported {errors:?}"
+            );
+
+            // CORRECT, unboosted.
+            assert_eq!(hits("alpha NOT beta").await, vec!["p2".to_owned()]);
+            assert_eq!(hits("(alpha NOT beta)").await, vec!["p2".to_owned()]);
+            assert!(hits("(alpha NOT alpha)").await.is_empty());
+
+            // WRONG, boosted. The excluded document returns.
+            assert_eq!(
+                hits("(alpha NOT beta)^2").await,
+                vec!["p1".to_owned(), "p2".to_owned()],
+                "if this is now [p2], tantivy fixed the boosted-group negation and DIV-009 \
+                 must be re-measured before it is retired"
+            );
+            // A self-contradictory group matches EVERY document once boosted.
+            assert_eq!(
+                hits("(alpha NOT alpha)^2").await,
+                vec!["p1".to_owned(), "p2".to_owned()],
+                "if this is now empty, tantivy fixed the boosted-group negation"
+            );
+            // And the AND form fails the other way, losing a document it should
+            // return — so this is not simply "boosting turns AND into OR".
+            assert!(
+                hits("(alpha AND NOT beta)^2").await.is_empty(),
+                "if this is now [p2], tantivy fixed the boosted-group negation"
+            );
+
+            // CONTROL: a boosted group WITHOUT a negation keeps its meaning, so
+            // the defect is specific to negation and not to grouping or boosts.
+            assert_eq!(
+                hits("(alpha OR beta)^2").await,
+                vec!["p1".to_owned(), "p2".to_owned()]
+            );
+            assert_eq!(hits("(beta)^2").await, vec!["p1".to_owned()]);
+        });
+    }
+
     fn sample_docs() -> Vec<IndexableDocument> {
         vec![
             IndexableDocument::new("doc-1", "Rust is a systems programming language")

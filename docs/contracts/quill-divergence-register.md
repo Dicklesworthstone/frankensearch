@@ -255,7 +255,7 @@ These are the classes the plan *predicts*; each becomes a numbered DIV entry whe
 - Root cause: Quill's Term scorer fuses each unfielded term's `[content, 2.0×title]` expansion into a single summed contribution per term; the pinned oracle expands every unfielded term into a two-clause boolean and accumulates 2N interleaved clause outputs. The f32 summation *association* differs, so scores diverge by 1–2 ULP as leaf count grows. Envelope members: (a) **≥3-leaf** pure-disjunctive shapes — 1–2 ULP `RankMismatch` on identical docs (reproduced bit pairs `0x415583bd`/`bc`, `0x41673288`/`87`, `0x4121c1e0`/`de`, `0x41addfb9`/`ba` at eight leaves; `0x4113fe32`/`33` at three leaves, read out of the DIV-008 witness object rather than transcribed); (b) a single top-level leaf boost over the multi-field expansion (1 ULP); (c) mixed-occur nesting that the Should-flatten (`0b9fad3b`) cannot splice (1–2 ULP). **Two-clause** disjunctions are bit-exact under the flatten and stay OUTSIDE this class.
 
   **Leaf-count boundary corrected 2026-08-04 (bd-gx7n4), by measurement.** This entry originally recorded member (a) as "≥8-leaf" and closed with "Pure-disjunctive spliceable shapes are bit-exact under the flatten and stay OUTSIDE this class." DIV-008 falsifies that sentence: a plain three-clause disjunction over the Core100 campaign corpus is NOT bit-exact, a 52-query sweep over the same corpus produced 9 such hits, the witness pair moves the ULP in OPPOSITE directions on the same document (which distinguishes summation association from a scoring bias in either engine), and only the two-clause control is bit-exact. The MECHANISM is unchanged and no new mechanism is admitted — the correction moves a measured lower bound from eight leaves to three and narrows the "outside" boundary to the shape actually measured as exact. The ≤2 ULP bound, the class, the typed reason, and the bd-55mvg ruling that the comparator's default config stays zero-tolerance are all untouched. Regression: `runner::tests::three_clause_or_diverges_at_one_ulp_without_the_div007_envelope`.
-- Consumer impact: result *sets* are identical; only rank order within ULP-adjacent score pairs can flip. No membership change belongs to this class. (The oracle's lenient-parse fallback silently DROPS every negation inside a boosted group — a *membership* divergence that classifies as `OracleBug`, never as `ScoreEpsilon`.)
+- Consumer impact: result *sets* are identical; only rank order within ULP-adjacent score pairs can flip. No membership change belongs to this class. (A negation inside a *boosted* group is a separate, *membership* divergence that classifies as `OracleBug`, never as `ScoreEpsilon` — see DIV-009. This entry previously described that as the oracle's lenient parse "dropping" the negation; measurement under bd-f20ye falsified it, and DIV-009 carries the corrected mechanism.)
 - Owner ruling (2026-08-03, delegated to SandyGrove, recorded in mail thread `bd-55mvg`): keep Quill's fused scorer; adopt this bounded tolerance class rather than mirroring the oracle's interleaved per-field accumulation, which would surrender the fused-loop optimization on exactly the QG-6 query-latency axis. The comparator's default config REMAINS zero-tolerance; campaign lanes covering composite shapes opt in with the typed reason.
 - Fixture: the four reproduced score-bit pairs above (bd-55mvg bead body); comparator typed-reason implementation and the generator unfence (groups, boosts, in-group negation except the bd-nqeb4 oracle-crash shape) tracked on bd-55mvg — blocked on active gauntlet file leases at ruling time.
 - Decision: accept (owner ruling; bounded)
@@ -336,16 +336,29 @@ not this row. This row is the human projection of it.
   ledger holding both active would trip the "one active mismatch signature cannot belong to multiple
   divergences" rule. That is a census-design constraint, not a defect in either entry.
 
-### DIV-009: the oracle's lenient parse drops a negation inside a boosted group
+### DIV-009: boosting a group changes its boolean meaning when the group negates
 
 - Class: `RankMismatch` (MEMBERSHIP — the engines disagree about which documents match, so no
   score-tolerance class can ever cover it)
 - First seen: 2026-08-04 · probing for a divergence the default-profile lane still refuses after
   bd-gx7n4 opened it to the DIV-007 score envelope (bd-73ok3)
-- Root cause: an ORACLE-side parse defect, with the conformance direction inverted — Quill retains
-  the negation and is correct, the pinned oracle's lenient-parse fallback discards it. DIV-007's
-  entry has always noted this mechanism parenthetically; DIV-009 gives it an id, because the E6.8
-  lane now ingests it and an ingested divergence needs one.
+- Root cause: an ORACLE-side lowering defect in tantivy 0.26.1, with the conformance direction
+  inverted — Quill executes these shapes correctly and the pinned oracle does not.
+  **The mechanism first recorded here was wrong and is corrected under bd-f20ye.** DIV-007's entry
+  and this row both said the lenient-parse fallback "drops" the negation. It does not: the `MustNot`
+  clause is present in the parsed query, the strict and lenient parses agree, and
+  `parse_query_lenient` reports NO errors for the offending shape. What actually happens is
+  structural — an unboosted group lowers its negation as a `MustNot` clause OF the enclosing
+  boolean, which excludes, while a boosted group nests it as
+  `BooleanQuery { [(MustNot, …)], msm: 0 }` and attaches that as a clause of the outer boolean, so a
+  matcher meaning "every document except B" becomes a positive alternative.
+- Measured at the parser and at the result set (`frankensearch-lexical`, two documents
+  `p1="alpha beta"`, `p2="alpha gamma"`), which is what falsified the original account:
+  `alpha NOT beta` → `[p2]`; `(alpha NOT beta)` → `[p2]`; `(alpha NOT beta)^2` → `[p1, p2]`, the
+  excluded document returns; `(alpha NOT alpha)` → `[]` but `(alpha NOT alpha)^2` → `[p1, p2]`, a
+  self-contradictory group matching everything; and `(alpha AND NOT beta)^2` → `[]`, failing the
+  OTHER way by losing a document it should return. A boosted group without a negation keeps its
+  meaning, so the defect is specific to negation rather than to grouping or boosts.
 - Measured with the lane's own enveloped comparator, shared Core100 corpus:
   `(release NOT release)^2` → `Failed`/`RankMismatch`; `(return NOT return)^2` → the same on a second
   operand; `(release NOT release)` → `Exact`, so the BOOST is what triggers it; and the reviewed
@@ -353,9 +366,16 @@ not this row. This row is the human projection of it.
 - Consumer impact: result SETS differ — a user query of this shape gets back documents the negation
   was supposed to exclude. Silent wrong results rather than a crash, which is worse, because nothing
   reports it. `frankensearch-lexical` is the shipping tantivy lane, so this is not gauntlet-only.
-- Fixture: campaign case `e68-oracle-bug-refusal` in the E6.8 witness suite; executable regression
+- Fixture: campaign case `e68-oracle-bug-refusal` in the E6.8 witness suite; executable regressions
   `runner::tests::live_default_profile_campaign_ingests_its_unclassified_divergence`, which asserts
-  it still fails closed in the same run where the reviewed score mechanism classifies.
+  it still fails closed in the same run where the reviewed score mechanism classifies, and
+  `frankensearch_lexical::tests::boosting_a_group_that_negates_changes_its_meaning_in_the_pinned_oracle`,
+  which pins the oracle's exact behaviour in both directions so a tantivy upgrade that changes it
+  becomes visible instead of silently moving the conformance target.
+- NOT fixed in the adapter, deliberately: `frankensearch-lexical` is simultaneously the shipping
+  tantivy backend and the pinned conformance oracle, so rewriting these queries there would move the
+  target Quill is measured against. That is an owner decision, recorded on `bd-f20ye`, not a P2 bug
+  fix.
 - Decision: **blocking** (bead `bd-f20ye`). Distinct from `bd-nqeb4`, which is a PhraseScorer panic
   on a negated absent phrase — different shape, different failure mode.
 - Machine record: minted on demand by the E6.8 lane rather than committed. DIV-008's committed

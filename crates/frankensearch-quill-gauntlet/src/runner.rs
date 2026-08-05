@@ -19388,7 +19388,10 @@ mod tests {
             comparison.divergences.push(Divergence {
                 class: DivergenceClass::OracleBug,
                 pointer: "/comparison/subject/ast_differences/boosted_group_negation".to_owned(),
-                oracle: "pinned oracle lenient fallback dropped negation inside boosted group"
+                // bd-f20ye: the negation is NOT dropped and lenient recovery is
+                // not involved. Boosting the group re-nests the MustNot as a
+                // positive alternative, so the group stops excluding.
+                oracle: "pinned oracle re-nested boosted-group negation as a positive alternative"
                     .to_owned(),
                 subject: "Quill retained boosted-group negation".to_owned(),
             });
@@ -20115,7 +20118,7 @@ mod tests {
     /// The bead a fresh mint of the membership refusal blocks against: the
     /// oracle-parse defect's own bead, not DIV-008's and not bd-nqeb4's.
     ///
-    /// bd-nqeb4 is a DIFFERENT oracle bug — a PhraseScorer panic on a negated
+    /// bd-nqeb4 is a DIFFERENT oracle bug — a `PhraseScorer` panic on a negated
     /// absent phrase. Pointing this disposition at it would have been a
     /// fabricated linkage between two unrelated defects that merely share an
     /// engine and a `NOT`.
@@ -20273,13 +20276,13 @@ mod tests {
             mismatch_signatures.clone(),
             DivergenceObservationNarrative {
                 observed_behavior:
-                    "the two engines disagree about which documents MATCH a negation inside a boosted group: the pinned oracle's lenient-parse fallback drops the negation and returns the documents it excludes."
+                    "the two engines disagree about which documents MATCH a negation inside a boosted group: the pinned oracle re-nests the negation as a positive alternative and returns the documents it was told to exclude."
                         .to_owned(),
                 expected_behavior:
                     "the same document set from both engines; a negation inside a boosted group excludes exactly what it names."
                         .to_owned(),
                 root_cause:
-                    "an oracle-side parse defect, not a Quill scoring one. The pinned oracle recovers from the boosted-group form by discarding the NOT clause entirely; Quill retains it. Because membership differs, this is a raw RankMismatch and cannot be an auto class -- the lane's reviewed summation-association tolerance covers score bits on identical document sets and deliberately does not reach here."
+                    "an oracle-side LOWERING defect, not a Quill scoring one and not a parse recovery: the MustNot clause survives parsing, but boosting the group nests it as its own boolean and attaches that as a positive alternative, so the group stops excluding (bd-f20ye). Quill lowers it correctly. Because membership differs, this is a raw RankMismatch and cannot be an auto class -- the lane's reviewed summation-association tolerance covers score bits on identical document sets and deliberately does not reach here."
                         .to_owned(),
                 consumer_impact:
                     "result SETS differ, which is the class of divergence a consumer notices first. It fails closed as unclassified in the default-profile lane, and the register is the only place a decision about it can be recorded."

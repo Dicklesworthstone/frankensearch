@@ -10349,7 +10349,7 @@ mod tests {
         ]);
         subject.ast_differences.push(AstDifference {
             kind: AstLoweringKind::OracleBug,
-            oracle: "boosted group lenient fallback dropped negation".to_owned(),
+            oracle: "boosted group re-nested its negation as a positive alternative".to_owned(),
             subject: "Quill retained the negated clause".to_owned(),
         });
         let oracle = observation(vec![
