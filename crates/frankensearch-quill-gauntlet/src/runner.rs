@@ -5584,7 +5584,7 @@ impl DifferentialCampaignRunner {
                 ),
             );
         }
-        let mut comparison = match evidence_case
+        let comparison = match evidence_case
             .validate_observations(engines, &subject, &oracle)
             .and_then(|()| compare_observations(subject, oracle, self.config.comparator_config))
         {
@@ -5599,12 +5599,18 @@ impl DifferentialCampaignRunner {
                 );
             }
         };
-        // bd-bxya1: attribute a known ORACLE lowering defect before anything
-        // downstream reads the comparison, so the mismatch signatures, the
-        // classification and the retained artifact object all agree on the
-        // class. Gated on the query SHAPE and on the oracle being the side that
-        // over-returned — never on a register row's opinion of who is wrong.
-        reclassify_oracle_blamed_lowering(&query.query, &mut comparison);
+        // bd-bxya1: the production wiring STOPS HERE, deliberately. Calling
+        // `reclassify_oracle_blamed_lowering` at this point produces a
+        // comparison the artifact cannot store: `ArtifactObject` re-derives its
+        // report from its own observations and refuses a mismatch
+        // ("artifact comparison report does not match its observations"), which
+        // is a correct integrity check and not one to route around. Emitting
+        // the class from production therefore requires the attribution to be an
+        // input to the comparator — a stored typed reason on `ComparatorConfig`,
+        // the way `score_epsilon_reason` already is — and
+        // `compare_observations_validated_v7` is frozen: "Semantic changes
+        // require a new object/report schema and a separate implementation."
+        // That decision is recorded on bd-bxya1 rather than taken here.
         let mismatch_text_bytes = match mismatches.preflight(&comparison, &query.id) {
             Ok(text_bytes) => text_bytes,
             Err(error) => {
@@ -5820,6 +5826,10 @@ fn lexical_case_summary(
     }
 }
 
+/// `#[cfg(test)]` until the frozen-v7 decision on bd-bxya1 lands: the gate is
+/// built and exercised, but nothing in production can call it yet, and saying
+/// so is honest where an `allow(dead_code)` would not be.
+///
 /// Whether a query carries the DIV-009 shape: a parenthesized group that
 /// contains a negation AND carries a boost (bd-bxya1).
 ///
@@ -5833,6 +5843,7 @@ fn lexical_case_summary(
 /// `oracle_blame_gate_fires_exactly_where_the_shipping_repair_does` pins the two
 /// against each other by OBSERVATION rather than by mirrored code, so they
 /// cannot drift apart silently.
+#[cfg(test)]
 fn query_carries_boosted_group_negation(query: &str) -> bool {
     if !query.contains(")^") {
         return false;
@@ -5917,6 +5928,7 @@ fn query_carries_boosted_group_negation(query: &str) -> bool {
 ///    correctly withheld. A subject-side defect on the same query shape shows
 ///    the opposite containment and is refused — that is the load-bearing
 ///    planted negative this bead requires.
+#[cfg(test)]
 fn oracle_blamed_lowering_defect(query: &str, comparison: &ComparisonReport) -> bool {
     if !query_carries_boosted_group_negation(query) {
         return false;
@@ -5957,6 +5969,7 @@ fn oracle_blamed_lowering_defect(query: &str, comparison: &ComparisonReport) -> 
 /// the class. Before this existed, the only producer of `OracleBug` was a
 /// test-side helper that mutated a comparison after the fact, so the class was
 /// fully plumbed and never emitted by anything shipping.
+#[cfg(test)]
 fn reclassify_oracle_blamed_lowering(query: &str, comparison: &mut ComparisonReport) -> bool {
     if !oracle_blamed_lowering_defect(query, comparison) {
         return false;
@@ -5988,6 +6001,7 @@ fn reclassify_oracle_blamed_lowering(query: &str, comparison: &mut ComparisonRep
 }
 
 /// Divergence classes that make a comparison a raw failure.
+#[cfg(test)]
 const fn is_failure_class(class: DivergenceClass) -> bool {
     matches!(
         class,
@@ -20277,12 +20291,10 @@ mod tests {
     /// same lane, different mechanism (membership, not summation association).
     #[cfg(feature = "tantivy-oracle")]
     const E68_REFUSAL_DIVERGENCE_ID: &str = "DIV-009";
-    /// Reviewer of record for DIV-009's acceptance: the owner ruling itself,
-    /// which is necessarily distinct from the recorder — the validator refuses
-    /// an acceptance whose reviewer is its own author, and a machine-emitted
-    /// artifact must never be able to accept its own failure.
+    /// The bead a fresh mint of the membership refusal blocks against: the
+    /// oracle-lowering defect's own bead, not DIV-008's and not bd-nqeb4's.
     #[cfg(feature = "tantivy-oracle")]
-    const E68_REFUSAL_REVIEWER: &str = "owner-ruling-bd-f20ye-2026-08-05";
+    const E68_REFUSAL_BLOCKING_BEAD: &str = "bd-f20ye";
     #[cfg(feature = "tantivy-oracle")]
     const E68_WITNESS_DIVERGENCE_ID: &str = "DIV-008";
     #[cfg(feature = "tantivy-oracle")]
@@ -20423,12 +20435,13 @@ mod tests {
                 recorded_at: E68_RECORDED_AT.to_owned(),
             },
             E68_REFUSAL_DIVERGENCE_ID,
-            // bd-bxya1: the production path now attributes this to the oracle,
-            // so the mint records the class the campaign actually emitted. It
-            // is also what lets the machine record carry the reviewed ACCEPT:
-            // `DivergenceDisposition::validate` refuses acceptance for a raw
-            // failure class, and `OracleBug` is a semantic one.
-            DivergenceClass::OracleBug,
+            // Still the raw class, because that is what the lane still emits:
+            // bd-bxya1 built and tested the oracle-blame gate but could not
+            // wire it into production without extending the frozen v7
+            // comparator contract. When that ruling lands this becomes
+            // `OracleBug` and the disposition below becomes the reviewed
+            // Accepted, which the validator refuses for a raw failure class.
+            DivergenceClass::RankMismatch,
             DivergenceFixtureEvidence {
                 fixture_id: E68_REFUSAL_CASE_ID.to_owned(),
                 fixture_sha256,
@@ -20464,20 +20477,19 @@ mod tests {
                 recorded_at: E68_RECORDED_AT.to_owned(),
             },
             divergence_id: E68_REFUSAL_DIVERGENCE_ID.to_owned(),
-            // bd-bxya1 closes the gap bd-f20ye's close named: the reviewed
-            // decision and the machine record now agree. The owner ruling of
-            // 2026-08-05 accepted this divergence, and with the production path
-            // emitting `OracleBug` the validator admits that acceptance —
-            // which it rightly refused while the lane still emitted a raw
-            // `RankMismatch`.
-            disposition: DivergenceDisposition::Accepted {
-                equivalence_law:
-                    "the pinned oracle is a COMPARATOR, not a semantics authority: a boosted group that re-nests its negation as a positive alternative is an oracle lowering defect, and Quill's membership is the correct one. The shipping search path repairs the shape while the oracle role stays bit-faithful, so the conformance target does not move."
-                        .to_owned(),
+            // BLOCKING, still, and the reason is recorded rather than papered
+            // over: the owner ruling of 2026-08-05 ACCEPTED this divergence,
+            // but `DivergenceDisposition::validate` refuses acceptance for a
+            // raw failure class, and the lane cannot yet emit the semantic
+            // `OracleBug` class (bd-bxya1). The reviewed decision and the
+            // machine record therefore still disagree, which is exactly the
+            // difference bd-f20ye's close said would have to be stated.
+            disposition: DivergenceDisposition::Blocking {
+                bead_id: E68_REFUSAL_BLOCKING_BEAD.to_owned(),
                 rationale:
-                    "no consumer is affected by the divergence itself: the shipping backend returns the correct document set, and the difference exists only between the shipping role and the deliberately unrepaired comparator role. It is retained rather than erased so that a tantivy upgrade which fixes the lowering becomes visible instead of silently changing the conformance target."
+                    "accepted by owner ruling on 2026-08-05, but the machine record cannot say so yet: the lane emits this as a raw RankMismatch and no acceptance may bless a raw failure class. It stays blocking until the campaign can emit the OracleBug class the attribution earns (bd-bxya1)."
                         .to_owned(),
-                reviewer: E68_REFUSAL_REVIEWER.to_owned(),
+                reviewer: E68_RECORDED_BY.to_owned(),
                 reviewed_at: E68_RECORDED_AT.to_owned(),
             },
         };
