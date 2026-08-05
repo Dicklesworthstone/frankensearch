@@ -579,9 +579,15 @@ impl MetamorphicReplayArtifact {
     /// Returns `None` when `GAUNTLET_ARTIFACT_ROOT` is unset, which is the
     /// ordinary developer case: a local `cargo test` run should report the
     /// failure without littering the working tree.
+    ///
+    /// A relative value resolves against the WORKSPACE root, not the process
+    /// working directory, so the file lands where CI's upload glob looks
+    /// (bd-s5nmk).
     #[must_use]
     pub fn configured_root() -> Option<std::path::PathBuf> {
-        std::env::var_os("GAUNTLET_ARTIFACT_ROOT").map(std::path::PathBuf::from)
+        std::env::var_os("GAUNTLET_ARTIFACT_ROOT")
+            .map(std::path::PathBuf::from)
+            .map(|configured| crate::artifact::resolve_artifact_root(&configured))
     }
 }
 
@@ -3806,17 +3812,20 @@ mod nightly_metamorphic_lane {
     /// `target/coverage` path, so remote-compilation returns it and a CI upload
     /// glob can find it.
     fn required_nightly_artifact_root() -> std::path::PathBuf {
-        let root = std::env::var_os("GAUNTLET_ARTIFACT_ROOT")
+        let configured = std::env::var_os("GAUNTLET_ARTIFACT_ROOT")
             .map(std::path::PathBuf::from)
             .expect("the nightly metamorphic lane requires GAUNTLET_ARTIFACT_ROOT");
         assert!(
-            root.is_relative()
-                && root.starts_with("target/coverage")
-                && !root
+            configured.is_relative()
+                && configured.starts_with("target/coverage")
+                && !configured
                     .components()
                     .any(|component| component == std::path::Component::ParentDir),
             "nightly artifacts must use a relative target/coverage path"
         );
+        // Resolved against the workspace, not the CWD cargo hands a test
+        // binary, so the receipt lands where the upload glob looks (bd-s5nmk).
+        let root = crate::artifact::resolve_artifact_root(&configured);
         std::fs::create_dir_all(&root).expect("create nightly metamorphic artifact root");
         root
     }

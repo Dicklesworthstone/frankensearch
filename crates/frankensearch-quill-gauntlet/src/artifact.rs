@@ -434,6 +434,42 @@ fn producer_workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+/// Resolve a configured artifact root to the directory a lane writes into.
+///
+/// A RELATIVE `GAUNTLET_ARTIFACT_ROOT` is resolved against the WORKSPACE root,
+/// not the process working directory (bd-s5nmk).
+///
+/// This is not a stylistic preference; resolving against the CWD is wrong in
+/// both places the artifacts have to be found:
+///
+/// - `cargo test -p <pkg>` runs a test binary with its current directory set to
+///   the PACKAGE root, so `target/coverage/lane` became
+///   `crates/frankensearch-quill-gauntlet/target/coverage/lane`. CI's
+///   `actions/upload-artifact` resolves `path:` against the workspace, so its
+///   globs matched nothing and `if-no-files-found: error` had nothing to guard.
+/// - the remote nightly lane runs under `rch`, which returns the workspace
+///   `target/` tree. Anything written beneath a package directory is not
+///   returned at all, which is exactly why
+///   `required_nightly_artifact_root` asserts the configured value is a
+///   relative `target/coverage` path: that assertion describes where the file
+///   must END UP, and only this resolution makes it true.
+///
+/// An absolute value is honoured unchanged, so a caller who wants a scratch
+/// directory (a test with a `tempdir`) still gets exactly what it asked for.
+///
+/// `#[cfg(test)]` for the same reason `metamorphic_maintenance_laws` is: every
+/// caller is a campaign lane living in a `#[cfg(test)] mod tests`, so under
+/// `--lib` there is genuinely no production consumer. Saying so is honest;
+/// exporting it as crate API or silencing dead-code with an allow would not be.
+#[cfg(test)]
+pub fn resolve_artifact_root(configured: &Path) -> PathBuf {
+    if configured.is_absolute() {
+        configured.to_path_buf()
+    } else {
+        producer_workspace_root().join(configured)
+    }
+}
+
 fn validate_live_git_checkout(
     repository: &Path,
     expected_root: &Path,
@@ -4279,6 +4315,109 @@ mod tests {
         ComparisonMode, CountState, DifferentialCase, EngineDescriptor, EngineFamily,
         EngineObservation, NativeTieKey, RankedHit, compare_observations,
     };
+
+    /// bd-s5nmk: a relative artifact root resolves against the WORKSPACE, and
+    /// specifically NOT against the package directory cargo makes the current
+    /// directory of a test binary.
+    ///
+    /// The negative half is the point. Asserting only "the resolved path ends
+    /// with target/coverage/lane" passes for both the correct and the broken
+    /// resolution, which is how the original defect survived review; this
+    /// asserts the package-relative location is NOT produced.
+    #[test]
+    fn a_relative_artifact_root_resolves_against_the_workspace_not_the_package() {
+        let resolved = resolve_artifact_root(Path::new("target/coverage/lane"));
+        assert!(
+            resolved.is_absolute(),
+            "a resolved artifact root must be absolute: {}",
+            resolved.display()
+        );
+
+        let workspace = producer_workspace_root()
+            .canonicalize()
+            .expect("canonicalize workspace root");
+        let canonical_parent = resolved
+            .parent()
+            .and_then(|parent| parent.parent())
+            .and_then(|parent| parent.parent())
+            .expect("resolved root has a workspace ancestor")
+            .canonicalize()
+            .expect("canonicalize resolved ancestor");
+        assert_eq!(
+            canonical_parent, workspace,
+            "a relative root must resolve under the workspace"
+        );
+
+        // PLANTED NEGATIVE: the location the defect produced.
+        let package_relative = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/coverage/lane");
+        assert_ne!(
+            resolved, package_relative,
+            "resolution regressed to the package directory, where CI's upload glob cannot see it"
+        );
+        assert!(
+            !resolved.starts_with(Path::new(env!("CARGO_MANIFEST_DIR")).join("target")),
+            "artifacts must not land under the package's own target directory: {}",
+            resolved.display()
+        );
+    }
+
+    /// An absolute root is honoured unchanged, so a caller with a `tempdir`
+    /// still writes exactly where it asked.
+    #[test]
+    fn an_absolute_artifact_root_is_left_alone() {
+        let directory = tempfile::tempdir().expect("scratch root");
+        assert_eq!(
+            resolve_artifact_root(directory.path()),
+            directory.path().to_path_buf()
+        );
+    }
+
+    /// bd-s5nmk, the drift guard: every `GAUNTLET_ARTIFACT_ROOT` a CI lane
+    /// configures must be covered by an `upload-artifact` glob in the same
+    /// workflow.
+    ///
+    /// The original defect was not a typo — the root and the glob agreed
+    /// textually and disagreed about what they were relative to. Resolution is
+    /// pinned by the test above; this pins the other half, so a future lane
+    /// that sets a root and forgets its upload, or renames one side only, fails
+    /// here instead of silently retaining nothing.
+    #[test]
+    fn every_configured_artifact_root_has_an_upload_glob() {
+        let workflow = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/ci.yml"),
+        )
+        .expect("read the CI workflow");
+
+        let configured_roots: Vec<&str> = workflow
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("GAUNTLET_ARTIFACT_ROOT:"))
+            .map(str::trim)
+            .collect();
+        assert!(
+            configured_roots.len() >= 4,
+            "expected every artifact lane to configure a root; found {}",
+            configured_roots.len()
+        );
+
+        // Every non-comment line mentioning a coverage path is a candidate
+        // upload glob; `path:` entries appear both inline and as list items.
+        let glob_lines: Vec<&str> = workflow
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#') && line.contains("target/coverage"))
+            .filter(|line| !line.contains("GAUNTLET_ARTIFACT_ROOT"))
+            .collect();
+
+        for root in configured_roots {
+            assert!(
+                glob_lines
+                    .iter()
+                    .any(|line| line.contains(root) && line.contains("**")),
+                "CI configures {root} but no upload glob covers it; artifacts written there \
+                 would be retained by nothing"
+            );
+        }
+    }
 
     fn assert_strict_tagged_round_trip<T>(value: &T)
     where

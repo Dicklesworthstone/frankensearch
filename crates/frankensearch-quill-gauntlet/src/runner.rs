@@ -21764,10 +21764,18 @@ mod tests {
         );
     }
 
+    /// Root the PR campaign lanes write their evidence into.
+    ///
+    /// A configured relative root resolves against the WORKSPACE, not the
+    /// process working directory, because `cargo test -p <pkg>` runs with its
+    /// CWD at the package root and CI's upload globs are workspace-relative
+    /// (bd-s5nmk). The unset case still falls back to the caller's temporary
+    /// directory, which is already absolute.
     #[cfg(feature = "tantivy-oracle")]
     fn live_pr_artifact_root(fallback: &std::path::Path, profile: &str) -> std::path::PathBuf {
         let root = std::env::var_os("GAUNTLET_ARTIFACT_ROOT")
             .map(std::path::PathBuf::from)
+            .map(|configured| crate::artifact::resolve_artifact_root(&configured))
             .unwrap_or_else(|| fallback.to_path_buf())
             .join(profile);
         std::fs::create_dir_all(&root).expect("create PR campaign artifact root");
@@ -22413,19 +22421,28 @@ mod tests {
         }
     }
 
+    /// Root the nightly campaign lane writes into.
+    ///
+    /// The assertion is on the CONFIGURED VALUE — it must stay a relative
+    /// `target/coverage` path so RCH returns it and CI can upload it — while
+    /// the returned path is that value resolved against the WORKSPACE root.
+    /// Before bd-s5nmk the value was used verbatim against a working directory
+    /// cargo sets to the package root, so the assertion described a location
+    /// the file never actually reached.
     #[cfg(feature = "tantivy-oracle")]
     fn required_nightly_artifact_root() -> std::path::PathBuf {
-        let root = std::env::var_os("GAUNTLET_ARTIFACT_ROOT")
+        let configured = std::env::var_os("GAUNTLET_ARTIFACT_ROOT")
             .map(std::path::PathBuf::from)
             .expect("nightly lane requires GAUNTLET_ARTIFACT_ROOT");
         assert!(
-            root.is_relative()
-                && root.starts_with("target/coverage")
-                && !root
+            configured.is_relative()
+                && configured.starts_with("target/coverage")
+                && !configured
                     .components()
                     .any(|component| component == std::path::Component::ParentDir),
             "nightly artifacts must use a relative target/coverage path so RCH returns them"
         );
+        let root = crate::artifact::resolve_artifact_root(&configured);
         std::fs::create_dir_all(&root).expect("create nightly campaign artifact root");
         root
     }

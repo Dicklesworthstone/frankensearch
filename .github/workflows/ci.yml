@@ -456,20 +456,17 @@ jobs:
       # nothing, which is why this is `ignore` rather than `error`: the PR
       # lanes' artifacts are failure evidence, not a per-run receipt.
       #
-      # BOTH paths are listed because `cargo test -p <pkg>` runs the test binary
-      # with its CWD set to the PACKAGE root, so a relative
-      # GAUNTLET_ARTIFACT_ROOT resolves under crates/frankensearch-quill-gauntlet/,
-      # not under the workspace root. Measured, not assumed: a local run of the
-      # nightly lane wrote its receipt to
-      # crates/frankensearch-quill-gauntlet/target/coverage/quill-metamorphic-nightly/.
+      # The path is workspace-relative and so is the artifact root, because
+      # `resolve_artifact_root` resolves a relative GAUNTLET_ARTIFACT_ROOT
+      # against the WORKSPACE rather than the package directory cargo makes a
+      # test binary's CWD (bd-s5nmk). `artifact::tests` pins both halves: the
+      # resolution, and that every configured root here has an upload glob.
       - name: Upload Quill E6.3 metamorphic replay artifacts
         if: always() && matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: quill-metamorphic-pr-${{ github.run_id }}
-          path: |
-            target/coverage/quill-metamorphic-pr/**
-            crates/frankensearch-quill-gauntlet/target/coverage/quill-metamorphic-pr/**
+          path: target/coverage/quill-metamorphic-pr/**
           if-no-files-found: ignore
           retention-days: 14
 
@@ -496,9 +493,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: quill-metamorphic-nightly-${{ github.run_id }}
-          path: |
-            target/coverage/quill-metamorphic-nightly/**
-            crates/frankensearch-quill-gauntlet/target/coverage/quill-metamorphic-nightly/**
+          path: target/coverage/quill-metamorphic-nightly/**
           if-no-files-found: error
           retention-days: 14
 
