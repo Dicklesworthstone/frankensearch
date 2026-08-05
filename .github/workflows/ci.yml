@@ -381,6 +381,15 @@ jobs:
           cargo check -p frankensearch --lib --no-default-features --features cass-compat
           cargo check -p frankensearch --all-targets --all-features
           cargo check -p frankensearch-fusion --all-targets --all-features
+          # bd-jt7b2: frankensearch-quill-gauntlet's --all-features build was
+          # DARK for 13 hours and 124 commits after the LexicalSearch trait
+          # split (327d264a), because three of its arms compile only under
+          # feature combinations nothing routinely builds. The guard above
+          # covers the FACADE's feature singles and the facade does not depend
+          # on this dev-only crate, so nothing could see the hole. This is the
+          # same defect class as bd-b7pz, reopened in a crate the old guard
+          # cannot reach — so the guard has to name the crate, not the facade.
+          cargo check -p frankensearch-quill-gauntlet --all-targets --all-features
 
       - name: cargo clippy (cass-compat lane) (bd-6281c)
         if: matrix.os == 'ubuntu-latest'
@@ -423,6 +432,8 @@ jobs:
       - name: Quill E6.3 metamorphic PR lane (bd-quill-e6.3)
         if: matrix.os == 'ubuntu-latest'
         timeout-minutes: 10
+        env:
+          GAUNTLET_ARTIFACT_ROOT: target/coverage/quill-metamorphic-pr
         run: cargo test -p frankensearch-quill-gauntlet --features perf-harness e63_ -- --test-threads=4
 
       # The three index-maintenance families do not match the `e63_` filter --
@@ -435,7 +446,61 @@ jobs:
       - name: Quill E6.3 index-maintenance families (bd-quill-e6.3)
         if: matrix.os == 'ubuntu-latest'
         timeout-minutes: 15
+        env:
+          GAUNTLET_ARTIFACT_ROOT: target/coverage/quill-metamorphic-pr
         run: "cargo test -p frankensearch-quill-gauntlet --features perf-harness metamorphic_maintenance_laws:: -- --test-threads=4"
+
+      # A violated law shrinks its failing seed to a bounded fixture and writes
+      # a redacted replay artifact before it fails the lane
+      # (bd-e63-metamorphic-replay-artifact-lane-6p3hh). A GREEN lane emits
+      # nothing, which is why this is `ignore` rather than `error`: the PR
+      # lanes' artifacts are failure evidence, not a per-run receipt.
+      #
+      # BOTH paths are listed because `cargo test -p <pkg>` runs the test binary
+      # with its CWD set to the PACKAGE root, so a relative
+      # GAUNTLET_ARTIFACT_ROOT resolves under crates/frankensearch-quill-gauntlet/,
+      # not under the workspace root. Measured, not assumed: a local run of the
+      # nightly lane wrote its receipt to
+      # crates/frankensearch-quill-gauntlet/target/coverage/quill-metamorphic-nightly/.
+      - name: Upload Quill E6.3 metamorphic replay artifacts
+        if: always() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: quill-metamorphic-pr-${{ github.run_id }}
+          path: |
+            target/coverage/quill-metamorphic-pr/**
+            crates/frankensearch-quill-gauntlet/target/coverage/quill-metamorphic-pr/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # The nightly half of the E6.3 acceptance's "PR and nightly campaigns".
+      # It sweeps a wider, deterministically derived seed set than the fixed PR
+      # matrix, so schedules the PR lanes never generate get executed against
+      # real merges, reopens and compactions. `--ignored` keeps it out of the
+      # ordinary suite, the same shape as the nightly xlarge generator lane.
+      - name: Nightly Quill E6.3 metamorphic sweep (bd-e63-metamorphic-replay-artifact-lane-6p3hh)
+        if: matrix.os == 'ubuntu-latest' && steps.validation_profile.outputs.profile == 'nightly'
+        timeout-minutes: 30
+        env:
+          GAUNTLET_ARTIFACT_ROOT: target/coverage/quill-metamorphic-nightly
+          QUILL_E63_NIGHTLY_SEEDS: "16"
+        run: "cargo test -p frankensearch-quill-gauntlet --features perf-harness --lib metamorphic_maintenance_laws::nightly_metamorphic_lane::nightly_metamorphic_maintenance_sweep -- --ignored --exact --nocapture"
+
+      # `error` here, unlike the PR upload above, because a completed nightly
+      # sweep ALWAYS writes its receipt -- including when it found violations,
+      # since the receipt is written before the lane fails. No files therefore
+      # means the sweep did not complete, which is exactly the silent-nightly
+      # failure this receipt exists to make visible.
+      - name: Upload Quill E6.3 nightly metamorphic evidence
+        if: always() && matrix.os == 'ubuntu-latest' && steps.validation_profile.outputs.profile == 'nightly'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: quill-metamorphic-nightly-${{ github.run_id }}
+          path: |
+            target/coverage/quill-metamorphic-nightly/**
+            crates/frankensearch-quill-gauntlet/target/coverage/quill-metamorphic-nightly/**
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Bind job-scoped Salej artifact lane
         id: salej_lane

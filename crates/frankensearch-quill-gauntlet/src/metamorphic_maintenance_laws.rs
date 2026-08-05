@@ -153,6 +153,539 @@ pub fn tombstone_compaction_verdict(divergences: &[Divergence]) -> LawVerdict {
     verdict_against(TOMBSTONE_COMPACTION_ALLOWED, divergences)
 }
 
+/// Current schema of an emitted metamorphic replay artifact.
+pub const METAMORPHIC_REPLAY_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+
+/// Directory, relative to `GAUNTLET_ARTIFACT_ROOT`, that replay artifacts are
+/// written under. Kept distinct from the campaign lanes' `objects/` tree so a
+/// CI upload glob can select metamorphic evidence on its own.
+pub const METAMORPHIC_REPLAY_ARTIFACT_DIR: &str = "metamorphic-replay";
+
+/// The bead a freshly observed law violation is filed against until triage
+/// moves it. A new violation is never self-dispositioned as accepted.
+pub const METAMORPHIC_REPLAY_DEFAULT_BLOCKER: &str = "bd-quill-e6-gauntlet-scale-rm3q.3";
+
+/// Longest bounded text this artifact admits in any single prose field.
+const MAX_REPLAY_ARTIFACT_TEXT_BYTES: usize = 4 * 1024;
+
+/// Recorder identity stamped on an automatically emitted artifact.
+///
+/// Deliberately not a human name: the emitter is the executor, and an
+/// `Accepted` disposition requires a reviewer distinct from the recorder, so a
+/// machine-emitted artifact can never be accepted without a human appearing.
+pub const METAMORPHIC_REPLAY_RECORDER: &str = "e63-metamorphic-executor";
+
+/// Current UTC wall clock in the artifact's timestamp shape.
+#[must_use]
+pub fn utc_now_stamp() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    format_utc_seconds(seconds)
+}
+
+/// Render Unix seconds as `YYYY-MM-DDTHH:MM:SSZ`.
+///
+/// Computed rather than shelled out to `date` so a failing law never depends on
+/// a subprocess to record when it failed, and so the conversion itself is unit
+/// testable against known instants. Civil-from-days is Howard Hinnant's
+/// algorithm, valid across the proleptic Gregorian calendar.
+fn format_utc_seconds(seconds: u64) -> String {
+    let days = i64::try_from(seconds / 86_400).unwrap_or(i64::MAX);
+    let time_of_day = seconds % 86_400;
+    let hour = time_of_day / 3_600;
+    let minute = (time_of_day % 3_600) / 60;
+    let second = time_of_day % 60;
+
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Review disposition attached to one emitted replay artifact.
+///
+/// Field-for-field the same shape as
+/// [`crate::runner::DivergenceDisposition`], deliberately: a metamorphic
+/// failure and an oracle-differential divergence are both "a mismatch someone
+/// has to rule on", and the terminal census
+/// (`bd-quill-e6-gauntlet-scale-rm3q.8.1`) should not have to learn a second
+/// vocabulary to count them together.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MetamorphicReplayDisposition {
+    /// The violation was repaired; the commit and its regression test are named.
+    Fixed {
+        /// Commit that repaired it.
+        fixing_commit: String,
+        /// Test that fails again if it returns.
+        regression_test: String,
+        /// Who reviewed the fix.
+        reviewer: String,
+        /// UTC review timestamp.
+        reviewed_at: String,
+    },
+    /// The divergence is a reviewed equivalence, not a defect.
+    Accepted {
+        /// The law under which the observed difference is equivalent.
+        equivalence_law: String,
+        /// Why a consumer is unaffected.
+        rationale: String,
+        /// Reviewer, who must not be the recorder.
+        reviewer: String,
+        /// UTC review timestamp.
+        reviewed_at: String,
+    },
+    /// Unresolved: the violation stands and blocks, owned by a bead.
+    Blocking {
+        /// Bead that owns the unresolved violation.
+        bead_id: String,
+        /// Why it blocks.
+        rationale: String,
+        /// Who recorded the block.
+        reviewer: String,
+        /// UTC timestamp.
+        reviewed_at: String,
+    },
+}
+
+/// A bounded, redacted, replayable record of one metamorphic law violation.
+///
+/// This is the artifact the E6.3 acceptance asks for: a failing seed reduced to
+/// a bounded fixture, emitted as a file rather than as a line in a CI log. A log
+/// line has no schema, no redaction pass, no disposition and no retention; this
+/// has all four.
+///
+/// # What is deliberately absent
+///
+/// No corpus text, no query text, no document ids. The fixture travels as the
+/// schedule's [`replay_signature`][crate::metamorphic_maintenance_schedules::MaintenanceSchedule::replay_signature],
+/// whose grammar is closed over step kinds, counts and corpus INDICES, so the
+/// artifact cannot express corpus content even if a caller tried to put it
+/// there — [`Self::validate`] re-parses the signature against that grammar
+/// rather than scanning for known-sensitive words, because a canary check only
+/// catches the corpus you already thought of.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetamorphicReplayArtifact {
+    /// Artifact schema version.
+    pub schema_version: u32,
+    /// Registry law id, e.g. `e6.3-merge-schedule-v1`.
+    pub law_id: String,
+    /// Generator identity that produced the schedule.
+    pub generator_id: String,
+    /// Seed of the ORIGINAL failing schedule, before shrinking.
+    pub seed: u64,
+    /// Corpus length the schedule was generated against.
+    pub corpus_len: usize,
+    /// Redacted replay identity of the original failing schedule.
+    pub original_replay_signature: String,
+    /// Redacted replay identity of the shrunk, still-failing fixture.
+    pub shrunk_replay_signature: String,
+    /// Step count of the original schedule.
+    pub original_step_count: usize,
+    /// Step count of the shrunk fixture; never larger than the original.
+    pub shrunk_step_count: usize,
+    /// Divergence classes the law refused, deduplicated in taxonomy order.
+    pub offending_classes: Vec<DivergenceClass>,
+    /// Whether the shrunk fixture was replayed and observed to fail again.
+    pub shrunk_fixture_reproduced: bool,
+    /// Disposition; a freshly emitted artifact is always `Blocking`.
+    pub disposition: MetamorphicReplayDisposition,
+    /// Who or what emitted this artifact.
+    pub recorded_by: String,
+    /// UTC emission timestamp.
+    pub recorded_at: String,
+}
+
+/// Proof that a nightly metamorphic lane actually ran, and over what.
+///
+/// Emitted on every nightly run, violation or not. Without it a nightly that
+/// silently stopped executing is indistinguishable from a nightly that ran and
+/// found nothing — both upload zero replay artifacts. This is the file that
+/// makes `if-no-files-found: error` a real assertion rather than a formality.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetamorphicNightlyReceipt {
+    /// Receipt schema version.
+    pub schema_version: u32,
+    /// Per-law execution evidence, in registry order.
+    pub laws: Vec<MetamorphicNightlyLawReceipt>,
+    /// How many seeds each law was swept over.
+    pub seeds_per_law: usize,
+    /// Replay artifacts emitted; zero on a clean nightly.
+    pub violations_emitted: usize,
+    /// UTC completion timestamp.
+    pub recorded_at: String,
+}
+
+/// Per-law evidence inside a nightly receipt.
+///
+/// `exercised` is the load-bearing number. A derived seed can produce a
+/// schedule whose transform is a no-op — a `merge` with a single sealed segment
+/// merges nothing — and such a seed makes its law VACUOUSLY true. Counting them
+/// separately is what stops a wide sweep from reporting coverage it did not
+/// have; the lane refuses to pass unless a stated fraction really exercised the
+/// transform.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetamorphicNightlyLawReceipt {
+    /// Registry law id.
+    pub law_id: String,
+    /// Seeds whose schedule really merged, recovered, or compacted.
+    pub exercised: usize,
+    /// Seeds whose schedule made the transform a no-op.
+    pub vacuous: usize,
+    /// Violations observed for this law.
+    pub violations: usize,
+}
+
+impl MetamorphicNightlyReceipt {
+    /// File name the nightly receipt is always written under.
+    pub const FILE_NAME: &'static str = "nightly-receipt.json";
+
+    /// Validate the receipt's shape and non-vacuity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the first violated rule. A receipt claiming
+    /// zero laws or zero seeds is refused: a lane that executed nothing must
+    /// not be able to publish a receipt saying it ran.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != METAMORPHIC_REPLAY_ARTIFACT_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported receipt schema {}",
+                self.schema_version
+            ));
+        }
+        if self.laws.is_empty() || self.seeds_per_law == 0 {
+            return Err("a nightly receipt must record executed laws and seeds".to_owned());
+        }
+        for law in &self.laws {
+            if !is_bounded_artifact_text(&law.law_id) {
+                return Err("a nightly receipt law id is empty or unbounded".to_owned());
+            }
+            if law.exercised == 0 {
+                return Err(format!(
+                    "{} was swept but never exercised, so its result is vacuous",
+                    law.law_id
+                ));
+            }
+            if law.exercised + law.vacuous != self.seeds_per_law {
+                return Err(format!(
+                    "{} accounts for {} of {} swept seeds",
+                    law.law_id,
+                    law.exercised + law.vacuous,
+                    self.seeds_per_law
+                ));
+            }
+        }
+        if self.laws.iter().map(|law| law.violations).sum::<usize>() != self.violations_emitted {
+            return Err("per-law violations do not sum to the emitted total".to_owned());
+        }
+        if !is_utc_artifact_timestamp(&self.recorded_at) {
+            return Err("recorded_at is not a UTC timestamp".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Write the receipt beside the lane's replay artifacts.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the receipt is invalid or cannot be written.
+    pub fn write_under(&self, root: &std::path::Path) -> Result<std::path::PathBuf, String> {
+        self.validate()?;
+        let directory = root.join(METAMORPHIC_REPLAY_ARTIFACT_DIR);
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| format!("cannot create replay artifact directory: {error}"))?;
+        let path = directory.join(Self::FILE_NAME);
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|error| format!("cannot serialize nightly receipt: {error}"))?;
+        std::fs::write(&path, bytes)
+            .map_err(|error| format!("cannot write nightly receipt: {error}"))?;
+        Ok(path)
+    }
+}
+
+impl MetamorphicReplayArtifact {
+    /// Validate schema, bounds, fixture monotonicity, redaction, and review.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the first violated rule.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != METAMORPHIC_REPLAY_ARTIFACT_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported metamorphic replay artifact schema {}",
+                self.schema_version
+            ));
+        }
+        for (field, value) in [
+            ("law_id", &self.law_id),
+            ("generator_id", &self.generator_id),
+            ("recorded_by", &self.recorded_by),
+        ] {
+            if !is_bounded_artifact_text(value) {
+                return Err(format!("{field} is empty, unbounded, or not canonical"));
+            }
+        }
+        if !is_utc_artifact_timestamp(&self.recorded_at) {
+            return Err("recorded_at is not a UTC timestamp".to_owned());
+        }
+        for (field, signature) in [
+            ("original_replay_signature", &self.original_replay_signature),
+            ("shrunk_replay_signature", &self.shrunk_replay_signature),
+        ] {
+            validate_redacted_replay_signature(signature)
+                .map_err(|reason| format!("{field}: {reason}"))?;
+        }
+        if self.shrunk_step_count > self.original_step_count {
+            return Err("shrinking must never grow a fixture".to_owned());
+        }
+        if self.offending_classes.is_empty() {
+            return Err("a violation artifact must name the classes it refused".to_owned());
+        }
+        if self
+            .offending_classes
+            .windows(2)
+            .any(|pair| divergence_class_order(pair[0]) >= divergence_class_order(pair[1]))
+        {
+            return Err("offending classes must be deduplicated in taxonomy order".to_owned());
+        }
+        if !self.shrunk_fixture_reproduced {
+            return Err(
+                "an artifact whose reduced fixture was not observed to reproduce points at a \
+                 reproduction that does not reproduce"
+                    .to_owned(),
+            );
+        }
+        self.validate_disposition()
+    }
+
+    fn validate_disposition(&self) -> Result<(), String> {
+        match &self.disposition {
+            MetamorphicReplayDisposition::Fixed {
+                fixing_commit,
+                regression_test,
+                reviewer,
+                reviewed_at,
+            } => {
+                let commit_is_exact = fixing_commit.len() == 40
+                    && fixing_commit
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+                if !commit_is_exact
+                    || !is_bounded_artifact_text(regression_test)
+                    || !is_bounded_artifact_text(reviewer)
+                    || !is_utc_artifact_timestamp(reviewed_at)
+                {
+                    return Err(
+                        "a fixed violation requires an exact commit, regression test, and review"
+                            .to_owned(),
+                    );
+                }
+            }
+            MetamorphicReplayDisposition::Accepted {
+                equivalence_law,
+                rationale,
+                reviewer,
+                reviewed_at,
+            } => {
+                // Same rule the Divergence Register enforces, for the same
+                // reason: acceptance is the one decision that excuses a
+                // mismatch, so it is the one that needs a second pair of eyes.
+                if !is_bounded_artifact_text(equivalence_law)
+                    || !is_bounded_artifact_text(rationale)
+                    || !is_bounded_artifact_text(reviewer)
+                    || reviewer == &self.recorded_by
+                    || !is_utc_artifact_timestamp(reviewed_at)
+                {
+                    return Err(
+                        "an accepted violation requires an equivalence law, rationale, and a \
+                         reviewer independent of the recorder"
+                            .to_owned(),
+                    );
+                }
+            }
+            MetamorphicReplayDisposition::Blocking {
+                bead_id,
+                rationale,
+                reviewer,
+                reviewed_at,
+            } => {
+                let bead_is_canonical = bead_id.starts_with("bd-")
+                    && bead_id.len() > 3
+                    && bead_id.len() <= 160
+                    && bead_id.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    });
+                if !bead_is_canonical
+                    || !is_bounded_artifact_text(rationale)
+                    || !is_bounded_artifact_text(reviewer)
+                    || !is_utc_artifact_timestamp(reviewed_at)
+                {
+                    return Err(
+                        "a blocking violation requires an owned bead, rationale, and review"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Content-addressed file name, stable across re-emissions of the same
+    /// law/seed so a rerun overwrites its own evidence rather than accreting.
+    #[must_use]
+    pub fn file_name(&self) -> String {
+        format!("{}-seed-{:#018x}.json", self.law_id, self.seed)
+    }
+
+    /// Write this artifact under `root`, creating the directory if needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the artifact is invalid, cannot be serialized, or
+    /// cannot be written. An invalid artifact is refused BEFORE any file is
+    /// created, so a malformed record never reaches a CI upload.
+    pub fn write_under(&self, root: &std::path::Path) -> Result<std::path::PathBuf, String> {
+        self.validate()?;
+        let directory = root.join(METAMORPHIC_REPLAY_ARTIFACT_DIR);
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| format!("cannot create replay artifact directory: {error}"))?;
+        let path = directory.join(self.file_name());
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|error| format!("cannot serialize replay artifact: {error}"))?;
+        std::fs::write(&path, bytes)
+            .map_err(|error| format!("cannot write replay artifact: {error}"))?;
+        Ok(path)
+    }
+
+    /// Resolve the configured artifact root, if a lane set one.
+    ///
+    /// Returns `None` when `GAUNTLET_ARTIFACT_ROOT` is unset, which is the
+    /// ordinary developer case: a local `cargo test` run should report the
+    /// failure without littering the working tree.
+    #[must_use]
+    pub fn configured_root() -> Option<std::path::PathBuf> {
+        std::env::var_os("GAUNTLET_ARTIFACT_ROOT").map(std::path::PathBuf::from)
+    }
+}
+
+/// Canonical bounded prose: non-empty, trimmed, printable, and budgeted.
+fn is_bounded_artifact_text(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_REPLAY_ARTIFACT_TEXT_BYTES
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ`, the same shape the Divergence Register admits.
+fn is_utc_artifact_timestamp(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 20
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && bytes[19] == b'Z'
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 4 | 7 | 10 | 13 | 16 | 19) || byte.is_ascii_digit()
+        })
+}
+
+/// Re-parse a replay signature against the schedule renderer's closed grammar.
+///
+/// This is the redaction check, and it is structural on purpose. The grammar is
+/// `seed=0x<16 hex> corpus_len=<digits> steps=[<step>,...]` where each step is
+/// `flush`, `merge`, `reopen`, `compact`, `ingest(<digits>)` or
+/// `tombstone(<digits>)`. Corpus text cannot be spelled in that alphabet, so a
+/// signature that parses is redacted by construction rather than by inspection.
+fn validate_redacted_replay_signature(signature: &str) -> Result<(), String> {
+    if signature.len() > MAX_REPLAY_ARTIFACT_TEXT_BYTES {
+        return Err("replay signature exceeds its byte budget".to_owned());
+    }
+    let rest = signature
+        .strip_prefix("seed=0x")
+        .ok_or_else(|| "replay signature must start with a seed".to_owned())?;
+    let (seed_hex, rest) = rest
+        .split_once(' ')
+        .ok_or_else(|| "replay signature is missing its corpus length".to_owned())?;
+    if seed_hex.len() != 16
+        || !seed_hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("replay signature seed is not exact lowercase hex".to_owned());
+    }
+    let rest = rest
+        .strip_prefix("corpus_len=")
+        .ok_or_else(|| "replay signature is missing its corpus length".to_owned())?;
+    let (corpus_len, steps) = rest
+        .split_once(' ')
+        .ok_or_else(|| "replay signature is missing its step list".to_owned())?;
+    if corpus_len.is_empty() || !corpus_len.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("replay signature corpus length is not a decimal count".to_owned());
+    }
+    let steps = steps
+        .strip_prefix("steps=[")
+        .and_then(|value| value.strip_suffix(']'))
+        .ok_or_else(|| "replay signature is missing its bracketed step list".to_owned())?;
+    if steps.is_empty() {
+        return Err("replay signature has no steps".to_owned());
+    }
+    for step in steps.split(',') {
+        let recognized = matches!(step, "flush" | "merge" | "reopen" | "compact")
+            || step
+                .strip_prefix("ingest(")
+                .or_else(|| step.strip_prefix("tombstone("))
+                .and_then(|value| value.strip_suffix(')'))
+                .is_some_and(|count| {
+                    !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit())
+                });
+        if !recognized {
+            return Err(format!(
+                "replay signature contains a token outside the redacted grammar: {step:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Total order used to require deduplicated, canonically ordered classes.
+const fn divergence_class_order(class: DivergenceClass) -> u8 {
+    match class {
+        DivergenceClass::TieOrder => 0,
+        DivergenceClass::ScoreEpsilon => 1,
+        DivergenceClass::RankMismatch => 2,
+        DivergenceClass::SnippetMismatch => 3,
+        DivergenceClass::SnippetWindow => 4,
+        DivergenceClass::CountMismatch => 5,
+        DivergenceClass::DocumentCountMismatch => 6,
+        DivergenceClass::GlobExpansionLimit => 7,
+        DivergenceClass::QueryCanonicalization => 8,
+        DivergenceClass::OracleBug => 9,
+        DivergenceClass::StatsSemantics => 10,
+        DivergenceClass::PostingRecordSemantics => 11,
+        DivergenceClass::UnicodeEdge => 12,
+        DivergenceClass::OversizedQueryToken => 13,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1240,16 +1773,23 @@ pub mod maintenance_law_execution {
     use frankensearch_core::IndexableDocument;
     use frankensearch_quill::QuillConfig;
 
+    use std::future::Future;
+
     use super::maintenance_execution::{MaintenanceBacking, execute_schedule, ingest_baseline};
     use super::{
-        LawVerdict, merge_schedule_verdict, reopen_recovery_verdict, tombstone_compaction_verdict,
+        LawVerdict, METAMORPHIC_REPLAY_ARTIFACT_SCHEMA_VERSION, METAMORPHIC_REPLAY_DEFAULT_BLOCKER,
+        METAMORPHIC_REPLAY_RECORDER, MetamorphicReplayArtifact, MetamorphicReplayDisposition,
+        divergence_class_order, merge_schedule_verdict, reopen_recovery_verdict,
+        tombstone_compaction_verdict, utc_now_stamp,
     };
     use crate::comparator::{
         ComparatorConfig, ComparisonReport, CountState, Divergence, DivergenceClass,
         EngineObservation, compare_observations,
     };
     use crate::engine::{DifferentialCase, GauntletEngine};
-    use crate::metamorphic_maintenance_schedules::{MaintenanceSchedule, MaintenanceStep};
+    use crate::metamorphic_maintenance_schedules::{
+        MaintenanceSchedule, MaintenanceStep, ShrinkDriver,
+    };
 
     /// One live execution of a maintenance law.
     pub struct MaintenanceLawOutcome {
@@ -1581,6 +2121,143 @@ pub mod maintenance_law_execution {
         }
     }
 
+    /// Reduce a failing schedule to a bounded fixture and emit its replay
+    /// artifact (`bd-e63-metamorphic-replay-artifact-lane-6p3hh`).
+    ///
+    /// This is what turns a failing seed into evidence a human can act on. The
+    /// caller supplies `still_fails`, which re-executes ITS OWN law against a
+    /// candidate schedule and reports whether the violation survives — so the
+    /// shrink predicate is the real law on a real index, never a stand-in.
+    ///
+    /// Three properties the emitted artifact carries, each of which is checked
+    /// by [`MetamorphicReplayArtifact::validate`] before a file is created:
+    ///
+    /// - the reduced fixture is REPLAYED once more after shrinking, and the
+    ///   artifact records whether it reproduced. An artifact that names a
+    ///   reproduction which does not reproduce is refused outright;
+    /// - the fixture travels as a replay signature whose grammar cannot spell
+    ///   corpus text, so redaction is structural rather than a word filter;
+    /// - a fresh violation is dispositioned BLOCKING against the owning bead.
+    ///   Emission never accepts its own failure.
+    ///
+    /// Returns the artifact and, when a lane set `GAUNTLET_ARTIFACT_ROOT`, the
+    /// path it was written to. A local `cargo test` with no root configured
+    /// still shrinks and still reports — it just does not litter the tree.
+    pub async fn shrink_and_emit_replay_artifact<Predicate, Verdict>(
+        law_id: &str,
+        original: &MaintenanceSchedule,
+        offending_classes: &[DivergenceClass],
+        root: Option<&std::path::Path>,
+        mut still_fails: Predicate,
+    ) -> (MetamorphicReplayArtifact, Option<std::path::PathBuf>)
+    where
+        Predicate: FnMut(MaintenanceSchedule) -> Verdict,
+        Verdict: Future<Output = bool>,
+    {
+        let mut driver = ShrinkDriver::new(original);
+        while let Some(candidate) = driver.next_candidate() {
+            let survives = still_fails(candidate).await;
+            driver.accept(survives);
+        }
+        let shrunk = driver.finish();
+        let reproduced = still_fails(shrunk.clone()).await;
+
+        let mut classes = offending_classes.to_vec();
+        classes.sort_by_key(|class| divergence_class_order(*class));
+        classes.dedup();
+
+        let artifact = MetamorphicReplayArtifact {
+            schema_version: METAMORPHIC_REPLAY_ARTIFACT_SCHEMA_VERSION,
+            law_id: law_id.to_owned(),
+            generator_id: law_id.to_owned(),
+            seed: original.seed(),
+            corpus_len: original.corpus_len(),
+            original_replay_signature: original.replay_signature(),
+            shrunk_replay_signature: shrunk.replay_signature(),
+            original_step_count: original.steps().len(),
+            shrunk_step_count: shrunk.steps().len(),
+            offending_classes: classes,
+            shrunk_fixture_reproduced: reproduced,
+            disposition: MetamorphicReplayDisposition::Blocking {
+                bead_id: METAMORPHIC_REPLAY_DEFAULT_BLOCKER.to_owned(),
+                rationale: format!(
+                    "{law_id} was violated by a live maintenance schedule and has had no review; \
+                     a freshly observed violation blocks until it is fixed or explicitly accepted \
+                     under a named equivalence law"
+                ),
+                reviewer: METAMORPHIC_REPLAY_RECORDER.to_owned(),
+                reviewed_at: utc_now_stamp(),
+            },
+            recorded_by: METAMORPHIC_REPLAY_RECORDER.to_owned(),
+            recorded_at: utc_now_stamp(),
+        };
+
+        let path = root.map(|root| {
+            artifact
+                .write_under(root)
+                .unwrap_or_else(|error| panic!("emit {law_id} replay artifact: {error}"))
+        });
+        (artifact, path)
+    }
+
+    /// The single entry point every law's seed matrix goes through.
+    ///
+    /// Returns `None` when the law held — there is nothing to emit — and
+    /// otherwise shrinks, emits, and hands back the artifact together with the
+    /// message the caller should fail with.
+    ///
+    /// Matrix tests and the emission tests both call THIS, deliberately. An
+    /// emit-on-failure path reached only from a branch that never runs in a
+    /// green suite is untested wiring, and untested wiring is exactly what
+    /// fails on the day it is finally needed. The emission tests drive a real
+    /// violation through this same function.
+    pub async fn replay_artifact_for_violation<Predicate, Verdict>(
+        law_id: &str,
+        schedule: &MaintenanceSchedule,
+        verdict: &LawVerdict,
+        root: Option<&std::path::Path>,
+        still_fails: Predicate,
+    ) -> Option<(
+        MetamorphicReplayArtifact,
+        Option<std::path::PathBuf>,
+        String,
+    )>
+    where
+        Predicate: FnMut(MaintenanceSchedule) -> Verdict,
+        Verdict: Future<Output = bool>,
+    {
+        let LawVerdict::Violated { offending } = verdict else {
+            return None;
+        };
+        let (artifact, path) =
+            shrink_and_emit_replay_artifact(law_id, schedule, offending, root, still_fails).await;
+        let message = fail_with_replay_artifact(&artifact, path.as_deref());
+        Some((artifact, path, message))
+    }
+
+    /// Fail a law with its replay artifact attached to the panic message.
+    ///
+    /// The message names the artifact path when a lane configured one, so a CI
+    /// log points at the uploaded file rather than being the only record.
+    pub fn fail_with_replay_artifact(
+        artifact: &MetamorphicReplayArtifact,
+        path: Option<&std::path::Path>,
+    ) -> String {
+        let location = path.map_or_else(
+            || "no GAUNTLET_ARTIFACT_ROOT configured, so no artifact file was written".to_owned(),
+            |path| format!("replay artifact: {}", path.display()),
+        );
+        format!(
+            "{} violated; original {} shrank to {} ({} -> {} steps, reproduced={}); {location}",
+            artifact.law_id,
+            artifact.original_replay_signature,
+            artifact.shrunk_replay_signature,
+            artifact.original_step_count,
+            artifact.shrunk_step_count,
+            artifact.shrunk_fixture_reproduced,
+        )
+    }
+
     /// The corpus a tombstone schedule leaves alive, in corpus order.
     ///
     /// This is the never-added control the law compares against: not "the same
@@ -1729,8 +2406,8 @@ mod merge_execution_tests {
 #[cfg(all(test, feature = "perf-harness"))]
 mod merge_schedule_law_tests {
     use super::maintenance_execution::{maintenance_corpus, merging_config};
-    use super::maintenance_law_execution::run_merge_schedule_law;
-    use super::{LawVerdict, MaintenanceRunnerCapabilities};
+    use super::maintenance_law_execution::{replay_artifact_for_violation, run_merge_schedule_law};
+    use super::{LawVerdict, MaintenanceRunnerCapabilities, MetamorphicReplayArtifact};
     use crate::metamorphic_maintenance_schedules::{MAINTENANCE_SEED_MATRIX, merge_schedule};
     use crate::runner::{MetamorphicLawApplicability, MetamorphicSkipReason};
     use frankensearch_core::IndexableDocument;
@@ -1775,13 +2452,36 @@ mod merge_schedule_law_tests {
                     "seed executed no real merge, so the law would be vacuously true: {}",
                     outcome.replay_signature
                 );
-                assert!(
-                    outcome.verdict.is_equivalent(),
-                    "merge-schedule law violated for {}: {:?} (divergences {:?})",
-                    outcome.replay_signature,
-                    outcome.verdict,
-                    outcome.report.divergences
-                );
+                // A violation shrinks to a bounded fixture and emits a redacted
+                // replay artifact before it fails the lane
+                // (bd-e63-metamorphic-replay-artifact-lane-6p3hh).
+                if let Some((_, _, failure)) = replay_artifact_for_violation(
+                    "e6.3-merge-schedule-v1",
+                    &schedule,
+                    &outcome.verdict,
+                    MetamorphicReplayArtifact::configured_root().as_deref(),
+                    |candidate| {
+                        let cx = &cx;
+                        let documents = &documents;
+                        async move {
+                            !run_merge_schedule_law(
+                                cx,
+                                merging_config(),
+                                documents,
+                                documents,
+                                &candidate,
+                                PROBE,
+                            )
+                            .await
+                            .verdict
+                            .is_equivalent()
+                        }
+                    },
+                )
+                .await
+                {
+                    panic!("{failure} (divergences {:?})", outcome.report.divergences);
+                }
                 // The comparison must have had something to compare. An empty
                 // result on both sides agrees perfectly and proves nothing.
                 assert!(
@@ -1915,8 +2615,10 @@ mod reopen_recovery_law_tests {
     use super::maintenance_execution::{
         MaintenanceBacking, execute_schedule, maintenance_corpus, recovery_config,
     };
-    use super::maintenance_law_execution::run_reopen_recovery_law;
-    use super::{LawVerdict, MaintenanceRunnerCapabilities};
+    use super::maintenance_law_execution::{
+        replay_artifact_for_violation, run_reopen_recovery_law,
+    };
+    use super::{LawVerdict, MaintenanceRunnerCapabilities, MetamorphicReplayArtifact};
     use crate::metamorphic_maintenance_schedules::{
         MAINTENANCE_SEED_MATRIX, MaintenanceSchedule, MaintenanceStep, reopen_recovery_schedule,
     };
@@ -1961,13 +2663,42 @@ mod reopen_recovery_law_tests {
                      true: {}",
                     outcome.replay_signature
                 );
-                assert!(
-                    outcome.verdict.is_equivalent(),
-                    "reopen-recovery law violated for {}: {:?} (divergences {:?})",
-                    outcome.replay_signature,
-                    outcome.verdict,
-                    outcome.report.divergences
-                );
+                // Each shrink candidate gets FRESH directories: replaying a
+                // durable schedule into a directory a previous candidate
+                // already populated would measure the leftovers, not the
+                // candidate (bd-e63-metamorphic-replay-artifact-lane-6p3hh).
+                if let Some((_, _, failure)) = replay_artifact_for_violation(
+                    "e6.3-reopen-recovery-v1",
+                    &schedule,
+                    &outcome.verdict,
+                    MetamorphicReplayArtifact::configured_root().as_deref(),
+                    |candidate| {
+                        let cx = &cx;
+                        let documents = &documents;
+                        async move {
+                            let baseline = tempfile::tempdir().expect("shrink baseline directory");
+                            let maintained =
+                                tempfile::tempdir().expect("shrink maintained directory");
+                            !run_reopen_recovery_law(
+                                cx,
+                                recovery_config(),
+                                baseline.path(),
+                                maintained.path(),
+                                documents,
+                                documents,
+                                &candidate,
+                                PROBE,
+                            )
+                            .await
+                            .verdict
+                            .is_equivalent()
+                        }
+                    },
+                )
+                .await
+                {
+                    panic!("{failure} (divergences {:?})", outcome.report.divergences);
+                }
                 assert!(
                     !outcome.report.subject.hits.is_empty(),
                     "the probe returned no hits, so the observation is empty: {}",
@@ -2128,8 +2859,10 @@ mod reopen_recovery_law_tests {
 #[cfg(all(test, feature = "perf-harness"))]
 mod tombstone_compaction_law_tests {
     use super::maintenance_execution::{maintenance_corpus, merging_config};
-    use super::maintenance_law_execution::{run_tombstone_compaction_law, survivors_of};
-    use super::{LawVerdict, MaintenanceRunnerCapabilities};
+    use super::maintenance_law_execution::{
+        replay_artifact_for_violation, run_tombstone_compaction_law, survivors_of,
+    };
+    use super::{LawVerdict, MaintenanceRunnerCapabilities, MetamorphicReplayArtifact};
     use crate::metamorphic_maintenance_schedules::{
         MAINTENANCE_SEED_MATRIX, MaintenanceSchedule, MaintenanceStep,
         tombstone_compaction_schedule,
@@ -2175,14 +2908,42 @@ mod tombstone_compaction_law_tests {
                      vacuously true: {}",
                     outcome.replay_signature
                 );
-                assert!(
-                    outcome.verdict.is_equivalent(),
-                    "tombstone-compaction law violated for {}: {:?} (membership divergences \
-                     {:?})",
-                    outcome.replay_signature,
-                    outcome.verdict,
-                    outcome.membership_divergences
-                );
+                // The survivor set is DERIVED from each candidate, not carried
+                // over from the original: a shrunk schedule that dropped a
+                // tombstone step has a different never-added control, and
+                // reusing the original's would compare against the wrong corpus
+                // (bd-e63-metamorphic-replay-artifact-lane-6p3hh).
+                if let Some((_, _, failure)) = replay_artifact_for_violation(
+                    "e6.3-tombstone-compaction-v1",
+                    &schedule,
+                    &outcome.verdict,
+                    MetamorphicReplayArtifact::configured_root().as_deref(),
+                    |candidate| {
+                        let cx = &cx;
+                        let documents = &documents;
+                        async move {
+                            let candidate_survivors = survivors_of(documents, &candidate);
+                            !run_tombstone_compaction_law(
+                                cx,
+                                merging_config(),
+                                documents,
+                                &candidate_survivors,
+                                &candidate,
+                                PROBE,
+                            )
+                            .await
+                            .verdict
+                            .is_equivalent()
+                        }
+                    },
+                )
+                .await
+                {
+                    panic!(
+                        "{failure} (membership divergences {:?})",
+                        outcome.membership_divergences
+                    );
+                }
             }
         });
     }
@@ -2453,8 +3214,10 @@ mod tombstone_compaction_law_tests {
 mod live_shrink_replay_tests {
     use super::maintenance_execution::{maintenance_corpus, merging_config, recovery_config};
     use super::maintenance_law_execution::{
-        run_merge_schedule_law, run_reopen_recovery_law, run_tombstone_compaction_law, survivors_of,
+        replay_artifact_for_violation, run_merge_schedule_law, run_reopen_recovery_law,
+        run_tombstone_compaction_law, survivors_of,
     };
+    use super::{MetamorphicReplayArtifact, MetamorphicReplayDisposition};
     use crate::metamorphic_maintenance_schedules::{
         MAINTENANCE_SEED_MATRIX, MaintenanceSchedule, ShrinkDriver, merge_schedule,
         reopen_recovery_schedule, tombstone_compaction_schedule,
@@ -2676,5 +3439,698 @@ mod live_shrink_replay_tests {
                 shrunk.replay_signature()
             );
         });
+    }
+
+    /// THE END-TO-END PROOF for
+    /// `bd-e63-metamorphic-replay-artifact-lane-6p3hh`: a REAL law violation,
+    /// on a real index, produces a registered replay artifact on disk.
+    ///
+    /// It goes through `replay_artifact_for_violation` — the same entry point
+    /// the three seed matrices call — so this is not a parallel test-only path.
+    /// The violation is genuine: `mutated_corpus()` changes doc-4 so the merged
+    /// arm and the control really do disagree.
+    ///
+    /// Everything the acceptance clause asks for is checked against the FILE,
+    /// after decoding it back off disk rather than inspecting the in-memory
+    /// value: shrunk to a bounded fixture, redacted, registered with a
+    /// disposition, and still reproducing.
+    #[test]
+    fn a_real_violation_emits_a_registered_replay_artifact() {
+        let baseline = maintenance_corpus();
+        let mutated = mutated_corpus();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().expect("replay artifact root");
+            let original = merge_schedule(MAINTENANCE_SEED_MATRIX[0], baseline.len());
+            let outcome = run_merge_schedule_law(
+                &cx,
+                merging_config(),
+                &baseline,
+                &mutated,
+                &original,
+                PROBE,
+            )
+            .await;
+            assert!(
+                !outcome.verdict.is_equivalent(),
+                "the emission fixture must actually violate its law, or this test proves nothing"
+            );
+
+            let (artifact, path, message) = replay_artifact_for_violation(
+                "e6.3-merge-schedule-v1",
+                &original,
+                &outcome.verdict,
+                Some(root.path()),
+                |candidate| {
+                    let cx = &cx;
+                    let baseline = &baseline;
+                    let mutated = &mutated;
+                    async move {
+                        !run_merge_schedule_law(
+                            cx,
+                            merging_config(),
+                            baseline,
+                            mutated,
+                            &candidate,
+                            PROBE,
+                        )
+                        .await
+                        .verdict
+                        .is_equivalent()
+                    }
+                },
+            )
+            .await
+            .expect("a violated law must produce an artifact");
+
+            // 1. A FILE EXISTS, under the configured root, in the metamorphic
+            //    subdirectory a CI upload glob can select.
+            let path = path.expect("a configured root must produce a written artifact");
+            assert!(path.is_file(), "no artifact file at {}", path.display());
+            assert_eq!(
+                path.parent().and_then(std::path::Path::file_name),
+                Some(std::ffi::OsStr::new(super::METAMORPHIC_REPLAY_ARTIFACT_DIR))
+            );
+            assert!(
+                message.contains(&path.display().to_string()),
+                "the failure message must point at the artifact: {message}"
+            );
+
+            // 2. IT DECODES AND VALIDATES off disk, not just in memory.
+            let decoded: MetamorphicReplayArtifact =
+                serde_json::from_slice(&std::fs::read(&path).expect("read artifact"))
+                    .expect("decode artifact");
+            decoded.validate().expect("the emitted artifact is valid");
+            assert_eq!(decoded, artifact);
+
+            // 3. BOUNDED FIXTURE: shrinking reduced it and never grew it.
+            assert!(
+                decoded.shrunk_step_count <= decoded.original_step_count,
+                "shrinking grew the fixture"
+            );
+            assert!(
+                decoded.shrunk_fixture_reproduced,
+                "the recorded fixture must have been replayed and observed to fail again"
+            );
+
+            // 4. REDACTED: no corpus text reaches the file, checked over the
+            //    RAW BYTES rather than the parsed fields, so a leak in any
+            //    field is caught. `saffron` is unique to the mutated corpus.
+            let raw = std::fs::read_to_string(&path).expect("read artifact bytes");
+            for leaked in ["saffron", "alpha beta", "doc-4"] {
+                assert!(
+                    !raw.contains(leaked),
+                    "the artifact leaked corpus text {leaked:?}"
+                );
+            }
+
+            // 5. REGISTERED, and registered as BLOCKING: an unreviewed
+            //    violation never disposes of itself as accepted.
+            match &decoded.disposition {
+                MetamorphicReplayDisposition::Blocking { bead_id, .. } => {
+                    assert_eq!(bead_id, super::METAMORPHIC_REPLAY_DEFAULT_BLOCKER);
+                }
+                MetamorphicReplayDisposition::Accepted { .. }
+                | MetamorphicReplayDisposition::Fixed { .. } => {
+                    panic!("a freshly emitted violation must block, not excuse itself")
+                }
+            }
+            assert_eq!(decoded.law_id, "e6.3-merge-schedule-v1");
+            assert_eq!(decoded.seed, original.seed());
+        });
+    }
+}
+
+/// Contract tests for the replay artifact itself
+/// (`bd-e63-metamorphic-replay-artifact-lane-6p3hh`).
+///
+/// These need no index: they pin the schema, the redaction grammar, the
+/// review policy, and the bounded-fixture rule. The live proof that a real
+/// violation produces one of these is
+/// `live_shrink_replay_tests::a_real_violation_emits_a_registered_replay_artifact`.
+#[cfg(test)]
+mod replay_artifact_contract_tests {
+    use super::{
+        METAMORPHIC_REPLAY_ARTIFACT_SCHEMA_VERSION, METAMORPHIC_REPLAY_DEFAULT_BLOCKER,
+        METAMORPHIC_REPLAY_RECORDER, MetamorphicReplayArtifact, MetamorphicReplayDisposition,
+        format_utc_seconds,
+    };
+    use crate::comparator::DivergenceClass;
+
+    fn blocking_artifact() -> MetamorphicReplayArtifact {
+        MetamorphicReplayArtifact {
+            schema_version: METAMORPHIC_REPLAY_ARTIFACT_SCHEMA_VERSION,
+            law_id: "e6.3-merge-schedule-v1".to_owned(),
+            generator_id: "e6.3-merge-schedule-v1".to_owned(),
+            seed: 0x0e63_0000_0000_0001,
+            corpus_len: 6,
+            original_replay_signature:
+                "seed=0x0e63000000000001 corpus_len=6 steps=[ingest(3),flush,merge,ingest(3),flush]"
+                    .to_owned(),
+            shrunk_replay_signature:
+                "seed=0x0e63000000000001 corpus_len=6 steps=[ingest(3),flush,merge]".to_owned(),
+            original_step_count: 5,
+            shrunk_step_count: 3,
+            offending_classes: vec![DivergenceClass::RankMismatch],
+            shrunk_fixture_reproduced: true,
+            disposition: MetamorphicReplayDisposition::Blocking {
+                bead_id: METAMORPHIC_REPLAY_DEFAULT_BLOCKER.to_owned(),
+                rationale: "unreviewed live violation".to_owned(),
+                reviewer: METAMORPHIC_REPLAY_RECORDER.to_owned(),
+                reviewed_at: "2026-08-04T21:00:00Z".to_owned(),
+            },
+            recorded_by: METAMORPHIC_REPLAY_RECORDER.to_owned(),
+            recorded_at: "2026-08-04T21:00:00Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_well_formed_blocking_artifact_validates_and_round_trips() {
+        let artifact = blocking_artifact();
+        artifact
+            .validate()
+            .expect("the reference artifact is valid");
+        let encoded = serde_json::to_vec(&artifact).expect("serialize");
+        let decoded: MetamorphicReplayArtifact = serde_json::from_slice(&encoded).expect("decode");
+        assert_eq!(decoded, artifact);
+        decoded.validate().expect("a decoded artifact stays valid");
+    }
+
+    /// PLANTED NEGATIVES, one mutation each. Every rule the artifact claims to
+    /// enforce is shown to actually reject something, because a validator whose
+    /// negatives are never exercised is indistinguishable from `Ok(())`.
+    #[test]
+    fn each_contract_rule_rejects_its_own_violation() {
+        // Plain `fn` items rather than boxed closures: none of these mutations
+        // capture anything, and a table of trait objects is a complex type for
+        // no benefit.
+        type Mutation = fn(&mut MetamorphicReplayArtifact);
+        let cases: &[(&str, Mutation)] = &[
+            ("schema", |artifact| artifact.schema_version += 1),
+            ("empty law id", |artifact| artifact.law_id.clear()),
+            ("non-UTC stamp", |artifact| {
+                artifact.recorded_at = "yesterday".to_owned();
+            }),
+            ("grown fixture", |artifact| {
+                artifact.shrunk_step_count = artifact.original_step_count + 1;
+            }),
+            ("no offending class", |artifact| {
+                artifact.offending_classes.clear();
+            }),
+            ("unordered classes", |artifact| {
+                artifact.offending_classes =
+                    vec![DivergenceClass::RankMismatch, DivergenceClass::TieOrder];
+            }),
+            ("duplicate classes", |artifact| {
+                artifact.offending_classes =
+                    vec![DivergenceClass::TieOrder, DivergenceClass::TieOrder];
+            }),
+            ("fixture that did not reproduce", |artifact| {
+                artifact.shrunk_fixture_reproduced = false;
+            }),
+            ("corpus text in the signature", |artifact| {
+                artifact.shrunk_replay_signature =
+                    "seed=0x0e63000000000001 corpus_len=6 steps=[alpha beta saffron]".to_owned();
+            }),
+            ("free prose in the signature", |artifact| {
+                artifact.shrunk_replay_signature = "it merged and then broke".to_owned();
+            }),
+            ("short seed in the signature", |artifact| {
+                artifact.shrunk_replay_signature = "seed=0x1 corpus_len=6 steps=[flush]".to_owned();
+            }),
+            ("unknown step kind", |artifact| {
+                artifact.shrunk_replay_signature =
+                    "seed=0x0e63000000000001 corpus_len=6 steps=[flush,vacuum]".to_owned();
+            }),
+            ("self-accepted violation", |artifact| {
+                artifact.disposition = MetamorphicReplayDisposition::Accepted {
+                    equivalence_law: "merges may reorder ties".to_owned(),
+                    rationale: "no consumer impact".to_owned(),
+                    reviewer: METAMORPHIC_REPLAY_RECORDER.to_owned(),
+                    reviewed_at: "2026-08-04T21:00:00Z".to_owned(),
+                };
+            }),
+            ("fix without an exact commit", |artifact| {
+                artifact.disposition = MetamorphicReplayDisposition::Fixed {
+                    fixing_commit: "HEAD~1".to_owned(),
+                    regression_test: "some::test".to_owned(),
+                    reviewer: "SandyGrove".to_owned(),
+                    reviewed_at: "2026-08-04T21:00:00Z".to_owned(),
+                };
+            }),
+            ("block on a non-bead", |artifact| {
+                artifact.disposition = MetamorphicReplayDisposition::Blocking {
+                    bead_id: "ticket-17".to_owned(),
+                    rationale: "unreviewed".to_owned(),
+                    reviewer: METAMORPHIC_REPLAY_RECORDER.to_owned(),
+                    reviewed_at: "2026-08-04T21:00:00Z".to_owned(),
+                };
+            }),
+        ];
+        for (label, mutate) in cases {
+            let mut artifact = blocking_artifact();
+            mutate(&mut artifact);
+            assert!(
+                artifact.validate().is_err(),
+                "the contract accepted a {label} artifact"
+            );
+        }
+    }
+
+    /// A reviewed acceptance by an INDEPENDENT reviewer is admitted, so the
+    /// rule above is "the recorder cannot accept its own failure" rather than
+    /// "acceptance is impossible".
+    #[test]
+    fn an_independently_reviewed_acceptance_is_admitted() {
+        let mut artifact = blocking_artifact();
+        artifact.disposition = MetamorphicReplayDisposition::Accepted {
+            equivalence_law: "a merge may reorder documents with equal scores".to_owned(),
+            rationale: "rank order within a tie group is not a consumer-visible contract"
+                .to_owned(),
+            reviewer: "SandyGrove".to_owned(),
+            reviewed_at: "2026-08-04T21:00:00Z".to_owned(),
+        };
+        artifact
+            .validate()
+            .expect("an independently reviewed acceptance is admissible");
+    }
+
+    #[test]
+    fn an_invalid_artifact_never_reaches_the_filesystem() {
+        let directory = tempfile::tempdir().expect("artifact root");
+        let mut artifact = blocking_artifact();
+        artifact.shrunk_fixture_reproduced = false;
+        let error = artifact
+            .write_under(directory.path())
+            .expect_err("an invalid artifact must be refused");
+        assert!(error.contains("reproduce"), "unexpected refusal: {error}");
+        assert!(
+            !directory
+                .path()
+                .join(super::METAMORPHIC_REPLAY_ARTIFACT_DIR)
+                .exists(),
+            "a refused artifact must not even create its directory"
+        );
+    }
+
+    #[test]
+    fn utc_rendering_matches_known_instants() {
+        assert_eq!(format_utc_seconds(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_utc_seconds(946_684_799), "1999-12-31T23:59:59Z");
+        // A leap day, which a naive 365-day conversion gets wrong.
+        assert_eq!(format_utc_seconds(1_709_164_800), "2024-02-29T00:00:00Z");
+        // Cross-checked against `date -u -d @1785888000`.
+        assert_eq!(format_utc_seconds(1_785_888_000), "2026-08-05T00:00:00Z");
+    }
+}
+
+/// The E6.3 NIGHTLY metamorphic lane
+/// (`bd-e63-metamorphic-replay-artifact-lane-6p3hh`).
+///
+/// The PR lanes execute the three index-maintenance families over the fixed
+/// `MAINTENANCE_SEED_MATRIX` under a 15-minute budget. This lane exists because
+/// the E6.3 acceptance asks for "PR and nightly campaigns", and a nightly is
+/// only worth running if it does something a PR lane cannot: it sweeps a wider,
+/// deterministically derived seed set, so schedules the fixed matrix never
+/// produces get executed against real merges, real reopens and real
+/// compactions.
+///
+/// It is `#[ignore]`d and run explicitly by CI with `-- --ignored`, the same
+/// shape as the nightly xlarge generator lane, so an ordinary `cargo test` is
+/// not silently red for want of an artifact root.
+#[cfg(all(test, feature = "perf-harness"))]
+mod nightly_metamorphic_lane {
+    use super::maintenance_execution::{maintenance_corpus, merging_config, recovery_config};
+    use super::maintenance_law_execution::{
+        replay_artifact_for_violation, run_merge_schedule_law, run_reopen_recovery_law,
+        run_tombstone_compaction_law, survivors_of,
+    };
+    use super::{
+        METAMORPHIC_REPLAY_ARTIFACT_SCHEMA_VERSION, MetamorphicNightlyLawReceipt,
+        MetamorphicNightlyReceipt, utc_now_stamp,
+    };
+    use crate::metamorphic_maintenance_schedules::{
+        merge_schedule, reopen_recovery_schedule, tombstone_compaction_schedule,
+    };
+
+    const PROBE: &str = "alpha";
+
+    /// Seeds the fixed PR matrix does not contain.
+    ///
+    /// Derived by mixing an index into a base constant rather than sampled from
+    /// a clock, so a nightly failure names a seed that reproduces exactly.
+    const NIGHTLY_SEED_BASE: u64 = 0x0e63_9147_0000_0000;
+
+    fn nightly_seeds(count: usize) -> Vec<u64> {
+        (0..count)
+            .map(|index| {
+                NIGHTLY_SEED_BASE
+                    ^ u64::try_from(index)
+                        .unwrap_or(0)
+                        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            })
+            .collect()
+    }
+
+    /// Seeds per law, overridable so the lane's budget is tunable from CI.
+    fn configured_seed_count() -> usize {
+        std::env::var("QUILL_E63_NIGHTLY_SEEDS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|count| *count > 0)
+            .unwrap_or(16)
+    }
+
+    /// The artifact root the nightly lane REQUIRES.
+    ///
+    /// Same constraint the nightly campaign lane imposes: a relative
+    /// `target/coverage` path, so remote-compilation returns it and a CI upload
+    /// glob can find it.
+    fn required_nightly_artifact_root() -> std::path::PathBuf {
+        let root = std::env::var_os("GAUNTLET_ARTIFACT_ROOT")
+            .map(std::path::PathBuf::from)
+            .expect("the nightly metamorphic lane requires GAUNTLET_ARTIFACT_ROOT");
+        assert!(
+            root.is_relative()
+                && root.starts_with("target/coverage")
+                && !root
+                    .components()
+                    .any(|component| component == std::path::Component::ParentDir),
+            "nightly artifacts must use a relative target/coverage path"
+        );
+        std::fs::create_dir_all(&root).expect("create nightly metamorphic artifact root");
+        root
+    }
+
+    /// Sweep all three maintenance laws over the wide nightly seed set.
+    ///
+    /// Every seed is checked for NON-VACUITY before its verdict is trusted: a
+    /// wider matrix is only wider coverage if the extra schedules actually
+    /// merge, recover and compact. A seed that exercised nothing fails the lane
+    /// rather than being counted as a pass.
+    #[test]
+    #[ignore = "nightly lane; run explicitly with --ignored and GAUNTLET_ARTIFACT_ROOT set"]
+    fn nightly_metamorphic_maintenance_sweep() {
+        let documents = maintenance_corpus();
+        let root = required_nightly_artifact_root();
+        let seed_count = configured_seed_count();
+        let seeds = nightly_seeds(seed_count);
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let mut failures: Vec<String> = Vec::new();
+            let (mut merge_exercised, mut merge_vacuous) = (0_usize, 0_usize);
+            let (mut reopen_exercised, mut reopen_vacuous) = (0_usize, 0_usize);
+            let (mut tombstone_exercised, mut tombstone_vacuous) = (0_usize, 0_usize);
+
+            for seed in seeds.iter().copied() {
+                let schedule = merge_schedule(seed, documents.len());
+                let outcome = run_merge_schedule_law(
+                    &cx,
+                    merging_config(),
+                    &documents,
+                    &documents,
+                    &schedule,
+                    PROBE,
+                )
+                .await;
+                // A derived seed whose `merge` had a single sealed segment
+                // merged nothing. That is a property of the schedule, not a
+                // law failure, so it is COUNTED rather than asserted; the lane
+                // enforces exercise in aggregate below.
+                if outcome.merges_executed >= 1 {
+                    merge_exercised += 1;
+                } else {
+                    merge_vacuous += 1;
+                }
+                if let Some((_, _, failure)) = replay_artifact_for_violation(
+                    "e6.3-merge-schedule-v1",
+                    &schedule,
+                    &outcome.verdict,
+                    Some(root.as_path()),
+                    |candidate| {
+                        let cx = &cx;
+                        let documents = &documents;
+                        async move {
+                            !run_merge_schedule_law(
+                                cx,
+                                merging_config(),
+                                documents,
+                                documents,
+                                &candidate,
+                                PROBE,
+                            )
+                            .await
+                            .verdict
+                            .is_equivalent()
+                        }
+                    },
+                )
+                .await
+                {
+                    failures.push(failure);
+                }
+            }
+
+            for seed in seeds.iter().copied() {
+                let baseline_root = tempfile::tempdir().expect("nightly baseline directory");
+                let maintained_root = tempfile::tempdir().expect("nightly maintained directory");
+                let schedule = reopen_recovery_schedule(seed, documents.len());
+                let outcome = run_reopen_recovery_law(
+                    &cx,
+                    recovery_config(),
+                    baseline_root.path(),
+                    maintained_root.path(),
+                    &documents,
+                    &documents,
+                    &schedule,
+                    PROBE,
+                )
+                .await;
+                if outcome.reopens_executed >= 1 {
+                    reopen_exercised += 1;
+                } else {
+                    reopen_vacuous += 1;
+                }
+                if let Some((_, _, failure)) = replay_artifact_for_violation(
+                    "e6.3-reopen-recovery-v1",
+                    &schedule,
+                    &outcome.verdict,
+                    Some(root.as_path()),
+                    |candidate| {
+                        let cx = &cx;
+                        let documents = &documents;
+                        async move {
+                            let baseline = tempfile::tempdir().expect("shrink baseline directory");
+                            let maintained =
+                                tempfile::tempdir().expect("shrink maintained directory");
+                            !run_reopen_recovery_law(
+                                cx,
+                                recovery_config(),
+                                baseline.path(),
+                                maintained.path(),
+                                documents,
+                                documents,
+                                &candidate,
+                                PROBE,
+                            )
+                            .await
+                            .verdict
+                            .is_equivalent()
+                        }
+                    },
+                )
+                .await
+                {
+                    failures.push(failure);
+                }
+            }
+
+            for seed in seeds.iter().copied() {
+                let schedule = tombstone_compaction_schedule(seed, documents.len());
+                let survivors = survivors_of(&documents, &schedule);
+                let outcome = run_tombstone_compaction_law(
+                    &cx,
+                    merging_config(),
+                    &documents,
+                    &survivors,
+                    &schedule,
+                    PROBE,
+                )
+                .await;
+                if outcome.compactions_with_work >= 1 {
+                    tombstone_exercised += 1;
+                } else {
+                    tombstone_vacuous += 1;
+                }
+                if let Some((_, _, failure)) = replay_artifact_for_violation(
+                    "e6.3-tombstone-compaction-v1",
+                    &schedule,
+                    &outcome.verdict,
+                    Some(root.as_path()),
+                    |candidate| {
+                        let cx = &cx;
+                        let documents = &documents;
+                        async move {
+                            let candidate_survivors = survivors_of(documents, &candidate);
+                            !run_tombstone_compaction_law(
+                                cx,
+                                merging_config(),
+                                documents,
+                                &candidate_survivors,
+                                &candidate,
+                                PROBE,
+                            )
+                            .await
+                            .verdict
+                            .is_equivalent()
+                        }
+                    },
+                )
+                .await
+                {
+                    failures.push(failure);
+                }
+            }
+
+            // The receipt is what distinguishes "the nightly ran and found
+            // nothing" from "the nightly did not run". It is written last so it
+            // cannot claim a sweep that did not complete.
+            let laws = vec![
+                MetamorphicNightlyLawReceipt {
+                    law_id: "e6.3-merge-schedule-v1".to_owned(),
+                    exercised: merge_exercised,
+                    vacuous: merge_vacuous,
+                    violations: failures
+                        .iter()
+                        .filter(|failure| failure.starts_with("e6.3-merge-schedule-v1"))
+                        .count(),
+                },
+                MetamorphicNightlyLawReceipt {
+                    law_id: "e6.3-reopen-recovery-v1".to_owned(),
+                    exercised: reopen_exercised,
+                    vacuous: reopen_vacuous,
+                    violations: failures
+                        .iter()
+                        .filter(|failure| failure.starts_with("e6.3-reopen-recovery-v1"))
+                        .count(),
+                },
+                MetamorphicNightlyLawReceipt {
+                    law_id: "e6.3-tombstone-compaction-v1".to_owned(),
+                    exercised: tombstone_exercised,
+                    vacuous: tombstone_vacuous,
+                    violations: failures
+                        .iter()
+                        .filter(|failure| failure.starts_with("e6.3-tombstone-compaction-v1"))
+                        .count(),
+                },
+            ];
+
+            // AGGREGATE NON-VACUITY. Individual seeds are allowed to produce a
+            // no-op transform; a sweep in which most of them do is a narrower
+            // lane wearing a wider one's name, and would report a green
+            // nightly having merged, recovered, or compacted almost nothing.
+            for law in &laws {
+                assert!(
+                    law.exercised * 4 >= seed_count,
+                    "{} exercised only {}/{} nightly seeds; the sweep is mostly vacuous",
+                    law.law_id,
+                    law.exercised,
+                    seed_count
+                );
+            }
+
+            let receipt = MetamorphicNightlyReceipt {
+                schema_version: METAMORPHIC_REPLAY_ARTIFACT_SCHEMA_VERSION,
+                laws,
+                seeds_per_law: seed_count,
+                violations_emitted: failures.len(),
+                recorded_at: utc_now_stamp(),
+            };
+            let path = receipt
+                .write_under(&root)
+                .expect("write the nightly metamorphic receipt");
+            eprintln!("E63_NIGHTLY_RECEIPT={}", path.display());
+
+            // The lane fails AFTER sweeping every seed and writing every
+            // artifact, not on the first violation. A nightly that stopped at
+            // the first failing seed would hide the other fifteen, and its
+            // receipt could never report a truthful violation count.
+            assert!(
+                failures.is_empty(),
+                "{} nightly metamorphic violation(s), each with a replay artifact under {}:\n{}",
+                failures.len(),
+                root.display(),
+                failures.join("\n")
+            );
+        });
+    }
+
+    /// The nightly seed set must not silently collapse onto the PR matrix or
+    /// onto itself; a sweep of duplicates is a narrower lane wearing a wider
+    /// lane's name.
+    #[test]
+    fn nightly_seeds_are_distinct_and_disjoint_from_the_pr_matrix() {
+        use crate::metamorphic_maintenance_schedules::MAINTENANCE_SEED_MATRIX;
+
+        let seeds = nightly_seeds(32);
+        let unique: std::collections::BTreeSet<u64> = seeds.iter().copied().collect();
+        assert_eq!(unique.len(), seeds.len(), "nightly seeds repeat");
+        for pr_seed in MAINTENANCE_SEED_MATRIX {
+            assert!(
+                !unique.contains(&pr_seed),
+                "nightly seed set re-runs PR seed {pr_seed:#018x}"
+            );
+        }
+    }
+
+    /// A receipt that claims a sweep it did not perform is refused.
+    #[test]
+    fn a_receipt_cannot_claim_an_empty_sweep() {
+        let receipt = MetamorphicNightlyReceipt {
+            schema_version: METAMORPHIC_REPLAY_ARTIFACT_SCHEMA_VERSION,
+            laws: vec![MetamorphicNightlyLawReceipt {
+                law_id: "e6.3-merge-schedule-v1".to_owned(),
+                exercised: 3,
+                vacuous: 1,
+                violations: 0,
+            }],
+            seeds_per_law: 4,
+            violations_emitted: 0,
+            recorded_at: "2026-08-04T21:00:00Z".to_owned(),
+        };
+        receipt.validate().expect("the reference receipt is valid");
+
+        let mut empty_laws = receipt.clone();
+        empty_laws.laws.clear();
+        assert!(empty_laws.validate().is_err(), "no laws is not a sweep");
+
+        let mut no_seeds = receipt.clone();
+        no_seeds.seeds_per_law = 0;
+        assert!(no_seeds.validate().is_err(), "no seeds is not a sweep");
+
+        // A law that was swept but never exercised is vacuous, not passing.
+        let mut vacuous = receipt.clone();
+        vacuous.laws[0].exercised = 0;
+        vacuous.laws[0].vacuous = 4;
+        assert!(
+            vacuous.validate().is_err(),
+            "a never-exercised law must not publish a receipt"
+        );
+
+        // The seed accounting must add up, or the receipt is describing a
+        // sweep other than the one that ran.
+        let mut unaccounted = receipt.clone();
+        unaccounted.laws[0].vacuous = 0;
+        assert!(
+            unaccounted.validate().is_err(),
+            "exercised plus vacuous must equal the swept seeds"
+        );
+
+        // A receipt whose per-law violations disagree with its total is
+        // internally inconsistent and must not validate.
+        let mut mismatched = receipt;
+        mismatched.violations_emitted = 1;
+        assert!(
+            mismatched.validate().is_err(),
+            "violation counts must reconcile"
+        );
     }
 }
