@@ -336,7 +336,7 @@ not this row. This row is the human projection of it.
   ledger holding both active would trip the "one active mismatch signature cannot belong to multiple
   divergences" rule. That is a census-design constraint, not a defect in either entry.
 
-### DIV-009: boosting a group changes its boolean meaning when the group negates
+### DIV-009: boosting a group changes its boolean meaning when the group negates (shipping path repaired, oracle pinned)
 
 - Class: `RankMismatch` (MEMBERSHIP — the engines disagree about which documents match, so no
   score-tolerance class can ever cover it)
@@ -372,18 +372,32 @@ not this row. This row is the human projection of it.
   `frankensearch_lexical::tests::boosting_a_group_that_negates_changes_its_meaning_in_the_pinned_oracle`,
   which pins the oracle's exact behaviour in both directions so a tantivy upgrade that changes it
   becomes visible instead of silently moving the conformance target.
-- NOT fixed in the adapter, deliberately: `frankensearch-lexical` is simultaneously the shipping
-  tantivy backend and the pinned conformance oracle, so rewriting these queries there would move the
-  target Quill is measured against. That is an owner decision, recorded on `bd-f20ye`, not a P2 bug
-  fix.
-- Decision: **blocking** (bead `bd-f20ye`). Distinct from `bd-nqeb4`, which is a PhraseScorer panic
-  on a negated absent phrase — different shape, different failure mode.
-- Machine record: minted on demand by the E6.8 lane rather than committed. DIV-008's committed
-  ledger and artifact remain the historical witness of what that lane did at `4efe400c`, when it was
-  still zero-tolerance; a fresh mint today records DIV-009 instead, because an auto-classified case
-  carries no register-worthy signature and the refusal is the case that can be ingested.
-- Reviewer: recorded and blocked by `Claude-pane12`; no independent review claimed, and none is
-  required to block.
+- Decision: **accept** — the two roles of `frankensearch-lexical` diverge here, deliberately, by
+  owner ruling (2026-08-05, recorded on `bd-f20ye`; the owner may override).
+- Equivalence law and rationale: the oracle is a pinned **comparator**, not a semantics authority. A
+  boost is a score multiplier; a boost that changes boolean MEMBERSHIP is a defect by any reading,
+  and `(a NOT b)^2` returning documents the query excluded is user-facing wrong. So the SHIPPING
+  search path repairs the shape while the `oracle_observe_*` family stays bit-faithful to Tantivy
+  0.26.1, defects included, and Quill continues to be measured against an unmoved target. Direct
+  precedent: Quill already fixed the NOT+prefix double-negation defect this oracle carries (bd-bsjw),
+  so the campaign has an established pattern for shipping-correct-while-oracle-faithful.
+- Scope of the divergence, stated exactly: `TantivyIndex::parse_query_shipping` strips the boost from
+  any parenthesized group containing a negation, and only the six user-facing `search*` methods call
+  it. Membership is then identical to the unboosted form; the boost factor is dropped rather than
+  redistributed, because a `MustNot` clause contributes no score and Tantivy cannot currently express
+  the boosted form correctly at all. `oracle_observe_query` and `oracle_observe_page` are unchanged.
+- Enforced by planted negatives in BOTH directions:
+  disabling the repair reddens "the shipping path must not return a document the query excluded";
+  leaking the repair into `oracle_observe_page` reddens "the oracle page surface must reproduce the
+  defect, not the repair". Neither direction can regress silently.
+- Machine record: minted on demand by the E6.8 lane rather than committed, and that mint still
+  records **blocking** — `DivergenceDisposition::Accepted` refuses a raw failure class by design, and
+  the lane observes this as a `RankMismatch` because it does not run the `OracleBug` reclassification
+  the bsjw probe applies. The accept above is the reviewed decision; teaching the default-profile lane
+  to classify this shape as `OracleBug` (with its per-fixture registry row) is the follow-up that
+  would let the two records agree, and is named here rather than left to be discovered.
+- Reviewer: owner ruling of 2026-08-05, recorded by `Claude-pane12`. Distinct from `bd-nqeb4`, which
+  is a `PhraseScorer` panic on a negated absent phrase — different shape, different failure mode.
 
 ---
 

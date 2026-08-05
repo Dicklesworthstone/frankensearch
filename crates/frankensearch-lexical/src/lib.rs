@@ -48,6 +48,7 @@ pub use tantivy::{
     TantivyDocument, Term,
 };
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -117,6 +118,119 @@ impl std::fmt::Display for QueryExplanation {
 }
 
 /// Classify a raw query string into a [`QueryExplanation`].
+/// Strip the boost from any parenthesized group that contains a negation
+/// (bd-f20ye), for the SHIPPING search path only.
+///
+/// # Why a boost has to be dropped rather than moved
+///
+/// Tantivy 0.26.1 lowers `(A NOT B)` as a `MustNot` clause OF the enclosing
+/// boolean, which excludes, but lowers `(A NOT B)^2` by nesting the negation in
+/// its own `BooleanQuery { [(MustNot, …)], msm: 0 }` and attaching THAT as a
+/// clause of the outer boolean. A matcher meaning "every document except B"
+/// then becomes a positive alternative, so the group stops excluding:
+/// `(A NOT B)^2` returns the documents B was supposed to remove, and
+/// `(A AND NOT B)^2` fails the other way and returns nothing.
+///
+/// The repair cannot be done on the parsed tree: `BoostQuery`'s fields are
+/// private and it exposes no accessors, so the boolean inside a boost is
+/// unreachable. It therefore happens on the query text, before parsing.
+///
+/// Dropping the boost is exact for MEMBERSHIP, which is the property at stake,
+/// and lossy for SCORING: a `MustNot` clause contributes no score, so the boost
+/// only ever scaled the positive operands, and those keep their relative order
+/// without it. Redistributing the factor onto each positive operand would
+/// preserve scores too, but requires splitting arbitrary group syntax by hand —
+/// more ways to be wrong, for an ordering nicety, on a shape Tantivy cannot
+/// currently express correctly at all.
+///
+/// Quoted phrases are respected, so a literal `"a NOT b"` never triggers it.
+fn repair_boosted_group_negation(query: &str) -> Cow<'_, str> {
+    // Cheap reject: no group boost, nothing to repair.
+    if !query.contains(")^") {
+        return Cow::Borrowed(query);
+    }
+
+    let bytes = query.as_bytes();
+    // One flag per open group: did THIS group contain a negation directly?
+    let mut group_negates: Vec<bool> = Vec::new();
+    // Byte ranges of `^<number>` suffixes to remove.
+    let mut drop_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut in_quotes = false;
+    let mut index = 0_usize;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'"' {
+            in_quotes = !in_quotes;
+            index += 1;
+            continue;
+        }
+        if in_quotes {
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'(' => group_negates.push(false),
+            b')' => {
+                let negates = group_negates.pop().unwrap_or(false);
+                // A boost suffix is `^` followed by a number, possibly decimal.
+                let mut cursor = index + 1;
+                if negates && cursor < bytes.len() && bytes[cursor] == b'^' {
+                    let start = cursor;
+                    cursor += 1;
+                    let digits_start = cursor;
+                    while cursor < bytes.len()
+                        && (bytes[cursor].is_ascii_digit() || bytes[cursor] == b'.')
+                    {
+                        cursor += 1;
+                    }
+                    if cursor > digits_start {
+                        drop_ranges.push((start, cursor));
+                    }
+                }
+            }
+            b'N' => {
+                // `NOT` as a standalone token, at this group's own level.
+                let is_token = query[index..].starts_with("NOT")
+                    && index.checked_sub(1).is_none_or(|previous| {
+                        bytes[previous].is_ascii_whitespace() || bytes[previous] == b'('
+                    })
+                    && bytes
+                        .get(index + 3)
+                        .is_none_or(|next| next.is_ascii_whitespace() || *next == b'(');
+                if is_token && let Some(current) = group_negates.last_mut() {
+                    *current = true;
+                }
+            }
+            b'-' => {
+                // Prefix exclusion: `-term`, not a hyphen inside a word.
+                let is_prefix = index.checked_sub(1).is_none_or(|previous| {
+                    bytes[previous].is_ascii_whitespace() || bytes[previous] == b'('
+                }) && bytes
+                    .get(index + 1)
+                    .is_some_and(|next| !next.is_ascii_whitespace());
+                if is_prefix && let Some(current) = group_negates.last_mut() {
+                    *current = true;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+
+    if drop_ranges.is_empty() {
+        return Cow::Borrowed(query);
+    }
+    let mut repaired = String::with_capacity(query.len());
+    let mut cursor = 0_usize;
+    for (start, end) in drop_ranges {
+        repaired.push_str(&query[cursor..start]);
+        cursor = end;
+    }
+    repaired.push_str(&query[cursor..]);
+    Cow::Owned(repaired)
+}
+
 fn classify_query(query: &str) -> QueryExplanation {
     let trimmed = query.trim();
     if trimmed.is_empty() {
@@ -1479,11 +1593,36 @@ impl TantivyIndex {
         parser
     }
 
+    /// Parse for the SHIPPING search path: lenient, plus the bd-f20ye repair.
+    ///
+    /// THE TWO ROLES OF THIS CRATE DIVERGE HERE, AND ONLY HERE.
+    /// `frankensearch-lexical` is both the shipping Tantivy backend and the
+    /// Quill gauntlet's pinned conformance oracle. Every `oracle_observe_*`
+    /// method keeps calling [`Self::parse_query_lenient`] and stays bit-faithful
+    /// to Tantivy 0.26.1, because the oracle is a pinned COMPARATOR and moving
+    /// it would silently move the target Quill is measured against. Every
+    /// user-facing `search*` method calls THIS instead, because a boost that
+    /// changes boolean MEMBERSHIP is a defect by any reading and shipping it to
+    /// users is not defensible.
+    ///
+    /// The resulting divergence between the two roles is registered as
+    /// **DIV-009** in `docs/contracts/quill-divergence-register.md`, disposition
+    /// accepted-with-rationale. Do not "unify" these two paths without
+    /// superseding that entry: the shipping path is deliberately NOT
+    /// bit-faithful to the oracle for this one query shape.
+    fn parse_query_shipping(&self, query: &str) -> Box<dyn tantivy::query::Query> {
+        self.parse_query_lenient(&repair_boosted_group_negation(query))
+    }
+
     /// Parse a query using lenient mode (never fails, returns best-effort query).
     ///
     /// Unknown field prefixes, unbalanced quotes, and other syntax issues are
     /// silently ignored rather than producing errors. This makes user-facing
     /// search robust against arbitrary input.
+    ///
+    /// BIT-FAITHFUL TO THE PINNED ORACLE. Callers in the `oracle_observe_*`
+    /// family depend on this reproducing Tantivy 0.26.1 exactly, defects
+    /// included — see [`Self::parse_query_shipping`] and DIV-009.
     fn parse_query_lenient(&self, query: &str) -> Box<dyn tantivy::query::Query> {
         let parser = self.query_parser();
         let (parsed, errors) = parser.parse_query_lenient(query);
@@ -1577,7 +1716,7 @@ impl TantivyIndex {
             return Ok(Vec::new());
         }
 
-        let parsed = self.parse_query_lenient(query);
+        let parsed = self.parse_query_shipping(query);
 
         let searcher = self.reader.searcher();
         let search_result = execute_query_with_offset(&searcher, &*parsed, limit, 0)?;
@@ -1834,7 +1973,7 @@ impl TantivyIndex {
             return Ok(Vec::new());
         }
 
-        let parsed = self.parse_query_lenient(query);
+        let parsed = self.parse_query_shipping(query);
         let searcher = self.reader.searcher();
         let hits = execute_top_k(&searcher, &*parsed, limit, 0)?;
         self.collect_id_hits(&searcher, hits)
@@ -1964,7 +2103,7 @@ impl TantivyIndex {
             return Ok(Vec::new());
         }
 
-        let parsed = self.parse_query_lenient(query);
+        let parsed = self.parse_query_shipping(query);
         let searcher = self.reader.searcher();
         let search_result = execute_query_with_offset(&searcher, &*parsed, limit, 0)?;
         self.collect_id_hits(&searcher, search_result.hits)
@@ -1987,7 +2126,7 @@ impl TantivyIndex {
             return Ok(Vec::new());
         }
 
-        let parsed = self.parse_query_lenient(query);
+        let parsed = self.parse_query_shipping(query);
         let searcher = self.reader.searcher();
         let hits = execute_top_k(&searcher, &*parsed, limit, 0)?;
         let mut results = Vec::with_capacity(hits.len());
@@ -2210,7 +2349,7 @@ impl frankensearch_core::traits::LexicalRead for TantivyIndex {
                 return Ok(Vec::new());
             }
 
-            let parsed = self.parse_query_lenient(query);
+            let parsed = self.parse_query_shipping(query);
 
             let searcher = self.reader.searcher();
             let top_docs = search_guarded(
@@ -2296,7 +2435,7 @@ impl frankensearch_core::traits::LexicalRead for TantivyIndex {
             let hits = if truncated.trim().is_empty() || limit == 0 {
                 Vec::new()
             } else {
-                let parsed = self.parse_query_lenient(truncated);
+                let parsed = self.parse_query_shipping(truncated);
                 execute_top_k(&searcher, &*parsed, limit, 0)?
             };
             let candidates = self
@@ -2520,6 +2659,7 @@ mod tests {
     /// (DIV-009, blocking on bd-f20ye) and this test exists so that a tantivy
     /// upgrade which changes the behaviour becomes VISIBLE instead of quietly
     /// shifting that target. Same posture as bd-nqeb4's `#[should_panic]` pin.
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn boosting_a_group_that_negates_changes_its_meaning_in_the_pinned_oracle() {
         run_with_cx(|cx| async move {
@@ -2536,6 +2676,7 @@ mod tests {
                 .expect("index bd-f20ye documents");
             index.commit(&cx).await.expect("commit bd-f20ye documents");
 
+            // The SHIPPING role, through the public search surface.
             let hits = |query: &'static str| {
                 let index = &index;
                 let cx = &cx;
@@ -2544,6 +2685,22 @@ mod tests {
                         .search(cx, query, 10)
                         .await
                         .expect("bd-f20ye search")
+                        .into_iter()
+                        .map(|hit| hit.doc_id)
+                        .collect::<Vec<_>>();
+                    ids.sort();
+                    ids
+                }
+            };
+            // The ORACLE role, through the conformance observation surface.
+            let oracle_hits = |query: &'static str| {
+                let index = &index;
+                let cx = &cx;
+                async move {
+                    let mut ids = index
+                        .oracle_observe_query(cx, query, 10, 64, &SnippetConfig::default())
+                        .expect("bd-f20ye oracle observation")
+                        .hits
                         .into_iter()
                         .map(|hit| hit.doc_id)
                         .collect::<Vec<_>>();
@@ -2562,33 +2719,100 @@ mod tests {
                 "bd-f20ye is not a lenient-recovery defect; the parser reported {errors:?}"
             );
 
-            // CORRECT, unboosted.
+            // CORRECT, unboosted — both roles agree here.
             assert_eq!(hits("alpha NOT beta").await, vec!["p2".to_owned()]);
             assert_eq!(hits("(alpha NOT beta)").await, vec!["p2".to_owned()]);
             assert!(hits("(alpha NOT alpha)").await.is_empty());
 
-            // WRONG, boosted. The excluded document returns.
+            // The page-observation surface must ALSO stay bit-faithful: a
+            // repair leaking into any oracle_observe_* method is what would
+            // move the conformance target without a comparison going red.
+            let page = index
+                .oracle_observe_page(&cx, "(alpha NOT beta)^2", 10, 0)
+                .expect("bd-f20ye oracle page observation");
             assert_eq!(
-                hits("(alpha NOT beta)^2").await,
+                page.hits.len(),
+                2,
+                "the oracle page surface must reproduce the defect, not the repair"
+            );
+
+            // STILL WRONG IN THE ORACLE ROLE, and that is the point: the
+            // comparator must reproduce Tantivy 0.26.1 byte for byte, defects
+            // included, or the conformance target moves under Quill.
+            assert_eq!(
+                oracle_hits("(alpha NOT beta)^2").await,
                 vec!["p1".to_owned(), "p2".to_owned()],
                 "if this is now [p2], tantivy fixed the boosted-group negation and DIV-009 \
                  must be re-measured before it is retired"
             );
-            // A self-contradictory group matches EVERY document once boosted.
             assert_eq!(
-                hits("(alpha NOT alpha)^2").await,
+                oracle_hits("(alpha NOT alpha)^2").await,
                 vec!["p1".to_owned(), "p2".to_owned()],
                 "if this is now empty, tantivy fixed the boosted-group negation"
             );
-            // And the AND form fails the other way, losing a document it should
-            // return — so this is not simply "boosting turns AND into OR".
             assert!(
-                hits("(alpha AND NOT beta)^2").await.is_empty(),
+                oracle_hits("(alpha AND NOT beta)^2").await.is_empty(),
                 "if this is now [p2], tantivy fixed the boosted-group negation"
             );
 
-            // CONTROL: a boosted group WITHOUT a negation keeps its meaning, so
-            // the defect is specific to negation and not to grouping or boosts.
+            // REPAIRED IN THE SHIPPING ROLE (bd-f20ye owner ruling): a boost
+            // must never change which documents match.
+            assert_eq!(
+                hits("(alpha NOT beta)^2").await,
+                vec!["p2".to_owned()],
+                "the shipping path must not return a document the query excluded"
+            );
+            assert!(
+                hits("(alpha NOT alpha)^2").await.is_empty(),
+                "a self-contradictory group must match nothing however it is boosted"
+            );
+            // THE INVARIANT THE RULING ASKS FOR, stated as an invariant rather
+            // than as hardcoded expectations: a boost must never change WHICH
+            // documents match. Asserting `boosted == unboosted` says exactly
+            // that, and stays true whatever the unboosted form happens to
+            // return.
+            for group in [
+                "(alpha NOT beta)",
+                "(alpha NOT alpha)",
+                "(alpha AND NOT beta)",
+                "(alpha -beta)",
+                "(alpha OR beta)",
+            ] {
+                let boosted = format!("{group}^2");
+                assert_eq!(
+                    hits(Box::leak(boosted.into_boxed_str())).await,
+                    hits(Box::leak(group.to_owned().into_boxed_str())).await,
+                    "boosting {group} changed which documents match in the shipping path"
+                );
+            }
+            // `(alpha AND NOT beta)` returns nothing in Tantivy 0.26.1 even
+            // UNGROUPED and UNBOOSTED — `A AND NOT B` lowers its negation as a
+            // Must-wrapped MustNot with no positive clause, so it matches
+            // nothing. That is a separate defect from this one and is filed
+            // separately; the invariant above deliberately does not assert what
+            // the unboosted form returns, only that the boost cannot change it.
+            assert!(hits("alpha AND NOT beta").await.is_empty());
+            // NESTED, so the repair is not merely a whole-query special case.
+            assert_eq!(
+                hits("beta OR (alpha NOT beta)^2").await,
+                vec!["p1".to_owned(), "p2".to_owned()]
+            );
+            assert_eq!(
+                hits("(alpha -beta)^3").await,
+                vec!["p2".to_owned()],
+                "the `-term` exclusion form must be repaired too"
+            );
+
+            // CONTROL: a boosted group WITHOUT a negation keeps its meaning in
+            // BOTH roles, so the repair is specific to negation and does not
+            // quietly disarm boosts in general.
+            for query in ["(alpha OR beta)^2", "(beta)^2"] {
+                assert_eq!(
+                    hits(query).await,
+                    oracle_hits(query).await,
+                    "{query} must be identical in both roles"
+                );
+            }
             assert_eq!(
                 hits("(alpha OR beta)^2").await,
                 vec!["p1".to_owned(), "p2".to_owned()]
@@ -2929,11 +3153,21 @@ mod tests {
                 "oracle: alpha-docs minus need-docs"
             );
 
-            // In-GROUP stacked prefixes (bd-bsjw finding 4): an unboosted
-            // group keeps the top-level collapse, but a BOOST on the group
-            // changes membership — the oracle's strict parse of the boosted
-            // group with stacked prefixes fails and the lenient fallback
-            // DROPS the negations entirely, leaving only the positive terms.
+            // In-GROUP stacked prefixes (bd-bsjw finding 4). `observe` here is
+            // the SHIPPING surface (`search_doc_ids`), which bd-f20ye repaired,
+            // so this now pins the repaired behaviour: a boost on the group no
+            // longer changes membership.
+            //
+            // The original assertion recorded the opposite and explained it as
+            // "the lenient fallback DROPS the negations". Measurement under
+            // bd-f20ye falsified that account — nothing is dropped, the
+            // `MustNot` survives parsing, and the lenient parser reports no
+            // errors. The defect was that a boosted group re-nests its negation
+            // as a positive alternative. The ORACLE-side pin of the unrepaired
+            // behaviour, which is what this test's name is about, now lives in
+            // `boosting_a_group_that_negates_changes_its_meaning_in_the_pinned_oracle`,
+            // where it is observed through `oracle_observe_*` rather than
+            // through a shipping method.
             assert_eq!(
                 observe("(alpha NOT -need)"),
                 vec!["doc-b".to_owned()],
@@ -2941,16 +3175,15 @@ mod tests {
             );
             assert_eq!(
                 observe("(alpha NOT -need)^2"),
-                vec!["doc-a".to_owned(), "doc-b".to_owned()],
-                "a boost on the group makes the oracle drop the negations \
-                 (lenient-parse fallback), changing MEMBERSHIP"
+                observe("(alpha NOT -need)"),
+                "bd-f20ye: in the shipping path a boost must not change which \
+                 documents match"
             );
             assert_eq!(
                 observe("(alpha NOT need)^2"),
-                vec!["doc-a".to_owned(), "doc-b".to_owned()],
-                "the boosted-group fallback drops PLAIN NOT as well — the \
-                 whole negation family loses its exclusions under a group \
-                 boost"
+                observe("(alpha NOT need)"),
+                "bd-f20ye: plain NOT under a group boost is repaired in the \
+                 shipping path too, not just the stacked-prefix form"
             );
         });
     }
