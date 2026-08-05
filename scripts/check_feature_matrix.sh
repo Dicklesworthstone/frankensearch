@@ -10,6 +10,7 @@ SCHEMA_VERSION="feature-smoke-lanes-v2"
 REQUIRED_LANES=(
   default
   both
+  all-features
   quill
   lexical-tantivy
   cass-compat
@@ -120,6 +121,7 @@ lane_features() {
   case "$1" in
     default) echo "default" ;;
     both) echo "lexical,lexical-tantivy" ;;
+    all-features) echo "all-features" ;;
     quill) echo "quill" ;;
     lexical-tantivy) echo "lexical-tantivy" ;;
     cass-compat) echo "cass-compat" ;;
@@ -140,6 +142,7 @@ lane_compile_command() {
   case "$1" in
     default) echo "cargo check -p frankensearch --all-targets" ;;
     both) echo "cargo check -p frankensearch --all-targets --no-default-features --features hash,lexical,lexical-tantivy" ;;
+    all-features) echo "cargo check -p frankensearch --all-targets --all-features" ;;
     quill) echo "cargo check -p frankensearch --lib --no-default-features --features quill" ;;
     lexical-tantivy) echo "cargo check -p frankensearch --lib --no-default-features --features lexical-tantivy" ;;
     cass-compat) echo "cargo check -p frankensearch --lib --no-default-features --features cass-compat" ;;
@@ -160,6 +163,7 @@ lane_behavior_command() {
   case "$1" in
     default) echo "cargo test -p frankensearch --lib feature_matrix_smoke::default_lane_behavior -- --exact --nocapture" ;;
     both) echo "cargo test -p frankensearch --lib --no-default-features --features hash,lexical,lexical-tantivy feature_matrix_smoke::both_backends_select_deterministically -- --exact --nocapture" ;;
+    all-features) echo "cargo test -p frankensearch --lib --all-features feature_matrix_smoke::both_backends_select_deterministically -- --exact --nocapture" ;;
     quill) echo "cargo test -p frankensearch --lib --no-default-features --features quill feature_matrix_smoke::quill_lane_behavior -- --exact --nocapture" ;;
     lexical-tantivy) echo "cargo test -p frankensearch --lib --no-default-features --features lexical-tantivy feature_matrix_smoke::lexical_tantivy_lane_behavior -- --exact --nocapture" ;;
     cass-compat) echo "cargo test -p frankensearch --lib --no-default-features --features cass-compat feature_matrix_smoke::cass_compat_lane_behavior -- --exact --nocapture" ;;
@@ -186,6 +190,7 @@ run_compile_lane() {
   case "$lane" in
     default) run_cargo check -p frankensearch --all-targets ;;
     both) run_cargo check -p frankensearch --all-targets --no-default-features --features hash,lexical,lexical-tantivy ;;
+    all-features) run_cargo check -p frankensearch --all-targets --all-features ;;
     quill) run_cargo check -p frankensearch --lib --no-default-features --features quill ;;
     lexical-tantivy) run_cargo check -p frankensearch --lib --no-default-features --features lexical-tantivy ;;
     cass-compat) run_cargo check -p frankensearch --lib --no-default-features --features cass-compat ;;
@@ -209,6 +214,7 @@ run_behavior_lane() {
   case "$lane" in
     default) output="$(run_cargo test -p frankensearch --lib feature_matrix_smoke::default_lane_behavior -- --exact --nocapture 2>&1)" ;;
     both) output="$(run_cargo test -p frankensearch --lib --no-default-features --features hash,lexical,lexical-tantivy feature_matrix_smoke::both_backends_select_deterministically -- --exact --nocapture 2>&1)" ;;
+    all-features) output="$(run_cargo test -p frankensearch --lib --all-features feature_matrix_smoke::both_backends_select_deterministically -- --exact --nocapture 2>&1)" ;;
     quill) output="$(run_cargo test -p frankensearch --lib --no-default-features --features quill feature_matrix_smoke::quill_lane_behavior -- --exact --nocapture 2>&1)" ;;
     lexical-tantivy) output="$(run_cargo test -p frankensearch --lib --no-default-features --features lexical-tantivy feature_matrix_smoke::lexical_tantivy_lane_behavior -- --exact --nocapture 2>&1)" ;;
     cass-compat) output="$(run_cargo test -p frankensearch --lib --no-default-features --features cass-compat feature_matrix_smoke::cass_compat_lane_behavior -- --exact --nocapture 2>&1)" ;;
