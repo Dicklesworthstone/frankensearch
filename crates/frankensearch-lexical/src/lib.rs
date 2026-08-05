@@ -330,6 +330,320 @@ fn repair_boosted_group_negation(query: &str) -> Cow<'_, str> {
     Cow::Owned(repaired)
 }
 
+/// One operand of a boolean level, with its occurrence prefix decoded.
+struct LevelOperand {
+    negated: bool,
+    required: bool,
+    text: String,
+}
+
+/// A parsed element of one boolean level.
+enum LevelItem {
+    Operand(LevelOperand),
+    And,
+    Or,
+}
+
+/// Repair a CONJUNCTION that contains a negated operand (bd-8a2a8, **DIV-010**).
+///
+/// THE DEFECT. The pinned grammar declares `default join := OR; explicit AND has
+/// precedence over OR` (`docs/contracts/quill-language-contract.md`), so
+/// `a NOT b AND c` reads as `a OR (c AND NOT b)`. Tantivy 0.26.1 lowers the
+/// `AND` conjunct to `Bool{[(Must, Bool{[(MustNot, b)], msm: 0}), (Must, c)]}`,
+/// whose first operand has no positive clause and therefore matches nothing, so
+/// the whole conjunct drops and only `a` survives. MEASURED on the shared
+/// Core100 fixture: `release NOT bounds AND small` returns 21 documents
+/// (`|release|`) where the declared reading is 41 (`|release ∪ small|`), which
+/// is what Quill returns and what this engine ITSELF returns when the same
+/// grouping is written out as `release ((small) NOT bounds)`. Two independent
+/// implementations agreeing on the explicit form is what attributes the defect
+/// to the implicit lowering rather than to either engine's semantics.
+///
+/// THE REPAIR normalises a whole `AND` chain that contains a negation into the
+/// occurrence spelling this engine already lowers correctly: every positive
+/// operand becomes `+operand` and every negative one `-operand`, in the operand
+/// order the user wrote, so `a NOT b AND c` becomes `a (-b +c)`. That is exact
+/// rather than approximate —
+/// `+`/`-` ARE the `Must`/`MustNot` the chain means — which matters because the
+/// obvious narrow alternative, deleting the `AND`, was measured to break queries
+/// that were already correct (`explains NOT bounds AND refactors` answers 60 and
+/// dropping the `AND` answers 59). It is textual for the same reason
+/// [`repair_and_not`] and [`repair_boosted_group_negation`] are: the lowering
+/// happens inside tantivy's parser and the resulting `BooleanQuery` cannot be
+/// rewritten from outside.
+///
+/// SCOPE, deliberately narrow. A chain is rewritten only when it holds more than
+/// one operand and at least one of them is negated; a pure-positive `a AND b`
+/// keeps its spelling. Anything the scanner cannot decode — an unbalanced quote,
+/// a dangling `AND`, an empty operand — returns the query untouched rather than
+/// guessing. Quoted text is skipped, so a literal `"a AND NOT b"` phrase is
+/// never rewritten, and a `field:(a b)` operand is carried through opaquely.
+///
+/// A CHAIN THAT SPANS ITS WHOLE LEVEL IS EMITTED WITHOUT PARENTHESES, which is
+/// load-bearing rather than cosmetic: [`repair_boosted_group_negation`] records
+/// negation against the INNERMOST open group, so wrapping `(a AND NOT b)^2` into
+/// `((+a -b))^2` would hide the negation from it and silently regress DIV-009.
+///
+/// NOT A CONFORMANCE CHANGE. This runs only from
+/// [`TantivyIndex::parse_query_shipping`]; every `oracle_observe_*` caller keeps
+/// using [`TantivyIndex::parse_query_lenient`] and still reproduces the defect,
+/// so the pinned comparator does not move.
+fn repair_negated_conjunction(query: &str) -> Cow<'_, str> {
+    // Cheap reject: without an explicit `AND` there is no chain to normalise.
+    if !query.contains("AND") {
+        return Cow::Borrowed(query);
+    }
+    rewrite_conjunction_level(query).map_or(Cow::Borrowed(query), Cow::Owned)
+}
+
+/// Is `token` present at `index` as a standalone token at this level?
+fn is_level_token(level: &str, index: usize, token: &str) -> bool {
+    let bytes = level.as_bytes();
+    level[index..].starts_with(token)
+        && index
+            .checked_sub(1)
+            .is_none_or(|previous| bytes[previous].is_ascii_whitespace() || bytes[previous] == b'(')
+        && bytes
+            .get(index + token.len())
+            .is_none_or(|next| next.is_ascii_whitespace() || *next == b'(')
+}
+
+/// Find the `)` matching the `(` at `open`, ignoring parentheses inside quotes.
+fn matching_close_paren(level: &str, open: usize) -> Option<usize> {
+    let bytes = level.as_bytes();
+    let mut depth = 0_usize;
+    let mut in_quotes = false;
+    for (offset, byte) in bytes[open..].iter().enumerate() {
+        let cursor = open + offset;
+        match byte {
+            b'"' => in_quotes = !in_quotes,
+            b'(' if !in_quotes => depth += 1,
+            b')' if !in_quotes => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(cursor);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Read one operand body starting at `start`, returning its text, the index just
+/// past it, and whether a nested level inside it was rewritten.
+fn parse_operand_body(level: &str, start: usize) -> Option<(String, usize, bool)> {
+    let bytes = level.as_bytes();
+    if start >= bytes.len() {
+        return None;
+    }
+    if bytes[start] == b'(' {
+        let close = matching_close_paren(level, start)?;
+        let inner = &level[start + 1..close];
+        let rewritten = rewrite_conjunction_level(inner);
+        let inner_changed = rewritten.is_some();
+        let inner_text = rewritten.unwrap_or_else(|| inner.to_string());
+        // Trailing modifiers stay attached to the group: `^boost`, `~slop`.
+        let mut cursor = close + 1;
+        while cursor < bytes.len()
+            && !bytes[cursor].is_ascii_whitespace()
+            && bytes[cursor] != b')'
+            && bytes[cursor] != b'('
+        {
+            cursor += 1;
+        }
+        let suffix = &level[close + 1..cursor];
+        return Some((format!("({inner_text}){suffix}"), cursor, inner_changed));
+    }
+
+    let mut in_quotes = false;
+    let mut cursor = start;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if byte == b'"' {
+            in_quotes = !in_quotes;
+            cursor += 1;
+            continue;
+        }
+        if in_quotes {
+            cursor += 1;
+            continue;
+        }
+        // A `(` inside a bare operand is a fielded group like `field:(a b)`:
+        // carry it through opaquely rather than splitting the operand in two.
+        if byte == b'(' {
+            cursor = matching_close_paren(level, cursor)? + 1;
+            continue;
+        }
+        if byte.is_ascii_whitespace() || byte == b')' {
+            break;
+        }
+        cursor += 1;
+    }
+    if in_quotes || cursor == start {
+        return None;
+    }
+    Some((level[start..cursor].to_string(), cursor, false))
+}
+
+/// Rewrite every negated `AND` chain at one boolean level, recursing into
+/// parenthesised operands. `None` means "nothing to change, or not decodable".
+fn rewrite_conjunction_level(level: &str) -> Option<String> {
+    let bytes = level.as_bytes();
+    let mut items: Vec<LevelItem> = Vec::new();
+    let mut nested_changed = false;
+    let mut index = 0_usize;
+
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        if is_level_token(level, index, "AND") {
+            items.push(LevelItem::And);
+            index += 3;
+            continue;
+        }
+        if is_level_token(level, index, "OR") {
+            items.push(LevelItem::Or);
+            index += 2;
+            continue;
+        }
+        // Occurrence prefixes: any run of negators, and an explicit `+`.
+        let mut negated = false;
+        let mut required = false;
+        loop {
+            let byte = *bytes.get(index)?;
+            if byte == b'-' || byte == b'+' {
+                // A bare `-` or `+` with nothing attached is not an occurrence
+                // prefix, and this scanner declines rather than guessing.
+                if bytes
+                    .get(index + 1)
+                    .is_none_or(|next| next.is_ascii_whitespace())
+                {
+                    return None;
+                }
+                if byte == b'-' {
+                    negated = true;
+                } else {
+                    required = true;
+                }
+                index += 1;
+                continue;
+            }
+            if is_level_token(level, index, "NOT") {
+                negated = true;
+                index += 3;
+                while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                    index += 1;
+                }
+                continue;
+            }
+            break;
+        }
+        let (text, next, inner_changed) = parse_operand_body(level, index)?;
+        nested_changed |= inner_changed;
+        items.push(LevelItem::Operand(LevelOperand {
+            negated,
+            required,
+            text,
+        }));
+        index = next;
+    }
+
+    // Group the level into `AND` chains. `AND` binds tighter than the default
+    // join, so a maximal chain is exactly the unit whose lowering is defective.
+    let mut chains: Vec<Vec<LevelOperand>> = Vec::new();
+    let mut joins: Vec<&'static str> = Vec::new();
+    let mut expect_operand = false;
+    let mut next_join = " ";
+    for item in items {
+        match item {
+            LevelItem::And => {
+                if chains.is_empty() || expect_operand {
+                    return None;
+                }
+                expect_operand = true;
+            }
+            LevelItem::Or => {
+                if chains.is_empty() || expect_operand {
+                    return None;
+                }
+                next_join = " OR ";
+            }
+            LevelItem::Operand(operand) => {
+                if expect_operand {
+                    chains.last_mut()?.push(operand);
+                    expect_operand = false;
+                } else {
+                    if !chains.is_empty() {
+                        joins.push(next_join);
+                    }
+                    next_join = " ";
+                    chains.push(vec![operand]);
+                }
+            }
+        }
+    }
+    if expect_operand || chains.is_empty() {
+        return None;
+    }
+
+    let single_chain = chains.len() == 1;
+    let mut rewrote = false;
+    let mut rendered: Vec<String> = Vec::with_capacity(chains.len());
+    for chain in &chains {
+        if chain.len() > 1 && chain.iter().any(|operand| operand.negated) {
+            rewrote = true;
+            let mut body = String::new();
+            for operand in chain {
+                if !body.is_empty() {
+                    body.push(' ');
+                }
+                body.push(if operand.negated { '-' } else { '+' });
+                body.push_str(&operand.text);
+            }
+            // Bare when it IS the level, so DIV-009 still sees the negation.
+            rendered.push(if single_chain {
+                body
+            } else {
+                format!("({body})")
+            });
+        } else if chain.len() > 1 {
+            rendered.push(
+                chain
+                    .iter()
+                    .map(render_operand)
+                    .collect::<Vec<_>>()
+                    .join(" AND "),
+            );
+        } else {
+            rendered.push(render_operand(&chain[0]));
+        }
+    }
+
+    if !rewrote && !nested_changed {
+        return None;
+    }
+    let mut output = rendered.first()?.clone();
+    for (position, piece) in rendered.iter().enumerate().skip(1) {
+        output.push_str(joins.get(position - 1)?);
+        output.push_str(piece);
+    }
+    Some(output)
+}
+
+/// Re-emit an operand outside a rewritten chain, preserving its occurrence.
+fn render_operand(operand: &LevelOperand) -> String {
+    if operand.negated {
+        format!("-{}", operand.text)
+    } else if operand.required {
+        format!("+{}", operand.text)
+    } else {
+        operand.text.clone()
+    }
+}
+
 fn classify_query(query: &str) -> QueryExplanation {
     let trimmed = query.trim();
     if trimmed.is_empty() {
@@ -1710,10 +2024,16 @@ impl TantivyIndex {
     /// superseding that entry: the shipping path is deliberately NOT
     /// bit-faithful to the oracle for this one query shape.
     fn parse_query_shipping(&self, query: &str) -> Box<dyn tantivy::query::Query> {
-        // bd-eeq0q runs FIRST: it rewrites `A AND NOT B` to `A NOT B`, which
-        // can turn a group into one the bd-f20ye repair then recognises as
-        // negating — `(A AND NOT B)^2` needs both, in this order.
-        let repaired = repair_and_not(query);
+        // ORDER IS LOAD-BEARING. bd-8a2a8 runs first because it decodes whole
+        // `AND` chains, and it needs to see the `AND` that bd-eeq0q deletes:
+        // after that deletion `a AND NOT b AND c` reads as the unrelated chain
+        // `NOT b AND c` and would be normalised to the wrong grouping. Both
+        // repairs leave a `-` or `NOT` inside the group they touch, so the
+        // bd-f20ye repair still recognises `(a AND NOT b)^2` as negating — it
+        // records negation against the innermost open group, which is why
+        // bd-8a2a8 emits a whole-level chain without adding parentheses.
+        let conjunction = repair_negated_conjunction(query);
+        let repaired = repair_and_not(&conjunction);
         self.parse_query_lenient(&repair_boosted_group_negation(&repaired))
     }
 
@@ -2864,6 +3184,236 @@ mod tests {
                 oracle_ids("alpha NOT beta"),
                 vec!["p2".to_owned()],
                 "the oracle's own correct spelling must be unaffected"
+            );
+        });
+    }
+
+    /// bd-8a2a8: the normal form the repair emits, asserted as TEXT.
+    ///
+    /// The end-to-end test below proves the answers; this one pins the shape,
+    /// because two of the properties that make the repair safe are invisible in
+    /// a result set. `(a AND NOT b)^2` must keep its `-` DIRECTLY inside the
+    /// boosted group — `repair_boosted_group_negation` records negation against
+    /// the innermost open group, so an extra layer of parentheses would silently
+    /// un-repair DIV-009 while every membership assertion stayed green. And a
+    /// query with nothing to repair must come back BORROWED, which is both the
+    /// allocation contract and a check that the scanner declines rather than
+    /// guesses on input it cannot decode.
+    #[test]
+    fn a_negated_conjunction_normalises_to_explicit_occurrences() {
+        for (query, expected) in [
+            // The reported defect: `AND` binds tighter than the default join.
+            // Operand ORDER is preserved; only the occurrences become explicit.
+            ("alpha NOT beta AND gamma", "alpha (-beta +gamma)"),
+            // A chain that IS the level keeps its operand order and adds no
+            // parentheses.
+            ("alpha AND NOT beta AND gamma", "+alpha -beta +gamma"),
+            ("gamma AND NOT beta", "+gamma -beta"),
+            ("NOT beta AND gamma", "-beta +gamma"),
+            // DIV-009 interlock: the `-` stays directly inside the boost.
+            ("(alpha AND NOT beta)^2", "(+alpha -beta)^2"),
+            // Operands are carried through whole: phrases, fields, boosts, and
+            // a fielded group that must not be split at its parenthesis.
+            ("alpha AND NOT \"beta gamma\"", "+alpha -\"beta gamma\""),
+            ("content:alpha^2 AND NOT beta", "+content:alpha^2 -beta"),
+            (
+                "field:(alpha beta) AND NOT gamma",
+                "+field:(alpha beta) -gamma",
+            ),
+            // Occurrence outside the chain survives: a `+` that is dropped
+            // turns a Must clause into a Should one.
+            ("+alpha delta AND NOT beta", "+alpha (+delta -beta)"),
+            // Recursion into a group, with the outer level left alone.
+            (
+                "(alpha NOT beta AND gamma) OR delta",
+                "(alpha (-beta +gamma)) OR delta",
+            ),
+            // Stacked negators lower to one exclusion.
+            ("alpha NOT -beta AND gamma", "alpha (-beta +gamma)"),
+        ] {
+            assert_eq!(
+                repair_negated_conjunction(query).as_ref(),
+                expected,
+                "normal form for {query:?}"
+            );
+        }
+
+        // PLANTED NEGATIVES: everything here must be returned untouched, and
+        // `Cow::Borrowed` proves the scanner did not merely round-trip it.
+        for untouched in [
+            // No explicit `AND`: nothing to normalise.
+            "alpha NOT beta",
+            "alpha -beta",
+            "alpha beta",
+            // A pure-positive conjunction is not defective; leave the spelling.
+            "alpha AND gamma",
+            "alpha AND beta AND gamma",
+            // User TEXT, not user syntax.
+            "\"alpha AND NOT beta\"",
+            // Lowercase `and` is a pair of ordinary terms in this grammar.
+            "alpha and not beta",
+            // Undecodable input is declined, never guessed at.
+            "alpha AND",
+            "AND NOT beta",
+            "alpha AND OR beta",
+            "alpha AND \"unbalanced",
+        ] {
+            assert!(
+                matches!(repair_negated_conjunction(untouched), Cow::Borrowed(_)),
+                "{untouched:?} must be left untouched, got {:?}",
+                repair_negated_conjunction(untouched)
+            );
+        }
+    }
+
+    /// bd-8a2a8: `A NOT B AND C` returns the declared reading on the SHIPPING
+    /// path, while the ORACLE path still reproduces tantivy 0.26.1's answer.
+    ///
+    /// THE DECLARED READING is `default join := OR; explicit AND has precedence
+    /// over OR` (`docs/contracts/quill-language-contract.md`), so
+    /// `alpha NOT beta AND gamma` is `alpha OR (gamma AND NOT beta)`. Tantivy
+    /// 0.26.1 lowers the conjunct's negation into a positive-less boolean, so
+    /// the conjunct matches nothing and the whole `AND` clause disappears —
+    /// `p3` is the document that only the correct reading returns.
+    ///
+    /// THE ATTRIBUTION CONTROL is the same query with its grouping written out.
+    /// `alpha ((gamma) NOT beta)` carries no `AND`, is therefore untouched by
+    /// every repair, and this engine answers it CORRECTLY on both roles. So the
+    /// engine already agrees with the declared reading when the grouping is
+    /// explicit, which is what places the defect in the implicit lowering
+    /// rather than in either side's semantics.
+    ///
+    /// PLANTED NEGATIVES RUN THREE DIRECTIONS. If the repair stops working the
+    /// shipping assertions go red; if it LEAKS into the oracle surface the
+    /// oracle assertions go red, which is the direction that matters more,
+    /// because a repaired oracle silently moves the conformance target Quill is
+    /// measured against. The third is the repair ORDER: `repair_and_not` deletes
+    /// the `AND` in front of a `NOT`, so if it ran first, `alpha AND NOT beta
+    /// AND gamma` would arrive here as the unrelated chain `NOT beta AND gamma`
+    /// and normalise to `alpha (+gamma -beta)` — a disjunction returning three
+    /// documents where the conjunction returns one.
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn a_negated_conjunction_reads_as_a_disjunct_on_shipping_while_the_oracle_stays_bit_faithful() {
+        run_with_cx(|cx| async move {
+            let index = TantivyIndex::in_memory().expect("bd-8a2a8 index");
+            index
+                .index_documents(
+                    &cx,
+                    &[
+                        IndexableDocument::new("p1", "alpha beta"),
+                        IndexableDocument::new("p2", "alpha gamma"),
+                        IndexableDocument::new("p3", "gamma"),
+                        IndexableDocument::new("p4", "beta gamma"),
+                        IndexableDocument::new("p5", "delta"),
+                    ],
+                )
+                .await
+                .expect("index bd-8a2a8 documents");
+            index.commit(&cx).await.expect("commit bd-8a2a8 documents");
+
+            let ship = |query: &'static str| {
+                let index = &index;
+                let cx = &cx;
+                async move {
+                    let mut ids = index
+                        .search(cx, query, 10)
+                        .await
+                        .expect("bd-8a2a8 shipping search")
+                        .into_iter()
+                        .map(|hit| hit.doc_id)
+                        .collect::<Vec<_>>();
+                    ids.sort();
+                    ids
+                }
+            };
+            let ids =
+                |wanted: &[&str]| wanted.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+
+            // THE DEFECT, and the same reading spelled three other ways. `p3`
+            // matches `gamma` without `beta`, so it appears only when the `AND`
+            // conjunct survives.
+            for query in [
+                "alpha NOT beta AND gamma",
+                "alpha NOT -beta AND gamma",
+                "alpha ((gamma) NOT beta)",
+                "alpha (gamma AND NOT beta)",
+            ] {
+                assert_eq!(
+                    ship(query).await,
+                    ids(&["p1", "p2", "p3"]),
+                    "shipping {query:?} must return alpha OR (gamma minus beta)"
+                );
+            }
+
+            // THE CHAIN STILL BINDS AS A CONJUNCTION. This is the repair-order
+            // negative: a disjunctive reading here would return three documents.
+            assert_eq!(
+                ship("alpha AND NOT beta AND gamma").await,
+                ids(&["p2"]),
+                "a single AND chain must stay a conjunction"
+            );
+            for query in ["gamma AND NOT beta", "NOT beta AND gamma"] {
+                assert_eq!(
+                    ship(query).await,
+                    ids(&["p2", "p3"]),
+                    "shipping {query:?} must return gamma minus beta"
+                );
+            }
+
+            // The contract's all-documents literal is an operand like any
+            // other, and must survive being given an explicit occurrence.
+            assert_eq!(
+                ship("* AND NOT beta").await,
+                ids(&["p2", "p3", "p5"]),
+                "every document except the excluded ones"
+            );
+
+            // Controls: a pure-positive conjunction is unchanged, an explicit
+            // `+` still means Must, and a quoted phrase is text.
+            assert_eq!(ship("alpha AND gamma").await, ids(&["p2"]));
+            assert_eq!(
+                ship("+alpha delta AND NOT beta").await,
+                ids(&["p1", "p2"]),
+                "a required clause must not be demoted to optional"
+            );
+            assert_eq!(
+                ship("alpha delta AND NOT beta").await,
+                ids(&["p1", "p2", "p5"]),
+                "without the `+` the same query is a disjunction"
+            );
+            assert!(
+                ship("\"alpha NOT beta AND gamma\"").await.is_empty(),
+                "a quoted phrase must not be rewritten into an operator form"
+            );
+
+            // THE ORACLE HAS NOT MOVED. Same index, same queries, through the
+            // conformance surface: tantivy 0.26.1's behaviour, defect included.
+            let oracle_ids = |query: &'static str| {
+                let mut ids = index
+                    .oracle_observe_query(&cx, query, 10, 64, &SnippetConfig::default())
+                    .expect("bd-8a2a8 oracle observation")
+                    .hits
+                    .into_iter()
+                    .map(|hit| hit.doc_id)
+                    .collect::<Vec<_>>();
+                ids.sort();
+                ids
+            };
+            assert_eq!(
+                oracle_ids("alpha NOT beta AND gamma"),
+                ids(&["p1", "p2"]),
+                "the oracle must still drop the AND conjunct entirely"
+            );
+            assert!(
+                oracle_ids("gamma AND NOT beta").is_empty(),
+                "the oracle must still return nothing for a bare negated conjunction"
+            );
+            assert_eq!(
+                oracle_ids("alpha ((gamma) NOT beta)"),
+                ids(&["p1", "p2", "p3"]),
+                "the explicit grouping is answered correctly by BOTH roles, which \
+                 is what attributes the defect to the implicit lowering"
             );
         });
     }

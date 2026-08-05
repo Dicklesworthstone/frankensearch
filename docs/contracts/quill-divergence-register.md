@@ -424,6 +424,30 @@ not this row. This row is the human projection of it.
   way. `NOT beta AND alpha` is repaired by the same change. `NOT alpha AND NOT beta` still returns
   nothing on both, because an exclusion-only conjunction has no positive term — that is agreement,
   not a defect, and is pinned so a later change cannot silently turn it into match-all.
+- EXTENDED 2026-08-04 by `bd-8a2a8`, same root cause, same decision, one more ORDERING. When the
+  conjunction is not the whole query — `A NOT B AND C` — the declared grammar reads it as
+  `A OR (C AND NOT B)` (`quill-language-contract.md`: "default join := OR; explicit AND has
+  precedence over OR"), and the defective lowering drops the entire `AND` conjunct rather than
+  emptying the query, so the divergence hides as a SHORTER result instead of an empty one. Measured
+  on the gauntlet's Core100 fixture, `release NOT bounds AND small` → 41 documents on Quill
+  (`|release ∪ small|`, the declared reading) and 21 on the unrepaired lexical path (`|release|`).
+  `repair_and_not` did not cover it, because it only deletes an `AND` that is immediately followed by
+  a `NOT`. THE ATTRIBUTION, which is what makes this an oracle defect rather than a Quill one: the
+  same engine answers `release ((small) NOT bounds)` — the identical query with its grouping written
+  out — with the same 41 documents Quill returns, on BOTH of its roles. An engine that already agrees
+  with the declared reading when the grouping is explicit is mislowering the implicit form, not
+  asserting a different semantics.
+- The bd-8a2a8 repair is `repair_negated_conjunction`, and it normalises rather than deletes: an
+  `AND` chain containing a negation is re-spelled with explicit occurrences, `a NOT b AND c` →
+  `a (-b +c)`, preserving operand order. That is exact rather than approximate, because `+`/`-` ARE
+  the `Must`/`MustNot` the chain means. The narrow alternative — deleting that `AND` too — was
+  MEASURED and rejected: it fixes `"ranked one" NOT bounds AND refactors` (19 documents, matching
+  Quill) while breaking `explains NOT bounds AND refactors`, which already answered 60 correctly and
+  drops to 59. A repair that regresses correct queries is not a repair. It runs BEFORE
+  `repair_and_not` in `parse_query_shipping`, because it decodes whole chains and must see the `AND`
+  that repair deletes; and it emits a chain that spans its whole level WITHOUT adding parentheses, so
+  `repair_boosted_group_negation` — which records negation against the innermost open group — still
+  recognises `(a AND NOT b)^2` as negating and DIV-009 does not silently regress.
 - Consumer impact: before this repair, the most common negation spelling silently returned NOTHING on
   both backends — no error, no warning, just an empty result for a query the user reasonably expects
   to work. That is worse than a crash because nothing reports it. After it, both backends answer
@@ -433,7 +457,14 @@ not this row. This row is the human projection of it.
   (the former tripwire, inverted rather than deleted, so the arc from agreement to divergence stays
   legible) and
   `frankensearch_lexical::tests::and_not_returns_a_minus_b_on_shipping_while_the_oracle_stays_bit_faithful`
-  (shipping repaired, oracle surface still defective, quoted literal untouched).
+  (shipping repaired, oracle surface still defective, quoted literal untouched). For the `bd-8a2a8`
+  ordering,
+  `frankensearch_lexical::tests::a_negated_conjunction_reads_as_a_disjunct_on_shipping_while_the_oracle_stays_bit_faithful`
+  (the declared reading on the shipping path, the dropped conjunct still dropped on the oracle
+  surface, and the explicit-grouping control answered correctly by both roles) and
+  `frankensearch_lexical::tests::a_negated_conjunction_normalises_to_explicit_occurrences`
+  (the emitted normal form as TEXT, because the DIV-009 interlock and the borrow-on-no-change
+  contract are both invisible in a result set).
 - Decision: **accept** — same equivalence law as DIV-009, which is the direct precedent.
 - Equivalence law and rationale: the oracle is a pinned **comparator**, not a semantics authority.
   Quill is the measured SUBJECT and the gauntlet observes it through `search_paginated`, the same
