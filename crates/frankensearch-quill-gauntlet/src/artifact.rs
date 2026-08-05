@@ -2172,6 +2172,185 @@ fn extend_compiler_input_reasons(
     }
 }
 
+/// One DEPENDENCY build script's execution record, exactly as Cargo reported
+/// it for THIS build.
+///
+/// # Why Cargo's execution record and not the target directory
+///
+/// The obvious collector globs `target/<profile>/build/*/output`. That is wrong
+/// here, and the counts say why: this repo builds every lane into ONE canonical
+/// target dir, which currently holds 210 build directories and 105 `output`
+/// files accumulated across every feature set, profile and agent that has ever
+/// built in it. A glob cannot tell which of those belong to the snapshot's own
+/// build, so it would absorb another lane's output while still calling the
+/// snapshot exact — violating the very acceptance clause it serves, that
+/// ambiguous paths fail closed — and it would drift run to run as peers build.
+/// Cargo's `build-script-executed` stream instead NAMES the units of this
+/// build: the invocation that leaves those 105 stale files behind reports
+/// exactly 31 records.
+///
+/// `cargo build --build-plan` would also have named them, but it is an unstable
+/// flag that has since been REMOVED: cargo 1.99.0-nightly rejects it with
+/// "unexpected argument". `--message-format=json` is the stable route.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactStoreV4DependencyBuildScriptRecord {
+    /// Cargo package id, including source and exact version.
+    pub package_id: String,
+    /// `cargo:rustc-cfg=` emissions, canonically ordered.
+    pub cfgs: Vec<String>,
+    /// `cargo:rustc-env=` emissions as name/value, canonically ordered.
+    pub env: Vec<(String, String)>,
+    /// `cargo:rustc-link-lib=` emissions, canonically ordered.
+    pub linked_libs: Vec<String>,
+    /// `cargo:rustc-link-search=` emissions, canonically ordered.
+    pub linked_paths: Vec<String>,
+    /// Cargo's unit directory NAME, such as `proc-macro2-3b38ca9fc7e78ad2`.
+    ///
+    /// Deliberately NOT the absolute `out_dir`. That path embeds
+    /// `CARGO_TARGET_DIR`, so digesting it would make the snapshot depend on
+    /// WHERE the build ran rather than WHAT was built, and two byte-identical
+    /// builds under different target dirs would disagree. The unit name still
+    /// carries Cargo's own hash over features, profile and dependency
+    /// versions, which is the part that is about the build.
+    pub unit_dir: String,
+}
+
+/// Parse Cargo's `--message-format=json` stream into canonical dependency
+/// build-script records.
+///
+/// # Errors
+///
+/// Fails closed on a malformed line, an absent or empty `package_id`, an
+/// `out_dir` with no unit component, and on a duplicate `(package_id,
+/// unit_dir)` — the same unit reported twice means the stream mixed builds, and
+/// silently keeping either copy is exactly the ambiguity this refuses.
+///
+/// # Why the key is the UNIT and not the package
+///
+/// One package legitimately runs its build script more than once in a single
+/// build, once per unit: a host unit for build-dependency/proc-macro use and a
+/// target unit for normal linkage, with different feature resolution and
+/// different `out_dir`s. The real capture this is tested against proves it —
+/// 31 records over 30 distinct packages, because `serde_core` appears as both
+/// `serde_core-d68a7d95f8797bbf` and `serde_core-79bd93f20e896c8e`. Keying on
+/// `package_id` alone would reject a perfectly ordinary build; that invariant
+/// was written here first and the real Cargo stream refuted it immediately,
+/// which a hand-written fixture would not have.
+pub fn collect_dependency_build_script_records(
+    cargo_json: &str,
+) -> Result<Vec<ArtifactStoreV4DependencyBuildScriptRecord>, GauntletError> {
+    let invalid = |reason: String| GauntletError::InvalidObservation { reason };
+    let mut records: Vec<ArtifactStoreV4DependencyBuildScriptRecord> = Vec::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+
+    for (index, line) in cargo_json.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(line)
+            .map_err(|error| invalid(format!("cargo json line {index} is not JSON: {error}")))?;
+        if value.get("reason").and_then(serde_json::Value::as_str) != Some("build-script-executed")
+        {
+            continue;
+        }
+
+        let package_id = value
+            .get("package_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if package_id.is_empty() {
+            return Err(invalid(format!(
+                "cargo json line {index} reports a build script with no package_id"
+            )));
+        }
+        let out_dir = value
+            .get("out_dir")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let unit_dir = Path::new(out_dir)
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "{package_id} reports an out_dir with no unit component"
+                ))
+            })?
+            .to_owned();
+        if !seen.insert((package_id.clone(), unit_dir.clone())) {
+            return Err(invalid(format!(
+                "duplicate build-script record for {package_id} unit {unit_dir}: \
+                 the stream mixed builds"
+            )));
+        }
+
+        let ordered_strings = |key: &str| -> Vec<String> {
+            let mut collected: Vec<String> = value
+                .get(key)
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            collected.sort();
+            collected
+        };
+        let mut env: Vec<(String, String)> = value
+            .get("env")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let pair = item.as_array()?;
+                        Some((
+                            pair.first()?.as_str()?.to_owned(),
+                            pair.get(1)?.as_str()?.to_owned(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        env.sort();
+
+        records.push(ArtifactStoreV4DependencyBuildScriptRecord {
+            package_id,
+            cfgs: ordered_strings("cfgs"),
+            env,
+            linked_libs: ordered_strings("linked_libs"),
+            linked_paths: ordered_strings("linked_paths"),
+            unit_dir,
+        });
+    }
+
+    records.sort();
+    Ok(records)
+}
+
+/// Canonical digest over the dependency build-script records.
+///
+/// # Errors
+///
+/// Returns [`GauntletError::InvalidObservation`] when the records cannot be
+/// canonically serialized.
+pub fn dependency_build_script_records_sha256(
+    records: &[ArtifactStoreV4DependencyBuildScriptRecord],
+) -> Result<String, GauntletError> {
+    let bytes = serde_json::to_vec(records).map_err(|error| GauntletError::InvalidObservation {
+        reason: format!("could not canonicalize dependency build-script records: {error}"),
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"frankensearch.artifactstore.v4.dependency-build-script.v1\0");
+    hasher.update(&bytes);
+    Ok(lower_hex(&hasher.finalize()))
+}
+
 /// Every `cargo:rustc-env=` value this crate's build script emits, read back
 /// out of the executable Cargo compiled them into.
 ///
@@ -5070,6 +5249,118 @@ mod tests {
     /// identical, and the snapshot would then claim exactness it no longer has.
     /// This reads build.rs itself and compares the two sets, so the drift is a
     /// test failure rather than a silently narrowed receipt.
+    /// A REAL capture of Cargo's build-script stream for this crate's own
+    /// build, so the collector is exercised against data Cargo actually
+    /// emitted rather than a hand-written approximation of it.
+    const DEPENDENCY_BUILD_SCRIPT_CAPTURE: &str =
+        include_str!("../fixtures/dependency-build-script-executed-v1.jsonl");
+
+    /// F1 slice: DEPENDENCY build-script output is collected from Cargo's own
+    /// execution record, and the collection is canonical and fail-closed.
+    #[test]
+    fn artifactstore_v4_dependency_build_script_records_are_canonical_and_fail_closed() {
+        let records = collect_dependency_build_script_records(DEPENDENCY_BUILD_SCRIPT_CAPTURE)
+            .expect("the real capture must collect");
+
+        // THE SELECTION PROPERTY, which is the whole reason this reads Cargo's
+        // record instead of the target directory: the shared target dir holds
+        // 105 `output` files from every lane ever built there, and this build
+        // has 31 units. A directory scan cannot tell those apart.
+        assert_eq!(
+            records.len(),
+            31,
+            "the capture must carry exactly this build's units"
+        );
+        assert!(
+            records.windows(2).all(|pair| pair[0] < pair[1]),
+            "records must be canonically ordered and duplicate-free"
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| !record.package_id.is_empty() && !record.unit_dir.is_empty()),
+            "every record must name its package and its unit"
+        );
+        // The unit dir is a NAME, never the absolute out_dir: an absolute path
+        // would bind the snapshot to where the build ran.
+        assert!(
+            records.iter().all(|record| !record.unit_dir.contains('/')),
+            "unit_dir must be a bare name, not a path"
+        );
+
+        // ONE PACKAGE, TWO UNITS is legal and must be ACCEPTED: a host unit for
+        // build-dependency/proc-macro use and a target unit for normal
+        // linkage, with different feature resolution and different out_dirs.
+        // The capture carries 31 records over 30 packages because serde_core
+        // appears twice. Keying identity on package_id alone would reject an
+        // ordinary build -- this collector did exactly that until the real
+        // stream refuted it.
+        let distinct_packages: BTreeSet<&str> = records
+            .iter()
+            .map(|record| record.package_id.as_str())
+            .collect();
+        assert_eq!(
+            distinct_packages.len(),
+            30,
+            "the capture must really contain a dual-unit package, or this proves nothing"
+        );
+
+        // Real emissions are present, so this is not a vacuous parse of empty
+        // arrays: proc-macro2 emits four cfgs in this capture.
+        let proc_macro2 = records
+            .iter()
+            .find(|record| record.package_id.contains("proc-macro2"))
+            .expect("the capture must include proc-macro2");
+        assert!(
+            proc_macro2.cfgs.contains(&"wrap_proc_macro".to_owned()),
+            "a real cfg emission must survive collection: {:?}",
+            proc_macro2.cfgs
+        );
+
+        // Digest is stable across a re-collection of the same bytes.
+        let digest = dependency_build_script_records_sha256(&records).expect("digest");
+        let recollected = collect_dependency_build_script_records(DEPENDENCY_BUILD_SCRIPT_CAPTURE)
+            .expect("re-collect");
+        assert_eq!(
+            digest,
+            dependency_build_script_records_sha256(&recollected).expect("digest"),
+            "collection must be deterministic"
+        );
+
+        // FAIL CLOSED. A duplicated package record means the stream mixed two
+        // builds; keeping either one silently is the ambiguity this refuses.
+        let first_line = DEPENDENCY_BUILD_SCRIPT_CAPTURE
+            .lines()
+            .next()
+            .expect("capture is non-empty");
+        let mixed = format!("{DEPENDENCY_BUILD_SCRIPT_CAPTURE}\n{first_line}");
+        let error = collect_dependency_build_script_records(&mixed)
+            .expect_err("a mixed stream must refuse");
+        assert!(
+            error.to_string().contains("mixed builds"),
+            "a duplicate package must refuse naming the cause, got: {error}"
+        );
+
+        // FAIL CLOSED on a record that names no package.
+        let anonymous =
+            r#"{"reason":"build-script-executed","package_id":"","out_dir":"/t/build/x/out"}"#;
+        assert!(
+            collect_dependency_build_script_records(anonymous).is_err(),
+            "a build script with no package_id must refuse"
+        );
+
+        // A mutated emission changes the digest -- the identity property F1
+        // requires of every compiler-visible input.
+        let mutated = DEPENDENCY_BUILD_SCRIPT_CAPTURE.replace("wrap_proc_macro", "wrap_proc_macr0");
+        let mutated_records =
+            collect_dependency_build_script_records(&mutated).expect("mutated capture collects");
+        assert_ne!(
+            digest,
+            dependency_build_script_records_sha256(&mutated_records).expect("digest"),
+            "a changed cfg emission must change the collection identity"
+        );
+    }
+
     ///
     /// It runs anywhere — no hardware gate — because it compares source text to
     /// a compiled-in list, not a produced artifact.
