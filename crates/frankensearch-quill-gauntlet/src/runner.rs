@@ -20885,6 +20885,46 @@ mod tests {
         (events, observation_sequence)
     }
 
+    /// The committed register with EVERY divergence this run re-mints removed,
+    /// which is the only base a live chain can append to (bd-h46f1).
+    ///
+    /// A single mint may drop its own prior events and re-append them, because
+    /// they are the register's tail. Two mints cannot each do that: once
+    /// DIV-010 is committed at sequences 6-7, DIV-009's committed events are no
+    /// longer the tail, and dropping them alone leaves the sequence gap
+    /// `1,2,3,6,7` that `DivergenceRegisterLedger::new` correctly refuses. The
+    /// chain therefore strips ALL of them at once and re-appends in order.
+    ///
+    /// That refusal is the tail constraint doing its job rather than a
+    /// limitation worked around: excising events from the MIDDLE of a register
+    /// is the shape a real history rewrite takes, and the only reason this is
+    /// allowed to do it is that every removed event is re-derived and appended
+    /// again in the same breath.
+    #[cfg(feature = "tantivy-oracle")]
+    fn e68_base_without(
+        committed: &DivergenceRegisterLedger,
+        divergence_ids: &[&str],
+    ) -> DivergenceRegisterLedger {
+        let events = committed
+            .events
+            .iter()
+            .filter(|event| match event {
+                DivergenceRegisterEvent::Observation(observation) => {
+                    !divergence_ids.contains(&observation.divergence_id.as_str())
+                }
+                DivergenceRegisterEvent::Disposition(disposition) => {
+                    !divergence_ids.contains(&disposition.divergence_id.as_str())
+                }
+                DivergenceRegisterEvent::Prediction(_) => true,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        DivergenceRegisterLedger::new(E68_LIVE_REGISTER_ID, events).expect(
+            "the committed register minus the divergences this run re-mints must itself be a valid \
+             ledger",
+        )
+    }
+
     /// Assemble an appended register and PROVE the append.
     ///
     /// THE BASELINE IS THE BASE REGISTER MINUS THIS DIVERGENCE'S OWN PRIOR
@@ -21936,8 +21976,17 @@ mod tests {
                 .expect("committed live divergence register"),
             )
             .expect("the committed register must decode and validate before anything appends");
-            let (ledger, mismatch_signatures) = e68_ingest_witness(
+            // THE LIVE CHAIN RE-MINTS BOTH, so it starts from the committed
+            // register with BOTH removed. Dropping only DIV-009's events would
+            // leave the sequence gap `1,2,3,6,7` once DIV-010 is committed
+            // after it, and the ledger correctly refuses that -- see
+            // `e68_base_without`.
+            let live_base = e68_base_without(
                 &committed_register,
+                &[E68_REFUSAL_DIVERGENCE_ID, E68_AND_NOT_DIVERGENCE_ID],
+            );
+            let (ledger, mismatch_signatures) = e68_ingest_witness(
+                &live_base,
                 &object,
                 e68_minimized_fixture_sha256(&fixture, E68_REFUSAL_CASE_ID),
             );
