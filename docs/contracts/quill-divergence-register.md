@@ -491,9 +491,40 @@ not this row. This row is the human projection of it.
   `alpha NOT beta` → `[p2]` on both; `alpha -beta` → `[p2]` on both;
   `alpha AND NOT beta` → `[p2]` on Quill and on the lexical SHIPPING path, `[]` on the
   `oracle_observe_*` surface; `(alpha AND NOT beta)` and `(alpha AND NOT beta)^2` behave the same
-  way. `NOT beta AND alpha` is repaired by the same change. `NOT alpha AND NOT beta` still returns
+  way. `NOT beta AND alpha` is repaired by the same change.
+- **RETRACTED 2026-08-05 (`bd-iiidv`): this entry claimed `NOT alpha AND NOT beta` "still returns
   nothing on both, because an exclusion-only conjunction has no positive term — that is agreement,
-  not a defect, and is pinned so a later change cannot silently turn it into match-all.
+  not a defect, and is pinned so a later change cannot silently turn it into match-all". That was
+  wrong twice over, and there was no such pin.** The sentence is retracted rather than deleted,
+  because it is what a reader checking whether this shape was covered would have relied on.
+  Measured on the gauntlet's Core100 fixture at a non-truncating limit, and on the four-document
+  lexical fixture:
+  - `NOT release AND NOT small` → **59** documents on Quill, **0** on the `oracle_observe_*`
+    surface. Not agreement.
+  - 59 is exactly the declared complement, `|Core100| − |release ∪ small|` = 100 − 41, and *not*
+    the complement of one operand (79). The operand pair is deliberately non-nested so those two
+    readings differ: `NOT release AND NOT bounds` cannot discriminate them, because `bounds` matches
+    one document and it is inside `release`. Quill honours BOTH exclusions.
+  - The same oracle answers every spelling of the same intent that carries no explicit `AND` with
+    that same complement: `NOT release NOT small` → 59 vs 59, `-release -small` → 59 vs 59, both
+    `Exact`. An all-negative root therefore does **not** match nothing — it has complement
+    semantics on both engines — and the `AND` spelling is the only one that diverges.
+  - `NOT small AND NOT release` diverges identically, so it is not an operand-order artifact.
+  - The shipping path was never affected, and it is covered TWICE over — measured, because the
+    first version of the new pin passed with `repair_negated_conjunction` disabled and was
+    therefore vacuous. `repair_negated_conjunction` normalises `NOT beta AND NOT gamma` →
+    `-beta -gamma`, and `repair_and_not` independently deletes the `AND` before the `NOT`, giving
+    `NOT beta NOT gamma`; either alone leaves `frankensearch-lexical`'s public search surface
+    answering the complement, and only disabling BOTH reddens the pin, at `[]` against `["p4"]`.
+    There was no shipping-side gap to fix; what was missing was the proof, now pinned by
+    `frankensearch_lexical::tests::an_all_negative_conjunction_is_complement_on_shipping_and_empty_on_the_oracle`
+    and by two normal-form cases in
+    `a_negated_conjunction_normalises_to_explicit_occurrences`.
+  - It is **this divergence, not a fourth one**: an explicit `AND` whose operand is a negation
+    lowers to a positive-less boolean that empties the conjunction, which is the root cause stated
+    above. The all-negative form is that mechanism with both operands negated, repaired by the same
+    repair, and it needs no separate register entry or witness. The machine record's existing
+    DIV-010 observation covers it.
 - EXTENDED 2026-08-04 by `bd-8a2a8`, same root cause, same decision, one more ORDERING. When the
   conjunction is not the whole query — `A NOT B AND C` — the declared grammar reads it as
   `A OR (C AND NOT B)` (`quill-language-contract.md`: "default join := OR; explicit AND has
@@ -571,9 +602,10 @@ not this row. This row is the human projection of it.
     its defect produces — and a subject-side defect shows the opposite containment and is refused.
     DIV-010 inverts the direction, and the inversion is measurably NOT discriminating:
     `NOT release AND NOT bounds` wears the identical shape, symptom and containment on this corpus
-    (79 subject hits against 0) and is not this divergence. A pure gate admitting DIV-010 would
-    launder it. Filed as `bd-iiidv`, which also records that the "agreement, not a defect" claim in
-    the Measured bullet above does not hold as written.
+    (79 subject hits against 0) and is not a *separately registrable* divergence — `bd-iiidv`
+    measured it as this same mechanism with both operands negated, and the Measured bullet's
+    "agreement, not a defect" claim about it is retracted above. A pure gate admitting DIV-010
+    would still launder any subject-side defect wearing that triple.
   - The evidence that DOES attribute this shape is the control case
     `e68-negated-conjunction-explicit` (`small NOT bounds`), which is `Exact` in the same run: the
     same oracle answers the same operands spelled without the explicit `AND` with the exact set the
