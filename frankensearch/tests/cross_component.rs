@@ -1317,8 +1317,8 @@ mod four_engine_generation_receipts {
     use frankensearch::index::native_hnsw::{HnswParams, ValidatedNativeHnsw};
     use frankensearch::index::{FsviV2IdentityBinding, ValidatedFsviBytes, VectorIndex};
     use frankensearch_core::generation::{
-        ArtifactGenerationIdentityV1, CommitRange, EmbeddingIdentityBundleV1, QuantizationFormat,
-        SourceCheckpointV1,
+        ArtifactGenerationIdentityV1, CommitRange, EmbeddingIdentityBundleV1, GenerationManifest,
+        MANIFEST_SCHEMA_VERSION, QuantizationFormat, SourceCheckpointV1, compute_manifest_hash,
     };
 
     /// One ordered document set, shared by every role.
@@ -1357,6 +1357,33 @@ mod four_engine_generation_receipts {
         }
         writer.finish().expect("seal the FSVI image");
         Arc::new(ValidatedFsviBytes::open_published(&path, &bound).expect("admit the sealed image"))
+    }
+
+    /// A real `GenerationManifest` over the shared document set.
+    ///
+    /// `for_metadata_manifest` requires `total_documents` to equal the docset
+    /// length and DERIVES the component checkpoint from `commit_range`, so this
+    /// is the only role whose drift is expressed by moving the manifest rather
+    /// than by passing a different checkpoint.
+    fn manifest_over(range: CommitRange) -> GenerationManifest {
+        let mut manifest = GenerationManifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            generation_id: "7hvtf-gen-001".to_owned(),
+            manifest_hash: String::new(),
+            commit_range: range,
+            build_started_at: 1_700_000_000_000,
+            build_completed_at: 1_700_000_060_000,
+            embedders: std::collections::BTreeMap::new(),
+            vector_artifacts: Vec::new(),
+            lexical_artifacts: Vec::new(),
+            repair_descriptors: Vec::new(),
+            activation_invariants: Vec::new(),
+            total_documents: DOCUMENTS.len() as u64,
+            metadata: std::collections::BTreeMap::new(),
+        };
+        manifest.manifest_hash =
+            compute_manifest_hash(&manifest).expect("hash the 7hvtf manifest image");
+        manifest
     }
 
     #[test]
@@ -1421,7 +1448,6 @@ mod four_engine_generation_receipts {
     #[test]
     fn four_real_producers_admit_as_one_generation() {
         use frankensearch::quill::{QuillConfig, QuillIndex};
-        use frankensearch_core::LexicalWrite;
         use frankensearch_core::generation::{
             CanonicalDocsetV1, ExactComponentReceiptV1, ExactGenerationComponentsV1,
         };
@@ -1434,8 +1460,9 @@ mod four_engine_generation_receipts {
 
         let vector = vector_component_receipt(owner.witness(), DOCUMENTS, checkpoint)
             .expect("vector receipt from the real FSVI witness");
-        let graph = ValidatedNativeHnsw::build(Arc::clone(&owner), HnswParams::default(), 0x7b_5eed)
-            .expect("native HNSW graph over the admitted owner");
+        let graph =
+            ValidatedNativeHnsw::build(Arc::clone(&owner), HnswParams::default(), 0x7b_5eed)
+                .expect("native HNSW graph over the admitted owner");
         let graph_receipt = graph
             .save(&directory.path().join("current.fshnsw"))
             .expect("save the graph and mint its receipt");
@@ -1471,7 +1498,7 @@ mod four_engine_generation_receipts {
             index.commit(&cx).await.expect("commit the Quill segment");
 
             let lexical = index
-                .keeper_snapshot()
+                .snapshot()
                 .exact_lexical_component_receipt(checkpoint)
                 .expect("lexical receipt from the committed keeper snapshot");
 
