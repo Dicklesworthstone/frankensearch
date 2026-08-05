@@ -21000,7 +21000,10 @@ mod tests {
             assert_eq!(
                 refusal.disposition,
                 CampaignDisposition::Unclassified,
-                "a membership divergence must still fail closed after the score envelope opt-in"
+                "a membership divergence must still fail closed after the score envelope opt-in \
+                 (reason={:?} diagnostic={:?})",
+                refusal.reason,
+                refusal.diagnostic
             );
             assert_eq!(refusal.rank_class, Some(RankClass::RankMismatch));
             assert!(
