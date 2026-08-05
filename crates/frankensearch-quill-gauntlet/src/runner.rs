@@ -6236,7 +6236,7 @@ fn oracle_blamed_lowering_defect(query: &str, comparison: &ComparisonReport) -> 
 /// where the query is in scope and takes the comparison the campaign's own
 /// comparator configuration produced — the UNATTRIBUTED one — because the
 /// symptom gate is stated over the raw class.
-pub(crate) fn oracle_blame_attribution(
+pub fn oracle_blame_attribution(
     query: &str,
     comparison: &ComparisonReport,
 ) -> Option<OracleBugReason> {
@@ -6252,20 +6252,18 @@ pub(crate) fn oracle_blame_attribution(
 /// observations. `comparison` must be the report produced by `base`; passing an
 /// already-attributed report yields `base`, because an `OracleBug` divergence
 /// does not satisfy the symptom gate.
-pub(crate) fn case_comparator_config(
+pub fn case_comparator_config(
     base: ComparatorConfig,
     query: &str,
     comparison: &ComparisonReport,
 ) -> ComparatorConfig {
-    match oracle_blame_attribution(query, comparison) {
-        Some(reason) => base.with_oracle_bug_reason(reason),
-        None => base,
-    }
+    oracle_blame_attribution(query, comparison)
+        .map_or(base, |reason| base.with_oracle_bug_reason(reason))
 }
 
 /// Re-derive one case's comparison under the configuration its own evidence
 /// earns, returning both so the caller stores exactly what it classified.
-pub(crate) fn attribute_case_comparison(
+pub fn attribute_case_comparison(
     base: ComparatorConfig,
     query: &str,
     comparison: ComparisonReport,

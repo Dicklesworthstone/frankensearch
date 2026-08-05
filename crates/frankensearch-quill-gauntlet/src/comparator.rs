@@ -7422,7 +7422,7 @@ fn compare_observations_validated_v8(
 /// an unsupported attribution is deliberate: a stored artifact that claims the
 /// oracle is at fault while its own observations say otherwise is not evidence,
 /// and it fails to store rather than being silently downgraded.
-pub(crate) fn apply_oracle_bug_attribution(
+pub fn apply_oracle_bug_attribution(
     reason: OracleBugReason,
     report: &mut ComparisonReport,
 ) -> Result<(), GauntletError> {

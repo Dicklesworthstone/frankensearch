@@ -344,12 +344,11 @@ fn is_canonical_git_revision(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn is_lower_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
+// `is_lower_sha256` lived here to shape-check a caller-supplied census digest.
+// bd-lvhfh removed that parameter: the census is now derived from the
+// registered ledger and compared against the registered digest, so there is no
+// free-form digest left to shape-check. Deleted rather than `#[allow]`ed —
+// a helper kept alive by an allow is a claim that something still validates.
 
 fn require_binding(
     binding: &AcceptedCandidateBindingV1,

@@ -965,7 +965,7 @@ impl ArtifactObject {
         match generation {
             ArtifactGeneration::Current => {
                 validate_stored_object_schema(self.object_schema_version)
-                    .map_err(|reason| GauntletError::InvalidContract { reason })?
+                    .map_err(|reason| GauntletError::InvalidContract { reason })?;
             }
             ArtifactGeneration::RetainedV7 => {
                 if self.object_schema_version != ARTIFACT_OBJECT_V7_SCHEMA_VERSION {
@@ -6031,7 +6031,7 @@ mod tests {
         // report and artifacts named different generations would be evidence
         // nothing could re-derive.
         assert_eq!(
-            u32::from(crate::runner::CAMPAIGN_REPORT_SCHEMA_VERSION),
+            crate::runner::CAMPAIGN_REPORT_SCHEMA_VERSION,
             OBJECT_SCHEMA_VERSION,
             "the report and artifact-object generations must not drift apart",
         );
