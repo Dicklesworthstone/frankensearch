@@ -5910,6 +5910,75 @@ fn query_carries_boosted_group_negation(query: &str) -> bool {
     false
 }
 
+/// Whether a query carries DIV-010's shape: an explicit `AND` together with a
+/// negation operand (bd-ult2q).
+///
+/// DIV-010's scope names exactly this — Quill's `parse_and` no longer re-wraps
+/// a `NOT` operand of an explicit `AND`, and the entry records that
+/// `NOT beta AND alpha` is repaired by the same change, so both operand orders
+/// belong to the one registered divergence.
+#[cfg(test)]
+fn query_carries_explicit_and_with_negation(query: &str) -> bool {
+    let mut has_and = false;
+    let mut has_negation = false;
+    let mut in_quotes = false;
+    for token in query.split_ascii_whitespace() {
+        // A quoted phrase is literal text, not syntax: `"a AND NOT b"` is one
+        // term and must never be read as the shape.
+        let quotes = token.matches('"').count();
+        if in_quotes {
+            if quotes % 2 == 1 {
+                in_quotes = false;
+            }
+            continue;
+        }
+        if quotes % 2 == 1 {
+            in_quotes = true;
+            continue;
+        }
+        let bare = token.trim_matches(|character: char| !character.is_ascii_alphanumeric());
+        if token == "AND" {
+            has_and = true;
+        }
+        if token == "NOT" || (token.starts_with('-') && !bare.is_empty()) {
+            has_negation = true;
+        }
+    }
+    has_and && has_negation
+}
+
+/// Limit the DIV-010 cross-check observes at.
+///
+/// Large enough that neither engine truncates on the shared Core100 corpus, so
+/// the comparison measures MEMBERSHIP rather than where each engine's ranking
+/// happened to cut a capped list.
+#[cfg(test)]
+const DIV010_CROSSCHECK_LIMIT: u64 = 512;
+
+/// Whether Quill's answer matches the INDEPENDENTLY REPAIRED implementation of
+/// the same query language (bd-ult2q).
+///
+/// This is the attribution step that lets the bsjw probe be register-aware
+/// without being weakened. DIV-009 and DIV-010 are registered, accepted splits
+/// in which the pinned comparator keeps a Tantivy 0.26.1 defect; the lexical
+/// crate's shipping path repairs it, and no `oracle_observe_*` caller touches
+/// that repair. So when Quill and the comparator disagree on a query of a
+/// registered shape, this asks a THIRD implementation who is right.
+///
+/// A shape-only tolerance would accept any Quill defect that happened to wear
+/// the shape. This cannot: a Quill membership defect disagrees with the
+/// repaired shipping answer and still fails the probe.
+///
+/// Both sides must be observed at a NON-TRUNCATING limit, or the comparison
+/// measures where each ranking cut a capped list rather than membership.
+#[cfg(test)]
+fn quill_agrees_with_the_repaired_shipping_path(
+    quill_ids: &BTreeSet<&str>,
+    shipping_ids: &BTreeSet<&str>,
+) -> bool {
+    quill_ids == shipping_ids
+}
+
 /// Structural evidence that the ORACLE is the failing side of a membership
 /// divergence (bd-bxya1).
 ///
@@ -19690,42 +19759,69 @@ mod tests {
                         );
                         summation_association_cases += 1;
                     }
-                    // bd-bxya1 NARROWED WHAT THIS PROBE TOLERATES, and the
-                    // narrowing found something. The old hand reclassifier
-                    // relabelled ANY RankMismatch on a boosted-negation shape
-                    // as OracleBug; the production gate additionally requires
-                    // the ORACLE to be the over-returning side, because that is
-                    // what attributes blame. Under it, seed 0x62736a770001
-                    // ordinal 49 — `fixture Nested -lifetime OR ((reads NOT
-                    // explicit)^2)^2` — is no longer reclassified: both engines
-                    // return the SAME documents and disagree only on score
-                    // (`test-rust-002@41e5b9cd` vs `@413a2dbe`).
+                    // REGISTER-AWARE ACCEPTANCE (bd-ult2q), one rule for both
+                    // registered shipping/oracle splits.
                     //
-                    // That residual is real and is NOT laundered here. It is
-                    // the scoring half of the same oracle lowering defect
-                    // (bd-f20ye / DIV-009), which the blame gate deliberately
-                    // cannot attribute from membership because membership is
-                    // identical. It is tolerated ONLY for a query carrying the
-                    // shape and ONLY when the document sets agree — a Quill
-                    // scoring defect on any other query still fails this probe.
-                    let score_only_on_the_known_shape =
-                        query_carries_boosted_group_negation(&query)
-                            && run
-                                .comparison
-                                .subject
-                                .hits
-                                .iter()
-                                .map(|hit| hit.doc_id.as_str())
-                                .collect::<BTreeSet<_>>()
-                                == run
-                                    .comparison
-                                    .oracle
-                                    .hits
-                                    .iter()
-                                    .map(|hit| hit.doc_id.as_str())
-                                    .collect::<BTreeSet<_>>();
+                    // DIV-009 (a boosted group that negates) and DIV-010
+                    // (`AND` beside a negation) are both REGISTERED and
+                    // ACCEPTED divergences in which the pinned comparator keeps
+                    // Tantivy 0.26.1's defect while the repaired side answers
+                    // correctly. A query of either shape SHOULD diverge here.
+                    //
+                    // What must never be tolerated is a QUILL defect wearing
+                    // one of those shapes, so the shape alone does not decide
+                    // anything: the lexical crate's independently repaired
+                    // SHIPPING path — which no `oracle_observe_*` caller
+                    // touches — is asked who is right, and Quill must match it
+                    // exactly. That is attribution, not tolerance.
+                    //
+                    // The cross-check observes at a NON-TRUNCATING limit,
+                    // because at the case's own limit both engines return the
+                    // same NUMBER of documents and differ only in which ones
+                    // the ranking cut. Measured on the ordinal-2 case:
+                    // quill=16 shipping=16 equal=false at limit 16, and
+                    // quill=99 shipping=99 equal=TRUE at 512. Comparing
+                    // truncated lists would have read a registered divergence
+                    // as an unexplained one.
+                    let registered_shipping_split = if run.comparison.status
+                        != ComparisonStatus::Exact
+                        && (query_carries_boosted_group_negation(&query)
+                            || query_carries_explicit_and_with_negation(&query))
+                    {
+                        let mut untruncated = DifferentialCase::new(
+                            format!("{}-registered-crosscheck", case.fixture_id),
+                            query.clone(),
+                            DIV010_CROSSCHECK_LIMIT,
+                        );
+                        untruncated.snippet_max_chars = None;
+                        untruncated.tie_expansion_limit = case.tie_expansion_limit;
+                        let quill =
+                            crate::engine::GauntletEngine::observe(&subject, &cx, &untruncated)
+                                .await
+                                .expect("untruncated Quill observation for a registered shape");
+                        let quill_ids = quill
+                            .hits
+                            .iter()
+                            .map(|hit| hit.doc_id.as_str())
+                            .collect::<BTreeSet<_>>();
+                        let shipping = oracle
+                            .index()
+                            .search_doc_ids(
+                                &cx,
+                                &query,
+                                usize::try_from(DIV010_CROSSCHECK_LIMIT).unwrap_or(usize::MAX),
+                            )
+                            .expect("repaired shipping answer for a registered shape");
+                        let shipping_ids = shipping
+                            .iter()
+                            .map(|hit| hit.doc_id.as_str())
+                            .collect::<BTreeSet<_>>();
+                        quill_agrees_with_the_repaired_shipping_path(&quill_ids, &shipping_ids)
+                    } else {
+                        false
+                    };
                     let acceptable = run.comparison.status == ComparisonStatus::Exact
-                        || score_only_on_the_known_shape
+                        || registered_shipping_split
                         || (run.comparison.status == ComparisonStatus::Classified
                             && run.comparison.divergences.iter().all(|divergence| {
                                 matches!(
@@ -20728,6 +20824,50 @@ mod tests {
                 "the agreement corpus must actually exercise the repair; it fired                  {observed_repairs} times"
             );
         });
+    }
+
+    /// bd-ult2q: the bsjw probe's register-aware acceptance admits ONLY a
+    /// divergence a third implementation attributes to the comparator.
+    #[test]
+    fn the_registered_split_gate_admits_agreement_and_refuses_disagreement() {
+        let set = |ids: &[&'static str]| ids.iter().copied().collect::<BTreeSet<&str>>();
+
+        // SHAPE RECOGNITION, both registered families and their near misses.
+        assert!(query_carries_explicit_and_with_negation("a AND NOT b"));
+        assert!(query_carries_explicit_and_with_negation("a NOT b AND c"));
+        assert!(query_carries_explicit_and_with_negation("a AND -b"));
+        assert!(
+            !query_carries_explicit_and_with_negation("a NOT b"),
+            "a negation without an explicit AND is not DIV-010's shape"
+        );
+        assert!(
+            !query_carries_explicit_and_with_negation("a AND b"),
+            "an AND without a negation is not DIV-010's shape"
+        );
+        assert!(
+            !query_carries_explicit_and_with_negation("\"a AND NOT b\""),
+            "a quoted phrase is literal text, not syntax"
+        );
+
+        // ATTRIBUTION: agreement with the repaired implementation admits.
+        assert!(quill_agrees_with_the_repaired_shipping_path(
+            &set(&["p1", "p2"]),
+            &set(&["p2", "p1"]),
+        ));
+
+        // PLANTED NEGATIVE, the load-bearing one: a Quill membership defect
+        // wearing a registered shape disagrees with the repaired path and must
+        // NOT be admitted. Measured instance: bsjw seed 0x62736a770001 ordinal
+        // 61 gives quill=39 against shipping=19 at a non-truncating limit, and
+        // the probe refuses it.
+        assert!(!quill_agrees_with_the_repaired_shipping_path(
+            &set(&["p1", "p2", "p3"]),
+            &set(&["p1", "p2"]),
+        ));
+        assert!(!quill_agrees_with_the_repaired_shipping_path(
+            &set(&["p1"]),
+            &set(&["p1", "p2"]),
+        ));
     }
 
     /// bd-73ok3: the campaign report's shape validator must admit the deferral
