@@ -4239,7 +4239,21 @@ mod tests {
             .map(|source| source.reason().code.as_str())
             .collect::<BTreeSet<_>>();
         assert!(codes.contains(PERF_ASSEMBLY_ENGINE_LIFECYCLE_NO_CLAIM_CODE));
-        assert!(codes.contains(PERF_ASSEMBLY_PROCESS_TREE_NO_CLAIM_CODE));
+        // THE PROCESS-TREE NO-CLAIM IS EXPECTED ABSENT, and that is the H2
+        // boundary MOVING rather than relaxing (bd-916qm). An assembly source
+        // is only ever built from an attempt that COMPLETED, and since
+        // 91c55d5b a completed receipt cannot be sealed at all unless its
+        // lifecycle proves descendant-tree quiescence -- `validate` refuses it
+        // with "lacks a completed descendant-tree quiescence proof", pinned by
+        // `local_perf_runner::tests::
+        // completed_receipt_rejects_direct_child_only_or_escaped_tree_claims`.
+        // The downstream NoClaim was the mitigation for a gap the producer now
+        // refuses to have, so asserting its presence asserted an unreachable
+        // state: the test was failing on a strengthened invariant, not a lost
+        // one. The emitting branch is kept as a fail-closed guard in case that
+        // completion invariant is ever relaxed, which is why this asserts the
+        // absence exactly rather than dropping the check.
+        assert!(!codes.contains(PERF_ASSEMBLY_PROCESS_TREE_NO_CLAIM_CODE));
         if assembly.has_full_plan_coverage() && assembly.counts().required_cells() != 0 {
             assert_eq!(
                 assembly.readiness(),

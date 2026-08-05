@@ -583,6 +583,15 @@ impl MetamorphicReplayArtifact {
     /// A relative value resolves against the WORKSPACE root, not the process
     /// working directory, so the file lands where CI's upload glob looks
     /// (bd-s5nmk).
+    ///
+    /// Gated to `perf-harness` because that is exactly the set of lanes that
+    /// call it — the law executors below — and no default-feature test can
+    /// exercise it honestly: reading it back would restate its body, and
+    /// setting `GAUNTLET_ARTIFACT_ROOT` from a test needs `std::env::set_var`,
+    /// which is `unsafe` in edition 2024 and this crate forbids. The narrower
+    /// cfg states that, rather than an `allow(dead_code)` that would also hide
+    /// the day it stops being called (bd-916qm).
+    #[cfg(feature = "perf-harness")]
     #[must_use]
     pub fn configured_root() -> Option<std::path::PathBuf> {
         std::env::var_os("GAUNTLET_ARTIFACT_ROOT")
@@ -3577,8 +3586,9 @@ mod live_shrink_replay_tests {
 mod replay_artifact_contract_tests {
     use super::{
         METAMORPHIC_REPLAY_ARTIFACT_SCHEMA_VERSION, METAMORPHIC_REPLAY_DEFAULT_BLOCKER,
-        METAMORPHIC_REPLAY_RECORDER, MetamorphicReplayArtifact, MetamorphicReplayDisposition,
-        format_utc_seconds,
+        METAMORPHIC_REPLAY_RECORDER, MetamorphicNightlyLawReceipt, MetamorphicNightlyReceipt,
+        MetamorphicReplayArtifact, MetamorphicReplayDisposition, format_utc_seconds,
+        is_utc_artifact_timestamp, utc_now_stamp,
     };
     use crate::comparator::DivergenceClass;
 
@@ -3746,6 +3756,118 @@ mod replay_artifact_contract_tests {
         assert_eq!(format_utc_seconds(1_709_164_800), "2024-02-29T00:00:00Z");
         // Cross-checked against `date -u -d @1785888000`.
         assert_eq!(format_utc_seconds(1_785_888_000), "2026-08-05T00:00:00Z");
+    }
+
+    /// The stamp every emitted record carries must be one the validators
+    /// admit. `format_utc_seconds` is pinned above against known instants;
+    /// this pins the OTHER half — that the wall-clock entry point feeds it and
+    /// its output survives `is_utc_artifact_timestamp`. Without this, a stamp
+    /// shape both writers agree on but no validator accepts would only be
+    /// discovered by a lane failing to publish.
+    #[test]
+    fn the_wall_clock_stamp_is_admissible_to_the_validators() {
+        let stamp = utc_now_stamp();
+        assert!(
+            is_utc_artifact_timestamp(&stamp),
+            "utc_now_stamp produced {stamp}, which no artifact validator admits"
+        );
+    }
+
+    fn reference_receipt() -> MetamorphicNightlyReceipt {
+        MetamorphicNightlyReceipt {
+            schema_version: METAMORPHIC_REPLAY_ARTIFACT_SCHEMA_VERSION,
+            laws: vec![MetamorphicNightlyLawReceipt {
+                law_id: "e6.3-merge-schedule-v1".to_owned(),
+                exercised: 3,
+                vacuous: 1,
+                violations: 0,
+            }],
+            seeds_per_law: 4,
+            violations_emitted: 0,
+            recorded_at: "2026-08-04T21:00:00Z".to_owned(),
+        }
+    }
+
+    /// A receipt that claims a sweep it did not perform is refused.
+    #[test]
+    fn a_receipt_cannot_claim_an_empty_sweep() {
+        let receipt = reference_receipt();
+        receipt.validate().expect("the reference receipt is valid");
+
+        let mut empty_laws = receipt.clone();
+        empty_laws.laws.clear();
+        assert!(empty_laws.validate().is_err(), "no laws is not a sweep");
+
+        let mut no_seeds = receipt.clone();
+        no_seeds.seeds_per_law = 0;
+        assert!(no_seeds.validate().is_err(), "no seeds is not a sweep");
+
+        // A law that was swept but never exercised is vacuous, not passing.
+        let mut vacuous = receipt.clone();
+        vacuous.laws[0].exercised = 0;
+        vacuous.laws[0].vacuous = 4;
+        assert!(
+            vacuous.validate().is_err(),
+            "a never-exercised law must not publish a receipt"
+        );
+
+        // The seed accounting must add up, or the receipt is describing a
+        // sweep other than the one that ran.
+        let mut unaccounted = receipt.clone();
+        unaccounted.laws[0].vacuous = 0;
+        assert!(
+            unaccounted.validate().is_err(),
+            "exercised plus vacuous must equal the swept seeds"
+        );
+
+        // A receipt whose per-law violations disagree with its total is
+        // internally inconsistent and must not validate.
+        let mut mismatched = receipt;
+        mismatched.violations_emitted = 1;
+        assert!(
+            mismatched.validate().is_err(),
+            "violation counts must reconcile"
+        );
+    }
+
+    /// The receipt is the file that makes `if-no-files-found: error` a real
+    /// assertion, so where it lands and when it is refused are contract, not
+    /// implementation detail: an invalid receipt must not reach the filesystem
+    /// at all, and a valid one must land under the name the CI glob looks for.
+    #[test]
+    fn a_receipt_reaches_the_filesystem_only_when_valid() {
+        let directory = tempfile::tempdir().expect("artifact root");
+
+        let mut vacuous = reference_receipt();
+        vacuous.laws[0].exercised = 0;
+        vacuous.laws[0].vacuous = 4;
+        let error = vacuous
+            .write_under(directory.path())
+            .expect_err("a vacuous receipt must be refused");
+        assert!(error.contains("vacuous"), "unexpected refusal: {error}");
+        assert!(
+            !directory
+                .path()
+                .join(super::METAMORPHIC_REPLAY_ARTIFACT_DIR)
+                .exists(),
+            "a refused receipt must not even create its directory"
+        );
+
+        let path = reference_receipt()
+            .write_under(directory.path())
+            .expect("a valid receipt is written");
+        assert_eq!(
+            path,
+            directory
+                .path()
+                .join(super::METAMORPHIC_REPLAY_ARTIFACT_DIR)
+                .join(MetamorphicNightlyReceipt::FILE_NAME),
+            "the receipt must land beside the replay artifacts under its fixed name"
+        );
+        let reloaded: MetamorphicNightlyReceipt =
+            serde_json::from_slice(&std::fs::read(&path).expect("read back the receipt"))
+                .expect("the written receipt round-trips");
+        assert_eq!(reloaded, reference_receipt());
     }
 }
 
@@ -4088,58 +4210,5 @@ mod nightly_metamorphic_lane {
                 "nightly seed set re-runs PR seed {pr_seed:#018x}"
             );
         }
-    }
-
-    /// A receipt that claims a sweep it did not perform is refused.
-    #[test]
-    fn a_receipt_cannot_claim_an_empty_sweep() {
-        let receipt = MetamorphicNightlyReceipt {
-            schema_version: METAMORPHIC_REPLAY_ARTIFACT_SCHEMA_VERSION,
-            laws: vec![MetamorphicNightlyLawReceipt {
-                law_id: "e6.3-merge-schedule-v1".to_owned(),
-                exercised: 3,
-                vacuous: 1,
-                violations: 0,
-            }],
-            seeds_per_law: 4,
-            violations_emitted: 0,
-            recorded_at: "2026-08-04T21:00:00Z".to_owned(),
-        };
-        receipt.validate().expect("the reference receipt is valid");
-
-        let mut empty_laws = receipt.clone();
-        empty_laws.laws.clear();
-        assert!(empty_laws.validate().is_err(), "no laws is not a sweep");
-
-        let mut no_seeds = receipt.clone();
-        no_seeds.seeds_per_law = 0;
-        assert!(no_seeds.validate().is_err(), "no seeds is not a sweep");
-
-        // A law that was swept but never exercised is vacuous, not passing.
-        let mut vacuous = receipt.clone();
-        vacuous.laws[0].exercised = 0;
-        vacuous.laws[0].vacuous = 4;
-        assert!(
-            vacuous.validate().is_err(),
-            "a never-exercised law must not publish a receipt"
-        );
-
-        // The seed accounting must add up, or the receipt is describing a
-        // sweep other than the one that ran.
-        let mut unaccounted = receipt.clone();
-        unaccounted.laws[0].vacuous = 0;
-        assert!(
-            unaccounted.validate().is_err(),
-            "exercised plus vacuous must equal the swept seeds"
-        );
-
-        // A receipt whose per-law violations disagree with its total is
-        // internally inconsistent and must not validate.
-        let mut mismatched = receipt;
-        mismatched.violations_emitted = 1;
-        assert!(
-            mismatched.validate().is_err(),
-            "violation counts must reconcile"
-        );
     }
 }

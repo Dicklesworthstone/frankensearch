@@ -5952,7 +5952,11 @@ fn query_carries_explicit_and_with_negation(query: &str) -> bool {
 /// Large enough that neither engine truncates on the shared Core100 corpus, so
 /// the comparison measures MEMBERSHIP rather than where each engine's ranking
 /// happened to cut a capped list.
-#[cfg(test)]
+///
+/// The cross-check itself only exists where a live oracle does, so the cfg
+/// matches its single caller exactly rather than silencing the wider
+/// `#[cfg(test)]` shape with an allow (bd-916qm).
+#[cfg(all(test, feature = "tantivy-oracle"))]
 const DIV010_CROSSCHECK_LIMIT: u64 = 512;
 
 /// Whether Quill's answer matches the INDEPENDENTLY REPAIRED implementation of

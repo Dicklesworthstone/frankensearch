@@ -4704,10 +4704,16 @@ mod tests {
 
     #[test]
     fn qg1_profile_plans_have_frozen_exhaustive_applicability_counts() {
-        // GOLDEN-CHANGE (terminal release receipt): every sealed terminal
-        // attempt now requires a post-unlock receipt. Matrix cells and
-        // applicability counts are unchanged; only their manifest-bound plan
-        // identities advance.
+        // GOLDEN-CHANGE (QG-5 xlarge re-pin, 02b5ec25): a plan identity binds
+        // the normalized normative manifest, so re-pinning QG-5 from medium to
+        // xlarge advances all three profile plan hashes. Every structural
+        // assertion below is unchanged and still passes -- 74 cells, the same
+        // Required/Diagnostic/NotApplicable split per profile, the same
+        // capacities and primary target width -- which is what distinguishes a
+        // manifest-identity advance from a matrix change. That commit did not
+        // re-freeze here, and this gate stayed red on the trunk until bd-916qm.
+        // The three hashes are the values the frozen registry and manifest now
+        // recompute to; they are read from the plan, never chosen.
         let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
         let cases = [
             (
@@ -4717,7 +4723,7 @@ mod tests {
                 16,
                 Some(64),
                 Some(64),
-                "02bdb2c12f434296c64007e9a19f0b260810d90aab2fdcc825303ab39f59a85f",
+                "e59deedec99d6d7d8ce7d7c53d2627997fefece864b500a5362c6b301d7a14c3",
             ),
             (
                 ExecutionProfileId::Smt2_128,
@@ -4726,7 +4732,7 @@ mod tests {
                 0,
                 Some(128),
                 Some(128),
-                "5190eab2b7efb661211563de20f91b777b94fe79dbfbbaabcda4121b9ecb2f1a",
+                "13ad902a710627eaee8cf8a1a4fb3674e73322c431c7fd7c8848059c2024c89b",
             ),
             (
                 ExecutionProfileId::Scheduler10,
@@ -4735,7 +4741,7 @@ mod tests {
                 40,
                 Some(10),
                 Some(8),
-                "df51edc2e6ef1f162bd44931503073148c8f1683255bef30ece9807a376e8fb1",
+                "cb90d7d60f5f9a25bd36510121828d934a5a61cc5dc438057b7685a349079ae4",
             ),
         ];
         let mut plan_hashes = BTreeSet::new();
@@ -5549,13 +5555,19 @@ mod tests {
     fn manifest_contract_hash_ignores_only_activation_state() {
         let manifest = PERF_MANIFEST;
         assert_eq!(manifest.matches("activated = false").count(), 10);
-        // GOLDEN-CHANGE (composite booking locks): every booked profile,
-        // worker, cpuset, fixture/cell scope, and storage slot now holds a
-        // canonical resource lock through terminal release.
+        // GOLDEN-CHANGE (QG-5 xlarge re-pin, 02b5ec25): the QG-5 fixture line
+        // moved from `50k docs (medium)` to `1M docs (xlarge)` once the e6.1
+        // xlarge generator landed, so the manifest a producer must bind is a
+        // different document and every measurement taken against the medium
+        // pin is correctly invalidated. That commit changed
+        // docs/contracts/quill-perf-gates.toml without re-freezing here, which
+        // is what left this gate red on the trunk (bd-916qm); the digest is
+        // re-frozen to the committed file, NOT the gate loosened -- the
+        // assertions below still bind every non-administrative byte.
         // Activation is still the sole administrative normalization exception.
         assert_eq!(
             perf_manifest_contract_sha256(manifest),
-            "99ecc8b62e9f3bbad875a4d2fc0c176656890e0fee1dec9d4ebd80deec45b9d8",
+            "6b23048474bf8812bfc3527c7eb6f28f70bbdc9b25618b2734ee709c9f7da048",
             "the normalized all-inactive manifest digest must remain frozen"
         );
         assert_eq!(

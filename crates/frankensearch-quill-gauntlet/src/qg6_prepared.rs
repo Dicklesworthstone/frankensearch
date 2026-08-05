@@ -32,8 +32,27 @@ const QG6_QUERY_IDENTITY_VERSION: &str = "frankensearch-qg6-query-identity-v1";
 const QG6_QUERY_GENERATOR_REVISION: &str = "frankensearch-qg6-frozen-80-query-generator-v2";
 const QG6_CORPUS_GENERATOR_REVISION: &str =
     "frankensearch-quill-gauntlet/generator-v2;schema=2;zipf=s11;vocab=8192;max_doc=4096";
+/// GOLDEN-CHANGE (Quill AND-NOT lowering repair, 8a6c243f).
+///
+/// This anchor hashes each normative query's PARSED AST, not just its text, and
+/// 8a6c243f deleted `wrap_not_for_and` from the Quill parser so that
+/// `A AND NOT B` stops lowering to an empty conjunction. Five of the eighty
+/// frozen queries carry that shape (`term00023 AND NOT term08191` and its four
+/// grouped/absent-term siblings), so their `parsed_ast_sha256` changed and the
+/// universe digest moved with them. The anchor did exactly its job -- it
+/// refused every QG-6 measurement taken against the pre-repair parser -- and it
+/// went unnoticed because 8a6c243f gated on a FILTERED gauntlet run (`e63_`,
+/// 31 tests) rather than the crate's lib suite; 51 tests were red on the trunk
+/// from that commit until bd-916qm.
+///
+/// CONSEQUENCE, stated rather than buried: every artifact carrying
+/// `query_set_sha256 = 4e9ed3dc...` -- the nine committed
+/// `.bench-history/attempts/qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z/t*/`
+/// QG-1 evidence files -- was measured against the old query universe and is no
+/// longer comparable to anything measured here. Re-freezing records that; it
+/// does not restore their comparability.
 const QG6_FROZEN_MANIFEST_SHA256: &str =
-    "4e9ed3dc59538a8f4fb8d100420fdb90e15cc64d4d7a6c8d5de7a3db1eaac1ca";
+    "0d9176a839fc468eb0c3f8a4e427bd2e81f7b2998a0f8974c27f8cc47620b20b";
 const EMPTY_DOCUMENT_ID_SHA256: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const QG6_AD_HOC_QUERY_GENERATOR_REVISION: &str = "frankensearch-qg6-ad-hoc-query-v1";
