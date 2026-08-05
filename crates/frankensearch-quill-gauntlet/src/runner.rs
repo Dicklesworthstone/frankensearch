@@ -20206,7 +20206,9 @@ mod tests {
                 boosted_group_negation_run.comparison.divergences
             );
             assert_eq!(
-                boosted_group_negation_run.comparator_config.oracle_bug_reason,
+                boosted_group_negation_run
+                    .comparator_config
+                    .oracle_bug_reason,
                 Some(OracleBugReason::BoostedGroupNegationLowering),
                 "the emitted class must be re-derivable from the stored configuration"
             );
@@ -20655,8 +20657,7 @@ mod tests {
     const E68_REFUSAL_REVIEWED_AT: &str = "2026-08-05T00:00:00Z";
     /// The law the acceptance rests on, stated so the record carries it.
     #[cfg(feature = "tantivy-oracle")]
-    const E68_REFUSAL_EQUIVALENCE_LAW: &str =
-        "a boost is a score multiplier and must not change boolean membership: for any group G and finite boost b, the document SET matched by (G)^b equals the set matched by (G). Quill satisfies this law; the pinned oracle does not, which is what attributes the divergence to the oracle.";
+    const E68_REFUSAL_EQUIVALENCE_LAW: &str = "a boost is a score multiplier and must not change boolean membership: for any group G and finite boost b, the document SET matched by (G)^b equals the set matched by (G). Quill satisfies this law; the pinned oracle does not, which is what attributes the divergence to the oracle.";
     #[cfg(feature = "tantivy-oracle")]
     const E68_WITNESS_DIVERGENCE_ID: &str = "DIV-008";
     #[cfg(feature = "tantivy-oracle")]
