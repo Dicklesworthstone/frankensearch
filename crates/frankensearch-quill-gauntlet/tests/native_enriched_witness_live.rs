@@ -687,3 +687,161 @@ fn an_inadmissible_enriched_receipt_can_never_authorize_a_replacement() {
         );
     });
 }
+
+/// bd-8nqz.4 slice 2 (happy path): a complete, current, admissible bundle
+/// DOES authorize -- and the grant is emitted so a clean run is harvestable.
+///
+/// A validator proved only by its refusals is indistinguishable from one that
+/// refuses everything. This is the positive control, and it is deliberately
+/// the same shape as bd-8nqz.4.1's emitter: the outcome is asserted by REASON,
+/// so the honest answer in a dirty tree ("inadmissible because dirty") is
+/// recorded as such rather than being allowed to stand in for a clean grant.
+#[cfg(feature = "tantivy-oracle")]
+#[test]
+fn a_complete_admissible_bundle_authorizes_and_emits_its_grant() {
+    use frankensearch_core::traits::LexicalWrite;
+    use frankensearch_lexical::TantivyIndex;
+    use frankensearch_quill_gauntlet::native_enriched_witness::{
+        AcceptedCandidateBindingV1, CapabilitySchemaArmV1, NativeEnrichedReceiptV1,
+        NativeEnrichedRunV1, observe_quill_capabilities, observe_quill_enrichments,
+        observe_quill_pages, observe_tantivy_enrichments, observe_tantivy_pages,
+    };
+    use frankensearch_quill_gauntlet::replacement_authorization::{
+        ReplacementEvidenceBundleV1, authorize,
+    };
+    use frankensearch_quill_gauntlet::{
+        CampaignContractModeV1, observe_live_quill_cancellation_receipt,
+    };
+
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let dir = tempfile::tempdir().expect("witness tempdir");
+        let quill = build_quill(&cx, dir.path()).await;
+
+        let tantivy_dir = tempfile::tempdir().expect("witness tempdir");
+        let tantivy =
+            TantivyIndex::create(tantivy_dir.path()).expect("create the witness Tantivy index");
+        for document in fixture_documents() {
+            tantivy
+                .index_document(&cx, &document)
+                .await
+                .expect("index a witness fixture document");
+        }
+        tantivy.commit(&cx).await.expect("commit the Tantivy index");
+
+        let mut capability_arms = Vec::new();
+        for arm in [
+            CapabilitySchemaArmV1::Positionless,
+            CapabilitySchemaArmV1::Positioned,
+        ] {
+            let index = QuillIndex::in_memory_with_schema(
+                arm.schema(),
+                QuillConfig {
+                    deterministic_ingest: true,
+                    max_ingest_shards: 1,
+                    ..QuillConfig::default()
+                },
+            )
+            .expect("build the capability index for this schema arm");
+            index
+                .index_documents(&cx, &fixture_documents())
+                .await
+                .expect("index the witness corpus into this schema arm");
+            index
+                .commit(&cx)
+                .await
+                .expect("commit the witness corpus in this schema arm");
+            capability_arms.push(index);
+        }
+
+        let mut observations = observe_quill_pages(&cx, &quill).expect("Quill pages");
+        observations.extend(observe_tantivy_pages(&cx, &tantivy).expect("Tantivy pages"));
+        let mut enriched_observations =
+            observe_quill_enrichments(&cx, &quill).expect("Quill enrichments");
+        enriched_observations
+            .extend(observe_tantivy_enrichments(&cx, &tantivy).expect("Tantivy enrichments"));
+
+        let run = NativeEnrichedRunV1 {
+            observations,
+            enriched_observations,
+            capability_outcomes: observe_quill_capabilities(
+                &cx,
+                &capability_arms[0],
+                &capability_arms[1],
+            ),
+            both_engines_observed: true,
+        };
+        let receipt =
+            NativeEnrichedReceiptV1::assemble_for_this_build(&run).expect("assemble the receipt");
+        let address = receipt.receipt_hash().expect("address");
+        let bytes = serde_json::to_vec(&receipt).expect("canonical body");
+        let verified = NativeEnrichedReceiptV1::load_canonical(&bytes, &address)
+            .expect("a receipt this build produced must load");
+
+        let candidate = receipt.producer.source_git_revision.clone();
+        let core = AcceptedCandidateBindingV1 {
+            candidate_source_revision: candidate.clone(),
+            contract_mode: CampaignContractModeV1::CoreLexicalV3,
+        };
+        let cass = AcceptedCandidateBindingV1 {
+            candidate_source_revision: candidate.clone(),
+            contract_mode: CampaignContractModeV1::CassTotalV1,
+        };
+        let cancellation = observe_live_quill_cancellation_receipt(&cx)
+            .await
+            .expect("observe the live Quill cancellation matrix");
+        let census = "0".repeat(64);
+
+        let bundle = ReplacementEvidenceBundleV1 {
+            candidate_source_revision: &candidate,
+            core_lexical_v3: Some(&core),
+            cass_total: Some(&cass),
+            native_enriched: Some(&verified),
+            cancellation: Some(&cancellation),
+            divergence_census_sha256: Some(&census),
+        };
+
+        let granted = authorize(&bundle);
+        println!("REPLACEMENT_AUTHORIZATION_CANDIDATE={candidate}");
+        println!(
+            "REPLACEMENT_AUTHORIZATION_PRODUCER_DIRTY={}",
+            receipt.producer.source_git_dirty
+        );
+        match &granted {
+            Ok(authorization) => {
+                println!("REPLACEMENT_AUTHORIZATION_GRANTED=yes");
+                println!(
+                    "REPLACEMENT_AUTHORIZATION_ENRICHED_ADDRESS={}",
+                    authorization.native_enriched_receipt_address
+                );
+                println!(
+                    "REPLACEMENT_AUTHORIZATION_CANCELLATION_BODY_SHA256={}",
+                    authorization.cancellation_body_sha256
+                );
+                println!(
+                    "REPLACEMENT_AUTHORIZATION_ENGINE_REVISION={}",
+                    authorization.cancellation_engine_revision
+                );
+            }
+            Err(error) => println!("REPLACEMENT_AUTHORIZATION_GRANTED=no reason={error}"),
+        }
+
+        // Asserted by REASON, and DETERMINED by the receipt's own producer
+        // state so exactly one outcome is pinned in any environment.
+        match granted {
+            Ok(authorization) => {
+                assert!(
+                    !receipt.producer.source_git_dirty,
+                    "a dirty producer must never yield a grant"
+                );
+                assert!(authorization.authorizes_replacement());
+                assert_eq!(authorization.candidate_source_revision, candidate);
+                assert_eq!(authorization.native_enriched_receipt_address, address);
+            }
+            Err(error) => assert!(
+                error.to_string().contains("dirty"),
+                "the only expected refusal for a complete both-engines bundle is a dirty \
+                 producer, got: {error}"
+            ),
+        }
+    });
+}
