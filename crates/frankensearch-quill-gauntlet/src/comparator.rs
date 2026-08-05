@@ -8824,6 +8824,124 @@ mod tests {
         });
     }
 
+    struct CancellationLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl std::io::Write for CancellationLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("cancellation trace buffer lock is not poisoned")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The bd-fjpu acceptance requires the detailed log to carry the boundary,
+    /// the checkpoint, the generation, the cancellation observation, and the
+    /// replay result, and to carry no unbounded content. That emission existed
+    /// with nothing asserting it, so dropping a field or adding a leaking one
+    /// was a silent change. This makes both halves executable.
+    ///
+    /// The capture is deliberately taken over the whole `frankensearch.quill`
+    /// target rather than the cancellation child alone: the leak assertion is
+    /// only worth having if it also sees the engine spans that run underneath
+    /// a cancelled request.
+    #[test]
+    fn the_detailed_cancellation_log_is_complete_and_leaks_no_content() {
+        let trace_buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer_buffer = Arc::clone(&trace_buffer);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_env_filter("off,frankensearch.quill=info")
+            .with_writer(move || CancellationLogWriter {
+                buffer: Arc::clone(&writer_buffer),
+            })
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                observe_live_quill_cancellation_receipt(&cx)
+                    .await
+                    .expect("observe the live Quill cancellation matrix");
+            });
+        });
+
+        let logs = String::from_utf8(
+            trace_buffer
+                .lock()
+                .expect("cancellation trace buffer lock is not poisoned")
+                .clone(),
+        )
+        .expect("captured cancellation logs are UTF-8");
+
+        let observed = logs
+            .lines()
+            .filter(|line| {
+                line.contains("recorded live method-bound Quill cancellation checkpoint")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            observed.len(),
+            QuillCancellationCheckpoint::REQUIRED.len(),
+            "every required checkpoint must emit exactly one detailed log line: {logs}"
+        );
+
+        for (line, checkpoint) in observed.iter().zip(QuillCancellationCheckpoint::REQUIRED) {
+            assert!(
+                line.contains(&format!("boundary={checkpoint:?}")),
+                "the detailed log must name its boundary as {checkpoint:?}: {line}"
+            );
+            for field in [
+                "checkpoint_ordinal=",
+                "observed_checkpoints=",
+                "keeper_generation_before=",
+                "keeper_generation_after_cancel=",
+                "keeper_generation_after_replay=",
+                "snapshot_epoch_before=",
+                "snapshot_epoch_after_cancel=",
+                "snapshot_epoch_after_replay=",
+                "cancellation_observed=true",
+                "replay_verified=true",
+            ] {
+                assert!(
+                    line.contains(field),
+                    "the {checkpoint:?} detailed log dropped {field}: {line}"
+                );
+            }
+        }
+
+        // Bounded content, asserted over EVERY captured line rather than the
+        // cancellation lines alone. `alpha`/`beta` are the query terms,
+        // `gamma` and `fixture` are body-only tokens no field may echo, and
+        // `cancel-doc-` is the document-ID prefix.
+        for forbidden in [
+            "alpha",
+            "beta",
+            "gamma",
+            "fixture",
+            "cancel-doc-",
+            "ordinal=\"",
+        ] {
+            // Report the OFFENDING LINE, not the whole capture. Printing the
+            // buffer names whichever span happens to be logged first, which
+            // reads as an accusation against innocent engine spans.
+            assert!(
+                !logs.lines().any(|line| line.contains(forbidden)),
+                "a cancellation-path log leaked unbounded content ({forbidden}) on: {}",
+                logs.lines()
+                    .find(|line| line.contains(forbidden))
+                    .unwrap_or_default()
+            );
+        }
+    }
+
     fn quill_hit(doc_id: &str, score: f32, native_doc_id: u32) -> RankedHit {
         RankedHit {
             doc_id: doc_id.to_owned(),
