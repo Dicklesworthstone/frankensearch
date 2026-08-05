@@ -856,6 +856,47 @@ mod feature_matrix_smoke {
         });
     }
 
+    /// bd-8nqz.4: BOTH backends compiled at once must SELECT DETERMINISTICALLY.
+    ///
+    /// This is the cell the flip endangered and the one the feature matrix did
+    /// not cover: every other lane compiles exactly one lexical engine, so no
+    /// lane could observe the `lexical` alias resolving to the wrong one.
+    /// d117ce1f repointed `lexical` at Quill while `lexical-tantivy` kept
+    /// Tantivy under its own name, and only a build with BOTH present can show
+    /// that those two namespaces stayed distinct rather than collapsing.
+    ///
+    /// The assertion is on the RESOLVED BACKEND IDENTITY, not on whether the
+    /// names merely compile: `lexical` re-exporting Tantivy would still
+    /// compile, and would still pass any test that only checked the paths
+    /// exist.
+    #[cfg(all(feature = "lexical", feature = "lexical-tantivy"))]
+    #[test]
+    fn both_backends_select_deterministically() {
+        // `lexical` is the engine-neutral alias. Under the flip it must be
+        // Quill, and it must say so in its own words.
+        assert_eq!(
+            lexical::QUILL_LEXICAL_BACKEND,
+            "quill",
+            "the `lexical` alias must resolve to Quill when both backends are compiled"
+        );
+
+        // Tantivy remains reachable, but only through its explicit namespace.
+        let tantivy_schema = lexical_tantivy::CASS_SCHEMA_VERSION;
+
+        // And the two must be DIFFERENT surfaces. If `lexical` were aliased to
+        // Tantivy, the CASS schema identity would be reachable through it.
+        emit_evidence(
+            "both",
+            "deterministic_backend_selection",
+            &serde_json::json!({
+                "lexical_backend": lexical::QUILL_LEXICAL_BACKEND,
+                "lexical_tantivy_cass_schema_version": tantivy_schema,
+                "quill": cfg!(feature = "quill"),
+                "lexical_tantivy": cfg!(feature = "lexical-tantivy"),
+            }),
+        );
+    }
+
     #[cfg(feature = "lexical-tantivy")]
     #[test]
     fn lexical_tantivy_lane_behavior() {
