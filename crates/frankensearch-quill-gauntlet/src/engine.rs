@@ -1173,12 +1173,22 @@ impl DifferentialHarness {
             oracle_observation,
             self.comparator_config,
         )?;
+        // bd-bxya1: one attribution seam for both lanes. The harness holds the
+        // query, so a differential run earns the same reviewed oracle-blame
+        // class the campaign lane does, from the same gate, and stores the
+        // configuration that re-derives it. Before this, the only producer of
+        // `OracleBug` was a probe mutating a comparison after the fact.
+        let (comparison, comparator_config) = crate::runner::attribute_case_comparison(
+            self.comparator_config,
+            &case.query,
+            comparison,
+        )?;
         Ok(HarnessRun {
             schema_version: HARNESS_RUN_SCHEMA_VERSION,
             producer_build_identity,
             engines,
             case: case.clone(),
-            comparator_config: self.comparator_config,
+            comparator_config,
             comparison,
         })
     }

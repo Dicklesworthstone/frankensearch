@@ -28,9 +28,9 @@ use crate::comparator::{
     ComparatorConfig, ComparisonReport, ComparisonStatus, Divergence, DivergenceClass,
     EngineObservation, LexicalBackendIdentity, LexicalComparisonStatus,
     LexicalContractBuildContext, LexicalEngineRole, LexicalFieldMismatch, LexicalMismatchClass,
-    LexicalProbeCoverage, LexicalSideCoverage, RankClass, compare_lexical_contracts,
-    compare_observations, lexical_mismatches_are_the_classified_rank_divergence,
-    observe_live_lexical_contract,
+    LexicalProbeCoverage, LexicalSideCoverage, OracleBugReason, RankClass,
+    compare_lexical_contracts, compare_observations,
+    lexical_mismatches_are_the_classified_rank_divergence, observe_live_lexical_contract,
 };
 #[cfg(any(test, feature = "tantivy-oracle"))]
 use crate::engine::BuiltInEngineProfile;
@@ -4557,10 +4557,28 @@ impl<'a> CampaignEvidenceValidator<'a> {
             query: (*query).clone(),
             registered_divergence: registered_divergence.clone(),
         };
+        // bd-bxya1: the per-case comparator configuration is RE-DERIVED here,
+        // never accepted. A stored oracle-blame attribution is only admissible
+        // if this verifier, holding the query and re-running the lane's own
+        // configuration over the artifact's own observations, reaches the same
+        // decision — so a fabricated attribution in a stored artifact is
+        // refused even though `object.validate()` can re-derive the report the
+        // fabrication produces. Deriving in BOTH directions also means a lane
+        // that silently skipped an attribution it owed cannot pass either.
+        let unattributed = compare_observations(
+            object.comparison.subject.clone(),
+            object.comparison.oracle.clone(),
+            self.report.config.comparator_config,
+        )?;
+        let expected_comparator_config = case_comparator_config(
+            self.report.config.comparator_config,
+            &query.query,
+            &unattributed,
+        );
         if object.oracle_dependency() != &self.report.oracle_dependency
             || object.engines != self.report.engines
             || object.case != expected_case
-            || object.comparator_config != self.report.config.comparator_config
+            || object.comparator_config != expected_comparator_config
             || object.campaign.as_ref() != Some(&expected_context)
             || result.disposition != disposition
             || result.reason != reason
@@ -5729,18 +5747,31 @@ impl DifferentialCampaignRunner {
                 );
             }
         };
-        // bd-bxya1: the production wiring STOPS HERE, deliberately. Calling
-        // `reclassify_oracle_blamed_lowering` at this point produces a
-        // comparison the artifact cannot store: `ArtifactObject` re-derives its
-        // report from its own observations and refuses a mismatch
-        // ("artifact comparison report does not match its observations"), which
-        // is a correct integrity check and not one to route around. Emitting
-        // the class from production therefore requires the attribution to be an
-        // input to the comparator — a stored typed reason on `ComparatorConfig`,
-        // the way `score_epsilon_reason` already is — and
-        // `compare_observations_validated_v7` is frozen: "Semantic changes
-        // require a new object/report schema and a separate implementation."
-        // That decision is recorded on bd-bxya1 rather than taken here.
+        // bd-bxya1: attribute oracle blame HERE, where the query is in scope,
+        // and re-derive the comparison from the per-case configuration rather
+        // than editing the one already built. `ArtifactObject` re-derives its
+        // stored report from its own stored observations, so a post-hoc edit
+        // makes the artifact unstorable ("artifact comparison report does not
+        // match its observations"); an input the artifact also stores
+        // re-derives exactly. Everything downstream — mismatch signatures, the
+        // campaign classification, the retained object — therefore sees one
+        // consistent class.
+        let (comparison, comparator_config) = match attribute_case_comparison(
+            self.config.comparator_config,
+            &query.query,
+            comparison,
+        ) {
+            Ok(attributed) => attributed,
+            Err(error) => {
+                return infrastructure_case(
+                    query,
+                    query_class,
+                    self.config.contract_mode,
+                    CampaignCaseReason::ComparisonFailed,
+                    error.to_string(),
+                );
+            }
+        };
         let mismatch_text_bytes = match mismatches.preflight(&comparison, &query.id) {
             Ok(text_bytes) => text_bytes,
             Err(error) => {
@@ -5788,7 +5819,7 @@ impl DifferentialCampaignRunner {
             producer_build_identity: producer_build_identity.clone(),
             engines: engines.clone(),
             case: evidence_case,
-            comparator_config: self.config.comparator_config,
+            comparator_config,
             comparison,
         };
         let context = CampaignArtifactContext {
@@ -5956,10 +5987,6 @@ fn lexical_case_summary(
     }
 }
 
-/// `#[cfg(test)]` until the frozen-v7 decision on bd-bxya1 lands: the gate is
-/// built and exercised, but nothing in production can call it yet, and saying
-/// so is honest where an `allow(dead_code)` would not be.
-///
 /// Whether a query carries the DIV-009 shape: a parenthesized group that
 /// contains a negation AND carries a boost (bd-bxya1).
 ///
@@ -5973,7 +6000,6 @@ fn lexical_case_summary(
 /// `oracle_blame_gate_fires_exactly_where_the_shipping_repair_does` pins the two
 /// against each other by OBSERVATION rather than by mirrored code, so they
 /// cannot drift apart silently.
-#[cfg(test)]
 fn query_carries_boosted_group_negation(query: &str) -> bool {
     if !query.contains(")^") {
         return false;
@@ -6131,7 +6157,6 @@ fn quill_agrees_with_the_repaired_shipping_path(
 ///    correctly withheld. A subject-side defect on the same query shape shows
 ///    the opposite containment and is refused — that is the load-bearing
 ///    planted negative this bead requires.
-#[cfg(test)]
 fn oracle_blamed_lowering_defect(query: &str, comparison: &ComparisonReport) -> bool {
     if !query_carries_boosted_group_negation(query) {
         return false;
@@ -6164,56 +6189,58 @@ fn oracle_blamed_lowering_defect(query: &str, comparison: &ComparisonReport) -> 
     oracle_ids.len() > subject_ids.len() && subject_ids.is_subset(&oracle_ids)
 }
 
-/// Relabel an oracle-blamed lowering defect to [`DivergenceClass::OracleBug`]
-/// on the PRODUCTION comparison path (bd-bxya1).
+/// The reviewed oracle-blame attribution a case's own evidence earns, if any
+/// (bd-bxya1).
 ///
-/// Runs immediately after the comparison is built, so the mismatch signatures,
-/// the campaign classification, and the retained artifact object all agree on
-/// the class. Before this existed, the only producer of `OracleBug` was a
-/// test-side helper that mutated a comparison after the fact, so the class was
-/// fully plumbed and never emitted by anything shipping.
-#[cfg(test)]
-fn reclassify_oracle_blamed_lowering(query: &str, comparison: &mut ComparisonReport) -> bool {
-    if !oracle_blamed_lowering_defect(query, comparison) {
-        return false;
-    }
-    comparison
-        .divergences
-        .retain(|divergence| divergence.class != DivergenceClass::RankMismatch);
-    comparison.divergences.push(Divergence {
-        class: DivergenceClass::OracleBug,
-        pointer: "/comparison/subject/ast_differences/boosted_group_negation".to_owned(),
-        oracle: "pinned oracle re-nested boosted-group negation as a positive alternative"
-            .to_owned(),
-        subject: "Quill retained boosted-group negation".to_owned(),
-    });
-    comparison.status = if comparison
-        .divergences
-        .iter()
-        .any(|divergence| is_failure_class(divergence.class))
-    {
-        ComparisonStatus::Failed
-    } else {
-        ComparisonStatus::Classified
-    };
-    comparison.first_divergence = comparison
-        .divergences
-        .first()
-        .map(|divergence| divergence.pointer.clone());
-    true
+/// This is the ONE producer of [`OracleBugReason`] and therefore the one
+/// producer of [`DivergenceClass::OracleBug`] on any production path. It runs
+/// where the query is in scope and takes the comparison the campaign's own
+/// comparator configuration produced — the UNATTRIBUTED one — because the
+/// symptom gate is stated over the raw class.
+pub(crate) fn oracle_blame_attribution(
+    query: &str,
+    comparison: &ComparisonReport,
+) -> Option<OracleBugReason> {
+    oracle_blamed_lowering_defect(query, comparison)
+        .then_some(OracleBugReason::BoostedGroupNegationLowering)
 }
 
-/// Divergence classes that make a comparison a raw failure.
-#[cfg(test)]
-const fn is_failure_class(class: DivergenceClass) -> bool {
-    matches!(
-        class,
-        DivergenceClass::RankMismatch
-            | DivergenceClass::SnippetMismatch
-            | DivergenceClass::CountMismatch
-            | DivergenceClass::DocumentCountMismatch
-            | DivergenceClass::PostingRecordSemantics
-    )
+/// The per-case comparator configuration: the lane's configuration plus any
+/// blame the case's own evidence earns (bd-bxya1).
+///
+/// Attribution is an INPUT to the comparator rather than an edit of its output,
+/// so the retained artifact re-derives the identical report from the identical
+/// observations. `comparison` must be the report produced by `base`; passing an
+/// already-attributed report yields `base`, because an `OracleBug` divergence
+/// does not satisfy the symptom gate.
+pub(crate) fn case_comparator_config(
+    base: ComparatorConfig,
+    query: &str,
+    comparison: &ComparisonReport,
+) -> ComparatorConfig {
+    match oracle_blame_attribution(query, comparison) {
+        Some(reason) => base.with_oracle_bug_reason(reason),
+        None => base,
+    }
+}
+
+/// Re-derive one case's comparison under the configuration its own evidence
+/// earns, returning both so the caller stores exactly what it classified.
+pub(crate) fn attribute_case_comparison(
+    base: ComparatorConfig,
+    query: &str,
+    comparison: ComparisonReport,
+) -> Result<(ComparisonReport, ComparatorConfig), GauntletError> {
+    let config = case_comparator_config(base, query, &comparison);
+    if config == base {
+        return Ok((comparison, base));
+    }
+    let attributed = compare_observations(
+        comparison.subject.clone(),
+        comparison.oracle.clone(),
+        config,
+    )?;
+    Ok((attributed, config))
 }
 
 fn classify_case(
@@ -6304,22 +6331,10 @@ fn classify_case_with_lexical(
     classify_case(query, comparison, registry)
 }
 
+/// One taxonomy, one place: the comparator owns the class and therefore owns
+/// which classes are bounded accept-by-class policies.
 fn is_auto_class(class: DivergenceClass) -> bool {
-    match class {
-        DivergenceClass::TieOrder | DivergenceClass::ScoreEpsilon => true,
-        DivergenceClass::RankMismatch
-        | DivergenceClass::SnippetMismatch
-        | DivergenceClass::SnippetWindow
-        | DivergenceClass::CountMismatch
-        | DivergenceClass::DocumentCountMismatch
-        | DivergenceClass::GlobExpansionLimit
-        | DivergenceClass::QueryCanonicalization
-        | DivergenceClass::OracleBug
-        | DivergenceClass::StatsSemantics
-        | DivergenceClass::PostingRecordSemantics
-        | DivergenceClass::UnicodeEdge
-        | DivergenceClass::OversizedQueryToken => false,
-    }
+    class.is_auto()
 }
 
 fn query_class(query: &GeneratedQueryCase) -> String {
@@ -19779,23 +19794,21 @@ mod tests {
             }
         }
 
-        /// bd-bxya1 retired this probe's hand reclassification: it now calls
-        /// the PRODUCTION path, so the probe measures what campaigns emit
-        /// rather than a parallel implementation that could drift from it.
+        /// bd-bxya1 retired this probe's hand reclassification ENTIRELY: the
+        /// harness itself now attributes oracle blame, so the probe reads the
+        /// class off the run it already has instead of computing one. There is
+        /// no longer a probe-side implementation that could drift from what
+        /// campaigns emit, because there is no probe-side implementation.
         ///
-        /// The one behavioural difference is deliberate. The production gate
-        /// additionally requires the ORACLE to be the over-returning side,
-        /// which is what attributes blame; this probe's fixtures satisfy that,
-        /// and any that stop satisfying it SHOULD stop being reclassified.
-        fn classify_boosted_group_negation_oracle_bug(
-            query: &str,
-            comparison: &mut ComparisonReport,
-        ) -> bool {
-            let reclassified = super::reclassify_oracle_blamed_lowering(query, comparison);
-            if reclassified {
-                comparison.score_epsilon_reason = None;
-            }
-            reclassified
+        /// The production gate additionally requires the ORACLE to be the
+        /// over-returning side, which is what attributes blame; a case that
+        /// stops satisfying that SHOULD stop being reclassified, and the
+        /// score-only residual below is exactly such a case.
+        fn carries_oracle_bug_class(comparison: &ComparisonReport) -> bool {
+            comparison
+                .divergences
+                .iter()
+                .any(|divergence| divergence.class == DivergenceClass::OracleBug)
         }
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -19909,7 +19922,7 @@ mod tests {
                             corpus_hash: Some(corpus_hash.clone()),
                         },
                     };
-                    let mut run = harness
+                    let run = harness
                         .run(&cx, &subject, &oracle, &case)
                         .await
                         .unwrap_or_else(|error| {
@@ -19918,8 +19931,14 @@ mod tests {
                                  query={query:?} failed to execute: {error}"
                             )
                         });
-                    if classify_boosted_group_negation_oracle_bug(&query, &mut run.comparison) {
+                    if carries_oracle_bug_class(&run.comparison) {
                         boosted_group_oracle_bug_cases += 1;
+                        assert_eq!(
+                            run.comparator_config.oracle_bug_reason,
+                            Some(OracleBugReason::BoostedGroupNegationLowering),
+                            "an emitted OracleBug must be re-derivable from the stored \
+                             configuration: seed={seed:#x} ordinal={ordinal} query={query:?}"
+                        );
                     }
                     if run.comparison.rank_class == RankClass::ScoreEpsilon {
                         assert_eq!(
@@ -20105,7 +20124,7 @@ mod tests {
                     corpus_hash: Some(corpus_hash.clone()),
                 },
             };
-            let mut boosted_group_negation_run = harness
+            let boosted_group_negation_run = harness
                 .run(&cx, &subject, &oracle, &boosted_group_negation_case)
                 .await
                 .unwrap_or_else(|error| {
@@ -20113,21 +20132,40 @@ mod tests {
                         "boosted-group negation probe failed: query={boosted_group_negation_query:?}: {error}"
                     )
                 });
+            // WITHOUT the attribution this is a raw membership failure, and the
+            // same observations still say so: re-deriving under the lane's
+            // unattributed configuration is what proves the attribution — not
+            // some other change — is what moved the class (bd-bxya1).
+            let unattributed = compare_observations(
+                boosted_group_negation_run.comparison.subject.clone(),
+                boosted_group_negation_run.comparison.oracle.clone(),
+                ComparatorConfig::default()
+                    .with_score_epsilon_reason(ScoreEpsilonReason::SummationAssociation),
+            )
+            .expect("unattributed re-derivation of the boosted-group negation observations");
             assert!(
-                boosted_group_negation_run
-                    .comparison
+                unattributed
                     .divergences
                     .iter()
                     .any(|divergence| divergence.class == DivergenceClass::RankMismatch),
                 "the pinned oracle fallback must make the raw membership divergence visible: {:#?}",
-                boosted_group_negation_run.comparison.divergences
+                unattributed.divergences
+            );
+            assert_eq!(
+                unattributed.status,
+                ComparisonStatus::Failed,
+                "the unattributed shape is a raw failure; that is what the attribution answers"
             );
             assert!(
-                classify_boosted_group_negation_oracle_bug(
-                    &boosted_group_negation_query,
-                    &mut boosted_group_negation_run.comparison,
-                ),
-                "the known boosted-group negation shape must route to OracleBug"
+                carries_oracle_bug_class(&boosted_group_negation_run.comparison),
+                "the known boosted-group negation shape must route to OracleBug on the \
+                 production path: {:#?}",
+                boosted_group_negation_run.comparison.divergences
+            );
+            assert_eq!(
+                boosted_group_negation_run.comparator_config.oracle_bug_reason,
+                Some(OracleBugReason::BoostedGroupNegationLowering),
+                "the emitted class must be re-derivable from the stored configuration"
             );
             assert_eq!(
                 boosted_group_negation_run.comparison.status,
@@ -20537,12 +20575,13 @@ mod tests {
     const E68_CONTROL_CASE_ID: &str = "e68-div007-control";
     /// The case that must STILL fail closed after bd-gx7n4 (bd-73ok3).
     ///
-    /// A negation inside a BOOSTED group: the pinned oracle's lenient-parse
-    /// fallback silently drops the negation, so the two engines disagree about
-    /// which documents MATCH. The register documents this as an `OracleBug`
-    /// membership divergence that "never" classifies as `ScoreEpsilon`, and the
-    /// campaign lane -- which does not run the bsjw probe's manual
-    /// reclassification -- sees it as a raw `RankMismatch`.
+    /// A negation inside a BOOSTED group: the pinned oracle re-nests it as a
+    /// positive alternative, so the two engines disagree about which documents
+    /// MATCH. The register documents this as an `OracleBug` membership
+    /// divergence that never classifies as `ScoreEpsilon`, and since bd-bxya1
+    /// the campaign lane emits that class itself — the blame is a stored
+    /// comparator INPUT the artifact re-derives, not a reclassification anyone
+    /// applies afterwards.
     ///
     /// It is deliberately a MEMBERSHIP divergence rather than another score
     /// one: it proves the lane's new tolerance is specific to the reviewed
@@ -20558,10 +20597,23 @@ mod tests {
     /// same lane, different mechanism (membership, not summation association).
     #[cfg(feature = "tantivy-oracle")]
     const E68_REFUSAL_DIVERGENCE_ID: &str = "DIV-009";
-    /// The bead a fresh mint of the membership refusal blocks against: the
-    /// oracle-lowering defect's own bead, not DIV-008's and not bd-nqeb4's.
+    /// The independent reviewer of DIV-009's acceptance.
+    ///
+    /// `DivergenceDisposition::validate` requires the reviewer to differ from
+    /// the observation's `recorded_by`, which is the whole point: the agent
+    /// that observed a divergence may not also certify it. This names the owner
+    /// ruling of 2026-08-05 recorded on `bd-f20ye`, not the recording pane.
     #[cfg(feature = "tantivy-oracle")]
-    const E68_REFUSAL_BLOCKING_BEAD: &str = "bd-f20ye";
+    const E68_REFUSAL_REVIEWER: &str =
+        "Dicklesworthstone (owner ruling of 2026-08-05, recorded on bd-f20ye)";
+    /// When DIV-009's acceptance was ruled — the owner ruling's own date, not
+    /// the hour the observation was recorded, which is a day earlier.
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_REFUSAL_REVIEWED_AT: &str = "2026-08-05T00:00:00Z";
+    /// The law the acceptance rests on, stated so the record carries it.
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_REFUSAL_EQUIVALENCE_LAW: &str =
+        "a boost is a score multiplier and must not change boolean membership: for any group G and finite boost b, the document SET matched by (G)^b equals the set matched by (G). Quill satisfies this law; the pinned oracle does not, which is what attributes the divergence to the oracle.";
     #[cfg(feature = "tantivy-oracle")]
     const E68_WITNESS_DIVERGENCE_ID: &str = "DIV-008";
     #[cfg(feature = "tantivy-oracle")]
@@ -20678,6 +20730,19 @@ mod tests {
             !mismatch_signatures.is_empty(),
             "the ingested object must carry at least one raw mismatch signature"
         );
+        // The class recorded below is READ OUT of the artifact, not asserted by
+        // this function: every non-auto divergence in the witness must be the
+        // OracleBug class the campaign attributed, or the mint fails rather
+        // than recording a class its own evidence does not carry (bd-bxya1).
+        assert!(
+            binding
+                .divergences
+                .iter()
+                .filter(|divergence| !is_auto_class(divergence.class))
+                .all(|divergence| divergence.class == DivergenceClass::OracleBug),
+            "the DIV-009 witness must carry the attributed OracleBug class: {:#?}",
+            binding.divergences
+        );
 
         let mut diagnostic_hasher = Sha256::new();
         for divergence in &binding.divergences {
@@ -20702,13 +20767,14 @@ mod tests {
                 recorded_at: E68_RECORDED_AT.to_owned(),
             },
             E68_REFUSAL_DIVERGENCE_ID,
-            // Still the raw class, because that is what the lane still emits:
-            // bd-bxya1 built and tested the oracle-blame gate but could not
-            // wire it into production without extending the frozen v7
-            // comparator contract. When that ruling lands this becomes
-            // `OracleBug` and the disposition below becomes the reviewed
-            // Accepted, which the validator refuses for a raw failure class.
-            DivergenceClass::RankMismatch,
+            // The SEMANTIC class the lane now emits (bd-bxya1). This is not a
+            // relabelling of the record: the artifact this observation is
+            // ingested from carries `OracleBug` itself, because the campaign
+            // stored the reviewed attribution as a comparator INPUT and the
+            // object re-derives the same report from the same observations.
+            // The assertion above refuses to mint if the artifact ever stops
+            // saying so, rather than letting this constant carry the claim.
+            DivergenceClass::OracleBug,
             DivergenceFixtureEvidence {
                 fixture_id: E68_REFUSAL_CASE_ID.to_owned(),
                 fixture_sha256,
@@ -20726,10 +20792,10 @@ mod tests {
                     "the same document set from both engines; a negation inside a boosted group excludes exactly what it names."
                         .to_owned(),
                 root_cause:
-                    "an oracle-side LOWERING defect, not a Quill scoring one and not a parse recovery: the MustNot clause survives parsing, but boosting the group nests it as its own boolean and attaches that as a positive alternative, so the group stops excluding (bd-f20ye). Quill lowers it correctly. Because membership differs, this is a raw RankMismatch and cannot be an auto class -- the lane's reviewed summation-association tolerance covers score bits on identical document sets and deliberately does not reach here."
+                    "an oracle-side LOWERING defect, not a Quill scoring one and not a parse recovery: the MustNot clause survives parsing, but boosting the group nests it as its own boolean and attaches that as a positive alternative, so the group stops excluding (bd-f20ye). Quill lowers it correctly. Membership differs, so no score-tolerance class can ever cover it -- the lane's reviewed summation-association tolerance covers score bits on identical document sets and deliberately does not reach here. The class recorded is OracleBug because the blame was PROVED on three independent pieces of evidence: the query shape, the membership symptom, and the side -- the oracle returned a strict superset of the subject's documents, which is the failure-to-exclude this defect produces (bd-bxya1)."
                         .to_owned(),
                 consumer_impact:
-                    "result SETS differ, which is the class of divergence a consumer notices first. It fails closed as unclassified in the default-profile lane, and the register is the only place a decision about it can be recorded."
+                    "result SETS differ, which is the class of divergence a consumer notices first. The campaign case still fails closed -- it carries no per-fixture register row and its total lexical contract still mismatches -- so attribution decides who is at fault, not whether the case passes."
                         .to_owned(),
             },
             diagnostic,
@@ -20744,20 +20810,23 @@ mod tests {
                 recorded_at: E68_RECORDED_AT.to_owned(),
             },
             divergence_id: E68_REFUSAL_DIVERGENCE_ID.to_owned(),
-            // BLOCKING, still, and the reason is recorded rather than papered
-            // over: the owner ruling of 2026-08-05 ACCEPTED this divergence,
-            // but `DivergenceDisposition::validate` refuses acceptance for a
-            // raw failure class, and the lane cannot yet emit the semantic
-            // `OracleBug` class (bd-bxya1). The reviewed decision and the
-            // machine record therefore still disagree, which is exactly the
-            // difference bd-f20ye's close said would have to be stated.
-            disposition: DivergenceDisposition::Blocking {
-                bead_id: E68_REFUSAL_BLOCKING_BEAD.to_owned(),
+            // ACCEPTED, which the machine record can finally say (bd-bxya1).
+            // The owner ruling of 2026-08-05 accepted this divergence, and the
+            // ledger recorded BLOCKING anyway because the lane emitted a raw
+            // `RankMismatch` and `DivergenceDisposition::validate` refuses
+            // acceptance for a raw failure class. The lane now emits the
+            // semantic `OracleBug` class the attribution earns, so the reviewed
+            // decision and the machine record agree without the validator being
+            // weakened: acceptance still refuses every raw failure class, and
+            // this one is no longer raw because its blame was PROVED, not
+            // asserted.
+            disposition: DivergenceDisposition::Accepted {
+                equivalence_law: E68_REFUSAL_EQUIVALENCE_LAW.to_owned(),
                 rationale:
-                    "accepted by owner ruling on 2026-08-05, but the machine record cannot say so yet: the lane emits this as a raw RankMismatch and no acceptance may bless a raw failure class. It stays blocking until the campaign can emit the OracleBug class the attribution earns (bd-bxya1)."
+                    "the pinned oracle is a comparator, not a semantics authority. A boost is a score multiplier; a boost that changes boolean MEMBERSHIP is a defect by any reading, and `(a NOT b)^2` returning documents the query excluded is user-facing wrong. frankensearch-lexical's SHIPPING path repairs the shape while `oracle_observe_*` stays bit-faithful to Tantivy 0.26.1, defects included, so Quill is still measured against an unmoved target."
                         .to_owned(),
-                reviewer: E68_RECORDED_BY.to_owned(),
-                reviewed_at: E68_RECORDED_AT.to_owned(),
+                reviewer: E68_REFUSAL_REVIEWER.to_owned(),
+                reviewed_at: E68_REFUSAL_REVIEWED_AT.to_owned(),
             },
         };
 
@@ -20836,10 +20905,11 @@ mod tests {
         // the divergence is a membership RankMismatch, and the ORACLE returned
         // the document the subject correctly excluded.
         let mut admitted = report(&["p2"], &["p1", "p2"], &[DivergenceClass::RankMismatch]);
-        assert!(
-            reclassify_oracle_blamed_lowering("(alpha NOT beta)^2", &mut admitted),
-            "the measured oracle defect must reclassify on the production path"
-        );
+        let reason = oracle_blame_attribution("(alpha NOT beta)^2", &admitted)
+            .expect("the measured oracle defect must attribute on the production path");
+        assert_eq!(reason, OracleBugReason::BoostedGroupNegationLowering);
+        crate::comparator::apply_oracle_bug_attribution(reason, &mut admitted)
+            .expect("the gate's verdict must satisfy the comparator's own observation checks");
         assert_eq!(
             admitted
                 .divergences
@@ -20853,10 +20923,23 @@ mod tests {
         // NEGATIVE 1 — THE LOAD-BEARING ONE: same shape, same symptom, but the
         // SUBJECT is the over-returning side. That is a Quill defect and must
         // never be relabelled as an oracle bug.
+        //
+        // Refused TWICE, independently: the gate declines to attribute, and the
+        // comparator refuses the attribution even when a configuration asserts
+        // it. The second lock is what makes a hand-written or fabricated stored
+        // reason unable to launder a subject-side defect.
         let mut subject_side = report(&["p1", "p2"], &["p2"], &[DivergenceClass::RankMismatch]);
         assert!(
-            !reclassify_oracle_blamed_lowering("(alpha NOT beta)^2", &mut subject_side),
-            "a SUBJECT-side membership defect must never reclassify as OracleBug"
+            oracle_blame_attribution("(alpha NOT beta)^2", &subject_side).is_none(),
+            "a SUBJECT-side membership defect must never attribute as OracleBug"
+        );
+        assert!(
+            crate::comparator::apply_oracle_bug_attribution(
+                OracleBugReason::BoostedGroupNegationLowering,
+                &mut subject_side,
+            )
+            .is_err(),
+            "a claimed attribution its own observations refute must be refused"
         );
         assert_eq!(
             subject_side.divergences[0].class,
@@ -20866,32 +20949,32 @@ mod tests {
 
         // NEGATIVE 2: the symptom without the structural shape. This is the
         // case a symptom-only implementation would wrongly admit.
-        let mut no_shape = report(&["p2"], &["p1", "p2"], &[DivergenceClass::RankMismatch]);
+        let no_shape = report(&["p2"], &["p1", "p2"], &[DivergenceClass::RankMismatch]);
         assert!(
-            !reclassify_oracle_blamed_lowering("alpha NOT beta", &mut no_shape),
+            oracle_blame_attribution("alpha NOT beta", &no_shape).is_none(),
             "an unboosted negation carries no oracle-blame evidence"
         );
 
         // NEGATIVE 3: the shape with a boost but no negation inside the group.
-        let mut no_negation = report(&["p2"], &["p1", "p2"], &[DivergenceClass::RankMismatch]);
+        let no_negation = report(&["p2"], &["p1", "p2"], &[DivergenceClass::RankMismatch]);
         assert!(
-            !reclassify_oracle_blamed_lowering("(alpha OR beta)^2", &mut no_negation),
+            oracle_blame_attribution("(alpha OR beta)^2", &no_negation).is_none(),
             "a boosted group without a negation is not this defect"
         );
 
         // NEGATIVE 4: identical membership. The oracle did not over-return, so
         // nothing attributes blame — this is the residual the bsjw probe
         // tolerates explicitly rather than relabelling.
-        let mut score_only = report(&["p1"], &["p1"], &[DivergenceClass::RankMismatch]);
+        let score_only = report(&["p1"], &["p1"], &[DivergenceClass::RankMismatch]);
         assert!(
-            !reclassify_oracle_blamed_lowering("(alpha NOT beta)^2", &mut score_only),
+            oracle_blame_attribution("(alpha NOT beta)^2", &score_only).is_none(),
             "identical document sets cannot attribute blame to either engine"
         );
 
         // NEGATIVE 5: the right shape and side, but a different symptom class.
-        let mut wrong_class = report(&["p2"], &["p1", "p2"], &[DivergenceClass::CountMismatch]);
+        let wrong_class = report(&["p2"], &["p1", "p2"], &[DivergenceClass::CountMismatch]);
         assert!(
-            !reclassify_oracle_blamed_lowering("(alpha NOT beta)^2", &mut wrong_class),
+            oracle_blame_attribution("(alpha NOT beta)^2", &wrong_class).is_none(),
             "only a membership RankMismatch is this defect's symptom"
         );
 
@@ -21312,9 +21395,19 @@ mod tests {
             // score mechanism classify in this lane; it must NOT have made the
             // lane tolerant in general. A negation inside a boosted group is a
             // MEMBERSHIP divergence -- the engines disagree about which
-            // documents match -- so it is a raw failure class no auto-class
-            // covers, and it still fails closed in the same suite, in the same
-            // run, under the same enveloped comparator.
+            // documents match -- and it still fails closed in the same suite,
+            // in the same run, under the same enveloped comparator.
+            //
+            // WHAT bd-bxya1 CHANGED, and what it deliberately did not. The lane
+            // now attributes this shape to the ORACLE and emits the semantic
+            // `OracleBug` class, so the register can accept it and the machine
+            // mint below can say so. The case still fails closed, for two
+            // reasons that are both correct and are stated rather than fixed by
+            // widening anything: it carries no per-fixture register row
+            // (`expected_divergence` is None), and the total lexical contract
+            // still mismatches -- the lexical axis defers only to a reviewed
+            // SCORE envelope, never to a membership class. Attribution earns a
+            // divergence a decidable class; it does not earn a case a pass.
             let refusal = report
                 .cases
                 .iter()
@@ -21323,7 +21416,8 @@ mod tests {
             assert_eq!(
                 refusal.disposition,
                 CampaignDisposition::Unclassified,
-                "a membership divergence must still fail closed after the score envelope opt-in \
+                "an unregistered membership divergence must still fail closed after the score \
+                 envelope opt-in and after oracle-blame attribution \
                  (reason={:?} diagnostic={:?})",
                 refusal.reason,
                 refusal.diagnostic
@@ -21346,6 +21440,36 @@ mod tests {
             // therefore still demonstrated on production evidence, by the same
             // run, on a divergence that genuinely needs a register decision.
             let object = load_campaign_case_object(&root, refusal);
+            // ACCEPTANCE 1 (bd-bxya1), on production evidence and with NO
+            // test-side mutation: the retained artifact carries the `OracleBug`
+            // class, carries the stored attribution that produced it, and
+            // re-derives that exact report from its own observations --
+            // `validate()` re-runs the v8 comparator over the stored evidence
+            // and refuses any report it cannot reproduce, which is precisely
+            // what a post-hoc reclassification could never satisfy.
+            object
+                .validate()
+                .expect("the attributed campaign object must re-derive its own report");
+            assert_eq!(
+                object.comparator_config.oracle_bug_reason,
+                Some(OracleBugReason::BoostedGroupNegationLowering),
+                "the campaign must store the attribution as a comparator input"
+            );
+            assert!(
+                object
+                    .comparison
+                    .divergences
+                    .iter()
+                    .filter(|divergence| !is_auto_class(divergence.class))
+                    .all(|divergence| divergence.class == DivergenceClass::OracleBug),
+                "the default-profile lane must emit OracleBug for the DIV-009 shape: {:#?}",
+                object.comparison.divergences
+            );
+            assert_eq!(
+                object.comparison.status,
+                ComparisonStatus::Classified,
+                "an attributed oracle bug is a classified comparison, not a raw failure"
+            );
             let (ledger, mismatch_signatures) = e68_ingest_witness(
                 &object,
                 e68_minimized_fixture_sha256(&fixture, E68_REFUSAL_CASE_ID),
@@ -21355,6 +21479,23 @@ mod tests {
                     &object,
                 ))
                 .expect("the ingested observation must join to its own witness object");
+            // ACCEPTANCE 4 (bd-bxya1): DIV-009's machine mint and its reviewed
+            // accept now AGREE. The ledger validates on assembly, and
+            // `DivergenceDisposition::validate` still refuses acceptance for
+            // every raw failure class -- nothing was weakened to get here; the
+            // class changed because the blame was proved.
+            assert!(
+                ledger.events.iter().any(|event| matches!(
+                    event,
+                    DivergenceRegisterEvent::Disposition(disposition)
+                        if disposition.divergence_id == E68_REFUSAL_DIVERGENCE_ID
+                            && matches!(
+                                disposition.disposition,
+                                DivergenceDisposition::Accepted { .. }
+                            )
+                )),
+                "the DIV-009 mint must record the reviewed acceptance"
+            );
 
             // The witness signature is the one the campaign itself emitted.
             assert!(

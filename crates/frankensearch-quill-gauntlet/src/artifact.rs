@@ -993,7 +993,10 @@ impl ArtifactObject {
                 });
             }
         }
-        self.comparator_config.validate_stored_v7()?;
+        // v8, not v7: this validates the CURRENT generation, which is the only
+        // one `validate_stored_object_schema` admits above, and a v8 object may
+        // carry the stored oracle-blame attribution v7 refuses (bd-bxya1).
+        self.comparator_config.validate_stored_v8()?;
         validate_generated_case_metadata(&self.case)?;
         if self.campaign.is_none()
             && self
@@ -5412,7 +5415,9 @@ mod tests {
             match version {
                 1 | 2 | 3 | 5 => assert!(reason.contains("unauthenticated legacy")),
                 4 => assert!(reason.contains("reserved pre-policy")),
-                6 => assert!(reason.contains("integrity only")),
+                // v7 joined v6 at the integrity ceiling when v8 became the
+                // current generation, and it routes by the same rule.
+                6 | 7 => assert!(reason.contains("integrity only")),
                 _ => unreachable!(),
             }
         }
@@ -6309,11 +6314,13 @@ mod tests {
     ///
     /// Both directions, because either alone is a different (weaker) claim.
     ///
-    /// FORWARD: the retained v7 golden still decodes, still addresses to its
-    /// own pinned v7 digest under its own hash domain, and still re-derives its
-    /// stored report from its own stored observations under the frozen v7
-    /// comparator. That is what "read-only" has to mean if the archive is to
-    /// stay worth keeping.
+    /// FORWARD: the retained v7 golden still decodes, its STORED BYTES still
+    /// address to its pinned v7 digest under its own hash domain, and it still
+    /// re-derives its stored report from its own stored observations under the
+    /// frozen v7 comparator. That is what "read-only" has to mean if the
+    /// archive is to stay worth keeping. What it does NOT mean is DTO
+    /// round-tripping: the current shape carries a field v7 never had, so a
+    /// retained object is verified from its bytes and never from a re-encode.
     ///
     /// BACKWARD: it is refused for admission, naming its generation, and it
     /// cannot be laundered into the current generation — stamping v8 on v7
@@ -6329,14 +6336,29 @@ mod tests {
             serde_json::from_slice(canonical).expect("the retained v7 object must still decode");
         assert_eq!(object.object_schema_version, 7);
 
-        // Its bytes have not moved, and it still addresses under the v7 domain.
-        assert_eq!(
-            object.canonical_bytes().expect("v7 canonical bytes"),
-            canonical
-        );
+        // Its stored BYTES have not moved and still address under the v7
+        // domain — verified from those bytes, never from a reserialization.
         assert_eq!(
             hash_object_bytes(canonical, 7).expect("registered v7 hash domain"),
             "3ba1751438f70da4dfb41bdce755906602a4b7d3d3fcf499803919c70473c800"
+        );
+        // The current DTO deliberately CANNOT reproduce them: v8 added
+        // `oracle_bug_reason` to the comparator configuration, so re-encoding a
+        // decoded v7 object emits a key its own generation never had. That is
+        // not damage to the archive — it is exactly why v8 is a new generation
+        // rather than a field added inside v7, and it is what `object_hash`
+        // means when it documents itself as not an original-byte verifier. A
+        // retained object is verified from its bytes; only a current object is
+        // verified from its DTO.
+        let reserialized = object.canonical_bytes().expect("v7 reserialization");
+        assert_ne!(reserialized, canonical);
+        assert!(
+            !String::from_utf8_lossy(canonical).contains("oracle_bug_reason"),
+            "the retained v7 bytes predate the v8 comparator input"
+        );
+        assert!(
+            String::from_utf8_lossy(&reserialized).contains("\"oracle_bug_reason\":null"),
+            "the current DTO adds exactly the v8 field, defaulted absent"
         );
 
         // It still re-derives its own report from its own observations under

@@ -102,7 +102,8 @@ pub use comparator::{
     QuillCancellationEvidenceOrigin, QuillCancellationObservation, QuillCancellationReceipt,
     QuillCancellationReceiptBody, RankClass, RankedHit, SCORE_EPSILON, ScoreEpsilonReason,
     SensitiveValueObservation, compare_cass_lexical_profiles, compare_lexical_contracts,
-    compare_lexical_observations, compare_observations, observe_lexical_outcome,
+    compare_lexical_observations, compare_observations, compare_observations_stored_v7,
+    compare_observations_stored_v8, observe_lexical_outcome,
     observe_live_quill_cancellation_receipt, observe_quill_cass_profile,
 };
 #[cfg(feature = "fuzz-harness")]

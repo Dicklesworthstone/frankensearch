@@ -342,8 +342,10 @@ not this row. This row is the human projection of it.
 
 ### DIV-009: boosting a group changes its boolean meaning when the group negates (shipping path repaired, oracle pinned)
 
-- Class: `RankMismatch` (MEMBERSHIP — the engines disagree about which documents match, so no
-  score-tolerance class can ever cover it)
+- Class: `OracleBug` (MEMBERSHIP — the engines disagree about which documents match, so no
+  score-tolerance class can ever cover it; the blame is ATTRIBUTED, not asserted — see the machine
+  record below). Recorded as a raw `RankMismatch` until bd-bxya1, because nothing in production
+  could emit the semantic class.
 - First seen: 2026-08-04 · probing for a divergence the default-profile lane still refuses after
   bd-gx7n4 opened it to the DIV-007 score envelope (bd-73ok3)
 - Root cause: an ORACLE-side lowering defect in tantivy 0.26.1, with the conformance direction
@@ -394,12 +396,24 @@ not this row. This row is the human projection of it.
   disabling the repair reddens "the shipping path must not return a document the query excluded";
   leaking the repair into `oracle_observe_page` reddens "the oracle page surface must reproduce the
   defect, not the repair". Neither direction can regress silently.
-- Machine record: minted on demand by the E6.8 lane rather than committed, and that mint still
-  records **blocking** — `DivergenceDisposition::Accepted` refuses a raw failure class by design, and
-  the lane observes this as a `RankMismatch` because it does not run the `OracleBug` reclassification
-  the bsjw probe applies. The accept above is the reviewed decision; teaching the default-profile lane
-  to classify this shape as `OracleBug` (with its per-fixture registry row) is the follow-up that
-  would let the two records agree, and is named here rather than left to be discovered.
+- Machine record: minted on demand by the E6.8 lane rather than committed, and the mint now records
+  **accepted**, agreeing with the reviewed decision above (bd-bxya1). What changed is the class, not
+  the validator: `DivergenceDisposition::Accepted` still refuses every raw failure class, and this
+  divergence is no longer raw because the campaign ATTRIBUTES it. The attribution is a stored
+  comparator INPUT — `ComparatorConfig::oracle_bug_reason`, part of the artifact/report v8 shape — so
+  the retained artifact re-derives the identical `OracleBug` report from its own observations, and
+  the campaign verifier re-derives the attribution independently from the query rather than accepting
+  the stored one. It is gated on three independent pieces of evidence, all required: the query SHAPE
+  (a boosted group containing a negation, not a register row's opinion), the SYMPTOM (a membership
+  `RankMismatch`), and the SIDE (the oracle returned a strict superset of the subject's documents,
+  which is what attributes blame). Six planted negatives, each refused alone against an admitting
+  control, pin the gate — the load-bearing one being a subject-side defect wearing the same shape and
+  symptom, which is refused twice: the gate declines to attribute it, and the comparator refuses the
+  attribution even when a configuration asserts it.
+- What attribution does NOT buy: the campaign case still fails closed. It carries no per-fixture
+  register row, and the total lexical contract still mismatches — the lexical axis defers only to a
+  reviewed SCORE envelope and deliberately never to a membership class. Attribution earns the
+  divergence a decidable class; it does not earn the case a pass.
 - Reviewer: owner ruling of 2026-08-05, recorded by `Claude-pane12`. Distinct from `bd-nqeb4`, which
   is a `PhraseScorer` panic on a negated absent phrase — different shape, different failure mode.
 
@@ -489,11 +503,14 @@ not this row. This row is the human projection of it.
   side, the exclusion-only and leading-`NOT` cases are pinned beside the repaired forms so a broader
   change to negative handling cannot pass by loosening them.
 - Machine record: no committed ledger event. This shape has not been observed by a live campaign
-  artifact, so there is nothing to ingest yet, and the same constraint DIV-009 records applies when
-  one appears — `DivergenceDisposition::Accepted` refuses a raw failure class, and the
-  default-profile lane emits `RankMismatch` without the `OracleBug` reclassification. The reviewed
-  accept above is the decision; making the machine record agree is the same named follow-up DIV-009
-  carries, and this entry does not claim it is done.
+  artifact, so there is nothing to ingest yet. The mechanism that would let a mint record the
+  reviewed accept now EXISTS (bd-bxya1 — a stored oracle-blame attribution the comparator applies and
+  the artifact re-derives), but it is deliberately scoped to DIV-009's boosted-group-with-negation
+  shape and does NOT fire here: `OracleBugReason` carries one variant, and a second one would need
+  its own three-gate evidence — the shape predicate for `AND` beside a negation, the membership
+  symptom, and a measured side. Until that lands, a live observation of this shape would still mint
+  as a raw `RankMismatch`, which `DivergenceDisposition::Accepted` refuses. The reviewed accept above
+  is the decision; this entry does not claim the machine record agrees.
 - Reviewer: recorded by `BlueOriole` under the owner routing of 2026-08-05 that directed this repair.
   No independent reviewer is claimed; an `accept` normally wants fresh eyes, and this row should be
   read as reviewed-by-one until a second agent signs it off.
