@@ -4590,11 +4590,30 @@ fn validate_campaign_case_result(
     let lexical_disposition_matches = match &result.lexical_contract {
         CampaignLexicalCaseSummary::CoreLexicalV3 {
             status: LexicalComparisonStatus::Mismatch,
+            first_mismatch,
             ..
         } => {
-            result.disposition == CampaignDisposition::Unclassified
+            let refuses_closed = result.disposition == CampaignDisposition::Unclassified
                 && result.reason == Some(CampaignCaseReason::LexicalContractMismatch)
+                && result.registered_divergence.is_none();
+            // bd-gx7n4 taught `classify_case_with_lexical` to defer to a rank
+            // axis that classified the SAME difference under a reviewed typed
+            // reason, but this validator still demanded that any lexical
+            // mismatch refuse; a lane that opted in produced a report it could
+            // not construct (bd-73ok3). The deferral is admissible only when
+            // the rank axis really classified as a score epsilon and the
+            // retained mismatch has that shape -- an unrelated lexical
+            // mismatch riding along with a ScoreEpsilon rank class still fails.
+            let defers_to_classified_rank = result.disposition
+                == CampaignDisposition::AutoClassified
+                && result.comparison_status == Some(ComparisonStatus::Classified)
+                && result.rank_class == Some(RankClass::ScoreEpsilon)
+                && result.reason.is_none()
                 && result.registered_divergence.is_none()
+                && first_mismatch
+                    .as_ref()
+                    .is_some_and(crate::comparator::lexical_mismatch_has_reviewed_score_shape);
+            refuses_closed || defers_to_classified_rank
         }
         CampaignLexicalCaseSummary::CoreLexicalV3 {
             status: LexicalComparisonStatus::Equivalent,
@@ -20070,6 +20089,33 @@ mod tests {
     const E68_WITNESS_CASE_ID: &str = "e68-div007-witness";
     #[cfg(feature = "tantivy-oracle")]
     const E68_CONTROL_CASE_ID: &str = "e68-div007-control";
+    /// The case that must STILL fail closed after bd-gx7n4 (bd-73ok3).
+    ///
+    /// A negation inside a BOOSTED group: the pinned oracle's lenient-parse
+    /// fallback silently drops the negation, so the two engines disagree about
+    /// which documents MATCH. The register documents this as an `OracleBug`
+    /// membership divergence that "never" classifies as `ScoreEpsilon`, and the
+    /// campaign lane -- which does not run the bsjw probe's manual
+    /// reclassification -- sees it as a raw `RankMismatch`.
+    ///
+    /// It is deliberately a MEMBERSHIP divergence rather than another score
+    /// one: it proves the lane's new tolerance is specific to the reviewed
+    /// score mechanism and does not quietly extend to documents appearing or
+    /// disappearing. Measured with the lane's own enveloped comparator:
+    /// `(release NOT release)^2` => Failed/RankMismatch, while the unboosted
+    /// `(release NOT release)` is Exact, so the boost is what triggers it.
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_REFUSAL_CASE_ID: &str = "e68-oracle-bug-refusal";
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_REFUSAL_QUERY: &str = "(release NOT release)^2";
+    /// Ingesting the refusal case mints a DIFFERENT divergence from DIV-008:
+    /// same lane, different mechanism (membership, not summation association).
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_REFUSAL_DIVERGENCE_ID: &str = "DIV-009";
+    /// The bead a fresh mint of the membership refusal blocks against. It is
+    /// the oracle-parse defect's own bead, not DIV-008's.
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_REFUSAL_BLOCKING_BEAD: &str = "bd-nqeb4";
     #[cfg(feature = "tantivy-oracle")]
     const E68_WITNESS_DIVERGENCE_ID: &str = "DIV-008";
     #[cfg(feature = "tantivy-oracle")]
@@ -20128,6 +20174,7 @@ mod tests {
             vec![
                 case(E68_WITNESS_CASE_ID, E68_WITNESS_QUERY),
                 case(E68_CONTROL_CASE_ID, E68_WITNESS_CONTROL_QUERY),
+                case(E68_REFUSAL_CASE_ID, E68_REFUSAL_QUERY),
             ],
         )
         .expect("E6.8 witness query suite");
@@ -20183,7 +20230,7 @@ mod tests {
         mismatch_signatures.dedup();
         assert!(
             !mismatch_signatures.is_empty(),
-            "the witness object must carry at least one raw mismatch signature"
+            "the ingested object must carry at least one raw mismatch signature"
         );
 
         let mut diagnostic_hasher = Sha256::new();
@@ -20197,7 +20244,7 @@ mod tests {
         }
         let diagnostic = RedactedDivergenceDiagnostic {
             payload_sha256: lower_hex(&diagnostic_hasher.finalize()),
-            marker: "<redacted:e68-div007-rank-mismatch>".to_owned(),
+            marker: "<redacted:e68-live-lane-rank-mismatch>".to_owned(),
         };
 
         let observation = DivergenceRegisterLedger::observation_from_artifact(
@@ -20208,28 +20255,29 @@ mod tests {
                 recorded_by: E68_RECORDED_BY.to_owned(),
                 recorded_at: E68_RECORDED_AT.to_owned(),
             },
-            E68_WITNESS_DIVERGENCE_ID,
+            E68_REFUSAL_DIVERGENCE_ID,
             DivergenceClass::RankMismatch,
             DivergenceFixtureEvidence {
-                fixture_id: E68_WITNESS_CASE_ID.to_owned(),
+                fixture_id: E68_REFUSAL_CASE_ID.to_owned(),
                 fixture_sha256,
-                regression_test: "runner::tests::three_clause_or_diverges_at_one_ulp_without_the_div007_envelope"
-                    .to_owned(),
+                regression_test:
+                    "runner::tests::live_default_profile_campaign_ingests_its_unclassified_divergence"
+                        .to_owned(),
                 minimized: true,
             },
             mismatch_signatures.clone(),
             DivergenceObservationNarrative {
                 observed_behavior:
-                    "Quill scores one document in a plain three-clause disjunction one ULP away from the pinned oracle; the returned document set and every rank position are identical."
+                    "the two engines disagree about which documents MATCH a negation inside a boosted group: the pinned oracle's lenient-parse fallback drops the negation and returns the documents it excludes."
                         .to_owned(),
                 expected_behavior:
-                    "the pinned oracle's score for that document, bit for bit, under the campaign comparator's zero-tolerance default configuration."
+                    "the same document set from both engines; a negation inside a boosted group excludes exactly what it names."
                         .to_owned(),
                 root_cause:
-                    "the DIV-007 mechanism outside its documented qualifiers: Quill's Term scorer fuses each unfielded term's [content, 2.0x title] expansion into one summed contribution while the pinned oracle accumulates interleaved per-field clause outputs, so f32 summation association differs. Observed at three leaves with no boost and no mixed-occur nesting, where DIV-007 documents eight leaves."
+                    "an oracle-side parse defect, not a Quill scoring one. The pinned oracle recovers from the boosted-group form by discarding the NOT clause entirely; Quill retains it. Because membership differs, this is a raw RankMismatch and cannot be an auto class -- the lane's reviewed summation-association tolerance covers score bits on identical document sets and deliberately does not reach here."
                         .to_owned(),
                 consumer_impact:
-                    "result sets are unchanged; only the order of two ULP-adjacent scores can flip. The campaign impact is the load-bearing one: the default-profile lane does not opt into the typed summation-association reason, so this emits as a raw RankMismatch and fails closed as unclassified."
+                    "result SETS differ, which is the class of divergence a consumer notices first. It fails closed as unclassified in the default-profile lane, and the register is the only place a decision about it can be recorded."
                         .to_owned(),
             },
             diagnostic,
@@ -20243,11 +20291,11 @@ mod tests {
                 recorded_by: E68_RECORDED_BY.to_owned(),
                 recorded_at: E68_RECORDED_AT.to_owned(),
             },
-            divergence_id: E68_WITNESS_DIVERGENCE_ID.to_owned(),
+            divergence_id: E68_REFUSAL_DIVERGENCE_ID.to_owned(),
             disposition: DivergenceDisposition::Blocking {
-                bead_id: E68_WITNESS_BLOCKING_BEAD.to_owned(),
+                bead_id: E68_REFUSAL_BLOCKING_BEAD.to_owned(),
                 rationale:
-                    "the bd-55mvg owner ruling accepts this mechanism only as a bounded ScoreEpsilon class that campaign lanes opt into with the typed reason, and keeps the comparator default zero-tolerance. The default-profile lane does not opt in, so the emitted mismatch is a raw failure class that no acceptance may bless. It blocks until the lane's envelope scope is decided; moving it off blocking requires an independent reviewer."
+                    "a membership divergence has no reviewed equivalence law and no acceptance may bless a raw failure class, so it blocks. The lane's summation-association tolerance covers score bits on identical document sets and does not reach a disagreement about which documents match; moving this off blocking requires an independent reviewer."
                         .to_owned(),
                 reviewer: E68_RECORDED_BY.to_owned(),
                 reviewed_at: E68_RECORDED_AT.to_owned(),
@@ -20263,6 +20311,136 @@ mod tests {
         )
         .expect("the ingested ledger must satisfy the v2 contract");
         (ledger, mismatch_signatures)
+    }
+
+    /// bd-73ok3: the campaign report's shape validator must admit the deferral
+    /// bd-gx7n4 taught the classifier, and must not admit more.
+    ///
+    /// This is the defect that made the E6.8 mint test red at origin/main.
+    /// `classify_case_with_lexical` learned to defer a lexical mismatch to a
+    /// rank axis that classified the SAME difference under a reviewed typed
+    /// reason; `validate_campaign_case_result` still demanded that any lexical
+    /// mismatch refuse. A lane that opted into the reason therefore produced a
+    /// report it could not construct: "campaign case disposition, lexical
+    /// scope, and evidence fields are inconsistent".
+    ///
+    /// This needs no index, no seal and no clean checkout, so unlike the live
+    /// mint it runs anywhere — which is the point, because the live lane can
+    /// only exercise this shape on a clean tree.
+    #[test]
+    fn a_lexical_mismatch_may_defer_only_to_a_rank_axis_that_actually_classified() {
+        let query = GeneratedQueryCase {
+            id: "shape-deferral".to_owned(),
+            syntax: QuerySyntax::Default,
+            query_kind: GeneratedQueryKind::Boolean,
+            query: "alpha OR beta".to_owned(),
+            limit: 20,
+            offset: 0,
+            count_requested: false,
+            filters: crate::generator::GeneratedQueryFilters::default(),
+            expected_divergence: None,
+            source: "runner.rs bd-73ok3 shape contract".to_owned(),
+        };
+        let score_mismatch = |path: &str| LexicalFieldMismatch {
+            class: LexicalMismatchClass::Score,
+            path: path.to_owned(),
+            oracle: "Some(\"0x4113fe32\")".to_owned(),
+            subject: "Some(\"0x4113fe33\")".to_owned(),
+        };
+        let case_result = |disposition: CampaignDisposition,
+                           rank_class: Option<RankClass>,
+                           comparison_status: Option<ComparisonStatus>,
+                           reason: Option<CampaignCaseReason>,
+                           first_mismatch: Option<LexicalFieldMismatch>| {
+            CampaignCaseResult {
+                case_id: "shape-deferral".to_owned(),
+                query_class: query_class(&query),
+                disposition,
+                comparison_status,
+                rank_class,
+                lexical_contract: CampaignLexicalCaseSummary::CoreLexicalV3 {
+                    status: LexicalComparisonStatus::Mismatch,
+                    first_mismatch,
+                    mismatch_count: 1,
+                    waived_difference_count: 0,
+                },
+                artifact_hash: Some("a".repeat(64)),
+                registered_divergence: None,
+                first_divergence: Some("/comparison/subject/hits/0".to_owned()),
+                reason,
+                diagnostic: None,
+            }
+        };
+        let validate = |result: &CampaignCaseResult| {
+            validate_campaign_case_result(
+                &query,
+                result,
+                &DivergenceRegistry::default(),
+                CampaignContractMode::CoreLexicalV3,
+            )
+        };
+
+        // ADMITTED: the rank axis classified the same score difference.
+        validate(&case_result(
+            CampaignDisposition::AutoClassified,
+            Some(RankClass::ScoreEpsilon),
+            Some(ComparisonStatus::Classified),
+            None,
+            Some(score_mismatch("/hits/0/normalized_score_bits")),
+        ))
+        .expect("a lexical mismatch that IS the classified rank divergence is consistent");
+
+        // STILL ADMITTED: the fail-closed shape, unchanged by this fix.
+        validate(&case_result(
+            CampaignDisposition::Unclassified,
+            Some(RankClass::RankMismatch),
+            Some(ComparisonStatus::Failed),
+            Some(CampaignCaseReason::LexicalContractMismatch),
+            Some(score_mismatch("/hits/0/normalized_score_bits")),
+        ))
+        .expect("a refusing lexical mismatch stays consistent");
+
+        // PLANTED NEGATIVES, one property each. Without them the rule would
+        // read "any AutoClassified case may carry any lexical mismatch", which
+        // is strictly weaker than what bd-gx7n4 actually implemented.
+        assert!(
+            validate(&case_result(
+                CampaignDisposition::AutoClassified,
+                Some(RankClass::TieOrder),
+                Some(ComparisonStatus::Classified),
+                None,
+                Some(score_mismatch("/hits/0/normalized_score_bits")),
+            ))
+            .is_err(),
+            "only a SCORE-epsilon rank class may absorb a lexical score mismatch"
+        );
+        assert!(
+            validate(&case_result(
+                CampaignDisposition::AutoClassified,
+                Some(RankClass::ScoreEpsilon),
+                Some(ComparisonStatus::Classified),
+                None,
+                Some(LexicalFieldMismatch {
+                    class: LexicalMismatchClass::Metadata,
+                    path: "/hits/0/metadata".to_owned(),
+                    oracle: "Some(\"a\")".to_owned(),
+                    subject: "Some(\"b\")".to_owned(),
+                }),
+            ))
+            .is_err(),
+            "an unrelated lexical mismatch must not ride along with a score-epsilon rank class"
+        );
+        assert!(
+            validate(&case_result(
+                CampaignDisposition::AutoClassified,
+                Some(RankClass::ScoreEpsilon),
+                Some(ComparisonStatus::Classified),
+                None,
+                None,
+            ))
+            .is_err(),
+            "a mismatch verdict with no retained mismatch cannot be checked, so it cannot defer"
+        );
     }
 
     /// bd-quill-e6-gauntlet-scale-rm3q.8 LIVE INGESTION.
@@ -20402,10 +20580,44 @@ mod tests {
                 "the control must stay exact, or the fail-closed verdict is not specific"
             );
 
-            let object = load_campaign_case_object(&root, witness);
+            // THE NEGATIVE, PRESERVED (bd-73ok3). bd-gx7n4 made the reviewed
+            // score mechanism classify in this lane; it must NOT have made the
+            // lane tolerant in general. A negation inside a boosted group is a
+            // MEMBERSHIP divergence -- the engines disagree about which
+            // documents match -- so it is a raw failure class no auto-class
+            // covers, and it still fails closed in the same suite, in the same
+            // run, under the same enveloped comparator.
+            let refusal = report
+                .cases
+                .iter()
+                .find(|case| case.case_id == E68_REFUSAL_CASE_ID)
+                .expect("refusal case is selected by the campaign");
+            assert_eq!(
+                refusal.disposition,
+                CampaignDisposition::Unclassified,
+                "a membership divergence must still fail closed after the score envelope opt-in"
+            );
+            assert_eq!(refusal.rank_class, Some(RankClass::RankMismatch));
+            assert!(
+                refusal.reason.is_some(),
+                "a fail-closed case must name why it refused"
+            );
+            assert!(
+                refusal.registered_divergence.is_none(),
+                "the refusal is unregistered; that is what makes it fail closed"
+            );
+
+            // INGESTION comes from the REFUSAL, not the witness. An auto class
+            // carries no register-worthy signature -- `observation_from_artifact`
+            // filters auto classes out and refuses an empty set -- so once the
+            // lane classifies DIV-007, the case that can be ingested is the one
+            // that still refuses. The acceptance's live-ingestion property is
+            // therefore still demonstrated on production evidence, by the same
+            // run, on a divergence that genuinely needs a register decision.
+            let object = load_campaign_case_object(&root, refusal);
             let (ledger, mismatch_signatures) = e68_ingest_witness(
                 &object,
-                e68_minimized_fixture_sha256(&fixture, E68_WITNESS_CASE_ID),
+                e68_minimized_fixture_sha256(&fixture, E68_REFUSAL_CASE_ID),
             );
             ledger
                 .validate_relational_integrity_against_artifact_objects(std::slice::from_ref(
@@ -20435,7 +20647,7 @@ mod tests {
                     mint.join("objects")
                         .join(format!(
                             "{}.json",
-                            witness.artifact_hash.as_deref().unwrap_or_default()
+                            refusal.artifact_hash.as_deref().unwrap_or_default()
                         ))
                         .display()
                 );

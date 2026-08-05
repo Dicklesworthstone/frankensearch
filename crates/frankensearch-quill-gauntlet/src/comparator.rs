@@ -6927,8 +6927,7 @@ pub struct AstDifference {
 ///
 /// The register's symmetry claims (DIV-004) continue to rest on their own named
 /// fixtures — argus scorer proofs and parser pins — never on this field.
-pub const ORACLE_LOWERING_UNOBSERVABLE: &str =
-    "oracle lowering unobservable: the pinned Tantivy compatibility parser emits no structured recovery diagnostics";
+pub const ORACLE_LOWERING_UNOBSERVABLE: &str = "oracle lowering unobservable: the pinned Tantivy compatibility parser emits no structured recovery diagnostics";
 
 /// Map one Quill parser diagnostic to its reviewed register lowering class.
 ///
@@ -7850,16 +7849,27 @@ pub fn lexical_mismatches_are_the_classified_rank_divergence(
             .all(|mismatch| lexical_mismatch_is_reviewed_score_epsilon(mismatch, reason))
 }
 
+/// Whether a lexical mismatch has the SHAPE a reviewed score epsilon can take:
+/// the `Score` class, on a score-bits path.
+///
+/// Split out for the campaign report's shape validator (bd-73ok3), which sees
+/// only the retained `first_mismatch` and the rank class — not the comparison's
+/// typed reason — so it can re-check the shape of the deferral without being
+/// able to re-decide it. Deciding stays with
+/// [`lexical_mismatches_are_the_classified_rank_divergence`], which sees every
+/// mismatch and the reason.
+#[must_use]
+pub fn lexical_mismatch_has_reviewed_score_shape(mismatch: &LexicalFieldMismatch) -> bool {
+    mismatch.class == LexicalMismatchClass::Score
+        && (mismatch.path.ends_with("/normalized_score_bits")
+            || mismatch.path.ends_with("/raw_lexical_score_bits"))
+}
+
 pub fn lexical_mismatch_is_reviewed_score_epsilon(
     mismatch: &LexicalFieldMismatch,
     reason: ScoreEpsilonReason,
 ) -> bool {
-    if mismatch.class != LexicalMismatchClass::Score {
-        return false;
-    }
-    if !(mismatch.path.ends_with("/normalized_score_bits")
-        || mismatch.path.ends_with("/raw_lexical_score_bits"))
-    {
+    if !lexical_mismatch_has_reviewed_score_shape(mismatch) {
         return false;
     }
     let parse = |value: &str| {
