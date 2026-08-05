@@ -1979,6 +1979,79 @@ fn extend_compiler_input_reasons(
     }
 }
 
+/// Every `cargo:rustc-env=` value this crate's build script emits, read back
+/// out of the executable Cargo compiled them into.
+///
+/// This is the producer's OWN build-script output, exactly — not an
+/// approximation of it. It is a file-scope const rather than a local so the
+/// drift guard
+/// (`artifactstore_v4_build_script_output_receipt_covers_every_emitted_name`)
+/// can compare these names against `build.rs` itself without standing up a
+/// source snapshot: `env!` cannot fail closed on an emission nobody listed, so
+/// the guard is what keeps "exact" honest.
+const PRODUCER_BUILD_SCRIPT_EMISSIONS: [(&str, &str); 15] = [
+    (
+        "FRANKENSEARCH_LEXICAL_CRATE_VERSION",
+        env!("FRANKENSEARCH_LEXICAL_CRATE_VERSION"),
+    ),
+    (
+        "QUILL_ARTIFACT_PRODUCER_CONTRACT_VERSION",
+        env!("QUILL_ARTIFACT_PRODUCER_CONTRACT_VERSION"),
+    ),
+    (
+        "QUILL_ORACLE_TANTIVY_CHECKSUM_SHA256",
+        env!("QUILL_ORACLE_TANTIVY_CHECKSUM_SHA256"),
+    ),
+    (
+        "QUILL_ORACLE_TANTIVY_SOURCE",
+        env!("QUILL_ORACLE_TANTIVY_SOURCE"),
+    ),
+    (
+        "QUILL_ORACLE_TANTIVY_VERSION",
+        env!("QUILL_ORACLE_TANTIVY_VERSION"),
+    ),
+    (
+        "QUILL_PERF_PRODUCER_CARGO_LOCK_SHA256",
+        env!("QUILL_PERF_PRODUCER_CARGO_LOCK_SHA256"),
+    ),
+    (
+        "QUILL_PERF_PRODUCER_CARGO_PROFILE",
+        env!("QUILL_PERF_PRODUCER_CARGO_PROFILE"),
+    ),
+    (
+        "QUILL_PERF_PRODUCER_CONTRACT_VERSION",
+        env!("QUILL_PERF_PRODUCER_CONTRACT_VERSION"),
+    ),
+    (
+        "QUILL_PERF_PRODUCER_ENABLED_FEATURES",
+        env!("QUILL_PERF_PRODUCER_ENABLED_FEATURES"),
+    ),
+    (
+        "QUILL_PERF_PRODUCER_ENABLED_FEATURES_SHA256",
+        env!("QUILL_PERF_PRODUCER_ENABLED_FEATURES_SHA256"),
+    ),
+    (
+        "QUILL_PERF_PRODUCER_GIT_DIRTY",
+        env!("QUILL_PERF_PRODUCER_GIT_DIRTY"),
+    ),
+    (
+        "QUILL_PERF_PRODUCER_GIT_REVISION",
+        env!("QUILL_PERF_PRODUCER_GIT_REVISION"),
+    ),
+    (
+        "QUILL_PERF_PRODUCER_RUSTC_VV_HEX",
+        env!("QUILL_PERF_PRODUCER_RUSTC_VV_HEX"),
+    ),
+    (
+        "QUILL_PERF_PRODUCER_SOURCE_VERIFICATION",
+        env!("QUILL_PERF_PRODUCER_SOURCE_VERIFICATION"),
+    ),
+    (
+        "QUILL_PERF_PRODUCER_TARGET_TRIPLE",
+        env!("QUILL_PERF_PRODUCER_TARGET_TRIPLE"),
+    ),
+];
+
 fn collect_current_linux_build_inputs(
     root: &Path,
     source: &ArtifactStoreV4SourceSnapshot,
@@ -2084,18 +2157,67 @@ fn collect_current_linux_build_inputs(
         "rustflags/absent".to_owned(),
         build_input(ArtifactStoreV4BuildInputKind::Rustflags, b"absent".to_vec()),
     );
-    // Cargo does not preserve a complete dependency build-script output
-    // manifest in the running executable. Record that structural absence as
-    // an exact, typed diagnostic instead of silently omitting the required
-    // BuildScriptOutput class. A caller seeking sealed admission must obtain
-    // an authoritative Cargo execution manifest separately.
+    // THE PRODUCER'S OWN BUILD-SCRIPT OUTPUT IS EXACTLY RECOVERABLE, and was
+    // previously covered by a blanket "unavailable" receipt that was true only
+    // of DEPENDENCY build scripts (bd-artifactstore-v4-f1-source-build-snapshot-ldqkt).
+    //
+    // This crate's build.rs emits its entire output as `cargo:rustc-env=`
+    // directives, which Cargo compiles into this executable. `env!` therefore
+    // reads the emitted values from the binary itself, at exactly the identity
+    // that produced it — an authoritative manifest of one build script's
+    // output, not an approximation of it. Every name the build script emits is
+    // listed here; adding an emission without adding it here changes the build
+    // script's real output while leaving this receipt unchanged, so the list is
+    // asserted against the build script's source by
+    // `artifactstore_v4_build_script_output_receipt_covers_every_emitted_name`.
+    let emitted_map = PRODUCER_BUILD_SCRIPT_EMISSIONS
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+        .collect::<BTreeMap<String, String>>();
     inputs.insert(
-        "build-script-output/current-process-availability".to_owned(),
+        "build-script-output/producer-emitted-rustc-env".to_owned(),
+        build_input(
+            ArtifactStoreV4BuildInputKind::BuildScriptOutput,
+            serde_json::to_vec(&serde_json::json!({
+                "availability": "exact",
+                "scope": "this crate's own build script",
+                "mechanism": "cargo:rustc-env emissions compiled into the running executable",
+                "emitted": emitted_map,
+            }))?,
+        ),
+    );
+    // The narrowed residual, which the blanket receipt used to overstate.
+    // A DEPENDENCY's build-script output is not recoverable from the running
+    // executable: Cargo keeps no manifest of it in the binary, and OUT_DIR
+    // paths for dependencies are not knowable at runtime. That remains an
+    // external-manifest problem and is still fail-closed rather than omitted.
+    inputs.insert(
+        "build-script-output/dependency-availability".to_owned(),
         build_input(
             ArtifactStoreV4BuildInputKind::BuildScriptOutput,
             serde_json::to_vec(&serde_json::json!({
                 "availability": "unavailable",
-                "reason": "running producer has no authoritative Cargo build-script output manifest",
+                "scope": "dependency build scripts",
+                "reason": "the running producer carries no authoritative Cargo manifest of dependency build-script output; sealed admission needs an external Cargo execution manifest",
+            }))?,
+        ),
+    );
+    // GeneratedSource was named in F1's acceptance and had NO collector site at
+    // all — the class was simply absent, which is the omission the acceptance
+    // criteria call out as fail-closed. This crate's build script writes no
+    // files (it emits only rustc-env directives), so the exact answer for the
+    // producer's own script is "none emitted", recorded as a typed receipt
+    // rather than left uncollected. A build script that starts writing to
+    // OUT_DIR makes this receipt false, which is what the source-side
+    // assertion below is for.
+    inputs.insert(
+        "generated-source/producer-build-script".to_owned(),
+        build_input(
+            ArtifactStoreV4BuildInputKind::GeneratedSource,
+            serde_json::to_vec(&serde_json::json!({
+                "availability": "none-emitted",
+                "scope": "this crate's own build script",
+                "reason": "the producer's build script emits only cargo:rustc-env directives and writes no files",
             }))?,
         ),
     );
@@ -4733,6 +4855,60 @@ mod tests {
             linux_running_image_build_input(&path_snapshot).is_err(),
             "a replaceable executable path must not satisfy the Linux receipt"
         );
+    }
+
+    /// bd-artifactstore-v4-f1-source-build-snapshot-ldqkt: the
+    /// `BuildScriptOutput` receipt is only "exact" if it lists everything the
+    /// build script emits.
+    ///
+    /// The receipt reads its values through `env!`, which cannot fail closed on
+    /// an emission nobody listed: a new `cargo:rustc-env=` line in build.rs
+    /// changes the real build-script output while leaving the receipt byte-
+    /// identical, and the snapshot would then claim exactness it no longer has.
+    /// This reads build.rs itself and compares the two sets, so the drift is a
+    /// test failure rather than a silently narrowed receipt.
+    ///
+    /// It runs anywhere — no hardware gate — because it compares source text to
+    /// a compiled-in list, not a produced artifact.
+    #[test]
+    fn artifactstore_v4_build_script_output_receipt_covers_every_emitted_name() {
+        let build_rs = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("build.rs"),
+        )
+        .expect("read the producer build script");
+        let mut emitted = build_rs
+            .lines()
+            .filter_map(|line| line.split_once("cargo:rustc-env=")?.1.split('=').next())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        emitted.sort();
+        emitted.dedup();
+        assert!(
+            !emitted.is_empty(),
+            "the build script must emit rustc-env directives, or this guard is vacuous"
+        );
+
+        let mut recorded = PRODUCER_BUILD_SCRIPT_EMISSIONS
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect::<Vec<_>>();
+        recorded.sort();
+
+        assert_eq!(
+            recorded, emitted,
+            "build.rs emits a different set of rustc-env names than the BuildScriptOutput receipt \
+             records; add the new emission to the receipt or the snapshot overstates its exactness"
+        );
+
+        // The values must be the ones actually compiled in, not placeholders:
+        // an entry whose value is empty would satisfy the name comparison above
+        // while recording nothing about the build.
+        for (name, value) in PRODUCER_BUILD_SCRIPT_EMISSIONS {
+            assert!(
+                !value.is_empty(),
+                "{name} recorded an empty value; the receipt would claim exactness over nothing"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
