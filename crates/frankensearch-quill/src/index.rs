@@ -15805,6 +15805,69 @@ mod tests {
         });
     }
 
+    /// bd-eeq0q: Quill SHARES the oracle's `A AND NOT B` lowering, measured.
+    ///
+    /// This pin is the reason the bd-eeq0q repair could land on the lexical
+    /// crate's shipping path WITHOUT a Divergence Register entry. The bead
+    /// posed the fork explicitly: if Quill returned `p2` here, repairing the
+    /// oracle's shipping side alone would have created a live cross-engine
+    /// MEMBERSHIP divergence. It does not — `wrap_not_for_and` (query.rs)
+    /// deliberately mirrors the same lowering, so both engines agree and no
+    /// Quill-versus-oracle comparison moves.
+    ///
+    /// It is therefore also the tripwire for the follow-up. The day Quill's
+    /// shipping path is repaired too, this test goes red and whoever does it
+    /// must register the divergence they have just created rather than
+    /// discover it in a campaign.
+    #[test]
+    fn quill_shares_the_oracle_and_not_lowering_so_no_divergence_exists_yet() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).expect("bd-eeq0q index");
+            for (id, content) in [("p1", "alpha beta"), ("p2", "alpha gamma")] {
+                LexicalWrite::index_document(&index, &cx, &IndexableDocument::new(id, content))
+                    .await
+                    .expect("index bd-eeq0q document");
+            }
+            LexicalWrite::commit(&index, &cx)
+                .await
+                .expect("commit bd-eeq0q documents");
+
+            let ids = |query: &'static str| {
+                let index = &index;
+                let cx = &cx;
+                async move {
+                    let mut ids = LexicalRead::search(index, cx, query, 10)
+                        .await
+                        .expect("bd-eeq0q Quill search")
+                        .into_iter()
+                        .map(|hit| hit.doc_id)
+                        .collect::<Vec<_>>();
+                    ids.sort();
+                    ids
+                }
+            };
+
+            // The spellings Quill already gets right.
+            assert_eq!(ids("alpha NOT beta").await, vec!["p2".to_owned()]);
+            assert_eq!(ids("alpha -beta").await, vec!["p2".to_owned()]);
+
+            // The shared defect. If any of these becomes ["p2"], Quill's
+            // shipping path has been repaired and a Divergence Register entry
+            // is now REQUIRED before the gauntlet meets this shape.
+            for query in [
+                "alpha AND NOT beta",
+                "(alpha AND NOT beta)",
+                "(alpha AND NOT beta)^2",
+            ] {
+                assert!(
+                    ids(query).await.is_empty(),
+                    "{query:?} changed on Quill; the oracle still returns nothing, so this is now \
+                     a cross-engine membership divergence and needs a register entry (bd-eeq0q)"
+                );
+            }
+        });
+    }
+
     #[test]
     fn quill_lexical_contract_is_immediate_hydratable_cancel_safe_and_upserts() {
         run_with_cx(|cx| async move {

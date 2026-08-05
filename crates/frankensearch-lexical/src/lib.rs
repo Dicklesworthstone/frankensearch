@@ -144,6 +144,105 @@ impl std::fmt::Display for QueryExplanation {
 /// currently express correctly at all.
 ///
 /// Quoted phrases are respected, so a literal `"a NOT b"` never triggers it.
+/// Rewrite `A AND NOT B` to `A NOT B` for the SHIPPING path only (bd-eeq0q).
+///
+/// THE DEFECT, measured on tantivy 0.26.1 with p1="alpha beta", p2="alpha gamma":
+///
+/// ```text
+///   alpha NOT beta            [p2]   correct
+///   alpha -beta               [p2]   correct
+///   alpha AND NOT beta        []     WRONG — p2 has alpha and no beta
+///   (alpha AND NOT beta)      []     WRONG
+///   (alpha AND NOT beta)^2    []     WRONG, and untouched by the bd-f20ye repair
+/// ```
+///
+/// `A AND NOT B` lowers to
+/// `Bool{[(Must, A), (Must, Bool{[(MustNot, B)], msm: 0})], msm: 0}`. The second
+/// `Must` operand is a boolean with only a `MustNot` clause and no positive
+/// clause, so it matches nothing and the whole conjunction is empty. The same
+/// engine returns the right answer for `A NOT B` and `A -B`, so this is an
+/// inconsistency inside one query language rather than a defensible reading.
+///
+/// The repair deletes the redundant `AND` in front of a `NOT`, which is exactly
+/// the spelling the engine already handles. It is textual for the same reason
+/// [`repair_boosted_group_negation`] is: the lowering happens inside tantivy's
+/// parser, and the resulting `BooleanQuery` cannot be rewritten from outside.
+///
+/// SCOPE, deliberately narrow. Only the exact token sequence `AND` `NOT` is
+/// touched, both uppercase, both standalone. Quoted text is skipped, so a
+/// literal `"a AND NOT b"` phrase query is never rewritten. Lowercase `and not`
+/// is a pair of ordinary terms in this grammar and is left alone.
+///
+/// NOT A CONFORMANCE CHANGE. This runs only from
+/// [`TantivyIndex::parse_query_shipping`]; every `oracle_observe_*` caller
+/// keeps using [`TantivyIndex::parse_query_lenient`] and still reproduces the
+/// defect, so the pinned comparator does not move. Quill was MEASURED to share
+/// this behaviour (it returns nothing for `A AND NOT B` too, because
+/// `wrap_not_for_and` in its parser mirrors the same lowering), which is why
+/// repairing this side alone changes no Quill-versus-oracle comparison.
+fn repair_and_not(query: &str) -> Cow<'_, str> {
+    // Cheap reject: the token pair cannot be present.
+    if !query.contains("AND") {
+        return Cow::Borrowed(query);
+    }
+
+    let bytes = query.as_bytes();
+    let mut drop_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut in_quotes = false;
+    let mut index = 0_usize;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'"' {
+            in_quotes = !in_quotes;
+            index += 1;
+            continue;
+        }
+        if in_quotes {
+            index += 1;
+            continue;
+        }
+        if byte == b'A' && query[index..].starts_with("AND") {
+            let starts_token = index.checked_sub(1).is_none_or(|previous| {
+                bytes[previous].is_ascii_whitespace() || bytes[previous] == b'('
+            });
+            // `AND` must be followed by whitespace, then `NOT` as its own token.
+            let mut cursor = index + 3;
+            let space_start = cursor;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            let had_space = cursor > space_start;
+            let followed_by_not = had_space
+                && query[cursor..].starts_with("NOT")
+                && bytes
+                    .get(cursor + 3)
+                    .is_some_and(|next| next.is_ascii_whitespace() || *next == b'(');
+            if starts_token && followed_by_not {
+                // Drop `AND` and the whitespace that separated it from `NOT`,
+                // leaving the preceding separator intact: `a AND NOT b`
+                // becomes `a NOT b`, never `aNOT b`.
+                drop_ranges.push((index, cursor));
+                index = cursor;
+                continue;
+            }
+        }
+        index += 1;
+    }
+
+    if drop_ranges.is_empty() {
+        return Cow::Borrowed(query);
+    }
+    let mut repaired = String::with_capacity(query.len());
+    let mut copied = 0_usize;
+    for (start, end) in drop_ranges {
+        repaired.push_str(&query[copied..start]);
+        copied = end;
+    }
+    repaired.push_str(&query[copied..]);
+    Cow::Owned(repaired)
+}
+
 fn repair_boosted_group_negation(query: &str) -> Cow<'_, str> {
     // Cheap reject: no group boost, nothing to repair.
     if !query.contains(")^") {
@@ -1611,7 +1710,11 @@ impl TantivyIndex {
     /// superseding that entry: the shipping path is deliberately NOT
     /// bit-faithful to the oracle for this one query shape.
     fn parse_query_shipping(&self, query: &str) -> Box<dyn tantivy::query::Query> {
-        self.parse_query_lenient(&repair_boosted_group_negation(query))
+        // bd-eeq0q runs FIRST: it rewrites `A AND NOT B` to `A NOT B`, which
+        // can turn a group into one the bd-f20ye repair then recognises as
+        // negating — `(A AND NOT B)^2` needs both, in this order.
+        let repaired = repair_and_not(query);
+        self.parse_query_lenient(&repair_boosted_group_negation(&repaired))
     }
 
     /// Parse a query using lenient mode (never fails, returns best-effort query).
@@ -2659,6 +2762,112 @@ mod tests {
     /// (DIV-009, blocking on bd-f20ye) and this test exists so that a tantivy
     /// upgrade which changes the behaviour becomes VISIBLE instead of quietly
     /// shifting that target. Same posture as bd-nqeb4's `#[should_panic]` pin.
+    /// bd-eeq0q: `A AND NOT B` returns A-minus-B on the SHIPPING path, while
+    /// the ORACLE path still reproduces tantivy 0.26.1's empty result.
+    ///
+    /// PLANTED NEGATIVES RUN BOTH DIRECTIONS, because this repair can fail two
+    /// opposite ways and only one of them is obvious. If the repair stops
+    /// working, the shipping assertions go red. If it LEAKS into the oracle
+    /// surface, the oracle assertions go red — that direction matters more,
+    /// since a repaired oracle would silently move the conformance target Quill
+    /// is measured against, which is the "weaken the oracle to make the
+    /// comparison pass" failure this crate's two-role split exists to prevent.
+    ///
+    /// The quoted control is the third direction: a literal `"a AND NOT b"`
+    /// phrase must never be rewritten, or the repair would corrupt user text
+    /// rather than user syntax.
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn and_not_returns_a_minus_b_on_shipping_while_the_oracle_stays_bit_faithful() {
+        run_with_cx(|cx| async move {
+            let index = TantivyIndex::in_memory().expect("bd-eeq0q index");
+            index
+                .index_documents(
+                    &cx,
+                    &[
+                        IndexableDocument::new("p1", "alpha beta"),
+                        IndexableDocument::new("p2", "alpha gamma"),
+                    ],
+                )
+                .await
+                .expect("index bd-eeq0q documents");
+            index.commit(&cx).await.expect("commit bd-eeq0q documents");
+
+            let ship = |query: &'static str| {
+                let index = &index;
+                let cx = &cx;
+                async move {
+                    let mut ids = index
+                        .search(cx, query, 10)
+                        .await
+                        .expect("bd-eeq0q shipping search")
+                        .into_iter()
+                        .map(|hit| hit.doc_id)
+                        .collect::<Vec<_>>();
+                    ids.sort();
+                    ids
+                }
+            };
+
+            // Every spelling of "alpha but not beta" agrees on the shipping
+            // path. The first two already worked; the rest are the repair.
+            for query in [
+                "alpha NOT beta",
+                "alpha -beta",
+                "alpha AND NOT beta",
+                "(alpha AND NOT beta)",
+                "(alpha AND NOT beta)^2",
+            ] {
+                assert_eq!(
+                    ship(query).await,
+                    vec!["p2".to_owned()],
+                    "shipping {query:?} must return A-minus-B"
+                );
+            }
+
+            // Repeated exclusion still excludes, and does not resurrect p1.
+            assert_eq!(
+                ship("alpha AND NOT beta AND NOT delta").await,
+                vec!["p2".to_owned()],
+                "a second AND NOT must keep excluding"
+            );
+
+            // A literal phrase is user TEXT, not user SYNTAX: never rewritten.
+            assert!(
+                ship("\"alpha AND NOT beta\"").await.is_empty(),
+                "a quoted phrase must not be rewritten into an operator form"
+            );
+
+            // THE ORACLE HAS NOT MOVED. Same index, same queries, through the
+            // conformance surface: tantivy 0.26.1's behaviour, defect included.
+            let oracle_ids = |query: &'static str| {
+                let mut ids = index
+                    .oracle_observe_query(&cx, query, 10, 64, &SnippetConfig::default())
+                    .expect("bd-eeq0q oracle observation")
+                    .hits
+                    .into_iter()
+                    .map(|hit| hit.doc_id)
+                    .collect::<Vec<_>>();
+                ids.sort();
+                ids
+            };
+            let oracle_empty = oracle_ids("alpha AND NOT beta");
+            assert!(
+                oracle_empty.is_empty(),
+                "the oracle must still reproduce the tantivy 0.26.1 defect, got {oracle_empty:?}"
+            );
+            assert!(
+                oracle_ids("(alpha AND NOT beta)^2").is_empty(),
+                "the boosted form must stay defective on the oracle surface too"
+            );
+            assert_eq!(
+                oracle_ids("alpha NOT beta"),
+                vec!["p2".to_owned()],
+                "the oracle's own correct spelling must be unaffected"
+            );
+        });
+    }
+
     #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn boosting_a_group_that_negates_changes_its_meaning_in_the_pinned_oracle() {
@@ -2785,13 +2994,20 @@ mod tests {
                     "boosting {group} changed which documents match in the shipping path"
                 );
             }
-            // `(alpha AND NOT beta)` returns nothing in Tantivy 0.26.1 even
-            // UNGROUPED and UNBOOSTED — `A AND NOT B` lowers its negation as a
-            // Must-wrapped MustNot with no positive clause, so it matches
-            // nothing. That is a separate defect from this one and is filed
-            // separately; the invariant above deliberately does not assert what
-            // the unboosted form returns, only that the boost cannot change it.
-            assert!(hits("alpha AND NOT beta").await.is_empty());
+            // SUPERSEDED BY bd-eeq0q, deliberately flipped rather than deleted.
+            // When this test landed, `A AND NOT B` returned nothing on the
+            // shipping path too — a SEPARATE defect from the boosted-group one,
+            // filed as bd-eeq0q and repaired there by `repair_and_not`. This
+            // assertion recorded the defect as it stood; it now records the
+            // repair. The invariant ABOVE is what belongs to this bead and is
+            // unchanged: a boost may not alter membership. Keeping the line
+            // (rather than dropping it) preserves the fact that the two defects
+            // were separable and were separated.
+            assert_eq!(
+                hits("alpha AND NOT beta").await,
+                vec!["p2".to_owned()],
+                "bd-eeq0q repairs the ungrouped form on the shipping path"
+            );
             // NESTED, so the repair is not merely a whole-query special case.
             assert_eq!(
                 hits("beta OR (alpha NOT beta)^2").await,
