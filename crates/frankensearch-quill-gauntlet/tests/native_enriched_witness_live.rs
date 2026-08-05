@@ -711,7 +711,9 @@ fn an_inadmissible_enriched_receipt_can_never_authorize_a_replacement() {
         let cancellation = observe_live_quill_cancellation_receipt(&cx)
             .await
             .expect("observe the live Quill cancellation matrix");
-        let census = "0".repeat(64);
+        let census: frankensearch_quill_gauntlet::DivergenceRegisterLedger =
+            serde_json::from_str(include_str!("../fixtures/divergence-register-v2-live.json"))
+                .expect("the registered divergence census parses");
 
         let bundle = ReplacementEvidenceBundleV1 {
             candidate_source_revision: &candidate,
@@ -719,7 +721,7 @@ fn an_inadmissible_enriched_receipt_can_never_authorize_a_replacement() {
             cass_total: Some(&cass),
             native_enriched: Some(&verified),
             cancellation: Some(&cancellation),
-            divergence_census_sha256: Some(&census),
+            divergence_census: Some(&census),
         };
 
         let error = authorize(&bundle)
@@ -859,7 +861,9 @@ fn a_complete_admissible_bundle_authorizes_and_emits_its_grant() {
         let cancellation = observe_live_quill_cancellation_receipt(&cx)
             .await
             .expect("observe the live Quill cancellation matrix");
-        let census = "0".repeat(64);
+        let census: frankensearch_quill_gauntlet::DivergenceRegisterLedger =
+            serde_json::from_str(include_str!("../fixtures/divergence-register-v2-live.json"))
+                .expect("the registered divergence census parses");
 
         let bundle = ReplacementEvidenceBundleV1 {
             candidate_source_revision: &candidate,
@@ -867,7 +871,7 @@ fn a_complete_admissible_bundle_authorizes_and_emits_its_grant() {
             cass_total: Some(&cass),
             native_enriched: Some(&verified),
             cancellation: Some(&cancellation),
-            divergence_census_sha256: Some(&census),
+            divergence_census: Some(&census),
         };
 
         let granted = authorize(&bundle);
