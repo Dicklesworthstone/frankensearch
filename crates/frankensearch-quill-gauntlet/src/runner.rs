@@ -20283,15 +20283,6 @@ mod tests {
     /// artifact must never be able to accept its own failure.
     #[cfg(feature = "tantivy-oracle")]
     const E68_REFUSAL_REVIEWER: &str = "owner-ruling-bd-f20ye-2026-08-05";
-    /// The bead a fresh mint of the membership refusal blocks against: the
-    /// oracle-parse defect's own bead, not DIV-008's and not bd-nqeb4's.
-    ///
-    /// bd-nqeb4 is a DIFFERENT oracle bug — a `PhraseScorer` panic on a negated
-    /// absent phrase. Pointing this disposition at it would have been a
-    /// fabricated linkage between two unrelated defects that merely share an
-    /// engine and a `NOT`.
-    #[cfg(feature = "tantivy-oracle")]
-    const E68_REFUSAL_BLOCKING_BEAD: &str = "bd-f20ye";
     #[cfg(feature = "tantivy-oracle")]
     const E68_WITNESS_DIVERGENCE_ID: &str = "DIV-008";
     #[cfg(feature = "tantivy-oracle")]
