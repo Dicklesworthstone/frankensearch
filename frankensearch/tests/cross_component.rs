@@ -1435,7 +1435,7 @@ mod four_engine_generation_receipts {
     /// The vector and ANN roles come from one written FSVI image and a graph
     /// built over that same admitted owner (slice 1). The lexical role comes
     /// from a Quill index that actually indexed and committed the same
-    /// documents. The metadata role comes from a GenerationManifest and DERIVES
+    /// documents. The metadata role comes from a `GenerationManifest` and DERIVES
     /// its checkpoint from the manifest's own commit range rather than
     /// accepting one, which is the fail-closed property bd-uu0ly chose and
     /// bd-z4zr3 preserved.
@@ -1443,7 +1443,7 @@ mod four_engine_generation_receipts {
     /// This is the join bd-z4zr3's acceptance asked for and could not build
     /// from inside one crate: "a four-role join built from the REAL producers
     /// -- FSVI witness, Quill descriptor, native HNSW receipt, and
-    /// GenerationManifest, over one document set -- admits."
+    /// `GenerationManifest`, over one document set -- admits."
     #[cfg(feature = "quill")]
     #[test]
     fn four_real_producers_admit_as_one_generation() {
@@ -1519,6 +1519,264 @@ mod four_engine_generation_receipts {
                 metadata.clone(),
             )
             .expect("four real producers admit as one generation");
+        });
+    }
+
+    /// Every non-anchor role is blamed for ITS OWN drift, over receipts that
+    /// four real producers actually minted.
+    ///
+    /// bd-z4zr3 proved this law with the index-local adapters and hand-built
+    /// stand-ins for lexical and metadata. The law is only worth as much as the
+    /// producers it was proven over, so it is re-proven here where the lexical
+    /// receipt came from a committed Quill snapshot and the metadata receipt
+    /// from a real manifest.
+    ///
+    /// Each drift is applied ALONE against the same all-agreeing control, so a
+    /// rejection is attributable to the role that moved rather than to the
+    /// harness. The metadata drift moves the MANIFEST rather than passing a
+    /// different checkpoint, because that role derives its checkpoint and
+    /// refuses a caller-supplied one — the asymmetry is deliberate, not an
+    /// inconsistency to clean up.
+    #[cfg(feature = "quill")]
+    #[test]
+    fn every_real_role_is_blamed_for_its_own_drift() {
+        use frankensearch::quill::{QuillConfig, QuillIndex};
+        use frankensearch_core::generation::{
+            CanonicalDocsetV1, ComponentJoinErrorV1, ExactComponentReceiptV1,
+            ExactGenerationComponentsV1,
+        };
+        use frankensearch_core::types::IndexableDocument;
+
+        let directory = tempfile::tempdir().expect("7hvtf drift directory");
+        let owner = fsvi_owner(directory.path());
+        let range = CommitRange { low: 1, high: 9 };
+        let other_range = CommitRange { low: 2, high: 11 };
+        let checkpoint = SourceCheckpointV1::derive(&range);
+        let drifted = SourceCheckpointV1::derive(&other_range);
+        assert_ne!(
+            checkpoint.to_bytes(),
+            drifted.to_bytes(),
+            "the two commit ranges must derive different checkpoints or nothing below is a drift"
+        );
+
+        let vector = vector_component_receipt(owner.witness(), DOCUMENTS, checkpoint)
+            .expect("anchor receipt");
+        let graph =
+            ValidatedNativeHnsw::build(Arc::clone(&owner), HnswParams::default(), 0x7b_5eed)
+                .expect("native HNSW graph over the admitted owner");
+        let graph_receipt = graph
+            .save(&directory.path().join("current.fshnsw"))
+            .expect("save the graph and mint its receipt");
+        let ann =
+            ann_component_receipt(&graph_receipt, DOCUMENTS, checkpoint).expect("ANN receipt");
+        let drifted_ann = ann_component_receipt(&graph_receipt, DOCUMENTS, drifted)
+            .expect("ANN receipt on another checkpoint");
+
+        let docset = CanonicalDocsetV1::from_ordered_live_documents(DOCUMENTS)
+            .expect("canonical docset over the shared ordered ids");
+        let manifest = manifest_over(range);
+        let manifest_bytes = serde_json::to_vec(&manifest).expect("serialize the manifest image");
+        let metadata =
+            ExactComponentReceiptV1::for_metadata_manifest(&manifest, &manifest_bytes, &docset)
+                .expect("metadata receipt");
+        let drifted_manifest = manifest_over(other_range);
+        let drifted_manifest_bytes =
+            serde_json::to_vec(&drifted_manifest).expect("serialize the drifted manifest");
+        let drifted_metadata = ExactComponentReceiptV1::for_metadata_manifest(
+            &drifted_manifest,
+            &drifted_manifest_bytes,
+            &docset,
+        )
+        .expect("metadata receipt over another commit range");
+
+        let quill_directory = directory.path().join("quill");
+        asupersync::test_utils::run_test_with_cx(move |cx| async move {
+            let index = QuillIndex::create(&cx, &quill_directory, QuillConfig::default())
+                .await
+                .expect("create the Quill index");
+            let documents = DOCUMENTS
+                .iter()
+                .map(|id| IndexableDocument {
+                    id: (*id).to_owned(),
+                    content: format!("{id} shares the generation document set"),
+                    title: None,
+                    metadata: std::collections::HashMap::new(),
+                })
+                .collect::<Vec<_>>();
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index the shared document set into Quill");
+            index.commit(&cx).await.expect("commit the Quill segment");
+
+            let snapshot = index.snapshot();
+            let lexical = snapshot
+                .exact_lexical_component_receipt(checkpoint)
+                .expect("lexical receipt");
+            let drifted_lexical = snapshot
+                .exact_lexical_component_receipt(drifted)
+                .expect("lexical receipt on another checkpoint");
+
+            // CONTROL: all four agreeing admit, so every rejection below is
+            // attributable to the single role that moved.
+            ExactGenerationComponentsV1::admit(
+                vector.clone(),
+                lexical.clone(),
+                Some(ann.clone()),
+                metadata.clone(),
+            )
+            .expect("the all-agreeing control must admit");
+
+            let blame =
+                |result: Result<ExactGenerationComponentsV1, ComponentJoinErrorV1>| match result {
+                    Err(ComponentJoinErrorV1::CheckpointDrift { role }) => role,
+                    other => panic!("expected a checkpoint drift, got {other:?}"),
+                };
+
+            assert_eq!(
+                blame(ExactGenerationComponentsV1::admit(
+                    vector.clone(),
+                    drifted_lexical,
+                    Some(ann.clone()),
+                    metadata.clone(),
+                )),
+                "lexical",
+                "a drifted Quill receipt must be blamed on lexical, not on metadata"
+            );
+            assert_eq!(
+                blame(ExactGenerationComponentsV1::admit(
+                    vector.clone(),
+                    lexical.clone(),
+                    Some(drifted_ann),
+                    metadata.clone(),
+                )),
+                "ann"
+            );
+            assert_eq!(
+                blame(ExactGenerationComponentsV1::admit(
+                    vector.clone(),
+                    lexical.clone(),
+                    Some(ann.clone()),
+                    drifted_metadata,
+                )),
+                "metadata"
+            );
+
+            // A receipt filed in another role's slot is refused BY ROLE, before
+            // any content comparison — otherwise a misfiled receipt would be
+            // reported as a drift and the operator would go looking for the
+            // wrong fault.
+            match ExactGenerationComponentsV1::admit(
+                vector.clone(),
+                ann.clone(),
+                Some(ann.clone()),
+                metadata.clone(),
+            ) {
+                Err(ComponentJoinErrorV1::RoleMismatch { expected, found }) => {
+                    assert_eq!((expected, found), ("lexical", "ann"));
+                }
+                other => panic!("expected a role mismatch, got {other:?}"),
+            }
+        });
+    }
+
+    /// A drifted ANCHOR is a different failure and is kept in its own test.
+    ///
+    /// `admit` compares every role against the vector anchor rather than
+    /// pairwise, so when the anchor itself moves, the roles that did NOT move
+    /// are the ones reported. Folding this into the per-role test above would
+    /// let "the anchor moved" be reported as "a component drifted", which is
+    /// precisely the misattribution bd-z4zr3 was filed to fix.
+    ///
+    /// All four roles are properly filed here on purpose: an earlier draft of
+    /// this test put a metadata receipt in the lexical slot, which tripped
+    /// `RoleMismatch` and never reached the anchor comparison at all — a test
+    /// that would have passed without the behaviour it claims to pin.
+    #[cfg(feature = "quill")]
+    #[test]
+    fn a_drifted_anchor_is_reported_against_the_roles_that_disagree_with_it() {
+        use frankensearch::quill::{QuillConfig, QuillIndex};
+        use frankensearch_core::generation::{
+            CanonicalDocsetV1, ComponentJoinErrorV1, ExactComponentReceiptV1,
+            ExactGenerationComponentsV1,
+        };
+        use frankensearch_core::types::IndexableDocument;
+
+        let directory = tempfile::tempdir().expect("7hvtf anchor directory");
+        let owner = fsvi_owner(directory.path());
+        let range = CommitRange { low: 1, high: 9 };
+        let checkpoint = SourceCheckpointV1::derive(&range);
+        let moved_anchor = SourceCheckpointV1::derive(&CommitRange { low: 5, high: 6 });
+
+        let vector =
+            vector_component_receipt(owner.witness(), DOCUMENTS, checkpoint).expect("anchor");
+        let drifted_vector = vector_component_receipt(owner.witness(), DOCUMENTS, moved_anchor)
+            .expect("anchor receipt on a different checkpoint");
+        let graph =
+            ValidatedNativeHnsw::build(Arc::clone(&owner), HnswParams::default(), 0x7b_5eed)
+                .expect("native HNSW graph over the admitted owner");
+        let graph_receipt = graph
+            .save(&directory.path().join("current.fshnsw"))
+            .expect("save the graph and mint its receipt");
+        let ann =
+            ann_component_receipt(&graph_receipt, DOCUMENTS, checkpoint).expect("ANN receipt");
+        let docset = CanonicalDocsetV1::from_ordered_live_documents(DOCUMENTS)
+            .expect("canonical docset over the shared ordered ids");
+        let manifest = manifest_over(range);
+        let manifest_bytes = serde_json::to_vec(&manifest).expect("serialize the manifest image");
+        let metadata =
+            ExactComponentReceiptV1::for_metadata_manifest(&manifest, &manifest_bytes, &docset)
+                .expect("metadata receipt");
+
+        let quill_directory = directory.path().join("quill");
+        asupersync::test_utils::run_test_with_cx(move |cx| async move {
+            let index = QuillIndex::create(&cx, &quill_directory, QuillConfig::default())
+                .await
+                .expect("create the Quill index");
+            let documents = DOCUMENTS
+                .iter()
+                .map(|id| IndexableDocument {
+                    id: (*id).to_owned(),
+                    content: format!("{id} shares the generation document set"),
+                    title: None,
+                    metadata: std::collections::HashMap::new(),
+                })
+                .collect::<Vec<_>>();
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index the shared document set into Quill");
+            index.commit(&cx).await.expect("commit the Quill segment");
+            let lexical = index
+                .snapshot()
+                .exact_lexical_component_receipt(checkpoint)
+                .expect("lexical receipt");
+
+            // CONTROL: the same four roles admit when the anchor has not moved,
+            // so the refusal below is caused by the anchor and nothing else.
+            ExactGenerationComponentsV1::admit(
+                vector.clone(),
+                lexical.clone(),
+                Some(ann.clone()),
+                metadata.clone(),
+            )
+            .expect("the unmoved control must admit");
+
+            match ExactGenerationComponentsV1::admit(drifted_vector, lexical, Some(ann), metadata) {
+                Err(ComponentJoinErrorV1::CheckpointDrift { role }) => {
+                    assert_ne!(
+                        role, "vector",
+                        "the anchor is the reference it compares against, so it can never be the \
+                         role named — that inversion is the bug bd-z4zr3 closed"
+                    );
+                    assert!(
+                        matches!(role, "lexical" | "ann" | "metadata"),
+                        "a moved anchor is reported against a role that disagrees with it, got \
+                         {role}"
+                    );
+                }
+                other => panic!("expected the moved anchor to be refused as drift, got {other:?}"),
+            }
         });
     }
 }
