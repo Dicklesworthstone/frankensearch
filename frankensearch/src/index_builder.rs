@@ -1017,7 +1017,7 @@ async fn build_lexical_index(
                 // compose_but_failed_batches_require_commit_retry). Reconcile
                 // so one rejected document cannot void the rest of the arm.
                 match lexical.commit(cx).await {
-                    Ok(()) => {}
+                    Ok(_) => {}
                     Err(error @ frankensearch_quill::QuillIndexError::Cancelled { .. }) => {
                         return Err(error.into());
                     }
