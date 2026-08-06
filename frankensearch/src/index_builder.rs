@@ -274,12 +274,15 @@ impl IndexBuilder {
     /// Returns `SearchError::InvalidConfig` if no documents were added.
     /// Returns `SearchError::Io` if the data directory cannot be created.
     /// Individual document embedding failures are collected in `IndexBuildStats.errors`
-    /// rather than aborting the build.
+    /// rather than aborting the build. Structured cancellation is never collected as a
+    /// document failure: it is returned immediately as [`SearchError::Cancelled`].
     #[allow(clippy::too_many_lines)]
     #[instrument(skip_all, fields(doc_count = self.documents.len(), data_dir = %self.data_dir.display()))]
     pub async fn build(mut self, cx: &Cx) -> SearchResult<IndexBuildStats> {
         let start = Instant::now();
         let metrics_exporter = self.config.metrics_exporter.clone();
+
+        build_checkpoint(cx, "index build start")?;
 
         if self.documents.is_empty() {
             let error = SearchError::InvalidConfig {
@@ -296,6 +299,7 @@ impl IndexBuilder {
             Some(stack) => stack,
             None => EmbedderStack::auto_detect_with(Some(&self.data_dir))?,
         };
+        build_checkpoint(cx, "index builder initialization")?;
 
         // A degraded stack here is not a transient runtime condition: the
         // vectors written below carry this embedder's identity, so the
@@ -412,6 +416,7 @@ impl IndexBuilder {
                             doc_count += 1;
                             lexical_docs.push(doc.clone());
                         }
+                        Err(error @ SearchError::Cancelled { .. }) => return Err(error),
                         Err(err) => {
                             tracing::warn!(doc_id = %doc.id, error = %err, "failed to embed document");
                             errors.push((doc.id.clone(), err.to_string()));
@@ -454,6 +459,7 @@ impl IndexBuilder {
                             }
                             lexical_docs.push(doc);
                         }
+                        Err(error @ SearchError::Cancelled { .. }) => return Err(error),
                         Err(err) => {
                             tracing::warn!(doc_id = %doc.id, error = %err, "failed to embed document");
                             errors.push((doc.id.clone(), err.to_string()));
@@ -507,6 +513,7 @@ impl IndexBuilder {
                             }
                             lexical_docs.push(doc);
                         }
+                        Err(error @ SearchError::Cancelled { .. }) => return Err(error),
                         Err(err) => {
                             tracing::warn!(doc_id = %doc.id, error = %err, "failed to embed document");
                             errors.push((doc.id.clone(), err.to_string()));
@@ -554,6 +561,7 @@ impl IndexBuilder {
                             quality_indexed += 1;
                         }
                     }
+                    Err(error @ SearchError::Cancelled { .. }) => return Err(error),
                     Err(err) => {
                         tracing::warn!(doc_id = %doc.id, error = %err, "failed to embed document");
                         errors.push((doc.id.clone(), err.to_string()));
@@ -572,6 +580,7 @@ impl IndexBuilder {
         }
 
         // Finalize index files.
+        build_checkpoint(cx, "vector index finalize")?;
         if doc_count == 0 {
             let error = SearchError::InvalidConfig {
                 field: "documents".to_owned(),
@@ -589,6 +598,7 @@ impl IndexBuilder {
                 return Err(error);
             }
         };
+        build_checkpoint(cx, "vector index finalized")?;
 
         #[cfg(not(any(feature = "lexical", feature = "quill")))]
         let (lexical_receipt, lexical_ms): (Option<LexicalArmReceipt>, f64) = (None, 0.0);
@@ -596,6 +606,7 @@ impl IndexBuilder {
         let (lexical_receipt, lexical_ms) = if lexical_docs.is_empty() {
             (None, 0.0)
         } else {
+            build_checkpoint(cx, "lexical index build")?;
             let lexical_path = self.data_dir.join("lexical");
             let lexical_start = Instant::now();
             match build_lexical_index(cx, &lexical_path, &lexical_docs).await {
@@ -616,12 +627,15 @@ impl IndexBuilder {
 
         #[cfg(feature = "durability")]
         {
+            build_checkpoint(cx, "durability sidecar protection")?;
             if let Err(error) = protect_durability_sidecars(&self.data_dir) {
                 export_error(metrics_exporter.as_ref(), &error);
                 return Err(error);
             }
+            build_checkpoint(cx, "durability sidecars protected")?;
         }
 
+        build_checkpoint(cx, "index build completion")?;
         let has_quality = quality_embedder.is_some();
         let size_bytes = compute_size_breakdown(&self.data_dir);
         export_index_updated(
@@ -675,6 +689,7 @@ impl IndexBuilder {
         let text = doc.content.as_str();
 
         // Fast embedding (required).
+        build_checkpoint(cx, "fast document embedding")?;
         let fast_start = Instant::now();
         let fast_vec = match fast_embedder.embed(cx, text).await {
             Ok(fast_vec) => {
@@ -687,16 +702,23 @@ impl IndexBuilder {
                 return Err(error);
             }
         };
+        build_checkpoint(cx, "fast document embedding completion")?;
         builder.add_fast_record(&doc.id, &fast_vec)?;
 
         // Quality embedding (optional).
         if let Some(qe) = quality_embedder {
+            build_checkpoint(cx, "quality document embedding")?;
             let quality_start = Instant::now();
             match qe.embed(cx, text).await {
                 Ok(quality_vec) => {
+                    build_checkpoint(cx, "quality document embedding completion")?;
                     let duration_ms = quality_start.elapsed().as_secs_f64() * 1000.0;
                     export_embedding_completed(metrics_exporter, qe, duration_ms);
                     builder.add_quality_record(&doc.id, &quality_vec)?;
+                }
+                Err(error @ SearchError::Cancelled { .. }) => {
+                    export_error(metrics_exporter, &error);
+                    return Err(error);
                 }
                 Err(error) => {
                     export_error(metrics_exporter, &error);
@@ -712,6 +734,15 @@ impl IndexBuilder {
 
         Ok(None)
     }
+}
+
+fn build_checkpoint(cx: &Cx, phase: &'static str) -> SearchResult<()> {
+    cx.checkpoint().map_err(|error| SearchError::Cancelled {
+        phase: phase.to_owned(),
+        reason: cx
+            .cancel_reason()
+            .map_or_else(|| error.to_string(), |reason| reason.to_string()),
+    })
 }
 
 fn export_error(metrics_exporter: Option<&Arc<dyn MetricsExporter>>, error: &SearchError) {
@@ -919,6 +950,7 @@ async fn build_lexical_index(
     data_dir: &Path,
     documents: &[IndexableDocument],
 ) -> SearchResult<LexicalArmReceipt> {
+    build_checkpoint(cx, "Quill lexical index initialization")?;
     // bd-8nqz.2: never initialize Quill on top of a foreign, damaged,
     // blue-green, or ambiguous layout — MANIFEST absence is NOT emptiness.
     // Empty proceeds; DirectQuill preserves the existing create-over-own
@@ -954,6 +986,7 @@ async fn build_lexical_index(
     };
     #[cfg(not(feature = "durability"))]
     let lexical = QuillIndex::create(cx, data_dir, config).await?;
+    build_checkpoint(cx, "Quill lexical document indexing")?;
 
     // Per-document indexing so one rejected document (duplicate id, oversized
     // field) cannot silently void the whole arm; failures land in the
@@ -962,6 +995,7 @@ async fn build_lexical_index(
     let mut errors: Vec<(String, String)> = Vec::new();
     let mut documents_iter = documents.iter();
     while let Some(document) = documents_iter.next() {
+        build_checkpoint(cx, "Quill lexical document indexing")?;
         match lexical.index_document(cx, document).await {
             Ok(()) => indexed += 1,
             // Cancellation is a caller contract, not a document defect: abort
@@ -982,28 +1016,36 @@ async fn build_lexical_index(
                 // prefix (Quill contract test: successful_sealed_batches_
                 // compose_but_failed_batches_require_commit_retry). Reconcile
                 // so one rejected document cannot void the rest of the arm.
-                if let Err(recovery_error) = lexical.commit(cx).await {
-                    tracing::warn!(
-                        error = %recovery_error,
-                        "lexical writer recovery failed; remaining documents skipped"
-                    );
-                    // Exact accounting: every unattempted document is recorded,
-                    // never silently dropped.
-                    for skipped in documents_iter {
-                        errors.push((
-                            skipped.id.clone(),
-                            format!(
-                                "skipped: lexical writer recovery failed after prior \
-                                 error: {recovery_error}"
-                            ),
-                        ));
+                match lexical.commit(cx).await {
+                    Ok(_) => {}
+                    Err(error @ frankensearch_quill::QuillIndexError::Cancelled { .. }) => {
+                        return Err(error.into());
                     }
-                    break;
+                    Err(recovery_error) => {
+                        tracing::warn!(
+                            error = %recovery_error,
+                            "lexical writer recovery failed; remaining documents skipped"
+                        );
+                        // Exact accounting: every unattempted document is recorded,
+                        // never silently dropped.
+                        for skipped in documents_iter {
+                            errors.push((
+                                skipped.id.clone(),
+                                format!(
+                                    "skipped: lexical writer recovery failed after prior \
+                                     error: {recovery_error}"
+                                ),
+                            ));
+                        }
+                        break;
+                    }
                 }
             }
         }
     }
+    build_checkpoint(cx, "Quill lexical publication")?;
     let _ = lexical.finish_bulk_load(cx).await?;
+    build_checkpoint(cx, "Quill lexical publication complete")?;
     Ok(LexicalArmReceipt {
         backend: "quill",
         path: data_dir.to_path_buf(),
@@ -1026,15 +1068,18 @@ async fn build_lexical_index(
     // (lexical without quill) is not built by the default-feature gates.
     use frankensearch_core::traits::LexicalWrite;
 
+    build_checkpoint(cx, "Tantivy lexical index initialization")?;
     let lexical = TantivyIndex::create(data_dir)?;
     let mut indexed = 0usize;
     let mut errors: Vec<(String, String)> = Vec::new();
     for document in documents {
+        build_checkpoint(cx, "Tantivy lexical document indexing")?;
         match lexical
             .index_documents(cx, std::slice::from_ref(document))
             .await
         {
             Ok(()) => indexed += 1,
+            Err(error @ SearchError::Cancelled { .. }) => return Err(error),
             Err(error) => {
                 tracing::warn!(
                     doc_id = %document.id,
@@ -1045,7 +1090,9 @@ async fn build_lexical_index(
             }
         }
     }
+    build_checkpoint(cx, "Tantivy lexical publication")?;
     lexical.commit(cx).await?;
+    build_checkpoint(cx, "Tantivy lexical publication complete")?;
     Ok(LexicalArmReceipt {
         backend: "tantivy",
         path: data_dir.to_path_buf(),
@@ -1100,7 +1147,11 @@ impl std::fmt::Debug for IndexBuilder {
 mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
+    #[cfg(not(any(feature = "lexical", feature = "quill")))]
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[cfg(not(any(feature = "lexical", feature = "quill")))]
+    use asupersync::types::CancelKind;
     #[cfg(all(feature = "quill", feature = "lexical-tantivy"))]
     use frankensearch_core::traits::LexicalWrite;
     use frankensearch_core::traits::{MetricsExporter, ModelCategory, SearchFuture};
@@ -1197,6 +1248,55 @@ mod tests {
         }
     }
 
+    #[cfg(not(any(feature = "lexical", feature = "quill")))]
+    struct CancelOnFirstEmbedder {
+        id: &'static str,
+        calls: Arc<AtomicUsize>,
+        return_typed_error: bool,
+    }
+
+    #[cfg(not(any(feature = "lexical", feature = "quill")))]
+    impl Embedder for CancelOnFirstEmbedder {
+        fn embed<'a>(&'a self, cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            let id = self.id;
+            let calls = Arc::clone(&self.calls);
+            let return_typed_error = self.return_typed_error;
+            Box::pin(async move {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(call, 0, "{id} was called after cancelling the build");
+                cx.cancel_with(CancelKind::User, Some("cancel-on-first embedder"));
+                if return_typed_error {
+                    Err(SearchError::Cancelled {
+                        phase: format!("{id} embedding"),
+                        reason: "cancel-on-first embedder".to_owned(),
+                    })
+                } else {
+                    Ok(vec![1.0, 0.0, 0.0, 0.0])
+                }
+            })
+        }
+
+        fn dimension(&self) -> usize {
+            4
+        }
+
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn model_name(&self) -> &str {
+            self.id
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
     #[derive(Debug, Default)]
     struct RecordingExporter {
         search: Mutex<Vec<SearchMetrics>>,
@@ -1245,6 +1345,27 @@ mod tests {
             dim: 4,
         });
         EmbedderStack::from_parts(fast, Some(quality))
+    }
+
+    #[cfg(not(any(feature = "lexical", feature = "quill")))]
+    fn cancel_on_first_stack(
+        cancelled_tier: &'static str,
+        calls: Arc<AtomicUsize>,
+    ) -> EmbedderStack {
+        let cancelling: Arc<dyn Embedder> = Arc::new(CancelOnFirstEmbedder {
+            id: cancelled_tier,
+            calls,
+            return_typed_error: cancelled_tier != "fast-canceller",
+        });
+        if cancelled_tier == "fast-canceller" {
+            EmbedderStack::from_parts(cancelling, None)
+        } else {
+            let fast: Arc<dyn Embedder> = Arc::new(StubEmbedder {
+                id: "stub-fast",
+                dim: 4,
+            });
+            EmbedderStack::from_parts(fast, Some(cancelling))
+        }
     }
 
     /// Identity-aware stub (bd-9xuj T2-C2): same deterministic vectors as
@@ -2337,6 +2458,68 @@ mod tests {
             let hits = lexical.search(&cx, "rollback", 5).await.unwrap();
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0].doc_id, "tantivy-doc");
+        });
+    }
+
+    /// A fast embedder that cancels the caller context but completes its own
+    /// work must still stop the vector-only build at the post-embed checkpoint,
+    /// before the second document is touched.
+    #[cfg(not(any(feature = "lexical", feature = "quill")))]
+    #[test]
+    fn vector_only_fast_cancellation_stops_later_documents() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let error = IndexBuilder::new(dir.path())
+                .with_embedder_stack(cancel_on_first_stack("fast-canceller", Arc::clone(&calls)))
+                .add_document("doc-1", "first")
+                .add_document("doc-2", "must not be embedded")
+                .build(&cx)
+                .await
+                .expect_err("fast cancellation must abort the vector-only build");
+
+            assert!(
+                matches!(
+                    &error,
+                    SearchError::Cancelled { phase, reason }
+                        if phase == "fast document embedding completion"
+                            && reason.contains("cancel-on-first embedder")
+                ),
+                "caller-context cancellation must stay typed, got {error:?}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    /// Quality cancellation must not be downgraded into a fast-only success
+    /// receipt. It aborts the vector-only build before the next document.
+    #[cfg(not(any(feature = "lexical", feature = "quill")))]
+    #[test]
+    fn vector_only_quality_cancellation_is_not_degraded() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let error = IndexBuilder::new(dir.path())
+                .with_embedder_stack(cancel_on_first_stack(
+                    "quality-canceller",
+                    Arc::clone(&calls),
+                ))
+                .add_document("doc-1", "first")
+                .add_document("doc-2", "must not be embedded")
+                .build(&cx)
+                .await
+                .expect_err("quality cancellation must abort the vector-only build");
+
+            assert!(
+                matches!(
+                    &error,
+                    SearchError::Cancelled { phase, reason }
+                        if phase == "quality-canceller embedding"
+                            && reason == "cancel-on-first embedder"
+                ),
+                "typed quality cancellation must survive unchanged, got {error:?}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
         });
     }
 
