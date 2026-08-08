@@ -23,7 +23,9 @@
 //! # Capture Points
 //!
 //! Repro packs are captured at:
-//! 1. **On demand**: Operator requests via CLI `fsfs repro capture`.
+//! 1. **On demand**: Operator requests via the TUI diagnostics action
+//!    (`diag.replay_trace`); a dedicated `fsfs repro` CLI subcommand is a
+//!    planned surface and does not exist today.
 //! 2. **On incident**: When a critical SLO violation or unrecoverable error occurs.
 //! 3. **On test failure**: E2E test harness captures repro for failing scenarios.
 //!
@@ -697,9 +699,9 @@ pub enum TraceSortOrder {
 
 /// Query/filter model for evidence trace lookups.
 ///
-/// This contract is shared by CLI and TUI flows:
-/// - CLI: `fsfs trace query ...`
-/// - TUI: trace/evidence views and drilldown panels
+/// This contract is shared by the TUI trace/evidence views and drilldown
+/// panels today; a dedicated `fsfs trace` CLI subcommand is a planned
+/// surface and does not exist today.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TraceQueryFilter {
     /// Exact trace ID match.

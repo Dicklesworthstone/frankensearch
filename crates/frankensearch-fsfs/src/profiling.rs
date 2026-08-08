@@ -120,6 +120,11 @@ impl ProfileWorkflow {
     }
 
     /// Materialize deterministic artifact entries for a run.
+    ///
+    /// The replay command is the step's own profiler invocation: re-running
+    /// it is the only deterministic reproduction of the artifact. No
+    /// `fsfs profile` subcommand exists, so this field must never name one
+    /// (bd-rh0t).
     #[must_use]
     pub fn artifact_manifest(&self, run_id: &str) -> Vec<ProfileArtifact> {
         self.steps
@@ -127,10 +132,7 @@ impl ProfileWorkflow {
             .map(|step| ProfileArtifact {
                 kind: step.kind,
                 artifact_path: format!("{run_id}/{}", step.artifact_path),
-                replay_command: format!(
-                    "fsfs profile replay --run-id {run_id} --kind {}",
-                    step.kind
-                ),
+                replay_command: step.command.clone(),
             })
             .collect()
     }
@@ -1248,10 +1250,11 @@ pub fn crawl_ingest_optimization_track() -> CrawlIngestOptimizationTrack {
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
-            replay_command: format!(
-                "fsfs profile replay --lane ingest --lever-id {} --compare baseline",
-                hotspot.lever_id
-            ),
+            // No `fsfs profile` subcommand exists (bd-rh0t): the deterministic
+            // replay of a lever's evidence is the baseline matrix itself.
+            replay_command:
+                "cargo test -p frankensearch-fsfs --test benchmark_baseline_matrix -- --nocapture"
+                    .to_owned(),
         })
         .collect::<Vec<_>>();
 
@@ -1259,8 +1262,12 @@ pub fn crawl_ingest_optimization_track() -> CrawlIngestOptimizationTrack {
         .iter()
         .map(|hotspot| RollbackGuardrail {
             lever_id: hotspot.lever_id.clone(),
+            // No `fsfs profile` subcommand exists (bd-rh0t): rolling a lever
+            // back is a source-level revert followed by the deterministic
+            // baseline proof that the regression is gone.
             rollback_command: format!(
-                "fsfs profile rollback --lever-id {} --restore baseline",
+                "git revert <commit-of-{}> && \
+                 cargo test -p frankensearch-fsfs --test benchmark_baseline_matrix -- --nocapture",
                 hotspot.lever_id
             ),
             abort_reason_codes: rollback_abort_reason_codes(hotspot.stage)
@@ -1511,12 +1518,30 @@ mod tests {
         for item in &track.proof_checklist {
             assert!(hotspot_ids.contains(item.lever_id.as_str()));
             assert!(!item.required_invariants.is_empty());
-            assert!(item.replay_command.contains("--lane ingest"));
+            assert!(
+                item.replay_command.contains("benchmark_baseline_matrix"),
+                "replay must name the deterministic baseline matrix, not a fictional subcommand"
+            );
+            assert!(
+                !item.replay_command.contains("fsfs profile"),
+                "fsfs has no profile subcommand (bd-rh0t)"
+            );
         }
 
         for guardrail in &track.rollback_guardrails {
             assert!(hotspot_ids.contains(guardrail.lever_id.as_str()));
-            assert!(guardrail.rollback_command.contains("fsfs profile rollback"));
+            assert!(
+                guardrail.rollback_command.contains("git revert"),
+                "rollback is a source revert plus baseline proof"
+            );
+            assert!(
+                guardrail.rollback_command.contains(&guardrail.lever_id),
+                "rollback names its lever"
+            );
+            assert!(
+                !guardrail.rollback_command.contains("fsfs profile"),
+                "fsfs has no profile subcommand (bd-rh0t)"
+            );
             assert!(!guardrail.abort_reason_codes.is_empty());
             assert_eq!(guardrail.recovery_reason_code, "opt.rollback.completed");
         }

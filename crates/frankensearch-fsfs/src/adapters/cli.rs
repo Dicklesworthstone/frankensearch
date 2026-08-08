@@ -1832,4 +1832,281 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
+    // ── bd-rh0t: advertised operator-command census ─────────────────────
+    //
+    // Every fsfs command string advertised by any runtime surface (status,
+    // doctor, degradation advice, lifecycle advisor, profiling payloads,
+    // help text, completion scripts, doc comments) must parse through the
+    // real CLI under the exact advertised argv. The census is the single
+    // registry: the source scan below fails closed on any advertised string
+    // that is not registered here, and the formerly fictional forms are
+    // pinned as rejected.
+
+    /// Normalized advertised commands (placeholders canonicalized to `<X>`).
+    const ADVERTISED_COMMAND_CENSUS: &[&str] = &[
+        "fsfs index <X>",
+        "fsfs index",
+        "fsfs index --full",
+        "fsfs index --full --index-dir <X> <X>",
+        "fsfs watch",
+        "fsfs doctor",
+        "fsfs doctor --index-dir <X> --format json",
+        "fsfs status",
+        "fsfs status --format json",
+        "fsfs status --index-dir <X> --format json",
+        "fsfs search",
+        "fsfs search <X>",
+        "fsfs search --fast-only --format json -- <X>",
+        "fsfs search --index-dir <X> --format json -- <X>",
+        "fsfs config validate --format json",
+        "fsfs config set search.quality_timeout_ms 1000",
+        "fsfs download-models",
+        "fsfs download-models --verify",
+        "fsfs download-models --list",
+        "fsfs download-models --model <X> --force",
+        "fsfs download-models --model <X> --verify",
+        "fsfs explain",
+        "fsfs update",
+        "fsfs update --check",
+        "fsfs uninstall --yes --dry-run --purge",
+    ];
+
+    /// Advertised forms that must NEVER parse: the fictional dry-run flags
+    /// this contract retired, the nonexistent profile/repro/trace
+    /// subcommands, and the nonexistent fsfsctl binary's grammar.
+    const FORMERLY_FICTIONAL_COMMANDS: &[&str] = &[
+        "doctor --retention-audit --dry-run",
+        "compact --dry-run",
+        "index --rebuild . --dry-run",
+        "config set search.quality_timeout_ms 1000 --dry-run",
+        "profile replay --run-id run-1 --kind heap",
+        "profile rollback --lever-id lever-1 --restore baseline",
+        "repro capture",
+        "trace query --trace-id t-1",
+        "policy set ingest.naive=true",
+    ];
+
+    /// Canonicalize one advertised command string: collapse whitespace and
+    /// map every placeholder shape (`<…>`, `{…}`, `$VAR`, `ALLCAPS`) to one
+    /// token so `fsfs index <path>` and `fsfs index {}` census identically.
+    fn normalize_advertised(command: &str) -> String {
+        command
+            .split_whitespace()
+            .map(|token| {
+                let placeholder = (token.starts_with('<') && token.ends_with('>'))
+                    || (token.starts_with('{') && token.ends_with('}'))
+                    || token.starts_with('$')
+                    || (token.len() > 1
+                        && token
+                            .chars()
+                            .all(|c| c.is_ascii_uppercase() || c == '_'));
+                if placeholder { "<X>" } else { token }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Substitute census placeholders with concrete, parseable argv values.
+    fn census_argv(command: &str) -> Vec<String> {
+        command
+            .split_whitespace()
+            .map(|token| if token == "<X>" { "." } else { token })
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn advertised_operator_commands_parse_through_the_real_cli() {
+        for advertised in ADVERTISED_COMMAND_CENSUS {
+            let argv = census_argv(advertised);
+            let parsed = parse_cli_args(argv.iter().map(String::as_str))
+                .unwrap_or_else(|error| {
+                    panic!("advertised command {advertised:?} must parse: {error}")
+                });
+            let expected = match argv[0].as_str() {
+                "index" => CliCommand::Index,
+                "watch" => CliCommand::Watch,
+                "doctor" => CliCommand::Doctor,
+                "status" => CliCommand::Status,
+                "search" => CliCommand::Search,
+                "config" => CliCommand::Config,
+                "download-models" => CliCommand::Download,
+                "explain" => CliCommand::Explain,
+                "update" => CliCommand::Update,
+                "uninstall" => CliCommand::Uninstall,
+                other => panic!("census entry names an unmapped command: {other}"),
+            };
+            assert_eq!(
+                parsed.command, expected,
+                "advertised command {advertised:?} parsed to the wrong command"
+            );
+        }
+    }
+
+    #[test]
+    fn formerly_fictional_commands_fail_with_actionable_errors() {
+        for fictional in FORMERLY_FICTIONAL_COMMANDS {
+            let argv: Vec<&str> = fictional.split_whitespace().collect();
+            let error = parse_cli_args(argv.clone())
+                .unwrap_or_else(|_| panic!("formerly fictional command {fictional:?} parsed"));
+            let _ = argv;
+            let message = error.to_string();
+            assert!(
+                message.contains("unknown command")
+                    || message.contains("only valid for")
+                    || message.contains("unknown")
+                    || message.contains("expected"),
+                "rejection of {fictional:?} must be actionable, got: {message}"
+            );
+        }
+    }
+
+    /// The degradation advisor's runtime-emitted commands, enumerated for
+    /// every failure kind, must each be census-registered and parseable.
+    #[test]
+    fn degradation_advisor_commands_are_censused_and_parse() {
+        use crate::degradation_advisor::{
+            DegradationAdvice, DegradationAdviceInput, DegradationFailureKind,
+        };
+
+        let failures = [
+            DegradationFailureKind::RefinementFailed,
+            DegradationFailureKind::LexicalFallback,
+            DegradationFailureKind::MissingQualityModel,
+            DegradationFailureKind::UnverifiableEmbeddingSpace,
+            DegradationFailureKind::Timeout,
+            DegradationFailureKind::CorruptIndex,
+            DegradationFailureKind::CacheMiss,
+            DegradationFailureKind::SemanticZeroSignal,
+        ];
+        let mut emitted = Vec::new();
+        for failure in failures {
+            let advice = DegradationAdvice::from_input(DegradationAdviceInput {
+                failure,
+                query: "census query",
+                index_dir: Some(Path::new(".")),
+                original_error: None,
+                replay_command: None,
+            });
+            for action in advice.next_actions {
+                if let Some(command) = action.command {
+                    emitted.push(command);
+                }
+            }
+            emitted.push(advice.replay_command);
+        }
+        assert!(
+            emitted.len() >= 8,
+            "degradation census must cover every failure kind"
+        );
+        for command in emitted {
+            let normalized = normalize_advertised(&command);
+            assert!(
+                ADVERTISED_COMMAND_CENSUS.contains(&normalized.as_str()),
+                "degradation advice emits uncensused command {command:?} (normalized {normalized:?})"
+            );
+            let argv = census_argv(&normalized);
+            parse_cli_args(argv.iter().map(String::as_str)).unwrap_or_else(|error| {
+                panic!("degradation advice command {command:?} must parse: {error}")
+            });
+        }
+    }
+
+    /// Profiling payloads must never advertise a nonexistent `fsfs profile`
+    /// subcommand; replay and rollback commands name real tools only.
+    #[test]
+    fn profiling_payloads_advertise_no_fictional_fsfs_commands() {
+        use crate::profiling::{ProfileWorkflow, crawl_ingest_optimization_track};
+
+        let workflow = ProfileWorkflow::for_dataset_profile("small");
+        for artifact in workflow.artifact_manifest("census-run") {
+            assert!(
+                !artifact.replay_command.starts_with("fsfs"),
+                "profile artifact replay must be the step's own real invocation: {}",
+                artifact.replay_command
+            );
+        }
+        let track = crawl_ingest_optimization_track();
+        for item in &track.proof_checklist {
+            assert!(
+                !item.replay_command.contains("fsfs profile"),
+                "proof checklist replay must not name a fictional subcommand"
+            );
+        }
+        for guardrail in &track.rollback_guardrails {
+            assert!(
+                !guardrail.rollback_command.contains("fsfs profile"),
+                "rollback guardrail must not name a fictional subcommand"
+            );
+        }
+    }
+
+    /// Help text and completion scripts advertise exactly the commands the
+    /// parser accepts — no more, no less.
+    #[test]
+    fn help_and_completion_advertisements_match_the_parser() {
+        for shell in [
+            CompletionShell::Bash,
+            CompletionShell::Zsh,
+            CompletionShell::Fish,
+            CompletionShell::PowerShell,
+        ] {
+            let script = completion_script(shell);
+            for name in CliCommand::ALL_NAMES {
+                assert!(
+                    script.contains(name),
+                    "{shell:?} completion is missing parser command {name}"
+                );
+            }
+            for fictional in ["profile", "repro", "trace", "fsfsctl"] {
+                assert!(
+                    !script.contains(fictional),
+                    "{shell:?} completion advertises fictional command {fictional}"
+                );
+            }
+        }
+    }
+
+    /// Scan non-test source for backtick-quoted `fsfs …` strings and require
+    /// each to be census-registered. This is the anti-drift guard: a new
+    /// advertised command that never reaches the census fails CI here.
+    #[test]
+    fn source_scan_finds_no_uncensused_advertised_command() {
+        let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found = Vec::new();
+        let mut stack = vec![src_root];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src dir") {
+                let path = entry.expect("src entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let text = std::fs::read_to_string(&path).expect("read source file");
+                    // Test modules pin rejected fictional strings on purpose;
+                    // they are not advertisements.
+                    let production = text.split("#[cfg(test)]").next().unwrap_or(&text);
+                    let mut rest = production;
+                    while let Some(start) = rest.find("`fsfs ") {
+                        let after = &rest[start + 1..];
+                        let end = after
+                            .find('`')
+                            .expect("backtick-quoted fsfs string must terminate");
+                        found.push((path.clone(), after[..end].to_owned()));
+                        rest = &after[end + 1..];
+                    }
+                }
+            }
+        }
+        assert!(!found.is_empty(), "the scan itself must not be vacuous");
+        for (path, command) in found {
+            let normalized = normalize_advertised(&command);
+            assert!(
+                ADVERTISED_COMMAND_CENSUS.contains(&normalized.as_str()),
+                "{} advertises uncensused command `{command}` (normalized `{normalized}`); \
+                 register it in ADVERTISED_COMMAND_CENSUS and prove it parses, or remove it",
+                path.display()
+            );
+        }
+    }
 }

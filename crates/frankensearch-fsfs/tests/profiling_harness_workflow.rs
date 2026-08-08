@@ -97,14 +97,28 @@ fn crawl_ingest_track_is_ranked_and_guarded() {
     for proof in &track.proof_checklist {
         assert!(hotspot_ids.contains(proof.lever_id.as_str()));
         assert!(!proof.required_invariants.is_empty());
-        assert!(proof.replay_command.contains("--lane ingest"));
+        assert!(
+            proof.replay_command.contains("benchmark_baseline_matrix"),
+            "replay must name the deterministic baseline matrix, not a fictional subcommand"
+        );
+        assert!(
+            !proof.replay_command.contains("fsfs profile"),
+            "fsfs has no profile subcommand (bd-rh0t)"
+        );
     }
 
     for guardrail in &track.rollback_guardrails {
         assert!(hotspot_ids.contains(guardrail.lever_id.as_str()));
         assert!(
-            guardrail.rollback_command.contains("fsfs profile rollback"),
-            "rollback command must be explicit"
+            guardrail.rollback_command.contains("git revert")
+                && guardrail
+                    .rollback_command
+                    .contains("benchmark_baseline_matrix"),
+            "rollback command must be a source revert plus the baseline proof"
+        );
+        assert!(
+            !guardrail.rollback_command.contains("fsfs profile"),
+            "fsfs has no profile subcommand (bd-rh0t)"
         );
         assert!(!guardrail.abort_reason_codes.is_empty());
     }

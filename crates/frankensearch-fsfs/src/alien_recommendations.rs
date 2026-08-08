@@ -227,7 +227,7 @@ mod tests {
                 "replay_command": "cargo test -p frankensearch --test ingest_replay"
             },
             "rollback_plan": {
-                "rollback_command": "fsfsctl policy set ingest.naive=true",
+                "rollback_command": "git revert <recommendation-commit> && cargo test -p frankensearch --test ingest_replay",
                 "abort_conditions": ["recall_drop_gt_5pct"]
             }
         })
