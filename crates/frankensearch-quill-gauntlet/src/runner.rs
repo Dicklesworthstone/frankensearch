@@ -24427,4 +24427,1732 @@ mod tests {
             }
         });
     }
+
+    // ------------------------------------------------------------------
+    // bd-campaign-report-v7-replay-freeze-715tp
+    //
+    // Stored-V7 aggregation corpus: the historical freeze for the transitive
+    // V7 behavior ABOVE the pinned report golden (runner.rs
+    // load_read_only_campaign_report_v7) and the pinned rank corpus
+    // (comparator.rs pinned_stored_v7_rank_corpus_replays_without_live_creation).
+    //
+    // One bounded fixture pins, for every comparator-emittable rank class,
+    // divergence class, lexical mismatch class, and cutoff/offset boundary:
+    //   * the rank-envelope ComparisonReport (recomputed here through
+    //     compare_observations_stored_v7),
+    //   * the total LexicalContractComparison (recomputed through
+    //     LexicalContractComparison::validate_replay over its retained
+    //     bundles),
+    //   * the CampaignCaseResult derived by classify_case_with_lexical plus
+    //     lexical_case_summary,
+    //   * and the report-level aggregates: query-class summaries
+    //     (summarize_query_classes_stored_v7), mismatch groups
+    //     (MismatchCollection), lexical_mismatches (LexicalMismatchCollection),
+    //     lexical_coverage (CampaignLexicalCoverageAccumulator), and the final
+    //     passed verdict (CampaignDisposition::passes over every case).
+    //
+    // Two of the fourteen DivergenceClass variants are intentionally absent:
+    // the current stored-V7 comparator has no emission path for SnippetWindow
+    // or PostingRecordSemantics (they are register/triage-only classes;
+    // divergence_register_accepts_only_reviewed_semantic_taxonomy pins their
+    // registerability), so no honest stored comparison can carry them.
+    // Likewise three LexicalMismatchClass variants are unreachable through
+    // validator-legal bundles (SourceIdentity: ordinary boundaries reject
+    // source/index variation and hydration lanes are candidate projections
+    // with metadata-only post-state restoration; Snippet and Highlight: the
+    // uniform per-bundle exposure rule makes exposed content simultaneously
+    // required and impossible in hydration lanes). The corpus pins the eight
+    // reachable lexical classes and asserts these documented absences.
+    //
+    // Raw stored evidence is the authoritative replay input; every expected
+    // output in the fixture was DERIVED ONCE through the frozen functions and
+    // independently reviewed before pinning. The generator
+    // (generate_stored_v7_aggregation_corpus_fixture) is a review tool that
+    // must never be used to force green: semantic changes require a new
+    // corpus schema and a fresh independent review, never silent byte
+    // regeneration.
+    //
+    // The replay is feature-independent: it consumes stored evidence only and
+    // must pass in the DEFAULT test configuration (no live engines).
+    // ------------------------------------------------------------------
+    mod stored_v7_aggregation_corpus {
+        use std::collections::BTreeMap;
+
+        use frankensearch_core::{ScoreSource, ScoredResult};
+        use serde::{Deserialize, Serialize};
+
+        use super::super::*;
+        use super::{AstDifference, AstLoweringKind, CountState, NativeTieKey, RankedHit};
+        use crate::comparator::{
+            LEXICAL_CONTRACT_BUNDLE_SCHEMA_VERSION, LexicalBackendIdentity, LexicalBoundary,
+            LexicalContractBundle, LexicalContractComparison, LexicalCountExposure,
+            LexicalCountState, LexicalEmptyShape, LexicalEngineRole, LexicalExposureContract,
+            LexicalFieldExposure, LexicalHighlightSpan, LexicalHitObservation,
+            LexicalHitSupplement, LexicalHydrationExecution, LexicalHydrationResult,
+            LexicalHydrationSelection, LexicalHydrationTransition, LexicalNonLexicalControlKind,
+            LexicalObservation, LexicalObservationContext, LexicalObservationOutcome,
+            LexicalObservationSupplement, LexicalObserved, LexicalWinnerOrigin,
+            LexicalWinnerProjection, ScoreEpsilonReason, SensitiveValueObservation,
+            compare_observations_stored_v7, expected_lexical_winner_hit,
+            expected_non_lexical_control_hit, observe_lexical_outcome, observe_lexical_search_error,
+        };
+
+        const STORED_V7_AGGREGATION_CORPUS_SCHEMA: &str =
+            "frankensearch.quill-campaign-report-v7-aggregation-corpus.v1";
+        const PINNED_STORED_V7_AGGREGATION_CORPUS_BYTES: &[u8] =
+            include_bytes!("../fixtures/campaign-report-v7-aggregation-corpus.json");
+        const PINNED_STORED_V7_AGGREGATION_CORPUS_SHA256: &str =
+            "0205d535ec9002b98a4466cc385342fbd0de92b0ece3db34d03e4c54fd9f41d5";
+
+        /// Posterior confidence input shared by every query-class summary in
+        /// the corpus. Mirrors the pinned golden's 0.85
+        /// posterior-confidence-bits convention.
+        const STORED_V7_CORPUS_CONFIDENCE: f64 = 0.85;
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StoredV7AggregationCorpus {
+        schema: String,
+        confidence_bits: u64,
+        registry: DivergenceRegistry,
+        /// Each distinct total lexical contract comparison exactly once;
+        /// cases reference entries by name so shared evidence is pinned once.
+        lexical_library: Vec<StoredV7LexicalLibraryEntry>,
+        cases: Vec<StoredV7AggregationCase>,
+        expected_aggregates: StoredV7AggregationAggregates,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StoredV7LexicalLibraryEntry {
+        name: String,
+        comparison: Box<LexicalContractComparison>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StoredV7AggregationCase {
+        name: String,
+        query: Box<crate::generator::GeneratedQueryCase>,
+        evidence: StoredV7CaseEvidence,
+        expected: StoredV7ExpectedCase,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+    enum StoredV7CaseEvidence {
+        /// A completed case: raw stored rank observations, the frozen
+        /// comparator configuration, and a reference into the lexical
+        /// library entry retaining both bundles.
+        Completed {
+            subject: Box<EngineObservation>,
+            oracle: Box<EngineObservation>,
+            comparator_config: ComparatorConfig,
+            lexical: String,
+        },
+        /// A case whose artifact never existed: no observations, no
+        /// comparison, typed infrastructure reason only.
+        Infrastructure { reason: CampaignCaseReason },
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StoredV7ExpectedCase {
+        /// The rank-envelope comparison recomputed from the stored
+        /// observations. Absent for infrastructure cases.
+        comparison: Option<ComparisonReport>,
+        case_result: CampaignCaseResult,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StoredV7AggregationAggregates {
+        query_classes: Vec<QueryClassSummary>,
+        mismatches: Vec<MismatchGroup>,
+        lexical_mismatches: Vec<LexicalMismatchGroup>,
+        lexical_coverage: CampaignLexicalCoverageSummary,
+        passed: bool,
+    }
+
+    // --- Corpus evidence construction -------------------------------------
+    //
+    // These builders mirror the comparator's own fixtures
+    // (comparator.rs lexical_contract_bundle) but sit here because the
+    // aggregation derivation under test is runner-private. They use only the
+    // public observation constructors plus the two pub(crate) hydration
+    // projections shared with the validator itself.
+
+    fn v7c_hit(doc_id: &str, score: f32, native_doc_id: u32) -> RankedHit {
+        RankedHit {
+            doc_id: doc_id.to_owned(),
+            score_bits: score.to_bits(),
+            native_tie_key: NativeTieKey::QuillDocId {
+                doc_id: native_doc_id,
+            },
+        }
+    }
+
+    fn v7c_oracle_hit(doc_id: &str, score: f32, doc_id_in_segment: u32) -> RankedHit {
+        RankedHit {
+            doc_id: doc_id.to_owned(),
+            score_bits: score.to_bits(),
+            native_tie_key: NativeTieKey::TantivyDocAddress {
+                segment_ord: 3,
+                doc_id: doc_id_in_segment,
+            },
+        }
+    }
+
+    fn v7c_observation(hits: Vec<RankedHit>) -> EngineObservation {
+        EngineObservation {
+            match_count: CountState::Value(u64::try_from(hits.len()).unwrap_or(u64::MAX)),
+            doc_count: 9,
+            hits,
+            cutoff_tie_group: Vec::new(),
+            cutoff_tie_complete: true,
+            offset_tie_group: Vec::new(),
+            offset_tie_complete: false,
+            snippets: BTreeMap::new(),
+            ast_differences: Vec::new(),
+        }
+    }
+
+    fn v7c_context(
+        engine: &str,
+        boundary: LexicalBoundary,
+        exposure: LexicalExposureContract,
+    ) -> LexicalObservationContext {
+        LexicalObservationContext::new(
+            boundary,
+            LexicalBackendIdentity {
+                engine: engine.to_owned(),
+                revision: format!("{engine}-v7-corpus-revision"),
+                index_identity: "stored-v7-corpus".to_owned(),
+            },
+            "a".repeat(64),
+            "b".repeat(64),
+            " Rust  search ",
+            0x51_7e_a2,
+            10,
+            exposure,
+        )
+        .expect("valid corpus lexical context")
+    }
+
+    fn v7c_result(doc_id: &str, score: f32) -> ScoredResult {
+        use frankensearch_core::{ExplanationPhase, HitExplanation};
+
+        ScoredResult {
+            doc_id: doc_id.into(),
+            score,
+            source: ScoreSource::Lexical,
+            index: None,
+            fast_score: None,
+            quality_score: None,
+            lexical_score: Some(score),
+            rerank_score: None,
+            explanation: Some(Box::new(HitExplanation {
+                final_score: f64::from(score),
+                components: Vec::new(),
+                phase: ExplanationPhase::Refined,
+                rank_movement: None,
+            })),
+            metadata: Some(std::sync::Arc::new(serde_json::json!({
+                "language": "rust",
+                "nested": {"stable": true}
+            }))),
+        }
+    }
+
+    fn v7c_page(
+        engine: &str,
+        boundary: LexicalBoundary,
+        results: Vec<ScoredResult>,
+    ) -> LexicalObservation {
+        observe_lexical_outcome(
+            v7c_context(engine, boundary, LexicalExposureContract::CORE_LEXICAL_SEARCH),
+            Ok(results),
+            &LexicalObservationSupplement::default(),
+        )
+        .expect("valid corpus lexical page")
+    }
+
+    fn v7c_hits(observation: &LexicalObservation) -> Vec<LexicalHitObservation> {
+        match &observation.outcome {
+            LexicalObservationOutcome::Success { hits, .. } => hits.clone(),
+            LexicalObservationOutcome::Error(_) => {
+                panic!("corpus fixture observation must be a success")
+            }
+        }
+    }
+
+    fn v7c_hydration(
+        selection: LexicalHydrationSelection,
+        input: LexicalObservation,
+        post_state: LexicalObservation,
+    ) -> LexicalHydrationTransition {
+        LexicalHydrationTransition {
+            selection,
+            execution: LexicalHydrationExecution::Attempted {
+                input: Box::new(input),
+                post_state: Box::new(post_state),
+                result: LexicalHydrationResult::Success,
+            },
+        }
+    }
+
+    /// Canonical bundle pair member, structurally identical to the
+    /// comparator's own fixture so the corpus replays the same evidence shape
+    /// the validator validates. The exposure contract is shared by every
+    /// lane, as the validator's request-context rule requires.
+    fn v7c_bundle_ex(
+        role: LexicalEngineRole,
+        fusion_metadata_deferred: bool,
+        exposure: LexicalExposureContract,
+    ) -> LexicalContractBundle {
+        let engine = match role {
+            LexicalEngineRole::Subject => "quill",
+            LexicalEngineRole::Oracle => "tantivy",
+        };
+        // Ordinary lanes carry snippet/highlight supplements exactly when the
+        // shared exposure contract exposes them.
+        let ordinary_page = |boundary: LexicalBoundary| {
+            let results = vec![v7c_result("doc-1", 3.5), v7c_result("doc-2", 2.5)];
+            let total = match exposure.total_count {
+                LexicalCountExposure::ExactRequested => LexicalCountState::Value(2),
+                LexicalCountExposure::NotRequested => LexicalCountState::NotRequested,
+                _ => LexicalCountState::NotExposed,
+            };
+            let supplement = if exposure.snippet == LexicalFieldExposure::Exposed {
+                LexicalObservationSupplement {
+                    total_count: total,
+                    hits: results
+                        .iter()
+                        .map(|result| {
+                            (
+                                result.doc_id.to_string(),
+                                LexicalHitSupplement {
+                                    snippet: SensitiveValueObservation::from_text(
+                                        "safe corpus snippet",
+                                    ),
+                                    highlight_spans: LexicalObserved::Value(vec![
+                                        LexicalHighlightSpan { start: 0, end: 4 },
+                                    ]),
+                                },
+                            )
+                        })
+                        .collect(),
+                }
+            } else {
+                LexicalObservationSupplement {
+                    total_count: total,
+                    hits: BTreeMap::new(),
+                }
+            };
+            observe_lexical_outcome(
+                v7c_context(engine, boundary, exposure),
+                Ok(results),
+                &supplement,
+            )
+            .expect("valid corpus ordinary page")
+        };
+        let full_search = ordinary_page(LexicalBoundary::FullSearch);
+        let mut fusion_candidates = ordinary_page(LexicalBoundary::FusionCandidates);
+        if fusion_metadata_deferred {
+            if let LexicalObservationOutcome::Success { hits, .. } = &mut fusion_candidates.outcome
+            {
+                for hit in hits {
+                    hit.metadata = SensitiveValueObservation::Absent;
+                }
+            }
+        }
+
+        let candidate_hits = v7c_hits(&fusion_candidates);
+        let full_hits = v7c_hits(&full_search);
+        let hydrate = |hits: Vec<LexicalHitObservation>| {
+            hits.into_iter()
+                .map(|mut hit| {
+                    if hit.raw_lexical_score_bits.is_some() {
+                        hit.metadata = full_hits
+                            .iter()
+                            .find(|full| full.doc_id == hit.doc_id)
+                            .expect("corpus hydration origin exists in full search")
+                            .metadata
+                            .clone();
+                    }
+                    hit
+                })
+                .collect::<Vec<_>>()
+        };
+        let page_from_hits = |boundary, hits: Vec<LexicalHitObservation>| LexicalObservation {
+            context: v7c_context(engine, boundary, exposure),
+            outcome: LexicalObservationOutcome::Success {
+                returned_count: u64::try_from(hits.len()).unwrap_or(u64::MAX),
+                empty_shape: if hits.is_empty() {
+                    LexicalEmptyShape::Empty
+                } else {
+                    LexicalEmptyShape::NonEmpty
+                },
+                total_count: match exposure.total_count {
+                    LexicalCountExposure::ExactRequested => {
+                        LexicalCountState::Value(u64::try_from(hits.len()).unwrap_or(u64::MAX))
+                    }
+                    LexicalCountExposure::NotRequested => LexicalCountState::NotRequested,
+                    _ => LexicalCountState::NotExposed,
+                },
+                hits,
+            },
+        };
+
+        let all_input_hits = candidate_hits
+            .iter()
+            .enumerate()
+            .map(|(rank, candidate)| {
+                expected_lexical_winner_hit(candidate, rank, rank, LexicalWinnerProjection::LexicalOnly)
+                    .expect("corpus all-lexical projection")
+            })
+            .collect::<Vec<_>>();
+        let strict_input_hits = vec![
+            expected_lexical_winner_hit(&candidate_hits[1], 1, 0, LexicalWinnerProjection::HybridFast)
+                .expect("corpus strict-hybrid projection"),
+        ];
+        let semantic_context = v7c_context(engine, LexicalBoundary::FusionHydrationSemanticOnlyInput, exposure);
+        let semantic_input_hits = vec![
+            expected_non_lexical_control_hit(&semantic_context, 0, LexicalNonLexicalControlKind::SemanticFast, 0)
+                .expect("corpus semantic-only projection"),
+        ];
+        let mixed_origins = vec![
+            LexicalWinnerOrigin::NonLexicalControl {
+                control_id: 1,
+                kind: LexicalNonLexicalControlKind::SemanticFast,
+            },
+            LexicalWinnerOrigin::Lexical {
+                candidate_rank: 1,
+                projection: LexicalWinnerProjection::HybridFast,
+            },
+            LexicalWinnerOrigin::Lexical {
+                candidate_rank: 0,
+                projection: LexicalWinnerProjection::LexicalOnly,
+            },
+            LexicalWinnerOrigin::NonLexicalControl {
+                control_id: 2,
+                kind: LexicalNonLexicalControlKind::GraphOnlyHybrid,
+            },
+        ];
+        let mixed_context = v7c_context(engine, LexicalBoundary::FusionHydrationMixedInput, exposure);
+        let mixed_input_hits = mixed_origins
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(position, origin)| match origin {
+                LexicalWinnerOrigin::Lexical {
+                    candidate_rank,
+                    projection,
+                } => expected_lexical_winner_hit(
+                    &candidate_hits[usize::try_from(candidate_rank).expect("corpus candidate rank")],
+                    usize::try_from(candidate_rank).expect("corpus candidate rank"),
+                    position,
+                    projection,
+                )
+                .expect("corpus mixed lexical projection"),
+                LexicalWinnerOrigin::NonLexicalControl { control_id, kind } => {
+                    expected_non_lexical_control_hit(&mixed_context, control_id, kind, position)
+                        .expect("corpus mixed control projection")
+                }
+            })
+            .collect::<Vec<_>>();
+
+        LexicalContractBundle {
+            schema_version: LEXICAL_CONTRACT_BUNDLE_SCHEMA_VERSION.to_owned(),
+            engine_role: role,
+            snapshot_sha256: "c".repeat(64),
+            fusion_metadata_deferred,
+            full_search,
+            fusion_candidates,
+            all_lexical_winners_hydration: v7c_hydration(
+                LexicalHydrationSelection::AllLexicalWinners,
+                page_from_hits(
+                    LexicalBoundary::FusionHydrationAllLexicalInput,
+                    all_input_hits.clone(),
+                ),
+                page_from_hits(
+                    LexicalBoundary::FusionHydrationAllLexicalPostState,
+                    hydrate(all_input_hits),
+                ),
+            ),
+            strict_hybrid_winners_hydration: v7c_hydration(
+                LexicalHydrationSelection::StrictHybridWinnerSubset {
+                    candidate_ranks: vec![1],
+                },
+                page_from_hits(
+                    LexicalBoundary::FusionHydrationHybridSubsetInput,
+                    strict_input_hits.clone(),
+                ),
+                page_from_hits(
+                    LexicalBoundary::FusionHydrationHybridSubsetPostState,
+                    hydrate(strict_input_hits),
+                ),
+            ),
+            semantic_only_hydration: v7c_hydration(
+                LexicalHydrationSelection::SemanticOnlyControl { control_id: 0 },
+                page_from_hits(
+                    LexicalBoundary::FusionHydrationSemanticOnlyInput,
+                    semantic_input_hits.clone(),
+                ),
+                page_from_hits(
+                    LexicalBoundary::FusionHydrationSemanticOnlyPostState,
+                    semantic_input_hits,
+                ),
+            ),
+            mixed_winners_hydration: v7c_hydration(
+                LexicalHydrationSelection::MixedFinalWinners {
+                    origins: mixed_origins,
+                },
+                page_from_hits(
+                    LexicalBoundary::FusionHydrationMixedInput,
+                    mixed_input_hits.clone(),
+                ),
+                page_from_hits(
+                    LexicalBoundary::FusionHydrationMixedPostState,
+                    hydrate(mixed_input_hits),
+                ),
+            ),
+        }
+    }
+
+    /// Canonical CORE-exposure bundle (the common case).
+    fn v7c_bundle(role: LexicalEngineRole, fusion_metadata_deferred: bool) -> LexicalContractBundle {
+        v7c_bundle_ex(
+            role,
+            fusion_metadata_deferred,
+            LexicalExposureContract::CORE_LEXICAL_SEARCH,
+        )
+    }
+
+    /// Compare a bundle pair into a total lexical contract comparison.
+    fn v7c_lexical(
+        name: &str,
+        subject: LexicalContractBundle,
+        oracle: LexicalContractBundle,
+    ) -> Box<LexicalContractComparison> {
+        Box::new(
+            compare_lexical_contracts(subject, oracle)
+                .unwrap_or_else(|error| panic!("corpus lexical case {name} must replay: {error}")),
+        )
+    }
+
+    fn v7c_error_observation(engine: &str, detail: &str) -> LexicalObservation {
+        let error = frankensearch_core::SearchError::QueryParseError {
+            query: "corpus redacted query".to_owned(),
+            detail: detail.to_owned(),
+        };
+        LexicalObservation {
+            context: v7c_context(
+                engine,
+                LexicalBoundary::FullSearch,
+                LexicalExposureContract::CORE_LEXICAL_SEARCH,
+            ),
+            outcome: LexicalObservationOutcome::Error(
+                observe_lexical_search_error(&error).expect("observe corpus error"),
+            ),
+        }
+    }
+
+    /// Mutate every lane context inside a bundle while preserving its
+    /// internal cross-lane consistency, so the only comparison difference is
+    /// subject-versus-oracle context.
+    fn v7c_map_bundle_contexts(
+        bundle: &mut LexicalContractBundle,
+        mutate: impl Fn(&mut LexicalObservationContext),
+    ) {
+        let apply = |observation: &mut LexicalObservation| mutate(&mut observation.context);
+        apply(&mut bundle.full_search);
+        apply(&mut bundle.fusion_candidates);
+        for transition in [
+            &mut bundle.all_lexical_winners_hydration,
+            &mut bundle.strict_hybrid_winners_hydration,
+            &mut bundle.semantic_only_hydration,
+            &mut bundle.mixed_winners_hydration,
+        ] {
+            if let LexicalHydrationExecution::Attempted {
+                input, post_state, ..
+            } = &mut transition.execution
+            {
+                apply(input);
+                apply(post_state);
+            }
+        }
+    }
+
+    /// Apply `ordinary` to the candidate's full-search and fusion-candidate
+    /// hits and `hydration` to every hydration-lane hit projected from that
+    /// candidate (input and post-state), so a planted difference stays
+    /// internally consistent under the validator's cross-lane rules.
+    /// Hydration projections carry the candidate's doc_id, raw score bits,
+    /// and metadata, but synthesize the normalized score and explanation —
+    /// which is why the two mutators are separate.
+    fn v7c_mutate_candidate_hit(
+        bundle: &mut LexicalContractBundle,
+        candidate_rank: usize,
+        ordinary: &dyn Fn(&mut LexicalHitObservation),
+        hydration: &dyn Fn(&mut LexicalHitObservation),
+    ) {
+        fn apply_at(
+            outcome: &mut LexicalObservationOutcome,
+            positions: &[usize],
+            mutate: &dyn Fn(&mut LexicalHitObservation),
+        ) {
+            if let LexicalObservationOutcome::Success { hits, .. } = outcome {
+                for &position in positions {
+                    if let Some(hit) = hits.get_mut(position) {
+                        mutate(hit);
+                    }
+                }
+            }
+        }
+        apply_at(
+            &mut bundle.full_search.outcome,
+            &[candidate_rank],
+            ordinary,
+        );
+        apply_at(
+            &mut bundle.fusion_candidates.outcome,
+            &[candidate_rank],
+            ordinary,
+        );
+        let (all_positions, strict_positions, mixed_positions): (&[usize], &[usize], &[usize]) =
+            match candidate_rank {
+                0 => (&[0], &[], &[2]),
+                1 => (&[1], &[0], &[1]),
+                _ => panic!("corpus bundles carry two candidates"),
+            };
+        for (transition, positions) in [
+            (&mut bundle.all_lexical_winners_hydration, all_positions),
+            (&mut bundle.strict_hybrid_winners_hydration, strict_positions),
+            (&mut bundle.mixed_winners_hydration, mixed_positions),
+        ] {
+            if let LexicalHydrationExecution::Attempted {
+                input, post_state, ..
+            } = &mut transition.execution
+            {
+                apply_at(&mut input.outcome, positions, hydration);
+                apply_at(&mut post_state.outcome, positions, hydration);
+            }
+        }
+    }
+
+    /// One lexical mismatch-class case: subject bundle mutated exactly one
+    /// class away from the shared oracle bundle.
+    fn v7c_lexical_class_cases() -> Vec<(&'static str, Box<LexicalContractComparison>)> {
+        let mut cases: Vec<(&'static str, Box<LexicalContractComparison>)> = Vec::new();
+        let oracle_bundle = || v7c_bundle(LexicalEngineRole::Oracle, false);
+
+        cases.push((
+            "lexical_equivalent",
+            v7c_lexical("lexical_equivalent", v7c_bundle(LexicalEngineRole::Subject, false), oracle_bundle()),
+        ));
+
+        cases.push((
+            "lexical_metadata_deferred_waiver",
+            v7c_lexical("lexical_metadata_deferred_waiver", v7c_bundle(LexicalEngineRole::Subject, true), oracle_bundle()),
+        ));
+
+        let mut context = v7c_bundle(LexicalEngineRole::Subject, false);
+        v7c_map_bundle_contexts(&mut context, |ctx| ctx.seed += 1);
+        cases.push(("lexical_context", v7c_lexical("lexical_context", context, oracle_bundle())));
+
+        let mut outcome = v7c_bundle(LexicalEngineRole::Subject, false);
+        outcome.full_search = v7c_error_observation("quill", "subject full-search failure");
+        cases.push(("lexical_outcome", v7c_lexical("lexical_outcome", outcome, oracle_bundle())));
+
+        let mut ordering = v7c_bundle(LexicalEngineRole::Subject, false);
+        v7c_mutate_candidate_hit(
+            &mut ordering,
+            1,
+            &|hit| hit.doc_id = "doc-3".to_owned(),
+            &|hit| hit.doc_id = "doc-3".to_owned(),
+        );
+        cases.push(("lexical_ordering", v7c_lexical("lexical_ordering", ordering, oracle_bundle())));
+
+        let mut score = v7c_bundle(LexicalEngineRole::Subject, false);
+        v7c_mutate_candidate_hit(
+            &mut score,
+            0,
+            &|hit| {
+                hit.normalized_score_bits = 3.4_f32.to_bits();
+                hit.raw_lexical_score_bits = Some(3.4_f32.to_bits());
+            },
+            &|hit| hit.raw_lexical_score_bits = Some(3.4_f32.to_bits()),
+        );
+        cases.push(("lexical_score", v7c_lexical("lexical_score", score, oracle_bundle())));
+
+        // NOTE: LexicalMismatchClass::SourceIdentity has no valid-evidence
+        // production path under the current hydration invariants: ordinary
+        // boundaries forbid source/index variation outright, hydration inputs
+        // are deterministically projected from the candidates, and hydration
+        // post-states may differ from inputs only in metadata. The class
+        // remains pinned by the comparator's per-hit comparison rule and its
+        // invalid-evidence rejection tests. The replay test asserts both the
+        // ten reachable classes and this documented absence.
+
+        let mut metadata = v7c_bundle(LexicalEngineRole::Subject, false);
+        v7c_mutate_candidate_hit(
+            &mut metadata,
+            0,
+            &|hit| hit.metadata = SensitiveValueObservation::from_text("corpus metadata value"),
+            &|hit| hit.metadata = SensitiveValueObservation::from_text("corpus metadata value"),
+        );
+        cases.push(("lexical_metadata", v7c_lexical("lexical_metadata", metadata, oracle_bundle())));
+
+        let mut explanation = v7c_bundle(LexicalEngineRole::Subject, false);
+        v7c_mutate_candidate_hit(
+            &mut explanation,
+            0,
+            &|hit| hit.explanation =
+                SensitiveValueObservation::from_text("corpus explanation value"),
+            &|_| {},
+        );
+        cases.push(("lexical_explanation", v7c_lexical("lexical_explanation", explanation, oracle_bundle())));
+
+        // NOTE: LexicalMismatchClass::Snippet and ::Highlight are likewise
+        // unreachable in bundle evidence: exposure is uniform across all
+        // lanes of a bundle, hydration projections always carry
+        // NotExposed snippet/highlight states, and exposed-exposure lanes
+        // reject NotExposed hits — so no valid bundle can expose snippet or
+        // highlight content at all. Both classes stay pinned at the
+        // single-observation level by comparator unit tests.
+
+        let counted_exposure = LexicalExposureContract {
+            total_count: LexicalCountExposure::ExactRequested,
+            ..LexicalExposureContract::CORE_LEXICAL_SEARCH
+        };
+        let set_total = |bundle: &mut LexicalContractBundle, total: u64| {
+            for observation in [&mut bundle.full_search, &mut bundle.fusion_candidates] {
+                if let LexicalObservationOutcome::Success { total_count, .. } =
+                    &mut observation.outcome
+                {
+                    *total_count = LexicalCountState::Value(total);
+                }
+            }
+        };
+        let mut count_subject = v7c_bundle_ex(LexicalEngineRole::Subject, false, counted_exposure);
+        set_total(&mut count_subject, 3);
+        let mut count_oracle = v7c_bundle_ex(LexicalEngineRole::Oracle, false, counted_exposure);
+        set_total(&mut count_oracle, 2);
+        cases.push(("lexical_count", v7c_lexical("lexical_count", count_subject, count_oracle)));
+
+        let mut error_subject = v7c_bundle(LexicalEngineRole::Subject, false);
+        error_subject.full_search =
+            v7c_error_observation("quill", "subject typed parse failure");
+        let mut error_oracle = v7c_bundle(LexicalEngineRole::Oracle, false);
+        error_oracle.full_search = v7c_error_observation("tantivy", "oracle typed parse failure");
+        cases.push(("lexical_error", v7c_lexical("lexical_error", error_subject, error_oracle)));
+
+        cases
+    }
+
+    // --- Corpus assembly and shared derivation ----------------------------
+
+    fn v7c_query(
+        id: &str,
+        kind: GeneratedQueryKind,
+        limit: u64,
+        offset: u64,
+        count_requested: bool,
+    ) -> Box<GeneratedQueryCase> {
+        Box::new(GeneratedQueryCase {
+            id: id.to_owned(),
+            syntax: QuerySyntax::Default,
+            query_kind: kind,
+            query: format!("corpus query {id}"),
+            limit,
+            offset,
+            count_requested,
+            filters: crate::generator::GeneratedQueryFilters::default(),
+            expected_divergence: None,
+            source: "bd-campaign-report-v7-replay-freeze-715tp-constructed".to_owned(),
+        })
+    }
+
+    fn v7c_exact_rank() -> (EngineObservation, EngineObservation) {
+        (
+            v7c_observation(vec![v7c_hit("a", 5.0, 1), v7c_hit("b", 4.0, 2)]),
+            v7c_observation(vec![v7c_oracle_hit("a", 5.0, 1), v7c_oracle_hit("b", 4.0, 2)]),
+        )
+    }
+
+    /// A cutoff substitution with a complete expanded oracle tie group: the
+    /// subject walked `c` into the page where the oracle shows `b`, and the
+    /// complete {b, c} group proves the difference is order-only.
+    fn v7c_cutoff_rank(complete: bool) -> (EngineObservation, EngineObservation) {
+        let mut subject = v7c_observation(vec![v7c_hit("a", 5.0, 1), v7c_hit("c", 4.0, 3)]);
+        subject.match_count = CountState::Value(3);
+        let mut oracle = v7c_observation(vec![v7c_oracle_hit("a", 5.0, 1), v7c_oracle_hit("b", 4.0, 2)]);
+        oracle.match_count = CountState::Value(3);
+        oracle.cutoff_tie_group = vec![v7c_oracle_hit("b", 4.0, 2), v7c_oracle_hit("c", 4.0, 3)];
+        oracle.cutoff_tie_complete = complete;
+        (subject, oracle)
+    }
+
+    /// A leading-offset substitution: page [C9, D8] at offset 2 inside oracle
+    /// order A10, B9, C9, D8; the subject walked B9 into the page instead.
+    fn v7c_offset_rank(complete: bool) -> (EngineObservation, EngineObservation) {
+        let subject = v7c_observation(vec![v7c_hit("b", 9.0, 1), v7c_hit("d", 8.0, 3)]);
+        let mut oracle = v7c_observation(vec![v7c_oracle_hit("c", 9.0, 2), v7c_oracle_hit("d", 8.0, 3)]);
+        oracle.offset_tie_group = vec![v7c_oracle_hit("b", 9.0, 1), v7c_oracle_hit("c", 9.0, 2)];
+        oracle.offset_tie_complete = complete;
+        (subject, oracle)
+    }
+
+    fn v7c_empty_page_rank() -> (EngineObservation, EngineObservation) {
+        let mut subject = v7c_observation(Vec::new());
+        subject.match_count = CountState::Value(2);
+        let mut oracle = v7c_observation(Vec::new());
+        oracle.match_count = CountState::Value(2);
+        (subject, oracle)
+    }
+
+    fn v7c_ast_rank(kind: AstLoweringKind) -> (EngineObservation, EngineObservation) {
+        let (mut subject, oracle) = v7c_exact_rank();
+        subject.ast_differences = vec![AstDifference {
+            kind,
+            oracle: "tantivy lowered form".to_owned(),
+            subject: "quill lowered form".to_owned(),
+        }];
+        (subject, oracle)
+    }
+
+    /// Same hits on both sides with one-ulp score differences inside the
+    /// configured epsilon: classified ScoreEpsilon only because the case
+    /// config opts into the typed summation-association reason.
+    fn v7c_score_epsilon_rank() -> (EngineObservation, EngineObservation) {
+        let nudged = |score: f32| f32::from_bits(score.to_bits() + 1);
+        (
+            v7c_observation(vec![v7c_hit("a", 5.0, 1), v7c_hit("b", 4.0, 2)]),
+            v7c_observation(vec![
+                v7c_oracle_hit("a", nudged(5.0), 1),
+                v7c_oracle_hit("b", nudged(4.0), 2),
+            ]),
+        )
+    }
+
+    fn v7c_count_mismatch_rank() -> (EngineObservation, EngineObservation) {
+        let (mut subject, mut oracle) = v7c_exact_rank();
+        subject.match_count = CountState::Value(2);
+        oracle.match_count = CountState::Value(3);
+        (subject, oracle)
+    }
+
+    fn v7c_doc_count_mismatch_rank() -> (EngineObservation, EngineObservation) {
+        let (mut subject, mut oracle) = v7c_exact_rank();
+        subject.doc_count = 9;
+        oracle.doc_count = 8;
+        (subject, oracle)
+    }
+
+    fn v7c_snippet_mismatch_rank() -> (EngineObservation, EngineObservation) {
+        let (mut subject, mut oracle) = v7c_exact_rank();
+        subject
+            .snippets
+            .insert("a".to_owned(), "subject snippet text".to_owned());
+        oracle
+            .snippets
+            .insert("a".to_owned(), "oracle snippet text".to_owned());
+        (subject, oracle)
+    }
+
+    /// Every case input in stable corpus order. Lexical comparisons are
+    /// shared from the class-case library so each lexical behavior is pinned
+    /// exactly once.
+    fn v7c_case_inputs() -> Vec<(String, Box<GeneratedQueryCase>, StoredV7CaseEvidence)> {
+        let default_config = ComparatorConfig::default();
+        let epsilon_config = ComparatorConfig::default()
+            .with_score_epsilon_reason(ScoreEpsilonReason::SummationAssociation);
+
+        let mut inputs: Vec<(String, Box<GeneratedQueryCase>, StoredV7CaseEvidence)> = Vec::new();
+        let mut add = |name: &str,
+                       query: Box<GeneratedQueryCase>,
+                       rank: (EngineObservation, EngineObservation),
+                       config: ComparatorConfig,
+                       lexical_case: &str| {
+            let evidence = StoredV7CaseEvidence::Completed {
+                subject: Box::new(rank.0),
+                oracle: Box::new(rank.1),
+                comparator_config: config,
+                lexical: lexical_case.to_owned(),
+            };
+            inputs.push((name.to_owned(), query, evidence));
+        };
+        let equivalent = "lexical_equivalent";
+
+        add(
+            "exact-term",
+            v7c_query("exact-term", GeneratedQueryKind::Term, 10, 0, false),
+            v7c_exact_rank(),
+            default_config,
+            equivalent,
+        );
+        add(
+            "tie-order-cutoff-complete",
+            v7c_query("tie-order-cutoff-complete", GeneratedQueryKind::MultiTerm, 2, 0, true),
+            v7c_cutoff_rank(true),
+            default_config,
+            equivalent,
+        );
+        add(
+            "tie-order-offset-complete",
+            v7c_query("tie-order-offset-complete", GeneratedQueryKind::Paginated, 2, 2, true),
+            v7c_offset_rank(true),
+            default_config,
+            equivalent,
+        );
+        add(
+            "score-epsilon-summation",
+            v7c_query("score-epsilon-summation", GeneratedQueryKind::Term, 10, 0, true),
+            v7c_score_epsilon_rank(),
+            epsilon_config,
+            equivalent,
+        );
+        add(
+            "cutoff-incomplete-fails",
+            v7c_query("cutoff-incomplete-fails", GeneratedQueryKind::Phrase, 2, 0, true),
+            v7c_cutoff_rank(false),
+            default_config,
+            equivalent,
+        );
+        add(
+            "offset-incomplete-fails",
+            v7c_query("offset-incomplete-fails", GeneratedQueryKind::Paginated, 2, 2, true),
+            v7c_offset_rank(false),
+            default_config,
+            equivalent,
+        );
+        add(
+            "offset-beyond-empty-page",
+            v7c_query("offset-beyond-empty-page", GeneratedQueryKind::Paginated, 2, 9, true),
+            v7c_empty_page_rank(),
+            default_config,
+            equivalent,
+        );
+        add(
+            "count-only-limit-zero",
+            v7c_query("count-only-limit-zero", GeneratedQueryKind::Counted, 0, 0, true),
+            v7c_empty_page_rank(),
+            default_config,
+            equivalent,
+        );
+        add(
+            "count-mismatch-fails",
+            v7c_query("count-mismatch-fails", GeneratedQueryKind::Counted, 10, 0, true),
+            v7c_count_mismatch_rank(),
+            default_config,
+            equivalent,
+        );
+        add(
+            "doc-count-mismatch-fails",
+            v7c_query("doc-count-mismatch-fails", GeneratedQueryKind::Counted, 10, 0, true),
+            v7c_doc_count_mismatch_rank(),
+            default_config,
+            equivalent,
+        );
+        add(
+            "snippet-mismatch-fails",
+            v7c_query("snippet-mismatch-fails", GeneratedQueryKind::Phrase, 10, 0, false),
+            v7c_snippet_mismatch_rank(),
+            default_config,
+            equivalent,
+        );
+        add(
+            "oversized-token-unregistered",
+            v7c_query("oversized-token-unregistered", GeneratedQueryKind::Term, 10, 0, false),
+            v7c_ast_rank(AstLoweringKind::OversizedQueryToken),
+            default_config,
+            equivalent,
+        );
+        for (name, kind, divergence) in [
+            ("register-oracle-bug", AstLoweringKind::OracleBug, "DIV-701"),
+            ("register-query-canonicalization", AstLoweringKind::QueryCanonicalization, "DIV-702"),
+            ("register-glob-expansion", AstLoweringKind::GlobExpansionLimit, "DIV-703"),
+            ("register-stats-semantics", AstLoweringKind::StatsSemantics, "DIV-704"),
+            ("register-unicode-edge", AstLoweringKind::UnicodeEdge, "DIV-705"),
+            ("register-oversized-token", AstLoweringKind::OversizedQueryToken, "DIV-706"),
+        ] {
+            let query_kind = if name == "register-glob-expansion" {
+                GeneratedQueryKind::Glob {
+                    pattern_class: GlobPatternClass::Exact,
+                }
+            } else if name == "register-oracle-bug" {
+                GeneratedQueryKind::Boolean
+            } else {
+                GeneratedQueryKind::Term
+            };
+            let mut query = v7c_query(name, query_kind, 10, 0, false);
+            query.expected_divergence = Some(divergence.to_owned());
+            add(name, query, v7c_ast_rank(kind), default_config, equivalent);
+        }
+        let mut not_registered = v7c_query(
+            "expected-not-registered",
+            GeneratedQueryKind::StructuredFilter {
+                filter_class: StructuredFilterClass::Agent,
+            },
+            10,
+            0,
+            false,
+        );
+        not_registered.expected_divergence = Some("DIV-799".to_owned());
+        add(
+            "expected-not-registered",
+            not_registered,
+            v7c_ast_rank(AstLoweringKind::OracleBug),
+            default_config,
+            equivalent,
+        );
+        let mut mismatch = v7c_query(
+            "expected-mismatch",
+            GeneratedQueryKind::Range {
+                range_class: RangeClass::Inclusive,
+            },
+            10,
+            0,
+            false,
+        );
+        mismatch.expected_divergence = Some("DIV-704".to_owned());
+        add(
+            "expected-mismatch",
+            mismatch,
+            v7c_ast_rank(AstLoweringKind::UnicodeEdge),
+            default_config,
+            equivalent,
+        );
+        for (name, lexical_case) in [
+            ("lexical-context-mismatch", "lexical_context"),
+            ("lexical-outcome-mismatch", "lexical_outcome"),
+            ("lexical-ordering-mismatch", "lexical_ordering"),
+            ("lexical-score-mismatch", "lexical_score"),
+            ("lexical-metadata-mismatch", "lexical_metadata"),
+            ("lexical-explanation-mismatch", "lexical_explanation"),
+            ("lexical-count-mismatch", "lexical_count"),
+            ("lexical-error-mismatch", "lexical_error"),
+        ] {
+            add(
+                name,
+                v7c_query(name, GeneratedQueryKind::Term, 10, 0, false),
+                v7c_exact_rank(),
+                default_config,
+                lexical_case,
+            );
+        }
+        add(
+            "lexical-metadata-deferred-waiver",
+            v7c_query("lexical-metadata-deferred-waiver", GeneratedQueryKind::Term, 10, 0, false),
+            v7c_exact_rank(),
+            default_config,
+            "lexical_metadata_deferred_waiver",
+        );
+        inputs.push((
+            "infrastructure-subject-failed".to_owned(),
+            v7c_query("infrastructure-subject-failed", GeneratedQueryKind::Term, 10, 0, false),
+            StoredV7CaseEvidence::Infrastructure {
+                reason: CampaignCaseReason::SubjectExecutionFailed,
+            },
+        ));
+        inputs
+    }
+
+    /// One case replayed purely from its stored evidence.
+    struct StoredV7ReplayedCase {
+        comparison: Option<ComparisonReport>,
+        evidence: Option<ArtifactLexicalContractEvidence>,
+        case_result: CampaignCaseResult,
+    }
+
+    /// The single derivation path shared by generation and pinned replay:
+    /// recompute the rank comparison from the stored observations, re-validate
+    /// the total lexical comparison from its retained bundles, classify, and
+    /// assemble the case result exactly as the campaign evidence validator
+    /// does. No expected value is ever read here.
+    fn replay_stored_v7_case(
+        query: &GeneratedQueryCase,
+        evidence: &StoredV7CaseEvidence,
+        library: &BTreeMap<String, Box<LexicalContractComparison>>,
+        registry: &DivergenceRegistry,
+    ) -> Result<StoredV7ReplayedCase, GauntletError> {
+        match evidence {
+            StoredV7CaseEvidence::Completed {
+                subject,
+                oracle,
+                comparator_config,
+                lexical,
+            } => {
+                let lexical = library.get(lexical).ok_or_else(|| {
+                    campaign_error(format!(
+                        "corpus case references unknown lexical library entry {lexical}"
+                    ))
+                })?;
+                let comparison = compare_observations_stored_v7(
+                    (**subject).clone(),
+                    (**oracle).clone(),
+                    *comparator_config,
+                )?;
+                lexical.validate_replay()?;
+                let evidence = ArtifactLexicalContractEvidence::CoreLexicalV3 {
+                    comparison: lexical.clone(),
+                };
+                let (disposition, reason, registered_divergence) =
+                    classify_case_with_lexical(query, &comparison, &evidence, registry);
+                let case_result = CampaignCaseResult {
+                    case_id: query.id.clone(),
+                    query_class: query_class(query),
+                    disposition,
+                    comparison_status: Some(comparison.status),
+                    rank_class: Some(comparison.rank_class),
+                    lexical_contract: lexical_case_summary(&evidence)?,
+                    artifact_hash: None,
+                    registered_divergence,
+                    first_divergence: comparison.first_divergence.clone(),
+                    reason,
+                    diagnostic: None,
+                };
+                Ok(StoredV7ReplayedCase {
+                    comparison: Some(comparison),
+                    evidence: Some(evidence),
+                    case_result,
+                })
+            }
+            StoredV7CaseEvidence::Infrastructure { reason } => {
+                let case_result = CampaignCaseResult {
+                    case_id: query.id.clone(),
+                    query_class: query_class(query),
+                    disposition: CampaignDisposition::InfrastructureError,
+                    comparison_status: None,
+                    rank_class: None,
+                    lexical_contract: CampaignLexicalCaseSummary::CoreLexicalV3Unavailable,
+                    artifact_hash: None,
+                    registered_divergence: None,
+                    first_divergence: None,
+                    reason: Some(reason.clone()),
+                    diagnostic: None,
+                };
+                Ok(StoredV7ReplayedCase {
+                    comparison: None,
+                    evidence: None,
+                    case_result,
+                })
+            }
+        }
+    }
+
+    /// Report-level aggregation shared by generation and pinned replay:
+    /// mismatch grouping, lexical mismatch grouping, lexical coverage,
+    /// query-class summaries, and the final pass verdict.
+    fn aggregate_stored_v7(
+        replayed: &[StoredV7ReplayedCase],
+        confidence: f64,
+    ) -> StoredV7AggregationAggregates {
+        let mut mismatches = MismatchCollection::default();
+        let mut lexical_mismatches = LexicalMismatchCollection::default();
+        let mut lexical_coverage =
+            CampaignLexicalCoverageAccumulator::new(CampaignContractMode::CoreLexicalV3);
+        let mut results = Vec::with_capacity(replayed.len());
+        for case in replayed {
+            if let (Some(comparison), Some(evidence)) = (&case.comparison, &case.evidence) {
+                mismatches
+                    .record(comparison, &case.case_result.case_id)
+                    .expect("corpus mismatch budget");
+                lexical_mismatches
+                    .record(evidence, &case.case_result.case_id)
+                    .expect("corpus lexical mismatch budget");
+                lexical_coverage.record(evidence);
+            }
+            results.push(case.case_result.clone());
+        }
+        let passed = results.iter().all(|result| result.disposition.passes());
+        StoredV7AggregationAggregates {
+            query_classes: summarize_query_classes_stored_v7(&results, confidence),
+            mismatches: mismatches.finish(),
+            lexical_mismatches: lexical_mismatches.finish(),
+            lexical_coverage: lexical_coverage.finish(),
+            passed,
+        }
+    }
+
+    /// Build the full corpus: register entries are computed from a first
+    /// replay with an empty registry (their mismatch signatures are derived,
+    /// never hand-written), then every case is replayed against the real
+    /// registry and the aggregates accumulated.
+    fn build_stored_v7_aggregation_corpus() -> StoredV7AggregationCorpus {
+        let inputs = v7c_case_inputs();
+        let library: BTreeMap<String, Box<LexicalContractComparison>> =
+            v7c_lexical_class_cases()
+                .into_iter()
+                .map(|(name, comparison)| (name.to_owned(), comparison))
+                .collect();
+        let empty_registry = DivergenceRegistry::default();
+
+        let mut register_entries = Vec::new();
+        for (_, query, evidence) in &inputs {
+            let Some(expected_id) = query.expected_divergence.clone() else {
+                continue;
+            };
+            if expected_id == "DIV-799" {
+                continue;
+            }
+            let replayed = replay_stored_v7_case(query, evidence, &library, &empty_registry)
+                .expect("register case replays with empty registry");
+            let comparison = replayed
+                .comparison
+                .as_ref()
+                .expect("register case has a comparison");
+            let class = comparison
+                .divergences
+                .iter()
+                .find(|divergence| !divergence.class.is_auto())
+                .map(|divergence| divergence.class)
+                .expect("register case has a non-auto divergence");
+            let mut signatures = comparison
+                .divergences
+                .iter()
+                .filter(|divergence| !divergence.class.is_auto())
+                .map(|divergence| mismatch_signature(comparison.rank_class, divergence))
+                .collect::<Vec<_>>();
+            signatures.sort();
+            if expected_id != "DIV-704" || query.id == "register-stats-semantics" {
+                register_entries.push(DivergenceRegisterEntry {
+                    id: expected_id,
+                    class,
+                    fixture_id: query.id.clone(),
+                    mismatch_signatures: signatures,
+                    decision: DivergenceRegisterDecision::Accept,
+                    root_cause: format!("corpus reviewed root cause for {}", query.id),
+                    consumer_impact: "corpus reviewed consumer impact".to_owned(),
+                    reviewer: "corpus-second-reviewer".to_owned(),
+                    reviewed_at: "2026-08-08".to_owned(),
+                });
+            }
+        }
+        register_entries.sort_by(|left, right| left.id.cmp(&right.id));
+        register_entries.dedup_by(|left, right| left.id == right.id);
+        let registry = DivergenceRegistry::new(register_entries).expect("corpus registry validates");
+
+        let mut cases = Vec::with_capacity(inputs.len());
+        let mut replayed_cases = Vec::with_capacity(inputs.len());
+        for (name, query, evidence) in inputs {
+            let replayed = replay_stored_v7_case(&query, &evidence, &library, &registry)
+                .expect("corpus case replays");
+            let expected = StoredV7ExpectedCase {
+                comparison: replayed.comparison.clone(),
+                case_result: replayed.case_result.clone(),
+            };
+            replayed_cases.push(replayed);
+            cases.push(StoredV7AggregationCase {
+                name,
+                query,
+                evidence,
+                expected,
+            });
+        }
+        let aggregates = aggregate_stored_v7(&replayed_cases, STORED_V7_CORPUS_CONFIDENCE);
+        StoredV7AggregationCorpus {
+            schema: STORED_V7_AGGREGATION_CORPUS_SCHEMA.to_owned(),
+            confidence_bits: STORED_V7_CORPUS_CONFIDENCE.to_bits(),
+            registry,
+            lexical_library: library
+                .into_iter()
+                .map(|(name, comparison)| StoredV7LexicalLibraryEntry { name, comparison })
+                .collect(),
+            cases,
+            expected_aggregates: aggregates,
+        }
+    }
+
+    /// Review tool for fixture creation and schema bumps. NEVER run to force
+    /// green: regenerated bytes require a new corpus schema and independent
+    /// review before they may replace the pinned fixture.
+    #[test]
+    #[ignore = "review tool: run explicitly with QUILL_GAUNTLET_V7_CORPUS_OUT=<path>"]
+    fn generate_stored_v7_aggregation_corpus_fixture() {
+        let Some(path) = std::env::var_os("QUILL_GAUNTLET_V7_CORPUS_OUT") else {
+            return;
+        };
+        let corpus = build_stored_v7_aggregation_corpus();
+        let mut bytes = serde_json::to_vec(&corpus).expect("serialize corpus");
+        bytes.push(b'\n');
+        std::fs::write(path, &bytes).expect("write corpus fixture");
+        eprintln!(
+            "stored V7 aggregation corpus: {} bytes, sha256 {}",
+            bytes.len(),
+            lower_hex(&Sha256::digest(&bytes))
+        );
+    }
+
+    /// Index the lexical library, failing closed on duplicate names, unknown
+    /// case references, or library entries no case consumes.
+    fn stored_v7_library(
+        corpus: &StoredV7AggregationCorpus,
+    ) -> Result<BTreeMap<String, Box<LexicalContractComparison>>, String> {
+        let mut library = BTreeMap::new();
+        for entry in &corpus.lexical_library {
+            if library
+                .insert(entry.name.clone(), entry.comparison.clone())
+                .is_some()
+            {
+                return Err(format!(
+                    "stored V7 aggregation corpus has duplicate lexical library entry {}",
+                    entry.name
+                ));
+            }
+        }
+        let mut used = BTreeMap::new();
+        for case in &corpus.cases {
+            if let StoredV7CaseEvidence::Completed { lexical, .. } = &case.evidence {
+                if !library.contains_key(lexical) {
+                    return Err(format!(
+                        "stored V7 case {} references unknown lexical library entry {lexical}",
+                        case.name
+                    ));
+                }
+                *used.entry(lexical.clone()).or_insert(0_usize) += 1;
+            }
+        }
+        for name in library.keys() {
+            if !used.contains_key(name) {
+                return Err(format!(
+                    "stored V7 lexical library entry {name} is consumed by no case"
+                ));
+            }
+        }
+        Ok(library)
+    }
+
+    fn load_pinned_stored_v7_aggregation_corpus(
+        bytes: &[u8],
+    ) -> Result<StoredV7AggregationCorpus, String> {
+        if lower_hex(&Sha256::digest(bytes)) != PINNED_STORED_V7_AGGREGATION_CORPUS_SHA256 {
+            return Err(
+                "stored V7 aggregation corpus bytes differ from the pinned SHA-256".to_owned(),
+            );
+        }
+        let canonical = bytes
+            .strip_suffix(b"\n")
+            .ok_or_else(|| "stored V7 aggregation corpus must end in exactly one LF".to_owned())?;
+        if canonical.ends_with(b"\n") {
+            return Err("stored V7 aggregation corpus must end in exactly one LF".to_owned());
+        }
+        let corpus: StoredV7AggregationCorpus =
+            serde_json::from_slice(canonical).map_err(|error| error.to_string())?;
+        if corpus.schema != STORED_V7_AGGREGATION_CORPUS_SCHEMA {
+            return Err("stored V7 aggregation corpus schema is not the pinned v1".to_owned());
+        }
+        stored_v7_library(&corpus)?;
+        Ok(corpus)
+    }
+
+    #[test]
+    fn pinned_stored_v7_aggregation_corpus_replays_without_live_creation() {
+        let corpus = load_pinned_stored_v7_aggregation_corpus(
+            PINNED_STORED_V7_AGGREGATION_CORPUS_BYTES,
+        )
+        .expect("stored V7 aggregation corpus must decode");
+        assert_eq!(corpus.cases.len(), 30, "bounded corpus cardinality");
+        let library = stored_v7_library(&corpus).expect("corpus library must be coherent");
+
+        let mut replayed_cases = Vec::with_capacity(corpus.cases.len());
+        for case in &corpus.cases {
+            let replayed =
+                replay_stored_v7_case(&case.query, &case.evidence, &library, &corpus.registry)
+                    .unwrap_or_else(|error| {
+                        panic!("stored V7 case {} must replay: {error}", case.name)
+                    });
+            assert_eq!(
+                replayed.comparison, case.expected.comparison,
+                "stored V7 case {} rank-envelope comparison drifted",
+                case.name
+            );
+            assert_eq!(
+                replayed.case_result, case.expected.case_result,
+                "stored V7 case {} case result drifted",
+                case.name
+            );
+            replayed_cases.push(replayed);
+        }
+        let aggregates =
+            aggregate_stored_v7(&replayed_cases, f64::from_bits(corpus.confidence_bits));
+        assert_eq!(
+            aggregates, corpus.expected_aggregates,
+            "stored V7 report-level aggregates drifted"
+        );
+
+        // Taxonomy coverage: the corpus must keep every comparator-emittable
+        // rank class, divergence class, lexical mismatch class, disposition,
+        // and cutoff/offset boundary. A future comparator change that drops a
+        // class fails here rather than silently shrinking the freeze.
+        let comparisons: Vec<&ComparisonReport> = replayed_cases
+            .iter()
+            .filter_map(|case| case.comparison.as_ref())
+            .collect();
+        for rank_class in [
+            RankClass::RankExact,
+            RankClass::TieOrder,
+            RankClass::ScoreEpsilon,
+            RankClass::RankMismatch,
+        ] {
+            assert!(
+                comparisons.iter().any(|c| c.rank_class == rank_class),
+                "corpus lost rank class {rank_class:?}"
+            );
+        }
+        for class in [
+            DivergenceClass::TieOrder,
+            DivergenceClass::ScoreEpsilon,
+            DivergenceClass::RankMismatch,
+            DivergenceClass::CountMismatch,
+            DivergenceClass::DocumentCountMismatch,
+            DivergenceClass::SnippetMismatch,
+            DivergenceClass::OracleBug,
+            DivergenceClass::OversizedQueryToken,
+            DivergenceClass::QueryCanonicalization,
+            DivergenceClass::GlobExpansionLimit,
+            DivergenceClass::StatsSemantics,
+            DivergenceClass::UnicodeEdge,
+        ] {
+            assert!(
+                comparisons
+                    .iter()
+                    .any(|c| c.divergences.iter().any(|d| d.class == class)),
+                "corpus lost comparator-emittable divergence class {class:?}"
+            );
+        }
+        // SnippetWindow and PostingRecordSemantics are register/triage-only:
+        // the stored-V7 comparator has no emission path, so no honest stored
+        // comparison may carry them.
+        for class in [
+            DivergenceClass::SnippetWindow,
+            DivergenceClass::PostingRecordSemantics,
+        ] {
+            assert!(
+                !comparisons
+                    .iter()
+                    .any(|c| c.divergences.iter().any(|d| d.class == class)),
+                "register-only divergence class {class:?} appeared in a stored comparison"
+            );
+        }
+        for class in [
+            LexicalMismatchClass::Context,
+            LexicalMismatchClass::Outcome,
+            LexicalMismatchClass::Ordering,
+            LexicalMismatchClass::Score,
+            LexicalMismatchClass::Metadata,
+            LexicalMismatchClass::Explanation,
+            LexicalMismatchClass::Count,
+            LexicalMismatchClass::Error,
+        ] {
+            assert!(
+                corpus
+                    .lexical_library
+                    .iter()
+                    .any(|entry| entry.comparison.mismatches.iter().any(|m| m.class == class)),
+                "corpus lost lexical mismatch class {class:?}"
+            );
+        }
+        // SourceIdentity, Snippet, and Highlight are unpinnable in honest
+        // stored bundle evidence: ordinary boundaries reject source/index
+        // variation as invalid, hydration inputs are candidate projections,
+        // hydration post-states may only restore metadata, and the uniform
+        // per-bundle exposure rule makes snippet/highlight content
+        // simultaneously required and impossible. No valid bundle pair can
+        // carry them, so the corpus must not either; they remain pinned at
+        // the single-observation level by comparator unit tests.
+        for class in [
+            LexicalMismatchClass::SourceIdentity,
+            LexicalMismatchClass::Snippet,
+            LexicalMismatchClass::Highlight,
+        ] {
+            assert!(
+                corpus
+                    .lexical_library
+                    .iter()
+                    .all(|entry| entry.comparison.mismatches.iter().all(|m| m.class != class)),
+                "{class:?} cannot appear in validator-legal stored evidence"
+            );
+        }
+        for disposition in [
+            CampaignDisposition::Exact,
+            CampaignDisposition::AutoClassified,
+            CampaignDisposition::RegisterClassified,
+            CampaignDisposition::Unclassified,
+            CampaignDisposition::InfrastructureError,
+        ] {
+            assert!(
+                replayed_cases
+                    .iter()
+                    .any(|case| case.case_result.disposition == disposition),
+                "corpus lost disposition {disposition:?}"
+            );
+        }
+        assert!(
+            !aggregates.passed,
+            "a corpus carrying unclassified and infrastructure cases cannot pass"
+        );
+        assert!(
+            aggregates
+                .query_classes
+                .iter()
+                .any(|summary| summary.exact > 0 && summary.unclassified > 0),
+            "at least one query class must pin mixed dispositions"
+        );
+
+        // Planted negatives: substitution, regeneration, and trailing-LF
+        // drift are refused before any decode or replay.
+        let mut substituted = PINNED_STORED_V7_AGGREGATION_CORPUS_BYTES.to_vec();
+        let Some(first_byte) = substituted.first_mut() else {
+            return;
+        };
+        *first_byte ^= 1;
+        assert!(
+            load_pinned_stored_v7_aggregation_corpus(&substituted).is_err(),
+            "a regenerated or substituted aggregation corpus must be refused"
+        );
+        let mut double_lf = PINNED_STORED_V7_AGGREGATION_CORPUS_BYTES.to_vec();
+        double_lf.push(b'\n');
+        assert!(
+            load_pinned_stored_v7_aggregation_corpus(&double_lf).is_err(),
+            "the trailing-LF policy must refuse a second terminator"
+        );
+        assert!(
+            load_pinned_stored_v7_aggregation_corpus(
+                &PINNED_STORED_V7_AGGREGATION_CORPUS_BYTES
+                    [..PINNED_STORED_V7_AGGREGATION_CORPUS_BYTES.len() - 1]
+            )
+            .is_err(),
+            "the trailing-LF policy must refuse a missing terminator"
+        );
+        let mut unknown: serde_json::Value =
+            serde_json::from_slice(PINNED_STORED_V7_AGGREGATION_CORPUS_BYTES)
+                .expect("decode pinned corpus value");
+        unknown["future_unbound_field"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<StoredV7AggregationCorpus>(unknown).is_err(),
+            "unknown corpus fields must fail closed"
+        );
+    }
+
+    // --- Two-fresh-process deterministic replay ---------------------------
+    //
+    // The replay contract's process boundary: two independent processes each
+    // re-derive the entire corpus from the pinned bytes and emit a receipt
+    // binding the fixture, the derivation digest, and the strict-remote
+    // environment identity (source revision/dirty state, Cargo.lock SHA-256,
+    // test-ELF SHA-256). The driver requires byte-identical receipts, bounded
+    // child output, absent redaction canaries, and retains child output as a
+    // failure artifact on any violation.
+
+    const STORED_V7_REPLAY_RECEIPT_SCHEMA: &str =
+        "frankensearch.quill-campaign-report-v7-aggregation-replay-receipt.v1";
+    const STORED_V7_REPLAY_CHILD_ENV: &str = "QUILL_GAUNTLET_V7_AGGREGATION_REPLAY_CHILD";
+    const STORED_V7_REPLAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+    const STORED_V7_REPLAY_MAX_LOG_LINES: usize = 10_000;
+    const STORED_V7_REPLAY_MAX_LOG_BYTES: usize = 8 * 1024 * 1024;
+
+    /// Raw sensitive source texts planted in the corpus evidence. Redaction
+    /// guarantees they survive only as digests; their appearance in replay
+    /// output proves a redaction breach.
+    const STORED_V7_REDACTION_CANARIES: [&str; 5] = [
+        "corpus metadata value",
+        "corpus explanation value",
+        "corpus redacted query",
+        "subject typed parse failure",
+        "oracle typed parse failure",
+    ];
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StoredV7ReplayReceipt {
+        schema: String,
+        fixture_sha256: String,
+        replay_digest: String,
+        case_count: usize,
+        source_git_revision: String,
+        source_git_dirty: bool,
+        cargo_lock_sha256: String,
+        test_elf_sha256: String,
+    }
+
+    /// Re-derive the complete corpus from the pinned fixture: every case and
+    /// every aggregate recomputed from raw stored evidence, with no expected
+    /// value consulted. This is the full replay both fresh processes run.
+    fn replay_stored_v7_aggregation_corpus_fresh(
+    ) -> Result<StoredV7AggregationCorpus, String> {
+        let corpus = load_pinned_stored_v7_aggregation_corpus(
+            PINNED_STORED_V7_AGGREGATION_CORPUS_BYTES,
+        )?;
+        let library = stored_v7_library(&corpus)?;
+        let mut cases = Vec::with_capacity(corpus.cases.len());
+        let mut replayed_cases = Vec::with_capacity(corpus.cases.len());
+        for case in &corpus.cases {
+            let replayed =
+                replay_stored_v7_case(&case.query, &case.evidence, &library, &corpus.registry)
+                    .map_err(|error| format!("case {} failed to replay: {error}", case.name))?;
+            let expected = StoredV7ExpectedCase {
+                comparison: replayed.comparison.clone(),
+                case_result: replayed.case_result.clone(),
+            };
+            replayed_cases.push(replayed);
+            cases.push(StoredV7AggregationCase {
+                name: case.name.clone(),
+                query: case.query.clone(),
+                evidence: case.evidence.clone(),
+                expected,
+            });
+        }
+        let expected_aggregates =
+            aggregate_stored_v7(&replayed_cases, f64::from_bits(corpus.confidence_bits));
+        Ok(StoredV7AggregationCorpus {
+            schema: corpus.schema,
+            confidence_bits: corpus.confidence_bits,
+            registry: corpus.registry,
+            lexical_library: corpus.lexical_library,
+            cases,
+            expected_aggregates,
+        })
+    }
+
+    fn stored_v7_replay_receipt() -> Result<String, String> {
+        let derived = replay_stored_v7_aggregation_corpus_fresh()?;
+        let canonical =
+            serde_json::to_vec(&derived).map_err(|error| format!("receipt encode: {error}"))?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"frankensearch/quill/stored-v7-aggregation-replay/v1\0");
+        hasher.update(&canonical);
+        let producer = crate::artifact::GauntletProducerBuildIdentity::compiled()
+            .map_err(|error| format!("producer identity: {error}"))?;
+        let receipt = StoredV7ReplayReceipt {
+            schema: STORED_V7_REPLAY_RECEIPT_SCHEMA.to_owned(),
+            fixture_sha256: PINNED_STORED_V7_AGGREGATION_CORPUS_SHA256.to_owned(),
+            replay_digest: lower_hex(&hasher.finalize()),
+            case_count: derived.cases.len(),
+            source_git_revision: producer.source_git_revision,
+            source_git_dirty: producer.source_git_dirty,
+            cargo_lock_sha256: producer.cargo_lock_sha256,
+            test_elf_sha256: producer.executable_sha256,
+        };
+        serde_json::to_string(&receipt).map_err(|error| format!("receipt serialize: {error}"))
+    }
+
+    /// Fresh-process helper: replays the pinned corpus, asserts the fresh
+    /// derivation equals the pinned expectation byte-for-byte, and prints the
+    /// receipt on one bounded line. No-op in the parent test process.
+    #[test]
+    fn stored_v7_aggregation_corpus_replay_process_helper() {
+        if std::env::var_os(STORED_V7_REPLAY_CHILD_ENV).is_none() {
+            return;
+        }
+        let derived = replay_stored_v7_aggregation_corpus_fresh()
+            .expect("fresh process must replay the pinned corpus");
+        let pinned = load_pinned_stored_v7_aggregation_corpus(
+            PINNED_STORED_V7_AGGREGATION_CORPUS_BYTES,
+        )
+        .expect("pinned corpus must decode in the fresh process");
+        assert_eq!(
+            derived, pinned,
+            "fresh-process derivation must equal the pinned corpus exactly"
+        );
+        println!(
+            "{}",
+            stored_v7_replay_receipt().expect("fresh process must emit a receipt")
+        );
+    }
+
+    #[test]
+    fn pinned_stored_v7_aggregation_corpus_replays_identically_in_two_fresh_processes() {
+        let current_test = std::env::current_exe().expect("current test executable");
+        let helper_name =
+            "runner::tests::stored_v7_aggregation_corpus::stored_v7_aggregation_corpus_replay_process_helper";
+        let mut receipts = Vec::new();
+        for round in 0..2 {
+            let mut child = std::process::Command::new(&current_test)
+                .args(["--exact", helper_name, "--nocapture"])
+                .env(STORED_V7_REPLAY_CHILD_ENV, "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn fresh replay process");
+
+            let deadline = std::time::Instant::now() + STORED_V7_REPLAY_TIMEOUT;
+            let status = loop {
+                if let Some(status) = child.try_wait().expect("poll fresh replay process") {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let output = child.wait_with_output().expect("collect killed child");
+                    let retained = std::env::temp_dir().join(format!(
+                        "stored-v7-aggregation-replay-timeout-round{round}-{}.log",
+                        std::process::id()
+                    ));
+                    let mut bytes = output.stdout.clone();
+                    bytes.extend_from_slice(&output.stderr);
+                    std::fs::write(&retained, &bytes).expect("retain timeout failure artifact");
+                    panic!(
+                        "fresh replay process exceeded {:?}; failure artifact retained at {}",
+                        STORED_V7_REPLAY_TIMEOUT,
+                        retained.display()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            };
+            let output = child.wait_with_output().expect("collect fresh replay output");
+            let stdout = output.stdout;
+            let stderr = output.stderr;
+            let retain_failure = |reason: &str| -> ! {
+                let retained = std::env::temp_dir().join(format!(
+                    "stored-v7-aggregation-replay-failure-round{round}-{}.log",
+                    std::process::id()
+                ));
+                let mut bytes = stdout.clone();
+                bytes.extend_from_slice(b"\n--- stderr ---\n");
+                bytes.extend_from_slice(&stderr);
+                std::fs::write(&retained, &bytes).expect("retain replay failure artifact");
+                panic!("{reason}; failure artifact retained at {}", retained.display());
+            };
+            if !status.success() {
+                retain_failure("fresh replay process exited nonzero");
+            }
+            let stdout_text = String::from_utf8(stdout.clone()).unwrap_or_else(|_| {
+                retain_failure("fresh replay stdout was not UTF-8");
+            });
+            if stdout.len() > STORED_V7_REPLAY_MAX_LOG_BYTES
+                || stdout_text.lines().count() > STORED_V7_REPLAY_MAX_LOG_LINES
+            {
+                retain_failure("fresh replay output exceeded its bounded budget");
+            }
+            for canary in STORED_V7_REDACTION_CANARIES {
+                if stdout_text.contains(canary) || stderr_text_contains(&stderr, canary) {
+                    retain_failure("fresh replay output leaked a redaction canary");
+                }
+            }
+            let receipt = stdout_text
+                .lines()
+                .find(|line| line.contains(STORED_V7_REPLAY_RECEIPT_SCHEMA))
+                .unwrap_or_else(|| retain_failure("fresh replay process emitted no receipt"))
+                .to_owned();
+            // The receipt must parse under the pinned schema before it may be
+            // compared: an unexpected shape fails here, not at the diff.
+            let _: StoredV7ReplayReceipt =
+                serde_json::from_str(&receipt).unwrap_or_else(|_| {
+                    retain_failure("fresh replay receipt did not decode under its schema");
+                });
+            receipts.push(receipt);
+        }
+        assert_eq!(
+            receipts[0], receipts[1],
+            "two fresh processes must derive byte-identical replay receipts"
+        );
+    }
+
+    fn stderr_text_contains(stderr: &[u8], canary: &str) -> bool {
+        String::from_utf8_lossy(stderr).contains(canary)
+    }
+}
+
 }
