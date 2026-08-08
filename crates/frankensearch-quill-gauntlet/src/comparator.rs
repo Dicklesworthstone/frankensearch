@@ -3689,11 +3689,11 @@ fn synthetic_explanation_observation(score: f32) -> Option<SensitiveValueObserva
 
 /// Canonical hydration-input projection for one lexical candidate.
 ///
-/// `pub(crate)` so the runner's stored-V7 aggregation corpus builds its
+/// `pub` so the runner's stored-V7 aggregation corpus builds its
 /// hydration lanes with exactly the projections this validator derives —
 /// duplicating the rule would let the corpus and the validator drift apart
 /// (bd-campaign-report-v7-replay-freeze-715tp).
-pub(crate) fn expected_lexical_winner_hit(
+pub fn expected_lexical_winner_hit(
     candidate: &LexicalHitObservation,
     candidate_rank: usize,
     winner_rank: usize,
@@ -3728,9 +3728,9 @@ pub(crate) fn expected_lexical_winner_hit(
 
 /// Canonical hydration-input projection for one non-lexical control winner.
 ///
-/// `pub(crate)` for the same stored-V7 aggregation corpus reason as
+/// `pub` for the same stored-V7 aggregation corpus reason as
 /// [`expected_lexical_winner_hit`].
-pub(crate) fn expected_non_lexical_control_hit(
+pub fn expected_non_lexical_control_hit(
     context: &LexicalObservationContext,
     control_id: u32,
     kind: LexicalNonLexicalControlKind,
