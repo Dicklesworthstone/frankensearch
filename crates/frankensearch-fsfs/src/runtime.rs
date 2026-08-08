@@ -14531,7 +14531,9 @@ fn print_cli_help() {
     println!("Search flags: --daemon --no-daemon --daemon-socket <path> --stream");
 }
 
-const fn completion_script(shell: CompletionShell) -> &'static str {
+/// `pub(crate)` so the advertised-command census (bd-rh0t, adapters::cli
+/// tests) can prove completion scripts name exactly the parser's commands.
+pub(crate) const fn completion_script(shell: CompletionShell) -> &'static str {
     match shell {
         CompletionShell::Bash => {
             "complete -W \"search serve index watch explain status flush config download-models download doctor update completions uninstall help version append-batch delete compact daemon\" fsfs"

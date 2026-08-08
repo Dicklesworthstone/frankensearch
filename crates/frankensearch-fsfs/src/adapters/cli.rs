@@ -1948,9 +1948,10 @@ mod tests {
     fn formerly_fictional_commands_fail_with_actionable_errors() {
         for fictional in FORMERLY_FICTIONAL_COMMANDS {
             let argv: Vec<&str> = fictional.split_whitespace().collect();
-            let error = parse_cli_args(argv.clone())
-                .unwrap_or_else(|_| panic!("formerly fictional command {fictional:?} parsed"));
-            let _ = argv;
+            let error = match parse_cli_args(argv) {
+                Ok(_) => panic!("formerly fictional command {fictional:?} parsed"),
+                Err(error) => error,
+            };
             let message = error.to_string();
             assert!(
                 message.contains("unknown command")
@@ -2052,7 +2053,7 @@ mod tests {
             CompletionShell::Fish,
             CompletionShell::PowerShell,
         ] {
-            let script = completion_script(shell);
+            let script = crate::runtime::completion_script(shell);
             for name in CliCommand::ALL_NAMES {
                 assert!(
                     script.contains(name),
