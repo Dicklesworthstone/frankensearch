@@ -167,6 +167,7 @@ pub use perf::{
     peak_rss_bytes, perf_manifest_contract_sha256, perf_writer_heap_bytes,
     seeded_balanced_pair_order, validate_matrix,
 };
+pub use perf::{PERF_RUN_PLAN_DOC_PATH, render_perf_run_plan_markdown};
 pub use perf_assembly::{
     PERF_ASSEMBLY_ENGINE_LIFECYCLE_NO_CLAIM_CODE, PERF_ASSEMBLY_MAX_ARTIFACT_BYTES,
     PERF_ASSEMBLY_MAX_RECEIPT_BYTES, PERF_ASSEMBLY_MAX_RETRY_PREDICATE_BYTES,

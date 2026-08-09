@@ -3926,6 +3926,204 @@ fn validate_qg6_matrix(matrix: &PerfMatrixSpec) -> Result<(), GauntletError> {
     Ok(())
 }
 
+// ─── Human run plan generation (bd-quill-e8-perf-doctrine-x4e4.15) ──────────
+//
+// The normative TOML is the machine-readable source of truth; the human run
+// plan is DERIVED from it (and from the compiled matrix), never hand-written.
+// `render_perf_run_plan_markdown` renders the complete plan; the drift test
+// in this module fails when the committed document differs from a fresh
+// render, so docs and harness cannot disagree silently.
+
+/// Repository path of the generated run-plan document.
+pub const PERF_RUN_PLAN_DOC_PATH: &str = "docs/contracts/quill-perf-gates.run-plan.md";
+
+/// Render the human operator run plan from the normative manifest and the
+/// canonical cell matrix.
+///
+/// The document carries the manifest contract hash it was rendered from; a
+/// reader can prove freshness by comparing hashes, and the drift test proves
+/// it on every build.
+///
+/// # Errors
+///
+/// Returns an error when the manifest is malformed or lacks the defaults the
+/// command template and machine table are rendered from.
+pub fn render_perf_run_plan_markdown() -> Result<String, GauntletError> {
+    use std::fmt::Write as _;
+
+    let manifest: toml::Value = toml::from_str(NORMATIVE_PERF_MANIFEST).map_err(|error| {
+        GauntletError::InvalidCampaign {
+            reason: format!("normative perf manifest does not parse: {error}"),
+        }
+    })?;
+    let defaults = manifest
+        .get("defaults")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| GauntletError::InvalidCampaign {
+            reason: "normative perf manifest lacks [defaults]".to_owned(),
+        })?;
+    let host_command = defaults
+        .get("registered_host_command")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| GauntletError::InvalidCampaign {
+            reason: "normative perf manifest lacks defaults.registered_host_command".to_owned(),
+        })?;
+    let machines = defaults
+        .get("machines")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| GauntletError::InvalidCampaign {
+            reason: "normative perf manifest lacks defaults.machines".to_owned(),
+        })?;
+    let gates = manifest
+        .get("gate")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| GauntletError::InvalidCampaign {
+            reason: "normative perf manifest lacks [gate] tables".to_owned(),
+        })?;
+    let matrix = PerfMatrixSpec::complete();
+    validate_matrix(&matrix)?;
+
+    let mut out = String::new();
+    out.push_str("# Quill Performance Gates — Generated Operator Run Plan\n\n");
+    out.push_str(
+        "**GENERATED FILE — do not edit.** Rendered from `quill-perf-gates.toml` and the\n\
+         compiled `PerfMatrixSpec` by `render_perf_run_plan_markdown`; the gauntlet test\n\
+         `perf_run_plan_document_matches_the_manifest` fails closed on any drift. Regenerate\n\
+         deliberately with `QUILL_PERF_RUN_PLAN_UPDATE=1`.\n\n",
+    );
+    let _ = writeln!(
+        &mut out,
+        "- manifest contract SHA-256: `{}`",
+        perf_manifest_contract_sha256(NORMATIVE_PERF_MANIFEST)
+    );
+    let _ = writeln!(
+        &mut out,
+        "- canonical matrix cells: {}\n",
+        matrix.cells.len()
+    );
+
+    out.push_str("## Registered machines\n\n");
+    out.push_str("| hardware-class | execution-profile | registry status |\n");
+    out.push_str("|---|---|---|\n");
+    let mut machine_keys = Vec::new();
+    for machine in machines {
+        let machine = machine
+            .as_str()
+            .ok_or_else(|| GauntletError::InvalidCampaign {
+                reason: "defaults.machines entries must be strings".to_owned(),
+            })?;
+        let (key, status) = machine.split_once(' ').unwrap_or((machine, ""));
+        let status = status
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim();
+        let (hardware_class, profile) =
+            key.split_once('/')
+                .ok_or_else(|| GauntletError::InvalidCampaign {
+                    reason: format!(
+                        "machine entry {key} is not <hardware-class>/<execution-profile>"
+                    ),
+                })?;
+        let _ = writeln!(&mut out, "| {hardware_class} | {profile} | {status} |");
+        machine_keys.push((hardware_class.to_owned(), profile.to_owned()));
+    }
+    out.push('\n');
+
+    out.push_str("## Gates\n\n");
+    for gate in PerfGate::ALL {
+        let table = gates
+            .get(gate.label())
+            .and_then(toml::Value::as_table)
+            .ok_or_else(|| GauntletError::InvalidCampaign {
+                reason: format!("manifest lacks [gate.{}]", gate.label()),
+            })?;
+        let name = table
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("<unnamed>");
+        let fixture = table
+            .get("fixture")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("<no fixture>");
+        let target = table
+            .get("target")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("<no target>");
+        let activated = table
+            .get("activated")
+            .and_then(toml::Value::as_bool)
+            .ok_or_else(|| GauntletError::InvalidCampaign {
+                reason: format!("gate {} lacks a boolean activated flag", gate.label()),
+            })?;
+        let _ = write!(&mut out, "### {} — {}\n\n", gate.label(), name);
+        let _ = writeln!(&mut out, "- activated: `{activated}`");
+        let _ = writeln!(&mut out, "- fixture: {fixture}");
+        let _ = writeln!(&mut out, "- target: {target}");
+        if let Some(width) = table.get("primary_target_cell_width") {
+            let _ = writeln!(&mut out, "- primary_target_cell_width: {width}");
+        }
+        if let Some(qpc) = table.get("queries_per_class") {
+            let _ = writeln!(&mut out, "- queries_per_class: {qpc}");
+        }
+        out.push('\n');
+
+        let cells = matrix.for_gate(gate);
+        let _ = write!(&mut out, "**Canonical cells ({}):**\n\n", cells.len());
+        out.push_str("| fixture | metric | corpus | threads | positions | extras |\n");
+        out.push_str("|---|---|---|---|---|---|\n");
+        for cell in cells {
+            let corpus = cell
+                .corpus
+                .map_or_else(|| "-".to_owned(), |c| c.label().to_owned());
+            let threads = cell
+                .threads
+                .map_or_else(|| "-".to_owned(), |t| t.to_string());
+            let positions = cell
+                .positions
+                .map_or_else(|| "-".to_owned(), |p| p.label().to_owned());
+            let mut extras = Vec::new();
+            if let Some(density) = cell.tombstone_density_pct {
+                extras.push(format!("tombstones={density}%"));
+            }
+            if let Some(class) = cell.query_class {
+                extras.push(format!("class={}", class.label()));
+            }
+            if let Some(k) = cell.k {
+                extras.push(format!("k={k}"));
+            }
+            if let Some(topology) = cell.topology {
+                extras.push(format!("topology={topology:?}"));
+            }
+            let _ = writeln!(
+                &mut out,
+                "| {} | {} | {} | {} | {} | {} |",
+                cell.fixture,
+                cell.metric,
+                corpus,
+                threads,
+                positions,
+                extras.join(", ")
+            );
+        }
+        out.push('\n');
+
+        out.push_str("**Registered-host commands:**\n\n```text\n");
+        for (hardware_class, profile) in &machine_keys {
+            let command = host_command
+                .replace("<QG-N>", gate.label())
+                .replace("<hardware-class>", hardware_class)
+                .replace("<execution-profile>", profile);
+            out.push_str(&command);
+            out.push('\n');
+        }
+        out.push_str("```\n\n");
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6198,5 +6396,28 @@ core id : 1
         assert_eq!("qg-1".parse::<PerfGate>().expect("QG-1"), PerfGate::Qg1);
         assert_eq!("QG_10".parse::<PerfGate>().expect("QG-10"), PerfGate::Qg10);
         assert!("QG-0".parse::<PerfGate>().is_err());
+    }
+
+    /// bd-quill-e8-perf-doctrine-x4e4.15: the human run plan is generated
+    /// from the manifest and the compiled matrix. This test re-renders it and
+    /// compares bytes, so the document can never drift from the harness.
+    /// Deliberate regeneration is `QUILL_PERF_RUN_PLAN_UPDATE=1` with a
+    /// reviewed diff — never to force green.
+    #[test]
+    fn perf_run_plan_document_matches_the_manifest() {
+        let rendered = render_perf_run_plan_markdown().expect("render run plan");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(PERF_RUN_PLAN_DOC_PATH);
+        if std::env::var_os("QUILL_PERF_RUN_PLAN_UPDATE").is_some() {
+            std::fs::write(&path, &rendered).expect("update run plan document");
+            return;
+        }
+        let committed = std::fs::read_to_string(&path).expect("read committed run plan document");
+        assert_eq!(
+            rendered, committed,
+            "the generated run plan drifted from the manifest/matrix; regenerate with \
+             QUILL_PERF_RUN_PLAN_UPDATE=1 and review the diff"
+        );
     }
 }
