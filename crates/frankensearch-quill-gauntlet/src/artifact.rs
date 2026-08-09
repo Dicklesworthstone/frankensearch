@@ -5601,24 +5601,71 @@ mod tests {
             producer.source_git_revision
         );
         assert_eq!(provenance["source_git_dirty"], producer.source_git_dirty);
-        let build_script_output = snapshots
+        // The producer's own build-script output is exactly recoverable from
+        // `cargo:rustc-env` emissions compiled into the running executable
+        // (bd-artifactstore-v4-f1-source-build-snapshot-ldqkt, 0e405943).
+        let producer_script_output = snapshots
             .build()
             .inputs
             .iter()
-            .find(|input| input.key == "build-script-output/current-process-availability")
-            .expect("Build snapshot must disclose build-script output availability");
+            .find(|input| input.key == "build-script-output/producer-emitted-rustc-env")
+            .expect("Build snapshot must bind the producer build-script output receipt");
         assert_eq!(
-            build_script_output.kind,
+            producer_script_output.kind,
             ArtifactStoreV4BuildInputKind::BuildScriptOutput
         );
+        let producer_receipt: serde_json::Value =
+            serde_json::from_slice(&producer_script_output.canonical_bytes)
+                .expect("decode producer build-script output receipt");
+        assert_eq!(producer_receipt["availability"], "exact");
+        let emitted = producer_receipt["emitted"]
+            .as_object()
+            .expect("producer receipt carries the emitted map");
+        assert_eq!(
+            emitted.len(),
+            PRODUCER_BUILD_SCRIPT_EMISSIONS.len(),
+            "receipt must carry exactly the drift-guarded emission set"
+        );
+        for (name, value) in PRODUCER_BUILD_SCRIPT_EMISSIONS {
+            assert_eq!(
+                emitted
+                    .get(name)
+                    .and_then(serde_json::Value::as_str)
+                    .expect("emission recorded"),
+                value,
+                "receipt value for {name} must equal the compiled-in emission"
+            );
+        }
+        // Dependency build-script output remains honestly fail-closed in the
+        // runtime collector: the running process carries no Cargo manifest of
+        // it, so the narrowed receipt records that unavailability. (The
+        // fixture-level binding proof for collected dependency records lives
+        // in artifactstore_v4_dependency_build_scripts_bind_the_build_identity;
+        // the runtime collector has no stream to collect from.)
+        let dependency_availability = snapshots
+            .build()
+            .inputs
+            .iter()
+            .find(|input| input.key == "build-script-output/dependency-availability")
+            .expect("Build snapshot must disclose dependency output availability");
         let availability: serde_json::Value =
-            serde_json::from_slice(&build_script_output.canonical_bytes)
-                .expect("decode build-script output availability receipt");
+            serde_json::from_slice(&dependency_availability.canonical_bytes)
+                .expect("decode dependency availability receipt");
         assert_eq!(availability["availability"], "unavailable");
         assert_eq!(
-            availability["reason"],
-            "running producer has no authoritative Cargo build-script output manifest"
+            availability["scope"], "dependency build scripts",
+            "the narrowed receipt names exactly the unavailable scope"
         );
+        let generated_source = snapshots
+            .build()
+            .inputs
+            .iter()
+            .find(|input| input.key == "generated-source/producer-build-script")
+            .expect("Build snapshot must disclose producer generated-source policy");
+        let generated: serde_json::Value =
+            serde_json::from_slice(&generated_source.canonical_bytes)
+                .expect("decode generated-source receipt");
+        assert_eq!(generated["availability"], "none-emitted");
         assert!(
             snapshots.build().inputs.iter().any(|input| {
                 input.kind == ArtifactStoreV4BuildInputKind::BuildScriptInput
