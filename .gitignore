@@ -147,6 +147,7 @@ repro_*.rs
 .beads/*.bad_*
 .beads/*.backup_*
 .beads/*.rebuild_*
+.beads/.beads.db.schema-migration-*.vacuum-*
 .beads/recovery*/
 .beads_recovery/
 
