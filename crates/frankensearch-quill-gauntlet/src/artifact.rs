@@ -4978,6 +4978,86 @@ mod tests {
         }
     }
 
+    /// bd-fttb: anything under a CI upload glob must be `FixturePublic`
+    /// evidence. A `PrivateLocal` envelope is detectable WITHOUT its key
+    /// (inspection reveals the declared classification), its sealed bytes
+    /// carry no plaintext canary, and its context refuses every non-local
+    /// destination. CI acceptance of public fixtures is the symmetric arm.
+    #[test]
+    fn ci_upload_globs_accept_public_and_refuse_private_envelopes() {
+        use crate::privacy::{
+            ArtifactClassification, ArtifactContentKind, ArtifactExportDestination,
+            ArtifactPrivacyContext, PrivateArtifactKey,
+        };
+        use std::time::Duration;
+
+        let private = ArtifactPrivacyContext::private_local(
+            PrivateArtifactKey::from_bytes([0x42; 32]),
+            Duration::from_secs(300),
+        )
+        .expect("private policy");
+        let canary = b"what is my private medical diagnosis";
+        let mut whole_object = b"{\"query\":\"".to_vec();
+        whole_object.extend_from_slice(canary);
+        whole_object.extend_from_slice(b"\"}");
+        let envelope = private
+            .seal(ArtifactContentKind::CampaignReport, &whole_object)
+            .expect("seal private envelope");
+
+        // Detection without the key: the declared classification is visible
+        // to any uploader, and the plaintext canary is not.
+        let metadata = ArtifactPrivacyContext::inspect(&envelope).expect("inspect sealed envelope");
+        assert_eq!(
+            metadata.policy.classification,
+            ArtifactClassification::PrivateLocal
+        );
+        assert!(
+            !envelope
+                .windows(canary.len())
+                .any(|window| window == canary),
+            "private plaintext must never appear in sealed envelope bytes"
+        );
+        for destination in [
+            ArtifactExportDestination::CiArtifact,
+            ArtifactExportDestination::ReleaseArtifact,
+            ArtifactExportDestination::ExternalUpload,
+        ] {
+            assert!(
+                private.authorize_export(destination).is_err(),
+                "private artifacts must be refused for {destination:?}"
+            );
+        }
+        private
+            .authorize_export(ArtifactExportDestination::LocalReplay)
+            .expect("local replay is the one admitted private destination");
+
+        // The public arm: fixtures are inspectable as FixturePublic and may
+        // leave the machine for CI and release evidence.
+        let public = ArtifactPrivacyContext::fixture_public();
+        let public_envelope = public
+            .seal(
+                ArtifactContentKind::CampaignReport,
+                b"{\"query\":\"committed synthetic fixture\"}",
+            )
+            .expect("seal public envelope");
+        let public_metadata =
+            ArtifactPrivacyContext::inspect(&public_envelope).expect("inspect public envelope");
+        assert_eq!(
+            public_metadata.policy.classification,
+            ArtifactClassification::FixturePublic
+        );
+        for destination in [
+            ArtifactExportDestination::LocalReplay,
+            ArtifactExportDestination::CiArtifact,
+            ArtifactExportDestination::ReleaseArtifact,
+            ArtifactExportDestination::ExternalUpload,
+        ] {
+            public
+                .authorize_export(destination)
+                .expect("public fixtures remain exportable");
+        }
+    }
+
     fn assert_strict_tagged_round_trip<T>(value: &T)
     where
         T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,

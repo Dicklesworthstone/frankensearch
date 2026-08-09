@@ -25146,7 +25146,7 @@ mod tests {
                 0,
                 &|hit| {
                     hit.explanation =
-                        SensitiveValueObservation::from_text("corpus explanation value")
+                        SensitiveValueObservation::from_text("corpus explanation value");
                 },
                 &|_| {},
             );

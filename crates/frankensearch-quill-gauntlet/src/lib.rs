@@ -35,6 +35,7 @@ mod perf;
 mod perf_assembly;
 mod perf_evidence;
 mod perf_ratchet;
+mod privacy;
 mod qg2_contract;
 mod qg6_prepared;
 pub mod replacement_authorization;
@@ -196,6 +197,13 @@ pub use perf_ratchet::{
     PERF_RATCHET_SCHEMA_VERSION, PERF_REGRESSION_ROBUST_Z, PerfCellComparison, PerfEvidenceFile,
     PerfGateDecision, PerfRatchetEvaluation, PerfRatchetMode, PerfRatchetReason,
     PerfRatchetRequest, evaluate_perf_ratchet, is_explicit_bootstrap, is_explicit_bootstrap_for,
+};
+pub use privacy::{
+    ARTIFACT_PRIVACY_POLICY_SCHEMA_VERSION, ArtifactClassification, ArtifactContentKind,
+    ArtifactEnvelopeMetadata, ArtifactExportDestination, ArtifactPrivacyContext,
+    ArtifactPrivacyError, ArtifactPrivacyPolicy, ArtifactRetentionStatus, OpenedArtifactBytes,
+    PRIVATE_ARTIFACT_MAX_RETENTION_SECONDS, PRIVATE_ARTIFACT_MIN_RETENTION_SECONDS,
+    PrivateArtifactKey, RedactedArtifactValue,
 };
 pub use qg2_contract::{
     QG2_CANONICAL_CONTRACT, QG2_CONTRACT_REPORT_SCHEMA_VERSION, QG2_LOGICAL_SURFACE_COUNT,

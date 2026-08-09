@@ -164,6 +164,12 @@ toml = "1.0.3"
 # SHA-256 verification for model manifests
 sha2 = "0.11.0"
 
+# Authenticated encryption and keyed digests for private evidence artifacts (bd-fttb)
+chacha20poly1305 = "=0.10.1"
+getrandom = "=0.2.17"
+hmac = "=0.13.0"
+zeroize = "=1.9.0"
+
 # PDF text extraction (digital PDFs with selectable text)
 pdf-extract = "0.10"
 
