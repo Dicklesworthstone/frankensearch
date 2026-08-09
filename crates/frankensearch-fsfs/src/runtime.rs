@@ -14531,7 +14531,7 @@ fn print_cli_help() {
     println!("Search flags: --daemon --no-daemon --daemon-socket <path> --stream");
 }
 
-/// `pub(crate)` so the advertised-command census (bd-rh0t, adapters::cli
+/// `pub(crate)` so the advertised-command census (bd-rh0t, `adapters::cli`
 /// tests) can prove completion scripts name exactly the parser's commands.
 pub(crate) const fn completion_script(shell: CompletionShell) -> &'static str {
     match shell {
@@ -26546,6 +26546,52 @@ mod tests {
                 .join(crate::lifecycle::PUBLICATION_LOCK_FILE_NAME)
                 .exists(),
             "doctor must not manufacture a publication lease"
+        );
+    }
+
+    /// bd-rh0t: the status diagnostic the operator-command contract points
+    /// at must be as read-only as doctor. Both are what degraded-mode
+    /// advice now recommends instead of fictional dry-run flags.
+    #[test]
+    fn status_payload_collection_is_observational_and_mutates_nothing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        let model_root = temp.path().join("models");
+        fs::create_dir_all(&index_root).expect("create index root");
+        fs::create_dir_all(&model_root).expect("create model root");
+        fs::write(index_root.join("stable-index-byte"), b"index").expect("seed stable index byte");
+        fs::write(model_root.join("stable-model-byte"), b"model").expect("seed stable model byte");
+        let index_before = snapshot_directory(&index_root);
+        let model_before = snapshot_directory(&model_root);
+
+        let mut config = FsfsConfig::default();
+        config.storage.index_dir = index_root.display().to_string();
+        config.indexing.model_dir = model_root.display().to_string();
+        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            command: CliCommand::Status,
+            index_dir: Some(index_root.clone()),
+            format: OutputFormat::Json,
+            ..CliInput::default()
+        });
+        let _payload = runtime
+            .collect_status_payload()
+            .expect("collect observational status payload");
+
+        assert_eq!(
+            snapshot_directory(&index_root),
+            index_before,
+            "status must not mutate the index root"
+        );
+        assert_eq!(
+            snapshot_directory(&model_root),
+            model_before,
+            "status must not touch the model root"
+        );
+        assert!(
+            !index_root
+                .join(crate::lifecycle::PUBLICATION_LOCK_FILE_NAME)
+                .exists(),
+            "status must not manufacture a publication lease"
         );
     }
 

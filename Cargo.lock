@@ -1930,10 +1930,13 @@ name = "frankensearch-quill-gauntlet"
 version = "0.2.1"
 dependencies = [
  "asupersync",
+ "chacha20poly1305 0.10.1",
  "criterion",
  "frankensearch-core",
  "frankensearch-lexical",
  "frankensearch-quill",
+ "getrandom 0.2.17",
+ "hmac",
  "jsonschema",
  "rayon",
  "rustix",
@@ -1947,6 +1950,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-normalization",
  "xxhash-rust",
+ "zeroize",
 ]
 
 [[package]]

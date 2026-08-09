@@ -303,9 +303,15 @@ fn workflow_artifact_manifest_is_reproducible() {
         artifacts[0].artifact_path,
         "run-2026-02-14/profiles/small/flamegraph.svg"
     );
-    assert!(artifacts[0].replay_command.contains("--kind flamegraph"));
-    assert!(artifacts[1].replay_command.contains("--kind heap"));
-    assert!(artifacts[2].replay_command.contains("--kind syscall"));
+    // The replay command is the step's own profiler invocation (bd-rh0t):
+    // re-running it deterministically reproduces the artifact, and no
+    // fictional `fsfs profile` subcommand is ever advertised.
+    assert!(artifacts[0].replay_command.contains("flamegraph"));
+    assert!(artifacts[1].replay_command.contains("heaptrack"));
+    assert!(artifacts[2].replay_command.contains("strace"));
+    for artifact in &artifacts {
+        assert!(!artifact.replay_command.contains("fsfs profile"));
+    }
 }
 
 #[test]

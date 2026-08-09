@@ -1897,9 +1897,7 @@ mod tests {
                     || (token.starts_with('{') && token.ends_with('}'))
                     || token.starts_with('$')
                     || (token.len() > 1
-                        && token
-                            .chars()
-                            .all(|c| c.is_ascii_uppercase() || c == '_'));
+                        && token.chars().all(|c| c.is_ascii_uppercase() || c == '_'));
                 if placeholder { "<X>" } else { token }
             })
             .collect::<Vec<_>>()
@@ -1921,10 +1919,9 @@ mod tests {
     fn advertised_operator_commands_parse_through_the_real_cli() {
         for advertised in ADVERTISED_COMMAND_CENSUS {
             let argv = census_argv(advertised);
-            let parsed = parse_cli_args(argv.iter().map(String::as_str))
-                .unwrap_or_else(|error| {
-                    panic!("advertised command {advertised:?} must parse: {error}")
-                });
+            let parsed = parse_cli_args(argv.iter().map(String::as_str)).unwrap_or_else(|error| {
+                panic!("advertised command {advertised:?} must parse: {error}")
+            });
             let expected = match argv[0].as_str() {
                 "index" => CliCommand::Index,
                 "watch" => CliCommand::Watch,
@@ -1949,9 +1946,8 @@ mod tests {
     fn formerly_fictional_commands_fail_with_actionable_errors() {
         for fictional in FORMERLY_FICTIONAL_COMMANDS {
             let argv: Vec<&str> = fictional.split_whitespace().collect();
-            let error = match parse_cli_args(argv) {
-                Ok(_) => panic!("formerly fictional command {fictional:?} parsed"),
-                Err(error) => error,
+            let Err(error) = parse_cli_args(argv) else {
+                panic!("formerly fictional command {fictional:?} parsed");
             };
             let message = error.to_string();
             assert!(
