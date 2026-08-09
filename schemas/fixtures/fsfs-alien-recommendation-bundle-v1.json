@@ -44,7 +44,7 @@
         "replay_command": "cargo test -p frankensearch --test ingest_replay"
       },
       "rollback_plan": {
-        "rollback_command": "fsfsctl policy set ingest.naive=true",
+        "rollback_command": "git revert <recommendation-commit> && cargo test -p frankensearch --test ingest_replay",
         "abort_conditions": [
           "recall_drop_gt_5pct"
         ]
@@ -93,7 +93,7 @@
         "replay_command": "cargo test -p frankensearch --test degrade_replay"
       },
       "rollback_plan": {
-        "rollback_command": "fsfsctl policy set degrade.static_threshold=true",
+        "rollback_command": "git revert <recommendation-commit> && cargo test -p frankensearch-fsfs --test benchmark_baseline_matrix -- --nocapture",
         "abort_conditions": [
           "state_oscillation_gt_3_per_hour"
         ]
@@ -143,7 +143,7 @@
         "replay_command": "cargo test -p frankensearch --test ranking_replay"
       },
       "rollback_plan": {
-        "rollback_command": "fsfsctl policy set ranking.fixed=true",
+        "rollback_command": "git revert <recommendation-commit> && cargo test -p frankensearch-fsfs --test benchmark_baseline_matrix -- --nocapture",
         "abort_conditions": [
           "ndcg_drop_gt_0.05",
           "latency_p95_regression_gt_15pct"
