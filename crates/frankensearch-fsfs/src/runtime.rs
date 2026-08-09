@@ -7903,7 +7903,7 @@ impl FsfsRuntime {
             warn!(
                 error = %error,
                 path = %Self::explain_session_path(&resources.index_root).display(),
-                "failed to persist explain-session context for follow-up `fsfs explain`"
+                "failed to persist explain-session context for follow-up `fsfs explain <result-id>`"
             );
         }
 
@@ -9398,7 +9398,7 @@ impl FsfsRuntime {
                     .to_owned(),
             )
         } else if active_engine == BlueGreenEngine::Tantivy {
-            Some("open the index with `fsfs search` or run `fsfs index <source-dir>` to rebuild into a fresh Quill sibling".to_owned())
+            Some("open the index with `fsfs search <query>` or run `fsfs index <source-dir>` to rebuild into a fresh Quill sibling".to_owned())
         } else if retained.is_empty() {
             None
         } else {
@@ -14536,16 +14536,16 @@ fn print_cli_help() {
 pub(crate) const fn completion_script(shell: CompletionShell) -> &'static str {
     match shell {
         CompletionShell::Bash => {
-            "complete -W \"search serve index watch explain status flush config download-models download doctor update completions uninstall help version append-batch delete compact daemon\" fsfs"
+            "complete -W \"search serve index watch explain status flush config download-models download doctor update completions uninstall help tui version append-batch delete compact daemon\" fsfs"
         }
         CompletionShell::Zsh => {
-            "compdef '_arguments \"1: :((search serve index watch explain status flush config download-models download doctor update completions uninstall help version append-batch delete compact daemon))\"' fsfs"
+            "compdef '_arguments \"1: :((search serve index watch explain status flush config download-models download doctor update completions uninstall help tui version append-batch delete compact daemon))\"' fsfs"
         }
         CompletionShell::Fish => {
-            "complete -c fsfs -f -a \"search serve index watch explain status flush config download-models download doctor update completions uninstall help version append-batch delete compact daemon\""
+            "complete -c fsfs -f -a \"search serve index watch explain status flush config download-models download doctor update completions uninstall help tui version append-batch delete compact daemon\""
         }
         CompletionShell::PowerShell => {
-            "Register-ArgumentCompleter -CommandName fsfs -ScriptBlock { param($wordToComplete) 'search','serve','index','watch','explain','status','flush','config','download-models','download','doctor','update','completions','uninstall','help','version','append-batch','delete','compact','daemon' | Where-Object { $_ -like \"$wordToComplete*\" } }"
+            "Register-ArgumentCompleter -CommandName fsfs -ScriptBlock { param($wordToComplete) 'search','serve','index','watch','explain','status','flush','config','download-models','download','doctor','update','completions','uninstall','help','tui','version','append-batch','delete','compact','daemon' | Where-Object { $_ -like \"$wordToComplete*\" } }"
         }
     }
 }

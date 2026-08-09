@@ -1848,14 +1848,13 @@ mod tests {
         "fsfs index <X>",
         "fsfs index",
         "fsfs index --full",
-        "fsfs index --full --index-dir <X> <X>",
+        "fsfs index . --full --index-dir <X>",
         "fsfs watch",
         "fsfs doctor",
         "fsfs doctor --index-dir <X> --format json",
         "fsfs status",
         "fsfs status --format json",
         "fsfs status --index-dir <X> --format json",
-        "fsfs search",
         "fsfs search <X>",
         "fsfs search --fast-only --format json -- <X>",
         "fsfs search --index-dir <X> --format json -- <X>",
@@ -1866,7 +1865,7 @@ mod tests {
         "fsfs download-models --list",
         "fsfs download-models --model <X> --force",
         "fsfs download-models --model <X> --verify",
-        "fsfs explain",
+        "fsfs explain <X>",
         "fsfs update",
         "fsfs update --check",
         "fsfs uninstall --yes --dry-run --purge",
@@ -1907,10 +1906,12 @@ mod tests {
             .join(" ")
     }
 
-    /// Substitute census placeholders with concrete, parseable argv values.
+    /// Substitute census placeholders with concrete, parseable argv values
+    /// and drop the `fsfs` argv0 the parser never sees.
     fn census_argv(command: &str) -> Vec<String> {
         command
             .split_whitespace()
+            .skip_while(|token| *token == "fsfs")
             .map(|token| if token == "<X>" { "." } else { token })
             .map(str::to_owned)
             .collect()
@@ -1985,8 +1986,8 @@ mod tests {
         for failure in failures {
             let advice = DegradationAdvice::from_input(DegradationAdviceInput {
                 failure,
-                query: "census query",
-                index_dir: Some(Path::new(".")),
+                query: "<query>",
+                index_dir: Some(Path::new("<index-dir>")),
                 original_error: None,
                 replay_command: None,
             });

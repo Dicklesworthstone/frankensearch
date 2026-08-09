@@ -297,7 +297,7 @@ fn next_actions_for(
                 2,
                 "degrade.action.rebuild_vector_index",
                 "Rebuild index artifacts in place when the semantic index is stale or unreadable.",
-                Some(format!("fsfs index --full --index-dir {index_dir} .")),
+                Some(format!("fsfs index . --full --index-dir {index_dir}")),
             ),
         ],
         DegradationFailureKind::MissingQualityModel => vec![
@@ -331,7 +331,7 @@ fn next_actions_for(
                 3,
                 "degrade.action.reindex_after_identity_change",
                 "Rebuild in place only if you intentionally change the canonical embedding identity.",
-                Some(format!("fsfs index --full --index-dir {index_dir} .")),
+                Some(format!("fsfs index . --full --index-dir {index_dir}")),
             ),
         ],
         DegradationFailureKind::Timeout => vec![
@@ -359,7 +359,7 @@ fn next_actions_for(
                 2,
                 "degrade.action.reindex_in_place",
                 "Rebuild index artifacts in place from source content; no cleanup is required.",
-                Some(format!("fsfs index --full --index-dir {index_dir} .")),
+                Some(format!("fsfs index . --full --index-dir {index_dir}")),
             ),
         ],
         DegradationFailureKind::CacheMiss => vec![
@@ -389,7 +389,7 @@ fn next_actions_for(
                 2,
                 "degrade.action.rebuild_unusable_vectors",
                 "Rebuild in place if the census shows live records without usable vectors (zero-norm or corrupt embeddings).",
-                Some(format!("fsfs index --full --index-dir {index_dir} .")),
+                Some(format!("fsfs index . --full --index-dir {index_dir}")),
             ),
         ],
     }
@@ -590,7 +590,7 @@ mod tests {
         assert!(actions.contains("lexical results"));
         assert!(actions.contains("producer-authenticated immutable identity"));
         assert!(actions.contains("only if you intentionally change"));
-        assert!(actions.contains("fsfs index --full --index-dir"));
+        assert!(actions.contains("fsfs index . --full --index-dir"));
         assert!(!actions.to_ascii_lowercase().contains("delete"));
     }
 
@@ -620,7 +620,7 @@ mod tests {
             .join("\n");
         assert_eq!(advice.failure, DegradationFailureKind::CorruptIndex);
         assert!(!advice.preserves_initial_results);
-        assert!(rendered.contains("fsfs index --full"));
+        assert!(rendered.contains("fsfs index . --full"));
         assert!(!action_text.to_ascii_lowercase().contains("delete"));
         Ok(())
     }

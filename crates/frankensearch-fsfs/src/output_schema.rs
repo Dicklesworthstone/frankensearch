@@ -431,7 +431,7 @@ pub struct IndexFreshnessPayload {
     pub unknown_missing_doc_segments: usize,
 }
 
-/// Search payload embedded in `OutputEnvelope::data` for `fsfs search`.
+/// Search payload embedded in `OutputEnvelope::data` for `fsfs search <query>`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchPayload {
     pub query: String,

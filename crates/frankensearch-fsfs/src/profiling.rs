@@ -123,7 +123,7 @@ impl ProfileWorkflow {
     ///
     /// The replay command is the step's own profiler invocation: re-running
     /// it is the only deterministic reproduction of the artifact. No
-    /// `fsfs profile` subcommand exists, so this field must never name one
+    /// fsfs-profile subcommand exists, so this field must never name one
     /// (bd-rh0t).
     #[must_use]
     pub fn artifact_manifest(&self, run_id: &str) -> Vec<ProfileArtifact> {
@@ -1250,7 +1250,7 @@ pub fn crawl_ingest_optimization_track() -> CrawlIngestOptimizationTrack {
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
-            // No `fsfs profile` subcommand exists (bd-rh0t): the deterministic
+            // No fsfs-profile subcommand exists (bd-rh0t): the deterministic
             // replay of a lever's evidence is the baseline matrix itself.
             replay_command:
                 "cargo test -p frankensearch-fsfs --test benchmark_baseline_matrix -- --nocapture"
@@ -1262,7 +1262,7 @@ pub fn crawl_ingest_optimization_track() -> CrawlIngestOptimizationTrack {
         .iter()
         .map(|hotspot| RollbackGuardrail {
             lever_id: hotspot.lever_id.clone(),
-            // No `fsfs profile` subcommand exists (bd-rh0t): rolling a lever
+            // No fsfs-profile subcommand exists (bd-rh0t): rolling a lever
             // back is a source-level revert followed by the deterministic
             // baseline proof that the regression is gone.
             rollback_command: format!(
@@ -1715,9 +1715,13 @@ mod tests {
                 artifact.artifact_path
             );
             assert!(
-                artifact.replay_command.contains("--run-id run-42"),
-                "replay command should reference run id: {}",
+                artifact.replay_command.contains("--profile tiny"),
+                "replay command re-runs the step's own profiler lane: {}",
                 artifact.replay_command
+            );
+            assert!(
+                !artifact.replay_command.contains("fsfs profile"),
+                "replay must never name the nonexistent fsfs-profile subcommand (bd-rh0t)"
             );
         }
     }
