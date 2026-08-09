@@ -8812,3 +8812,35 @@ provenance gap belongs to the owner of `bd-quill-e1-scribe-bejd.7`.
 The other four re-adjudicated rows from this sweep were corrected in place, in their own entries:
 2026-07-11 `bd-5973` (two cells) and 2026-07-14 `bd-r3lf` (one cell), with matching corrections in
 `docs/NEGATIVE_EVIDENCE.md`.
+
+## 2026-08-09 — AUDIT: host-conditional range for the FSVI 4-bit self-ratio (`bd-fourbit-self-ratio-not-portable-1eqce`)
+
+The retry predicate of the 2026-08-03 hostless-ratio correction is now met: the
+same-invocation `fsvi_4bit_vs_incumbent` self-comparison (candidate 4-bit mult=5
+vs our exact flat scan, N=100k DIM=384 K=10 QUERIES=32 MULT=5, 61 rounds,
+corrected A/A null gate 1.000±0.030) was executed on three hosts with distinct
+core topologies, each arm self-reporting host, CPU, thread count, and ELF
+SHA-256.
+
+| Host | CPU | Threads | cand_4bit_mult5 / ours_exact_flat (median) | Null | ELF SHA-256 (prefix) |
+|---|---|---|---|---|---|
+| thinkstation1 (local, clean HEAD 368b994b) | AMD Ryzen Threadripper PRO 5975WX | 64 | 0.2261 → **4.42x** | CLEAN (median 0.9912, p5 0.9500, p95 1.0374) | 33e87dbf55d8544a |
+| hetzner2 (strict-remote RCH hz2, run A) | AMD EPYC-Genoa | 16 | 0.7323 → **1.37x** | CLEAN (median 0.9912) | c79b0c8e40a65735 |
+| hetzner2 (strict-remote RCH hz2, run B) | AMD EPYC-Genoa | 16 | 0.7575 → **1.32x** | CLEAN | c64758a780259d15 |
+| vmi1152480 (strict-remote, 2026-07-31 card) | AMD EPYC (IBPB) | 10 | 0.9560 → **1.05x** | per that card | self-reported there |
+
+**Bounded host-conditional range: 1.05x–4.42x** across 10/16/64-thread hosts.
+The mechanism is visible in the per-arm concurrency evidence: on the 64-thread
+host both arms saturate (cpu/wall 38–40) and the candidate's 18.3 MiB packed
+slab versus the flat arm's 146.5 MiB region produces the full bandwidth
+advantage; on the 10- and 16-thread hosts neither arm saturates (cpu/wall
+2.8–3.4 and 9.6–10.7), diluting the same advantage to near-parity. The
+historical hostless 2.56x/3.22x/3.09x multipliers sit inside this range and
+remain historical `SELF-SPEEDUP / MAINTENANCE` observations; the range above
+is the current host-conditional evidence for the same comparison.
+
+This row is maintenance-class self-speedup evidence. It does not reinstate any
+incumbent or superlative claim: the retracted `fastest lossless` wording stays
+retracted (`bd-retract-fastest-lossless-superlative-3ush8`), and the bracketed
+incumbent arm here is one ndarray configuration, not a fastest-incumbent
+screen.
