@@ -22593,14 +22593,14 @@ mod tests {
     /// live mismatch CAN be ingested, this proves the ingested record still
     /// says what it said, still joins to its witnesses, and still redacts.
     ///
-    /// TWO WITNESSES SINCE bd-dxedq, and the second one is why this test
-    /// changed shape. The committed register carries DIV-008 and DIV-009, so it
-    /// spans a generation boundary: DIV-008's witness is a v7 object and
-    /// DIV-009's is v8. Both are read as RETAINED evidence — addressed from
-    /// their committed bytes — including the one that could still address
-    /// itself today. That is deliberate. A witness stops being able to
-    /// re-encode itself at the NEXT schema bump, not at the one that already
-    /// happened, and this test must not be the thing that discovers it.
+    /// FOUR WITNESSES SINCE bd-4oiwf. DIV-008 has a v7 object, DIV-009 has a v8
+    /// object, and DIV-010 retains its original v8 raw-failure witness alongside
+    /// the superseding v9 control-attributed witness. All are read as RETAINED
+    /// evidence — addressed from their committed bytes — including generations
+    /// that could still address themselves today. That is deliberate. A
+    /// witness stops being able to re-encode itself at the NEXT schema bump,
+    /// not at the one that already happened, and this test must not be the
+    /// thing that discovers it.
     #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn committed_live_divergence_register_joins_its_witness_and_stays_redacted() {
@@ -22631,6 +22631,7 @@ mod tests {
             retained(E68_LIVE_WITNESS_FIXTURE),
             retained(E68_REFUSAL_WITNESS_FIXTURE),
             retained(E68_AND_NOT_WITNESS_FIXTURE),
+            retained(E68_AND_NOT_V9_WITNESS_FIXTURE),
         ];
         // EVERY OBSERVATION, ITS OWN WITNESS. The join refuses in both
         // directions — an observation without a witness and a witness no
@@ -22649,6 +22650,7 @@ mod tests {
             ledger
                 .events
                 .iter()
+                .rev()
                 .find_map(|event| match event {
                     DivergenceRegisterEvent::Observation(observation)
                         if observation.divergence_id == divergence_id =>
@@ -22660,6 +22662,22 @@ mod tests {
                     | DivergenceRegisterEvent::Prediction(_) => None,
                 })
                 .unwrap_or_else(|| panic!("committed register holds {divergence_id}"))
+        };
+        let observations_for = |divergence_id: &str| {
+            ledger
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    DivergenceRegisterEvent::Observation(observation)
+                        if observation.divergence_id == divergence_id =>
+                    {
+                        Some(observation.as_ref())
+                    }
+                    DivergenceRegisterEvent::Observation(_)
+                    | DivergenceRegisterEvent::Disposition(_)
+                    | DivergenceRegisterEvent::Prediction(_) => None,
+                })
+                .collect::<Vec<_>>()
         };
         let dispositions_for = |divergence_id: &str| {
             ledger
@@ -22769,25 +22787,54 @@ mod tests {
             }
         }
 
-        // DIV-010, RECORDED AS WHAT THE MACHINE CAN PROVE (bd-h46f1). Its prose
-        // entry carries a reviewed accept; the ledger carries a raw
-        // `RankMismatch` observation and a BLOCKING disposition, because
-        // acceptance refuses every raw failure class and the attribution that
-        // would earn the semantic class lives in a different campaign case
-        // (bd-4oiwf). Asserting the kind here is what stops a later edit from
-        // upgrading the record without the evidence that upgrade requires.
-        let and_not = observation_for(E68_AND_NOT_DIVERGENCE_ID);
-        assert_eq!(and_not.class, DivergenceClass::RankMismatch);
-        assert_eq!(
-            and_not.fixture.fixture_sha256,
-            e68_minimized_fixture_sha256(&fixture, E68_AND_NOT_CASE_ID),
-            "the recorded minimized fixture no longer hashes to the committed negated-conjunction \
-             case"
-        );
-        let and_not_dispositions = dispositions_for(E68_AND_NOT_DIVERGENCE_ID);
-        let [blocked] = and_not_dispositions.as_slice() else {
+        // DIV-010'S COMPLETE ATTRIBUTION HISTORY (bd-4oiwf). The v8 witness and
+        // BLOCKING disposition remain immutable evidence of what the old
+        // artifact could prove. The appended v9 witness carries the explicit
+        // control, earns OracleBug, and supersedes both active records with the
+        // reviewed acceptance. A replacement of either old event would fail
+        // the append-only successor proof; omitting either witness would fail
+        // the relational join above.
+        let and_not_observations = observations_for(E68_AND_NOT_DIVERGENCE_ID);
+        let [raw, attributed] = and_not_observations.as_slice() else {
             panic!(
-                "DIV-010 carries exactly one disposition, not {}",
+                "DIV-010 carries exactly two observations, not {}",
+                and_not_observations.len()
+            )
+        };
+        assert_eq!(raw.class, DivergenceClass::RankMismatch);
+        assert_eq!(attributed.class, DivergenceClass::OracleBug);
+        assert_eq!(attributed.header.supersedes, Some(raw.header.sequence));
+        for observation in [raw, attributed] {
+            assert_eq!(
+                observation.fixture.fixture_sha256,
+                e68_minimized_fixture_sha256(&fixture, E68_AND_NOT_CASE_ID),
+                "the recorded minimized fixture no longer hashes to the committed \
+                 negated-conjunction case"
+            );
+        }
+        let raw_address = raw
+            .first_recorded_witness_artifact_object
+            .as_ref()
+            .expect("DIV-010's historical observation addresses its v8 witness");
+        assert_eq!(
+            raw_address.scheme,
+            DivergenceArtifactObjectHashScheme::ArtifactObjectV8Sha256
+        );
+        assert_eq!(raw_address.object_schema_version, 8);
+        let attributed_address = attributed
+            .first_recorded_witness_artifact_object
+            .as_ref()
+            .expect("DIV-010's active observation addresses its v9 witness");
+        assert_eq!(
+            attributed_address.scheme,
+            DivergenceArtifactObjectHashScheme::ArtifactObjectV9Sha256
+        );
+        assert_eq!(attributed_address.object_schema_version, 9);
+
+        let and_not_dispositions = dispositions_for(E68_AND_NOT_DIVERGENCE_ID);
+        let [blocked, accepted] = and_not_dispositions.as_slice() else {
+            panic!(
+                "DIV-010 carries exactly two dispositions, not {}",
                 and_not_dispositions.len()
             )
         };
@@ -22796,10 +22843,26 @@ mod tests {
                 assert_eq!(bead_id, E68_AND_NOT_BLOCKING_BEAD);
             }
             DivergenceDisposition::Accepted { .. } | DivergenceDisposition::Fixed { .. } => {
-                panic!(
-                    "DIV-010's machine record is BLOCKING; an accept here would be one the \
-                     validator's own rules cannot support"
-                )
+                panic!("DIV-010's retained v8 disposition is BLOCKING")
+            }
+        }
+        assert_eq!(accepted.header.supersedes, Some(blocked.header.sequence));
+        match &accepted.disposition {
+            DivergenceDisposition::Accepted {
+                equivalence_law,
+                reviewer,
+                ..
+            } => {
+                assert_eq!(equivalence_law, E68_AND_NOT_EQUIVALENCE_LAW);
+                assert_eq!(reviewer, E68_AND_NOT_REVIEWER);
+                assert_ne!(
+                    reviewer.as_str(),
+                    attributed.header.recorded_by.as_str(),
+                    "DIV-010's attributed acceptance requires independent review"
+                );
+            }
+            DivergenceDisposition::Blocking { .. } | DivergenceDisposition::Fixed { .. } => {
+                panic!("DIV-010's active v9 disposition is the reviewed accept")
             }
         }
 

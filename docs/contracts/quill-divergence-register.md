@@ -36,10 +36,10 @@ stream retains:
 
 - the exact first-recorded gauntlet witness case and object address as
   `{scheme: "frankensearch-quill-gauntlet/artifact-object/v<N>/sha256", object_schema_version: <N>, digest: <64 lowercase hex>}`.
-  Two generations are admitted, `N` in `{7, 8}`, and the scheme pins the version — a v7 scheme
-  carrying `object_schema_version: 8`, or the reverse, is refused. v7 addresses are RETAINED, not
-  reissued: the witnesses already in the ledger keep them and their bytes are unchanged, while a
-  fresh mint records a v8 address (bd-bxya1);
+  Three generations are admitted, `N` in `{7, 8, 9}`, and the scheme pins the version — a scheme
+  carrying another generation's `object_schema_version` is refused. v7 and v8 addresses are
+  RETAINED, not reissued: the witnesses already in the ledger keep them and their bytes are
+  unchanged, while a fresh mint records a v9 address (bd-4oiwf);
 - canonical producer-build identity SHA-256, oracle dependency-contract
   SHA-256, historical lexical-contract audit revision, corpus and query
   manifest SHA-256s, query-suite source kind, and query-source identity
@@ -57,6 +57,14 @@ so deletion, reordering, or editing of historical evidence fails even when the
 resulting JSON remains internally valid. Corrected observation evidence also
 requires a later disposition event, preventing an old review from silently
 blessing new evidence.
+
+Observation class corrections remain forbidden except for one typed evidence-generation migration:
+the same minimized fixture may move from a v8 `RankMismatch` witness to a v9 `OracleBug` witness.
+The v8 artifact could not carry DIV-010's cross-case control and therefore correctly failed closed;
+v9 can carry and re-derive that control. The predicate fixes both generations, both classes, the
+first-recorded case, and every fixture-evidence field. Wrong-generation, changed-fixture, and every
+other class transition remain rejected, while the external witness join proves the v9 object itself
+actually earned `OracleBug` (bd-4oiwf).
 
 Schema v2 deliberately removes v1's separate subject/oracle Git revisions.
 Those fields could describe historical source snapshots but could not identify
@@ -84,8 +92,9 @@ just as loudly as a missing one (bd-dxedq). A witness is presented as
 `DivergenceWitness::Current` when it can reproduce its own bytes, or
 `DivergenceWitness::Retained` when it is committed evidence addressed FROM
 those bytes; a register that spans a generation boundary needs both forms in
-one join, which is why the live register carries a v7 witness for DIV-008 and a
-v8 witness for DIV-009. A multi-class object must be covered exactly; a
+one join, which is why the live register carries a v7 witness for DIV-008, a
+v8 witness for DIV-009, and both the retained v8 and superseding v9 witnesses
+for DIV-010. A multi-class object must be covered exactly; a
 missing, extra, duplicate, or substituted class/signature claim fails.
 Corrections for the same divergence may repeat the same claim, but a second
 divergence ID may not claim it. Stored-evidence validation is used rather than
@@ -208,14 +217,14 @@ nothing verifies.
 | --- | --- |
 | DIV-008 | **ENFORCED** — observation seq 1, blocking seq 2, `fixed` seq 3 (supersedes 2) |
 | DIV-009 | **ENFORCED** — observation seq 4, reviewed `accepted` seq 5 |
-| DIV-010 | **ENFORCED, AND THE MACHINE SAYS SOMETHING THE PROSE DOES NOT** — observation seq 6, `blocking` seq 7 on `bd-4oiwf`. The decision below is an **accept**; the ledger cannot record one, because the lane emits a raw `RankMismatch` and acceptance refuses every raw failure class. See the entry's machine-record bullet |
+| DIV-010 | **ENFORCED** — retained v8 `RankMismatch` observation seq 6 and `blocking` seq 7; appended v9 `OracleBug` observation seq 8 (supersedes 6) and reviewed `accepted` seq 9 (supersedes 7) |
 | DIV-001 … DIV-007 | **PROSE-ONLY** — recorded before the typed ingestion contract existed; their first-seen artifacts were never retained, so they cannot be reconstructed after the fact |
 
 A prose-only entry is not thereby wrong — DIV-001 through DIV-007 all cite regression tests that
 exist and pass. It is *unverified by the mechanism this page describes*, and the point of the table
-is that a reader can tell the difference without reading the ledger. DIV-010 is the third state and
-the most important one to render honestly: enforced, and enforced at a *weaker* disposition than the
-row claims.
+is that a reader can tell the difference without reading the ledger. DIV-010 demonstrates the
+append-only correction state: its earlier, weaker machine conclusion remains visible even though a
+new evidence generation now supports the reviewed decision.
 
 ### DIV-001: standalone CASS negation loses complement semantics
 
@@ -471,8 +480,8 @@ not this row. This row is the human projection of it.
 
 ### DIV-010: `A AND NOT B` matches nothing in tantivy 0.26.1; Quill now answers it correctly
 
-- Class: `RankMismatch` (MEMBERSHIP — the engines disagree about which documents match, so no
-  score-tolerance class can cover it)
+- Class: `OracleBug` (MEMBERSHIP — the engines disagree about which documents match, so no
+  score-tolerance class can cover it; v9 attributes the defect with a stored cross-case control)
 - First seen: 2026-08-05 · found while implementing bd-f20ye's shipping repair, filed as `bd-eeq0q`,
   and made a DIVERGENCE by `bd-quill-shipping-conformance-parse-split-w7bsu`
 - Root cause: `A AND NOT B` lowers to
@@ -586,37 +595,30 @@ not this row. This row is the human projection of it.
   side, the exclusion-only and leading-`NOT` cases are pinned beside the repaired forms so a broader
   change to negative handling cannot pass by loosening them.
 - Machine record: `crates/frankensearch-quill-gauntlet/fixtures/divergence-register-v2-live.json`
-  (observation seq 6, `blocking` seq 7 on `bd-4oiwf`; ledger SHA-256
-  `3db7452268fab30b2cc26411e938df3fd237ba2acdbc87ba225be38ac6f148fa`). Minted from a clean checkout
-  at `db6d336c`, run `e68-live-ingestion`, from campaign case `e68-negated-conjunction-refusal`
-  (`small AND NOT bounds`, observed at a non-truncating limit of 512 — the oracle returns NOTHING,
-  the subject returns the documents the query asks for); v8 witness object
-  `46176fa8c9f7911eea852bc4089740323322f1be95c4563329d5c6dec29dd0f9`, committed at
-  `crates/frankensearch-quill-gauntlet/fixtures/artifact-object-v8-div010-live.json` (bd-h46f1).
-- **THE MACHINE RECORD IS `blocking`, AND THE DECISION ABOVE IS `accept`.** That gap is deliberate
-  and is the honest state, not an oversight. The lane emits a raw `RankMismatch` for this shape and
-  `DivergenceDisposition::validate` refuses acceptance for every raw failure class. Earning the
-  semantic class the way DIV-009 did requires an attribution the ARTIFACT can re-derive, and this
-  shape has none available:
-  - DIV-009's third gate is the SIDE — the oracle returns a strict SUPERSET, the failure-to-exclude
-    its defect produces — and a subject-side defect shows the opposite containment and is refused.
-    DIV-010 inverts the direction, and the inversion is measurably NOT discriminating:
-    `NOT release AND NOT bounds` wears the identical shape, symptom and containment on this corpus
-    (79 subject hits against 0) and is not a *separately registrable* divergence — `bd-iiidv`
-    measured it as this same mechanism with both operands negated, and the Measured bullet's
-    "agreement, not a defect" claim about it is retracted above. A pure gate admitting DIV-010
-    would still launder any subject-side defect wearing that triple.
-  - The evidence that DOES attribute this shape is the control case
-    `e68-negated-conjunction-explicit` (`small NOT bounds`), which is `Exact` in the same run: the
-    same oracle answers the same operands spelled without the explicit `AND` with the exact set the
-    subject returns, isolating the keyword as the trigger. It lives in a DIFFERENT campaign case, so
-    the DIV-010 artifact cannot re-derive it, and bd-bxya1's design rests on the verifier
-    re-deriving attribution rather than trusting a stored claim.
-  - The structural alternative is closed: `ORACLE_LOWERING_UNOBSERVABLE` records, as a binding
-    condition of the D1(c) ruling, that the pinned parser emits no structured recovery diagnostics,
-    so there is no oracle-side AST to gate on.
-  `bd-4oiwf` owns carrying that control into the artifact. Moving this row off `blocking`
-  additionally requires the independent reviewer the Reviewer line below says it does not have.
+  retains the original v8 `RankMismatch` observation seq 6 and `blocking` seq 7 on `bd-4oiwf`
+  byte-for-byte, then appends v9 `OracleBug` observation seq 8 (supersedes 6) and reviewed
+  `accepted` seq 9 (supersedes 7). The ledger hash is
+  `2fa251818ab71467807a13b26f94a25c87d1c94ea33ef109870f6e48d8987816`. The v8 witness remains
+  `46176fa8c9f7911eea852bc4089740323322f1be95c4563329d5c6dec29dd0f9` at
+  `crates/frankensearch-quill-gauntlet/fixtures/artifact-object-v8-div010-live.json`; it is still
+  required by the relational join because superseding evidence never erases history.
+- The successor was minted by the sealed live lane from clean revision
+  `70e1c01ba9e8f23b9b988ee5e1569e577148260c`, case
+  `e68-negated-conjunction-refusal`, at a non-truncating limit of 512. Its v9 witness address is
+  `201e3c43e3534692661a47ae8d5faa68c84361297dba02b0c94aa1e73657fb57`, committed at
+  `crates/frankensearch-quill-gauntlet/fixtures/artifact-object-v9-div010-live.json`.
+- **THE ARTIFACT NOW CARRIES THE ATTRIBUTION, NOT MERELY ITS CONCLUSION.** The stored
+  `e68-negated-conjunction-explicit` control observes `small NOT bounds` through both engines. Both
+  are exact on that equivalent spelling, and its membership equals the witness subject's; only the
+  explicit `AND` makes the oracle empty the conjunction. v9 re-runs the comparison from those four
+  observations and emits `OracleBug`. The verifier independently reconstructs the required control
+  query and refuses truncation, a changed case, an inexact control, or a control whose subject does
+  not match the witness subject.
+- The load-bearing negative is the formerly indistinguishable failure direction: a planted
+  SUBJECT-side membership defect with the same `A AND NOT B` shape is denied `OracleBug` because it
+  disagrees with the stored control. Membership containment by itself therefore remains
+  insufficient; the old single-case gate still declines DIV-010, and neither a register row nor
+  disposition prose can assign blame.
 - Which SHAPE is minted, and why it is not the other one: the bd-8a2a8 ordering (`A NOT B AND C`,
   where the conjunct is dropped and the result is merely shorter) was tried first and the mint
   REFUSED it — `one active mismatch signature cannot belong to multiple divergences`. A signature
@@ -624,12 +626,9 @@ not this row. This row is the human projection of it.
   shape DIV-008 already holds active. DIV-008's own note predicted this collision for DIV-006 and
   called it a census-design constraint; it is now a measured one. The emptied form is this entry's
   own first measurement and its signature is a length disagreement, so one ledger carries both.
-- Reviewer: recorded by `BlueOriole` under the owner routing of 2026-08-05 that directed this repair.
-  No independent reviewer is claimed; an `accept` normally wants fresh eyes, and this row should be
-  read as reviewed-by-one until a second agent signs it off. The ledger's `blocking` disposition at
-  sequence 7 is self-reviewed by its recorder, which is legal precisely because blocking grants
-  nothing — `DivergenceDisposition::validate` enforces an independent reviewer only for acceptance,
-  which is the decision that needs one.
+- Reviewer: `RubyJaguar`, reviewed 2026-08-10, independent of observation recorder
+  `Claude-pane12`. The retained sequence-7 blocking disposition remains part of history; the
+  independent review is bound to the superseding sequence-9 acceptance.
 
 ---
 

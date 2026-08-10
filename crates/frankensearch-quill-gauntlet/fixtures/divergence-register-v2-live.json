@@ -213,6 +213,70 @@
           "reviewed_at": "2026-08-04T19:00:00Z"
         }
       }
+    },
+    {
+      "event_type": "observation",
+      "event": {
+        "header": {
+          "sequence": 8,
+          "supersedes": 6,
+          "recorded_by": "Claude-pane12",
+          "recorded_at": "2026-08-04T19:00:00Z"
+        },
+        "divergence_id": "DIV-010",
+        "class": "oracle_bug",
+        "first_recorded_witness_case_id": "e68-negated-conjunction-refusal",
+        "first_recorded_witness_artifact_object": {
+          "scheme": "frankensearch-quill-gauntlet/artifact-object/v9/sha256",
+          "object_schema_version": 9,
+          "digest": "201e3c43e3534692661a47ae8d5faa68c84361297dba02b0c94aa1e73657fb57"
+        },
+        "revisions": {
+          "producer_build_identity_sha256": "247904afadb19a77522062a01969f2c0f84ac66012d7c8bb0a639b55f84a09ad",
+          "oracle_dependency_contract_sha256": "58988c117389e3222fc6c2202d311fc70158ef0e65e069100181be5fd98d3ba3",
+          "oracle_lexical_contract_audit_revision": "062a5e5b2d41653b1c8b07888eda1a765e421f49",
+          "corpus_manifest_sha256": "28640a81dce43433fd33b16b62c265b51ad7e0973466d1f790f688b4441e39c9",
+          "query_manifest_sha256": "4c32ae2095ae1ac409aebf368247f4c577b4d143a7f2cf292bee6a1aec7bf6b9",
+          "query_suite_source": "explicit_cases",
+          "query_source_identity_sha256": "eeeb3f778bfcc990db03f5408add4e398c5ddf8a1d213b30a08fe5900a91d4ee"
+        },
+        "fixture": {
+          "fixture_id": "e68-negated-conjunction-refusal",
+          "fixture_sha256": "47451c5dc2cfa9730753b875d0c9429f34322916203cf446c33dc6c6c17a09a6",
+          "regression_test": "runner::tests::live_default_profile_campaign_ingests_its_unclassified_divergence",
+          "minimized": true
+        },
+        "mismatch_signatures": [
+          "498db47b76609909361e374ebddce7808a5dd3320cc85243b9e44b855a115c52"
+        ],
+        "observed_behavior": "the two engines disagree about which documents MATCH a conjunction that carries a negation: the pinned oracle returns NOTHING at all, while the subject returns the documents the query asks for.",
+        "expected_behavior": "the same document set from both engines; a negation inside an explicit conjunction excludes what it names rather than emptying the conjunction.",
+        "root_cause": "an oracle-side LOWERING defect in tantivy 0.26.1: `A AND NOT B` lowers to a conjunction whose second Must operand is a boolean holding only a MustNot clause, which has no positive term, matches nothing, and empties whatever it is conjoined with. Quill lowers it correctly since bd-quill-shipping-conformance-parse-split-w7bsu, and frankensearch-lexical's SHIPPING path repairs it while every oracle_observe_* caller stays bit-faithful to the defect. The blame is ATTRIBUTED BY THE STORED CONTROL: the same oracle answers the same operands spelled without the explicit AND exactly, and that control's membership equals the witness subject's. A genuine subject-side defect wearing the same shape is refused when it disagrees with the control (bd-4oiwf).",
+        "consumer_impact": "result SETS differ and the difference is silent: the most common negation spelling returns NOTHING, with no error and no warning, for a query the user reasonably expects to work. The campaign case fails closed -- it carries no per-fixture register row and its total lexical contract still mismatches.",
+        "diagnostic": {
+          "payload_sha256": "9c0a985b273ded658c07bb09e499a5d3a935633f32f78a5a566e317b77f48ab7",
+          "marker": "<redacted:e68-live-lane-negated-conjunction>"
+        }
+      }
+    },
+    {
+      "event_type": "disposition",
+      "event": {
+        "header": {
+          "sequence": 9,
+          "supersedes": 7,
+          "recorded_by": "Claude-pane12",
+          "recorded_at": "2026-08-04T19:00:00Z"
+        },
+        "divergence_id": "DIV-010",
+        "disposition": {
+          "kind": "accepted",
+          "equivalence_law": "for operands A and B, the document set matched by `A AND NOT B` equals the set matched by the equivalent occurrence spelling `A NOT B`; the pinned oracle answers the control exactly but empties the explicit-AND form, while Quill returns the control set for both",
+          "rationale": "the pinned oracle is a comparator, not a semantics authority. It agrees exactly with Quill on the equivalent occurrence spelling and fails only when the explicit AND keyword triggers its positive-less nested boolean lowering. The v9 artifact carries that control and re-derives the attribution; membership direction alone is insufficient and remains rejected.",
+          "reviewer": "RubyJaguar",
+          "reviewed_at": "2026-08-10T06:00:00Z"
+        }
+      }
     }
   ]
 }
