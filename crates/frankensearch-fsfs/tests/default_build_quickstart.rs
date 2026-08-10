@@ -731,7 +731,8 @@ mod loader_only {
         );
 
         let vector_path = index.join("vector/index.fsvi");
-        let vector_index = VectorIndex::open(&vector_path).expect("open durable quickstart FSVI");
+        let vector_index =
+            VectorIndex::open_read_only(&vector_path).expect("inspect durable quickstart FSVI");
         assert_eq!(
             vector_index.record_count(),
             QUICKSTART_DOCUMENT_COUNT,

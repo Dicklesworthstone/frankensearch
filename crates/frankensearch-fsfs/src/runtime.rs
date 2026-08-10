@@ -9211,7 +9211,7 @@ impl FsfsRuntime {
                 suggestion: Some("run `fsfs index <dir>` to build the semantic index".to_owned()),
             };
         }
-        let index = match VectorIndex::open(&vector_path) {
+        let index = match VectorIndex::open_read_only(&vector_path) {
             Ok(index) => index,
             Err(error) => {
                 return DoctorCheck {
@@ -12165,7 +12165,7 @@ impl FsfsRuntime {
             !matches!(resource_mode, SearchExecutionMode::LexicalOnly) || lexical_index.is_none();
         let degradation_advice = Vec::new();
         let vector_index = if should_open_vector && vector_path.exists() {
-            Some(VectorIndex::open(&vector_path)?)
+            Some(VectorIndex::open_read_only(&vector_path)?)
         } else {
             None
         };
@@ -26505,6 +26505,34 @@ mod tests {
             payload.checks.len(),
             "verdict counts should sum to total checks"
         );
+    }
+
+    #[test]
+    fn doctor_zero_signal_check_coexists_with_a_live_vector_reader() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+        fs::create_dir_all(vector_path.parent().expect("vector path parent"))
+            .expect("create vector directory");
+        let mut writer = VectorIndex::create(&vector_path, "potion-multilingual-128m", 4)
+            .expect("create vector index");
+        writer
+            .write_record("docs/healthy.md", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write healthy vector");
+        writer.finish().expect("finish vector index");
+
+        let live_reader =
+            VectorIndex::open_read_only(&vector_path).expect("retain a live shared reader");
+        let check = FsfsRuntime::collect_zero_signal_doctor_check(&index_root);
+
+        assert_eq!(check.verdict, super::DoctorVerdict::Pass);
+        assert_eq!(check.name, "semantic.zero_signal");
+        assert!(
+            check.detail.contains("records=1") && check.detail.contains("usable=1"),
+            "doctor should inspect the shared published mapping: {}",
+            check.detail
+        );
+        drop(live_reader);
     }
 
     #[test]

@@ -8,6 +8,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
+#[cfg(target_os = "linux")]
 use std::io::Read as _;
 use std::path::{Component, Path};
 use std::sync::Arc;
