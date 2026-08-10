@@ -18687,3 +18687,86 @@ Do not retry this exact 11-byte tagged-inline representation on the current
 workload. Any revisit needs a materially different profiled corpus or a design
 that removes more than the arena dereference without enlarging the entry or
 weakening exact collision verification.
+
+### 2026-08-10 — REJECT: carrying the SIMD uppercase mask into token emission is neutral-to-slower (`bd-6oiq`, RubyJaguar)
+
+**Comparison class: SELF-SPEEDUP diagnostic.** No competitive or QG-1 claim is
+made. The certified `trj-zen3-5995wx` runner remained unavailable; this round
+ran on the diagnostic `ovh-a` Ryzen 7 5800X worker.
+
+After the interner family exhausted its three-reject retry budget, the current
+full-medium worker profile supplied a distinct tokenizer vein:
+`emit_normalized_token` accounted for 3.32% exclusive worker CPU. The shipping
+32-byte classifier already formed an uppercase vector while producing its
+alphanumeric mask, discarded that case classification, and later rescanned
+each all-ASCII token with `any(is_ascii_uppercase)` solely to decide whether
+the normalized source slice could be borrowed. The candidate returned the
+uppercase mask with the existing alphanumeric/non-ASCII masks and carried one
+`has_ascii_uppercase` bit across vector chunks and the scalar Unicode/tail
+path. Emission then consumed that bit instead of rescanning the token. It did
+not change boundary discovery, lowercase bytes, the Unicode fallback, token
+positions or offsets, admission, interning, flush accounting, or segment
+encoding. This is not the rejected fused-copy/lowercase or boundary-mask
+family.
+
+A focused regression pinned borrowing for a long lowercase token and scratch
+normalization for uppercase bytes at offsets 0, 1, 30, 31, 32, 33, 63, 64,
+and 69. Strict RCH on `ovh-a` passed that test 1/1 and the complete candidate
+Quill library suite: **561 passed, 0 failed, 1 ignored**. Candidate diff
+SHA-256 was
+`c968b9fc4dd6e326c70ca784f29e45efeeab3bd0578bc9026313a4afd6684fe2`;
+candidate `scribe.rs` SHA-256 was
+`e05f28b1b968065577f77638bc11ad5b9552ff334222c700bcc00f2fe7c5db67`.
+The strict-RCH release-perf build used worker target
+`.rch-target-ovh-a-pool-3ffe0dd55dc6b08cd271f361c14ebf27` and produced
+these executing ELF receipts:
+
+- baseline: `42b2a4723d54c2c9a88544224a0ca8a2e29540bed5f4c6fefedd99371bc60c27`;
+- candidate: `d2fb4504398e2ac3d70c2ccd48ac821ac5e95e806c2cb30d3bb060fd3f856266`.
+
+The first 50,000-document attempt failed closed before artifact creation. One
+round crossed the shipping one-second visibility-publication boundary: even
+the two baseline twins produced different index totals (83,493,280 versus
+83,700,920 bytes), while the candidate produced 83,774,510 bytes. Those
+samples mix different segment topologies and carry no performance verdict.
+They are not repaired, averaged, or relabeled as canonical evidence.
+
+A bounded retry retained the full generator, 5,000-document batches,
+120,000,000-byte heap, 8 threads, and positions, but stopped at 40,000
+documents so every child remained below the wall-clock topology switch. One
+remote Node process ran one warmup per arm and then 21 seeded randomized
+rounds, each with two independently timed baseline twins and one candidate.
+A/B uses the geometric mean of the two baseline times. Every child reported
+the same 66,131,120 index bytes. Ratios use baseline-time / candidate-time, so
+values above 1 favor the candidate:
+
+A/A null: 0.997844 [0.995191, 1.006708], same invocation.
+
+| metric | result |
+|---|---:|
+| A/A median | 0.997844 |
+| A/A bootstrap median CI95 | [0.995191, 1.006708] |
+| candidate speedup median | **0.992877** |
+| candidate bootstrap median CI95 | **[0.985397, 0.997425]** |
+| pairs candidate faster | 4 / 21 |
+| pairs at or above 1.03 | 0 / 21 |
+| baseline / candidate median seconds | 0.591078 / 0.595277 |
+| baseline / candidate median docs/s | 67,673 / 67,196 |
+
+The A/A interval contains 1.0 while the entire A/B interval lies below it.
+Host load moved from 1.18 to 1.09 on 16 logical CPUs. This bounded result is
+not a canonical QG-1 cell, but it is sufficient for the pre-registered
+maintenance decision: the candidate is directionally slower, only four pairs
+favor it, and none reach 1.03. Raw JSON SHA-256 is
+`0d07a8da4409b18b45c873c10666f015723778c4ac0b52f7ea8ad73dcdec59e3`
+(preserved at
+`/data/tmp/bd-6oiq-casecarry-ab-40000-20260810T1920Z.json` and on `ovh-a`).
+
+**Decision: REJECT / NO-SHIP.** The candidate and its test were manually
+removed. Shipping `scribe.rs` is byte-identical to HEAD at
+`cd690fbf0fa1d3cc19252917e1b0be6ac3d8417d953f1b83e85b840e6c5abdd7`.
+Do not retry carrying this extra uppercase bitmask/state through the current
+tokenizer. The eliminated lowercase proof scan is cheaper than the additional
+mask extraction and per-span state; revisit only after a new profile shows a
+materially different case mix or an emitter design can consume case
+classification with no added hot-loop mask/state cost.
