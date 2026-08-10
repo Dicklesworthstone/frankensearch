@@ -909,6 +909,30 @@ release_lines = {line.strip() for line in release.splitlines()}
 
 release_targets = re.findall(r"^\s+target:\s+([^\s#]+)", release, flags=re.MULTILINE)
 lite_targets = re.findall(r"^\s+target:\s+([^\s#]+)", lite, flags=re.MULTILINE)
+installer_targets = re.findall(
+    r"^\s+target:\s+([^\s#]+)", installer_platform, flags=re.MULTILINE
+)
+require(
+    installer_targets
+    == [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+    ],
+    f"native installer proof target matrix drifted: {installer_targets}",
+)
+require(
+    "ubuntu-24.04-arm" in installer_platform,
+    "native Linux aarch64 installer proof must use the GitHub-hosted ARM runner",
+)
+require(
+    "loader_only::default_build_indexes_and_returns_a_real_hybrid_result"
+    in installer_platform
+    and "FRANKENSEARCH_REQUIRE_SEMANTIC_E2E: \"1\"" in installer_platform
+    and "matrix.expected_profile == 'semantic-loaders'" in installer_platform,
+    "semantic installer targets must execute the real offline stock-default quickstart",
+)
 require(
     release_targets == ["aarch64-apple-darwin", "x86_64-pc-windows-msvc"],
     f"full embedded release target matrix drifted: {release_targets}",

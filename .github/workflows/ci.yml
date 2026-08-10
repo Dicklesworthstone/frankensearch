@@ -32,6 +32,10 @@ jobs:
             target: x86_64-unknown-linux-gnu
             cargo_args: ""
             expected_profile: semantic-loaders
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            cargo_args: ""
+            expected_profile: semantic-loaders
           - os: macos-15
             target: aarch64-apple-darwin
             cargo_args: ""
@@ -100,6 +104,21 @@ jobs:
       - name: Build declared installer profile
         run: cargo build --locked --release -p frankensearch-fsfs ${{ matrix.cargo_args }}
 
+      - name: Cache verified model inputs for native semantic proof
+        if: matrix.expected_profile == 'semantic-loaders'
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/frankensearch/models
+          key: installer-platform-models-${{ runner.os }}-${{ runner.arch }}-v1-a28f4eeb-c9745ed1
+
+      - name: Provision verified model inputs for native semantic proof
+        if: matrix.expected_profile == 'semantic-loaders'
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/rch-ensure-deps.sh --models-only
+          scripts/rch-ensure-deps.sh --models-only --check
+
       - name: Install built binary through installer production primitive
         env:
           FSFS_INSTALL_CONTRACT_TEST: "1"
@@ -120,6 +139,41 @@ jobs:
             sha256sum "${bin_dir}/fsfs" >"${proof_dir}/binary.sha256"
           else
             shasum -a 256 "${bin_dir}/fsfs" >"${proof_dir}/binary.sha256"
+          fi
+
+      - name: Exercise real native semantic quickstart offline
+        if: matrix.expected_profile == 'semantic-loaders'
+        timeout-minutes: 30
+        shell: bash
+        env:
+          FRANKENSEARCH_REQUIRE_SEMANTIC_E2E: "1"
+        run: |
+          set -euo pipefail
+          proof_dir="${RUNNER_TEMP}/fsfs-installer-platform"
+          export FRANKENSEARCH_MODEL_DIR="${HOME}/.local/share/frankensearch/models"
+
+          cargo test --locked -p frankensearch-fsfs --test default_build_quickstart \
+            loader_only::default_build_indexes_and_returns_a_real_hybrid_result \
+            -- --ignored --exact --nocapture \
+            2>&1 | tee "${proof_dir}/semantic-e2e.log"
+
+          {
+            printf 'target=%s\n' '${{ matrix.target }}'
+            printf 'runner_os=%s\n' "${RUNNER_OS}"
+            printf 'runner_arch=%s\n' "${RUNNER_ARCH}"
+            printf 'revision=%s\n' "${GITHUB_SHA}"
+            printf 'offline=true\n'
+            uname -a
+          } >"${proof_dir}/semantic-e2e.receipt"
+
+          receipt_paths=(
+            "${FRANKENSEARCH_MODEL_DIR}/potion-multilingual-128M/.verified"
+            "${FRANKENSEARCH_MODEL_DIR}/all-MiniLM-L6-v2/.verified"
+          )
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${receipt_paths[@]}" >"${proof_dir}/model-receipts.sha256"
+          else
+            shasum -a 256 "${receipt_paths[@]}" >"${proof_dir}/model-receipts.sha256"
           fi
 
       - name: Upload installer platform proof
