@@ -401,6 +401,10 @@ fn file_witness(
     let stat = rustix::fs::fstat(file).map_err(|_| GenerationRootAdmissionErrorV1::Io)?;
     let size =
         u64::try_from(stat.st_size).map_err(|_| GenerationRootAdmissionErrorV1::UnsafeFileType)?;
+    #[cfg(target_env = "musl")]
+    let links = u64::from(stat.st_nlink);
+    #[cfg(not(target_env = "musl"))]
+    let links = stat.st_nlink;
     Ok(GenerationRootFileWitnessV1 {
         device: stat.st_dev,
         inode: stat.st_ino,
@@ -408,7 +412,7 @@ fn file_witness(
         // `st_nlink` is `u64` on glibc/x86_64 but `u32` on some musl targets
         // (aarch64-unknown-linux-musl), so widen explicitly rather than
         // relying on the platform-specific width matching the witness field.
-        links: u64::from(stat.st_nlink),
+        links,
         uid: stat.st_uid,
         gid: stat.st_gid,
         size,
