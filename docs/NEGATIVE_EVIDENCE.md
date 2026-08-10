@@ -18853,3 +18853,75 @@ the remaining sink closure regressed whole-job throughput. Revisit only after
 a new profile identifies an independently removable admission mechanism or a
 typed analyzer API can eliminate callback dispatch without duplicating the
 hot sink body.
+
+### 2026-08-10 — REJECT: stack-sorting canonical metadata pairs is slower (`bd-6oiq`, RubyJaguar)
+
+**Comparison class: SELF-SPEEDUP diagnostic.** This is maintenance evidence,
+not a competitive or QG-1 claim. The certified `trj-zen3-5995wx` runner was
+unavailable; the round ran on diagnostic worker `ovh-a`, an AMD Ryzen 7 5800X.
+
+After excluding the exhausted interner, tokenizer, admission-callback, and
+direct canonical-encoder families, the current exact-base full-medium worker
+profile showed `write_canonical_metadata` at 5.66% exclusive / 11.33%
+inclusive CPU. The pinned corpus carries 11 metadata entries per document,
+while shipping code rebuilds a `BTreeMap` of borrowed key/value pairs before
+serializing into the already-reused shard buffer. The candidate kept
+serde_json's string escaping and map serializer, but sorted up to 16 borrowed
+pairs in a fixed stack array; larger maps used one sorted `Vec`. This made no
+custom JSON emitter, content-hash, stored-byte, flush-accounting, or format
+change, and therefore did not repeat P12's rejected direct encoder.
+
+A focused byte-oracle regression compared the candidate with the literal old
+`BTreeMap` serialization at 0, 1, 15, 16, 17, and 31 entries, including
+Unicode, quotes, backslashes, and controls. Strict RCH on `ovh-a` passed that
+test 1/1 and the full candidate Quill library suite: **561 passed, 0 failed, 1
+ignored**. Candidate diff SHA-256 was
+`5375e45cab6f18e335860db8a2c5d56a669a482323e08fbdd078bd1fd011a652`;
+candidate `index.rs` SHA-256 was
+`a750c02551a9fb8d868aa91649c0f539e199212a79ae468c62793d56beaa337c`.
+The strict-RCH release-perf build used worker target
+`.rch-target-ovh-a-pool-3ffe0dd55dc6b08cd271f361c14ebf27` with
+`-C force-frame-pointers=yes` and produced these executing ELF receipts:
+
+- baseline: `42b2a4723d54c2c9a88544224a0ca8a2e29540bed5f4c6fefedd99371bc60c27`;
+- candidate: `d5e832e3947ed246b9e0a984238b0b3706cf3d2b230f927b676ff7e2ed99abe3`.
+
+The bounded invocation kept the full generator, 40,000 documents, 5,000-doc
+batches, 120,000,000-byte heap, 8 threads, and positions. One remote Node
+process ran one warmup per arm and 21 seeded randomized rounds, each with two
+independently timed baseline twins plus one candidate. A/B uses the geometric
+mean of the baseline twins. All 65 children produced exactly 66,132,080 index
+bytes. Ratios use baseline-time / candidate-time, so values above 1 favor the
+candidate.
+
+A/A null: 0.997636 [0.989648, 1.013219], same invocation.
+
+| metric | result |
+|---|---:|
+| A/A median | 0.997636 |
+| A/A bootstrap median CI95 | [0.989648, 1.013219] |
+| candidate speedup median | **0.982224** |
+| candidate bootstrap median CI95 | **[0.972930, 0.986132]** |
+| pairs candidate faster | 4 / 21 |
+| pairs at or above 1.03 | 0 / 21 |
+| baseline / candidate median seconds | 0.430985 / 0.438322 |
+| baseline / candidate median docs/s | 92,811 / 91,257 |
+| baseline / candidate median peak RSS | 299,909,120 / 303,685,632 bytes |
+
+The A/A interval contains 1.0 while the entire A/B interval lies below it.
+The candidate was about 1.8% slower and increased median peak RSS by 1.3%.
+Host load fell from 8.19 to 7.07 on 16 logical CPUs, so the adverse result is
+not explained by worsening load. Raw JSON SHA-256 is
+`5f234499352afdb59a4b6e76c3089c998eda0ed5d556e8467864d3c7a2d41ee2`
+(preserved at
+`/data/tmp/bd-6oiq-metadata-order-ab-40000-20260810T2016Z.json` and on
+`ovh-a`).
+
+**Decision: REJECT / NO-SHIP.** The candidate and byte-oracle test were
+manually removed. Shipping `index.rs` is byte-identical to HEAD at
+`97632d7f865d5ab23e225323e0fcbc971f87fa9216036a073b1c788623959b85`.
+Do not retry stack or per-document `Vec` sorting of borrowed canonical metadata
+pairs on this workload: eliminating the ordering-map nodes did not offset the
+sort/adapter cost. The canonical-metadata ordering vein is closed unless a new
+profile and materially different representation remove ordering work entirely
+while retaining exact bytes and serde_json's tuned emitter.
