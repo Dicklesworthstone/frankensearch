@@ -1415,17 +1415,15 @@ mod four_engine_generation_receipts {
              to the image would make a rebuilt graph indistinguishable from an unchanged one"
         );
 
-        // Control: the digest agreement above is order-sensitive, so it cannot
-        // be an artefact of both roles hashing "the same three names in any
-        // order". Reversing the live document order for one role alone must
-        // move its digest away from the anchor's.
+        // The caller cannot use the adapter as an oracle for inventing a new
+        // canonical preimage. Reversing the IDs must fail against the
+        // engine-local digest authenticated by the persisted graph receipt,
+        // before a contradictory component reaches the composite join.
         let mut reordered = DOCUMENTS;
         reordered.reverse();
-        let reordered_ann = ann_component_receipt(&graph_receipt, reordered, checkpoint)
-            .expect("ANN receipt over a reordered docset");
-        assert_ne!(
-            reordered_ann.docset_digest, vector.docset_digest,
-            "a reordered live-document set must not produce the anchor's digest"
+        assert!(
+            ann_component_receipt(&graph_receipt, reordered, checkpoint).is_err(),
+            "an ANN adapter must reject identifiers not witnessed by the graph's FSVI generation"
         );
     }
 
@@ -1627,56 +1625,51 @@ mod four_engine_generation_receipts {
             )
             .expect("the all-agreeing control must admit");
 
-            let blame =
-                |result: Result<ExactGenerationComponentsV1, ComponentJoinErrorV1>| match result {
-                    Err(ComponentJoinErrorV1::CheckpointDrift { role }) => role,
-                    other => panic!("expected a checkpoint drift, got {other:?}"),
-                };
-
             assert_eq!(
-                blame(ExactGenerationComponentsV1::admit(
+                ExactGenerationComponentsV1::admit(
                     vector.clone(),
                     drifted_lexical,
                     Some(ann.clone()),
                     metadata.clone(),
-                )),
-                "lexical",
+                ),
+                Err(ComponentJoinErrorV1::CheckpointDrift { role: "lexical" }),
                 "a drifted Quill receipt must be blamed on lexical, not on metadata"
             );
             assert_eq!(
-                blame(ExactGenerationComponentsV1::admit(
+                ExactGenerationComponentsV1::admit(
                     vector.clone(),
                     lexical.clone(),
                     Some(drifted_ann),
                     metadata.clone(),
-                )),
-                "ann"
+                ),
+                Err(ComponentJoinErrorV1::CheckpointDrift { role: "ann" })
             );
             assert_eq!(
-                blame(ExactGenerationComponentsV1::admit(
+                ExactGenerationComponentsV1::admit(
                     vector.clone(),
                     lexical.clone(),
                     Some(ann.clone()),
                     drifted_metadata,
-                )),
-                "metadata"
+                ),
+                Err(ComponentJoinErrorV1::CheckpointDrift { role: "metadata" })
             );
 
             // A receipt filed in another role's slot is refused BY ROLE, before
             // any content comparison — otherwise a misfiled receipt would be
             // reported as a drift and the operator would go looking for the
             // wrong fault.
-            match ExactGenerationComponentsV1::admit(
-                vector.clone(),
-                ann.clone(),
-                Some(ann.clone()),
-                metadata.clone(),
-            ) {
-                Err(ComponentJoinErrorV1::RoleMismatch { expected, found }) => {
-                    assert_eq!((expected, found), ("lexical", "ann"));
-                }
-                other => panic!("expected a role mismatch, got {other:?}"),
-            }
+            assert_eq!(
+                ExactGenerationComponentsV1::admit(
+                    vector.clone(),
+                    ann.clone(),
+                    Some(ann.clone()),
+                    metadata.clone(),
+                ),
+                Err(ComponentJoinErrorV1::RoleMismatch {
+                    expected: "lexical",
+                    found: "ann",
+                })
+            );
         });
     }
 
@@ -1762,21 +1755,18 @@ mod four_engine_generation_receipts {
             )
             .expect("the unmoved control must admit");
 
-            match ExactGenerationComponentsV1::admit(drifted_vector, lexical, Some(ann), metadata) {
-                Err(ComponentJoinErrorV1::CheckpointDrift { role }) => {
-                    assert_ne!(
-                        role, "vector",
-                        "the anchor is the reference it compares against, so it can never be the \
-                         role named — that inversion is the bug bd-z4zr3 closed"
-                    );
-                    assert!(
-                        matches!(role, "lexical" | "ann" | "metadata"),
-                        "a moved anchor is reported against a role that disagrees with it, got \
-                         {role}"
-                    );
-                }
-                other => panic!("expected the moved anchor to be refused as drift, got {other:?}"),
-            }
+            let observed =
+                ExactGenerationComponentsV1::admit(drifted_vector, lexical, Some(ann), metadata);
+            assert!(
+                matches!(
+                    &observed,
+                    Err(ComponentJoinErrorV1::CheckpointDrift {
+                        role: "lexical" | "ann" | "metadata"
+                    })
+                ),
+                "a moved anchor must be reported against a non-vector role that disagrees with \
+                 it, got {observed:?}"
+            );
         });
     }
 }

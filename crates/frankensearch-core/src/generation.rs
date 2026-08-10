@@ -4412,6 +4412,12 @@ pub enum ComponentJoinErrorV1 {
         /// The role whose digest disagreed with the vector anchor.
         role: &'static str,
     },
+    /// One component disagreed on the live-document census.
+    #[error("{role} component reports a different live-document count")]
+    LiveDocumentCountDrift {
+        /// The role whose count disagreed with the vector anchor.
+        role: &'static str,
+    },
     /// One component disagreed on the shared source checkpoint.
     #[error("{role} component was built from a different source checkpoint")]
     CheckpointDrift {
@@ -4494,6 +4500,7 @@ impl ExactGenerationComponentsV1 {
         }
 
         let anchor_docset = vector.docset_digest;
+        let anchor_live_document_count = vector.live_document_count;
         let anchor_checkpoint = vector.source_checkpoint;
         for receipt in [Some(&lexical), ann.as_ref(), Some(&metadata)]
             .into_iter()
@@ -4501,6 +4508,11 @@ impl ExactGenerationComponentsV1 {
         {
             if receipt.docset_digest != anchor_docset {
                 return Err(ComponentJoinErrorV1::DocsetDrift {
+                    role: receipt.role.as_str(),
+                });
+            }
+            if receipt.live_document_count != anchor_live_document_count {
+                return Err(ComponentJoinErrorV1::LiveDocumentCountDrift {
                     role: receipt.role.as_str(),
                 });
             }
@@ -7628,6 +7640,35 @@ mod tests {
                         if named == role.as_str()
                 ),
                 "{} checkpoint drift must reject on its own role, observed {observed:?}",
+                role.as_str()
+            );
+        }
+    }
+
+    /// The canonical digest already binds the document count when a receipt
+    /// comes from a correct producer, but `live_document_count` is also part of
+    /// the public receipt and composite identity. A malformed or incorrectly
+    /// adapted receipt must not carry a contradictory census through a
+    /// successful join merely because its digest still matches.
+    #[test]
+    fn each_role_live_document_count_drift_rejects_on_that_role() {
+        for (role, lexical_count, ann_count, metadata_count) in [
+            (GenerationComponentRole::Lexical, 3, 4, 4),
+            (GenerationComponentRole::Ann, 4, 5, 4),
+            (GenerationComponentRole::Metadata, 4, 4, 0),
+        ] {
+            let (vector, mut lexical, mut ann, mut metadata) = control_quartet();
+            lexical.live_document_count = lexical_count;
+            ann.live_document_count = ann_count;
+            metadata.live_document_count = metadata_count;
+            let observed = ExactGenerationComponentsV1::admit(vector, lexical, Some(ann), metadata);
+            assert!(
+                matches!(
+                    observed,
+                    Err(ComponentJoinErrorV1::LiveDocumentCountDrift { role: named })
+                        if named == role.as_str()
+                ),
+                "{} live-document count drift must reject on its own role, observed {observed:?}",
                 role.as_str()
             );
         }

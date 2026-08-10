@@ -39,6 +39,7 @@ use frankensearch_core::generation::{
     CanonicalDocsetV1, ExactComponentReceiptV1, GenerationAuthorityErrorV1,
     GenerationComponentReceiptV1, GenerationComponentRole, SourceCheckpointV1,
 };
+use sha2::{Digest, Sha256};
 
 use crate::FsviV2Witness;
 use crate::native_hnsw::NativeHnswGenerationReceiptV2;
@@ -76,6 +77,7 @@ fn sha256_from_hex(
 /// for an empty identifier or a duplicate. A duplicate is rejected rather than
 /// deduplicated, so a corrupted owner cannot be made to agree with a healthy
 /// one.
+#[cfg(test)]
 fn canonical_docset_digest<I, S>(
     ordered_live_documents: I,
 ) -> Result<[u8; 32], GenerationAuthorityErrorV1>
@@ -86,18 +88,71 @@ where
     Ok(CanonicalDocsetV1::from_ordered_live_documents(ordered_live_documents)?.digest())
 }
 
+/// Recompute both document-set domains and prove the caller supplied the
+/// identifiers authenticated by the engine witness.
+///
+/// Re-domaining is not a one-way conversion from a digest: it necessarily
+/// takes the original identifiers. That makes the engine-local digest the
+/// only available check that the supplied preimage is the one the engine
+/// actually observed. Without this comparison, a caller can substitute any
+/// other valid identifier list and mint a canonical receipt for documents the
+/// witness never authenticated.
+fn authenticated_docset<I, S>(
+    ordered_live_documents: I,
+    expected_fsvi_digest: [u8; 32],
+    digest_field: &'static str,
+) -> Result<(CanonicalDocsetV1, u64), GenerationAuthorityErrorV1>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let documents = ordered_live_documents
+        .into_iter()
+        .map(Into::into)
+        .collect::<Vec<String>>();
+    let canonical =
+        CanonicalDocsetV1::from_ordered_live_documents(documents.iter().map(String::as_str))?;
+
+    let mut fsvi_hasher = Sha256::new();
+    crate::update_digest_domain(&mut fsvi_hasher, crate::ORDERED_DOCSET_DIGEST_DOMAIN);
+    let live_document_count =
+        u64::try_from(documents.len()).map_err(|_| GenerationAuthorityErrorV1::InvalidField {
+            field: "component_receipt.live_document_count",
+        })?;
+    fsvi_hasher.update(live_document_count.to_be_bytes());
+    for document in &documents {
+        let byte_len = u64::try_from(document.len()).map_err(|_| {
+            GenerationAuthorityErrorV1::InvalidField {
+                field: "component_receipt.docset.document_id",
+            }
+        })?;
+        fsvi_hasher.update(byte_len.to_be_bytes());
+        fsvi_hasher.update(document.as_bytes());
+    }
+    let observed_fsvi_digest: [u8; 32] = fsvi_hasher.finalize().into();
+    if observed_fsvi_digest != expected_fsvi_digest {
+        return Err(GenerationAuthorityErrorV1::InvalidField {
+            field: digest_field,
+        });
+    }
+
+    Ok((canonical, live_document_count))
+}
+
 /// Derive the vector-component receipt from a validated FSVI v2 witness.
 ///
 /// `ordered_live_documents` must be the owner's live document identifiers in
 /// exact generation order — the same sequence the witness's own digest was
 /// taken over. It is a parameter rather than something read back out of the
 /// witness precisely because the witness only retains a digest, and a digest
-/// cannot be re-domained.
+/// cannot be re-domained. The adapter recomputes the witness domain before
+/// computing the canonical domain, so a different preimage is refused.
 ///
 /// # Errors
 ///
 /// Returns [`GenerationAuthorityErrorV1`] when the identifiers are not a valid
-/// canonical docset, or when the resulting receipt fails its own validation.
+/// canonical docset, do not match the witness digest/count, or when the
+/// resulting receipt fails its own validation.
 pub fn vector_component_receipt<I, S>(
     witness: &FsviV2Witness,
     ordered_live_documents: I,
@@ -107,14 +162,24 @@ where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
+    let (docset, live_document_count) = authenticated_docset(
+        ordered_live_documents,
+        witness.ordered_live_docset_digest,
+        "component_receipt.vector.ordered_live_docset_digest",
+    )?;
+    if live_document_count != witness.live_count {
+        return Err(GenerationAuthorityErrorV1::InvalidField {
+            field: "component_receipt.vector.live_document_count",
+        });
+    }
     let receipt = ExactComponentReceiptV1 {
         role: GenerationComponentRole::Vector,
         bytes: GenerationComponentReceiptV1 {
             byte_len: witness.byte_len,
             sha256: witness.whole_image_sha256,
         },
-        docset_digest: canonical_docset_digest(ordered_live_documents)?,
-        live_document_count: witness.live_count,
+        docset_digest: docset.digest(),
+        live_document_count,
         source_checkpoint: source_checkpoint.to_bytes(),
     };
     receipt.validate()?;
@@ -128,12 +193,15 @@ where
 /// would make a rebuilt graph indistinguishable from an unchanged one.
 ///
 /// `ordered_live_documents` carries the same requirement and the same reason as
-/// [`vector_component_receipt`].
+/// [`vector_component_receipt`]. The live-document count is derived from this
+/// authenticated preimage, not from `point_count`: native HNSW contains one
+/// point per physical FSVI row, including tombstones.
 ///
 /// # Errors
 ///
 /// Returns [`GenerationAuthorityErrorV1`] for a malformed hex digest, an
-/// invalid canonical docset, or a receipt that fails its own validation.
+/// invalid or unwitnessed canonical docset, or a receipt that fails its own
+/// validation.
 pub fn ann_component_receipt<I, S>(
     receipt: &NativeHnswGenerationReceiptV2,
     ordered_live_documents: I,
@@ -143,14 +211,23 @@ where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
+    let expected_fsvi_digest = sha256_from_hex(
+        "ordered_live_docset_digest",
+        &receipt.ordered_live_docset_digest,
+    )?;
+    let (docset, live_document_count) = authenticated_docset(
+        ordered_live_documents,
+        expected_fsvi_digest,
+        "component_receipt.ann.ordered_live_docset_digest",
+    )?;
     let component = ExactComponentReceiptV1 {
         role: GenerationComponentRole::Ann,
         bytes: GenerationComponentReceiptV1 {
             byte_len: receipt.graph_byte_len,
             sha256: sha256_from_hex("graph_sha256", &receipt.graph_sha256)?,
         },
-        docset_digest: canonical_docset_digest(ordered_live_documents)?,
-        live_document_count: receipt.point_count,
+        docset_digest: docset.digest(),
+        live_document_count,
         source_checkpoint: source_checkpoint.to_bytes(),
     };
     component.validate()?;
@@ -160,7 +237,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::canonical_docset_digest;
-    use frankensearch_core::generation::{CanonicalDocsetV1, CommitRange, SourceCheckpointV1};
+    use frankensearch_core::generation::{
+        CanonicalDocsetV1, CommitRange, GenerationAuthorityErrorV1, SourceCheckpointV1,
+    };
     use sha2::{Digest, Sha256};
 
     /// Mirror of the FSVI v2 ordered-live-docset digest, byte for byte with the
@@ -277,7 +356,6 @@ mod tests {
     /// Distinct byte markers per field, so a mis-mapped adapter produces a
     /// visibly wrong value rather than a coincidentally right one.
     const WITNESS_IMAGE_SHA: [u8; 32] = [0xA1; 32];
-    const WITNESS_FSVI_DOCSET_DIGEST: [u8; 32] = [0xA2; 32];
     const WITNESS_CONTENT_DIGEST: [u8; 32] = [0xA3; 32];
 
     fn witness_fixture() -> FsviV2Witness {
@@ -294,8 +372,9 @@ mod tests {
             input_fingerprint: [0xB4; 32],
             storage_fingerprint: [0xB5; 32],
             generation_fingerprint: [0xB6; 32],
-            // Deliberately NOT the canonical digest: the adapter must recompute.
-            ordered_live_docset_digest: WITNESS_FSVI_DOCSET_DIGEST,
+            // The engine-local digest authenticates the preimage supplied to
+            // the adapter; it is deliberately NOT the canonical digest.
+            ordered_live_docset_digest: fsvi_domain_digest(&DOCS),
             vector_content_digest: WITNESS_CONTENT_DIGEST,
             dimension: 4,
             quantization: Quantization::F32,
@@ -315,6 +394,16 @@ mod tests {
         text
     }
 
+    fn hex_digest(digest: [u8; 32]) -> String {
+        use std::fmt::Write as _;
+
+        let mut text = String::with_capacity(64);
+        for byte in digest {
+            write!(text, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        text
+    }
+
     fn ann_receipt_fixture() -> NativeHnswGenerationReceiptV2 {
         NativeHnswGenerationReceiptV2 {
             schema_version: 2,
@@ -327,7 +416,7 @@ mod tests {
             embedding_input_fingerprint: hex32(0xC5),
             vector_storage_fingerprint: hex32(0xC6),
             vector_content_digest: hex32(0xC7),
-            ordered_live_docset_digest: hex32(0xC8),
+            ordered_live_docset_digest: hex_digest(fsvi_domain_digest(&DOCS)),
             // The FSVI image digest, which the ANN component must NOT bind to.
             fsvi_whole_image_sha256: hex32(0xA1),
             fsvi_physical_row_count: 5,
@@ -343,7 +432,10 @@ mod tests {
                 ef_search: 32,
             },
             seed: 42,
-            point_count: DOCS.len() as u64,
+            // Native HNSW has one point per physical FSVI row, including
+            // tombstones. The exact-component census must instead come from
+            // the authenticated live identifiers above.
+            point_count: 5,
             entry_point: Some(0),
             max_level: 3,
             payload_crc32: 0x1234_5678,
@@ -419,7 +511,8 @@ mod tests {
             "the ANN component must not bind the FSVI whole-image digest"
         );
 
-        assert_eq!(receipt.live_document_count, ann.point_count);
+        assert_eq!(receipt.live_document_count, DOCS.len() as u64);
+        assert_ne!(receipt.live_document_count, ann.point_count);
         assert_eq!(receipt.source_checkpoint, checkpoint().to_bytes());
         assert_ne!(
             receipt.docset_digest,
@@ -496,57 +589,48 @@ mod tests {
         .expect("a generation without an ANN sidecar is still exact");
     }
 
-    /// Drift controls, each mutation applied ALONE and rejected on the role
-    /// that drifted. An adapter fed a different document set must not be able
-    /// to pass itself off as agreeing with the anchor.
+    /// The caller-supplied preimage must match the engine-local digest before
+    /// either adapter can mint a canonical receipt. Waiting for the composite
+    /// join to notice disagreement is too late: all roles could otherwise be
+    /// fed the same invented set and agree on a document identity no producer
+    /// witnessed.
     #[test]
-    fn an_adapter_fed_a_different_docset_rejects_on_its_own_role() {
-        let anchor = vector_component_receipt(&witness_fixture(), DOCS, checkpoint())
-            .expect("anchor vector receipt");
-        let canonical = anchor.docset_digest;
+    fn adapters_reject_docsets_not_authenticated_by_the_producer() {
+        let reordered = ["doc-a", "doc-c", "doc-b"];
+        let substituted = ["doc-a", "doc-b", "doc-z"];
+        assert_eq!(reordered.len(), DOCS.len());
+        assert_eq!(substituted.len(), DOCS.len());
 
-        // ANN built from a different ordered set, everything else identical.
-        let drifted_ann = ann_component_receipt(
-            &ann_receipt_fixture(),
-            ["doc-a", "doc-c", "doc-b"],
-            checkpoint(),
-        )
-        .expect("ann receipt over a reordered set");
-        assert_ne!(drifted_ann.docset_digest, canonical);
-        let observed = ExactGenerationComponentsV1::admit(
-            anchor.clone(),
-            lexical_component(canonical, checkpoint()),
-            Some(drifted_ann),
-            metadata_component(canonical, checkpoint()),
-        );
-        assert!(
-            matches!(
-                observed,
-                Err(ComponentJoinErrorV1::DocsetDrift { role: "ann" })
-            ),
-            "observed {observed:?}"
-        );
+        for documents in [reordered, substituted] {
+            assert!(
+                vector_component_receipt(&witness_fixture(), documents, checkpoint()).is_err(),
+                "vector adapter accepted unwitnessed documents: {documents:?}"
+            );
+            assert!(
+                ann_component_receipt(&ann_receipt_fixture(), documents, checkpoint()).is_err(),
+                "ANN adapter accepted unwitnessed documents: {documents:?}"
+            );
+        }
 
-        // A vector anchor built from a different set moves the anchor itself,
-        // so the OTHERS drift against it -- the first mandatory role checked
-        // after the anchor is lexical.
-        let drifted_anchor =
-            vector_component_receipt(&witness_fixture(), ["doc-a", "doc-b"], checkpoint())
-                .expect("vector receipt over a shorter set");
-        assert_ne!(drifted_anchor.docset_digest, canonical);
-        let observed = ExactGenerationComponentsV1::admit(
-            drifted_anchor,
-            lexical_component(canonical, checkpoint()),
-            None,
-            metadata_component(canonical, checkpoint()),
-        );
-        assert!(
-            matches!(
-                observed,
-                Err(ComponentJoinErrorV1::DocsetDrift { role: "lexical" })
-            ),
-            "the anchor defines truth, so a drifted anchor makes the others wrong: {observed:?}"
-        );
+        vector_component_receipt(&witness_fixture(), DOCS, checkpoint())
+            .expect("the witnessed vector docset remains valid");
+        ann_component_receipt(&ann_receipt_fixture(), DOCS, checkpoint())
+            .expect("the witnessed ANN docset remains valid");
+    }
+
+    #[test]
+    fn vector_adapter_rejects_a_witness_count_that_contradicts_its_digest() {
+        let mut witness = witness_fixture();
+        witness.live_count += 1;
+        assert!(matches!(
+            vector_component_receipt(&witness, DOCS, checkpoint()),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "component_receipt.vector.live_document_count"
+            })
+        ));
+
+        vector_component_receipt(&witness_fixture(), DOCS, checkpoint())
+            .expect("the consistent witness remains valid");
     }
 
     /// A checkpoint that disagrees rejects on the drifting role, with the
