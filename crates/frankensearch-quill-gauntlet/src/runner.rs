@@ -6308,7 +6308,7 @@ fn query_carries_explicit_and_with_negation(query: &str) -> bool {
 /// complex orderings whose reviewed control needs regrouping deliberately
 /// return a spelling that will not match a campaign case, so they fail closed
 /// until their own typed relation is defined.
-fn negated_conjunction_control_query(query: &str) -> Option<String> {
+pub fn negated_conjunction_control_query(query: &str) -> Option<String> {
     let mut control = Vec::new();
     let mut removed_and = false;
     let mut has_negation = false;
