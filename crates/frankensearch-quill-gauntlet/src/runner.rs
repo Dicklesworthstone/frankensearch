@@ -1881,6 +1881,42 @@ impl DivergenceObservationEvent {
     }
 }
 
+/// Whether a correction is the one evidence-generation migration that may
+/// refine an observation's class (bd-4oiwf).
+///
+/// DIV-010 was first recorded from a v8 object before that object could carry
+/// the explicit-form control needed to attribute the mismatch. The retained
+/// row therefore correctly failed closed as `RankMismatch`. A v9 object can
+/// carry that control and may refine the SAME minimized fixture to
+/// `OracleBug`. This is deliberately not a general class-correction escape
+/// hatch: both witness generations, both classes, the case ID, and every
+/// fixture-evidence field are fixed by the predicate. The relational witness
+/// join separately proves that the addressed v9 object actually carries the
+/// attributed class.
+fn is_v9_oracle_attribution_migration(
+    previous: &DivergenceObservationEvent,
+    successor: &DivergenceObservationEvent,
+) -> bool {
+    previous.class == DivergenceClass::RankMismatch
+        && successor.class == DivergenceClass::OracleBug
+        && previous.first_recorded_witness_case_id == successor.first_recorded_witness_case_id
+        && previous.fixture == successor.fixture
+        && previous
+            .first_recorded_witness_artifact_object
+            .as_ref()
+            .is_some_and(|address| {
+                address.scheme == DivergenceArtifactObjectHashScheme::ArtifactObjectV8Sha256
+                    && address.object_schema_version == DIVERGENCE_ARTIFACT_OBJECT_SCHEMA_VERSION_V8
+            })
+        && successor
+            .first_recorded_witness_artifact_object
+            .as_ref()
+            .is_some_and(|address| {
+                address.scheme == DivergenceArtifactObjectHashScheme::ArtifactObjectV9Sha256
+                    && address.object_schema_version == DIVERGENCE_ARTIFACT_OBJECT_SCHEMA_VERSION_V9
+            })
+}
+
 impl DivergenceDisposition {
     fn validate(&self, observation: &DivergenceObservationEvent) -> Result<(), GauntletError> {
         match self {
@@ -2447,7 +2483,10 @@ impl DivergenceRegisterLedger {
                     observation.validate(schema_version)?;
                     if observations
                         .get(&observation.divergence_id)
-                        .is_some_and(|previous| previous.class != observation.class)
+                        .is_some_and(|previous| {
+                            previous.class != observation.class
+                                && !is_v9_oracle_attribution_migration(previous, observation)
+                        })
                     {
                         return Err(campaign_error(
                             "divergence observation correction cannot change its class",
@@ -11062,6 +11101,122 @@ mod tests {
         assert!(
             !table.contains("accepted"),
             "a superseded acceptance must not still read as the active state: {table}"
+        );
+    }
+
+    /// DIV-010's v8 witness lacked the stored control needed to assign blame,
+    /// so its raw `RankMismatch` may be refined only by a v9 witness for the
+    /// exact same minimized fixture. Every neighbouring transition is a
+    /// planted negative against turning this migration into a general class
+    /// rewrite mechanism.
+    #[test]
+    fn only_the_exact_v8_to_v9_oracle_attribution_migration_changes_class() {
+        let binding = ingestion_binding();
+        let mut previous = DivergenceRegisterLedger::observation_from_binding(
+            &binding,
+            ingestion_header(),
+            "DIV-010",
+            DivergenceClass::RankMismatch,
+            ingestion_fixture(),
+            vec!["c".repeat(64)],
+            ingestion_narrative(),
+            ingestion_diagnostic(),
+        )
+        .expect("mint previous observation");
+        previous.first_recorded_witness_artifact_object = Some(
+            DivergenceArtifactObjectHash::v8_sha256("8".repeat(64))
+                .expect("valid retained v8 address"),
+        );
+
+        let mut successor = previous.clone();
+        successor.header = DivergenceRegisterEventHeader {
+            sequence: 3,
+            supersedes: Some(1),
+            recorded_by: "bd-4oiwf-campaign-ingestor".to_owned(),
+            recorded_at: "2026-08-10T12:02:00Z".to_owned(),
+        };
+        successor.class = DivergenceClass::OracleBug;
+        successor.first_recorded_witness_artifact_object = Some(
+            DivergenceArtifactObjectHash::v9_sha256("9".repeat(64))
+                .expect("valid current v9 address"),
+        );
+
+        let ledger = |previous: DivergenceObservationEvent,
+                      successor: DivergenceObservationEvent| {
+            DivergenceRegisterLedger::new(
+                "bd-4oiwf-attribution-migration",
+                vec![
+                    DivergenceRegisterEvent::Observation(Box::new(previous)),
+                    DivergenceRegisterEvent::Disposition(DivergenceDispositionEvent {
+                        header: DivergenceRegisterEventHeader {
+                            sequence: 2,
+                            supersedes: None,
+                            recorded_by: "bd-4oiwf-campaign-ingestor".to_owned(),
+                            recorded_at: "2026-08-10T12:01:00Z".to_owned(),
+                        },
+                        divergence_id: "DIV-010".to_owned(),
+                        disposition: DivergenceDisposition::Blocking {
+                            bead_id: "bd-4oiwf".to_owned(),
+                            rationale: "The v8 witness could not assign blame.".to_owned(),
+                            reviewer: "bd-4oiwf-independent-reviewer".to_owned(),
+                            reviewed_at: "2026-08-10T12:00:30Z".to_owned(),
+                        },
+                    }),
+                    DivergenceRegisterEvent::Observation(Box::new(successor)),
+                    DivergenceRegisterEvent::Disposition(DivergenceDispositionEvent {
+                        header: DivergenceRegisterEventHeader {
+                            sequence: 4,
+                            supersedes: Some(2),
+                            recorded_by: "bd-4oiwf-campaign-ingestor".to_owned(),
+                            recorded_at: "2026-08-10T12:03:00Z".to_owned(),
+                        },
+                        divergence_id: "DIV-010".to_owned(),
+                        disposition: DivergenceDisposition::Accepted {
+                            equivalence_law:
+                                "The explicit-form control assigns the defect to the oracle."
+                                    .to_owned(),
+                            rationale: "The v9 witness stores the exact two-engine control."
+                                .to_owned(),
+                            reviewer: "bd-4oiwf-independent-reviewer".to_owned(),
+                            reviewed_at: "2026-08-10T12:02:30Z".to_owned(),
+                        },
+                    }),
+                ],
+            )
+        };
+
+        ledger(previous.clone(), successor.clone())
+            .expect("the exact v8 RankMismatch to v9 OracleBug migration is admitted");
+
+        let mut wrong_successor_class = successor.clone();
+        wrong_successor_class.class = DivergenceClass::SnippetWindow;
+        assert!(
+            ledger(previous.clone(), wrong_successor_class).is_err(),
+            "an arbitrary class correction must remain rejected"
+        );
+
+        let mut wrong_successor_generation = successor.clone();
+        wrong_successor_generation.first_recorded_witness_artifact_object = Some(
+            DivergenceArtifactObjectHash::v8_sha256("9".repeat(64))
+                .expect("valid but non-migrating v8 address"),
+        );
+        assert!(
+            ledger(previous.clone(), wrong_successor_generation).is_err(),
+            "an OracleBug relabel without a v9 witness must remain rejected"
+        );
+
+        let mut wrong_previous_class = previous.clone();
+        wrong_previous_class.class = DivergenceClass::QueryCanonicalization;
+        assert!(
+            ledger(wrong_previous_class, successor.clone()).is_err(),
+            "a semantic-class observation cannot be laundered through the migration"
+        );
+
+        let mut changed_fixture = successor;
+        changed_fixture.fixture.fixture_sha256 = "d".repeat(64);
+        assert!(
+            ledger(previous, changed_fixture).is_err(),
+            "a different fixture is a new observation, not an attribution refinement"
         );
     }
 
