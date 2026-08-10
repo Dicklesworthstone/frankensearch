@@ -18537,3 +18537,72 @@ Do not retry a wider per-field source table on this workload without a new
 profile showing the repeated lookup/allocation family above the materiality
 floor. The table's larger per-document fill/write footprint plausibly consumes
 the saved tiny-slice searches; a future retry must first count that split.
+
+### 2026-08-10 — REJECT: direct-mapped hot-term cache slows full-medium ingest (`bd-6oiq`, RubyJaguar)
+
+**Comparison class: SELF-SPEEDUP diagnostic.** No competitive or QG-1 claim is
+made. The certified `trj-zen3-5995wx` runner remained unavailable; this round
+ran on the diagnostic `ovh-a` Ryzen 7 5800X worker.
+
+After the schema resolver round was restored, the current full-medium profile
+still left `TermInterner::find_in_bucket` as the dominant concrete worker
+frame. The ledger already contains the identity-hasher and inline-span keeps,
+so neither was retried. The distinct hypothesis was Zipf locality: a 64-slot
+fixed direct map of `(finalized hash, BucketEntry)` might let common repeated
+terms bypass the already-identity-hashed bucket table.
+
+The candidate added that cache only to the mutating `intern` path. A slot hit
+still compared the complete `(field ordinal, term bytes)` key in the arena;
+hash equality alone never admitted an id. A miss fell through to the existing
+collision bucket and refreshed the slot. Cache entries were copied safely on
+clone, cleared on reset, and excluded from logical `bytes_used`, so segment
+flush boundaries could not move. A focused test forced all terms to hash to
+zero, alternated two different keys through the same slot, cloned the
+interner, reset it, and proved stable ids, exact byte verification, and fresh
+post-reset dense ids. The first focused command used an incorrect bare
+`--exact` filter and ran zero tests; it is discarded. The corrected strict-RCH
+focused run passed 1/1, and the complete strict-RCH Quill library suite passed
+**561 tests, 0 failed, 1 ignored**.
+
+Candidate patch SHA-256 was
+`a531385772e92495e90bbc3eaa40fc9e34b2b561986905a3b4a430b8fbc1100d`;
+candidate `scribe.rs` SHA-256 was
+`38fe654d3b3aa1ab52c64ef99e93ff8ec1a57ccc7fba814f49c79353a6f4854b`.
+The baseline executing ELF SHA-256 was `42b2a4723d54c2c9a88544224a0ca8a2e29540bed5f4c6fefedd99371bc60c27`.
+The candidate executing ELF SHA-256 was `ec778d8b80802f3d806e55e7f8dd34cab8f976bc1bf7190fa58f666caf58c601`.
+
+One remote Python process verified both ELFs, ran one warmup per arm, then 21
+seeded randomized rounds. Each round contained two independently timed
+baseline twins and one candidate; A/B used the geometric mean of the two
+baseline times, avoiding pseudoreplication. Workload: 50,000 documents, batch
+5,000, heap 120,000,000 bytes, 8 threads, positions on, full scale. Ratios use
+baseline-time / candidate-time, so values above 1 favor the candidate:
+
+A/A null: 0.999584 [0.992753, 1.004412], same invocation.
+
+| metric | result |
+|---|---:|
+| A/A median | 0.999584 |
+| A/A bootstrap median CI95 | [0.992753, 1.004412] |
+| candidate speedup median | **0.987653** |
+| candidate bootstrap median CI95 | **[0.984860, 0.995174]** |
+| pairs candidate faster | 5 / 21 |
+| pairs at or above 1.03 | 1 / 21 |
+| baseline / candidate median seconds | 0.785885 / 0.797120 |
+| baseline / candidate median docs/s | 63,623 / 62,726 |
+
+The A/A interval contains 1.0 while the complete A/B interval lies below it.
+Host load decreased from 6.35 to 6.02 on a 16-logical-CPU worker; this remains
+diagnostic rather than certified evidence, but no favorable interpretation can
+clear the pre-registered 1.03 maintenance line. Every child reported the same
+83,683,104 index bytes. Raw JSON SHA-256 is
+`313639e071fc8a90e6f80af8115946f08437fa19253604cd7da34f48e277018e`
+(preserved at `/data/tmp/bd-6oiq-hotcache-ab-20260810.json` and on `ovh-a`).
+
+**Decision: REJECT / NO-SHIP.** The cache and its test were manually removed;
+shipping `scribe.rs` is byte-identical to HEAD at
+`cd690fbf0fa1d3cc19252917e1b0be6ac3d8417d953f1b83e85b840e6c5abdd7`.
+Do not retry this fixed direct-map family on the current workload. Its extra
+slot load and exact verification plausibly cost more than the bucket probes it
+avoids; any future revisit first needs counted hit/miss attribution showing a
+materially different term-locality regime, then a newly bounded cache design.
