@@ -5,6 +5,15 @@ MODE="all"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCHEMA="$ROOT_DIR/schemas/fsfs-packaging-release-install-v1.schema.json"
 FAILURES=0
+INSTALLER_EXPECTED_PROFILE="${FSFS_INSTALL_EXPECTED_PROFILE:-semantic-loaders}"
+
+case "$INSTALLER_EXPECTED_PROFILE" in
+  semantic-loaders|explicit-lite) ;;
+  *)
+    echo "ERROR: invalid FSFS_INSTALL_EXPECTED_PROFILE '$INSTALLER_EXPECTED_PROFILE' (expected semantic-loaders|explicit-lite)" >&2
+    exit 2
+    ;;
+esac
 
 usage() {
   cat <<USAGE
@@ -122,6 +131,11 @@ check_installer_behavior() {
   local archive="$ROOT_DIR/README.md"
   local expected=""
   local installer_shell="${FSFS_INSTALL_TEST_BASH:-bash}"
+  local staged_stub_work staged_stub
+
+  staged_stub_work=$(mktemp -d)
+  staged_stub="$staged_stub_work/fsfs"
+  installer_write_stub "$staged_stub" "1.0.0"
 
   echo "[installer] exercising fail-closed checksum and profile routing behavior"
   if command -v sha256sum >/dev/null 2>&1; then
@@ -200,28 +214,30 @@ check_installer_behavior() {
     FAILURES=$((FAILURES + 1))
   fi
 
-  if FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" provision /bin/true >/dev/null; then
+  if FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" provision "$staged_stub" >/dev/null; then
     echo "[installer][OK]   staged semantic provisioning admits verified success"
   else
     echo "[installer][FAIL] staged semantic provisioning rejected verified success"
     FAILURES=$((FAILURES + 1))
   fi
 
-  if FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" provision /bin/false >/dev/null 2>&1; then
+  if FSFS_STUB_VERIFY_STATUS=1 FSFS_INSTALL_CONTRACT_TEST=1 \
+    "$installer_shell" "$installer" provision "$staged_stub" >/dev/null 2>&1; then
     echo "[installer][FAIL] staged semantic provisioning failure unexpectedly admitted"
     FAILURES=$((FAILURES + 1))
   else
     echo "[installer][OK]   staged semantic provisioning failure preserves the destination path"
   fi
 
-  if FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" verify-staged /bin/true >/dev/null; then
+  if FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" verify-staged "$staged_stub" >/dev/null; then
     echo "[installer][OK]   staged binary verification admits a runnable candidate"
   else
     echo "[installer][FAIL] staged binary verification rejected a runnable candidate"
     FAILURES=$((FAILURES + 1))
   fi
 
-  if FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" verify-staged /bin/false >/dev/null 2>&1; then
+  if FSFS_STUB_FAIL_FROM_DEST="$staged_stub_work" FSFS_INSTALL_CONTRACT_TEST=1 \
+    "$installer_shell" "$installer" verify-staged "$staged_stub" >/dev/null 2>&1; then
     echo "[installer][FAIL] staged binary verification failure unexpectedly admitted"
     FAILURES=$((FAILURES + 1))
   else
@@ -578,6 +594,50 @@ check_installer_offline_e2e() {
   rm -rf "$work"
 }
 
+# Intel macOS cannot load the pinned ONNX Runtime distribution. Prove the real
+# native top-level default path rejects before replacement, while the workflow
+# separately builds and installs the explicitly requested lite profile.
+check_installer_unsupported_native_e2e() {
+  local installer="$ROOT_DIR/install.sh"
+  local installer_shell="${FSFS_INSTALL_TEST_BASH:-bash}"
+  local native_os native_arch work archive dest digest status output before_digest after_digest
+
+  native_os=$(uname -s)
+  native_arch=$(uname -m)
+  echo "[installer] exercising native unsupported-semantic preservation"
+  if [[ "$native_os" != "Darwin" || "$native_arch" != "x86_64" ]]; then
+    echo "[installer][FAIL] explicit-lite native proof requires Darwin x86_64, got $native_os $native_arch"
+    FAILURES=$((FAILURES + 1))
+    return
+  fi
+
+  work=$(mktemp -d)
+  dest="$work/bin"
+  mkdir -p "$work/stage" "$dest"
+  installer_write_stub "$work/stage/fsfs" "9.9.9"
+  installer_write_stub "$dest/fsfs" "1.0.0"
+  archive="$work/fsfs-9.9.9-local.tar.gz"
+  tar -czf "$archive" -C "$work/stage" fsfs
+  digest=$(installer_file_digest "$archive")
+  before_digest=$(installer_file_digest "$dest/fsfs")
+
+  status=0
+  output=$(env NO_COLOR=1 "FSFS_INSTALL_LOCK_FILE=$work/install.lock" \
+    "$installer_shell" "$installer" --offline --version v9.9.9 \
+    --artifact-url "$archive" --checksum "$digest" --dest "$dest" 2>&1) || status=$?
+  after_digest=$(installer_file_digest "$dest/fsfs")
+  if [[ "$status" -eq 78 \
+    && "$output" == *"unsupported_platform"* \
+    && "$output" == *"--lite"* \
+    && "$before_digest" == "$after_digest" ]] \
+    && "$dest/fsfs" version | grep -q '1\.0\.0'; then
+    echo "[installer][OK]   native Intel macOS default rejects actionably before incumbent replacement"
+  else
+    echo "[installer][FAIL] native unsupported default status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
 # Contract "Integrity and Signature Policy" + "Upgrade UX Expectations": every
 # required reason code that the installer owns must have a real emitter.
 check_installer_release_policy() {
@@ -930,6 +990,10 @@ require(
     "toolchain: nightly-2026-07-20" in installer_platform
     and "components: rustfmt, clippy" in installer_platform,
     "installer proof must install every component pinned by rust-toolchain.toml",
+)
+require(
+    "FSFS_INSTALL_EXPECTED_PROFILE: ${{ matrix.expected_profile }}" in installer_platform,
+    "installer proof must select the native contract from the declared profile",
 )
 require(
     "python3 -m venv" in installer_platform
@@ -1353,9 +1417,15 @@ fi
 if [[ "$MODE" == "installer" || "$MODE" == "all" ]]; then
   check_installer_behavior
   check_installer_preflight
-  check_installer_offline_e2e
+  if [[ "$INSTALLER_EXPECTED_PROFILE" == "semantic-loaders" ]]; then
+    check_installer_offline_e2e
+  else
+    check_installer_unsupported_native_e2e
+  fi
   check_installer_release_policy
-  check_installer_rollback_e2e
+  if [[ "$INSTALLER_EXPECTED_PROFILE" == "semantic-loaders" ]]; then
+    check_installer_rollback_e2e
+  fi
 fi
 if [[ "$MODE" == "model-features" || "$MODE" == "all" ]]; then
   check_model_features

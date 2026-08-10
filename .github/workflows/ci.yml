@@ -111,6 +111,7 @@ jobs:
       - name: Exercise installer with the platform system Bash
         env:
           FSFS_INSTALL_TEST_BASH: /bin/bash
+          FSFS_INSTALL_EXPECTED_PROFILE: ${{ matrix.expected_profile }}
         run: |
           /bin/bash --version | head -n 1
           /bin/bash -n install.sh
