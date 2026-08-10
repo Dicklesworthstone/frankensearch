@@ -18465,3 +18465,75 @@ lever, is byte-identical, and was left in place. Retry only with a fixture whose
 stored-byte volume is a materially larger share of seal cost than 7.5 MB per
 65,535-document lease, or once seal cost elsewhere has dropped far enough for a
 ~1 ms step to matter.
+
+### 2026-08-10 — REJECT: schema-indexed document-input resolver misses the maintenance bar (`bd-6oiq`, RubyJaguar)
+
+**Comparison class: SELF-SPEEDUP diagnostic.** No competitive or QG-1 claim is
+made. The certified `trj-zen3-5995wx` runner remained unavailable; `ovh-a` is a
+diagnostic VPS class.
+
+The current full-medium worker profile put
+`ColumnarAccumulator::add_document_with_values::{closure#6}` at 7.62% exclusive
+worker CPU. Source inspection found that the generic accumulator first
+validated the indexed/numeric/stored input slices, then linearly searched those
+same small slices again for stored-size admission, schema-order tokenization,
+numeric resolution, and stored-field appends. It also materialized a fresh
+`Vec<Option<NumericValue>>` per document. No prior ledger row covered this
+specific repeated-resolution family; the tempting canonical-metadata rewrite
+was separately rejected by P12 and was not retried.
+
+The one-lever candidate replaced the `Vec<bool>` duplicate scratch with one
+schema-indexed source table (`Absent | Indexed(index) | Numeric(index) |
+Stored(index)`). Validation still ran in the same public slice order and all
+column mutation still ran in schema order, but later stages resolved each field
+by direct index and the numeric staging allocation disappeared. Logical
+`bytes_used` accounting stayed pinned to the former bit-vector size so flush
+boundaries and durable segment bytes could not move. A focused regression test
+first left the resolver populated by a rejected duplicate document, then proved
+that shuffled indexed, numeric, and stored inputs produced the expected
+schema-ordered term ids, typed numeric value, and exact stored bytes.
+
+Candidate patch SHA-256 was
+`b6e5923e73d567d847e686fd80a8a5b49db661efd3162412fbd39a4d9a977e31`;
+candidate `scribe.rs` SHA-256 was
+`b4c442217bd81a64f7ce31744f72a600109c247b6ace7e3865d4f55b8e72b6f8`.
+Strict RCH on `ovh-a` passed the focused test and then the complete Quill
+library suite: **561 passed, 0 failed, 1 ignored**. That suite includes the
+existing atomic-validation, deterministic replay, scalar/parallel byte
+identity, flush-boundary, stored/numeric sidecar, and ingest lifecycle gates.
+
+Executing ELF SHA-256 receipts were preserved independently:
+
+- baseline executing ELF SHA-256: `42b2a4723d54c2c9a88544224a0ca8a2e29540bed5f4c6fefedd99371bc60c27`;
+- candidate executing ELF SHA-256: `2aa684adbfd6d327d09a28ee40e5ba91342f824f8f827e6106aeeb4f8008d44e`.
+
+Same-invocation diagnostic workload: 50,000 documents, batch 5,000, heap
+120,000,000 bytes, 8 threads, positions on, full scale. One seeded Python
+process ran an untimed warmup and then 21 randomized rounds containing two
+baseline twins plus one candidate. Ratios below use baseline-time / candidate-
+time, so values above 1 favor the candidate:
+
+| metric | result |
+|---|---:|
+| A/A median | 0.993749 |
+| A/A bootstrap median CI95 | [0.990853, 0.999407] |
+| candidate speedup median | **0.987530** |
+| candidate bootstrap median CI95 | **[0.983572, 0.995959]** |
+| pairs candidate faster | 3 / 21 |
+| pairs at or above 1.03 | 1 / 21 |
+| baseline / candidate median docs/s | 62,625 / 62,389 |
+
+The first six rounds occupied a visibly slower host phase (roughly 1.4-1.7 s
+per child before settling near 0.8 s), and the A/A interval narrowly excluded
+1.0, so this evidence is not used to claim a regression. It is sufficient for
+the pre-registered keep decision: the candidate point estimate is below 1.0,
+only one pair reaches the 1.03 material line, and its interval cannot support a
+keep under any admissible null interpretation.
+
+**Decision: REJECT / NO-SHIP.** The candidate was manually restored; shipping
+`scribe.rs` is again byte-identical to HEAD at
+`cd690fbf0fa1d3cc19252917e1b0be6ac3d8417d953f1b83e85b840e6c5abdd7`.
+Do not retry a wider per-field source table on this workload without a new
+profile showing the repeated lookup/allocation family above the materiality
+floor. The table's larger per-document fill/write footprint plausibly consumes
+the saved tiny-slice searches; a future retry must first count that split.
