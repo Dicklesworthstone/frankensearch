@@ -18770,3 +18770,86 @@ tokenizer. The eliminated lowercase proof scan is cheaper than the additional
 mask extraction and per-span state; revisit only after a new profile shows a
 materially different case mix or an emitter design can consume case
 classification with no added hot-loop mask/state cost.
+
+### 2026-08-10 — REJECT: fusing the borrowed-token admission callback is slower (`bd-6oiq`, RubyJaguar)
+
+**Comparison class: SELF-SPEEDUP diagnostic.** This is maintenance evidence,
+not a competitive or QG-1 claim. The certified `trj-zen3-5995wx` runner was
+unavailable; the round ran on diagnostic worker `ovh-a`, an AMD Ryzen 7 5800X.
+
+After the tokenizer case-state rejection, the current full-medium worker
+profile supplied a distinct callback vein: the `analyze_admitted_borrowed`
+closure accounted for 6.64% exclusive worker CPU. Source search found exactly
+one borrowed-ingest caller. The candidate removed that helper and performed
+the identical post-normalization `MAX_TERM_BYTES` check, raw/admitted/oversized
+accounting, warning, term interning, and token-column append in the
+accumulator's existing analyzer sink. This removed one nested `dyn FnMut`
+callback layer without changing token boundaries, normalized term bytes,
+positions, fieldnorms, flush accounting, tracing fields, or segment encoding.
+
+A focused regression pinned the subtle admission case where the source is
+under `MAX_TERM_BYTES` but Unicode lowercase expansion exceeds it, and proved
+that the following token retains its position gap. Strict RCH on `ovh-a`
+passed that test 1/1 and the full candidate Quill library suite: **561 passed,
+0 failed, 1 ignored**. Candidate diff SHA-256 was
+`a24abde34a349b0b09927d3d84742da436f8935192db2c494e14b0eb52396e5f`;
+candidate `scribe.rs` SHA-256 was
+`77c2c7b7a5d09a69ce328e236476ce2aeba3628101f35ba7430ec9d55ec876e2`.
+The strict-RCH release-perf build used worker target
+`.rch-target-ovh-a-pool-3ffe0dd55dc6b08cd271f361c14ebf27` with
+`-C force-frame-pointers=yes` and produced these executing ELF receipts:
+
+- baseline: `42b2a4723d54c2c9a88544224a0ca8a2e29540bed5f4c6fefedd99371bc60c27`;
+- candidate: `3580cca5a000fa621be15e55649287f38421f4749b58b01f9ba3ecfb01cc0ef6`.
+
+The first two bounded-driver invocations failed closed on their first baseline
+warmup, before the candidate executed and before either could create an
+artifact. The exact baseline ELF produced 66,132,080 index bytes twice, while
+the driver had carried 66,131,120 as an absolute constant from the preceding
+invocation. Because the publication topology is wall-clock-sensitive, a
+cross-invocation absolute byte total was not a valid arm-parity gate. The
+repair and its admit/lose split were recorded in Beads before any candidate
+execution: the first baseline warmup anchors the current invocation, then the
+candidate warmup and every timed child must match that topology exactly. The
+two prior invocations remain rejected/no-artifact. The repair did not alter the
+workload, order, sample count, speed threshold, estimator, or ELF identity and
+cannot admit a within-invocation cross-arm byte mismatch.
+
+The repaired invocation kept the full generator, 40,000 documents, 5,000-doc
+batches, 120,000,000-byte heap, 8 threads, and positions. One remote Node
+process ran one warmup per arm and 21 seeded randomized rounds, each with two
+independently timed baseline twins plus one candidate. A/B uses the geometric
+mean of the baseline twins. All 65 children produced exactly 66,132,080 index
+bytes. Ratios use baseline-time / candidate-time, so values above 1 favor the
+candidate.
+
+A/A null: 1.000226 [0.995141, 1.013076], same invocation.
+
+| metric | result |
+|---|---:|
+| A/A median | 1.000226 |
+| A/A bootstrap median CI95 | [0.995141, 1.013076] |
+| candidate speedup median | **0.983239** |
+| candidate bootstrap median CI95 | **[0.978173, 0.990925]** |
+| pairs candidate faster | 0 / 21 |
+| pairs at or above 1.03 | 0 / 21 |
+| baseline / candidate median seconds | 0.403222 / 0.408597 |
+| baseline / candidate median docs/s | 99,201 / 97,896 |
+
+The A/A interval contains 1.0 while the complete A/B interval lies below it;
+the candidate was slower in every pair. Host load moved from 1.47 to 1.31 on
+16 logical CPUs. Raw JSON SHA-256 is
+`a6c77f889bab4259ff4f10dab7cfce76fa24f8473c406d59e93343fbe65d6801`
+(preserved at
+`/data/tmp/bd-6oiq-admission-fusion-ab-40000-20260810T1946Z.json` and on
+`ovh-a`).
+
+**Decision: REJECT / NO-SHIP.** The candidate and its focused test were
+manually removed. Shipping `scribe.rs` is byte-identical to HEAD at
+`cd690fbf0fa1d3cc19252917e1b0be6ac3d8417d953f1b83e85b840e6c5abdd7`.
+Do not retry this exact admission-callback fusion on the current ingest path:
+the removed indirect layer was already optimized well enough that enlarging
+the remaining sink closure regressed whole-job throughput. Revisit only after
+a new profile identifies an independently removable admission mechanism or a
+typed analyzer API can eliminate callback dispatch without duplicating the
+hot sink body.
