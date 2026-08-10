@@ -13388,6 +13388,21 @@ if not close_only_contended or not explicit_unlock_released:
         }
 
         #[test]
+        fn physical_apfs_acl_add_remove_cycle_rejects_then_admits_same_root() {
+            let root_path = fixture_root("acl-add-remove-cycle");
+            set_non_empty_acl(&root_path, true);
+
+            let error = QualifiedGenerationRoot::admit(&root_path)
+                .expect_err("the ACL-bearing APFS root must fail closed");
+            assert_eq!(error.kind(), GenerationRootErrorKind::AclRejected);
+            assert_eq!(error.stage(), GenerationRootStage::InspectAcl);
+
+            set_empty_acl(&root_path);
+            QualifiedGenerationRoot::admit(&root_path)
+                .expect("the same APFS root must qualify after its ACL is removed");
+        }
+
+        #[test]
         fn physical_apfs_rejects_acl_bearing_artifact_control_and_lock_targets() {
             let artifact_root = fixture_root("artifact-target-acl");
             let artifact_path = private_file(&artifact_root, "artifact", b"sealed");
