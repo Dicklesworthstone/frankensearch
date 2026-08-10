@@ -18606,3 +18606,84 @@ Do not retry this fixed direct-map family on the current workload. Its extra
 slot load and exact verification plausibly cost more than the bucket probes it
 avoids; any future revisit first needs counted hit/miss attribution showing a
 materially different term-locality regime, then a newly bounded cache design.
+
+### 2026-08-10 — REJECT: inline short composite bucket keys do not clear the maintenance bar (`bd-6oiq`, RubyJaguar)
+
+**Comparison class: SELF-SPEEDUP diagnostic.** No competitive or QG-1 claim is
+made. The certified `trj-zen3-5995wx` runner remained unavailable; this round
+ran on the diagnostic `ovh-a` Ryzen 7 5800X worker.
+
+The current full-medium worker profile placed `TermInterner::find_in_bucket`
+at 21.48% of attributed worker CPU. After the direct-mapped cache rejected,
+the distinct hypothesis was that its dominant `term00001`-shaped keys could
+avoid the random arena dereference used for collision verification. The
+candidate kept `BucketEntry` at 16 bytes but encoded complete composite keys
+of at most 11 bytes inside its existing 12-byte span payload; longer keys
+retained the exact arena-span route. The high tag bit distinguished the two
+forms, exact field-prefix and term-byte verification remained mandatory, and
+`Bucket`, `TERM_BUCKET_BYTES_ESTIMATE`, logical flush accounting, and durable
+segment boundaries were unchanged. A focused test pinned the 9/10-byte term
+boundary, `One` and forced-collision `Many` buckets, duplicates, clone/reset,
+and exact fallback-span decoding.
+
+The candidate was committed and pushed concurrently as
+`b63c84de63601d3866bc9f4c755f944d370b0ad6` while its strict-RCH full suite
+was running, before this performance adjudication. The later merge
+`195c398c75e811f7838cab25657190825058add5` did not alter the measured Quill
+source or dependency seam. That concurrent landing is not evidence of a keep;
+the reject below required a narrow corrective manual restore.
+
+Candidate diff SHA-256 was
+`55e2218d270468f685f21fbd1d0a4f442ca3b6d38c08e5b6c556b69c4b6fcc5c`;
+candidate `scribe.rs` SHA-256 was
+`604568291e7a9e9500d4e12ff051ddd192d5274842ede034386fb9123fad6bae`.
+An exact-base `b63c84de` release-perf build completed through strict RCH on
+`ovh-a` with clean-overlay fingerprint
+`fe0d5151031be8fda7951fe7fe1f42f7ce344018fdb3ed21e6ada866b230b195`.
+Candidate validation passed the focused test 1/1 and the complete Quill
+library suite: **560 passed, 0 failed, 1 ignored**. After the decision, the
+manually restored source passed the original focused invariant test 1/1 and
+the same complete suite: **560 passed, 0 failed, 1 ignored**.
+
+Executing ELF SHA-256 receipts were:
+
+- baseline: `42b2a4723d54c2c9a88544224a0ca8a2e29540bed5f4c6fefedd99371bc60c27`;
+- candidate: `37231a05578358ebc1b48097947a192122998e78e034980209dcc72d4a8208c9`.
+
+One remote Python process verified both ELFs, ran one warmup per arm, then 21
+seeded randomized rounds. Each round contained two independently timed
+baseline twins and one candidate; A/B used the geometric mean of the twins.
+Workload: 50,000 documents, batch 5,000, heap 120,000,000 bytes, 8 threads,
+positions on, full scale. Ratios use baseline-time / candidate-time, so values
+above 1 favor the candidate.
+
+A/A null: 1.016440 [0.990486, 1.033942], same invocation.
+
+| metric | result |
+|---|---:|
+| A/A median | 1.016440 |
+| A/A bootstrap median CI95 | [0.990486, 1.033942] |
+| candidate speedup median | **1.003645** |
+| candidate bootstrap median CI95 | **[0.988244, 1.019850]** |
+| pairs candidate faster | 11 / 21 |
+| pairs at or above 1.03 | 5 / 21 |
+| baseline / candidate median seconds | 0.801741 / 0.804781 |
+| baseline / candidate median docs/s | 62,364 / 62,129 |
+
+The A/A interval contains 1.0, and the A/B interval both contains parity and
+stays wholly below the pre-registered 1.03 maintenance threshold. Host load
+moved from 3.98 to 4.74 on 16 logical CPUs; every child reported the same
+83,683,104 index bytes. Raw JSON SHA-256 is
+`43119dae234355b089e14338b4ded06516a28ca7e2a1d2f0e93548f770ac8eea`
+(preserved at `/data/tmp/bd-6oiq-inlinekey-ab-20260810T1834Z.json` and on
+`ovh-a`).
+
+**Decision: REJECT / CORRECTIVE NO-SHIP.** The inline representation and its
+replacement test were manually removed after the concurrent pre-verdict
+landing. Shipping `scribe.rs` is again byte-identical to the pre-candidate
+source at
+`cd690fbf0fa1d3cc19252917e1b0be6ac3d8417d953f1b83e85b840e6c5abdd7`.
+Do not retry this exact 11-byte tagged-inline representation on the current
+workload. Any revisit needs a materially different profiled corpus or a design
+that removes more than the arena dereference without enlarging the entry or
+weakening exact collision verification.
