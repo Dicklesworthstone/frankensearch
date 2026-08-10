@@ -16971,10 +16971,17 @@ mod tests {
         let report =
             crate::artifact::pinned_campaign_report_v8().expect("load pinned CampaignReport V8");
         assert_eq!(report.schema_version, CAMPAIGN_REPORT_V8_SCHEMA_VERSION);
-        assert_eq!(
+        let mut report_hasher = Sha256::new();
+        report_hasher.update(
+            report_hash_domain(CAMPAIGN_REPORT_V8_SCHEMA_VERSION).expect("v8 report hash domain"),
+        );
+        report_hasher.update(
             report
-                .report_hash_unchecked_fixture()
-                .expect("pinned report hash"),
+                .canonical_bytes_unchecked()
+                .expect("pinned canonical report"),
+        );
+        assert_eq!(
+            lower_hex(&report_hasher.finalize()),
             PINNED_CAMPAIGN_REPORT_V8_REPORT_SHA256
         );
 
