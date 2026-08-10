@@ -395,23 +395,24 @@ impl GenerationRootCapabilityV1 {
 }
 
 #[cfg(target_os = "linux")]
+fn widen_link_count(links: impl Into<u64>) -> u64 {
+    links.into()
+}
+
+#[cfg(target_os = "linux")]
 fn file_witness(
     file: &File,
 ) -> Result<GenerationRootFileWitnessV1, GenerationRootAdmissionErrorV1> {
     let stat = rustix::fs::fstat(file).map_err(|_| GenerationRootAdmissionErrorV1::Io)?;
     let size =
         u64::try_from(stat.st_size).map_err(|_| GenerationRootAdmissionErrorV1::UnsafeFileType)?;
-    #[cfg(target_env = "musl")]
-    let links = u64::from(stat.st_nlink);
-    #[cfg(not(target_env = "musl"))]
-    let links = stat.st_nlink;
+    let links = widen_link_count(stat.st_nlink);
     Ok(GenerationRootFileWitnessV1 {
         device: stat.st_dev,
         inode: stat.st_ino,
         mode: stat.st_mode,
-        // `st_nlink` is `u64` on glibc/x86_64 but `u32` on some musl targets
-        // (aarch64-unknown-linux-musl), so widen explicitly rather than
-        // relying on the platform-specific width matching the witness field.
+        // `st_nlink` width follows the target ABI (for example, it is `u32` on
+        // glibc/aarch64 and some musl targets), so widen at this boundary.
         links,
         uid: stat.st_uid,
         gid: stat.st_gid,
