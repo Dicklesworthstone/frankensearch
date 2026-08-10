@@ -1732,6 +1732,11 @@ impl DivergenceArtifactObjectHash {
 
     /// Construct a current v9 artifact identity from a lowercase SHA-256
     /// digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `digest` is not exactly 64 lowercase hexadecimal
+    /// characters.
     pub fn v9_sha256(digest: impl Into<String>) -> Result<Self, GauntletError> {
         let identity = Self {
             scheme: DivergenceArtifactObjectHashScheme::ArtifactObjectV9Sha256,
@@ -6303,7 +6308,7 @@ fn query_carries_explicit_and_with_negation(query: &str) -> bool {
 /// complex orderings whose reviewed control needs regrouping deliberately
 /// return a spelling that will not match a campaign case, so they fail closed
 /// until their own typed relation is defined.
-pub(crate) fn negated_conjunction_control_query(query: &str) -> Option<String> {
+fn negated_conjunction_control_query(query: &str) -> Option<String> {
     let mut control = Vec::new();
     let mut removed_and = false;
     let mut has_negation = false;
@@ -21118,7 +21123,7 @@ mod tests {
     #[cfg(feature = "tantivy-oracle")]
     const E68_AND_NOT_WITNESS_FIXTURE: &str = "fixtures/artifact-object-v8-div010-live.json";
     /// Superseding v9 witness whose stored explicit-form control earns the
-    /// semantic OracleBug class (bd-4oiwf).
+    /// semantic `OracleBug` class (bd-4oiwf).
     #[cfg(feature = "tantivy-oracle")]
     const E68_AND_NOT_V9_WITNESS_FIXTURE: &str = "fixtures/artifact-object-v9-div010-live.json";
     /// A non-truncating limit for the DIV-010 pair.
@@ -22670,7 +22675,7 @@ mod tests {
                 })
                 .unwrap_or_else(|| panic!("committed register holds {divergence_id}"))
         };
-        let observations_for = |divergence_id: &str| {
+        let all_observations_for = |divergence_id: &str| {
             ledger
                 .events
                 .iter()
@@ -22801,7 +22806,7 @@ mod tests {
         // reviewed acceptance. A replacement of either old event would fail
         // the append-only successor proof; omitting either witness would fail
         // the relational join above.
-        let and_not_observations = observations_for(E68_AND_NOT_DIVERGENCE_ID);
+        let and_not_observations = all_observations_for(E68_AND_NOT_DIVERGENCE_ID);
         let [raw, attributed] = and_not_observations.as_slice() else {
             panic!(
                 "DIV-010 carries exactly two observations, not {}",

@@ -7396,6 +7396,11 @@ pub fn compare_observations(
 /// `control` is mandatory only for the v9 DIV-010 reason and is rejected for
 /// every other reason, keeping the new input from becoming an unaudited side
 /// channel into older classifications.
+///
+/// # Errors
+///
+/// Returns an error for invalid current comparator configuration, malformed
+/// observations, or control evidence inconsistent with the classified case.
 pub fn compare_observations_with_control(
     subject: EngineObservation,
     oracle: EngineObservation,
@@ -7443,6 +7448,11 @@ pub fn compare_observations_stored_v8(
 }
 
 /// Re-derive a stored v9 report, including any cross-case attribution input.
+///
+/// # Errors
+///
+/// Returns an error for an invalid stored v9 configuration, malformed
+/// observations, or control evidence inconsistent with the stored case.
 pub fn compare_observations_stored_v9(
     subject: EngineObservation,
     oracle: EngineObservation,
