@@ -1428,6 +1428,12 @@ impl NativeHnswGenerationReceiptV2 {
         Ok(())
     }
 
+    /// Seal a synthetic receipt used by sibling-module unit tests.
+    #[cfg(test)]
+    pub(crate) fn seal_for_test(&mut self) -> SearchResult<()> {
+        self.seal()
+    }
+
     fn canonical_body_bytes(&self) -> SearchResult<Vec<u8>> {
         let basename = self.graph_basename.as_bytes();
         let basename_len = u16::try_from(basename.len()).map_err(|_| {
@@ -4130,6 +4136,7 @@ mod tests {
                 .write_record(doc_id, vector)
                 .expect("write FSVI v2 owner row");
         }
+        // ubs:ignore -- finalizes a deterministic VectorIndex test fixture; no token or randomness.
         writer.finish().expect("finish FSVI v2 owner fixture");
         admit_owned_fsvi_fixture(&path, binding)
     }
@@ -4168,6 +4175,8 @@ mod tests {
                 .write_record(doc_id, vector)
                 .expect("write FSVI v2 owner row");
         }
+        // The publication nonce is public identity metadata, not a token.
+        // ubs:ignore -- finalizes a deterministic VectorIndex test fixture; no randomness.
         writer.finish().expect("finish FSVI v2 owner fixture");
         admit_owned_fsvi_fixture(&path, binding)
     }

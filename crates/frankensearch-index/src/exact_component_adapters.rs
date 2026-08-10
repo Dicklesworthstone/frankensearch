@@ -110,15 +110,13 @@ where
         .into_iter()
         .map(Into::into)
         .collect::<Vec<String>>();
-    let canonical =
-        CanonicalDocsetV1::from_ordered_live_documents(documents.iter().map(String::as_str))?;
-
-    let mut fsvi_hasher = Sha256::new();
-    crate::update_digest_domain(&mut fsvi_hasher, crate::ORDERED_DOCSET_DIGEST_DOMAIN);
     let live_document_count =
         u64::try_from(documents.len()).map_err(|_| GenerationAuthorityErrorV1::InvalidField {
             field: "component_receipt.live_document_count",
         })?;
+
+    let mut fsvi_hasher = Sha256::new();
+    crate::update_digest_domain(&mut fsvi_hasher, crate::ORDERED_DOCSET_DIGEST_DOMAIN);
     fsvi_hasher.update(live_document_count.to_be_bytes());
     for document in &documents {
         let byte_len = u64::try_from(document.len()).map_err(|_| {
@@ -130,6 +128,12 @@ where
         fsvi_hasher.update(document.as_bytes());
     }
     let observed_fsvi_digest: [u8; 32] = fsvi_hasher.finalize().into();
+
+    // Validate before reporting a digest mismatch, so malformed identifiers
+    // retain their more precise typed error. Move the already-owned strings
+    // into the canonical set rather than copying every identifier a second
+    // time merely to re-domain it.
+    let canonical = CanonicalDocsetV1::from_ordered_live_documents(documents)?;
     if observed_fsvi_digest != expected_fsvi_digest {
         return Err(GenerationAuthorityErrorV1::InvalidField {
             field: digest_field,
@@ -199,8 +203,9 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`GenerationAuthorityErrorV1`] for a malformed hex digest, an
-/// invalid or unwitnessed canonical docset, or a receipt that fails its own
+/// Returns [`GenerationAuthorityErrorV1`] when the native receipt fails its
+/// own structural/integrity validation, a digest is malformed, the canonical
+/// docset is invalid or unwitnessed, or the resulting neutral receipt fails
 /// validation.
 pub fn ann_component_receipt<I, S>(
     receipt: &NativeHnswGenerationReceiptV2,
@@ -211,6 +216,11 @@ where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
+    receipt
+        .validate()
+        .map_err(|_| GenerationAuthorityErrorV1::InvalidField {
+            field: "component_receipt.ann.native_receipt",
+        })?;
     let expected_fsvi_digest = sha256_from_hex(
         "ordered_live_docset_digest",
         &receipt.ordered_live_docset_digest,
@@ -405,11 +415,12 @@ mod tests {
     }
 
     fn ann_receipt_fixture() -> NativeHnswGenerationReceiptV2 {
-        NativeHnswGenerationReceiptV2 {
+        let artifact_generation =
+            ArtifactGenerationIdentityV1::new(7, [0x4d; 16]).expect("valid test generation");
+        let mut receipt = NativeHnswGenerationReceiptV2 {
             schema_version: 2,
-            artifact_generation: ArtifactGenerationIdentityV1::new(7, [0x4d; 16])
-                .expect("valid test generation"),
-            artifact_generation_fingerprint: hex32(0xC1),
+            artifact_generation,
+            artifact_generation_fingerprint: artifact_generation.fingerprint(),
             embedding_identity_fingerprint: hex32(0xC2),
             embedding_space_fingerprint: hex32(0xC3),
             embedding_producer_fingerprint: hex32(0xC4),
@@ -441,8 +452,11 @@ mod tests {
             payload_crc32: 0x1234_5678,
             header_crc32: 0x8765_4321,
             topology_sha256: hex32(0xD2),
-            receipt_sha256: hex32(0xD3),
-        }
+            receipt_sha256: String::new(),
+        };
+        receipt.seal_for_test().expect("seal test ANN receipt");
+        receipt.validate().expect("test ANN receipt validates");
+        receipt
     }
 
     /// The vector adapter maps from the WITNESS, field by field. Each assertion
@@ -631,6 +645,29 @@ mod tests {
 
         vector_component_receipt(&witness_fixture(), DOCS, checkpoint())
             .expect("the consistent witness remains valid");
+    }
+
+    /// The adapter consumes a public serializable receipt, so it must enforce
+    /// that receipt's own integrity boundary rather than assuming every caller
+    /// obtained it directly from the native graph publisher.
+    #[test]
+    fn ann_adapter_rejects_a_receipt_with_a_stale_internal_seal() {
+        let mut receipt = ann_receipt_fixture();
+        receipt.graph_byte_len += 1;
+        assert!(
+            receipt.validate().is_err(),
+            "the mutation control must invalidate the receipt body seal"
+        );
+
+        assert!(matches!(
+            ann_component_receipt(&receipt, DOCS, checkpoint()),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "component_receipt.ann.native_receipt"
+            })
+        ));
+
+        ann_component_receipt(&ann_receipt_fixture(), DOCS, checkpoint())
+            .expect("the sealed control receipt remains admissible");
     }
 
     /// A checkpoint that disagrees rejects on the drifting role, with the
