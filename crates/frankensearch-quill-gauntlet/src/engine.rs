@@ -24,8 +24,8 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::GauntletError;
 use crate::artifact::GauntletProducerBuildIdentity;
 use crate::comparator::{
-    ComparatorConfig, ComparisonReport, CountState, EngineObservation, NativeTieKey, RankedHit,
-    compare_observations,
+    ComparatorConfig, ComparisonReport, CountState, EngineObservation, NativeTieKey,
+    OracleBugControlObservation, RankedHit, compare_observations,
 };
 #[cfg(feature = "tantivy-oracle")]
 use crate::generator::GeneratedDocument;
@@ -1051,11 +1051,13 @@ pub struct HarnessRun {
     pub engines: EnginePairIdentity,
     pub case: DifferentialCase,
     pub comparator_config: ComparatorConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_bug_control: Option<OracleBugControlObservation>,
     pub comparison: ComparisonReport,
 }
 
 /// Current serialized harness-run schema.
-pub const HARNESS_RUN_SCHEMA_VERSION: u32 = 2;
+pub const HARNESS_RUN_SCHEMA_VERSION: u32 = 3;
 
 impl HarnessRun {
     pub(crate) fn validate_diagnostic_creation(&self) -> Result<(), GauntletError> {
@@ -1189,6 +1191,7 @@ impl DifferentialHarness {
             engines,
             case: case.clone(),
             comparator_config,
+            oracle_bug_control: None,
             comparison,
         })
     }

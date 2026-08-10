@@ -7103,6 +7103,25 @@ pub enum OracleBugReason {
     /// The pinned oracle re-nests a boosted group's negation as a positive
     /// alternative, so it fails to EXCLUDE and over-returns (DIV-009).
     BoostedGroupNegationLowering,
+    /// The pinned oracle empties an explicit conjunction when one operand is
+    /// a negation, while answering the equivalent spelling without `AND`
+    /// exactly (DIV-010).
+    NegatedConjunctionLowering,
+}
+
+/// Cross-case observation that attributes DIV-010 to the pinned oracle.
+///
+/// Unlike DIV-009, the failing case cannot identify the broken side from its
+/// containment direction: a subject-side defect can under-return too. The
+/// explicit-form control is therefore stored as comparator input in v9 so the
+/// artifact can re-derive both the control's agreement and the witness/control
+/// membership equality rather than trusting a recorded reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OracleBugControlObservation {
+    pub case: crate::DifferentialCase,
+    pub subject: EngineObservation,
+    pub oracle: EngineObservation,
 }
 
 /// Comparator configuration encoded without JSON floating-point ambiguity.
@@ -7133,6 +7152,8 @@ impl ComparatorConfig {
     /// The pinned epsilon is UNCHANGED across the v7 -> v8 boundary. Named
     /// separately so a later epsilon move cannot ride along on this bump.
     const V8_SCORE_EPSILON_BITS: u32 = Self::V7_SCORE_EPSILON_BITS;
+    /// v9 changes attribution evidence, not the numeric comparison envelope.
+    const V9_SCORE_EPSILON_BITS: u32 = Self::V8_SCORE_EPSILON_BITS;
 
     /// Construct a comparator configuration.
     ///
@@ -7181,8 +7202,8 @@ impl ComparatorConfig {
     }
 
     pub(crate) fn validate_contract(self) -> Result<(), GauntletError> {
-        self.validate_stored_v8()?;
-        if SCORE_EPSILON.to_bits() != Self::V8_SCORE_EPSILON_BITS {
+        self.validate_stored_v9()?;
+        if SCORE_EPSILON.to_bits() != Self::V9_SCORE_EPSILON_BITS {
             return Err(GauntletError::InvalidComparatorConfig {
                 reason: "current comparator epsilon changed without a schema-version bump"
                     .to_owned(),
@@ -7212,11 +7233,27 @@ impl ComparatorConfig {
     }
 
     pub(crate) fn validate_stored_v8(self) -> Result<(), GauntletError> {
+        if self.oracle_bug_reason == Some(OracleBugReason::NegatedConjunctionLowering) {
+            return Err(GauntletError::InvalidComparatorConfig {
+                reason: "stored v8 comparator configuration cannot carry a v9 cross-case oracle-blame reason"
+                    .to_owned(),
+            });
+        }
         if self.score_epsilon_bits == Self::V8_SCORE_EPSILON_BITS {
             Ok(())
         } else {
             Err(GauntletError::InvalidComparatorConfig {
                 reason: "stored v8 score epsilon is outside its frozen contract".to_owned(),
+            })
+        }
+    }
+
+    pub(crate) fn validate_stored_v9(self) -> Result<(), GauntletError> {
+        if self.score_epsilon_bits == Self::V9_SCORE_EPSILON_BITS {
+            Ok(())
+        } else {
+            Err(GauntletError::InvalidComparatorConfig {
+                reason: "stored v9 score epsilon is outside its frozen contract".to_owned(),
             })
         }
     }
@@ -7350,10 +7387,24 @@ pub fn compare_observations(
     oracle: EngineObservation,
     config: ComparatorConfig,
 ) -> Result<ComparisonReport, GauntletError> {
+    compare_observations_with_control(subject, oracle, config, None, None)
+}
+
+/// Compare current-generation observations with optional cross-case oracle
+/// attribution evidence.
+///
+/// `control` is mandatory only for the v9 DIV-010 reason and is rejected for
+/// every other reason, keeping the new input from becoming an unaudited side
+/// channel into older classifications.
+pub fn compare_observations_with_control(
+    subject: EngineObservation,
+    oracle: EngineObservation,
+    config: ComparatorConfig,
+    case: Option<&crate::DifferentialCase>,
+    control: Option<&OracleBugControlObservation>,
+) -> Result<ComparisonReport, GauntletError> {
     config.validate_contract()?;
-    // Current creation is v8. A future comparator must add a new versioned
-    // implementation instead of modifying a frozen path.
-    compare_observations_validated_v8(subject, oracle, config)
+    compare_observations_validated_v9(subject, oracle, config, case, control)
 }
 
 /// Re-derive a stored v7 report from its own stored observations.
@@ -7389,6 +7440,65 @@ pub fn compare_observations_stored_v8(
 ) -> Result<ComparisonReport, GauntletError> {
     config.validate_stored_v8()?;
     compare_observations_validated_v8(subject, oracle, config)
+}
+
+/// Re-derive a stored v9 report, including any cross-case attribution input.
+pub fn compare_observations_stored_v9(
+    subject: EngineObservation,
+    oracle: EngineObservation,
+    config: ComparatorConfig,
+    case: &crate::DifferentialCase,
+    control: Option<&OracleBugControlObservation>,
+) -> Result<ComparisonReport, GauntletError> {
+    config.validate_stored_v9()?;
+    compare_observations_validated_v9(subject, oracle, config, Some(case), control)
+}
+
+/// Artifact/report-v9 comparator implementation.
+fn compare_observations_validated_v9(
+    subject: EngineObservation,
+    oracle: EngineObservation,
+    config: ComparatorConfig,
+    case: Option<&crate::DifferentialCase>,
+    control: Option<&OracleBugControlObservation>,
+) -> Result<ComparisonReport, GauntletError> {
+    let mut report = compare_observations_validated_v7(subject, oracle, config)?;
+    match config.oracle_bug_reason {
+        None => {
+            if control.is_some() {
+                return Err(GauntletError::InvalidComparatorConfig {
+                    reason:
+                        "cross-case oracle-blame control is present without an attribution reason"
+                            .to_owned(),
+                });
+            }
+        }
+        Some(OracleBugReason::BoostedGroupNegationLowering) => {
+            if control.is_some() {
+                return Err(GauntletError::InvalidComparatorConfig {
+                    reason: "boosted-group oracle attribution must not carry a cross-case control"
+                        .to_owned(),
+                });
+            }
+            apply_oracle_bug_attribution(
+                OracleBugReason::BoostedGroupNegationLowering,
+                &mut report,
+            )?;
+        }
+        Some(OracleBugReason::NegatedConjunctionLowering) => {
+            let case = case.ok_or_else(|| GauntletError::InvalidComparatorConfig {
+                reason: "negated-conjunction oracle attribution is missing its witness query"
+                    .to_owned(),
+            })?;
+            let control = control.ok_or_else(|| GauntletError::InvalidComparatorConfig {
+                reason:
+                    "negated-conjunction oracle attribution is missing its explicit-form control"
+                        .to_owned(),
+            })?;
+            apply_negated_conjunction_oracle_bug_attribution(case, control, config, &mut report)?;
+        }
+    }
+    Ok(report)
 }
 
 /// Artifact/report-v8 comparator implementation.
@@ -7436,22 +7546,129 @@ pub fn apply_oracle_bug_attribution(
     reason: OracleBugReason,
     report: &mut ComparisonReport,
 ) -> Result<(), GauntletError> {
-    let OracleBugReason::BoostedGroupNegationLowering = reason;
+    if reason != OracleBugReason::BoostedGroupNegationLowering {
+        return Err(GauntletError::InvalidComparatorConfig {
+            reason: "cross-case oracle attribution requires its stored control observation"
+                .to_owned(),
+        });
+    }
     if !oracle_over_returned_on_a_membership_divergence(report) {
         return Err(GauntletError::InvalidComparatorConfig {
             reason: "stored oracle-blame attribution is not supported by its own observations"
                 .to_owned(),
         });
     }
+    relabel_membership_divergence_as_oracle_bug(
+        report,
+        "/comparison/subject/ast_differences/boosted_group_negation",
+        "pinned oracle re-nested boosted-group negation as a positive alternative",
+        "Quill retained boosted-group negation",
+    );
+    Ok(())
+}
+
+fn apply_negated_conjunction_oracle_bug_attribution(
+    witness_case: &crate::DifferentialCase,
+    control: &OracleBugControlObservation,
+    config: ComparatorConfig,
+    report: &mut ComparisonReport,
+) -> Result<(), GauntletError> {
+    witness_case.validate_shape()?;
+    control.case.validate_shape()?;
+    let expected_control_query = crate::runner::negated_conjunction_control_query(&witness_case.query)
+        .ok_or_else(|| GauntletError::InvalidComparatorConfig {
+            reason: "negated-conjunction attribution query does not carry the reviewed AND-plus-negation shape"
+                .to_owned(),
+        })?;
+    if control.case.query != expected_control_query
+        || control.case.limit != witness_case.limit
+        || control.case.offset != witness_case.offset
+        || control.case.tie_expansion_limit != witness_case.tie_expansion_limit
+        || control.case.count_requested != witness_case.count_requested
+        || control.case.snippet_max_chars != witness_case.snippet_max_chars
+        || control.case.metadata != witness_case.metadata
+    {
+        return Err(GauntletError::InvalidComparatorConfig {
+            reason: "negated-conjunction control is not the same-campaign explicit-form equivalent"
+                .to_owned(),
+        });
+    }
+    if !membership_only_divergence(report) {
+        return Err(GauntletError::InvalidComparatorConfig {
+            reason: "negated-conjunction oracle attribution requires a raw membership divergence"
+                .to_owned(),
+        });
+    }
+    let limit = usize::try_from(witness_case.limit).map_err(|_| {
+        GauntletError::InvalidComparatorConfig {
+            reason: "negated-conjunction witness limit does not fit usize".to_owned(),
+        }
+    })?;
+    if report.subject.hits.len() >= limit
+        || report.oracle.hits.len() >= limit
+        || control.subject.hits.len() >= limit
+        || control.oracle.hits.len() >= limit
+    {
+        return Err(GauntletError::InvalidComparatorConfig {
+            reason: "negated-conjunction attribution requires non-truncated witness and control observations"
+                .to_owned(),
+        });
+    }
+    let mut control_config = config;
+    control_config.oracle_bug_reason = None;
+    let control_report = compare_observations_validated_v7(
+        control.subject.clone(),
+        control.oracle.clone(),
+        control_config,
+    )?;
+    if control_report.status != ComparisonStatus::Exact {
+        return Err(GauntletError::InvalidComparatorConfig {
+            reason: "negated-conjunction explicit-form control is not exact across engines"
+                .to_owned(),
+        });
+    }
+    let witness_subject_ids = report
+        .subject
+        .hits
+        .iter()
+        .map(|hit| hit.doc_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let control_subject_ids = control
+        .subject
+        .hits
+        .iter()
+        .map(|hit| hit.doc_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if witness_subject_ids != control_subject_ids {
+        return Err(GauntletError::InvalidComparatorConfig {
+            reason:
+                "negated-conjunction witness does not match the explicit-form control's membership"
+                    .to_owned(),
+        });
+    }
+    relabel_membership_divergence_as_oracle_bug(
+        report,
+        "/comparison/control/negated_conjunction_lowering",
+        "pinned oracle emptied the explicit AND-plus-negation form",
+        "Quill matched the independently agreeing explicit-form control",
+    );
+    Ok(())
+}
+
+fn relabel_membership_divergence_as_oracle_bug(
+    report: &mut ComparisonReport,
+    pointer: &str,
+    oracle: &str,
+    subject: &str,
+) {
     report
         .divergences
         .retain(|divergence| divergence.class != DivergenceClass::RankMismatch);
     report.divergences.push(Divergence {
         class: DivergenceClass::OracleBug,
-        pointer: "/comparison/subject/ast_differences/boosted_group_negation".to_owned(),
-        oracle: "pinned oracle re-nested boosted-group negation as a positive alternative"
-            .to_owned(),
-        subject: "Quill retained boosted-group negation".to_owned(),
+        pointer: pointer.to_owned(),
+        oracle: oracle.to_owned(),
+        subject: subject.to_owned(),
     });
     report.status = if report.divergences.is_empty() {
         ComparisonStatus::Exact
@@ -7468,7 +7685,20 @@ pub fn apply_oracle_bug_attribution(
         .divergences
         .first()
         .map(|divergence| divergence.pointer.clone());
-    Ok(())
+}
+
+fn membership_only_divergence(report: &ComparisonReport) -> bool {
+    let mut saw_membership_divergence = false;
+    for divergence in &report.divergences {
+        if divergence.class.is_auto() {
+            continue;
+        }
+        if divergence.class != DivergenceClass::RankMismatch {
+            return false;
+        }
+        saw_membership_divergence = true;
+    }
+    saw_membership_divergence
 }
 
 /// The observation-side half of the blame test: a membership-only divergence in
@@ -10897,6 +11127,103 @@ mod tests {
             )
             .is_err(),
             "an exact comparison must not be turned into a classified divergence"
+        );
+    }
+
+    /// bd-4oiwf: v9 earns DIV-010's oracle class from the explicit-form
+    /// control, never from under-return direction alone.
+    #[test]
+    fn negated_conjunction_attribution_requires_the_matching_control_observation() {
+        let uncounted = |hits: Vec<RankedHit>| {
+            let mut value = observation(hits);
+            value.match_count = CountState::NotRequested;
+            value
+        };
+        let mut witness_case =
+            crate::DifferentialCase::new("div010-witness", "alpha AND NOT beta", 10);
+        witness_case.count_requested = false;
+        let mut control_case = crate::DifferentialCase::new("div010-control", "alpha NOT beta", 10);
+        control_case.count_requested = false;
+        let control = OracleBugControlObservation {
+            case: control_case.clone(),
+            subject: uncounted(vec![quill_hit("kept", 1.0, 1)]),
+            oracle: uncounted(vec![tantivy_hit("kept", 1.0, 1)]),
+        };
+        let attributed = ComparatorConfig::default()
+            .with_oracle_bug_reason(OracleBugReason::NegatedConjunctionLowering);
+
+        let admitted = compare_observations_with_control(
+            uncounted(vec![quill_hit("kept", 1.0, 1)]),
+            uncounted(Vec::new()),
+            attributed,
+            Some(&witness_case),
+            Some(&control),
+        )
+        .expect("the measured witness/control pair earns DIV-010 attribution");
+        assert_eq!(admitted.status, ComparisonStatus::Classified);
+        assert_eq!(
+            admitted
+                .divergences
+                .iter()
+                .map(|divergence| divergence.class)
+                .collect::<Vec<_>>(),
+            vec![DivergenceClass::OracleBug]
+        );
+
+        // LOAD-BEARING NEGATIVE: the same AND-plus-negation shape and the same
+        // under-return direction can be caused by a subject defect. The exact
+        // control disagrees with that defective subject, so it must stay raw.
+        assert!(
+            compare_observations_with_control(
+                uncounted(vec![quill_hit("subject-defect", 1.0, 1)]),
+                uncounted(Vec::new()),
+                attributed,
+                Some(&witness_case),
+                Some(&control),
+            )
+            .is_err(),
+            "a genuine subject-side defect wearing DIV-010's shape must not be attributed to the oracle"
+        );
+
+        let wrong_shape = crate::DifferentialCase::new("wrong-shape", "alpha NOT beta", 10);
+        assert!(
+            compare_observations_with_control(
+                uncounted(vec![quill_hit("kept", 1.0, 1)]),
+                uncounted(Vec::new()),
+                attributed,
+                Some(&wrong_shape),
+                Some(&control),
+            )
+            .is_err(),
+            "the explicit AND-plus-negation shape is mandatory"
+        );
+
+        let mut disagreeing_control = control.clone();
+        disagreeing_control.oracle = uncounted(Vec::new());
+        assert!(
+            compare_observations_with_control(
+                uncounted(vec![quill_hit("kept", 1.0, 1)]),
+                uncounted(Vec::new()),
+                attributed,
+                Some(&witness_case),
+                Some(&disagreeing_control),
+            )
+            .is_err(),
+            "a control that is not exact across engines attributes nothing"
+        );
+
+        let mut unrelated_control = control;
+        unrelated_control.case.query = "alpha -beta".to_owned();
+        assert!(
+            compare_observations_with_control(
+                uncounted(vec![quill_hit("kept", 1.0, 1)]),
+                uncounted(Vec::new()),
+                attributed,
+                Some(&witness_case),
+                Some(&unrelated_control),
+            )
+            .is_err(),
+            "an unrelated exact case cannot substitute for the derived control"
         );
     }
 
