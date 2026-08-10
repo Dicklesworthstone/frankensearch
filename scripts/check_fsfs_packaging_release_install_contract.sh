@@ -927,6 +927,14 @@ require(
     "native Linux aarch64 installer proof must use the GitHub-hosted ARM runner",
 )
 require(
+    "python3 -m venv" in installer_platform
+    and '"${validator_venv}/bin/python" -m pip install --upgrade pip jsonschema'
+    in installer_platform
+    and '>>"${GITHUB_PATH}"' in installer_platform
+    and "pip install --user" not in installer_platform,
+    "installer proof must provision jsonschema in an isolated cross-platform venv",
+)
+require(
     "loader_only::default_build_indexes_and_returns_a_real_hybrid_result"
     in installer_platform
     and "FRANKENSEARCH_REQUIRE_SEMANTIC_E2E: \"1\"" in installer_platform

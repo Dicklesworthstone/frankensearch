@@ -90,7 +90,22 @@ jobs:
       - name: Install jsonschema validator module
         # The standalone `jsonschema` CLI was removed in python-jsonschema 4.x;
         # the contract scripts fall back to the python3 module, which must exist.
-        run: python3 -m pip install --user --upgrade jsonschema
+        # Use a runner-temp venv because Homebrew Python enforces PEP 668 and
+        # rejects even user-site installs on current macOS runner images.
+        shell: bash
+        run: |
+          set -euo pipefail
+          proof_dir="${RUNNER_TEMP}/fsfs-installer-platform"
+          validator_venv="${RUNNER_TEMP}/fsfs-jsonschema-venv"
+          mkdir -p "${proof_dir}"
+          printf 'runner_os=%s\nrunner_arch=%s\n' "${RUNNER_OS}" "${RUNNER_ARCH}" \
+            >"${proof_dir}/jsonschema-preflight.txt"
+          python3 -m venv "${validator_venv}"
+          "${validator_venv}/bin/python" -m pip install --upgrade pip jsonschema \
+            2>&1 | tee "${proof_dir}/jsonschema-install.log"
+          "${validator_venv}/bin/python" -c 'import jsonschema; print(jsonschema.__version__)' \
+            >"${proof_dir}/jsonschema-version.txt"
+          printf '%s\n' "${validator_venv}/bin" >>"${GITHUB_PATH}"
 
       - name: Exercise installer with the platform system Bash
         env:
