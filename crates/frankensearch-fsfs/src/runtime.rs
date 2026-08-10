@@ -20177,10 +20177,20 @@ mod tests {
                 0
             );
 
-            let mut mutator = VectorIndex::open(&vector_path).expect("open WAL mutator");
+            let contended = VectorIndex::open_writer(&vector_path)
+                .expect_err("retained search reader must exclude a WAL writer");
+            assert!(matches!(
+                contended,
+                SearchError::InvalidConfig { field, .. } if field == "fsvi.map_lock"
+            ));
+
+            drop(resources.vector_index.take());
+            let mut mutator =
+                VectorIndex::open_writer(&vector_path).expect("open WAL append writer");
             mutator
                 .append("new.md", &vector)
                 .expect("append successor vector through WAL");
+            drop(mutator);
             assert!(
                 runtime
                     .rebind_search_resources_if_generation_changed(
@@ -20203,11 +20213,15 @@ mod tests {
                     .contains("new.md")
             );
 
+            drop(resources.vector_index.take());
+            let mut mutator =
+                VectorIndex::open_writer(&vector_path).expect("open WAL tombstone writer");
             assert!(
                 mutator
                     .soft_delete("old.md")
                     .expect("tombstone main vector through WAL")
             );
+            drop(mutator);
             assert!(
                 runtime
                     .rebind_search_resources_if_generation_changed(
@@ -21863,12 +21877,7 @@ mod tests {
 
         let displaced_wal = index_root.join("blocked-vector-wal");
         fs::rename(&wal_path, &displaced_wal).expect("preserve and displace WAL blocker");
-        let mut live = sink
-            .vector_index
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut durable = VectorIndex::open(&vector_path).expect("reopen durable vector index");
-        for (label, index) in [("live handle", &mut *live), ("fresh open", &mut durable)] {
+        let assert_old_vector = |label: &str, index: &mut VectorIndex| {
             let hits = index
                 .search_top_k(&old_vector, 1, None)
                 .expect("search old vector");
@@ -21879,7 +21888,26 @@ mod tests {
                 !index.is_deleted(0),
                 "{label}: failed replacement tombstoned the old vector"
             );
+        };
+        {
+            let mut live = sink
+                .vector_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_old_vector("live handle", &mut live);
+
+            let contended = VectorIndex::open_read_only(&vector_path)
+                .expect_err("live writer mapping must exclude a second published mapping");
+            assert!(matches!(
+                contended,
+                SearchError::InvalidConfig { field, .. } if field == "fsvi.map_lock"
+            ));
         }
+        drop(sink);
+
+        let mut durable = VectorIndex::open_read_only(&vector_path)
+            .expect("reopen durable vector index after live writer drops");
+        assert_old_vector("fresh read-only open", &mut durable);
     }
 
     #[test]
@@ -21930,12 +21958,7 @@ mod tests {
 
             fs::rename(&wal_path, index_root.join("blocked-watcher-wal"))
                 .expect("preserve and displace WAL blocker");
-            let mut live = pipeline
-                .vector_index
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut durable = VectorIndex::open(&vector_path).expect("reopen durable vector index");
-            for (label, index) in [("live handle", &mut *live), ("fresh open", &mut durable)] {
+            let assert_old_vector = |label: &str, index: &mut VectorIndex| {
                 let hits = index
                     .search_top_k(&old_vector, 1, None)
                     .expect("search old vector");
@@ -21946,7 +21969,26 @@ mod tests {
                     !index.is_deleted(0),
                     "{label}: failed watcher replacement tombstoned the old vector"
                 );
+            };
+            {
+                let mut live = pipeline
+                    .vector_index
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert_old_vector("live handle", &mut live);
+
+                let contended = VectorIndex::open_read_only(&vector_path)
+                    .expect_err("live watcher mapping must exclude a second published mapping");
+                assert!(matches!(
+                    contended,
+                    SearchError::InvalidConfig { field, .. } if field == "fsvi.map_lock"
+                ));
             }
+            drop(pipeline);
+
+            let mut durable = VectorIndex::open_read_only(&vector_path)
+                .expect("reopen durable vector index after watcher drops");
+            assert_old_vector("fresh read-only open", &mut durable);
         });
     }
 
