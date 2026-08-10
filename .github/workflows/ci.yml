@@ -61,7 +61,7 @@ jobs:
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
           asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
           frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
-          fast_cmaes_ref="17f633e2c24bdd0c358310949066e5922b9e17b5"
+          fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
             local repo_url="$1"
@@ -104,7 +104,7 @@ jobs:
           python3 -m venv "${validator_venv}"
           "${validator_venv}/bin/python" -m pip install --upgrade pip jsonschema \
             2>&1 | tee "${proof_dir}/jsonschema-install.log"
-          "${validator_venv}/bin/python" -c 'import jsonschema; print(jsonschema.__version__)' \
+          "${validator_venv}/bin/python" -c 'from importlib.metadata import version; print(version("jsonschema"))' \
             >"${proof_dir}/jsonschema-version.txt"
           printf '%s\n' "${validator_venv}/bin" >>"${GITHUB_PATH}"
 
@@ -164,6 +164,7 @@ jobs:
         shell: bash
         env:
           FRANKENSEARCH_REQUIRE_SEMANTIC_E2E: "1"
+          FSFS_E2E_BINARY: ${{ runner.temp }}/fsfs-installer-platform/bin/fsfs
         run: |
           set -euo pipefail
           proof_dir="${RUNNER_TEMP}/fsfs-installer-platform"
@@ -229,7 +230,7 @@ jobs:
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
           asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
           frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
-          fast_cmaes_ref="17f633e2c24bdd0c358310949066e5922b9e17b5"
+          fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
             local repo_url="$1"
@@ -1152,7 +1153,7 @@ jobs:
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
           asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
           frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
-          fast_cmaes_ref="17f633e2c24bdd0c358310949066e5922b9e17b5"
+          fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
             local repo_url="$1"
@@ -1276,7 +1277,7 @@ jobs:
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
           asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
           frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
-          fast_cmaes_ref="17f633e2c24bdd0c358310949066e5922b9e17b5"
+          fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
             local repo_url="$1"
@@ -1348,7 +1349,7 @@ jobs:
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
           asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
           frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
-          fast_cmaes_ref="17f633e2c24bdd0c358310949066e5922b9e17b5"
+          fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_at_ref() {
             local repo_url="$1"
@@ -1459,7 +1460,7 @@ jobs:
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
           asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
           frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
-          fast_cmaes_ref="17f633e2c24bdd0c358310949066e5922b9e17b5"
+          fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
             local repo_url="$1"
@@ -1520,7 +1521,7 @@ jobs:
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
           asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
           frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
-          fast_cmaes_ref="17f633e2c24bdd0c358310949066e5922b9e17b5"
+          fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
             local repo_url="$1"
@@ -1716,7 +1717,7 @@ jobs:
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
           asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
           frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
-          fast_cmaes_ref="17f633e2c24bdd0c358310949066e5922b9e17b5"
+          fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
             local repo_url="$1"
@@ -1920,7 +1921,7 @@ jobs:
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
           asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
           frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
-          fast_cmaes_ref="17f633e2c24bdd0c358310949066e5922b9e17b5"
+          fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
             local repo_url="$1"
@@ -2035,9 +2036,7 @@ jobs:
           for required in \
             "${archive_path}" \
             "${archive_path}.sha256" \
-            "dist/${archive_base}.metadata.json" \
-            "${installer_archive_path}" \
-            "${installer_archive_path}.sha256"; do
+            "dist/${archive_base}.metadata.json"; do
             if [[ ! -f "${required}" ]]; then
               echo "release.build.missing_target: target=${TARGET_TRIPLE} missing=${required}" >&2
               exit 1
@@ -2202,7 +2201,7 @@ jobs:
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
           asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
           frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
-          fast_cmaes_ref="17f633e2c24bdd0c358310949066e5922b9e17b5"
+          fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
             local repo_url="$1"

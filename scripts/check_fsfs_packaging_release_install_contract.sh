@@ -17,7 +17,7 @@ esac
 
 usage() {
   cat <<USAGE
-Usage: scripts/check_fsfs_packaging_release_install_contract.sh [--mode unit|integration|e2e|installer|model-features|all]
+Usage: scripts/check_fsfs_packaging_release_install_contract.sh [--mode unit|integration|e2e|installer-behavior|installer|model-features|all]
 
 Validates fsfs packaging/release/install fixtures and model-feature boundaries.
 USAGE
@@ -42,9 +42,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$MODE" in
-  unit|integration|e2e|installer|model-features|all) ;;
+  unit|integration|e2e|installer-behavior|installer|model-features|all) ;;
   *)
-    echo "ERROR: invalid mode '$MODE' (expected unit|integration|e2e|installer|model-features|all)" >&2
+    echo "ERROR: invalid mode '$MODE' (expected unit|integration|e2e|installer-behavior|installer|model-features|all)" >&2
     exit 2
     ;;
 esac
@@ -131,11 +131,28 @@ check_installer_behavior() {
   local archive="$ROOT_DIR/README.md"
   local expected=""
   local installer_shell="${FSFS_INSTALL_TEST_BASH:-bash}"
-  local staged_stub_work staged_stub
+  local candidate success_executable="" failure_executable=""
 
-  staged_stub_work=$(mktemp -d)
-  staged_stub="$staged_stub_work/fsfs"
-  installer_write_stub "$staged_stub" "1.0.0"
+  # macOS does not provide /bin/true or /bin/false. Resolve the external
+  # utilities from the two standard locations instead of creating a temporary
+  # scripted binary that this read-only behavior probe cannot safely clean up.
+  for candidate in /usr/bin/true /bin/true; do
+    if [[ -x "$candidate" ]]; then
+      success_executable="$candidate"
+      break
+    fi
+  done
+  for candidate in /usr/bin/false /bin/false; do
+    if [[ -x "$candidate" ]]; then
+      failure_executable="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$success_executable" || -z "$failure_executable" ]]; then
+    echo "[installer][FAIL] checker requires external true and false utilities"
+    FAILURES=$((FAILURES + 1))
+    return
+  fi
 
   echo "[installer] exercising fail-closed checksum and profile routing behavior"
   if command -v sha256sum >/dev/null 2>&1; then
@@ -214,30 +231,30 @@ check_installer_behavior() {
     FAILURES=$((FAILURES + 1))
   fi
 
-  if FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" provision "$staged_stub" >/dev/null; then
+  if FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" provision "$success_executable" >/dev/null; then
     echo "[installer][OK]   staged semantic provisioning admits verified success"
   else
     echo "[installer][FAIL] staged semantic provisioning rejected verified success"
     FAILURES=$((FAILURES + 1))
   fi
 
-  if FSFS_STUB_VERIFY_STATUS=1 FSFS_INSTALL_CONTRACT_TEST=1 \
-    "$installer_shell" "$installer" provision "$staged_stub" >/dev/null 2>&1; then
+  if FSFS_INSTALL_CONTRACT_TEST=1 \
+    "$installer_shell" "$installer" provision "$failure_executable" >/dev/null 2>&1; then
     echo "[installer][FAIL] staged semantic provisioning failure unexpectedly admitted"
     FAILURES=$((FAILURES + 1))
   else
     echo "[installer][OK]   staged semantic provisioning failure preserves the destination path"
   fi
 
-  if FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" verify-staged "$staged_stub" >/dev/null; then
+  if FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" verify-staged "$success_executable" >/dev/null; then
     echo "[installer][OK]   staged binary verification admits a runnable candidate"
   else
     echo "[installer][FAIL] staged binary verification rejected a runnable candidate"
     FAILURES=$((FAILURES + 1))
   fi
 
-  if FSFS_STUB_FAIL_FROM_DEST="$staged_stub_work" FSFS_INSTALL_CONTRACT_TEST=1 \
-    "$installer_shell" "$installer" verify-staged "$staged_stub" >/dev/null 2>&1; then
+  if FSFS_INSTALL_CONTRACT_TEST=1 \
+    "$installer_shell" "$installer" verify-staged "$failure_executable" >/dev/null 2>&1; then
     echo "[installer][FAIL] staged binary verification failure unexpectedly admitted"
     FAILURES=$((FAILURES + 1))
   else
@@ -863,6 +880,7 @@ embed_lib_path = root / "crates/frankensearch-embed/src/lib.rs"
 bundled_models_path = root / "crates/frankensearch-embed/src/bundled_default_models.rs"
 runtime_path = root / "crates/frankensearch-fsfs/src/runtime.rs"
 auto_detect_path = root / "crates/frankensearch-embed/src/auto_detect.rs"
+rch_deps_path = root / "scripts/rch-ensure-deps.sh"
 
 with manifest_path.open("rb") as handle:
     manifest = tomllib.load(handle)
@@ -944,6 +962,7 @@ for evidence_marker in (
     )
 
 workflow = workflow_path.read_text(encoding="utf-8")
+rch_deps = rch_deps_path.read_text(encoding="utf-8")
 
 
 def job(name: str) -> str:
@@ -1007,8 +1026,22 @@ require(
     "loader_only::default_build_indexes_and_returns_a_real_hybrid_result"
     in installer_platform
     and "FRANKENSEARCH_REQUIRE_SEMANTIC_E2E: \"1\"" in installer_platform
+    and "FSFS_E2E_BINARY: ${{ runner.temp }}/fsfs-installer-platform/bin/fsfs"
+    in installer_platform
+    and 'std::env::var_os("FSFS_E2E_BINARY")' in quickstart
     and "matrix.expected_profile == 'semantic-loaders'" in installer_platform,
-    "semantic installer targets must execute the real offline stock-default quickstart",
+    "semantic installer targets must execute the installed binary in the real offline quickstart",
+)
+bootstrap_fast_cmaes = re.search(r'^FAST_CMAES_REF="([0-9a-f]{40})"$', rch_deps, re.MULTILINE)
+workflow_fast_cmaes_refs = set(
+    re.findall(r'^\s+fast_cmaes_ref="([0-9a-f]{40})"$', workflow, re.MULTILINE)
+)
+require(
+    bootstrap_fast_cmaes is not None
+    and workflow_fast_cmaes_refs == {bootstrap_fast_cmaes.group(1)},
+    "workflow fast_cmaes refs must match the authoritative RCH bootstrap pin: "
+    f"workflow={sorted(workflow_fast_cmaes_refs)} bootstrap="
+    f"{bootstrap_fast_cmaes.group(1) if bootstrap_fast_cmaes else '<missing>'}",
 )
 require(
     release_targets == ["aarch64-apple-darwin", "x86_64-pc-windows-msvc"],
@@ -1023,6 +1056,10 @@ require(
         "aarch64-apple-darwin",
     ],
     f"explicit lite release target matrix drifted: {lite_targets}",
+)
+require(
+    "installer_archive_path" not in lite,
+    "explicit-lite archives must not publish or require the semantic installer alias",
 )
 
 
@@ -1337,8 +1374,6 @@ PY
     FAILURES=$((FAILURES + 1))
   fi
 
-  check_installer_behavior
-
   local default_tree lite_tree all_features_tree
   if ! default_tree="$(
     cargo tree --locked -p frankensearch-fsfs --edges normal --prefix none
@@ -1403,19 +1438,26 @@ fi
 if [[ "$MODE" == "e2e" || "$MODE" == "all" ]]; then
   check_e2e
 fi
+if [[ "$MODE" == "installer-behavior" ]]; then
+  check_installer_behavior
+fi
 if [[ "$MODE" == "installer" || "$MODE" == "all" || "$MODE" == "model-features" ]]; then
-  # The --locked callers downstream (this script's cargo-tree profile audit,
-  # and the CI installer-platform build step that runs after `--mode installer`)
-  # need a current lockfile, but Cargo.lock is deliberately untracked
-  # (.gitignore): fresh checkouts and CI runners have none, and a dev tree's
-  # local copy can be stale after manifest changes — either way --locked fails
-  # with "cannot create/update the lock file". Refresh it here (the
-  # consumer-smoke idiom in ci.yml) so every --locked caller in the job
-  # resolves against this one snapshot.
-  (cd "$ROOT_DIR" && cargo generate-lockfile)
+  # Cargo.lock is checked in and is the release dependency snapshot. Validate
+  # it without rewriting it: generating a replacement here would let a stale
+  # manifest/lock pair pass the later --locked gates against different bytes
+  # than the repository actually reviewed.
+  if [[ ! -f "$ROOT_DIR/Cargo.lock" ]]; then
+    echo "[lockfile][FAIL] checked-in Cargo.lock is missing"
+    FAILURES=$((FAILURES + 1))
+  elif (cd "$ROOT_DIR" && cargo metadata --locked --no-deps --format-version 1 >/dev/null); then
+    echo "[lockfile][OK]   checked-in dependency snapshot is current"
+  else
+    echo "[lockfile][FAIL] checked-in Cargo.lock does not match the manifests"
+    FAILURES=$((FAILURES + 1))
+  fi
+  check_installer_behavior
 fi
 if [[ "$MODE" == "installer" || "$MODE" == "all" ]]; then
-  check_installer_behavior
   check_installer_preflight
   if [[ "$INSTALLER_EXPECTED_PROFILE" == "semantic-loaders" ]]; then
     check_installer_offline_e2e

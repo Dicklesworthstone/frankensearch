@@ -39,6 +39,41 @@ mod loader_only {
         stderr: String,
     }
 
+    fn fsfs_binary() -> PathBuf {
+        std::env::var_os("FSFS_E2E_BINARY").map_or_else(
+            || PathBuf::from(env!("CARGO_BIN_EXE_fsfs")),
+            |value| {
+                let path = PathBuf::from(value);
+                assert!(
+                    path.is_absolute(),
+                    "FSFS_E2E_BINARY must identify an absolute installed-binary path: {}",
+                    path.display()
+                );
+                assert!(
+                    path.is_file(),
+                    "FSFS_E2E_BINARY does not identify a regular file: {}",
+                    path.display()
+                );
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+
+                    let mode = fs::metadata(&path)
+                        .expect("read FSFS_E2E_BINARY metadata")
+                        .permissions()
+                        .mode();
+                    assert_ne!(
+                        mode & 0o111,
+                        0,
+                        "FSFS_E2E_BINARY is not executable: {}",
+                        path.display()
+                    );
+                }
+                path
+            },
+        )
+    }
+
     impl CommandOutcome {
         fn combined_output(&self) -> String {
             format!("{}\n{}", self.stdout, self.stderr)
@@ -46,14 +81,20 @@ mod loader_only {
     }
 
     fn log_binary_profile(lane: &str) {
-        let profile = if cfg!(debug_assertions) {
+        let verified_executable = fsfs_binary();
+        let harness_profile = if cfg!(debug_assertions) {
             "debug"
         } else {
             "release"
         };
+        let binary_origin = if std::env::var_os("FSFS_E2E_BINARY").is_some() {
+            "explicit-installed-override"
+        } else {
+            "cargo-test-target"
+        };
         eprintln!(
-            "[default-build-e2e] stage=stock-default-contract event=start lane={lane} binary={} profile={profile} semantic_loaders={} embedded_models={}",
-            env!("CARGO_BIN_EXE_fsfs"),
+            "[default-build-e2e] stage=stock-default-contract event=start lane={lane} binary={} binary_origin={binary_origin} harness_profile={harness_profile} semantic_loaders={} embedded_models={}",
+            verified_executable.display(),
             cfg!(feature = "semantic-loaders"),
             cfg!(feature = "embedded-models")
         );
@@ -102,12 +143,13 @@ mod loader_only {
             I: IntoIterator<Item = S>,
             S: AsRef<OsStr>,
         {
+            let verified_executable = fsfs_binary();
             let stdout_path = self.log_root.join(format!("{label}.stdout.log"));
             let stderr_path = self.log_root.join(format!("{label}.stderr.log"));
             let stdout_file = File::create(&stdout_path).expect("create subprocess stdout log");
             let stderr_file = File::create(&stderr_path).expect("create subprocess stderr log");
 
-            let mut command = Command::new(env!("CARGO_BIN_EXE_fsfs"));
+            let mut command = Command::new(&verified_executable);
             command
                 .args(args)
                 .current_dir(cwd)
@@ -134,7 +176,7 @@ mod loader_only {
 
             eprintln!(
                 "[default-build-e2e] stage={label} event=spawn binary={} model_root={} timeout_ms={}",
-                env!("CARGO_BIN_EXE_fsfs"),
+                verified_executable.display(),
                 self.model_root.display(),
                 timeout.as_millis()
             );
