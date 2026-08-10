@@ -1265,25 +1265,110 @@ impl Default for ByteArena {
     }
 }
 
+/// Bytes available inside one bucket entry beside its dense id.
+///
+/// An [`ArenaSpan`] occupies 12 bytes. Reserving its final byte as a tag leaves
+/// 11 bytes for an inline composite key: the two-byte field prefix plus a term
+/// of at most nine bytes. Longer keys retain the existing arena-span route.
+const INLINE_BUCKET_KEY_BYTES: usize = std::mem::size_of::<ArenaSpan>() - 1;
+const INLINE_BUCKET_KEY_TAG: u8 = 0x80;
+const INLINE_BUCKET_KEY_LEN_MASK: u8 = !INLINE_BUCKET_KEY_TAG;
+
+/// Exact lookup payload stored beside a bucket entry's dense id.
+///
+/// Short composite keys are stored byte-for-byte so the hit path can verify
+/// them without following a random pointer into the arena. Longer keys encode
+/// the same [`ArenaSpan`] that `BucketEntry` stored before this representation
+/// existed. The high bit of `tag` distinguishes the forms; arena spans reserve
+/// that bit because ingest terms are bounded far below 2 GiB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BucketKey {
+    bytes: [u8; INLINE_BUCKET_KEY_BYTES],
+    tag: u8,
+}
+
+impl BucketKey {
+    fn new(span: ArenaSpan, field_ord: u16, term: &[u8]) -> Self {
+        let composite_len = FIELD_PREFIX_BYTES.saturating_add(term.len());
+        if composite_len <= INLINE_BUCKET_KEY_BYTES {
+            let mut bytes = [0_u8; INLINE_BUCKET_KEY_BYTES];
+            bytes[..FIELD_PREFIX_BYTES].copy_from_slice(&field_ord.to_be_bytes());
+            bytes[FIELD_PREFIX_BYTES..composite_len].copy_from_slice(term);
+            return Self {
+                bytes,
+                tag: INLINE_BUCKET_KEY_TAG
+                    | u8::try_from(composite_len).expect("inline key length fits u8"),
+            };
+        }
+        Self::from_span(span)
+    }
+
+    fn from_span(span: ArenaSpan) -> Self {
+        assert!(
+            span.len < (1_u32 << 31),
+            "arena span length collides with inline bucket-key tag"
+        );
+        let mut encoded = [0_u8; std::mem::size_of::<ArenaSpan>()];
+        encoded[..4].copy_from_slice(&span.chunk.to_le_bytes());
+        encoded[4..8].copy_from_slice(&span.offset.to_le_bytes());
+        encoded[8..].copy_from_slice(&span.len.to_le_bytes());
+        let mut bytes = [0_u8; INLINE_BUCKET_KEY_BYTES];
+        bytes.copy_from_slice(&encoded[..INLINE_BUCKET_KEY_BYTES]);
+        Self {
+            bytes,
+            tag: encoded[INLINE_BUCKET_KEY_BYTES],
+        }
+    }
+
+    fn inline_key(&self) -> Option<&[u8]> {
+        if self.tag & INLINE_BUCKET_KEY_TAG == 0 {
+            return None;
+        }
+        let len = usize::from(self.tag & INLINE_BUCKET_KEY_LEN_MASK);
+        Some(&self.bytes[..len])
+    }
+
+    fn span(&self) -> Option<ArenaSpan> {
+        if self.tag & INLINE_BUCKET_KEY_TAG != 0 {
+            return None;
+        }
+        let mut encoded = [0_u8; std::mem::size_of::<ArenaSpan>()];
+        encoded[..INLINE_BUCKET_KEY_BYTES].copy_from_slice(&self.bytes);
+        encoded[INLINE_BUCKET_KEY_BYTES] = self.tag;
+        Some(ArenaSpan {
+            chunk: u32::from_le_bytes(encoded[..4].try_into().expect("four chunk bytes")),
+            offset: u32::from_le_bytes(encoded[4..8].try_into().expect("four offset bytes")),
+            len: u32::from_le_bytes(encoded[8..].try_into().expect("four length bytes")),
+        })
+    }
+
+    fn matches(&self, arena: &ByteArena, field_ord: u16, term: &[u8]) -> bool {
+        if let Some(key) = self.inline_key() {
+            return key.len() == FIELD_PREFIX_BYTES + term.len()
+                && key[..FIELD_PREFIX_BYTES] == field_ord.to_be_bytes()
+                && key[FIELD_PREFIX_BYTES..] == *term;
+        }
+        let key = arena.resolve(
+            self.span()
+                .expect("non-inline bucket key must encode an arena span"),
+        );
+        key.len() == FIELD_PREFIX_BYTES + term.len()
+            && key[..FIELD_PREFIX_BYTES] == field_ord.to_be_bytes()
+            && key[FIELD_PREFIX_BYTES..] == *term
+    }
+}
+
 /// One interned term as seen from the `buckets` map: the dense id plus an
-/// inline copy of the term's arena span.
+/// exact short key or the term's arena span in the same 12-byte payload.
 ///
-/// The span is deliberately duplicated from `spans[id]` (P8 locality lever,
-/// bd-e8h-w2-interner-arena-x9s38): the per-token hot path (`find_in_bucket`
-/// → `matches`) verifies key bytes straight from the map entry, removing the
-/// dependent `spans[id]` load — a random-access cache miss per repeated
-/// token sitting on the longest load chain (map entry → span → arena bytes).
 /// `spans` remains the id → span source of truth for the resolve APIs
-/// (`composite_key`, `field_and_term`, `sorted_ids`).
-///
-/// INVARIANT (span-mirror): `entry.span == spans[entry.id as usize]` for
-/// every entry reachable from `buckets`. Both are written exactly once,
-/// together, in `intern_accounted`; spans are never mutated afterwards (the
-/// arena is append-only between resets, and `reset` clears both containers).
+/// (`composite_key`, `field_and_term`, `sorted_ids`). Bucket entries are
+/// written once in `intern_accounted`; inline keys are exact, while fallback
+/// spans equal `spans[id]` and remain valid until both containers are reset.
 #[derive(Debug, Clone, Copy)]
 struct BucketEntry {
     id: u32,
-    span: ArenaSpan,
+    key: BucketKey,
 }
 
 /// Collision bucket: hash → interned entry/entries. The `Many` arm is
@@ -1306,6 +1391,8 @@ pub(crate) const TERM_BUCKET_BYTES_ESTIMATE: usize = 8 + std::mem::size_of::<Buc
 // `One(u32) | Many(Vec<u32>)` shape. If this assert fires, do NOT relax it:
 // pin the constant to 40 and re-derive flush parity evidence.
 const _: () = assert!(TERM_BUCKET_BYTES_ESTIMATE == 40);
+const _: () = assert!(std::mem::size_of::<BucketKey>() == 12);
+const _: () = assert!(std::mem::size_of::<BucketEntry>() == 16);
 
 /// Identity [`Hasher`] for the interner's `buckets` map.
 ///
@@ -1455,25 +1542,15 @@ impl<S: BuildHasher> TermInterner<S> {
         h.finish()
     }
 
-    /// Verify a candidate's key bytes against `(field_ord, term)`.
-    ///
-    /// Takes the span (from the bucket entry's inline copy) rather than an
-    /// id so the hit path never touches `spans` (see [`BucketEntry`]).
-    fn matches(&self, span: ArenaSpan, field_ord: u16, term: &[u8]) -> bool {
-        let key = self.arena.resolve(span);
-        key.len() == FIELD_PREFIX_BYTES + term.len()
-            && key[..FIELD_PREFIX_BYTES] == field_ord.to_be_bytes()
-            && key[FIELD_PREFIX_BYTES..] == *term
-    }
-
     fn find_in_bucket(&self, hash: u64, field_ord: u16, term: &[u8]) -> Option<u32> {
         match self.buckets.get(&hash)? {
-            Bucket::One(entry) => self
-                .matches(entry.span, field_ord, term)
+            Bucket::One(entry) => entry
+                .key
+                .matches(&self.arena, field_ord, term)
                 .then_some(entry.id),
             Bucket::Many(entries) => entries
                 .iter()
-                .find(|entry| self.matches(entry.span, field_ord, term))
+                .find(|entry| entry.key.matches(&self.arena, field_ord, term))
                 .map(|entry| entry.id),
         }
     }
@@ -1515,10 +1592,12 @@ impl<S: BuildHasher> TermInterner<S> {
         let span = self.arena.push(&self.key_scratch);
         let id = u32::try_from(self.spans.len()).expect("term id space exceeds u32");
         self.spans.push(span);
-        // Written together with `spans` — the span-mirror invariant
-        // (`entry.span == spans[entry.id]`, see [`BucketEntry`]) holds here
-        // by construction and is never mutated afterwards.
-        let entry = BucketEntry { id, span };
+        // Written together with `spans`: short keys carry their complete
+        // composite bytes, while longer keys carry this exact span.
+        let entry = BucketEntry {
+            id,
+            key: BucketKey::new(span, field_ord, term),
+        };
         // `bucket_bytes` (first tuple element) feeds `running_bytes_used`,
         // the shard flush trigger: its values are PINNED to the pre-P8
         // id-only increments (u32-based) as a byte-identity contract — the
@@ -7243,34 +7322,58 @@ mod tests {
         );
     }
 
-    /// Pins the span-mirror invariant documented on [`BucketEntry`]:
-    /// `entry.span == spans[entry.id]` for every entry reachable from
-    /// `buckets`, across One buckets, forced `Many` collisions, duplicates,
-    /// and reset/reuse cycles. If an insert path ever stores a stale or
-    /// wrong span inline, `matches` would verify against the wrong key
-    /// bytes and dedup would silently break — this test catches the
-    /// mirror drift directly.
+    /// Pins both exact bucket-key representations across One buckets, forced
+    /// `Many` collisions, duplicates, clone, and reset/reuse cycles. Composite
+    /// keys through 11 bytes must be inline; larger keys must encode the exact
+    /// arena span from `spans[id]`. Either form must verify the complete field
+    /// prefix and term bytes rather than trusting the hash.
     #[test]
-    fn bucket_entries_mirror_spans_across_collisions_and_reset() {
-        fn assert_span_mirror<S: BuildHasher>(interner: &TermInterner<S>) {
+    fn bucket_entries_inline_short_keys_and_mirror_long_spans() {
+        fn assert_entry<S: BuildHasher>(interner: &TermInterner<S>, entry: &BucketEntry) {
+            let composite = interner.composite_key(entry.id);
+            let field_ord = u16::from_be_bytes(
+                composite[..FIELD_PREFIX_BYTES]
+                    .try_into()
+                    .expect("composite field prefix"),
+            );
+            let term = &composite[FIELD_PREFIX_BYTES..];
+            assert!(
+                entry.key.matches(&interner.arena, field_ord, term),
+                "bucket key must verify its source composite key"
+            );
+            if composite.len() <= INLINE_BUCKET_KEY_BYTES {
+                assert_eq!(
+                    entry.key.inline_key(),
+                    Some(composite),
+                    "short composite key must be stored byte-for-byte inline"
+                );
+                assert_eq!(entry.key.span(), None, "inline key must not expose a span");
+            } else {
+                assert_eq!(
+                    entry.key.inline_key(),
+                    None,
+                    "long composite key must use its arena span"
+                );
+                assert_eq!(
+                    entry.key.span(),
+                    Some(interner.spans[entry.id as usize]),
+                    "fallback span diverged from spans[{}]",
+                    entry.id
+                );
+            }
+        }
+
+        fn assert_bucket_keys<S: BuildHasher>(interner: &TermInterner<S>) {
             let mut seen = 0_usize;
             for bucket in interner.buckets.values() {
                 match bucket {
                     Bucket::One(entry) => {
-                        assert_eq!(
-                            entry.span, interner.spans[entry.id as usize],
-                            "One-bucket entry span diverged from spans[{}]",
-                            entry.id
-                        );
+                        assert_entry(interner, entry);
                         seen += 1;
                     }
                     Bucket::Many(entries) => {
                         for entry in entries {
-                            assert_eq!(
-                                entry.span, interner.spans[entry.id as usize],
-                                "Many-bucket entry span diverged from spans[{}]",
-                                entry.id
-                            );
+                            assert_entry(interner, entry);
                             seen += 1;
                         }
                     }
@@ -7283,34 +7386,56 @@ mod tests {
             );
         }
 
-        // Normal hasher: One-dominant buckets, duplicates on the hit path.
+        assert_eq!(std::mem::size_of::<BucketKey>(), 12);
+        assert_eq!(std::mem::size_of::<BucketEntry>(), 16);
+
+        // Normal hasher: boundary keys plus One-dominant buckets and duplicate
+        // hits. Nine term bytes plus the field prefix fit exactly inline;
+        // ten term bytes cross to the fallback representation.
         let mut interner = TermInterner::new();
+        for (field_ord, term) in [
+            (0, b"".as_slice()),
+            (1, b"a".as_slice()),
+            (2, b"term00001".as_slice()),
+            (3, b"term000010".as_slice()),
+        ] {
+            let first = interner.intern(field_ord, term);
+            assert_eq!(interner.intern(field_ord, term), first);
+        }
         for i in 0..500_u32 {
             let term = format!("mirror-{i:03}");
             let first = interner.intern((i % 4) as u16, term.as_bytes());
             let again = interner.intern((i % 4) as u16, term.as_bytes());
-            assert_eq!(first, again, "duplicate intern must dedup via the mirror");
+            assert_eq!(
+                first, again,
+                "duplicate intern must dedup via its exact key"
+            );
         }
-        assert_span_mirror(&interner);
+        assert_bucket_keys(&interner);
+        assert_bucket_keys(&interner.clone());
 
         // Reset drops both containers together; reuse re-establishes the
-        // mirror against fresh arena spans.
+        // representations against fresh arena spans.
         interner.reset();
-        assert_span_mirror(&interner);
+        assert_bucket_keys(&interner);
+        interner.intern(0, b"term00001");
         for i in 0..100_u32 {
             let term = format!("post-reset-{i:03}");
             interner.intern(0, term.as_bytes());
         }
-        assert_span_mirror(&interner);
+        assert_bucket_keys(&interner);
 
-        // Constant hasher: every key rides the Many verification path.
+        // Constant hasher: short inline keys and long fallback keys share one
+        // Many bucket, so correctness must come from their exact bytes.
         let mut colliding: TermInterner<ConstBuild> =
             TermInterner::with_hasher(ConstBuild::default());
         for i in 0..200_u32 {
+            let short = format!("c{i:08}");
+            colliding.intern((i % 3) as u16, short.as_bytes());
             let term = format!("mirror-collide-{i:03}");
             colliding.intern((i % 3) as u16, term.as_bytes());
         }
-        assert_span_mirror(&colliding);
+        assert_bucket_keys(&colliding);
     }
 
     #[test]
