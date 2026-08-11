@@ -1277,6 +1277,12 @@ pub struct DeltaPostingCursor<'a> {
     current_ordinal: Option<u32>,
     next_ordinal: u32,
     last_physical_doc: Option<u32>,
+    /// Physical rows this term holds, tombstoned ones included.
+    ///
+    /// A step is only real while an unread row remains, so this bounds the
+    /// admissions: a walk that ends exactly on a logical-block boundary must
+    /// not buy a permit for a block that does not exist.
+    physical_len: u32,
     size_hint: u32,
     cost: u64,
     segment_num_docs: u32,
@@ -1327,6 +1333,20 @@ impl<'a> DeltaPostingCursor<'a> {
         checkpoint: Option<&dyn QueryWorkCheckpoint>,
     ) -> Result<Self, ArgusError> {
         let term = delta.find_term(field_ord, term_bytes);
+        // Delta term metadata is not a lookup. `live_doc_freq` walks the whole
+        // physical chain to count survivors, so opening a cursor reads every
+        // row of the term before a single posting is served. That walk is
+        // admitted here, before it runs, at the same physical-block rate the
+        // scan itself pays. A term that is missing entirely still admits —
+        // with zero units — so a cancelled query cannot open cursors forever.
+        if let Some(checkpoint) = checkpoint {
+            let physical = term.map_or(0, DeltaTerm::physical_doc_freq);
+            let blocks = physical.div_ceil(DELTA_LOGICAL_BLOCK_POSTINGS as usize);
+            checkpoint.admit(
+                QueryWorkKind::PostingBlock,
+                u64::try_from(blocks).unwrap_or(u64::MAX),
+            )?;
+        }
         let (live_doc_freq, block_max) =
             term.map_or((0, None), DeltaTerm::live_doc_freq_and_block_max);
         let size_hint = u32::try_from(live_doc_freq).map_err(|_| {
@@ -1341,6 +1361,8 @@ impl<'a> DeltaPostingCursor<'a> {
         let segment_num_docs = u32::try_from(delta.live_document_count())
             .map_err(|_| ArgusError::CursorInvariant("Delta live document count exceeds u32"))?;
         let remaining = term.map(DeltaTerm::postings);
+        let physical_len = u32::try_from(term.map_or(0, DeltaTerm::physical_doc_freq))
+            .map_err(|_| ArgusError::CursorInvariant("Delta physical row count exceeds u32"))?;
         let mut cursor = Self {
             term,
             block_max,
@@ -1349,6 +1371,7 @@ impl<'a> DeltaPostingCursor<'a> {
             current_ordinal: None,
             next_ordinal: 0,
             last_physical_doc: None,
+            physical_len,
             size_hint,
             cost,
             segment_num_docs,
@@ -1389,8 +1412,12 @@ impl<'a> DeltaPostingCursor<'a> {
             if let Some(checkpoint) = checkpoint {
                 // Admitted before the step, never after: a tombstoned run is
                 // still work, and the query must be able to stop inside it.
-                let units = u64::from(self.next_ordinal % DELTA_LOGICAL_BLOCK_POSTINGS == 0);
-                checkpoint.admit(QueryWorkKind::PostingBlock, units)?;
+                // A step past the last physical row reads nothing, so a walk
+                // that ends exactly on a block boundary buys no phantom
+                // permit for a block that does not exist — it still polls.
+                let opens_block = self.next_ordinal < self.physical_len
+                    && self.next_ordinal % DELTA_LOGICAL_BLOCK_POSTINGS == 0;
+                checkpoint.admit(QueryWorkKind::PostingBlock, u64::from(opens_block))?;
             }
             let Some(posting) = remaining.next() else {
                 self.current = None;
@@ -6760,7 +6787,10 @@ mod tests {
                 .units
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert_eq!(units.as_slice(), [1].as_slice());
+            // The metadata scan is admitted first, at one unit per physical
+            // block it walks (301 rows => 3), then construction's own step at
+            // ordinal 0 opens the first block.
+            assert_eq!(units.as_slice(), [3, 1].as_slice());
         }
 
         assert!(cursor.next()?.is_some(), "the run ends at a live posting");
@@ -6773,13 +6803,14 @@ mod tests {
         // physical step of the run.
         assert_eq!(
             units.len(),
-            usize::try_from(DELTA_TOMBSTONE_RUN)? + 2,
-            "every physical step of the tombstone run must admit"
+            usize::try_from(DELTA_TOMBSTONE_RUN)? + 3,
+            "the metadata scan, construction's step, the pre-move poll, and \
+             one admission per physical step of the run"
         );
         assert_eq!(
             units.iter().sum::<u64>(),
-            3,
-            "ordinals 0, 128 and 256 each open a logical block"
+            6,
+            "three units for the metadata scan, then ordinals 0, 128 and 256"
         );
         Ok(())
     }
@@ -6788,11 +6819,11 @@ mod tests {
     fn delta_tombstone_walk_refused_mid_run_makes_no_further_progress()
     -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = delta_tombstone_snapshot()?;
-        // Admission 1 is construction's step at ordinal 0, admission 2 is the
-        // wrapper's pre-move poll, and the walk's step at physical ordinal N
-        // is admission N + 2. Refuse at ordinal 128 — a block boundary in the
-        // middle of the tombstone run.
-        let checkpoint = Arc::new(CancelOnNthAdmission::new(130));
+        // Admission 1 is the metadata scan, 2 is construction's step at
+        // ordinal 0, 3 is the wrapper's pre-move poll, and the walk's step at
+        // physical ordinal N is admission N + 3. Refuse at ordinal 128 — a
+        // block boundary in the middle of the tombstone run.
+        let checkpoint = Arc::new(CancelOnNthAdmission::new(131));
         let handle: Arc<dyn QueryWorkCheckpoint> = checkpoint.clone();
         let inner = DeltaPostingCursor::new_admitted(&snapshot, 0, b"alpha", handle.as_ref())?;
         let mut cursor = CheckpointPostingCursor::new(inner, Arc::clone(&handle))?;
@@ -6821,7 +6852,7 @@ mod tests {
         let admissions_at_refusal = checkpoint
             .admissions
             .load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(admissions_at_refusal, 130);
+        assert_eq!(admissions_at_refusal, 131);
         assert_eq!(
             PostingCursor::doc(&cursor),
             doc_before,

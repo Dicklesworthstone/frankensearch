@@ -10582,7 +10582,11 @@ fn query_work_upper_bound(
         dictionary_blocks = dictionary_blocks.saturating_add(u64::from(count));
     }
     for delta in snapshot.delta_snapshots() {
-        let docs = u64::try_from(delta.live_document_count()).unwrap_or(u64::MAX);
+        // A Delta walk is charged over the physical rows it reads, tombstones
+        // included, so the ceiling has to be drawn from the same population.
+        // Bounding it by the live count let a tombstone-heavy generation
+        // exhaust a budget that was sized for a fraction of the work.
+        let docs = u64::try_from(delta.physical_document_count()).unwrap_or(u64::MAX);
         physical_docs = physical_docs.saturating_add(docs);
         posting_blocks_per_stream = posting_blocks_per_stream.saturating_add(docs.div_ceil(128));
         let terms = u64::try_from(delta.segment().sorted_terms().len()).unwrap_or(u64::MAX);
