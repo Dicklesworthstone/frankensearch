@@ -224,8 +224,50 @@ impl WatcherExecutionPolicy {
 /// Snapshot map used for crash-recovery catch-up.
 pub type FileSnapshot = BTreeMap<PathBuf, u64>;
 
-type SnapshotCollector =
-    dyn Fn(&[PathBuf], &DiscoveryConfig) -> SearchResult<FileSnapshot> + Send + Sync;
+/// Whether an authoritative scan actually observed every in-scope path.
+///
+/// A snapshot is only evidence of absence where the scan was allowed to look.
+/// A directory the walk could not read, and a root that was not there at all,
+/// both produce a *short* snapshot that is indistinguishable from deletion if
+/// the caller forgets to ask. Deletion derivation therefore consumes this
+/// receipt, and an incomplete scan derives no deletes and leaves the prior
+/// baseline authoritative.
+///
+/// The recorded paths are the ones the scan could not resolve, not the ones it
+/// skipped by policy: an excluded root or a filtered path is a complete
+/// observation that the path is out of scope.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanCompleteness {
+    unresolved: BTreeSet<PathBuf>,
+}
+
+impl ScanCompleteness {
+    /// Whether every in-scope path was resolved.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.unresolved.is_empty()
+    }
+
+    /// Paths the scan could not resolve, in deterministic order.
+    pub fn unresolved_paths(&self) -> impl ExactSizeIterator<Item = &Path> {
+        self.unresolved.iter().map(PathBuf::as_path)
+    }
+
+    /// Number of unresolved paths.
+    #[must_use]
+    pub fn unresolved_count(&self) -> usize {
+        self.unresolved.len()
+    }
+
+    /// Record a path whose contents or existence could not be established.
+    fn record_unresolved(&mut self, path: impl Into<PathBuf>) {
+        self.unresolved.insert(path.into());
+    }
+}
+
+type SnapshotCollector = dyn Fn(&[PathBuf], &DiscoveryConfig) -> SearchResult<(FileSnapshot, ScanCompleteness)>
+    + Send
+    + Sync;
 
 /// Public watcher statistics snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -940,27 +982,47 @@ impl FsWatcher {
     /// # Errors
     ///
     /// Returns errors from filesystem traversal that are not safe to ignore.
-    pub fn collect_snapshot(&self) -> SearchResult<FileSnapshot> {
+    pub fn collect_snapshot(&self) -> SearchResult<(FileSnapshot, ScanCompleteness)> {
         collect_snapshot_from_roots(&self.roots, &self.discovery)
     }
 
     /// Build catch-up events by diffing prior and current snapshots.
     ///
+    /// An incomplete scan still reports the creates and modifies it observed —
+    /// those paths demonstrably exist — but derives no deletes, and leaves
+    /// reconciliation required so a later complete scan can settle the
+    /// difference.
+    ///
     /// # Errors
     ///
     /// Returns errors from current snapshot collection.
     pub fn build_catchup_events(&self, previous: &FileSnapshot) -> SearchResult<Vec<WatchEvent>> {
-        let current = self.collect_snapshot()?;
-        Ok(Self::diff_snapshots(previous, &current, now_millis()))
+        let (current, completeness) = self.collect_snapshot()?;
+        if !completeness.is_complete() {
+            lock_or_recover(&self.reconciliation).require_full_scan();
+        }
+        Ok(Self::diff_snapshots(
+            previous,
+            &current,
+            now_millis(),
+            &completeness,
+        ))
     }
 
     /// Deterministically diff two snapshots into create/modify/delete events.
+    ///
+    /// Deletes are derived only from a complete scan. `current` is a statement
+    /// about absence only where the scan was able to look, so an incomplete
+    /// receipt suppresses every delete rather than inventing one for a path
+    /// the scan never resolved.
     #[must_use]
     pub fn diff_snapshots(
         previous: &FileSnapshot,
         current: &FileSnapshot,
         observed_at_ms: u64,
+        completeness: &ScanCompleteness,
     ) -> Vec<WatchEvent> {
+        let derive_deletes = completeness.is_complete();
         let mut events = Vec::new();
         let mut prev_iter = previous.iter();
         let mut curr_iter = current.iter();
@@ -970,7 +1032,9 @@ impl FsWatcher {
         while let (Some((p_path, p_time)), Some((c_path, c_time))) = (p_next, c_next) {
             match p_path.cmp(c_path) {
                 std::cmp::Ordering::Less => {
-                    events.push(WatchEvent::deleted(p_path, observed_at_ms));
+                    if derive_deletes {
+                        events.push(WatchEvent::deleted(p_path, observed_at_ms));
+                    }
                     p_next = prev_iter.next();
                 }
                 std::cmp::Ordering::Greater => {
@@ -988,7 +1052,9 @@ impl FsWatcher {
         }
 
         while let Some((p_path, _)) = p_next {
-            events.push(WatchEvent::deleted(p_path, observed_at_ms));
+            if derive_deletes {
+                events.push(WatchEvent::deleted(p_path, observed_at_ms));
+            }
             p_next = prev_iter.next();
         }
 
@@ -1109,12 +1175,20 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
         return Ok(());
     }
 
-    let baseline = collect_snapshot_from_roots(&context.roots, &context.discovery)?;
+    let (baseline, baseline_completeness) =
+        collect_snapshot_from_roots(&context.roots, &context.discovery)?;
     {
         let mut reconciliation = lock_or_recover(&context.reconciliation);
+        // A short startup baseline would make the first authoritative rescan
+        // read every unobserved path as a creation and, once promoted, every
+        // later disappearance as a delete. Adopt it, but require a rescan so
+        // it is replaced by a complete one.
         if !reconciliation.baseline_initialized {
             reconciliation.indexed_snapshot = baseline;
             reconciliation.baseline_initialized = true;
+        }
+        if !baseline_completeness.is_complete() {
+            reconciliation.require_full_scan();
         }
     }
 
@@ -1539,7 +1613,7 @@ async fn run_authoritative_reconciliation(
     // state, while batches produced after this clear remain queued and are
     // applied after the rescan.
     lock_or_recover(ready_batches).clear();
-    let current = snapshot_collector(roots, discovery)?;
+    let (current, completeness) = snapshot_collector(roots, discovery)?;
     let observed_at_ms = now_millis();
     let mount_table = build_mount_table(discovery);
     let mut events = current
@@ -1555,14 +1629,26 @@ async fn run_authoritative_reconciliation(
         })
         .collect::<Vec<_>>();
 
-    let mut deletion_candidates = indexed_snapshot.keys().cloned().collect::<BTreeSet<_>>();
-    deletion_candidates.extend(affected_paths);
-    events.extend(
-        deletion_candidates
-            .into_iter()
-            .filter(|path| !current.contains_key(path))
-            .map(|path| WatchEvent::deleted(path, observed_at_ms)),
-    );
+    // An incomplete rescan is not authoritative about absence. It still
+    // reindexes everything it did observe above, but it derives no deletes:
+    // a path missing from a short snapshot may simply be one the scan could
+    // not read.
+    if completeness.is_complete() {
+        let mut deletion_candidates = indexed_snapshot.keys().cloned().collect::<BTreeSet<_>>();
+        deletion_candidates.extend(affected_paths);
+        events.extend(
+            deletion_candidates
+                .into_iter()
+                .filter(|path| !current.contains_key(path))
+                .map(|path| WatchEvent::deleted(path, observed_at_ms)),
+        );
+    } else {
+        warn!(
+            unresolved_paths = completeness.unresolved_count(),
+            "watcher rescan could not resolve every path; deriving no deletions and keeping \
+             reconciliation required"
+        );
+    }
 
     for event_batch in events.chunks(batch_size.max(1)) {
         if cx.is_cancel_requested() {
@@ -1587,10 +1673,17 @@ async fn run_authoritative_reconciliation(
 
     let mut state = lock_or_recover(reconciliation);
     if state.epoch == epoch {
-        state.indexed_snapshot = current;
-        state.baseline_initialized = true;
-        state.required = false;
-        state.affected_paths.clear();
+        if completeness.is_complete() {
+            state.indexed_snapshot = current;
+            state.baseline_initialized = true;
+            state.required = false;
+            state.affected_paths.clear();
+        } else {
+            // Promoting a short snapshot to the baseline would make the next
+            // complete scan diff against it and delete everything the failed
+            // scan could not see. Keep the old baseline and stay required.
+            state.required = true;
+        }
     }
     Ok(())
 }
@@ -1602,11 +1695,17 @@ fn record_successful_events(
     events: &[WatchEvent],
     snapshot_collector: &SnapshotCollector,
 ) -> SearchResult<()> {
-    let current = snapshot_collector(roots, discovery)?;
+    let (current, completeness) = snapshot_collector(roots, discovery)?;
     let mut state = lock_or_recover(reconciliation);
     if !state.baseline_initialized {
         state.indexed_snapshot = current.clone();
         state.baseline_initialized = true;
+    }
+    if !completeness.is_complete() {
+        // The per-event updates below stay correct — they are keyed on paths
+        // this batch actually touched — but the snapshot behind them is short,
+        // so the baseline must still be re-established authoritatively.
+        state.required = true;
     }
     for event in events {
         if let Some(modified_at_ms) = current.get(&event.path) {
@@ -1871,13 +1970,20 @@ fn watcher_error(error: &notify::Error) -> SearchError {
 fn collect_snapshot_from_roots(
     roots: &[PathBuf],
     discovery: &DiscoveryConfig,
-) -> SearchResult<FileSnapshot> {
+) -> SearchResult<(FileSnapshot, ScanCompleteness)> {
     let mut snapshot = FileSnapshot::new();
+    let mut completeness = ScanCompleteness::default();
     let mount_table = build_mount_table(discovery);
     for root in roots {
-        collect_snapshot_for_root(root, discovery, Some(&mount_table), &mut snapshot)?;
+        collect_snapshot_for_root(
+            root,
+            discovery,
+            Some(&mount_table),
+            &mut snapshot,
+            &mut completeness,
+        )?;
     }
-    Ok(snapshot)
+    Ok((snapshot, completeness))
 }
 
 fn collect_snapshot_for_root(
@@ -1885,8 +1991,13 @@ fn collect_snapshot_for_root(
     discovery: &DiscoveryConfig,
     mount_table: Option<&MountTable>,
     snapshot: &mut FileSnapshot,
+    completeness: &mut ScanCompleteness,
 ) -> SearchResult<()> {
     if !root.exists() {
+        // A root that is not there is not the same claim as a root that is
+        // there and empty. An unmounted or not-yet-created root would
+        // otherwise diff as the deletion of everything beneath it.
+        completeness.record_unresolved(root);
         return Ok(());
     }
 
@@ -1939,29 +2050,52 @@ fn collect_snapshot_for_root(
             continue;
         }
 
+        // Every skip below leaves part of the tree unobserved, so each one
+        // records the path it could not resolve. Skipping silently is what
+        // turns an unreadable directory into a subtree of phantom deletes.
         let dir_entries = match fs::read_dir(&dir_path) {
             Ok(entries) => entries,
-            Err(error) if is_ignorable_walk_error(&error) => continue,
+            Err(error) if is_ignorable_walk_error(&error) => {
+                completeness.record_unresolved(&dir_path);
+                continue;
+            }
             Err(error) => return Err(error.into()),
         };
 
         for entry in dir_entries {
             let entry = match entry {
                 Ok(entry) => entry,
-                Err(error) if is_ignorable_walk_error(&error) => continue,
+                Err(error) if is_ignorable_walk_error(&error) => {
+                    // The directory's remaining entries are unknown, so the
+                    // directory itself is what went unresolved.
+                    completeness.record_unresolved(&dir_path);
+                    continue;
+                }
                 Err(error) => return Err(error.into()),
             };
 
             let path = entry.path();
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
-                Err(error) if is_ignorable_walk_error(&error) => continue,
+                Err(error) if is_ignorable_walk_error(&error) => {
+                    completeness.record_unresolved(&path);
+                    continue;
+                }
                 Err(error) => return Err(error.into()),
             };
 
             let metadata = match fs::metadata(&path) {
                 Ok(metadata) => metadata,
-                Err(error) if is_ignorable_walk_error(&error) => continue,
+                // A `NotFound` here is the one skip that is a complete
+                // observation: the entry was listed and has since gone, which
+                // is exactly the absence a delete should be derived from.
+                // Treating it as unresolved would make every scan of a
+                // changing tree incomplete and suppress deletes forever.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if is_ignorable_walk_error(&error) => {
+                    completeness.record_unresolved(&path);
+                    continue;
+                }
                 Err(error) => return Err(error.into()),
             };
 
@@ -2181,10 +2315,10 @@ mod tests {
     use super::{
         DEFAULT_BATCH_SIZE, DEFAULT_DEBOUNCE_MS, FileSnapshot, FsWatcher, NoopWatchIngestPipeline,
         PendingBatchLease, PendingEvents, ReadyBatchQueue, ReconciliationState,
-        ReconciliationTracker, WatchBatchOutcome, WatchEvent, WatchEventKind, WatchIngestFuture,
-        WatchIngestOp, WatchIngestPipeline, WatcherExecutionPolicy, WatcherLifecycle, WatcherStop,
-        collect_snapshot_from_roots, drain_notify_channel, flush_pending_batches,
-        normalize_file_key, now_millis, observe_pressure_transition,
+        ReconciliationTracker, ScanCompleteness, WatchBatchOutcome, WatchEvent, WatchEventKind,
+        WatchIngestFuture, WatchIngestOp, WatchIngestPipeline, WatcherExecutionPolicy,
+        WatcherLifecycle, WatcherStop, collect_snapshot_from_roots, drain_notify_channel,
+        flush_pending_batches, normalize_file_key, now_millis, observe_pressure_transition,
         run_authoritative_reconciliation, run_ingest_loop,
     };
     use crate::config::DiscoveryConfig;
@@ -2642,7 +2776,8 @@ mod tests {
         current.insert(PathBuf::from("/repo/a.rs"), 11);
         current.insert(PathBuf::from("/repo/c.rs"), 30);
 
-        let events = FsWatcher::diff_snapshots(&previous, &current, 1_000);
+        let events =
+            FsWatcher::diff_snapshots(&previous, &current, 1_000, &ScanCompleteness::default());
         assert_eq!(events.len(), 3);
 
         let mut kinds = events
@@ -2679,7 +2814,11 @@ mod tests {
             DiscoveryConfig::default(),
             Arc::new(NoopWatchIngestPipeline),
         );
-        let snapshot = watcher.collect_snapshot().expect("collect snapshot");
+        let (snapshot, completeness) = watcher.collect_snapshot().expect("collect snapshot");
+        assert!(
+            completeness.is_complete(),
+            "readable fixture scans complete"
+        );
 
         assert!(snapshot.contains_key(&src_dir.join("lib.rs")));
         assert!(!snapshot.contains_key(&node_modules_dir.join("index.js")));
@@ -2710,9 +2849,20 @@ mod tests {
         );
 
         let mut snapshot = FileSnapshot::new();
-        super::collect_snapshot_for_root(&root, &discovery, Some(&mount_table), &mut snapshot)
-            .expect("collect snapshot");
+        let mut completeness = ScanCompleteness::default();
+        super::collect_snapshot_for_root(
+            &root,
+            &discovery,
+            Some(&mount_table),
+            &mut snapshot,
+            &mut completeness,
+        )
+        .expect("collect snapshot");
         assert!(snapshot.is_empty(), "network root should be excluded");
+        assert!(
+            completeness.is_complete(),
+            "an excluded root is a complete observation that it is out of scope"
+        );
     }
 
     #[cfg(unix)]
@@ -2731,8 +2881,16 @@ mod tests {
             ..DiscoveryConfig::default()
         };
         let mut snapshot = FileSnapshot::new();
-        super::collect_snapshot_for_root(&symlink_root, &discovery, None, &mut snapshot)
-            .expect("collect snapshot");
+        let mut completeness = ScanCompleteness::default();
+        super::collect_snapshot_for_root(
+            &symlink_root,
+            &discovery,
+            None,
+            &mut snapshot,
+            &mut completeness,
+        )
+        .expect("collect snapshot");
+        assert!(completeness.is_complete());
         assert!(
             snapshot.is_empty(),
             "root symlink should be skipped when follow_symlinks=false"
@@ -2755,8 +2913,16 @@ mod tests {
             ..DiscoveryConfig::default()
         };
         let mut snapshot = FileSnapshot::new();
-        super::collect_snapshot_for_root(&symlink_root, &discovery, None, &mut snapshot)
-            .expect("collect snapshot");
+        let mut completeness = ScanCompleteness::default();
+        super::collect_snapshot_for_root(
+            &symlink_root,
+            &discovery,
+            None,
+            &mut snapshot,
+            &mut completeness,
+        )
+        .expect("collect snapshot");
+        assert!(completeness.is_complete());
         assert!(
             snapshot.contains_key(&symlink_root.join("lib.rs")),
             "root symlink contents should be indexed when follow_symlinks=true"
@@ -3273,8 +3439,10 @@ mod tests {
             }
 
             fs::write(&late_path, "fn late() {}\n").expect("write late fixture");
-            let expected_snapshot = collect_snapshot_from_roots(&roots, &discovery)
-                .expect("collect expected second baseline");
+            let (expected_snapshot, expected_completeness) =
+                collect_snapshot_from_roots(&roots, &discovery)
+                    .expect("collect expected second baseline");
+            assert!(expected_completeness.is_complete());
             run_authoritative_reconciliation(
                 &cx,
                 &roots,
@@ -3596,6 +3764,165 @@ mod tests {
         });
     }
 
+    /// An unreadable subtree must not be reported as a complete scan, and the
+    /// diff against it must derive no deletes for the files it hid.
+    ///
+    /// The fixture is deliberately *readable first*: the same tree is scanned
+    /// once with the subtree readable and once with it chmod-0, so the only
+    /// difference between the two runs is the permission bit. Without the
+    /// completeness receipt the second snapshot is simply shorter, and the
+    /// diff turns every hidden file into a deletion — which is the failure
+    /// this asserts against, not a hypothetical one.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_subtree_is_incomplete_and_derives_no_deletes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("g3-unreadable-subtree");
+        let open_dir = root.join("open");
+        let closed_dir = root.join("closed");
+        fs::create_dir_all(&open_dir).expect("create open dir");
+        fs::create_dir_all(&closed_dir).expect("create closed dir");
+        let open_file = open_dir.join("visible.rs");
+        let hidden_file = closed_dir.join("hidden.rs");
+        fs::write(&open_file, "fn visible() {}\n").expect("write visible fixture");
+        fs::write(&hidden_file, "fn hidden() {}\n").expect("write hidden fixture");
+
+        let discovery = DiscoveryConfig::default();
+        let roots = vec![root.clone()];
+
+        let (baseline, baseline_completeness) =
+            collect_snapshot_from_roots(&roots, &discovery).expect("baseline scan");
+        assert!(
+            baseline_completeness.is_complete(),
+            "the readable control must scan complete"
+        );
+        assert!(baseline.contains_key(&open_file));
+        assert!(
+            baseline.contains_key(&hidden_file),
+            "the control must see the file the hostile run will hide"
+        );
+
+        // Close the subtree without removing or rewriting anything.
+        let original = fs::metadata(&closed_dir)
+            .expect("read closed dir metadata")
+            .permissions();
+        fs::set_permissions(&closed_dir, fs::Permissions::from_mode(0o000)).expect("close subtree");
+
+        // Probe the precondition through the same syscall the walk uses. A
+        // privileged uid ignores the mode bits, and the hostile condition
+        // would silently not exist — the test must fail loudly there rather
+        // than pass without ever hiding anything.
+        let denial_is_enforced = fs::read_dir(&closed_dir).is_err();
+
+        let (short, short_completeness) =
+            collect_snapshot_from_roots(&roots, &discovery).expect("hostile scan still succeeds");
+
+        // Restore before asserting so a failure cannot leave the temp tree
+        // undeletable for the harness.
+        fs::set_permissions(&closed_dir, original).expect("restore subtree permissions");
+
+        assert!(
+            denial_is_enforced,
+            "fixture precondition failed: mode 0o000 did not deny read_dir (running as root?), \
+             so this test could not hide anything and proves nothing"
+        );
+        assert!(
+            !short_completeness.is_complete(),
+            "an unreadable directory must be reported as unresolved, not as an empty one"
+        );
+        assert!(
+            short_completeness
+                .unresolved_paths()
+                .any(|path| path == closed_dir),
+            "the unresolved path must name the directory that could not be read"
+        );
+        assert!(
+            !short.contains_key(&hidden_file),
+            "the hostile scan really is short — otherwise this proves nothing"
+        );
+
+        let events = FsWatcher::diff_snapshots(&baseline, &short, 1_000, &short_completeness);
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.kind == WatchEventKind::Deleted),
+            "an incomplete scan must derive no deletions, got {events:?}"
+        );
+
+        // The same short snapshot with a complete receipt WOULD delete, which
+        // is what makes the gate load-bearing rather than decorative.
+        let unguarded =
+            FsWatcher::diff_snapshots(&baseline, &short, 1_000, &ScanCompleteness::default());
+        assert!(
+            unguarded
+                .iter()
+                .any(|event| event.kind == WatchEventKind::Deleted && event.path == hidden_file),
+            "control: a complete receipt over the same pair does derive the delete"
+        );
+    }
+
+    /// A root that is not there is unresolved, never an empty directory.
+    ///
+    /// This is the unmounted-root case: the previous baseline holds real
+    /// files, the root then disappears, and a scan that called that "complete
+    /// and empty" would delete the entire index.
+    #[test]
+    fn vanished_root_is_incomplete_and_derives_no_deletes() {
+        let temp = tempdir().expect("tempdir");
+        let present_root = temp.path().join("g3-present-root");
+        let absent_root = temp.path().join("g3-absent-root");
+        fs::create_dir_all(&present_root).expect("create present root");
+        let present_file = present_root.join("kept.rs");
+        fs::write(&present_file, "fn kept() {}\n").expect("write present fixture");
+
+        let discovery = DiscoveryConfig::default();
+        let roots = vec![present_root.clone(), absent_root.clone()];
+
+        // `absent_root` is never created: nothing is deleted by this test.
+        assert!(!absent_root.exists(), "the absent root must stay absent");
+
+        let (snapshot, completeness) =
+            collect_snapshot_from_roots(&roots, &discovery).expect("scan with an absent root");
+
+        assert!(
+            !completeness.is_complete(),
+            "a missing root must be unresolved, not silently empty"
+        );
+        assert!(
+            completeness
+                .unresolved_paths()
+                .any(|path| path == absent_root),
+            "the unresolved path must name the missing root"
+        );
+        assert!(
+            snapshot.contains_key(&present_file),
+            "the readable root is still scanned"
+        );
+
+        let mut baseline = snapshot.clone();
+        let vanished_file = absent_root.join("was-indexed.rs");
+        baseline.insert(vanished_file.clone(), 10);
+
+        let events = FsWatcher::diff_snapshots(&baseline, &snapshot, 2_000, &completeness);
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.kind == WatchEventKind::Deleted),
+            "a missing root must not delete what it used to hold, got {events:?}"
+        );
+
+        let unguarded =
+            FsWatcher::diff_snapshots(&baseline, &snapshot, 2_000, &ScanCompleteness::default());
+        assert!(
+            unguarded
+                .iter()
+                .any(|event| event.kind == WatchEventKind::Deleted && event.path == vanished_file),
+            "control: a complete receipt over the same pair does derive the delete"
+        );
+    }
+
     #[test]
     fn collect_snapshot_supports_file_root() {
         let temp = tempdir().expect("tempdir");
@@ -3607,7 +3934,11 @@ mod tests {
             DiscoveryConfig::default(),
             Arc::new(NoopWatchIngestPipeline),
         );
-        let snapshot = watcher.collect_snapshot().expect("collect snapshot");
+        let (snapshot, completeness) = watcher.collect_snapshot().expect("collect snapshot");
+        assert!(
+            completeness.is_complete(),
+            "readable fixture scans complete"
+        );
 
         assert!(snapshot.contains_key(&file_root));
         assert_eq!(snapshot.len(), 1);
