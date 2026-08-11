@@ -111,8 +111,6 @@ pub use comparator::{
     compare_observations_with_control, observe_lexical_outcome,
     observe_live_quill_cancellation_receipt, observe_quill_cass_profile,
 };
-#[cfg(feature = "fuzz-harness")]
-pub use engine::scalar_g1a_fuzz_pair;
 pub use engine::{
     CASS_TANTIVY_ORACLE_CONFIG_HASH, ComparisonMode, DifferentialCase, DifferentialCaseMetadata,
     DifferentialHarness, EngineDescriptor, EngineFamily, EnginePairIdentity, GauntletEngine,
@@ -120,6 +118,16 @@ pub use engine::{
 };
 #[cfg(feature = "tantivy-oracle")]
 pub use engine::{CassQuillSubject, CassTantivyOracle, TantivyOracle};
+#[cfg(feature = "fuzz-harness")]
+pub use engine::{
+    TYPED_QUERY_FUZZ_GENERATOR_ID, TYPED_QUERY_FUZZ_MAX_INPUT_BYTES,
+    TYPED_QUERY_FUZZ_REPLAY_SCHEMA_VERSION, TYPED_QUERY_FUZZ_SHRINK_FUEL,
+    TypedQueryFailureFingerprint, TypedQueryFuzzReplay, TypedQueryFuzzWorkload,
+    TypedQueryLenientAsymmetry, TypedQueryOracleBehavior, TypedQueryTree,
+    load_typed_query_fuzz_replay, materialize_typed_query_fuzz_workload,
+    persist_typed_query_fuzz_replay, scalar_g1a_fuzz_pair, typed_query_failure_divergence_class,
+    typed_query_fuzz_corpus_spec, typed_query_fuzz_seed, typed_query_fuzz_vocabulary,
+};
 pub use generator::{
     CORE_RELEVANCE_DOCUMENT_COUNT, CassDocumentFields, CorpusManifest, CorpusSourceManifest,
     FULL_SHARED_DOCUMENT_COUNT, GENERATOR_ID, GENERATOR_SCHEMA_VERSION, GeneratedDocument,
@@ -215,14 +223,13 @@ pub use privacy::{
 pub use qg2_contract::{
     QG2_CANONICAL_CONTRACT, QG2_CONTRACT_REPORT_SCHEMA_VERSION, QG2_LOGICAL_SURFACE_COUNT,
     QG2_MANIFEST_BLOCK_POST_REGION, QG2_MANIFEST_BLOCK_PRE_REGION, QG2_NO_CLAIM,
-    QG2_PHYSICAL_LOCATOR_COUNT, QG2_PREFLIGHT_REPORT_SCHEMA_VERSION,
-    QG2_SENTINEL_COUNT, Qg2CommitBoundary, Qg2ComparatorContract, Qg2ContractDivergence,
-    Qg2ContractReport, Qg2ContractStatus, Qg2DurabilityScope, Qg2ExcludedOperation,
-    Qg2PreflightReport, Qg2PreflightState, Qg2PreservedValueReceipt, Qg2SelectorReceipt,
-    Qg2SelectorState, Qg2SentinelRebind, Qg2SentinelSummary, Qg2SourceNonregression,
-    Qg2StaleHistoryDisposition, Qg2StaleHistoryReceipt, Qg2StorageTopology, Qg2SurfaceReceipt,
-    Qg2TimingEnd, Qg2TimingStart, Qg2TopologySummary, validate_qg2_contract,
-    validate_qg2_preflight,
+    QG2_PHYSICAL_LOCATOR_COUNT, QG2_PREFLIGHT_REPORT_SCHEMA_VERSION, QG2_SENTINEL_COUNT,
+    Qg2CommitBoundary, Qg2ComparatorContract, Qg2ContractDivergence, Qg2ContractReport,
+    Qg2ContractStatus, Qg2DurabilityScope, Qg2ExcludedOperation, Qg2PreflightReport,
+    Qg2PreflightState, Qg2PreservedValueReceipt, Qg2SelectorReceipt, Qg2SelectorState,
+    Qg2SentinelRebind, Qg2SentinelSummary, Qg2SourceNonregression, Qg2StaleHistoryDisposition,
+    Qg2StaleHistoryReceipt, Qg2StorageTopology, Qg2SurfaceReceipt, Qg2TimingEnd, Qg2TimingStart,
+    Qg2TopologySummary, validate_qg2_contract, validate_qg2_preflight,
 };
 pub use qg6_prepared::{
     Qg6ArmLifecycle, Qg6ArmRole, Qg6Comparison, Qg6ExperimentIdentity, Qg6FourArmResultReceipts,

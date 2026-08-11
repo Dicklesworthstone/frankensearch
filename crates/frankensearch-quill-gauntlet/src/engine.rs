@@ -15,6 +15,10 @@ use frankensearch_quill::{
     CASS_SEMANTIC_SCHEMA, CURRENT_ENGINE_VERSION, EncodedSegment, KeeperSnapshot,
     ManifestFieldStats, ManifestSegment, TombstoneSet,
 };
+#[cfg(feature = "fuzz-harness")]
+use frankensearch_quill::{
+    DEFAULT_SCHEMA, DefaultQueryParser, ParsedQuery, Query, QueryDiagnosticKind,
+};
 use frankensearch_quill::{QuillConfig, QuillIndex, QuillSearchResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -27,9 +31,13 @@ use crate::comparator::{
     ComparatorConfig, ComparisonReport, CountState, EngineObservation, NativeTieKey,
     OracleBugControlObservation, RankedHit, compare_observations,
 };
+#[cfg(feature = "fuzz-harness")]
+use crate::comparator::{ComparisonStatus, Divergence, DivergenceClass, RankClass};
 #[cfg(feature = "tantivy-oracle")]
 use crate::generator::GeneratedDocument;
 use crate::generator::MAX_DOCUMENT_ID_BYTES;
+#[cfg(feature = "fuzz-harness")]
+use crate::generator::{CorpusManifest, SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent};
 #[cfg(feature = "tantivy-oracle")]
 use crate::runner::SemanticContract;
 use crate::version_contract::oracle_version_contract;
@@ -2378,6 +2386,891 @@ pub async fn scalar_g1a_fuzz_pair(
     Ok((subject, oracle))
 }
 
+/// Version of the typed-query fuzz input grammar and replay payload.
+///
+/// Version three binds the original corpus seed and manifest to the minimized
+/// AST bytes.  Earlier payloads could render the minimized query against a
+/// different regenerated corpus and therefore were not replayable evidence.
+#[cfg(feature = "fuzz-harness")]
+pub const TYPED_QUERY_FUZZ_REPLAY_SCHEMA_VERSION: u32 = 3;
+/// Stable generator identity for the version-three typed-query grammar.
+#[cfg(feature = "fuzz-harness")]
+pub const TYPED_QUERY_FUZZ_GENERATOR_ID: &str = "typed-query-tree-fuzz-v3";
+/// Maximum libFuzzer input length admitted by the typed-query target.
+#[cfg(feature = "fuzz-harness")]
+pub const TYPED_QUERY_FUZZ_MAX_INPUT_BYTES: usize = 64;
+/// Bounded number of structural candidates considered by the typed shrinker.
+#[cfg(feature = "fuzz-harness")]
+pub const TYPED_QUERY_FUZZ_SHRINK_FUEL: usize = 64;
+
+#[cfg(feature = "fuzz-harness")]
+const TYPED_QUERY_FUZZ_DOCUMENT_COUNT: u64 = 16;
+#[cfg(feature = "fuzz-harness")]
+const TYPED_QUERY_FUZZ_VOCABULARY_SIZE: u32 = 32;
+#[cfg(feature = "fuzz-harness")]
+const TYPED_QUERY_FUZZ_DOCUMENT_BYTES: u32 = 256;
+#[cfg(feature = "fuzz-harness")]
+const TYPED_QUERY_FUZZ_OVERSIZED_TOKEN_BYTES: usize = 65_531;
+#[cfg(feature = "fuzz-harness")]
+const TYPED_QUERY_FUZZ_SEED_BASIS: u64 = 0x6273_6a77_0002_f29b;
+#[cfg(feature = "fuzz-harness")]
+const TYPED_QUERY_FUZZ_SEED_MULTIPLIER: u64 = 0x1000_0000_01b3;
+
+/// Closed AST grammar consumed by the typed-query fuzz target.
+///
+/// This stays in the runnable gauntlet crate rather than the `test = false`
+/// fuzz target, so artifact replay and hostile tests exercise the same byte
+/// interpretation as libFuzzer.
+#[cfg(feature = "fuzz-harness")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypedQueryTree {
+    Empty,
+    Term(u8),
+    Phrase(u8, u8),
+    NegatedTerm(u8),
+    Boolean(u8, u8, u8),
+    NestedBoolean(u8, u8, u8),
+    Fielded(u8),
+    BoostedTerm(u8),
+    Slop(u8, u8),
+    PhrasePrefix(u8, u8),
+    UnterminatedPhrase(u8, u8),
+    EscapedTerm(u8, u8),
+    TrailingBoolean(u8),
+    NonFiniteBoost(u8),
+    OversizedToken(u8),
+    MalformedNestedOperator(u8, u8, u8),
+    MalformedOperator(u8, u8),
+    MalformedField(u8),
+    MalformedEscape(u8),
+    MalformedBoost(u8),
+    MalformedSlop(u8, u8),
+    OovOnly(u8),
+    MixedHitMiss(u8, u8),
+}
+
+#[cfg(feature = "fuzz-harness")]
+impl TypedQueryTree {
+    /// Decode the closed grammar from a bounded libFuzzer byte slice.
+    #[must_use]
+    pub fn from_input(input: &[u8]) -> Self {
+        let byte = |index| input.get(index).copied().unwrap_or(0);
+        let first = byte(1);
+        let second = byte(2);
+        match byte(0) % 23 {
+            0 => Self::Empty,
+            1 => Self::Term(first),
+            2 => Self::Phrase(first, second),
+            3 => Self::NegatedTerm(first),
+            4 => Self::Boolean(first, second, byte(3)),
+            5 => Self::NestedBoolean(first, second, byte(3)),
+            6 => Self::Fielded(first),
+            7 => Self::BoostedTerm(first),
+            8 => Self::Slop(first, second),
+            9 => Self::PhrasePrefix(first, second),
+            10 => Self::UnterminatedPhrase(first, second),
+            11 => Self::EscapedTerm(first, second),
+            12 => Self::TrailingBoolean(first),
+            13 => Self::NonFiniteBoost(first),
+            14 => Self::OversizedToken(first),
+            15 => Self::MalformedNestedOperator(first, second, byte(3)),
+            16 => Self::MalformedOperator(first, second),
+            17 => Self::MalformedField(first),
+            18 => Self::MalformedEscape(first),
+            19 => Self::MalformedBoost(first),
+            20 => Self::MalformedSlop(first, second),
+            21 => Self::OovOnly(first),
+            _ => Self::MixedHitMiss(first, second),
+        }
+    }
+
+    /// Canonical minimal byte representation of this tree.
+    #[must_use]
+    pub fn canonical_input(self) -> Vec<u8> {
+        match self {
+            Self::Empty => vec![0],
+            Self::Term(first) => vec![1, first],
+            Self::Phrase(first, second) => vec![2, first, second],
+            Self::NegatedTerm(first) => vec![3, first],
+            Self::Boolean(first, second, connective) => vec![4, first, second, connective],
+            Self::NestedBoolean(first, second, third) => vec![5, first, second, third],
+            Self::Fielded(first) => vec![6, first],
+            Self::BoostedTerm(first) => vec![7, first],
+            Self::Slop(first, second) => vec![8, first, second],
+            Self::PhrasePrefix(first, second) => vec![9, first, second],
+            Self::UnterminatedPhrase(first, second) => vec![10, first, second],
+            Self::EscapedTerm(first, second) => vec![11, first, second],
+            Self::TrailingBoolean(first) => vec![12, first],
+            Self::NonFiniteBoost(first) => vec![13, first],
+            Self::OversizedToken(first) => vec![14, first],
+            Self::MalformedNestedOperator(first, second, third) => vec![15, first, second, third],
+            Self::MalformedOperator(first, second) => vec![16, first, second],
+            Self::MalformedField(first) => vec![17, first],
+            Self::MalformedEscape(first) => vec![18, first],
+            Self::MalformedBoost(first) => vec![19, first],
+            Self::MalformedSlop(first, second) => vec![20, first, second],
+            Self::OovOnly(first) => vec![21, first],
+            Self::MixedHitMiss(first, second) => vec![22, first, second],
+        }
+    }
+
+    /// Render the AST against the exact persisted corpus vocabulary.
+    #[must_use]
+    pub fn render(self, vocabulary: &[String]) -> String {
+        assert!(
+            !vocabulary.is_empty(),
+            "typed-query rendering requires the replayed corpus vocabulary"
+        );
+        let word = |index: u8| vocabulary[usize::from(index) % vocabulary.len()].as_str();
+        match self {
+            Self::Empty => String::new(),
+            Self::Term(term) => word(term).to_owned(),
+            Self::Phrase(first, second) => format!("\"{} {}\"", word(first), word(second)),
+            Self::NegatedTerm(term) => format!("-{}", word(term)),
+            Self::Boolean(first, second, connective) => {
+                let operator = if connective.is_multiple_of(2) {
+                    "AND"
+                } else {
+                    "OR"
+                };
+                format!("{} {operator} {}", word(first), word(second))
+            }
+            Self::NestedBoolean(first, second, third) => {
+                format!("({} OR {}) AND {}", word(first), word(second), word(third))
+            }
+            Self::Fielded(term) => format!("content:{}", word(term)),
+            Self::BoostedTerm(term) => format!("{}^2", word(term)),
+            Self::Slop(first, second) => format!("\"{} {}\"~1", word(first), word(second)),
+            Self::PhrasePrefix(first, second) => format!("\"{} {}\"*", word(first), word(second)),
+            Self::UnterminatedPhrase(first, second) => {
+                format!("\"{} {}", word(first), word(second))
+            }
+            Self::EscapedTerm(first, second) => format!(r"{}\:{}", word(first), word(second)),
+            Self::TrailingBoolean(term) => format!("{} OR", word(term)),
+            Self::NonFiniteBoost(term) => {
+                format!("{} {}^{}", word(term), word(term), "9".repeat(400))
+            }
+            Self::OversizedToken(term) => {
+                let suffix_len =
+                    TYPED_QUERY_FUZZ_OVERSIZED_TOKEN_BYTES.saturating_sub(word(term).len());
+                format!("{}{}", word(term), "x".repeat(suffix_len))
+            }
+            Self::MalformedNestedOperator(first, second, third) => {
+                format!(
+                    "({} AND ({} OR )) AND {}",
+                    word(first),
+                    word(second),
+                    word(third)
+                )
+            }
+            Self::MalformedOperator(first, second) => {
+                format!("{} AND OR {}", word(first), word(second))
+            }
+            Self::MalformedField(term) => format!(":{}", word(term)),
+            Self::MalformedEscape(term) => format!(r"{}\", word(term)),
+            Self::MalformedBoost(term) => format!("{}^not-a-number", word(term)),
+            Self::MalformedSlop(first, second) => {
+                format!("\"{} {}\"~not-a-number", word(first), word(second))
+            }
+            Self::OovOnly(miss) => format!("oovterm{miss}"),
+            Self::MixedHitMiss(hit, miss) => format!("{} OR oovterm{miss}", word(hit)),
+        }
+    }
+
+    /// Quill capability refusal asserted independently of parser recovery.
+    #[must_use]
+    pub const fn exact_refusal_detail(self) -> Option<&'static str> {
+        match self {
+            Self::Slop(..) => Some("phrase slop=1 prefix=false"),
+            Self::PhrasePrefix(..) => Some("phrase slop=0 prefix=true"),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_nonfinite_boost(self) -> bool {
+        matches!(self, Self::NonFiniteBoost(..))
+    }
+
+    #[must_use]
+    pub const fn is_reviewed_oversized_lowering(self) -> bool {
+        matches!(self, Self::OversizedToken(..))
+    }
+
+    /// Grammar that Quill deliberately repairs with `parse_lenient`.
+    #[must_use]
+    pub const fn is_malformed(self) -> bool {
+        matches!(
+            self,
+            Self::UnterminatedPhrase(..)
+                | Self::TrailingBoolean(..)
+                | Self::MalformedNestedOperator(..)
+                | Self::MalformedOperator(..)
+                | Self::MalformedField(..)
+                | Self::MalformedEscape(..)
+                | Self::MalformedBoost(..)
+                | Self::MalformedSlop(..)
+        )
+    }
+
+    /// Strictly smaller candidates for structural failure shrinking.
+    #[must_use]
+    pub fn shrink_candidates(self) -> Vec<Self> {
+        let mut candidates = match self {
+            Self::Empty => Vec::new(),
+            Self::Term(term) => vec![(term != 0).then_some(Self::Term(0))],
+            Self::Phrase(first, second) => vec![
+                Some(Self::Term(first)),
+                Some(Self::Term(second)),
+                (first != 0 || second != 0).then_some(Self::Phrase(0, 0)),
+            ],
+            Self::NegatedTerm(term) => vec![
+                Some(Self::Term(term)),
+                (term != 0).then_some(Self::NegatedTerm(0)),
+            ],
+            Self::Boolean(first, second, _) => vec![
+                Some(Self::Term(first)),
+                Some(Self::Term(second)),
+                (first != 0 || second != 0).then_some(Self::Boolean(0, 0, 0)),
+            ],
+            Self::NestedBoolean(first, second, third) => vec![
+                Some(Self::Boolean(first, second, 1)),
+                Some(Self::Boolean(second, third, 0)),
+                Some(Self::Term(third)),
+                (first != 0 || second != 0 || third != 0).then_some(Self::NestedBoolean(0, 0, 0)),
+            ],
+            Self::Fielded(term) => vec![
+                Some(Self::Term(term)),
+                (term != 0).then_some(Self::Fielded(0)),
+            ],
+            Self::BoostedTerm(term) => vec![
+                Some(Self::Term(term)),
+                (term != 0).then_some(Self::BoostedTerm(0)),
+            ],
+            Self::Slop(first, second) => {
+                vec![(first != 0 || second != 0).then_some(Self::Slop(0, 0))]
+            }
+            Self::PhrasePrefix(first, second) => {
+                vec![(first != 0 || second != 0).then_some(Self::PhrasePrefix(0, 0))]
+            }
+            Self::UnterminatedPhrase(first, second) => {
+                vec![(first != 0 || second != 0).then_some(Self::UnterminatedPhrase(0, 0))]
+            }
+            Self::EscapedTerm(first, second) => {
+                vec![(first != 0 || second != 0).then_some(Self::EscapedTerm(0, 0))]
+            }
+            Self::TrailingBoolean(term) => vec![(term != 0).then_some(Self::TrailingBoolean(0))],
+            Self::NonFiniteBoost(term) => vec![(term != 0).then_some(Self::NonFiniteBoost(0))],
+            Self::OversizedToken(term) => vec![(term != 0).then_some(Self::OversizedToken(0))],
+            Self::MalformedNestedOperator(first, second, third) => vec![
+                Some(Self::MalformedOperator(first, second)),
+                (first != 0 || second != 0 || third != 0)
+                    .then_some(Self::MalformedNestedOperator(0, 0, 0)),
+            ],
+            Self::MalformedOperator(first, second) => {
+                vec![(first != 0 || second != 0).then_some(Self::MalformedOperator(0, 0))]
+            }
+            Self::MalformedField(term) => vec![(term != 0).then_some(Self::MalformedField(0))],
+            Self::MalformedEscape(term) => vec![(term != 0).then_some(Self::MalformedEscape(0))],
+            Self::MalformedBoost(term) => vec![(term != 0).then_some(Self::MalformedBoost(0))],
+            Self::MalformedSlop(first, second) => {
+                vec![(first != 0 || second != 0).then_some(Self::MalformedSlop(0, 0))]
+            }
+            Self::OovOnly(miss) => vec![(miss != 0).then_some(Self::OovOnly(0))],
+            Self::MixedHitMiss(hit, miss) => vec![
+                Some(Self::OovOnly(miss)),
+                (hit != 0 || miss != 0).then_some(Self::MixedHitMiss(0, 0)),
+            ],
+        }
+        .into_iter()
+        .flatten()
+        .filter(|candidate| *candidate != self)
+        .collect::<Vec<_>>();
+        candidates.sort_unstable_by_key(|candidate| format!("{candidate:?}"));
+        candidates.dedup();
+        candidates
+    }
+}
+
+/// Exact comparison signature that a minimized fuzz replay must retain.
+#[cfg(feature = "fuzz-harness")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypedQueryFailureFingerprint {
+    pub status: ComparisonStatus,
+    pub rank_class: RankClass,
+    pub first_divergence: Option<String>,
+    pub divergences: Vec<Divergence>,
+}
+
+#[cfg(feature = "fuzz-harness")]
+impl TypedQueryFailureFingerprint {
+    /// Capture the entire semantic failure signature, not just its first class.
+    #[must_use]
+    pub fn from_report(report: &ComparisonReport) -> Self {
+        Self {
+            status: report.status,
+            rank_class: report.rank_class,
+            first_divergence: report.first_divergence.clone(),
+            divergences: report.divergences.clone(),
+        }
+    }
+}
+
+/// Return the fix-required class carried by a failed report.
+///
+/// Score epsilon and tie order are accepted automatic classes and cannot name
+/// an emitted minimized divergence artifact by themselves.
+#[cfg(feature = "fuzz-harness")]
+pub fn typed_query_failure_divergence_class(
+    report: &ComparisonReport,
+) -> Result<DivergenceClass, GauntletError> {
+    report
+        .divergences
+        .iter()
+        .find(|divergence| {
+            !matches!(
+                divergence.class,
+                DivergenceClass::ScoreEpsilon | DivergenceClass::TieOrder
+            )
+        })
+        .map(|divergence| divergence.class)
+        .ok_or_else(|| GauntletError::InvalidObservation {
+            reason: "failed typed-query fuzz comparison lacks a non-automatic divergence class"
+                .to_owned(),
+        })
+}
+
+/// Fully materialized deterministic input to one typed-query differential run.
+#[cfg(feature = "fuzz-harness")]
+#[derive(Clone, Debug)]
+pub struct TypedQueryFuzzWorkload {
+    pub original_input: Vec<u8>,
+    pub ast: TypedQueryTree,
+    pub seed: u64,
+    pub corpus_spec: SyntheticCorpusSpec,
+    pub corpus_manifest: CorpusManifest,
+    pub corpus_manifest_hash: String,
+    pub documents: Vec<GeneratedDocument>,
+    pub vocabulary: Vec<String>,
+    pub case: DifferentialCase,
+}
+
+#[cfg(feature = "fuzz-harness")]
+impl TypedQueryFuzzWorkload {
+    /// Build a case for a shrunk AST against this exact original corpus.
+    #[must_use]
+    pub fn case_for_ast(&self, ast: TypedQueryTree) -> DifferentialCase {
+        typed_query_differential_case(
+            &self.original_input,
+            self.seed,
+            ast,
+            ast.render(&self.vocabulary),
+            &self.corpus_manifest_hash,
+        )
+    }
+
+    /// Stable provenance text used only for diagnostic failures in the target.
+    #[must_use]
+    pub fn provenance_for_ast(&self, ast: TypedQueryTree) -> String {
+        typed_query_provenance(
+            &self.original_input,
+            self.seed,
+            ast,
+            &self.corpus_manifest_hash,
+        )
+    }
+}
+
+/// Construct the deterministic corpus, vocabulary, and differential case for
+/// a bounded libFuzzer input.
+///
+/// The input bytes are retained even when several byte strings decode to one
+/// AST: their seed determines the corpus and is thus part of replay identity.
+#[cfg(feature = "fuzz-harness")]
+pub fn materialize_typed_query_fuzz_workload(
+    input: &[u8],
+) -> Result<TypedQueryFuzzWorkload, GauntletError> {
+    if input.len() > TYPED_QUERY_FUZZ_MAX_INPUT_BYTES {
+        return Err(GauntletError::InvalidGenerator {
+            reason: format!(
+                "typed-query fuzz input exceeds {} bytes",
+                TYPED_QUERY_FUZZ_MAX_INPUT_BYTES
+            ),
+        });
+    }
+    let seed = typed_query_fuzz_seed(input);
+    materialize_typed_query_fuzz_workload_with_recipe(
+        input,
+        seed,
+        typed_query_fuzz_corpus_spec(seed),
+    )
+}
+
+#[cfg(feature = "fuzz-harness")]
+fn materialize_typed_query_fuzz_workload_with_recipe(
+    original_input: &[u8],
+    seed: u64,
+    corpus_spec: SyntheticCorpusSpec,
+) -> Result<TypedQueryFuzzWorkload, GauntletError> {
+    if original_input.len() > TYPED_QUERY_FUZZ_MAX_INPUT_BYTES {
+        return Err(GauntletError::InvalidGenerator {
+            reason: "stored typed-query fuzz input exceeds the schema-v3 byte bound".to_owned(),
+        });
+    }
+    if seed != typed_query_fuzz_seed(original_input) {
+        return Err(GauntletError::ManifestMismatch {
+            reason: "stored typed-query fuzz seed does not match the original input bytes"
+                .to_owned(),
+        });
+    }
+    if corpus_spec != typed_query_fuzz_corpus_spec(seed) {
+        return Err(GauntletError::ManifestMismatch {
+            reason: "stored typed-query fuzz corpus recipe is not the schema-v3 fixed recipe"
+                .to_owned(),
+        });
+    }
+    let corpus = SyntheticCorpus::new(corpus_spec.clone())?;
+    let corpus_manifest = corpus.manifest()?;
+    corpus.verify_manifest(&corpus_manifest)?;
+    let corpus_manifest_hash = corpus_manifest.manifest_hash()?;
+    let documents = corpus.iter().collect::<Vec<_>>();
+    let vocabulary = typed_query_fuzz_vocabulary(&documents)?;
+    let ast = TypedQueryTree::from_input(original_input);
+    let case = typed_query_differential_case(
+        original_input,
+        seed,
+        ast,
+        ast.render(&vocabulary),
+        &corpus_manifest_hash,
+    );
+    Ok(TypedQueryFuzzWorkload {
+        original_input: original_input.to_vec(),
+        ast,
+        seed,
+        corpus_spec,
+        corpus_manifest,
+        corpus_manifest_hash,
+        documents,
+        vocabulary,
+        case,
+    })
+}
+
+/// Fixed corpus recipe that accompanies every schema-v3 byte stream.
+#[cfg(feature = "fuzz-harness")]
+#[must_use]
+pub const fn typed_query_fuzz_corpus_spec(seed: u64) -> SyntheticCorpusSpec {
+    SyntheticCorpusSpec {
+        seed,
+        document_count: TYPED_QUERY_FUZZ_DOCUMENT_COUNT,
+        vocabulary_size: TYPED_QUERY_FUZZ_VOCABULARY_SIZE,
+        zipf_exponent: ZipfExponent::S11,
+        max_document_bytes: TYPED_QUERY_FUZZ_DOCUMENT_BYTES,
+    }
+}
+
+/// Deterministic 64-bit seed for the full raw libFuzzer input.
+#[cfg(feature = "fuzz-harness")]
+#[must_use]
+pub fn typed_query_fuzz_seed(input: &[u8]) -> u64 {
+    input
+        .iter()
+        .fold(TYPED_QUERY_FUZZ_SEED_BASIS, |state, byte| {
+            state
+                .rotate_left(5)
+                .wrapping_mul(TYPED_QUERY_FUZZ_SEED_MULTIPLIER)
+                ^ u64::from(*byte)
+        })
+}
+
+/// Derive the exact regular-corpus vocabulary used to render a fuzz AST.
+#[cfg(feature = "fuzz-harness")]
+pub fn typed_query_fuzz_vocabulary(
+    documents: &[GeneratedDocument],
+) -> Result<Vec<String>, GauntletError> {
+    let mut vocabulary = documents
+        .iter()
+        .filter(|document| document.pathology.is_none())
+        .flat_map(|document| document.content.split_whitespace())
+        .filter(|word| {
+            word.strip_prefix("term").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        })
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    vocabulary.sort_unstable();
+    vocabulary.dedup();
+    if vocabulary.is_empty() {
+        return Err(GauntletError::ManifestMismatch {
+            reason: "typed-query fuzz corpus has no searchable regular terms".to_owned(),
+        });
+    }
+    Ok(vocabulary)
+}
+
+#[cfg(feature = "fuzz-harness")]
+fn typed_query_differential_case(
+    original_input: &[u8],
+    seed: u64,
+    ast: TypedQueryTree,
+    query: String,
+    corpus_manifest_hash: &str,
+) -> DifferentialCase {
+    let input_hex = typed_query_hex(original_input);
+    DifferentialCase {
+        fixture_id: format!("typed-query-tree-v3-{input_hex}-{ast:?}"),
+        query,
+        limit: 20,
+        offset: 0,
+        tie_expansion_limit: 256,
+        count_requested: true,
+        snippet_max_chars: None,
+        metadata: DifferentialCaseMetadata {
+            generator_id: Some(typed_query_provenance(
+                original_input,
+                seed,
+                ast,
+                corpus_manifest_hash,
+            )),
+            generator_seed: Some(seed),
+            corpus_hash: Some(corpus_manifest_hash.to_owned()),
+        },
+    }
+}
+
+#[cfg(feature = "fuzz-harness")]
+fn typed_query_provenance(
+    original_input: &[u8],
+    seed: u64,
+    ast: TypedQueryTree,
+    corpus_manifest_hash: &str,
+) -> String {
+    format!(
+        "generator={TYPED_QUERY_FUZZ_GENERATOR_ID};schema={TYPED_QUERY_FUZZ_REPLAY_SCHEMA_VERSION};input={};corpus_seed={seed:016x};docs={TYPED_QUERY_FUZZ_DOCUMENT_COUNT};vocab={TYPED_QUERY_FUZZ_VOCABULARY_SIZE};zipf=s11;bytes={TYPED_QUERY_FUZZ_DOCUMENT_BYTES};ast={ast:?};manifest={corpus_manifest_hash}",
+        typed_query_hex(original_input),
+    )
+}
+
+#[cfg(feature = "fuzz-harness")]
+fn typed_query_hex(input: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(input.len().saturating_mul(2));
+    for byte in input {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+/// Exact oracle result intentionally paired with Quill's lenient syntax repair.
+#[cfg(feature = "fuzz-harness")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TypedQueryOracleBehavior {
+    /// The pinned Tantivy oracle accepted the query and exposed no lowering
+    /// record in its normalized observation surface.
+    AcceptedWithoutAstDifferences,
+}
+
+/// Typed classification of a malformed grammar input, rather than an assumed
+/// shared parser error.  The recovered AST and all Quill diagnostic kinds are
+/// retained so the fuzz lane asserts the production `parse_lenient` contract.
+#[cfg(feature = "fuzz-harness")]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TypedQueryLenientAsymmetry {
+    pub recovered_quill_ast: Query,
+    pub quill_diagnostic_kinds: Vec<QueryDiagnosticKind>,
+    pub oracle_behavior: TypedQueryOracleBehavior,
+}
+
+#[cfg(feature = "fuzz-harness")]
+impl QuillSubject {
+    /// Parse with the same default schema as the scalar G1a subject without
+    /// turning malformed syntax into a harness failure.
+    ///
+    /// This API is deliberately fuzz-harness-only: regular observations return
+    /// normalized result evidence, while this corrective lane must also assert
+    /// the raw recovered Quill AST and diagnostics.
+    pub fn parse_typed_query_lenient(&self, query: &str) -> Result<ParsedQuery, GauntletError> {
+        self.require_committed()?;
+        let parser = DefaultQueryParser::new(DEFAULT_SCHEMA).map_err(|error| {
+            GauntletError::InvalidContract {
+                reason: format!("cannot bind the scalar G1a lenient parser: {error}"),
+            }
+        })?;
+        Ok(parser.parse_lenient(query))
+    }
+
+    /// Classify the expected malformed-syntax asymmetry after both live engine
+    /// observations completed successfully.
+    pub fn classify_typed_query_lenient_asymmetry(
+        &self,
+        ast: TypedQueryTree,
+        query: &str,
+        oracle_observation: &EngineObservation,
+    ) -> Result<TypedQueryLenientAsymmetry, GauntletError> {
+        if !ast.is_malformed() {
+            return Err(GauntletError::InvalidCase {
+                reason: "lenient syntax classification requires an explicit malformed typed AST"
+                    .to_owned(),
+            });
+        }
+        let parsed = self.parse_typed_query_lenient(query)?;
+        let quill_diagnostic_kinds = parsed
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.kind)
+            .collect::<Vec<_>>();
+        if quill_diagnostic_kinds.is_empty() {
+            return Err(GauntletError::InvalidObservation {
+                reason: "Quill parse_lenient returned no recovery diagnostics for an explicit malformed typed AST"
+                    .to_owned(),
+            });
+        }
+        if !oracle_observation.ast_differences.is_empty() {
+            return Err(GauntletError::InvalidObservation {
+                reason: "pinned Tantivy oracle must accept malformed typed-query grammar without normalized AST differences"
+                    .to_owned(),
+            });
+        }
+        Ok(TypedQueryLenientAsymmetry {
+            recovered_quill_ast: parsed.query,
+            quill_diagnostic_kinds,
+            oracle_behavior: TypedQueryOracleBehavior::AcceptedWithoutAstDifferences,
+        })
+    }
+}
+
+/// Durable minimized replay payload for one unclassified typed-query failure.
+///
+/// The original input is not discarded: it fixes the corpus seed.  The
+/// minimized bytes are stored separately and must reconstruct the minimized
+/// AST and query against that exact regenerated corpus.
+#[cfg(feature = "fuzz-harness")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypedQueryFuzzReplay {
+    pub schema_version: u32,
+    pub generator_id: String,
+    pub original_input: Vec<u8>,
+    pub original_seed: u64,
+    pub corpus_spec: SyntheticCorpusSpec,
+    pub corpus_manifest: CorpusManifest,
+    pub corpus_manifest_hash: String,
+    pub vocabulary: Vec<String>,
+    pub minimized_input: Vec<u8>,
+    pub minimized_ast: TypedQueryTree,
+    pub minimized_query: String,
+    pub fingerprint: TypedQueryFailureFingerprint,
+    pub divergence_class: DivergenceClass,
+}
+
+#[cfg(feature = "fuzz-harness")]
+impl TypedQueryFuzzReplay {
+    /// Create and immediately validate a minimized artifact from a live run.
+    pub fn from_failure(
+        workload: &TypedQueryFuzzWorkload,
+        minimized_ast: TypedQueryTree,
+        minimized_report: &ComparisonReport,
+    ) -> Result<Self, GauntletError> {
+        if minimized_report.status != ComparisonStatus::Failed {
+            return Err(GauntletError::InvalidObservation {
+                reason: "only a failed comparison may become a typed-query minimized replay"
+                    .to_owned(),
+            });
+        }
+        let fingerprint = TypedQueryFailureFingerprint::from_report(minimized_report);
+        let divergence_class = typed_query_failure_divergence_class(minimized_report)?;
+        let replay = Self {
+            schema_version: TYPED_QUERY_FUZZ_REPLAY_SCHEMA_VERSION,
+            generator_id: TYPED_QUERY_FUZZ_GENERATOR_ID.to_owned(),
+            original_input: workload.original_input.clone(),
+            original_seed: workload.seed,
+            corpus_spec: workload.corpus_spec.clone(),
+            corpus_manifest: workload.corpus_manifest.clone(),
+            corpus_manifest_hash: workload.corpus_manifest_hash.clone(),
+            vocabulary: workload.vocabulary.clone(),
+            minimized_input: minimized_ast.canonical_input(),
+            minimized_ast,
+            minimized_query: minimized_ast.render(&workload.vocabulary),
+            fingerprint,
+            divergence_class,
+        };
+        replay.replay_workload()?;
+        Ok(replay)
+    }
+
+    /// Deterministically rebuild the corpus and minimized case from durable
+    /// replay bytes, refusing any seed, corpus, AST, query, or fingerprint
+    /// mutation before an engine is invoked.
+    pub fn replay_workload(&self) -> Result<TypedQueryFuzzWorkload, GauntletError> {
+        if self.schema_version != TYPED_QUERY_FUZZ_REPLAY_SCHEMA_VERSION
+            || self.generator_id != TYPED_QUERY_FUZZ_GENERATOR_ID
+        {
+            return Err(GauntletError::ManifestMismatch {
+                reason: "unsupported typed-query fuzz replay schema or generator".to_owned(),
+            });
+        }
+        if self.original_seed != typed_query_fuzz_seed(&self.original_input) {
+            return Err(GauntletError::ManifestMismatch {
+                reason: "typed-query replay original seed does not match original input".to_owned(),
+            });
+        }
+        if TypedQueryTree::from_input(&self.minimized_input) != self.minimized_ast {
+            return Err(GauntletError::ManifestMismatch {
+                reason: "typed-query replay minimized bytes do not reconstruct the minimized AST"
+                    .to_owned(),
+            });
+        }
+        if self.fingerprint.status != ComparisonStatus::Failed
+            || self.divergence_class
+                != typed_query_failure_divergence_class_from_fingerprint(&self.fingerprint)?
+        {
+            return Err(GauntletError::ManifestMismatch {
+                reason: "typed-query replay fingerprint and divergence class are inconsistent"
+                    .to_owned(),
+            });
+        }
+        let mut workload = materialize_typed_query_fuzz_workload_with_recipe(
+            &self.original_input,
+            self.original_seed,
+            self.corpus_spec.clone(),
+        )?;
+        if workload.corpus_manifest != self.corpus_manifest
+            || workload.corpus_manifest_hash != self.corpus_manifest_hash
+        {
+            return Err(GauntletError::ManifestMismatch {
+                reason: "typed-query replay regenerated corpus does not match its stored manifest identity"
+                    .to_owned(),
+            });
+        }
+        if workload.vocabulary != self.vocabulary {
+            return Err(GauntletError::ManifestMismatch {
+                reason:
+                    "typed-query replay regenerated vocabulary does not match stored vocabulary"
+                        .to_owned(),
+            });
+        }
+        let expected_query = self.minimized_ast.render(&workload.vocabulary);
+        if expected_query != self.minimized_query {
+            return Err(GauntletError::ManifestMismatch {
+                reason:
+                    "typed-query replay minimized query does not match minimized AST and vocabulary"
+                        .to_owned(),
+            });
+        }
+        workload.ast = self.minimized_ast;
+        workload.case = workload.case_for_ast(self.minimized_ast);
+        if workload.case.query != self.minimized_query {
+            return Err(GauntletError::ManifestMismatch {
+                reason: "typed-query replay rebuilt case query differs from stored minimized query"
+                    .to_owned(),
+            });
+        }
+        Ok(workload)
+    }
+
+    /// Collision-resistant artifact key that visibly binds corpus and exact
+    /// failure signature as well as the full replay payload.
+    pub fn artifact_key(&self) -> Result<String, GauntletError> {
+        self.replay_workload()?;
+        let fingerprint_bytes = serde_json::to_vec(&self.fingerprint)?;
+        let payload_bytes = serde_json::to_vec(self)?;
+        Ok(format!(
+            "{}-{}-{}",
+            self.corpus_manifest_hash,
+            typed_query_sha256(b"fingerprint-v1\0", &fingerprint_bytes),
+            typed_query_sha256(b"payload-v3\0", &payload_bytes),
+        ))
+    }
+
+    /// Canonical JSON bytes validated by the real replay entrypoint.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, GauntletError> {
+        self.replay_workload()?;
+        Ok(serde_json::to_vec(self)?)
+    }
+}
+
+/// Persist a replay under a key that includes corpus and failure identity.
+#[cfg(feature = "fuzz-harness")]
+pub fn persist_typed_query_fuzz_replay(
+    root: &std::path::Path,
+    replay: &TypedQueryFuzzReplay,
+) -> Result<std::path::PathBuf, GauntletError> {
+    let bytes = replay.canonical_bytes()?;
+    let key = replay.artifact_key()?;
+    let directory = root.join("typed_query_tree");
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join(format!("{key}.json"));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            use std::io::Write as _;
+
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = std::fs::read(&path)?;
+            if existing != bytes {
+                return Err(GauntletError::ArtifactCollision { path });
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(path)
+}
+
+/// Load and validate a minimized replay before returning it to a runner.
+#[cfg(feature = "fuzz-harness")]
+pub fn load_typed_query_fuzz_replay(
+    path: &std::path::Path,
+) -> Result<TypedQueryFuzzReplay, GauntletError> {
+    let replay = serde_json::from_slice::<TypedQueryFuzzReplay>(&std::fs::read(path)?)?;
+    replay.replay_workload()?;
+    Ok(replay)
+}
+
+#[cfg(feature = "fuzz-harness")]
+fn typed_query_failure_divergence_class_from_fingerprint(
+    fingerprint: &TypedQueryFailureFingerprint,
+) -> Result<DivergenceClass, GauntletError> {
+    fingerprint
+        .divergences
+        .iter()
+        .find(|divergence| {
+            !matches!(
+                divergence.class,
+                DivergenceClass::ScoreEpsilon | DivergenceClass::TieOrder
+            )
+        })
+        .map(|divergence| divergence.class)
+        .ok_or_else(|| GauntletError::ManifestMismatch {
+            reason: "typed-query replay fingerprint lacks a non-automatic divergence class"
+                .to_owned(),
+        })
+}
+
+#[cfg(feature = "fuzz-harness")]
+fn typed_query_sha256(domain: &[u8], bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut output = String::with_capacity(digest.len().saturating_mul(2));
+    for byte in digest {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
 #[cfg(feature = "fuzz-harness")]
 impl QuillSubject {
     /// Build fresh scalar-G1a adapters for one external fuzz shrink attempt.
@@ -2883,11 +3776,11 @@ mod tests {
     };
 
     use super::*;
-    use crate::comparator::{ComparisonStatus, RankClass};
-    // Every `DivergenceClass` reference in this module sits inside a
-    // `perf-harness` block, so the import carries the same gate.
-    #[cfg(feature = "perf-harness")]
+    #[cfg(feature = "fuzz-harness")]
+    use crate::comparator::Divergence;
+    #[cfg(any(feature = "perf-harness", feature = "fuzz-harness"))]
     use crate::comparator::DivergenceClass;
+    use crate::comparator::{ComparisonStatus, RankClass};
 
     const E55_ID_FIELD: u16 = 0;
     const E55_CONTENT_FIELD: u16 = 1;
@@ -9669,6 +10562,175 @@ mod tests {
                 oracle.observe(&cx, &case).await,
                 Err(GauntletError::InvalidCase { .. })
             ));
+        });
+    }
+
+    #[cfg(feature = "fuzz-harness")]
+    fn typed_query_test_replay(
+        input: &[u8],
+        minimized_ast: TypedQueryTree,
+    ) -> TypedQueryFuzzReplay {
+        let workload =
+            materialize_typed_query_fuzz_workload(input).expect("typed-query test workload");
+        TypedQueryFuzzReplay {
+            schema_version: TYPED_QUERY_FUZZ_REPLAY_SCHEMA_VERSION,
+            generator_id: TYPED_QUERY_FUZZ_GENERATOR_ID.to_owned(),
+            original_input: workload.original_input.clone(),
+            original_seed: workload.seed,
+            corpus_spec: workload.corpus_spec.clone(),
+            corpus_manifest: workload.corpus_manifest.clone(),
+            corpus_manifest_hash: workload.corpus_manifest_hash.clone(),
+            vocabulary: workload.vocabulary.clone(),
+            minimized_input: minimized_ast.canonical_input(),
+            minimized_ast,
+            minimized_query: minimized_ast.render(&workload.vocabulary),
+            fingerprint: TypedQueryFailureFingerprint {
+                status: ComparisonStatus::Failed,
+                rank_class: RankClass::RankMismatch,
+                first_divergence: Some("/comparison/subject/hits/0".to_owned()),
+                divergences: vec![Divergence {
+                    class: DivergenceClass::RankMismatch,
+                    pointer: "/comparison/subject/hits/0".to_owned(),
+                    oracle: "oracle-doc".to_owned(),
+                    subject: "quill-doc".to_owned(),
+                }],
+            },
+            divergence_class: DivergenceClass::RankMismatch,
+        }
+    }
+
+    #[cfg(feature = "fuzz-harness")]
+    #[test]
+    fn typed_query_seed_is_64_bit_and_pinned() {
+        assert_eq!(
+            typed_query_fuzz_seed(&[0, 1, 2, 3, 255]),
+            0x45b5_a892_b3d3_b5e9,
+            "the schema-v3 byte-to-corpus seed must stay a deliberate u64 mapping"
+        );
+    }
+
+    #[cfg(feature = "fuzz-harness")]
+    #[test]
+    fn typed_query_replay_reconstructs_and_rejects_hostile_mutations() {
+        let replay = typed_query_test_replay(&[22, 1, 7, 99], TypedQueryTree::MixedHitMiss(1, 7));
+        let rebuilt = replay
+            .replay_workload()
+            .expect("the shared replay entrypoint must rebuild the minimized case");
+        assert_eq!(rebuilt.ast, TypedQueryTree::MixedHitMiss(1, 7));
+        assert_eq!(rebuilt.case.query, replay.minimized_query);
+        assert_eq!(rebuilt.corpus_manifest_hash, replay.corpus_manifest_hash);
+
+        let mut seed_tamper = replay.clone();
+        seed_tamper.original_seed ^= 1;
+        assert!(seed_tamper.replay_workload().is_err());
+
+        let mut corpus_tamper = replay.clone();
+        corpus_tamper.corpus_manifest_hash = "0".repeat(64);
+        assert!(corpus_tamper.replay_workload().is_err());
+
+        let mut ast_tamper = replay.clone();
+        ast_tamper.minimized_ast = TypedQueryTree::OovOnly(7);
+        assert!(ast_tamper.replay_workload().is_err());
+
+        let mut query_tamper = replay.clone();
+        query_tamper.minimized_query.push('!');
+        assert!(query_tamper.replay_workload().is_err());
+
+        let mut fingerprint_tamper = replay.clone();
+        fingerprint_tamper.fingerprint.divergences[0].class = DivergenceClass::ScoreEpsilon;
+        assert!(fingerprint_tamper.replay_workload().is_err());
+
+        let same_ast_new_corpus =
+            typed_query_test_replay(&[22, 1, 7, 98], TypedQueryTree::MixedHitMiss(1, 7));
+        assert_ne!(
+            replay.artifact_key().expect("first replay key"),
+            same_ast_new_corpus
+                .artifact_key()
+                .expect("second replay key"),
+            "same minimized AST from a different raw seed must not collide"
+        );
+
+        let mut fingerprint_collision = replay.clone();
+        fingerprint_collision.fingerprint.first_divergence =
+            Some("/comparison/subject/hits/1".to_owned());
+        assert_ne!(
+            replay.artifact_key().expect("original replay key"),
+            fingerprint_collision
+                .artifact_key()
+                .expect("different fingerprint replay key"),
+            "different failure fingerprints must not collide under one artifact key"
+        );
+    }
+
+    #[cfg(feature = "fuzz-harness")]
+    #[test]
+    fn typed_query_grammar_covers_oov_mixed_and_lenient_malformed_forms() {
+        let vocabulary = vec!["term0".to_owned(), "term1".to_owned()];
+        let oov = TypedQueryTree::OovOnly(9);
+        let mixed = TypedQueryTree::MixedHitMiss(1, 9);
+        assert_eq!(oov.render(&vocabulary), "oovterm9");
+        assert_eq!(mixed.render(&vocabulary), "term1 OR oovterm9");
+        for tree in [
+            TypedQueryTree::UnterminatedPhrase(1, 0),
+            TypedQueryTree::TrailingBoolean(1),
+            TypedQueryTree::MalformedNestedOperator(1, 0, 1),
+            TypedQueryTree::MalformedOperator(1, 0),
+            TypedQueryTree::MalformedField(1),
+            TypedQueryTree::MalformedEscape(1),
+            TypedQueryTree::MalformedBoost(1),
+            TypedQueryTree::MalformedSlop(1, 0),
+            oov,
+            mixed,
+        ] {
+            assert_eq!(TypedQueryTree::from_input(&tree.canonical_input()), tree);
+        }
+    }
+
+    #[cfg(feature = "fuzz-harness")]
+    #[test]
+    fn typed_query_malformed_lane_classifies_lenient_quill_and_oracle_acceptance() {
+        let workload = materialize_typed_query_fuzz_workload(&[15, 1, 2, 3])
+            .expect("malformed typed-query workload");
+        let documents = workload
+            .documents
+            .iter()
+            .cloned()
+            .map(frankensearch_core::IndexableDocument::from)
+            .collect::<Vec<_>>();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (subject, oracle) = scalar_g1a_fuzz_pair(&cx, &documents)
+                .await
+                .expect("committed malformed-lane engines");
+            let subject_observation = subject
+                .observe(&cx, &workload.case)
+                .await
+                .expect("Quill parse_lenient observation");
+            let oracle_observation = oracle
+                .observe(&cx, &workload.case)
+                .await
+                .expect("exact successful pinned-oracle observation");
+            let asymmetry = subject
+                .classify_typed_query_lenient_asymmetry(
+                    workload.ast,
+                    &workload.case.query,
+                    &oracle_observation,
+                )
+                .expect("typed lenient asymmetry");
+            assert!(
+                !asymmetry.quill_diagnostic_kinds.is_empty(),
+                "Quill must retain a malformed-syntax recovery diagnostic"
+            );
+            assert_ne!(
+                asymmetry.recovered_quill_ast,
+                Query::Empty,
+                "this nested malformed query must recover a usable Quill AST rather than vanish"
+            );
+            assert_eq!(
+                asymmetry.oracle_behavior,
+                TypedQueryOracleBehavior::AcceptedWithoutAstDifferences
+            );
+            assert!(subject_observation.ast_differences.is_empty());
+            assert!(oracle_observation.ast_differences.is_empty());
         });
     }
 
