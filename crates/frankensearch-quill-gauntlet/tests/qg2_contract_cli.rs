@@ -6,33 +6,21 @@ use std::process::{Command, Output};
 use frankensearch_quill_gauntlet::{
     PerfGate, PerfGateArtifact, QG2_CANONICAL_CONTRACT, QG2_CONTRACT_REPORT_SCHEMA_VERSION,
     QG2_MANIFEST_BLOCK_POST_REGION, QG2_MANIFEST_BLOCK_PRE_REGION, QG2_NO_CLAIM,
-    QG2_PREFLIGHT_REPORT_SCHEMA_VERSION, QG6_QUERY_GROUPS, perf_manifest_contract_sha256,
+    QG2_PREFLIGHT_REPORT_SCHEMA_VERSION, perf_manifest_contract_sha256,
 };
 
 /// A manifest carrying every normative gate, with the given protected block
 /// verbatim in the QG-2 position, so the fresh-process fixture satisfies the
 /// same topology the live consumer requires.
 fn manifest_with_qg2_block(block: &str) -> String {
-    use std::fmt::Write as _;
+    const LIVE: &str = include_str!("../../../docs/contracts/quill-perf-gates.toml");
 
-    let mut manifest = String::new();
-    for gate in PerfGate::ALL {
-        if gate == PerfGate::Qg2 {
-            manifest.push_str(block);
-            continue;
-        }
-        let label = gate.label();
-        let _ = write!(
-            &mut manifest,
-            "[gate.{label}]\nname = \"{label} gate\"\nfixture = \"{label} fixture\"\n\
-             target = \"{label} target\"\n"
-        );
-        if gate == PerfGate::Qg6 {
-            let _ = writeln!(&mut manifest, "queries_per_class = {QG6_QUERY_GROUPS}");
-        }
-        manifest.push_str("activated = false\n\n");
-    }
-    manifest
+    assert_eq!(
+        LIVE.matches(QG2_MANIFEST_BLOCK_PRE_REGION).count(),
+        1,
+        "the live manifest must still carry the exact protected bootstrap block"
+    );
+    LIVE.replacen(QG2_MANIFEST_BLOCK_PRE_REGION, block, 1)
 }
 use serde_json::{Value, json};
 use tempfile::TempDir;

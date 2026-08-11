@@ -2258,6 +2258,19 @@ fn validate_perf_manifest_schema_bindings(
     Ok(())
 }
 
+/// Run the live manifest admission the planner runs, for one gate.
+///
+/// The Q2C contract readers must agree with *this* function, not with a
+/// restatement of it. Restating the rules has now drifted from them twice —
+/// missing gate presence, field placement, the positive QG-1 primary target
+/// width, and the exact schema set — so the readers call it instead.
+pub(crate) fn validate_normative_manifest(
+    manifest: &str,
+    gate: PerfGate,
+) -> Result<(), PerfApplicabilityPlanError> {
+    perf_gate_manifest_identity(manifest, gate).map(|_| ())
+}
+
 fn perf_gate_manifest_identity(
     manifest: &str,
     gate: PerfGate,

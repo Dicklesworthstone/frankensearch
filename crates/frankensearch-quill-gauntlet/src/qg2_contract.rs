@@ -517,28 +517,6 @@ struct ManifestGate {
 }
 
 impl ManifestGate {
-    /// Field names this gate actually declares, for placement checking.
-    fn declared_fields(&self) -> Vec<&'static str> {
-        let mut declared = Vec::with_capacity(7);
-        for (field, present) in [
-            ("name", self.name.is_some()),
-            ("fixture", self.fixture.is_some()),
-            ("target", self.target.is_some()),
-            ("activated", self.activated.is_some()),
-            (
-                "primary_target_cell_width",
-                self.primary_target_cell_width.is_some(),
-            ),
-            ("queries_per_class", self.queries_per_class.is_some()),
-            ("qg2_contract", self.qg2_contract.is_some()),
-        ] {
-            if present {
-                declared.push(field);
-            }
-        }
-        declared
-    }
-
     /// Every scalar a normative gate must declare, regardless of gate.
     fn declares_required_scalars(&self) -> bool {
         self.name.is_some() && self.target.is_some() && self.activated.is_some()
@@ -972,7 +950,13 @@ fn manifest_block_agreement(source: &str, applied: bool) -> Result<(), String> {
     let document = toml::from_str::<ManifestDocument>(source).map_err(|error| {
         format!("the manifest does not parse under the closed gate model: {error}")
     })?;
-    manifest_topology_parity(&document)?;
+    // Parity by delegation, not by restatement. Two prior attempts to mirror
+    // the planner's rules here drifted from them; this runs the planner's own
+    // admission over the same bytes, so gate presence, scalar shape, field
+    // placement, the positive QG-1 primary target width, and the exact schema
+    // set can never diverge from what planning will accept.
+    crate::perf::validate_normative_manifest(source, PerfGate::Qg2)
+        .map_err(|error| format!("the live manifest consumer rejects this manifest: {error}"))?;
     if document
         .gate
         .get("QG-2")
@@ -987,92 +971,6 @@ fn manifest_block_agreement(source: &str, applied: bool) -> Result<(), String> {
 /// Agreement for the applied side, used by the applied-state validator.
 fn applied_manifest_block_agreement(source: &str) -> Result<(), String> {
     manifest_block_agreement(source, true)
-}
-
-/// Fields each normative gate may declare, mirroring the live consumer's
-/// per-gate allowlist exactly.
-///
-/// The typed model is necessarily a *union* of every gate's fields, so without
-/// this placement table a QG-1-only knob on QG-3 — or a QG-6 count on QG-2 —
-/// parses cleanly here while the consumer rejects it as an unexpected field.
-const fn gate_field_placement(gate: PerfGate) -> &'static [&'static str] {
-    match gate {
-        PerfGate::Qg1 => &[
-            "name",
-            "fixture",
-            "target",
-            "primary_target_cell_width",
-            "activated",
-        ],
-        PerfGate::Qg2 => &["name", "fixture", "target", "activated", "qg2_contract"],
-        PerfGate::Qg6 => &[
-            "name",
-            "fixture",
-            "queries_per_class",
-            "target",
-            "activated",
-        ],
-        _ => &["name", "fixture", "target", "activated"],
-    }
-}
-
-/// Require the same gate topology and field placement the live consumer does.
-///
-/// Byte-binding the QG-2 block says nothing about the other nine gates, so a
-/// manifest could satisfy the Q2C selector and still be refused by planning.
-/// These are the consumer's rules restated over the typed model: every
-/// normative gate present, `name`/`fixture`/`target` non-empty, `activated`
-/// boolean, the frozen QG-6 group count, no field outside its gate's
-/// allowlist, and no gate label the normative set does not define.
-fn manifest_topology_parity(document: &ManifestDocument) -> Result<(), String> {
-    for gate in PerfGate::ALL {
-        let label = gate.label();
-        let Some(policy) = document.gate.get(label) else {
-            return Err(format!("manifest gate.{label} is missing or not a table"));
-        };
-        for (field, value) in [
-            ("name", &policy.name),
-            ("fixture", &policy.fixture),
-            ("target", &policy.target),
-        ] {
-            if !value
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-            {
-                return Err(format!("manifest gate.{label}.{field} is missing or empty"));
-            }
-        }
-        if policy.activated.is_none() {
-            return Err(format!(
-                "manifest gate.{label}.activated is missing or not boolean"
-            ));
-        }
-        if gate == PerfGate::Qg6
-            && policy
-                .queries_per_class
-                .and_then(|count| usize::try_from(count).ok())
-                != Some(crate::QG6_QUERY_GROUPS)
-        {
-            return Err(format!(
-                "manifest gate.{label}.queries_per_class must equal the frozen QG-6 group count {}",
-                crate::QG6_QUERY_GROUPS
-            ));
-        }
-        let allowed = gate_field_placement(gate);
-        for field in policy.declared_fields() {
-            if !allowed.contains(&field) {
-                return Err(format!(
-                    "manifest gate.{label} defines unexpected field {field}"
-                ));
-            }
-        }
-    }
-    for label in document.gate.keys() {
-        if !PerfGate::ALL.iter().any(|gate| gate.label() == label) {
-            return Err(format!("manifest defines unexpected gate.{label}"));
-        }
-    }
-    Ok(())
 }
 
 fn validate_manifest_surface(repo_root: &Path, report: &mut ReportBuilder) {
@@ -3104,29 +3002,23 @@ mod tests {
     /// The fixture must satisfy the same topology the live consumer requires —
     /// all ten gates, non-empty scalars, the frozen QG-6 count — or the tests
     /// would be exercising a manifest planning would refuse.
+    /// The **live** normative manifest with the given protected block in the
+    /// QG-2 position.
+    ///
+    /// A hand-built manifest cannot stay at parity with the planner: two
+    /// synthetic generations already omitted the positive QG-1 primary target
+    /// width and the entire `[schemas]` table. Deriving from the shipping file
+    /// means the fixture inherits every requirement the planner has, including
+    /// ones nobody remembered to restate.
     fn manifest_with_qg2_block(block: &str) -> String {
-        let mut manifest = String::new();
-        for gate in PerfGate::ALL {
-            if gate == PerfGate::Qg2 {
-                manifest.push_str(block);
-                continue;
-            }
-            let label = gate.label();
-            let _ = write!(
-                &mut manifest,
-                "[gate.{label}]\nname = \"{label} gate\"\nfixture = \"{label} fixture\"\n\
-                 target = \"{label} target\"\n"
-            );
-            if gate == PerfGate::Qg6 {
-                let _ = writeln!(
-                    &mut manifest,
-                    "queries_per_class = {}",
-                    crate::QG6_QUERY_GROUPS
-                );
-            }
-            manifest.push_str("activated = false\n\n");
-        }
-        manifest
+        const LIVE: &str = include_str!("../../../docs/contracts/quill-perf-gates.toml");
+
+        assert_eq!(
+            LIVE.matches(QG2_MANIFEST_BLOCK_PRE_REGION).count(),
+            1,
+            "the live manifest must still carry the exact protected bootstrap block"
+        );
+        LIVE.replacen(QG2_MANIFEST_BLOCK_PRE_REGION, block, 1)
     }
 
     /// Manifest at the protected base. The QG-2 block is the protected block
@@ -3410,19 +3302,11 @@ mod tests {
             ),
             (
                 "an empty required scalar on a non-QG-2 gate",
-                applied.replacen("target = \"QG-5 target\"", "target = \"   \"", 1),
+                applied.replacen("name = \"dependency surface\"", "name = \"   \"", 1),
             ),
             (
                 "a missing required scalar on a non-QG-2 gate",
-                applied.replacen("fixture = \"QG-4 fixture\"\n", "", 1),
-            ),
-            (
-                "a missing activated flag",
-                applied.replacen(
-                    "target = \"QG-7 target\"\nactivated = false",
-                    "target = \"QG-7 target\"",
-                    1,
-                ),
+                applied.replacen("name = \"dependency surface\"\n", "", 1),
             ),
             (
                 "a wrong frozen QG-6 group count",
@@ -3433,20 +3317,24 @@ mod tests {
                 ),
             ),
             (
-                "a QG-1-only field placed on another gate",
+                "a QG-1 primary target width of zero",
                 applied.replacen(
-                    "target = \"QG-9 target\"\n",
-                    "target = \"QG-9 target\"\nprimary_target_cell_width = 8\n",
+                    "primary_target_cell_width = 8",
+                    "primary_target_cell_width = 0",
                     1,
                 ),
             ),
             (
-                "a QG-6-only field placed on another gate",
-                applied.replacen(
-                    "target = \"QG-8 target\"\n",
-                    "target = \"QG-8 target\"\nqueries_per_class = 16\n",
-                    1,
-                ),
+                "a missing QG-1 primary target width",
+                applied.replacen("primary_target_cell_width = 8\n", "", 1),
+            ),
+            (
+                "a missing top-level schema binding",
+                applied.replacen("history_pointer = ", "unbound_pointer = ", 1),
+            ),
+            (
+                "an extra top-level schema binding",
+                applied.replacen("[evidence]", "extra_schema = \"x\"\n\n[evidence]", 1),
             ),
         ] {
             assert_ne!(mutated, applied, "{label} mutation must apply");
