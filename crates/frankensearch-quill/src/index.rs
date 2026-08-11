@@ -12295,6 +12295,9 @@ fn snapshot_string_range_terms(
                 checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
                 admitted_block = Some(block);
             }
+            // Both tests are O(1) now that the live count is taken at freeze,
+            // so this expansion costs the dictionary blocks it already
+            // admits and nothing more.
             if term.field_ord() == field_ord
                 && term.live_doc_freq() != 0
                 && term_in_string_range(term.term(), &lower, &upper)
@@ -12663,6 +12666,9 @@ fn snapshot_glob_terms(
                 }
                 admitted_block = Some(block);
             }
+            // The live count is taken at freeze, so this stays O(1) per term
+            // even on the `checkpoint == None` path, which has nothing to
+            // admit against and previously walked every chain unmetered.
             if term.field_ord() == field_ord
                 && term.live_doc_freq() != 0
                 && star_glob_matches(pattern, term.term())
@@ -12868,6 +12874,9 @@ fn checkpointed_snapshot_doc_freq(
         }
     }
     for delta in snapshot.delta_snapshots() {
+        // `live_doc_freq` is answered from the count taken at freeze, so this
+        // is a lookup rather than a traversal and needs no admission of its
+        // own.
         let delta_doc_freq = delta
             .find_term(field_ord, term)
             .map_or(0, |found| found.live_doc_freq());

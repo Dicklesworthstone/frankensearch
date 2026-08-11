@@ -1333,19 +1333,13 @@ impl<'a> DeltaPostingCursor<'a> {
         checkpoint: Option<&dyn QueryWorkCheckpoint>,
     ) -> Result<Self, ArgusError> {
         let term = delta.find_term(field_ord, term_bytes);
-        // Delta term metadata is not a lookup. `live_doc_freq` walks the whole
-        // physical chain to count survivors, so opening a cursor reads every
-        // row of the term before a single posting is served. That walk is
-        // admitted here, before it runs, at the same physical-block rate the
-        // scan itself pays. A term that is missing entirely still admits —
-        // with zero units — so a cancelled query cannot open cursors forever.
+        // Term metadata is answered from the count taken at freeze, so
+        // opening a cursor reads no rows and buys no permit for the lookup.
+        // It still polls: a term missing from this generation does no work at
+        // all, and that is exactly the path on which a cancelled query would
+        // otherwise open cursors forever without ever being told to stop.
         if let Some(checkpoint) = checkpoint {
-            let physical = term.map_or(0, DeltaTerm::physical_doc_freq);
-            let blocks = physical.div_ceil(DELTA_LOGICAL_BLOCK_POSTINGS as usize);
-            checkpoint.admit(
-                QueryWorkKind::PostingBlock,
-                u64::try_from(blocks).unwrap_or(u64::MAX),
-            )?;
+            checkpoint.admit(QueryWorkKind::PostingBlock, 0)?;
         }
         let (live_doc_freq, block_max) =
             term.map_or((0, None), DeltaTerm::live_doc_freq_and_block_max);
@@ -6977,9 +6971,12 @@ mod tests {
         Ok(delta.freeze(1))
     }
 
-    /// Ordinals kept live: one inside the first block, then one just past
-    /// each of the 128 and 256 boundaries.
-    const DELTA_INTERLEAVED_LIVE: [u32; 3] = [10, 130, 250];
+    /// Ordinals kept live: one inside the first logical block, then one just
+    /// past each of the 128 and 256 boundaries.
+    ///
+    /// 258 rather than 250 on purpose — 250 still sits in the second block,
+    /// so it would not have exercised the third at all.
+    const DELTA_INTERLEAVED_LIVE: [u32; 3] = [10, 130, 258];
 
     #[test]
     fn delta_walk_skips_tombstones_across_block_boundaries()

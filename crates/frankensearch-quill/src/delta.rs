@@ -806,6 +806,17 @@ pub struct DeltaSegment {
     tombstone_words: Vec<u64>,
     tombstone_count: usize,
     logical_bytes_used: usize,
+    /// Exact live posting count per term, present only in a frozen epoch.
+    ///
+    /// Counting survivors means walking a term's whole physical chain, and
+    /// query-time metadata reads — document frequency, range and glob
+    /// expansion, snippet term selection — all ask for that count. Doing it
+    /// per read turned every metadata lookup into a full scan of the term,
+    /// unbounded by anything the query had admitted. A frozen epoch cannot
+    /// change, so the count is computed once at [`DeltaSegment::freeze`] and
+    /// read in O(1) thereafter. `None` marks a still-mutable segment, where
+    /// the walk is correct because there is nothing to cache against.
+    live_doc_freqs: Option<Vec<u32>>,
 }
 
 /// Immutable, owner-isolated copy of one published delta generation.
@@ -1113,6 +1124,7 @@ impl DeltaSegment {
             tombstone_words,
             tombstone_count: 0,
             logical_bytes_used: 0,
+            live_doc_freqs: None,
         })
     }
 
@@ -1156,33 +1168,41 @@ impl DeltaSegment {
     #[must_use]
     pub fn freeze(&self, keeper_generation: u64) -> DeltaSnapshot {
         let snapshot_owner_id = NEXT_DELTA_OWNER_ID.fetch_add(1, Ordering::Relaxed);
+        let mut segment = Self {
+            schema: self.schema,
+            lease_base: self.lease_base,
+            lease_end: self.lease_end,
+            next_docid_floor: self.next_docid_floor,
+            budget_bytes: self.budget_bytes,
+            owner_id: snapshot_owner_id,
+            generation: self.generation,
+            fields: self.fields.clone(),
+            terms: self.terms.clone(),
+            chains: self.chains.clone(),
+            posting_arena: self.posting_arena.snapshot_copy(),
+            position_arena: self.position_arena.snapshot_copy(),
+            document_docids: self.document_docids.clone(),
+            document_ids: self.document_ids.clone(),
+            document_content_hashes: self.document_content_hashes.clone(),
+            document_term_offsets: self.document_term_offsets.clone(),
+            document_term_ids: self.document_term_ids.clone(),
+            fieldnorms: self.fieldnorms.clone(),
+            numeric_fields: self.numeric_fields.clone(),
+            stored_fields: self.stored_fields.clone(),
+            live_ids: self.live_ids.clone(),
+            tombstone_words: self.tombstone_words.clone(),
+            tombstone_count: self.tombstone_count,
+            logical_bytes_used: self.logical_bytes_used,
+            live_doc_freqs: None,
+        };
+        // Computed from the frozen copy, never from `self`: liveness is
+        // evaluated against this epoch's own generation and tombstones, and
+        // the postings iterator stamps each row with the reading segment's
+        // owner id. One pass at publication replaces a pass per metadata read
+        // for the whole life of the snapshot.
+        segment.live_doc_freqs = Some(segment.compute_live_doc_freqs());
         DeltaSnapshot {
-            segment: Self {
-                schema: self.schema,
-                lease_base: self.lease_base,
-                lease_end: self.lease_end,
-                next_docid_floor: self.next_docid_floor,
-                budget_bytes: self.budget_bytes,
-                owner_id: snapshot_owner_id,
-                generation: self.generation,
-                fields: self.fields.clone(),
-                terms: self.terms.clone(),
-                chains: self.chains.clone(),
-                posting_arena: self.posting_arena.snapshot_copy(),
-                position_arena: self.position_arena.snapshot_copy(),
-                document_docids: self.document_docids.clone(),
-                document_ids: self.document_ids.clone(),
-                document_content_hashes: self.document_content_hashes.clone(),
-                document_term_offsets: self.document_term_offsets.clone(),
-                document_term_ids: self.document_term_ids.clone(),
-                fieldnorms: self.fieldnorms.clone(),
-                numeric_fields: self.numeric_fields.clone(),
-                stored_fields: self.stored_fields.clone(),
-                live_ids: self.live_ids.clone(),
-                tombstone_words: self.tombstone_words.clone(),
-                tombstone_count: self.tombstone_count,
-                logical_bytes_used: self.logical_bytes_used,
-            },
+            segment,
             keeper_generation,
             // Each frozen epoch is a distinct publication candidate, even
             // when two freezes observe the same mutable Delta generation.
@@ -1190,6 +1210,20 @@ impl DeltaSegment {
             // must never be replaceable by an earlier, shorter snapshot.
             lineage_id: snapshot_owner_id,
         }
+    }
+
+    /// Count survivors per term for a frozen epoch, one chain pass each.
+    fn compute_live_doc_freqs(&self) -> Vec<u32> {
+        (0..self.chains.len())
+            .map(|term_index| {
+                let term_index = u32::try_from(term_index).unwrap_or(u32::MAX);
+                let term = DeltaTerm {
+                    delta: self,
+                    term_index,
+                };
+                u32::try_from(term.walk_live_doc_freq()).unwrap_or(u32::MAX)
+            })
+            .collect()
     }
 
     /// Apply one complete document without seal sidecar values.
@@ -1265,6 +1299,11 @@ impl DeltaSegment {
         numeric_values: &[DeltaNumericValue],
         stored_values: &[DeltaStoredValue<'_>],
     ) -> Result<DeltaApply, DeltaError> {
+        // A published epoch is never mutated — readers hold a frozen copy —
+        // but dropping the cache on any mutation keeps that a property of the
+        // code rather than of the call graph, so a stale count cannot outlive
+        // a change to the rows it counted.
+        self.live_doc_freqs = None;
         self.validate_document(
             global_docid,
             &document_id,
@@ -1867,6 +1906,9 @@ impl DeltaSegment {
 
     /// Delete a live delta identity. A repeated or sealed-only delete is a miss.
     pub fn delete_delta_id(&mut self, document_id: &str) -> Option<u32> {
+        // A deletion changes which postings survive, so any cached count is
+        // stale from here on. See `apply_document_inner`.
+        self.live_doc_freqs = None;
         let (removed_id, global_docid) = self.live_ids.remove_entry(document_id)?;
         let identity_bytes =
             size_of::<DocId>() + size_of::<u32>() + HASH_SLOT_ESTIMATE + removed_id.len();
@@ -2348,6 +2390,22 @@ impl<'a> DeltaTerm<'a> {
     /// Live posting count after applying delta tombstones.
     #[must_use]
     pub fn live_doc_freq(self) -> usize {
+        // A frozen epoch answers from the count taken at publication, so a
+        // metadata read never walks the chain. Only a still-mutable segment
+        // falls through to the walk, and it has no query traffic to bound.
+        if let Some(cached) = self.delta.live_doc_freqs.as_ref() {
+            if let Some(live) = cached.get(self.term_index as usize) {
+                return *live as usize;
+            }
+        }
+        self.walk_live_doc_freq()
+    }
+
+    /// Count survivors by walking the physical chain.
+    ///
+    /// This is the definition the cache is built from; every other caller
+    /// should be going through [`Self::live_doc_freq`].
+    fn walk_live_doc_freq(self) -> usize {
         self.postings()
             .filter(|posting| self.is_live(*posting))
             .count()
