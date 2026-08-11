@@ -11820,10 +11820,13 @@ fn lower_query_with_mode<'a>(
                             )
                         }
                         QueryLeaf::Delta(delta) => {
-                            let cursor = DeltaPostingCursor::new(
+                            // As above: the construction pull is admitted as
+                            // it walks, not after it.
+                            let cursor = DeltaPostingCursor::new_admitted(
                                 delta,
                                 field.field_id,
                                 term.text.as_bytes(),
+                                checkpoint.as_ref(),
                             )?;
                             PhraseTerm::new(
                                 field.field_id,
@@ -12799,8 +12802,14 @@ fn lower_leaf_term<'a>(
     match leaf {
         QueryLeaf::Sealed(segment) => {
             checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
-            let (cursor, fieldnorms) =
-                open_sealed_term_cursor(segment, schema, field_ord, term, rank_pruning)?;
+            let (cursor, fieldnorms) = open_sealed_term_cursor(
+                segment,
+                schema,
+                field_ord,
+                term,
+                rank_pruning,
+                checkpoint,
+            )?;
             #[cfg(feature = "profile-internals")]
             checkpoint.record_term_dictionary_view();
             let cursor =
@@ -12808,7 +12817,10 @@ fn lower_leaf_term<'a>(
             build_term_scorer(cursor, fieldnorms, stats, doc_freq, record_option, boost)
         }
         QueryLeaf::Delta(delta) => {
-            let cursor = DeltaPostingCursor::new(delta, field_ord, term)?;
+            // The construction pull can walk a tombstoned prefix, so it is
+            // admitted as it walks rather than after the fact.
+            let cursor =
+                DeltaPostingCursor::new_admitted(delta, field_ord, term, checkpoint.as_ref())?;
             let cursor =
                 CheckpointPostingCursor::new(cursor, clone_query_checkpoint_for_argus(checkpoint))?;
             build_term_scorer(
@@ -12876,6 +12888,7 @@ fn open_sealed_term_cursor<'a>(
     field_ord: u16,
     term: &[u8],
     rank_pruning: bool,
+    checkpoint: &QueryCheckpointHandle<'_>,
 ) -> Result<(SealedPostingCursor<'a>, DocLenField<'a>), QuillIndexError> {
     let manifest = segment.manifest();
     let expected = term_field_ords(schema);
@@ -12890,10 +12903,19 @@ fn open_sealed_term_cursor<'a>(
         .ok_or_else(|| invalid_state(format!("DOCLEN has no field {field_ord}")))?;
     let dictionary = open_dictionary(segment, schema)?;
     let Some(found) = dictionary.lookup(field_ord, term)? else {
+        // A term absent from this segment decodes nothing, so it is charged
+        // nothing: the empty list below has no blocks to load.
         let postings = PostingList::parse(&[], 0)?.into_cursor()?;
         let cursor = SealedPostingCursor::from_owned(postings, 0, segment.doc_count());
         return Ok((cursor, fieldnorms));
     };
+    // Every construction path below decodes the term's first posting block
+    // while building its cursor, so the permit for that block is admitted
+    // here — before the decode — and `CheckpointPostingCursor` no longer
+    // charges for it afterwards.
+    if found.metadata.doc_freq > 0 {
+        checkpoint.admit(QueryWorkKind::PostingBlock, 1)?;
+    }
 
     let postings_section = required_section(segment, SectionKind::POSTINGS)?;
     let postings_bytes = span(postings_section, found.metadata.postings, "POSTINGS")?;

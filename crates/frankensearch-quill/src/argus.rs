@@ -24,6 +24,11 @@ use crate::quiver::{
 
 pub use crate::query::Occur;
 
+/// Postings per Delta logical block, the granularity a Delta walk charges.
+///
+/// Delta postings are not encoded in blocks, so this is the accounting unit
+/// that keeps a Delta scan's fuel comparable with a sealed scan's.
+const DELTA_LOGICAL_BLOCK_POSTINGS: u32 = 128;
 const UNION_HORIZON: usize = 4_096;
 const UNION_HORIZON_U64: u64 = 4_096;
 pub(crate) const MAX_SCORE_MAX_CLAUSES: usize = 8;
@@ -483,17 +488,51 @@ pub trait PostingCursor {
         None
     }
 
-    /// Number of block entries performed since `previous`.
+    /// Blocks [`Self::next`] would decode, determined without decoding.
     ///
-    /// Sealed skip seeks decode only their destination block, so the default
-    /// charges one when the ordinal changes. Sequential Delta cursors override
-    /// this to charge every traversed logical block.
-    fn work_blocks_since(&self, previous: Option<u64>) -> u64 {
-        match (previous, self.current_work_block()) {
-            (_, None) => 0,
-            (Some(previous), Some(current)) if previous == current => 0,
-            _ => 1,
-        }
+    /// This is the permit a caller must admit *before* the move, so it has to
+    /// mirror the move exactly: too low lets a decode run unadmitted, too
+    /// high charges for work never done. The default reports zero, which is
+    /// correct for cursors that decode nothing and for cursors that admit
+    /// their own work internally through [`Self::next_admitted`].
+    fn block_permit_for_next(&self) -> u64 {
+        0
+    }
+
+    /// Blocks [`Self::advance`] would decode, determined without decoding.
+    fn block_permit_for_advance(&self, _target: u32) -> u64 {
+        0
+    }
+
+    /// Step one posting, admitting any work this cursor performs internally.
+    ///
+    /// The default is for cursors whose whole cost is the block permit their
+    /// caller already admitted. A cursor that can perform an unbounded amount
+    /// of work inside one move — a Delta cursor walking a tombstoned prefix —
+    /// overrides this to admit as it goes, so cancellation is observed during
+    /// the walk instead of after it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the checkpoint's refusal or a typed cursor failure.
+    fn next_admitted(
+        &mut self,
+        _checkpoint: &dyn QueryWorkCheckpoint,
+    ) -> Result<Option<u32>, ArgusError> {
+        self.next()
+    }
+
+    /// Seek, admitting any work this cursor performs internally.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the checkpoint's refusal or a typed cursor failure.
+    fn advance_admitted(
+        &mut self,
+        _checkpoint: &dyn QueryWorkCheckpoint,
+        target: u32,
+    ) -> Result<Option<u32>, ArgusError> {
+        self.advance(target)
     }
 }
 
@@ -571,8 +610,27 @@ where
         (**self).current_work_block()
     }
 
-    fn work_blocks_since(&self, previous: Option<u64>) -> u64 {
-        (**self).work_blocks_since(previous)
+    fn block_permit_for_next(&self) -> u64 {
+        (**self).block_permit_for_next()
+    }
+
+    fn block_permit_for_advance(&self, target: u32) -> u64 {
+        (**self).block_permit_for_advance(target)
+    }
+
+    fn next_admitted(
+        &mut self,
+        checkpoint: &dyn QueryWorkCheckpoint,
+    ) -> Result<Option<u32>, ArgusError> {
+        (**self).next_admitted(checkpoint)
+    }
+
+    fn advance_admitted(
+        &mut self,
+        checkpoint: &dyn QueryWorkCheckpoint,
+        target: u32,
+    ) -> Result<Option<u32>, ArgusError> {
+        (**self).advance_admitted(checkpoint, target)
     }
 }
 
@@ -699,15 +757,33 @@ impl<'a> CheckpointPostingCursor<'a> {
     where
         C: PostingCursor + 'a,
     {
-        let cursor = Self {
+        Ok(Self {
             inner: Box::new(inner),
             checkpoint: PostingCheckpoint::Shared(checkpoint),
             refused: None,
-        };
-        if cursor.inner.current_work_block().is_some() {
-            cursor.checkpoint.admit(QueryWorkKind::PostingBlock, 1)?;
-        }
-        Ok(cursor)
+        })
+    }
+
+    /// Admit the block a cursor's construction is about to decode.
+    ///
+    /// Construction decodes the first block before any wrapper exists, so the
+    /// caller admits it here — *before* building the cursor — and this type no
+    /// longer charges for it afterwards. `decodes_initial_block` is false for
+    /// a term with no blocks, which must not be charged for a decode it never
+    /// performs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the checkpoint's refusal, in which case the caller must not
+    /// construct the cursor at all.
+    pub fn admit_initial_block(
+        checkpoint: &dyn QueryWorkCheckpoint,
+        decodes_initial_block: bool,
+    ) -> Result<(), ArgusError> {
+        checkpoint.admit(
+            QueryWorkKind::PostingBlock,
+            u64::from(decodes_initial_block),
+        )
     }
 
     /// Repeat a retained refusal instead of doing any further work.
@@ -723,16 +799,17 @@ impl<'a> CheckpointPostingCursor<'a> {
         }
     }
 
-    /// Admit the blocks this move entered — possibly none.
+    /// Admit `units`, retaining any refusal so the cursor becomes terminal.
     ///
-    /// Every move admits. A zero-unit admission charges no fuel and touches
-    /// no work counter, because [`QueryWorkCheckpoint::admit`] returns right
-    /// after its cancellation poll when `units == 0`, so metering still
-    /// reflects entered blocks only. Skipping the call for an in-block step
-    /// instead is what makes a cancelled query keep walking its plan: the
-    /// drain of a scored candidate and the move that exhausts a cursor both
-    /// charge zero blocks, so a request arriving after the last block entry
-    /// was never observed and the query returned a complete result set.
+    /// Every move admits at least once, with zero units when it enters no
+    /// block. A zero-unit admission charges no fuel and touches no work
+    /// counter, because [`QueryWorkCheckpoint::admit`] returns right after its
+    /// cancellation poll when `units == 0`, so metering still reflects entered
+    /// blocks only. Dropping that call for an in-block step is what lets a
+    /// cancelled query keep walking its plan: the drain of a scored candidate
+    /// and the move that exhausts a cursor both enter zero blocks, so a
+    /// request arriving after the last block entry would never be observed and
+    /// the query would return a complete result set.
     ///
     /// The cursor leaf itself takes no lock: the whole cost of the per-move
     /// admission is the checkpoint's cancellation poll, and that poll cannot
@@ -741,18 +818,7 @@ impl<'a> CheckpointPostingCursor<'a> {
     /// exactly the in-block blind spot described above. Removing the poll's
     /// lock is therefore a checkpoint-side or upstream concern, not a cursor
     /// one (`bd-quill-cancel-poll-leaf-fastpath-tzztr`).
-    ///
-    /// # Ordering (WIP — `bd-quill-cancel-poll-leaf-fastpath-tzztr`)
-    ///
-    /// This admission still runs *after* the move it accounts for, because
-    /// units come from [`PostingCursor::work_blocks_since`], which can only
-    /// report entered blocks once the move has happened. That does not
-    /// satisfy [`QueryWorkCheckpoint::admit`]'s pre-work gate, and it is
-    /// being replaced by a side-effect-free poll before movement plus a block
-    /// permit admitted before actual block entry. Do not document this
-    /// ordering as the intended contract.
-    fn checkpoint_move(&mut self, previous: Option<u64>) -> Result<(), ArgusError> {
-        let units = self.inner.work_blocks_since(previous);
+    fn admit_or_refuse(&mut self, units: u64) -> Result<(), ArgusError> {
         match self.checkpoint.admit(QueryWorkKind::PostingBlock, units) {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -790,18 +856,36 @@ impl PostingCursor for CheckpointPostingCursor<'_> {
 
     fn next(&mut self) -> Result<Option<u32>, ArgusError> {
         self.guard_refused()?;
-        let previous = self.inner.current_work_block();
-        let moved = self.inner.next()?;
-        self.checkpoint_move(previous)?;
-        Ok(moved)
+        self.admit_or_refuse(0)?;
+        let permit = self.inner.block_permit_for_next();
+        if permit > 0 {
+            self.admit_or_refuse(permit)?;
+        }
+        let checkpoint = self.checkpoint.as_borrowed();
+        match self.inner.next_admitted(checkpoint) {
+            Ok(moved) => Ok(moved),
+            Err(error) => {
+                self.refused = RefusedAdmission::capture(&error);
+                Err(error)
+            }
+        }
     }
 
     fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
         self.guard_refused()?;
-        let previous = self.inner.current_work_block();
-        let moved = self.inner.advance(target)?;
-        self.checkpoint_move(previous)?;
-        Ok(moved)
+        self.admit_or_refuse(0)?;
+        let permit = self.inner.block_permit_for_advance(target);
+        if permit > 0 {
+            self.admit_or_refuse(permit)?;
+        }
+        let checkpoint = self.checkpoint.as_borrowed();
+        match self.inner.advance_admitted(checkpoint, target) {
+            Ok(moved) => Ok(moved),
+            Err(error) => {
+                self.refused = RefusedAdmission::capture(&error);
+                Err(error)
+            }
+        }
     }
 
     fn validated_post_move_contract(&self) -> Option<ValidatedPostMoveContract> {
@@ -852,8 +936,12 @@ impl PostingCursor for CheckpointPostingCursor<'_> {
         self.inner.current_work_block()
     }
 
-    fn work_blocks_since(&self, previous: Option<u64>) -> u64 {
-        self.inner.work_blocks_since(previous)
+    fn block_permit_for_next(&self) -> u64 {
+        self.inner.block_permit_for_next()
+    }
+
+    fn block_permit_for_advance(&self, target: u32) -> u64 {
+        self.inner.block_permit_for_advance(target)
     }
 }
 
@@ -1121,6 +1209,25 @@ impl PostingCursor for SealedPostingCursor<'_> {
             }
         }
     }
+
+    /// Exactly the decodes the next step performs, from the codec's own
+    /// mirror of that step. A positional step touches its paired posting
+    /// cursor once; a docs step decodes at most its successor block.
+    fn block_permit_for_next(&self) -> u64 {
+        match &self.inner {
+            SealedCursorInner::Docs(cursor) => u64::from(cursor.next_decodes_block()),
+            SealedCursorInner::Positions(cursor) => cursor.next_decode_count(),
+        }
+    }
+
+    /// Exactly the decodes the seek performs. A positional seek is two-stage
+    /// and can decode several blocks, so the permit is a count, not a flag.
+    fn block_permit_for_advance(&self, target: u32) -> u64 {
+        match &self.inner {
+            SealedCursorInner::Docs(cursor) => u64::from(cursor.advance_decodes_block(target)),
+            SealedCursorInner::Positions(cursor) => cursor.advance_decode_count(target),
+        }
+    }
 }
 
 impl PositionsReader for SealedPostingCursor<'_> {
@@ -1190,6 +1297,35 @@ impl<'a> DeltaPostingCursor<'a> {
         field_ord: u16,
         term_bytes: &[u8],
     ) -> Result<Self, ArgusError> {
+        Self::open(delta, field_ord, term_bytes, None)
+    }
+
+    /// Open the same cursor with its construction walk admitted.
+    ///
+    /// Construction pulls the first live posting, and that pull can traverse
+    /// an arbitrarily long tombstoned prefix. Shipping callers use this so the
+    /// walk is admitted as it happens instead of running before any checkpoint
+    /// exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns the checkpoint's refusal, or the same typed invariant failures
+    /// as [`Self::new`].
+    pub fn new_admitted(
+        delta: &'a DeltaSnapshot,
+        field_ord: u16,
+        term_bytes: &[u8],
+        checkpoint: &dyn QueryWorkCheckpoint,
+    ) -> Result<Self, ArgusError> {
+        Self::open(delta, field_ord, term_bytes, Some(checkpoint))
+    }
+
+    fn open(
+        delta: &'a DeltaSnapshot,
+        field_ord: u16,
+        term_bytes: &[u8],
+        checkpoint: Option<&dyn QueryWorkCheckpoint>,
+    ) -> Result<Self, ArgusError> {
         let term = delta.find_term(field_ord, term_bytes);
         let (live_doc_freq, block_max) =
             term.map_or((0, None), DeltaTerm::live_doc_freq_and_block_max);
@@ -1217,11 +1353,23 @@ impl<'a> DeltaPostingCursor<'a> {
             cost,
             segment_num_docs,
         };
-        cursor.pull_next_live()?;
+        cursor.pull_next_live(checkpoint)?;
         Ok(cursor)
     }
 
-    fn pull_next_live(&mut self) -> Result<Option<u32>, ArgusError> {
+    /// Pull the next live posting, admitting each physical step it walks.
+    ///
+    /// A Delta term can carry an arbitrarily long tombstoned prefix, and one
+    /// move walks all of it. Admitting only at the end would leave that walk
+    /// uncancellable and charge its blocks after the fact, so the admission
+    /// happens *inside* the loop, before each physical step: zero units
+    /// within a logical block, one unit when the step opens a new one. The
+    /// unit total is therefore unchanged — one per logical block entered —
+    /// while cancellation is observed every posting.
+    fn pull_next_live(
+        &mut self,
+        checkpoint: Option<&dyn QueryWorkCheckpoint>,
+    ) -> Result<Option<u32>, ArgusError> {
         let Some(term) = self.term else {
             self.current = None;
             self.current_ordinal = None;
@@ -1233,6 +1381,12 @@ impl<'a> DeltaPostingCursor<'a> {
             return Ok(None);
         };
         loop {
+            if let Some(checkpoint) = checkpoint {
+                // Admitted before the step, never after: a tombstoned run is
+                // still work, and the query must be able to stop inside it.
+                let units = u64::from(self.next_ordinal % DELTA_LOGICAL_BLOCK_POSTINGS == 0);
+                checkpoint.admit(QueryWorkKind::PostingBlock, units)?;
+            }
             let Some(posting) = remaining.next() else {
                 self.current = None;
                 self.current_ordinal = None;
@@ -1295,7 +1449,7 @@ impl PostingCursor for DeltaPostingCursor<'_> {
         if self.current.is_none() {
             return Ok(None);
         }
-        self.pull_next_live()
+        self.pull_next_live(None)
     }
 
     fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
@@ -1303,7 +1457,7 @@ impl PostingCursor for DeltaPostingCursor<'_> {
             return Ok(self.doc());
         }
         loop {
-            let moved = self.pull_next_live()?;
+            let moved = self.pull_next_live(None)?;
             if moved.is_none_or(|doc| doc >= target) {
                 return Ok(moved);
             }
@@ -1331,14 +1485,43 @@ impl PostingCursor for DeltaPostingCursor<'_> {
     }
 
     fn current_work_block(&self) -> Option<u64> {
-        self.current_ordinal.map(|ordinal| u64::from(ordinal) / 128)
+        self.current_ordinal
+            .map(|ordinal| u64::from(ordinal / DELTA_LOGICAL_BLOCK_POSTINGS))
     }
 
-    fn work_blocks_since(&self, previous: Option<u64>) -> u64 {
-        match (previous, self.current_work_block()) {
-            (_, None) => 0,
-            (Some(previous), Some(current)) if current >= previous => current - previous,
-            _ => 1,
+    /// Delta admits its own walk inside `pull_next_live`, so the caller must
+    /// not pre-charge a permit on top of it.
+    fn block_permit_for_next(&self) -> u64 {
+        0
+    }
+
+    fn block_permit_for_advance(&self, _target: u32) -> u64 {
+        0
+    }
+
+    fn next_admitted(
+        &mut self,
+        checkpoint: &dyn QueryWorkCheckpoint,
+    ) -> Result<Option<u32>, ArgusError> {
+        if self.current.is_none() {
+            return Ok(None);
+        }
+        self.pull_next_live(Some(checkpoint))
+    }
+
+    fn advance_admitted(
+        &mut self,
+        checkpoint: &dyn QueryWorkCheckpoint,
+        target: u32,
+    ) -> Result<Option<u32>, ArgusError> {
+        if self.doc().is_none_or(|doc| doc >= target) {
+            return Ok(self.doc());
+        }
+        loop {
+            let moved = self.pull_next_live(Some(checkpoint))?;
+            if moved.is_none_or(|doc| doc >= target) {
+                return Ok(moved);
+            }
         }
     }
 }
@@ -5926,20 +6109,25 @@ mod tests {
         // move per remaining posting plus the final move that reports `None`.
         assert_eq!(moves + 1, postings.len());
 
+        // The block already decoded at construction is charged by
+        // `admit_initial_block` at the call site, which this test does not
+        // call, so the cursor itself charges only the blocks its own moves
+        // entered: one per boundary crossed.
         assert_eq!(
             checkpoint
                 .admitted_units
                 .load(std::sync::atomic::Ordering::SeqCst),
-            u64::try_from(block_count)?,
-            "fuel charges one unit per entered block and nothing for an in-block step"
+            u64::try_from(block_count - 1)?,
+            "a move charges one unit per block it enters and nothing for an in-block step"
         );
+        // Every move admits once to observe cancellation before it moves, and
+        // a move that enters a block admits a second time for its permit.
         assert_eq!(
             checkpoint
                 .admissions
                 .load(std::sync::atomic::Ordering::SeqCst),
-            postings.len() + 1,
-            "every move admits so it can observe cancellation: one admission for the \
-             already-decoded first block, then one per move including the exhausting move"
+            postings.len() + block_count - 1,
+            "one pre-move poll per move, plus one permit per entered block"
         );
         Ok(())
     }
@@ -5956,15 +6144,17 @@ mod tests {
             list.block_count() > 1,
             "fixture must cross a posting-block boundary"
         );
-        // Admission 1 is the already-decoded first block. Admission 2 is the
-        // first step to the next posting, which stays inside that block and
-        // therefore charges nothing — exactly the move a cursor that only
-        // admits entered blocks cannot refuse.
-        let checkpoint = Arc::new(CancelOnNthAdmission::new(2));
+        // Admission 1 is the first move's pre-move poll. That move stays
+        // inside the decoded block, so it never reaches a permit — it is
+        // exactly the move a cursor that only admits entered blocks cannot
+        // refuse, and it is refused here before it moves at all.
+        let checkpoint = Arc::new(CancelOnNthAdmission::new(1));
         let checkpoint_for_cursor: Arc<dyn QueryWorkCheckpoint> = checkpoint.clone();
         let segment_num_docs = u32::try_from(postings.len())?;
         let sealed = SealedPostingCursor::new(&list, segment_num_docs)?;
         let mut cursor = CheckpointPostingCursor::new(sealed, checkpoint_for_cursor)?;
+        let entry_doc = PostingCursor::doc(&cursor);
+        let entry_block = PostingCursor::current_work_block(&cursor);
 
         let error = cursor
             .next()
@@ -5983,15 +6173,21 @@ mod tests {
                 .units_at_fire
                 .load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "the refused in-block move must be admitted with zero units so it charges no fuel"
+            "the pre-move poll is admitted with zero units so it charges no fuel"
         );
         assert_eq!(
             checkpoint
                 .admissions
                 .load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "the cursor must stop at the refusal instead of walking to the next block boundary"
+            1,
+            "the refusal must stop the move before it reaches a permit"
         );
+        assert_eq!(
+            PostingCursor::doc(&cursor),
+            entry_doc,
+            "a refused move must not move the cursor"
+        );
+        assert_eq!(PostingCursor::current_work_block(&cursor), entry_block);
         Ok(())
     }
 
@@ -6007,11 +6203,11 @@ mod tests {
             list.block_count() > 1,
             "fixture must cross a posting-block boundary"
         );
-        // One admission for the already-decoded first block, then one per
-        // move: the last of those is the move that reports exhaustion, which
-        // enters no block at all and so is the other move a block-only
-        // cursor cannot refuse.
-        let exhausting_admission = postings.len() + 1;
+        // Each move polls once before moving, and the two moves that enter a
+        // block add a permit, so the exhausting move's poll is admission
+        // `moves + entered_blocks`. That move enters no block at all, which
+        // makes it the other move a block-only cursor could never refuse.
+        let exhausting_admission = postings.len() + list.block_count() - 1;
         let checkpoint = Arc::new(CancelOnNthAdmission::new(exhausting_admission));
         let checkpoint_for_cursor: Arc<dyn QueryWorkCheckpoint> = checkpoint.clone();
         let segment_num_docs = u32::try_from(postings.len())?;
@@ -6095,29 +6291,44 @@ mod tests {
             .clone();
         assert_eq!(
             units.len(),
-            postings.len() + 1,
-            "the construction admission plus one per move, including the exhausting move"
+            postings.len() + block_count - 1,
+            "one pre-move poll per move, plus one permit per entered block"
         );
         assert_eq!(
             units.iter().sum::<u64>(),
-            u64::try_from(block_count)?,
-            "the whole scan charges exactly one unit per entered block"
+            u64::try_from(block_count - 1)?,
+            "the scan charges exactly one unit per block its moves entered"
         );
         assert_eq!(
             units.first(),
-            Some(&1),
-            "construction charges the already-decoded first block"
+            Some(&0),
+            "the first admission is a poll, before any movement"
         );
         assert_eq!(
-            units.get(1..3),
-            Some([0, 0].as_slice()),
-            "consecutive in-block steps admit for cancellation while charging nothing"
+            units.get(0..3),
+            Some([0, 0, 0].as_slice()),
+            "consecutive in-block steps poll for cancellation while charging nothing"
         );
         assert_eq!(
             units.last(),
             Some(&0),
             "the exhausting move enters no block and charges nothing"
         );
+        // A permit is admitted immediately before the move that decodes, so
+        // every unit in the sequence is preceded by that move's own poll.
+        let permit_positions: Vec<usize> = units
+            .iter()
+            .enumerate()
+            .filter_map(|(index, charged)| (*charged == 1).then_some(index))
+            .collect();
+        assert_eq!(permit_positions.len(), block_count - 1);
+        for position in permit_positions {
+            assert_eq!(
+                units.get(position - 1),
+                Some(&0),
+                "a permit must follow its own move's poll"
+            );
+        }
         Ok(())
     }
 
@@ -6127,11 +6338,11 @@ mod tests {
     /// Stepping with `next` cannot pin either fact: consecutive steps only ever
     /// move one block, so there the per-move charge and the distance travelled
     /// are indistinguishable. A sealed skip seek decodes only its destination
-    /// block, which is why the default `work_blocks_since` charges one for any
-    /// ordinal change, while a sequential Delta cursor deliberately charges
-    /// every traversed block. This is therefore the one move where a cursor
-    /// that adopted the cumulative rule would start over-charging fuel, and the
-    /// one move whose refusal a `next`-only test can never observe.
+    /// block, which is why its permit is one for any ordinal change, while a
+    /// Delta walk charges every logical block it crosses. This is therefore
+    /// the one move where a cursor that adopted the cumulative rule would
+    /// over-charge fuel, and the one move whose refusal a `next`-only test can
+    /// never observe.
     #[test]
     fn checkpoint_cursor_charges_one_unit_for_a_multi_block_skip_and_refuses_on_it()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -6168,16 +6379,18 @@ mod tests {
             .clone();
         assert_eq!(
             units.as_slice(),
-            [1, 1].as_slice(),
-            "construction charges the first block and the skip charges only its destination"
+            [0, 1].as_slice(),
+            "the skip polls first, then takes one permit for the block it will decode"
         );
 
-        // The same skip must be refusable. Admission 1 is construction and
-        // admission 2 is the advance, so the refusal lands on the skip itself.
+        // The same skip must be refusable *at its permit*, before it moves.
+        // Admission 1 is the pre-move poll and admission 2 is that permit.
         let checkpoint = Arc::new(CancelOnNthAdmission::new(2));
         let checkpoint_for_cursor: Arc<dyn QueryWorkCheckpoint> = checkpoint.clone();
         let sealed = SealedPostingCursor::new(&list, segment_num_docs)?;
         let mut cursor = CheckpointPostingCursor::new(sealed, checkpoint_for_cursor)?;
+        let refused_doc = PostingCursor::doc(&cursor);
+        let refused_block = PostingCursor::current_work_block(&cursor);
         let error = cursor
             .advance(skip_target)
             .expect_err("a skip must observe a refusing checkpoint");
@@ -6195,60 +6408,97 @@ mod tests {
                 .units_at_fire
                 .load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "the refused skip must be admitted with the single block it entered"
+            "the refused permit carries the single block the skip would have decoded"
         );
         assert_eq!(
             checkpoint
                 .admissions
                 .load(std::sync::atomic::Ordering::SeqCst),
             2,
-            "the refusal must land on the advance, not on a later move"
+            "the refusal must land on the permit, not on a later move"
+        );
+        assert_eq!(
+            PostingCursor::doc(&cursor),
+            refused_doc,
+            "a permit refused before the seek must leave the cursor where it was"
+        );
+        assert_eq!(
+            PostingCursor::current_work_block(&cursor),
+            refused_block,
+            "a refused permit must decode nothing"
         );
         Ok(())
     }
 
-    /// A checkpoint refusing the construction admission must fail construction
-    /// outright.
+    /// A refusal at the construction permit must happen before anything is
+    /// decoded, and must therefore stop the caller building a cursor at all.
     ///
-    /// The first block is decoded before any move exists, so a cancellation
-    /// arriving that early has exactly one place to be observed, and the cursor
-    /// must never come into being able to serve postings from it.
+    /// This is the pre-work gate at its earliest point: the first block is
+    /// decoded while the inner cursor is being constructed, so the only
+    /// honest place to admit it is *before* that construction runs. The test
+    /// proves the ordering by never constructing the inner cursor on the
+    /// refusing path — a design that admitted afterwards could not fail here.
     #[test]
-    fn checkpoint_cursor_surfaces_cancellation_at_construction()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn construction_permit_is_refused_before_any_decode() -> Result<(), Box<dyn std::error::Error>>
+    {
         let postings = (0..257)
             .map(|docid| Posting::new(docid, 1))
             .collect::<Vec<_>>();
         let encoded = EncodedPostingList::encode(&postings)?;
         let list = encoded.posting_list()?;
         let checkpoint = Arc::new(CancelOnNthAdmission::new(1));
-        let checkpoint_for_cursor: Arc<dyn QueryWorkCheckpoint> = checkpoint.clone();
-        let sealed = SealedPostingCursor::new(&list, u32::try_from(postings.len())?)?;
 
-        // `CheckpointPostingCursor` is not `Debug`, so the outcome is matched
-        // in place rather than unwrapped.
+        let refusal = CheckpointPostingCursor::admit_initial_block(checkpoint.as_ref(), true)
+            .expect_err("the construction permit must be refusable");
         assert!(
             matches!(
-                CheckpointPostingCursor::new(sealed, checkpoint_for_cursor),
-                Err(ArgusError::QueryCancelled {
+                refusal,
+                ArgusError::QueryCancelled {
                     phase: "checkpoint_cursor_unit_test"
-                })
+                }
             ),
-            "a refused construction admission must fail the cursor outright",
+            "expected the checkpoint's typed refusal, got {refusal:?}"
         );
         assert_eq!(
             checkpoint
                 .units_at_fire
                 .load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "construction admits the already-decoded first block"
+            "the construction permit carries the block construction will decode"
         );
         assert_eq!(
             checkpoint
                 .admissions
                 .load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "a refused construction must not admit twice"
+            "a refused construction permit must not admit twice"
+        );
+
+        // A term with nothing to decode is charged nothing, so an empty
+        // posting list cannot be refused for work it will never do.
+        let idle = Arc::new(CountingCheckpoint::default());
+        CheckpointPostingCursor::admit_initial_block(idle.as_ref(), false)?;
+        assert_eq!(
+            idle.admitted_units
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an empty term must not be charged for a decode it never performs"
+        );
+
+        // On the admitted path the cursor builds and its first move takes no
+        // permit, because construction already paid for the decoded block.
+        let admitting = Arc::new(CountingCheckpoint::default());
+        CheckpointPostingCursor::admit_initial_block(admitting.as_ref(), true)?;
+        let admitting_for_cursor: Arc<dyn QueryWorkCheckpoint> = admitting.clone();
+        let sealed = SealedPostingCursor::new(&list, u32::try_from(postings.len())?)?;
+        let mut cursor = CheckpointPostingCursor::new(sealed, admitting_for_cursor)?;
+        cursor.next()?;
+        assert_eq!(
+            admitting
+                .admitted_units
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an in-block first step adds no unit on top of the construction permit"
         );
         Ok(())
     }
@@ -6270,8 +6520,9 @@ mod tests {
         let encoded = EncodedPostingList::encode(&postings)?;
         let list = encoded.posting_list()?;
         let segment_num_docs = u32::try_from(postings.len())?;
-        // Admission 1 is construction; admission 2 is the first in-block step.
-        let checkpoint = Arc::new(CancelOnNthAdmission::new(2));
+        // Admission 1 is the first move's pre-move poll, so the refusal lands
+        // before the cursor has moved at all.
+        let checkpoint = Arc::new(CancelOnNthAdmission::new(1));
         let checkpoint_for_cursor: Arc<dyn QueryWorkCheckpoint> = checkpoint.clone();
         let sealed = SealedPostingCursor::new(&list, segment_num_docs)?;
         let mut cursor = CheckpointPostingCursor::new(sealed, checkpoint_for_cursor)?;
@@ -6293,7 +6544,10 @@ mod tests {
         let refused_admissions = checkpoint
             .admissions
             .load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(refused_admissions, 2);
+        assert_eq!(
+            refused_admissions, 1,
+            "the pre-move poll is refused before the move reaches a permit"
+        );
 
         for attempt in 0..2 {
             let repeated = cursor
@@ -6342,25 +6596,25 @@ mod tests {
         Ok(())
     }
 
-    /// Refuses with an exact fuel-exhaustion error on the second admission.
+    /// Refuses with an exact fuel-exhaustion error on the first admission.
     #[derive(Default)]
-    struct FuelExhaustedOnSecondAdmission {
+    struct FuelExhaustedOnFirstAdmission {
         admissions: std::sync::atomic::AtomicUsize,
     }
 
-    impl FuelExhaustedOnSecondAdmission {
+    impl FuelExhaustedOnFirstAdmission {
         const BUDGET: u64 = 7;
         const CONSUMED: u64 = 5;
         const POSTING_BLOCKS: u64 = 3;
     }
 
-    impl QueryWorkCheckpoint for FuelExhaustedOnSecondAdmission {
+    impl QueryWorkCheckpoint for FuelExhaustedOnFirstAdmission {
         fn admit(&self, _kind: QueryWorkKind, _units: u64) -> Result<(), ArgusError> {
             let ordinal = self
                 .admissions
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
                 + 1;
-            if ordinal == 2 {
+            if ordinal == 1 {
                 return Err(ArgusError::QueryFuelExhausted {
                     budget: Self::BUDGET,
                     consumed: Self::CONSUMED,
@@ -6389,7 +6643,7 @@ mod tests {
             .collect::<Vec<_>>();
         let encoded = EncodedPostingList::encode(&postings)?;
         let list = encoded.posting_list()?;
-        let checkpoint = Arc::new(FuelExhaustedOnSecondAdmission::new());
+        let checkpoint = Arc::new(FuelExhaustedOnFirstAdmission::default());
         let checkpoint_for_cursor: Arc<dyn QueryWorkCheckpoint> = checkpoint.clone();
         let sealed = SealedPostingCursor::new(&list, u32::try_from(postings.len())?)?;
         let mut cursor = CheckpointPostingCursor::new(sealed, checkpoint_for_cursor)?;
@@ -6403,11 +6657,11 @@ mod tests {
                 matches!(
                     error,
                     ArgusError::QueryFuelExhausted {
-                        budget: FuelExhaustedOnSecondAdmission::BUDGET,
-                        consumed: FuelExhaustedOnSecondAdmission::CONSUMED,
+                        budget: FuelExhaustedOnFirstAdmission::BUDGET,
+                        consumed: FuelExhaustedOnFirstAdmission::CONSUMED,
                         segments_touched: 1,
                         dictionary_blocks: 2,
-                        posting_blocks: FuelExhaustedOnSecondAdmission::POSTING_BLOCKS,
+                        posting_blocks: FuelExhaustedOnFirstAdmission::POSTING_BLOCKS,
                         position_docs: 0,
                     }
                 ),
@@ -6418,7 +6672,7 @@ mod tests {
             checkpoint
                 .admissions
                 .load(std::sync::atomic::Ordering::SeqCst),
-            2,
+            1,
             "the repeated refusal must come from the cursor, not from a fresh admission"
         );
         Ok(())
@@ -7109,8 +7363,11 @@ mod tests {
         fn current_work_block(&self) -> Option<u64> {
             self.inner.current_work_block()
         }
-        fn work_blocks_since(&self, previous: Option<u64>) -> u64 {
-            self.inner.work_blocks_since(previous)
+        fn block_permit_for_next(&self) -> u64 {
+            self.inner.block_permit_for_next()
+        }
+        fn block_permit_for_advance(&self, target: u32) -> u64 {
+            self.inner.block_permit_for_advance(target)
         }
     }
 
