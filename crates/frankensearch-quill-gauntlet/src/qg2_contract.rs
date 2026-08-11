@@ -419,7 +419,7 @@ const HYPEROPT_GROUP: [TextSurfaceSpec; 2] = [
 /// is what stops a coordinated rewrite of `name`, `fixture`, `target`, or
 /// `activated` from passing as the protected base while the typed contract
 /// still parses.
-pub(crate) const QG2_MANIFEST_BLOCK_PRE_REGION: &str = r#"[gate.QG-2]
+pub const QG2_MANIFEST_BLOCK_PRE_REGION: &str = r#"[gate.QG-2]
 name = "bulk indexing, single-thread"
 fixture = "medium; positions ON; threads = 1; commit included"
 target = "docs_per_sec >= 1.5x oracle"
@@ -435,7 +435,7 @@ activated = false
 /// quiescence scope, because a QG-2 fixture that still advertises commit-
 /// inclusive durable framing contradicts the contract in the same block.
 /// Rendering the table alone would leave that contradiction in place.
-pub(crate) const QG2_MANIFEST_BLOCK_POST_REGION: &str = r#"[gate.QG-2]
+pub const QG2_MANIFEST_BLOCK_POST_REGION: &str = r#"[gate.QG-2]
 name = "bulk indexing, single-thread"
 fixture = "medium; positions ON; threads = 1; continuous first-feed through terminal searchable visibility and complete worker/merge/queue quiescence"
 target = "docs_per_sec >= 1.5x oracle"
@@ -491,10 +491,61 @@ struct ManifestDocument {
     gate: BTreeMap<String, ManifestGate>,
 }
 
+/// One gate policy, closed against unknown fields.
+///
+/// A partial model would let an attacker park an unmodelled key inside
+/// `[gate.QG-2]` that the preflight never sees but the live consumer does, so
+/// the two could disagree about the same bytes. Every field the normative
+/// manifest may legitimately carry is declared here and checked below.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManifestGate {
     #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    fixture: Option<String>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    activated: Option<bool>,
+    #[serde(default)]
+    primary_target_cell_width: Option<u64>,
+    #[serde(default)]
+    queries_per_class: Option<u64>,
+    #[serde(default)]
     qg2_contract: Option<Qg2ComparatorContract>,
+}
+
+impl ManifestGate {
+    /// Every scalar a normative gate must declare, regardless of gate.
+    fn declares_required_scalars(&self) -> bool {
+        self.name.is_some() && self.target.is_some() && self.activated.is_some()
+    }
+
+    /// Whether the typed view agrees with the byte-determined QG-2 state.
+    ///
+    /// This is the cross-check that keeps the byte layer and the typed layer
+    /// from drifting apart: the parsed `fixture` must be the exact string the
+    /// matched protected block carries, and the nested contract must be present
+    /// exactly when that block is the applied one.
+    fn agrees_with_qg2_block(&self, block: &str, applied: bool) -> bool {
+        if !self.declares_required_scalars() {
+            return false;
+        }
+        let fixture_agrees = self
+            .fixture
+            .as_deref()
+            .is_some_and(|fixture| block.contains(&format!("fixture = \"{fixture}\"")));
+        let contract_agrees = if applied {
+            self.qg2_contract.as_ref() == Some(&Qg2ComparatorContract::canonical())
+        } else {
+            self.qg2_contract.is_none()
+        };
+        // QG-2 owns neither of these two gate-specific knobs.
+        let scope_agrees =
+            self.primary_target_cell_width.is_none() && self.queries_per_class.is_none();
+        fixture_agrees && contract_agrees && scope_agrees
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1841,14 +1892,39 @@ fn preflight_manifest(repo_root: &Path, builder: &mut PreflightBuilder) {
         }
     }
 
-    if drift.is_none()
-        && let Err(error) = toml::from_str::<ManifestDocument>(&source)
-    {
-        state = Qg2SelectorState::Drift;
-        drift = Some((
-            "qg2.preflight.manifest_parse",
-            format!("the manifest does not parse: {error}"),
-        ));
+    // The byte layer and the typed layer must agree about the same block. A
+    // manifest that parses, matches a protected block byte for byte, and still
+    // disagrees under its closed typed model is drift, not a pass.
+    if drift.is_none() {
+        match toml::from_str::<ManifestDocument>(&source) {
+            Err(error) => {
+                state = Qg2SelectorState::Drift;
+                drift = Some((
+                    "qg2.preflight.manifest_parse",
+                    format!("the manifest does not parse under the closed gate model: {error}"),
+                ));
+            }
+            Ok(document) => {
+                let applied = state == Qg2SelectorState::Applied;
+                let block = if applied {
+                    QG2_MANIFEST_BLOCK_POST_REGION
+                } else {
+                    QG2_MANIFEST_BLOCK_PRE_REGION
+                };
+                let agrees = document
+                    .gate
+                    .get("QG-2")
+                    .is_some_and(|gate| gate.agrees_with_qg2_block(block, applied));
+                if !agrees {
+                    state = Qg2SelectorState::Drift;
+                    drift = Some((
+                        "qg2.preflight.manifest_typed_disagreement",
+                        "the typed gate.QG-2 view disagrees with the byte-matched protected block"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
     }
 
     // Never hand a rendered poststate to a mutation without proving it parses
@@ -2249,10 +2325,10 @@ mod tests {
         fs::write(root.join(COMPREHENSIVE_PLAN_PATH), plan_document()).expect("plan fixture");
         fs::write(root.join(HYPEROPT_DOC_PATH), hyperopt_document()).expect("hyperopt fixture");
 
-        let manifest = format!(
-            "[gate.QG-2]\nname = \"bulk indexing, single-thread\"\nactivated = false\n\n[gate.QG-2.qg2_contract]\ncontract = {contract:?}\nstorage_topology = \"symmetric_in_memory\"\ndurability_scope = \"non_durable\"\ntiming_start = \"first_document_feed\"\ntiming_end = \"terminal_searchable_visibility_and_complete_worker_merge_queue_quiescence\"\ncommit_boundary = \"searchable_visibility_not_durable_publication\"\nexcluded_operations = [\"fsync\", \"F_FULLFSYNC\", \"crash_recovery\", \"durable_publication\", \"on_disk_bytes\"]\nsource_nonregression = \"durable_gates_and_production_source_durability_remain_mandatory\"\n",
-            contract = QG2_CANONICAL_CONTRACT
-        );
+        // The applied fixture carries the *protected* projected block verbatim,
+        // so the applied-state tests bind the same bytes the live tree must
+        // reach rather than a hand-written lookalike.
+        let manifest = applied_manifest();
         fs::write(root.join(PERF_MANIFEST_PATH), &manifest).expect("manifest fixture");
 
         let mut tracker = String::new();
@@ -2867,14 +2943,21 @@ mod tests {
 
     /// Manifest at the protected base: `[gate.QG-2]` followed immediately by
     /// `[gate.QG-3]`, with no nested contract table.
+    const MANIFEST_HEAD: &str =
+        "[gate.QG-1]\nname = \"bulk indexing, multi-core\"\nactivated = false\n\n";
+    const MANIFEST_TAIL: &str =
+        "[gate.QG-3]\nname = \"watch-mode incremental\"\nactivated = false\n";
+
+    /// Manifest at the protected base. The QG-2 block is the protected block
+    /// verbatim, not a lookalike, so the fixture exercises the same byte
+    /// identity the live tree must have.
     fn bootstrap_manifest() -> String {
-        // The QG-2 block is the *protected* block verbatim, not a lookalike, so
-        // the fixture exercises the same byte identity the live tree must have.
-        format!(
-            "[gate.QG-1]\nname = \"bulk indexing, multi-core\"\nactivated = false\n\n\
-             {QG2_MANIFEST_BLOCK_PRE_REGION}\
-             [gate.QG-3]\nname = \"watch-mode incremental\"\nactivated = false\n"
-        )
+        format!("{MANIFEST_HEAD}{QG2_MANIFEST_BLOCK_PRE_REGION}{MANIFEST_TAIL}")
+    }
+
+    /// The same manifest once the protected projection is applied.
+    fn applied_manifest() -> String {
+        format!("{MANIFEST_HEAD}{QG2_MANIFEST_BLOCK_POST_REGION}{MANIFEST_TAIL}")
     }
 
     /// The three documents at the protected base: both renamed law headings

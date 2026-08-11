@@ -214,7 +214,8 @@ pub use privacy::{
 };
 pub use qg2_contract::{
     QG2_CANONICAL_CONTRACT, QG2_CONTRACT_REPORT_SCHEMA_VERSION, QG2_LOGICAL_SURFACE_COUNT,
-    QG2_NO_CLAIM, QG2_PHYSICAL_LOCATOR_COUNT, QG2_PREFLIGHT_REPORT_SCHEMA_VERSION,
+    QG2_MANIFEST_BLOCK_POST_REGION, QG2_MANIFEST_BLOCK_PRE_REGION, QG2_NO_CLAIM,
+    QG2_PHYSICAL_LOCATOR_COUNT, QG2_PREFLIGHT_REPORT_SCHEMA_VERSION,
     QG2_SENTINEL_COUNT, Qg2CommitBoundary, Qg2ComparatorContract, Qg2ContractDivergence,
     Qg2ContractReport, Qg2ContractStatus, Qg2DurabilityScope, Qg2ExcludedOperation,
     Qg2PreflightReport, Qg2PreflightState, Qg2PreservedValueReceipt, Qg2SelectorReceipt,

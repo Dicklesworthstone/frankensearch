@@ -5,8 +5,13 @@ use std::process::{Command, Output};
 
 use frankensearch_quill_gauntlet::{
     PerfGate, PerfGateArtifact, QG2_CANONICAL_CONTRACT, QG2_CONTRACT_REPORT_SCHEMA_VERSION,
-    QG2_NO_CLAIM, QG2_PREFLIGHT_REPORT_SCHEMA_VERSION, perf_manifest_contract_sha256,
+    QG2_MANIFEST_BLOCK_POST_REGION, QG2_MANIFEST_BLOCK_PRE_REGION, QG2_NO_CLAIM,
+    QG2_PREFLIGHT_REPORT_SCHEMA_VERSION, perf_manifest_contract_sha256,
 };
+
+const MANIFEST_HEAD: &str =
+    "[gate.QG-1]\nname = \"bulk indexing, multi-core\"\nactivated = false\n\n";
+const MANIFEST_TAIL: &str = "[gate.QG-3]\nname = \"watch-mode incremental\"\nactivated = false\n";
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -85,10 +90,9 @@ fn complete_contract_fixture() -> TempDir {
     )
     .expect("hyperopt fixture");
 
-    let manifest = format!(
-        "[gate.QG-2]\nname = \"bulk indexing, single-thread\"\nactivated = false\n\n[gate.QG-2.qg2_contract]\ncontract = {contract:?}\nstorage_topology = \"symmetric_in_memory\"\ndurability_scope = \"non_durable\"\ntiming_start = \"first_document_feed\"\ntiming_end = \"terminal_searchable_visibility_and_complete_worker_merge_queue_quiescence\"\ncommit_boundary = \"searchable_visibility_not_durable_publication\"\nexcluded_operations = [\"fsync\", \"F_FULLFSYNC\", \"crash_recovery\", \"durable_publication\", \"on_disk_bytes\"]\nsource_nonregression = \"durable_gates_and_production_source_durability_remain_mandatory\"\n",
-        contract = QG2_CANONICAL_CONTRACT
-    );
+    // The protected projected block verbatim, so the fresh-process fixture
+    // binds the same bytes the live tree must reach.
+    let manifest = format!("{MANIFEST_HEAD}{QG2_MANIFEST_BLOCK_POST_REGION}{MANIFEST_TAIL}");
     fs::write(root.join("docs/contracts/quill-perf-gates.toml"), &manifest)
         .expect("manifest fixture");
 
@@ -306,16 +310,7 @@ fn revert_to_bootstrap(root: &std::path::Path) -> String {
     )
     .expect("bootstrap hyperopt");
 
-    let manifest = concat!(
-        "[gate.QG-2]\n",
-        "name = \"bulk indexing, single-thread\"\n",
-        "activated = false\n",
-        "\n",
-        "[gate.QG-3]\n",
-        "name = \"watch-mode incremental\"\n",
-        "activated = false\n",
-    )
-    .to_owned();
+    let manifest = format!("{MANIFEST_HEAD}{QG2_MANIFEST_BLOCK_PRE_REGION}{MANIFEST_TAIL}");
     fs::write(root.join("docs/contracts/quill-perf-gates.toml"), &manifest)
         .expect("bootstrap manifest");
 
