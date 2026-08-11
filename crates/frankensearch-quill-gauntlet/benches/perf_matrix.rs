@@ -1199,9 +1199,13 @@ fn qg1_live_sample_binding(
     provenance: &PerfSampleProvenance,
     stream_role: &str,
     stream_sequence: u64,
+    expected_stream_row_count: u64,
+    expected_pair_count: u64,
+    trusted_cell_input_sha256: &str,
     sample_id: u64,
     block_id: u64,
     arm: PerfSampleArm,
+    order: PerfSampleOrder,
 ) -> Option<Qg1SampleBinding> {
     let continuous = continuous?;
     let receipt = &continuous.lifecycle_receipt;
@@ -1274,13 +1278,17 @@ fn qg1_live_sample_binding(
         stream_role: stream_role.to_owned(),
         stream_id_sha256: String::new(),
         stream_sequence,
+        expected_stream_row_count,
+        expected_pair_count,
         raw_sample_id: sample_id,
         raw_block_id: block_id,
         raw_arm: arm,
+        raw_order: order,
         lifecycle_receipt_id_sha256: String::new(),
         lifecycle_receipt_sha256: String::new(),
         prepared_corpus_sha256: provenance.corpus_sha256.clone(),
         prepared_input_sha256: String::new(),
+        trusted_cell_input_sha256: trusted_cell_input_sha256.to_owned(),
         prepared_manifest_sha256: receipt.prepared_input.manifest_sha256.clone(),
         indexed_content_sha256: receipt.prepared_input.indexed_content_sha256.clone(),
         document_count: receipt.prepared_input.document_count,
@@ -1299,6 +1307,20 @@ fn qg1_live_sample_binding(
         terminal_endpoint_ns: receipt.interval_ended_ns,
         lifecycle_witness,
     };
+    let observed_trusted_cell_input_sha256 = Qg1SampleBinding::trusted_cell_input_sha256(
+        scope,
+        provenance,
+        &binding.prepared_manifest_sha256,
+        &binding.indexed_content_sha256,
+        binding.document_count,
+        binding.content_bytes,
+        binding.prepared_batch_count,
+        &binding.batch_coverage,
+        &binding.tail_document_id,
+    );
+    if binding.trusted_cell_input_sha256 != observed_trusted_cell_input_sha256 {
+        return None;
+    }
     binding.seal_lifecycle_receipt(scope, provenance);
     Some(binding)
 }
@@ -3604,6 +3626,56 @@ fn raw_sample_work(context: &BenchContext, spec: &PerfCellSpec) -> (Option<u64>,
     )
 }
 
+/// Freeze the exact prepared QG-1 input before warmup or measurement. The
+/// resulting identity is an expected per-cell value, not a per-row receipt
+/// digest: every lifecycle binding must reproduce it from the input it used.
+fn qg1_prepared_cell_input_identity(
+    context: &BenchContext,
+    spec: &PerfCellSpec,
+    scope: &PerfOperationScope,
+    provenance: &PerfSampleProvenance,
+) -> Option<String> {
+    if qg1_producer_coverage(spec) != Some(Qg1ProducerCoverage::EngineIndexingLifecycle) {
+        return None;
+    }
+    let document_count = context
+        .scale
+        .document_count(spec.document_count.expect("QG-1 throughput document count"));
+    let prepared = context.qg1_sample_input(document_count);
+    let mut next_document = 0_u64;
+    let batch_coverage = prepared
+        .batches
+        .iter()
+        .map(|batch| {
+            let document_count =
+                u64::try_from(batch.len()).expect("QG-1 prepared batch length fits u64");
+            let coverage = Qg1BatchCoverage {
+                document_start: next_document,
+                document_count,
+            };
+            next_document = next_document
+                .checked_add(document_count)
+                .expect("QG-1 prepared batch coverage fits u64");
+            coverage
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        next_document, prepared.binding.document_count,
+        "QG-1 trusted cell identity must cover the complete prepared input"
+    );
+    Some(Qg1SampleBinding::trusted_cell_input_sha256(
+        scope,
+        provenance,
+        &prepared.binding.manifest_sha256,
+        &prepared.binding.indexed_content_sha256,
+        prepared.binding.document_count,
+        prepared.binding.content_bytes,
+        prepared.binding.batch_count,
+        &batch_coverage,
+        &prepared.binding.tail_document_id,
+    ))
+}
+
 /// Resolve a raw QG-1 denominator from the prepared input the continuous
 /// measurement actually consumed.  A separately recomputed work/byte pair is
 /// allowed only when it is exactly equal; otherwise the sample is rejected
@@ -3774,6 +3846,7 @@ struct PairedStreamRunner<'a> {
     order: Vec<PerfSampleArm>,
     work_units: Option<u64>,
     byte_count: Option<u64>,
+    qg1_trusted_cell_input_sha256: Option<String>,
     samples: Vec<PerfRawSample>,
 }
 
@@ -3789,6 +3862,8 @@ impl<'a> PairedStreamRunner<'a> {
         let order =
             seeded_balanced_pair_order(plan.rounds, plan.seed).expect("paired order schedule");
         let (work_units, byte_count) = raw_sample_work(context, spec);
+        let qg1_trusted_cell_input_sha256 =
+            qg1_prepared_cell_input_identity(context, spec, scope, &evidence.sample_provenance);
         for _ in 0..evidence.policy.warmup_rounds {
             let _ = black_box(measure_metric_with_query(
                 context,
@@ -3814,6 +3889,7 @@ impl<'a> PairedStreamRunner<'a> {
             order,
             work_units,
             byte_count,
+            qg1_trusted_cell_input_sha256,
             samples,
         }
     }
@@ -3902,6 +3978,21 @@ impl<'a> PairedStreamRunner<'a> {
         let qg1_sample_binding = if qg1_producer_coverage(self.spec)
             == Some(Qg1ProducerCoverage::EngineIndexingLifecycle)
         {
+            let stream_sequence = block_id
+                .checked_sub(self.plan.block_id_base)
+                .and_then(|round| round.checked_mul(2))
+                .and_then(|sequence| {
+                    sequence.checked_add(match sample_order {
+                        PerfSampleOrder::First => 0,
+                        PerfSampleOrder::Second => 1,
+                    })
+                })
+                .expect("QG-1 raw-order stream sequence fits u64");
+            let expected_pair_count =
+                u64::try_from(self.plan.rounds).expect("QG-1 pair count fits u64");
+            let expected_stream_row_count = expected_pair_count
+                .checked_mul(2)
+                .expect("QG-1 stream row count fits u64");
             qg1_live_sample_binding(
                 measurement.continuous.as_ref(),
                 window.ended_ns - window.started_ns,
@@ -3910,12 +4001,16 @@ impl<'a> PairedStreamRunner<'a> {
                 self.plan
                     .qg1_stream_role
                     .expect("QG-1 paired stream has one canonical role"),
-                sample_id
-                    .checked_sub(self.plan.sample_id_base)
-                    .expect("QG-1 sample ID belongs to its stream"),
+                stream_sequence,
+                expected_stream_row_count,
+                expected_pair_count,
+                self.qg1_trusted_cell_input_sha256
+                    .as_deref()
+                    .expect("QG-1 producer has a pre-timing trusted cell input identity"),
                 sample_id,
                 block_id,
                 sample_arm,
+                sample_order,
             )
         } else {
             None
@@ -3987,9 +4082,11 @@ fn validate_qg1_three_stream_prepared_identity(
         })?;
         if binding.prepared_corpus_sha256 != first.prepared_corpus_sha256
             || binding.prepared_input_sha256 != first.prepared_input_sha256
+            || binding.trusted_cell_input_sha256 != first.trusted_cell_input_sha256
         {
             return Err(
-                "QG-1 effect and both null streams disagree on frozen prepared input".to_owned(),
+                "QG-1 effect and both null streams disagree on frozen trusted prepared input"
+                    .to_owned(),
             );
         }
     }
@@ -6412,6 +6509,25 @@ mod tests {
                                     sample_id: u64,
                                     block_id: u64,
                                     arm: PerfSampleArm| {
+            let batch_coverage = receipt
+                .batches
+                .iter()
+                .map(|batch| Qg1BatchCoverage {
+                    document_start: batch.document_start,
+                    document_count: batch.document_count,
+                })
+                .collect::<Vec<_>>();
+            let trusted_cell_input_sha256 = Qg1SampleBinding::trusted_cell_input_sha256(
+                &scope,
+                &provenance,
+                &receipt.prepared_input.manifest_sha256,
+                &receipt.prepared_input.indexed_content_sha256,
+                receipt.prepared_input.document_count,
+                receipt.prepared_input.content_bytes,
+                receipt.prepared_input.batch_count,
+                &batch_coverage,
+                &receipt.prepared_input.tail_document_id,
+            );
             let continuous = super::Qg1ContinuousMeasurement {
                 work_units: receipt.document_count,
                 origin: std::time::Instant::now(),
@@ -6426,9 +6542,16 @@ mod tests {
                 &provenance,
                 stream_role,
                 stream_sequence,
+                20,
+                10,
+                &trusted_cell_input_sha256,
                 sample_id,
                 block_id,
                 arm,
+                match arm {
+                    PerfSampleArm::Control => PerfSampleOrder::First,
+                    PerfSampleArm::Treatment => PerfSampleOrder::Second,
+                },
             )
         };
         let proved_binding = binding_from_receipt(
