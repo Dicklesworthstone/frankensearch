@@ -6,12 +6,34 @@ use std::process::{Command, Output};
 use frankensearch_quill_gauntlet::{
     PerfGate, PerfGateArtifact, QG2_CANONICAL_CONTRACT, QG2_CONTRACT_REPORT_SCHEMA_VERSION,
     QG2_MANIFEST_BLOCK_POST_REGION, QG2_MANIFEST_BLOCK_PRE_REGION, QG2_NO_CLAIM,
-    QG2_PREFLIGHT_REPORT_SCHEMA_VERSION, perf_manifest_contract_sha256,
+    QG2_PREFLIGHT_REPORT_SCHEMA_VERSION, QG6_QUERY_GROUPS, perf_manifest_contract_sha256,
 };
 
-const MANIFEST_HEAD: &str =
-    "[gate.QG-1]\nname = \"bulk indexing, multi-core\"\nactivated = false\n\n";
-const MANIFEST_TAIL: &str = "[gate.QG-3]\nname = \"watch-mode incremental\"\nactivated = false\n";
+/// A manifest carrying every normative gate, with the given protected block
+/// verbatim in the QG-2 position, so the fresh-process fixture satisfies the
+/// same topology the live consumer requires.
+fn manifest_with_qg2_block(block: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut manifest = String::new();
+    for gate in PerfGate::ALL {
+        if gate == PerfGate::Qg2 {
+            manifest.push_str(block);
+            continue;
+        }
+        let label = gate.label();
+        let _ = write!(
+            &mut manifest,
+            "[gate.{label}]\nname = \"{label} gate\"\nfixture = \"{label} fixture\"\n\
+             target = \"{label} target\"\n"
+        );
+        if gate == PerfGate::Qg6 {
+            let _ = writeln!(&mut manifest, "queries_per_class = {QG6_QUERY_GROUPS}");
+        }
+        manifest.push_str("activated = false\n\n");
+    }
+    manifest
+}
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -92,7 +114,7 @@ fn complete_contract_fixture() -> TempDir {
 
     // The protected projected block verbatim, so the fresh-process fixture
     // binds the same bytes the live tree must reach.
-    let manifest = format!("{MANIFEST_HEAD}{QG2_MANIFEST_BLOCK_POST_REGION}{MANIFEST_TAIL}");
+    let manifest = manifest_with_qg2_block(QG2_MANIFEST_BLOCK_POST_REGION);
     fs::write(root.join("docs/contracts/quill-perf-gates.toml"), &manifest)
         .expect("manifest fixture");
 
@@ -310,7 +332,7 @@ fn revert_to_bootstrap(root: &std::path::Path) -> String {
     )
     .expect("bootstrap hyperopt");
 
-    let manifest = format!("{MANIFEST_HEAD}{QG2_MANIFEST_BLOCK_PRE_REGION}{MANIFEST_TAIL}");
+    let manifest = manifest_with_qg2_block(QG2_MANIFEST_BLOCK_PRE_REGION);
     fs::write(root.join("docs/contracts/quill-perf-gates.toml"), &manifest)
         .expect("bootstrap manifest");
 

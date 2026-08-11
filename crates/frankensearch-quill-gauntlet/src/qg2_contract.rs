@@ -517,6 +517,28 @@ struct ManifestGate {
 }
 
 impl ManifestGate {
+    /// Field names this gate actually declares, for placement checking.
+    fn declared_fields(&self) -> Vec<&'static str> {
+        let mut declared = Vec::with_capacity(7);
+        for (field, present) in [
+            ("name", self.name.is_some()),
+            ("fixture", self.fixture.is_some()),
+            ("target", self.target.is_some()),
+            ("activated", self.activated.is_some()),
+            (
+                "primary_target_cell_width",
+                self.primary_target_cell_width.is_some(),
+            ),
+            ("queries_per_class", self.queries_per_class.is_some()),
+            ("qg2_contract", self.qg2_contract.is_some()),
+        ] {
+            if present {
+                declared.push(field);
+            }
+        }
+        declared
+    }
+
     /// Every scalar a normative gate must declare, regardless of gate.
     fn declares_required_scalars(&self) -> bool {
         self.name.is_some() && self.target.is_some() && self.activated.is_some()
@@ -950,20 +972,7 @@ fn manifest_block_agreement(source: &str, applied: bool) -> Result<(), String> {
     let document = toml::from_str::<ManifestDocument>(source).map_err(|error| {
         format!("the manifest does not parse under the closed gate model: {error}")
     })?;
-    let normative = PerfGate::ALL
-        .iter()
-        .map(|gate| gate.label())
-        .collect::<BTreeSet<_>>();
-    for (label, gate) in &document.gate {
-        if !normative.contains(label.as_str()) {
-            return Err(format!("manifest defines unexpected gate.{label}"));
-        }
-        if label != "QG-2" && gate.qg2_contract.is_some() {
-            return Err(format!(
-                "gate.{label} declares a qg2_contract table that only QG-2 may carry"
-            ));
-        }
-    }
+    manifest_topology_parity(&document)?;
     if document
         .gate
         .get("QG-2")
@@ -978,6 +987,92 @@ fn manifest_block_agreement(source: &str, applied: bool) -> Result<(), String> {
 /// Agreement for the applied side, used by the applied-state validator.
 fn applied_manifest_block_agreement(source: &str) -> Result<(), String> {
     manifest_block_agreement(source, true)
+}
+
+/// Fields each normative gate may declare, mirroring the live consumer's
+/// per-gate allowlist exactly.
+///
+/// The typed model is necessarily a *union* of every gate's fields, so without
+/// this placement table a QG-1-only knob on QG-3 — or a QG-6 count on QG-2 —
+/// parses cleanly here while the consumer rejects it as an unexpected field.
+const fn gate_field_placement(gate: PerfGate) -> &'static [&'static str] {
+    match gate {
+        PerfGate::Qg1 => &[
+            "name",
+            "fixture",
+            "target",
+            "primary_target_cell_width",
+            "activated",
+        ],
+        PerfGate::Qg2 => &["name", "fixture", "target", "activated", "qg2_contract"],
+        PerfGate::Qg6 => &[
+            "name",
+            "fixture",
+            "queries_per_class",
+            "target",
+            "activated",
+        ],
+        _ => &["name", "fixture", "target", "activated"],
+    }
+}
+
+/// Require the same gate topology and field placement the live consumer does.
+///
+/// Byte-binding the QG-2 block says nothing about the other nine gates, so a
+/// manifest could satisfy the Q2C selector and still be refused by planning.
+/// These are the consumer's rules restated over the typed model: every
+/// normative gate present, `name`/`fixture`/`target` non-empty, `activated`
+/// boolean, the frozen QG-6 group count, no field outside its gate's
+/// allowlist, and no gate label the normative set does not define.
+fn manifest_topology_parity(document: &ManifestDocument) -> Result<(), String> {
+    for gate in PerfGate::ALL {
+        let label = gate.label();
+        let Some(policy) = document.gate.get(label) else {
+            return Err(format!("manifest gate.{label} is missing or not a table"));
+        };
+        for (field, value) in [
+            ("name", &policy.name),
+            ("fixture", &policy.fixture),
+            ("target", &policy.target),
+        ] {
+            if !value
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                return Err(format!("manifest gate.{label}.{field} is missing or empty"));
+            }
+        }
+        if policy.activated.is_none() {
+            return Err(format!(
+                "manifest gate.{label}.activated is missing or not boolean"
+            ));
+        }
+        if gate == PerfGate::Qg6
+            && policy
+                .queries_per_class
+                .and_then(|count| usize::try_from(count).ok())
+                != Some(crate::QG6_QUERY_GROUPS)
+        {
+            return Err(format!(
+                "manifest gate.{label}.queries_per_class must equal the frozen QG-6 group count {}",
+                crate::QG6_QUERY_GROUPS
+            ));
+        }
+        let allowed = gate_field_placement(gate);
+        for field in policy.declared_fields() {
+            if !allowed.contains(&field) {
+                return Err(format!(
+                    "manifest gate.{label} defines unexpected field {field}"
+                ));
+            }
+        }
+    }
+    for label in document.gate.keys() {
+        if !PerfGate::ALL.iter().any(|gate| gate.label() == label) {
+            return Err(format!("manifest defines unexpected gate.{label}"));
+        }
+    }
+    Ok(())
 }
 
 fn validate_manifest_surface(repo_root: &Path, report: &mut ReportBuilder) {
@@ -3003,21 +3098,47 @@ mod tests {
 
     /// Manifest at the protected base: `[gate.QG-2]` followed immediately by
     /// `[gate.QG-3]`, with no nested contract table.
-    const MANIFEST_HEAD: &str =
-        "[gate.QG-1]\nname = \"bulk indexing, multi-core\"\nactivated = false\n\n";
-    const MANIFEST_TAIL: &str =
-        "[gate.QG-3]\nname = \"watch-mode incremental\"\nactivated = false\n";
+    /// A manifest carrying every normative gate, with the given protected block
+    /// verbatim in the QG-2 position.
+    ///
+    /// The fixture must satisfy the same topology the live consumer requires —
+    /// all ten gates, non-empty scalars, the frozen QG-6 count — or the tests
+    /// would be exercising a manifest planning would refuse.
+    fn manifest_with_qg2_block(block: &str) -> String {
+        let mut manifest = String::new();
+        for gate in PerfGate::ALL {
+            if gate == PerfGate::Qg2 {
+                manifest.push_str(block);
+                continue;
+            }
+            let label = gate.label();
+            let _ = write!(
+                &mut manifest,
+                "[gate.{label}]\nname = \"{label} gate\"\nfixture = \"{label} fixture\"\n\
+                 target = \"{label} target\"\n"
+            );
+            if gate == PerfGate::Qg6 {
+                let _ = writeln!(
+                    &mut manifest,
+                    "queries_per_class = {}",
+                    crate::QG6_QUERY_GROUPS
+                );
+            }
+            manifest.push_str("activated = false\n\n");
+        }
+        manifest
+    }
 
     /// Manifest at the protected base. The QG-2 block is the protected block
     /// verbatim, not a lookalike, so the fixture exercises the same byte
     /// identity the live tree must have.
     fn bootstrap_manifest() -> String {
-        format!("{MANIFEST_HEAD}{QG2_MANIFEST_BLOCK_PRE_REGION}{MANIFEST_TAIL}")
+        manifest_with_qg2_block(QG2_MANIFEST_BLOCK_PRE_REGION)
     }
 
     /// The same manifest once the protected projection is applied.
     fn applied_manifest() -> String {
-        format!("{MANIFEST_HEAD}{QG2_MANIFEST_BLOCK_POST_REGION}{MANIFEST_TAIL}")
+        manifest_with_qg2_block(QG2_MANIFEST_BLOCK_POST_REGION)
     }
 
     /// The three documents at the protected base: both renamed law headings
@@ -3272,6 +3393,80 @@ mod tests {
                     .any(|divergence| divergence.code == "qg2.manifest.projected_block"),
                 "{label} unexpectedly passed: {:#?}",
                 report.divergences
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_topology_and_field_placement_match_the_live_consumer() {
+        // Byte-binding the QG-2 block says nothing about the other nine gates,
+        // so each of these satisfied the Q2C selector while planning would have
+        // refused the same file. Parity means both readers reject all of them.
+        let applied = applied_manifest();
+        for (label, mutated) in [
+            (
+                "a missing normative gate",
+                applied.replacen("[gate.QG-10]", "[omitted.QG-10]", 1),
+            ),
+            (
+                "an empty required scalar on a non-QG-2 gate",
+                applied.replacen("target = \"QG-5 target\"", "target = \"   \"", 1),
+            ),
+            (
+                "a missing required scalar on a non-QG-2 gate",
+                applied.replacen("fixture = \"QG-4 fixture\"\n", "", 1),
+            ),
+            (
+                "a missing activated flag",
+                applied.replacen(
+                    "target = \"QG-7 target\"\nactivated = false",
+                    "target = \"QG-7 target\"",
+                    1,
+                ),
+            ),
+            (
+                "a wrong frozen QG-6 group count",
+                applied.replacen(
+                    &format!("queries_per_class = {}", crate::QG6_QUERY_GROUPS),
+                    "queries_per_class = 4",
+                    1,
+                ),
+            ),
+            (
+                "a QG-1-only field placed on another gate",
+                applied.replacen(
+                    "target = \"QG-9 target\"\n",
+                    "target = \"QG-9 target\"\nprimary_target_cell_width = 8\n",
+                    1,
+                ),
+            ),
+            (
+                "a QG-6-only field placed on another gate",
+                applied.replacen(
+                    "target = \"QG-8 target\"\n",
+                    "target = \"QG-8 target\"\nqueries_per_class = 16\n",
+                    1,
+                ),
+            ),
+        ] {
+            assert_ne!(mutated, applied, "{label} mutation must apply");
+            assert!(
+                manifest_block_agreement(&mutated, true).is_err(),
+                "{label} must fail the shared agreement"
+            );
+            let fixture = complete_fixture();
+            fs::write(fixture.path(PERF_MANIFEST_PATH), &mutated).expect("parity mutation");
+            assert!(
+                validate_qg2_contract(fixture.root())
+                    .divergences
+                    .iter()
+                    .any(|divergence| divergence.code == "qg2.manifest.projected_block"),
+                "{label} unexpectedly passed the applied validator"
+            );
+            assert_eq!(
+                validate_qg2_preflight(fixture.root()).state,
+                Qg2PreflightState::Drift,
+                "{label} unexpectedly passed the preflight"
             );
         }
     }

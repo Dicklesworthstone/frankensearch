@@ -43,7 +43,7 @@
     "discovered_physical_locators": 9,
     "validated_physical_locators": 9
   },
-  "manifest_sha256": "d4dce97bb3e78c50b55729eebad8abc16811e6287b42ab93c57f66bf8fed8474",
+  "manifest_sha256": "632ac8d194cc674823b958901ca9d1e2799629684ad8f20e0b9c60ba0c435c49",
   "sentinels": {
     "expected": 10,
     "discovered": 10,
