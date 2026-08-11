@@ -24,10 +24,17 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{PerfGate, PerfGateArtifact, is_explicit_bootstrap, perf_manifest_contract_sha256};
+use crate::{
+    PerfGate, PerfGateArtifact, is_explicit_bootstrap, is_explicit_bootstrap_for,
+    perf_manifest_contract_sha256,
+};
 
 /// Version of the fresh-process QG-2 contract validation report.
 pub const QG2_CONTRACT_REPORT_SCHEMA_VERSION: &str = "frankensearch.quill-qg2-contract-report.v1";
+/// Version of the fresh-process QG-2 bootstrap preflight report.
+pub const QG2_PREFLIGHT_REPORT_SCHEMA_VERSION: &str = "frankensearch.quill-qg2-preflight-report.v1";
+/// Fixed no-claim status bound into every preflight receipt.
+pub const QG2_NO_CLAIM: &str = "Q2C binds contract identity only. It admits no performance evidence and authorizes no gate activation, target satisfaction, or speed claim.";
 /// Exact normative QG-2 clause shared by every authoritative physical locator.
 pub const QG2_CANONICAL_CONTRACT: &str = "BINDING Q2C COMPARATOR CONTRACT 2026-07-31: QG-2 compares both arms symmetrically in memory with no durable storage. Continuous timing begins at the first document feed and ends only after terminal searchable visibility plus complete worker, merge, and queue quiescence. Commit is the searchable-visibility boundary, not durable publication. QG-2 excludes fsync, F_FULLFSYNC, crash recovery, durable publication, and on-disk-byte measurements. Durable gates and production-source durability nonregression remain mandatory outside QG-2.";
 /// Number of independent normative QG-2 contract surfaces.
@@ -57,6 +64,8 @@ const MANIFEST_RETRY: &str = "Restore the typed gate.QG-2.qg2_contract table, se
 const TRACKER_RETRY: &str = "Restore the binding active tracker note without rewriting historical comments, then rerun quill-qg2-contract.";
 const STALE_RETRY: &str = "Keep the stale phrase append-only behind its binding supersession; do not promote it into an active field.";
 const SENTINEL_RETRY: &str = "After final TOML bytes settle, recompute the normalized manifest SHA-256 and change only manifest_sha256 in all ten unmeasured sentinels.";
+const PREFLIGHT_DRIFT_RETRY: &str = "Restore the protected bootstrap state at the named selector, or apply the canonical contract to every selector; a tree split across both fails closed.";
+const PREFLIGHT_RENDER_RETRY: &str = "Fix the rendered QG-2 contract table so it parses back to the canonical typed contract, then rerun the preflight.";
 
 /// Storage topology admitted by the QG-2 comparator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,8 +341,24 @@ struct TextSurfaceSpec {
     logical_surface: &'static str,
     locator: &'static str,
     path: &'static str,
+    /// Start anchor of the bounded region at the protected bootstrap base.
+    ///
+    /// Two selectors rename their law heading as part of the correction, so
+    /// their PRE and POST start anchors are different, mutually exclusive
+    /// strings. For the other three the anchor survives the correction and
+    /// this equals `region_start`; those selectors are told apart purely by
+    /// whether the bounded region carries the canonical clause.
+    pre_region_start: &'static str,
+    /// Start anchor of the bounded region once the correction is applied.
     region_start: &'static str,
     region_end: &'static str,
+}
+
+impl TextSurfaceSpec {
+    /// Whether applying the correction also renames this region's start anchor.
+    fn anchors_differ(self) -> bool {
+        self.pre_region_start != self.region_start
+    }
 }
 
 /// Sole locator of logical surface 1, in the performance-gate law list.
@@ -341,6 +366,7 @@ const PERF_GATES_GROUP: [TextSurfaceSpec; 1] = [TextSurfaceSpec {
     logical_surface: "performance_gate_law_1",
     locator: "perf_gate_law_1",
     path: PERF_GATES_DOC_PATH,
+    pre_region_start: "1. **No benchmark-only semantics.**",
     region_start: "1. **No benchmark-only semantics; comparator scope is explicit.**",
     region_end: "2. **Distributions, not averages.**",
 }];
@@ -351,6 +377,7 @@ const PLAN_GROUP: [TextSurfaceSpec; 2] = [
         logical_surface: "comprehensive_plan_qg2",
         locator: "comprehensive_plan_qg2_row",
         path: COMPREHENSIVE_PLAN_PATH,
+        pre_region_start: "| **QG-2 Bulk indexing, single-thread**",
         region_start: "| **QG-2 Bulk indexing, single-thread**",
         region_end: "| **QG-3 Watch-mode incremental**",
     },
@@ -358,6 +385,7 @@ const PLAN_GROUP: [TextSurfaceSpec; 2] = [
         logical_surface: "comprehensive_plan_qg2",
         locator: "comprehensive_plan_method_law_1",
         path: COMPREHENSIVE_PLAN_PATH,
+        pre_region_start: "Method: the five standing laws \u{2014}",
         region_start: "Method: the five standing laws \u{2014}",
         region_end: "## 15. The Conformance Gauntlet (Bet Q5)",
     },
@@ -370,6 +398,7 @@ const HYPEROPT_GROUP: [TextSurfaceSpec; 2] = [
         logical_surface: "hyperopt_law_7_and_epic",
         locator: "hyperopt_law_7",
         path: HYPEROPT_DOC_PATH,
+        pre_region_start: "7. **Platform-symmetric durability.**",
         region_start: "7. **QG-2 comparator scope and platform durability.**",
         region_end: "## 2. Hardware/profile matrix",
     },
@@ -377,9 +406,32 @@ const HYPEROPT_GROUP: [TextSurfaceSpec; 2] = [
         logical_surface: "hyperopt_law_7_and_epic",
         locator: "hyperopt_w2_fsync_row",
         path: HYPEROPT_DOC_PATH,
+        pre_region_start: "| Commit-path fsync count |",
         region_start: "| Commit-path fsync count |",
         region_end: "### W3 \u{2014} Parallel scale-out",
     },
+];
+
+/// The three tracker selectors, as `(logical surface, locator, issue id)`.
+///
+/// Single source of truth for both the applied-state validator and the
+/// bootstrap preflight, so the two can never bind different issue identities.
+const TRACKER_SELECTORS: [(&str, &str, &str); 3] = [
+    (
+        "hyperopt_law_7_and_epic",
+        "hyperopt_epic_active_contract",
+        "bd-quill-e8-hyperopt-nyps",
+    ),
+    (
+        "qg2_r1_quarantine",
+        "qg2_r1_active_contract",
+        "bd-quill-e8-perf-doctrine-x4e4.5.5",
+    ),
+    (
+        "gate_activation_scope",
+        "gate_activation_active_contract",
+        "bd-h6eh",
+    ),
 ];
 
 /// Exact one-to-many grouping of the nine physical locators over the six
@@ -508,15 +560,15 @@ impl ReportBuilder {
             self.dropped_divergences = self.dropped_divergences.saturating_add(1);
             return;
         }
-        self.divergences.push(Qg2ContractDivergence {
-            code: bounded(code, MAX_DIAGNOSTIC_BYTES),
-            path: bounded(path, MAX_DIAGNOSTIC_BYTES),
-            expected: bounded(expected, MAX_DIAGNOSTIC_BYTES),
-            observed: observed.map(|value| bounded(value, MAX_DIAGNOSTIC_BYTES)),
-            expected_sha256: bounded(expected_sha256, 64),
-            observed_sha256: observed_sha256.map(|value| bounded(value, 64)),
-            retry: bounded(retry, MAX_RETRY_BYTES),
-        });
+        self.divergences.push(bounded_divergence(
+            code,
+            path,
+            expected,
+            observed,
+            expected_sha256,
+            observed_sha256,
+            retry,
+        ));
     }
 
     fn finish(mut self) -> Qg2ContractReport {
@@ -863,23 +915,7 @@ fn validate_manifest_surface(repo_root: &Path, report: &mut ReportBuilder) {
 }
 
 fn validate_tracker_surfaces(repo_root: &Path, report: &mut ReportBuilder) {
-    let expected = [
-        (
-            "hyperopt_law_7_and_epic",
-            "hyperopt_epic_active_contract",
-            "bd-quill-e8-hyperopt-nyps",
-        ),
-        (
-            "qg2_r1_quarantine",
-            "qg2_r1_active_contract",
-            "bd-quill-e8-perf-doctrine-x4e4.5.5",
-        ),
-        (
-            "gate_activation_scope",
-            "gate_activation_active_contract",
-            "bd-h6eh",
-        ),
-    ];
+    let expected = TRACKER_SELECTORS;
     let source = match fs::read_to_string(repo_root.join(TRACKER_PATH)) {
         Ok(source) => source,
         Err(error) => {
@@ -1255,6 +1291,829 @@ fn validate_one_sentinel(
     valid
 }
 
+// ---------------------------------------------------------------------------
+// Bootstrap preflight: typed PRE contracts for the same nine selectors.
+//
+// `validate_qg2_contract` answers "is the correction applied and exact?". It
+// cannot answer "is this tree the protected bootstrap base, ready to mutate?",
+// because at the base every locator is legitimately clause-free and the nested
+// TOML table is legitimately absent — which the applied-state validator can
+// only report as divergence. The preflight below is the other half: expected
+// bootstrap absence is a PASS, and only ambiguity, unexpected content, or a
+// tree split across both states fails closed.
+// ---------------------------------------------------------------------------
+
+/// State of one physical selector relative to the Q2C correction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Qg2SelectorState {
+    /// Exact protected bootstrap state. Expected absence, never an error.
+    Bootstrap,
+    /// Already carries the exact canonical contract.
+    Applied,
+    /// Neither exact bootstrap nor exact applied. Fails closed.
+    Drift,
+}
+
+/// Terminal state of a whole-tree bootstrap preflight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Qg2PreflightState {
+    /// Every selector is at its exact bootstrap contract; mutation may proceed.
+    BootstrapReady,
+    /// Every selector already carries the canonical contract; mutation is a
+    /// no-op and re-running it would be the only way to change bytes.
+    AlreadyApplied,
+    /// Fail-closed: drift at a selector, or a tree split across both states.
+    Drift,
+}
+
+/// Preflight receipt for one physical selector.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Qg2SelectorReceipt {
+    /// Logical surface identity, shared with the applied-state report.
+    pub logical_surface: String,
+    /// Unique physical locator identity.
+    pub locator: String,
+    /// Project-relative source path.
+    pub path: String,
+    /// Tracker issue identity when this is a Beads selector.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue_id: Option<String>,
+    /// Which side of the correction this selector is on.
+    pub state: Qg2SelectorState,
+    /// Digest of the bounded bootstrap region, when the selector is at PRE.
+    ///
+    /// Absent for a tracker selector at PRE: its bootstrap state is an *absent*
+    /// note, which has no bytes to bind. Absence is the receipt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_sha256: Option<String>,
+    /// Digest of the bounded applied region or note, when the selector is POST.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_sha256: Option<String>,
+}
+
+/// Manifest-digest rebinding one bootstrap sentinel would require.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Qg2SentinelRebind {
+    /// Project-relative sentinel path.
+    pub path: String,
+    /// Gate identity the sentinel must match.
+    pub gate: PerfGate,
+    /// Normalized manifest digest the sentinel carries now.
+    pub bound_manifest_sha256: String,
+    /// Normalized manifest digest of the rendered poststate manifest.
+    pub rebound_manifest_sha256: String,
+    /// Whether applying the correction changes this sentinel's one mutable
+    /// field. False when the tree is already applied.
+    pub rebind_required: bool,
+}
+
+/// Fresh-process bootstrap preflight report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Qg2PreflightReport {
+    /// Report wire schema.
+    pub schema_version: String,
+    /// Terminal state of the whole tree.
+    pub state: Qg2PreflightState,
+    /// Canonical typed comparator contract this preflight would render.
+    pub contract: Qg2ComparatorContract,
+    /// Fixed no-claim status; this receipt admits no performance evidence.
+    pub no_claim: String,
+    /// Ordered receipts for all nine expected physical selectors.
+    pub selectors: Vec<Qg2SelectorReceipt>,
+    /// Normalized manifest digest before the correction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_sha256_pre: Option<String>,
+    /// Normalized manifest digest of the rendered poststate manifest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_sha256_post: Option<String>,
+    /// Per-sentinel manifest rebinding the correction implies.
+    pub sentinel_rebinds: Vec<Qg2SentinelRebind>,
+    /// Ordered, bounded divergences.
+    pub divergences: Vec<Qg2ContractDivergence>,
+    /// Number of additional divergences suppressed by the report bound.
+    pub dropped_divergences: usize,
+}
+
+impl Qg2PreflightReport {
+    /// Whether every selector is at its exact protected bootstrap contract.
+    #[must_use]
+    pub const fn is_bootstrap_ready(&self) -> bool {
+        matches!(self.state, Qg2PreflightState::BootstrapReady)
+    }
+}
+
+struct PreflightBuilder {
+    selectors: Vec<Qg2SelectorReceipt>,
+    manifest_sha256_pre: Option<String>,
+    manifest_sha256_post: Option<String>,
+    sentinel_rebinds: Vec<Qg2SentinelRebind>,
+    divergences: Vec<Qg2ContractDivergence>,
+    dropped_divergences: usize,
+}
+
+impl PreflightBuilder {
+    fn new() -> Self {
+        Self {
+            selectors: Vec::with_capacity(QG2_PHYSICAL_LOCATOR_COUNT),
+            manifest_sha256_pre: None,
+            manifest_sha256_post: None,
+            sentinel_rebinds: Vec::with_capacity(QG2_SENTINEL_COUNT),
+            divergences: Vec::new(),
+            dropped_divergences: 0,
+        }
+    }
+
+    fn divergence(
+        &mut self,
+        code: &str,
+        path: &str,
+        expected: &str,
+        observed: Option<&str>,
+        retry: &str,
+    ) {
+        if self.divergences.len() == MAX_DIVERGENCES {
+            self.dropped_divergences = self.dropped_divergences.saturating_add(1);
+            return;
+        }
+        let expected_sha256 = sha256_hex(expected.as_bytes());
+        let observed_sha256 = observed.map(|value| sha256_hex(value.as_bytes()));
+        self.divergences.push(bounded_divergence(
+            code,
+            path,
+            expected,
+            observed,
+            &expected_sha256,
+            observed_sha256.as_deref(),
+            retry,
+        ));
+    }
+
+    fn finish(mut self) -> Qg2PreflightReport {
+        let bootstrap = self
+            .selectors
+            .iter()
+            .filter(|receipt| receipt.state == Qg2SelectorState::Bootstrap)
+            .count();
+        let applied = self
+            .selectors
+            .iter()
+            .filter(|receipt| receipt.state == Qg2SelectorState::Applied)
+            .count();
+        if self.selectors.len() != QG2_PHYSICAL_LOCATOR_COUNT {
+            self.divergence(
+                "qg2.preflight.selector_count",
+                "qg2://preflight",
+                &QG2_PHYSICAL_LOCATOR_COUNT.to_string(),
+                Some(&self.selectors.len().to_string()),
+                PREFLIGHT_DRIFT_RETRY,
+            );
+        } else if self.divergences.is_empty()
+            && bootstrap != QG2_PHYSICAL_LOCATOR_COUNT
+            && applied != QG2_PHYSICAL_LOCATOR_COUNT
+        {
+            // Every selector is individually exact, but they disagree about
+            // which side of the correction the tree is on. A half-applied tree
+            // is precisely the state the mutation must never leave behind, so
+            // it fails closed even though no single selector is at fault.
+            self.divergence(
+                "qg2.preflight.split_state",
+                "qg2://preflight",
+                &format!(
+                    "all {QG2_PHYSICAL_LOCATOR_COUNT} selectors on one side of the correction"
+                ),
+                Some(&format!(
+                    "{bootstrap} bootstrap, {applied} applied selectors"
+                )),
+                PREFLIGHT_DRIFT_RETRY,
+            );
+        }
+        let state = if !self.divergences.is_empty() {
+            Qg2PreflightState::Drift
+        } else if bootstrap == QG2_PHYSICAL_LOCATOR_COUNT {
+            Qg2PreflightState::BootstrapReady
+        } else {
+            Qg2PreflightState::AlreadyApplied
+        };
+        Qg2PreflightReport {
+            schema_version: QG2_PREFLIGHT_REPORT_SCHEMA_VERSION.to_owned(),
+            state,
+            contract: Qg2ComparatorContract::canonical(),
+            no_claim: QG2_NO_CLAIM.to_owned(),
+            selectors: self.selectors,
+            manifest_sha256_pre: self.manifest_sha256_pre,
+            manifest_sha256_post: self.manifest_sha256_post,
+            sentinel_rebinds: self.sentinel_rebinds,
+            divergences: self.divergences,
+            dropped_divergences: self.dropped_divergences,
+        }
+    }
+}
+
+/// Classify one repository against the typed bootstrap contract of all six
+/// logical surfaces and nine physical selectors.
+///
+/// This function performs only read operations, and never mutates the tree,
+/// the tracker, or the sentinels. It renders the poststate manifest in memory
+/// and verifies that render round-trips back to the canonical typed contract,
+/// so a rendering defect is caught before any mutation could consume it.
+#[must_use]
+pub fn validate_qg2_preflight(repo_root: &Path) -> Qg2PreflightReport {
+    let mut builder = PreflightBuilder::new();
+    preflight_text_group(repo_root, &PERF_GATES_GROUP, &mut builder);
+    preflight_text_group(repo_root, &PLAN_GROUP, &mut builder);
+    preflight_manifest(repo_root, &mut builder);
+    preflight_text_group(repo_root, &HYPEROPT_GROUP, &mut builder);
+    preflight_tracker(repo_root, &mut builder);
+    preflight_sentinels(repo_root, &mut builder);
+    builder.finish()
+}
+
+struct TextSelectorOutcome {
+    state: Qg2SelectorState,
+    pre_sha256: Option<String>,
+    post_sha256: Option<String>,
+    detail: Option<String>,
+}
+
+impl TextSelectorOutcome {
+    fn drift(detail: String) -> Self {
+        Self {
+            state: Qg2SelectorState::Drift,
+            pre_sha256: None,
+            post_sha256: None,
+            detail: Some(detail),
+        }
+    }
+
+    fn bootstrap(region: BoundedRegion<'_>) -> Self {
+        let count = region.text.matches(QG2_CANONICAL_CONTRACT).count();
+        if count == 0 {
+            Self {
+                state: Qg2SelectorState::Bootstrap,
+                pre_sha256: Some(sha256_hex(region.text.as_bytes())),
+                post_sha256: None,
+                detail: None,
+            }
+        } else {
+            Self::drift(format!(
+                "the bootstrap region already carries {count} canonical clauses; expected none"
+            ))
+        }
+    }
+
+    fn applied(region: BoundedRegion<'_>) -> Self {
+        let count = region.text.matches(QG2_CANONICAL_CONTRACT).count();
+        if count == 1 {
+            Self {
+                state: Qg2SelectorState::Applied,
+                pre_sha256: None,
+                post_sha256: Some(sha256_hex(region.text.as_bytes())),
+                detail: None,
+            }
+        } else {
+            Self::drift(format!(
+                "the applied region carries {count} canonical clauses; expected exactly one"
+            ))
+        }
+    }
+}
+
+fn classify_text_selector(source: &str, spec: TextSurfaceSpec) -> TextSelectorOutcome {
+    if spec.anchors_differ() {
+        // The correction renames this region's heading, so exactly one of the
+        // two anchors may resolve. Both resolving is ambiguity, not progress.
+        return match (
+            unique_region(source, spec.pre_region_start, spec.region_end),
+            unique_region(source, spec.region_start, spec.region_end),
+        ) {
+            (Ok(_), Ok(_)) => TextSelectorOutcome::drift(
+                "both the bootstrap and applied start anchors resolve; the region is ambiguous"
+                    .to_owned(),
+            ),
+            (Ok(region), Err(_)) => TextSelectorOutcome::bootstrap(region),
+            (Err(_), Ok(region)) => TextSelectorOutcome::applied(region),
+            (Err(bootstrap_error), Err(applied_error)) => TextSelectorOutcome::drift(format!(
+                "neither anchor resolves: bootstrap ({bootstrap_error}); applied ({applied_error})"
+            )),
+        };
+    }
+    // The anchor survives the correction, so only the clause tells the states
+    // apart: none is the protected base, exactly one is applied.
+    match unique_region(source, spec.region_start, spec.region_end) {
+        Ok(region) => match region.text.matches(QG2_CANONICAL_CONTRACT).count() {
+            0 => TextSelectorOutcome::bootstrap(region),
+            1 => TextSelectorOutcome::applied(region),
+            count => TextSelectorOutcome::drift(format!(
+                "the bounded region carries {count} canonical clauses; expected none or one"
+            )),
+        },
+        Err(error) => TextSelectorOutcome::drift(error),
+    }
+}
+
+fn preflight_text_group(
+    repo_root: &Path,
+    group: &[TextSurfaceSpec],
+    builder: &mut PreflightBuilder,
+) {
+    let Some(path) = group.first().map(|spec| spec.path) else {
+        return;
+    };
+    let source = match fs::read_to_string(repo_root.join(path)) {
+        Ok(source) => source,
+        Err(error) => {
+            builder.divergence(
+                "qg2.preflight.read",
+                path,
+                "readable authoritative document",
+                Some(&error.to_string()),
+                PREFLIGHT_DRIFT_RETRY,
+            );
+            for spec in group {
+                builder.selectors.push(Qg2SelectorReceipt {
+                    logical_surface: spec.logical_surface.to_owned(),
+                    locator: spec.locator.to_owned(),
+                    path: path.to_owned(),
+                    issue_id: None,
+                    state: Qg2SelectorState::Drift,
+                    pre_sha256: None,
+                    post_sha256: None,
+                });
+            }
+            return;
+        }
+    };
+    let outcomes = group
+        .iter()
+        .map(|spec| classify_text_selector(&source, *spec))
+        .collect::<Vec<_>>();
+
+    // The file may carry exactly one canonical clause per *applied* selector
+    // and no others. At the protected base that means zero clauses anywhere,
+    // so a clause parked outside every bounded region cannot slip through as
+    // "expected bootstrap absence".
+    let applied_in_file = outcomes
+        .iter()
+        .filter(|outcome| outcome.state == Qg2SelectorState::Applied)
+        .count();
+    let file_clause_count = source.matches(QG2_CANONICAL_CONTRACT).count();
+    if file_clause_count != applied_in_file {
+        builder.divergence(
+            "qg2.preflight.file_census",
+            path,
+            &format!("exactly {applied_in_file} canonical Q2C clauses in the whole file"),
+            Some(&format!("{file_clause_count} canonical clauses")),
+            PREFLIGHT_DRIFT_RETRY,
+        );
+    }
+
+    for (spec, outcome) in group.iter().zip(outcomes) {
+        if let Some(detail) = outcome.detail.as_deref() {
+            builder.divergence(
+                "qg2.preflight.selector_drift",
+                &format!("{path}#{}", spec.locator),
+                "a clause-free bootstrap region, or an applied region with exactly one clause",
+                Some(detail),
+                PREFLIGHT_DRIFT_RETRY,
+            );
+        }
+        builder.selectors.push(Qg2SelectorReceipt {
+            logical_surface: spec.logical_surface.to_owned(),
+            locator: spec.locator.to_owned(),
+            path: path.to_owned(),
+            issue_id: None,
+            state: outcome.state,
+            pre_sha256: outcome.pre_sha256,
+            post_sha256: outcome.post_sha256,
+        });
+    }
+}
+
+/// Where the typed QG-2 table sits relative to the `[gate.QG-2]` block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Qg2BlockTopology {
+    /// `[gate.QG-2]` is followed immediately by `[gate.QG-3]`: the protected
+    /// base. The offset is where the rendered table must be inserted.
+    Bootstrap { insert_offset: usize },
+    /// `[gate.QG-2]` is followed immediately by its nested contract table.
+    Applied,
+}
+
+fn qg2_block_topology(source: &str) -> Result<Qg2BlockTopology, String> {
+    const QG2_HEADER: &str = "[gate.QG-2]";
+    const QG3_HEADER: &str = "[gate.QG-3]";
+    const CONTRACT_HEADER: &str = "[gate.QG-2.qg2_contract]";
+
+    let mut offset = 0usize;
+    let mut qg2_offset: Option<usize> = None;
+    let mut following: Option<(usize, String)> = None;
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed == QG2_HEADER {
+            if qg2_offset.is_some() {
+                return Err(format!("{QG2_HEADER} appears more than once"));
+            }
+            qg2_offset = Some(offset);
+        } else if qg2_offset.is_some() && following.is_none() && trimmed.starts_with('[') {
+            following = Some((offset, trimmed.to_owned()));
+        }
+        offset = offset.saturating_add(line.len());
+    }
+    if qg2_offset.is_none() {
+        return Err(format!("{QG2_HEADER} is absent"));
+    }
+    match following {
+        Some((insert_offset, header)) if header == QG3_HEADER => {
+            Ok(Qg2BlockTopology::Bootstrap { insert_offset })
+        }
+        Some((_, header)) if header == CONTRACT_HEADER => Ok(Qg2BlockTopology::Applied),
+        Some((_, header)) => Err(format!(
+            "{QG2_HEADER} is followed by {header}, not {QG3_HEADER}"
+        )),
+        None => Err(format!("{QG2_HEADER} is followed by no table header")),
+    }
+}
+
+/// Render the canonical contract as an exact nested TOML table.
+///
+/// Every scalar is rendered through the same serde representation the parser
+/// accepts, so the rendered table cannot drift from the typed contract's
+/// `#[serde(rename)]` spellings. JSON string escaping is a valid TOML basic
+/// string for every value serde can produce here.
+fn render_qg2_contract_table(contract: &Qg2ComparatorContract) -> Result<String, String> {
+    let mut rendered = String::with_capacity(1024);
+    rendered.push_str("[gate.QG-2.qg2_contract]\n");
+    for (key, value) in [
+        ("contract", serde_json::to_string(&contract.contract)),
+        (
+            "storage_topology",
+            serde_json::to_string(&contract.storage_topology),
+        ),
+        (
+            "durability_scope",
+            serde_json::to_string(&contract.durability_scope),
+        ),
+        (
+            "timing_start",
+            serde_json::to_string(&contract.timing_start),
+        ),
+        ("timing_end", serde_json::to_string(&contract.timing_end)),
+        (
+            "commit_boundary",
+            serde_json::to_string(&contract.commit_boundary),
+        ),
+        (
+            "excluded_operations",
+            serde_json::to_string(&contract.excluded_operations),
+        ),
+        (
+            "source_nonregression",
+            serde_json::to_string(&contract.source_nonregression),
+        ),
+    ] {
+        let value = value.map_err(|error| format!("unserializable {key}: {error}"))?;
+        writeln!(&mut rendered, "{key} = {value}")
+            .map_err(|error| format!("unwritable {key}: {error}"))?;
+    }
+    rendered.push('\n');
+    Ok(rendered)
+}
+
+fn preflight_manifest(repo_root: &Path, builder: &mut PreflightBuilder) {
+    let source = match fs::read_to_string(repo_root.join(PERF_MANIFEST_PATH)) {
+        Ok(source) => source,
+        Err(error) => {
+            builder.divergence(
+                "qg2.preflight.read",
+                PERF_MANIFEST_PATH,
+                "readable typed QG-2 manifest",
+                Some(&error.to_string()),
+                PREFLIGHT_DRIFT_RETRY,
+            );
+            builder.selectors.push(Qg2SelectorReceipt {
+                logical_surface: "machine_manifest_qg2".to_owned(),
+                locator: "perf_manifest_qg2_contract".to_owned(),
+                path: PERF_MANIFEST_PATH.to_owned(),
+                issue_id: None,
+                state: Qg2SelectorState::Drift,
+                pre_sha256: None,
+                post_sha256: None,
+            });
+            return;
+        }
+    };
+    builder.manifest_sha256_pre = Some(perf_manifest_contract_sha256(&source));
+
+    let canonical = Qg2ComparatorContract::canonical();
+    let mut state = Qg2SelectorState::Drift;
+    let mut pre_sha256 = None;
+    let mut post_sha256 = None;
+    let mut rendered: Option<String> = None;
+    let mut drift: Option<(&'static str, String)> = None;
+
+    match toml::from_str::<ManifestDocument>(&source) {
+        Err(error) => {
+            drift = Some((
+                "qg2.preflight.manifest_parse",
+                format!("the manifest does not parse: {error}"),
+            ));
+        }
+        Ok(document) => {
+            let observed = document
+                .gate
+                .get("QG-2")
+                .and_then(|gate| gate.qg2_contract.as_ref());
+            match (qg2_block_topology(&source), observed) {
+                (Ok(Qg2BlockTopology::Bootstrap { insert_offset }), None) => {
+                    state = Qg2SelectorState::Bootstrap;
+                    pre_sha256 = Some(sha256_hex(source.as_bytes()));
+                    match render_qg2_contract_table(&canonical) {
+                        Ok(table) => {
+                            let mut applied =
+                                String::with_capacity(source.len().saturating_add(table.len()));
+                            applied.push_str(&source[..insert_offset]);
+                            applied.push_str(&table);
+                            applied.push_str(&source[insert_offset..]);
+                            rendered = Some(applied);
+                        }
+                        Err(error) => {
+                            drift = Some(("qg2.preflight.render", error));
+                        }
+                    }
+                }
+                (Ok(Qg2BlockTopology::Applied), Some(observed)) if observed == &canonical => {
+                    state = Qg2SelectorState::Applied;
+                    post_sha256 = Some(sha256_hex(source.as_bytes()));
+                    rendered = Some(source.clone());
+                }
+                (Ok(Qg2BlockTopology::Applied), Some(_)) => {
+                    drift = Some((
+                        "qg2.preflight.manifest_conflict",
+                        "a nested qg2_contract table exists but is not the canonical contract"
+                            .to_owned(),
+                    ));
+                }
+                (Ok(topology), observed) => {
+                    drift = Some((
+                        "qg2.preflight.manifest_conflict",
+                        format!(
+                            "table topology {topology:?} disagrees with a {} typed contract",
+                            if observed.is_some() {
+                                "present"
+                            } else {
+                                "absent"
+                            }
+                        ),
+                    ));
+                }
+                (Err(error), _) => {
+                    drift = Some(("qg2.preflight.manifest_topology", error));
+                }
+            }
+        }
+    }
+
+    // Never hand a rendered poststate to a mutation without proving it parses
+    // back to the exact typed contract it claims to encode.
+    if let Some(candidate) = rendered.as_deref() {
+        match toml::from_str::<ManifestDocument>(candidate) {
+            Ok(document)
+                if document
+                    .gate
+                    .get("QG-2")
+                    .and_then(|gate| gate.qg2_contract.as_ref())
+                    == Some(&canonical) =>
+            {
+                builder.manifest_sha256_post = Some(perf_manifest_contract_sha256(candidate));
+            }
+            Ok(_) => {
+                state = Qg2SelectorState::Drift;
+                drift = Some((
+                    "qg2.preflight.render_roundtrip",
+                    "the rendered manifest does not parse back to the canonical typed contract"
+                        .to_owned(),
+                ));
+            }
+            Err(error) => {
+                state = Qg2SelectorState::Drift;
+                drift = Some((
+                    "qg2.preflight.render_roundtrip",
+                    format!("the rendered manifest does not parse: {error}"),
+                ));
+            }
+        }
+    }
+
+    if let Some((code, detail)) = drift {
+        let retry = if code == "qg2.preflight.render" || code == "qg2.preflight.render_roundtrip" {
+            PREFLIGHT_RENDER_RETRY
+        } else {
+            PREFLIGHT_DRIFT_RETRY
+        };
+        builder.divergence(
+            code,
+            "docs/contracts/quill-perf-gates.toml#gate.QG-2",
+            "either the protected [gate.QG-2] block followed immediately by [gate.QG-3], or the exact canonical nested table",
+            Some(&detail),
+            retry,
+        );
+        state = Qg2SelectorState::Drift;
+    }
+
+    builder.selectors.push(Qg2SelectorReceipt {
+        logical_surface: "machine_manifest_qg2".to_owned(),
+        locator: "perf_manifest_qg2_contract".to_owned(),
+        path: PERF_MANIFEST_PATH.to_owned(),
+        issue_id: None,
+        state,
+        pre_sha256,
+        post_sha256,
+    });
+}
+
+fn preflight_tracker(repo_root: &Path, builder: &mut PreflightBuilder) {
+    let source = match fs::read_to_string(repo_root.join(TRACKER_PATH)) {
+        Ok(source) => source,
+        Err(error) => {
+            builder.divergence(
+                "qg2.preflight.read",
+                TRACKER_PATH,
+                "readable tracker JSONL",
+                Some(&error.to_string()),
+                PREFLIGHT_DRIFT_RETRY,
+            );
+            for (logical_surface, locator, issue_id) in TRACKER_SELECTORS {
+                builder.selectors.push(Qg2SelectorReceipt {
+                    logical_surface: logical_surface.to_owned(),
+                    locator: locator.to_owned(),
+                    path: TRACKER_PATH.to_owned(),
+                    issue_id: Some(issue_id.to_owned()),
+                    state: Qg2SelectorState::Drift,
+                    pre_sha256: None,
+                    post_sha256: None,
+                });
+            }
+            return;
+        }
+    };
+
+    let expected_ids = TRACKER_SELECTORS
+        .iter()
+        .map(|(_, _, issue_id)| *issue_id)
+        .collect::<BTreeSet<_>>();
+    let mut selected = BTreeMap::<String, Vec<TrackerIssue>>::new();
+    for (line_index, line) in source.lines().enumerate() {
+        match serde_json::from_str::<TrackerIssue>(line) {
+            Ok(issue) => {
+                let marker_count = issue.active_marker_count();
+                if marker_count > 0 && !expected_ids.contains(issue.id.as_str()) {
+                    builder.divergence(
+                        "qg2.preflight.tracker_extra_surface",
+                        &format!("{TRACKER_PATH}#{}", issue.id),
+                        "the canonical clause only in the three protected tracker selectors",
+                        Some(&format!("{marker_count} canonical clauses")),
+                        PREFLIGHT_DRIFT_RETRY,
+                    );
+                }
+                if expected_ids.contains(issue.id.as_str()) {
+                    selected.entry(issue.id.clone()).or_default().push(issue);
+                }
+            }
+            Err(error) => builder.divergence(
+                "qg2.preflight.tracker_jsonl",
+                &format!("{TRACKER_PATH}:{}", line_index + 1),
+                "one valid tracker JSON object",
+                Some(&error.to_string()),
+                PREFLIGHT_DRIFT_RETRY,
+            ),
+        }
+    }
+
+    for (logical_surface, locator, issue_id) in TRACKER_SELECTORS {
+        let matches = selected.get(issue_id).map_or(&[][..], Vec::as_slice);
+        let (state, post_sha256, detail) = if matches.len() == 1 {
+            match matches[0].notes.as_deref() {
+                // Absent or empty notes are the protected base, exactly as the
+                // bootstrap contract specifies. This is not an error.
+                None | Some("") => (Qg2SelectorState::Bootstrap, None, None),
+                Some(note) if note == QG2_CANONICAL_CONTRACT => (
+                    Qg2SelectorState::Applied,
+                    Some(sha256_hex(note.as_bytes())),
+                    None,
+                ),
+                Some(note) => (
+                    Qg2SelectorState::Drift,
+                    None,
+                    Some(format!(
+                        "unexpected nonempty notes of {} bytes at the protected base",
+                        note.len()
+                    )),
+                ),
+            }
+        } else {
+            (
+                Qg2SelectorState::Drift,
+                None,
+                Some(format!(
+                    "{} tracker objects; expected exactly one",
+                    matches.len()
+                )),
+            )
+        };
+        if let Some(detail) = detail.as_deref() {
+            builder.divergence(
+                "qg2.preflight.selector_drift",
+                &format!("{TRACKER_PATH}#{issue_id}.notes"),
+                "exactly one issue whose notes are absent, or exactly the canonical contract",
+                Some(detail),
+                PREFLIGHT_DRIFT_RETRY,
+            );
+        }
+        builder.selectors.push(Qg2SelectorReceipt {
+            logical_surface: logical_surface.to_owned(),
+            locator: locator.to_owned(),
+            path: TRACKER_PATH.to_owned(),
+            issue_id: Some(issue_id.to_owned()),
+            state,
+            pre_sha256: None,
+            post_sha256,
+        });
+    }
+}
+
+fn preflight_sentinels(repo_root: &Path, builder: &mut PreflightBuilder) {
+    let (Some(bound), Some(rebound)) = (
+        builder.manifest_sha256_pre.clone(),
+        builder.manifest_sha256_post.clone(),
+    ) else {
+        builder.divergence(
+            "qg2.preflight.sentinel_manifest_unavailable",
+            HISTORY_DIRECTORY,
+            "both manifest digests from a readable, renderable manifest",
+            None,
+            PREFLIGHT_RENDER_RETRY,
+        );
+        return;
+    };
+    for gate in PerfGate::ALL {
+        let path = format!(
+            "{HISTORY_DIRECTORY}/{}.unmeasured.latest.json",
+            gate.label()
+        );
+        let bytes = match fs::read(repo_root.join(&path)) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                builder.divergence(
+                    "qg2.preflight.sentinel_read",
+                    &path,
+                    "readable canonical bootstrap sentinel",
+                    Some(&error.to_string()),
+                    SENTINEL_RETRY,
+                );
+                continue;
+            }
+        };
+        let artifact = match serde_json::from_slice::<PerfGateArtifact>(&bytes) {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                builder.divergence(
+                    "qg2.preflight.sentinel_parse",
+                    &path,
+                    "current-schema bootstrap sentinel JSON",
+                    Some(&error.to_string()),
+                    SENTINEL_RETRY,
+                );
+                continue;
+            }
+        };
+        if !is_explicit_bootstrap_for(&artifact, gate, &bound) {
+            builder.divergence(
+                "qg2.preflight.sentinel_binding",
+                &path,
+                &format!(
+                    "an exact {} bootstrap sentinel bound to {bound}",
+                    gate.label()
+                ),
+                Some(&format!(
+                    "gate={:?} bound to {}",
+                    artifact.gate, artifact.manifest_sha256
+                )),
+                SENTINEL_RETRY,
+            );
+        }
+        let rebind_required = artifact.manifest_sha256 != rebound;
+        builder.sentinel_rebinds.push(Qg2SentinelRebind {
+            path,
+            gate,
+            bound_manifest_sha256: artifact.manifest_sha256,
+            rebound_manifest_sha256: rebound.clone(),
+            rebind_required,
+        });
+    }
+}
+
 /// One bounded locator region resolved inside its authoritative document.
 #[derive(Debug, Clone, Copy)]
 struct BoundedRegion<'a> {
@@ -1289,6 +2148,28 @@ fn unique_region<'a>(source: &'a str, start: &str, end: &str) -> Result<BoundedR
         start: start_offset,
         end: start_offset.saturating_add(end_offset),
     })
+}
+
+/// Build one divergence with every field clamped to its diagnostic bound.
+#[allow(clippy::too_many_arguments)]
+fn bounded_divergence(
+    code: &str,
+    path: &str,
+    expected: &str,
+    observed: Option<&str>,
+    expected_sha256: &str,
+    observed_sha256: Option<&str>,
+    retry: &str,
+) -> Qg2ContractDivergence {
+    Qg2ContractDivergence {
+        code: bounded(code, MAX_DIAGNOSTIC_BYTES),
+        path: bounded(path, MAX_DIAGNOSTIC_BYTES),
+        expected: bounded(expected, MAX_DIAGNOSTIC_BYTES),
+        observed: observed.map(|value| bounded(value, MAX_DIAGNOSTIC_BYTES)),
+        expected_sha256: bounded(expected_sha256, 64),
+        observed_sha256: observed_sha256.map(|value| bounded(value, 64)),
+        retry: bounded(retry, MAX_RETRY_BYTES),
+    }
 }
 
 fn contract_json(contract: &Qg2ComparatorContract) -> String {
@@ -2006,6 +2887,441 @@ mod tests {
             perf_manifest_contract_sha256(&fixture.manifest),
             perf_manifest_contract_sha256(&changed_topology)
         );
+    }
+
+    /// Manifest at the protected base: `[gate.QG-2]` followed immediately by
+    /// `[gate.QG-3]`, with no nested contract table.
+    fn bootstrap_manifest() -> String {
+        concat!(
+            "[gate.QG-1]\n",
+            "name = \"bulk indexing, multi-core\"\n",
+            "activated = false\n",
+            "\n",
+            "[gate.QG-2]\n",
+            "name = \"bulk indexing, single-thread\"\n",
+            "fixture = \"medium; positions ON; threads = 1; commit included\"\n",
+            "target = \"docs_per_sec >= 1.5x oracle\"\n",
+            "activated = false\n",
+            "\n",
+            "[gate.QG-3]\n",
+            "name = \"watch-mode incremental\"\n",
+            "activated = false\n",
+        )
+        .to_owned()
+    }
+
+    /// The three documents at the protected base: both renamed law headings
+    /// still carry their bootstrap spelling and no region carries a clause.
+    fn bootstrap_fixture() -> Fixture {
+        let directory = tempfile::tempdir().expect("temporary repository");
+        let root = directory.path();
+        fs::create_dir_all(root.join("docs/contracts")).expect("contract directory");
+        fs::create_dir_all(root.join(".beads")).expect("tracker directory");
+        fs::create_dir_all(root.join(HISTORY_DIRECTORY)).expect("history directory");
+
+        fs::write(
+            root.join(PERF_GATES_DOC_PATH),
+            concat!(
+                "# Laws\n",
+                "1. **No benchmark-only semantics.** Durability settings, commits, and result \
+                 consumption match shipped defaults.\n",
+                "2. **Distributions, not averages.** next\n",
+            ),
+        )
+        .expect("bootstrap performance gate fixture");
+        fs::write(
+            root.join(COMPREHENSIVE_PLAN_PATH),
+            concat!(
+                "| **QG-2 Bulk indexing, single-thread** | >= 1.5x tantivy |\n",
+                "| **QG-3 Watch-mode incremental** | next |\n",
+                "\n",
+                "Method: the five standing laws \u{2014} (1) no benchmark-only semantics.\n",
+                "\n",
+                "## 15. The Conformance Gauntlet (Bet Q5)\n",
+            ),
+        )
+        .expect("bootstrap plan fixture");
+        fs::write(
+            root.join(HYPEROPT_DOC_PATH),
+            concat!(
+                "7. **Platform-symmetric durability.** On macOS a commit number is admissible \
+                 only with F_FULLFSYNC attested symmetric.\n",
+                "## 2. Hardware/profile matrix\n",
+                "\n",
+                "### W2 \u{2014} Bulk-index single-thread cost (QG-1 and QG-2)\n",
+                "\n",
+                "| Commit-path fsync count | batch directory syncs | census first. |\n",
+                "\n",
+                "### W3 \u{2014} Parallel scale-out\n",
+            ),
+        )
+        .expect("bootstrap hyperopt fixture");
+
+        let manifest = bootstrap_manifest();
+        fs::write(root.join(PERF_MANIFEST_PATH), &manifest).expect("bootstrap manifest fixture");
+
+        let mut tracker = String::new();
+        for (_, _, issue_id) in TRACKER_SELECTORS {
+            tracker.push_str(
+                &serde_json::to_string(&json!({ "id": issue_id })).expect("tracker issue"),
+            );
+            tracker.push('\n');
+        }
+        fs::write(root.join(TRACKER_PATH), tracker).expect("bootstrap tracker fixture");
+
+        let manifest_sha256 = perf_manifest_contract_sha256(&manifest);
+        let template = serde_json::from_str::<PerfGateArtifact>(include_str!(
+            "../../../.bench-history/QG-1.v7.unmeasured.latest.json"
+        ))
+        .expect("sentinel template");
+        for gate in PerfGate::ALL {
+            let mut artifact = template.clone();
+            artifact.gate = gate;
+            artifact.manifest_sha256.clone_from(&manifest_sha256);
+            fs::write(
+                root.join(format!(
+                    "{HISTORY_DIRECTORY}/{}.unmeasured.latest.json",
+                    gate.label()
+                )),
+                serde_json::to_vec_pretty(&artifact).expect("sentinel JSON"),
+            )
+            .expect("bootstrap sentinel fixture");
+        }
+        Fixture {
+            directory,
+            manifest,
+        }
+    }
+
+    fn preflight_state(report: &Qg2PreflightReport, locator: &str) -> Qg2SelectorState {
+        let missing = format!("preflight must carry a receipt for {locator}");
+        report
+            .selectors
+            .iter()
+            .find(|receipt| receipt.locator == locator)
+            .expect(&missing)
+            .state
+    }
+
+    fn has_preflight_divergence(
+        report: &Qg2PreflightReport,
+        code: &str,
+        path_suffix: &str,
+    ) -> bool {
+        report
+            .divergences
+            .iter()
+            .any(|divergence| divergence.code == code && divergence.path.ends_with(path_suffix))
+    }
+
+    #[test]
+    fn protected_base_preflights_as_bootstrap_ready() {
+        let fixture = bootstrap_fixture();
+        let report = validate_qg2_preflight(fixture.root());
+        assert!(report.is_bootstrap_ready(), "{:#?}", report.divergences);
+        assert_eq!(report.selectors.len(), QG2_PHYSICAL_LOCATOR_COUNT);
+        assert!(
+            report
+                .selectors
+                .iter()
+                .all(|receipt| receipt.state == Qg2SelectorState::Bootstrap)
+        );
+        assert_eq!(
+            report
+                .selectors
+                .iter()
+                .map(|receipt| receipt.locator.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "perf_gate_law_1",
+                "comprehensive_plan_qg2_row",
+                "comprehensive_plan_method_law_1",
+                "perf_manifest_qg2_contract",
+                "hyperopt_law_7",
+                "hyperopt_w2_fsync_row",
+                "hyperopt_epic_active_contract",
+                "qg2_r1_active_contract",
+                "gate_activation_active_contract",
+            ]
+        );
+        assert_eq!(report.no_claim, QG2_NO_CLAIM);
+    }
+
+    #[test]
+    fn expected_bootstrap_absence_is_not_a_divergence() {
+        // The whole point of the preflight: on the very same tree the
+        // applied-state validator must report divergence (the correction is
+        // not applied yet) while the preflight reports a clean ready state.
+        let fixture = bootstrap_fixture();
+        let applied_view = validate_qg2_contract(fixture.root());
+        assert!(!applied_view.is_pass());
+        assert!(!applied_view.divergences.is_empty());
+
+        let preflight = validate_qg2_preflight(fixture.root());
+        assert_eq!(preflight.state, Qg2PreflightState::BootstrapReady);
+        assert!(preflight.divergences.is_empty(), "{preflight:#?}");
+    }
+
+    #[test]
+    fn applied_tree_preflights_as_already_applied_with_no_rebind() {
+        let fixture = complete_fixture();
+        let report = validate_qg2_preflight(fixture.root());
+        assert_eq!(
+            report.state,
+            Qg2PreflightState::AlreadyApplied,
+            "{:#?}",
+            report.divergences
+        );
+        assert!(
+            report
+                .selectors
+                .iter()
+                .all(|receipt| receipt.state == Qg2SelectorState::Applied)
+        );
+        assert_eq!(report.manifest_sha256_pre, report.manifest_sha256_post);
+        assert_eq!(report.sentinel_rebinds.len(), QG2_SENTINEL_COUNT);
+        assert!(
+            report
+                .sentinel_rebinds
+                .iter()
+                .all(|rebind| !rebind.rebind_required)
+        );
+    }
+
+    #[test]
+    fn bootstrap_preflight_binds_the_full_sentinel_rebind_cascade() {
+        let fixture = bootstrap_fixture();
+        let report = validate_qg2_preflight(fixture.root());
+        let pre = report
+            .manifest_sha256_pre
+            .as_deref()
+            .expect("bootstrap manifest digest");
+        let post = report
+            .manifest_sha256_post
+            .as_deref()
+            .expect("rendered manifest digest");
+        assert_ne!(
+            pre, post,
+            "inserting the typed contract must move the normalized manifest digest"
+        );
+        assert_eq!(report.sentinel_rebinds.len(), QG2_SENTINEL_COUNT);
+        assert!(report.sentinel_rebinds.iter().all(|rebind| {
+            rebind.bound_manifest_sha256 == pre
+                && rebind.rebound_manifest_sha256 == post
+                && rebind.rebind_required
+        }));
+        assert_eq!(
+            report
+                .sentinel_rebinds
+                .iter()
+                .map(|rebind| rebind.gate)
+                .collect::<Vec<_>>(),
+            PerfGate::ALL.to_vec()
+        );
+    }
+
+    #[test]
+    fn rendered_contract_table_round_trips_to_the_canonical_typed_contract() {
+        let canonical = Qg2ComparatorContract::canonical();
+        let table = render_qg2_contract_table(&canonical).expect("render canonical table");
+        assert!(table.starts_with("[gate.QG-2.qg2_contract]\n"));
+
+        let source = bootstrap_manifest();
+        let insert_offset = match qg2_block_topology(&source) {
+            Ok(Qg2BlockTopology::Bootstrap { insert_offset }) => Some(insert_offset),
+            Ok(Qg2BlockTopology::Applied) | Err(_) => None,
+        }
+        .expect("the bootstrap manifest must expose a bootstrap topology");
+        let mut applied = String::new();
+        applied.push_str(&source[..insert_offset]);
+        applied.push_str(&table);
+        applied.push_str(&source[insert_offset..]);
+
+        let document =
+            toml::from_str::<ManifestDocument>(&applied).expect("rendered manifest must parse");
+        assert_eq!(
+            document
+                .gate
+                .get("QG-2")
+                .and_then(|gate| gate.qg2_contract.as_ref()),
+            Some(&canonical)
+        );
+        assert_eq!(qg2_block_topology(&applied), Ok(Qg2BlockTopology::Applied));
+    }
+
+    #[test]
+    fn a_tree_split_across_both_states_fails_closed() {
+        let fixture = bootstrap_fixture();
+        let plan = fs::read_to_string(fixture.path(COMPREHENSIVE_PLAN_PATH)).expect("plan fixture");
+        fs::write(
+            fixture.path(COMPREHENSIVE_PLAN_PATH),
+            plan.replacen(
+                "| **QG-2 Bulk indexing, single-thread** | >= 1.5x tantivy |",
+                &format!("| **QG-2 Bulk indexing, single-thread** | {QG2_CANONICAL_CONTRACT} |"),
+                1,
+            ),
+        )
+        .expect("half-applied mutation");
+
+        let report = validate_qg2_preflight(fixture.root());
+        assert_eq!(report.state, Qg2PreflightState::Drift);
+        assert_eq!(
+            preflight_state(&report, "comprehensive_plan_qg2_row"),
+            Qg2SelectorState::Applied
+        );
+        assert_eq!(
+            preflight_state(&report, "comprehensive_plan_method_law_1"),
+            Qg2SelectorState::Bootstrap
+        );
+        assert!(
+            report
+                .divergences
+                .iter()
+                .any(|divergence| divergence.code == "qg2.preflight.split_state"),
+            "{:#?}",
+            report.divergences
+        );
+    }
+
+    #[test]
+    fn a_clause_outside_every_region_is_not_expected_bootstrap_absence() {
+        let fixture = bootstrap_fixture();
+        let plan = fs::read_to_string(fixture.path(COMPREHENSIVE_PLAN_PATH)).expect("plan fixture");
+        fs::write(
+            fixture.path(COMPREHENSIVE_PLAN_PATH),
+            format!("{plan}\nAppendix. {QG2_CANONICAL_CONTRACT}\n"),
+        )
+        .expect("out-of-region clause mutation");
+
+        let report = validate_qg2_preflight(fixture.root());
+        assert_eq!(report.state, Qg2PreflightState::Drift);
+        assert!(has_preflight_divergence(
+            &report,
+            "qg2.preflight.file_census",
+            COMPREHENSIVE_PLAN_PATH
+        ));
+    }
+
+    #[test]
+    fn unexpected_tracker_notes_at_the_protected_base_are_drift() {
+        let fixture = bootstrap_fixture();
+        let mut tracker = String::new();
+        for (index, (_, _, issue_id)) in TRACKER_SELECTORS.into_iter().enumerate() {
+            let issue = if index == 2 {
+                json!({ "id": issue_id, "notes": "a peer's unrelated active note" })
+            } else {
+                json!({ "id": issue_id })
+            };
+            tracker.push_str(&serde_json::to_string(&issue).expect("tracker issue"));
+            tracker.push('\n');
+        }
+        fs::write(fixture.path(TRACKER_PATH), tracker).expect("unexpected notes mutation");
+
+        let report = validate_qg2_preflight(fixture.root());
+        assert_eq!(report.state, Qg2PreflightState::Drift);
+        assert_eq!(
+            preflight_state(&report, "gate_activation_active_contract"),
+            Qg2SelectorState::Drift
+        );
+        assert_eq!(
+            preflight_state(&report, "hyperopt_epic_active_contract"),
+            Qg2SelectorState::Bootstrap
+        );
+        assert!(has_preflight_divergence(
+            &report,
+            "qg2.preflight.selector_drift",
+            "#bd-h6eh.notes"
+        ));
+    }
+
+    #[test]
+    fn a_conflicting_nested_contract_table_is_drift() {
+        let fixture = bootstrap_fixture();
+        let conflicting = fixture.manifest.replace(
+            "[gate.QG-3]",
+            concat!(
+                "[gate.QG-2.qg2_contract]\n",
+                "contract = \"an earlier draft of the comparator contract\"\n",
+                "storage_topology = \"symmetric_in_memory\"\n",
+                "durability_scope = \"non_durable\"\n",
+                "timing_start = \"first_document_feed\"\n",
+                "timing_end = \"terminal_searchable_visibility_and_complete_worker_merge_queue_quiescence\"\n",
+                "commit_boundary = \"searchable_visibility_not_durable_publication\"\n",
+                "excluded_operations = [\"fsync\"]\n",
+                "source_nonregression = \"durable_gates_and_production_source_durability_remain_mandatory\"\n",
+                "\n",
+                "[gate.QG-3]",
+            ),
+        );
+        fs::write(fixture.path(PERF_MANIFEST_PATH), conflicting)
+            .expect("conflicting table mutation");
+
+        let report = validate_qg2_preflight(fixture.root());
+        assert_eq!(report.state, Qg2PreflightState::Drift);
+        assert_eq!(
+            preflight_state(&report, "perf_manifest_qg2_contract"),
+            Qg2SelectorState::Drift
+        );
+        assert!(
+            report
+                .divergences
+                .iter()
+                .any(|divergence| divergence.code == "qg2.preflight.manifest_conflict"),
+            "{:#?}",
+            report.divergences
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_renamed_anchor_is_drift() {
+        let fixture = bootstrap_fixture();
+        let laws = fs::read_to_string(fixture.path(PERF_GATES_DOC_PATH)).expect("laws fixture");
+        fs::write(
+            fixture.path(PERF_GATES_DOC_PATH),
+            laws.replace(
+                "2. **Distributions, not averages.**",
+                concat!(
+                    "1. **No benchmark-only semantics; comparator scope is explicit.** draft\n",
+                    "2. **Distributions, not averages.**",
+                ),
+            ),
+        )
+        .expect("ambiguous anchor mutation");
+
+        let report = validate_qg2_preflight(fixture.root());
+        assert_eq!(report.state, Qg2PreflightState::Drift);
+        assert_eq!(
+            preflight_state(&report, "perf_gate_law_1"),
+            Qg2SelectorState::Drift
+        );
+        assert!(has_preflight_divergence(
+            &report,
+            "qg2.preflight.selector_drift",
+            "#perf_gate_law_1"
+        ));
+    }
+
+    #[test]
+    fn a_sentinel_bound_to_a_foreign_digest_is_drift() {
+        let fixture = bootstrap_fixture();
+        let path = fixture.path(".bench-history/QG-7.unmeasured.latest.json");
+        let mut artifact =
+            serde_json::from_slice::<PerfGateArtifact>(&fs::read(&path).expect("QG-7 bytes"))
+                .expect("QG-7 JSON");
+        artifact.manifest_sha256 = "b".repeat(64);
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&artifact).expect("mutated QG-7"),
+        )
+        .expect("foreign digest mutation");
+
+        let report = validate_qg2_preflight(fixture.root());
+        assert_eq!(report.state, Qg2PreflightState::Drift);
+        assert!(has_preflight_divergence(
+            &report,
+            "qg2.preflight.sentinel_binding",
+            "QG-7.unmeasured.latest.json"
+        ));
     }
 
     #[test]

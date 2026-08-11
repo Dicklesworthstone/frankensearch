@@ -214,11 +214,14 @@ pub use privacy::{
 };
 pub use qg2_contract::{
     QG2_CANONICAL_CONTRACT, QG2_CONTRACT_REPORT_SCHEMA_VERSION, QG2_LOGICAL_SURFACE_COUNT,
-    QG2_PHYSICAL_LOCATOR_COUNT, QG2_SENTINEL_COUNT, Qg2CommitBoundary, Qg2ComparatorContract,
-    Qg2ContractDivergence, Qg2ContractReport, Qg2ContractStatus, Qg2DurabilityScope,
-    Qg2ExcludedOperation, Qg2PreservedValueReceipt, Qg2SentinelSummary, Qg2SourceNonregression,
+    QG2_NO_CLAIM, QG2_PHYSICAL_LOCATOR_COUNT, QG2_PREFLIGHT_REPORT_SCHEMA_VERSION,
+    QG2_SENTINEL_COUNT, Qg2CommitBoundary, Qg2ComparatorContract, Qg2ContractDivergence,
+    Qg2ContractReport, Qg2ContractStatus, Qg2DurabilityScope, Qg2ExcludedOperation,
+    Qg2PreflightReport, Qg2PreflightState, Qg2PreservedValueReceipt, Qg2SelectorReceipt,
+    Qg2SelectorState, Qg2SentinelRebind, Qg2SentinelSummary, Qg2SourceNonregression,
     Qg2StaleHistoryDisposition, Qg2StaleHistoryReceipt, Qg2StorageTopology, Qg2SurfaceReceipt,
     Qg2TimingEnd, Qg2TimingStart, Qg2TopologySummary, validate_qg2_contract,
+    validate_qg2_preflight,
 };
 pub use qg6_prepared::{
     Qg6ArmLifecycle, Qg6ArmRole, Qg6Comparison, Qg6ExperimentIdentity, Qg6FourArmResultReceipts,

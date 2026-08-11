@@ -5,7 +5,7 @@ use std::process::{Command, Output};
 
 use frankensearch_quill_gauntlet::{
     PerfGate, PerfGateArtifact, QG2_CANONICAL_CONTRACT, QG2_CONTRACT_REPORT_SCHEMA_VERSION,
-    perf_manifest_contract_sha256,
+    QG2_NO_CLAIM, QG2_PREFLIGHT_REPORT_SCHEMA_VERSION, perf_manifest_contract_sha256,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -16,7 +16,7 @@ const INVOCATION_ERROR_GOLDEN: &str = concat!(
     "  \"schema_version\": \"frankensearch.quill-qg2-contract-report.v1\",\n",
     "  \"status\": \"invocation_error\",\n",
     "  \"code\": \"qg2.cli.invalid_invocation\",\n",
-    "  \"expected\": \"usage: quill-qg2-contract --repo-root <path>\",\n",
+    "  \"expected\": \"usage: quill-qg2-contract --repo-root <path> [--mode applied|bootstrap-preflight]\",\n",
     "  \"observed\": \"missing --repo-root\",\n",
     "  \"retry\": \"Invoke the validator with exactly one --repo-root <path> pair.\"\n",
     "}\n",
@@ -262,6 +262,224 @@ fn fresh_process_contract_divergence_is_structured_and_exits_one() {
         report["divergences"]
             .as_array()
             .is_some_and(|divergences| !divergences.is_empty())
+    );
+}
+
+/// Rewrite the applied contract fixture back to its protected bootstrap form:
+/// both renamed law headings revert, every canonical clause disappears, the
+/// nested TOML table is removed, and the three tracker notes go absent.
+fn revert_to_bootstrap(root: &std::path::Path) -> String {
+    fs::write(
+        root.join("docs/contracts/quill-perf-gates.md"),
+        concat!(
+            "# Laws\n",
+            "1. **No benchmark-only semantics.** Durability settings and commits match shipped \
+             defaults.\n",
+            "2. **Distributions, not averages.** next\n",
+        ),
+    )
+    .expect("bootstrap laws");
+    fs::write(
+        root.join("COMPREHENSIVE_PLAN_FOR_THE_QUILL_LEXICAL_ENGINE.md"),
+        concat!(
+            "| **QG-2 Bulk indexing, single-thread** | >= 1.5x tantivy |\n",
+            "| **QG-3 Watch-mode incremental** | next |\n",
+            "\n",
+            "Method: the five standing laws \u{2014} (1) no benchmark-only semantics.\n",
+            "\n",
+            "## 15. The Conformance Gauntlet (Bet Q5)\n",
+        ),
+    )
+    .expect("bootstrap plan");
+    fs::write(
+        root.join("docs/contracts/quill-hyperopt-campaign.md"),
+        concat!(
+            "7. **Platform-symmetric durability.** On macOS a commit number needs F_FULLFSYNC.\n",
+            "## 2. Hardware/profile matrix\n",
+            "\n",
+            "### W2 \u{2014} Bulk-index single-thread cost (QG-1 and QG-2)\n",
+            "\n",
+            "| Commit-path fsync count | batch directory syncs | census first. |\n",
+            "\n",
+            "### W3 \u{2014} Parallel scale-out\n",
+        ),
+    )
+    .expect("bootstrap hyperopt");
+
+    let manifest = concat!(
+        "[gate.QG-2]\n",
+        "name = \"bulk indexing, single-thread\"\n",
+        "activated = false\n",
+        "\n",
+        "[gate.QG-3]\n",
+        "name = \"watch-mode incremental\"\n",
+        "activated = false\n",
+    )
+    .to_owned();
+    fs::write(root.join("docs/contracts/quill-perf-gates.toml"), &manifest)
+        .expect("bootstrap manifest");
+
+    let mut tracker = String::new();
+    for issue_id in [
+        "bd-quill-e8-hyperopt-nyps",
+        "bd-quill-e8-perf-doctrine-x4e4.5.5",
+        "bd-h6eh",
+    ] {
+        tracker
+            .push_str(&serde_json::to_string(&json!({ "id": issue_id })).expect("tracker issue"));
+        tracker.push('\n');
+    }
+    fs::write(root.join(".beads/issues.jsonl"), tracker).expect("bootstrap tracker");
+
+    let manifest_sha256 = perf_manifest_contract_sha256(&manifest);
+    let template = serde_json::from_slice::<PerfGateArtifact>(include_bytes!(
+        "../../../.bench-history/QG-1.v7.unmeasured.latest.json"
+    ))
+    .expect("sentinel template");
+    for gate in PerfGate::ALL {
+        let mut artifact = template.clone();
+        artifact.gate = gate;
+        artifact.manifest_sha256.clone_from(&manifest_sha256);
+        fs::write(
+            root.join(format!(
+                ".bench-history/{}.unmeasured.latest.json",
+                gate.label()
+            )),
+            serde_json::to_vec_pretty(&artifact).expect("sentinel JSON"),
+        )
+        .expect("bootstrap sentinel");
+    }
+    manifest_sha256
+}
+
+#[test]
+fn fresh_process_preflight_admits_the_protected_bootstrap_base() {
+    let fixture = complete_contract_fixture();
+    let bootstrap_manifest_sha256 = revert_to_bootstrap(fixture.path());
+
+    let output = invoke(&[
+        std::ffi::OsStr::new("--repo-root"),
+        fixture.path().as_os_str(),
+        std::ffi::OsStr::new("--mode"),
+        std::ffi::OsStr::new("bootstrap-preflight"),
+    ]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let report: Value =
+        serde_json::from_slice(&output.stdout).expect("preflight stdout must be valid JSON");
+    assert_eq!(
+        report["schema_version"],
+        QG2_PREFLIGHT_REPORT_SCHEMA_VERSION
+    );
+    assert_eq!(report["state"], "bootstrap_ready");
+    assert_eq!(report["no_claim"], QG2_NO_CLAIM);
+    assert!(
+        report["divergences"]
+            .as_array()
+            .is_some_and(std::vec::Vec::is_empty)
+    );
+    let selectors = report["selectors"]
+        .as_array()
+        .expect("preflight must carry selector receipts");
+    assert_eq!(selectors.len(), 9);
+    assert!(
+        selectors
+            .iter()
+            .all(|receipt| receipt["state"] == "bootstrap")
+    );
+    assert_eq!(report["manifest_sha256_pre"], bootstrap_manifest_sha256);
+    assert_ne!(
+        report["manifest_sha256_post"], bootstrap_manifest_sha256,
+        "inserting the typed contract must move the normalized manifest digest"
+    );
+    let rebinds = report["sentinel_rebinds"]
+        .as_array()
+        .expect("preflight must carry sentinel rebinds");
+    assert_eq!(rebinds.len(), 10);
+    assert!(
+        rebinds
+            .iter()
+            .all(|rebind| rebind["rebind_required"] == true)
+    );
+}
+
+#[test]
+fn fresh_process_preflight_rejects_an_unexpected_tracker_note_with_a_typed_reason() {
+    let fixture = complete_contract_fixture();
+    revert_to_bootstrap(fixture.path());
+    let mut tracker = String::new();
+    for issue_id in [
+        "bd-quill-e8-hyperopt-nyps",
+        "bd-quill-e8-perf-doctrine-x4e4.5.5",
+    ] {
+        tracker
+            .push_str(&serde_json::to_string(&json!({ "id": issue_id })).expect("tracker issue"));
+        tracker.push('\n');
+    }
+    tracker.push_str(
+        &serde_json::to_string(&json!({
+            "id": "bd-h6eh",
+            "notes": "an unrelated active note that is not the canonical contract"
+        }))
+        .expect("planted tracker note"),
+    );
+    tracker.push('\n');
+    fs::write(fixture.path().join(".beads/issues.jsonl"), tracker)
+        .expect("planted tracker mutation");
+
+    let output = invoke(&[
+        std::ffi::OsStr::new("--repo-root"),
+        fixture.path().as_os_str(),
+        std::ffi::OsStr::new("--mode"),
+        std::ffi::OsStr::new("bootstrap-preflight"),
+    ]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let report: Value =
+        serde_json::from_slice(&output.stdout).expect("preflight stdout must be valid JSON");
+    assert_eq!(report["state"], "drift");
+    let divergences = report["divergences"]
+        .as_array()
+        .expect("report must carry divergences");
+    assert!(
+        divergences.iter().any(|divergence| {
+            divergence["code"] == "qg2.preflight.selector_drift"
+                && divergence["path"] == ".beads/issues.jsonl#bd-h6eh.notes"
+                && divergence["retry"]
+                    .as_str()
+                    .is_some_and(|retry| !retry.is_empty())
+        }),
+        "{divergences:#?}"
+    );
+}
+
+#[test]
+fn fresh_process_preflight_refuses_an_already_applied_tree_as_a_mutation_base() {
+    // The applied fixture is a truthful tree, but it is not a base a mutation
+    // may consume, so the preflight reports it and exits nonzero.
+    let fixture = complete_contract_fixture();
+    let output = invoke(&[
+        std::ffi::OsStr::new("--repo-root"),
+        fixture.path().as_os_str(),
+        std::ffi::OsStr::new("--mode"),
+        std::ffi::OsStr::new("bootstrap-preflight"),
+    ]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value =
+        serde_json::from_slice(&output.stdout).expect("preflight stdout must be valid JSON");
+    assert_eq!(report["state"], "already_applied");
+    assert!(
+        report["divergences"]
+            .as_array()
+            .is_some_and(std::vec::Vec::is_empty),
+        "an already-applied tree is refused as a base, not reported as broken"
+    );
+    assert_eq!(
+        report["manifest_sha256_pre"], report["manifest_sha256_post"],
+        "an applied tree renders to itself"
     );
 }
 
