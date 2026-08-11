@@ -1494,6 +1494,50 @@ impl<'a> PostingCursor<'a> {
             .map(|block| block.last_doc)
     }
 
+    /// Whether [`Self::next`] would decode a block, without decoding one.
+    ///
+    /// This mirrors the branch in [`Self::next`] exactly and must keep
+    /// mirroring it: a caller admits the cost of a block *before* the decode
+    /// happens, so a predicate that drifts from the move it predicts either
+    /// charges for work never done or lets work run unadmitted. It reads only
+    /// the already-decoded block state and the validated block table.
+    #[must_use]
+    pub fn next_decodes_block(&self) -> bool {
+        let CursorState::Positioned { block, within } = self.state else {
+            return false;
+        };
+        if within + 1 < self.decoded_count {
+            return false;
+        }
+        block + 1 < self.blocks.as_slice().len()
+    }
+
+    /// Whether [`Self::advance`] would decode a block, without decoding one.
+    ///
+    /// Mirrors [`Self::advance`] under the same obligation as
+    /// [`Self::next_decodes_block`]: a satisfied target, a hit inside the
+    /// decoded tail, and a target past every remaining block all decode
+    /// nothing.
+    #[must_use]
+    pub fn advance_decodes_block(&self, target: u32) -> bool {
+        let CursorState::Positioned {
+            block: current_block,
+            within: current_within,
+        } = self.state
+        else {
+            return false;
+        };
+        if self.decoded_docs[current_within] >= target {
+            return false;
+        }
+        let current_tail = &self.decoded_docs[current_within + 1..self.decoded_count];
+        if current_tail.partition_point(|doc_id| *doc_id < target) < current_tail.len() {
+            return false;
+        }
+        let later = &self.blocks.as_slice()[current_block + 1..];
+        later.partition_point(|block| block.last_doc < target) != later.len()
+    }
+
     /// Current zero-based posting ordinal for later POSITIONS alignment.
     #[must_use]
     pub fn posting_ordinal(&self) -> Option<u32> {
@@ -12967,6 +13011,103 @@ mod tests {
             assert_eq!(owned.block_index(), borrowed.block_index());
             assert_eq!(owned.block_last_doc(), borrowed.block_last_doc());
         }
+        Ok(())
+    }
+
+    /// The decode predicates must agree with the moves they predict on every
+    /// step of a full scan, in both directions of the answer.
+    ///
+    /// A caller admits a block's cost *before* the decode, so drift is not a
+    /// cosmetic defect: predicting `false` where a decode happens lets work
+    /// run unadmitted — the exact hole an admission gate exists to close —
+    /// and predicting `true` where none happens charges fuel for work never
+    /// performed. The observation is `block_index()`, which changes only when
+    /// `load_block` ran. The fixture asserts both answers actually occur, so
+    /// a predicate hard-coded either way fails here rather than passing
+    /// vacuously.
+    #[test]
+    fn next_decode_predicate_agrees_with_every_observed_decode() -> TestResult {
+        let expected = dense_postings(POSTINGS_PER_BLOCK * 2 + 3, 0);
+        let encoded = EncodedPostingList::encode(&expected)?;
+        let mut cursor = encoded.posting_list()?.into_cursor()?;
+
+        let mut predicted_decodes = 0_usize;
+        let mut observed_decodes = 0_usize;
+        let mut in_block_steps = 0_usize;
+        loop {
+            let predicted = cursor.next_decodes_block();
+            let before = cursor.block_index();
+            let moved = cursor.next()?;
+            let after = cursor.block_index();
+            let decoded = matches!((before, after), (Some(before), Some(after)) if before != after);
+            assert_eq!(
+                predicted, decoded,
+                "prediction disagreed at {before:?} -> {after:?}"
+            );
+            predicted_decodes += usize::from(predicted);
+            observed_decodes += usize::from(decoded);
+            in_block_steps += usize::from(!decoded && moved.is_some());
+            if moved.is_none() {
+                break;
+            }
+        }
+
+        assert_eq!(predicted_decodes, observed_decodes);
+        assert_eq!(
+            observed_decodes, 2,
+            "a three-block fixture decodes twice after construction"
+        );
+        assert!(
+            in_block_steps > 0,
+            "the fixture must also exercise the false answer"
+        );
+        Ok(())
+    }
+
+    /// The same obligation for skips, across every interesting target class.
+    ///
+    /// Each target gets a fresh cursor so the prediction is made from the
+    /// construction state, which is where a skip permit is decided.
+    #[test]
+    fn advance_decode_predicate_agrees_with_every_observed_skip() -> TestResult {
+        let expected = dense_postings(POSTINGS_PER_BLOCK * 3, 0);
+        let encoded = EncodedPostingList::encode(&expected)?;
+        let last = expected.last().ok_or("non-empty fixture")?.doc_id;
+        let targets = [
+            0,
+            expected[0].doc_id,
+            expected[1].doc_id,
+            expected[POSTINGS_PER_BLOCK - 1].doc_id,
+            expected[POSTINGS_PER_BLOCK].doc_id,
+            expected[POSTINGS_PER_BLOCK * 2].doc_id,
+            last,
+            last.saturating_add(1),
+            u32::MAX,
+        ];
+
+        let mut predicted_true = 0_usize;
+        let mut predicted_false = 0_usize;
+        for target in targets {
+            let mut cursor = encoded.posting_list()?.into_cursor()?;
+            let predicted = cursor.advance_decodes_block(target);
+            let before = cursor.block_index();
+            cursor.advance(target)?;
+            let after = cursor.block_index();
+            let decoded = matches!((before, after), (Some(before), Some(after)) if before != after);
+            assert_eq!(
+                predicted, decoded,
+                "prediction disagreed for target={target}: {before:?} -> {after:?}"
+            );
+            if predicted {
+                predicted_true += 1;
+            } else {
+                predicted_false += 1;
+            }
+        }
+        assert!(
+            predicted_true > 0 && predicted_false > 0,
+            "the target matrix must exercise both answers"
+        );
         Ok(())
     }
 

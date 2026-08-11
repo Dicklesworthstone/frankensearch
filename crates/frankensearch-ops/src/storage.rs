@@ -1275,6 +1275,88 @@ impl OpsIngestionMetrics {
     }
 }
 
+/// RAII reservation over [`OpsIngestionMetrics::pending_events`].
+///
+/// The counter is a *reservation*, not a gauge: a batch adds its record count
+/// on entry so concurrent batches see it for backpressure, and removes it when
+/// the batch reaches a terminal state. The removal has to happen on **every**
+/// exit, and after the ingest path became `async` the ordinary early-return
+/// and error paths stopped being the only ones — a caller that drops the
+/// in-flight future (request cancellation, a timeout race, a `select!` losing
+/// arm) unwinds nothing and returns through no `?`, and a panic inside the
+/// transaction unwinds straight past a bare `fetch_sub`. Either one used to
+/// strand the reservation on the counter forever, and because backpressure
+/// compares against that counter, a few stranded batches wedge ingest closed
+/// permanently for the life of the process.
+///
+/// Binding the decrement to `Drop` makes every exit identical: normal return,
+/// `?`, panic, and future-drop all run it exactly once. [`Self::release`] is
+/// the success path — it performs the same single decrement and hands back the
+/// pre-decrement depth the caller needs for its telemetry, then disarms `Drop`
+/// so the counter cannot be decremented twice.
+#[derive(Debug)]
+struct PendingEventsReservation {
+    metrics: Arc<OpsIngestionMetrics>,
+    reserved: usize,
+    released: bool,
+}
+
+impl PendingEventsReservation {
+    /// Reserve `reserved` pending events and report the depth observed before
+    /// this reservation was added.
+    fn acquire(metrics: &Arc<OpsIngestionMetrics>, reserved: usize) -> (Self, usize) {
+        let queue_depth_before = metrics
+            .pending_events
+            .fetch_add(reserved, Ordering::Relaxed);
+        (
+            Self {
+                metrics: Arc::clone(metrics),
+                reserved,
+                released: false,
+            },
+            queue_depth_before,
+        )
+    }
+
+    /// Perform the single decrement, returning the depth observed before it.
+    ///
+    /// Idempotent: once released, later calls (including `Drop`) are no-ops
+    /// and return the reserved count so `saturating_sub` still yields zero.
+    fn decrement(&mut self) -> usize {
+        if self.released {
+            return self.reserved;
+        }
+        self.released = true;
+        self.metrics
+            .pending_events
+            .fetch_sub(self.reserved, Ordering::Relaxed)
+    }
+
+    /// Release on the success path and return the pre-decrement queue depth.
+    fn release(mut self) -> usize {
+        self.decrement()
+    }
+}
+
+impl Drop for PendingEventsReservation {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let _ = self.decrement();
+        // Reaching here means the batch never got to its release point: the
+        // future was dropped mid-ingest or a panic is unwinding. The counter
+        // is restored either way; log it so a wedged-looking queue can be
+        // traced back to the abandoned batch instead of to backpressure.
+        tracing::warn!(
+            target: "frankensearch.ops.storage",
+            event = "search_events_ingest_abandoned",
+            reserved = self.reserved,
+            "ingest batch abandoned before release; pending_events reservation reclaimed"
+        );
+    }
+}
+
 /// Connection wrapper for ops telemetry storage.
 pub struct OpsStorage {
     conn: AsyncConnection,
@@ -1413,10 +1495,10 @@ impl OpsStorage {
         }
 
         let requested = events.len();
-        let queue_depth_before = self
-            .ingestion_metrics
-            .pending_events
-            .fetch_add(requested, Ordering::Relaxed);
+        // Held across the ingest await: its `Drop` is what makes cancellation
+        // and panic exits reclaim the reservation instead of stranding it.
+        let (reservation, queue_depth_before) =
+            PendingEventsReservation::acquire(&self.ingestion_metrics, requested);
         let queue_depth_with_reservation = queue_depth_before.saturating_add(requested);
         Self::log_ingest_start(
             requested,
@@ -1428,9 +1510,9 @@ impl OpsStorage {
             .update_high_watermark(queue_depth_with_reservation);
 
         if queue_depth_with_reservation > backpressure_threshold {
-            self.ingestion_metrics
-                .pending_events
-                .fetch_sub(requested, Ordering::Relaxed);
+            // Refused before any work: release explicitly so this path keeps
+            // its exact single decrement rather than relying on the drop log.
+            let _ = reservation.release();
             self.ingestion_metrics
                 .total_backpressured_batches
                 .fetch_add(1, Ordering::Relaxed);
@@ -1450,11 +1532,7 @@ impl OpsStorage {
         let ingest_result = self.ingest_search_events_transaction(cx, events).await;
 
         let write_latency_us = duration_as_u64(started.elapsed().as_micros());
-        let queue_depth_after = self
-            .ingestion_metrics
-            .pending_events
-            .fetch_sub(requested, Ordering::Relaxed)
-            .saturating_sub(requested);
+        let queue_depth_after = reservation.release().saturating_sub(requested);
 
         self.ingestion_metrics
             .total_batches
@@ -3807,8 +3885,9 @@ mod tests {
 
     use super::{
         EvidenceLinkRecord, OPS_SCHEMA_MIGRATIONS_TABLE_SQL, OPS_SCHEMA_VERSION,
-        OpsRetentionPolicy, OpsStorage, ResourceSampleRecord, SearchEventPhase, SearchEventRecord,
-        SloHealth, SloMaterializationConfig, SloScope, SummaryWindow, bootstrap, current_version,
+        OpsIngestionMetrics, OpsRetentionPolicy, OpsStorage, PendingEventsReservation,
+        ResourceSampleRecord, SearchEventPhase, SearchEventRecord, SloHealth,
+        SloMaterializationConfig, SloScope, SummaryWindow, bootstrap, current_version,
         evidence_link_id, ops_error, parse_slo_search_p99_ms_override,
     };
     use frankensearch_core::{
@@ -3820,6 +3899,137 @@ mod tests {
     };
     use fsqlite::Connection;
     use fsqlite_types::value::SqliteValue;
+
+    // ----------------------------------------------------------------------
+    // pending_events reservation: every exit must decrement exactly once.
+    //
+    // These are deliberately runtime-free and database-free. The property
+    // under test is the reservation's own exit accounting, and driving it
+    // through a real ingest would make the panic and drop cases depend on a
+    // connection, an executor, and a schema — none of which the property
+    // involves. Each test asserts the counter's exact value, not merely that
+    // it is "not leaked", so an over-decrement fails just as loudly as a leak.
+    // ----------------------------------------------------------------------
+
+    fn pending_events(metrics: &Arc<OpsIngestionMetrics>) -> usize {
+        metrics.snapshot().pending_events
+    }
+
+    #[test]
+    fn pending_events_reservation_releases_once_on_success() {
+        let metrics = Arc::new(OpsIngestionMetrics::default());
+        let (reservation, queue_depth_before) = PendingEventsReservation::acquire(&metrics, 5);
+        assert_eq!(queue_depth_before, 0, "an empty queue reports depth zero");
+        assert_eq!(pending_events(&metrics), 5, "the reservation is visible");
+
+        let observed_before_release = reservation.release();
+
+        assert_eq!(
+            observed_before_release, 5,
+            "release reports the pre-decrement depth used for queue_depth_after"
+        );
+        assert_eq!(
+            pending_events(&metrics),
+            0,
+            "release decrements exactly once; the guard's Drop must not decrement again"
+        );
+    }
+
+    #[test]
+    fn pending_events_reservation_release_leaves_a_concurrent_reservation_intact() {
+        // The counter is shared, so an over-decrement would be invisible in a
+        // single-batch test: the value would still land on zero. A second
+        // outstanding reservation makes a double decrement observable.
+        let metrics = Arc::new(OpsIngestionMetrics::default());
+        let (first, _) = PendingEventsReservation::acquire(&metrics, 4);
+        let (second, second_depth_before) = PendingEventsReservation::acquire(&metrics, 3);
+        assert_eq!(second_depth_before, 4);
+        assert_eq!(pending_events(&metrics), 7);
+
+        drop(second);
+
+        assert_eq!(
+            pending_events(&metrics),
+            4,
+            "one release must remove only its own reservation"
+        );
+        drop(first);
+        assert_eq!(pending_events(&metrics), 0);
+    }
+
+    #[test]
+    fn pending_events_reservation_reclaims_on_drop_without_release() {
+        // Stands in for the cancellation exit: the in-flight ingest future is
+        // dropped at its await point, so no return path and no `?` ever runs.
+        let metrics = Arc::new(OpsIngestionMetrics::default());
+        {
+            let (_reservation, _) = PendingEventsReservation::acquire(&metrics, 9);
+            assert_eq!(pending_events(&metrics), 9);
+        }
+        assert_eq!(
+            pending_events(&metrics),
+            0,
+            "an abandoned batch must not strand its reservation and wedge backpressure"
+        );
+    }
+
+    #[test]
+    fn pending_events_reservation_reclaims_when_a_panic_unwinds_through_it() {
+        let metrics = Arc::new(OpsIngestionMetrics::default());
+        let panicking = std::panic::catch_unwind({
+            let metrics = Arc::clone(&metrics);
+            move || {
+                let (_reservation, _) = PendingEventsReservation::acquire(&metrics, 6);
+                assert_eq!(pending_events(&metrics), 6);
+                panic!("ingest panicked while holding a pending_events reservation");
+            }
+        });
+
+        assert!(panicking.is_err(), "the fixture must actually panic");
+        assert_eq!(
+            pending_events(&metrics),
+            0,
+            "unwinding past the release point must still reclaim the reservation"
+        );
+    }
+
+    #[test]
+    fn pending_events_reservation_never_double_decrements() {
+        let metrics = Arc::new(OpsIngestionMetrics::default());
+        // Park a second reservation so any extra decrement drives the counter
+        // below the parked value instead of harmlessly bottoming out at zero.
+        let (parked, _) = PendingEventsReservation::acquire(&metrics, 2);
+        let (mut reservation, _) = PendingEventsReservation::acquire(&metrics, 7);
+        assert_eq!(pending_events(&metrics), 9);
+
+        let first = reservation.decrement();
+        let second = reservation.decrement();
+        let third = reservation.decrement();
+
+        assert_eq!(
+            first, 9,
+            "the first decrement reports the pre-decrement depth"
+        );
+        assert_eq!(
+            (second, third),
+            (7, 7),
+            "later decrements are no-ops that report the reserved count so \
+             saturating_sub still yields zero"
+        );
+        assert_eq!(
+            pending_events(&metrics),
+            2,
+            "repeated release must not consume another batch's reservation"
+        );
+        drop(reservation);
+        assert_eq!(
+            pending_events(&metrics),
+            2,
+            "Drop after an explicit release must not decrement again"
+        );
+        drop(parked);
+        assert_eq!(pending_events(&metrics), 0);
+    }
 
     fn table_exists(conn: &Connection, table_name: &str) -> bool {
         // Probe table existence with a zero-row SELECT instead of
