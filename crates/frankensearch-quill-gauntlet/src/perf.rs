@@ -825,6 +825,22 @@ fn qg1_bulk_cell_resources(
     Ok((threads, writer_heap_bytes))
 }
 
+/// Reconstruct the sole timing scope admitted by the QG-1 incumbent screen.
+///
+/// The public matrix scope supplies the cell-derived operation identity,
+/// version, and unit.  QG-1 engine indexing is intentionally stricter than
+/// the generic matrix default: its rate must be recomputable from one
+/// continuous work/time interval, so this screen requires native throughput
+/// semantics for that exact scope.
+fn qg1_expected_throughput_scope(
+    cell: &PerfCellSpec,
+) -> Result<PerfOperationScope, Qg1TantivyIncumbentError> {
+    qg1_bulk_cell_resources(cell)?;
+    let mut scope = perf_operation_scope(cell.gate, &cell.fixture, &cell.metric);
+    scope.semantics = PerfMetricSemantics::Throughput;
+    Ok(scope)
+}
+
 /// Build the complete, machine-profile-qualified Tantivy candidate universe for
 /// one QG-1 bulk cell.
 ///
@@ -891,11 +907,16 @@ fn qg1_stream_matches_configs(
             })
 }
 
-fn qg1_valid_throughput_experiment(experiment: &PairedExperimentResult) -> bool {
+fn qg1_valid_throughput_experiment(
+    experiment: &PairedExperimentResult,
+    expected_scope: &PerfOperationScope,
+    expected_provenance: Option<&PerfSampleProvenance>,
+) -> bool {
     experiment.verify_recomputed().is_ok()
         && experiment.status == PairedEvidenceStatus::Valid
         && experiment.claim_state == PairedClaimState::EligibleForDecision
-        && experiment.scope.semantics == PerfMetricSemantics::Throughput
+        && experiment.scope == *expected_scope
+        && expected_provenance.is_none_or(|provenance| experiment.provenance == *provenance)
 }
 
 impl Qg1TantivyIncumbentScreen {
@@ -912,6 +933,7 @@ impl Qg1TantivyIncumbentScreen {
         pilots: Vec<Qg1TantivyIncumbentPilot>,
     ) -> Result<Self, Qg1TantivyIncumbentError> {
         let candidates = preregister_qg1_tantivy_incumbents(cell, &screen_plan, semantic_contract)?;
+        let expected_scope = qg1_expected_throughput_scope(cell)?;
         let no_decision = |reason: impl Into<String>| Self {
             schema_version: QG1_TANTIVY_INCUMBENT_SCREEN_SCHEMA_VERSION.to_owned(),
             screen_plan: screen_plan.clone(),
@@ -962,7 +984,7 @@ impl Qg1TantivyIncumbentScreen {
                     "candidate materialized an infeasible writer width",
                 ));
             }
-            if !qg1_valid_throughput_experiment(&pilot.experiment)
+            if !qg1_valid_throughput_experiment(&pilot.experiment, &expected_scope, None)
                 || !qg1_stream_matches_configs(
                     &pilot.experiment,
                     Some(&shipping_auto.config_sha256),
@@ -1051,6 +1073,12 @@ impl Qg1TantivyIncumbentScreen {
             .selected_candidate
             .as_ref()
             .ok_or(Qg1TantivyIncumbentError::NoProvisionalSelection)?;
+        let expected_pilot = recomputed_screen
+            .pilots
+            .first()
+            .ok_or(Qg1TantivyIncumbentError::ScreenSelectionMismatch)?;
+        let expected_scope = &expected_pilot.experiment.scope;
+        let expected_provenance = &expected_pilot.experiment.provenance;
         let pilot_receipts = self
             .pilots
             .iter()
@@ -1069,7 +1097,7 @@ impl Qg1TantivyIncumbentScreen {
         }) {
             return Err(Qg1TantivyIncumbentError::StreamReceiptMismatch);
         }
-        decision.recompute_against(selected_candidate)?;
+        decision.recompute_against(selected_candidate, expected_scope, expected_provenance)?;
         Ok(())
     }
 }
@@ -1118,6 +1146,8 @@ impl Qg1TantivyBoundStream {
         control_config_sha256: Option<&str>,
         treatment_config_sha256: Option<&str>,
         estimator_config: &PairedEstimatorConfig,
+        expected_scope: &PerfOperationScope,
+        expected_provenance: &PerfSampleProvenance,
     ) -> Result<(), Qg1TantivyIncumbentError> {
         if self.kind != kind
             || self.control_tantivy_config_sha256.as_deref() != control_config_sha256
@@ -1137,6 +1167,11 @@ impl Qg1TantivyBoundStream {
             )
         {
             return Err(Qg1TantivyIncumbentError::DecisionCandidateMismatch);
+        }
+        if self.samples.iter().any(|sample| {
+            sample.scope != *expected_scope || sample.provenance != *expected_provenance
+        }) {
+            return Err(Qg1TantivyIncumbentError::DecisionInvocationMismatch);
         }
         if self.stream_receipt_sha256 != self.recomputed_stream_receipt_sha256()? {
             return Err(Qg1TantivyIncumbentError::StreamReceiptMismatch);
@@ -1171,6 +1206,8 @@ impl Qg1TantivyIncumbentDecision {
     fn recompute_against(
         &self,
         selected_candidate: &Qg1TantivyIncumbentCandidate,
+        expected_scope: &PerfOperationScope,
+        expected_provenance: &PerfSampleProvenance,
     ) -> Result<(PairedExperimentResult, PairedExperimentResult), Qg1TantivyIncumbentError> {
         if self.estimator_config
             != PairedEstimatorConfig::predeclared(self.estimator_config.bootstrap_seed)
@@ -1205,6 +1242,8 @@ impl Qg1TantivyIncumbentDecision {
                 control_config,
                 treatment_config,
                 &self.estimator_config,
+                expected_scope,
+                expected_provenance,
             )?;
             if !receipts.insert(stream.stream_receipt_sha256.clone()) {
                 return Err(Qg1TantivyIncumbentError::StreamReceiptMismatch);
@@ -1227,9 +1266,15 @@ impl Qg1TantivyIncumbentDecision {
         let quill_decision =
             estimate_paired_experiment(&effect, &quill_null, &self.estimator_config)
                 .map_err(|_| Qg1TantivyIncumbentError::DecisionEvidenceInvalid)?;
-        if !qg1_valid_throughput_experiment(&tantivy_decision)
-            || !qg1_valid_throughput_experiment(&quill_decision)
-        {
+        if !qg1_valid_throughput_experiment(
+            &tantivy_decision,
+            expected_scope,
+            Some(expected_provenance),
+        ) || !qg1_valid_throughput_experiment(
+            &quill_decision,
+            expected_scope,
+            Some(expected_provenance),
+        ) {
             return Err(Qg1TantivyIncumbentError::DecisionEvidenceInvalid);
         }
         Ok((tantivy_decision, quill_decision))
@@ -5223,6 +5268,10 @@ mod tests {
         .expect("screen plan")
     }
 
+    fn qg1_throughput_scope(cell: &PerfCellSpec) -> PerfOperationScope {
+        qg1_expected_throughput_scope(cell).expect("canonical QG-1 throughput scope")
+    }
+
     fn bind_tantivy_configs(
         samples: &mut [PerfRawSample],
         control_config_sha256: Option<&str>,
@@ -5239,16 +5288,16 @@ mod tests {
     fn qg1_pilot(
         candidate: Qg1TantivyIncumbentCandidate,
         shipping_auto: &Qg1TantivyIncumbentCandidate,
+        scope: &PerfOperationScope,
         run_id: &str,
         treatment_duration: u64,
         receipt_label: &str,
     ) -> Qg1TantivyIncumbentPilot {
-        let scope = operation_scope(PerfMetricSemantics::Throughput);
         let provenance = provenance(run_id);
         let control_durations = [1_000_000; PERF_MIN_RUNS];
         let treatment_durations = [treatment_duration; PERF_MIN_RUNS];
         let mut effect = duration_stream(
-            &scope,
+            scope,
             &provenance,
             &control_durations,
             &treatment_durations,
@@ -5260,7 +5309,7 @@ mod tests {
             Some(&candidate.config_sha256),
         );
         let mut null = duration_stream(
-            &scope,
+            scope,
             &provenance,
             &control_durations,
             &control_durations,
@@ -5302,6 +5351,7 @@ mod tests {
         let candidates = preregister_qg1_tantivy_incumbents(cell, screen_plan, semantic_contract)
             .expect("preregister");
         let shipping_auto = &candidates[0];
+        let scope = qg1_throughput_scope(cell);
         candidates
             .iter()
             .cloned()
@@ -5316,6 +5366,7 @@ mod tests {
                 qg1_pilot(
                     candidate,
                     shipping_auto,
+                    &scope,
                     run_id,
                     treatment_duration,
                     &format!("pilot-{index}"),
@@ -5325,13 +5376,14 @@ mod tests {
     }
 
     fn qg1_bound_stream(
+        cell: &PerfCellSpec,
         kind: Qg1TantivyDecisionStreamKind,
         run_id: &str,
         control_config_sha256: Option<&str>,
         treatment_config_sha256: Option<&str>,
         treatment_duration: u64,
     ) -> Qg1TantivyBoundStream {
-        let scope = operation_scope(PerfMetricSemantics::Throughput);
+        let scope = qg1_throughput_scope(cell);
         let provenance = provenance(run_id);
         let durations = [1_000_000; PERF_MIN_RUNS];
         let mut effect = duration_stream(
@@ -5353,6 +5405,49 @@ mod tests {
             .recomputed_stream_receipt_sha256()
             .expect("stream receipt");
         stream
+    }
+
+    fn qg1_decision(
+        cell: &PerfCellSpec,
+        selected: &Qg1TantivyIncumbentCandidate,
+        run_id: &str,
+    ) -> Qg1TantivyIncumbentDecision {
+        Qg1TantivyIncumbentDecision {
+            estimator_config: estimator_config(),
+            tantivy_vs_quill: qg1_bound_stream(
+                cell,
+                Qg1TantivyDecisionStreamKind::TantivyVsQuill,
+                run_id,
+                Some(&selected.config_sha256),
+                None,
+                500_000,
+            ),
+            tantivy_null: qg1_bound_stream(
+                cell,
+                Qg1TantivyDecisionStreamKind::TantivyNull,
+                run_id,
+                Some(&selected.config_sha256),
+                Some(&selected.config_sha256),
+                1_000_000,
+            ),
+            quill_null: qg1_bound_stream(
+                cell,
+                Qg1TantivyDecisionStreamKind::QuillNull,
+                run_id,
+                None,
+                None,
+                1_000_000,
+            ),
+        }
+    }
+
+    fn qg1_rebind_stream_scope(stream: &mut Qg1TantivyBoundStream, scope: &PerfOperationScope) {
+        for sample in &mut stream.samples {
+            sample.scope = scope.clone();
+        }
+        stream.stream_receipt_sha256 = stream
+            .recomputed_stream_receipt_sha256()
+            .expect("scope-bound stream receipt");
     }
 
     #[test]
@@ -5406,30 +5501,7 @@ mod tests {
         );
         assert_eq!(screen.tied_fastest_candidates, vec![selected.clone()]);
 
-        let decision = Qg1TantivyIncumbentDecision {
-            estimator_config: estimator_config(),
-            tantivy_vs_quill: qg1_bound_stream(
-                Qg1TantivyDecisionStreamKind::TantivyVsQuill,
-                "one-live-invocation",
-                Some(&selected.config_sha256),
-                None,
-                500_000,
-            ),
-            tantivy_null: qg1_bound_stream(
-                Qg1TantivyDecisionStreamKind::TantivyNull,
-                "one-live-invocation",
-                Some(&selected.config_sha256),
-                Some(&selected.config_sha256),
-                1_000_000,
-            ),
-            quill_null: qg1_bound_stream(
-                Qg1TantivyDecisionStreamKind::QuillNull,
-                "one-live-invocation",
-                None,
-                None,
-                1_000_000,
-            ),
-        };
+        let decision = qg1_decision(&cell, selected, "one-live-invocation");
         screen
             .validate_decision(&cell, &semantic_contract, &decision)
             .expect("same-invocation T/Quill, T/T, and Q/Q streams bind selected candidate");
@@ -5485,6 +5557,102 @@ mod tests {
     }
 
     #[test]
+    fn qg1_incumbent_screen_rejects_cross_invocation_and_unrelated_throughput_scopes() {
+        let cell = qg1_bulk_cell(4);
+        let semantic_contract = qg1_semantic_contract();
+        let screen_plan = qg1_screen_plan(vec![1, 2, 4]);
+        let pilots = qg1_complete_pilots(
+            &cell,
+            &screen_plan,
+            &semantic_contract,
+            "one-live-invocation",
+        );
+        let screen = Qg1TantivyIncumbentScreen::screen(
+            &cell,
+            screen_plan.clone(),
+            &semantic_contract,
+            pilots,
+        )
+        .expect("valid incumbent screen");
+        let selected = screen
+            .selected_candidate
+            .as_ref()
+            .expect("CI-distinct fastest candidate");
+        let decision = qg1_decision(&cell, selected, "one-live-invocation");
+
+        let mut cross_invocation = decision.clone();
+        for sample in &mut cross_invocation.tantivy_vs_quill.samples {
+            sample.provenance = provenance("later-process-invocation");
+        }
+        cross_invocation.tantivy_vs_quill.stream_receipt_sha256 = cross_invocation
+            .tantivy_vs_quill
+            .recomputed_stream_receipt_sha256()
+            .expect("cross-invocation receipt");
+        assert_eq!(
+            screen.validate_decision(&cell, &semantic_contract, &cross_invocation),
+            Err(Qg1TantivyIncumbentError::DecisionInvocationMismatch)
+        );
+
+        let mut wrong_scope = qg1_throughput_scope(&cell);
+        wrong_scope.operation_id = "qg1.unrelated_throughput".to_owned();
+        let mut unrelated_tantivy_vs_quill = decision.clone();
+        qg1_rebind_stream_scope(
+            &mut unrelated_tantivy_vs_quill.tantivy_vs_quill,
+            &wrong_scope,
+        );
+        let mut unrelated_tantivy_null = decision.clone();
+        qg1_rebind_stream_scope(&mut unrelated_tantivy_null.tantivy_null, &wrong_scope);
+        let mut unrelated_quill_null = decision.clone();
+        qg1_rebind_stream_scope(&mut unrelated_quill_null.quill_null, &wrong_scope);
+        for unrelated_scope in [
+            unrelated_tantivy_vs_quill,
+            unrelated_tantivy_null,
+            unrelated_quill_null,
+        ] {
+            assert_eq!(
+                screen.validate_decision(&cell, &semantic_contract, &unrelated_scope),
+                Err(Qg1TantivyIncumbentError::DecisionInvocationMismatch)
+            );
+        }
+
+        let mut wrong_scope_pilots = qg1_complete_pilots(
+            &cell,
+            &screen_plan,
+            &semantic_contract,
+            "one-live-invocation",
+        );
+        let pilot = &mut wrong_scope_pilots[0];
+        let (effect_samples, null_samples) = (
+            &mut pilot.experiment.effect_samples,
+            &mut pilot.experiment.null_samples,
+        );
+        for sample in effect_samples.iter_mut().chain(null_samples.iter_mut()) {
+            sample.scope = wrong_scope.clone();
+        }
+        pilot.experiment = estimate_paired_experiment(
+            &pilot.experiment.effect_samples,
+            &pilot.experiment.null_samples,
+            &estimator_config(),
+        )
+        .expect("unrelated scope remains generically valid throughput evidence");
+        pilot.stream_receipt_sha256 = pilot
+            .recomputed_stream_receipt_sha256()
+            .expect("unrelated-scope pilot receipt");
+        let rejected_pilots = Qg1TantivyIncumbentScreen::screen(
+            &cell,
+            screen_plan,
+            &semantic_contract,
+            wrong_scope_pilots,
+        )
+        .expect("wrong-scope pilot is a fail-closed no-decision receipt");
+        assert!(rejected_pilots.selected_candidate.is_none());
+        assert_eq!(
+            rejected_pilots.no_decision_reason.as_deref(),
+            Some("candidate pilot lacks valid configuration-bound throughput evidence")
+        );
+    }
+
+    #[test]
     fn qg1_incumbent_screen_reports_ci_ties_without_a_unique_winner() {
         let cell = qg1_bulk_cell(4);
         let semantic_contract = qg1_semantic_contract();
@@ -5496,9 +5664,11 @@ mod tests {
             "one-live-invocation",
         );
         let shipping_auto = pilots[0].candidate.clone();
+        let scope = qg1_throughput_scope(&cell);
         pilots[3] = qg1_pilot(
             pilots[3].candidate.clone(),
             &shipping_auto,
+            &scope,
             "one-live-invocation",
             500_000,
             "pilot-3-repeated",
@@ -5506,6 +5676,7 @@ mod tests {
         pilots[2] = qg1_pilot(
             pilots[2].candidate.clone(),
             &shipping_auto,
+            &scope,
             "one-live-invocation",
             500_000,
             "pilot-2-repeated",
@@ -5604,9 +5775,11 @@ mod tests {
         let candidates =
             preregister_qg1_tantivy_incumbents(&cell, &screen_plan, &semantic_contract)
                 .expect("candidates");
+        let scope = qg1_throughput_scope(&cell);
         split_invocation[1] = qg1_pilot(
             candidates[1].clone(),
             &candidates[0],
+            &scope,
             "different-invocation",
             500_000,
             "pilot-different-invocation",
