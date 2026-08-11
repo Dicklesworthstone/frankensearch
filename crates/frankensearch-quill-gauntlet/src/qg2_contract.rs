@@ -412,6 +412,47 @@ const HYPEROPT_GROUP: [TextSurfaceSpec; 2] = [
     },
 ];
 
+/// Exact protected `[gate.QG-2]` block at the bootstrap base, verbatim from
+/// protected commit `3f86ea57`.
+///
+/// Binding the whole block by bytes — not just the absence of a nested table —
+/// is what stops a coordinated rewrite of `name`, `fixture`, `target`, or
+/// `activated` from passing as the protected base while the typed contract
+/// still parses.
+pub(crate) const QG2_MANIFEST_BLOCK_PRE_REGION: &str = r#"[gate.QG-2]
+name = "bulk indexing, single-thread"
+fixture = "medium; positions ON; threads = 1; commit included"
+target = "docs_per_sec >= 1.5x oracle"
+activated = false
+
+"#;
+
+/// Exact protected `[gate.QG-2]` block once the correction is applied,
+/// verbatim from the frozen candidate `4e136ac8`.
+///
+/// The projection is **not** only the nested table: the `fixture` string is
+/// rewritten from "commit included" to the continuous first-feed-through-
+/// quiescence scope, because a QG-2 fixture that still advertises commit-
+/// inclusive durable framing contradicts the contract in the same block.
+/// Rendering the table alone would leave that contradiction in place.
+pub(crate) const QG2_MANIFEST_BLOCK_POST_REGION: &str = r#"[gate.QG-2]
+name = "bulk indexing, single-thread"
+fixture = "medium; positions ON; threads = 1; continuous first-feed through terminal searchable visibility and complete worker/merge/queue quiescence"
+target = "docs_per_sec >= 1.5x oracle"
+activated = false
+
+[gate.QG-2.qg2_contract]
+contract = "BINDING Q2C COMPARATOR CONTRACT 2026-07-31: QG-2 compares both arms symmetrically in memory with no durable storage. Continuous timing begins at the first document feed and ends only after terminal searchable visibility plus complete worker, merge, and queue quiescence. Commit is the searchable-visibility boundary, not durable publication. QG-2 excludes fsync, F_FULLFSYNC, crash recovery, durable publication, and on-disk-byte measurements. Durable gates and production-source durability nonregression remain mandatory outside QG-2."
+storage_topology = "symmetric_in_memory"
+durability_scope = "non_durable"
+timing_start = "first_document_feed"
+timing_end = "terminal_searchable_visibility_and_complete_worker_merge_queue_quiescence"
+commit_boundary = "searchable_visibility_not_durable_publication"
+excluded_operations = ["fsync", "F_FULLFSYNC", "crash_recovery", "durable_publication", "on_disk_bytes"]
+source_nonregression = "durable_gates_and_production_source_durability_remain_mandatory"
+
+"#;
+
 /// The three tracker selectors, as `(logical surface, locator, issue id)`.
 ///
 /// Single source of truth for both the applied-state validator and the
@@ -1692,11 +1733,16 @@ fn preflight_text_group(
 }
 
 /// Where the typed QG-2 table sits relative to the `[gate.QG-2]` block.
+///
+/// Byte equality against the two protected blocks already decides the state.
+/// This is the independent structural corroboration: the exact-byte match must
+/// also agree with the document's table ordering, so a protected block pasted
+/// into the wrong position — or duplicated under a foreign header — cannot be
+/// admitted on byte equality alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Qg2BlockTopology {
-    /// `[gate.QG-2]` is followed immediately by `[gate.QG-3]`: the protected
-    /// base. The offset is where the rendered table must be inserted.
-    Bootstrap { insert_offset: usize },
+    /// `[gate.QG-2]` is followed immediately by `[gate.QG-3]`: the base.
+    Bootstrap,
     /// `[gate.QG-2]` is followed immediately by its nested contract table.
     Applied,
 }
@@ -1706,79 +1752,30 @@ fn qg2_block_topology(source: &str) -> Result<Qg2BlockTopology, String> {
     const QG3_HEADER: &str = "[gate.QG-3]";
     const CONTRACT_HEADER: &str = "[gate.QG-2.qg2_contract]";
 
-    let mut offset = 0usize;
-    let mut qg2_offset: Option<usize> = None;
-    let mut following: Option<(usize, String)> = None;
+    let mut seen_qg2 = false;
+    let mut following: Option<String> = None;
     for line in source.split_inclusive('\n') {
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed == QG2_HEADER {
-            if qg2_offset.is_some() {
+            if seen_qg2 {
                 return Err(format!("{QG2_HEADER} appears more than once"));
             }
-            qg2_offset = Some(offset);
-        } else if qg2_offset.is_some() && following.is_none() && trimmed.starts_with('[') {
-            following = Some((offset, trimmed.to_owned()));
+            seen_qg2 = true;
+        } else if seen_qg2 && following.is_none() && trimmed.starts_with('[') {
+            following = Some(trimmed.to_owned());
         }
-        offset = offset.saturating_add(line.len());
     }
-    if qg2_offset.is_none() {
+    if !seen_qg2 {
         return Err(format!("{QG2_HEADER} is absent"));
     }
     match following {
-        Some((insert_offset, header)) if header == QG3_HEADER => {
-            Ok(Qg2BlockTopology::Bootstrap { insert_offset })
-        }
-        Some((_, header)) if header == CONTRACT_HEADER => Ok(Qg2BlockTopology::Applied),
-        Some((_, header)) => Err(format!(
+        Some(header) if header == QG3_HEADER => Ok(Qg2BlockTopology::Bootstrap),
+        Some(header) if header == CONTRACT_HEADER => Ok(Qg2BlockTopology::Applied),
+        Some(header) => Err(format!(
             "{QG2_HEADER} is followed by {header}, not {QG3_HEADER}"
         )),
         None => Err(format!("{QG2_HEADER} is followed by no table header")),
     }
-}
-
-/// Render the canonical contract as an exact nested TOML table.
-///
-/// Every scalar is rendered through the same serde representation the parser
-/// accepts, so the rendered table cannot drift from the typed contract's
-/// `#[serde(rename)]` spellings. JSON string escaping is a valid TOML basic
-/// string for every value serde can produce here.
-fn render_qg2_contract_table(contract: &Qg2ComparatorContract) -> Result<String, String> {
-    let mut rendered = String::with_capacity(1024);
-    rendered.push_str("[gate.QG-2.qg2_contract]\n");
-    for (key, value) in [
-        ("contract", serde_json::to_string(&contract.contract)),
-        (
-            "storage_topology",
-            serde_json::to_string(&contract.storage_topology),
-        ),
-        (
-            "durability_scope",
-            serde_json::to_string(&contract.durability_scope),
-        ),
-        (
-            "timing_start",
-            serde_json::to_string(&contract.timing_start),
-        ),
-        ("timing_end", serde_json::to_string(&contract.timing_end)),
-        (
-            "commit_boundary",
-            serde_json::to_string(&contract.commit_boundary),
-        ),
-        (
-            "excluded_operations",
-            serde_json::to_string(&contract.excluded_operations),
-        ),
-        (
-            "source_nonregression",
-            serde_json::to_string(&contract.source_nonregression),
-        ),
-    ] {
-        let value = value.map_err(|error| format!("unserializable {key}: {error}"))?;
-        writeln!(&mut rendered, "{key} = {value}")
-            .map_err(|error| format!("unwritable {key}: {error}"))?;
-    }
-    rendered.push('\n');
-    Ok(rendered)
 }
 
 fn preflight_manifest(repo_root: &Path, builder: &mut PreflightBuilder) {
@@ -1813,66 +1810,45 @@ fn preflight_manifest(repo_root: &Path, builder: &mut PreflightBuilder) {
     let mut rendered: Option<String> = None;
     let mut drift: Option<(&'static str, String)> = None;
 
-    match toml::from_str::<ManifestDocument>(&source) {
-        Err(error) => {
-            drift = Some((
-                "qg2.preflight.manifest_parse",
-                format!("the manifest does not parse: {error}"),
+    // Byte identity, not inference. The block is the selector, so `name`,
+    // `fixture`, `target`, and `activated` are all bound; nothing about the
+    // block can be rewritten while still classifying as a protected base.
+    let bootstrap_blocks = source.matches(QG2_MANIFEST_BLOCK_PRE_REGION).count();
+    let applied_blocks = source.matches(QG2_MANIFEST_BLOCK_POST_REGION).count();
+    match (bootstrap_blocks, applied_blocks) {
+        (1, 0) if qg2_block_topology(&source) == Ok(Qg2BlockTopology::Bootstrap) => {
+            state = Qg2SelectorState::Bootstrap;
+            pre_sha256 = Some(sha256_hex(QG2_MANIFEST_BLOCK_PRE_REGION.as_bytes()));
+            rendered = Some(source.replacen(
+                QG2_MANIFEST_BLOCK_PRE_REGION,
+                QG2_MANIFEST_BLOCK_POST_REGION,
+                1,
             ));
         }
-        Ok(document) => {
-            let observed = document
-                .gate
-                .get("QG-2")
-                .and_then(|gate| gate.qg2_contract.as_ref());
-            match (qg2_block_topology(&source), observed) {
-                (Ok(Qg2BlockTopology::Bootstrap { insert_offset }), None) => {
-                    state = Qg2SelectorState::Bootstrap;
-                    pre_sha256 = Some(sha256_hex(source.as_bytes()));
-                    match render_qg2_contract_table(&canonical) {
-                        Ok(table) => {
-                            let mut applied =
-                                String::with_capacity(source.len().saturating_add(table.len()));
-                            applied.push_str(&source[..insert_offset]);
-                            applied.push_str(&table);
-                            applied.push_str(&source[insert_offset..]);
-                            rendered = Some(applied);
-                        }
-                        Err(error) => {
-                            drift = Some(("qg2.preflight.render", error));
-                        }
-                    }
-                }
-                (Ok(Qg2BlockTopology::Applied), Some(observed)) if observed == &canonical => {
-                    state = Qg2SelectorState::Applied;
-                    post_sha256 = Some(sha256_hex(source.as_bytes()));
-                    rendered = Some(source.clone());
-                }
-                (Ok(Qg2BlockTopology::Applied), Some(_)) => {
-                    drift = Some((
-                        "qg2.preflight.manifest_conflict",
-                        "a nested qg2_contract table exists but is not the canonical contract"
-                            .to_owned(),
-                    ));
-                }
-                (Ok(topology), observed) => {
-                    drift = Some((
-                        "qg2.preflight.manifest_conflict",
-                        format!(
-                            "table topology {topology:?} disagrees with a {} typed contract",
-                            if observed.is_some() {
-                                "present"
-                            } else {
-                                "absent"
-                            }
-                        ),
-                    ));
-                }
-                (Err(error), _) => {
-                    drift = Some(("qg2.preflight.manifest_topology", error));
-                }
-            }
+        (0, 1) if qg2_block_topology(&source) == Ok(Qg2BlockTopology::Applied) => {
+            state = Qg2SelectorState::Applied;
+            post_sha256 = Some(sha256_hex(QG2_MANIFEST_BLOCK_POST_REGION.as_bytes()));
+            rendered = Some(source.clone());
         }
+        (bootstrap, applied) => {
+            drift = Some((
+                "qg2.preflight.manifest_conflict",
+                format!(
+                    "expected exactly one protected [gate.QG-2] block on one side of the \
+                     correction; found {bootstrap} bootstrap and {applied} applied blocks"
+                ),
+            ));
+        }
+    }
+
+    if drift.is_none()
+        && let Err(error) = toml::from_str::<ManifestDocument>(&source)
+    {
+        state = Qg2SelectorState::Drift;
+        drift = Some((
+            "qg2.preflight.manifest_parse",
+            format!("the manifest does not parse: {error}"),
+        ));
     }
 
     // Never hand a rendered poststate to a mutation without proving it parses
@@ -2892,22 +2868,13 @@ mod tests {
     /// Manifest at the protected base: `[gate.QG-2]` followed immediately by
     /// `[gate.QG-3]`, with no nested contract table.
     fn bootstrap_manifest() -> String {
-        concat!(
-            "[gate.QG-1]\n",
-            "name = \"bulk indexing, multi-core\"\n",
-            "activated = false\n",
-            "\n",
-            "[gate.QG-2]\n",
-            "name = \"bulk indexing, single-thread\"\n",
-            "fixture = \"medium; positions ON; threads = 1; commit included\"\n",
-            "target = \"docs_per_sec >= 1.5x oracle\"\n",
-            "activated = false\n",
-            "\n",
-            "[gate.QG-3]\n",
-            "name = \"watch-mode incremental\"\n",
-            "activated = false\n",
+        // The QG-2 block is the *protected* block verbatim, not a lookalike, so
+        // the fixture exercises the same byte identity the live tree must have.
+        format!(
+            "[gate.QG-1]\nname = \"bulk indexing, multi-core\"\nactivated = false\n\n\
+             {QG2_MANIFEST_BLOCK_PRE_REGION}\
+             [gate.QG-3]\nname = \"watch-mode incremental\"\nactivated = false\n"
         )
-        .to_owned()
     }
 
     /// The three documents at the protected base: both renamed law headings
@@ -3121,32 +3088,62 @@ mod tests {
     }
 
     #[test]
-    fn rendered_contract_table_round_trips_to_the_canonical_typed_contract() {
-        let canonical = Qg2ComparatorContract::canonical();
-        let table = render_qg2_contract_table(&canonical).expect("render canonical table");
-        assert!(table.starts_with("[gate.QG-2.qg2_contract]\n"));
+    fn the_protected_projection_rewrites_the_fixture_and_not_only_the_table() {
+        // The correction is not "insert a table". The protected projection also
+        // retires the "commit included" fixture string, because a QG-2 fixture
+        // that still advertises commit-inclusive durable framing contradicts the
+        // contract sitting in the same block. A projection that only inserted
+        // the table would leave that contradiction standing.
+        assert!(QG2_MANIFEST_BLOCK_PRE_REGION.contains("threads = 1; commit included"));
+        assert!(!QG2_MANIFEST_BLOCK_POST_REGION.contains("commit included"));
+        assert!(QG2_MANIFEST_BLOCK_POST_REGION.contains(
+            "continuous first-feed through terminal searchable visibility and complete \
+             worker/merge/queue quiescence"
+        ));
+        assert!(QG2_MANIFEST_BLOCK_POST_REGION.contains("[gate.QG-2.qg2_contract]\n"));
 
-        let source = bootstrap_manifest();
-        let insert_offset = match qg2_block_topology(&source) {
-            Ok(Qg2BlockTopology::Bootstrap { insert_offset }) => Some(insert_offset),
-            Ok(Qg2BlockTopology::Applied) | Err(_) => None,
+        for block in [
+            QG2_MANIFEST_BLOCK_PRE_REGION,
+            QG2_MANIFEST_BLOCK_POST_REGION,
+        ] {
+            assert!(block.starts_with("[gate.QG-2]\n"));
+            assert!(
+                block.ends_with("\n\n"),
+                "a block must not swallow its successor"
+            );
+            assert!(!block.contains("[gate.QG-3]"));
         }
-        .expect("the bootstrap manifest must expose a bootstrap topology");
-        let mut applied = String::new();
-        applied.push_str(&source[..insert_offset]);
-        applied.push_str(&table);
-        applied.push_str(&source[insert_offset..]);
+    }
 
+    #[test]
+    fn the_projected_manifest_parses_back_to_the_canonical_typed_contract() {
+        let source = bootstrap_manifest();
+        assert_eq!(
+            source.matches(QG2_MANIFEST_BLOCK_PRE_REGION).count(),
+            1,
+            "the bootstrap fixture must carry the exact protected block"
+        );
+        assert_eq!(qg2_block_topology(&source), Ok(Qg2BlockTopology::Bootstrap));
+
+        let applied = source.replacen(
+            QG2_MANIFEST_BLOCK_PRE_REGION,
+            QG2_MANIFEST_BLOCK_POST_REGION,
+            1,
+        );
         let document =
-            toml::from_str::<ManifestDocument>(&applied).expect("rendered manifest must parse");
+            toml::from_str::<ManifestDocument>(&applied).expect("projected manifest must parse");
         assert_eq!(
             document
                 .gate
                 .get("QG-2")
                 .and_then(|gate| gate.qg2_contract.as_ref()),
-            Some(&canonical)
+            Some(&Qg2ComparatorContract::canonical())
         );
         assert_eq!(qg2_block_topology(&applied), Ok(Qg2BlockTopology::Applied));
+        assert_ne!(
+            perf_manifest_contract_sha256(&source),
+            perf_manifest_contract_sha256(&applied)
+        );
     }
 
     #[test]

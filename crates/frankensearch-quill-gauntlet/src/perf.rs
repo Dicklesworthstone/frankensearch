@@ -2100,6 +2100,7 @@ fn validate_perf_manifest_gate_set(
                 "activated",
             ]
             .as_slice(),
+            PerfGate::Qg2 => ["name", "fixture", "target", "activated", "qg2_contract"].as_slice(),
             PerfGate::Qg6 => [
                 "name",
                 "fixture",
@@ -2118,6 +2119,9 @@ fn validate_perf_manifest_gate_set(
                 });
             }
         }
+        if gate == PerfGate::Qg2 {
+            validate_qg2_comparator_contract_table(policy, requested_gate)?;
+        }
     }
 
     let expected_labels = PerfGate::ALL
@@ -2133,6 +2137,43 @@ fn validate_perf_manifest_gate_set(
         }
     }
     Ok(())
+}
+
+/// Admit the one nested table the gate manifest may carry, and admit it only
+/// as the exact canonical QG-2 comparator contract.
+///
+/// Absence is the protected bootstrap state and stays admissible, so this
+/// never forces the contract to exist. Presence is admitted only when the
+/// table deserializes to the closed typed contract *and* equals the canonical
+/// value field for field: an unknown key, a missing key, a reordered exclusion
+/// list, or one altered enum spelling is a manifest-contract error. Widening
+/// the allowlist without this check would turn `qg2_contract` into an
+/// unvalidated free-text hole in an otherwise closed manifest.
+fn validate_qg2_comparator_contract_table(
+    policy: &toml::Table,
+    requested_gate: PerfGate,
+) -> Result<(), PerfApplicabilityPlanError> {
+    let Some(value) = policy.get("qg2_contract") else {
+        return Ok(());
+    };
+    let observed = value
+        .clone()
+        .try_into::<crate::qg2_contract::Qg2ComparatorContract>()
+        .map_err(|error| PerfApplicabilityPlanError::ManifestContract {
+            gate: requested_gate,
+            detail: format!(
+                "manifest gate.QG-2.qg2_contract is not the closed typed comparator contract: {error}"
+            ),
+        })?;
+    if observed == crate::qg2_contract::Qg2ComparatorContract::canonical() {
+        Ok(())
+    } else {
+        Err(PerfApplicabilityPlanError::ManifestContract {
+            gate: requested_gate,
+            detail: "manifest gate.QG-2.qg2_contract is not the canonical Q2C comparator contract"
+                .to_owned(),
+        })
+    }
 }
 
 fn validate_perf_manifest_schema_bindings(
@@ -7189,6 +7230,92 @@ mod tests {
             stored_primary_mutation.verify_against(&matrix, &registry),
             Err(PerfApplicabilityPlanError::PlanMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn the_applied_qg2_contract_block_is_admitted_by_its_live_manifest_consumer() {
+        // The correction is only real if the live consumer accepts the applied
+        // manifest. Before this admission the projected block made
+        // perf_gate_manifest_identity fail with "unexpected field qg2_contract",
+        // so applying the contract would have broken planning for every gate.
+        let bootstrap = PERF_MANIFEST;
+        assert_eq!(
+            bootstrap
+                .matches(crate::qg2_contract::QG2_MANIFEST_BLOCK_PRE_REGION)
+                .count(),
+            1,
+            "the live manifest must still carry the exact protected QG-2 block"
+        );
+        let applied = bootstrap.replacen(
+            crate::qg2_contract::QG2_MANIFEST_BLOCK_PRE_REGION,
+            crate::qg2_contract::QG2_MANIFEST_BLOCK_POST_REGION,
+            1,
+        );
+
+        for gate in [PerfGate::Qg1, PerfGate::Qg2] {
+            perf_gate_manifest_identity(&applied, gate)
+                .expect("the applied QG-2 contract block must be admitted by the live consumer");
+        }
+        assert_ne!(
+            perf_manifest_contract_sha256(bootstrap),
+            perf_manifest_contract_sha256(&applied),
+            "applying the contract must move the normalized manifest digest"
+        );
+    }
+
+    #[test]
+    fn the_qg2_contract_table_is_admitted_only_as_the_exact_canonical_contract() {
+        let applied = PERF_MANIFEST.replacen(
+            crate::qg2_contract::QG2_MANIFEST_BLOCK_PRE_REGION,
+            crate::qg2_contract::QG2_MANIFEST_BLOCK_POST_REGION,
+            1,
+        );
+
+        // Altered prose still parses as the typed contract, so only value
+        // equality catches it. Widening the allowlist without this check would
+        // let any string ride into an otherwise closed manifest.
+        let altered = applied.replacen(
+            "BINDING Q2C COMPARATOR CONTRACT 2026-07-31: QG-2 compares",
+            "BINDING Q2C COMPARATOR CONTRACT 2026-07-31: QG-2 sometimes compares",
+            1,
+        );
+        assert_ne!(altered, applied, "the alteration mutation must apply");
+        let altered = perf_gate_manifest_identity(&altered, PerfGate::Qg2)
+            .expect_err("an altered contract clause must be rejected");
+        assert!(
+            altered
+                .to_string()
+                .contains("is not the canonical Q2C comparator contract"),
+            "unexpected altered-contract error: {altered}"
+        );
+
+        // An unknown key inside the table is a closed-shape violation.
+        let unknown_key = applied.replacen(
+            "storage_topology = \"symmetric_in_memory\"",
+            "storage_topology = \"symmetric_in_memory\"\nextra_scope = \"durable\"",
+            1,
+        );
+        let unknown_key = perf_gate_manifest_identity(&unknown_key, PerfGate::Qg2)
+            .expect_err("an unknown contract field must be rejected");
+        assert!(
+            unknown_key
+                .to_string()
+                .contains("is not the closed typed comparator contract"),
+            "unexpected unknown-field error: {unknown_key}"
+        );
+
+        // The admission is QG-2 only: the same table under another gate stays
+        // an unexpected field.
+        let foreign_gate =
+            applied.replacen("[gate.QG-2.qg2_contract]", "[gate.QG-3.qg2_contract]", 1);
+        let foreign_gate = perf_gate_manifest_identity(&foreign_gate, PerfGate::Qg1)
+            .expect_err("the contract table must not be admitted under another gate");
+        assert!(
+            foreign_gate
+                .to_string()
+                .contains("manifest gate.QG-3 defines unexpected field qg2_contract"),
+            "unexpected foreign-gate error: {foreign_gate}"
+        );
     }
 
     #[test]
