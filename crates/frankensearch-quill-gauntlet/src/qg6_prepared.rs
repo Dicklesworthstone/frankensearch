@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::hint::black_box;
 use std::ops::Bound;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use frankensearch_quill::{
     BooleanOperator, DEFAULT_SCHEMA, DefaultQueryParser, Occur, Query, QueryValue,
@@ -2298,6 +2298,786 @@ pub fn seeded_interleaved_four_arm_schedule(
     Ok(schedule)
 }
 
+const QG6_R1_RESIDUAL_ROLE_COUNT: usize = 6;
+const QG6_R1_RESIDUAL_ROLE_COUNT_U8: u8 = 6;
+const QG6_R1_RESIDUAL_LEAF_COUNT: usize = QG6_R1_RESIDUAL_ROLE_COUNT * QG6_R1_RESIDUAL_ROLE_COUNT;
+const QG6_R1_RESIDUAL_LEAF_COUNT_U64: u64 = 36;
+const QG6_R1_RESIDUAL_WILLIAMS_BASE_ROW: [u8; QG6_R1_RESIDUAL_ROLE_COUNT] = [0, 1, 5, 2, 4, 3];
+const QG6_R1_RESIDUAL_SOURCE_ELF_CONSISTENCY_VERSION: &str =
+    "frankensearch-qg6-r1-residual-source-elf-consistency-v1";
+const QG6_R1_RESIDUAL_STANDARDIZED_WORKLOAD_VERSION: &str =
+    "frankensearch-qg6-r1-residual-standardized-workload-v1";
+const QG6_R1_RESIDUAL_ROLE_COUNT_F64: f64 = 6.0;
+const QG6_R1_RESIDUAL_MAX_LATENCY: Duration = Duration::from_secs(60);
+
+/// The six physically independent timing roles required by the QG-6 R1
+/// residual diagnostic. This is deliberately separate from [`Qg6ArmRole`]:
+/// the latter is the four-arm formal QG-6 gate and cannot be relabelled into
+/// this diagnostic's Old/Current/Tantivy A/A and A/B topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Qg6ResidualArmRole {
+    /// First independently constructed exact-control instance.
+    OldA,
+    /// Second independently constructed exact-control instance.
+    OldB,
+    /// First independently constructed reviewed-current instance.
+    CurrentA,
+    /// Second independently constructed reviewed-current instance.
+    CurrentB,
+    /// First independently constructed pinned-Tantivy instance.
+    TantivyA,
+    /// Second independently constructed pinned-Tantivy instance.
+    TantivyB,
+}
+
+impl Qg6ResidualArmRole {
+    /// Canonical role order used by the Williams design and contrast vector.
+    pub const ALL: [Self; QG6_R1_RESIDUAL_ROLE_COUNT] = [
+        Self::OldA,
+        Self::OldB,
+        Self::CurrentA,
+        Self::CurrentB,
+        Self::TantivyA,
+        Self::TantivyB,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::OldA => 0,
+            Self::OldB => 1,
+            Self::CurrentA => 2,
+            Self::CurrentB => 3,
+            Self::TantivyA => 4,
+            Self::TantivyB => 5,
+        }
+    }
+}
+
+/// Separate cache/lifecycle strata. A meta-block may contain one stratum only;
+/// mixing first-touch, ranked miss, and generation-rebind observations makes a
+/// residual estimate uninterpretable and is rejected before estimation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Qg6ResidualStratum {
+    /// Fresh six-arm instances before any query has touched them.
+    FirstTouch,
+    /// A semantics-preserving nonce established an exact ranked-cache miss.
+    SteadyRankedCacheMiss,
+    /// A matched mutation/delete schedule completed before observation.
+    GenerationRebind,
+}
+
+/// Observed cache disposition compatible with one residual stratum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Qg6ResidualCacheDisposition {
+    /// The invocation is the stratum's first touch.
+    FirstTouch,
+    /// The invocation proved a ranked-cache miss without disabling the cache.
+    RankedMiss,
+    /// The invocation occurred after the matched rebind schedule.
+    GenerationRebind,
+}
+
+impl Qg6ResidualStratum {
+    const fn expected_cache_disposition(self) -> Qg6ResidualCacheDisposition {
+        match self {
+            Self::FirstTouch => Qg6ResidualCacheDisposition::FirstTouch,
+            Self::SteadyRankedCacheMiss => Qg6ResidualCacheDisposition::RankedMiss,
+            Self::GenerationRebind => Qg6ResidualCacheDisposition::GenerationRebind,
+        }
+    }
+}
+
+/// One predeclared position in a complete six-sweep Williams meta-block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg6ResidualWilliamsLeaf {
+    /// Globally unique leaf identifier for this meta-block.
+    pub leaf_id: u64,
+    /// Caller-provided meta-block identity.
+    pub meta_block_id: u64,
+    /// Williams design row in the range `0..6`.
+    pub sweep: u8,
+    /// Ordinal within one six-role sweep in the range `0..6`.
+    pub ordinal: u8,
+    /// The independently constructed physical arm to invoke at this position.
+    pub role: Qg6ResidualArmRole,
+}
+
+/// Raw, exactly-once timing observation for one residual Williams leaf.
+///
+/// Every field is a bounded identifier or a monotonic timing value. Raw query,
+/// corpus, path, and result payload bytes never enter this in-memory contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg6ResidualLeafObservation {
+    /// Scheduled leaf identity.
+    pub leaf_id: u64,
+    /// Meta-block identity.
+    pub meta_block_id: u64,
+    /// Scheduled Williams row.
+    pub sweep: u8,
+    /// Scheduled ordinal.
+    pub ordinal: u8,
+    /// Scheduled physical arm.
+    pub role: Qg6ResidualArmRole,
+    /// Lifecycle stratum; all leaves in one admitted block must agree.
+    pub stratum: Qg6ResidualStratum,
+    /// Public query class; all leaves in one admitted block must agree.
+    pub query_class: PerfQueryClass,
+    /// Bounded, non-sensitive local query identifier.
+    pub query_id: String,
+    /// Receipt binding this physical instance to its independent construction.
+    pub instance_receipt_sha256: String,
+    /// Digest of the backing bytes for this physical instance.
+    pub backing_sha256: String,
+    /// Receipt for the physical arm's ranked-cache namespace. This must be
+    /// independent across all six arms even when the stratum is first touch.
+    pub ranked_cache_receipt_sha256: String,
+    /// Digest of the resolved storage path identity, never a raw filesystem path.
+    pub path_receipt_sha256: String,
+    /// Exact source revision digest for this physical arm.
+    pub source_sha256: String,
+    /// Exact Cargo.lock digest for this physical arm.
+    pub cargo_lock_sha256: String,
+    /// Self-reported timing ELF digest for this physical arm.
+    pub timing_elf_sha256: String,
+    /// Domain-separated cross-field consistency digest. This detects an
+    /// in-record source/lockfile/ELF mix-up; it is not source-build proof.
+    pub source_elf_consistency_sha256: String,
+    /// Fixture identity shared by all six arms.
+    pub fixture_sha256: String,
+    /// Query-contract identity shared by all six arms.
+    pub query_contract_sha256: String,
+    /// Digest of the runner-defined, backend-neutral workload: exactly one
+    /// timed dispatch of `query_id` under `query_contract_sha256`. This is
+    /// recomputed at admission and is not an engine work counter.
+    pub standardized_workload_sha256: String,
+    /// Exact result-envelope digest after the timed invocation.
+    pub result_envelope_sha256: String,
+    /// Observed cache state; cache disabling cannot masquerade as a miss.
+    pub cache_disposition: Qg6ResidualCacheDisposition,
+    /// Generation witness after the stratum's lifecycle boundary.
+    pub generation: u64,
+    /// Monotonic interval start in nanoseconds relative to the meta-block origin.
+    pub started_ns: u64,
+    /// Monotonic interval end in nanoseconds relative to the meta-block origin.
+    pub ended_ns: u64,
+    /// Independently recorded latency, required to equal `ended_ns - started_ns`.
+    pub latency_ns: u64,
+}
+
+/// Five contrasts that must be resampled together by a later hierarchical
+/// bootstrap. This type deliberately contains one vector per admitted
+/// query/meta-block rather than independent per-contrast samples, preserving
+/// their covariance for the next estimator stage.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg6ResidualJointContrastVector {
+    /// `mean(log(OldB)) - mean(log(OldA))` A/A null.
+    pub old_b_minus_old_a: f64,
+    /// `mean(log(CurrentB)) - mean(log(CurrentA))` A/A null.
+    pub current_b_minus_current_a: f64,
+    /// `mean(log(TantivyB)) - mean(log(TantivyA))` A/A null.
+    pub tantivy_b_minus_tantivy_a: f64,
+    /// Mean current log latency minus mean old log latency. Maintenance only.
+    pub current_mean_minus_old_mean: f64,
+    /// Mean current log latency minus mean Tantivy log latency. Diagnostic only.
+    pub current_mean_minus_tantivy_mean: f64,
+}
+
+/// Schedule-level admission for a provenance-bound meta-block eligible to
+/// become one joint bootstrap draw.
+///
+/// This deliberately does **not** constitute full QG-6 R1 evidence admission:
+/// host/affinity evidence, typed search outcomes, inter-sweep boundary-effect
+/// bounds, and the hierarchical bootstrap gate are owned by later slices.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg6ResidualScheduleAdmission {
+    /// Canonical six-by-six Williams design used for admission.
+    pub schedule: Vec<Qg6ResidualWilliamsLeaf>,
+    /// Exactly one raw observation for each schedule leaf, in scheduled order.
+    pub leaves: Vec<Qg6ResidualLeafObservation>,
+    /// The five contrasts derived jointly from these same raw leaves.
+    pub joint_contrasts: Qg6ResidualJointContrastVector,
+}
+
+/// Fail-closed residual-schedule or leaf-admission error.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum Qg6ResidualValidationError {
+    /// A caller supplied a schedule other than the complete Williams design.
+    #[error("QG-6 R1 residual Williams schedule rejected: {reason}")]
+    InvalidSchedule {
+        /// Bounded reason with no query, path, or corpus payload.
+        reason: String,
+    },
+    /// A raw leaf is malformed, incomplete, duplicated, or arithmetically invalid.
+    #[error("QG-6 R1 residual leaf rejected: {reason}")]
+    InvalidLeaf {
+        /// Bounded reason with no query, path, or corpus payload.
+        reason: String,
+    },
+    /// The six arms do not retain the required physical/provenance separation.
+    #[error("QG-6 R1 residual provenance rejected: {reason}")]
+    ProvenanceMismatch {
+        /// Bounded reason with no query, path, or corpus payload.
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Qg6ResidualRoleProvenance {
+    instance_receipt_sha256: String,
+    backing_sha256: String,
+    ranked_cache_receipt_sha256: String,
+    path_receipt_sha256: String,
+    source_sha256: String,
+    cargo_lock_sha256: String,
+    timing_elf_sha256: String,
+    source_elf_consistency_sha256: String,
+}
+
+impl From<&Qg6ResidualLeafObservation> for Qg6ResidualRoleProvenance {
+    fn from(leaf: &Qg6ResidualLeafObservation) -> Self {
+        Self {
+            instance_receipt_sha256: leaf.instance_receipt_sha256.clone(),
+            backing_sha256: leaf.backing_sha256.clone(),
+            ranked_cache_receipt_sha256: leaf.ranked_cache_receipt_sha256.clone(),
+            path_receipt_sha256: leaf.path_receipt_sha256.clone(),
+            source_sha256: leaf.source_sha256.clone(),
+            cargo_lock_sha256: leaf.cargo_lock_sha256.clone(),
+            timing_elf_sha256: leaf.timing_elf_sha256.clone(),
+            source_elf_consistency_sha256: leaf.source_elf_consistency_sha256.clone(),
+        }
+    }
+}
+
+/// Construct the canonical six-sweep Williams design for one meta-block.
+///
+/// The base row is `[0, 1, 5, 2, 4, 3]`; each following row applies the
+/// required cyclic role mapping. The resulting schedule has exactly 36 leaves,
+/// each role occupies each ordinal once, every ordered pair is before/after
+/// three times, and every directed immediate predecessor occurs once.
+///
+/// # Errors
+///
+/// Rejects a meta-block identity whose leaf-ID range would overflow.
+pub fn qg6_residual_williams_schedule(
+    meta_block_id: u64,
+) -> Result<Vec<Qg6ResidualWilliamsLeaf>, Qg6ResidualValidationError> {
+    let schedule = canonical_residual_williams_schedule(meta_block_id)?;
+    validate_qg6_residual_williams_schedule(&schedule)?;
+    Ok(schedule)
+}
+
+/// Verify a supplied six-role residual schedule before any physical leaf may
+/// be observed. Arbitrary column permutations and prefixes are rejected.
+///
+/// # Errors
+///
+/// Rejects noncanonical rows, duplicate/missing leaves, unbalanced order, or
+/// an incomplete 36-leaf design.
+pub fn validate_qg6_residual_williams_schedule(
+    schedule: &[Qg6ResidualWilliamsLeaf],
+) -> Result<(), Qg6ResidualValidationError> {
+    if schedule.len() != QG6_R1_RESIDUAL_LEAF_COUNT {
+        return Err(Qg6ResidualValidationError::InvalidSchedule {
+            reason: "Williams meta-block must contain exactly 36 leaves".to_owned(),
+        });
+    }
+    let meta_block_id = schedule[0].meta_block_id;
+    let expected = canonical_residual_williams_schedule(meta_block_id)?;
+    if schedule != expected {
+        return Err(Qg6ResidualValidationError::InvalidSchedule {
+            reason: "Williams leaves differ from the canonical six-role design".to_owned(),
+        });
+    }
+    validate_residual_williams_balance(schedule)
+}
+
+/// Construct a domain-separated source/lockfile/ELF consistency digest.
+///
+/// This is an integrity check for fields already observed by the runner; it
+/// does not prove that a self-reported ELF came from a source revision. The
+/// later artifact receipt must independently prove that source-build relation.
+///
+/// # Errors
+///
+/// Rejects non-lowercase-SHA256 inputs.
+pub fn qg6_residual_source_elf_consistency_sha256(
+    source_sha256: &str,
+    cargo_lock_sha256: &str,
+    timing_elf_sha256: &str,
+) -> Result<String, Qg6ResidualValidationError> {
+    if ![source_sha256, cargo_lock_sha256, timing_elf_sha256]
+        .into_iter()
+        .all(is_lower_hex_sha256)
+    {
+        return Err(Qg6ResidualValidationError::ProvenanceMismatch {
+            reason: "source, Cargo.lock, and timing ELF identities must be lowercase SHA-256"
+                .to_owned(),
+        });
+    }
+    let mut hasher = Sha256::new();
+    hash_len_prefixed(
+        &mut hasher,
+        QG6_R1_RESIDUAL_SOURCE_ELF_CONSISTENCY_VERSION.as_bytes(),
+    );
+    hash_len_prefixed(&mut hasher, source_sha256.as_bytes());
+    hash_len_prefixed(&mut hasher, cargo_lock_sha256.as_bytes());
+    hash_len_prefixed(&mut hasher, timing_elf_sha256.as_bytes());
+    Ok(lower_hex(hasher.finalize()))
+}
+
+/// Construct the backend-neutral workload identity for one residual leaf.
+///
+/// Each leaf executes one predeclared query contract exactly once. The digest
+/// binds that standardized workload before backend dispatch, so it cannot be
+/// substituted by an engine-specific counter.
+///
+/// # Errors
+///
+/// Rejects a malformed query identifier or query-contract digest.
+pub fn qg6_residual_standardized_workload_sha256(
+    query_id: &str,
+    query_contract_sha256: &str,
+) -> Result<String, Qg6ResidualValidationError> {
+    if !is_valid_residual_query_id(query_id) || !is_lower_hex_sha256(query_contract_sha256) {
+        return Err(Qg6ResidualValidationError::InvalidLeaf {
+            reason: "residual standardized workload requires a bounded query ID and SHA-256 query contract"
+                .to_owned(),
+        });
+    }
+    let mut hasher = Sha256::new();
+    hash_len_prefixed(
+        &mut hasher,
+        QG6_R1_RESIDUAL_STANDARDIZED_WORKLOAD_VERSION.as_bytes(),
+    );
+    hash_len_prefixed(&mut hasher, query_id.as_bytes());
+    hash_len_prefixed(&mut hasher, query_contract_sha256.as_bytes());
+    hasher.update(1_u8.to_le_bytes());
+    Ok(lower_hex(hasher.finalize()))
+}
+
+/// Admit schedule-level prerequisites for exactly one complete residual
+/// meta-block and derive its joint contrast vector.
+///
+/// The later hierarchical bootstrap must resample these vectors as one unit.
+/// This function cannot admit evidence for a performance claim: it does not
+/// validate host evidence, typed outcomes, or inter-sweep boundary effects.
+///
+/// # Errors
+///
+/// Rejects incomplete, forged, duplicate, overlapped, malformed, mixed-
+/// stratum, mismatched-provenance, or source/ELF-inconsistent leaf sets.
+pub fn admit_qg6_residual_schedule_meta_block(
+    observations: Vec<Qg6ResidualLeafObservation>,
+) -> Result<Qg6ResidualScheduleAdmission, Qg6ResidualValidationError> {
+    if observations.len() != QG6_R1_RESIDUAL_LEAF_COUNT {
+        return Err(Qg6ResidualValidationError::InvalidLeaf {
+            reason: "residual meta-block must retain exactly 36 observations".to_owned(),
+        });
+    }
+    let meta_block_id = observations[0].meta_block_id;
+    let schedule = qg6_residual_williams_schedule(meta_block_id)?;
+    let mut leaves_by_id = BTreeMap::new();
+    for observation in observations {
+        validate_residual_leaf_shape(&observation)?;
+        if observation.meta_block_id != meta_block_id {
+            return Err(Qg6ResidualValidationError::InvalidLeaf {
+                reason: "residual meta-block mixes meta-block identities".to_owned(),
+            });
+        }
+        if leaves_by_id
+            .insert(observation.leaf_id, observation)
+            .is_some()
+        {
+            return Err(Qg6ResidualValidationError::InvalidLeaf {
+                reason: "residual meta-block contains a duplicate leaf ID".to_owned(),
+            });
+        }
+    }
+
+    let mut ordered = Vec::new();
+    ordered
+        .try_reserve_exact(QG6_R1_RESIDUAL_LEAF_COUNT)
+        .map_err(|_| Qg6ResidualValidationError::InvalidLeaf {
+            reason: "residual observation ordering allocation failed".to_owned(),
+        })?;
+    for expected in &schedule {
+        let observed = leaves_by_id.remove(&expected.leaf_id).ok_or_else(|| {
+            Qg6ResidualValidationError::InvalidLeaf {
+                reason: "residual meta-block is missing a scheduled leaf".to_owned(),
+            }
+        })?;
+        if observed.sweep != expected.sweep
+            || observed.ordinal != expected.ordinal
+            || observed.role != expected.role
+        {
+            return Err(Qg6ResidualValidationError::InvalidLeaf {
+                reason: "residual leaf does not match its scheduled Williams position".to_owned(),
+            });
+        }
+        ordered.push(observed);
+    }
+    if !leaves_by_id.is_empty() {
+        return Err(Qg6ResidualValidationError::InvalidLeaf {
+            reason: "residual meta-block contains an unscheduled leaf".to_owned(),
+        });
+    }
+    validate_residual_leaf_intervals(&ordered)?;
+    validate_residual_shared_scope(&ordered)?;
+    let role_provenance = validate_residual_role_provenance(&ordered)?;
+    validate_residual_provenance_families(&role_provenance)?;
+    Ok(Qg6ResidualScheduleAdmission {
+        schedule,
+        joint_contrasts: residual_joint_contrast_vector(&ordered),
+        leaves: ordered,
+    })
+}
+
+fn canonical_residual_williams_schedule(
+    meta_block_id: u64,
+) -> Result<Vec<Qg6ResidualWilliamsLeaf>, Qg6ResidualValidationError> {
+    let first_leaf_id = meta_block_id
+        .checked_mul(QG6_R1_RESIDUAL_LEAF_COUNT_U64)
+        .ok_or_else(|| Qg6ResidualValidationError::InvalidSchedule {
+            reason: "meta-block leaf-ID range overflows u64".to_owned(),
+        })?;
+    let mut expected = Vec::new();
+    expected
+        .try_reserve_exact(QG6_R1_RESIDUAL_LEAF_COUNT)
+        .map_err(|_| Qg6ResidualValidationError::InvalidSchedule {
+            reason: "canonical Williams schedule allocation failed".to_owned(),
+        })?;
+    for sweep in 0_u8..QG6_R1_RESIDUAL_ROLE_COUNT_U8 {
+        for ordinal in 0_u8..QG6_R1_RESIDUAL_ROLE_COUNT_U8 {
+            let role_index = (QG6_R1_RESIDUAL_WILLIAMS_BASE_ROW[usize::from(ordinal)] + sweep)
+                % QG6_R1_RESIDUAL_ROLE_COUNT_U8;
+            let leaf_offset =
+                u64::from(sweep) * u64::from(QG6_R1_RESIDUAL_ROLE_COUNT_U8) + u64::from(ordinal);
+            let role = *Qg6ResidualArmRole::ALL
+                .get(usize::from(role_index))
+                .ok_or_else(|| Qg6ResidualValidationError::InvalidSchedule {
+                    reason: "canonical Williams role index is out of bounds".to_owned(),
+                })?;
+            expected.push(Qg6ResidualWilliamsLeaf {
+                leaf_id: first_leaf_id.checked_add(leaf_offset).ok_or_else(|| {
+                    Qg6ResidualValidationError::InvalidSchedule {
+                        reason: "meta-block leaf ID overflows u64".to_owned(),
+                    }
+                })?,
+                meta_block_id,
+                sweep,
+                ordinal,
+                role,
+            });
+        }
+    }
+    Ok(expected)
+}
+
+fn validate_residual_williams_balance(
+    schedule: &[Qg6ResidualWilliamsLeaf],
+) -> Result<(), Qg6ResidualValidationError> {
+    let mut role_ordinal_counts = [[0_u8; QG6_R1_RESIDUAL_ROLE_COUNT]; QG6_R1_RESIDUAL_ROLE_COUNT];
+    let mut before_counts = [[0_u8; QG6_R1_RESIDUAL_ROLE_COUNT]; QG6_R1_RESIDUAL_ROLE_COUNT];
+    let mut predecessor_counts = [[0_u8; QG6_R1_RESIDUAL_ROLE_COUNT]; QG6_R1_RESIDUAL_ROLE_COUNT];
+    for row in schedule.chunks_exact(QG6_R1_RESIDUAL_ROLE_COUNT) {
+        for leaf in row {
+            role_ordinal_counts[leaf.role.index()][usize::from(leaf.ordinal)] += 1;
+        }
+        for left in 0..QG6_R1_RESIDUAL_ROLE_COUNT {
+            for right in left + 1..QG6_R1_RESIDUAL_ROLE_COUNT {
+                before_counts[row[left].role.index()][row[right].role.index()] += 1;
+            }
+        }
+        for pair in row.windows(2) {
+            predecessor_counts[pair[0].role.index()][pair[1].role.index()] += 1;
+        }
+    }
+    for role in Qg6ResidualArmRole::ALL {
+        if role_ordinal_counts[role.index()]
+            .iter()
+            .any(|count| *count != 1)
+        {
+            return Err(Qg6ResidualValidationError::InvalidSchedule {
+                reason: "each residual role must occupy every ordinal exactly once".to_owned(),
+            });
+        }
+        for other in Qg6ResidualArmRole::ALL {
+            if role == other {
+                continue;
+            }
+            if before_counts[role.index()][other.index()] != 3
+                || before_counts[other.index()][role.index()] != 3
+            {
+                return Err(Qg6ResidualValidationError::InvalidSchedule {
+                    reason: "each ordered residual role pair must be before/after 3/3".to_owned(),
+                });
+            }
+            if predecessor_counts[role.index()][other.index()] != 1 {
+                return Err(Qg6ResidualValidationError::InvalidSchedule {
+                    reason: "each directed residual immediate predecessor must occur once"
+                        .to_owned(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_valid_residual_query_id(query_id: &str) -> bool {
+    !query_id.is_empty()
+        && query_id.len() <= MAX_QUERY_ID_BYTES
+        && query_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn validate_residual_leaf_shape(
+    leaf: &Qg6ResidualLeafObservation,
+) -> Result<(), Qg6ResidualValidationError> {
+    if !is_valid_residual_query_id(&leaf.query_id) {
+        return Err(Qg6ResidualValidationError::InvalidLeaf {
+            reason: "residual query ID must be a bounded non-sensitive identifier".to_owned(),
+        });
+    }
+    if ![
+        &leaf.instance_receipt_sha256,
+        &leaf.backing_sha256,
+        &leaf.ranked_cache_receipt_sha256,
+        &leaf.path_receipt_sha256,
+        &leaf.source_sha256,
+        &leaf.cargo_lock_sha256,
+        &leaf.timing_elf_sha256,
+        &leaf.source_elf_consistency_sha256,
+        &leaf.fixture_sha256,
+        &leaf.query_contract_sha256,
+        &leaf.standardized_workload_sha256,
+        &leaf.result_envelope_sha256,
+    ]
+    .into_iter()
+    .all(|value| is_lower_hex_sha256(value))
+    {
+        return Err(Qg6ResidualValidationError::InvalidLeaf {
+            reason: "residual identity fields must be lowercase SHA-256 values".to_owned(),
+        });
+    }
+    let expected_consistency = qg6_residual_source_elf_consistency_sha256(
+        &leaf.source_sha256,
+        &leaf.cargo_lock_sha256,
+        &leaf.timing_elf_sha256,
+    )?;
+    if leaf.source_elf_consistency_sha256 != expected_consistency {
+        return Err(Qg6ResidualValidationError::ProvenanceMismatch {
+            reason: "residual source/Cargo.lock/timing-ELF consistency digest does not verify"
+                .to_owned(),
+        });
+    }
+    let expected_workload =
+        qg6_residual_standardized_workload_sha256(&leaf.query_id, &leaf.query_contract_sha256)?;
+    if leaf.standardized_workload_sha256 != expected_workload {
+        return Err(Qg6ResidualValidationError::InvalidLeaf {
+            reason: "residual standardized workload digest does not verify".to_owned(),
+        });
+    }
+    if leaf.ended_ns <= leaf.started_ns
+        || leaf.latency_ns == 0
+        || leaf.ended_ns - leaf.started_ns != leaf.latency_ns
+    {
+        return Err(Qg6ResidualValidationError::InvalidLeaf {
+            reason: "residual monotonic interval and latency arithmetic disagree".to_owned(),
+        });
+    }
+    if Duration::from_nanos(leaf.latency_ns) > QG6_R1_RESIDUAL_MAX_LATENCY {
+        return Err(Qg6ResidualValidationError::InvalidLeaf {
+            reason: "residual latency exceeds the bounded estimator domain".to_owned(),
+        });
+    }
+    if leaf.cache_disposition != leaf.stratum.expected_cache_disposition() {
+        return Err(Qg6ResidualValidationError::InvalidLeaf {
+            reason: "residual cache disposition is incompatible with its stratum".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_residual_leaf_intervals(
+    ordered: &[Qg6ResidualLeafObservation],
+) -> Result<(), Qg6ResidualValidationError> {
+    for pair in ordered.windows(2) {
+        if pair[1].started_ns < pair[0].ended_ns {
+            return Err(Qg6ResidualValidationError::InvalidLeaf {
+                reason: "residual timed leaf intervals overlap or violate Williams order"
+                    .to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_residual_shared_scope(
+    ordered: &[Qg6ResidualLeafObservation],
+) -> Result<(), Qg6ResidualValidationError> {
+    let reference = &ordered[0];
+    for leaf in &ordered[1..] {
+        if leaf.stratum != reference.stratum
+            || leaf.query_class != reference.query_class
+            || leaf.query_id != reference.query_id
+            || leaf.fixture_sha256 != reference.fixture_sha256
+            || leaf.query_contract_sha256 != reference.query_contract_sha256
+            || leaf.result_envelope_sha256 != reference.result_envelope_sha256
+            || leaf.generation != reference.generation
+            || leaf.cache_disposition != reference.cache_disposition
+        {
+            return Err(Qg6ResidualValidationError::InvalidLeaf {
+                reason:
+                    "residual meta-block mixes query, result, generation, cache, or stratum scope"
+                        .to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_residual_role_provenance(
+    ordered: &[Qg6ResidualLeafObservation],
+) -> Result<[Qg6ResidualRoleProvenance; QG6_R1_RESIDUAL_ROLE_COUNT], Qg6ResidualValidationError> {
+    let mut by_role: [Option<Qg6ResidualRoleProvenance>; QG6_R1_RESIDUAL_ROLE_COUNT] =
+        std::array::from_fn(|_| None);
+    for leaf in ordered {
+        let candidate = Qg6ResidualRoleProvenance::from(leaf);
+        let slot = &mut by_role[leaf.role.index()];
+        if let Some(existing) = slot {
+            if existing != &candidate {
+                return Err(Qg6ResidualValidationError::ProvenanceMismatch {
+                    reason: "one residual role changed its physical provenance within a meta-block"
+                        .to_owned(),
+                });
+            }
+        } else {
+            *slot = Some(candidate);
+        }
+    }
+    let [
+        Some(old_a),
+        Some(old_b),
+        Some(current_a),
+        Some(current_b),
+        Some(tantivy_a),
+        Some(tantivy_b),
+    ] = by_role
+    else {
+        return Err(Qg6ResidualValidationError::ProvenanceMismatch {
+            reason: "residual meta-block omitted a physical arm provenance".to_owned(),
+        });
+    };
+    Ok([old_a, old_b, current_a, current_b, tantivy_a, tantivy_b])
+}
+
+fn validate_residual_provenance_families(
+    by_role: &[Qg6ResidualRoleProvenance; QG6_R1_RESIDUAL_ROLE_COUNT],
+) -> Result<(), Qg6ResidualValidationError> {
+    let mut instances = BTreeSet::new();
+    let mut backings = BTreeSet::new();
+    let mut ranked_caches = BTreeSet::new();
+    let mut paths = BTreeSet::new();
+    for provenance in by_role {
+        if !instances.insert(provenance.instance_receipt_sha256.as_str())
+            || !backings.insert(provenance.backing_sha256.as_str())
+            || !ranked_caches.insert(provenance.ranked_cache_receipt_sha256.as_str())
+            || !paths.insert(provenance.path_receipt_sha256.as_str())
+        {
+            return Err(Qg6ResidualValidationError::ProvenanceMismatch {
+                reason: "residual physical arms share an instance, backing, ranked-cache, or path receipt"
+                    .to_owned(),
+            });
+        }
+    }
+    if instances.len() != QG6_R1_RESIDUAL_ROLE_COUNT
+        || backings.len() != QG6_R1_RESIDUAL_ROLE_COUNT
+        || ranked_caches.len() != QG6_R1_RESIDUAL_ROLE_COUNT
+        || paths.len() != QG6_R1_RESIDUAL_ROLE_COUNT
+    {
+        return Err(Qg6ResidualValidationError::ProvenanceMismatch {
+            reason: "residual physical-arm receipt cardinality is not six".to_owned(),
+        });
+    }
+    let old_a = &by_role[Qg6ResidualArmRole::OldA.index()];
+    let old_b = &by_role[Qg6ResidualArmRole::OldB.index()];
+    let current_a = &by_role[Qg6ResidualArmRole::CurrentA.index()];
+    let current_b = &by_role[Qg6ResidualArmRole::CurrentB.index()];
+    let tantivy_a = &by_role[Qg6ResidualArmRole::TantivyA.index()];
+    let tantivy_b = &by_role[Qg6ResidualArmRole::TantivyB.index()];
+    for (left, right) in [
+        (old_a, old_b),
+        (current_a, current_b),
+        (tantivy_a, tantivy_b),
+    ] {
+        if left.source_sha256 != right.source_sha256 {
+            return Err(Qg6ResidualValidationError::ProvenanceMismatch {
+                reason: "residual A/A causal source identity differs".to_owned(),
+            });
+        }
+    }
+    if by_role
+        .iter()
+        .any(|provenance| provenance.cargo_lock_sha256 != old_a.cargo_lock_sha256)
+        || by_role
+            .iter()
+            .any(|provenance| provenance.timing_elf_sha256 != old_a.timing_elf_sha256)
+    {
+        return Err(Qg6ResidualValidationError::ProvenanceMismatch {
+            reason: "all six residual arms must share one Cargo.lock and one timing ELF".to_owned(),
+        });
+    }
+    if old_a.source_sha256 == current_a.source_sha256
+        || old_a.source_sha256 == tantivy_a.source_sha256
+        || current_a.source_sha256 == tantivy_a.source_sha256
+    {
+        return Err(Qg6ResidualValidationError::ProvenanceMismatch {
+            reason: "old, current, and Tantivy residual source families must differ".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn residual_joint_contrast_vector(
+    ordered: &[Qg6ResidualLeafObservation],
+) -> Qg6ResidualJointContrastVector {
+    let means = std::array::from_fn(|index| {
+        let role = Qg6ResidualArmRole::ALL[index];
+        let total = ordered
+            .iter()
+            .filter(|leaf| leaf.role == role)
+            .map(|leaf| Duration::from_nanos(leaf.latency_ns).as_secs_f64().ln())
+            .sum::<f64>();
+        total / QG6_R1_RESIDUAL_ROLE_COUNT_F64
+    });
+    let old_mean =
+        (means[Qg6ResidualArmRole::OldA.index()] + means[Qg6ResidualArmRole::OldB.index()]) / 2.0;
+    let current_mean = (means[Qg6ResidualArmRole::CurrentA.index()]
+        + means[Qg6ResidualArmRole::CurrentB.index()])
+        / 2.0;
+    let tantivy_mean = (means[Qg6ResidualArmRole::TantivyA.index()]
+        + means[Qg6ResidualArmRole::TantivyB.index()])
+        / 2.0;
+    Qg6ResidualJointContrastVector {
+        old_b_minus_old_a: means[Qg6ResidualArmRole::OldB.index()]
+            - means[Qg6ResidualArmRole::OldA.index()],
+        current_b_minus_current_a: means[Qg6ResidualArmRole::CurrentB.index()]
+            - means[Qg6ResidualArmRole::CurrentA.index()],
+        tantivy_b_minus_tantivy_a: means[Qg6ResidualArmRole::TantivyB.index()]
+            - means[Qg6ResidualArmRole::TantivyA.index()],
+        current_mean_minus_old_mean: current_mean - old_mean,
+        current_mean_minus_tantivy_mean: current_mean - tantivy_mean,
+    }
+}
+
 fn pair_roles(
     comparison: Qg6Comparison,
     control_first: bool,
@@ -3228,6 +4008,82 @@ mod tests {
         )
     }
 
+    fn residual_digest(value: u64) -> String {
+        format!("{value:064x}")
+    }
+
+    fn residual_observation(
+        scheduled: &Qg6ResidualWilliamsLeaf,
+        started_ns: u64,
+    ) -> Qg6ResidualLeafObservation {
+        let family = u64::try_from(scheduled.role.index() / 2).expect("family fits u64");
+        let source_sha256 = residual_digest(10 + family);
+        let cargo_lock_sha256 = residual_digest(20);
+        let timing_elf_sha256 = residual_digest(30);
+        let query_id = "identifier-0".to_owned();
+        let query_contract_sha256 = residual_digest(71);
+        Qg6ResidualLeafObservation {
+            leaf_id: scheduled.leaf_id,
+            meta_block_id: scheduled.meta_block_id,
+            sweep: scheduled.sweep,
+            ordinal: scheduled.ordinal,
+            role: scheduled.role,
+            stratum: Qg6ResidualStratum::SteadyRankedCacheMiss,
+            query_class: PerfQueryClass::Identifier,
+            query_id: query_id.clone(),
+            instance_receipt_sha256: residual_digest(
+                40 + u64::try_from(scheduled.role.index()).expect("role fits u64"),
+            ),
+            backing_sha256: residual_digest(
+                50 + u64::try_from(scheduled.role.index()).expect("role fits u64"),
+            ),
+            ranked_cache_receipt_sha256: residual_digest(
+                55 + u64::try_from(scheduled.role.index()).expect("role fits u64"),
+            ),
+            path_receipt_sha256: residual_digest(
+                60 + u64::try_from(scheduled.role.index()).expect("role fits u64"),
+            ),
+            source_elf_consistency_sha256: qg6_residual_source_elf_consistency_sha256(
+                &source_sha256,
+                &cargo_lock_sha256,
+                &timing_elf_sha256,
+            )
+            .expect("valid source/ELF binding"),
+            source_sha256,
+            cargo_lock_sha256,
+            timing_elf_sha256,
+            fixture_sha256: residual_digest(70),
+            standardized_workload_sha256: qg6_residual_standardized_workload_sha256(
+                &query_id,
+                &query_contract_sha256,
+            )
+            .expect("valid standardized workload"),
+            query_contract_sha256,
+            result_envelope_sha256: residual_digest(72),
+            cache_disposition: Qg6ResidualCacheDisposition::RankedMiss,
+            generation: 3,
+            started_ns,
+            ended_ns: started_ns
+                + 100
+                + u64::try_from(scheduled.role.index()).expect("role fits u64"),
+            latency_ns: 100 + u64::try_from(scheduled.role.index()).expect("role fits u64"),
+        }
+    }
+
+    fn valid_residual_meta_block() -> Vec<Qg6ResidualLeafObservation> {
+        qg6_residual_williams_schedule(7)
+            .expect("Williams schedule")
+            .iter()
+            .enumerate()
+            .map(|(index, scheduled)| {
+                residual_observation(
+                    scheduled,
+                    u64::try_from(index).expect("bounded test index") * 1_000,
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn schedule_is_deterministic_balanced_and_interleaves_comparisons() {
         let first = seeded_interleaved_four_arm_schedule(4, 11, 0x5155_494c).expect("schedule");
@@ -3264,6 +4120,230 @@ mod tests {
                 .abs_diff(*first_counts.values().min().expect("first counts"))
                 <= 1
         );
+    }
+
+    #[test]
+    fn residual_williams_schedule_and_complete_leaf_store_admit_one_joint_vector() {
+        let schedule = qg6_residual_williams_schedule(7).expect("six-role schedule");
+        validate_qg6_residual_williams_schedule(&schedule).expect("balanced Williams design");
+        assert_eq!(schedule.len(), 36);
+
+        let mut role_ordinal_counts = BTreeMap::new();
+        let mut before_counts = BTreeMap::new();
+        let mut predecessor_counts = BTreeMap::new();
+        for row in schedule.chunks_exact(6) {
+            for leaf in row {
+                *role_ordinal_counts
+                    .entry((leaf.role, leaf.ordinal))
+                    .or_insert(0_usize) += 1;
+            }
+            for left in 0..6 {
+                for right in left + 1..6 {
+                    *before_counts
+                        .entry((row[left].role, row[right].role))
+                        .or_insert(0_usize) += 1;
+                }
+            }
+            for pair in row.windows(2) {
+                *predecessor_counts
+                    .entry((pair[0].role, pair[1].role))
+                    .or_insert(0_usize) += 1;
+            }
+        }
+        for role in Qg6ResidualArmRole::ALL {
+            for ordinal in 0_u8..6 {
+                assert_eq!(role_ordinal_counts[&(role, ordinal)], 1);
+            }
+            for other in Qg6ResidualArmRole::ALL {
+                if role == other {
+                    continue;
+                }
+                assert_eq!(before_counts[&(role, other)], 3);
+                assert_eq!(before_counts[&(other, role)], 3);
+                assert_eq!(predecessor_counts[&(role, other)], 1);
+            }
+        }
+
+        let admitted = admit_qg6_residual_schedule_meta_block(valid_residual_meta_block())
+            .expect("complete independent physical observations admit");
+        assert_eq!(admitted.leaves.len(), 36);
+        assert_eq!(
+            admitted
+                .leaves
+                .iter()
+                .map(|leaf| leaf.leaf_id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            36
+        );
+        assert!(admitted.joint_contrasts.old_b_minus_old_a.is_finite());
+        assert!(
+            admitted
+                .joint_contrasts
+                .current_mean_minus_tantivy_mean
+                .is_finite()
+        );
+    }
+
+    #[test]
+    fn residual_williams_validator_rejects_forged_role_permutation() {
+        let mut forged = qg6_residual_williams_schedule(7).expect("schedule");
+        forged[0].role = forged[1].role;
+        assert!(matches!(
+            validate_qg6_residual_williams_schedule(&forged),
+            Err(Qg6ResidualValidationError::InvalidSchedule { .. })
+        ));
+    }
+
+    #[test]
+    fn residual_admission_rejects_truncated_leaf_store() {
+        let mut observations = valid_residual_meta_block();
+        observations.pop();
+        assert!(matches!(
+            admit_qg6_residual_schedule_meta_block(observations),
+            Err(Qg6ResidualValidationError::InvalidLeaf { .. })
+        ));
+    }
+
+    #[test]
+    fn residual_admission_rejects_duplicate_leaf_id() {
+        let mut observations = valid_residual_meta_block();
+        observations[1].leaf_id = observations[0].leaf_id;
+        assert!(matches!(
+            admit_qg6_residual_schedule_meta_block(observations),
+            Err(Qg6ResidualValidationError::InvalidLeaf { .. })
+        ));
+    }
+
+    #[test]
+    fn residual_admission_rejects_shared_ranked_cache_receipt() {
+        let mut observations = valid_residual_meta_block();
+        let old_a_cache_receipt = observations
+            .iter()
+            .find(|leaf| leaf.role == Qg6ResidualArmRole::OldA)
+            .expect("OldA observation")
+            .ranked_cache_receipt_sha256
+            .clone();
+        for leaf in observations
+            .iter_mut()
+            .filter(|leaf| leaf.role == Qg6ResidualArmRole::CurrentA)
+        {
+            leaf.ranked_cache_receipt_sha256 = old_a_cache_receipt.clone();
+        }
+        assert!(matches!(
+            admit_qg6_residual_schedule_meta_block(observations),
+            Err(Qg6ResidualValidationError::ProvenanceMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn residual_admission_rejects_overlapped_intervals() {
+        let mut observations = valid_residual_meta_block();
+        observations[1].started_ns = observations[0].ended_ns - 1;
+        observations[1].ended_ns = observations[1].started_ns + observations[1].latency_ns;
+        assert!(matches!(
+            admit_qg6_residual_schedule_meta_block(observations),
+            Err(Qg6ResidualValidationError::InvalidLeaf { .. })
+        ));
+    }
+
+    #[test]
+    fn residual_admission_rejects_unbounded_latency_before_estimation() {
+        let mut observations = valid_residual_meta_block();
+        observations[0].started_ns = 0;
+        observations[0].ended_ns = u64::MAX;
+        observations[0].latency_ns = u64::MAX;
+        assert!(matches!(
+            admit_qg6_residual_schedule_meta_block(observations),
+            Err(Qg6ResidualValidationError::InvalidLeaf { .. })
+        ));
+    }
+
+    #[test]
+    fn residual_admission_rejects_standardized_workload_mutation() {
+        let mut observations = valid_residual_meta_block();
+        observations[0].standardized_workload_sha256 = residual_digest(97);
+        assert!(matches!(
+            admit_qg6_residual_schedule_meta_block(observations),
+            Err(Qg6ResidualValidationError::InvalidLeaf { .. })
+        ));
+    }
+
+    #[test]
+    fn residual_admission_rejects_source_elf_consistency_forgery() {
+        let mut observations = valid_residual_meta_block();
+        let current_a = observations
+            .iter()
+            .position(|leaf| leaf.role == Qg6ResidualArmRole::CurrentA)
+            .expect("CurrentA leaf");
+        observations[current_a].timing_elf_sha256 = residual_digest(99);
+        assert!(matches!(
+            admit_qg6_residual_schedule_meta_block(observations),
+            Err(Qg6ResidualValidationError::ProvenanceMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn residual_admission_rejects_mismatched_aa_causal_source() {
+        let mut observations = valid_residual_meta_block();
+        for leaf in observations
+            .iter_mut()
+            .filter(|leaf| leaf.role == Qg6ResidualArmRole::CurrentA)
+        {
+            leaf.source_sha256 = residual_digest(96);
+            leaf.source_elf_consistency_sha256 = qg6_residual_source_elf_consistency_sha256(
+                &leaf.source_sha256,
+                &leaf.cargo_lock_sha256,
+                &leaf.timing_elf_sha256,
+            )
+            .expect("valid consistency digest");
+        }
+        assert!(matches!(
+            admit_qg6_residual_schedule_meta_block(observations),
+            Err(Qg6ResidualValidationError::ProvenanceMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn residual_admission_rejects_per_role_elf_even_when_consistency_recomputes() {
+        let mut observations = valid_residual_meta_block();
+        for leaf in observations
+            .iter_mut()
+            .filter(|leaf| leaf.role == Qg6ResidualArmRole::CurrentA)
+        {
+            leaf.timing_elf_sha256 = residual_digest(99);
+            leaf.source_elf_consistency_sha256 = qg6_residual_source_elf_consistency_sha256(
+                &leaf.source_sha256,
+                &leaf.cargo_lock_sha256,
+                &leaf.timing_elf_sha256,
+            )
+            .expect("valid consistency digest");
+        }
+        assert!(matches!(
+            admit_qg6_residual_schedule_meta_block(observations),
+            Err(Qg6ResidualValidationError::ProvenanceMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn residual_admission_rejects_per_role_lockfile_even_when_consistency_recomputes() {
+        let mut observations = valid_residual_meta_block();
+        for leaf in observations
+            .iter_mut()
+            .filter(|leaf| leaf.role == Qg6ResidualArmRole::CurrentA)
+        {
+            leaf.cargo_lock_sha256 = residual_digest(98);
+            leaf.source_elf_consistency_sha256 = qg6_residual_source_elf_consistency_sha256(
+                &leaf.source_sha256,
+                &leaf.cargo_lock_sha256,
+                &leaf.timing_elf_sha256,
+            )
+            .expect("valid consistency digest");
+        }
+        assert!(matches!(
+            admit_qg6_residual_schedule_meta_block(observations),
+            Err(Qg6ResidualValidationError::ProvenanceMismatch { .. })
+        ));
     }
 
     #[test]

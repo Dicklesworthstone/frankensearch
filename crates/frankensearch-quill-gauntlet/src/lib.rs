@@ -219,9 +219,15 @@ pub use qg6_prepared::{
     Qg6ArmLifecycle, Qg6ArmRole, Qg6Comparison, Qg6ExperimentIdentity, Qg6FourArmResultReceipts,
     Qg6HarnessError, Qg6LifecycleReceipt, Qg6Measurement, Qg6PairBlock, Qg6Phase,
     Qg6PreparedExperiment, Qg6QueryGroupReceipt, Qg6QueryIdentityReceipt, Qg6QuerySpec,
-    Qg6RankedHitReceipt, Qg6ResultReceipt, Qg6SampleOrder, Qg6SearchHit, Qg6SearchResult,
-    Qg6SelectionClaim, Qg6SelectionScope, Qg6SemanticContract, Qg6SetupRecorder, Qg6TimedSample,
-    Qg6ValidatedExperiment, qg6_result_sequence_sha256, seeded_interleaved_four_arm_schedule,
+    Qg6RankedHitReceipt, Qg6ResidualArmRole, Qg6ResidualCacheDisposition,
+    Qg6ResidualJointContrastVector, Qg6ResidualLeafObservation, Qg6ResidualScheduleAdmission,
+    Qg6ResidualStratum, Qg6ResidualValidationError, Qg6ResidualWilliamsLeaf, Qg6ResultReceipt,
+    Qg6SampleOrder, Qg6SearchHit, Qg6SearchResult, Qg6SelectionClaim, Qg6SelectionScope,
+    Qg6SemanticContract, Qg6SetupRecorder, Qg6TimedSample, Qg6ValidatedExperiment,
+    admit_qg6_residual_schedule_meta_block, qg6_residual_source_elf_consistency_sha256,
+    qg6_residual_standardized_workload_sha256, qg6_residual_williams_schedule,
+    qg6_result_sequence_sha256, seeded_interleaved_four_arm_schedule,
+    validate_qg6_residual_williams_schedule,
 };
 pub use runner::{
     CAMPAIGN_REPORT_SCHEMA_VERSION, CAMPAIGN_REPORT_V9_SCHEMA_VERSION,
