@@ -1173,6 +1173,36 @@ pub enum BenchmarkWidthUnobservableReason {
     EngineSelectedWidthNotExposed,
 }
 
+/// Which writer construction the caller explicitly asked for.
+///
+/// The plan, not the thread count, decides whether a benchmark receipt exists.
+/// Inferring "benchmark" from `writer_threads: None` made every ordinary
+/// `create`/`open`/`in_memory` index carry a shipping-auto receipt it never
+/// asked for, which would let ordinary constructions masquerade as screened
+/// benchmark candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterPlan {
+    /// Ordinary shipping construction. Never produces a benchmark receipt.
+    Shipping,
+    /// Explicit benchmark construction through Tantivy's own width selection.
+    #[cfg(feature = "bench-internals")]
+    BenchmarkShippingAuto,
+    /// Explicit benchmark construction at a pinned width.
+    #[cfg(feature = "bench-internals")]
+    BenchmarkFixed(usize),
+}
+
+impl WriterPlan {
+    /// Pinned width, when the plan names one.
+    const fn fixed_threads(self) -> Option<usize> {
+        match self {
+            #[cfg(feature = "bench-internals")]
+            Self::BenchmarkFixed(threads) => Some(threads),
+            _ => None,
+        }
+    }
+}
+
 /// Read the positions setting back out of a live index schema.
 ///
 /// The benchmark reopen path receives a caller's `positions` claim but attaches
@@ -1227,7 +1257,11 @@ impl BenchmarkWriterReceipt {
     /// so the recorded mode and heap cannot drift from the `Index::writer` or
     /// `writer_with_num_threads` call that really happened. `positions` is read
     /// back from the live schema, never from a caller's claim.
-    fn seed(mode: BenchmarkWriterMode, writer_heap_bytes: usize, index: &Index) -> Self {
+    fn seed(
+        mode: BenchmarkWriterMode,
+        writer_heap_bytes: usize,
+        index: &Index,
+    ) -> SearchResult<Self> {
         let materialized_width = match mode {
             BenchmarkWriterMode::ShippingAuto => BenchmarkMaterializedWidth::Unobservable {
                 reason: BenchmarkWidthUnobservableReason::EngineSelectedWidthNotExposed,
@@ -1237,18 +1271,29 @@ impl BenchmarkWriterReceipt {
             }
         };
         let schema = index.schema();
-        Self {
+        // Absent positions evidence is a missing fact, not a false one. A
+        // defaulted `false` would put an unearned claim into every artifact
+        // this receipt is later bound into.
+        let positions =
+            positions_from_live_schema(&schema).ok_or_else(|| SearchError::InvalidConfig {
+                field: "tantivy.positions".to_owned(),
+                value: "unavailable".to_owned(),
+                reason: "live index schema exposes no indexed content field, so the positions \
+                         option cannot be authenticated"
+                    .to_owned(),
+            })?;
+        Ok(Self {
             mode,
             writer_heap_bytes,
             materialized_width,
-            positions: positions_from_live_schema(&schema).unwrap_or(false),
+            positions,
             schema_fields: schema
                 .fields()
                 .map(|(_, entry)| entry.name().to_owned())
                 .collect(),
             tokenizer_name: TOKENIZER_NAME.to_owned(),
             writer_rearmed: false,
-        }
+        })
     }
 }
 
@@ -1578,7 +1623,14 @@ impl TantivyIndex {
         let (schema, fields) = build_schema_with_positions(positions);
         let index = Index::create_in_ram(schema.clone());
         reject_positions_disagreement(&index, positions)?;
-        Self::from_index_with_writer_threads(index, schema, fields, None, writer_heap_bytes, None)
+        Self::from_index_with_writer_threads(
+            index,
+            schema,
+            fields,
+            None,
+            writer_heap_bytes,
+            WriterPlan::BenchmarkShippingAuto,
+        )
     }
 
     /// Create a new Tantivy index at the given directory path.
@@ -1678,7 +1730,9 @@ impl TantivyIndex {
             fields,
             None,
             WRITER_HEAP_BYTES,
-            Some(1),
+            // An ordinary single-threaded oracle, not a benchmark candidate:
+            // it pins a width but claims no screening receipt.
+            WriterPlan::Shipping,
         )
     }
 
@@ -1774,7 +1828,7 @@ impl TantivyIndex {
             fields,
             None,
             writer_heap_bytes,
-            Some(writer_threads),
+            WriterPlan::BenchmarkFixed(writer_threads),
         )
     }
 
@@ -1812,7 +1866,7 @@ impl TantivyIndex {
             fields,
             Some(path.to_path_buf()),
             writer_heap_bytes,
-            Some(writer_threads),
+            WriterPlan::BenchmarkFixed(writer_threads),
         )
     }
 
@@ -1848,7 +1902,7 @@ impl TantivyIndex {
             fields,
             Some(path.to_path_buf()),
             writer_heap_bytes,
-            Some(writer_threads),
+            WriterPlan::BenchmarkFixed(writer_threads),
         )
     }
 
@@ -2110,7 +2164,14 @@ impl TantivyIndex {
         path: Option<PathBuf>,
         writer_heap_bytes: usize,
     ) -> SearchResult<Self> {
-        Self::from_index_with_writer_threads(index, schema, fields, path, writer_heap_bytes, None)
+        Self::from_index_with_writer_threads(
+            index,
+            schema,
+            fields,
+            path,
+            writer_heap_bytes,
+            WriterPlan::Shipping,
+        )
     }
 
     fn from_index_with_writer_threads(
@@ -2119,7 +2180,7 @@ impl TantivyIndex {
         mut fields: SchemaFields,
         path: Option<PathBuf>,
         writer_heap_bytes: usize,
-        writer_threads: Option<usize>,
+        plan: WriterPlan,
     ) -> SearchResult<Self> {
         // Resolve the `ord` fast field against the *actual* index schema so
         // indexes created before this field existed (no `ord`) cleanly fall back
@@ -2145,22 +2206,26 @@ impl TantivyIndex {
         // produced here by the arm that actually ran.
         #[cfg(feature = "bench-internals")]
         let mut benchmark_writer_receipt = None;
-        let writer = match writer_threads {
-            None => {
+        let writer = match plan {
+            // Ordinary shipping construction reaches the same Tantivy call as a
+            // benchmark shipping-auto construction, and deliberately produces no
+            // receipt: only an explicit benchmark plan may claim one.
+            WriterPlan::Shipping => index.writer(writer_heap_bytes),
+            #[cfg(feature = "bench-internals")]
+            WriterPlan::BenchmarkShippingAuto => {
                 let writer = index.writer(writer_heap_bytes);
-                #[cfg(feature = "bench-internals")]
                 if writer.is_ok() {
                     benchmark_writer_receipt = Some(BenchmarkWriterReceipt::seed(
                         BenchmarkWriterMode::ShippingAuto,
                         writer_heap_bytes,
                         &index,
-                    ));
+                    )?);
                 }
                 writer
             }
-            Some(thread_count) => {
+            #[cfg(feature = "bench-internals")]
+            WriterPlan::BenchmarkFixed(thread_count) => {
                 let writer = index.writer_with_num_threads(thread_count, writer_heap_bytes);
-                #[cfg(feature = "bench-internals")]
                 if writer.is_ok() {
                     benchmark_writer_receipt = Some(BenchmarkWriterReceipt::seed(
                         BenchmarkWriterMode::Fixed {
@@ -2168,7 +2233,7 @@ impl TantivyIndex {
                         },
                         writer_heap_bytes,
                         &index,
-                    ));
+                    )?);
                 }
                 writer
             }
@@ -2226,7 +2291,7 @@ impl TantivyIndex {
             ord_table: RwLock::new(ord_table),
             path,
             #[cfg(feature = "bench-internals")]
-            benchmark_writer_threads: writer_threads,
+            benchmark_writer_threads: plan.fixed_threads(),
             // Seeded above by the selection branch itself, so the record and
             // the call it describes cannot disagree.
             //
@@ -6075,6 +6140,65 @@ mod benchmark_writer_mode_tests {
         }
     }
 
+    /// Heap that is exactly one thread's floor.
+    ///
+    /// This is the label-independent discriminator. `writer_with_num_threads`
+    /// rejects a width whose per-thread share falls under Tantivy's floor,
+    /// while `Index::writer` *clamps* the width instead of failing. So at this
+    /// budget the two constructors disagree observably: a fixed eight-wide
+    /// construction must fail and a shipping-auto construction must succeed.
+    const ONE_THREAD_FLOOR_HEAP: usize = 15_000_000;
+
+    #[test]
+    fn the_constructor_is_discriminated_by_behaviour_not_by_its_label() {
+        // If ShippingAuto secretly called writer_with_num_threads(8, ..) this
+        // would fail; if Fixed{8} secretly called Index::writer it would
+        // succeed. Neither can be rescued by a matching label.
+        let auto = TantivyIndex::in_memory_with_shipping_auto_writer(ONE_THREAD_FLOOR_HEAP, true)
+            .expect("Index::writer clamps the width instead of rejecting this budget");
+        assert_eq!(
+            auto.benchmark_writer_receipt().expect("receipt").mode,
+            BenchmarkWriterMode::ShippingAuto
+        );
+
+        assert!(
+            TantivyIndex::in_memory_with_benchmark_config(ONE_THREAD_FLOOR_HEAP, 8, true).is_err(),
+            "writer_with_num_threads must reject eight writers sharing one writer's floor"
+        );
+    }
+
+    #[test]
+    fn the_rearm_constructor_is_discriminated_the_same_way() {
+        let index = TantivyIndex::in_memory_with_shipping_auto_writer(HEAP, true)
+            .expect("auto writer at a comfortable budget");
+        // The rearm must reconstruct through writer_with_num_threads, so it
+        // inherits that constructor's floor rejection. Succeeding here would
+        // prove it had fallen back to Index::writer.
+        assert!(
+            index
+                .benchmark_join_workers_and_rearm(ONE_THREAD_FLOOR_HEAP, 8)
+                .is_err(),
+            "rearm must reconstruct at a pinned width, not through the auto path"
+        );
+    }
+
+    #[test]
+    fn ordinary_constructors_claim_no_benchmark_receipt() {
+        // Only an explicit benchmark plan may produce a receipt. An ordinary
+        // index that happens to reach the same Tantivy call must not be able to
+        // present itself as a screened candidate.
+        let ordinary = TantivyIndex::in_memory().expect("ordinary in-memory index");
+        assert!(ordinary.benchmark_writer_receipt().is_none());
+        assert!(ordinary.benchmark_materialized_writer_threads().is_none());
+
+        let oracle =
+            TantivyIndex::in_memory_single_threaded_oracle().expect("single-threaded oracle");
+        assert!(
+            oracle.benchmark_writer_receipt().is_none(),
+            "pinning a width is not the same as claiming a screening receipt"
+        );
+    }
+
     #[test]
     fn a_reopened_index_rejects_a_disagreeing_positions_claim() {
         let directory = tempfile::tempdir().expect("temporary index directory");
@@ -6094,6 +6218,32 @@ mod benchmark_writer_mode_tests {
             .expect("reopen with the true positions setting");
         assert!(
             reopened
+                .benchmark_writer_receipt()
+                .expect("receipt")
+                .positions,
+            "the reopened receipt must carry the live schema's positions option"
+        );
+    }
+
+    #[test]
+    fn a_reopened_positions_off_index_rejects_the_mirrored_claim() {
+        // Mirror of the case above: the rejection must be symmetric, or a
+        // positions-off index could be reopened while claiming positions-on and
+        // carry that false claim into every downstream receipt.
+        let directory = tempfile::tempdir().expect("temporary index directory");
+        let path = directory.path().join("oracle");
+        TantivyIndex::create_with_benchmark_config(&path, HEAP, 2, false)
+            .expect("create without positions");
+
+        assert!(matches!(
+            TantivyIndex::open_with_benchmark_config(&path, HEAP, 2, true),
+            Err(SearchError::InvalidConfig { .. })
+        ));
+
+        let reopened = TantivyIndex::open_with_benchmark_config(&path, HEAP, 2, false)
+            .expect("reopen with the true positions setting");
+        assert!(
+            !reopened
                 .benchmark_writer_receipt()
                 .expect("receipt")
                 .positions,
