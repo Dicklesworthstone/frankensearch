@@ -39,9 +39,9 @@
   "topology": {
     "expected_logical_surfaces": 6,
     "discovered_logical_surfaces": 6,
-    "expected_physical_locators": 7,
-    "discovered_physical_locators": 7,
-    "validated_physical_locators": 7
+    "expected_physical_locators": 9,
+    "discovered_physical_locators": 9,
+    "validated_physical_locators": 9
   },
   "manifest_sha256": "d3fb1833221504765cdc119e1cf2f50f013c3916f0faf70bb743665f5ab5ed79",
   "sentinels": {
@@ -69,6 +69,15 @@
       "valid": true
     },
     {
+      "logical_surface": "comprehensive_plan_qg2",
+      "locator": "comprehensive_plan_method_law_1",
+      "path": "COMPREHENSIVE_PLAN_FOR_THE_QUILL_LEXICAL_ENGINE.md",
+      "discovered": true,
+      "marker_count": 1,
+      "content_sha256": "05607cc61339115efee0b51eb679da46d1617d77e39cf20095c8ca3ab7a7f2ab",
+      "valid": true
+    },
+    {
       "logical_surface": "machine_manifest_qg2",
       "locator": "perf_manifest_qg2_contract",
       "path": "docs/contracts/quill-perf-gates.toml",
@@ -84,6 +93,15 @@
       "discovered": true,
       "marker_count": 1,
       "content_sha256": "b0018a985b1efb699358258419639ecab82a63ea7f411909df19f5af35b592a5",
+      "valid": true
+    },
+    {
+      "logical_surface": "hyperopt_law_7_and_epic",
+      "locator": "hyperopt_w2_fsync_row",
+      "path": "docs/contracts/quill-hyperopt-campaign.md",
+      "discovered": true,
+      "marker_count": 1,
+      "content_sha256": "cf2282ab7b2186800cdce66f77fd857f8b9405472fe74eed5f472003454a4d65",
       "valid": true
     },
     {

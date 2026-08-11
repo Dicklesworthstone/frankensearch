@@ -1,8 +1,20 @@
 //! Executable validation for the QG-2 symmetric in-memory comparator contract.
 //!
 //! The validator is intentionally read-only. It binds the six logical
-//! contract surfaces, their seven physical locators, the typed TOML topology,
+//! contract surfaces, their nine physical locators, the typed TOML topology,
 //! and the ten canonical unmeasured sentinels into one fresh-process receipt.
+//!
+//! Two of the six logical surfaces are one-to-many — the comprehensive-plan
+//! surface holds two locators and the hyperopt surface three — and two files
+//! host two locators each. Locator identity is therefore bounded by region, not
+//! by file: a file carries exactly as many canonical clauses as it hosts
+//! locators, every declared region carries exactly one, and regions declared
+//! for the same file must stay disjoint and in declared document order.
+//!
+//! The file-wide census is deliberately whole-file: a stray clause parked
+//! outside every bounded region invalidates *every* locator in that file, since
+//! nothing in the file is trustworthy until the census is exact again. Per
+//! locator, the divergence still names the one region that must be repaired.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -21,7 +33,7 @@ pub const QG2_CANONICAL_CONTRACT: &str = "BINDING Q2C COMPARATOR CONTRACT 2026-0
 /// Number of independent normative QG-2 contract surfaces.
 pub const QG2_LOGICAL_SURFACE_COUNT: usize = 6;
 /// Number of concrete locators occupied by the six logical surfaces.
-pub const QG2_PHYSICAL_LOCATOR_COUNT: usize = 7;
+pub const QG2_PHYSICAL_LOCATOR_COUNT: usize = 9;
 /// Number of canonical unmeasured gate sentinels.
 pub const QG2_SENTINEL_COUNT: usize = 10;
 
@@ -174,7 +186,9 @@ pub enum Qg2ContractStatus {
 /// Receipt for one expected physical contract locator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Qg2SurfaceReceipt {
-    /// Logical surface identity. One logical surface has two physical locators.
+    /// Logical surface identity. Two of the six logical surfaces are
+    /// one-to-many: the comprehensive-plan surface holds two locators and the
+    /// hyperopt surface three. The other four hold exactly one each.
     pub logical_surface: String,
     /// Unique physical locator identity.
     pub locator: String,
@@ -290,14 +304,14 @@ pub struct Qg2ContractReport {
     pub contract: Qg2ComparatorContract,
     /// Explicit acceptance receipt for append-only superseded historical text.
     pub stale_history: Qg2StaleHistoryReceipt,
-    /// Exact six-logical/seven-physical topology summary.
+    /// Exact six-logical/nine-physical topology summary.
     pub topology: Qg2TopologySummary,
     /// Normalized performance-manifest SHA-256.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_sha256: Option<String>,
     /// Exact ten-sentinel summary.
     pub sentinels: Qg2SentinelSummary,
-    /// Ordered receipts for all seven expected physical locators.
+    /// Ordered receipts for all nine expected physical locators.
     pub surfaces: Vec<Qg2SurfaceReceipt>,
     /// Ordered, bounded divergences.
     pub divergences: Vec<Qg2ContractDivergence>,
@@ -322,27 +336,62 @@ struct TextSurfaceSpec {
     region_end: &'static str,
 }
 
-const PERF_GATES_SURFACE: TextSurfaceSpec = TextSurfaceSpec {
+/// Sole locator of logical surface 1, in the performance-gate law list.
+const PERF_GATES_GROUP: [TextSurfaceSpec; 1] = [TextSurfaceSpec {
     logical_surface: "performance_gate_law_1",
     locator: "perf_gate_law_1",
     path: PERF_GATES_DOC_PATH,
     region_start: "1. **No benchmark-only semantics; comparator scope is explicit.**",
     region_end: "2. **Distributions, not averages.**",
-};
-const PLAN_SURFACE: TextSurfaceSpec = TextSurfaceSpec {
-    logical_surface: "comprehensive_plan_qg2",
-    locator: "comprehensive_plan_qg2_row",
-    path: COMPREHENSIVE_PLAN_PATH,
-    region_start: "| **QG-2 Bulk indexing, single-thread**",
-    region_end: "| **QG-3 Watch-mode incremental**",
-};
-const HYPEROPT_SURFACE: TextSurfaceSpec = TextSurfaceSpec {
-    logical_surface: "hyperopt_law_7_and_epic",
-    locator: "hyperopt_law_7",
-    path: HYPEROPT_DOC_PATH,
-    region_start: "7. **QG-2 comparator scope and platform durability.**",
-    region_end: "## 2. Hardware/profile matrix",
-};
+}];
+/// Both locators of logical surface 2, in declared document order: the QG-2
+/// gate row and the Method clause whose law 1 otherwise reads durable.
+const PLAN_GROUP: [TextSurfaceSpec; 2] = [
+    TextSurfaceSpec {
+        logical_surface: "comprehensive_plan_qg2",
+        locator: "comprehensive_plan_qg2_row",
+        path: COMPREHENSIVE_PLAN_PATH,
+        region_start: "| **QG-2 Bulk indexing, single-thread**",
+        region_end: "| **QG-3 Watch-mode incremental**",
+    },
+    TextSurfaceSpec {
+        logical_surface: "comprehensive_plan_qg2",
+        locator: "comprehensive_plan_method_law_1",
+        path: COMPREHENSIVE_PLAN_PATH,
+        region_start: "Method: the five standing laws \u{2014}",
+        region_end: "## 15. The Conformance Gauntlet (Bet Q5)",
+    },
+];
+/// The two document locators of logical surface 4, in declared document order:
+/// campaign law 7 and the W2 commit-path fsync lever row. The third locator of
+/// this surface is the epic's tracker note, validated with the other trackers.
+const HYPEROPT_GROUP: [TextSurfaceSpec; 2] = [
+    TextSurfaceSpec {
+        logical_surface: "hyperopt_law_7_and_epic",
+        locator: "hyperopt_law_7",
+        path: HYPEROPT_DOC_PATH,
+        region_start: "7. **QG-2 comparator scope and platform durability.**",
+        region_end: "## 2. Hardware/profile matrix",
+    },
+    TextSurfaceSpec {
+        logical_surface: "hyperopt_law_7_and_epic",
+        locator: "hyperopt_w2_fsync_row",
+        path: HYPEROPT_DOC_PATH,
+        region_start: "| Commit-path fsync count |",
+        region_end: "### W3 \u{2014} Parallel scale-out",
+    },
+];
+
+/// Exact one-to-many grouping of the nine physical locators over the six
+/// logical surfaces, in the sorted order the validator compares against.
+const EXPECTED_LOGICAL_GROUPING: [(&str, usize); QG2_LOGICAL_SURFACE_COUNT] = [
+    ("comprehensive_plan_qg2", 2),
+    ("gate_activation_scope", 1),
+    ("hyperopt_law_7_and_epic", 3),
+    ("machine_manifest_qg2", 1),
+    ("performance_gate_law_1", 1),
+    ("qg2_r1_quarantine", 1),
+];
 
 #[derive(Debug, Deserialize)]
 struct ManifestDocument {
@@ -488,14 +537,36 @@ impl ReportBuilder {
             self.divergence(
                 "qg2.topology.validator_map",
                 "qg2://validator-map",
-                "six configured logical surfaces mapped to seven unique physical locators",
+                "six configured logical surfaces mapped to nine unique physical locators",
                 Some(&format!(
                     "{} logical surfaces, {} locators, {} receipts",
                     configured_logical.len(),
                     configured_locators.len(),
                     self.surfaces.len()
                 )),
-                "Restore the validator's fixed six-logical/seven-physical topology map.",
+                "Restore the validator's fixed six-logical/nine-physical topology map.",
+            );
+        }
+        // Keys are owned: `divergence` below reborrows `self` mutably, so the
+        // grouping cannot keep borrowing `self.surfaces`.
+        let configured_grouping =
+            self.surfaces
+                .iter()
+                .fold(BTreeMap::<String, usize>::new(), |mut grouping, receipt| {
+                    *grouping.entry(receipt.logical_surface.clone()).or_default() += 1;
+                    grouping
+                });
+        let expected_grouping = EXPECTED_LOGICAL_GROUPING
+            .into_iter()
+            .map(|(surface, locators)| (surface.to_owned(), locators))
+            .collect::<BTreeMap<String, usize>>();
+        if configured_grouping != expected_grouping {
+            self.divergence(
+                "qg2.topology.logical_grouping",
+                "qg2://validator-map",
+                &format!("{expected_grouping:?}"),
+                Some(&format!("{configured_grouping:?}")),
+                "Restore the exact one-to-many grouping of the nine locators over six surfaces.",
             );
         }
         let discovered_logical = self
@@ -563,80 +634,117 @@ impl ReportBuilder {
 #[must_use]
 pub fn validate_qg2_contract(repo_root: &Path) -> Qg2ContractReport {
     let mut report = ReportBuilder::new();
-    validate_text_surface(repo_root, PERF_GATES_SURFACE, &mut report);
-    validate_text_surface(repo_root, PLAN_SURFACE, &mut report);
+    validate_text_group(repo_root, &PERF_GATES_GROUP, &mut report);
+    validate_text_group(repo_root, &PLAN_GROUP, &mut report);
     validate_manifest_surface(repo_root, &mut report);
-    validate_text_surface(repo_root, HYPEROPT_SURFACE, &mut report);
+    validate_text_group(repo_root, &HYPEROPT_GROUP, &mut report);
     validate_tracker_surfaces(repo_root, &mut report);
     validate_sentinels(repo_root, &mut report);
     report.finish()
 }
 
-fn validate_text_surface(repo_root: &Path, spec: TextSurfaceSpec, report: &mut ReportBuilder) {
-    let source = match fs::read_to_string(repo_root.join(spec.path)) {
+/// Validate every locator declared for one authoritative document.
+///
+/// The whole file must carry exactly as many canonical clauses as it hosts
+/// locators, and each declared region exactly one, so a clause parked outside
+/// every bounded region is a divergence rather than a silent pass. Regions are
+/// additionally required to be disjoint and to appear in declared order, which
+/// is what makes two locators in one file independently repairable.
+fn validate_text_group(repo_root: &Path, group: &[TextSurfaceSpec], report: &mut ReportBuilder) {
+    let Some(path) = group.first().map(|spec| spec.path) else {
+        return;
+    };
+    let source = match fs::read_to_string(repo_root.join(path)) {
         Ok(source) => source,
         Err(error) => {
             report.divergence(
                 "qg2.surface.read",
-                spec.path,
+                path,
                 QG2_CANONICAL_CONTRACT,
                 Some(&error.to_string()),
                 SURFACE_RETRY,
             );
-            report
-                .surfaces
-                .push(surface_receipt(spec, false, 0, None, false));
+            for spec in group {
+                report
+                    .surfaces
+                    .push(surface_receipt(*spec, false, 0, None, false));
+            }
             return;
         }
     };
-    let marker_count = source.matches(QG2_CANONICAL_CONTRACT).count();
-    let region = unique_region(&source, spec.region_start, spec.region_end);
-    let mut valid = marker_count == 1;
-    if marker_count != 1 {
+    let file_marker_count = source.matches(QG2_CANONICAL_CONTRACT).count();
+    let expected_marker_count = group.len();
+    let file_markers_exact = file_marker_count == expected_marker_count;
+    if !file_markers_exact {
         report.divergence(
             "qg2.surface.marker_count",
-            spec.path,
-            "exactly one canonical Q2C clause in the authoritative file",
-            Some(&format!("{marker_count} canonical clauses")),
+            path,
+            &format!(
+                "exactly {expected_marker_count} canonical Q2C clauses in the authoritative file"
+            ),
+            Some(&format!("{file_marker_count} canonical clauses")),
             SURFACE_RETRY,
         );
     }
-    let content_sha256 = match region {
-        Ok(region) => {
-            if region.matches(QG2_CANONICAL_CONTRACT).count() != 1 {
+    let mut preceding: Option<(usize, &'static str)> = None;
+    for spec in group {
+        let locator_path = format!("{path}#{}", spec.locator);
+        let mut valid = file_markers_exact;
+        let mut marker_count = 0;
+        let content_sha256 = match unique_region(&source, spec.region_start, spec.region_end) {
+            Ok(region) => {
+                marker_count = region.text.matches(QG2_CANONICAL_CONTRACT).count();
+                if marker_count != 1 {
+                    valid = false;
+                    report.divergence(
+                        "qg2.surface.marker_scope",
+                        &locator_path,
+                        "exactly one canonical Q2C clause inside the named bounded region",
+                        Some(&format!("{marker_count} canonical clauses in the region")),
+                        SURFACE_RETRY,
+                    );
+                }
+                if let Some((preceding_end, preceding_locator)) = preceding
+                    && region.start < preceding_end
+                {
+                    valid = false;
+                    report.divergence(
+                        "qg2.surface.region_overlap",
+                        &locator_path,
+                        &format!("region starting at or after the end of {preceding_locator}"),
+                        Some(&format!(
+                            "region starts at byte {} but {preceding_locator} ends at byte {preceding_end}",
+                            region.start
+                        )),
+                        SURFACE_RETRY,
+                    );
+                }
+                preceding = Some((region.end, spec.locator));
+                Some(sha256_hex(region.text.as_bytes()))
+            }
+            Err(error) => {
                 valid = false;
                 report.divergence(
-                    "qg2.surface.marker_scope",
-                    spec.path,
-                    "canonical Q2C clause inside the named authoritative region",
-                    Some(region),
+                    "qg2.surface.region",
+                    &locator_path,
+                    &format!(
+                        "one region from {:?} through {:?}",
+                        spec.region_start, spec.region_end
+                    ),
+                    Some(&error),
                     SURFACE_RETRY,
                 );
+                Some(sha256_hex(source.as_bytes()))
             }
-            Some(sha256_hex(region.as_bytes()))
-        }
-        Err(error) => {
-            valid = false;
-            report.divergence(
-                "qg2.surface.region",
-                spec.path,
-                &format!(
-                    "one region from {:?} through {:?}",
-                    spec.region_start, spec.region_end
-                ),
-                Some(&error),
-                SURFACE_RETRY,
-            );
-            Some(sha256_hex(source.as_bytes()))
-        }
-    };
-    report.surfaces.push(surface_receipt(
-        spec,
-        true,
-        marker_count,
-        content_sha256,
-        valid,
-    ));
+        };
+        report.surfaces.push(surface_receipt(
+            *spec,
+            true,
+            marker_count,
+            content_sha256,
+            valid,
+        ));
+    }
 }
 
 fn surface_receipt(
@@ -1147,7 +1255,18 @@ fn validate_one_sentinel(
     valid
 }
 
-fn unique_region<'a>(source: &'a str, start: &str, end: &str) -> Result<&'a str, String> {
+/// One bounded locator region resolved inside its authoritative document.
+#[derive(Debug, Clone, Copy)]
+struct BoundedRegion<'a> {
+    /// Region bytes, from the start anchor up to the end anchor.
+    text: &'a str,
+    /// Byte offset of the start anchor inside the whole document.
+    start: usize,
+    /// Byte offset immediately past the region, where the end anchor begins.
+    end: usize,
+}
+
+fn unique_region<'a>(source: &'a str, start: &str, end: &str) -> Result<BoundedRegion<'a>, String> {
     let start_count = source.matches(start).count();
     if start_count != 1 {
         return Err(format!("start anchor count was {start_count}, expected 1"));
@@ -1165,7 +1284,11 @@ fn unique_region<'a>(source: &'a str, start: &str, end: &str) -> Result<&'a str,
     let end_offset = tail
         .find(end)
         .ok_or_else(|| "end anchor disappeared after counting".to_owned())?;
-    Ok(&tail[..end_offset])
+    Ok(BoundedRegion {
+        text: &tail[..end_offset],
+        start: start_offset,
+        end: start_offset.saturating_add(end_offset),
+    })
 }
 
 fn contract_json(contract: &Qg2ComparatorContract) -> String {
@@ -1221,6 +1344,37 @@ mod tests {
         }
     }
 
+    /// Plan document carrying both declared locators of logical surface 2, in
+    /// declared document order.
+    fn plan_document() -> String {
+        format!(
+            "| **QG-2 Bulk indexing, single-thread** | {QG2_CANONICAL_CONTRACT} |\n\
+             | **QG-3 Watch-mode incremental** | next |\n\
+             \n\
+             Method: the five standing laws \u{2014} (1) no benchmark-only semantics. \
+             {QG2_CANONICAL_CONTRACT}\n\
+             \n\
+             ## 15. The Conformance Gauntlet (Bet Q5)\n"
+        )
+    }
+
+    /// Hyperopt document carrying both of that surface's document locators.
+    ///
+    /// Law 7's bounded region is byte-identical to the single-locator fixture
+    /// it replaces, so adding the W2 row cannot perturb law 7's receipt hash.
+    fn hyperopt_document() -> String {
+        format!(
+            "7. **QG-2 comparator scope and platform durability.** {QG2_CANONICAL_CONTRACT}\n\
+             ## 2. Hardware/profile matrix\n\
+             \n\
+             ### W2 \u{2014} Bulk-index single-thread cost (QG-1 and QG-2)\n\
+             \n\
+             | Commit-path fsync count | batch directory syncs | {QG2_CANONICAL_CONTRACT} |\n\
+             \n\
+             ### W3 \u{2014} Parallel scale-out\n"
+        )
+    }
+
     fn complete_fixture() -> Fixture {
         let directory = tempfile::tempdir().expect("temporary repository");
         let root = directory.path();
@@ -1235,20 +1389,8 @@ mod tests {
             ),
         )
         .expect("performance gate fixture");
-        fs::write(
-            root.join(COMPREHENSIVE_PLAN_PATH),
-            format!(
-                "| **QG-2 Bulk indexing, single-thread** | {QG2_CANONICAL_CONTRACT} |\n| **QG-3 Watch-mode incremental** | next |\n"
-            ),
-        )
-        .expect("plan fixture");
-        fs::write(
-            root.join(HYPEROPT_DOC_PATH),
-            format!(
-                "7. **QG-2 comparator scope and platform durability.** {QG2_CANONICAL_CONTRACT}\n## 2. Hardware/profile matrix\n"
-            ),
-        )
-        .expect("hyperopt fixture");
+        fs::write(root.join(COMPREHENSIVE_PLAN_PATH), plan_document()).expect("plan fixture");
+        fs::write(root.join(HYPEROPT_DOC_PATH), hyperopt_document()).expect("hyperopt fixture");
 
         let manifest = format!(
             "[gate.QG-2]\nname = \"bulk indexing, single-thread\"\nactivated = false\n\n[gate.QG-2.qg2_contract]\ncontract = {contract:?}\nstorage_topology = \"symmetric_in_memory\"\ndurability_scope = \"non_durable\"\ntiming_start = \"first_document_feed\"\ntiming_end = \"terminal_searchable_visibility_and_complete_worker_merge_queue_quiescence\"\ncommit_boundary = \"searchable_visibility_not_durable_publication\"\nexcluded_operations = [\"fsync\", \"F_FULLFSYNC\", \"crash_recovery\", \"durable_publication\", \"on_disk_bytes\"]\nsource_nonregression = \"durable_gates_and_production_source_durability_remain_mandatory\"\n",
@@ -1308,15 +1450,15 @@ mod tests {
     }
 
     #[test]
-    fn complete_fixture_has_exact_six_by_seven_topology_and_ten_sentinels() {
+    fn complete_fixture_has_exact_six_by_nine_topology_and_ten_sentinels() {
         let fixture = complete_fixture();
         let report = validate_qg2_contract(fixture.root());
         assert!(report.is_pass(), "{:#?}", report.divergences);
         assert_eq!(report.topology.expected_logical_surfaces, 6);
         assert_eq!(report.topology.discovered_logical_surfaces, 6);
-        assert_eq!(report.topology.expected_physical_locators, 7);
-        assert_eq!(report.topology.discovered_physical_locators, 7);
-        assert_eq!(report.topology.validated_physical_locators, 7);
+        assert_eq!(report.topology.expected_physical_locators, 9);
+        assert_eq!(report.topology.discovered_physical_locators, 9);
+        assert_eq!(report.topology.validated_physical_locators, 9);
         assert_eq!(report.sentinels.expected, 10);
         assert_eq!(report.sentinels.discovered, 10);
         assert_eq!(report.sentinels.validated, 10);
@@ -1336,12 +1478,80 @@ mod tests {
         assert!(report.stale_history.valid);
     }
 
+    fn has_divergence(report: &Qg2ContractReport, code: &str, path_suffix: &str) -> bool {
+        report
+            .divergences
+            .iter()
+            .any(|divergence| divergence.code == code && divergence.path.ends_with(path_suffix))
+    }
+
+    fn locator_receipt<'a>(report: &'a Qg2ContractReport, locator: &str) -> &'a Qg2SurfaceReceipt {
+        let missing = format!("report must carry a receipt for {locator}");
+        report
+            .surfaces
+            .iter()
+            .find(|receipt| receipt.locator == locator)
+            .expect(&missing)
+    }
+
+    #[test]
+    fn report_binds_the_nine_protected_locators_in_declared_order() {
+        let fixture = complete_fixture();
+        let report = validate_qg2_contract(fixture.root());
+        assert!(report.is_pass(), "{:#?}", report.divergences);
+        assert_eq!(
+            report
+                .surfaces
+                .iter()
+                .map(|receipt| (receipt.logical_surface.as_str(), receipt.locator.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("performance_gate_law_1", "perf_gate_law_1"),
+                ("comprehensive_plan_qg2", "comprehensive_plan_qg2_row"),
+                ("comprehensive_plan_qg2", "comprehensive_plan_method_law_1"),
+                ("machine_manifest_qg2", "perf_manifest_qg2_contract"),
+                ("hyperopt_law_7_and_epic", "hyperopt_law_7"),
+                ("hyperopt_law_7_and_epic", "hyperopt_w2_fsync_row"),
+                ("hyperopt_law_7_and_epic", "hyperopt_epic_active_contract"),
+                ("qg2_r1_quarantine", "qg2_r1_active_contract"),
+                ("gate_activation_scope", "gate_activation_active_contract"),
+            ]
+        );
+        let grouping =
+            report
+                .surfaces
+                .iter()
+                .fold(BTreeMap::<&str, usize>::new(), |mut grouping, receipt| {
+                    *grouping
+                        .entry(receipt.logical_surface.as_str())
+                        .or_default() += 1;
+                    grouping
+                });
+        assert_eq!(
+            grouping,
+            BTreeMap::from([
+                ("comprehensive_plan_qg2", 2),
+                ("gate_activation_scope", 1),
+                ("hyperopt_law_7_and_epic", 3),
+                ("machine_manifest_qg2", 1),
+                ("performance_gate_law_1", 1),
+                ("qg2_r1_quarantine", 1),
+            ])
+        );
+        assert!(
+            report
+                .surfaces
+                .iter()
+                .all(|receipt| receipt.discovered && receipt.valid && receipt.marker_count == 1)
+        );
+    }
+
     #[test]
     fn missing_and_extra_contract_markers_fail_closed() {
         let fixture = complete_fixture();
         fs::write(
             fixture.path(COMPREHENSIVE_PLAN_PATH),
-            "| **QG-2 Bulk indexing, single-thread** | missing |\n| **QG-3 Watch-mode incremental** | next |\n",
+            plan_document().replacen(QG2_CANONICAL_CONTRACT, "missing", 1),
         )
         .expect("missing marker mutation");
         let missing = validate_qg2_contract(fixture.root());
@@ -1349,11 +1559,18 @@ mod tests {
             divergence.code == "qg2.surface.marker_count"
                 && divergence.path == COMPREHENSIVE_PLAN_PATH
         }));
+        assert!(has_divergence(
+            &missing,
+            "qg2.surface.marker_scope",
+            "#comprehensive_plan_qg2_row"
+        ));
 
         fs::write(
             fixture.path(COMPREHENSIVE_PLAN_PATH),
-            format!(
-                "| **QG-2 Bulk indexing, single-thread** | {QG2_CANONICAL_CONTRACT} {QG2_CANONICAL_CONTRACT} |\n| **QG-3 Watch-mode incremental** | next |\n"
+            plan_document().replacen(
+                QG2_CANONICAL_CONTRACT,
+                &format!("{QG2_CANONICAL_CONTRACT} {QG2_CANONICAL_CONTRACT}"),
+                1,
             ),
         )
         .expect("extra marker mutation");
@@ -1362,6 +1579,204 @@ mod tests {
             divergence.code == "qg2.surface.marker_count"
                 && divergence.path == COMPREHENSIVE_PLAN_PATH
         }));
+        assert!(has_divergence(
+            &extra,
+            "qg2.surface.marker_scope",
+            "#comprehensive_plan_qg2_row"
+        ));
+    }
+
+    #[test]
+    fn plan_method_law_locator_is_mandatory() {
+        let fixture = complete_fixture();
+        let method_clause_removed = plan_document()
+            .rsplit_once(QG2_CANONICAL_CONTRACT)
+            .map(|(head, tail)| {
+                format!("{head}durability settings identical to shipped defaults{tail}")
+            })
+            .expect("plan fixture carries the method clause");
+        fs::write(
+            fixture.path(COMPREHENSIVE_PLAN_PATH),
+            &method_clause_removed,
+        )
+        .expect("method clause mutation");
+
+        let report = validate_qg2_contract(fixture.root());
+        assert!(!report.is_pass());
+        assert!(has_divergence(
+            &report,
+            "qg2.surface.marker_scope",
+            "#comprehensive_plan_method_law_1"
+        ));
+        assert!(
+            report
+                .divergences
+                .iter()
+                .any(|divergence| divergence.code == "qg2.surface.marker_count"
+                    && divergence.path == COMPREHENSIVE_PLAN_PATH)
+        );
+        assert!(!locator_receipt(&report, "comprehensive_plan_method_law_1").valid);
+        assert_eq!(
+            locator_receipt(&report, "comprehensive_plan_method_law_1").marker_count,
+            0
+        );
+
+        // A failed file-wide census invalidates BOTH locators hosted by that
+        // file, by design: until the census is exact again, nothing in the file
+        // is trustworthy, so `validated` drops by two rather than by one. The
+        // per-locator diagnostics stay precise underneath that — only the
+        // Method region is named — which is what keeps the repair targeted
+        // without letting the neighbour's receipt claim validity meanwhile.
+        assert!(!locator_receipt(&report, "comprehensive_plan_qg2_row").valid);
+        assert_eq!(report.topology.validated_physical_locators, 7);
+        assert!(
+            !has_divergence(
+                &report,
+                "qg2.surface.marker_scope",
+                "#comprehensive_plan_qg2_row"
+            ),
+            "the region diagnostic must name the Method locator, not its file neighbour"
+        );
+        assert_eq!(
+            locator_receipt(&report, "comprehensive_plan_qg2_row").marker_count,
+            1
+        );
+        assert!(locator_receipt(&report, "perf_gate_law_1").valid);
+    }
+
+    #[test]
+    fn hyperopt_w2_fsync_row_locator_is_mandatory() {
+        let fixture = complete_fixture();
+        let row_clause_removed = hyperopt_document()
+            .rsplit_once(QG2_CANONICAL_CONTRACT)
+            .map(|(head, tail)| format!("{head}Law 7 on macOS.{tail}"))
+            .expect("hyperopt fixture carries the W2 row clause");
+        fs::write(fixture.path(HYPEROPT_DOC_PATH), &row_clause_removed)
+            .expect("W2 fsync row mutation");
+
+        let report = validate_qg2_contract(fixture.root());
+        assert!(!report.is_pass());
+        assert!(has_divergence(
+            &report,
+            "qg2.surface.marker_scope",
+            "#hyperopt_w2_fsync_row"
+        ));
+        assert!(!locator_receipt(&report, "hyperopt_w2_fsync_row").valid);
+
+        // Same file-wide census semantics as the plan surface: both document
+        // locators of this file go invalid, while the third locator of the same
+        // *logical* surface — the epic's tracker note, which lives in another
+        // file — is untouched. That is the line between file census and
+        // logical-surface grouping.
+        assert!(!locator_receipt(&report, "hyperopt_law_7").valid);
+        assert!(locator_receipt(&report, "hyperopt_epic_active_contract").valid);
+        assert_eq!(report.topology.validated_physical_locators, 7);
+    }
+
+    #[test]
+    fn clause_outside_every_bounded_region_fails_closed() {
+        let fixture = complete_fixture();
+        fs::write(
+            fixture.path(COMPREHENSIVE_PLAN_PATH),
+            format!("{}\nAppendix. {QG2_CANONICAL_CONTRACT}\n", plan_document()),
+        )
+        .expect("out-of-region clause mutation");
+
+        let report = validate_qg2_contract(fixture.root());
+        assert!(!report.is_pass());
+        assert!(
+            report
+                .divergences
+                .iter()
+                .any(|divergence| divergence.code == "qg2.surface.marker_count"
+                    && divergence.path == COMPREHENSIVE_PLAN_PATH
+                    && divergence.observed.as_deref() == Some("3 canonical clauses"))
+        );
+        assert!(
+            !report
+                .divergences
+                .iter()
+                .any(|divergence| divergence.code == "qg2.surface.marker_scope"),
+            "both bounded regions still hold exactly one clause; only the file census can catch a stray"
+        );
+    }
+
+    #[test]
+    fn duplicate_clause_inside_one_region_fails_closed() {
+        let fixture = complete_fixture();
+        fs::write(
+            fixture.path(HYPEROPT_DOC_PATH),
+            hyperopt_document().replace(
+                &format!("| {QG2_CANONICAL_CONTRACT} |"),
+                &format!("| {QG2_CANONICAL_CONTRACT} {QG2_CANONICAL_CONTRACT} |"),
+            ),
+        )
+        .expect("duplicate region clause mutation");
+
+        let report = validate_qg2_contract(fixture.root());
+        assert!(has_divergence(
+            &report,
+            "qg2.surface.marker_scope",
+            "#hyperopt_w2_fsync_row"
+        ));
+        assert_eq!(
+            locator_receipt(&report, "hyperopt_w2_fsync_row").marker_count,
+            2
+        );
+        assert!(
+            !has_divergence(&report, "qg2.surface.marker_scope", "#hyperopt_law_7"),
+            "the duplicate must be charged to the W2 row, not to law 7"
+        );
+        assert_eq!(locator_receipt(&report, "hyperopt_law_7").marker_count, 1);
+    }
+
+    #[test]
+    fn reordered_plan_regions_fail_closed() {
+        let fixture = complete_fixture();
+        fs::write(
+            fixture.path(COMPREHENSIVE_PLAN_PATH),
+            format!(
+                "Method: the five standing laws \u{2014} (1) no benchmark-only semantics. \
+                 {QG2_CANONICAL_CONTRACT}\n\
+                 \n\
+                 | **QG-2 Bulk indexing, single-thread** | {QG2_CANONICAL_CONTRACT} |\n\
+                 | **QG-3 Watch-mode incremental** | next |\n\
+                 \n\
+                 ## 15. The Conformance Gauntlet (Bet Q5)\n"
+            ),
+        )
+        .expect("reordered region mutation");
+
+        let report = validate_qg2_contract(fixture.root());
+        assert!(!report.is_pass());
+        assert!(has_divergence(
+            &report,
+            "qg2.surface.region_overlap",
+            "#comprehensive_plan_method_law_1"
+        ));
+        assert!(!locator_receipt(&report, "comprehensive_plan_method_law_1").valid);
+    }
+
+    #[test]
+    fn missing_region_anchor_fails_closed() {
+        let fixture = complete_fixture();
+        fs::write(
+            fixture.path(COMPREHENSIVE_PLAN_PATH),
+            plan_document().replace(
+                "## 15. The Conformance Gauntlet (Bet Q5)",
+                "## 15. Gauntlet",
+            ),
+        )
+        .expect("missing end anchor mutation");
+
+        let report = validate_qg2_contract(fixture.root());
+        assert!(!report.is_pass());
+        assert!(has_divergence(
+            &report,
+            "qg2.surface.region",
+            "#comprehensive_plan_method_law_1"
+        ));
+        assert!(locator_receipt(&report, "comprehensive_plan_qg2_row").valid);
     }
 
     #[test]

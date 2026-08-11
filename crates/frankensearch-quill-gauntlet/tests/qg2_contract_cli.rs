@@ -29,6 +29,37 @@ fn invoke(arguments: &[&std::ffi::OsStr]) -> Output {
         .expect("fresh quill-qg2-contract process must start")
 }
 
+/// Plan document carrying both declared locators of logical surface 2, in
+/// declared document order: the QG-2 gate row and the Method law-1 clause.
+fn plan_document() -> String {
+    format!(
+        "| **QG-2 Bulk indexing, single-thread** | {QG2_CANONICAL_CONTRACT} |\n\
+         | **QG-3 Watch-mode incremental** | next |\n\
+         \n\
+         Method: the five standing laws \u{2014} (1) no benchmark-only semantics. \
+         {QG2_CANONICAL_CONTRACT}\n\
+         \n\
+         ## 15. The Conformance Gauntlet (Bet Q5)\n"
+    )
+}
+
+/// Hyperopt document carrying campaign law 7 and the W2 commit-path fsync row.
+///
+/// Law 7's bounded region is byte-identical to the single-locator fixture it
+/// replaces, so adding the W2 row cannot perturb law 7's receipt hash.
+fn hyperopt_document() -> String {
+    format!(
+        "7. **QG-2 comparator scope and platform durability.** {QG2_CANONICAL_CONTRACT}\n\
+         ## 2. Hardware/profile matrix\n\
+         \n\
+         ### W2 \u{2014} Bulk-index single-thread cost (QG-1 and QG-2)\n\
+         \n\
+         | Commit-path fsync count | batch directory syncs | {QG2_CANONICAL_CONTRACT} |\n\
+         \n\
+         ### W3 \u{2014} Parallel scale-out\n"
+    )
+}
+
 fn complete_contract_fixture() -> TempDir {
     let fixture = tempfile::tempdir().expect("temporary repository");
     let root = fixture.path();
@@ -45,16 +76,12 @@ fn complete_contract_fixture() -> TempDir {
     .expect("performance gate fixture");
     fs::write(
         root.join("COMPREHENSIVE_PLAN_FOR_THE_QUILL_LEXICAL_ENGINE.md"),
-        format!(
-            "| **QG-2 Bulk indexing, single-thread** | {QG2_CANONICAL_CONTRACT} |\n| **QG-3 Watch-mode incremental** | next |\n"
-        ),
+        plan_document(),
     )
     .expect("plan fixture");
     fs::write(
         root.join("docs/contracts/quill-hyperopt-campaign.md"),
-        format!(
-            "7. **QG-2 comparator scope and platform durability.** {QG2_CANONICAL_CONTRACT}\n## 2. Hardware/profile matrix\n"
-        ),
+        hyperopt_document(),
     )
     .expect("hyperopt fixture");
 
@@ -131,6 +158,89 @@ fn fresh_process_success_stdout_matches_golden_and_exits_zero() {
         String::from_utf8(output.stdout).expect("success stdout must be UTF-8"),
         std::str::from_utf8(SUCCESS_GOLDEN).expect("success golden must be UTF-8")
     );
+}
+
+#[test]
+fn fresh_process_binds_every_protected_locator_from_disk() {
+    let fixture = complete_contract_fixture();
+    let output = invoke(&[
+        std::ffi::OsStr::new("--repo-root"),
+        fixture.path().as_os_str(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let report: Value =
+        serde_json::from_slice(&output.stdout).expect("success stdout must be valid JSON");
+    let surfaces = report["surfaces"]
+        .as_array()
+        .expect("report must carry surface receipts");
+    assert_eq!(
+        surfaces
+            .iter()
+            .map(|receipt| receipt["locator"].as_str().expect("locator identity"))
+            .collect::<Vec<_>>(),
+        vec![
+            "perf_gate_law_1",
+            "comprehensive_plan_qg2_row",
+            "comprehensive_plan_method_law_1",
+            "perf_manifest_qg2_contract",
+            "hyperopt_law_7",
+            "hyperopt_w2_fsync_row",
+            "hyperopt_epic_active_contract",
+            "qg2_r1_active_contract",
+            "gate_activation_active_contract",
+        ]
+    );
+    assert!(
+        surfaces
+            .iter()
+            .all(|receipt| receipt["discovered"] == true && receipt["valid"] == true)
+    );
+    assert_eq!(report["topology"]["expected_physical_locators"], 9);
+    assert_eq!(report["topology"]["validated_physical_locators"], 9);
+    assert_eq!(report["sentinels"]["validated"], 10);
+}
+
+#[test]
+fn fresh_process_rejects_an_omitted_w2_fsync_row_locator_with_a_typed_reason() {
+    let fixture = complete_contract_fixture();
+    let document = hyperopt_document();
+    let (head, tail) = document
+        .rsplit_once(QG2_CANONICAL_CONTRACT)
+        .expect("hyperopt fixture carries the W2 row clause");
+    fs::write(
+        fixture
+            .path()
+            .join("docs/contracts/quill-hyperopt-campaign.md"),
+        format!("{head}Law 7 on macOS.{tail}"),
+    )
+    .expect("planted W2 fsync row omission");
+
+    let output = invoke(&[
+        std::ffi::OsStr::new("--repo-root"),
+        fixture.path().as_os_str(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let report: Value =
+        serde_json::from_slice(&output.stdout).expect("divergence stdout must be valid JSON");
+    assert_eq!(report["status"], "divergence");
+    let divergences = report["divergences"]
+        .as_array()
+        .expect("report must carry divergences");
+    assert!(
+        divergences.iter().any(|divergence| {
+            divergence["code"] == "qg2.surface.marker_scope"
+                && divergence["path"]
+                    == "docs/contracts/quill-hyperopt-campaign.md#hyperopt_w2_fsync_row"
+                && divergence["retry"]
+                    .as_str()
+                    .is_some_and(|retry| !retry.is_empty())
+        }),
+        "{divergences:#?}"
+    );
+    assert_eq!(report["topology"]["validated_physical_locators"], 7);
 }
 
 #[test]
