@@ -606,9 +606,84 @@ impl PostingCheckpoint<'_> {
 /// [`QueryWorkCheckpoint::admit`] is the only place a scoring cursor can
 /// discharge it, so an in-block step still has to call it — with zero units,
 /// which charges nothing.
+///
+/// A refusal is terminal: every later move repeats it without decoding,
+/// without moving, and without admitting again, so a refused cursor charges
+/// no further fuel and its reported position stays where the refusal found
+/// it. This is a necessary part of the pre-work gate, not the whole of it —
+/// the admission ordering itself is being reworked under
+/// `bd-quill-cancel-poll-leaf-fastpath-tzztr`.
 pub struct CheckpointPostingCursor<'a> {
     inner: Box<dyn PostingCursor + 'a>,
     checkpoint: PostingCheckpoint<'a>,
+    refused: Option<RefusedAdmission>,
+}
+
+/// One checkpoint refusal, retained so a refused cursor can repeat it exactly
+/// without ever touching the cursor it wraps again.
+///
+/// [`ArgusError`] is not `Clone`, but both refusal variants carry only `Copy`
+/// data, so the exact error — variant and every field — is reconstructible.
+/// Anything else a checkpoint returns is propagated unchanged and does not
+/// make the cursor terminal, because only these two are refusals.
+#[derive(Clone, Copy, Debug)]
+enum RefusedAdmission {
+    Cancelled {
+        phase: &'static str,
+    },
+    FuelExhausted {
+        budget: u64,
+        consumed: u64,
+        segments_touched: u64,
+        dictionary_blocks: u64,
+        posting_blocks: u64,
+        position_docs: u64,
+    },
+}
+
+impl RefusedAdmission {
+    fn capture(error: &ArgusError) -> Option<Self> {
+        match *error {
+            ArgusError::QueryCancelled { phase } => Some(Self::Cancelled { phase }),
+            ArgusError::QueryFuelExhausted {
+                budget,
+                consumed,
+                segments_touched,
+                dictionary_blocks,
+                posting_blocks,
+                position_docs,
+            } => Some(Self::FuelExhausted {
+                budget,
+                consumed,
+                segments_touched,
+                dictionary_blocks,
+                posting_blocks,
+                position_docs,
+            }),
+            _ => None,
+        }
+    }
+
+    const fn error(self) -> ArgusError {
+        match self {
+            Self::Cancelled { phase } => ArgusError::QueryCancelled { phase },
+            Self::FuelExhausted {
+                budget,
+                consumed,
+                segments_touched,
+                dictionary_blocks,
+                posting_blocks,
+                position_docs,
+            } => ArgusError::QueryFuelExhausted {
+                budget,
+                consumed,
+                segments_touched,
+                dictionary_blocks,
+                posting_blocks,
+                position_docs,
+            },
+        }
+    }
 }
 
 impl<'a> CheckpointPostingCursor<'a> {
@@ -627,11 +702,25 @@ impl<'a> CheckpointPostingCursor<'a> {
         let cursor = Self {
             inner: Box::new(inner),
             checkpoint: PostingCheckpoint::Shared(checkpoint),
+            refused: None,
         };
         if cursor.inner.current_work_block().is_some() {
             cursor.checkpoint.admit(QueryWorkKind::PostingBlock, 1)?;
         }
         Ok(cursor)
+    }
+
+    /// Repeat a retained refusal instead of doing any further work.
+    ///
+    /// A refused cursor is terminal: it decodes nothing, mutates nothing, and
+    /// admits nothing again, so its position stays exactly where the refusal
+    /// found it and no further fuel can be charged against a query that has
+    /// already been told to stop.
+    fn guard_refused(&self) -> Result<(), ArgusError> {
+        match self.refused {
+            Some(refusal) => Err(refusal.error()),
+            None => Ok(()),
+        }
     }
 
     /// Admit the blocks this move entered — possibly none.
@@ -652,11 +741,25 @@ impl<'a> CheckpointPostingCursor<'a> {
     /// exactly the in-block blind spot described above. Removing the poll's
     /// lock is therefore a checkpoint-side or upstream concern, not a cursor
     /// one (`bd-quill-cancel-poll-leaf-fastpath-tzztr`).
-    fn checkpoint_move(&self, previous: Option<u64>) -> Result<(), ArgusError> {
-        self.checkpoint.admit(
-            QueryWorkKind::PostingBlock,
-            self.inner.work_blocks_since(previous),
-        )
+    ///
+    /// # Ordering (WIP — `bd-quill-cancel-poll-leaf-fastpath-tzztr`)
+    ///
+    /// This admission still runs *after* the move it accounts for, because
+    /// units come from [`PostingCursor::work_blocks_since`], which can only
+    /// report entered blocks once the move has happened. That does not
+    /// satisfy [`QueryWorkCheckpoint::admit`]'s pre-work gate, and it is
+    /// being replaced by a side-effect-free poll before movement plus a block
+    /// permit admitted before actual block entry. Do not document this
+    /// ordering as the intended contract.
+    fn checkpoint_move(&mut self, previous: Option<u64>) -> Result<(), ArgusError> {
+        let units = self.inner.work_blocks_since(previous);
+        match self.checkpoint.admit(QueryWorkKind::PostingBlock, units) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.refused = RefusedAdmission::capture(&error);
+                Err(error)
+            }
+        }
     }
 }
 
@@ -686,6 +789,7 @@ impl PostingCursor for CheckpointPostingCursor<'_> {
     }
 
     fn next(&mut self) -> Result<Option<u32>, ArgusError> {
+        self.guard_refused()?;
         let previous = self.inner.current_work_block();
         let moved = self.inner.next()?;
         self.checkpoint_move(previous)?;
@@ -693,6 +797,7 @@ impl PostingCursor for CheckpointPostingCursor<'_> {
     }
 
     fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+        self.guard_refused()?;
         let previous = self.inner.current_work_block();
         let moved = self.inner.advance(target)?;
         self.checkpoint_move(previous)?;
@@ -708,6 +813,10 @@ impl PostingCursor for CheckpointPostingCursor<'_> {
         Some(Box::new(CheckpointPostingCursor {
             inner,
             checkpoint: PostingCheckpoint::Borrowed(self.checkpoint.as_borrowed()),
+            // A fork inherits the shared checkpoint but not the parent's
+            // refusal: it is a fresh cursor over already-charged bytes, and
+            // its own first admission observes any standing refusal.
+            refused: None,
         }))
     }
 
@@ -6140,6 +6249,177 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             1,
             "a refused construction must not admit twice"
+        );
+        Ok(())
+    }
+
+    /// A refusal must end the cursor: no decode, no mutation, no admission,
+    /// and no externally visible progress on any later move.
+    ///
+    /// The refusal is injected on an in-block step, so the move that carried
+    /// it charged nothing — which means every later admission this test
+    /// forbids would be pure post-refusal work. Both move shapes are driven
+    /// after the refusal, because they are separate entry points and a guard
+    /// on only one of them is exactly the bug this pins.
+    #[test]
+    fn refused_checkpoint_cursor_makes_no_further_progress_or_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let postings = (0..257)
+            .map(|docid| Posting::new(docid, 1))
+            .collect::<Vec<_>>();
+        let encoded = EncodedPostingList::encode(&postings)?;
+        let list = encoded.posting_list()?;
+        let segment_num_docs = u32::try_from(postings.len())?;
+        // Admission 1 is construction; admission 2 is the first in-block step.
+        let checkpoint = Arc::new(CancelOnNthAdmission::new(2));
+        let checkpoint_for_cursor: Arc<dyn QueryWorkCheckpoint> = checkpoint.clone();
+        let sealed = SealedPostingCursor::new(&list, segment_num_docs)?;
+        let mut cursor = CheckpointPostingCursor::new(sealed, checkpoint_for_cursor)?;
+
+        let refusal = cursor
+            .next()
+            .expect_err("the injected refusal must surface on the in-block step");
+        assert!(
+            matches!(
+                refusal,
+                ArgusError::QueryCancelled {
+                    phase: "checkpoint_cursor_unit_test"
+                }
+            ),
+            "expected the checkpoint's typed refusal, got {refusal:?}"
+        );
+        let refused_doc = PostingCursor::doc(&cursor);
+        let refused_block = PostingCursor::current_work_block(&cursor);
+        let refused_admissions = checkpoint
+            .admissions
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(refused_admissions, 2);
+
+        for attempt in 0..2 {
+            let repeated = cursor
+                .next()
+                .expect_err("a refused cursor must keep refusing next()");
+            assert!(
+                matches!(
+                    repeated,
+                    ArgusError::QueryCancelled {
+                        phase: "checkpoint_cursor_unit_test"
+                    }
+                ),
+                "attempt {attempt} lost the refusal: {repeated:?}"
+            );
+            let skipped = cursor
+                .advance(segment_num_docs - 1)
+                .expect_err("a refused cursor must keep refusing advance()");
+            assert!(
+                matches!(
+                    skipped,
+                    ArgusError::QueryCancelled {
+                        phase: "checkpoint_cursor_unit_test"
+                    }
+                ),
+                "attempt {attempt} lost the refusal on advance: {skipped:?}"
+            );
+        }
+
+        assert_eq!(
+            checkpoint
+                .admissions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            refused_admissions,
+            "a refused cursor must not admit again, so it can charge no further fuel"
+        );
+        assert_eq!(
+            PostingCursor::doc(&cursor),
+            refused_doc,
+            "a refused cursor must not move: its reported document must not change"
+        );
+        assert_eq!(
+            PostingCursor::current_work_block(&cursor),
+            refused_block,
+            "a refused cursor must not decode: its work block must not change"
+        );
+        Ok(())
+    }
+
+    /// Refuses with an exact fuel-exhaustion error on the second admission.
+    #[derive(Default)]
+    struct FuelExhaustedOnSecondAdmission {
+        admissions: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FuelExhaustedOnSecondAdmission {
+        const BUDGET: u64 = 7;
+        const CONSUMED: u64 = 5;
+        const POSTING_BLOCKS: u64 = 3;
+    }
+
+    impl QueryWorkCheckpoint for FuelExhaustedOnSecondAdmission {
+        fn admit(&self, _kind: QueryWorkKind, _units: u64) -> Result<(), ArgusError> {
+            let ordinal = self
+                .admissions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if ordinal == 2 {
+                return Err(ArgusError::QueryFuelExhausted {
+                    budget: Self::BUDGET,
+                    consumed: Self::CONSUMED,
+                    segments_touched: 1,
+                    dictionary_blocks: 2,
+                    posting_blocks: Self::POSTING_BLOCKS,
+                    position_docs: 0,
+                });
+            }
+            Ok(())
+        }
+    }
+
+    /// A repeated refusal must be the *same* refusal, field for field.
+    ///
+    /// Fuel exhaustion carries the progress diagnostics a caller reports, so
+    /// substituting a cancellation — or a fuel error with re-derived counters
+    /// — would silently change what the query says happened. This is what
+    /// separates retaining the refusal from merely remembering that one
+    /// occurred.
+    #[test]
+    fn refused_checkpoint_cursor_repeats_the_exact_fuel_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let postings = (0..257)
+            .map(|docid| Posting::new(docid, 1))
+            .collect::<Vec<_>>();
+        let encoded = EncodedPostingList::encode(&postings)?;
+        let list = encoded.posting_list()?;
+        let checkpoint = Arc::new(FuelExhaustedOnSecondAdmission::new());
+        let checkpoint_for_cursor: Arc<dyn QueryWorkCheckpoint> = checkpoint.clone();
+        let sealed = SealedPostingCursor::new(&list, u32::try_from(postings.len())?)?;
+        let mut cursor = CheckpointPostingCursor::new(sealed, checkpoint_for_cursor)?;
+
+        let first = cursor.next().expect_err("fuel exhaustion must surface");
+        let repeated = cursor
+            .next()
+            .expect_err("a fuel-exhausted cursor must keep refusing");
+        for (label, error) in [("first", &first), ("repeated", &repeated)] {
+            assert!(
+                matches!(
+                    error,
+                    ArgusError::QueryFuelExhausted {
+                        budget: FuelExhaustedOnSecondAdmission::BUDGET,
+                        consumed: FuelExhaustedOnSecondAdmission::CONSUMED,
+                        segments_touched: 1,
+                        dictionary_blocks: 2,
+                        posting_blocks: FuelExhaustedOnSecondAdmission::POSTING_BLOCKS,
+                        position_docs: 0,
+                    }
+                ),
+                "{label} refusal lost its exact fuel diagnostics: {error:?}"
+            );
+        }
+        assert_eq!(
+            checkpoint
+                .admissions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the repeated refusal must come from the cursor, not from a fresh admission"
         );
         Ok(())
     }
