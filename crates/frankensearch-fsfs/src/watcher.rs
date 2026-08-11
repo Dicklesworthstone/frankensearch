@@ -110,20 +110,42 @@ pub struct WatchBatchOutcome {
     pub skipped: usize,
 }
 
+/// Boxed ingest future, dyn-safe like [`frankensearch_core::SearchFuture`] but
+/// deliberately without its `Send` bound.
+///
+/// `SearchFuture` is the pattern this follows and would be the default choice,
+/// but the live sink's `apply_batch_inner` is declared
+/// `#[allow(clippy::future_not_send)]`: its future is genuinely not `Send`, so
+/// it cannot coerce into a `Send`-bounded box. Dropping the bound is sound
+/// here because an ingest future is always created and driven on one thread —
+/// either the caller's task in [`FsWatcher::process_events_now`] or the
+/// watcher's own worker thread — and never handed to another. Making ingest
+/// `Send` is an ingest-internals change (the vector-index mutex guard spans
+/// awaits), not part of this conversion.
+pub type WatchIngestFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = SearchResult<T>> + 'a>>;
+
 /// Ingest sink contract consumed by the watcher.
+///
+/// The methods take the caller's [`Cx`] and return a boxed future, so `Arc<dyn
+/// WatchIngestPipeline>` keeps working while the sink stays async. Handing the
+/// sink a runtime instead of a `Cx` is what previously forced a `block_on` at
+/// every call site and left ingest with no way to observe the caller's
+/// cancellation.
 pub trait WatchIngestPipeline: Send + Sync {
-    /// Apply one watcher-produced batch.
+    /// Apply one watcher-produced batch under the caller's `Cx`.
     ///
     /// Returns the number of successfully reindexed files.
     ///
     /// # Errors
     ///
-    /// Returns any ingest/indexing failure from the downstream pipeline.
-    fn apply_batch(
-        &self,
-        batch: &[WatchIngestOp],
-        rt: &asupersync::runtime::Runtime,
-    ) -> SearchResult<usize>;
+    /// Returns any ingest/indexing failure from the downstream pipeline, or a
+    /// cancellation error once `cx` is cancelled.
+    fn apply_batch<'a>(
+        &'a self,
+        cx: &'a Cx,
+        batch: &'a [WatchIngestOp],
+    ) -> WatchIngestFuture<'a, usize>;
 
     /// Poll an out-of-band durable flush request.
     ///
@@ -134,8 +156,8 @@ pub trait WatchIngestPipeline: Send + Sync {
     /// # Errors
     ///
     /// Returns any durable publication or acknowledgement failure.
-    fn poll_flush_barrier(&self, _rt: &asupersync::runtime::Runtime) -> SearchResult<bool> {
-        Ok(false)
+    fn poll_flush_barrier<'a>(&'a self, _cx: &'a Cx) -> WatchIngestFuture<'a, bool> {
+        Box::pin(async { Ok(false) })
     }
 }
 
@@ -144,12 +166,12 @@ pub trait WatchIngestPipeline: Send + Sync {
 pub struct NoopWatchIngestPipeline;
 
 impl WatchIngestPipeline for NoopWatchIngestPipeline {
-    fn apply_batch(
-        &self,
-        _batch: &[WatchIngestOp],
-        _rt: &asupersync::runtime::Runtime,
-    ) -> SearchResult<usize> {
-        Ok(0)
+    fn apply_batch<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        _batch: &'a [WatchIngestOp],
+    ) -> WatchIngestFuture<'a, usize> {
+        Box::pin(async { Ok(0) })
     }
 }
 
@@ -406,6 +428,11 @@ impl FsWatcher {
             stop_flag: worker_stop,
             base_debounce_ms,
             base_batch_size,
+            // Cloning shares the caller's cancellation source, so `stop()` and
+            // an upstream cancel both reach ingest. Previously this `cx` was
+            // checked once here and then dropped, and the sink minted a fresh
+            // root context per batch.
+            cx: cx.clone(),
         };
 
         let worker = thread::Builder::new()
@@ -489,7 +516,11 @@ impl FsWatcher {
     /// # Errors
     ///
     /// Returns any downstream ingest error.
-    pub fn process_events_now(&self, events: &[WatchEvent]) -> SearchResult<WatchBatchOutcome> {
+    pub async fn process_events_now(
+        &self,
+        cx: &Cx,
+        events: &[WatchEvent],
+    ) -> SearchResult<WatchBatchOutcome> {
         for event in events {
             self.stats.mark_event(event.observed_at_ms);
         }
@@ -504,16 +535,11 @@ impl FsWatcher {
             });
         }
 
-        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .map_err(|error| SearchError::SubsystemError {
-                subsystem: "watcher.ingest",
-                source: Box::new(std::io::Error::other(format!(
-                    "failed to create ingest runtime: {error}"
-                ))),
-            })?;
-
-        let outcome = process_event_batch(&self.discovery, self.ingest.as_ref(), events, &rt)?;
+        // Runs on the caller's executor under the caller's `Cx`: this path
+        // builds no runtime of its own and therefore cannot strand ingest work
+        // on a private one that the caller cannot cancel.
+        let outcome =
+            process_event_batch(&self.discovery, self.ingest.as_ref(), events, cx).await?;
         self.stats.add_reindexed(outcome.reindexed);
         self.stats.add_skipped(outcome.skipped);
         Ok(outcome)
@@ -594,6 +620,10 @@ struct WorkerContext {
     stop_flag: Arc<AtomicBool>,
     base_debounce_ms: u64,
     base_batch_size: usize,
+    /// The `Cx` `FsWatcher::start` was called with, carried onto the worker
+    /// thread so every ingest batch runs under the caller's cancellation and
+    /// request identity instead of a context minted inside the sink.
+    cx: Cx,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -602,7 +632,16 @@ fn run_worker_loop(context: &WorkerContext) -> SearchResult<()> {
     let mut watcher = build_notify_watcher(event_tx)?;
     let mount_table = build_mount_table(&context.discovery);
 
-    let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+    // The one remaining sync/async bridge in this crate, and it is structural:
+    // `notify` delivers through a std mpsc channel, so this loop must block in
+    // `recv_timeout` on a dedicated OS thread and therefore cannot run as a task
+    // on the caller's executor. What changed is that the executor no longer owns
+    // the *context*: every future driven here runs under `context.cx`, cloned
+    // from the caller, so cancellation and request identity flow through.
+    // Removing this bridge entirely requires replacing the notify channel with
+    // an asupersync channel, which would change the watcher's thread lifecycle
+    // and is deliberately out of scope here.
+    let bridge = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .map_err(|error| SearchError::SubsystemError {
             subsystem: "watcher.ingest",
@@ -632,7 +671,9 @@ fn run_worker_loop(context: &WorkerContext) -> SearchResult<()> {
 
     let mut pending = PendingEvents::default();
     let mut events_were_dropped = false;
-    while !context.stop_flag.load(Ordering::Acquire) {
+    // An upstream cancel now ends the loop on the same footing as `stop()`;
+    // before this the caller's `Cx` never reached the worker at all.
+    while !context.stop_flag.load(Ordering::Acquire) && !context.cx.is_cancel_requested() {
         let policy = WatcherExecutionPolicy::for_pressure(
             pressure_state_from_code(context.pressure_state.load(Ordering::Acquire)),
             context.base_debounce_ms,
@@ -671,7 +712,7 @@ fn run_worker_loop(context: &WorkerContext) -> SearchResult<()> {
             );
         }
 
-        match context.ingest.poll_flush_barrier(&rt) {
+        match bridge.block_on(context.ingest.poll_flush_barrier(&context.cx)) {
             Ok(true) => debug!("watcher acknowledged a durable flush barrier"),
             Ok(false) => {}
             Err(error) => {
@@ -712,7 +753,12 @@ fn run_worker_loop(context: &WorkerContext) -> SearchResult<()> {
             continue;
         }
 
-        match process_event_batch(&context.discovery, context.ingest.as_ref(), &ready, &rt) {
+        match bridge.block_on(process_event_batch(
+            &context.discovery,
+            context.ingest.as_ref(),
+            &ready,
+            &context.cx,
+        )) {
             Ok(outcome) => {
                 context.stats.add_reindexed(outcome.reindexed);
                 context.stats.add_skipped(outcome.skipped);
@@ -795,11 +841,11 @@ fn process_notify_result(
     }
 }
 
-fn process_event_batch(
+async fn process_event_batch(
     discovery: &DiscoveryConfig,
     ingest: &dyn WatchIngestPipeline,
     events: &[WatchEvent],
-    rt: &asupersync::runtime::Runtime,
+    cx: &Cx,
 ) -> SearchResult<WatchBatchOutcome> {
     let mut ops = Vec::new();
     let mut skipped = 0_usize;
@@ -816,7 +862,7 @@ fn process_event_batch(
     let reindexed = if ops.is_empty() {
         0
     } else {
-        ingest.apply_batch(&ops, rt)?
+        ingest.apply_batch(cx, &ops).await?
     };
 
     Ok(WatchBatchOutcome {
@@ -1334,6 +1380,8 @@ mod tests {
     struct RecordingPipeline {
         batches: Mutex<Vec<Vec<WatchIngestOp>>>,
         fail_next: AtomicBool,
+        /// Cancellation state of the `Cx` the sink was actually handed.
+        observed_cancelled: AtomicBool,
     }
 
     impl RecordingPipeline {
@@ -1346,20 +1394,27 @@ mod tests {
     }
 
     impl WatchIngestPipeline for RecordingPipeline {
-        fn apply_batch(
-            &self,
-            batch: &[WatchIngestOp],
-            _rt: &asupersync::runtime::Runtime,
-        ) -> SearchResult<usize> {
-            if self.fail_next.swap(false, Ordering::AcqRel) {
-                return Err(frankensearch_core::SearchError::SubsystemError {
-                    subsystem: "test",
-                    source: Box::new(io::Error::other("forced failure")),
-                });
-            }
+        fn apply_batch<'a>(
+            &'a self,
+            cx: &'a Cx,
+            batch: &'a [WatchIngestOp],
+        ) -> WatchIngestFuture<'a, usize> {
+            Box::pin(async move {
+                // Recording the observed cancellation state is what lets the
+                // lineage test below prove the caller's `Cx` actually arrives
+                // here rather than a freshly minted one.
+                self.observed_cancelled
+                    .store(cx.is_cancel_requested(), Ordering::Release);
+                if self.fail_next.swap(false, Ordering::AcqRel) {
+                    return Err(frankensearch_core::SearchError::SubsystemError {
+                        subsystem: "test",
+                        source: Box::new(io::Error::other("forced failure")),
+                    });
+                }
 
-            lock_or_recover(&self.batches).push(batch.to_vec());
-            Ok(batch.len())
+                lock_or_recover(&self.batches).push(batch.to_vec());
+                Ok(batch.len())
+            })
         }
     }
 
@@ -1379,50 +1434,56 @@ mod tests {
 
     #[test]
     fn exclusion_patterns_filter_node_modules_git_and_target() {
-        let pipeline = Arc::new(RecordingPipeline::default());
-        let watcher = FsWatcher::new(
-            vec![PathBuf::from("/tmp/repo")],
-            DiscoveryConfig::default(),
-            pipeline.clone(),
-        );
+        run_test_with_cx(|cx| async move {
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let watcher = FsWatcher::new(
+                vec![PathBuf::from("/tmp/repo")],
+                DiscoveryConfig::default(),
+                pipeline.clone(),
+            );
 
-        let events = [
-            WatchEvent::modified("/tmp/repo/node_modules/pkg/index.js", 1_000, Some(128)),
-            WatchEvent::modified("/tmp/repo/.git/config", 1_001, Some(32)),
-            WatchEvent::modified("/tmp/repo/target/debug/app", 1_002, Some(64)),
-        ];
-        let outcome = watcher
-            .process_events_now(&events)
-            .expect("process excluded paths");
+            let events = [
+                WatchEvent::modified("/tmp/repo/node_modules/pkg/index.js", 1_000, Some(128)),
+                WatchEvent::modified("/tmp/repo/.git/config", 1_001, Some(32)),
+                WatchEvent::modified("/tmp/repo/target/debug/app", 1_002, Some(64)),
+            ];
+            let outcome = watcher
+                .process_events_now(&cx, &events)
+                .await
+                .expect("process excluded paths");
 
-        assert_eq!(
-            outcome,
-            WatchBatchOutcome {
-                accepted: 0,
-                reindexed: 0,
-                skipped: 3
-            }
-        );
-        assert!(pipeline.all_ops().is_empty());
+            assert_eq!(
+                outcome,
+                WatchBatchOutcome {
+                    accepted: 0,
+                    reindexed: 0,
+                    skipped: 3
+                }
+            );
+            assert!(pipeline.all_ops().is_empty());
+        });
     }
 
     #[test]
     fn binary_files_are_filtered_by_discovery_classifier() {
-        let pipeline = Arc::new(RecordingPipeline::default());
-        let watcher = FsWatcher::new(
-            vec![PathBuf::from("/tmp/repo")],
-            DiscoveryConfig::default(),
-            pipeline.clone(),
-        );
+        run_test_with_cx(|cx| async move {
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let watcher = FsWatcher::new(
+                vec![PathBuf::from("/tmp/repo")],
+                DiscoveryConfig::default(),
+                pipeline.clone(),
+            );
 
-        let event = WatchEvent::modified("/tmp/repo/assets/image.png", 1_000, Some(2048));
-        let outcome = watcher
-            .process_events_now(&[event])
-            .expect("process binary");
-        assert_eq!(outcome.accepted, 0);
-        assert_eq!(outcome.reindexed, 0);
-        assert_eq!(outcome.skipped, 1);
-        assert!(pipeline.all_ops().is_empty());
+            let event = WatchEvent::modified("/tmp/repo/assets/image.png", 1_000, Some(2048));
+            let outcome = watcher
+                .process_events_now(&cx, &[event])
+                .await
+                .expect("process binary");
+            assert_eq!(outcome.accepted, 0);
+            assert_eq!(outcome.reindexed, 0);
+            assert_eq!(outcome.skipped, 1);
+            assert!(pipeline.all_ops().is_empty());
+        });
     }
 
     #[test]
@@ -1459,17 +1520,22 @@ mod tests {
             WatchEvent::modified("/tmp/repo/src/lib.rs", 1_100, Some(256)),
             WatchEvent::modified("/tmp/repo/node_modules/pkg/index.js", 1_101, Some(128)),
         ];
-        let outcome = watcher.process_events_now(&events).expect("process events");
-        assert_eq!(outcome.accepted, 1);
-        assert_eq!(outcome.reindexed, 1);
-        assert_eq!(outcome.skipped, 1);
+        run_test_with_cx(|cx| async move {
+            let outcome = watcher
+                .process_events_now(&cx, &events)
+                .await
+                .expect("process events");
+            assert_eq!(outcome.accepted, 1);
+            assert_eq!(outcome.reindexed, 1);
+            assert_eq!(outcome.skipped, 1);
 
-        let stats = watcher.stats();
-        assert_eq!(stats.events_received, 2);
-        assert_eq!(stats.files_reindexed, 1);
-        assert_eq!(stats.files_skipped, 1);
-        assert_eq!(stats.errors, 0);
-        assert!(stats.last_event_at.is_some());
+            let stats = watcher.stats();
+            assert_eq!(stats.events_received, 2);
+            assert_eq!(stats.files_reindexed, 1);
+            assert_eq!(stats.files_skipped, 1);
+            assert_eq!(stats.errors, 0);
+            assert!(stats.last_event_at.is_some());
+        });
     }
 
     #[test]
@@ -1511,14 +1577,17 @@ mod tests {
         );
         watcher.apply_pressure_state(PressureState::Degraded);
 
-        let event = WatchEvent::modified("/tmp/repo/src/lib.rs", now_millis(), Some(128));
-        let outcome = watcher
-            .process_events_now(&[event])
-            .expect("degraded process");
-        assert_eq!(outcome.accepted, 0);
-        assert_eq!(outcome.reindexed, 0);
-        assert_eq!(outcome.skipped, 1);
-        assert!(pipeline.all_ops().is_empty());
+        run_test_with_cx(|cx| async move {
+            let event = WatchEvent::modified("/tmp/repo/src/lib.rs", now_millis(), Some(128));
+            let outcome = watcher
+                .process_events_now(&cx, &[event])
+                .await
+                .expect("degraded process");
+            assert_eq!(outcome.accepted, 0);
+            assert_eq!(outcome.reindexed, 0);
+            assert_eq!(outcome.skipped, 1);
+            assert!(pipeline.all_ops().is_empty());
+        });
     }
 
     #[test]
@@ -1661,17 +1730,20 @@ mod tests {
             pipeline.clone(),
         );
 
-        let event = WatchEvent::deleted("/tmp/repo/src/lib.rs", 9_999);
-        let outcome = watcher
-            .process_events_now(&[event])
-            .expect("delete processing");
-        assert_eq!(outcome.accepted, 1);
-        assert_eq!(outcome.reindexed, 1);
-        assert_eq!(outcome.skipped, 0);
+        run_test_with_cx(|cx| async move {
+            let event = WatchEvent::deleted("/tmp/repo/src/lib.rs", 9_999);
+            let outcome = watcher
+                .process_events_now(&cx, &[event])
+                .await
+                .expect("delete processing");
+            assert_eq!(outcome.accepted, 1);
+            assert_eq!(outcome.reindexed, 1);
+            assert_eq!(outcome.skipped, 0);
 
-        let ops = pipeline.all_ops();
-        assert_eq!(ops.len(), 1);
-        assert!(matches!(ops[0], WatchIngestOp::Delete { .. }));
+            let ops = pipeline.all_ops();
+            assert_eq!(ops.len(), 1);
+            assert!(matches!(ops[0], WatchIngestOp::Delete { .. }));
+        });
     }
 
     #[test]
@@ -1683,17 +1755,20 @@ mod tests {
             pipeline.clone(),
         );
 
-        let event = WatchEvent::deleted("/tmp/repo/node_modules/pkg/index.js", 7_777);
-        let outcome = watcher
-            .process_events_now(&[event])
-            .expect("delete for excluded path");
-        assert_eq!(outcome.accepted, 1);
-        assert_eq!(outcome.reindexed, 1);
-        assert_eq!(outcome.skipped, 0);
+        run_test_with_cx(|cx| async move {
+            let event = WatchEvent::deleted("/tmp/repo/node_modules/pkg/index.js", 7_777);
+            let outcome = watcher
+                .process_events_now(&cx, &[event])
+                .await
+                .expect("delete for excluded path");
+            assert_eq!(outcome.accepted, 1);
+            assert_eq!(outcome.reindexed, 1);
+            assert_eq!(outcome.skipped, 0);
 
-        let ops = pipeline.all_ops();
-        assert_eq!(ops.len(), 1);
-        assert!(matches!(ops[0], WatchIngestOp::Delete { .. }));
+            let ops = pipeline.all_ops();
+            assert_eq!(ops.len(), 1);
+            assert!(matches!(ops[0], WatchIngestOp::Delete { .. }));
+        });
     }
 
     #[test]
@@ -1750,31 +1825,73 @@ mod tests {
 
         let pipeline = Arc::new(RecordingPipeline::default());
         let watcher = FsWatcher::new(vec![root], DiscoveryConfig::default(), pipeline.clone());
-        let outcome = watcher
-            .process_events_now(&mapped)
-            .expect("process rename mapping");
-        assert_eq!(outcome.accepted, 2);
-        assert_eq!(outcome.reindexed, 2);
-        assert_eq!(outcome.skipped, 0);
+        run_test_with_cx(|cx| async move {
+            let outcome = watcher
+                .process_events_now(&cx, &mapped)
+                .await
+                .expect("process rename mapping");
+            assert_eq!(outcome.accepted, 2);
+            assert_eq!(outcome.reindexed, 2);
+            assert_eq!(outcome.skipped, 0);
 
-        let ops = pipeline.all_ops();
-        assert_eq!(ops.len(), 2);
-        assert!(
-            matches!(
-                &ops[0],
-                WatchIngestOp::Delete { file_key, .. }
-                    if file_key == &normalize_file_key(&old_path)
-            ),
-            "rename old path should map to delete op"
-        );
-        assert!(
-            matches!(
-                &ops[1],
-                WatchIngestOp::Upsert { file_key, .. }
-                    if file_key == &normalize_file_key(&new_path)
-            ),
-            "rename new path should map to upsert op"
-        );
+            let ops = pipeline.all_ops();
+            assert_eq!(ops.len(), 2);
+            assert!(
+                matches!(
+                    &ops[0],
+                    WatchIngestOp::Delete { file_key, .. }
+                        if file_key == &normalize_file_key(&old_path)
+                ),
+                "rename old path should map to delete op"
+            );
+            assert!(
+                matches!(
+                    &ops[1],
+                    WatchIngestOp::Upsert { file_key, .. }
+                        if file_key == &normalize_file_key(&new_path)
+                ),
+                "rename new path should map to upsert op"
+            );
+        });
+    }
+
+    /// The caller's `Cx` must reach the ingest sink itself.
+    ///
+    /// This is the regression guard for the defect this conversion fixes: the
+    /// sink used to be handed a `Runtime` and mint `Cx::for_request()` per
+    /// batch, so a cancelled caller was indistinguishable from a live one at
+    /// the point where indexing actually happens. Asserting on a *cancelled*
+    /// context is what makes the check non-vacuous — a freshly minted root
+    /// context always reports `false` here, so the old code fails this test
+    /// while satisfying every other assertion in this module.
+    #[test]
+    fn ingest_sink_observes_the_callers_cancellation_not_a_fresh_context() {
+        run_test_with_cx(|cx| async move {
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let watcher = FsWatcher::new(
+                vec![PathBuf::from("/tmp/repo")],
+                DiscoveryConfig::default(),
+                pipeline.clone(),
+            );
+            let event = WatchEvent::modified("/tmp/repo/src/lib.rs", now_millis(), Some(128));
+
+            watcher
+                .process_events_now(&cx, std::slice::from_ref(&event))
+                .await
+                .expect("live context processes the batch");
+            assert!(
+                !pipeline.observed_cancelled.load(Ordering::Acquire),
+                "a live caller context must arrive at the sink as live"
+            );
+
+            cx.set_cancel_requested(true);
+            let _ = watcher.process_events_now(&cx, &[event]).await;
+            assert!(
+                pipeline.observed_cancelled.load(Ordering::Acquire),
+                "the sink must observe the caller's cancellation, which a freshly \
+                 minted per-batch context can never report"
+            );
+        });
     }
 
     #[test]

@@ -1816,21 +1816,20 @@ struct StorageBatchContext {
 }
 
 impl WatchIngestPipeline for LiveIngestPipeline {
-    fn apply_batch(
-        &self,
-        batch: &[WatchIngestOp],
-        rt: &asupersync::runtime::Runtime,
-    ) -> frankensearch_core::SearchResult<usize> {
-        let cx = Cx::for_request();
-        rt.block_on(self.apply_batch_inner(&cx, batch))
+    fn apply_batch<'a>(
+        &'a self,
+        cx: &'a Cx,
+        batch: &'a [WatchIngestOp],
+    ) -> crate::watcher::WatchIngestFuture<'a, usize> {
+        // The caller's `Cx` reaches ingest directly. This used to mint
+        // `Cx::for_request()` per batch, which gave every batch a fresh root
+        // context: watcher cancellation could not reach indexing, and no
+        // request identity survived the hop.
+        Box::pin(self.apply_batch_inner(cx, batch))
     }
 
-    fn poll_flush_barrier(
-        &self,
-        rt: &asupersync::runtime::Runtime,
-    ) -> frankensearch_core::SearchResult<bool> {
-        let cx = Cx::for_request();
-        rt.block_on(self.acknowledge_flush_barrier(&cx))
+    fn poll_flush_barrier<'a>(&'a self, cx: &'a Cx) -> crate::watcher::WatchIngestFuture<'a, bool> {
+        Box::pin(self.acknowledge_flush_barrier(cx))
     }
 }
 
@@ -22326,19 +22325,17 @@ mod tests {
                 .build_live_ingest_pipeline(&cx)
                 .await
                 .expect("build live ingest pipeline");
-            let ingest_rt = asupersync::runtime::RuntimeBuilder::current_thread()
-                .build()
-                .expect("build ingest runtime");
 
             let applied = pipeline
                 .apply_batch(
+                    &cx,
                     &[WatchIngestOp::Upsert {
                         file_key: file_path.display().to_string(),
                         revision: 11,
                         ingestion_class: IngestionClass::FullSemanticLexical,
                     }],
-                    &ingest_rt,
                 )
+                .await
                 .expect("semantic upsert should succeed");
             assert_eq!(applied, 1);
 
@@ -22426,19 +22423,17 @@ mod tests {
                 vector_index,
                 Arc::new(HashEmbedder::default_256()),
             );
-            let ingest_rt = asupersync::runtime::RuntimeBuilder::current_thread()
-                .build()
-                .expect("build ingest runtime");
             let missing_path = target_root.join("src/ghost.rs");
             let applied = pipeline
                 .apply_batch(
+                    &cx,
                     &[WatchIngestOp::Upsert {
                         file_key: missing_path.display().to_string(),
                         revision: 42,
                         ingestion_class: IngestionClass::FullSemanticLexical,
                     }],
-                    &ingest_rt,
                 )
+                .await
                 .expect("upsert missing file should be treated as delete");
 
             assert_eq!(applied, 1);
@@ -22585,18 +22580,16 @@ mod tests {
                 vector_index,
                 Arc::new(HashEmbedder::default_256()),
             );
-            let ingest_rt = asupersync::runtime::RuntimeBuilder::current_thread()
-                .build()
-                .expect("build ingest runtime");
             let applied = pipeline
                 .apply_batch(
+                    &cx,
                     &[WatchIngestOp::Upsert {
                         file_key: binary_path.display().to_string(),
                         revision: 42,
                         ingestion_class: IngestionClass::FullSemanticLexical,
                     }],
-                    &ingest_rt,
                 )
+                .await
                 .expect("binary upsert should prune stale entries");
 
             assert_eq!(applied, 1);
@@ -22657,18 +22650,16 @@ mod tests {
                 vector_index,
                 Arc::new(HashEmbedder::default_256()),
             );
-            let ingest_rt = asupersync::runtime::RuntimeBuilder::current_thread()
-                .build()
-                .expect("build ingest runtime");
             let applied = pipeline
                 .apply_batch(
+                    &cx,
                     &[WatchIngestOp::Upsert {
                         file_key: file_path.display().to_string(),
                         revision: 7,
                         ingestion_class: IngestionClass::LexicalOnly,
                     }],
-                    &ingest_rt,
                 )
+                .await
                 .expect("lexical-only upsert should succeed");
 
             assert_eq!(applied, 1);
@@ -22744,18 +22735,16 @@ mod tests {
                 vector_index,
                 Arc::new(HashEmbedder::default_256()),
             );
-            let ingest_rt = asupersync::runtime::RuntimeBuilder::current_thread()
-                .build()
-                .expect("build ingest runtime");
             let applied = pipeline
                 .apply_batch(
+                    &cx,
                     &[WatchIngestOp::Upsert {
                         file_key: file_path.display().to_string(),
                         revision: 8,
                         ingestion_class: IngestionClass::MetadataOnly,
                     }],
-                    &ingest_rt,
                 )
+                .await
                 .expect("metadata-only upsert should prune stale index entries");
 
             assert_eq!(applied, 1);
