@@ -1,16 +1,16 @@
 # Dependency Upgrade Log
 
-## 2026-08-11 — Phase 1: Asupersync family (batch-test-pending)
+## 2026-08-11 — Asupersync 0.4.3 resolution barrier: REJECTED
 
-**Scope:** only the root `asupersync` workspace constraint. This is a
-manifest-only Phase 1 batch: Cargo/RCH/UBS, GitHub Actions, and any lockfile
-resolution are intentionally deferred to the central verifier.
+**Scope:** the root `asupersync` workspace constraint was tested as an isolated
+family update. The central lock-resolution barrier rejected it before any
+build, test, performance claim, or downstream dependency update.
 
-### Asupersync: `0.3.10` → `0.4.3`
+### Asupersync: attempted `0.3.10` → `0.4.3`; retained `0.3.10`
 
 - **Target provenance:** stable `v0.4.3` tag and source changelog, plus the
   local registry/lock baseline at `0.3.10`.
-- **Constraint:** `>=0.3.10, <0.4` → `>=0.4.3, <0.5`; retains
+- **Attempted constraint:** `>=0.3.10, <0.4` → `>=0.4.3, <0.5`, retaining
   `default-features = false` and the production `proc-macros` feature exactly.
 - **Breaking-change review:** v0.4.0 correctly re-anchors the earlier
   tracked-session-channel break: `TrackedSender::try_reserve` now receives
@@ -21,10 +21,17 @@ resolution are intentionally deferred to the central verifier.
 - **Feature/API review:** the required `proc-macros`, `test-internals`, `tls`,
   and `tls-webpki-roots` feature names remain available at the target. The
   existing production/test feature-unification boundary is unchanged.
-- **Tests:** **batch-test-pending**. No Cargo build/test/check/clippy,
-  RCH, UBS, GitHub Actions, or manual `Cargo.lock` editing occurred in this
-  phase. `Cargo.lock` remains reserved and records `asupersync 0.3.10` until
-  central Cargo resolution and validation produce the target graph.
+- **Resolution result:** **REJECT**. Normal lock resolution retained
+  FrankenSQLite 0.1.19 on Asupersync 0.3.10 and added Asupersync 0.4.3 for the
+  workspace, producing two runtime, kernel, decision, and evidence universes.
+  Forcing the Asupersync package replacement instead downgraded the entire
+  FrankenSQLite family to 0.1.2 and introduced Asupersync 0.2.9 alongside
+  0.4.3. Both graphs violate the single-runtime contract.
+- **Disposition:** restored the `>=0.3.10, <0.4` constraint and the original
+  lockfile. No Cargo build/test/check/clippy, RCH, UBS, GitHub Actions, or
+  performance run was attempted because dependency resolution itself failed.
+  Asupersync 0.4.3 may be retried only with the separately authorized
+  FrankenSQLite 0.2.1 async/data migration.
 
 ### FrankenSQLite / `fsqlite`: research complete, intentionally deferred
 
