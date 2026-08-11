@@ -13,20 +13,31 @@
 //!
 //! # Content mode
 //!
-//! Only `Stored` and `Contentless` modes are supported. External content mode
-//! is NOT available in `FrankenSQLite` V1.
+//! The in-memory adapter below supports `Stored` and `Contentless` modes.
+//! Persisted tables are inspected from their SQLite metadata so that `Stored`,
+//! external-content, and contentless layouts are never inferred from caller
+//! configuration.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use asupersync::Cx;
 use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::traits::SearchFuture;
 use frankensearch_core::types::{IndexableDocument, ScoreSource, ScoredResult};
+use fsqlite::{AsyncConnection, Row};
 use fsqlite_ext_fts5::{Fts5Table, snippet as fts5_snippet};
+use fsqlite_types::cx::Cx as FsqliteCx;
+use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument, warn};
+
+use crate::connection::{
+    Storage, fsqlite_cx, map_storage_error_at, require_async_transaction_cleanup_capability,
+};
+use crate::schema::PORTER_FTS5_REBUILD_TABLE;
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -38,6 +49,13 @@ const MAX_QUERY_LENGTH: usize = 10_000;
 
 /// Default snippet window size in tokens.
 const DEFAULT_SNIPPET_TOKENS: usize = 20;
+
+/// The on-disk marker written after applying the 0.2.1 Porter rebuild.
+///
+/// FrankenSQLite 0.2.1 changes Porter token handling. A prior Porter index
+/// must be rebuilt from its complete content source; accepting an unmarked
+/// table would make terms silently unfindable.
+pub const PORTER_FTS5_REBUILD_VERSION: i64 = 1;
 
 /// Column index: content (primary search field).
 const COL_CONTENT: usize = 2;
@@ -52,6 +70,8 @@ pub enum Fts5ContentMode {
     /// FTS5 stores its own copy of the content (supports snippets).
     #[default]
     Stored,
+    /// FTS5 indexes a separately governed content table.
+    External,
     /// Index-only mode — no content retrieval or snippet support.
     Contentless,
 }
@@ -336,6 +356,796 @@ impl Fts5LexicalSearch {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistedFts5Metadata {
+    content_mode: Fts5ContentMode,
+    tokenizer: String,
+}
+
+/// A read-only, persisted FTS5 search path.
+///
+/// Unlike [`Fts5LexicalSearch`], this reader executes `MATCH` against the
+/// virtual table in the supplied [`Storage`] database. It revalidates the
+/// table DDL and the governed rebuild marker on every open and search, so an
+/// unrebuilt Porter index cannot be queried through an in-memory side path.
+/// The table must expose `doc_id` and `metadata_json` columns; those are the
+/// persisted storage contract required to produce `ScoredResult` values.
+pub struct PersistedFts5LexicalSearch {
+    storage: Arc<Storage>,
+    table_name: String,
+    config: Fts5AdapterConfig,
+    doc_count: usize,
+}
+
+impl std::fmt::Debug for PersistedFts5LexicalSearch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PersistedFts5LexicalSearch")
+            .field("table_name", &self.table_name)
+            .field("config", &self.config)
+            .field("doc_count", &self.doc_count)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PersistedFts5LexicalSearch {
+    /// Open a governed persisted Porter FTS5 table.
+    ///
+    /// This checks the table's actual `sqlite_master` DDL rather than trusting
+    /// an application-supplied content mode or tokenizer. It also requires the
+    /// committed rebuild marker before returning a searchable reader.
+    pub async fn open(
+        cx: &Cx,
+        storage: Arc<Storage>,
+        table_name: &str,
+    ) -> SearchResult<Self> {
+        let table_name = validated_fts5_identifier(table_name)?;
+        let fsqlite_cx = fsqlite_cx(cx);
+        let metadata = ensure_porter_fts5_ready(&fsqlite_cx, storage.connection(), &table_name)
+            .await?;
+        let doc_count = persisted_fts5_doc_count(&fsqlite_cx, storage.connection(), &table_name)
+            .await?;
+
+        Ok(Self {
+            storage,
+            table_name,
+            config: Fts5AdapterConfig {
+                content_mode: metadata.content_mode,
+                tokenizer: Fts5TokenizerChoice::Porter,
+                title_boost: TITLE_BOOST,
+            },
+            doc_count,
+        })
+    }
+
+    /// Return the verified table configuration read from persisted metadata.
+    #[must_use]
+    pub fn config(&self) -> &Fts5AdapterConfig {
+        &self.config
+    }
+}
+
+impl frankensearch_core::LexicalRead for PersistedFts5LexicalSearch {
+    #[instrument(skip_all, fields(table = %self.table_name, query = %query, limit = limit))]
+    fn search<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        limit: usize,
+    ) -> SearchFuture<'a, Vec<ScoredResult>> {
+        Box::pin(async move {
+            let query = Fts5LexicalSearch::truncate_query(query);
+            if query.trim().is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let fsqlite_cx = fsqlite_cx(cx);
+            // This is intentionally in the live data path, not only in the
+            // rebuild helper: external DDL or marker changes fail the search
+            // closed before MATCH can return a stale Porter result.
+            ensure_porter_fts5_ready(
+                &fsqlite_cx,
+                self.storage.connection(),
+                &self.table_name,
+            )
+            .await?;
+
+            let limit = i64::try_from(limit).map_err(|_| SearchError::InvalidConfig {
+                field: "fts5.limit".to_owned(),
+                value: limit.to_string(),
+                reason: "does not fit SQLite's signed integer limit".to_owned(),
+            })?;
+            let params = [
+                SqliteValue::Text(query.to_owned().into()),
+                SqliteValue::Integer(limit),
+            ];
+            let rows = self
+                .storage
+                .connection()
+                .query_with_params(
+                    &fsqlite_cx,
+                    &format!(
+                        "SELECT doc_id, metadata_json, bm25({0}) FROM {0} \
+                         WHERE {0} MATCH ?1 ORDER BY bm25({0}), rowid LIMIT ?2;",
+                        self.table_name
+                    ),
+                    &params,
+                )
+                .await
+                .map_err(|error| map_storage_error_at("persisted Porter FTS5 search", error))?;
+
+            rows.iter()
+                .map(decode_persisted_fts5_row)
+                .collect::<SearchResult<Vec<_>>>()
+        })
+    }
+
+    fn doc_count(&self) -> usize {
+        self.doc_count
+    }
+}
+
+/// Rebuild a persisted Porter FTS5 table for FrankenSQLite 0.2.1.
+///
+/// The table's own DDL decides its content mode. Ordinary stored and external
+/// tables use FTS5's `rebuild` command; contentless tables are rejected because
+/// authoritative text and original rowids must be re-ingested instead.
+///
+/// The rebuild is intentionally gated before `BEGIN`: 0.2.1 cannot submit the
+/// required non-cancelled rollback on cancellation, error, commit failure, or
+/// panic. The 0.3 implementation must issue rebuild, marker upsert, and
+/// `COMMIT` in one transaction and roll that transaction back exactly once
+/// with the dedicated cleanup capability when any of those steps fails.
+pub async fn rebuild_porter_fts5_table(
+    cx: &Cx,
+    conn: &AsyncConnection,
+    table_name: &str,
+) -> SearchResult<()> {
+    let table_name = validated_fts5_identifier(table_name)?;
+    let fsqlite_cx = fsqlite_cx(cx);
+    let metadata = read_persisted_fts5_metadata(&fsqlite_cx, conn, &table_name).await?;
+    ensure_rebuildable_porter_fts5(&table_name, &metadata)?;
+
+    match read_porter_fts5_rebuild_marker(&fsqlite_cx, conn, &table_name).await? {
+        Some(PORTER_FTS5_REBUILD_VERSION) => return Ok(()),
+        Some(version) if version > PORTER_FTS5_REBUILD_VERSION => {
+            return Err(SearchError::InvalidConfig {
+                field: "fts5.rebuild_version".to_owned(),
+                value: version.to_string(),
+                reason: "database was rebuilt by a newer Porter FTS5 migration; refusing a downgrade".to_owned(),
+            });
+        }
+        Some(_) | None => {}
+    }
+
+    require_async_transaction_cleanup_capability()
+}
+
+fn validated_fts5_identifier(table_name: &str) -> SearchResult<String> {
+    let mut chars = table_name.chars();
+    let valid_start = chars.next().is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic());
+    let valid_rest = chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric());
+    if valid_start && valid_rest {
+        Ok(table_name.to_owned())
+    } else {
+        Err(SearchError::InvalidConfig {
+            field: "fts5.table_name".to_owned(),
+            value: table_name.to_owned(),
+            reason: "must be a SQLite ASCII identifier before it is interpolated into a rebuild statement".to_owned(),
+        })
+    }
+}
+
+async fn ensure_porter_fts5_ready(
+    fsqlite_cx: &FsqliteCx,
+    conn: &AsyncConnection,
+    table_name: &str,
+) -> SearchResult<PersistedFts5Metadata> {
+    let metadata = read_persisted_fts5_metadata(fsqlite_cx, conn, table_name).await?;
+    ensure_rebuildable_porter_fts5(table_name, &metadata)?;
+
+    match read_porter_fts5_rebuild_marker(fsqlite_cx, conn, table_name).await? {
+        Some(PORTER_FTS5_REBUILD_VERSION) => Ok(metadata),
+        Some(version) if version > PORTER_FTS5_REBUILD_VERSION => Err(SearchError::InvalidConfig {
+            field: "fts5.rebuild_version".to_owned(),
+            value: version.to_string(),
+            reason: "database was rebuilt by a newer Porter FTS5 migration; refusing a downgrade".to_owned(),
+        }),
+        Some(version) => Err(SearchError::InvalidConfig {
+            field: "fts5.rebuild_version".to_owned(),
+            value: version.to_string(),
+            reason: "Porter FTS5 table has an obsolete rebuild marker; rebuild must complete and commit before search".to_owned(),
+        }),
+        None => Err(SearchError::InvalidConfig {
+            field: "fts5.rebuild_version".to_owned(),
+            value: table_name.to_owned(),
+            reason: "Porter FTS5 table has no committed rebuild marker; refusing potentially stale search results".to_owned(),
+        }),
+    }
+}
+
+async fn read_persisted_fts5_metadata(
+    fsqlite_cx: &FsqliteCx,
+    conn: &AsyncConnection,
+    table_name: &str,
+) -> SearchResult<PersistedFts5Metadata> {
+    let params = [SqliteValue::Text(table_name.to_owned().into())];
+    let rows = conn
+        .query_with_params(
+            fsqlite_cx,
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1;",
+            &params,
+        )
+        .await
+        .map_err(|error| map_storage_error_at("read persisted FTS5 table metadata", error))?;
+
+    let [row] = rows.as_slice() else {
+        return Err(persisted_fts5_metadata_error(
+            table_name,
+            if rows.is_empty() {
+                "table is absent from sqlite_master"
+            } else {
+                "sqlite_master returned more than one table definition"
+            },
+        ));
+    };
+    let Some(SqliteValue::Text(sql)) = row.get(0) else {
+        return Err(persisted_fts5_metadata_error(
+            table_name,
+            "sqlite_master.sql is not text",
+        ));
+    };
+
+    parse_persisted_fts5_metadata(table_name, sql.as_ref())
+}
+
+async fn read_porter_fts5_rebuild_marker(
+    fsqlite_cx: &FsqliteCx,
+    conn: &AsyncConnection,
+    table_name: &str,
+) -> SearchResult<Option<i64>> {
+    let params = [SqliteValue::Text(table_name.to_owned().into())];
+    let rows = conn
+        .query_with_params(
+            fsqlite_cx,
+            &format!(
+                "SELECT rebuild_version FROM {PORTER_FTS5_REBUILD_TABLE} WHERE table_name = ?1;"
+            ),
+            &params,
+        )
+        .await
+        .map_err(|error| map_storage_error_at("read Porter FTS5 rebuild marker", error))?;
+
+    let row = match rows.as_slice() {
+        [] => return Ok(None),
+        [row] => row,
+        _ => {
+            return Err(SearchError::InvalidConfig {
+                field: "fts5.rebuild_version".to_owned(),
+                value: table_name.to_owned(),
+                reason: "governed Porter FTS5 marker table contains duplicate rows for one table".to_owned(),
+            });
+        }
+    };
+    match row.get(0) {
+        Some(SqliteValue::Integer(version)) => Ok(Some(*version)),
+        Some(value) => Err(SearchError::InvalidConfig {
+            field: "fts5.rebuild_version".to_owned(),
+            value: format!("{table_name}: {value:?}"),
+            reason: "refusing to query a Porter FTS5 table whose governed rebuild marker is not an integer".to_owned(),
+        }),
+        None => Err(SearchError::InvalidConfig {
+            field: "fts5.rebuild_version".to_owned(),
+            value: format!("{table_name}: missing column"),
+            reason: "refusing to query a Porter FTS5 table whose governed rebuild marker row is malformed".to_owned(),
+        }),
+    }
+}
+
+fn ensure_rebuildable_porter_fts5(
+    table_name: &str,
+    metadata: &PersistedFts5Metadata,
+) -> SearchResult<()> {
+    if !metadata
+        .tokenizer
+        .split_ascii_whitespace()
+        .next()
+        .is_some_and(|tokenizer| tokenizer.eq_ignore_ascii_case("porter"))
+    {
+        return Err(SearchError::InvalidConfig {
+            field: "fts5.tokenize".to_owned(),
+            value: metadata.tokenizer.clone(),
+            reason: format!(
+                "{table_name} is not a Porter FTS5 table according to its persisted sqlite_master definition"
+            ),
+        });
+    }
+    if metadata.content_mode == Fts5ContentMode::Contentless {
+        return Err(SearchError::InvalidConfig {
+            field: "fts5.content_mode".to_owned(),
+            value: "contentless".to_owned(),
+            reason: "Porter FTS5 rebuild requires authoritative text and original rowids; recreate the contentless table and re-ingest source documents rather than rebuilding from an index or preview".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+async fn persisted_fts5_doc_count(
+    fsqlite_cx: &FsqliteCx,
+    conn: &AsyncConnection,
+    table_name: &str,
+) -> SearchResult<usize> {
+    let rows = conn
+        .query(fsqlite_cx, &format!("SELECT COUNT(*) FROM {table_name};"))
+        .await
+        .map_err(|error| map_storage_error_at("count persisted Porter FTS5 documents", error))?;
+    let [row] = rows.as_slice() else {
+        return Err(persisted_fts5_metadata_error(
+            table_name,
+            "COUNT(*) did not return exactly one row",
+        ));
+    };
+    let Some(SqliteValue::Integer(count)) = row.get(0) else {
+        return Err(persisted_fts5_metadata_error(
+            table_name,
+            "COUNT(*) did not return an integer",
+        ));
+    };
+    usize::try_from(*count).map_err(|_| {
+        persisted_fts5_metadata_error(table_name, "COUNT(*) is negative or does not fit usize")
+    })
+}
+
+fn decode_persisted_fts5_row(row: &Row) -> SearchResult<ScoredResult> {
+    let Some(SqliteValue::Text(doc_id)) = row.get(0) else {
+        return Err(persisted_fts5_result_error("doc_id must be non-NULL TEXT"));
+    };
+    if doc_id.is_empty() {
+        return Err(persisted_fts5_result_error("doc_id must not be empty"));
+    }
+
+    let metadata = match row.get(1) {
+        None => return Err(persisted_fts5_result_error("metadata_json column is missing")),
+        Some(SqliteValue::Null) => None,
+        Some(SqliteValue::Text(text)) if text.is_empty() => None,
+        Some(SqliteValue::Text(text)) => Some(serde_json::from_str(text).map_err(|error| {
+            SearchError::InvalidConfig {
+                field: "fts5.metadata_json".to_owned(),
+                value: error.to_string(),
+                reason: "persisted FTS5 metadata_json is not valid JSON".to_owned(),
+            }
+        })?),
+        Some(value) => {
+            return Err(persisted_fts5_result_error(&format!(
+                "metadata_json must be TEXT or NULL, got {value:?}"
+            )));
+        }
+    };
+
+    let raw_score = match row.get(2) {
+        Some(SqliteValue::Float(score)) => *score,
+        Some(SqliteValue::Integer(score)) => *score as f64,
+        Some(value) => {
+            return Err(persisted_fts5_result_error(&format!(
+                "bm25 score must be REAL or INTEGER, got {value:?}"
+            )));
+        }
+        None => return Err(persisted_fts5_result_error("bm25 score column is missing")),
+    };
+    let score = -raw_score;
+    if !score.is_finite() || score > f64::from(f32::MAX) {
+        return Err(persisted_fts5_result_error(
+            "bm25 score is non-finite or does not fit f32",
+        ));
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let score = score as f32;
+
+    Ok(ScoredResult {
+        doc_id: doc_id.to_string().into(),
+        score,
+        source: ScoreSource::Lexical,
+        index: None,
+        fast_score: None,
+        quality_score: None,
+        lexical_score: Some(score),
+        rerank_score: None,
+        explanation: None,
+        metadata,
+    })
+}
+
+fn parse_persisted_fts5_metadata(
+    table_name: &str,
+    create_sql: &str,
+) -> SearchResult<PersistedFts5Metadata> {
+    let mut cursor = Fts5DdlCursor::new(create_sql);
+    cursor.expect_keyword("CREATE", table_name)?;
+    cursor.expect_keyword("VIRTUAL", table_name)?;
+    cursor.expect_keyword("TABLE", table_name)?;
+    if cursor.consume_keyword("IF") {
+        cursor.expect_keyword("NOT", table_name)?;
+        cursor.expect_keyword("EXISTS", table_name)?;
+    }
+    let declared_table = cursor
+        .identifier()
+        .ok_or_else(|| persisted_fts5_metadata_error(table_name, "missing virtual table name"))?;
+    if !declared_table.eq_ignore_ascii_case(table_name) {
+        return Err(persisted_fts5_metadata_error(
+            table_name,
+            "sqlite_master definition declares a different table name",
+        ));
+    }
+    cursor.expect_keyword("USING", table_name)?;
+    cursor.expect_keyword("FTS5", table_name)?;
+    let arguments = cursor.parenthesized(table_name)?;
+    cursor.finish(table_name)?;
+
+    let mut content_mode = Fts5ContentMode::Stored;
+    let mut saw_content = false;
+    let mut tokenizer = None;
+    for argument in split_fts5_arguments(arguments, table_name)? {
+        let Some((key, value)) = split_fts5_option(argument, table_name)? else {
+            continue;
+        };
+        if key.eq_ignore_ascii_case("content") {
+            if saw_content {
+                return Err(persisted_fts5_metadata_error(
+                    table_name,
+                    "duplicate content option",
+                ));
+            }
+            saw_content = true;
+            content_mode = if parse_fts5_option_value(value, table_name)?.is_empty() {
+                Fts5ContentMode::Contentless
+            } else {
+                Fts5ContentMode::External
+            };
+        } else if key.eq_ignore_ascii_case("tokenize") {
+            if tokenizer.is_some() {
+                return Err(persisted_fts5_metadata_error(
+                    table_name,
+                    "duplicate tokenize option",
+                ));
+            }
+            tokenizer = Some(parse_fts5_option_value(value, table_name)?);
+        }
+    }
+
+    let tokenizer = tokenizer.ok_or_else(|| {
+        persisted_fts5_metadata_error(table_name, "missing explicit tokenize option")
+    })?;
+    Ok(PersistedFts5Metadata {
+        content_mode,
+        tokenizer,
+    })
+}
+
+fn split_fts5_arguments<'a>(arguments: &'a str, table_name: &str) -> SearchResult<Vec<&'a str>> {
+    let mut items = Vec::new();
+    let mut start = 0;
+    let mut depth = 0_u32;
+    let mut quote = None;
+    let bytes = arguments.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(delimiter) = quote {
+            if byte == delimiter {
+                if index + 1 < bytes.len() && bytes[index + 1] == delimiter {
+                    index += 2;
+                    continue;
+                }
+                quote = None;
+            }
+        } else {
+            match byte {
+                b'\'' | b'\"' | b'`' => quote = Some(byte),
+                b'[' => quote = Some(b']'),
+                b'(' => depth = depth.saturating_add(1),
+                b')' => {
+                    if depth == 0 {
+                        return Err(persisted_fts5_metadata_error(
+                            table_name,
+                            "unbalanced parenthesis in FTS5 arguments",
+                        ));
+                    }
+                    depth -= 1;
+                }
+                b',' if depth == 0 => {
+                    items.push(arguments[start..index].trim());
+                    start = index + 1;
+                }
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    if quote.is_some() || depth != 0 {
+        return Err(persisted_fts5_metadata_error(
+            table_name,
+            "unterminated quote or parenthesis in FTS5 arguments",
+        ));
+    }
+    let final_item = arguments[start..].trim();
+    if final_item.is_empty() {
+        return Err(persisted_fts5_metadata_error(
+            table_name,
+            "empty FTS5 argument",
+        ));
+    }
+    items.push(final_item);
+    Ok(items)
+}
+
+fn split_fts5_option<'a>(
+    argument: &'a str,
+    table_name: &str,
+) -> SearchResult<Option<(&'a str, &'a str)>> {
+    let mut quote = None;
+    let mut depth = 0_u32;
+    let bytes = argument.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(delimiter) = quote {
+            if byte == delimiter {
+                if index + 1 < bytes.len() && bytes[index + 1] == delimiter {
+                    index += 2;
+                    continue;
+                }
+                quote = None;
+            }
+        } else {
+            match byte {
+                b'\'' | b'\"' | b'`' => quote = Some(byte),
+                b'[' => quote = Some(b']'),
+                b'(' => depth = depth.saturating_add(1),
+                b')' => {
+                    if depth == 0 {
+                        return Err(persisted_fts5_metadata_error(
+                            table_name,
+                            "unbalanced parenthesis in an FTS5 argument",
+                        ));
+                    }
+                    depth -= 1;
+                }
+                b'=' if depth == 0 => {
+                    let key = argument[..index].trim();
+                    let value = argument[index + 1..].trim();
+                    if key.is_empty() || value.is_empty() {
+                        return Err(persisted_fts5_metadata_error(
+                            table_name,
+                            "FTS5 option has an empty key or value",
+                        ));
+                    }
+                    return Ok(Some((key, value)));
+                }
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    if quote.is_some() || depth != 0 {
+        return Err(persisted_fts5_metadata_error(
+            table_name,
+            "unterminated quote or parenthesis in an FTS5 argument",
+        ));
+    }
+    Ok(None)
+}
+
+fn parse_fts5_option_value(value: &str, table_name: &str) -> SearchResult<String> {
+    let value = value.trim();
+    let Some(quote) = value.as_bytes().first().copied().filter(|quote| {
+        matches!(quote, b'\'' | b'\"' | b'`')
+    }) else {
+        return Ok(value.to_ascii_lowercase());
+    };
+    if value.len() < 2 {
+        return Err(persisted_fts5_metadata_error(
+            table_name,
+            "unterminated quoted FTS5 option value",
+        ));
+    }
+
+    let mut decoded = String::new();
+    let bytes = value.as_bytes();
+    let mut index = 1;
+    while index < bytes.len() {
+        if bytes[index] == quote {
+            if index + 1 < bytes.len() && bytes[index + 1] == quote {
+                decoded.push(quote as char);
+                index += 2;
+                continue;
+            }
+            if !value[index + 1..].trim().is_empty() {
+                return Err(persisted_fts5_metadata_error(
+                    table_name,
+                    "trailing text after quoted FTS5 option value",
+                ));
+            }
+            return Ok(decoded.to_ascii_lowercase());
+        }
+        let Some(character) = value[index..].chars().next() else {
+            break;
+        };
+        decoded.push(character);
+        index += character.len_utf8();
+    }
+    Err(persisted_fts5_metadata_error(
+        table_name,
+        "unterminated quoted FTS5 option value",
+    ))
+}
+
+struct Fts5DdlCursor<'a> {
+    source: &'a str,
+    index: usize,
+}
+
+impl<'a> Fts5DdlCursor<'a> {
+    const fn new(source: &'a str) -> Self {
+        Self { source, index: 0 }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self
+            .source
+            .as_bytes()
+            .get(self.index)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            self.index += 1;
+        }
+    }
+
+    fn consume_keyword(&mut self, keyword: &str) -> bool {
+        self.skip_whitespace();
+        let remaining = &self.source[self.index..];
+        let Some(candidate) = remaining.get(..keyword.len()) else {
+            return false;
+        };
+        if !candidate.eq_ignore_ascii_case(keyword) {
+            return false;
+        }
+        if remaining
+            .as_bytes()
+            .get(keyword.len())
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            return false;
+        }
+        self.index += keyword.len();
+        true
+    }
+
+    fn expect_keyword(&mut self, keyword: &str, table_name: &str) -> SearchResult<()> {
+        if self.consume_keyword(keyword) {
+            Ok(())
+        } else {
+            Err(persisted_fts5_metadata_error(
+                table_name,
+                &format!("expected {keyword} in CREATE VIRTUAL TABLE definition"),
+            ))
+        }
+    }
+
+    fn identifier(&mut self) -> Option<String> {
+        self.skip_whitespace();
+        let byte = *self.source.as_bytes().get(self.index)?;
+        let closing = match byte {
+            b'\"' => Some(b'\"'),
+            b'`' => Some(b'`'),
+            b'[' => Some(b']'),
+            _ => None,
+        };
+        if let Some(closing) = closing {
+            self.index += 1;
+            let start = self.index;
+            while let Some(current) = self.source.as_bytes().get(self.index).copied() {
+                if current == closing {
+                    let value = self.source[start..self.index].to_owned();
+                    self.index += 1;
+                    return Some(value);
+                }
+                self.index += 1;
+            }
+            return None;
+        }
+
+        if !(byte == b'_' || byte.is_ascii_alphabetic()) {
+            return None;
+        }
+        let start = self.index;
+        self.index += 1;
+        while self
+            .source
+            .as_bytes()
+            .get(self.index)
+            .is_some_and(|current| *current == b'_' || current.is_ascii_alphanumeric())
+        {
+            self.index += 1;
+        }
+        Some(self.source[start..self.index].to_owned())
+    }
+
+    fn parenthesized(&mut self, table_name: &str) -> SearchResult<&'a str> {
+        self.skip_whitespace();
+        if self.source.as_bytes().get(self.index) != Some(&b'(') {
+            return Err(persisted_fts5_metadata_error(
+                table_name,
+                "expected FTS5 argument list",
+            ));
+        }
+        self.index += 1;
+        let start = self.index;
+        let mut depth = 0_u32;
+        let mut quote = None;
+        while let Some(byte) = self.source.as_bytes().get(self.index).copied() {
+            if let Some(delimiter) = quote {
+                if byte == delimiter {
+                    if self.source.as_bytes().get(self.index + 1) == Some(&delimiter) {
+                        self.index += 2;
+                        continue;
+                    }
+                    quote = None;
+                }
+            } else {
+                match byte {
+                    b'\'' | b'\"' | b'`' => quote = Some(byte),
+                    b'[' => quote = Some(b']'),
+                    b'(' => depth = depth.saturating_add(1),
+                    b')' if depth == 0 => {
+                        let end = self.index;
+                        self.index += 1;
+                        return Ok(&self.source[start..end]);
+                    }
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+            }
+            self.index += 1;
+        }
+        Err(persisted_fts5_metadata_error(
+            table_name,
+            "unterminated FTS5 argument list",
+        ))
+    }
+
+    fn finish(&mut self, table_name: &str) -> SearchResult<()> {
+        self.skip_whitespace();
+        if self.source.as_bytes().get(self.index) == Some(&b';') {
+            self.index += 1;
+            self.skip_whitespace();
+        }
+        if self.index == self.source.len() {
+            Ok(())
+        } else {
+            Err(persisted_fts5_metadata_error(
+                table_name,
+                "unexpected trailing text in CREATE VIRTUAL TABLE definition",
+            ))
+        }
+    }
+}
+
+fn persisted_fts5_metadata_error(table_name: &str, reason: &str) -> SearchError {
+    SearchError::InvalidConfig {
+        field: "fts5.persisted_metadata".to_owned(),
+        value: table_name.to_owned(),
+        reason: reason.to_owned(),
+    }
+}
+
+fn persisted_fts5_result_error(reason: &str) -> SearchError {
+    SearchError::InvalidConfig {
+        field: "fts5.persisted_result".to_owned(),
+        value: reason.to_owned(),
+        reason: "persisted FTS5 table does not meet the frankensearch result contract".to_owned(),
+    }
+}
+
 // ─── Split lexical trait implementations ────────────────────────────────────
 
 #[allow(clippy::significant_drop_tightening)]
@@ -543,6 +1353,45 @@ mod tests {
         assert_eq!(config.content_mode, Fts5ContentMode::Stored);
         assert_eq!(config.tokenizer, Fts5TokenizerChoice::Unicode61);
         assert!((config.title_boost - TITLE_BOOST).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn persisted_metadata_uses_ddl_for_content_mode_and_porter() {
+        let stored = parse_persisted_fts5_metadata(
+            "docs",
+            "CREATE VIRTUAL TABLE docs USING fts5(doc_id, metadata_json, tokenize='porter unicode61');",
+        )
+        .expect("stored Porter definition should parse");
+        assert_eq!(stored.content_mode, Fts5ContentMode::Stored);
+        ensure_rebuildable_porter_fts5("docs", &stored)
+            .expect("stored Porter definition should be rebuildable");
+
+        let external = parse_persisted_fts5_metadata(
+            "docs",
+            "CREATE VIRTUAL TABLE docs USING fts5(doc_id, metadata_json, content='documents', tokenize='porter');",
+        )
+        .expect("external Porter definition should parse");
+        assert_eq!(external.content_mode, Fts5ContentMode::External);
+        ensure_rebuildable_porter_fts5("docs", &external)
+            .expect("external Porter definition should be rebuildable");
+    }
+
+    #[test]
+    fn persisted_metadata_rejects_contentless_or_non_porter_tables() {
+        let contentless = parse_persisted_fts5_metadata(
+            "docs",
+            "CREATE VIRTUAL TABLE docs USING fts5(doc_id, metadata_json, content='', tokenize='porter');",
+        )
+        .expect("contentless Porter definition should parse before its policy check");
+        assert_eq!(contentless.content_mode, Fts5ContentMode::Contentless);
+        assert!(ensure_rebuildable_porter_fts5("docs", &contentless).is_err());
+
+        let unicode = parse_persisted_fts5_metadata(
+            "docs",
+            "CREATE VIRTUAL TABLE docs USING fts5(doc_id, metadata_json, tokenize='unicode61');",
+        )
+        .expect("non-Porter definition should still parse");
+        assert!(ensure_rebuildable_porter_fts5("docs", &unicode).is_err());
     }
 
     // -- Indexing --

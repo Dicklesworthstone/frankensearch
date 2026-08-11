@@ -1,11 +1,14 @@
 use std::error::Error;
 use std::fmt;
-use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::future::Future;
+use std::pin::Pin;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
-use fsqlite::{Connection, FrankenError};
+use fsqlite::{AsyncConnection, ConnectionEnv, FrankenError, RuntimeConfig};
+use fsqlite_types::cx::Cx as FsqliteCx;
 use serde::{Deserialize, Serialize};
 
 use crate::metrics::{StorageMetrics, StorageMetricsSnapshot};
@@ -55,12 +58,13 @@ impl Default for StorageConfig {
 }
 
 pub struct Storage {
-    conn: Connection,
+    conn: AsyncConnection,
     config: StorageConfig,
     metrics: StorageMetrics,
 }
 
-static FILE_BOOTSTRAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static FILE_BOOTSTRAP_LOCK: std::sync::OnceLock<asupersync::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
 
 // FrankenSQLite already retries contention while it opens the pager, but later
 // connection-admission stages can still return a typed Busy/Locked error while
@@ -85,43 +89,64 @@ fn connection_open_retry_delay(failed_attempt: u32) -> Duration {
     Duration::from_millis(delay_ms)
 }
 
-fn retry_connection_open<T>(
-    mut operation: impl FnMut() -> Result<T, FrankenError>,
-    mut on_retry: impl FnMut(u32, Duration, &FrankenError),
-) -> Result<T, FrankenError> {
+pub(crate) fn fsqlite_cx(cx: &Cx) -> FsqliteCx {
+    let fsqlite_cx = FsqliteCx::new();
+    fsqlite_cx.set_native_cx(cx.clone());
+    fsqlite_cx
+}
+
+/// Reject transactions until FrankenSQLite supplies its 0.3 cleanup context.
+///
+/// `AsyncConnection` 0.2.1 validates both the caller `Cx` and its attached
+/// native context before every SQL command. Once the operation Cx has been
+/// cancelled, neither can submit the compensating `ROLLBACK`; using a mask
+/// merely defers that cancellation and using a detached `Cx<cap::None>` has no
+/// runtime capability to drive the worker. Entering a transaction under those
+/// conditions would therefore make cancellation able to strand it.
+///
+/// The 0.3 contract this gate requires is an operation-local, runtime-affine
+/// cleanup capability which is deliberately independent of request
+/// cancellation and has a bounded cleanup budget. The future transaction
+/// implementation must use it exactly once after *every* post-`BEGIN`
+/// cancellation, ordinary error, commit error, or panic; it must then return
+/// the original error/cancellation or resume the original panic. Do not
+/// replace this gate with a cancellation mask, `block_on`, a resolver trick,
+/// or a fresh runtime.
+pub(crate) fn require_async_transaction_cleanup_capability() -> SearchResult<()> {
+    Err(SearchError::InvalidConfig {
+        field: "storage.fsqlite_async_cleanup".to_owned(),
+        value: "fsqlite 0.2.1".to_owned(),
+        reason: "requires the published FrankenSQLite 0.3 operation-local, runtime-affine, non-cancelled cleanup capability before this migration may begin a transaction".to_owned(),
+    })
+}
+
+async fn open_connection_with_retry(cx: &Cx, path: &str) -> Result<AsyncConnection, FrankenError> {
+    let fsqlite_cx = fsqlite_cx(cx);
+    let env = ConnectionEnv::new_with_root_cx(RuntimeConfig::default(), &fsqlite_cx);
     let mut attempt = 1;
     loop {
-        match operation() {
-            Ok(value) => return Ok(value),
+        match AsyncConnection::open_with_env(&fsqlite_cx, path, env.clone()).await {
+            Ok(connection) => return Ok(connection),
             Err(error)
                 if is_retryable_connection_open_error(&error)
                     && attempt < CONNECTION_OPEN_MAX_ATTEMPTS =>
             {
                 let delay = connection_open_retry_delay(attempt);
-                on_retry(attempt.saturating_add(1), delay, &error);
+                tracing::debug!(
+                    target: "frankensearch.storage",
+                    path,
+                    next_attempt = attempt.saturating_add(1),
+                    max_attempts = CONNECTION_OPEN_MAX_ATTEMPTS,
+                    ?delay,
+                    error = %error,
+                    "retrying transient storage connection-open contention"
+                );
+                asupersync::time::sleep(cx.now(), delay).await;
                 attempt = attempt.saturating_add(1);
             }
             Err(error) => return Err(error),
         }
     }
-}
-
-fn open_connection_with_retry(path: &str) -> Result<Connection, FrankenError> {
-    retry_connection_open(
-        || Connection::open(path),
-        |next_attempt, delay, error| {
-            tracing::debug!(
-                target: "frankensearch.storage",
-                path,
-                next_attempt,
-                max_attempts = CONNECTION_OPEN_MAX_ATTEMPTS,
-                ?delay,
-                error = %error,
-                "retrying transient storage connection-open contention"
-            );
-            std::thread::sleep(delay);
-        },
-    )
 }
 
 #[derive(Debug)]
@@ -159,7 +184,7 @@ impl std::fmt::Debug for Storage {
 }
 
 impl Storage {
-    pub fn open(config: StorageConfig) -> SearchResult<Self> {
+    pub async fn open(cx: &Cx, config: StorageConfig) -> SearchResult<Self> {
         tracing::debug!(
             target: "frankensearch.storage",
             path = %config.db_path.display(),
@@ -173,16 +198,18 @@ impl Storage {
         let file_bootstrap_guard = if config.db_path.as_os_str() == ":memory:" {
             None
         } else {
-            Some(FILE_BOOTSTRAP_LOCK.lock().map_err(|_| {
-                map_storage_error_at(
-                    "file bootstrap lock",
-                    std::io::Error::other("lock poisoned"),
-                )
-            })?)
+            Some(
+                FILE_BOOTSTRAP_LOCK
+                    .get_or_init(|| asupersync::sync::Mutex::new(()))
+                    .lock(cx)
+                    .await
+                    .map_err(|error| map_storage_error_at("file bootstrap lock", error))?,
+            )
         };
 
         let path = config.db_path.to_string_lossy().to_string();
-        let conn = open_connection_with_retry(&path)
+        let conn = open_connection_with_retry(cx, &path)
+            .await
             .map_err(|error| map_storage_error_at("connection open", error))?;
 
         let storage = Self {
@@ -192,12 +219,13 @@ impl Storage {
         };
 
         storage.metrics.record_open();
-        storage.apply_pragmas()?;
-        schema::bootstrap(storage.connection())?;
+        storage.apply_pragmas(cx).await?;
+        schema::bootstrap(cx, storage.connection()).await?;
         storage.metrics.record_schema_bootstrap();
 
         let version =
-            schema::current_version_at(storage.connection(), "post-open schema verification")?;
+            schema::current_version_at(cx, storage.connection(), "post-open schema verification")
+                .await?;
         drop(file_bootstrap_guard);
         tracing::debug!(
             target: "frankensearch.storage",
@@ -208,12 +236,12 @@ impl Storage {
         Ok(storage)
     }
 
-    pub fn open_in_memory() -> SearchResult<Self> {
-        Self::open(StorageConfig::in_memory())
+    pub async fn open_in_memory(cx: &Cx) -> SearchResult<Self> {
+        Self::open(cx, StorageConfig::in_memory()).await
     }
 
     #[must_use]
-    pub fn connection(&self) -> &Connection {
+    pub fn connection(&self) -> &AsyncConnection {
         &self.conn
     }
 
@@ -227,11 +255,12 @@ impl Storage {
         self.metrics.snapshot()
     }
 
-    pub fn transaction<F, T>(&self, f: F) -> SearchResult<T>
-    where
-        F: FnOnce(&Connection) -> SearchResult<T>,
-    {
-        self.transaction_with_mode(self.config.begin_sql(), f)
+    pub async fn transaction<T>(
+        &self,
+        cx: &Cx,
+        f: impl for<'a> FnOnce(&'a AsyncConnection, &'a FsqliteCx) -> StorageFuture<'a, T>,
+    ) -> SearchResult<T> {
+        self.transaction_with_mode(cx, self.config.begin_sql(), f).await
     }
 
     /// Run a closure inside a `BEGIN IMMEDIATE` transaction.
@@ -240,78 +269,33 @@ impl Storage {
     /// preventing concurrent writers from interleaving reads and writes.
     /// Use this when correctness depends on serialized read-then-write
     /// (e.g. `claim_batch`).
-    pub fn immediate_transaction<F, T>(&self, f: F) -> SearchResult<T>
-    where
-        F: FnOnce(&Connection) -> SearchResult<T>,
-    {
-        self.transaction_with_mode("BEGIN IMMEDIATE;", f)
+    pub async fn immediate_transaction<T>(
+        &self,
+        cx: &Cx,
+        f: impl for<'a> FnOnce(&'a AsyncConnection, &'a FsqliteCx) -> StorageFuture<'a, T>,
+    ) -> SearchResult<T> {
+        self.transaction_with_mode(cx, "BEGIN IMMEDIATE;", f).await
     }
 
-    fn transaction_with_mode<F, T>(&self, begin_sql: &str, f: F) -> SearchResult<T>
-    where
-        F: FnOnce(&Connection) -> SearchResult<T>,
-    {
+    async fn transaction_with_mode<T>(
+        &self,
+        _cx: &Cx,
+        begin_sql: &str,
+        _f: impl for<'a> FnOnce(&'a AsyncConnection, &'a FsqliteCx) -> StorageFuture<'a, T>,
+    ) -> SearchResult<T> {
         tracing::trace!(
             target: "frankensearch.storage",
             begin_sql,
             "starting storage transaction"
         );
 
-        self.conn.execute(begin_sql).map_err(map_storage_error)?;
-
-        let outcome = catch_unwind(AssertUnwindSafe(|| f(&self.conn)));
-
-        match outcome {
-            Ok(Ok(value)) => {
-                self.conn.execute("COMMIT;").map_err(|commit_err| {
-                    if let Err(rollback_err) = self.conn.execute("ROLLBACK;") {
-                        tracing::warn!(
-                            target: "frankensearch.storage",
-                            error = %rollback_err,
-                            "rollback failed after commit error"
-                        );
-                    }
-                    map_storage_error(commit_err)
-                })?;
-                self.metrics.record_commit();
-                tracing::trace!(target: "frankensearch.storage", "storage transaction committed");
-                Ok(value)
-            }
-            Ok(Err(err)) => {
-                if let Err(rollback_err) = self.conn.execute("ROLLBACK;") {
-                    tracing::warn!(
-                        target: "frankensearch.storage",
-                        error = %rollback_err,
-                        "rollback failed after closure error"
-                    );
-                }
-                self.metrics.record_rollback();
-                tracing::debug!(
-                    target: "frankensearch.storage",
-                    ?err,
-                    "storage transaction rolled back due to closure error"
-                );
-                Err(err)
-            }
-            Err(payload) => {
-                if let Err(rollback_err) = self.conn.execute("ROLLBACK;") {
-                    tracing::error!(
-                        target: "frankensearch.storage",
-                        error = %rollback_err,
-                        "critical: rollback failed during panic recovery"
-                    );
-                }
-                self.metrics.record_rollback();
-                tracing::error!(
-                    target: "frankensearch.storage",
-                    "storage transaction rolled back after panic"
-                );
-                resume_unwind(payload);
-            }
-        }
+        // This must remain before BEGIN. See
+        // `require_async_transaction_cleanup_capability` for the exact
+        // cancellation, error-preservation, and panic-rethrow contract.
+        require_async_transaction_cleanup_capability()
     }
 
-    fn apply_pragmas(&self) -> SearchResult<()> {
+    async fn apply_pragmas(&self, cx: &Cx) -> SearchResult<()> {
         tracing::trace!(
             target: "frankensearch.storage",
             wal_mode = self.config.wal_mode,
@@ -321,39 +305,45 @@ impl Storage {
             "applying storage pragmas"
         );
 
+        let fsqlite_cx = fsqlite_cx(cx);
         self.conn
-            .execute("PRAGMA foreign_keys=ON;")
+            .execute(&fsqlite_cx, "PRAGMA foreign_keys=ON;")
+            .await
             .map_err(|error| map_storage_error_at("apply foreign_keys pragma", error))?;
 
         if self.config.wal_mode {
             self.conn
-                .execute("PRAGMA journal_mode=WAL;")
+                .execute(&fsqlite_cx, "PRAGMA journal_mode=WAL;")
+                .await
                 .map_err(|error| map_storage_error_at("apply journal_mode pragma", error))?;
-        } else if let Err(error) = self.conn.execute("PRAGMA journal_mode=DELETE;") {
+        } else if let Err(error) = self.conn.execute(&fsqlite_cx, "PRAGMA journal_mode=DELETE;").await {
             tracing::warn!(
                 target: "frankensearch.storage",
                 ?error,
                 "journal_mode=DELETE was not accepted by backend; falling back to WAL"
             );
             self.conn
-                .execute("PRAGMA journal_mode=WAL;")
+                .execute(&fsqlite_cx, "PRAGMA journal_mode=WAL;")
+                .await
                 .map_err(|error| {
                     map_storage_error_at("apply journal_mode fallback pragma", error)
                 })?;
         }
 
         self.conn
-            .execute(&format!(
+            .execute(&fsqlite_cx, &format!(
                 "PRAGMA busy_timeout={};",
                 self.config.busy_timeout_ms
             ))
+            .await
             .map_err(|error| map_storage_error_at("apply busy_timeout pragma", error))?;
 
         self.conn
-            .execute(&format!(
+            .execute(&fsqlite_cx, &format!(
                 "PRAGMA cache_size={};",
                 self.config.cache_size_pages
             ))
+            .await
             .map_err(|error| map_storage_error_at("apply cache_size pragma", error))?;
 
         if self.config.raptorq_repair_symbols > 0 {
@@ -370,6 +360,9 @@ impl Storage {
     }
 }
 
+pub(crate) type StorageFuture<'a, T> = Pin<Box<dyn Future<Output = SearchResult<T>> + 'a>>;
+
+#[allow(dead_code)] // Used by retained tests until the 0.3 transaction wrapper lands.
 pub(crate) fn map_storage_error<E>(source: E) -> SearchError
 where
     E: std::error::Error + Send + Sync + 'static,

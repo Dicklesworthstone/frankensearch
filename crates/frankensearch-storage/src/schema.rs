@@ -1,12 +1,21 @@
 use std::io;
 
+use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
-use fsqlite::{Connection, FrankenError, Row};
+use fsqlite::{AsyncConnection, FrankenError, Row};
 use fsqlite_types::value::SqliteValue;
 
-use crate::connection::map_storage_error_at;
+use crate::connection::{
+    fsqlite_cx, map_storage_error_at, require_async_transaction_cleanup_capability,
+};
 
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
+
+/// Governed marker table for the FTS5 Porter tokenizer rebuild.
+///
+/// This belongs to the storage schema rather than to the rebuild operation so
+/// that a failed or cancelled rebuild cannot leave behind ad-hoc schema.
+pub(crate) const PORTER_FTS5_REBUILD_TABLE: &str = "frankensearch_fts5_rebuild_version";
 
 struct Migration {
     version: i64,
@@ -130,6 +139,10 @@ const LATEST_SCHEMA: &[&str] = &[
         created_at INTEGER NOT NULL\
     );",
     "CREATE INDEX IF NOT EXISTS idx_bookmarks_doc_query ON bookmarks(doc_id, query);",
+    "CREATE TABLE IF NOT EXISTS frankensearch_fts5_rebuild_version (\
+        table_name TEXT PRIMARY KEY,\
+        rebuild_version INTEGER NOT NULL\
+    );",
 ];
 
 const MIGRATIONS: &[Migration] = &[
@@ -321,10 +334,19 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS idx_bookmarks_doc_query ON bookmarks(doc_id, query);",
         ],
     },
+    Migration {
+        version: 7,
+        statements: &[
+            "CREATE TABLE IF NOT EXISTS frankensearch_fts5_rebuild_version (\
+                table_name TEXT PRIMARY KEY,\
+                rebuild_version INTEGER NOT NULL\
+            );",
+        ],
+    },
 ];
 
-pub fn bootstrap(conn: &Connection) -> SearchResult<()> {
-    match schema_version_state(conn, "schema preflight")? {
+pub async fn bootstrap(cx: &Cx, conn: &AsyncConnection) -> SearchResult<()> {
+    match schema_version_state(cx, conn, "schema preflight").await? {
         SchemaVersionState::Present(version) => {
             reject_future_version(version, "schema preflight")?;
             if version == SCHEMA_VERSION {
@@ -339,40 +361,26 @@ pub fn bootstrap(conn: &Connection) -> SearchResult<()> {
         SchemaVersionState::MissingTable | SchemaVersionState::Empty => {}
     }
 
-    conn.execute("BEGIN IMMEDIATE;")
-        .map_err(|error| map_storage_error_at("schema transaction begin", error))?;
-    let result = bootstrap_inner(conn);
-    match result {
-        Ok(()) => conn.execute("COMMIT;").map(|_| ()).map_err(|commit_err| {
-            if let Err(rollback_err) = conn.execute("ROLLBACK;") {
-                tracing::warn!(
-                    target: "frankensearch.storage",
-                    stage = "schema transaction rollback after commit",
-                    error = %rollback_err,
-                    "rollback failed after schema bootstrap commit error"
-                );
-            }
-            map_storage_error_at("schema transaction commit", commit_err)
-        }),
-        Err(error) => {
-            if let Err(rollback_err) = conn.execute("ROLLBACK;") {
-                tracing::warn!(
-                    target: "frankensearch.storage",
-                    stage = "schema transaction rollback after bootstrap",
-                    error = %rollback_err,
-                    "rollback failed after schema bootstrap error"
-                );
-            }
-            Err(error)
-        }
-    }
+    // Schema migration writes must share the transaction cleanup contract with
+    // every other storage write. Failing before BEGIN is deliberate: 0.2.1
+    // cannot roll this transaction back after request cancellation.
+    // This 0.3 cleanup capability gate intentionally prevents post-BEGIN
+    // code until it can preserve the original cancellation/error and rethrow a
+    // panic after exactly-once rollback. Leaving this as the tail expression
+    // is safer than a best-effort rollback that could strand `schema_version`
+    // half-migrated.
+    require_async_transaction_cleanup_capability()
 }
 
-fn bootstrap_inner(conn: &Connection) -> SearchResult<()> {
-    conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);")
+#[allow(dead_code)] // Re-enabled with the required 0.3 cleanup transaction wrapper.
+async fn bootstrap_inner(fsqlite_cx: &FsqliteCx, conn: &AsyncConnection) -> SearchResult<()> {
+    conn.execute(fsqlite_cx, "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);")
+        .await
         .map_err(|error| map_storage_error_at("schema transaction marker table", error))?;
 
-    let mut version = current_version_optional_at(conn, "schema transaction recheck")?.unwrap_or(0);
+    let mut version = current_version_optional_with_cx(fsqlite_cx, conn, "schema transaction recheck")
+        .await?
+        .unwrap_or(0);
     reject_future_version(version, "schema transaction recheck")?;
 
     if version == 0 {
@@ -383,15 +391,18 @@ fn bootstrap_inner(conn: &Connection) -> SearchResult<()> {
         );
 
         for statement in LATEST_SCHEMA {
-            conn.execute(statement)
+            conn.execute(fsqlite_cx, statement)
+                .await
                 .map_err(|error| map_storage_error_at("fresh schema application", error))?;
         }
 
         let params = [SqliteValue::Integer(SCHEMA_VERSION)];
         conn.execute_with_params(
+            fsqlite_cx,
             "INSERT OR REPLACE INTO schema_version(version) VALUES (?1);",
             &params,
         )
+        .await
         .map_err(|error| map_storage_error_at("fresh schema marker write", error))?;
         version = SCHEMA_VERSION;
     }
@@ -416,15 +427,18 @@ fn bootstrap_inner(conn: &Connection) -> SearchResult<()> {
         );
 
         for statement in migration.statements {
-            conn.execute(statement)
+            conn.execute(fsqlite_cx, statement)
+                .await
                 .map_err(|error| map_storage_error_at("schema migration application", error))?;
         }
 
         let params = [SqliteValue::Integer(migration.version)];
         conn.execute_with_params(
+            fsqlite_cx,
             "INSERT OR REPLACE INTO schema_version(version) VALUES (?1);",
             &params,
         )
+        .await
         .map_err(|error| map_storage_error_at("schema migration marker write", error))?;
         version = migration.version;
     }
@@ -438,25 +452,40 @@ fn bootstrap_inner(conn: &Connection) -> SearchResult<()> {
     Ok(())
 }
 
-pub fn current_version(conn: &Connection) -> SearchResult<i64> {
-    current_version_at(conn, "schema version read")
+pub async fn current_version(cx: &Cx, conn: &AsyncConnection) -> SearchResult<i64> {
+    current_version_at(cx, conn, "schema version read").await
 }
 
-pub(crate) fn current_version_at(conn: &Connection, stage: &'static str) -> SearchResult<i64> {
-    current_version_optional_at(conn, stage)?
+pub(crate) async fn current_version_at(
+    cx: &Cx,
+    conn: &AsyncConnection,
+    stage: &'static str,
+) -> SearchResult<i64> {
+    current_version_optional_at(cx, conn, stage)
+        .await?
         .ok_or_else(|| schema_contract_error(stage, "schema_version table has no rows"))
 }
 
 #[cfg(test)]
-fn current_version_optional(conn: &Connection) -> SearchResult<Option<i64>> {
-    current_version_optional_at(conn, "schema version read")
+async fn current_version_optional(cx: &Cx, conn: &AsyncConnection) -> SearchResult<Option<i64>> {
+    current_version_optional_at(cx, conn, "schema version read").await
 }
 
-fn current_version_optional_at(
-    conn: &Connection,
+async fn current_version_optional_at(
+    cx: &Cx,
+    conn: &AsyncConnection,
     stage: &'static str,
 ) -> SearchResult<Option<i64>> {
-    match schema_version_state(conn, stage)? {
+    let fsqlite_cx = fsqlite_cx(cx);
+    current_version_optional_with_cx(&fsqlite_cx, conn, stage).await
+}
+
+async fn current_version_optional_with_cx(
+    fsqlite_cx: &FsqliteCx,
+    conn: &AsyncConnection,
+    stage: &'static str,
+) -> SearchResult<Option<i64>> {
+    match schema_version_state_with_cx(fsqlite_cx, conn, stage).await? {
         SchemaVersionState::MissingTable => Err(map_storage_error_at(
             stage,
             FrankenError::NoSuchTable {
@@ -468,18 +497,34 @@ fn current_version_optional_at(
     }
 }
 
-fn schema_version_state(
-    conn: &Connection,
+async fn schema_version_state(
+    cx: &Cx,
+    conn: &AsyncConnection,
+    stage: &'static str,
+) -> SearchResult<SchemaVersionState> {
+    let fsqlite_cx = fsqlite_cx(cx);
+    schema_version_state_with_cx(&fsqlite_cx, conn, stage).await
+}
+
+async fn schema_version_state_with_cx(
+    fsqlite_cx: &FsqliteCx,
+    conn: &AsyncConnection,
     stage: &'static str,
 ) -> SearchResult<SchemaVersionState> {
     let table_columns = conn
-        .query("PRAGMA table_info(schema_version);")
+        .query(fsqlite_cx, "PRAGMA table_info(schema_version);")
+        .await
         .map_err(|error| map_storage_error_at(stage, error))?;
     if table_columns.is_empty() {
         return Ok(SchemaVersionState::MissingTable);
     }
 
-    let rows = match conn.query("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1;")
+    let rows = match conn
+        .query(
+            fsqlite_cx,
+            "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1;",
+        )
+        .await
     {
         Ok(rows) => rows,
         Err(FrankenError::NoSuchTable { name }) if name == "schema_version" => {

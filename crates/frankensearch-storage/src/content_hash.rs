@@ -2,13 +2,15 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::io;
 
+use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
-use fsqlite::{Connection, Row};
+use fsqlite::{AsyncConnection, Row};
+use fsqlite_types::cx::Cx as FsqliteCx;
 use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::connection::Storage;
+use crate::connection::{Storage, fsqlite_cx};
 use crate::document::EmbeddingStatus;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -86,12 +88,14 @@ pub fn sha256_hex(content: &str) -> String {
     ContentHasher::hash_hex(content)
 }
 
-pub fn record_content_hash(
-    conn: &Connection,
+pub async fn record_content_hash(
+    cx: &Cx,
+    conn: &AsyncConnection,
     content_hash: &str,
     doc_id: &str,
     seen_at: i64,
 ) -> SearchResult<usize> {
+    let fsqlite_cx = fsqlite_cx(cx);
     let sql = "INSERT INTO content_hashes \
         (content_hash, first_doc_id, seen_count, first_seen_at, last_seen_at) \
         VALUES (?1, ?2, 1, ?3, ?4) \
@@ -106,21 +110,26 @@ pub fn record_content_hash(
         SqliteValue::Integer(seen_at),
     ];
 
-    conn.execute_with_params(sql, &params)
+    conn.execute_with_params(&fsqlite_cx, sql, &params)
+        .await
         .map_err(storage_error)
 }
 
-pub fn lookup_content_hash(
-    conn: &Connection,
+pub async fn lookup_content_hash(
+    cx: &Cx,
+    conn: &AsyncConnection,
     content_hash: &str,
 ) -> SearchResult<Option<ContentHashRecord>> {
+    let fsqlite_cx = fsqlite_cx(cx);
     let params = [SqliteValue::Text(content_hash.to_owned().into())];
     let rows = conn
         .query_with_params(
+            &fsqlite_cx,
             "SELECT content_hash, first_doc_id, seen_count, first_seen_at, last_seen_at \
              FROM content_hashes WHERE content_hash = ?1;",
             &params,
         )
+        .await
         .map_err(storage_error)?;
 
     let Some(row) = rows.first() else {
@@ -137,8 +146,9 @@ pub fn lookup_content_hash(
 }
 
 impl Storage {
-    pub fn check_dedup(
+    pub async fn check_dedup(
         &self,
+        cx: &Cx,
         doc_id: &str,
         new_hash: &[u8; 32],
         embedder_id: &str,
@@ -147,7 +157,8 @@ impl Storage {
         ensure_non_empty(embedder_id, "embedder_id")?;
 
         let items = [(doc_id.to_owned(), *new_hash)];
-        self.check_dedup_batch(&items, embedder_id)?
+        self.check_dedup_batch(cx, &items, embedder_id)
+            .await?
             .into_iter()
             .next()
             .ok_or_else(|| SearchError::SubsystemError {
@@ -156,8 +167,9 @@ impl Storage {
             })
     }
 
-    pub fn check_dedup_batch(
+    pub async fn check_dedup_batch(
         &self,
+        cx: &Cx,
         items: &[(String, [u8; 32])],
         embedder_id: &str,
     ) -> SearchResult<Vec<DeduplicationDecision>> {
@@ -177,8 +189,8 @@ impl Storage {
             }
         }
 
-        self.transaction(|conn| {
-            let existing = fetch_existing_dedup_rows(conn, items, embedder_id)?;
+        self.transaction(cx, |conn, fsqlite_cx| Box::pin(async move {
+            let existing = fetch_existing_dedup_rows(fsqlite_cx, conn, items, embedder_id).await?;
             let mut decisions = Vec::with_capacity(items.len());
             let mut skipped_docs = 0_u64;
             let mut new_docs = 0_u64;
@@ -212,12 +224,14 @@ impl Storage {
             );
 
             Ok(decisions)
-        })
+        }))
+        .await
     }
 }
 
-fn fetch_existing_dedup_rows(
-    conn: &Connection,
+async fn fetch_existing_dedup_rows(
+    fsqlite_cx: &FsqliteCx,
+    conn: &AsyncConnection,
     items: &[(String, [u8; 32])],
     embedder_id: &str,
 ) -> SearchResult<HashMap<String, DedupRow>> {
@@ -245,7 +259,8 @@ fn fetch_existing_dedup_rows(
     }
 
     let rows = conn
-        .query_with_params(&sql, &params)
+        .query_with_params(fsqlite_cx, &sql, &params)
+        .await
         .map_err(storage_error)?;
     let mut existing = HashMap::with_capacity(rows.len());
 

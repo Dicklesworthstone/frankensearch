@@ -33,6 +33,7 @@ pub use document::{
 #[cfg(feature = "fts5")]
 pub use fts5_adapter::{
     Fts5AdapterConfig, Fts5ContentMode, Fts5Hit, Fts5LexicalSearch, Fts5TokenizerChoice,
+    PORTER_FTS5_REBUILD_VERSION, PersistedFts5LexicalSearch, rebuild_porter_fts5_table,
 };
 pub use history::{
     Bookmark, SearchHistoryEntry, add_bookmark, count_bookmarks, count_search_history,
