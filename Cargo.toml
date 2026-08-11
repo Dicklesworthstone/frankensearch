@@ -62,18 +62,12 @@ frankensearch-quill = { version = "0.2.1", path = "crates/frankensearch-quill" }
 # it through their [dev-dependencies] entry:
 #   asupersync = { workspace = true, features = ["test-internals"] }
 # Same fix shape as frankensqlite (#104).
-# Keep this pin aligned with HFDT and FrankenSQLite so downstream
-# workspaces resolve a single Asupersync runtime universe. The range
-# `>=0.3.10, <0.4` lets a downstream workspace patch to compatible 0.3.x
-# source without creating two runtime universes. The floor is 0.3.10: it is
-# the first published release containing the scoped test-logging fix from
-# 92e6cc6d, while 0.3.9 may still install the process-global TRACE bridge and
-# amplify Tokenizers output (bd-irb1). It also retains the timer fix absent
-# from crates.io 0.3.4, whose `time::sleep` futures never fired under bare
-# current-thread `block_on` runtimes (bd-z6pu). Hard-pinning the old release
-# was unsatisfiable under downstream patches and deadlocked am's dependency
-# graph (cargo resolution EXIT 101). [bd-3h229]
-asupersync = { version = ">=0.3.10, <0.5", default-features = false, features = ["proc-macros"] }
+# Keep this pin aligned with HFDT and FrankenSQLite so downstream workspaces
+# resolve a single Asupersync runtime universe. The 0.4.3 floor carries the
+# scoped test-logging and timer fixes required by this workspace; the <0.5
+# ceiling permits compatible 0.4.x source overrides without admitting a future
+# semver-major API line. [bd-3h229]
+asupersync = { version = ">=0.4.3, <0.5", default-features = false, features = ["proc-macros"] }
 arc-swap = "=1.9.2"
 
 # Descriptor-relative generation-root admission. Keep the syscall surface
@@ -192,6 +186,16 @@ ftui-widgets = "0.2.1"
 ftui-tty = "0.2.1"
 ftui-backend = "0.2.1"
 ftui-extras = "0.2.1"
+
+# Bind the directly consumed FrankenSQLite 0.1.19 crates to HFDT's audited
+# synchronous publication branch, advanced to Asupersync 0.4.3, so downstream
+# workspaces retain the reviewed API and resolve one runtime universe.
+[patch.crates-io]
+fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
+fsqlite-core = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
+fsqlite-error = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
+fsqlite-ext-fts5 = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
+fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
 
 [workspace.lints.rust]
 # `deny` instead of `forbid` so crates that need unsafe (e.g. mmap) can opt in.
