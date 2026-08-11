@@ -4412,6 +4412,13 @@ struct QuillWriterState {
     /// an ambiguous partial batch must be reconciled by `commit` before any
     /// further scalar indexing is accepted.
     ingest_retry_required: bool,
+    /// Test-only, per index, default OFF. When set, the shared-nothing routes
+    /// arm the shard rendezvous from their REAL plan so a test can force
+    /// overlap. It must stay opt-in: arming it for every `cfg(test)` fan-out
+    /// changes scheduling across the whole suite and makes a serial pool wait
+    /// out the rendezvous deadline on every batch.
+    #[cfg(test)]
+    force_ingest_overlap_rendezvous: bool,
 }
 
 impl Deref for QuillWriterState {
@@ -4734,6 +4741,8 @@ impl QuillWriterState {
             pending_delta_seal: None,
             unpublished_since: None,
             ingest_retry_required: false,
+            #[cfg(test)]
+            force_ingest_overlap_rendezvous: false,
         })
     }
 
@@ -5475,7 +5484,9 @@ impl QuillWriterState {
 
         let checkpoint = ParallelIngestCheckpoint::new(&self.reader);
         #[cfg(test)]
-        observation.arm_rendezvous(plan.active_shards);
+        if self.force_ingest_overlap_rendezvous {
+            observation.arm_rendezvous(plan.active_shards);
+        }
         let completed = work
             .into_par_iter()
             .map(|work| {
@@ -5746,7 +5757,9 @@ impl QuillWriterState {
 
         let checkpoint = ParallelIngestCheckpoint::new(&self.reader);
         #[cfg(test)]
-        observation.arm_rendezvous(plan.active_shards);
+        if self.force_ingest_overlap_rendezvous {
+            observation.arm_rendezvous(plan.active_shards);
+        }
         let completed = work
             .into_par_iter()
             .map(|work| {
@@ -23452,6 +23465,9 @@ mod tests {
                 let mut index = QuillIndex::in_memory(config).expect("overlap index");
                 let documents = parallel_budget_fixture_documents(250);
                 let writer = index.writer_mut();
+                // Opt in explicitly: the rendezvous is per index and off by
+                // default, so no other test's scheduling is affected.
+                writer.force_ingest_overlap_rendezvous = true;
                 let plan = plan_parallel_ingest(
                     documents.len(),
                     writer.shard_router.shard_count(),
@@ -23669,10 +23685,20 @@ mod tests {
             .unwrap_or_else(|| panic!("field {key} missing from:\n{captured}"))
             + needle.len();
         let rest = &captured[start..];
+        // A QUOTED value runs to its closing quote and may legally contain
+        // commas — `parallel_pool_local_worker_ids="0,1,2"` is ONE value, not
+        // three fields. Treating a comma as an outer delimiter truncated it to
+        // the first id.
+        if let Some(body) = rest.strip_prefix('"') {
+            let end = body
+                .find('"')
+                .unwrap_or_else(|| panic!("unterminated quoted {key} in:\n{captured}"));
+            return &body[..end];
+        }
         let end = rest
             .find(|c: char| c == ' ' || c == ',' || c == '}' || c == '\n')
             .unwrap_or(rest.len());
-        rest[..end].trim_matches('"')
+        &rest[..end]
     }
 
     fn assert_ingest_span_reports(captured: &str, terminal: &str, succeeded: bool) {
@@ -23770,6 +23796,7 @@ mod tests {
                         ..QuillConfig::default()
                     };
                     let mut index = QuillIndex::in_memory(config).expect("success receipt index");
+                    index.writer_mut().force_ingest_overlap_rendezvous = true;
                     let documents = (0..250)
                         .map(|ordinal| {
                             IndexableDocument::new(
