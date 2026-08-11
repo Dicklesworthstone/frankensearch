@@ -1182,8 +1182,17 @@ pub enum BenchmarkWidthUnobservableReason {
 /// benchmark candidates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WriterPlan {
-    /// Ordinary shipping construction. Never produces a benchmark receipt.
+    /// Ordinary shipping construction through Tantivy's own width selection.
+    /// Never produces a benchmark receipt.
     Shipping,
+    /// Ordinary construction at a pinned width. Never produces a benchmark
+    /// receipt either.
+    ///
+    /// Width and receipt are independent axes. Collapsing this into
+    /// `Shipping` silently moved the single-threaded oracle off
+    /// `writer_with_num_threads(1, heap)` and onto Tantivy's auto selection —
+    /// a real behaviour change bought only to express "no receipt".
+    PinnedWidth(usize),
     /// Explicit benchmark construction through Tantivy's own width selection.
     #[cfg(feature = "bench-internals")]
     BenchmarkShippingAuto,
@@ -1192,13 +1201,17 @@ enum WriterPlan {
     BenchmarkFixed(usize),
 }
 
+#[cfg(feature = "bench-internals")]
 impl WriterPlan {
-    /// Pinned width, when the plan names one.
-    const fn fixed_threads(self) -> Option<usize> {
+    /// Width recorded on the benchmark accessor.
+    ///
+    /// Only a benchmark plan reports one: `PinnedWidth` pins a width without
+    /// claiming any screening identity. Gated with the field it feeds, so the
+    /// default build has no unreachable helper to warn about.
+    const fn benchmark_threads(self) -> Option<usize> {
         match self {
-            #[cfg(feature = "bench-internals")]
             Self::BenchmarkFixed(threads) => Some(threads),
-            _ => None,
+            Self::Shipping | Self::PinnedWidth(_) | Self::BenchmarkShippingAuto => None,
         }
     }
 }
@@ -1731,8 +1744,8 @@ impl TantivyIndex {
             None,
             WRITER_HEAP_BYTES,
             // An ordinary single-threaded oracle, not a benchmark candidate:
-            // it pins a width but claims no screening receipt.
-            WriterPlan::Shipping,
+            // it really does pin width 1, and claims no screening receipt.
+            WriterPlan::PinnedWidth(1),
         )
     }
 
@@ -2211,6 +2224,11 @@ impl TantivyIndex {
             // benchmark shipping-auto construction, and deliberately produces no
             // receipt: only an explicit benchmark plan may claim one.
             WriterPlan::Shipping => index.writer(writer_heap_bytes),
+            // Pinned but unscreened: the same Tantivy call a benchmark fixed
+            // plan makes, deliberately without a receipt.
+            WriterPlan::PinnedWidth(thread_count) => {
+                index.writer_with_num_threads(thread_count, writer_heap_bytes)
+            }
             #[cfg(feature = "bench-internals")]
             WriterPlan::BenchmarkShippingAuto => {
                 let writer = index.writer(writer_heap_bytes);
@@ -2291,7 +2309,7 @@ impl TantivyIndex {
             ord_table: RwLock::new(ord_table),
             path,
             #[cfg(feature = "bench-internals")]
-            benchmark_writer_threads: plan.fixed_threads(),
+            benchmark_writer_threads: plan.benchmark_threads(),
             // Seeded above by the selection branch itself, so the record and
             // the call it describes cannot disagree.
             //
@@ -6196,6 +6214,41 @@ mod benchmark_writer_mode_tests {
         assert!(
             oracle.benchmark_writer_receipt().is_none(),
             "pinning a width is not the same as claiming a screening receipt"
+        );
+        assert!(
+            oracle.benchmark_materialized_writer_threads().is_none(),
+            "an unscreened oracle authenticates no width to a screening consumer"
+        );
+    }
+
+    #[test]
+    fn the_ordinary_pinned_oracle_still_reaches_the_fixed_constructor() {
+        // Width and receipt are independent axes, and conflating them once
+        // already moved this oracle off writer_with_num_threads(1, ..) and onto
+        // Tantivy's auto selection.
+        //
+        // Discrimination here is bounded by what Tantivy exposes: there is no
+        // public width accessor, and at this crate's writer budget both
+        // constructors succeed for width 1, so no failure-mode difference
+        // separates them the way the one-thread-floor budget separates the
+        // eight-wide case above. What is checkable is that the pinned plan
+        // still constructs, and still refuses to present a screening identity.
+        let oracle =
+            TantivyIndex::in_memory_single_threaded_oracle().expect("single-threaded oracle");
+        assert!(oracle.benchmark_writer_receipt().is_none());
+
+        // The behavioural probe that *is* available: a benchmark fixed plan at
+        // width 1 reaches the same Tantivy call, and unlike the auto path it
+        // accepts a budget far below what auto selection would clamp for.
+        let pinned_narrow =
+            TantivyIndex::in_memory_with_benchmark_config(ONE_THREAD_FLOOR_HEAP, 1, true)
+                .expect("writer_with_num_threads accepts one writer at one writer's floor");
+        assert_eq!(
+            pinned_narrow
+                .benchmark_writer_receipt()
+                .expect("receipt")
+                .materialized_width,
+            BenchmarkMaterializedWidth::Authenticated(1)
         );
     }
 
