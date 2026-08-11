@@ -348,14 +348,51 @@ type ReadyBatchQueue = Arc<Mutex<VecDeque<Vec<WatchEvent>>>>;
 
 type ProducerHandle = thread::JoinHandle<SearchResult<()>>;
 
+/// Test-only observer invoked at one exact point in the stop protocol.
+///
+/// The hooks exist so a test can inspect the lock state *at* the publication
+/// and park boundaries instead of inferring it from timing. They are compiled
+/// out of shipping builds, and the production paths below are unchanged apart
+/// from the two `#[cfg(test)]` call sites.
+#[cfg(test)]
+type StopObserver = Box<dyn Fn(&WatcherStop) + Send + Sync>;
+
 #[derive(Default)]
 struct WatcherStop {
     requested: AtomicBool,
     wait_lock: Mutex<()>,
     wait_cv: Condvar,
+    /// Invoked at the instant the stop flag is published.
+    #[cfg(test)]
+    publish_observer: Mutex<Option<StopObserver>>,
+    /// Invoked while `wait_lock` is held, immediately before parking.
+    #[cfg(test)]
+    park_observer: Mutex<Option<StopObserver>>,
 }
 
 impl WatcherStop {
+    /// Observe the exact publication boundary. The observer runs wherever the
+    /// flag store runs, so a regression that moves the store out of
+    /// `wait_lock` moves the observation with it.
+    #[cfg(test)]
+    fn set_publish_observer(&self, observer: StopObserver) {
+        *lock_or_recover(&self.publish_observer) = Some(observer);
+    }
+
+    /// Observe the exact park boundary, while `wait_lock` is still held.
+    #[cfg(test)]
+    fn set_park_observer(&self, observer: StopObserver) {
+        *lock_or_recover(&self.park_observer) = Some(observer);
+    }
+
+    #[cfg(test)]
+    fn notify_observer(&self, slot: &Mutex<Option<StopObserver>>) {
+        let observer = lock_or_recover(slot);
+        if let Some(observer) = observer.as_ref() {
+            observer(self);
+        }
+    }
+
     fn request(&self) {
         // The store and the notify must both happen under `wait_lock`, not just
         // the notify. `wait_or_stopped` tests the flag while holding that lock
@@ -368,6 +405,8 @@ impl WatcherStop {
         // waiter's check-then-wait, so the waiter either observes the flag or
         // is already parked and receives the notify.
         let _publication = lock_or_recover(&self.wait_lock);
+        #[cfg(test)]
+        self.notify_observer(&self.publish_observer);
         self.requested.store(true, Ordering::Release);
         self.wait_cv.notify_all();
     }
@@ -376,17 +415,34 @@ impl WatcherStop {
         self.requested.load(Ordering::Acquire)
     }
 
+    /// Park for at most `duration`, returning early only for a real stop.
+    ///
+    /// A single `wait_timeout` is not a wait for `duration` — a condvar may
+    /// wake for no reason at all, and any such wakeup made the previous form
+    /// return `false` as though the backoff had elapsed. The caller treats
+    /// that as "the backoff is over", so a spurious wakeup silently shortened
+    /// a restart backoff of up to `MAX_BACKOFF_MS` to nothing and the loop
+    /// span. The wait must therefore be a predicate/deadline loop: wake, test
+    /// the flag, and re-park for the *remaining* time unless stop is actually
+    /// requested.
+    ///
+    /// `wait_timeout_while` is exactly that loop — it re-checks the predicate
+    /// on every wakeup and tracks the deadline across re-parks, so `duration`
+    /// is an upper bound on the whole call rather than on one park.
     fn wait_or_stopped(&self, duration: Duration) -> bool {
         if self.is_requested() {
             return true;
         }
         let guard = lock_or_recover(&self.wait_lock);
-        if !self.is_requested() {
-            let _guard = self
-                .wait_cv
-                .wait_timeout(guard, duration)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
+        // Announced while the lock is still held: a notifier that then
+        // acquires `wait_lock` can only do so once this thread has released
+        // it into the wait below, which is what makes "parked" observable.
+        #[cfg(test)]
+        self.notify_observer(&self.park_observer);
+        let (_guard, _timed_out) = self
+            .wait_cv
+            .wait_timeout_while(guard, duration, |()| !self.is_requested())
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.is_requested()
     }
 }
@@ -2329,70 +2385,121 @@ mod tests {
     ///
     /// The interleaving is forced rather than raced: the test holds `wait_lock`
     /// itself, which is exactly the state `wait_or_stopped` is in after it has
-    /// read the flag as `false` and before `wait_timeout` releases the lock.
-    /// A `request()` that publishes outside the lock returns immediately in
-    /// that state — its store and its notify both land in the waiter's blind
-    /// window, and the real waiter then sleeps the full backoff with stop
-    /// already requested. The corrected `request()` cannot return until the
-    /// lock is free, so the observation below is deterministic in both
-    /// directions: `false` before release, `true` after the join.
+    /// read the flag as `false` and before it parks. A `request()` that
+    /// publishes outside the lock returns immediately in that state — its
+    /// store and its notify both land in the waiter's blind window, and the
+    /// real waiter then sleeps the full backoff with stop already requested.
+    ///
+    /// The verdict is an observation taken *at* the publication, not a race
+    /// between two threads. The observer runs at the flag store itself and
+    /// asks whether `wait_lock` is held there: `try_lock` fails from the
+    /// owning thread, so a publication inside the lock reports "held". A
+    /// regression that moves the store back outside the lock moves the
+    /// observer with it, `try_lock` then succeeds, and this fails. Single
+    /// threaded on purpose — there is no scheduling for a false green to hide
+    /// in.
     #[test]
-    fn stop_request_cannot_publish_inside_the_waiters_check_then_park_window() {
+    fn stop_request_publishes_only_while_holding_the_wait_lock() {
         let stop = Arc::new(WatcherStop::default());
-        let published = Arc::new(AtomicBool::new(false));
+        let observed = Arc::new(AtomicUsize::new(0));
+        let held_at_publication = Arc::new(AtomicBool::new(false));
 
-        let held = super::lock_or_recover(&stop.wait_lock);
+        {
+            let observed = Arc::clone(&observed);
+            let held_at_publication = Arc::clone(&held_at_publication);
+            stop.set_publish_observer(Box::new(move |stop: &WatcherStop| {
+                // `try_lock` from the thread that already owns the mutex
+                // returns `WouldBlock`; an unheld mutex hands the guard over.
+                let unheld = stop.wait_lock.try_lock().is_ok();
+                held_at_publication.store(!unheld, Ordering::Release);
+                observed.fetch_add(1, Ordering::AcqRel);
+            }));
+        }
 
-        let requester = {
-            let stop = Arc::clone(&stop);
-            let published = Arc::clone(&published);
-            thread::spawn(move || {
-                stop.request();
-                published.store(true, Ordering::Release);
-            })
-        };
+        stop.request();
 
-        // Give the requester every chance to publish. On the pre-fix code it
-        // does, because nothing stops it from storing and notifying while this
-        // thread owns the window; that is the lost wakeup.
-        thread::sleep(Duration::from_millis(50));
-        assert!(
-            !published.load(Ordering::Acquire),
-            "stop publication escaped the waiter's check-then-park window; a waiter \
-             parked here would miss the notify and sleep the entire backoff"
+        assert_eq!(
+            observed.load(Ordering::Acquire),
+            1,
+            "the publication boundary must be reached exactly once"
         );
         assert!(
-            !stop.is_requested(),
-            "the stop flag became visible before the wait window closed"
+            held_at_publication.load(Ordering::Acquire),
+            "the stop flag was published without holding wait_lock; a waiter between its \
+             flag check and its park would miss the notify and sleep the entire backoff"
         );
-
-        drop(held);
-        requester.join().expect("stop requester thread");
-        assert!(published.load(Ordering::Acquire));
         assert!(stop.is_requested());
     }
 
-    /// A waiter already parked in `wait_or_stopped` returns on the notify
-    /// rather than serving out its timeout.
+    /// A wakeup that is not a stop must not end the backoff.
+    ///
+    /// This is the property a single `wait_timeout` cannot hold: a condvar may
+    /// wake a waiter for no reason, and the previous form returned `false` on
+    /// any such wakeup, which the caller reads as "the backoff elapsed". The
+    /// notify below carries no stop — it is issued under `wait_lock` exactly
+    /// as `request()` does, but without the store — so it is indistinguishable
+    /// from a spurious wakeup. Pre-fix the waiter returns `false` there and
+    /// this fails on `stopped`; post-fix it re-parks and only the real stop
+    /// releases it.
+    ///
+    /// "Parked" is proven by two facts in sequence, with no sleeping or
+    /// spinning. The park observer runs while the waiter still holds
+    /// `wait_lock`, so receiving its signal proves the waiter is inside
+    /// `wait_or_stopped` and past its flag check. This thread then blocks
+    /// acquiring `wait_lock`, which cannot be granted until the waiter has
+    /// released it *into* the condvar wait. Owning the lock therefore means
+    /// the waiter is parked, and the notify issued under it is delivered.
     #[test]
-    fn parked_waiter_wakes_on_stop_instead_of_sleeping_the_backoff() {
+    fn spurious_wakeup_does_not_shorten_the_backoff_and_stop_still_wakes_it() {
         const BACKOFF: Duration = Duration::from_secs(30);
         let stop = Arc::new(WatcherStop::default());
+        // Signalled from inside the park boundary; waited on by this thread.
+        let parking = Arc::new((Mutex::new(false), Condvar::new()));
+
+        {
+            let parking = Arc::clone(&parking);
+            stop.set_park_observer(Box::new(move |_stop: &WatcherStop| {
+                let (announced, ready) = &*parking;
+                *super::lock_or_recover(announced) = true;
+                ready.notify_all();
+            }));
+        }
 
         let waiter = {
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
-                let started = std::time::Instant::now();
+                let started = Instant::now();
                 let stopped = stop.wait_or_stopped(BACKOFF);
                 (stopped, started.elapsed())
             })
         };
 
-        thread::sleep(Duration::from_millis(50));
+        {
+            let (announced, ready) = &*parking;
+            let mut announced = super::lock_or_recover(announced);
+            while !*announced {
+                announced = ready
+                    .wait(announced)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+        {
+            // Blocks until the waiter releases `wait_lock` into the condvar.
+            let _parked = super::lock_or_recover(&stop.wait_lock);
+            stop.wait_cv.notify_all();
+        }
+        assert!(
+            !stop.is_requested(),
+            "the spurious notify must not have requested a stop"
+        );
+
         stop.request();
 
         let (stopped, elapsed) = waiter.join().expect("stop waiter thread");
-        assert!(stopped, "wait_or_stopped must report the requested stop");
+        assert!(
+            stopped,
+            "a wakeup carrying no stop ended the wait; the backoff was cut short"
+        );
         assert!(
             elapsed < BACKOFF / 2,
             "waiter served {elapsed:?} of a {BACKOFF:?} backoff instead of waking on stop"
@@ -2412,7 +2519,8 @@ mod tests {
     use std::io;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::thread;
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
 
