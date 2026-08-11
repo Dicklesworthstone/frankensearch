@@ -1105,6 +1105,120 @@ fn validate_benchmark_writer_threads(writer_threads: usize) -> SearchResult<()> 
     Ok(())
 }
 
+/// Which Tantivy writer constructor a benchmark index literally called.
+///
+/// This is a constructor identity, not a request record: `ShippingAuto` means
+/// [`Index::writer`] was called and Tantivy chose the pool width itself;
+/// `Fixed` means [`Index::writer_with_num_threads`] was called with exactly
+/// the recorded width.
+#[cfg(feature = "bench-internals")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchmarkWriterMode {
+    /// The shipping default path: `Index::writer(heap)`.
+    ShippingAuto,
+    /// The pinned path: `Index::writer_with_num_threads(threads, heap)`.
+    Fixed {
+        /// Exact width handed to Tantivy.
+        threads: usize,
+    },
+}
+
+/// Writer-pool width, and whether it is authenticated or merely unknown.
+///
+/// Tantivy 0.26.1 computes the `ShippingAuto` width inside `Index::writer`
+/// from `available_parallelism()` clamped by the heap budget, and exposes no
+/// accessor for it — `pub fn num_threads` does not exist anywhere in that
+/// crate. Recomputing it here would mean copying `MAX_NUM_THREAD` and
+/// `MEMORY_BUDGET_NUM_BYTES_MIN` into this crate and presenting an inference
+/// as an observation, which would drift silently on any version bump. The
+/// unknown is therefore typed, not filled in.
+#[cfg(feature = "bench-internals")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchmarkMaterializedWidth {
+    /// The exact width Tantivy was given and used.
+    Authenticated(usize),
+    /// No trustworthy width is observable; evidence needing one must fail closed.
+    Unobservable {
+        /// Why the width cannot be authenticated.
+        reason: &'static str,
+    },
+}
+
+#[cfg(feature = "bench-internals")]
+impl BenchmarkMaterializedWidth {
+    /// The authenticated width, or `None` when no width is observable.
+    #[must_use]
+    pub const fn authenticated(self) -> Option<usize> {
+        match self {
+            Self::Authenticated(threads) => Some(threads),
+            Self::Unobservable { .. } => None,
+        }
+    }
+}
+
+/// Reason bound into every `ShippingAuto` receipt.
+#[cfg(feature = "bench-internals")]
+pub const SHIPPING_AUTO_WIDTH_UNOBSERVABLE: &str =
+    "tantivy 0.26.1 Index::writer selects the pool width internally and exposes no accessor";
+
+/// Typed receipt for one benchmark writer construction.
+///
+/// Oracle identity is exactly what this crate can authenticate in-process: the
+/// tokenizer name actually registered, the field names actually present in the
+/// live index schema, and the positions flag that built that schema. Tantivy's
+/// crate version and source identity are deliberately absent — they are not
+/// observable here, and asserting them would be a restatement that can drift.
+#[cfg(feature = "bench-internals")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BenchmarkWriterReceipt {
+    /// Which constructor was called.
+    pub mode: BenchmarkWriterMode,
+    /// Heap budget handed to that constructor.
+    pub writer_heap_bytes: usize,
+    /// Authenticated width, or a typed unknown.
+    pub materialized_width: BenchmarkMaterializedWidth,
+    /// Positions setting that built the schema.
+    pub positions: bool,
+    /// Field names present in the live index schema, in schema order.
+    pub schema_fields: Vec<String>,
+    /// Tokenizer registered on this index.
+    pub tokenizer_name: &'static str,
+    /// Whether this writer replaced an earlier joined writer.
+    pub writer_rearmed: bool,
+}
+
+#[cfg(feature = "bench-internals")]
+impl BenchmarkWriterReceipt {
+    fn new(
+        mode: BenchmarkWriterMode,
+        writer_heap_bytes: usize,
+        positions: bool,
+        index: &Index,
+    ) -> Self {
+        let materialized_width = match mode {
+            BenchmarkWriterMode::ShippingAuto => BenchmarkMaterializedWidth::Unobservable {
+                reason: SHIPPING_AUTO_WIDTH_UNOBSERVABLE,
+            },
+            BenchmarkWriterMode::Fixed { threads } => {
+                BenchmarkMaterializedWidth::Authenticated(threads)
+            }
+        };
+        Self {
+            mode,
+            writer_heap_bytes,
+            materialized_width,
+            positions,
+            schema_fields: index
+                .schema()
+                .fields()
+                .map(|(_, entry)| entry.name().to_owned())
+                .collect(),
+            tokenizer_name: TOKENIZER_NAME,
+            writer_rearmed: false,
+        }
+    }
+}
+
 /// Fused equivalent of Tantivy's `SimpleTokenizer` followed by `LowerCaser`.
 ///
 /// ASCII characters are classified directly from their byte and each token is
@@ -1330,6 +1444,10 @@ pub struct TantivyIndex {
     /// Exact writer-pool width accepted by Tantivy's benchmark constructor.
     #[cfg(feature = "bench-internals")]
     benchmark_writer_threads: Option<usize>,
+    /// Typed receipt for the benchmark writer construction, when this index
+    /// was built through a benchmark seam.
+    #[cfg(feature = "bench-internals")]
+    benchmark_writer_receipt: Option<BenchmarkWriterReceipt>,
 }
 
 impl std::fmt::Debug for TantivyIndex {
@@ -1367,11 +1485,55 @@ impl TantivyIndex {
 
     /// Return the writer-pool width successfully materialized by the
     /// benchmark-only Tantivy constructor.
+    ///
+    /// `None` means no width is authenticated, which is the honest answer for
+    /// the shipping-auto path; it is never a stand-in for an inferred width.
     #[cfg(feature = "bench-internals")]
     #[doc(hidden)]
     #[must_use]
     pub const fn benchmark_materialized_writer_threads(&self) -> Option<usize> {
         self.benchmark_writer_threads
+    }
+
+    /// Typed receipt for the benchmark writer this index was constructed with.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn benchmark_writer_receipt(&self) -> Option<&BenchmarkWriterReceipt> {
+        self.benchmark_writer_receipt.as_ref()
+    }
+
+    /// Construct an in-memory oracle through Tantivy's **shipping** writer
+    /// selection: `Index::writer(heap)` is called literally, and the resulting
+    /// pool width is reported as unobservable rather than guessed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the ordinary Tantivy writer-construction error, including the
+    /// heap-too-small case, which stays fail-closed here.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub fn in_memory_with_shipping_auto_writer(
+        writer_heap_bytes: usize,
+        positions: bool,
+    ) -> SearchResult<Self> {
+        let (schema, fields) = build_schema_with_positions(positions);
+        let index = Index::create_in_ram(schema.clone());
+        let mut built = Self::from_index_with_writer_threads(
+            index,
+            schema,
+            fields,
+            None,
+            writer_heap_bytes,
+            None,
+        )?;
+        built.benchmark_writer_receipt = Some(BenchmarkWriterReceipt::new(
+            BenchmarkWriterMode::ShippingAuto,
+            writer_heap_bytes,
+            positions,
+            &built.index,
+        ));
+        Ok(built)
     }
 
     /// Create a new Tantivy index at the given directory path.
@@ -1560,14 +1722,23 @@ impl TantivyIndex {
         validate_benchmark_writer_threads(writer_threads)?;
         let (schema, fields) = build_schema_with_positions(positions);
         let index = Index::create_in_ram(schema.clone());
-        Self::from_index_with_writer_threads(
+        let mut built = Self::from_index_with_writer_threads(
             index,
             schema,
             fields,
             None,
             writer_heap_bytes,
             Some(writer_threads),
-        )
+        )?;
+        built.benchmark_writer_receipt = Some(BenchmarkWriterReceipt::new(
+            BenchmarkWriterMode::Fixed {
+                threads: writer_threads,
+            },
+            writer_heap_bytes,
+            positions,
+            &built.index,
+        ));
+        Ok(built)
     }
 
     /// Create an on-disk oracle with the same explicit benchmark pins as
@@ -1597,14 +1768,23 @@ impl TantivyIndex {
                 source: Box::new(error),
             }
         })?;
-        Self::from_index_with_writer_threads(
+        let mut built = Self::from_index_with_writer_threads(
             index,
             schema,
             fields,
             Some(path.to_path_buf()),
             writer_heap_bytes,
             Some(writer_threads),
-        )
+        )?;
+        built.benchmark_writer_receipt = Some(BenchmarkWriterReceipt::new(
+            BenchmarkWriterMode::Fixed {
+                threads: writer_threads,
+            },
+            writer_heap_bytes,
+            positions,
+            &built.index,
+        ));
+        Ok(built)
     }
 
     /// Reopen an on-disk oracle with the benchmark's pinned writer budget.
@@ -1632,14 +1812,23 @@ impl TantivyIndex {
             subsystem: "tantivy",
             source: Box::new(error),
         })?;
-        Self::from_index_with_writer_threads(
+        let mut built = Self::from_index_with_writer_threads(
             index,
             schema,
             fields,
             Some(path.to_path_buf()),
             writer_heap_bytes,
             Some(writer_threads),
-        )
+        )?;
+        built.benchmark_writer_receipt = Some(BenchmarkWriterReceipt::new(
+            BenchmarkWriterMode::Fixed {
+                threads: writer_threads,
+            },
+            writer_heap_bytes,
+            positions,
+            &built.index,
+        ));
+        Ok(built)
     }
 
     /// Join every indexing and merge worker, then rearm the same benchmark index.
@@ -1672,6 +1861,7 @@ impl TantivyIndex {
             ord_table,
             path,
             benchmark_writer_threads: _,
+            benchmark_writer_receipt,
         } = self;
         let mut receipt = Self::benchmark_join_writer(&index, writer)?;
         let writer = index
@@ -1691,6 +1881,19 @@ impl TantivyIndex {
                 ord_table,
                 path,
                 benchmark_writer_threads: Some(writer_threads),
+                benchmark_writer_receipt: benchmark_writer_receipt.map(|previous| {
+                    BenchmarkWriterReceipt {
+                        mode: BenchmarkWriterMode::Fixed {
+                            threads: writer_threads,
+                        },
+                        writer_heap_bytes,
+                        materialized_width: BenchmarkMaterializedWidth::Authenticated(
+                            writer_threads,
+                        ),
+                        writer_rearmed: true,
+                        ..previous
+                    }
+                }),
             },
             receipt,
         ))
@@ -1722,9 +1925,11 @@ impl TantivyIndex {
             ord_table,
             path,
             benchmark_writer_threads,
+            benchmark_writer_receipt,
         } = self;
         let receipt = Self::benchmark_join_writer(&index, writer)?;
         drop((doc_count, ord_table, path, benchmark_writer_threads));
+        drop(benchmark_writer_receipt);
         Ok((BenchmarkRetainedTantivyReader { fields, reader }, receipt))
     }
 
@@ -1972,6 +2177,10 @@ impl TantivyIndex {
             path,
             #[cfg(feature = "bench-internals")]
             benchmark_writer_threads: writer_threads,
+            // The receipt is stamped by the benchmark seam that knows the
+            // positions flag which actually built the schema; deriving it back
+            // out of the schema here would be an inference, not a record.
+            benchmark_writer_receipt: None,
         })
     }
 
@@ -4397,10 +4606,7 @@ mod tests {
                 .benchmark_search_exact_id("terminal-join")
                 .expect("search the prepared terminal tail after worker join");
             assert_eq!(
-                tail_ids
-                    .iter()
-                    .map(DocId::as_str)
-                    .collect::<Vec<_>>(),
+                tail_ids.iter().map(DocId::as_str).collect::<Vec<_>>(),
                 ["terminal-join"],
                 "a counted segment is not accepted in place of a post-join tail search"
             );
@@ -5591,5 +5797,138 @@ mod tests {
                 other => panic!("expected a typed subsystem error, got {other:?}"),
             }
         });
+    }
+}
+
+#[cfg(all(test, feature = "bench-internals"))]
+mod benchmark_writer_mode_tests {
+    use super::{
+        BenchmarkMaterializedWidth, BenchmarkWriterMode, SHIPPING_AUTO_WIDTH_UNOBSERVABLE,
+        TOKENIZER_NAME, TantivyIndex,
+    };
+    use frankensearch_core::SearchError;
+
+    const HEAP: usize = 64 * 1024 * 1024;
+
+    #[test]
+    fn shipping_auto_uses_the_pinned_selection_path_and_reports_no_width() {
+        let index = TantivyIndex::in_memory_with_shipping_auto_writer(HEAP, true)
+            .expect("shipping-auto writer");
+        let receipt = index
+            .benchmark_writer_receipt()
+            .expect("shipping-auto stamps a receipt");
+
+        assert_eq!(receipt.mode, BenchmarkWriterMode::ShippingAuto);
+        assert_eq!(
+            receipt.materialized_width,
+            BenchmarkMaterializedWidth::Unobservable {
+                reason: SHIPPING_AUTO_WIDTH_UNOBSERVABLE,
+            }
+        );
+        // The unknown must stay unknown everywhere it is read.
+        assert_eq!(receipt.materialized_width.authenticated(), None);
+        assert_eq!(index.benchmark_materialized_writer_threads(), None);
+        assert_eq!(receipt.writer_heap_bytes, HEAP);
+        assert!(!receipt.writer_rearmed);
+    }
+
+    #[test]
+    fn fixed_width_is_authenticated_exactly() {
+        for threads in [1usize, 3, 8] {
+            let index = TantivyIndex::in_memory_with_benchmark_config(HEAP, threads, true)
+                .expect("fixed writer");
+            let receipt = index.benchmark_writer_receipt().expect("fixed receipt");
+
+            assert_eq!(receipt.mode, BenchmarkWriterMode::Fixed { threads });
+            assert_eq!(
+                receipt.materialized_width,
+                BenchmarkMaterializedWidth::Authenticated(threads)
+            );
+            assert_eq!(receipt.materialized_width.authenticated(), Some(threads));
+            assert_eq!(index.benchmark_materialized_writer_threads(), Some(threads));
+        }
+    }
+
+    #[test]
+    fn invalid_width_and_insufficient_heap_fail_closed() {
+        assert!(matches!(
+            TantivyIndex::in_memory_with_benchmark_config(HEAP, 0, true),
+            Err(SearchError::InvalidConfig { .. })
+        ));
+        // A heap below Tantivy's per-writer floor must surface its typed
+        // construction error, never a silently downgraded pool.
+        assert!(TantivyIndex::in_memory_with_benchmark_config(1, 4, true).is_err());
+        assert!(TantivyIndex::in_memory_with_shipping_auto_writer(1, true).is_err());
+    }
+
+    #[test]
+    fn shipping_and_fixed_receipts_are_distinguishable() {
+        let auto = TantivyIndex::in_memory_with_shipping_auto_writer(HEAP, true)
+            .expect("shipping-auto writer");
+        let fixed =
+            TantivyIndex::in_memory_with_benchmark_config(HEAP, 4, true).expect("fixed writer");
+        let auto = auto
+            .benchmark_writer_receipt()
+            .expect("auto receipt")
+            .clone();
+        let fixed = fixed.benchmark_writer_receipt().expect("fixed receipt");
+
+        assert_ne!(
+            &auto, fixed,
+            "the two modes must not produce equal receipts"
+        );
+        assert_ne!(auto.mode, fixed.mode);
+        assert_ne!(auto.materialized_width, fixed.materialized_width);
+        // Identity that is genuinely shared must still match, or the receipt
+        // would be distinguishing on incidental noise instead of on mode.
+        assert_eq!(auto.schema_fields, fixed.schema_fields);
+        assert_eq!(auto.tokenizer_name, fixed.tokenizer_name);
+    }
+
+    #[test]
+    fn schema_and_oracle_identity_track_the_index_that_was_built() {
+        let with_positions = TantivyIndex::in_memory_with_shipping_auto_writer(HEAP, true)
+            .expect("positions-on writer");
+        let without_positions = TantivyIndex::in_memory_with_shipping_auto_writer(HEAP, false)
+            .expect("positions-off writer");
+        let with_positions = with_positions
+            .benchmark_writer_receipt()
+            .expect("receipt")
+            .clone();
+        let without_positions = without_positions
+            .benchmark_writer_receipt()
+            .expect("receipt");
+
+        assert!(with_positions.positions);
+        assert!(!without_positions.positions);
+        assert_ne!(
+            &with_positions, without_positions,
+            "a positions mutation must change the receipt"
+        );
+        assert_eq!(with_positions.tokenizer_name, TOKENIZER_NAME);
+        assert!(
+            with_positions
+                .schema_fields
+                .iter()
+                .any(|field| field == "body"),
+            "schema identity must be read from the live index schema: {:?}",
+            with_positions.schema_fields
+        );
+    }
+
+    #[test]
+    fn a_fresh_writer_never_claims_a_rearm() {
+        for index in [
+            TantivyIndex::in_memory_with_shipping_auto_writer(HEAP, true).expect("auto"),
+            TantivyIndex::in_memory_with_benchmark_config(HEAP, 2, true).expect("fixed"),
+        ] {
+            assert!(
+                !index
+                    .benchmark_writer_receipt()
+                    .expect("receipt")
+                    .writer_rearmed,
+                "a freshly constructed writer must not report a rearm"
+            );
+        }
     }
 }
