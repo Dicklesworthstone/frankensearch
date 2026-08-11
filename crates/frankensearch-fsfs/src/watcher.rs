@@ -315,6 +315,17 @@ struct WatcherStop {
 
 impl WatcherStop {
     fn request(&self) {
+        // The store and the notify must both happen under `wait_lock`, not just
+        // the notify. `wait_or_stopped` tests the flag while holding that lock
+        // and only then hands it to `wait_timeout`. Publishing the flag outside
+        // the lock lets the store and the wakeup both land inside that window:
+        // the waiter reads `false`, we set `true` and notify with no waiter
+        // registered, the notification is dropped, and the waiter then sleeps
+        // the entire backoff — up to MAX_BACKOFF_MS — with stop already
+        // requested. Holding the lock across both serialises this against the
+        // waiter's check-then-wait, so the waiter either observes the flag or
+        // is already parked and receives the notify.
+        let _publication = lock_or_recover(&self.wait_lock);
         self.requested.store(true, Ordering::Release);
         self.wait_cv.notify_all();
     }
@@ -2177,6 +2188,82 @@ mod tests {
         run_authoritative_reconciliation, run_ingest_loop,
     };
     use crate::config::DiscoveryConfig;
+
+    /// `WatcherStop::request` must publish the flag and the notify inside
+    /// `wait_lock`, so a waiter cannot be skipped between its check and its
+    /// park.
+    ///
+    /// The interleaving is forced rather than raced: the test holds `wait_lock`
+    /// itself, which is exactly the state `wait_or_stopped` is in after it has
+    /// read the flag as `false` and before `wait_timeout` releases the lock.
+    /// A `request()` that publishes outside the lock returns immediately in
+    /// that state — its store and its notify both land in the waiter's blind
+    /// window, and the real waiter then sleeps the full backoff with stop
+    /// already requested. The corrected `request()` cannot return until the
+    /// lock is free, so the observation below is deterministic in both
+    /// directions: `false` before release, `true` after the join.
+    #[test]
+    fn stop_request_cannot_publish_inside_the_waiters_check_then_park_window() {
+        let stop = Arc::new(WatcherStop::default());
+        let published = Arc::new(AtomicBool::new(false));
+
+        let held = super::lock_or_recover(&stop.wait_lock);
+
+        let requester = {
+            let stop = Arc::clone(&stop);
+            let published = Arc::clone(&published);
+            thread::spawn(move || {
+                stop.request();
+                published.store(true, Ordering::Release);
+            })
+        };
+
+        // Give the requester every chance to publish. On the pre-fix code it
+        // does, because nothing stops it from storing and notifying while this
+        // thread owns the window; that is the lost wakeup.
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !published.load(Ordering::Acquire),
+            "stop publication escaped the waiter's check-then-park window; a waiter \
+             parked here would miss the notify and sleep the entire backoff"
+        );
+        assert!(
+            !stop.is_requested(),
+            "the stop flag became visible before the wait window closed"
+        );
+
+        drop(held);
+        requester.join().expect("stop requester thread");
+        assert!(published.load(Ordering::Acquire));
+        assert!(stop.is_requested());
+    }
+
+    /// A waiter already parked in `wait_or_stopped` returns on the notify
+    /// rather than serving out its timeout.
+    #[test]
+    fn parked_waiter_wakes_on_stop_instead_of_sleeping_the_backoff() {
+        const BACKOFF: Duration = Duration::from_secs(30);
+        let stop = Arc::new(WatcherStop::default());
+
+        let waiter = {
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let stopped = stop.wait_or_stopped(BACKOFF);
+                (stopped, started.elapsed())
+            })
+        };
+
+        thread::sleep(Duration::from_millis(50));
+        stop.request();
+
+        let (stopped, elapsed) = waiter.join().expect("stop waiter thread");
+        assert!(stopped, "wait_or_stopped must report the requested stop");
+        assert!(
+            elapsed < BACKOFF / 2,
+            "waiter served {elapsed:?} of a {BACKOFF:?} backoff instead of waking on stop"
+        );
+    }
     use crate::pressure::PressureState;
     use asupersync::Cx;
     use asupersync::runtime::RuntimeBuilder;
