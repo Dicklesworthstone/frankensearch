@@ -5,6 +5,7 @@
 //! pragmas, runs migrations, and validates migration checksums.
 
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,7 +16,8 @@ use frankensearch_core::{
     SearchError, SearchEventPhase as TelemetrySearchEventPhase, SearchResult,
     TELEMETRY_SCHEMA_VERSION, TelemetryEnvelope, TelemetryEvent, TelemetryQueryClass,
 };
-use fsqlite::{Connection, Row};
+use fsqlite::{AsyncConnection, Row};
+use fsqlite_types::cx::Cx;
 use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 
@@ -1276,7 +1278,7 @@ impl OpsIngestionMetrics {
 
 /// Connection wrapper for ops telemetry storage.
 pub struct OpsStorage {
-    conn: Connection,
+    conn: AsyncConnection,
     config: OpsStorageConfig,
     ingestion_metrics: Arc<OpsIngestionMetrics>,
 }
@@ -1299,11 +1301,15 @@ impl std::fmt::Debug for OpsStorage {
 impl OpsStorage {
     /// Open storage and bootstrap schema if needed.
     ///
+    /// The caller's [`Cx`] is checkpointed by every FrankenSQLite call, so a
+    /// cancelled context aborts the open (and any bootstrap statement already
+    /// in flight) with [`SearchError`] rather than completing the schema.
+    ///
     /// # Errors
     ///
     /// Returns an error if the database connection cannot be opened,
     /// pragmas fail to apply, or schema bootstrap/migration fails.
-    pub fn open(config: OpsStorageConfig) -> SearchResult<Self> {
+    pub async fn open(cx: &Cx, config: OpsStorageConfig) -> SearchResult<Self> {
         tracing::debug!(
             target: "frankensearch.ops.storage",
             path = %config.db_path.display(),
@@ -1313,15 +1319,16 @@ impl OpsStorage {
             "opening ops storage connection"
         );
 
-        let conn =
-            Connection::open(config.db_path.to_string_lossy().to_string()).map_err(ops_error)?;
+        let conn = AsyncConnection::open(cx, config.db_path.to_string_lossy().to_string())
+            .await
+            .map_err(ops_error)?;
         let storage = Self {
             conn,
             config,
             ingestion_metrics: Arc::new(OpsIngestionMetrics::default()),
         };
-        storage.apply_pragmas()?;
-        bootstrap(storage.connection())?;
+        storage.apply_pragmas(cx).await?;
+        bootstrap(cx, storage.connection()).await?;
         Ok(storage)
     }
 
@@ -1330,13 +1337,13 @@ impl OpsStorage {
     /// # Errors
     ///
     /// Returns an error if in-memory database bootstrap fails.
-    pub fn open_in_memory() -> SearchResult<Self> {
-        Self::open(OpsStorageConfig::in_memory())
+    pub async fn open_in_memory(cx: &Cx) -> SearchResult<Self> {
+        Self::open(cx, OpsStorageConfig::in_memory()).await
     }
 
     /// Underlying database connection.
     #[must_use]
-    pub const fn connection(&self) -> &Connection {
+    pub const fn connection(&self) -> &AsyncConnection {
         &self.conn
     }
 
@@ -1351,8 +1358,8 @@ impl OpsStorage {
     /// # Errors
     ///
     /// Returns an error if schema metadata cannot be read.
-    pub fn current_schema_version(&self) -> SearchResult<i64> {
-        current_version(self.connection())
+    pub async fn current_schema_version(&self, cx: &Cx) -> SearchResult<i64> {
+        current_version(cx, self.connection()).await
     }
 
     /// Current ingestion metrics snapshot used by dashboards and tests.
@@ -2356,63 +2363,86 @@ impl OpsStorage {
         })
     }
 
-    fn apply_pragmas(&self) -> SearchResult<()> {
+    async fn apply_pragmas(&self, cx: &Cx) -> SearchResult<()> {
         self.conn
-            .execute("PRAGMA foreign_keys=ON;")
+            .execute(cx, "PRAGMA foreign_keys=ON;")
+            .await
             .map_err(ops_error)?;
         if self.config.wal_mode {
             self.conn
-                .execute("PRAGMA journal_mode=WAL;")
+                .execute(cx, "PRAGMA journal_mode=WAL;")
+                .await
                 .map_err(ops_error)?;
-        } else if let Err(error) = self.conn.execute("PRAGMA journal_mode=DELETE;") {
+        } else if let Err(error) = self.conn.execute(cx, "PRAGMA journal_mode=DELETE;").await {
             tracing::warn!(
                 target: "frankensearch.ops.storage",
                 ?error,
                 "journal_mode=DELETE was not accepted; falling back to WAL"
             );
             self.conn
-                .execute("PRAGMA journal_mode=WAL;")
+                .execute(cx, "PRAGMA journal_mode=WAL;")
+                .await
                 .map_err(ops_error)?;
         }
 
         self.conn
-            .execute(&format!(
-                "PRAGMA busy_timeout={};",
-                self.config.busy_timeout_ms
-            ))
+            .execute(
+                cx,
+                &format!("PRAGMA busy_timeout={};", self.config.busy_timeout_ms),
+            )
+            .await
             .map_err(ops_error)?;
         self.conn
-            .execute(&format!(
-                "PRAGMA cache_size={};",
-                self.config.cache_size_pages
-            ))
+            .execute(
+                cx,
+                &format!("PRAGMA cache_size={};", self.config.cache_size_pages),
+            )
+            .await
             .map_err(ops_error)?;
 
         Ok(())
     }
 
-    fn with_transaction<T, F>(&self, operation: F) -> SearchResult<T>
+    /// Run `operation` inside one FrankenSQLite transaction.
+    ///
+    /// The bracket now uses the native `begin_transaction` /
+    /// `commit_transaction` / `rollback_transaction` calls instead of raw
+    /// `BEGIN;` / `COMMIT;` statements, so the transaction boundary observes
+    /// the same `Cx` cancellation checkpoint as the statements inside it.
+    /// `operation` is a closure returning a future so it can `.await` the
+    /// connection; the rollback-on-error and rollback-on-failed-commit
+    /// behavior, including the warn-and-continue on a failed rollback, is
+    /// unchanged from the synchronous bracket.
+    async fn with_transaction<T, F, Fut>(&self, cx: &Cx, operation: F) -> SearchResult<T>
     where
-        F: FnOnce(&Connection) -> SearchResult<T>,
+        F: FnOnce(&'_ AsyncConnection, &'_ Cx) -> Fut,
+        Fut: Future<Output = SearchResult<T>>,
     {
-        self.connection().execute("BEGIN;").map_err(ops_error)?;
-        let result = operation(self.connection());
+        self.connection()
+            .begin_transaction(cx)
+            .await
+            .map_err(ops_error)?;
+        let result = operation(self.connection(), cx).await;
         match result {
             Ok(value) => {
-                self.connection().execute("COMMIT;").map_err(|commit_err| {
-                    if let Err(rollback_err) = self.connection().execute("ROLLBACK;") {
-                        tracing::warn!(
-                            target: "frankensearch.ops.storage",
-                            error = %rollback_err,
-                            "rollback failed after operations storage commit error"
-                        );
+                match self.connection().commit_transaction(cx).await {
+                    Ok(()) => {}
+                    Err(commit_err) => {
+                        if let Err(rollback_err) = self.connection().rollback_transaction(cx).await
+                        {
+                            tracing::warn!(
+                                target: "frankensearch.ops.storage",
+                                error = %rollback_err,
+                                "rollback failed after operations storage commit error"
+                            );
+                        }
+                        return Err(ops_error(commit_err));
                     }
-                    ops_error(commit_err)
-                })?;
+                }
                 Ok(value)
             }
             Err(error) => {
-                if let Err(rollback_err) = self.connection().execute("ROLLBACK;") {
+                if let Err(rollback_err) = self.connection().rollback_transaction(cx).await {
                     tracing::warn!(
                         target: "frankensearch.ops.storage",
                         error = %rollback_err,
@@ -2452,11 +2482,12 @@ impl OpsIngestBatchResult {
 ///
 /// Returns an error if migration metadata cannot be read, any migration fails,
 /// checksums do not match, or an unsupported schema version is detected.
-pub fn bootstrap(conn: &Connection) -> SearchResult<()> {
-    conn.execute(OPS_SCHEMA_MIGRATIONS_TABLE_SQL)
+pub async fn bootstrap(cx: &Cx, conn: &AsyncConnection) -> SearchResult<()> {
+    conn.execute(cx, OPS_SCHEMA_MIGRATIONS_TABLE_SQL)
+        .await
         .map_err(ops_error)?;
 
-    let mut version = current_version_optional(conn)?.unwrap_or(0);
+    let mut version = current_version_optional(cx, conn).await?.unwrap_or(0);
     if version > OPS_SCHEMA_VERSION {
         return Err(SearchError::SubsystemError {
             subsystem: "ops-storage",
@@ -2470,11 +2501,11 @@ pub fn bootstrap(conn: &Connection) -> SearchResult<()> {
         if migration.version <= version {
             continue;
         }
-        apply_migration(conn, migration)?;
+        apply_migration(cx, conn, migration).await?;
         version = migration.version;
     }
 
-    validate_migration_checksums(conn)?;
+    validate_migration_checksums(cx, conn).await?;
     Ok(())
 }
 
@@ -2484,16 +2515,22 @@ pub fn bootstrap(conn: &Connection) -> SearchResult<()> {
 ///
 /// Returns an error if migration metadata cannot be queried or no versions
 /// have been recorded.
-pub fn current_version(conn: &Connection) -> SearchResult<i64> {
-    current_version_optional(conn)?.ok_or_else(|| SearchError::SubsystemError {
-        subsystem: "ops-storage",
-        source: Box::new(io::Error::other(
-            "ops_schema_migrations table has no version rows",
-        )),
-    })
+pub async fn current_version(cx: &Cx, conn: &AsyncConnection) -> SearchResult<i64> {
+    current_version_optional(cx, conn)
+        .await?
+        .ok_or_else(|| SearchError::SubsystemError {
+            subsystem: "ops-storage",
+            source: Box::new(io::Error::other(
+                "ops_schema_migrations table has no version rows",
+            )),
+        })
 }
 
-fn apply_migration(conn: &Connection, migration: &OpsMigration) -> SearchResult<()> {
+async fn apply_migration(
+    cx: &Cx,
+    conn: &AsyncConnection,
+    migration: &OpsMigration,
+) -> SearchResult<()> {
     tracing::debug!(
         target: "frankensearch.ops.storage",
         migration_version = migration.version,
@@ -2506,7 +2543,7 @@ fn apply_migration(conn: &Connection, migration: &OpsMigration) -> SearchResult<
     // the sqlite_master btree page from overflowing when the accumulated
     // DDL text exceeds the 4 KiB page size.
     for statement in migration.statements {
-        conn.execute(statement).map_err(ops_error)?;
+        conn.execute(cx, statement).await.map_err(ops_error)?;
     }
 
     // Record the migration metadata.
@@ -2518,17 +2555,23 @@ fn apply_migration(conn: &Connection, migration: &OpsMigration) -> SearchResult<
         SqliteValue::Integer(i64::from(migration.reversible)),
     ];
     conn.execute_with_params(
+        cx,
         "INSERT INTO ops_schema_migrations(version, name, applied_at_ms, checksum, reversible) \
          VALUES (?1, ?2, ?3, ?4, ?5);",
         &params,
     )
+    .await
     .map_err(ops_error)?;
     Ok(())
 }
 
-fn validate_migration_checksums(conn: &Connection) -> SearchResult<()> {
+async fn validate_migration_checksums(cx: &Cx, conn: &AsyncConnection) -> SearchResult<()> {
     let rows = conn
-        .query("SELECT version, checksum FROM ops_schema_migrations ORDER BY version ASC;")
+        .query(
+            cx,
+            "SELECT version, checksum FROM ops_schema_migrations ORDER BY version ASC;",
+        )
+        .await
         .map_err(ops_error)?;
     for row in &rows {
         let version = row_i64(row, 0, "ops_schema_migrations.version")?;
@@ -2554,9 +2597,13 @@ fn validate_migration_checksums(conn: &Connection) -> SearchResult<()> {
     Ok(())
 }
 
-fn current_version_optional(conn: &Connection) -> SearchResult<Option<i64>> {
+async fn current_version_optional(cx: &Cx, conn: &AsyncConnection) -> SearchResult<Option<i64>> {
     let rows = conn
-        .query("SELECT version FROM ops_schema_migrations ORDER BY version DESC LIMIT 1;")
+        .query(
+            cx,
+            "SELECT version FROM ops_schema_migrations ORDER BY version DESC LIMIT 1;",
+        )
+        .await
         .map_err(ops_error)?;
     let Some(row) = rows.first() else {
         return Ok(None);
