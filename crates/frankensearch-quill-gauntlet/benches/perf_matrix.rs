@@ -3198,6 +3198,7 @@ impl<'a> PairedStreamRunner<'a> {
             observed_value: Some(value),
             group_id: self.plan.group_id,
             qg6_sample_binding: None,
+            tantivy_config_sha256: None,
         }
     }
 
@@ -3549,6 +3550,7 @@ fn qg6_raw_sample(
             query_id: sample.query_id.clone(),
             result_sequence_sha256: sample.result_sha256.clone(),
         }),
+        tantivy_config_sha256: None,
     }
 }
 

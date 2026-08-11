@@ -3368,6 +3368,7 @@ mod tests {
             observed_value: Some(control_value),
             group_id,
             qg6_sample_binding: None,
+            tantivy_config_sha256: None,
         });
         samples.push(PerfRawSample {
             block_id,
@@ -3388,6 +3389,7 @@ mod tests {
             observed_value: Some(treatment_value),
             group_id,
             qg6_sample_binding: None,
+            tantivy_config_sha256: None,
         });
     }
 
