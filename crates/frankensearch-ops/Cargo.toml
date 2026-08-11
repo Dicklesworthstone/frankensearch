@@ -86,8 +86,8 @@ fsqlite-types = "0.2.1"
 
 # Runtime for the async telemetry store. Every `AsyncConnection` call requires
 # a live asupersync runtime on the calling thread (`Runtime::current_handle`),
-# so the ops binary owns one; the workspace pin is the same 0.3.10 that
-# FrankenSQLite 0.2.1 itself builds against.
+# so the ops binary owns one. The workspace and patched FrankenSQLite 0.2.1
+# revision both resolve the same Asupersync 0.4.3 runtime.
 asupersync = { workspace = true }
 
 # Terminal UI rendering (FrankenTUI)

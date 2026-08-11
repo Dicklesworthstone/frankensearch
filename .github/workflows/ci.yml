@@ -59,8 +59,8 @@ jobs:
         run: |
           set -euo pipefail
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
-          asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
-          frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
+          asupersync_ref="3b34c9b0a14c55eb814cf4aaeceeba3be0c0a72e"
+          frankensqlite_ref="68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690"
           fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
@@ -228,8 +228,8 @@ jobs:
         run: |
           set -euo pipefail
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
-          asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
-          frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
+          asupersync_ref="3b34c9b0a14c55eb814cf4aaeceeba3be0c0a72e"
+          frankensqlite_ref="68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690"
           fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
@@ -1151,8 +1151,8 @@ jobs:
         run: |
           set -euo pipefail
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
-          asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
-          frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
+          asupersync_ref="3b34c9b0a14c55eb814cf4aaeceeba3be0c0a72e"
+          frankensqlite_ref="68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690"
           fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
@@ -1275,8 +1275,8 @@ jobs:
         run: |
           set -euo pipefail
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
-          asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
-          frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
+          asupersync_ref="3b34c9b0a14c55eb814cf4aaeceeba3be0c0a72e"
+          frankensqlite_ref="68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690"
           fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
@@ -1347,8 +1347,8 @@ jobs:
         run: |
           set -euo pipefail
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
-          asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
-          frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
+          asupersync_ref="3b34c9b0a14c55eb814cf4aaeceeba3be0c0a72e"
+          frankensqlite_ref="68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690"
           fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_at_ref() {
@@ -1458,8 +1458,8 @@ jobs:
         run: |
           set -euo pipefail
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
-          asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
-          frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
+          asupersync_ref="3b34c9b0a14c55eb814cf4aaeceeba3be0c0a72e"
+          frankensqlite_ref="68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690"
           fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
@@ -1519,8 +1519,8 @@ jobs:
         run: |
           set -euo pipefail
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
-          asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
-          frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
+          asupersync_ref="3b34c9b0a14c55eb814cf4aaeceeba3be0c0a72e"
+          frankensqlite_ref="68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690"
           fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
@@ -1715,8 +1715,8 @@ jobs:
         run: |
           set -euo pipefail
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
-          asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
-          frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
+          asupersync_ref="3b34c9b0a14c55eb814cf4aaeceeba3be0c0a72e"
+          frankensqlite_ref="68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690"
           fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
@@ -1919,8 +1919,8 @@ jobs:
         run: |
           set -euo pipefail
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
-          asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
-          frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
+          asupersync_ref="3b34c9b0a14c55eb814cf4aaeceeba3be0c0a72e"
+          frankensqlite_ref="68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690"
           fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
@@ -2199,8 +2199,8 @@ jobs:
         run: |
           set -euo pipefail
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
-          asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
-          frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
+          asupersync_ref="3b34c9b0a14c55eb814cf4aaeceeba3be0c0a72e"
+          frankensqlite_ref="68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690"
           fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {

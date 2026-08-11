@@ -38,10 +38,10 @@ set -euo pipefail
 # These MUST match the refs in .github/workflows/ci.yml.
 
 ASUPERSYNC_REPO="https://github.com/Dicklesworthstone/asupersync.git"
-ASUPERSYNC_REF="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
+ASUPERSYNC_REF="3b34c9b0a14c55eb814cf4aaeceeba3be0c0a72e"
 
 FRANKENSQLITE_REPO="https://github.com/Dicklesworthstone/frankensqlite.git"
-FRANKENSQLITE_REF="5c99eeb93d789c1309d5c46a540289369ff39535"
+FRANKENSQLITE_REF="68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690"
 
 FAST_CMAES_REPO="https://github.com/Dicklesworthstone/fast_cmaes.git"
 FAST_CMAES_REF="9406d5ec9512767106c9639628e30902ef7eae32"
