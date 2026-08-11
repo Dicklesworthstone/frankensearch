@@ -6756,6 +6756,109 @@ mod tests {
         Ok(delta.freeze(1))
     }
 
+    /// One exact logical block of live Delta rows.
+    ///
+    /// This shape distinguishes the final real row at ordinal 127 from a
+    /// nonexistent row at ordinal 128: both are where a block-only accounting
+    /// implementation is tempted to charge a phantom next block.
+    fn delta_exact_block_snapshot() -> Result<DeltaSnapshot, Box<dyn std::error::Error>> {
+        let mut delta = crate::delta::DeltaSegment::new(DELTA_TOMBSTONE_SCHEMA, 0, usize::MAX)?;
+        let norms = [crate::delta::DeltaFieldNorm {
+            field_ord: 0,
+            raw_length: 1,
+            fieldnorm_id: fieldnorm_to_id(1),
+        }];
+        for global_docid in 0..DELTA_LOGICAL_BLOCK_POSTINGS {
+            let document_id = format!("exact-block-{global_docid}");
+            let position = [global_docid];
+            delta.apply_document(
+                global_docid,
+                DocId::from(document_id.as_str()),
+                &norms,
+                &[crate::delta::DeltaTermPosting {
+                    field_ord: 0,
+                    term: b"alpha",
+                    frequency: 1,
+                    positions: Some(&position),
+                }],
+            )?;
+        }
+        Ok(delta.freeze(1))
+    }
+
+    #[test]
+    fn delta_missing_term_open_polls_without_charging_a_row()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = delta_tombstone_snapshot()?;
+        let checkpoint = Arc::new(CancelOnNthAdmission::new(1));
+
+        let error =
+            match DeltaPostingCursor::new_admitted(&snapshot, 0, b"missing", checkpoint.as_ref()) {
+                Ok(_) => panic!("a missing-term open must observe its cancellation poll"),
+                Err(error) => error,
+            };
+        assert!(
+            matches!(
+                error,
+                ArgusError::QueryCancelled {
+                    phase: "checkpoint_cursor_unit_test"
+                }
+            ),
+            "expected the checkpoint's typed refusal, got {error:?}"
+        );
+        assert_eq!(
+            checkpoint
+                .units_at_fire
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a missing term has no physical row to charge"
+        );
+        assert_eq!(
+            checkpoint
+                .admissions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the missing-term open must issue exactly its zero-unit poll"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn delta_exact_logical_block_has_no_phantom_admission() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let snapshot = delta_exact_block_snapshot()?;
+        let checkpoint = Arc::new(UnitSequenceCheckpoint::default());
+        let mut cursor =
+            DeltaPostingCursor::new_admitted(&snapshot, 0, b"alpha", checkpoint.as_ref())?;
+        let mut rows = if cursor.doc().is_some() { 1 } else { 0 };
+        while cursor.next_admitted(checkpoint.as_ref())?.is_some() {
+            rows += 1;
+        }
+
+        assert_eq!(rows, usize::try_from(DELTA_LOGICAL_BLOCK_POSTINGS)?);
+        let units = checkpoint
+            .units
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            units.len(),
+            usize::try_from(DELTA_LOGICAL_BLOCK_POSTINGS)? + 2,
+            "one open poll, the first real block, then one poll for every remaining row and the final empty step"
+        );
+        assert_eq!(units.get(0..2), Some([0, 1].as_slice()));
+        assert!(
+            units[2..].iter().all(|&units| units == 0),
+            "ordinal 128 is past the physical end and must not buy a second block"
+        );
+        assert_eq!(
+            units.iter().sum::<u64>(),
+            1,
+            "exactly one 128-row Delta block was opened"
+        );
+        Ok(())
+    }
+
     /// A Delta walk over a tombstone run admits every physical step, so it
     /// can be refused in the middle of the run and stops there.
     ///
@@ -6781,10 +6884,10 @@ mod tests {
                 .units
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // The metadata scan is admitted first, at one unit per physical
-            // block it walks (301 rows => 3), then construction's own step at
-            // ordinal 0 opens the first block.
-            assert_eq!(units.as_slice(), [3, 1].as_slice());
+            // Opening polls before the lookup, then construction's first
+            // real step opens ordinal 0's block. Metadata uses the frozen
+            // O(1) live count, so it neither scans nor charges three blocks.
+            assert_eq!(units.as_slice(), [0, 1].as_slice());
         }
 
         assert!(cursor.next()?.is_some(), "the run ends at a live posting");
@@ -6793,18 +6896,18 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        // One construction step, one pre-move poll, then one admission per
-        // physical step of the run.
+        // One zero-unit open poll, one construction step, one wrapper poll,
+        // then one admission per remaining physical step of the run.
         assert_eq!(
             units.len(),
             usize::try_from(DELTA_TOMBSTONE_RUN)? + 3,
-            "the metadata scan, construction's step, the pre-move poll, and \
-             one admission per physical step of the run"
+            "the open poll, construction's step, the pre-move poll, and one \
+             admission per remaining physical step of the run"
         );
         assert_eq!(
             units.iter().sum::<u64>(),
-            6,
-            "three units for the metadata scan, then ordinals 0, 128 and 256"
+            3,
+            "one unit for each real physical block at ordinals 0, 128 and 256"
         );
         Ok(())
     }
@@ -6813,10 +6916,10 @@ mod tests {
     fn delta_tombstone_walk_refused_mid_run_makes_no_further_progress()
     -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = delta_tombstone_snapshot()?;
-        // Admission 1 is the metadata scan, 2 is construction's step at
-        // ordinal 0, 3 is the wrapper's pre-move poll, and the walk's step at
-        // physical ordinal N is admission N + 3. Refuse at ordinal 128 — a
-        // block boundary in the middle of the tombstone run.
+        // Admission 1 is the zero-unit open poll, 2 is construction's step
+        // at ordinal 0, 3 is the wrapper's pre-move poll, and the walk's step
+        // at physical ordinal N is admission N + 3. Refuse at ordinal 128 —
+        // a block boundary in the middle of the tombstone run.
         let checkpoint = Arc::new(CancelOnNthAdmission::new(131));
         let handle: Arc<dyn QueryWorkCheckpoint> = checkpoint.clone();
         let inner = DeltaPostingCursor::new_admitted(&snapshot, 0, b"alpha", handle.as_ref())?;
@@ -6885,10 +6988,10 @@ mod tests {
     fn raw_delta_cursor_refused_mid_walk_keeps_its_physical_position()
     -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = delta_tombstone_snapshot()?;
-        // Construction spends admission 1 on the metadata scan and admission
-        // 2 on the step at ordinal 0, so the walk's step at physical ordinal
-        // N is admission N + 2. Refuse at ordinal 128, a block boundary deep
-        // inside the tombstone run.
+        // Construction spends admission 1 on the zero-unit open poll and
+        // admission 2 on the step at ordinal 0, so the walk's step at physical
+        // ordinal N is admission N + 2. Refuse at ordinal 128, a block
+        // boundary deep inside the tombstone run.
         let checkpoint = Arc::new(CancelOnNthAdmission::new(130));
         let mut cursor =
             DeltaPostingCursor::new_admitted(&snapshot, 0, b"alpha", checkpoint.as_ref())?;

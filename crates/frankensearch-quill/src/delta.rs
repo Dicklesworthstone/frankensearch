@@ -1167,7 +1167,7 @@ impl DeltaSegment {
     #[must_use]
     pub fn freeze(&self, keeper_generation: u64) -> DeltaSnapshot {
         let snapshot_owner_id = NEXT_DELTA_OWNER_ID.fetch_add(1, Ordering::Relaxed);
-        let mut segment = Self {
+        let segment = Self {
             schema: self.schema,
             lease_base: self.lease_base,
             lease_end: self.lease_end,
@@ -1923,6 +1923,16 @@ impl DeltaSegment {
             .collect()
     }
 
+    /// Number of distinct `(field, term)` keys retained by this generation.
+    ///
+    /// Unlike [`Self::sorted_terms`], this is O(1) and does not allocate a
+    /// temporary ordered view. Callers that need only a dictionary-work
+    /// ceiling must use this count rather than materializing every term.
+    #[must_use]
+    pub fn term_count(&self) -> usize {
+        self.terms.len()
+    }
+
     /// Physical fieldnorm, including a tombstoned row.
     #[must_use]
     pub fn fieldnorm_id(&self, field_ord: u16, global_docid: u32) -> Option<u8> {
@@ -2338,10 +2348,20 @@ impl DeltaSegment {
         let (Ok(start), Ok(end)) = (usize::try_from(start), usize::try_from(end)) else {
             return;
         };
-        let Some(term_ids) = self.document_term_ids.get(start..end) else {
+        let Some(term_count) = end.checked_sub(start) else {
             return;
         };
-        for term_index in term_ids.to_vec() {
+        for offset in 0..term_count {
+            // Copy one ID out before taking the disjoint mutable chain
+            // borrow. Cloning the whole slice here used transient storage
+            // proportional to document term count on every replacement and
+            // deletion.
+            let Some(term_slot) = start.checked_add(offset) else {
+                return;
+            };
+            let Some(term_index) = self.document_term_ids.get(term_slot).copied() else {
+                return;
+            };
             let Ok(term_offset) = usize::try_from(term_index) else {
                 continue;
             };
@@ -3382,15 +3402,13 @@ mod tests {
         Ok(())
     }
 
-    /// The maintained live count must equal a walk of the chain, on every
+    /// The maintained live count must equal a walk of each chain, on every
     /// axis that can change liveness.
     ///
-    /// The walk is the definition; the counter is the optimisation, so this
-    /// compares them rather than comparing the counter to a number I chose.
-    /// Supersession, deletion, and a document that is superseded and *then*
-    /// deleted are all exercised, because the last of those is where an
-    /// exactly-once decrement is the difference between a correct count and a
-    /// silent under-count that would erase a term from expansion.
+    /// The walks are the definitions; the counters are the optimisation. This
+    /// covers independent chains, a replacement whose term set changes, an
+    /// already-set tombstone bit, and a reset generation, rather than merely
+    /// comparing one counter to a hand-picked number.
     #[test]
     fn maintained_live_count_matches_a_walk_on_every_liveness_axis() -> Result<(), DeltaError> {
         fn walk_live(delta: &DeltaSegment, term_bytes: &[u8]) -> usize {
@@ -3399,67 +3417,155 @@ mod tests {
                 .expect("fixture term is present");
             term.postings().filter(|row| term.is_live(*row)).count()
         }
-        fn assert_agrees(delta: &DeltaSegment, term_bytes: &[u8], expected: usize, label: &str) {
-            let term = delta
-                .find_term(1, term_bytes)
-                .expect("fixture term is present");
-            assert_eq!(
-                term.live_doc_freq(),
-                walk_live(delta, term_bytes),
-                "counter disagreed with a walk after {label}"
-            );
-            assert_eq!(
-                term.live_doc_freq(),
-                expected,
-                "unexpected live count after {label}"
-            );
+        fn assert_agrees(delta: &DeltaSegment, expected: &[(&[u8], usize)], label: &str) {
+            for &(term_bytes, expected) in expected {
+                let term = delta
+                    .find_term(1, term_bytes)
+                    .expect("fixture term is present");
+                assert_eq!(
+                    term.live_doc_freq(),
+                    walk_live(delta, term_bytes),
+                    "counter disagreed with a walk for {term_bytes:?} after {label}"
+                );
+                assert_eq!(
+                    term.live_doc_freq(),
+                    expected,
+                    "unexpected live count for {term_bytes:?} after {label}"
+                );
+            }
         }
 
         let mut delta = DeltaSegment::new(TEST_SCHEMA, 0, usize::MAX)?;
-        let apply = |delta: &mut DeltaSegment, docid: u32, id: &str| -> Result<(), DeltaError> {
+        let apply = |delta: &mut DeltaSegment,
+                     docid: u32,
+                     id: &str,
+                     terms: &[&[u8]]|
+         -> Result<(), DeltaError> {
             let position = [docid];
+            let postings = terms
+                .iter()
+                .map(|term| DeltaTermPosting {
+                    field_ord: 1,
+                    term: *term,
+                    frequency: 1,
+                    positions: Some(&position),
+                })
+                .collect::<Vec<_>>();
             delta.apply_document(
                 docid,
                 DocId::from(id),
-                &norms(0, 1, 0),
-                &[DeltaTermPosting {
-                    field_ord: 1,
-                    term: b"alpha",
-                    frequency: 1,
-                    positions: Some(&position),
-                }],
+                &norms(
+                    0,
+                    u32::try_from(terms.len()).expect("test term count fits u32"),
+                    0,
+                ),
+                &postings,
             )?;
             Ok(())
         };
 
-        apply(&mut delta, 0, "a")?;
-        apply(&mut delta, 1, "b")?;
-        apply(&mut delta, 2, "c")?;
-        assert_agrees(&delta, b"alpha", 3, "three fresh documents");
+        apply(&mut delta, 0, "a", &[b"alpha", b"beta"])?;
+        apply(&mut delta, 1, "b", &[b"alpha", b"beta"])?;
+        apply(&mut delta, 2, "c", &[b"beta", b"gamma"])?;
+        assert_agrees(
+            &delta,
+            &[(b"alpha", 2), (b"beta", 3), (b"gamma", 1)],
+            "independent fresh chains",
+        );
 
-        // Supersession: re-applying "b" retires its earlier physical row.
-        apply(&mut delta, 3, "b")?;
-        assert_agrees(&delta, b"alpha", 3, "one supersession");
+        // Replacing b changes its term set. The old alpha and beta postings
+        // retire before the new beta and delta postings become live.
+        apply(&mut delta, 3, "b", &[b"beta", b"delta"])?;
+        assert_agrees(
+            &delta,
+            &[(b"alpha", 1), (b"beta", 3), (b"gamma", 1), (b"delta", 1)],
+            "replacement with changed terms",
+        );
 
-        // Deletion retires the surviving row of "a".
+        // Deletion retires the surviving row of a without touching the other
+        // independent chains.
         assert_eq!(delta.delete_delta_id("a"), Some(0));
-        assert_agrees(&delta, b"alpha", 2, "one deletion");
+        assert_agrees(
+            &delta,
+            &[(b"alpha", 0), (b"beta", 2), (b"gamma", 1), (b"delta", 1)],
+            "one deletion",
+        );
 
-        // Superseded *then* deleted: the older row is already tombstoned, so
-        // only the newer one may be retired. A decrement that fired twice
-        // would report 0 here, and one that never fired would report 2.
+        // Superseded then deleted: only b's later physical row may retire.
         assert_eq!(delta.delete_delta_id("b"), Some(3));
-        assert_agrees(&delta, b"alpha", 1, "supersede-then-delete");
+        assert_agrees(
+            &delta,
+            &[(b"alpha", 0), (b"beta", 1), (b"gamma", 1), (b"delta", 0)],
+            "supersede-then-delete",
+        );
 
-        // Deleting an unknown identity changes nothing.
-        assert_eq!(delta.delete_delta_id("missing"), None);
-        assert_agrees(&delta, b"alpha", 1, "a no-op deletion");
+        // Deleting c sets its bit once. Re-marking that exact bit must leave
+        // every counter intact; this is the duplicate-tombstone branch the
+        // public identity path reaches after an already retired row.
+        assert_eq!(delta.delete_delta_id("c"), Some(2));
+        let before_duplicate_mark = delta
+            .sorted_terms()
+            .into_iter()
+            .map(|term| (term.term().to_vec(), term.live_doc_freq()))
+            .collect::<Vec<_>>();
+        assert_eq!(delta.mark_tombstone(2), 0);
+        assert_eq!(
+            delta
+                .sorted_terms()
+                .into_iter()
+                .map(|term| (term.term().to_vec(), term.live_doc_freq()))
+                .collect::<Vec<_>>(),
+            before_duplicate_mark,
+            "an already-set tombstone bit must not decrement again"
+        );
+        assert_agrees(
+            &delta,
+            &[(b"alpha", 0), (b"beta", 0), (b"gamma", 0), (b"delta", 0)],
+            "same-bit duplicate tombstone",
+        );
 
-        // A frozen epoch carries the counts with its chains, needing no pass
-        // of its own, and must agree with a walk of the frozen rows.
+        let canonical_terms = delta
+            .sorted_terms()
+            .into_iter()
+            .map(|term| term.term().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            canonical_terms,
+            [
+                b"alpha".to_vec(),
+                b"beta".to_vec(),
+                b"delta".to_vec(),
+                b"gamma".to_vec(),
+            ],
+            "dictionary enumeration remains canonical even when all rows are tombstoned"
+        );
+        assert_eq!(delta.term_count(), 4);
+
+        // A frozen epoch carries the counters with its chains, needing no
+        // publication-time walk.
         let snapshot = delta.freeze(7);
         let frozen = snapshot.segment();
-        assert_agrees(frozen, b"alpha", 1, "freeze");
+        assert_agrees(
+            frozen,
+            &[(b"alpha", 0), (b"beta", 0), (b"gamma", 0), (b"delta", 0)],
+            "freeze",
+        );
+
+        let generation_before_reset = delta.generation;
+        delta.reset_after_seal(0)?;
+        assert_eq!(delta.generation, generation_before_reset.wrapping_add(1));
+        assert_eq!(delta.term_count(), 0);
+        apply(&mut delta, 4, "next-generation", &[b"zeta", b"alpha"])?;
+        assert_agrees(&delta, &[(b"alpha", 1), (b"zeta", 1)], "reset generation");
+        assert_eq!(
+            delta
+                .sorted_terms()
+                .into_iter()
+                .map(|term| term.term().to_vec())
+                .collect::<Vec<_>>(),
+            [b"alpha".to_vec(), b"zeta".to_vec()],
+            "a reset generation rebuilds dictionary order independently"
+        );
         Ok(())
     }
 

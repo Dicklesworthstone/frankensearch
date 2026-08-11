@@ -10589,7 +10589,7 @@ fn query_work_upper_bound(
         let docs = u64::try_from(delta.physical_document_count()).unwrap_or(u64::MAX);
         physical_docs = physical_docs.saturating_add(docs);
         posting_blocks_per_stream = posting_blocks_per_stream.saturating_add(docs.div_ceil(128));
-        let terms = u64::try_from(delta.segment().sorted_terms().len()).unwrap_or(u64::MAX);
+        let terms = u64::try_from(delta.segment().term_count()).unwrap_or(u64::MAX);
         dictionary_blocks = dictionary_blocks.saturating_add(terms.div_ceil(16));
     }
 
@@ -14708,64 +14708,76 @@ mod tests {
         )
     }
 
-    /// A tombstone-heavy Delta must keep fuel metering switched on.
+    /// A tombstone-heavy published Delta gets enough query work for every
+    /// physical block the public scorer can walk.
     ///
-    /// `QueryCheckpoint` meters only when the work upper bound exceeds the
-    /// budget — a ceiling at or below the budget means the query provably
-    /// cannot exhaust it, so metering is skipped. Bounding a Delta by its
-    /// *live* documents made that inference false: the walk is charged over
-    /// physical rows, so a generation of 301 rows with 2 survivors reported a
-    /// ceiling of 2, metering switched off, and the walk then charged nothing
-    /// and could never refuse however much it read. Drawing the ceiling from
-    /// physical rows restores the invariant.
+    /// This deliberately goes through snapshot composition, the production
+    /// work-bound function, and the public search API. The two live rows sit
+    /// in three physical posting blocks, so replacing the physical count with
+    /// the live count makes the independently calculated bound disagree before
+    /// the query is allowed to claim that its exact budget is sufficient.
     #[test]
-    fn tombstone_heavy_delta_bound_keeps_fuel_metering_enabled() {
-        const LIVE_ROWS: u64 = 2;
-        const PHYSICAL_ROWS: u64 = 301;
-        const BUDGET: u64 = 3;
-
+    fn tombstone_heavy_delta_public_query_accepts_its_physical_work_budget() {
         let cx = Cx::for_testing();
-
-        // The old ceiling: 2 <= 3, so nothing is metered and the walk can
-        // read every row it likes without ever being refused.
-        let unmetered = QueryCheckpoint::new(&cx, "fuel_live_bound", BUDGET, LIVE_ROWS);
-        for unit in 0..PHYSICAL_ROWS {
-            unmetered
-                .admit(QueryWorkKind::PostingBlock, 1)
-                .unwrap_or_else(|error| {
-                    panic!("a live-bounded checkpoint must not meter, refused at {unit}: {error:?}")
-                });
+        let keeper = Arc::new(KeeperSnapshot::in_memory(DEFAULT_SCHEMA).expect("genesis Keeper"));
+        let generation = keeper.loaded_manifest().manifest.generation;
+        let mut delta = DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("Delta shard");
+        apply_alpha_delta(&mut delta, 0, "first-live", 1);
+        for global_docid in 1..=300 {
+            apply_alpha_delta(&mut delta, global_docid, "churn", 1);
         }
+        assert_eq!(delta.physical_document_count(), 301);
+        assert_eq!(delta.live_document_count(), 2);
 
-        // The corrected ceiling: 301 > 3, so the same walk is metered and
-        // refuses once it has spent the budget.
-        let metered = QueryCheckpoint::new(&cx, "fuel_physical_bound", BUDGET, PHYSICAL_ROWS);
-        for _ in 0..BUDGET {
-            metered
-                .admit(QueryWorkKind::PostingBlock, 1)
-                .expect("units within the budget must be admitted");
-        }
-        let error = metered
-            .admit(QueryWorkKind::PostingBlock, 1)
-            .expect_err("a metered checkpoint must refuse past its budget");
+        let frozen = Arc::new(delta.freeze(generation));
+        let snapshot =
+            QuillSearchSnapshot::compose(0, Arc::clone(&keeper), vec![Arc::clone(&frozen)])
+                .expect("compose tombstone-heavy Delta snapshot");
+        let query = Query::Term {
+            fields: vec![crate::query::QueryField::new(CONTENT_FIELD, 1.0)],
+            text: "alpha".to_owned(),
+        };
+        let work_budget = query_work_upper_bound(
+            &query,
+            &snapshot,
+            QuillConfig::default().glob_expansion_limit,
+        )
+        .expect("bound tombstone-heavy public query");
+        let physical_blocks = u64::try_from(frozen.segment().physical_document_count())
+            .expect("physical Delta rows fit u64")
+            .div_ceil(128);
+        let live_blocks = u64::try_from(frozen.live_document_count())
+            .expect("live Delta rows fit u64")
+            .div_ceil(128);
+        let exact_physical_budget = 1_u64.saturating_add(physical_blocks.saturating_mul(2));
+        let stale_live_budget = 1_u64.saturating_add(live_blocks.saturating_mul(2));
+        assert_eq!(
+            work_budget, exact_physical_budget,
+            "a one-term, Delta-only query pays one segment plus both possible physical block walks"
+        );
         assert!(
-            matches!(
-                error,
-                ArgusError::QueryFuelExhausted {
-                    budget: BUDGET,
-                    consumed: BUDGET,
-                    posting_blocks: BUDGET,
-                    ..
-                }
-            ),
-            "expected exact fuel diagnostics, got {error:?}"
+            work_budget > stale_live_budget,
+            "the physical Delta span, not its live survivors, determines this query's work ceiling"
         );
 
-        // Zero-unit polls stay free under metering, so cancellation
-        // observation is never rationed by the budget.
-        metered
-            .admit(QueryWorkKind::PostingBlock, 0)
-            .expect("a zero-unit poll must remain admissible after exhaustion");
+        let index = QuillIndex::in_memory(QuillConfig {
+            query_fuel_budget: work_budget,
+            ..deterministic_config()
+        })
+        .expect("create exact-budget public index");
+        assert_eq!(
+            index.snapshot().loaded_manifest().manifest.generation,
+            generation,
+            "the independently composed and public genesis snapshots share one generation"
+        );
+        index
+            .publish_delta_table(vec![frozen])
+            .expect("publish tombstone-heavy Delta epoch");
+        let result = index
+            .search_paginated(&cx, "content:alpha", 10, 0, true)
+            .expect("the public query must fit its production work budget");
+        assert_eq!(result.total_count, Some(2));
+        assert_eq!(result.hits.len(), 2);
     }
 
     #[test]
