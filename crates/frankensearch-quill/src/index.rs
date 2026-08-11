@@ -14699,6 +14699,66 @@ mod tests {
         )
     }
 
+    /// A tombstone-heavy Delta must keep fuel metering switched on.
+    ///
+    /// `QueryCheckpoint` meters only when the work upper bound exceeds the
+    /// budget — a ceiling at or below the budget means the query provably
+    /// cannot exhaust it, so metering is skipped. Bounding a Delta by its
+    /// *live* documents made that inference false: the walk is charged over
+    /// physical rows, so a generation of 301 rows with 2 survivors reported a
+    /// ceiling of 2, metering switched off, and the walk then charged nothing
+    /// and could never refuse however much it read. Drawing the ceiling from
+    /// physical rows restores the invariant.
+    #[test]
+    fn tombstone_heavy_delta_bound_keeps_fuel_metering_enabled() {
+        const LIVE_ROWS: u64 = 2;
+        const PHYSICAL_ROWS: u64 = 301;
+        const BUDGET: u64 = 3;
+
+        let cx = Cx::for_testing();
+
+        // The old ceiling: 2 <= 3, so nothing is metered and the walk can
+        // read every row it likes without ever being refused.
+        let unmetered = QueryCheckpoint::new(&cx, "fuel_live_bound", BUDGET, LIVE_ROWS);
+        for unit in 0..PHYSICAL_ROWS {
+            unmetered
+                .admit(QueryWorkKind::PostingBlock, 1)
+                .unwrap_or_else(|error| {
+                    panic!("a live-bounded checkpoint must not meter, refused at {unit}: {error:?}")
+                });
+        }
+
+        // The corrected ceiling: 301 > 3, so the same walk is metered and
+        // refuses once it has spent the budget.
+        let metered = QueryCheckpoint::new(&cx, "fuel_physical_bound", BUDGET, PHYSICAL_ROWS);
+        for _ in 0..BUDGET {
+            metered
+                .admit(QueryWorkKind::PostingBlock, 1)
+                .expect("units within the budget must be admitted");
+        }
+        let error = metered
+            .admit(QueryWorkKind::PostingBlock, 1)
+            .expect_err("a metered checkpoint must refuse past its budget");
+        assert!(
+            matches!(
+                error,
+                ArgusError::QueryFuelExhausted {
+                    budget: BUDGET,
+                    consumed: BUDGET,
+                    posting_blocks: BUDGET,
+                    ..
+                }
+            ),
+            "expected exact fuel diagnostics, got {error:?}"
+        );
+
+        // Zero-unit polls stay free under metering, so cancellation
+        // observation is never rationed by the budget.
+        metered
+            .admit(QueryWorkKind::PostingBlock, 0)
+            .expect("a zero-unit poll must remain admissible after exhaustion");
+    }
+
     #[test]
     fn query_fuel_checkpoint_diagnostics_and_cancellation_are_deterministic() {
         fn exhaust_once(cx: &Cx) -> (u64, u64, u64, u64, u64, u64) {

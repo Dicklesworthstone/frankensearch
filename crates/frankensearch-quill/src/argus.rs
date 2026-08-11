@@ -6878,6 +6878,154 @@ mod tests {
         Ok(())
     }
 
+    /// A refusal inside the walk must leave the raw cursor's physical state
+    /// exactly as the refused step found it.
+    ///
+    /// The wrapper's terminal refusal hides this: it stops calling the inner
+    /// cursor at all. Here the Delta cursor is driven directly, so the only
+    /// thing standing between a refusal and a corrupted walk is that the
+    /// admission precedes the physical step. The resumed walk is the proof
+    /// that nothing was consumed or skipped — it must land on the next live
+    /// posting having read every remaining row exactly once.
+    #[test]
+    fn raw_delta_cursor_refused_mid_walk_keeps_its_physical_position()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = delta_tombstone_snapshot()?;
+        // Construction spends admission 1 on the metadata scan and admission
+        // 2 on the step at ordinal 0, so the walk's step at physical ordinal
+        // N is admission N + 2. Refuse at ordinal 128, a block boundary deep
+        // inside the tombstone run.
+        let checkpoint = Arc::new(CancelOnNthAdmission::new(130));
+        let mut cursor =
+            DeltaPostingCursor::new_admitted(&snapshot, 0, b"alpha", checkpoint.as_ref())?;
+        assert_eq!(cursor.current_ordinal, Some(0));
+        assert_eq!(cursor.next_ordinal, 1);
+        assert_eq!(cursor.physical_len, DELTA_TOMBSTONE_RUN + 1);
+
+        let error = cursor
+            .next_admitted(checkpoint.as_ref())
+            .expect_err("the walk must observe the refusal mid-run");
+        assert!(
+            matches!(
+                error,
+                ArgusError::QueryCancelled {
+                    phase: "checkpoint_cursor_unit_test"
+                }
+            ),
+            "expected the checkpoint's typed refusal, got {error:?}"
+        );
+
+        // The refused step never ran: its ordinal was not consumed, the last
+        // physical docid is still the row before it, and the published
+        // posting is untouched.
+        assert_eq!(
+            cursor.next_ordinal, 128,
+            "the refused step must not consume its ordinal"
+        );
+        assert_eq!(
+            cursor.last_physical_doc,
+            Some(127),
+            "the last physical row read must still be the one before the refusal"
+        );
+        assert_eq!(cursor.current_ordinal, Some(0));
+        assert_eq!(cursor.doc(), Some(0));
+        assert!(
+            cursor.remaining.is_some(),
+            "a refused walk must keep its physical iterator"
+        );
+
+        // Resuming unadmitted proves the iterator sat exactly at ordinal 128:
+        // the walk reaches the trailing live posting and ends having consumed
+        // every physical row once.
+        assert_eq!(cursor.pull_next_live(None)?, Some(DELTA_TOMBSTONE_RUN));
+        assert_eq!(cursor.next_ordinal, DELTA_TOMBSTONE_RUN + 1);
+        assert_eq!(cursor.current_ordinal, Some(DELTA_TOMBSTONE_RUN));
+        Ok(())
+    }
+
+    /// Live postings scattered between tombstones, across two block seams.
+    ///
+    /// Every ordinal carries the same churn identity except the chosen ones,
+    /// so each unique identity stays live while the churn rows are superseded
+    /// down to their last.
+    fn delta_interleaved_snapshot() -> Result<DeltaSnapshot, Box<dyn std::error::Error>> {
+        let mut delta = crate::delta::DeltaSegment::new(DELTA_TOMBSTONE_SCHEMA, 0, usize::MAX)?;
+        let norms = [crate::delta::DeltaFieldNorm {
+            field_ord: 0,
+            raw_length: 1,
+            fieldnorm_id: fieldnorm_to_id(1),
+        }];
+        for ordinal in 0..DELTA_TOMBSTONE_RUN {
+            let identity = if DELTA_INTERLEAVED_LIVE.contains(&ordinal) {
+                format!("live-{ordinal}")
+            } else {
+                "churn".to_owned()
+            };
+            let position = [ordinal];
+            delta.apply_document(
+                ordinal,
+                DocId::from(identity.as_str()),
+                &norms,
+                &[crate::delta::DeltaTermPosting {
+                    field_ord: 0,
+                    term: b"alpha",
+                    frequency: 1,
+                    positions: Some(&position),
+                }],
+            )?;
+        }
+        Ok(delta.freeze(1))
+    }
+
+    /// Ordinals kept live: one inside the first block, then one just past
+    /// each of the 128 and 256 boundaries.
+    const DELTA_INTERLEAVED_LIVE: [u32; 3] = [10, 130, 250];
+
+    #[test]
+    fn delta_walk_skips_tombstones_across_block_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = delta_interleaved_snapshot()?;
+        // The final churn row survives as its identity's newest posting.
+        let last_churn = DELTA_TOMBSTONE_RUN - 1;
+
+        let mut cursor = DeltaPostingCursor::new(&snapshot, 0, b"alpha")?;
+        assert_eq!(
+            cursor.doc(),
+            Some(DELTA_INTERLEAVED_LIVE[0]),
+            "construction must skip the tombstones before the first live row"
+        );
+        let mut walked = vec![cursor.doc().ok_or("first live posting")?];
+        while let Some(doc) = cursor.next()? {
+            walked.push(doc);
+        }
+        assert_eq!(
+            walked,
+            vec![
+                DELTA_INTERLEAVED_LIVE[0],
+                DELTA_INTERLEAVED_LIVE[1],
+                DELTA_INTERLEAVED_LIVE[2],
+                last_churn,
+            ],
+            "the walk must yield exactly the live postings, in order"
+        );
+
+        // A seek crossing both seams in one call lands on the first live
+        // posting at or past the target, not on a tombstone.
+        let mut seeking = DeltaPostingCursor::new(&snapshot, 0, b"alpha")?;
+        assert_eq!(
+            seeking.advance(DELTA_INTERLEAVED_LIVE[1] - 1)?,
+            Some(DELTA_INTERLEAVED_LIVE[1])
+        );
+        assert_eq!(
+            seeking.advance(DELTA_INTERLEAVED_LIVE[2])?,
+            Some(DELTA_INTERLEAVED_LIVE[2]),
+            "a seek landing exactly on a live posting must not move past it"
+        );
+        assert_eq!(seeking.advance(last_churn)?, Some(last_churn));
+        assert_eq!(seeking.advance(u32::MAX)?, None);
+        Ok(())
+    }
+
     #[derive(Clone, Debug)]
     struct TermBoundOnlyCursor(VecCursor);
 
