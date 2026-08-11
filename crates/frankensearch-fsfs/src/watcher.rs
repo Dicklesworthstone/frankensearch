@@ -11,12 +11,13 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
 use asupersync::runtime::TaskHandle;
+use asupersync::types::CancelReason;
 use frankensearch_core::{SearchError, SearchResult};
 use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -27,6 +28,7 @@ use crate::config::{
 };
 use crate::mount_info::{FsCategory, MountTable, read_system_mounts};
 use crate::pressure::PressureState;
+use crate::stream_protocol::is_retryable_error;
 
 pub const DEFAULT_DEBOUNCE_MS: u64 = 500;
 pub const DEFAULT_BATCH_SIZE: usize = 100;
@@ -297,14 +299,240 @@ impl WatcherStatsInner {
     }
 }
 
+type ReadyBatchQueue = Arc<Mutex<VecDeque<Vec<WatchEvent>>>>;
+
+type ProducerHandle = thread::JoinHandle<SearchResult<()>>;
+
 #[derive(Default)]
-struct WatcherControl {
-    stop_flag: Option<Arc<AtomicBool>>,
-    producer: Option<thread::JoinHandle<()>>,
-    ingest_task: Option<TaskHandle<SearchResult<()>>>,
+struct WatcherStop {
+    requested: AtomicBool,
+    wait_lock: Mutex<()>,
+    wait_cv: Condvar,
 }
 
-type ReadyBatchQueue = Arc<Mutex<VecDeque<Vec<WatchEvent>>>>;
+impl WatcherStop {
+    fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+        self.wait_cv.notify_all();
+    }
+
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+
+    fn wait_or_stopped(&self, duration: Duration) -> bool {
+        if self.is_requested() {
+            return true;
+        }
+        let guard = lock_or_recover(&self.wait_lock);
+        if !self.is_requested() {
+            let _guard = self
+                .wait_cv
+                .wait_timeout(guard, duration)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        self.is_requested()
+    }
+}
+
+#[derive(Default)]
+struct ReconciliationState {
+    indexed_snapshot: FileSnapshot,
+    baseline_initialized: bool,
+    required: bool,
+    affected_paths: BTreeSet<PathBuf>,
+    epoch: u64,
+}
+
+type ReconciliationTracker = Arc<Mutex<ReconciliationState>>;
+
+impl ReconciliationState {
+    fn require_for_events(&mut self, events: &[WatchEvent]) {
+        self.required = true;
+        self.epoch = self.epoch.saturating_add(1);
+        self.affected_paths
+            .extend(events.iter().map(|event| event.path.clone()));
+    }
+
+    fn require_full_scan(&mut self) {
+        self.required = true;
+        self.epoch = self.epoch.saturating_add(1);
+    }
+}
+
+enum WatcherLifecycle {
+    Stopped,
+    Starting {
+        generation: u64,
+        stop: Arc<WatcherStop>,
+    },
+    Running {
+        generation: u64,
+        stop: Arc<WatcherStop>,
+        producer: ProducerHandle,
+        ingest_task: TaskHandle<SearchResult<()>>,
+    },
+    Stopping {
+        generation: u64,
+        stop: Arc<WatcherStop>,
+    },
+}
+
+impl Default for WatcherLifecycle {
+    fn default() -> Self {
+        Self::Stopped
+    }
+}
+
+#[derive(Default)]
+struct WatcherControl {
+    next_generation: u64,
+    lifecycle: WatcherLifecycle,
+}
+
+enum StartDecision {
+    AlreadyRunning,
+    ObservedGenerationCompleted,
+    Wait(u64),
+    Begin {
+        generation: u64,
+        stop: Arc<WatcherStop>,
+    },
+    Drain {
+        generation: u64,
+        stop: Arc<WatcherStop>,
+        producer: ProducerHandle,
+        ingest_task: TaskHandle<SearchResult<()>>,
+    },
+}
+
+enum StopDecision {
+    Done,
+    Wait,
+    Drain {
+        generation: u64,
+        stop: Arc<WatcherStop>,
+        producer: ProducerHandle,
+        ingest_task: TaskHandle<SearchResult<()>>,
+    },
+}
+
+impl WatcherControl {
+    fn start_decision(&mut self, observed_generation: Option<u64>) -> StartDecision {
+        match &self.lifecycle {
+            WatcherLifecycle::Stopped
+                if observed_generation.is_some_and(|observed| self.next_generation >= observed) =>
+            {
+                StartDecision::ObservedGenerationCompleted
+            }
+            WatcherLifecycle::Stopped => {
+                self.next_generation = self.next_generation.saturating_add(1);
+                let generation = self.next_generation;
+                let stop = Arc::new(WatcherStop::default());
+                self.lifecycle = WatcherLifecycle::Starting {
+                    generation,
+                    stop: Arc::clone(&stop),
+                };
+                StartDecision::Begin { generation, stop }
+            }
+            WatcherLifecycle::Starting { generation, .. }
+            | WatcherLifecycle::Stopping { generation, .. } => StartDecision::Wait(*generation),
+            WatcherLifecycle::Running {
+                producer,
+                ingest_task,
+                ..
+            } if !producer.is_finished() && !ingest_task.is_finished() => {
+                StartDecision::AlreadyRunning
+            }
+            WatcherLifecycle::Running { .. } => {
+                let old = std::mem::take(&mut self.lifecycle);
+                let WatcherLifecycle::Running {
+                    generation,
+                    stop,
+                    producer,
+                    ingest_task,
+                } = old
+                else {
+                    unreachable!("running lifecycle was just matched")
+                };
+                stop.request();
+                self.lifecycle = WatcherLifecycle::Stopping {
+                    generation,
+                    stop: Arc::clone(&stop),
+                };
+                StartDecision::Drain {
+                    generation,
+                    stop,
+                    producer,
+                    ingest_task,
+                }
+            }
+        }
+    }
+
+    fn stop_decision(&mut self) -> StopDecision {
+        match &self.lifecycle {
+            WatcherLifecycle::Stopped => StopDecision::Done,
+            WatcherLifecycle::Starting { generation, stop } => {
+                let generation = *generation;
+                let stop = Arc::clone(stop);
+                stop.request();
+                self.lifecycle = WatcherLifecycle::Stopping { generation, stop };
+                StopDecision::Wait
+            }
+            WatcherLifecycle::Stopping { .. } => StopDecision::Wait,
+            WatcherLifecycle::Running { .. } => {
+                let old = std::mem::take(&mut self.lifecycle);
+                let WatcherLifecycle::Running {
+                    generation,
+                    stop,
+                    producer,
+                    ingest_task,
+                } = old
+                else {
+                    unreachable!("running lifecycle was just matched")
+                };
+                stop.request();
+                self.lifecycle = WatcherLifecycle::Stopping {
+                    generation,
+                    stop: Arc::clone(&stop),
+                };
+                StopDecision::Drain {
+                    generation,
+                    stop,
+                    producer,
+                    ingest_task,
+                }
+            }
+        }
+    }
+
+    fn generation_can_publish(&self, generation: u64) -> bool {
+        matches!(
+            &self.lifecycle,
+            WatcherLifecycle::Starting {
+                generation: active,
+                ..
+            } if *active == generation
+        )
+    }
+
+    fn complete_generation(&mut self, generation: u64) {
+        let belongs_to_generation = matches!(
+            &self.lifecycle,
+            WatcherLifecycle::Starting {
+                generation: active,
+                ..
+            } | WatcherLifecycle::Stopping {
+                generation: active,
+                ..
+            } if *active == generation
+        );
+        if belongs_to_generation {
+            self.lifecycle = WatcherLifecycle::Stopped;
+        }
+    }
+}
 
 /// Filesystem watcher service for live incremental re-indexing.
 pub struct FsWatcher {
@@ -316,6 +544,7 @@ pub struct FsWatcher {
     pressure_state: Arc<AtomicU8>,
     stats: Arc<WatcherStatsInner>,
     ready_batches: ReadyBatchQueue,
+    reconciliation: ReconciliationTracker,
     control: Mutex<WatcherControl>,
 }
 
@@ -335,6 +564,7 @@ impl FsWatcher {
             pressure_state: Arc::new(AtomicU8::new(pressure_state_to_code(PressureState::Normal))),
             stats: Arc::new(WatcherStatsInner::default()),
             ready_batches: Arc::new(Mutex::new(VecDeque::new())),
+            reconciliation: Arc::new(Mutex::new(ReconciliationState::default())),
             control: Mutex::new(WatcherControl::default()),
         }
     }
@@ -386,6 +616,22 @@ impl FsWatcher {
         self.stats.snapshot()
     }
 
+    /// Report whether a started watcher generation has reached a terminal task
+    /// outcome that its owner must join with [`Self::stop_checked`].
+    #[must_use]
+    pub fn has_terminal_task_outcome(&self) -> bool {
+        let control = lock_or_recover(&self.control);
+        match &control.lifecycle {
+            WatcherLifecycle::Stopped => control.next_generation > 0,
+            WatcherLifecycle::Running {
+                producer,
+                ingest_task,
+                ..
+            } => producer.is_finished() || ingest_task.is_finished(),
+            WatcherLifecycle::Starting { .. } | WatcherLifecycle::Stopping { .. } => false,
+        }
+    }
+
     /// Start background watch processing.
     ///
     /// # Errors
@@ -399,150 +645,212 @@ impl FsWatcher {
             });
         }
 
-        let (previous_producer, previous_ingest_task) = {
-            let mut control = lock_or_recover(&self.control);
-            let producer_running = control
-                .producer
-                .as_ref()
-                .is_some_and(|producer| !producer.is_finished());
-            let ingest_running = control
-                .ingest_task
-                .as_ref()
-                .is_some_and(|task| !task.is_finished());
-            if producer_running && ingest_running {
-                return Ok(());
+        let mut observed_generation = None;
+        loop {
+            let decision = lock_or_recover(&self.control).start_decision(observed_generation);
+            match decision {
+                StartDecision::AlreadyRunning | StartDecision::ObservedGenerationCompleted => {
+                    return Ok(());
+                }
+                StartDecision::Wait(generation) => {
+                    observed_generation = Some(generation);
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+                StartDecision::Drain {
+                    generation,
+                    stop,
+                    producer,
+                    ingest_task,
+                } => {
+                    stop.request();
+                    let result = finish_watcher_tasks(cx, Some(producer), Some(ingest_task)).await;
+                    lock_or_recover(&self.control).complete_generation(generation);
+                    result?;
+                }
+                StartDecision::Begin { generation, stop } => {
+                    return self.start_generation(cx, generation, stop).await;
+                }
             }
+        }
+    }
 
-            if let Some(stop_flag) = control.stop_flag.take() {
-                stop_flag.store(true, Ordering::Release);
-            }
-            (control.producer.take(), control.ingest_task.take())
-        };
-        finish_watcher_tasks(cx, previous_producer, previous_ingest_task).await;
+    async fn start_generation(
+        &self,
+        cx: &Cx,
+        generation: u64,
+        stop: Arc<WatcherStop>,
+    ) -> SearchResult<()> {
+        const ADMISSION_POLLS: usize = 1_000;
 
-        let stop_flag = Arc::new(AtomicBool::new(false));
+        let admitted = Arc::new(AtomicBool::new(false));
+        let admitted_for_task = Arc::clone(&admitted);
+        let producer_done = Arc::new(AtomicBool::new(false));
+        let producer_done_for_task = Arc::clone(&producer_done);
         let ingest = Arc::clone(&self.ingest);
         let ingest_discovery = self.discovery.clone();
         let ingest_stats = Arc::clone(&self.stats);
         let ingest_queue = Arc::clone(&self.ready_batches);
-        let ingest_stop = Arc::clone(&stop_flag);
-        let ingest_task = cx
-            .spawn_local(move |child_cx| async move {
-                let _stop_producer_on_exit = IngestTaskStopGuard {
-                    stop_flag: Arc::clone(&ingest_stop),
-                };
-                run_ingest_loop(
-                    &child_cx,
-                    &ingest_discovery,
-                    ingest.as_ref(),
-                    &ingest_queue,
-                    &ingest_stop,
-                    &ingest_stats,
-                )
-                .await
-            })
-            .map_err(|error| SearchError::SubsystemError {
-                subsystem: "watcher.ingest",
-                source: Box::new(io::Error::other(format!(
+        let ingest_stop = Arc::clone(&stop);
+        let ingest_reconciliation = Arc::clone(&self.reconciliation);
+        let ingest_roots = self.roots.clone();
+        let ingest_batch_size = self.base_batch_size;
+        let ingest_task = match cx.spawn_local(move |child_cx| async move {
+            admitted_for_task.store(true, Ordering::Release);
+            let _stop_producer_on_exit = IngestTaskStopGuard {
+                stop: Arc::clone(&ingest_stop),
+            };
+            run_ingest_loop(
+                &child_cx,
+                &ingest_roots,
+                &ingest_discovery,
+                ingest.as_ref(),
+                &ingest_queue,
+                &ingest_stop,
+                &ingest_stats,
+                &ingest_reconciliation,
+                ingest_batch_size,
+                &producer_done_for_task,
+            )
+            .await
+        }) {
+            Ok(task) => task,
+            Err(error) => {
+                let error = watcher_task_error(format!(
                     "failed to spawn caller-owned ingest task: {error}"
-                ))),
-            })?;
+                ));
+                lock_or_recover(&self.control).complete_generation(generation);
+                return Err(error);
+            }
+        };
 
-        let producer_stats = Arc::clone(&self.stats);
-        let producer_stop = Arc::clone(&stop_flag);
+        for _ in 0..ADMISSION_POLLS {
+            if admitted.load(Ordering::Acquire) {
+                break;
+            }
+            let still_starting = lock_or_recover(&self.control).generation_can_publish(generation);
+            if stop.is_requested() || !still_starting {
+                stop.request();
+                ingest_task.abort_with_reason(CancelReason::shutdown());
+                let _ = finish_watcher_tasks(cx, None, Some(ingest_task)).await;
+                lock_or_recover(&self.control).complete_generation(generation);
+                return Ok(());
+            }
+            if ingest_task.is_finished() {
+                let result = finish_watcher_tasks(cx, None, Some(ingest_task)).await;
+                lock_or_recover(&self.control).complete_generation(generation);
+                return result;
+            }
+            asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+        }
+
+        if !admitted.load(Ordering::Acquire) {
+            stop.request();
+            ingest_task.abort_with_reason(CancelReason::user(
+                "watcher ingest admission handshake timed out",
+            ));
+            let _ = finish_watcher_tasks(cx, None, Some(ingest_task)).await;
+            let error =
+                watcher_task_error("watcher ingest task was not admitted within 1000 polls");
+            lock_or_recover(&self.control).complete_generation(generation);
+            return Err(error);
+        }
+
+        if ingest_task.is_finished() {
+            let result = finish_watcher_tasks(cx, None, Some(ingest_task)).await;
+            lock_or_recover(&self.control).complete_generation(generation);
+            return result;
+        }
+
         let producer_context = ProducerContext {
             roots: self.roots.clone(),
             discovery: self.discovery.clone(),
             stats: Arc::clone(&self.stats),
             pressure_state: Arc::clone(&self.pressure_state),
-            stop_flag: Arc::clone(&stop_flag),
+            stop: Arc::clone(&stop),
             ready_batches: Arc::clone(&self.ready_batches),
+            reconciliation: Arc::clone(&self.reconciliation),
+            producer_done,
             base_debounce_ms: self.base_debounce_ms,
             base_batch_size: self.base_batch_size,
         };
 
         let producer = match thread::Builder::new()
             .name("fsfs-watcher".to_owned())
-            .spawn(move || {
-                const MAX_RESTARTS: usize = 10;
-                const MIN_BACKOFF_MS: u64 = 500;
-                const MAX_BACKOFF_MS: u64 = 30_000;
-                let mut restarts = 0_usize;
-                loop {
-                    match run_producer_loop(&producer_context) {
-                        Ok(()) => break,
-                        Err(error) => {
-                            producer_stats.add_error();
-                            producer_stats
-                                .worker_restarts
-                                .fetch_add(1, Ordering::Relaxed);
-                            restarts = restarts.saturating_add(1);
-                            if producer_context.stop_flag.load(Ordering::Acquire) {
-                                debug!(
-                                    error = %error,
-                                    "watcher producer exited with error after stop signal"
-                                );
-                                break;
-                            }
-                            if restarts > MAX_RESTARTS {
-                                warn!(
-                                    error = %error,
-                                    restarts,
-                                    "watcher producer exhausted restart attempts; giving up"
-                                );
-                                break;
-                            }
-                            let backoff_ms = MIN_BACKOFF_MS
-                                .saturating_mul(1_u64 << restarts.min(6))
-                                .min(MAX_BACKOFF_MS);
-                            warn!(
-                                error = %error,
-                                restart_attempt = restarts,
-                                backoff_ms,
-                                "watcher producer failed; restarting after backoff"
-                            );
-                            thread::sleep(Duration::from_millis(backoff_ms));
-                        }
-                    }
-                }
-                producer_stats.watching_dirs.store(0, Ordering::Relaxed);
-                producer_stop.store(true, Ordering::Release);
-            }) {
+            .spawn(move || run_producer_supervisor(&producer_context))
+        {
             Ok(producer) => producer,
             Err(error) => {
-                stop_flag.store(true, Ordering::Release);
-                finish_watcher_tasks(cx, None, Some(ingest_task)).await;
-                return Err(SearchError::SubsystemError {
-                    subsystem: WATCHER_SUBSYSTEM,
-                    source: Box::new(io::Error::other(format!(
-                        "failed to spawn watcher producer: {error}"
-                    ))),
-                });
+                stop.request();
+                ingest_task.abort_with_reason(CancelReason::shutdown());
+                let _ = finish_watcher_tasks(cx, None, Some(ingest_task)).await;
+                let error =
+                    watcher_task_error(format!("failed to spawn watcher producer: {error}"));
+                lock_or_recover(&self.control).complete_generation(generation);
+                return Err(error);
             }
         };
 
-        let mut control = lock_or_recover(&self.control);
-        control.stop_flag = Some(stop_flag);
-        control.producer = Some(producer);
-        control.ingest_task = Some(ingest_task);
-        Ok(())
-    }
-
-    /// Stop background watch processing.
-    pub async fn stop(&self, cx: &Cx) {
-        let (stop_flag, producer, ingest_task) = {
+        let mut pair = Some((producer, ingest_task));
+        let published = {
             let mut control = lock_or_recover(&self.control);
-            (
-                control.stop_flag.take(),
-                control.producer.take(),
-                control.ingest_task.take(),
-            )
+            if control.generation_can_publish(generation) && !stop.is_requested() {
+                let (producer, ingest_task) = pair.take().expect("unpublished watcher pair");
+                control.lifecycle = WatcherLifecycle::Running {
+                    generation,
+                    stop: Arc::clone(&stop),
+                    producer,
+                    ingest_task,
+                };
+                true
+            } else {
+                false
+            }
         };
 
-        if let Some(flag) = stop_flag {
-            flag.store(true, Ordering::Release);
+        if published {
+            return Ok(());
         }
-        finish_watcher_tasks(cx, producer, ingest_task).await;
+
+        stop.request();
+        let (producer, ingest_task) = pair.expect("unpublished watcher pair remains owned");
+        let result = finish_watcher_tasks(cx, Some(producer), Some(ingest_task)).await;
+        lock_or_recover(&self.control).complete_generation(generation);
+        result
+    }
+
+    /// Stop background watch processing, logging any terminal task failure.
+    pub async fn stop(&self, cx: &Cx) {
+        if let Err(error) = self.stop_checked(cx).await {
+            warn!(error = %error, "fsfs watcher stopped after a task failure");
+        }
+    }
+
+    /// Stop background watch processing and return any terminal task failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns a producer or ingest task's terminal failure after both tasks
+    /// have been joined.
+    pub async fn stop_checked(&self, cx: &Cx) -> SearchResult<()> {
+        loop {
+            match lock_or_recover(&self.control).stop_decision() {
+                StopDecision::Done => return Ok(()),
+                StopDecision::Wait => {
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+                StopDecision::Drain {
+                    generation,
+                    stop,
+                    producer,
+                    ingest_task,
+                } => {
+                    stop.request();
+                    let result = finish_watcher_tasks(cx, Some(producer), Some(ingest_task)).await;
+                    lock_or_recover(&self.control).complete_generation(generation);
+                    return result;
+                }
+            }
+        }
     }
 
     /// Process one explicit event batch immediately (without debounce).
@@ -569,11 +877,39 @@ impl FsWatcher {
             });
         }
 
+        if lock_or_recover(&self.reconciliation).required {
+            run_authoritative_reconciliation(
+                cx,
+                &self.roots,
+                &self.discovery,
+                self.ingest.as_ref(),
+                &self.reconciliation,
+                &self.ready_batches,
+                &self.stats,
+                self.base_batch_size,
+            )
+            .await?;
+        }
+
         // Runs on the caller's executor under the caller's `Cx`: this path
         // builds no runtime of its own and therefore cannot strand ingest work
         // on a private one that the caller cannot cancel.
-        let outcome =
-            process_event_batch(&self.discovery, self.ingest.as_ref(), events, cx).await?;
+        let prepared = prepare_event_batch(&self.discovery, events);
+        if prepared.ops.is_empty() {
+            let outcome = prepared.outcome(0);
+            self.stats.add_skipped(outcome.skipped);
+            return Ok(outcome);
+        }
+
+        let mut guard = DirectApplyGuard::new(&self.reconciliation, events);
+        let reindexed = self.ingest.apply_batch(cx, &prepared.ops).await?;
+        if let Err(error) =
+            record_successful_events(&self.roots, &self.discovery, &self.reconciliation, events)
+        {
+            return Err(error);
+        }
+        guard.commit();
+        let outcome = prepared.outcome(reindexed);
         self.stats.add_reindexed(outcome.reindexed);
         self.stats.add_skipped(outcome.skipped);
         Ok(outcome)
@@ -645,15 +981,87 @@ impl FsWatcher {
     }
 }
 
+impl Drop for FsWatcher {
+    fn drop(&mut self) {
+        let mut control = lock_or_recover(&self.control);
+        match &mut control.lifecycle {
+            WatcherLifecycle::Stopped => {}
+            WatcherLifecycle::Starting { stop, .. } | WatcherLifecycle::Stopping { stop, .. } => {
+                stop.request()
+            }
+            WatcherLifecycle::Running {
+                stop, ingest_task, ..
+            } => {
+                stop.request();
+                ingest_task.abort_with_reason(CancelReason::shutdown());
+            }
+        }
+    }
+}
+
 struct ProducerContext {
     roots: Vec<PathBuf>,
     discovery: DiscoveryConfig,
     stats: Arc<WatcherStatsInner>,
     pressure_state: Arc<AtomicU8>,
-    stop_flag: Arc<AtomicBool>,
+    stop: Arc<WatcherStop>,
     ready_batches: ReadyBatchQueue,
+    reconciliation: ReconciliationTracker,
+    producer_done: Arc<AtomicBool>,
     base_debounce_ms: u64,
     base_batch_size: usize,
+}
+
+fn run_producer_supervisor(context: &ProducerContext) -> SearchResult<()> {
+    const MAX_RESTARTS: usize = 10;
+    const MIN_BACKOFF_MS: u64 = 500;
+    const MAX_BACKOFF_MS: u64 = 30_000;
+
+    let mut restarts = 0_usize;
+    let terminal = loop {
+        match run_producer_loop(context) {
+            Ok(()) => break Ok(()),
+            Err(error) => {
+                context.stats.add_error();
+                restarts = restarts.saturating_add(1);
+                if context.stop.is_requested() {
+                    debug!(error = %error, "watcher producer exited with error after stop signal");
+                    break Err(error);
+                }
+                if restarts > MAX_RESTARTS || !is_retryable_error(&error) {
+                    warn!(
+                        error = %error,
+                        restarts,
+                        "watcher producer reached a terminal failure"
+                    );
+                    break Err(error);
+                }
+                context
+                    .stats
+                    .worker_restarts
+                    .fetch_add(1, Ordering::Relaxed);
+                let backoff_ms = MIN_BACKOFF_MS
+                    .saturating_mul(1_u64 << restarts.min(6))
+                    .min(MAX_BACKOFF_MS);
+                warn!(
+                    error = %error,
+                    restart_attempt = restarts,
+                    backoff_ms,
+                    "watcher producer failed; restarting after backoff"
+                );
+                if context
+                    .stop
+                    .wait_or_stopped(Duration::from_millis(backoff_ms))
+                {
+                    break Err(error);
+                }
+            }
+        }
+    };
+    context.stats.watching_dirs.store(0, Ordering::Relaxed);
+    context.producer_done.store(true, Ordering::Release);
+    context.stop.request();
+    terminal
 }
 
 #[allow(clippy::too_many_lines)]
@@ -681,9 +1089,19 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
         return Ok(());
     }
 
+    let baseline = collect_snapshot_from_roots(&context.roots, &context.discovery)?;
+    {
+        let mut reconciliation = lock_or_recover(&context.reconciliation);
+        if !reconciliation.baseline_initialized {
+            reconciliation.indexed_snapshot = baseline;
+            reconciliation.baseline_initialized = true;
+        }
+    }
+
     let mut pending = PendingEvents::default();
-    let mut events_were_dropped = false;
-    while !context.stop_flag.load(Ordering::Acquire) {
+    let mut pressure_was_disabled = false;
+    let mut disconnected = false;
+    while !context.stop.is_requested() {
         let policy = WatcherExecutionPolicy::for_pressure(
             pressure_state_from_code(context.pressure_state.load(Ordering::Acquire)),
             context.base_debounce_ms,
@@ -710,7 +1128,10 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
                 Some(&mount_table),
             ),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                disconnected = true;
+                break;
+            }
         }
         while let Ok(event) = event_rx.try_recv() {
             process_notify_result(
@@ -722,10 +1143,14 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
             );
         }
 
+        observe_pressure_transition(
+            policy.watching_enabled,
+            &mut pressure_was_disabled,
+            &context.reconciliation,
+        );
         if !policy.watching_enabled {
             let dropped = pending.clear();
             if dropped > 0 {
-                events_were_dropped = true;
                 context.stats.add_skipped(dropped);
                 context.stats.events_dropped_pressure.fetch_add(
                     u64::try_from(dropped).unwrap_or(u64::MAX),
@@ -740,15 +1165,6 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
             continue;
         }
 
-        // Catchup scan after pressure relief: if events were dropped while
-        // watching was disabled, the filesystem may have changed. Re-queue
-        // synthetic events via diff_snapshots when we detect that pressure
-        // has returned to normal and events were previously dropped.
-        if events_were_dropped {
-            events_were_dropped = false;
-            debug!("pressure relieved after drops; scheduling catchup on next batch cycle");
-        }
-
         let ready = pending.drain_ready(now_millis(), policy.debounce_ms, policy.batch_size);
         if ready.is_empty() {
             continue;
@@ -757,35 +1173,98 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
         lock_or_recover(&context.ready_batches).push_back(ready);
     }
 
+    // Stop delivery before draining the channel so no callback can race the
+    // final debounce flush. Events not yet old enough are still real work and
+    // must be queued rather than discarded at shutdown.
+    drop(watcher);
+    let final_policy = WatcherExecutionPolicy::for_pressure(
+        pressure_state_from_code(context.pressure_state.load(Ordering::Acquire)),
+        context.base_debounce_ms,
+        context.base_batch_size,
+    );
+    drain_notify_channel(
+        &event_rx,
+        final_policy,
+        &context.stats,
+        &mut pending,
+        Some(&mount_table),
+    );
+    if !final_policy.watching_enabled || pressure_was_disabled {
+        lock_or_recover(&context.reconciliation).require_full_scan();
+    }
+    flush_pending_batches(
+        &mut pending,
+        &context.ready_batches,
+        context.base_batch_size,
+    );
+
+    if disconnected && !context.stop.is_requested() {
+        return Err(watcher_task_error(
+            "notify channel disconnected before watcher shutdown",
+        ));
+    }
     Ok(())
 }
 
+fn drain_notify_channel(
+    event_rx: &std::sync::mpsc::Receiver<notify::Result<Event>>,
+    policy: WatcherExecutionPolicy,
+    stats: &WatcherStatsInner,
+    pending: &mut PendingEvents,
+    mount_table: Option<&MountTable>,
+) {
+    while let Ok(event) = event_rx.try_recv() {
+        process_notify_result(event, policy, stats, pending, mount_table);
+    }
+}
+
+fn observe_pressure_transition(
+    watching_enabled: bool,
+    pressure_was_disabled: &mut bool,
+    reconciliation: &ReconciliationTracker,
+) {
+    if !watching_enabled {
+        *pressure_was_disabled = true;
+    } else if std::mem::take(pressure_was_disabled) {
+        lock_or_recover(reconciliation).require_full_scan();
+        debug!("pressure relieved; requiring authoritative watcher rescan");
+    }
+}
+
 struct IngestTaskStopGuard {
-    stop_flag: Arc<AtomicBool>,
+    stop: Arc<WatcherStop>,
 }
 
 impl Drop for IngestTaskStopGuard {
     fn drop(&mut self) {
-        self.stop_flag.store(true, Ordering::Release);
+        self.stop.request();
     }
 }
 
 struct PendingBatchLease {
     queue: ReadyBatchQueue,
+    reconciliation: ReconciliationTracker,
     batch: Option<Vec<WatchEvent>>,
+    live_apply_started: bool,
 }
 
 impl PendingBatchLease {
-    fn acquire(queue: &ReadyBatchQueue) -> Option<Self> {
+    fn acquire(queue: &ReadyBatchQueue, reconciliation: &ReconciliationTracker) -> Option<Self> {
         let batch = lock_or_recover(queue).pop_front()?;
         Some(Self {
             queue: Arc::clone(queue),
+            reconciliation: Arc::clone(reconciliation),
             batch: Some(batch),
+            live_apply_started: false,
         })
     }
 
     fn events(&self) -> &[WatchEvent] {
         self.batch.as_deref().unwrap_or_default()
+    }
+
+    fn begin_live_apply(&mut self) {
+        self.live_apply_started = true;
     }
 
     fn commit(mut self) {
@@ -796,20 +1275,74 @@ impl PendingBatchLease {
 impl Drop for PendingBatchLease {
     fn drop(&mut self) {
         if let Some(batch) = self.batch.take() {
-            lock_or_recover(&self.queue).push_front(batch);
+            if self.live_apply_started {
+                lock_or_recover(&self.reconciliation).require_for_events(&batch);
+            } else {
+                lock_or_recover(&self.queue).push_front(batch);
+            }
+        }
+    }
+}
+
+struct DirectApplyGuard {
+    reconciliation: ReconciliationTracker,
+    events: Vec<WatchEvent>,
+    committed: bool,
+}
+
+impl DirectApplyGuard {
+    fn new(reconciliation: &ReconciliationTracker, events: &[WatchEvent]) -> Self {
+        Self {
+            reconciliation: Arc::clone(reconciliation),
+            events: events.to_vec(),
+            committed: false,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for DirectApplyGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            lock_or_recover(&self.reconciliation).require_for_events(&self.events);
+        }
+    }
+}
+
+struct PreparedWatchBatch {
+    ops: Vec<WatchIngestOp>,
+    accepted: usize,
+    skipped: usize,
+}
+
+impl PreparedWatchBatch {
+    const fn outcome(&self, reindexed: usize) -> WatchBatchOutcome {
+        WatchBatchOutcome {
+            accepted: self.accepted,
+            reindexed,
+            skipped: self.skipped,
         }
     }
 }
 
 async fn run_ingest_loop(
     cx: &Cx,
+    roots: &[PathBuf],
     discovery: &DiscoveryConfig,
     ingest: &dyn WatchIngestPipeline,
     ready_batches: &ReadyBatchQueue,
-    stop_flag: &AtomicBool,
+    stop: &WatcherStop,
     stats: &WatcherStatsInner,
+    reconciliation: &ReconciliationTracker,
+    batch_size: usize,
+    producer_done: &AtomicBool,
 ) -> SearchResult<()> {
     const IDLE_POLL: Duration = Duration::from_millis(10);
+    const MAX_RECONCILIATION_ATTEMPTS: usize = 3;
+    let mut reconciliation_attempts = 0_usize;
 
     loop {
         if cx.is_cancel_requested() {
@@ -822,38 +1355,96 @@ async fn run_ingest_loop(
             });
         }
 
+        if lock_or_recover(reconciliation).required {
+            match run_authoritative_reconciliation(
+                cx,
+                roots,
+                discovery,
+                ingest,
+                reconciliation,
+                ready_batches,
+                stats,
+                batch_size,
+            )
+            .await
+            {
+                Ok(()) => {
+                    reconciliation_attempts = 0;
+                    continue;
+                }
+                Err(error) => {
+                    stats.add_error();
+                    reconciliation_attempts = reconciliation_attempts.saturating_add(1);
+                    if !is_retryable_error(&error)
+                        || cx.is_cancel_requested()
+                        || reconciliation_attempts >= MAX_RECONCILIATION_ATTEMPTS
+                    {
+                        return Err(error);
+                    }
+                    warn!(error = %error, "watcher reconciliation failed; retrying full rescan");
+                    asupersync::time::sleep(cx.now(), IDLE_POLL).await;
+                    continue;
+                }
+            }
+        }
+
         match ingest.poll_flush_barrier(cx).await {
             Ok(true) => debug!("watcher acknowledged a durable flush barrier"),
             Ok(false) => {}
             Err(error) => {
                 stats.add_error();
                 warn!(error = %error, "watcher failed to acknowledge a durable flush barrier");
+                if !is_retryable_error(&error) {
+                    return Err(error);
+                }
             }
         }
 
-        let Some(lease) = PendingBatchLease::acquire(ready_batches) else {
-            if stop_flag.load(Ordering::Acquire) {
+        let Some(mut lease) = PendingBatchLease::acquire(ready_batches, reconciliation) else {
+            if stop.is_requested() && producer_done.load(Ordering::Acquire) {
                 return Ok(());
             }
             asupersync::time::sleep(cx.now(), IDLE_POLL).await;
             continue;
         };
 
-        match process_event_batch(discovery, ingest, lease.events(), cx).await {
-            Ok(outcome) => {
+        let prepared = prepare_event_batch(discovery, lease.events());
+        if prepared.ops.is_empty() {
+            stats.add_skipped(prepared.skipped);
+            lease.commit();
+            continue;
+        }
+
+        // This is the point of no replay. Once the sink future is created it
+        // may mutate lexical, vector, or storage state before returning. Any
+        // non-success from here requires a filesystem-authoritative rescan.
+        lease.begin_live_apply();
+        match ingest.apply_batch(cx, &prepared.ops).await {
+            Ok(reindexed) => {
+                let events = lease.events().to_vec();
+                let outcome = prepared.outcome(reindexed);
                 stats.add_reindexed(outcome.reindexed);
                 stats.add_skipped(outcome.skipped);
-                // `apply_batch` returns only after the live sink's lexical
-                // commit succeeds. Until this point, Drop puts the complete
-                // batch back at the queue front on error, unwind, task cancel,
-                // or future drop.
+                if let Err(error) =
+                    record_successful_events(roots, discovery, reconciliation, &events)
+                {
+                    stats.add_error();
+                    if !is_retryable_error(&error) || cx.is_cancel_requested() {
+                        return Err(error);
+                    }
+                    asupersync::time::sleep(cx.now(), IDLE_POLL).await;
+                    continue;
+                }
                 lease.commit();
             }
             Err(error) => {
                 stats.add_error();
-                warn!(error = %error, "watcher ingest failed; preserving whole batch for retry");
+                warn!(
+                    error = %error,
+                    "watcher ingest failed after mutation boundary; requiring full rescan"
+                );
                 drop(lease);
-                if stop_flag.load(Ordering::Acquire) || cx.is_cancel_requested() {
+                if !is_retryable_error(&error) || cx.is_cancel_requested() {
                     return Err(error);
                 }
                 asupersync::time::sleep(cx.now(), IDLE_POLL).await;
@@ -864,24 +1455,161 @@ async fn run_ingest_loop(
 
 async fn finish_watcher_tasks(
     cx: &Cx,
-    producer: Option<thread::JoinHandle<()>>,
+    producer: Option<ProducerHandle>,
     ingest_task: Option<TaskHandle<SearchResult<()>>>,
-) {
-    if let Some(producer) = producer
-        && let Err(error) = producer.join()
-    {
-        warn!(?error, "fsfs watcher producer panicked during shutdown");
+) -> SearchResult<()> {
+    let mut failure = None;
+    if let Some(producer) = producer {
+        match producer.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => failure = Some(error),
+            Err(error) => {
+                failure = Some(watcher_task_error(format!(
+                    "fsfs watcher producer panicked during shutdown: {error:?}"
+                )));
+            }
+        }
     }
 
     if let Some(mut ingest_task) = ingest_task {
         match ingest_task.join(cx).await {
             Ok(Ok(())) => {}
-            Ok(Err(error)) if matches!(&error, SearchError::Cancelled { .. }) => {
-                debug!(error = %error, "fsfs watcher ingest task cancelled");
+            Ok(Err(error)) => {
+                failure.get_or_insert(error);
             }
-            Ok(Err(error)) => warn!(error = %error, "fsfs watcher ingest task failed"),
-            Err(error) => debug!(error = %error, "fsfs watcher ingest task terminated"),
+            Err(error) => {
+                failure.get_or_insert_with(|| {
+                    watcher_task_error(format!("fsfs watcher ingest task terminated: {error}"))
+                });
+            }
         }
+    }
+
+    failure.map_or(Ok(()), Err)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_authoritative_reconciliation(
+    cx: &Cx,
+    roots: &[PathBuf],
+    discovery: &DiscoveryConfig,
+    ingest: &dyn WatchIngestPipeline,
+    reconciliation: &ReconciliationTracker,
+    ready_batches: &ReadyBatchQueue,
+    stats: &WatcherStatsInner,
+    batch_size: usize,
+) -> SearchResult<()> {
+    let (epoch, indexed_snapshot, affected_paths) = {
+        let state = lock_or_recover(reconciliation);
+        (
+            state.epoch,
+            state.indexed_snapshot.clone(),
+            state.affected_paths.clone(),
+        )
+    };
+    // Every batch already visible here predates the authoritative snapshot
+    // below. Dropping it is safe: the rescan covers its final filesystem
+    // state, while batches produced after this clear remain queued and are
+    // applied after the rescan.
+    lock_or_recover(ready_batches).clear();
+    let current = collect_snapshot_from_roots(roots, discovery)?;
+    let observed_at_ms = now_millis();
+    let mount_table = build_mount_table(discovery);
+    let mut events = current
+        .keys()
+        .cloned()
+        .map(|path| {
+            build_watch_event(
+                path,
+                WatchEventKind::Modified,
+                observed_at_ms,
+                Some(&mount_table),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut deletion_candidates = indexed_snapshot.keys().cloned().collect::<BTreeSet<_>>();
+    deletion_candidates.extend(affected_paths);
+    events.extend(
+        deletion_candidates
+            .into_iter()
+            .filter(|path| !current.contains_key(path))
+            .map(|path| WatchEvent::deleted(path, observed_at_ms)),
+    );
+
+    for event_batch in events.chunks(batch_size.max(1)) {
+        if cx.is_cancel_requested() {
+            return Err(SearchError::Cancelled {
+                phase: "watch.reconcile".to_owned(),
+                reason: cx.cancel_reason().map_or_else(
+                    || "watcher reconciliation cancelled".to_owned(),
+                    |reason| reason.to_string(),
+                ),
+            });
+        }
+        let prepared = prepare_event_batch(discovery, event_batch);
+        if prepared.ops.is_empty() {
+            stats.add_skipped(prepared.skipped);
+            continue;
+        }
+        let reindexed = ingest.apply_batch(cx, &prepared.ops).await?;
+        let outcome = prepared.outcome(reindexed);
+        stats.add_reindexed(outcome.reindexed);
+        stats.add_skipped(outcome.skipped);
+    }
+
+    let mut state = lock_or_recover(reconciliation);
+    state.indexed_snapshot = current;
+    state.baseline_initialized = true;
+    if state.epoch == epoch {
+        state.required = false;
+        state.affected_paths.clear();
+    }
+    Ok(())
+}
+
+fn record_successful_events(
+    roots: &[PathBuf],
+    discovery: &DiscoveryConfig,
+    reconciliation: &ReconciliationTracker,
+    events: &[WatchEvent],
+) -> SearchResult<()> {
+    let current = collect_snapshot_from_roots(roots, discovery)?;
+    let mut state = lock_or_recover(reconciliation);
+    if !state.baseline_initialized {
+        state.indexed_snapshot = current.clone();
+        state.baseline_initialized = true;
+    }
+    for event in events {
+        if let Some(modified_at_ms) = current.get(&event.path) {
+            state
+                .indexed_snapshot
+                .insert(event.path.clone(), *modified_at_ms);
+        } else {
+            state.indexed_snapshot.remove(&event.path);
+        }
+    }
+    Ok(())
+}
+
+fn flush_pending_batches(
+    pending: &mut PendingEvents,
+    ready_batches: &ReadyBatchQueue,
+    batch_size: usize,
+) {
+    loop {
+        let batch = pending.drain_all(batch_size.max(1));
+        if batch.is_empty() {
+            break;
+        }
+        lock_or_recover(ready_batches).push_back(batch);
+    }
+}
+
+fn watcher_task_error(message: impl Into<String>) -> SearchError {
+    SearchError::SubsystemError {
+        subsystem: WATCHER_SUBSYSTEM,
+        source: Box::new(io::Error::other(message.into())),
     }
 }
 
@@ -917,12 +1645,7 @@ fn process_notify_result(
     }
 }
 
-async fn process_event_batch(
-    discovery: &DiscoveryConfig,
-    ingest: &dyn WatchIngestPipeline,
-    events: &[WatchEvent],
-    cx: &Cx,
-) -> SearchResult<WatchBatchOutcome> {
+fn prepare_event_batch(discovery: &DiscoveryConfig, events: &[WatchEvent]) -> PreparedWatchBatch {
     let mut ops = Vec::new();
     let mut skipped = 0_usize;
 
@@ -934,18 +1657,11 @@ async fn process_event_batch(
         }
     }
 
-    let accepted = ops.len();
-    let reindexed = if ops.is_empty() {
-        0
-    } else {
-        ingest.apply_batch(cx, &ops).await?
-    };
-
-    Ok(WatchBatchOutcome {
-        accepted,
-        reindexed,
+    PreparedWatchBatch {
+        accepted: ops.len(),
+        ops,
         skipped,
-    })
+    }
 }
 
 fn event_to_ingest_op(discovery: &DiscoveryConfig, event: &WatchEvent) -> Option<WatchIngestOp> {
@@ -1416,6 +2132,10 @@ impl PendingEvents {
         ready_events
     }
 
+    fn drain_all(&mut self, batch_size: usize) -> Vec<WatchEvent> {
+        self.drain_ready(u64::MAX, 0, batch_size)
+    }
+
     fn earliest_observed_at(&self) -> Option<u64> {
         self.by_time.keys().next().copied()
     }
@@ -1432,27 +2152,29 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use super::{
         DEFAULT_BATCH_SIZE, DEFAULT_DEBOUNCE_MS, FileSnapshot, FsWatcher, NoopWatchIngestPipeline,
-        PendingBatchLease, PendingEvents, ReadyBatchQueue, WatchBatchOutcome, WatchEvent,
-        WatchEventKind, WatchIngestFuture, WatchIngestOp, WatchIngestPipeline,
-        WatcherExecutionPolicy, normalize_file_key, now_millis, run_ingest_loop,
+        PendingBatchLease, PendingEvents, ReadyBatchQueue, ReconciliationState,
+        ReconciliationTracker, WatchBatchOutcome, WatchEvent, WatchEventKind, WatchIngestFuture,
+        WatchIngestOp, WatchIngestPipeline, WatcherExecutionPolicy, WatcherLifecycle, WatcherStop,
+        drain_notify_channel, flush_pending_batches, normalize_file_key, now_millis,
+        observe_pressure_transition, run_ingest_loop,
     };
     use crate::config::DiscoveryConfig;
     use crate::pressure::PressureState;
     use asupersync::Cx;
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::test_utils::run_test_with_cx;
-    use asupersync::types::{CancelKind, CancelReason};
+    use asupersync::types::CancelKind;
     use frankensearch_core::SearchError;
     use notify::event::{CreateKind, ModifyKind, RenameMode};
     use notify::{Event, EventKind};
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::{BTreeSet, HashMap, VecDeque};
     use std::fs;
     use std::future::Future;
     use std::io;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
 
     use crate::mount_info::{FsCategory, MountTable};
@@ -1462,7 +2184,7 @@ mod tests {
         batches: Mutex<Vec<Vec<WatchIngestOp>>>,
         attempts: Mutex<Vec<Vec<WatchIngestOp>>>,
         fail_next: AtomicBool,
-        stop_on_success: Mutex<Option<Arc<AtomicBool>>>,
+        stop_on_success: Mutex<Option<Arc<WatcherStop>>>,
         /// Cancellation state of the `Cx` the sink was actually handed.
         observed_cancelled: AtomicBool,
     }
@@ -1473,10 +2195,6 @@ mod tests {
                 .iter()
                 .flat_map(|batch| batch.iter().cloned())
                 .collect()
-        }
-
-        fn attempts(&self) -> Vec<Vec<WatchIngestOp>> {
-            lock_or_recover(&self.attempts).clone()
         }
     }
 
@@ -1501,10 +2219,66 @@ mod tests {
                 }
 
                 lock_or_recover(&self.batches).push(batch.to_vec());
-                if let Some(stop_flag) = lock_or_recover(&self.stop_on_success).as_ref() {
-                    stop_flag.store(true, Ordering::Release);
+                if let Some(stop) = lock_or_recover(&self.stop_on_success).as_ref() {
+                    stop.request();
                 }
                 Ok(batch.len())
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct PartialMutationPipeline {
+        attempts: AtomicUsize,
+        applied: Mutex<Vec<WatchIngestOp>>,
+        fail_after_first: AtomicBool,
+        stop_on_success: Mutex<Option<Arc<WatcherStop>>>,
+    }
+
+    impl WatchIngestPipeline for PartialMutationPipeline {
+        fn apply_batch<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            batch: &'a [WatchIngestOp],
+        ) -> WatchIngestFuture<'a, usize> {
+            Box::pin(async move {
+                self.attempts.fetch_add(1, Ordering::AcqRel);
+                if self.fail_after_first.swap(false, Ordering::AcqRel) {
+                    if let Some(first) = batch.first() {
+                        lock_or_recover(&self.applied).push(first.clone());
+                    }
+                    return Err(SearchError::SubsystemError {
+                        subsystem: "test",
+                        source: Box::new(io::Error::other("failed after first live mutation")),
+                    });
+                }
+                lock_or_recover(&self.applied).extend_from_slice(batch);
+                if let Some(stop) = lock_or_recover(&self.stop_on_success).as_ref() {
+                    stop.request();
+                }
+                Ok(batch.len())
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct PermanentFailurePipeline {
+        attempts: AtomicUsize,
+    }
+
+    impl WatchIngestPipeline for PermanentFailurePipeline {
+        fn apply_batch<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _batch: &'a [WatchIngestOp],
+        ) -> WatchIngestFuture<'a, usize> {
+            Box::pin(async move {
+                self.attempts.fetch_add(1, Ordering::AcqRel);
+                Err(SearchError::InvalidConfig {
+                    field: "watch.test".to_owned(),
+                    value: "poison".to_owned(),
+                    reason: "permanent batch failure".to_owned(),
+                })
             })
         }
     }
@@ -2006,13 +2780,16 @@ mod tests {
     #[test]
     fn ingest_sink_observes_the_callers_cancellation_not_a_fresh_context() {
         run_test_with_cx(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let file = temp.path().join("lib.rs");
+            fs::write(&file, "fn live() {}\n").expect("write live file");
             let pipeline = Arc::new(RecordingPipeline::default());
             let watcher = FsWatcher::new(
-                vec![PathBuf::from("/tmp/repo")],
+                vec![temp.path().to_path_buf()],
                 DiscoveryConfig::default(),
                 pipeline.clone(),
             );
-            let event = WatchEvent::modified("/tmp/repo/src/lib.rs", now_millis(), Some(128));
+            let event = WatchEvent::modified(file, now_millis(), Some(128));
 
             watcher
                 .process_events_now(&cx, std::slice::from_ref(&event))
@@ -2096,7 +2873,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_batch_lease_requeues_the_whole_batch_at_the_front_on_drop() {
+    fn pending_batch_lease_requeues_only_before_live_apply_starts() {
         let first = vec![
             WatchEvent::modified("/tmp/repo/src/a.rs", 100, Some(10)),
             WatchEvent::modified("/tmp/repo/src/b.rs", 110, Some(20)),
@@ -2104,8 +2881,10 @@ mod tests {
         let second = vec![WatchEvent::deleted("/tmp/repo/src/c.rs", 120)];
         let queue: ReadyBatchQueue =
             Arc::new(Mutex::new(VecDeque::from([first.clone(), second.clone()])));
+        let reconciliation: ReconciliationTracker =
+            Arc::new(Mutex::new(ReconciliationState::default()));
 
-        let lease = PendingBatchLease::acquire(&queue).expect("first batch lease");
+        let lease = PendingBatchLease::acquire(&queue, &reconciliation).expect("first batch lease");
         assert_eq!(lease.events(), first);
         assert_eq!(lock_or_recover(&queue).front(), Some(&second));
         drop(lease);
@@ -2115,69 +2894,95 @@ mod tests {
             vec![first, second],
             "dropping a lease must restore the complete batch before later work"
         );
+        assert!(!lock_or_recover(&reconciliation).required);
     }
 
     #[test]
-    fn pending_batch_lease_requeues_on_panic_unwind() {
-        let batch = vec![WatchEvent::deleted("/tmp/repo/src/panic.rs", 200)];
+    fn live_apply_drop_disarms_replay_and_requires_reconciliation() {
+        let batch = vec![WatchEvent::deleted("/tmp/repo/src/dropped.rs", 200)];
         let queue: ReadyBatchQueue = Arc::new(Mutex::new(VecDeque::from([batch.clone()])));
+        let reconciliation: ReconciliationTracker =
+            Arc::new(Mutex::new(ReconciliationState::default()));
+
+        let mut lease = PendingBatchLease::acquire(&queue, &reconciliation).expect("batch lease");
+        lease.begin_live_apply();
+        drop(lease);
+
+        assert!(lock_or_recover(&queue).is_empty());
+        let state = lock_or_recover(&reconciliation);
+        assert!(state.required);
+        assert!(state.affected_paths.contains(&batch[0].path));
+    }
+
+    #[test]
+    fn panic_after_live_apply_boundary_requires_reconciliation_without_replay() {
+        let batch = vec![WatchEvent::deleted("/tmp/repo/src/panic.rs", 300)];
+        let queue: ReadyBatchQueue = Arc::new(Mutex::new(VecDeque::from([batch.clone()])));
+        let reconciliation: ReconciliationTracker =
+            Arc::new(Mutex::new(ReconciliationState::default()));
 
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
             let queue = Arc::clone(&queue);
+            let reconciliation = Arc::clone(&reconciliation);
             move || {
-                let _lease = PendingBatchLease::acquire(&queue).expect("batch lease");
-                panic!("hostile ingest unwind");
+                let mut lease =
+                    PendingBatchLease::acquire(&queue, &reconciliation).expect("batch lease");
+                lease.begin_live_apply();
+                panic!("hostile ingest unwind after first possible mutation");
             }
         }));
         assert!(unwind.is_err());
-        assert_eq!(lock_or_recover(&queue).front(), Some(&batch));
-    }
-
-    #[test]
-    fn pending_batch_lease_requeues_when_owning_future_is_dropped() {
-        let batch = vec![WatchEvent::deleted("/tmp/repo/src/dropped.rs", 300)];
-        let queue: ReadyBatchQueue = Arc::new(Mutex::new(VecDeque::from([batch.clone()])));
-        let queue_for_future = Arc::clone(&queue);
-        let mut future = Box::pin(async move {
-            let _lease = PendingBatchLease::acquire(&queue_for_future).expect("batch lease");
-            std::future::pending::<()>().await;
-        });
-        let waker = std::task::Waker::noop();
-        let mut poll_cx = std::task::Context::from_waker(waker);
-        assert!(future.as_mut().poll(&mut poll_cx).is_pending());
         assert!(lock_or_recover(&queue).is_empty());
-        drop(future);
-        assert_eq!(lock_or_recover(&queue).front(), Some(&batch));
+        assert!(lock_or_recover(&reconciliation).required);
     }
 
     #[test]
-    fn failed_batch_is_retried_once_without_partial_queue_mutation() {
+    fn post_first_mutation_failure_converges_through_full_rescan() {
         run_on_runtime_task(|cx| async move {
-            let pipeline = Arc::new(RecordingPipeline::default());
-            pipeline.fail_next.store(true, Ordering::Release);
-            let stop_flag = Arc::new(AtomicBool::new(false));
-            *lock_or_recover(&pipeline.stop_on_success) = Some(Arc::clone(&stop_flag));
+            let temp = tempdir().expect("tempdir");
+            let first_path = temp.path().join("a.rs");
+            let second_path = temp.path().join("b.rs");
+            fs::write(&first_path, "fn a() {}\n").expect("write first");
+            fs::write(&second_path, "fn b() {}\n").expect("write second");
+
+            let pipeline = Arc::new(PartialMutationPipeline::default());
+            pipeline.fail_after_first.store(true, Ordering::Release);
+            let stop = Arc::new(WatcherStop::default());
+            *lock_or_recover(&pipeline.stop_on_success) = Some(Arc::clone(&stop));
 
             let events = vec![
-                WatchEvent::deleted("/tmp/repo/src/a.rs", 100),
-                WatchEvent::deleted("/tmp/repo/src/b.rs", 110),
+                WatchEvent::modified(&first_path, 100, Some(10)),
+                WatchEvent::modified(&second_path, 110, Some(10)),
             ];
-            let queue: ReadyBatchQueue = Arc::new(Mutex::new(VecDeque::from([events.clone()])));
+            let stale_later_delete = WatchEvent::deleted(&first_path, 120);
+            let queue: ReadyBatchQueue = Arc::new(Mutex::new(VecDeque::from([
+                events,
+                vec![stale_later_delete],
+            ])));
+            let reconciliation: ReconciliationTracker =
+                Arc::new(Mutex::new(ReconciliationState::default()));
             let stats = Arc::new(super::WatcherStatsInner::default());
             let discovery = DiscoveryConfig::default();
             let pipeline_for_task = Arc::clone(&pipeline);
             let queue_for_task = Arc::clone(&queue);
-            let stop_for_task = Arc::clone(&stop_flag);
+            let stop_for_task = Arc::clone(&stop);
             let stats_for_task = Arc::clone(&stats);
+            let reconciliation_for_task = Arc::clone(&reconciliation);
+            let root = temp.path().to_path_buf();
+            let producer_done = Arc::new(AtomicBool::new(true));
             let mut task = cx
                 .spawn_local(move |child_cx| async move {
                     run_ingest_loop(
                         &child_cx,
+                        &[root],
                         &discovery,
                         pipeline_for_task.as_ref(),
                         &queue_for_task,
                         &stop_for_task,
                         &stats_for_task,
+                        &reconciliation_for_task,
+                        100,
+                        &producer_done,
                     )
                     .await
                 })
@@ -2186,24 +2991,34 @@ mod tests {
             task.join(&cx)
                 .await
                 .expect("ingest task terminal result")
-                .expect("fail-once batch should retry successfully");
+                .expect("full rescan should converge after partial mutation");
 
-            let attempts = pipeline.attempts();
-            assert_eq!(
-                attempts.len(),
-                2,
-                "one failure must cause exactly one retry"
+            assert_eq!(pipeline.attempts.load(Ordering::Acquire), 2);
+            let applied = lock_or_recover(&pipeline.applied);
+            assert_eq!(applied.len(), 3);
+            assert!(
+                applied
+                    .iter()
+                    .all(|op| matches!(op, WatchIngestOp::Upsert { .. })),
+                "the stale queued delete must be subsumed by the rescan"
             );
-            assert_eq!(attempts[0], attempts[1]);
-            assert_eq!(attempts[0].len(), events.len());
-            assert_eq!(lock_or_recover(&pipeline.batches).len(), 1);
+            let upserted_files = applied
+                .iter()
+                .filter_map(|op| match op {
+                    WatchIngestOp::Upsert { file_key, .. } => Some(file_key.clone()),
+                    WatchIngestOp::Delete { .. } => None,
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(upserted_files.len(), 2);
+            drop(applied);
             assert!(lock_or_recover(&queue).is_empty());
+            assert!(!lock_or_recover(&reconciliation).required);
             assert_eq!(stats.snapshot().errors, 1);
         });
     }
 
     #[test]
-    fn child_cancellation_preserves_typed_lineage_and_pending_batch() {
+    fn same_region_task_cancellation_reports_the_natural_user_reason() {
         run_on_runtime_task(|cx| async move {
             let pipeline = Arc::new(CancellationProbePipeline::default());
             let temp = tempdir().expect("tempdir");
@@ -2227,56 +3042,222 @@ mod tests {
                 panic!("ingest task did not acquire the queued batch");
             }
 
-            let parent_reason = CancelReason::user("watcher parent cancelled");
-            cx.set_cancel_reason(parent_reason.clone());
-            let child_reason = CancelReason::parent_cancelled().with_cause(parent_reason);
-            lock_or_recover(&watcher.control)
-                .ingest_task
-                .as_ref()
-                .expect("ingest task handle")
-                .abort_with_reason(child_reason);
-            watcher.stop(&cx).await;
+            {
+                let control = lock_or_recover(&watcher.control);
+                let WatcherLifecycle::Running { ingest_task, .. } = &control.lifecycle else {
+                    panic!("watcher should be running");
+                };
+                ingest_task.abort();
+            }
+            let _stop_error = watcher
+                .stop_checked(&cx)
+                .await
+                .expect_err("cancel must surface");
 
             let child_cx = lock_or_recover(&pipeline.child_cx)
                 .clone()
                 .expect("sink observed child context");
-            assert!(cx.cancelled_by(CancelKind::User));
             assert_eq!(
                 child_cx.cancel_reason().map(|reason| reason.kind),
-                Some(CancelKind::ParentCancelled)
+                Some(CancelKind::User)
             );
-            assert!(child_cx.cancelled_by(CancelKind::ParentCancelled));
+            assert!(child_cx.cancelled_by(CancelKind::User));
+            assert!(!child_cx.cancelled_by(CancelKind::ParentCancelled));
             let chain = child_cx
                 .cancel_chain()
                 .map(|reason| reason.kind)
                 .collect::<Vec<_>>();
-            assert_eq!(chain, vec![CancelKind::ParentCancelled, CancelKind::User]);
+            assert_eq!(chain, vec![CancelKind::User]);
             assert!(pipeline.future_dropped.load(Ordering::Acquire));
             assert_eq!(pipeline.attempts.load(Ordering::Acquire), 1);
-            assert_eq!(
-                lock_or_recover(&watcher.ready_batches).front(),
-                Some(&batch)
-            );
-            assert!(lock_or_recover(&watcher.control).ingest_task.is_none());
+            assert!(lock_or_recover(&watcher.ready_batches).is_empty());
+            assert!(lock_or_recover(&watcher.reconciliation).required);
+            assert!(matches!(
+                &lock_or_recover(&watcher.control).lifecycle,
+                WatcherLifecycle::Stopped
+            ));
         });
     }
 
     #[test]
-    fn start_and_stop_producer_with_caller_owned_ingest_task() {
+    fn concurrent_starts_and_stop_publish_one_generation_and_terminate() {
         run_on_runtime_task(|cx| async move {
             let temp = tempdir().expect("tempdir");
-            let watcher = FsWatcher::new(
+            let watcher = Arc::new(FsWatcher::new(
                 vec![temp.path().to_path_buf()],
                 DiscoveryConfig::default(),
                 Arc::new(NoopWatchIngestPipeline),
-            );
+            ));
 
-            watcher.start(&cx).await.expect("start watcher");
-            watcher.stop(&cx).await;
+            let first_watcher = Arc::clone(&watcher);
+            let second_watcher = Arc::clone(&watcher);
+            let second_entered = Arc::new(AtomicBool::new(false));
+            let second_entered_for_task = Arc::clone(&second_entered);
+            let mut first = cx
+                .spawn_local(move |child_cx| async move { first_watcher.start(&child_cx).await })
+                .expect("spawn first start");
+            let mut second = cx
+                .spawn_local(move |child_cx| async move {
+                    second_entered_for_task.store(true, Ordering::Release);
+                    second_watcher.start(&child_cx).await
+                })
+                .expect("spawn second start");
+
+            for _ in 0..1_000 {
+                if second_entered.load(Ordering::Acquire) {
+                    break;
+                }
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            let stop_watcher = Arc::clone(&watcher);
+            let mut stop = cx
+                .spawn_local(
+                    move |child_cx| async move { stop_watcher.stop_checked(&child_cx).await },
+                )
+                .expect("spawn concurrent stop");
+
+            first
+                .join(&cx)
+                .await
+                .expect("first start task")
+                .expect("first start result");
+            second
+                .join(&cx)
+                .await
+                .expect("second start task")
+                .expect("second start result");
+            stop.join(&cx)
+                .await
+                .expect("stop task")
+                .expect("stop result");
+            assert_eq!(lock_or_recover(&watcher.control).next_generation, 1);
+
             let control = lock_or_recover(&watcher.control);
-            assert!(control.producer.is_none());
-            assert!(control.ingest_task.is_none());
+            assert!(matches!(&control.lifecycle, WatcherLifecycle::Stopped));
         });
+    }
+
+    #[test]
+    fn permanent_poison_batch_is_not_retried_and_stop_surfaces_failure() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let file = temp.path().join("poison.rs");
+            fs::write(&file, "fn poison() {}\n").expect("write poison");
+            let pipeline = Arc::new(PermanentFailurePipeline::default());
+            let watcher = FsWatcher::new(
+                vec![temp.path().to_path_buf()],
+                DiscoveryConfig::default(),
+                pipeline.clone(),
+            );
+            watcher.start(&cx).await.expect("start watcher");
+            lock_or_recover(&watcher.ready_batches).push_back(vec![WatchEvent::modified(
+                file,
+                500,
+                Some(16),
+            )]);
+
+            for _ in 0..1_000 {
+                if pipeline.attempts.load(Ordering::Acquire) > 0 {
+                    break;
+                }
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            let error = watcher
+                .stop_checked(&cx)
+                .await
+                .expect_err("poison failure must surface");
+            assert!(error.to_string().contains("permanent batch failure"));
+            assert_eq!(pipeline.attempts.load(Ordering::Acquire), 1);
+            assert!(lock_or_recover(&watcher.reconciliation).required);
+        });
+    }
+
+    #[test]
+    fn stop_flushes_events_that_have_not_reached_the_debounce_deadline() {
+        let temp = tempdir().expect("tempdir");
+        let channel_path = temp.path().join("channel.rs");
+        fs::write(&channel_path, "fn channel() {}\n").expect("write channel file");
+        let mut pending = PendingEvents::default();
+        let event = WatchEvent::modified("/tmp/repo/src/debounce.rs", 1_000, Some(8));
+        pending.push(event.clone());
+        assert!(pending.drain_ready(1_001, 500, 10).is_empty());
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(Event::new(EventKind::Modify(ModifyKind::Data(
+            notify::event::DataChange::Any,
+        )))
+        .add_path(channel_path.clone())))
+            .expect("queue channel event");
+        let stats = super::WatcherStatsInner::default();
+        drain_notify_channel(
+            &rx,
+            WatcherExecutionPolicy::for_pressure(PressureState::Normal, 500, 10),
+            &stats,
+            &mut pending,
+            None,
+        );
+        let queue: ReadyBatchQueue = Arc::new(Mutex::new(VecDeque::new()));
+
+        flush_pending_batches(&mut pending, &queue, 10);
+
+        let drained = lock_or_recover(&queue)
+            .iter()
+            .flatten()
+            .map(|event| event.path.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(drained, BTreeSet::from([event.path, channel_path]));
+        assert!(pending.by_path.is_empty());
+    }
+
+    #[test]
+    fn pressure_recovery_requires_an_authoritative_rescan() {
+        let reconciliation: ReconciliationTracker =
+            Arc::new(Mutex::new(ReconciliationState::default()));
+        let mut pressure_was_disabled = false;
+
+        observe_pressure_transition(false, &mut pressure_was_disabled, &reconciliation);
+        assert!(pressure_was_disabled);
+        assert!(!lock_or_recover(&reconciliation).required);
+        observe_pressure_transition(true, &mut pressure_was_disabled, &reconciliation);
+
+        assert!(!pressure_was_disabled);
+        assert!(lock_or_recover(&reconciliation).required);
+    }
+
+    #[test]
+    fn stop_signal_interrupts_the_maximum_producer_backoff() {
+        let stop = Arc::new(WatcherStop::default());
+        let waiter_stop = Arc::clone(&stop);
+        let waiter = std::thread::spawn(move || {
+            let started = Instant::now();
+            assert!(waiter_stop.wait_or_stopped(Duration::from_secs(30)));
+            started.elapsed()
+        });
+
+        std::thread::sleep(Duration::from_millis(10));
+        stop.request();
+        let elapsed = waiter.join().expect("backoff waiter must not panic");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "stop should wake producer backoff promptly, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn dropping_a_starting_watcher_signals_its_generation() {
+        let stop = Arc::new(WatcherStop::default());
+        let watcher = FsWatcher::new(
+            Vec::new(),
+            DiscoveryConfig::default(),
+            Arc::new(NoopWatchIngestPipeline),
+        );
+        lock_or_recover(&watcher.control).lifecycle = WatcherLifecycle::Starting {
+            generation: 1,
+            stop: Arc::clone(&stop),
+        };
+
+        drop(watcher);
+
+        assert!(stop.is_requested());
     }
 
     #[test]
@@ -2295,15 +3276,12 @@ mod tests {
             asupersync::time::sleep(cx.now(), Duration::from_millis(100)).await;
 
             {
-                let producer_finished = lock_or_recover(&watcher.control)
-                    .producer
-                    .as_ref()
-                    .expect("producer handle should be retained")
-                    .is_finished();
-                assert!(
-                    producer_finished,
-                    "expected initial producer to have exited"
-                );
+                let control = lock_or_recover(&watcher.control);
+                assert!(match &control.lifecycle {
+                    WatcherLifecycle::Stopped => true,
+                    WatcherLifecycle::Running { producer, .. } => producer.is_finished(),
+                    WatcherLifecycle::Starting { .. } | WatcherLifecycle::Stopping { .. } => false,
+                });
             }
 
             // Create the root and start again. Both terminal handles are drained
@@ -2313,18 +3291,21 @@ mod tests {
             asupersync::time::sleep(cx.now(), Duration::from_millis(50)).await;
 
             {
-                let finished = lock_or_recover(&watcher.control)
-                    .producer
-                    .as_ref()
-                    .expect("producer handle should exist after restart")
-                    .is_finished();
+                let control = lock_or_recover(&watcher.control);
+                let finished = match &control.lifecycle {
+                    WatcherLifecycle::Running { producer, .. } => producer.is_finished(),
+                    _ => panic!("producer handle should exist after restart"),
+                };
                 assert!(
                     !finished,
                     "watcher should replace finished producer handle on restart"
                 );
             }
 
-            watcher.stop(&cx).await;
+            watcher
+                .stop_checked(&cx)
+                .await
+                .expect("stop restarted watcher");
         });
     }
 

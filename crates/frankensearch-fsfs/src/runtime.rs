@@ -14259,7 +14259,7 @@ impl FsfsRuntime {
                             Some((&lifecycle_tracker, &storage_paths)),
                         )
                         .await;
-                    watcher.stop(cx).await;
+                    watcher.stop_checked(cx).await?;
                     self.finalize_shutdown(cx, reason, Some(&vi_handle)).await?;
                 }
                 Err(ref error)
@@ -14312,6 +14312,9 @@ impl FsfsRuntime {
 
         loop {
             if let Some(watcher) = watcher {
+                if watcher.has_terminal_task_outcome() {
+                    return ShutdownReason::Error("filesystem watcher task terminated".to_owned());
+                }
                 let now_ms = pressure_timestamp_ms();
                 if now_ms.saturating_sub(last_pressure_sample_ms) >= sample_interval_ms {
                     let mut target_watcher_state: Option<PressureState> = None;
