@@ -1192,6 +1192,10 @@ enum WriterPlan {
     /// `Shipping` silently moved the single-threaded oracle off
     /// `writer_with_num_threads(1, heap)` and onto Tantivy's auto selection —
     /// a real behaviour change bought only to express "no receipt".
+    ///
+    /// Gated with its only constructor, so the default build carries no
+    /// variant that nothing can build.
+    #[cfg(feature = "tantivy-oracle")]
     PinnedWidth(usize),
     /// Explicit benchmark construction through Tantivy's own width selection.
     #[cfg(feature = "bench-internals")]
@@ -1211,7 +1215,9 @@ impl WriterPlan {
     const fn benchmark_threads(self) -> Option<usize> {
         match self {
             Self::BenchmarkFixed(threads) => Some(threads),
-            Self::Shipping | Self::PinnedWidth(_) | Self::BenchmarkShippingAuto => None,
+            Self::Shipping | Self::BenchmarkShippingAuto => None,
+            #[cfg(feature = "tantivy-oracle")]
+            Self::PinnedWidth(_) => None,
         }
     }
 }
@@ -1564,6 +1570,51 @@ pub struct TantivyIndex {
     /// was built through a benchmark seam.
     #[cfg(feature = "bench-internals")]
     benchmark_writer_receipt: Option<BenchmarkWriterReceipt>,
+    /// Which Tantivy writer constructor this index actually invoked.
+    ///
+    /// Per-instance and test-only: a plan or receipt records what the caller
+    /// *asked for*, so a test reading either proves nothing about the call that
+    /// ran. This is written by the helper that performs the call itself. It is
+    /// deliberately not a global counter — parallel tests would race one.
+    #[cfg(test)]
+    observed_writer_call: WriterCall,
+}
+
+/// The Tantivy writer constructor a `TantivyIndex` actually invoked.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterCall {
+    /// `Index::writer(heap)` — Tantivy selected the width.
+    Auto,
+    /// `Index::writer_with_num_threads(threads, heap)`.
+    Fixed(usize),
+}
+
+/// Perform the shipping-auto Tantivy call, recording that it was the one made.
+fn call_auto_writer(
+    index: &Index,
+    writer_heap_bytes: usize,
+    #[cfg(test)] observed: &mut WriterCall,
+) -> tantivy::Result<IndexWriter> {
+    #[cfg(test)]
+    {
+        *observed = WriterCall::Auto;
+    }
+    index.writer(writer_heap_bytes)
+}
+
+/// Perform the pinned-width Tantivy call, recording that it was the one made.
+fn call_fixed_writer(
+    index: &Index,
+    threads: usize,
+    writer_heap_bytes: usize,
+    #[cfg(test)] observed: &mut WriterCall,
+) -> tantivy::Result<IndexWriter> {
+    #[cfg(test)]
+    {
+        *observed = WriterCall::Fixed(threads);
+    }
+    index.writer_with_num_threads(threads, writer_heap_bytes)
 }
 
 impl std::fmt::Debug for TantivyIndex {
@@ -2219,19 +2270,38 @@ impl TantivyIndex {
         // produced here by the arm that actually ran.
         #[cfg(feature = "bench-internals")]
         let mut benchmark_writer_receipt = None;
+        // Default is overwritten by whichever helper actually runs below; the
+        // helper is the only writer of this value.
+        #[cfg(test)]
+        let mut observed_writer_call = WriterCall::Auto;
         let writer = match plan {
             // Ordinary shipping construction reaches the same Tantivy call as a
             // benchmark shipping-auto construction, and deliberately produces no
             // receipt: only an explicit benchmark plan may claim one.
-            WriterPlan::Shipping => index.writer(writer_heap_bytes),
+            WriterPlan::Shipping => call_auto_writer(
+                &index,
+                writer_heap_bytes,
+                #[cfg(test)]
+                &mut observed_writer_call,
+            ),
             // Pinned but unscreened: the same Tantivy call a benchmark fixed
             // plan makes, deliberately without a receipt.
-            WriterPlan::PinnedWidth(thread_count) => {
-                index.writer_with_num_threads(thread_count, writer_heap_bytes)
-            }
+            #[cfg(feature = "tantivy-oracle")]
+            WriterPlan::PinnedWidth(thread_count) => call_fixed_writer(
+                &index,
+                thread_count,
+                writer_heap_bytes,
+                #[cfg(test)]
+                &mut observed_writer_call,
+            ),
             #[cfg(feature = "bench-internals")]
             WriterPlan::BenchmarkShippingAuto => {
-                let writer = index.writer(writer_heap_bytes);
+                let writer = call_auto_writer(
+                    &index,
+                    writer_heap_bytes,
+                    #[cfg(test)]
+                    &mut observed_writer_call,
+                );
                 if writer.is_ok() {
                     benchmark_writer_receipt = Some(BenchmarkWriterReceipt::seed(
                         BenchmarkWriterMode::ShippingAuto,
@@ -2243,7 +2313,13 @@ impl TantivyIndex {
             }
             #[cfg(feature = "bench-internals")]
             WriterPlan::BenchmarkFixed(thread_count) => {
-                let writer = index.writer_with_num_threads(thread_count, writer_heap_bytes);
+                let writer = call_fixed_writer(
+                    &index,
+                    thread_count,
+                    writer_heap_bytes,
+                    #[cfg(test)]
+                    &mut observed_writer_call,
+                );
                 if writer.is_ok() {
                     benchmark_writer_receipt = Some(BenchmarkWriterReceipt::seed(
                         BenchmarkWriterMode::Fixed {
@@ -2318,6 +2394,8 @@ impl TantivyIndex {
             // no-feature build names a field that does not exist.
             #[cfg(feature = "bench-internals")]
             benchmark_writer_receipt,
+            #[cfg(test)]
+            observed_writer_call,
         })
     }
 
@@ -6221,35 +6299,47 @@ mod benchmark_writer_mode_tests {
         );
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
-    fn the_ordinary_pinned_oracle_still_reaches_the_fixed_constructor() {
-        // Width and receipt are independent axes, and conflating them once
-        // already moved this oracle off writer_with_num_threads(1, ..) and onto
-        // Tantivy's auto selection.
-        //
-        // Discrimination here is bounded by what Tantivy exposes: there is no
-        // public width accessor, and at this crate's writer budget both
-        // constructors succeed for width 1, so no failure-mode difference
-        // separates them the way the one-thread-floor budget separates the
-        // eight-wide case above. What is checkable is that the pinned plan
-        // still constructs, and still refuses to present a screening identity.
+    fn the_ordinary_pinned_oracle_invokes_the_fixed_constructor() {
+        use super::WriterCall;
+
+        // Asserting "no receipt" here proves nothing: reverting this oracle to
+        // WriterPlan::Shipping keeps the receipt absent while silently moving
+        // the writer onto Tantivy's auto selection, which is exactly the
+        // regression this test exists to catch. So observe the call itself,
+        // recorded by the helper that performed it, on this instance — not a
+        // global counter that parallel tests would race.
         let oracle =
             TantivyIndex::in_memory_single_threaded_oracle().expect("single-threaded oracle");
-        assert!(oracle.benchmark_writer_receipt().is_none());
 
-        // The behavioural probe that *is* available: a benchmark fixed plan at
-        // width 1 reaches the same Tantivy call, and unlike the auto path it
-        // accepts a budget far below what auto selection would clamp for.
-        let pinned_narrow =
-            TantivyIndex::in_memory_with_benchmark_config(ONE_THREAD_FLOOR_HEAP, 1, true)
-                .expect("writer_with_num_threads accepts one writer at one writer's floor");
         assert_eq!(
-            pinned_narrow
-                .benchmark_writer_receipt()
-                .expect("receipt")
-                .materialized_width,
-            BenchmarkMaterializedWidth::Authenticated(1)
+            oracle.observed_writer_call,
+            WriterCall::Fixed(1),
+            "the oracle must invoke writer_with_num_threads(1, ..), not the auto path"
         );
+        assert!(
+            oracle.benchmark_writer_receipt().is_none(),
+            "invoking the fixed constructor still claims no screening identity"
+        );
+    }
+
+    #[test]
+    fn the_observed_call_tracks_the_constructor_each_plan_reaches() {
+        use super::WriterCall;
+
+        // The same observer over the benchmark plans, so a plan that reached
+        // the wrong Tantivy entry point cannot hide behind a matching label.
+        let auto =
+            TantivyIndex::in_memory_with_shipping_auto_writer(HEAP, true).expect("auto writer");
+        assert_eq!(auto.observed_writer_call, WriterCall::Auto);
+
+        let fixed =
+            TantivyIndex::in_memory_with_benchmark_config(HEAP, 4, true).expect("fixed writer");
+        assert_eq!(fixed.observed_writer_call, WriterCall::Fixed(4));
+
+        let ordinary = TantivyIndex::in_memory().expect("ordinary in-memory index");
+        assert_eq!(ordinary.observed_writer_call, WriterCall::Auto);
     }
 
     #[test]
