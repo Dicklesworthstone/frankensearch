@@ -73,7 +73,7 @@ frankensearch-quill = { version = "0.2.1", path = "crates/frankensearch-quill" }
 # current-thread `block_on` runtimes (bd-z6pu). Hard-pinning the old release
 # was unsatisfiable under downstream patches and deadlocked am's dependency
 # graph (cargo resolution EXIT 101). [bd-3h229]
-asupersync = { version = ">=0.3.10, <0.4", default-features = false, features = ["proc-macros"] }
+asupersync = { version = ">=0.3.10, <0.5", default-features = false, features = ["proc-macros"] }
 arc-swap = "=1.9.2"
 
 # Descriptor-relative generation-root admission. Keep the syscall surface
