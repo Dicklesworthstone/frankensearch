@@ -910,6 +910,76 @@ fn surface_receipt(
     }
 }
 
+/// Byte, topology, and typed agreement every manifest must satisfy for the
+/// byte-matched QG-2 block, shared by the applied validator and the preflight.
+///
+/// `applied` selects which protected block is authoritative. Beyond that block
+/// this also closes two gaps the typed contract cannot see on its own: a gate
+/// label the normative set does not define, and a `qg2_contract` table hung
+/// under some *other* gate, where the live consumer would reject it as an
+/// unexpected field while a QG-2-only check would never look.
+fn manifest_block_agreement(source: &str, applied: bool) -> Result<(), String> {
+    let (expected, other, expected_topology) = if applied {
+        (
+            QG2_MANIFEST_BLOCK_POST_REGION,
+            QG2_MANIFEST_BLOCK_PRE_REGION,
+            Qg2BlockTopology::Applied,
+        )
+    } else {
+        (
+            QG2_MANIFEST_BLOCK_PRE_REGION,
+            QG2_MANIFEST_BLOCK_POST_REGION,
+            Qg2BlockTopology::Bootstrap,
+        )
+    };
+    let expected_count = source.matches(expected).count();
+    let other_count = source.matches(other).count();
+    if expected_count != 1 || other_count != 0 {
+        return Err(format!(
+            "expected exactly one protected block on the {} side; found {expected_count} expected \
+             and {other_count} opposite blocks",
+            if applied { "applied" } else { "bootstrap" }
+        ));
+    }
+    match qg2_block_topology(source) {
+        Ok(topology) if topology == expected_topology => {}
+        Ok(topology) => return Err(format!("table ordering reports {topology:?}")),
+        Err(error) => return Err(error),
+    }
+
+    let document = toml::from_str::<ManifestDocument>(source).map_err(|error| {
+        format!("the manifest does not parse under the closed gate model: {error}")
+    })?;
+    let normative = PerfGate::ALL
+        .iter()
+        .map(|gate| gate.label())
+        .collect::<BTreeSet<_>>();
+    for (label, gate) in &document.gate {
+        if !normative.contains(label.as_str()) {
+            return Err(format!("manifest defines unexpected gate.{label}"));
+        }
+        if label != "QG-2" && gate.qg2_contract.is_some() {
+            return Err(format!(
+                "gate.{label} declares a qg2_contract table that only QG-2 may carry"
+            ));
+        }
+    }
+    if document
+        .gate
+        .get("QG-2")
+        .is_some_and(|gate| gate.agrees_with_qg2_block(expected, applied))
+    {
+        Ok(())
+    } else {
+        Err("the typed gate.QG-2 view disagrees with the byte-matched protected block".to_owned())
+    }
+}
+
+/// Agreement for the applied side, used by the applied-state validator.
+fn applied_manifest_block_agreement(source: &str) -> Result<(), String> {
+    manifest_block_agreement(source, true)
+}
+
 fn validate_manifest_surface(repo_root: &Path, report: &mut ReportBuilder) {
     let source = match fs::read_to_string(repo_root.join(PERF_MANIFEST_PATH)) {
         Ok(source) => source,
@@ -948,6 +1018,22 @@ fn validate_manifest_surface(repo_root: &Path, report: &mut ReportBuilder) {
             "docs/contracts/quill-perf-gates.toml#gate.QG-2.qg2_contract",
             "exactly one canonical Q2C clause",
             Some(&format!("{marker_count} canonical clauses")),
+            MANIFEST_RETRY,
+        );
+    }
+
+    // The typed contract alone cannot see a coordinated rewrite of `name`,
+    // `fixture`, `target`, or `activated` sitting beside it, so the applied
+    // state is bound to the exact protected projected block by bytes, by table
+    // ordering, and by typed agreement — the same three checks the bootstrap
+    // preflight applies, so the two can never disagree about one manifest.
+    if let Err(detail) = applied_manifest_block_agreement(&source) {
+        valid = false;
+        report.divergence(
+            "qg2.manifest.projected_block",
+            "docs/contracts/quill-perf-gates.toml#gate.QG-2",
+            "the exact protected projected [gate.QG-2] block",
+            Some(&detail),
             MANIFEST_RETRY,
         );
     }
@@ -1892,39 +1978,13 @@ fn preflight_manifest(repo_root: &Path, builder: &mut PreflightBuilder) {
         }
     }
 
-    // The byte layer and the typed layer must agree about the same block. A
-    // manifest that parses, matches a protected block byte for byte, and still
-    // disagrees under its closed typed model is drift, not a pass.
-    if drift.is_none() {
-        match toml::from_str::<ManifestDocument>(&source) {
-            Err(error) => {
-                state = Qg2SelectorState::Drift;
-                drift = Some((
-                    "qg2.preflight.manifest_parse",
-                    format!("the manifest does not parse under the closed gate model: {error}"),
-                ));
-            }
-            Ok(document) => {
-                let applied = state == Qg2SelectorState::Applied;
-                let block = if applied {
-                    QG2_MANIFEST_BLOCK_POST_REGION
-                } else {
-                    QG2_MANIFEST_BLOCK_PRE_REGION
-                };
-                let agrees = document
-                    .gate
-                    .get("QG-2")
-                    .is_some_and(|gate| gate.agrees_with_qg2_block(block, applied));
-                if !agrees {
-                    state = Qg2SelectorState::Drift;
-                    drift = Some((
-                        "qg2.preflight.manifest_typed_disagreement",
-                        "the typed gate.QG-2 view disagrees with the byte-matched protected block"
-                            .to_owned(),
-                    ));
-                }
-            }
-        }
+    // Exactly the agreement the applied validator applies, so one manifest can
+    // never be a pass to one reader and drift to the other.
+    if drift.is_none()
+        && let Err(detail) = manifest_block_agreement(&source, state == Qg2SelectorState::Applied)
+    {
+        state = Qg2SelectorState::Drift;
+        drift = Some(("qg2.preflight.manifest_typed_disagreement", detail));
     }
 
     // Never hand a rendered poststate to a mutation without proving it parses
@@ -3168,6 +3228,92 @@ mod tests {
                 .collect::<Vec<_>>(),
             PerfGate::ALL.to_vec()
         );
+    }
+
+    #[test]
+    fn the_applied_validator_binds_the_exact_projected_block() {
+        // Before the block binding these three mutations all false-greened: the
+        // typed contract was still canonical and the file still held exactly one
+        // canonical clause, so a coordinated rewrite beside the contract passed.
+        for (label, mutated) in [
+            (
+                "fixture rewritten beside the contract",
+                applied_manifest().replacen(
+                    "fixture = \"medium; positions ON; threads = 1; continuous",
+                    "fixture = \"medium; positions ON; threads = 1; commit included; continuous",
+                    1,
+                ),
+            ),
+            (
+                "activated flipped beside the contract",
+                applied_manifest().replacen(
+                    "target = \"docs_per_sec >= 1.5x oracle\"\nactivated = false",
+                    "target = \"docs_per_sec >= 1.5x oracle\"\nactivated = true",
+                    1,
+                ),
+            ),
+            (
+                "name rewritten beside the contract",
+                applied_manifest().replacen(
+                    "name = \"bulk indexing, single-thread\"",
+                    "name = \"bulk indexing, relaxed\"",
+                    1,
+                ),
+            ),
+        ] {
+            assert_ne!(mutated, applied_manifest(), "{label} mutation must apply");
+            let fixture = complete_fixture();
+            fs::write(fixture.path(PERF_MANIFEST_PATH), &mutated).expect("block mutation");
+            let report = validate_qg2_contract(fixture.root());
+            assert!(
+                report
+                    .divergences
+                    .iter()
+                    .any(|divergence| divergence.code == "qg2.manifest.projected_block"),
+                "{label} unexpectedly passed: {:#?}",
+                report.divergences
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrong_gate_contract_table_or_extra_label_is_rejected_by_both_readers() {
+        // QG-2 keeps its exact projected block; a *second* canonical table is
+        // hung under QG-3, which a QG-2-only check would never look at.
+        let table = QG2_MANIFEST_BLOCK_POST_REGION
+            .split_once("[gate.QG-2.qg2_contract]\n")
+            .map(|(_, table)| table)
+            .expect("the projected block carries the contract table");
+        let foreign_table = format!("{}[gate.QG-3.qg2_contract]\n{table}", applied_manifest());
+        let extra_label = format!("{}\n[gate.QG-11]\nactivated = false\n", applied_manifest());
+
+        for (label, mutated) in [
+            ("a contract table under another gate", foreign_table),
+            ("an undefined gate label", extra_label),
+        ] {
+            // The live consumer rejects both. Both readers must agree, or the
+            // preflight blesses a manifest that planning will refuse.
+            assert!(
+                manifest_block_agreement(&mutated, true).is_err(),
+                "{label} must fail the applied agreement"
+            );
+            let fixture = complete_fixture();
+            fs::write(fixture.path(PERF_MANIFEST_PATH), &mutated).expect("agreement mutation");
+            let applied_view = validate_qg2_contract(fixture.root());
+            assert!(
+                applied_view
+                    .divergences
+                    .iter()
+                    .any(|divergence| divergence.code == "qg2.manifest.projected_block"),
+                "{label} unexpectedly passed the applied validator"
+            );
+            let preflight = validate_qg2_preflight(fixture.root());
+            assert_eq!(
+                preflight.state,
+                Qg2PreflightState::Drift,
+                "{label} unexpectedly passed the preflight"
+            );
+        }
     }
 
     #[test]
