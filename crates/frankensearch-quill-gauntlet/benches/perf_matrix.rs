@@ -29,7 +29,9 @@ use asupersync::{Cx, runtime::Runtime};
 use criterion::Criterion;
 use frankensearch_core::bench_support::print_bench_elf_sha256;
 use frankensearch_core::{IndexableDocument, LexicalRead, LexicalWrite};
-use frankensearch_lexical::{BenchmarkWriterJoinReceipt, SnippetConfig, TantivyIndex};
+use frankensearch_lexical::{
+    BenchmarkRetainedTantivyReader, BenchmarkWriterJoinReceipt, SnippetConfig, TantivyIndex,
+};
 use frankensearch_quill::scribe::{FrankensearchTokenizer, TokenAnalyzer};
 use frankensearch_quill::{
     Analyzer, CompactionPolicy, DEFAULT_SCHEMA, FieldDescriptor, FieldKind, QuillConfig,
@@ -921,12 +923,15 @@ struct Qg1ContinuousTimingReceipt {
     /// The retired pre-search Tantivy rearm join is retained only so old
     /// receipts fail closed rather than being silently accepted as equivalent.
     pre_search_rearm_join_completed_ns: Option<u64>,
-    terminal_search_attempt_completed_ns: u64,
     terminal_worker_join_completed_ns: Option<u64>,
     /// The exact receipt returned by Tantivy's one-shot, non-rearming worker
     /// join. Quill has no corresponding external writer API.
     terminal_tantivy_join: Option<BenchmarkWriterJoinReceipt>,
-    terminal_quiescence_completed_ns: u64,
+    /// Captured immediately when the retained read-only handle returns the
+    /// exact prepared-tail query. Tantivy workers have already joined and stay
+    /// quiescent through that query, so one real boundary replaces fabricated
+    /// post-hoc equal timestamps.
+    terminal_searchable_quiescence_completed_ns: u64,
     interval_ended_ns: u64,
     terminal_searchability: Qg1TerminalFact,
     terminal_quiescence: Qg1TerminalFact,
@@ -1004,24 +1009,6 @@ impl Qg1ContinuousTimingReceipt {
                 "QG-1 rejects the retired Tantivy rearm join before terminal search".to_owned(),
             );
         }
-        if self.terminal_search_attempt_completed_ns < cursor {
-            return Err("QG-1 terminal search preceded terminal commit".to_owned());
-        }
-        cursor = self.terminal_search_attempt_completed_ns;
-        if let Some(joined) = self.terminal_worker_join_completed_ns {
-            if joined < cursor {
-                return Err("QG-1 terminal worker join preceded searchability".to_owned());
-            }
-            cursor = joined;
-        }
-        if self.terminal_quiescence_completed_ns < cursor
-            || self.interval_ended_ns != self.terminal_quiescence_completed_ns
-        {
-            return Err(
-                "QG-1 continuous interval must end exactly when terminal quiescence completes"
-                    .to_owned(),
-            );
-        }
         match self.arm {
             EngineArm::Quill => {
                 if self.terminal_worker_join_completed_ns.is_some()
@@ -1033,6 +1020,11 @@ impl Qg1ContinuousTimingReceipt {
                             .to_owned(),
                     );
                 }
+                if self.terminal_searchable_quiescence_completed_ns < cursor {
+                    return Err(
+                        "QG-1 retained Quill tail search preceded terminal commit".to_owned(),
+                    );
+                }
             }
             EngineArm::Tantivy => {
                 let Some(join) = self.terminal_tantivy_join else {
@@ -1041,18 +1033,34 @@ impl Qg1ContinuousTimingReceipt {
                             .to_owned(),
                     );
                 };
-                if self.terminal_worker_join_completed_ns.is_none()
-                    || self.quill_publication_generation_delta.is_some()
-                    || join.writer_rearmed
-                    || join.searchable_segments_before == 0
-                    || join.searchable_segments_after == 0
-                {
+                let Some(joined) = self.terminal_worker_join_completed_ns else {
                     return Err(
-                        "QG-1 Tantivy receipt lacks one retained-reader, nonrearming terminal worker join"
+                        "QG-1 Tantivy receipt lacks the terminal worker-join boundary"
+                            .to_owned(),
+                    );
+                };
+                if self.quill_publication_generation_delta.is_some() || join.writer_rearmed {
+                    return Err(
+                        "QG-1 Tantivy receipt names an impossible nonrearming join lifecycle"
+                            .to_owned(),
+                    );
+                }
+                if joined < cursor {
+                    return Err("QG-1 Tantivy worker join preceded terminal commit".to_owned());
+                }
+                if self.terminal_searchable_quiescence_completed_ns < joined {
+                    return Err(
+                        "QG-1 retained Tantivy tail search preceded the terminal worker join"
                             .to_owned(),
                     );
                 }
             }
+        }
+        if self.interval_ended_ns != self.terminal_searchable_quiescence_completed_ns {
+            return Err(
+                "QG-1 continuous interval must end at the retained-reader searchable-quiescence boundary"
+                    .to_owned(),
+            );
         }
         Ok(())
     }
@@ -1089,6 +1097,7 @@ struct Qg1ContinuousMeasurement {
     origin: Instant,
     elapsed_ns: u64,
     prepared_input: Qg1PreparedSampleBinding,
+    lifecycle_receipt: Qg1ContinuousTimingReceipt,
 }
 
 /// One measured cell value, plus the continuous interval behind it when the
@@ -1122,10 +1131,9 @@ struct Qg1ContinuousInterval {
     batches: Vec<Qg1BatchTiming>,
     recorded_batch_count: usize,
     terminal_commit_completed_ns: Option<u64>,
-    terminal_search_attempt_completed_ns: Option<u64>,
     terminal_worker_join_completed_ns: Option<u64>,
     terminal_tantivy_join: Option<BenchmarkWriterJoinReceipt>,
-    terminal_quiescence_completed_ns: Option<u64>,
+    terminal_searchable_quiescence_completed_ns: Option<u64>,
 }
 
 impl Qg1ContinuousInterval {
@@ -1140,10 +1148,9 @@ impl Qg1ContinuousInterval {
             batches: Vec::new(),
             recorded_batch_count: 0,
             terminal_commit_completed_ns: None,
-            terminal_search_attempt_completed_ns: None,
             terminal_worker_join_completed_ns: None,
             terminal_tantivy_join: None,
-            terminal_quiescence_completed_ns: None,
+            terminal_searchable_quiescence_completed_ns: None,
         }
     }
 
@@ -1225,13 +1232,13 @@ impl Qg1ContinuousInterval {
         );
     }
 
-    fn mark_terminal_search_attempt(&mut self) -> u64 {
+    fn mark_terminal_searchable_quiescence(&mut self) -> u64 {
         let completed = self.elapsed_ns();
         assert!(
-            self.terminal_search_attempt_completed_ns
+            self.terminal_searchable_quiescence_completed_ns
                 .replace(completed)
                 .is_none(),
-            "QG-1 terminal search boundary repeated"
+            "QG-1 retained-reader searchable-quiescence boundary repeated"
         );
         completed
     }
@@ -1251,15 +1258,6 @@ impl Qg1ContinuousInterval {
         completed
     }
 
-    fn mark_terminal_quiescence_at(&mut self, completed: u64) {
-        assert!(
-            self.terminal_quiescence_completed_ns
-                .replace(completed)
-                .is_none(),
-            "QG-1 terminal quiescence boundary repeated"
-        );
-    }
-
     fn finish(
         self,
         quill_publication_generation_delta: Option<u64>,
@@ -1271,8 +1269,8 @@ impl Qg1ContinuousInterval {
             .expect("QG-1 continuous interval includes at least one engine feed");
         let work_units = self.prepared_input.document_count;
         let interval_ended_ns = self
-            .terminal_quiescence_completed_ns
-            .expect("QG-1 continuous interval includes terminal quiescence");
+            .terminal_searchable_quiescence_completed_ns
+            .expect("QG-1 continuous interval includes retained-reader searchable quiescence");
         let receipt = Qg1ContinuousTimingReceipt {
             producer_coverage: Qg1ProducerCoverage::EngineIndexingLifecycle,
             arm: self.arm,
@@ -1286,12 +1284,9 @@ impl Qg1ContinuousInterval {
                 .terminal_commit_completed_ns
                 .expect("QG-1 continuous interval includes terminal commit"),
             pre_search_rearm_join_completed_ns: None,
-            terminal_search_attempt_completed_ns: self
-                .terminal_search_attempt_completed_ns
-                .expect("QG-1 continuous interval includes terminal search"),
             terminal_worker_join_completed_ns: self.terminal_worker_join_completed_ns,
             terminal_tantivy_join: self.terminal_tantivy_join,
-            terminal_quiescence_completed_ns: interval_ended_ns,
+            terminal_searchable_quiescence_completed_ns: interval_ended_ns,
             interval_ended_ns,
             terminal_searchability,
             terminal_quiescence,
@@ -1306,6 +1301,7 @@ impl Qg1ContinuousInterval {
             origin,
             elapsed_ns: receipt.interval_ended_ns,
             prepared_input: receipt.prepared_input.clone(),
+            lifecycle_receipt: receipt.clone(),
         };
         (measurement, receipt)
     }
@@ -2191,9 +2187,10 @@ fn qg1_terminal_searchability<E: LexicalRead>(
     let result = context
         .runtime
         .block_on(index.search(&context.cx, &terminal_query, 2));
-    // Capture the boundary immediately when the engine's search call returns;
-    // converting result IDs into a proof record must not move the measured end.
-    interval.mark_terminal_search_attempt();
+    // Capture the one terminal boundary immediately when the retained Quill
+    // read owner returns. Converting IDs into a proof record must not move the
+    // end of the measured searchable-and-quiescent state.
+    interval.mark_terminal_searchable_quiescence();
     match result {
         Ok(results) => {
             let document_ids = results
@@ -2217,16 +2214,53 @@ fn qg1_terminal_searchability<E: LexicalRead>(
     }
 }
 
-fn qg1_tantivy_quiescence_fact(terminal_join: &BenchmarkWriterJoinReceipt) -> Qg1TerminalFact {
+fn qg1_tantivy_terminal_searchability(
+    reader: &BenchmarkRetainedTantivyReader,
+    interval: &mut Qg1ContinuousInterval,
+) -> Qg1TerminalFact {
+    let expected_document_id = interval.prepared_input.tail_document_id.clone();
+    let result = reader.benchmark_search_exact_id(&expected_document_id);
+    // This is the actual QG-1 endpoint: Tantivy's writer workers have already
+    // joined, the retained reader is still alive, and the tail query just
+    // returned. No segment metadata, `drop`, assertion, or proof conversion
+    // lies between that return and the single terminal timestamp.
+    interval.mark_terminal_searchable_quiescence();
+    match result {
+        Ok(document_ids) => {
+            let observed_document_ids = document_ids
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>();
+            let fact = if observed_document_ids == [expected_document_id] {
+                Qg1TerminalFact::proven("exact_prepared_tail_sentinel_visible_after_tantivy_join")
+            } else {
+                Qg1TerminalFact::no_claim(format!(
+                    "post-join Tantivy tail lookup returned {observed_document_ids:?} instead of \
+                     [{expected_document_id:?}]"
+                ))
+            };
+            black_box(observed_document_ids);
+            fact
+        }
+        Err(error) => Qg1TerminalFact::no_claim(format!(
+            "post-join Tantivy tail lookup for {expected_document_id:?} failed: {error}"
+        )),
+    }
+}
+
+fn qg1_tantivy_quiescence_fact(
+    terminal_join: &BenchmarkWriterJoinReceipt,
+    terminal_searchability: &Qg1TerminalFact,
+) -> Qg1TerminalFact {
     if !terminal_join.writer_rearmed
-        && terminal_join.searchable_segments_before > 0
-        && terminal_join.searchable_segments_after > 0
+        && matches!(terminal_searchability, Qg1TerminalFact::Proven { .. })
     {
-        Qg1TerminalFact::proven("retained_reader_searchable_across_single_nonrearming_worker_join")
+        Qg1TerminalFact::proven("one_nonrearming_tantivy_writer_join_precedes_retained_reader_tail_search")
     } else {
         Qg1TerminalFact::no_claim(format!(
-            "Tantivy terminal lifecycle did not prove one nonrearming worker join after search: \
-             terminal_join=({},{},rearmed={})",
+            "Tantivy terminal lifecycle did not prove one nonrearming worker join followed by \
+             a retained-reader tail search: terminal_join=({},{},rearmed={}), \
+             tail_search={terminal_searchability:?}",
             terminal_join.searchable_segments_before,
             terminal_join.searchable_segments_after,
             terminal_join.writer_rearmed,
