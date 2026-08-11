@@ -644,6 +644,14 @@ impl<'a> CheckpointPostingCursor<'a> {
     /// drain of a scored candidate and the move that exhausts a cursor both
     /// charge zero blocks, so a request arriving after the last block entry
     /// was never observed and the query returned a complete result set.
+    ///
+    /// The cursor leaf itself takes no lock: the whole cost of the per-move
+    /// admission is the checkpoint's cancellation poll, and that poll cannot
+    /// be elided or amortized here. It has to read state only the canceller
+    /// can write, and a mirror refreshed at block granularity would restore
+    /// exactly the in-block blind spot described above. Removing the poll's
+    /// lock is therefore a checkpoint-side or upstream concern, not a cursor
+    /// one (`bd-quill-cancel-poll-leaf-fastpath-tzztr`).
     fn checkpoint_move(&self, previous: Option<u64>) -> Result<(), ArgusError> {
         self.checkpoint.admit(
             QueryWorkKind::PostingBlock,
@@ -5874,6 +5882,136 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             2,
             "the cursor must stop at the refusal instead of walking to the next block boundary"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_cursor_surfaces_cancellation_on_the_exhausting_move()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let postings = (0..257)
+            .map(|docid| Posting::new(docid, 1))
+            .collect::<Vec<_>>();
+        let encoded = EncodedPostingList::encode(&postings)?;
+        let list = encoded.posting_list()?;
+        assert!(
+            list.block_count() > 1,
+            "fixture must cross a posting-block boundary"
+        );
+        // One admission for the already-decoded first block, then one per
+        // move: the last of those is the move that reports exhaustion, which
+        // enters no block at all and so is the other move a block-only
+        // cursor cannot refuse.
+        let exhausting_admission = postings.len() + 1;
+        let checkpoint = Arc::new(CancelOnNthAdmission::new(exhausting_admission));
+        let checkpoint_for_cursor: Arc<dyn QueryWorkCheckpoint> = checkpoint.clone();
+        let segment_num_docs = u32::try_from(postings.len())?;
+        let sealed = SealedPostingCursor::new(&list, segment_num_docs)?;
+        let mut cursor = CheckpointPostingCursor::new(sealed, checkpoint_for_cursor)?;
+
+        let mut moves = 0_usize;
+        let error = loop {
+            match cursor.next() {
+                Ok(Some(_)) => moves += 1,
+                Ok(None) => panic!("the exhausting move must observe the refusing checkpoint"),
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(
+            moves + 1,
+            postings.len(),
+            "the refusal must land on the exhausting move, not on an earlier one"
+        );
+        assert!(
+            matches!(
+                error,
+                ArgusError::QueryCancelled {
+                    phase: "checkpoint_cursor_unit_test"
+                }
+            ),
+            "expected the checkpoint's typed refusal, got {error:?}"
+        );
+        assert_eq!(
+            checkpoint
+                .units_at_fire
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an exhausted cursor enters no block, so its final move charges no fuel"
+        );
+        Ok(())
+    }
+
+    /// Records the exact per-admission unit sequence a full scan produces.
+    #[derive(Default)]
+    struct UnitSequenceCheckpoint {
+        units: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl QueryWorkCheckpoint for UnitSequenceCheckpoint {
+        fn admit(&self, kind: QueryWorkKind, units: u64) -> Result<(), ArgusError> {
+            assert_eq!(kind, QueryWorkKind::PostingBlock);
+            self.units
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(units);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn checkpoint_cursor_charges_a_unit_only_where_it_enters_a_block()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let postings = (0..257)
+            .map(|docid| Posting::new(docid, 1))
+            .collect::<Vec<_>>();
+        let encoded = EncodedPostingList::encode(&postings)?;
+        let list = encoded.posting_list()?;
+        let block_count = list.block_count();
+        assert!(
+            block_count > 1,
+            "fixture must cross a posting-block boundary"
+        );
+        let checkpoint = Arc::new(UnitSequenceCheckpoint::default());
+        let checkpoint_for_cursor: Arc<dyn QueryWorkCheckpoint> = checkpoint.clone();
+        let segment_num_docs = u32::try_from(postings.len())?;
+        let sealed = SealedPostingCursor::new(&list, segment_num_docs)?;
+        let mut cursor = CheckpointPostingCursor::new(sealed, checkpoint_for_cursor)?;
+
+        while cursor.next()?.is_some() {}
+
+        let units = checkpoint
+            .units
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            units.len(),
+            postings.len() + 1,
+            "the construction admission plus one per move, including the exhausting move"
+        );
+        assert!(
+            units.iter().all(|charged| *charged <= 1),
+            "a single move can enter at most one posting block: {units:?}"
+        );
+        assert_eq!(
+            units.iter().sum::<u64>(),
+            u64::try_from(block_count)?,
+            "the whole scan charges exactly one unit per entered block"
+        );
+        assert_eq!(
+            units.first(),
+            Some(&1),
+            "construction charges the already-decoded first block"
+        );
+        assert_eq!(
+            units.get(1..3),
+            Some([0, 0].as_slice()),
+            "consecutive in-block steps admit for cancellation while charging nothing"
+        );
+        assert_eq!(
+            units.last(),
+            Some(&0),
+            "the exhausting move enters no block and charges nothing"
         );
         Ok(())
     }
