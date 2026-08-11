@@ -878,6 +878,51 @@ impl Qg1ContinuousTimingReceipt {
     }
 }
 
+/// Work completed per elapsed second, derived exactly as
+/// [`PerfMetricSemantics::Throughput`] derives it inside the estimator.
+///
+/// A QG-1 row reports this number twice: once as the sample's `observed_value`,
+/// which feeds the published absolutes, and once when the estimator recomputes
+/// it from that sample's own work and interval. Sharing one expression is what
+/// makes those two numbers identical rather than merely close.
+fn throughput_per_second(work_units: u64, elapsed_ns: u64) -> f64 {
+    work_units as f64 * 1_000_000_000.0 / elapsed_ns as f64
+}
+
+/// The exact continuous engine interval one QG-1 measurement was derived from.
+///
+/// `origin` is the interval's own zero point. Keeping it lets a caller place the
+/// interval inside a longer timeline without the interval needing to know that
+/// timeline exists.
+#[derive(Clone, Copy)]
+struct Qg1ContinuousMeasurement {
+    work_units: u64,
+    origin: Instant,
+    elapsed_ns: u64,
+}
+
+/// One measured cell value, plus the continuous interval behind it when the
+/// producer actually measured one.
+///
+/// Only QG-1's engine-indexing cells carry `continuous`. Every other cell in
+/// this matrix reports a value assembled from independently timed calls, and the
+/// absence of an interval here is what stops such a value from being typed as
+/// throughput downstream.
+struct MetricMeasurement {
+    value: f64,
+    continuous: Option<Qg1ContinuousMeasurement>,
+}
+
+impl MetricMeasurement {
+    /// A directly observed value with no continuous interval behind it.
+    const fn gauge(value: f64) -> Self {
+        Self {
+            value,
+            continuous: None,
+        }
+    }
+}
+
 struct Qg1ContinuousInterval {
     origin: Instant,
     arm: EngineArm,
@@ -1032,9 +1077,10 @@ impl Qg1ContinuousInterval {
         quill_publication_generation_delta: Option<u64>,
         terminal_searchability: Qg1TerminalFact,
         terminal_quiescence: Qg1TerminalFact,
-    ) -> (Duration, Qg1ContinuousTimingReceipt) {
-        let elapsed = self.origin.elapsed();
-        let interval_ended_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+    ) -> (Qg1ContinuousMeasurement, Qg1ContinuousTimingReceipt) {
+        let origin = self.origin;
+        let work_units = self.document_count;
+        let interval_ended_ns = u64::try_from(origin.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let receipt = Qg1ContinuousTimingReceipt {
             producer_coverage: Qg1ProducerCoverage::EngineIndexingLifecycle,
             arm: self.arm,
@@ -1063,7 +1109,14 @@ impl Qg1ContinuousInterval {
         receipt
             .validate()
             .expect("invalid QG-1 continuous timing receipt");
-        (elapsed, receipt)
+        // The measurement and the receipt name one interval, not two: a single
+        // `elapsed()` reading is published in both.
+        let measurement = Qg1ContinuousMeasurement {
+            work_units,
+            origin,
+            elapsed_ns: receipt.interval_ended_ns,
+        };
+        (measurement, receipt)
     }
 }
 
@@ -1533,8 +1586,9 @@ fn emit_qg1_continuous_timing_receipt(spec: &PerfCellSpec, timing: Qg1Continuous
         schema_version: "quill-qg1-continuous-timing-v1",
         admission_status: "no_claim",
         admission_no_claim_code: QG1_TIMING_DIAGNOSTIC_NO_CLAIM_CODE,
-        admission_no_claim_detail: "diagnostic phase trace is not bound into PerfRawSample or the \
-                                    H2 assembler and cannot independently support a QG-1 claim",
+        admission_no_claim_detail: "only the continuous interval this trace names is bound into \
+                                    PerfRawSample; the per-phase breakdown reaches no H2 assembler \
+                                    and cannot independently support a QG-1 claim",
         run_id,
         sequence,
         gate: spec.gate.to_string(),
@@ -1983,13 +2037,13 @@ fn qg1_bulk_metric_continuous(
     spec: &PerfCellSpec,
     arm: EngineArm,
     count: u64,
-) -> f64 {
+) -> MetricMeasurement {
     assert_eq!(
         qg1_producer_coverage(spec),
         Some(Qg1ProducerCoverage::EngineIndexingLifecycle),
         "continuous QG-1 engine lifecycle is reserved for docs_per_second indexing arms"
     );
-    let elapsed = match arm {
+    let measurement = match arm {
         EngineArm::Quill => {
             let index = quill_in_memory(spec);
             let generation_before = index.snapshot().loaded_manifest().manifest.generation;
@@ -2002,7 +2056,7 @@ fn qg1_bulk_metric_continuous(
             interval.mark_terminal_search_attempt();
             interval.mark_terminal_quiescence();
             let generation_delta = generation_before_terminal.saturating_sub(generation_before);
-            let (elapsed, receipt) = interval.finish(
+            let (measurement, receipt) = interval.finish(
                 Some(generation_delta),
                 terminal_searchability,
                 Qg1TerminalFact::proven("awaited_quill_inline_publication_and_tier_merges"),
@@ -2019,9 +2073,9 @@ fn qg1_bulk_metric_continuous(
                 quill_config(spec).max_visibility_lag_ms,
                 periodic_commit_calls,
                 generation_delta,
-                elapsed.as_nanos(),
+                measurement.elapsed_ns,
             );
-            elapsed
+            measurement
         }
         EngineArm::Tantivy => {
             let index = tantivy_in_memory(spec);
@@ -2056,7 +2110,7 @@ fn qg1_bulk_metric_continuous(
             let terminal_quiescence =
                 qg1_tantivy_quiescence_fact(&post_commit_receipt, &terminal_idle_receipt);
             interval.mark_terminal_quiescence();
-            let (elapsed, receipt) =
+            let (measurement, receipt) =
                 interval.finish(None, terminal_searchability, terminal_quiescence);
             emit_tantivy_lifecycle_receipt(spec, "qg1_post_commit_join", &post_commit_receipt);
             emit_tantivy_lifecycle_receipt(spec, "qg1_terminal_idle_join", &terminal_idle_receipt);
@@ -2069,15 +2123,30 @@ fn qg1_bulk_metric_continuous(
                 spec.gate,
                 spec.fixture,
                 quill_config(spec).max_visibility_lag_ms,
-                elapsed.as_nanos(),
+                measurement.elapsed_ns,
             );
-            elapsed
+            measurement
         }
     };
-    count as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE)
+    assert_eq!(
+        measurement.work_units, count,
+        "QG-1 continuous interval must cover the exact requested document count"
+    );
+    assert!(
+        measurement.elapsed_ns > 0,
+        "QG-1 continuous interval must span positive monotonic time"
+    );
+    MetricMeasurement {
+        value: throughput_per_second(measurement.work_units, measurement.elapsed_ns),
+        continuous: Some(measurement),
+    }
 }
 
-fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
+fn bulk_metric_unpooled(
+    context: &BenchContext,
+    spec: &PerfCellSpec,
+    arm: EngineArm,
+) -> MetricMeasurement {
     let requested = spec.document_count.expect("bulk document count");
     let count = context.scale.document_count(requested);
     if spec.gate == PerfGate::Qg1 {
@@ -2161,10 +2230,12 @@ fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: Engine
             elapsed
         }
     };
-    count as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE)
+    // A sum of independently timed calls, so it carries no continuous interval
+    // and cannot be published as throughput.
+    MetricMeasurement::gauge(count as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE))
 }
 
-fn bulk_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
+fn bulk_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> MetricMeasurement {
     if !matches!(spec.gate, PerfGate::Qg1 | PerfGate::Qg8) || arm != EngineArm::Quill {
         return bulk_metric_unpooled(context, spec, arm);
     }
@@ -2954,7 +3025,11 @@ fn dependency_surface_metric() -> f64 {
         .count() as f64
 }
 
-fn measure_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
+fn measure_metric(
+    context: &BenchContext,
+    spec: &PerfCellSpec,
+    arm: EngineArm,
+) -> MetricMeasurement {
     measure_metric_with_query(context, spec, arm, None)
 }
 
@@ -2963,20 +3038,20 @@ fn measure_metric_with_query(
     spec: &PerfCellSpec,
     arm: EngineArm,
     query_override: Option<&str>,
-) -> f64 {
+) -> MetricMeasurement {
     match spec.gate {
         PerfGate::Qg1 if spec.metric == "tokenize_docs_per_second" => {
-            tokenize_metric(context, spec)
+            MetricMeasurement::gauge(tokenize_metric(context, spec))
         }
         PerfGate::Qg1 | PerfGate::Qg2 | PerfGate::Qg8 => bulk_metric(context, spec, arm),
         PerfGate::Qg3 if spec.metric == "docs_per_second" => bulk_metric(context, spec, arm),
-        PerfGate::Qg3 => watch_metric(context, spec, arm),
-        PerfGate::Qg4 => commit_metric(context, spec, arm),
-        PerfGate::Qg5 => compaction_metric(context, spec, arm),
-        PerfGate::Qg6 => query_metric(context, spec, arm, query_override),
-        PerfGate::Qg7 => memory_metric(context, spec, arm),
-        PerfGate::Qg9 => cold_open_metric(context, spec, arm),
-        PerfGate::Qg10 => dependency_surface_metric(),
+        PerfGate::Qg3 => MetricMeasurement::gauge(watch_metric(context, spec, arm)),
+        PerfGate::Qg4 => MetricMeasurement::gauge(commit_metric(context, spec, arm)),
+        PerfGate::Qg5 => MetricMeasurement::gauge(compaction_metric(context, spec, arm)),
+        PerfGate::Qg6 => MetricMeasurement::gauge(query_metric(context, spec, arm, query_override)),
+        PerfGate::Qg7 => MetricMeasurement::gauge(memory_metric(context, spec, arm)),
+        PerfGate::Qg9 => MetricMeasurement::gauge(cold_open_metric(context, spec, arm)),
+        PerfGate::Qg10 => MetricMeasurement::gauge(dependency_surface_metric()),
     }
 }
 
@@ -3006,8 +3081,19 @@ struct EvidenceContext {
     sample_provenance: PerfSampleProvenance,
 }
 
-fn metric_semantics(metric: &str) -> PerfMetricSemantics {
-    match metric {
+fn metric_semantics(spec: &PerfCellSpec) -> PerfMetricSemantics {
+    // A QG-1 engine-indexing cell derives its rate from one continuous
+    // first-feed-through-quiescence interval over an exact document count, so it
+    // is a native throughput operation and the estimator recomputes it from the
+    // sample itself. Every other rate in this matrix — the QG-1 tokenizer
+    // diagnostic, QG-2/QG-3/QG-8 bulk indexing, QG-3 updates — is a sum of
+    // independently timed calls that excludes the gaps between them. Typing one
+    // of those as Throughput would silently redefine it as work over the outer
+    // sample window, a different and unmeasured quantity, so they stay gauges.
+    if qg1_producer_coverage(spec) == Some(Qg1ProducerCoverage::EngineIndexingLifecycle) {
+        return PerfMetricSemantics::Throughput;
+    }
+    match spec.metric.as_str() {
         "docs_per_second" | "tokenize_docs_per_second" | "updates_per_second" => {
             PerfMetricSemantics::GaugeHigherIsBetter
         }
@@ -3019,7 +3105,7 @@ fn operation_scope(spec: &PerfCellSpec) -> PerfOperationScope {
     PerfOperationScope {
         operation_id: format!("{}.{}.{}", spec.gate, spec.fixture, spec.metric),
         version: 1,
-        semantics: metric_semantics(&spec.metric),
+        semantics: metric_semantics(spec),
         unit: unit(spec).to_owned(),
     }
 }
@@ -3037,6 +3123,101 @@ fn raw_sample_work(context: &BenchContext, spec: &PerfCellSpec) -> (Option<u64>,
         "QG-1 throughput sample requires positive immutable content bytes"
     );
     (Some(document_count), Some(content_bytes))
+}
+
+/// One continuous engine interval, resolved onto the stream's own clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Qg1IntervalOffsets {
+    work_units: u64,
+    started_ns: u64,
+    elapsed_ns: u64,
+}
+
+/// The timing window one raw sample publishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Qg1SampleWindow {
+    started_ns: u64,
+    ended_ns: u64,
+}
+
+/// Decide the `started_ns`/`ended_ns` a [`PerfRawSample`] may publish, failing
+/// closed on every way a rate can be attached to time it was not measured over.
+///
+/// `Throughput` is not a label the harness may apply at will. The estimator
+/// recomputes such a sample as `work_units * 1e9 / (ended_ns - started_ns)`, so
+/// the published window has to be the continuous engine interval itself and the
+/// work has to be the work that interval processed. The converse matters just as
+/// much: a continuous interval filed under gauge semantics publishes a rate no
+/// clock will ever check again, which is how an unmeasured number survives into
+/// an artifact.
+fn qg1_sample_window(
+    semantics: PerfMetricSemantics,
+    declared_work_units: Option<u64>,
+    call_started_ns: u64,
+    call_ended_ns: u64,
+    continuous: Option<Qg1IntervalOffsets>,
+) -> Result<Qg1SampleWindow, String> {
+    match (semantics, continuous) {
+        (PerfMetricSemantics::Throughput, Some(interval)) => {
+            if interval.elapsed_ns == 0 {
+                return Err("continuous engine interval spans no monotonic time".to_owned());
+            }
+            if declared_work_units != Some(interval.work_units) {
+                return Err(format!(
+                    "throughput sample declares work_units {declared_work_units:?} but its \
+                     continuous interval processed {}",
+                    interval.work_units
+                ));
+            }
+            let ended_ns = interval
+                .started_ns
+                .checked_add(interval.elapsed_ns)
+                .ok_or_else(|| {
+                    "continuous engine interval overflows the stream clock".to_owned()
+                })?;
+            if interval.started_ns < call_started_ns || ended_ns > call_ended_ns {
+                return Err(format!(
+                    "continuous engine interval [{}, {ended_ns}] escapes the call it was measured \
+                     in [{call_started_ns}, {call_ended_ns}]",
+                    interval.started_ns
+                ));
+            }
+            Ok(Qg1SampleWindow {
+                started_ns: interval.started_ns,
+                ended_ns,
+            })
+        }
+        (PerfMetricSemantics::Throughput, None) => Err("throughput samples require one \
+                                                        continuous engine interval; a summed \
+                                                        per-call duration is not work over \
+                                                        elapsed time"
+            .to_owned()),
+        (
+            PerfMetricSemantics::Duration
+            | PerfMetricSemantics::GaugeHigherIsBetter
+            | PerfMetricSemantics::GaugeLowerIsBetter,
+            Some(_),
+        ) => Err(format!(
+            "a continuous engine interval must be published as Throughput, not as {semantics:?}, \
+             which stores the rate without ever recomputing it from that interval"
+        )),
+        (
+            PerfMetricSemantics::Duration
+            | PerfMetricSemantics::GaugeHigherIsBetter
+            | PerfMetricSemantics::GaugeLowerIsBetter,
+            None,
+        ) => {
+            let ended_ns = if call_ended_ns <= call_started_ns {
+                call_started_ns.saturating_add(1)
+            } else {
+                call_ended_ns
+            };
+            Ok(Qg1SampleWindow {
+                started_ns: call_started_ns,
+                ended_ns,
+            })
+        }
+    }
 }
 
 fn fixture_seed(fixture: &str) -> u64 {
@@ -3172,16 +3353,43 @@ impl<'a> PairedStreamRunner<'a> {
         block_id: u64,
         sample_id: u64,
     ) -> PerfRawSample {
-        let started_ns = u64::try_from(self.origin.elapsed().as_nanos()).expect("monotonic ns");
-        let value = black_box(measure_metric_with_query(
+        let call_started_ns =
+            u64::try_from(self.origin.elapsed().as_nanos()).expect("monotonic ns");
+        let measurement = black_box(measure_metric_with_query(
             self.context,
             self.spec,
             engine,
             self.plan.query_override,
         ));
-        let mut ended_ns = u64::try_from(self.origin.elapsed().as_nanos()).expect("monotonic ns");
-        if ended_ns <= started_ns {
-            ended_ns = started_ns + 1;
+        let call_ended_ns = u64::try_from(self.origin.elapsed().as_nanos()).expect("monotonic ns");
+        let continuous = measurement.continuous.map(|interval| Qg1IntervalOffsets {
+            work_units: interval.work_units,
+            started_ns: u64::try_from(interval.origin.duration_since(self.origin).as_nanos())
+                .expect("monotonic ns"),
+            elapsed_ns: interval.elapsed_ns,
+        });
+        let window = qg1_sample_window(
+            self.scope.semantics,
+            self.work_units,
+            call_started_ns,
+            call_ended_ns,
+            continuous,
+        )
+        .expect("QG sample timing is not publishable");
+        if self.scope.semantics == PerfMetricSemantics::Throughput {
+            // The published absolutes read `observed_value` while the estimator
+            // recomputes the same rate from the published window. A QG-1 row is
+            // only coherent if those are one number, not two derivations that
+            // happen to agree.
+            assert_eq!(
+                measurement.value.to_bits(),
+                throughput_per_second(
+                    self.work_units.expect("throughput work units"),
+                    window.ended_ns - window.started_ns,
+                )
+                .to_bits(),
+                "QG-1 observed throughput must equal the rate derived from its published interval"
+            );
         }
         PerfRawSample {
             block_id,
@@ -3191,11 +3399,11 @@ impl<'a> PairedStreamRunner<'a> {
             phase: PerfSamplePhase::Measurement,
             scope: self.scope.clone(),
             provenance: self.evidence.sample_provenance.clone(),
-            started_ns,
-            ended_ns,
+            started_ns: window.started_ns,
+            ended_ns: window.ended_ns,
             work_units: self.work_units,
             byte_count: self.byte_count,
-            observed_value: Some(value),
+            observed_value: Some(measurement.value),
             group_id: self.plan.group_id,
             qg6_sample_binding: None,
             tantivy_config_sha256: None,
@@ -4877,8 +5085,8 @@ fn register_criterion_cell(c: &mut Criterion, context: &BenchContext, spec: &Per
             bencher.iter_custom(|iterations| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iterations {
-                    let value = black_box(measure_metric(context, spec, arm));
-                    total += metric_duration(context, spec, value);
+                    let measurement = black_box(measure_metric(context, spec, arm));
+                    total += metric_duration(context, spec, measurement.value);
                 }
                 total
             });
@@ -5323,6 +5531,8 @@ fn main() {
     #[cfg(test)]
     if std::env::var_os("QUILL_PERF_H1_PRODUCER_SELF_CHECK").is_some() {
         tests::assert_qg1_continuous_interval_contract();
+        tests::assert_qg1_throughput_semantics_contract();
+        tests::assert_throughput_typing_is_not_cosmetic();
         tests::assert_qg1_real_terminal_visibility_contract();
         tests::assert_qg1_raw_sample_work_contract();
         tests::assert_qg1_disjoint_partial_shard_contract();
@@ -5571,12 +5781,48 @@ mod tests {
         );
         let first_sequence =
             super::QG1_CONTINUOUS_TIMING_COUNTER.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            super::metric_semantics(&spec),
+            frankensearch_quill_gauntlet::PerfMetricSemantics::Throughput,
+            "the real QG-1 indexing cell publishes native throughput"
+        );
+        let mut measured = Vec::new();
         for arm in [super::EngineArm::Quill, super::EngineArm::Tantivy] {
-            let throughput = super::bulk_metric(&context, &spec, arm);
+            let measurement = super::bulk_metric(&context, &spec, arm);
             assert!(
-                throughput.is_finite() && throughput > 0.0,
+                measurement.value.is_finite() && measurement.value > 0.0,
                 "real {arm:?} terminal sample must return positive finite throughput"
             );
+            let continuous = measurement
+                .continuous
+                .expect("a real QG-1 engine arm publishes its continuous interval");
+            assert_eq!(
+                continuous.work_units, 500,
+                "the interval must cover the exact immutable 500-document corpus"
+            );
+            assert!(continuous.elapsed_ns > 0);
+            assert_eq!(
+                measurement.value.to_bits(),
+                super::throughput_per_second(continuous.work_units, continuous.elapsed_ns)
+                    .to_bits(),
+                "the reported rate must be exactly work over the continuous interval"
+            );
+            // The same interval, run through the publication chokepoint the
+            // paired stream uses, is admissible as Throughput and nothing else.
+            let window = super::qg1_sample_window(
+                frankensearch_quill_gauntlet::PerfMetricSemantics::Throughput,
+                Some(continuous.work_units),
+                0,
+                continuous.elapsed_ns.saturating_add(1),
+                Some(super::Qg1IntervalOffsets {
+                    work_units: continuous.work_units,
+                    started_ns: 0,
+                    elapsed_ns: continuous.elapsed_ns,
+                }),
+            )
+            .expect("a real continuous interval is publishable as throughput");
+            assert_eq!(window.ended_ns - window.started_ns, continuous.elapsed_ns);
+            measured.push((arm, continuous));
         }
 
         let receipts = {
@@ -5625,6 +5871,19 @@ mod tests {
                 record.timing.producer_coverage,
                 super::Qg1ProducerCoverage::EngineIndexingLifecycle
             );
+            // The receipt and the sample are not two independent observations of
+            // the run: the interval the receipt reports is the interval the
+            // sample publishes, and the work it names is the work the rate is
+            // divided by.
+            let (_, continuous) = measured
+                .iter()
+                .find(|(measured_arm, _)| *measured_arm == arm)
+                .expect("every measured arm has a continuous interval");
+            assert_eq!(
+                record.timing.interval_ended_ns, continuous.elapsed_ns,
+                "the published sample window must be the receipt's continuous interval"
+            );
+            assert_eq!(record.timing.document_count, continuous.work_units);
         }
     }
 
@@ -5690,6 +5949,384 @@ mod tests {
     #[test]
     fn qg1_throughput_raw_samples_bind_equal_work_and_content_bytes() {
         assert_qg1_raw_sample_work_contract();
+    }
+
+    pub fn assert_qg1_throughput_semantics_contract() {
+        use frankensearch_quill_gauntlet::{PerfGate, PerfMatrixSpec, PerfMetricSemantics};
+
+        let matrix = PerfMatrixSpec::complete();
+        let indexing = matrix
+            .for_gate(PerfGate::Qg1)
+            .into_iter()
+            .find(|spec| spec.metric == "docs_per_second")
+            .expect("canonical QG-1 indexing cell")
+            .clone();
+        let tokenizer = matrix
+            .for_gate(PerfGate::Qg1)
+            .into_iter()
+            .find(|spec| spec.metric == "tokenize_docs_per_second")
+            .expect("canonical QG-1 tokenizer diagnostic")
+            .clone();
+
+        assert_eq!(
+            super::metric_semantics(&indexing),
+            PerfMetricSemantics::Throughput,
+            "a continuous QG-1 engine interval is a native throughput operation"
+        );
+        assert_eq!(
+            super::operation_scope(&indexing).semantics,
+            PerfMetricSemantics::Throughput,
+            "the scope every QG-1 indexing sample carries must say so too"
+        );
+        assert_eq!(
+            super::metric_semantics(&tokenizer),
+            PerfMetricSemantics::GaugeHigherIsBetter,
+            "the tokenizer diagnostic sums per-batch calls and cannot claim throughput semantics"
+        );
+        // Same metric name, different producer: QG-8 bulk indexing still sums
+        // independently timed batches, so the name alone must not decide.
+        let mut summed_bulk = indexing.clone();
+        summed_bulk.gate = PerfGate::Qg8;
+        assert_eq!(
+            super::metric_semantics(&summed_bulk),
+            PerfMetricSemantics::GaugeHigherIsBetter
+        );
+        let latency = matrix
+            .for_gate(PerfGate::Qg4)
+            .into_iter()
+            .next()
+            .expect("canonical QG-4 latency cell")
+            .clone();
+        assert_eq!(
+            super::metric_semantics(&latency),
+            PerfMetricSemantics::GaugeLowerIsBetter
+        );
+
+        let interval = super::Qg1IntervalOffsets {
+            work_units: 500,
+            started_ns: 40,
+            elapsed_ns: 100,
+        };
+        assert_eq!(
+            super::qg1_sample_window(
+                PerfMetricSemantics::Throughput,
+                Some(500),
+                10,
+                400,
+                Some(interval),
+            )
+            .expect("a continuous interval publishes its own window"),
+            super::Qg1SampleWindow {
+                started_ns: 40,
+                ended_ns: 140,
+            },
+            "the published window must be the interval, not the enclosing call"
+        );
+
+        // Planted negative: the same real interval filed as a gauge.
+        let gauge_error = super::qg1_sample_window(
+            PerfMetricSemantics::GaugeHigherIsBetter,
+            Some(500),
+            10,
+            400,
+            Some(interval),
+        )
+        .expect_err("a continuous interval must not be published as a gauge");
+        assert!(
+            gauge_error.contains("must be published as Throughput"),
+            "unexpected gauge rejection: {gauge_error}"
+        );
+
+        // Planted negative: throughput semantics offered a summed per-call
+        // duration, which is all any non-QG-1 rate producer can offer.
+        let summed_error =
+            super::qg1_sample_window(PerfMetricSemantics::Throughput, Some(500), 10, 400, None)
+                .expect_err("summed per-call timing must not be published as throughput");
+        assert!(
+            summed_error.contains("summed per-call duration"),
+            "unexpected summed-call rejection: {summed_error}"
+        );
+
+        let work_error = super::qg1_sample_window(
+            PerfMetricSemantics::Throughput,
+            Some(499),
+            10,
+            400,
+            Some(interval),
+        )
+        .expect_err("declared work must equal the work the interval processed");
+        assert!(
+            work_error.contains("continuous interval processed 500"),
+            "unexpected work rejection: {work_error}"
+        );
+        assert!(
+            super::qg1_sample_window(
+                PerfMetricSemantics::Throughput,
+                None,
+                10,
+                400,
+                Some(interval)
+            )
+            .is_err(),
+            "a throughput sample without work units cannot be derived"
+        );
+
+        let overrun = super::Qg1IntervalOffsets {
+            elapsed_ns: 400,
+            ..interval
+        };
+        assert!(
+            super::qg1_sample_window(
+                PerfMetricSemantics::Throughput,
+                Some(500),
+                10,
+                400,
+                Some(overrun)
+            )
+            .is_err(),
+            "an interval must not end after the call that measured it"
+        );
+        let early = super::Qg1IntervalOffsets {
+            started_ns: 5,
+            ..interval
+        };
+        assert!(
+            super::qg1_sample_window(
+                PerfMetricSemantics::Throughput,
+                Some(500),
+                10,
+                400,
+                Some(early)
+            )
+            .is_err(),
+            "an interval must not begin before the call that measured it"
+        );
+        let empty = super::Qg1IntervalOffsets {
+            elapsed_ns: 0,
+            ..interval
+        };
+        assert!(
+            super::qg1_sample_window(
+                PerfMetricSemantics::Throughput,
+                Some(500),
+                10,
+                400,
+                Some(empty)
+            )
+            .is_err(),
+            "a zero-length interval cannot carry a rate"
+        );
+
+        // Gauge producers keep the enclosing call window, including its
+        // degenerate-resolution guard.
+        assert_eq!(
+            super::qg1_sample_window(
+                PerfMetricSemantics::GaugeHigherIsBetter,
+                Some(500),
+                10,
+                400,
+                None
+            )
+            .expect("gauge samples publish their call window"),
+            super::Qg1SampleWindow {
+                started_ns: 10,
+                ended_ns: 400,
+            }
+        );
+        assert_eq!(
+            super::qg1_sample_window(PerfMetricSemantics::GaugeLowerIsBetter, None, 10, 10, None)
+                .expect("gauge samples publish their call window"),
+            super::Qg1SampleWindow {
+                started_ns: 10,
+                ended_ns: 11,
+            }
+        );
+
+        // The retired summed-call form, applied to the hostile fixture: 100 ns
+        // of individually timed calls inside a 170 ns interval reports a rate
+        // 1.7x too high for the very same 20 documents.
+        let receipt = hostile_tantivy_continuous_receipt();
+        let continuous_rate =
+            super::throughput_per_second(receipt.document_count, receipt.interval_ended_ns);
+        let summed_rate = super::throughput_per_second(receipt.document_count, 100);
+        assert!(
+            summed_rate > continuous_rate * 1.69 && summed_rate < continuous_rate * 1.71,
+            "summed-call timing must overstate the rate: {summed_rate} vs {continuous_rate}"
+        );
+    }
+
+    #[test]
+    fn qg1_indexing_is_throughput_and_summed_or_gauge_timing_is_rejected() {
+        assert_qg1_throughput_semantics_contract();
+    }
+
+    /// A throughput row is recomputed by the estimator from work and interval; a
+    /// gauge row is whatever number the harness stored. This runs one paired
+    /// stream through the real estimator twice with identical timings and work,
+    /// changing only the declared semantics and the stored observation.
+    pub fn assert_throughput_typing_is_not_cosmetic() {
+        use frankensearch_quill_gauntlet::{
+            PERF_MIN_RUNS, PairedEstimatorConfig, PerfMetricSemantics, PerfOperationScope,
+            PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
+            estimate_paired_experiment,
+        };
+
+        const WORK_UNITS: u64 = 500;
+        const CONTROL_NS: u64 = 2_000_000;
+        const TREATMENT_NS: u64 = 1_000_000;
+        let rounds = u64::try_from(PERF_MIN_RUNS).expect("min runs fits u64") + 2;
+
+        let scope = |semantics| PerfOperationScope {
+            operation_id: "qg1.synthetic.bulk_index_publish".to_owned(),
+            version: 1,
+            semantics,
+            unit: "docs/s".to_owned(),
+        };
+        let provenance = PerfSampleProvenance {
+            run_id: "qg1-semantics-control".to_owned(),
+            executable_sha256: "a".repeat(64),
+            corpus_sha256: "b".repeat(64),
+            input_identity: None,
+            worker_id: "synthetic-worker".to_owned(),
+            build_profile: "release-perf".to_owned(),
+        };
+        let sample = |semantics: PerfMetricSemantics,
+                      block_id: u64,
+                      sample_id: u64,
+                      arm: PerfSampleArm,
+                      order: PerfSampleOrder,
+                      elapsed_ns: u64,
+                      observed_value: f64| PerfRawSample {
+            block_id,
+            sample_id,
+            arm,
+            order,
+            phase: PerfSamplePhase::Measurement,
+            scope: scope(semantics),
+            provenance: provenance.clone(),
+            started_ns: block_id.wrapping_mul(100_000_000),
+            ended_ns: block_id.wrapping_mul(100_000_000) + elapsed_ns,
+            work_units: Some(WORK_UNITS),
+            byte_count: Some(WORK_UNITS * 1_024),
+            observed_value: Some(observed_value),
+            group_id: None,
+            qg6_sample_binding: None,
+            tantivy_config_sha256: None,
+        };
+        // `stored_treatment` is the only lever: `None` stores the honest derived
+        // rate, `Some(value)` stores a fabricated one over the same interval.
+        let stream = |semantics: PerfMetricSemantics,
+                      base_block: u64,
+                      base_id: u64,
+                      treatment_base_ns: u64,
+                      stored_treatment: Option<f64>| {
+            (0..rounds)
+                .flat_map(|round| {
+                    // Per-round jitter keeps the distributions non-degenerate
+                    // without changing which arm is faster.
+                    let control_ns = CONTROL_NS + round;
+                    let treatment_ns = treatment_base_ns + round;
+                    let (control_order, treatment_order) = if round % 2 == 0 {
+                        (PerfSampleOrder::First, PerfSampleOrder::Second)
+                    } else {
+                        (PerfSampleOrder::Second, PerfSampleOrder::First)
+                    };
+                    [
+                        sample(
+                            semantics,
+                            base_block + round,
+                            base_id + round * 2,
+                            PerfSampleArm::Control,
+                            control_order,
+                            control_ns,
+                            super::throughput_per_second(WORK_UNITS, control_ns),
+                        ),
+                        sample(
+                            semantics,
+                            base_block + round,
+                            base_id + round * 2 + 1,
+                            PerfSampleArm::Treatment,
+                            treatment_order,
+                            treatment_ns,
+                            stored_treatment.unwrap_or_else(|| {
+                                super::throughput_per_second(WORK_UNITS, treatment_ns)
+                            }),
+                        ),
+                    ]
+                })
+                .collect::<Vec<_>>()
+        };
+        let config = PairedEstimatorConfig::predeclared(0x1cec_0a57_5eed_0001);
+
+        let throughput_null = stream(
+            PerfMetricSemantics::Throughput,
+            1_000,
+            10_000,
+            CONTROL_NS,
+            None,
+        );
+        let honest = estimate_paired_experiment(
+            &stream(PerfMetricSemantics::Throughput, 0, 0, TREATMENT_NS, None),
+            &throughput_null,
+            &config,
+        )
+        .expect("throughput stream is structurally valid");
+        let tampered = estimate_paired_experiment(
+            &stream(
+                PerfMetricSemantics::Throughput,
+                0,
+                0,
+                TREATMENT_NS,
+                Some(1.0),
+            ),
+            &throughput_null,
+            &config,
+        )
+        .expect("tampered throughput stream is structurally valid");
+        assert_eq!(
+            honest.effect.treatment.p50.to_bits(),
+            tampered.effect.treatment.p50.to_bits(),
+            "throughput is recomputed from work and interval, so a fabricated observation \
+             cannot move it"
+        );
+        assert!(
+            honest.effect.treatment.p50 <= super::throughput_per_second(WORK_UNITS, TREATMENT_NS)
+                && honest.effect.treatment.p50
+                    >= super::throughput_per_second(WORK_UNITS, TREATMENT_NS + rounds),
+            "the throughput estimate must fall inside the rates its intervals imply: {}",
+            honest.effect.treatment.p50
+        );
+
+        // The identical fabricated observation under gauge semantics: nothing
+        // recomputes it, so it simply becomes the answer.
+        let gauge = estimate_paired_experiment(
+            &stream(
+                PerfMetricSemantics::GaugeHigherIsBetter,
+                0,
+                0,
+                TREATMENT_NS,
+                Some(1.0),
+            ),
+            &stream(
+                PerfMetricSemantics::GaugeHigherIsBetter,
+                1_000,
+                10_000,
+                CONTROL_NS,
+                None,
+            ),
+            &config,
+        )
+        .expect("gauge stream is structurally valid");
+        assert_eq!(
+            gauge.effect.treatment.p50.to_bits(),
+            1.0_f64.to_bits(),
+            "a gauge publishes whatever the harness stored, which is why a rate must not be one"
+        );
+    }
+
+    #[test]
+    fn gauge_typing_would_publish_a_rate_no_clock_ever_checked() {
+        assert_throughput_typing_is_not_cosmetic();
     }
 
     #[test]
