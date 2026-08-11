@@ -14259,7 +14259,7 @@ impl FsfsRuntime {
                             Some((&lifecycle_tracker, &storage_paths)),
                         )
                         .await;
-                    watcher.stop().await;
+                    watcher.stop(cx).await;
                     self.finalize_shutdown(cx, reason, Some(&vi_handle)).await?;
                 }
                 Err(ref error)
