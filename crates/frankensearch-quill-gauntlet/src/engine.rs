@@ -3068,6 +3068,9 @@ pub struct TypedQueryFuzzReplay {
 }
 
 #[cfg(feature = "fuzz-harness")]
+const TYPED_QUERY_FUZZ_REPLAY_EXTENSION: &str = "json";
+
+#[cfg(feature = "fuzz-harness")]
 impl TypedQueryFuzzReplay {
     /// Create and immediately validate a minimized artifact from a live run.
     pub fn from_failure(
@@ -3175,14 +3178,20 @@ impl TypedQueryFuzzReplay {
     /// Collision-resistant artifact key that visibly binds corpus and exact
     /// failure signature as well as the full replay payload.
     pub fn artifact_key(&self) -> Result<String, GauntletError> {
-        self.replay_workload()?;
+        let canonical_bytes = self.canonical_bytes()?;
+        self.artifact_key_from_canonical_bytes(&canonical_bytes)
+    }
+
+    fn artifact_key_from_canonical_bytes(
+        &self,
+        canonical_bytes: &[u8],
+    ) -> Result<String, GauntletError> {
         let fingerprint_bytes = serde_json::to_vec(&self.fingerprint)?;
-        let payload_bytes = serde_json::to_vec(self)?;
         Ok(format!(
             "{}-{}-{}",
             self.corpus_manifest_hash,
             typed_query_sha256(b"fingerprint-v1\0", &fingerprint_bytes),
-            typed_query_sha256(b"payload-v3\0", &payload_bytes),
+            typed_query_sha256(b"payload-v3\0", canonical_bytes),
         ))
     }
 
@@ -3200,10 +3209,10 @@ pub fn persist_typed_query_fuzz_replay(
     replay: &TypedQueryFuzzReplay,
 ) -> Result<std::path::PathBuf, GauntletError> {
     let bytes = replay.canonical_bytes()?;
-    let key = replay.artifact_key()?;
+    let key = replay.artifact_key_from_canonical_bytes(&bytes)?;
     let directory = root.join("typed_query_tree");
     std::fs::create_dir_all(&directory)?;
-    let path = directory.join(format!("{key}.json"));
+    let path = directory.join(typed_query_fuzz_replay_filename(&key));
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -3231,9 +3240,35 @@ pub fn persist_typed_query_fuzz_replay(
 pub fn load_typed_query_fuzz_replay(
     path: &std::path::Path,
 ) -> Result<TypedQueryFuzzReplay, GauntletError> {
-    let replay = serde_json::from_slice::<TypedQueryFuzzReplay>(&std::fs::read(path)?)?;
-    replay.replay_workload()?;
+    let stored_bytes = std::fs::read(path)?;
+    let replay = serde_json::from_slice::<TypedQueryFuzzReplay>(&stored_bytes)?;
+    let canonical_bytes = replay.canonical_bytes()?;
+    if stored_bytes != canonical_bytes {
+        return Err(GauntletError::ManifestMismatch {
+            reason: "typed-query replay bytes are not canonical".to_owned(),
+        });
+    }
+    let key = replay.artifact_key_from_canonical_bytes(&canonical_bytes)?;
+    let expected_filename = typed_query_fuzz_replay_filename(&key);
+    let actual_filename = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| GauntletError::ManifestMismatch {
+            reason: "typed-query replay path has no UTF-8 final filename component".to_owned(),
+        })?;
+    if actual_filename != expected_filename {
+        return Err(GauntletError::ManifestMismatch {
+            reason: format!(
+                "typed-query replay filename must be {expected_filename}, found {actual_filename}"
+            ),
+        });
+    }
     Ok(replay)
+}
+
+#[cfg(feature = "fuzz-harness")]
+fn typed_query_fuzz_replay_filename(key: &str) -> String {
+    format!("{key}.{TYPED_QUERY_FUZZ_REPLAY_EXTENSION}")
 }
 
 #[cfg(feature = "fuzz-harness")]
@@ -10566,6 +10601,9 @@ mod tests {
     }
 
     #[cfg(feature = "fuzz-harness")]
+    /// Synthesizes a structurally valid failed fingerprint for persistence
+    /// tests. It deliberately does not claim an engine divergence was
+    /// re-executed; that belongs to the fuzz target's live subject/oracle run.
     fn typed_query_test_replay(
         input: &[u8],
         minimized_ast: TypedQueryTree,
@@ -10597,6 +10635,19 @@ mod tests {
             },
             divergence_class: DivergenceClass::RankMismatch,
         }
+    }
+
+    #[cfg(feature = "fuzz-harness")]
+    fn typed_query_replay_test_root(label: &str) -> std::path::PathBuf {
+        static DIRECTORY_NONCE: AtomicUsize = AtomicUsize::new(0);
+
+        let nonce = DIRECTORY_NONCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frankensearch-typed-query-replay-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("create unique owned replay test directory");
+        root
     }
 
     #[cfg(feature = "fuzz-harness")]
@@ -10660,6 +10711,133 @@ mod tests {
                 .expect("different fingerprint replay key"),
             "different failure fingerprints must not collide under one artifact key"
         );
+    }
+
+    #[cfg(feature = "fuzz-harness")]
+    #[test]
+    fn typed_query_public_replay_persistence_authenticates_canonical_filename() {
+        let replay = typed_query_test_replay(&[22, 1, 7, 99], TypedQueryTree::MixedHitMiss(1, 7));
+        let root = typed_query_replay_test_root("public-persistence");
+        let path = persist_typed_query_fuzz_replay(&root, &replay)
+            .expect("persist with create-new in an owned directory");
+        let canonical_bytes = replay.canonical_bytes().expect("canonical replay bytes");
+        let artifact_key = replay.artifact_key().expect("canonical artifact key");
+        let expected_filename = typed_query_fuzz_replay_filename(&artifact_key);
+        assert_eq!(
+            path.file_name().and_then(std::ffi::OsStr::to_str),
+            Some(expected_filename.as_str()),
+            "the persisted final path component must be the canonical content-addressed name"
+        );
+        assert_eq!(
+            load_typed_query_fuzz_replay(&path).expect("load canonical persisted replay"),
+            replay,
+            "the public load entrypoint must reconstruct the persisted replay"
+        );
+
+        let reject_under_original_key = |label: &str, bytes: Vec<u8>| {
+            std::fs::write(&path, bytes).expect("plant hostile replay bytes under original key");
+            assert!(
+                matches!(
+                    load_typed_query_fuzz_replay(&path),
+                    Err(GauntletError::ManifestMismatch { .. })
+                ),
+                "{label} must not load under the original content-addressed key"
+            );
+            std::fs::write(&path, &canonical_bytes).expect("restore owned canonical replay bytes");
+        };
+
+        let replacement =
+            typed_query_test_replay(&[22, 1, 7, 98], TypedQueryTree::MixedHitMiss(1, 7));
+        assert_ne!(
+            replacement.artifact_key().expect("replacement key"),
+            artifact_key,
+            "a different corpus identity must not reuse the original key"
+        );
+        reject_under_original_key(
+            "valid replacement replay",
+            replacement.canonical_bytes().expect("replacement bytes"),
+        );
+
+        let mut fingerprint_tamper = replay.clone();
+        fingerprint_tamper.fingerprint.first_divergence =
+            Some("/comparison/subject/hits/1".to_owned());
+        assert_ne!(
+            fingerprint_tamper
+                .artifact_key()
+                .expect("tampered fingerprint key"),
+            artifact_key,
+            "a fingerprint mutation must change the canonical key"
+        );
+        reject_under_original_key(
+            "fingerprint mutation",
+            fingerprint_tamper
+                .canonical_bytes()
+                .expect("fingerprint mutation bytes"),
+        );
+        let mut noncanonical_bytes = canonical_bytes.clone();
+        noncanonical_bytes.push(b'\n');
+        reject_under_original_key("noncanonical encoding", noncanonical_bytes);
+
+        let mut seed_tamper = replay.clone();
+        seed_tamper.original_seed ^= 1;
+        reject_under_original_key(
+            "seed mutation",
+            serde_json::to_vec(&seed_tamper).expect("seed mutation bytes"),
+        );
+
+        let mut corpus_tamper = replay.clone();
+        corpus_tamper.corpus_manifest_hash = "0".repeat(64);
+        reject_under_original_key(
+            "corpus identity mutation",
+            serde_json::to_vec(&corpus_tamper).expect("corpus mutation bytes"),
+        );
+
+        let mut ast_tamper = replay.clone();
+        ast_tamper.minimized_ast = TypedQueryTree::OovOnly(7);
+        reject_under_original_key(
+            "AST mutation",
+            serde_json::to_vec(&ast_tamper).expect("AST mutation bytes"),
+        );
+
+        let mut query_tamper = replay.clone();
+        query_tamper.minimized_query.push('!');
+        reject_under_original_key(
+            "query mutation",
+            serde_json::to_vec(&query_tamper).expect("query mutation bytes"),
+        );
+
+        let wrong_filename = path.with_file_name("not-the-content-key.json");
+        std::fs::write(&wrong_filename, &canonical_bytes)
+            .expect("plant valid replay under wrong filename");
+        assert!(matches!(
+            load_typed_query_fuzz_replay(&wrong_filename),
+            Err(GauntletError::ManifestMismatch { .. })
+        ));
+
+        let unknown_extension = path.with_extension("replay");
+        std::fs::write(&unknown_extension, &canonical_bytes)
+            .expect("plant valid replay with unknown extension");
+        assert!(matches!(
+            load_typed_query_fuzz_replay(&unknown_extension),
+            Err(GauntletError::ManifestMismatch { .. })
+        ));
+
+        let collision_root = typed_query_replay_test_root("create-new-collision");
+        let collision_path = collision_root
+            .join("typed_query_tree")
+            .join(&expected_filename);
+        std::fs::create_dir_all(
+            collision_path
+                .parent()
+                .expect("collision path has a typed-query directory"),
+        )
+        .expect("create owned collision directory");
+        std::fs::write(&collision_path, b"unrelated existing replay")
+            .expect("plant pre-existing collision");
+        assert!(matches!(
+            persist_typed_query_fuzz_replay(&collision_root, &replay),
+            Err(GauntletError::ArtifactCollision { path: reported }) if reported == collision_path
+        ));
     }
 
     #[cfg(feature = "fuzz-harness")]
