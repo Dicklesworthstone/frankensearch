@@ -5989,10 +5989,6 @@ mod tests {
             postings.len() + 1,
             "the construction admission plus one per move, including the exhausting move"
         );
-        assert!(
-            units.iter().all(|charged| *charged <= 1),
-            "a single move can enter at most one posting block: {units:?}"
-        );
         assert_eq!(
             units.iter().sum::<u64>(),
             u64::try_from(block_count)?,
@@ -6012,6 +6008,138 @@ mod tests {
             units.last(),
             Some(&0),
             "the exhausting move enters no block and charges nothing"
+        );
+        Ok(())
+    }
+
+    /// A skip that crosses more than one block still charges exactly one unit,
+    /// and that same admission is refusable.
+    ///
+    /// Stepping with `next` cannot pin either fact: consecutive steps only ever
+    /// move one block, so there the per-move charge and the distance travelled
+    /// are indistinguishable. A sealed skip seek decodes only its destination
+    /// block, which is why the default `work_blocks_since` charges one for any
+    /// ordinal change, while a sequential Delta cursor deliberately charges
+    /// every traversed block. This is therefore the one move where a cursor
+    /// that adopted the cumulative rule would start over-charging fuel, and the
+    /// one move whose refusal a `next`-only test can never observe.
+    #[test]
+    fn checkpoint_cursor_charges_one_unit_for_a_multi_block_skip_and_refuses_on_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let postings = (0..257)
+            .map(|docid| Posting::new(docid, 1))
+            .collect::<Vec<_>>();
+        let encoded = EncodedPostingList::encode(&postings)?;
+        let list = encoded.posting_list()?;
+        assert!(
+            list.block_count() >= 3,
+            "fixture must offer a skip across at least two block boundaries"
+        );
+        let segment_num_docs = u32::try_from(postings.len())?;
+        let skip_target = u32::try_from(postings.len() - 1)?;
+
+        let recorder = Arc::new(UnitSequenceCheckpoint::default());
+        let recorder_for_cursor: Arc<dyn QueryWorkCheckpoint> = recorder.clone();
+        let sealed = SealedPostingCursor::new(&list, segment_num_docs)?;
+        let mut cursor = CheckpointPostingCursor::new(sealed, recorder_for_cursor)?;
+        let entry_block = PostingCursor::current_work_block(&cursor);
+        assert_eq!(cursor.advance(skip_target)?, Some(skip_target));
+        let landed_block = PostingCursor::current_work_block(&cursor);
+        let blocks_travelled = landed_block
+            .zip(entry_block)
+            .map_or(0, |(landed, entry)| landed.saturating_sub(entry));
+        assert!(
+            blocks_travelled >= 2,
+            "the fixture must skip a whole block, not step: {entry_block:?} -> {landed_block:?}"
+        );
+        let units = recorder
+            .units
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            units.as_slice(),
+            [1, 1].as_slice(),
+            "construction charges the first block and the skip charges only its destination"
+        );
+
+        // The same skip must be refusable. Admission 1 is construction and
+        // admission 2 is the advance, so the refusal lands on the skip itself.
+        let checkpoint = Arc::new(CancelOnNthAdmission::new(2));
+        let checkpoint_for_cursor: Arc<dyn QueryWorkCheckpoint> = checkpoint.clone();
+        let sealed = SealedPostingCursor::new(&list, segment_num_docs)?;
+        let mut cursor = CheckpointPostingCursor::new(sealed, checkpoint_for_cursor)?;
+        let error = cursor
+            .advance(skip_target)
+            .expect_err("a skip must observe a refusing checkpoint");
+        assert!(
+            matches!(
+                error,
+                ArgusError::QueryCancelled {
+                    phase: "checkpoint_cursor_unit_test"
+                }
+            ),
+            "expected the checkpoint's typed refusal, got {error:?}"
+        );
+        assert_eq!(
+            checkpoint
+                .units_at_fire
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the refused skip must be admitted with the single block it entered"
+        );
+        assert_eq!(
+            checkpoint
+                .admissions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the refusal must land on the advance, not on a later move"
+        );
+        Ok(())
+    }
+
+    /// A checkpoint refusing the construction admission must fail construction
+    /// outright.
+    ///
+    /// The first block is decoded before any move exists, so a cancellation
+    /// arriving that early has exactly one place to be observed, and the cursor
+    /// must never come into being able to serve postings from it.
+    #[test]
+    fn checkpoint_cursor_surfaces_cancellation_at_construction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let postings = (0..257)
+            .map(|docid| Posting::new(docid, 1))
+            .collect::<Vec<_>>();
+        let encoded = EncodedPostingList::encode(&postings)?;
+        let list = encoded.posting_list()?;
+        let checkpoint = Arc::new(CancelOnNthAdmission::new(1));
+        let checkpoint_for_cursor: Arc<dyn QueryWorkCheckpoint> = checkpoint.clone();
+        let sealed = SealedPostingCursor::new(&list, u32::try_from(postings.len())?)?;
+
+        // `CheckpointPostingCursor` is not `Debug`, so the outcome is matched
+        // in place rather than unwrapped.
+        assert!(
+            matches!(
+                CheckpointPostingCursor::new(sealed, checkpoint_for_cursor),
+                Err(ArgusError::QueryCancelled {
+                    phase: "checkpoint_cursor_unit_test"
+                })
+            ),
+            "a refused construction admission must fail the cursor outright",
+        );
+        assert_eq!(
+            checkpoint
+                .units_at_fire
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "construction admits the already-decoded first block"
+        );
+        assert_eq!(
+            checkpoint
+                .admissions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a refused construction must not admit twice"
         );
         Ok(())
     }
