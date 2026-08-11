@@ -1604,6 +1604,10 @@ fn call_auto_writer(
 }
 
 /// Perform the pinned-width Tantivy call, recording that it was the one made.
+///
+/// Gated to the features that actually reach it — the oracle's pinned plan and
+/// the benchmark seams — so the default build has no helper without a caller.
+#[cfg(any(feature = "tantivy-oracle", feature = "bench-internals"))]
 fn call_fixed_writer(
     index: &Index,
     threads: usize,
@@ -2001,14 +2005,26 @@ impl TantivyIndex {
             path,
             benchmark_writer_threads: _,
             benchmark_writer_receipt,
+            #[cfg(test)]
+                observed_writer_call: _,
         } = self;
         let mut receipt = Self::benchmark_join_writer(&index, writer)?;
-        let writer = index
-            .writer_with_num_threads(writer_threads, writer_heap_bytes)
-            .map_err(|error| SearchError::SubsystemError {
-                subsystem: "tantivy",
-                source: Box::new(error),
-            })?;
+        // The rearm reconstructs through the same helper the fixed plan uses,
+        // so its observation is the call it actually made rather than the one
+        // the old writer had made.
+        #[cfg(test)]
+        let mut observed_writer_call = WriterCall::Auto;
+        let writer = call_fixed_writer(
+            &index,
+            writer_threads,
+            writer_heap_bytes,
+            #[cfg(test)]
+            &mut observed_writer_call,
+        )
+        .map_err(|error| SearchError::SubsystemError {
+            subsystem: "tantivy",
+            source: Box::new(error),
+        })?;
         receipt.writer_rearmed = true;
         Ok((
             Self {
@@ -2033,6 +2049,8 @@ impl TantivyIndex {
                         ..previous
                     }
                 }),
+                #[cfg(test)]
+                observed_writer_call,
             },
             receipt,
         ))
@@ -2065,6 +2083,8 @@ impl TantivyIndex {
             path,
             benchmark_writer_threads,
             benchmark_writer_receipt,
+            #[cfg(test)]
+                observed_writer_call: _,
         } = self;
         let receipt = Self::benchmark_join_writer(&index, writer)?;
         drop((doc_count, ord_table, path, benchmark_writer_threads));
