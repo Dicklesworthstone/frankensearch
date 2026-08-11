@@ -19936,6 +19936,141 @@ mod tests {
         });
     }
 
+    /// A REAL publisher rejection — raised inside `publish_owned_segments`,
+    /// after the pending inventory has already been handed to it — must leave
+    /// the writer's own copy of the payload retained at the exact same
+    /// allocation, and the repaired retry must publish that allocation.
+    ///
+    /// The sibling prepublication test cannot see this, which is why both
+    /// exist: it aborts at the checkpoint before the publisher is ever called,
+    /// so a refactor that moves `pending_owned_segments` into the call —
+    /// `mem::take` and friends — would still pass it while silently losing the
+    /// sealed bytes on any publisher error. The failure injected here is the
+    /// publisher's own typed duplicate-segment rejection, reachable only after
+    /// ownership of the inventory has transferred, so an emptied pending
+    /// inventory fails the very next assertion.
+    #[test]
+    fn memory_publisher_error_retains_the_exact_pending_payload_then_retries() {
+        run_with_cx(|cx| async move {
+            let mut index =
+                QuillIndex::in_memory(deterministic_config()).expect("create in-memory index");
+            index
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("doc-a", "aardvark burrows deep"),
+                )
+                .await
+                .expect("stage the publisher-failure document");
+            let generation = index.snapshot().loaded_manifest().manifest.generation;
+
+            // Seal without publishing. The encoded segment now sits in the
+            // writer's pending inventory exactly as an interrupted commit
+            // leaves it, with no MANIFEST proposal prepared yet.
+            index
+                .writer_mut()
+                .flush_all_shards(&cx, LifecycleTrigger::ExplicitFlush)
+                .await
+                .expect("seal the pending segment without publishing it");
+
+            // Arm the publisher failure: one segment supplied twice is rejected
+            // by `publish_owned_segments` itself. Cloning the retained segment
+            // shares its backing, so the injected duplicate adds no payload.
+            let (payload_ptr, payload, segment_id) = {
+                let writer = index.writer_mut();
+                assert_eq!(
+                    writer.pending_owned_segments.len(),
+                    1,
+                    "the flush must seal exactly one pending segment"
+                );
+                let retained = &writer.pending_owned_segments[0];
+                let witness = (
+                    retained.as_bytes().as_ptr(),
+                    retained.as_bytes().to_vec(),
+                    retained.header().segment_id,
+                );
+                let duplicate = writer.pending_owned_segments[0].clone();
+                writer.pending_owned_segments.push(duplicate);
+                witness
+            };
+
+            assert!(
+                matches!(
+                    index.commit(&cx).await,
+                    Err(QuillIndexError::Keeper(KeeperError::InvalidTransition {
+                        detail,
+                        ..
+                    })) if detail.contains("supplied more than once")
+                ),
+                "the duplicated owned segment must be rejected by the publisher itself",
+            );
+
+            {
+                let writer = index.writer_mut();
+                assert_eq!(
+                    writer.pending_owned_segments.len(),
+                    2,
+                    "a rejected publication must retain the inventory it handed over"
+                );
+                assert_eq!(
+                    writer.pending_owned_segments[0].as_bytes().as_ptr(),
+                    payload_ptr,
+                    "the retained payload must be the exact same allocation, never a copy"
+                );
+                assert_eq!(
+                    writer.pending_owned_segments[0].as_bytes(),
+                    payload.as_slice(),
+                    "the failed attempt must not disturb the retained payload bytes"
+                );
+                // Repair only the injected duplicate. The sealed original stays
+                // exactly where the failed publication left it.
+                writer.pending_owned_segments.truncate(1);
+            }
+            assert_eq!(
+                index.snapshot().loaded_manifest().manifest.generation,
+                generation,
+                "a rejected publication must not advance the published generation"
+            );
+            assert!(
+                index
+                    .search_paginated(&cx, "aardvark", 10, 0, true)
+                    .expect("query the unchanged epoch")
+                    .hits
+                    .is_empty(),
+                "a rejected publication must not make the segment visible"
+            );
+
+            let published = index
+                .commit(&cx)
+                .await
+                .expect("the repaired retry publishes the retained segment");
+            assert!(
+                index.writer_mut().pending_owned_segments.is_empty(),
+                "a successful publication must consume the pending inventory"
+            );
+            let segment = published
+                .segments()
+                .iter()
+                .find(|segment| segment.header().segment_id == segment_id)
+                .expect("the retry installs the exact retained segment");
+            assert_eq!(
+                segment.source_bytes().as_ptr(),
+                payload_ptr,
+                "the retry must adopt the retained allocation, never a copy"
+            );
+            assert_eq!(
+                segment.source_bytes(),
+                payload.as_slice(),
+                "the retried publication must seal byte-identical FSLX"
+            );
+            segment.verify().expect("the published segment verifies");
+            let hits = index
+                .search_paginated(&cx, "aardvark", 10, 0, true)
+                .expect("query the retried publication");
+            assert_eq!(hits.total_count, Some(1));
+            assert_eq!(hits.hits[0].document_id, "doc-a");
+        });
+    }
+
     #[test]
     fn dropped_delta_seal_after_manifest_install_resumes_exact_generation() {
         // This fixture intentionally pauses inside real blocking filesystem
