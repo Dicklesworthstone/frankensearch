@@ -7262,10 +7262,26 @@ pub struct IdHashSection<'a> {
 pub(crate) struct IdHashLookupPlan {
     docid_lo: u64,
     span: usize,
+    dense: bool,
     id_map_blob_offset: usize,
     id_map_len: usize,
     id_hash_len: usize,
     capacity: usize,
+}
+
+/// Admission-derived physical-row presence decision for one IDMAP domain.
+///
+/// A dense plan has already proved that every in-range ordinal has an IDMAP
+/// entry. Hole-bearing plans deliberately defer to the byte-backed lookup so
+/// the existing offset and identifier validation path remains authoritative.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IdMapPresence {
+    /// The global document id is outside the admitted IDMAP domain.
+    Absent,
+    /// Admission proved that this in-range document id has a physical row.
+    Present,
+    /// The domain contains holes, so the IDMAP bytes must decide this row.
+    RequiresIdMap,
 }
 
 impl<'a> IdHashSection<'a> {
@@ -7316,9 +7332,11 @@ impl<'a> IdHashSection<'a> {
     /// validation.
     #[must_use]
     pub(crate) fn lookup_plan(self) -> IdHashLookupPlan {
+        let span = self.id_map.offset_count();
         IdHashLookupPlan {
             docid_lo: self.id_map.docid_lo,
-            span: self.id_map.offset_count(),
+            span,
+            dense: self.id_map.present_count() == span,
             id_map_blob_offset: self.id_map.bytes.len() - self.id_map.blob.len(),
             id_map_len: self.id_map.bytes.len(),
             id_hash_len: self.bytes.len(),
@@ -7391,6 +7409,29 @@ impl<'a> IdHashSection<'a> {
 }
 
 impl IdHashLookupPlan {
+    /// Decide physical-row presence before accessing the IDMAP section.
+    ///
+    /// `Present` is possible only when admission proved a dense map; a plan
+    /// with holes always returns [`IdMapPresence::RequiresIdMap`] in range so
+    /// callers retain the pre-existing byte-backed lookup.
+    #[must_use]
+    pub(crate) fn identity_row_presence(self, global_docid: u32) -> IdMapPresence {
+        let Some(ordinal) = u64::from(global_docid).checked_sub(self.docid_lo) else {
+            return IdMapPresence::Absent;
+        };
+        let Ok(ordinal) = usize::try_from(ordinal) else {
+            return IdMapPresence::Absent;
+        };
+        if ordinal >= self.span {
+            return IdMapPresence::Absent;
+        }
+        if self.dense {
+            IdMapPresence::Present
+        } else {
+            IdMapPresence::RequiresIdMap
+        }
+    }
+
     /// Whether the bound IDMAP contains a physical row for this global docid.
     #[must_use]
     pub(crate) fn contains_global_docid(self, id_map_bytes: &[u8], global_docid: u32) -> bool {
@@ -15461,6 +15502,104 @@ mod tests {
         assert_eq!(actual.capacity(), expected.capacity());
         assert_eq!(actual.occupied(), expected.occupied());
         actual.section(monolithic.section()?)?;
+        Ok(())
+    }
+
+    #[test]
+    fn id_hash_lookup_plan_presence_is_admission_derived() -> TestResult {
+        let dense_map = EncodedIdMapSection::encode(
+            10,
+            12,
+            &[
+                Some(IdMapEntryInput::new("dense-a", 1)),
+                Some(IdMapEntryInput::new("dense-b", 2)),
+            ],
+        )?;
+        let dense_hash = EncodedIdHashSection::encode(dense_map.section()?)?;
+        let dense =
+            IdHashSection::parse(dense_hash.as_bytes(), dense_map.section()?)?.lookup_plan();
+        assert_eq!(
+            dense.identity_row_presence(9),
+            IdMapPresence::Absent,
+            "below the admitted domain is absent"
+        );
+        assert_eq!(
+            dense.identity_row_presence(10),
+            IdMapPresence::Present,
+            "admission proves every dense in-range row"
+        );
+        assert_eq!(dense.identity_row_presence(11), IdMapPresence::Present);
+        assert_eq!(
+            dense.identity_row_presence(12),
+            IdMapPresence::Absent,
+            "the exclusive upper bound remains absent"
+        );
+
+        let hole_map = EncodedIdMapSection::encode(
+            20,
+            23,
+            &[
+                Some(IdMapEntryInput::new("left", 3)),
+                None,
+                Some(IdMapEntryInput::new("right", 4)),
+            ],
+        )?;
+        let hole_hash = EncodedIdHashSection::encode(hole_map.section()?)?;
+        let holes = IdHashSection::parse(hole_hash.as_bytes(), hole_map.section()?)?.lookup_plan();
+        assert_eq!(holes.identity_row_presence(19), IdMapPresence::Absent);
+        assert_eq!(
+            holes.identity_row_presence(20),
+            IdMapPresence::RequiresIdMap,
+            "hole-bearing plans must not infer even a present row"
+        );
+        assert_eq!(
+            holes.identity_row_presence(21),
+            IdMapPresence::RequiresIdMap
+        );
+        assert_eq!(
+            holes.identity_row_presence(22),
+            IdMapPresence::RequiresIdMap
+        );
+        assert!(
+            holes.contains_global_docid(hole_map.as_bytes(), 20),
+            "the unchanged byte-backed path accepts a present row"
+        );
+        assert!(
+            !holes.contains_global_docid(hole_map.as_bytes(), 21),
+            "the unchanged byte-backed path rejects an IDMAP hole"
+        );
+
+        let empty_map = EncodedIdMapSection::encode(0, 0, &[])?;
+        let empty_hash = EncodedIdHashSection::encode(empty_map.section()?)?;
+        let empty =
+            IdHashSection::parse(empty_hash.as_bytes(), empty_map.section()?)?.lookup_plan();
+        assert_eq!(empty.identity_row_presence(0), IdMapPresence::Absent);
+
+        let boundary_map = EncodedIdMapSection::encode(
+            u64::from(u32::MAX),
+            u64::from(u32::MAX) + 1,
+            &[Some(IdMapEntryInput::new("max", 5))],
+        )?;
+        let boundary_hash = EncodedIdHashSection::encode(boundary_map.section()?)?;
+        let boundary =
+            IdHashSection::parse(boundary_hash.as_bytes(), boundary_map.section()?)?.lookup_plan();
+        assert_eq!(
+            boundary.identity_row_presence(u32::MAX - 1),
+            IdMapPresence::Absent
+        );
+        assert_eq!(
+            boundary.identity_row_presence(u32::MAX),
+            IdMapPresence::Present
+        );
+
+        let mut corrupt = dense_map.as_bytes().to_vec();
+        if corrupt.pop().is_none() {
+            return Err("encoded IDMAP fixture is nonempty".into());
+        }
+        assert!(
+            IdMapSection::parse(&corrupt, 10, 12).is_err(),
+            "corrupt IDMAP bytes are rejected before a lookup plan can be admitted"
+        );
         Ok(())
     }
 

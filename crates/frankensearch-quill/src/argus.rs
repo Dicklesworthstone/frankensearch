@@ -597,8 +597,15 @@ impl PostingCheckpoint<'_> {
     }
 }
 
-/// Posting cursor wrapper that checks cancellation and fuel only when a coarse
-/// posting block is entered.
+/// Posting cursor wrapper that charges coarse fuel only for entered posting
+/// blocks while observing cancellation on every move.
+///
+/// The two halves of that sentence are separate concerns and must stay
+/// separate. Fuel is a cost model, so only a newly entered block is charged.
+/// Cancellation is a liveness obligation, and
+/// [`QueryWorkCheckpoint::admit`] is the only place a scoring cursor can
+/// discharge it, so an in-block step still has to call it — with zero units,
+/// which charges nothing.
 pub struct CheckpointPostingCursor<'a> {
     inner: Box<dyn PostingCursor + 'a>,
     checkpoint: PostingCheckpoint<'a>,
@@ -627,12 +634,21 @@ impl<'a> CheckpointPostingCursor<'a> {
         Ok(cursor)
     }
 
+    /// Admit the blocks this move entered — possibly none.
+    ///
+    /// Every move admits. A zero-unit admission charges no fuel and touches
+    /// no work counter, because [`QueryWorkCheckpoint::admit`] returns right
+    /// after its cancellation poll when `units == 0`, so metering still
+    /// reflects entered blocks only. Skipping the call for an in-block step
+    /// instead is what makes a cancelled query keep walking its plan: the
+    /// drain of a scored candidate and the move that exhausts a cursor both
+    /// charge zero blocks, so a request arriving after the last block entry
+    /// was never observed and the query returned a complete result set.
     fn checkpoint_move(&self, previous: Option<u64>) -> Result<(), ArgusError> {
-        let units = self.inner.work_blocks_since(previous);
-        if units != 0 {
-            self.checkpoint.admit(QueryWorkKind::PostingBlock, units)?;
-        }
-        Ok(())
+        self.checkpoint.admit(
+            QueryWorkKind::PostingBlock,
+            self.inner.work_blocks_since(previous),
+        )
     }
 }
 
@@ -5729,8 +5745,43 @@ mod tests {
         }
     }
 
+    /// Refuses the `fire_on`-th admission the way a cancelled real
+    /// [`QueryCheckpoint`] does, and counts what it saw.
+    struct CancelOnNthAdmission {
+        fire_on: usize,
+        admissions: std::sync::atomic::AtomicUsize,
+        units_at_fire: std::sync::atomic::AtomicU64,
+    }
+
+    impl CancelOnNthAdmission {
+        fn new(fire_on: usize) -> Self {
+            Self {
+                fire_on,
+                admissions: std::sync::atomic::AtomicUsize::new(0),
+                units_at_fire: std::sync::atomic::AtomicU64::new(u64::MAX),
+            }
+        }
+    }
+
+    impl QueryWorkCheckpoint for CancelOnNthAdmission {
+        fn admit(&self, _kind: QueryWorkKind, units: u64) -> Result<(), ArgusError> {
+            let ordinal = self
+                .admissions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if ordinal == self.fire_on {
+                self.units_at_fire
+                    .store(units, std::sync::atomic::Ordering::SeqCst);
+                return Err(ArgusError::QueryCancelled {
+                    phase: "checkpoint_cursor_unit_test",
+                });
+            }
+            Ok(())
+        }
+    }
+
     #[test]
-    fn checkpoint_cursor_admits_only_entered_posting_blocks()
+    fn checkpoint_cursor_charges_entered_blocks_and_admits_every_move()
     -> Result<(), Box<dyn std::error::Error>> {
         let postings = (0..257)
             .map(|docid| Posting::new(docid, 1))
@@ -5750,21 +5801,79 @@ mod tests {
 
         assert!(PostingCursor::validated_post_move_contract(&cursor).is_some());
 
-        while cursor.next()?.is_some() {}
+        let mut moves = 0_usize;
+        while cursor.next()?.is_some() {
+            moves += 1;
+        }
+        // The cursor starts on the first posting, so exhausting it takes one
+        // move per remaining posting plus the final move that reports `None`.
+        assert_eq!(moves + 1, postings.len());
 
-        assert_eq!(
-            checkpoint
-                .admissions
-                .load(std::sync::atomic::Ordering::SeqCst),
-            block_count,
-            "the checkpoint runs once for each entered block, never for an in-block posting"
-        );
         assert_eq!(
             checkpoint
                 .admitted_units
                 .load(std::sync::atomic::Ordering::SeqCst),
             u64::try_from(block_count)?,
-            "the charged work is unchanged"
+            "fuel charges one unit per entered block and nothing for an in-block step"
+        );
+        assert_eq!(
+            checkpoint
+                .admissions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            postings.len() + 1,
+            "every move admits so it can observe cancellation: one admission for the \
+             already-decoded first block, then one per move including the exhausting move"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_cursor_surfaces_cancellation_on_an_in_block_move()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let postings = (0..257)
+            .map(|docid| Posting::new(docid, 1))
+            .collect::<Vec<_>>();
+        let encoded = EncodedPostingList::encode(&postings)?;
+        let list = encoded.posting_list()?;
+        assert!(
+            list.block_count() > 1,
+            "fixture must cross a posting-block boundary"
+        );
+        // Admission 1 is the already-decoded first block. Admission 2 is the
+        // first step to the next posting, which stays inside that block and
+        // therefore charges nothing — exactly the move a cursor that only
+        // admits entered blocks cannot refuse.
+        let checkpoint = Arc::new(CancelOnNthAdmission::new(2));
+        let checkpoint_for_cursor: Arc<dyn QueryWorkCheckpoint> = checkpoint.clone();
+        let segment_num_docs = u32::try_from(postings.len())?;
+        let sealed = SealedPostingCursor::new(&list, segment_num_docs)?;
+        let mut cursor = CheckpointPostingCursor::new(sealed, checkpoint_for_cursor)?;
+
+        let error = cursor
+            .next()
+            .expect_err("an in-block step must observe a refusing checkpoint");
+        assert!(
+            matches!(
+                error,
+                ArgusError::QueryCancelled {
+                    phase: "checkpoint_cursor_unit_test"
+                }
+            ),
+            "expected the checkpoint's typed refusal, got {error:?}"
+        );
+        assert_eq!(
+            checkpoint
+                .units_at_fire
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the refused in-block move must be admitted with zero units so it charges no fuel"
+        );
+        assert_eq!(
+            checkpoint
+                .admissions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the cursor must stop at the refusal instead of walking to the next block boundary"
         );
         Ok(())
     }

@@ -19737,6 +19737,117 @@ mod tests {
         });
     }
 
+    /// The ordinary scalar commit publishes by sharing the pending payload
+    /// backing, and a publication that fails after the flush sealed that
+    /// payload must retain it — unmoved — for the retry.
+    ///
+    /// Both halves are pinned by allocation identity rather than by content,
+    /// which is what makes this a regression test instead of a restatement of
+    /// the code: while `EncodedSegment` owned its bytes outright, publication
+    /// consumed a deep copy of `pending_owned_segments`, so the installed
+    /// segment's image lived at a different address than the payload the
+    /// writer retained for retry. Any future design that copies the payload,
+    /// or that moves the pending inventory out before publication succeeds,
+    /// fails here.
+    #[cfg(feature = "conformance-internals")]
+    #[test]
+    fn memory_commit_publication_failure_retains_the_exact_pending_payload_then_retries() {
+        run_with_cx(|cx| async move {
+            let mut index =
+                QuillIndex::in_memory(deterministic_config()).expect("create in-memory index");
+            index
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("doc-a", "aardvark burrows deep"),
+                )
+                .await
+                .expect("stage the commit-retry document");
+            let generation = index.snapshot().loaded_manifest().manifest.generation;
+
+            // Inject the failure at the exact publication boundary: the shard
+            // flush has already sealed the encoded segment into the writer's
+            // pending inventory and the successor MANIFEST is prepared, but
+            // the Keeper has adopted nothing yet.
+            let controller = index.conformance_cancellation_controller();
+            controller
+                .arm(ConformanceCancellationStage::CommitPublication, 1)
+                .expect("arm the commit publication checkpoint");
+            // `KeeperSnapshot` is deliberately not `Debug`, so the outcome is
+            // matched in place rather than unwrapped.
+            assert!(
+                matches!(
+                    index.commit(&cx).await,
+                    Err(QuillIndexError::Cancelled {
+                        phase: "commit publish"
+                    })
+                ),
+                "the injected failure must abort the commit at publication",
+            );
+            assert!(controller.fired());
+            assert_eq!(controller.observed_checkpoints(), 1);
+            controller.disarm();
+            cx.set_cancel_requested(false);
+
+            let (payload_ptr, payload, segment_id) = {
+                let pending = &index.writer_mut().pending_owned_segments;
+                assert_eq!(
+                    pending.len(),
+                    1,
+                    "the failed publication must retain the sealed segment for retry"
+                );
+                let retained = &pending[0];
+                (
+                    retained.as_bytes().as_ptr(),
+                    retained.as_bytes().to_vec(),
+                    retained.header().segment_id,
+                )
+            };
+            assert_eq!(
+                index.snapshot().loaded_manifest().manifest.generation,
+                generation,
+                "an aborted publication must not advance the published generation"
+            );
+            assert!(
+                index
+                    .search_paginated(&cx, "aardvark", 10, 0, true)
+                    .expect("query the unchanged epoch")
+                    .hits
+                    .is_empty(),
+                "the retained segment must stay invisible until publication succeeds"
+            );
+
+            let published = index
+                .commit(&cx)
+                .await
+                .expect("the retry publishes the retained segment");
+            assert!(
+                index.writer_mut().pending_owned_segments.is_empty(),
+                "a successful publication must consume the pending inventory"
+            );
+            let segment = published
+                .segments()
+                .iter()
+                .find(|segment| segment.header().segment_id == segment_id)
+                .expect("the retry installs the exact retained segment");
+            assert_eq!(
+                segment.source_bytes().as_ptr(),
+                payload_ptr,
+                "publication must adopt the retained payload allocation, never copy it"
+            );
+            assert_eq!(
+                segment.source_bytes(),
+                payload.as_slice(),
+                "the retried publication must seal byte-identical FSLX"
+            );
+            segment.verify().expect("the published segment verifies");
+            let hits = index
+                .search_paginated(&cx, "aardvark", 10, 0, true)
+                .expect("query the retried publication");
+            assert_eq!(hits.total_count, Some(1));
+            assert_eq!(hits.hits[0].document_id, "doc-a");
+        });
+    }
+
     #[test]
     fn dropped_delta_seal_after_manifest_install_resumes_exact_generation() {
         // This fixture intentionally pauses inside real blocking filesystem

@@ -44,8 +44,8 @@ use crate::quiver::{
     EncodedIdHashSection, EncodedIdMapSection, EncodedNumericSection, EncodedPositionList,
     EncodedPostingList, EncodedStatsSection, EncodedStoredMetaSection, FieldStats,
     IdHashCodecError, IdHashLookupPlan, IdHashSection, IdMapCodecError, IdMapEntry,
-    IdMapEntryInput, IdMapSection, NumericEntry, NumericFieldInput, NumericSection, PositionList,
-    Posting, PostingList, StatsSection, StoredMetaFieldInput, StoredMetaSection,
+    IdMapEntryInput, IdMapPresence, IdMapSection, NumericEntry, NumericFieldInput, NumericSection,
+    PositionList, Posting, PostingList, StatsSection, StoredMetaFieldInput, StoredMetaSection,
     ValidatedTermPruningMetadata, aggregate_field_stats,
 };
 use crate::schema::{FieldKind, SchemaDescriptor};
@@ -2645,11 +2645,16 @@ impl RecoveredSegment {
     }
 
     fn contains_identity_row(&self, global_docid: u32) -> bool {
-        self.reader
-            .section(SectionKind::IDMAP)
-            .ok()
-            .flatten()
-            .is_some_and(|id_map| self.id_lookup.contains_global_docid(id_map, global_docid))
+        match self.id_lookup.identity_row_presence(global_docid) {
+            IdMapPresence::Absent => false,
+            IdMapPresence::Present => true,
+            IdMapPresence::RequiresIdMap => self
+                .reader
+                .section(SectionKind::IDMAP)
+                .ok()
+                .flatten()
+                .is_some_and(|id_map| self.id_lookup.contains_global_docid(id_map, global_docid)),
+        }
     }
 
     fn lookup_document_id(&self, document_id: &str) -> Result<Option<(u32, u64)>, KeeperError> {
@@ -16915,6 +16920,144 @@ mod tests {
             published.materialize_document_id(0),
             Some(DocId::new("owned-a")),
             "retained owned backing does not change the older snapshot"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dense_idmap_liveness_preserves_owned_and_mapped_visibility() -> TestResult {
+        let original = KeeperSnapshot::in_memory(DEFAULT_SCHEMA)?;
+        let dense = encoded_identity_test_segment(
+            0xb11,
+            10,
+            &[Some("owned-dense-a"), Some("owned-dense-b")],
+        )?;
+        let holes = encoded_identity_test_segment(0xb12, 20, &[None, Some("owned-hole")])?;
+        let mut proposed = original.next_manifest()?;
+        proposed.docid_high_watermark = 22;
+        proposed.segments = vec![manifest_segment(&dense, 10), manifest_segment(&holes, 20)];
+        let owned = original.publish_owned_segments(&proposed, vec![dense, holes])?;
+        let [owned_dense, owned_holes] = owned.segments() else {
+            return Err("fixture publishes two owned segments".into());
+        };
+        assert_eq!(
+            owned_dense.id_lookup.identity_row_presence(10),
+            IdMapPresence::Present
+        );
+        assert_eq!(
+            owned_holes.id_lookup.identity_row_presence(20),
+            IdMapPresence::RequiresIdMap
+        );
+        assert_eq!(
+            owned_holes.id_lookup.identity_row_presence(21),
+            IdMapPresence::RequiresIdMap
+        );
+        assert!(crate::argus::LiveDocs::is_live(owned_dense, 10));
+        assert!(crate::argus::LiveDocs::is_live(owned_dense, 11));
+        assert!(!crate::argus::LiveDocs::is_live(owned_holes, 20));
+        assert!(crate::argus::LiveDocs::is_live(owned_holes, 21));
+        let owned_dense_hits = crate::argus::ReferenceScorer::all(10, 12, 2)?
+            .top_k(2, owned_dense)?
+            .into_iter()
+            .map(|hit| (hit.global_docid, hit.score.to_bits()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            owned_dense_hits,
+            vec![(10, 1.0_f32.to_bits()), (11, 1.0_f32.to_bits())],
+            "dense owned rows retain the exact collector hit, order, and score contract"
+        );
+        assert_eq!(
+            owned.materialize_document_id(10),
+            Some(DocId::new("owned-dense-a"))
+        );
+        assert_eq!(owned.materialize_document_id(20), None);
+        assert_eq!(
+            owned.materialize_document_id(21),
+            Some(DocId::new("owned-hole"))
+        );
+
+        let mut tombstoned_manifest = owned.next_manifest()?;
+        assert!(tombstoned_manifest.segments[0].insert_tombstone(11)?);
+        let tombstoned = owned.publish_owned_segments(&tombstoned_manifest, Vec::new())?;
+        assert!(tombstoned.is_live(10));
+        assert!(
+            !tombstoned.is_live(11),
+            "a dense physical row remains hidden by its manifest tombstone"
+        );
+        let tombstoned_dense = &tombstoned.segments()[0];
+        let tombstoned_dense_hits = crate::argus::ReferenceScorer::all(10, 12, 2)?
+            .top_k(2, tombstoned_dense)?
+            .into_iter()
+            .map(|hit| (hit.global_docid, hit.score.to_bits()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tombstoned_dense_hits,
+            vec![(10, 1.0_f32.to_bits())],
+            "dense rows retain the tombstone filter in collector results"
+        );
+        assert_eq!(tombstoned.materialize_document_id(11), None);
+        assert!(tombstoned.is_live(21));
+
+        let directory = tempdir()?;
+        let mut mapped_dense = write_identity_test_segment(
+            directory.path(),
+            0xb13,
+            1,
+            50,
+            &[Some("mapped-dense-a"), Some("mapped-dense-b")],
+        )?;
+        assert!(mapped_dense.insert_tombstone(51)?);
+        let mapped_holes = write_identity_test_segment(
+            directory.path(),
+            0xb14,
+            2,
+            60,
+            &[None, Some("mapped-hole")],
+        )?;
+        let mapped_manifest = durable_test_manifest(1, vec![mapped_dense, mapped_holes]);
+        write_manifest(&directory.path().join("MANIFEST"), &mapped_manifest)?;
+        let mapped = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+        let [mapped_dense, mapped_holes] = mapped.segments() else {
+            return Err("fixture opens two mapped segments".into());
+        };
+        assert_eq!(
+            mapped_dense.id_lookup.identity_row_presence(50),
+            IdMapPresence::Present
+        );
+        assert_eq!(
+            mapped_holes.id_lookup.identity_row_presence(60),
+            IdMapPresence::RequiresIdMap
+        );
+        assert!(mapped.is_live(50));
+        assert!(
+            !mapped.is_live(51),
+            "tombstones retain their visibility gate"
+        );
+        assert!(
+            !mapped.is_live(60),
+            "mapped holes retain byte-backed absence"
+        );
+        assert!(mapped.is_live(61));
+        assert!(!mapped.is_live(62));
+        let mapped_dense_hits = crate::argus::ReferenceScorer::all(50, 52, 2)?
+            .top_k(2, mapped_dense)?
+            .into_iter()
+            .map(|hit| (hit.global_docid, hit.score.to_bits()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mapped_dense_hits,
+            vec![(50, 1.0_f32.to_bits())],
+            "mapped dense rows retain exact collector order, score, and tombstone parity"
+        );
+        assert_eq!(
+            mapped.materialize_document_id(50),
+            Some(DocId::new("mapped-dense-a"))
+        );
+        assert_eq!(mapped.materialize_document_id(51), None);
+        assert_eq!(mapped.materialize_document_id(60), None);
+        assert_eq!(
+            mapped.materialize_document_id(61),
+            Some(DocId::new("mapped-hole"))
         );
         Ok(())
     }
