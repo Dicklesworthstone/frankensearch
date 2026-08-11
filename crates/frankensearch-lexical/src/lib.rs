@@ -1247,6 +1247,66 @@ pub struct BenchmarkWriterJoinReceipt {
     pub writer_rearmed: bool,
 }
 
+/// Read-only Tantivy search handle retained across a terminal writer join.
+///
+/// This deliberately owns no writer.  A terminal benchmark obtains it only by
+/// consuming [`TantivyIndex`] through
+/// [`TantivyIndex::benchmark_join_workers_retaining_reader`], which joins the
+/// real Tantivy workers first and leaves this handle alive for the required
+/// post-join searchable-tail query.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub struct BenchmarkRetainedTantivyReader {
+    fields: SchemaFields,
+    reader: IndexReader,
+}
+
+#[cfg(feature = "bench-internals")]
+impl BenchmarkRetainedTantivyReader {
+    /// Run an exact stored-ID query through the reader retained after a writer
+    /// join.
+    ///
+    /// This is intentionally a narrow benchmark seam rather than a general
+    /// second lexical API: it proves that the terminal prepared-tail document
+    /// is searchable *after* workers have quiesced, without creating or
+    /// rearming a writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed Tantivy search or document-loading failure.
+    pub fn benchmark_search_exact_id(&self, document_id: &str) -> SearchResult<Vec<DocId>> {
+        let query = TermQuery::new(
+            Term::from_field_text(self.fields.id, document_id),
+            IndexRecordOption::Basic,
+        );
+        let searcher = self.reader.searcher();
+        let top_docs = search_guarded(
+            &searcher,
+            &query,
+            &TopDocs::with_limit(2).order_by_score(),
+        )?;
+
+        top_docs
+            .into_iter()
+            .map(|(_, doc_address)| {
+                let document: TantivyDocument =
+                    searcher
+                        .doc(doc_address)
+                        .map_err(|error| SearchError::SubsystemError {
+                            subsystem: "tantivy",
+                            source: Box::new(error),
+                        })?;
+                let document_id = document
+                    .get_first(self.fields.id)
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                Ok(document_id.into())
+            })
+            .collect()
+    }
+}
+
 /// Ordered searchable-segment geometry from the pinned Tantivy oracle.
 ///
 /// This conformance-only receipt preserves Tantivy's native `segment_ord`
@@ -1651,6 +1711,38 @@ impl TantivyIndex {
         ))
     }
 
+    /// Join every indexing and merge worker while retaining a read-only search
+    /// handle and without constructing another writer.
+    ///
+    /// The returned handle is the only terminal benchmark surface capable of
+    /// proving that a query returned after the actual worker join.  Segment
+    /// metadata is retained in the receipt for diagnostics but is not a
+    /// searchability proof.
+    ///
+    /// # Errors
+    ///
+    /// Returns a poisoned writer-mutex, Tantivy worker/merge, or segment
+    /// metadata error.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub fn benchmark_join_workers_retaining_reader(
+        self,
+    ) -> SearchResult<(BenchmarkRetainedTantivyReader, BenchmarkWriterJoinReceipt)> {
+        let Self {
+            index,
+            fields,
+            reader,
+            writer,
+            doc_count,
+            ord_table,
+            path,
+            benchmark_writer_threads,
+        } = self;
+        let receipt = Self::benchmark_join_writer(&index, writer)?;
+        drop((doc_count, ord_table, path, benchmark_writer_threads));
+        Ok((BenchmarkRetainedTantivyReader { fields, reader }, receipt))
+    }
+
     /// Join every indexing and merge worker without constructing another writer.
     ///
     /// This is the terminal lifecycle fence for one-shot bulk measurements. It
@@ -1665,29 +1757,7 @@ impl TantivyIndex {
     #[cfg(feature = "bench-internals")]
     #[doc(hidden)]
     pub fn benchmark_join_workers(self) -> SearchResult<BenchmarkWriterJoinReceipt> {
-        let Self {
-            index,
-            fields,
-            reader,
-            writer,
-            doc_count,
-            ord_table,
-            path,
-            benchmark_writer_threads,
-        } = self;
-        let receipt = Self::benchmark_join_writer(&index, writer)?;
-        // Keep the same reader, ordinal, and accounting owners alive across the
-        // join as the rearm path. Dropping them first could release pinned
-        // segment/search state and make the terminal benchmark lifecycle a
-        // materially different incumbent workload.
-        drop((
-            fields,
-            reader,
-            doc_count,
-            ord_table,
-            path,
-            benchmark_writer_threads,
-        ));
+        let (_reader, receipt) = self.benchmark_join_workers_retaining_reader()?;
         Ok(receipt)
     }
 
@@ -4318,7 +4388,7 @@ mod tests {
 
     #[cfg(feature = "bench-internals")]
     #[test]
-    fn benchmark_writer_join_terminal_does_not_rearm() {
+    fn benchmark_writer_join_terminal_retains_searchable_reader_without_rearm() {
         let idx = TantivyIndex::in_memory_with_benchmark_config(50_000_000, 1, true)
             .expect("create benchmark oracle");
         run_with_cx(|cx| async move {
@@ -4332,12 +4402,30 @@ mod tests {
                 .await
                 .expect("commit terminal-fence document");
 
-            let receipt = idx
-                .benchmark_join_workers()
-                .expect("join workers without rearming");
+            let (reader, receipt) = idx
+                .benchmark_join_workers_retaining_reader()
+                .expect("join workers while retaining the terminal reader");
             assert!(receipt.searchable_segments_before > 0);
             assert!(receipt.searchable_segments_after > 0);
             assert!(!receipt.writer_rearmed);
+            let tail_ids = reader
+                .benchmark_search_exact_id("terminal-join")
+                .expect("search the prepared terminal tail after worker join");
+            assert_eq!(
+                tail_ids
+                    .iter()
+                    .map(DocId::as_str)
+                    .collect::<Vec<_>>(),
+                ["terminal-join"],
+                "a counted segment is not accepted in place of a post-join tail search"
+            );
+            assert!(
+                reader
+                    .benchmark_search_exact_id("missing-terminal-tail")
+                    .expect("search missing terminal tail after worker join")
+                    .is_empty(),
+                "planted negative: the retained reader must not fabricate tail visibility"
+            );
         });
     }
 
