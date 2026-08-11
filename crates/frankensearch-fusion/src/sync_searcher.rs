@@ -267,10 +267,20 @@ pub fn bench_nqc_empty_weight_early(
 }
 
 /// Progressive synchronous searcher backed by [`InMemoryTwoTierIndex`].
+#[derive(Clone, Copy, Debug, Default)]
+enum SyncFastRetrieval {
+    #[default]
+    Exact,
+    ApproximateInt8ForBench {
+        candidate_multiplier: usize,
+    },
+}
+
 pub struct SyncTwoTierSearcher {
     index: Arc<InMemoryTwoTierIndex>,
     lexical: Option<Arc<dyn SyncLexicalSearch>>,
     search_params: Option<SearchParams>,
+    fast_retrieval: SyncFastRetrieval,
     config: TwoTierConfig,
     rrf_lexical_weight: f64,
     rrf_semantic_weight: f64,
@@ -304,6 +314,7 @@ impl SyncTwoTierSearcher {
             index,
             lexical: None,
             search_params: None,
+            fast_retrieval: SyncFastRetrieval::Exact,
             config,
             rrf_lexical_weight: 1.0,
             rrf_semantic_weight: 1.0,
@@ -350,6 +361,23 @@ impl SyncTwoTierSearcher {
     #[must_use]
     pub const fn with_search_params(mut self, params: SearchParams) -> Self {
         self.search_params = Some(params);
+        self
+    }
+
+    /// Select the approximate int8 candidate generator for an isolated
+    /// regression test or benchmark only. The public product default remains
+    /// exact regardless of sidecar availability; this explicit seam keeps
+    /// approximate-vs-exact controls meaningful without restoring an
+    /// approximate production route.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn with_approximate_int8_fast_fetch_for_bench(
+        mut self,
+        candidate_multiplier: usize,
+    ) -> Self {
+        self.fast_retrieval = SyncFastRetrieval::ApproximateInt8ForBench {
+            candidate_multiplier,
+        };
         self
     }
 
@@ -952,30 +980,22 @@ impl SyncTwoTierSearcher {
     ) -> SearchResult<Vec<VectorHit>> {
         let fast_index = self.index.fast_index();
         self.search_params.map_or_else(
-            || {
-                // Default: the fast tier is a *reranked candidate generator* (its hits
-                // are re-scored by the quality tier + RRF), so use the int8 two-pass
-                // (parallel + cutoff) instead of the exact f16 scan.
-                //
-                // int8 (was 4-bit): on REAL embeddings the int8 candidate set is EXACTLY
-                // lossless (candidate-recall@10 = 1.0000 in this fetch=K·3, mult=3 regime,
-                // potion-256 + MiniLM-384), whereas 4-bit was only 0.9930–0.9973 (its
-                // "recall=1.0" was a synthetic-corpus artifact). And int8 is also FASTER at
-                // scale: 0.985 ms vs 4-bit 1.070 ms @ N≈130k (1.09×, separated CIs) — the
-                // AVX2 `dot_i8_i8` kernel beats the 4-bit nibble-unpack, so 4-bit's
-                // ½-bandwidth edge does not pay when pass-1 is compute-bound (see
-                // docs/NEGATIVE_EVIDENCE.md 2026-07-02). Net: strictly-lossless candidate
-                // set → identical fused top-k, faster, for ~2× the fast-tier slab bytes
-                // (int8 `dim` vs 4-bit `dim/2`; ~12.8 MB extra @100k dim256 — negligible).
-                // mult=3 keeps ample margin (int8 is lossless from mult=2); `fetch` is
-                // already a candidate over-fetch, so a larger multiplier is wasteful.
-                const FAST_TIER_MULT: usize = 3;
-                fast_index.search_top_k_int8_two_pass_filtered(
+            || match self.fast_retrieval {
+                SyncFastRetrieval::Exact => {
+                    // The public default is exact whether the optional cache is
+                    // attached or unavailable. A verified sidecar may prune only
+                    // inside `search_top_k`; it must never select a different
+                    // candidate-generation algorithm or change visible results.
+                    fast_index.search_top_k(query_vec, fetch, filter)
+                }
+                SyncFastRetrieval::ApproximateInt8ForBench {
+                    candidate_multiplier,
+                } => fast_index.search_top_k_int8_two_pass_filtered(
                     query_vec,
                     fetch,
-                    FAST_TIER_MULT,
+                    candidate_multiplier,
                     filter,
-                )
+                ),
             },
             // Explicit params: honour the exact scan + parallelism configuration.
             |params| fast_index.search_top_k_with_params(query_vec, fetch, filter, params),
@@ -1011,11 +1031,11 @@ impl SyncTwoTierSearcher {
         }
         // State-scoped reasons come from the index census rather than from a
         // second search. Re-scanning would cost a full extra pass on a path
-        // that has already answered, and — because the production fast lane
-        // is the int8 two-pass while the classified lane is the exact scan —
-        // the two can disagree, which would leave an empty result carrying
-        // no reason at all. The census cannot disagree with itself, and
-        // always yields a reason.
+        // that has already answered. The production and classified routes are
+        // both exact, but the second scan could still observe a concurrent
+        // index state change and fabricate a reason for a result it did not
+        // produce. The census cannot disagree with itself, and always yields
+        // a reason.
         self.index
             .fast_index()
             .zero_signal_state()
@@ -1028,6 +1048,7 @@ impl std::fmt::Debug for SyncTwoTierSearcher {
         f.debug_struct("SyncTwoTierSearcher")
             .field("has_lexical", &self.lexical.is_some())
             .field("search_params", &self.search_params)
+            .field("fast_retrieval", &self.fast_retrieval)
             .field("has_quality_index", &self.index.has_quality_index())
             .field("config", &self.config)
             .field("rrf_lexical_weight", &self.rrf_lexical_weight)
@@ -1355,6 +1376,7 @@ mod tests {
     use frankensearch_core::ScoreSource;
     use frankensearch_core::generation::EmbeddingIdentityBundleV1;
     use frankensearch_index::{InMemoryTwoTierIndex, InMemoryVectorIndex};
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
     /// Bind one synthetic vector to an explicitly synthetic identity.
     ///
@@ -1437,17 +1459,169 @@ mod tests {
         )
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn admitted_v2_default_product_preserves_exact_result_across_cache_states() {
+        // The first record fixes the global int8 scale at one. The remaining
+        // zero rows and the final 0.003 f16 row then all quantize to the same
+        // int8 pass-1 score for query [0, 1]. The approximate candidate route
+        // cannot retain the final exact winner. The default product scan must
+        // return that winner both with an attached sidecar and with a hostile
+        // unavailable cache: the sidecar may accelerate the exact route, but
+        // cache state must not select a different algorithm. This is a route
+        // proof by an observable result, not a private-field assertion.
+        const CORPUS_ROWS: usize = 10_002;
+        let dir = temp_dir("residual-default-product-route");
+        let source_path = dir.join("source.fsvi");
+        let cache_dir = dir.join("residual-cache");
+        let unavailable_cache = dir.join("residual-cache-is-a-file");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&unavailable_cache)
+            .expect("create a non-directory cache obstacle without replacement");
+
+        let mut artifact = EmbeddingIdentityBundleV1::explicit_test_model("residual-route", 2);
+        "fsvi-v2".clone_into(&mut artifact.storage.format);
+        artifact.storage.quantization = frankensearch_core::generation::QuantizationFormat::F16;
+        "little-endian".clone_into(&mut artifact.storage.endianness);
+        let binding = frankensearch_index::FsviV2IdentityBinding::new(
+            frankensearch_core::generation::ArtifactGenerationIdentityV1::new(73, [0x5e; 16])
+                .expect("test generation"),
+            artifact.freeze().expect("freeze test identity"),
+        )
+        .expect("valid FSVI-v2 binding");
+        let mut writer = frankensearch_index::VectorIndex::create_v2(&source_path, binding.clone())
+            .expect("create admitted-v2 source");
+        writer
+            .write_record("scale", &[1.0, 0.0])
+            .expect("write global scale row");
+        for row in 0..CORPUS_ROWS - 2 {
+            writer
+                .write_record(&format!("zero-{row:05}"), &[0.0, 0.0])
+                .expect("write zero candidate");
+        }
+        writer
+            .write_record("exact-winner", &[0.0, 0.003])
+            .expect("write exact-only winner");
+        writer.finish().expect("seal admitted-v2 source");
+        let owner = frankensearch_index::VectorIndex::open_admitted_v2(&source_path, &binding)
+            .expect("admit immutable source");
+        let query_vector = vec![0.0, 1.0];
+
+        let approximate = InMemoryVectorIndex::from_admitted_v2(&owner)
+            .expect("load independently for negative control")
+            .search_top_k_int8_two_pass(&query_vector, 1, 3)
+            .expect("run approximate negative control");
+        assert_ne!(
+            approximate[0].doc_id, "exact-winner",
+            "the all-tied int8 candidate pass must demonstrate why this route needs exact selection"
+        );
+
+        let config = TwoTierConfig {
+            fast_only: true,
+            ..TwoTierConfig::default()
+        };
+        let query_identity = EmbeddingIdentityBundleV1::explicit_test_model("residual-route", 2);
+        assert!(
+            CORPUS_ROWS >= SearchParams::default().parallel_threshold,
+            "the product fixture must remain in the default parallel target scale"
+        );
+        let unavailable = SyncTwoTierSearcher::from_admitted_v2_with_residual_sidecar_cache(
+            &owner,
+            &unavailable_cache,
+            None,
+            config.clone(),
+        )
+        .expect("an unavailable cache preserves the shipping exact product");
+        assert!(
+            !unavailable.index.fast_index().has_exact_residual_sidecar(),
+            "the regular-file cache obstacle must leave no sidecar attached"
+        );
+        let unavailable_query = TieredQueryEmbeddings::fast_only(
+            BoundQueryEmbedding::new(query_vector.clone(), query_identity.clone())
+                .expect("bind exact unavailable-cache query identity"),
+        );
+        let (unavailable_results, _) = unavailable
+            .search_collect(&unavailable_query, 1)
+            .expect("unavailable-cache default product search");
+        assert_eq!(
+            unavailable_results[0].doc_id, "exact-winner",
+            "cache failure must retain the same exact winner rather than selecting int8 candidates"
+        );
+
+        std::fs::create_dir(&cache_dir).expect("create fresh immutable cache directory");
+        let searcher = SyncTwoTierSearcher::from_admitted_v2_with_residual_sidecar_cache(
+            &owner,
+            &cache_dir,
+            None,
+            config.clone(),
+        )
+        .expect("construct shipping sync product through the sidecar cache route");
+        assert!(
+            searcher.search_params.is_none(),
+            "the regression exercises the default product search selection"
+        );
+        let query = TieredQueryEmbeddings::fast_only(
+            BoundQueryEmbedding::new(query_vector.clone(), query_identity.clone())
+                .expect("bind exact query identity"),
+        );
+        let (results, _) = searcher
+            .search_collect(&query, 1)
+            .expect("default product search");
+        assert_eq!(
+            results[0].doc_id, "exact-winner",
+            "an attached sidecar preserves the same shipping exact result"
+        );
+        let entry_count_after_publish = std::fs::read_dir(&cache_dir)
+            .expect("read immutable cache directory")
+            .flatten()
+            .count();
+        assert_eq!(
+            entry_count_after_publish, 1,
+            "exactly one sidecar was published"
+        );
+
+        let reopened = SyncTwoTierSearcher::from_admitted_v2_with_residual_sidecar_cache(
+            &owner, &cache_dir, None, config,
+        )
+        .expect("reopen shipping sync product through the existing cache entry");
+        let reopened_query = TieredQueryEmbeddings::fast_only(
+            BoundQueryEmbedding::new(query_vector, query_identity).expect("bind reopened query"),
+        );
+        let (reopened_results, _) = reopened
+            .search_collect(&reopened_query, 1)
+            .expect("reopened default product search");
+        assert_eq!(reopened_results[0].doc_id, "exact-winner");
+        assert_eq!(
+            std::fs::read_dir(&cache_dir)
+                .expect("read reused immutable cache directory")
+                .flatten()
+                .count(),
+            entry_count_after_publish,
+            "reopening selects the generation-matched artifact without overwriting or publishing another"
+        );
+    }
+
     fn temp_dir(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "frankensearch-sync-dbp10-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+        static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..1024 {
+            let nonce = TEMP_NONCE.fetch_add(1, AtomicOrdering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "frankensearch-sync-dbp10-{label}-{}-{}-{nonce}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return dir,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create unique temp dir: {error}"),
+            }
+        }
+        panic!("exhausted unique temp directory names")
     }
 
     fn make_index() -> Arc<InMemoryTwoTierIndex> {

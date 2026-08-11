@@ -1,8 +1,7 @@
 //! End-to-end A/B: `SyncTwoTierSearcher` hybrid search with the fast-tier fetch
-//! routed to the int8 two-pass (default path) vs the exact f16 scan (explicit
-//! `SearchParams`). The fast tier is a reranked candidate generator, so the int8
-//! candidate set (recall=1.0) yields identical fused results — this measures the
-//! hybrid-level speedup from the int8 fetch.
+//! routed explicitly to the int8 two-pass control vs the exact f16 product
+//! default. The approximate route is benchmark-only; production sync retrieval
+//! remains exact regardless of optional cache state.
 //!
 //! Run with:
 //! ```bash
@@ -18,7 +17,7 @@ use frankensearch_core::TwoTierConfig;
 use frankensearch_core::generation::EmbeddingIdentityBundleV1;
 use frankensearch_core::types::{BoundQueryEmbedding, TieredQueryEmbeddings};
 use frankensearch_fusion::SyncTwoTierSearcher;
-use frankensearch_index::{InMemoryTwoTierIndex, InMemoryVectorIndex, SearchParams};
+use frankensearch_index::{InMemoryTwoTierIndex, InMemoryVectorIndex};
 
 /// Bind a synthetic bench vector to an explicitly synthetic identity, for both
 /// tiers (this bench builds both from the same generated space).
@@ -90,10 +89,10 @@ fn bench_sync_int8_fetch(c: &mut Criterion) {
     let quality = InMemoryVectorIndex::from_vectors(ids, quality_vecs, DIM).expect("quality");
     let index = Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)));
 
-    // Default path → int8 two-pass fast tier; explicit params → exact f16 scan.
-    let int8 = SyncTwoTierSearcher::new(index.clone(), TwoTierConfig::default());
-    let exact = SyncTwoTierSearcher::new(index.clone(), TwoTierConfig::default())
-        .with_search_params(SearchParams::default());
+    // The approximate arm is an explicit control. Product defaults stay exact.
+    let int8 = SyncTwoTierSearcher::new(index.clone(), TwoTierConfig::default())
+        .with_approximate_int8_fast_fetch_for_bench(3);
+    let exact = SyncTwoTierSearcher::new(index.clone(), TwoTierConfig::default());
 
     // Bound ONCE, outside every timed region: binding a query to its identity
     // is setup, not part of the search being measured.
@@ -109,9 +108,7 @@ fn bench_sync_int8_fetch(c: &mut Criterion) {
 
     let mut qi = 0usize;
     let mut g = c.benchmark_group("sync_int8_fetch");
-    // Default path: the fast tier now uses the 4-bit two-pass (wired in
-    // search_fast_hits); this arm measures the end-to-end 4-bit-fetch hybrid.
-    g.bench_function("fast_fetch_4bit", |b| {
+    g.bench_function("explicit_approximate_int8_fetch", |b| {
         b.iter(|| {
             let q = &queries[qi % QUERIES];
             qi += 1;

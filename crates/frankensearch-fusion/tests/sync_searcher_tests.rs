@@ -156,7 +156,7 @@ fn search_iter_yields_initial_then_refined() {
 }
 
 #[test]
-fn default_fourbit_fetch_matches_explicit_exact_on_clustered_fixture() {
+fn explicit_int8_fetch_control_matches_exact_on_clustered_fixture() {
     const DOCS: usize = 2_048;
     const DIM: usize = 128;
     const CLUSTERS: usize = 32;
@@ -171,7 +171,8 @@ fn default_fourbit_fetch_matches_explicit_exact_on_clustered_fixture() {
             ))
         })
         .collect::<Vec<_>>();
-    let approximate = SyncTwoTierSearcher::new(index.clone(), TwoTierConfig::default());
+    let approximate = SyncTwoTierSearcher::new(index.clone(), TwoTierConfig::default())
+        .with_approximate_int8_fast_fetch_for_bench(3);
     let exact = SyncTwoTierSearcher::new(index, TwoTierConfig::default())
         .with_search_params(SearchParams::default());
 
