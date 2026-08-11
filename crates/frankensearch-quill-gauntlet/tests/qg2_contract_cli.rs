@@ -15,12 +15,19 @@ use frankensearch_quill_gauntlet::{
 fn manifest_with_qg2_block(block: &str) -> String {
     const LIVE: &str = include_str!("../../../docs/contracts/quill-perf-gates.toml");
 
-    assert_eq!(
-        LIVE.matches(QG2_MANIFEST_BLOCK_PRE_REGION).count(),
-        1,
-        "the live manifest must still carry the exact protected bootstrap block"
-    );
-    LIVE.replacen(QG2_MANIFEST_BLOCK_PRE_REGION, block, 1)
+    // Either protected state is acceptable, so these fixtures survive the
+    // governed transition that rewrites the shipping file to POST.
+    let bootstrap = LIVE.matches(QG2_MANIFEST_BLOCK_PRE_REGION).count();
+    let applied = LIVE.matches(QG2_MANIFEST_BLOCK_POST_REGION).count();
+    let current = match (bootstrap, applied) {
+        (1, 0) => QG2_MANIFEST_BLOCK_PRE_REGION,
+        (0, 1) => QG2_MANIFEST_BLOCK_POST_REGION,
+        _ => panic!(
+            "the shipping manifest must carry exactly one protected QG-2 block \
+             (bootstrap={bootstrap}, applied={applied})"
+        ),
+    };
+    LIVE.replacen(current, block, 1)
 }
 use serde_json::{Value, json};
 use tempfile::TempDir;

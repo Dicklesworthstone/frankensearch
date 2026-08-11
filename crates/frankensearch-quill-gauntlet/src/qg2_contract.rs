@@ -950,12 +950,13 @@ fn manifest_block_agreement(source: &str, applied: bool) -> Result<(), String> {
     let document = toml::from_str::<ManifestDocument>(source).map_err(|error| {
         format!("the manifest does not parse under the closed gate model: {error}")
     })?;
-    // Parity by delegation, not by restatement. Two prior attempts to mirror
-    // the planner's rules here drifted from them; this runs the planner's own
-    // admission over the same bytes, so gate presence, scalar shape, field
-    // placement, the positive QG-1 primary target width, and the exact schema
-    // set can never diverge from what planning will accept.
-    crate::perf::validate_normative_manifest(source, PerfGate::Qg2)
+    // Parity by delegation, not by restatement. Prior attempts to mirror the
+    // planner's rules here drifted from them, and delegating for QG-2 alone
+    // still missed gate-specific identity the planner only reads from the
+    // requested gate's own table — QG-1's positive primary target width being
+    // the case that slipped through. Asking for all ten gates is the question a
+    // contract reader actually means: would planning accept this file?
+    crate::perf::validate_normative_manifest_all_gates(source)
         .map_err(|error| format!("the live manifest consumer rejects this manifest: {error}"))?;
     if document
         .gate
@@ -3013,12 +3014,21 @@ mod tests {
     fn manifest_with_qg2_block(block: &str) -> String {
         const LIVE: &str = include_str!("../../../docs/contracts/quill-perf-gates.toml");
 
-        assert_eq!(
-            LIVE.matches(QG2_MANIFEST_BLOCK_PRE_REGION).count(),
-            1,
-            "the live manifest must still carry the exact protected bootstrap block"
-        );
-        LIVE.replacen(QG2_MANIFEST_BLOCK_PRE_REGION, block, 1)
+        // Accept either protected state, so these fixtures stay valid after the
+        // governed transition rewrites the shipping file to POST. Requiring the
+        // bootstrap block specifically would turn every contract test red the
+        // moment the correction it exists to protect actually lands.
+        let bootstrap = LIVE.matches(QG2_MANIFEST_BLOCK_PRE_REGION).count();
+        let applied = LIVE.matches(QG2_MANIFEST_BLOCK_POST_REGION).count();
+        let current = match (bootstrap, applied) {
+            (1, 0) => QG2_MANIFEST_BLOCK_PRE_REGION,
+            (0, 1) => QG2_MANIFEST_BLOCK_POST_REGION,
+            _ => panic!(
+                "the shipping manifest must carry exactly one protected QG-2 block \
+                 (bootstrap={bootstrap}, applied={applied})"
+            ),
+        };
+        LIVE.replacen(current, block, 1)
     }
 
     /// Manifest at the protected base. The QG-2 block is the protected block

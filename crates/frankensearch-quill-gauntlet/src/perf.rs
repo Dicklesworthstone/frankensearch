@@ -2271,6 +2271,23 @@ pub(crate) fn validate_normative_manifest(
     perf_gate_manifest_identity(manifest, gate).map(|_| ())
 }
 
+/// Run that admission for **every** normative gate.
+///
+/// `perf_gate_manifest_identity` reads gate-specific identity — notably QG-1's
+/// positive `primary_target_cell_width` — only from the *requested* gate's own
+/// table, so admitting a manifest for one gate says nothing about the other
+/// nine. A contract reader asking "would planning accept this file?" must ask
+/// for all ten, which is what this does. Still no restatement: every rule comes
+/// from the live entry point.
+pub(crate) fn validate_normative_manifest_all_gates(
+    manifest: &str,
+) -> Result<(), PerfApplicabilityPlanError> {
+    for gate in PerfGate::ALL {
+        validate_normative_manifest(manifest, gate)?;
+    }
+    Ok(())
+}
+
 fn perf_gate_manifest_identity(
     manifest: &str,
     gate: PerfGate,
