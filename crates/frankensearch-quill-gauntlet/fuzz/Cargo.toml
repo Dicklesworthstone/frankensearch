@@ -11,7 +11,10 @@ cargo-fuzz = true
 frankensearch-quill = { path = "../../frankensearch-quill" }
 frankensearch-core = { path = "../../frankensearch-core" }
 frankensearch-quill-gauntlet = { path = "..", features = ["fuzz-harness"] }
-asupersync = { path = "../../../../asupersync", default-features = false, features = ["test-internals"] }
+# Match the registry source selected by the gauntlet workspace dependency. A
+# path copy here would make `Cx` a different Rust type from the one accepted by
+# `scalar_g1a_fuzz_pair`, even when both packages report the same version.
+asupersync = { version = "=0.3.10", default-features = false, features = ["proc-macros", "test-internals"] }
 libfuzzer-sys = "=0.4.13"
 
 [[bin]]

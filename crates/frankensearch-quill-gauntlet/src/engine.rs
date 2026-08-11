@@ -2354,8 +2354,19 @@ pub async fn scalar_g1a_fuzz_pair(
         deterministic_ingest: true,
         ..QuillConfig::default()
     };
-    let mut subject = QuillSubject::in_memory(config)?;
-    let mut oracle = TantivyOracle::in_memory_scalar_g1a()?;
+    // Capture the producer source once, then bind both engines to that exact
+    // identity. This keeps every fresh external-fuzz pair in one provenance
+    // universe even when a dirty checkout changes while a long fuzz job runs.
+    let producer = GauntletProducerBuildIdentity::compiled()?;
+    let mut subject = QuillSubject::in_memory_with_source(
+        config,
+        &producer.source_git_revision,
+        producer.source_git_dirty,
+    )?;
+    let mut oracle = TantivyOracle::in_memory_scalar_g1a_with_source(
+        &producer.source_git_revision,
+        producer.source_git_dirty,
+    )?;
     subject.claim_fresh_campaign()?;
     oracle.claim_fresh_campaign()?;
     subject.index_mut()?.index_documents(cx, documents).await?;
@@ -2365,6 +2376,48 @@ pub async fn scalar_g1a_fuzz_pair(
     subject.mark_committed()?;
     oracle.mark_committed()?;
     Ok((subject, oracle))
+}
+
+#[cfg(feature = "fuzz-harness")]
+impl QuillSubject {
+    /// Build fresh scalar-G1a adapters for one external fuzz shrink attempt.
+    ///
+    /// An external `cargo-fuzz` target cannot safely reproduce the private
+    /// claim/index/commit lifecycle itself.  These factories deliberately
+    /// return fresh, uncommitted engines for every [`crate::ShrinkDriver`]
+    /// candidate, leaving the shrinker to own the complete campaign
+    /// lifecycle.  This is distinct from [`scalar_g1a_fuzz_pair`], which
+    /// returns one already-committed pair for the initial observation.
+    #[must_use]
+    pub fn scalar_g1a_fuzz_shrink_factories()
+    -> (crate::ShrinkEngineFactory, crate::ShrinkEngineFactory) {
+        use crate::DifferentialCampaignEngine;
+
+        let config = QuillConfig {
+            deterministic_ingest: true,
+            ..QuillConfig::default()
+        };
+        let producer = GauntletProducerBuildIdentity::compiled()
+            .expect("capture the source identity for fuzz shrink factories");
+        let subject_revision = producer.source_git_revision.clone();
+        let oracle_revision = producer.source_git_revision;
+        let source_dirty = producer.source_git_dirty;
+        let make_subject = Box::new(move || {
+            Ok(Box::new(Self::in_memory_with_source(
+                config.clone(),
+                subject_revision.clone(),
+                source_dirty,
+            )?) as Box<dyn DifferentialCampaignEngine>)
+        });
+        let make_oracle = Box::new(|| {
+            Ok(Box::new(TantivyOracle::in_memory_scalar_g1a_with_source(
+                &oracle_revision,
+                source_dirty,
+            )?)
+                as Box<dyn DifferentialCampaignEngine>)
+        });
+        (make_subject, make_oracle)
+    }
 }
 
 #[cfg(feature = "tantivy-oracle")]
@@ -9617,6 +9670,85 @@ mod tests {
                 oracle.observe(&cx, &case).await,
                 Err(GauntletError::InvalidCase { .. })
             ));
+        });
+    }
+
+    #[cfg(feature = "fuzz-harness")]
+    #[test]
+    fn scalar_g1a_fuzz_shrink_factories_create_independent_fresh_lifecycles() {
+        use crate::runner::DifferentialCampaignEngine;
+
+        let (mut make_subject, mut make_oracle) = QuillSubject::scalar_g1a_fuzz_shrink_factories();
+        let mut first_subject = make_subject().expect("first fresh fuzz subject");
+        let mut second_subject = make_subject().expect("second fresh fuzz subject");
+        let mut first_oracle = make_oracle().expect("first fresh fuzz oracle");
+        let mut second_oracle = make_oracle().expect("second fresh fuzz oracle");
+
+        assert_eq!(first_subject.descriptor().family, EngineFamily::Quill);
+        assert_eq!(second_subject.descriptor().family, EngineFamily::Quill);
+        assert_eq!(first_oracle.descriptor().family, EngineFamily::Tantivy);
+        assert_eq!(second_oracle.descriptor().family, EngineFamily::Tantivy);
+        assert_eq!(
+            first_subject.semantic_contract(),
+            SemanticContract::scalar_g1a()
+        );
+        assert_eq!(
+            first_oracle.semantic_contract(),
+            SemanticContract::scalar_g1a()
+        );
+
+        let corpus = crate::SyntheticCorpus::new(crate::SyntheticCorpusSpec {
+            seed: 0x6273_6a77_fa57_0001,
+            document_count: 16,
+            vocabulary_size: 32,
+            zipf_exponent: crate::ZipfExponent::S11,
+            max_document_bytes: 256,
+        })
+        .expect("fresh-factory test corpus");
+        let manifest = corpus.manifest().expect("fresh-factory test manifest");
+        let documents = corpus.iter().collect::<Vec<_>>();
+        let contract = SemanticContract::scalar_g1a();
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for engine in [
+                &mut first_subject,
+                &mut second_subject,
+                &mut first_oracle,
+                &mut second_oracle,
+            ] {
+                engine
+                    .begin_corpus(&cx, &manifest, &contract)
+                    .await
+                    .expect("each factory result must begin a new lifecycle");
+            }
+            for engine in [
+                &mut first_subject,
+                &mut second_subject,
+                &mut first_oracle,
+                &mut second_oracle,
+            ] {
+                engine
+                    .index_batch(&cx, &documents)
+                    .await
+                    .expect("each factory result must index independently");
+            }
+            for engine in [
+                &mut first_subject,
+                &mut second_subject,
+                &mut first_oracle,
+                &mut second_oracle,
+            ] {
+                let receipt = engine
+                    .commit_corpus(&cx, &manifest, &contract)
+                    .await
+                    .expect("each factory result must commit its own corpus");
+                assert_eq!(receipt.document_count, manifest.document_count);
+                assert_eq!(
+                    receipt.semantic_contract,
+                    SemanticContract::scalar_g1a(),
+                    "each independent factory lifecycle must retain scalar G1a"
+                );
+            }
         });
     }
 }
