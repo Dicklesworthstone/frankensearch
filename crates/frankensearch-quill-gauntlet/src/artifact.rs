@@ -4209,7 +4209,7 @@ pub struct PinnedDirectory;
     target_os = "watchos"
 ))]
 impl PinnedDirectory {
-    fn open_path(path: &Path) -> Result<Self, GauntletError> {
+    pub(crate) fn open_path(path: &Path) -> Result<Self, GauntletError> {
         Self::walk_path(path, false)
     }
 
@@ -4305,6 +4305,12 @@ impl PinnedDirectory {
         self.open_child(name)
     }
 
+    /// Open or create one direct child directory through this pinned
+    /// descriptor.  The resulting capability never follows a child symlink.
+    pub(crate) fn ensure_child_directory(&self, name: &OsStr) -> Result<Self, GauntletError> {
+        self.ensure_child(name)
+    }
+
     fn create_child_exclusive(&self, name: &OsStr) -> Result<Option<Self>, GauntletError> {
         use rustix::fs::{Mode, mkdirat};
         use rustix::io::Errno;
@@ -4346,15 +4352,23 @@ impl PinnedDirectory {
         max_bytes: u64,
     ) -> Result<Vec<u8>, GauntletError> {
         use rustix::fs::{FileType, Mode, OFlags, fstat, openat};
+        use rustix::io::Errno;
 
         validate_child_name(&self.display_path, name)?;
-        let descriptor = openat(
+        let descriptor = match openat(
             &self.file,
             name,
             OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
             Mode::empty(),
-        )
-        .map_err(std::io::Error::from)?;
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(Errno::LOOP | Errno::NOTDIR) => {
+                return Err(GauntletError::UnsafeStorePath {
+                    path: self.display_path.join(name),
+                });
+            }
+            Err(error) => return Err(std::io::Error::from(error).into()),
+        };
         let stat = fstat(&descriptor).map_err(std::io::Error::from)?;
         let size = u64::try_from(stat.st_size).unwrap_or(u64::MAX);
         if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile || size > max_bytes {
@@ -4362,7 +4376,7 @@ impl PinnedDirectory {
                 path: self.display_path.join(name),
             });
         }
-        let file = File::from(descriptor);
+        let mut file = File::from(descriptor);
         let capacity = usize::try_from(size).map_err(|_| GauntletError::UnsafeStorePath {
             path: self.display_path.join(name),
         })?;
@@ -4373,14 +4387,103 @@ impl PinnedDirectory {
                 format!("unable to reserve bounded artifact read: {error}"),
             )
         })?;
-        file.take(max_bytes.saturating_add(1))
+        (&mut file)
+            .take(max_bytes.saturating_add(1))
             .read_to_end(&mut bytes)?;
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        let after = fstat(&file).map_err(std::io::Error::from)?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes
+            || stat.st_dev != after.st_dev
+            || stat.st_ino != after.st_ino
+            || stat.st_mode != after.st_mode
+            || stat.st_size != after.st_size
+            || stat.st_mtime != after.st_mtime
+            || stat.st_mtime_nsec != after.st_mtime_nsec
+            || stat.st_ctime != after.st_ctime
+            || stat.st_ctime_nsec != after.st_ctime_nsec
+            || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != size
+        {
             return Err(GauntletError::UnsafeStorePath {
                 path: self.display_path.join(name),
             });
         }
         Ok(bytes)
+    }
+
+    /// Read one exact regular child through this descriptor and also prove
+    /// that the displayed directory name still identifies this capability.
+    /// This rejects a directory substitution made while an operation holds
+    /// the original descriptor rather than silently reading through a new
+    /// path target.
+    pub(crate) fn read_regular_bounded_stable(
+        &self,
+        name: &OsStr,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, GauntletError> {
+        let bytes = self.read_regular_bounded(name, max_bytes)?;
+        self.verify_display_path_identity()?;
+        Ok(bytes)
+    }
+
+    /// Reject a display path whose current directory object is no longer the
+    /// one held by this capability.  Re-opening uses the same no-follow walk,
+    /// so an inserted symlink is rejected as well.
+    pub(crate) fn verify_display_path_identity(&self) -> Result<(), GauntletError> {
+        use rustix::fs::fstat;
+
+        let reopened = Self::open_path(&self.display_path)?;
+        let pinned = fstat(&self.file).map_err(std::io::Error::from)?;
+        let current = fstat(&reopened.file).map_err(std::io::Error::from)?;
+        if pinned.st_dev != current.st_dev || pinned.st_ino != current.st_ino {
+            return Err(GauntletError::UnsafeStorePath {
+                path: self.display_path.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Write one new regular child exactly once.  Existing entries are never
+    /// opened for writing; callers receive `Ok(false)` and can authenticate
+    /// the existing regular file through a separate no-follow read.
+    pub(crate) fn write_regular_create_new(
+        &self,
+        name: &OsStr,
+        bytes: &[u8],
+    ) -> Result<bool, GauntletError> {
+        use rustix::fs::{FileType, Mode, OFlags, fstat, openat};
+        use rustix::io::Errno;
+
+        validate_child_name(&self.display_path, name)?;
+        let descriptor = match openat(
+            &self.file,
+            name,
+            OFlags::WRONLY
+                | OFlags::CREATE
+                | OFlags::EXCL
+                | OFlags::CLOEXEC
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK,
+            Mode::RUSR | Mode::WUSR,
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(Errno::EXIST) => return Ok(false),
+            Err(Errno::LOOP | Errno::NOTDIR) => {
+                return Err(GauntletError::UnsafeStorePath {
+                    path: self.display_path.join(name),
+                });
+            }
+            Err(error) => return Err(std::io::Error::from(error).into()),
+        };
+        let stat = fstat(&descriptor).map_err(std::io::Error::from)?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile || stat.st_size != 0 {
+            return Err(GauntletError::UnsafeStorePath {
+                path: self.display_path.join(name),
+            });
+        }
+        let mut file = File::from(descriptor);
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        self.file.sync_all()?;
+        Ok(true)
     }
 
     pub(crate) fn entry_names(
@@ -4805,7 +4908,7 @@ impl PinnedDirectory {
         .into())
     }
 
-    fn open_path(_path: &Path) -> Result<Self, GauntletError> {
+    pub(crate) fn open_path(_path: &Path) -> Result<Self, GauntletError> {
         Self::unsupported()
     }
 
@@ -4834,6 +4937,10 @@ impl PinnedDirectory {
         Self::unsupported()
     }
 
+    pub(crate) fn ensure_child_directory(&self, _name: &OsStr) -> Result<Self, GauntletError> {
+        Self::unsupported()
+    }
+
     fn create_child_exclusive(&self, _name: &OsStr) -> Result<Option<Self>, GauntletError> {
         Self::unsupported()
     }
@@ -4851,6 +4958,26 @@ impl PinnedDirectory {
         _name: &OsStr,
         _max_bytes: u64,
     ) -> Result<Vec<u8>, GauntletError> {
+        Self::unsupported()
+    }
+
+    pub(crate) fn read_regular_bounded_stable(
+        &self,
+        _name: &OsStr,
+        _max_bytes: u64,
+    ) -> Result<Vec<u8>, GauntletError> {
+        Self::unsupported()
+    }
+
+    pub(crate) fn verify_display_path_identity(&self) -> Result<(), GauntletError> {
+        Self::unsupported()
+    }
+
+    pub(crate) fn write_regular_create_new(
+        &self,
+        _name: &OsStr,
+        _bytes: &[u8],
+    ) -> Result<bool, GauntletError> {
         Self::unsupported()
     }
 

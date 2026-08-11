@@ -27,6 +27,8 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::GauntletError;
 use crate::artifact::GauntletProducerBuildIdentity;
+#[cfg(feature = "fuzz-harness")]
+use crate::artifact::PinnedDirectory;
 use crate::comparator::{
     ComparatorConfig, ComparisonReport, CountState, EngineObservation, NativeTieKey,
     OracleBugControlObservation, RankedHit, compare_observations,
@@ -3069,6 +3071,13 @@ pub struct TypedQueryFuzzReplay {
 
 #[cfg(feature = "fuzz-harness")]
 const TYPED_QUERY_FUZZ_REPLAY_EXTENSION: &str = "json";
+#[cfg(feature = "fuzz-harness")]
+const TYPED_QUERY_FUZZ_REPLAY_DIRECTORY: &str = "typed_query_tree";
+/// A replay contains a 64-byte fuzz input, a fixed sixteen-document manifest,
+/// and one typed AST.  This bounded reader fails closed before allocating for
+/// an untrusted sidecar file.
+#[cfg(feature = "fuzz-harness")]
+const MAX_TYPED_QUERY_FUZZ_REPLAY_BYTES: u64 = 1024 * 1024;
 
 #[cfg(feature = "fuzz-harness")]
 impl TypedQueryFuzzReplay {
@@ -3209,29 +3218,28 @@ pub fn persist_typed_query_fuzz_replay(
     replay: &TypedQueryFuzzReplay,
 ) -> Result<std::path::PathBuf, GauntletError> {
     let bytes = replay.canonical_bytes()?;
-    let key = replay.artifact_key_from_canonical_bytes(&bytes)?;
-    let directory = root.join("typed_query_tree");
-    std::fs::create_dir_all(&directory)?;
-    let path = directory.join(typed_query_fuzz_replay_filename(&key));
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-    {
-        Ok(mut file) => {
-            use std::io::Write as _;
-
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let existing = std::fs::read(&path)?;
-            if existing != bytes {
-                return Err(GauntletError::ArtifactCollision { path });
-            }
-        }
-        Err(error) => return Err(error.into()),
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_TYPED_QUERY_FUZZ_REPLAY_BYTES {
+        return Err(GauntletError::InvalidCase {
+            reason: "typed-query replay canonical payload exceeds its bounded sidecar budget"
+                .to_owned(),
+        });
     }
+    let key = replay.artifact_key_from_canonical_bytes(&bytes)?;
+    let filename = typed_query_fuzz_replay_filename(&key);
+    let root_directory = PinnedDirectory::ensure_path(root)?;
+    let replay_directory = root_directory
+        .ensure_child_directory(std::ffi::OsStr::new(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY))?;
+    let path = root.join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY).join(&filename);
+    if !replay_directory.write_regular_create_new(std::ffi::OsStr::new(&filename), &bytes)? {
+        let existing = replay_directory.read_regular_bounded_stable(
+            std::ffi::OsStr::new(&filename),
+            MAX_TYPED_QUERY_FUZZ_REPLAY_BYTES,
+        )?;
+        if existing != bytes {
+            return Err(GauntletError::ArtifactCollision { path });
+        }
+    }
+    replay_directory.verify_display_path_identity()?;
     Ok(path)
 }
 
@@ -3240,7 +3248,40 @@ pub fn persist_typed_query_fuzz_replay(
 pub fn load_typed_query_fuzz_replay(
     path: &std::path::Path,
 ) -> Result<TypedQueryFuzzReplay, GauntletError> {
-    let stored_bytes = std::fs::read(path)?;
+    let filename = path
+        .file_name()
+        .ok_or_else(|| GauntletError::ManifestMismatch {
+            reason: "typed-query replay path has no final filename component".to_owned(),
+        })?;
+    if path.extension() != Some(std::ffi::OsStr::new(TYPED_QUERY_FUZZ_REPLAY_EXTENSION)) {
+        return Err(GauntletError::ManifestMismatch {
+            reason: "typed-query replay path uses an unknown extension".to_owned(),
+        });
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| GauntletError::ManifestMismatch {
+            reason: "typed-query replay path has no parent directory".to_owned(),
+        })?;
+    if parent.file_name() != Some(std::ffi::OsStr::new(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY)) {
+        return Err(GauntletError::ManifestMismatch {
+            reason: "typed-query replay must reside directly in typed_query_tree".to_owned(),
+        });
+    }
+    let replay_directory = PinnedDirectory::open_path(parent)?;
+    load_typed_query_fuzz_replay_from_directory(&replay_directory, filename)
+}
+
+/// Authenticate a replay through an already-owned sidecar-directory capability.
+/// The public path entrypoint opens that capability with a no-follow component
+/// walk before reaching this shared validation path.
+#[cfg(feature = "fuzz-harness")]
+fn load_typed_query_fuzz_replay_from_directory(
+    replay_directory: &PinnedDirectory,
+    filename: &std::ffi::OsStr,
+) -> Result<TypedQueryFuzzReplay, GauntletError> {
+    let stored_bytes = replay_directory
+        .read_regular_bounded_stable(filename, MAX_TYPED_QUERY_FUZZ_REPLAY_BYTES)?;
     let replay = serde_json::from_slice::<TypedQueryFuzzReplay>(&stored_bytes)?;
     let canonical_bytes = replay.canonical_bytes()?;
     if stored_bytes != canonical_bytes {
@@ -3250,9 +3291,8 @@ pub fn load_typed_query_fuzz_replay(
     }
     let key = replay.artifact_key_from_canonical_bytes(&canonical_bytes)?;
     let expected_filename = typed_query_fuzz_replay_filename(&key);
-    let actual_filename = path
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
+    let actual_filename = filename
+        .to_str()
         .ok_or_else(|| GauntletError::ManifestMismatch {
             reason: "typed-query replay path has no UTF-8 final filename component".to_owned(),
         })?;
@@ -3263,6 +3303,7 @@ pub fn load_typed_query_fuzz_replay(
             ),
         });
     }
+    replay_directory.verify_display_path_identity()?;
     Ok(replay)
 }
 
@@ -10651,6 +10692,21 @@ mod tests {
     }
 
     #[cfg(feature = "fuzz-harness")]
+    fn typed_query_write_new_owned_file(path: &std::path::Path, bytes: &[u8]) {
+        use std::io::Write as _;
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("create one new owned hostile replay artifact");
+        file.write_all(bytes)
+            .expect("write one new owned hostile replay artifact");
+        file.sync_all()
+            .expect("sync one new owned hostile replay artifact");
+    }
+
+    #[cfg(feature = "fuzz-harness")]
     #[test]
     fn typed_query_seed_is_64_bit_and_pinned() {
         assert_eq!(
@@ -10733,17 +10789,32 @@ mod tests {
             replay,
             "the public load entrypoint must reconstruct the persisted replay"
         );
+        assert_eq!(
+            persist_typed_query_fuzz_replay(&root, &replay)
+                .expect("authenticate an already-created canonical replay without overwrite"),
+            path,
+            "a duplicate persist may only reuse the same authenticated create-new artifact"
+        );
 
         let reject_under_original_key = |label: &str, bytes: Vec<u8>| {
-            std::fs::write(&path, bytes).expect("plant hostile replay bytes under original key");
+            let hostile_root = typed_query_replay_test_root(label);
+            let hostile_directory = hostile_root.join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY);
+            std::fs::create_dir(&hostile_directory)
+                .expect("create unique hostile typed-query directory");
+            let hostile_path = hostile_directory.join(&expected_filename);
+            typed_query_write_new_owned_file(&hostile_path, &bytes);
             assert!(
                 matches!(
-                    load_typed_query_fuzz_replay(&path),
+                    load_typed_query_fuzz_replay(&hostile_path),
                     Err(GauntletError::ManifestMismatch { .. })
                 ),
                 "{label} must not load under the original content-addressed key"
             );
-            std::fs::write(&path, &canonical_bytes).expect("restore owned canonical replay bytes");
+            assert_eq!(
+                std::fs::read(&hostile_path).expect("hostile artifact remains intact"),
+                bytes,
+                "{label} must not be overwritten during rejection"
+            );
         };
 
         let replacement =
@@ -10806,17 +10877,25 @@ mod tests {
             serde_json::to_vec(&query_tamper).expect("query mutation bytes"),
         );
 
-        let wrong_filename = path.with_file_name("not-the-content-key.json");
-        std::fs::write(&wrong_filename, &canonical_bytes)
-            .expect("plant valid replay under wrong filename");
+        let wrong_filename_root = typed_query_replay_test_root("wrong-filename");
+        let wrong_filename_directory = wrong_filename_root.join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY);
+        std::fs::create_dir(&wrong_filename_directory)
+            .expect("create wrong-filename typed-query directory");
+        let wrong_filename = wrong_filename_directory.join("not-the-content-key.json");
+        typed_query_write_new_owned_file(&wrong_filename, &canonical_bytes);
         assert!(matches!(
             load_typed_query_fuzz_replay(&wrong_filename),
             Err(GauntletError::ManifestMismatch { .. })
         ));
 
-        let unknown_extension = path.with_extension("replay");
-        std::fs::write(&unknown_extension, &canonical_bytes)
-            .expect("plant valid replay with unknown extension");
+        let unknown_extension_root = typed_query_replay_test_root("unknown-extension");
+        let unknown_extension_directory =
+            unknown_extension_root.join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY);
+        std::fs::create_dir(&unknown_extension_directory)
+            .expect("create unknown-extension typed-query directory");
+        let unknown_extension =
+            unknown_extension_directory.join("replay-with-unknown-extension.replay");
+        typed_query_write_new_owned_file(&unknown_extension, &canonical_bytes);
         assert!(matches!(
             load_typed_query_fuzz_replay(&unknown_extension),
             Err(GauntletError::ManifestMismatch { .. })
@@ -10832,12 +10911,138 @@ mod tests {
                 .expect("collision path has a typed-query directory"),
         )
         .expect("create owned collision directory");
-        std::fs::write(&collision_path, b"unrelated existing replay")
-            .expect("plant pre-existing collision");
+        typed_query_write_new_owned_file(&collision_path, b"unrelated existing replay");
         assert!(matches!(
             persist_typed_query_fuzz_replay(&collision_root, &replay),
             Err(GauntletError::ArtifactCollision { path: reported }) if reported == collision_path
         ));
+        assert_eq!(
+            std::fs::read(&collision_path).expect("collision artifact remains intact"),
+            b"unrelated existing replay"
+        );
+        assert_eq!(
+            load_typed_query_fuzz_replay(&path).expect("original replay remains loadable"),
+            replay,
+            "hostile cases must not overwrite the original persisted artifact"
+        );
+    }
+
+    #[cfg(all(feature = "fuzz-harness", target_os = "linux"))]
+    #[test]
+    fn typed_query_replay_sidecar_rejects_symlinks_nonregular_entries_and_directory_swaps() {
+        use std::os::unix::fs::symlink;
+
+        let replay = typed_query_test_replay(&[22, 1, 7, 99], TypedQueryTree::MixedHitMiss(1, 7));
+        let canonical_bytes = replay.canonical_bytes().expect("canonical replay bytes");
+        let filename = typed_query_fuzz_replay_filename(
+            &replay.artifact_key().expect("canonical artifact key"),
+        );
+
+        let final_target_root = typed_query_replay_test_root("final-symlink-target");
+        let final_target = persist_typed_query_fuzz_replay(&final_target_root, &replay)
+            .expect("persist final-symlink target");
+        let final_symlink_root = typed_query_replay_test_root("final-symlink");
+        let final_symlink_directory = final_symlink_root.join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY);
+        std::fs::create_dir(&final_symlink_directory).expect("create final-symlink directory");
+        let final_symlink = final_symlink_directory.join(&filename);
+        symlink(&final_target, &final_symlink).expect("plant final-component symlink");
+        assert!(matches!(
+            persist_typed_query_fuzz_replay(&final_symlink_root, &replay),
+            Err(GauntletError::UnsafeStorePath { .. })
+        ));
+        assert!(matches!(
+            load_typed_query_fuzz_replay(&final_symlink),
+            Err(GauntletError::UnsafeStorePath { .. })
+        ));
+        assert!(
+            std::fs::symlink_metadata(&final_symlink)
+                .expect("final symlink remains intact")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(&final_target).expect("final target remains intact"),
+            canonical_bytes
+        );
+
+        let directory_target_root = typed_query_replay_test_root("directory-symlink-target");
+        let directory_target = persist_typed_query_fuzz_replay(&directory_target_root, &replay)
+            .expect("persist directory-symlink target");
+        let directory_symlink_root = typed_query_replay_test_root("directory-symlink");
+        let directory_symlink = directory_symlink_root.join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY);
+        symlink(
+            directory_target
+                .parent()
+                .expect("directory target has sidecar parent"),
+            &directory_symlink,
+        )
+        .expect("plant typed-query-tree directory symlink");
+        let directory_symlink_path = directory_symlink.join(&filename);
+        assert!(matches!(
+            persist_typed_query_fuzz_replay(&directory_symlink_root, &replay),
+            Err(GauntletError::UnsafeStorePath { .. })
+        ));
+        assert!(matches!(
+            load_typed_query_fuzz_replay(&directory_symlink_path),
+            Err(GauntletError::UnsafeStorePath { .. })
+        ));
+        assert!(
+            std::fs::symlink_metadata(&directory_symlink)
+                .expect("directory symlink remains intact")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            load_typed_query_fuzz_replay(&directory_target)
+                .expect("directory symlink target remains loadable"),
+            replay
+        );
+
+        let nonregular_root = typed_query_replay_test_root("nonregular-collision");
+        let nonregular_directory = nonregular_root.join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY);
+        std::fs::create_dir(&nonregular_directory).expect("create nonregular sidecar directory");
+        let nonregular_collision = nonregular_directory.join(&filename);
+        std::fs::create_dir(&nonregular_collision).expect("plant nonregular collision directory");
+        assert!(matches!(
+            persist_typed_query_fuzz_replay(&nonregular_root, &replay),
+            Err(GauntletError::UnsafeStorePath { .. })
+        ));
+        assert!(
+            std::fs::metadata(&nonregular_collision)
+                .expect("nonregular collision remains intact")
+                .is_dir()
+        );
+
+        let swap_root = typed_query_replay_test_root("directory-swap");
+        let swap_path =
+            persist_typed_query_fuzz_replay(&swap_root, &replay).expect("persist swap source");
+        let swap_directory = swap_path
+            .parent()
+            .expect("swap source has sidecar parent")
+            .to_path_buf();
+        let pinned_directory =
+            PinnedDirectory::open_path(&swap_directory).expect("acquire sidecar capability");
+        let displaced_directory = swap_root.join("typed_query_tree-displaced");
+        std::fs::rename(&swap_directory, &displaced_directory)
+            .expect("move owned sidecar directory without deletion");
+        std::fs::create_dir(&swap_directory).expect("create substituted sidecar directory");
+        typed_query_write_new_owned_file(&swap_path, &canonical_bytes);
+        assert!(matches!(
+            load_typed_query_fuzz_replay_from_directory(
+                &pinned_directory,
+                std::ffi::OsStr::new(&filename),
+            ),
+            Err(GauntletError::UnsafeStorePath { path }) if path == swap_directory
+        ));
+        assert_eq!(
+            std::fs::read(displaced_directory.join(&filename))
+                .expect("displaced original artifact remains intact"),
+            canonical_bytes
+        );
+        assert_eq!(
+            std::fs::read(&swap_path).expect("substituted artifact remains intact"),
+            canonical_bytes
+        );
     }
 
     #[cfg(feature = "fuzz-harness")]
