@@ -1576,8 +1576,6 @@ enum ParallelIngestTerminal {
     SerialCompleted,
     /// Nothing to do: the batch was empty. A success, with no work witnessed.
     NoWork,
-    /// The routes declined and the serial path did not finish.
-    RouteDeclined,
     Cancelled,
 }
 
@@ -1589,7 +1587,6 @@ impl ParallelIngestTerminal {
             Self::FanoutFallbackCompleted => "fanout_fallback_completed",
             Self::SerialCompleted => "serial_completed",
             Self::NoWork => "no_work",
-            Self::RouteDeclined => "route_declined",
             Self::Cancelled => "cancelled",
         }
     }
@@ -1598,7 +1595,6 @@ impl ParallelIngestTerminal {
         match code {
             1 => Self::FanoutCompleted,
             2 => Self::SerialCompleted,
-            3 => Self::RouteDeclined,
             4 => Self::Cancelled,
             5 => Self::FanoutFallbackCompleted,
             6 => Self::NoWork,
@@ -1611,7 +1607,6 @@ impl ParallelIngestTerminal {
             Self::Aborted => 0,
             Self::FanoutCompleted => 1,
             Self::SerialCompleted => 2,
-            Self::RouteDeclined => 3,
             Self::Cancelled => 4,
             Self::FanoutFallbackCompleted => 5,
             Self::NoWork => 6,
@@ -1651,8 +1646,14 @@ impl ParallelIngestTerminal {
 /// long before any receipt is built still leaves a complete, published witness
 /// — which is exactly the case the earlier success-path-only counter missed.
 ///
-/// Cost is per SHARD, never per document: two atomic RMWs and one short lock
-/// per shard, so nothing here perturbs the tokenizing inner loop.
+/// Cost is per SHARD, never per document — but it is NOT free, and an earlier
+/// revision of this comment wrongly claimed "two atomic RMWs, non-perturbing".
+/// A successful shard performs about FIVE atomic read-modify-writes
+/// (`started`, `in_flight` up, `peak` fetch_max, `completed`, `in_flight`
+/// down) plus one acquisition of a mutex CONTENDED by every other shard in the
+/// batch. That is cheap relative to accumulating a shard's documents and it
+/// never touches the per-token path, but it has not been measured and no
+/// no-overhead claim is made.
 #[derive(Debug)]
 struct ParallelBatchObservation {
     run_seq: u64,
@@ -1667,6 +1668,11 @@ struct ParallelBatchObservation {
     /// poisoned lock would publish zero distinct slots, which is
     /// indistinguishable from an honest "no identifiable workers".
     identity_degraded: AtomicBool,
+    /// The shared-nothing routes declined this batch. Recorded as a FACT, not
+    /// as a terminal: work still lies ahead when it is set, so a fallback
+    /// panic or a dropped future must still publish `Aborted` rather than a
+    /// stale "declined" that reads like an ending.
+    shared_nothing_declined: AtomicBool,
     terminal: AtomicU8,
     /// Test-only rendezvous: when set, each shard waits inside `enter_shard`
     /// until `rendezvous_width` shards are in flight (or a deadline passes),
@@ -1690,6 +1696,7 @@ impl Default for ParallelBatchObservation {
             unidentified_shards: AtomicUsize::new(0),
             worker_ids: StdMutex::new(Vec::new()),
             identity_degraded: AtomicBool::new(false),
+            shared_nothing_declined: AtomicBool::new(false),
             terminal: AtomicU8::new(ParallelIngestTerminal::Aborted.code()),
             #[cfg(test)]
             rendezvous_width: None,
@@ -1788,6 +1795,7 @@ impl ParallelBatchObservation {
             unidentified_shards: self.unidentified_shards.load(Ordering::Acquire),
             peak_shards_in_flight: self.peak_in_flight.load(Ordering::Acquire),
             identity_degraded: self.identity_degraded.load(Ordering::Acquire),
+            shared_nothing_declined: self.shared_nothing_declined.load(Ordering::Acquire),
         }
     }
 
@@ -1843,6 +1851,7 @@ impl Drop for ParallelObservationRecorder<'_> {
         // The terminal is read, never inferred: the driver classifies it from
         // the typed operation outcome before this runs.
         let terminal = self.observation.terminal();
+        let succeeded = terminal.is_success();
         let witness = self.observation.snapshot();
         let worker_ids = self
             .observation
@@ -1880,7 +1889,12 @@ impl Drop for ParallelObservationRecorder<'_> {
             .record("parallel_pool_local_worker_ids", worker_ids.as_str());
         self.span
             .record("parallel_identity_degraded", witness.identity_degraded);
+        self.span.record(
+            "parallel_shared_nothing_declined",
+            witness.shared_nothing_declined,
+        );
         self.span.record("parallel_terminal", terminal.as_str());
+        self.span.record("parallel_succeeded", succeeded);
     }
 }
 
@@ -1926,6 +1940,7 @@ struct ParallelWorkerWitness {
     unidentified_shards: usize,
     peak_shards_in_flight: usize,
     identity_degraded: bool,
+    shared_nothing_declined: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5934,6 +5949,8 @@ impl QuillWriterState {
             parallel_peak_shards_in_flight = tracing::field::Empty,
             parallel_pool_local_worker_ids = tracing::field::Empty,
             parallel_identity_degraded = tracing::field::Empty,
+            parallel_shared_nothing_declined = tracing::field::Empty,
+            parallel_succeeded = tracing::field::Empty,
             parallel_terminal = tracing::field::Empty,
             arena_bytes_used_high_water = tracing::field::Empty,
             arena_bytes_reserved_high_water = tracing::field::Empty,
@@ -6084,7 +6101,13 @@ impl QuillWriterState {
                 // observation belong to an attempt whose work was DISCARDED, so
                 // the terminal must say so rather than read as a completed
                 // fan-out.
-                observation.set_terminal(ParallelIngestTerminal::RouteDeclined);
+                // A decline is a FACT about routing, not an ending: the whole
+                // scalar/fallback path still lies ahead. Terminal stays `Aborted`
+                // until the typed result or a real success, so a fallback panic or
+                // a dropped future cannot publish a stale success-shaped terminal.
+                observation
+                    .shared_nothing_declined
+                    .store(true, Ordering::Release);
                 // The parallel route arms this guard only at its transactional
                 // commit boundary. The serial route still mutates the live router
                 // and allocator directly, so arm it immediately before doing so.
@@ -13188,10 +13211,11 @@ fn term_field_ords(schema: SchemaDescriptor) -> Vec<u16> {
 mod tests {
     use std::collections::BTreeMap;
     use std::future::Future;
-    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    // Unconditional: the shipping-driver ingest-span capture below needs both
+    // on every test build, not only under bench+conformance. (Third instance
+    // of this cfg-gated-import trap in this workstream.)
     use std::io::{self, Write};
     use std::sync::Arc;
-    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
     use std::task::{Context, Poll, Waker};
@@ -23538,10 +23562,14 @@ mod tests {
         assert_eq!(panic_witness.completed_shards, 0);
         assert!(!panicked.terminal().is_success());
 
-        // `RouteDeclined` and `Aborted` are both non-success, so neither can be
-        // read as a completed fan-out.
+        // A shared-nothing decline is a routing FACT and must not move the
+        // terminal: work still lies ahead when it is recorded.
         let declined = ParallelBatchObservation::default();
-        declined.set_terminal(ParallelIngestTerminal::RouteDeclined);
+        declined
+            .shared_nothing_declined
+            .store(true, Ordering::Release);
+        assert!(declined.snapshot().shared_nothing_declined);
+        assert_eq!(declined.terminal(), ParallelIngestTerminal::Aborted);
         assert!(!declined.terminal().is_success());
         let cancelled = ParallelBatchObservation::default();
         cancelled.set_terminal(ParallelIngestTerminal::Cancelled);
@@ -23568,13 +23596,211 @@ mod tests {
             ParallelIngestTerminal::from_error(&invalid_state("worker failed")),
             ParallelIngestTerminal::Aborted,
         );
+    }
 
-        // Fail-closed identity: a degraded read is flagged, never silently
-        // reported as "no workers".
-        let degraded = ParallelBatchObservation::default();
-        assert!(!degraded.snapshot().identity_degraded);
-        degraded.identity_degraded.store(true, Ordering::Release);
-        assert!(degraded.snapshot().identity_degraded);
+    /// Capture the closed `scribe.ingest` span so shipping-driver tests can
+    /// assert what the recorder actually EMITTED, not what a private route
+    /// returned.
+    struct IngestSpanCapture {
+        buffer: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    impl Write for IngestSpanCapture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("ingest span capture buffer is not poisoned")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run `body` under a subscriber that emits closed spans, and return the
+    /// captured text.
+    fn capture_ingest_spans(body: impl FnOnce()) -> String {
+        let buffer = Arc::new(StdMutex::new(Vec::<u8>::new()));
+        let writer_buffer = Arc::clone(&buffer);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_env_filter("off,frankensearch.quill=info")
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_writer(move || IngestSpanCapture {
+                buffer: Arc::clone(&writer_buffer),
+            })
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        let captured = buffer
+            .lock()
+            .expect("ingest span capture buffer is not poisoned")
+            .clone();
+        String::from_utf8(captured).expect("captured spans are utf8")
+    }
+
+    fn assert_ingest_span_reports(captured: &str, terminal: &str, succeeded: bool) {
+        assert!(
+            captured.contains("parallel_terminal"),
+            "no ingest span was emitted at all:\n{captured}",
+        );
+        assert!(
+            captured.contains(terminal),
+            "expected terminal {terminal} in:\n{captured}",
+        );
+        assert!(
+            captured.contains(&format!("parallel_succeeded={succeeded}")),
+            "expected parallel_succeeded={succeeded} in:\n{captured}",
+        );
+    }
+
+    #[test]
+    fn shipping_driver_emits_a_receipt_on_the_empty_batch_early_exit() {
+        // The empty-batch exit returns before any routing. Before the recorder
+        // moved above the early exits this emitted NOTHING.
+        let captured = capture_ingest_spans(|| {
+            run_with_cx(|cx| async move {
+                let mut index =
+                    QuillIndex::in_memory(QuillConfig::default()).expect("empty-batch index");
+                index
+                    .index_documents(&cx, &[])
+                    .await
+                    .expect("an empty batch is not an error");
+            });
+        });
+        assert_ingest_span_reports(&captured, "no_work", true);
+    }
+
+    #[test]
+    fn shipping_driver_emits_an_aborted_receipt_on_an_admission_error() {
+        // Duplicate ids inside one batch are refused by admission, which is
+        // another exit that used to precede the recorder.
+        let captured = capture_ingest_spans(|| {
+            run_with_cx(|cx| async move {
+                let mut index =
+                    QuillIndex::in_memory(QuillConfig::default()).expect("admission-error index");
+                let duplicate = vec![
+                    IndexableDocument::new("duplicate-id", "alpha"),
+                    IndexableDocument::new("duplicate-id", "beta"),
+                ];
+                index
+                    .index_documents(&cx, &duplicate)
+                    .await
+                    .expect_err("a duplicate id in one batch must be refused");
+            });
+        });
+        assert_ingest_span_reports(&captured, "aborted", false);
+    }
+
+    #[test]
+    fn shipping_driver_emits_a_cancelled_receipt_from_the_typed_error() {
+        // Classified from the typed `QuillIndexError::Cancelled`, not from a
+        // live flag read at drop time.
+        let captured = capture_ingest_spans(|| {
+            run_with_cx(|cx| async move {
+                let mut index =
+                    QuillIndex::in_memory(QuillConfig::default()).expect("cancellation index");
+                let cancelled = cx.clone();
+                cancelled.set_cancel_requested(true);
+                let documents = vec![IndexableDocument::new("cancelled-doc", "alpha beta")];
+                let error = index
+                    .index_documents(&cancelled, &documents)
+                    .await
+                    .expect_err("a cancelled Cx must be refused");
+                assert!(matches!(error, QuillIndexError::Cancelled { .. }));
+            });
+        });
+        assert_ingest_span_reports(&captured, "cancelled", false);
+    }
+
+    #[test]
+    fn shipping_driver_emits_a_success_receipt_with_witness_fields() {
+        let captured = capture_ingest_spans(|| {
+            run_with_cx(|cx| async move {
+                let config = QuillConfig {
+                    max_ingest_shards: 4,
+                    max_visibility_lag_ms: 60_000,
+                    ..QuillConfig::default()
+                };
+                let mut index = QuillIndex::in_memory(config).expect("success receipt index");
+                let documents = (0..250)
+                    .map(|ordinal| {
+                        IndexableDocument::new(
+                            format!("receipt-doc-{ordinal:05}"),
+                            "alpha beta gamma delta",
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                index
+                    .index_documents(&cx, &documents)
+                    .await
+                    .expect("index the success-receipt batch");
+            });
+        });
+        // Whichever route carried it, the whole operation succeeded and the
+        // witness fields are present on the emitted span.
+        assert!(captured.contains("parallel_succeeded=true"), "{captured}");
+        assert!(captured.contains("parallel_started_shards"), "{captured}");
+        assert!(
+            captured.contains("parallel_peak_shards_in_flight"),
+            "{captured}"
+        );
+        assert!(
+            captured.contains("parallel_identity_degraded=false"),
+            "{captured}"
+        );
+        assert!(
+            captured.contains("parallel_shared_nothing_declined"),
+            "{captured}"
+        );
+    }
+
+    #[test]
+    fn poisoned_worker_id_lock_fails_closed_on_every_branch() {
+        // Really poison the mutex — do not set the flag by hand, or the
+        // PoisonError branches never execute.
+        let observation = Arc::new(ParallelBatchObservation::default());
+        assert!(!observation.snapshot().identity_degraded);
+        let poisoner = Arc::clone(&observation);
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let poisoned = std::thread::spawn(move || {
+            let _guard = poisoner
+                .worker_ids
+                .lock()
+                .expect("lock is not yet poisoned");
+            panic!("poison the worker-id lock");
+        })
+        .join();
+        std::panic::set_hook(previous_hook);
+        assert!(poisoned.is_err());
+        assert!(observation.worker_ids.is_poisoned());
+
+        // WRITE branch: `enter_shard` must run inside a pool so a worker index
+        // exists and the lock is actually attempted.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("build poison-branch pool");
+        let writer = Arc::clone(&observation);
+        pool.install(|| {
+            drop(writer.enter_shard());
+        });
+        assert!(
+            observation.identity_degraded.load(Ordering::Acquire),
+            "a failed identity write must fail closed",
+        );
+
+        // READ branches: both report degraded and empty rather than a
+        // confident zero.
+        let witness = observation.snapshot();
+        assert!(witness.identity_degraded);
+        assert_eq!(witness.distinct_worker_slots, 0);
+        assert!(observation.sorted_worker_ids().is_empty());
+        // The shard itself was still counted; only identity was lost.
+        assert_eq!(witness.started_shards, 1);
     }
 
     #[test]
