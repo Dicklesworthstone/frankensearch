@@ -348,7 +348,7 @@ impl PerfCellSpec {
 pub const QG1_TANTIVY_INCUMBENT_TANTIVY_VERSION: &str = "0.26.1";
 /// Wire schema for the provisional QG-1 Tantivy incumbent screen.
 pub const QG1_TANTIVY_INCUMBENT_SCREEN_SCHEMA_VERSION: &str =
-    "quill-qg1-tantivy-incumbent-screen-v1";
+    "quill-qg1-tantivy-incumbent-screen-v2";
 
 /// Tantivy writer construction admitted to the QG-1 incumbent screen.
 ///
@@ -404,6 +404,9 @@ pub struct Qg1TantivySemanticContract {
     pub searchable_terminal_scope_sha256: String,
     /// Exact durability receipt.
     pub durability_sha256: String,
+    /// Exact Quill backend/configuration receipt used in the same-invocation
+    /// T/Quill and Quill/Quill streams.
+    pub quill_config_sha256: String,
 }
 
 impl Qg1TantivySemanticContract {
@@ -417,6 +420,7 @@ impl Qg1TantivySemanticContract {
                 &self.visibility_sha256,
                 &self.searchable_terminal_scope_sha256,
                 &self.durability_sha256,
+                &self.quill_config_sha256,
             ]
             .into_iter()
             .any(|digest| !is_lower_hex_digest(digest))
@@ -459,6 +463,12 @@ pub struct Qg1TantivyIncumbentScreenPlan {
     pub external_cpu_budget: usize,
     /// Fixed Tantivy widths preregistered before pilots execute.
     pub preregistered_writer_widths: Vec<usize>,
+    /// Exact QG-1 bulk work denominator, derived from the canonical cell.
+    pub work_units: u64,
+    /// Exact prepared-content byte denominator emitted by the live producer.
+    pub content_bytes: u64,
+    /// Domain-separated receipt binding the canonical cell and both denominators.
+    pub work_contract_sha256: String,
     /// Domain-separated identity of this immutable screen plan.
     pub plan_sha256: String,
 }
@@ -468,17 +478,31 @@ impl Qg1TantivyIncumbentScreenPlan {
     ///
     /// # Errors
     ///
-    /// Returns an error for an empty CPU budget or a non-canonical width list.
+    /// Returns an error for an invalid bulk cell, empty denominator, empty CPU
+    /// budget, or non-canonical width list.
     pub fn new(
         machine_profile: MachineProfileKey,
         external_cpu_budget: usize,
         preregistered_writer_widths: Vec<usize>,
+        cell: &PerfCellSpec,
+        content_bytes: u64,
     ) -> Result<Self, Qg1TantivyIncumbentError> {
+        qg1_bulk_cell_resources(cell)?;
+        let work_units = cell
+            .document_count
+            .filter(|count| *count > 0)
+            .ok_or(Qg1TantivyIncumbentError::InvalidBulkCell)?;
+        if content_bytes == 0 {
+            return Err(Qg1TantivyIncumbentError::InvalidScreenPlan);
+        }
         let mut plan = Self {
             schema_version: QG1_TANTIVY_INCUMBENT_SCREEN_SCHEMA_VERSION.to_owned(),
             machine_profile,
             external_cpu_budget,
             preregistered_writer_widths,
+            work_units,
+            content_bytes,
+            work_contract_sha256: qg1_bulk_work_contract_sha256(cell, work_units, content_bytes)?,
             plan_sha256: String::new(),
         };
         plan.validate_shape()?;
@@ -489,6 +513,9 @@ impl Qg1TantivyIncumbentScreenPlan {
     fn validate_shape(&self) -> Result<(), Qg1TantivyIncumbentError> {
         if self.schema_version != QG1_TANTIVY_INCUMBENT_SCREEN_SCHEMA_VERSION
             || self.external_cpu_budget == 0
+            || self.work_units == 0
+            || self.content_bytes == 0
+            || !is_lower_hex_digest(&self.work_contract_sha256)
             || self.preregistered_writer_widths.is_empty()
             || self
                 .preregistered_writer_widths
@@ -513,6 +540,9 @@ impl Qg1TantivyIncumbentScreenPlan {
         update_length_framed(&mut hasher, self.schema_version.as_bytes());
         update_length_framed(&mut hasher, machine_profile.as_slice());
         update_length_framed(&mut hasher, self.external_cpu_budget.to_string().as_bytes());
+        update_length_framed(&mut hasher, self.work_units.to_string().as_bytes());
+        update_length_framed(&mut hasher, self.content_bytes.to_string().as_bytes());
+        update_length_framed(&mut hasher, self.work_contract_sha256.as_bytes());
         for width in &self.preregistered_writer_widths {
             update_length_framed(&mut hasher, width.to_string().as_bytes());
         }
@@ -525,6 +555,16 @@ impl Qg1TantivyIncumbentScreenPlan {
             return Err(Qg1TantivyIncumbentError::InvalidScreenPlan);
         }
         let (_, writer_heap_bytes) = qg1_bulk_cell_resources(cell)?;
+        let expected_work_units = cell
+            .document_count
+            .filter(|count| *count > 0)
+            .ok_or(Qg1TantivyIncumbentError::InvalidBulkCell)?;
+        if self.work_units != expected_work_units
+            || self.work_contract_sha256
+                != qg1_bulk_work_contract_sha256(cell, self.work_units, self.content_bytes)?
+        {
+            return Err(Qg1TantivyIncumbentError::InvalidScreenPlan);
+        }
         if self.preregistered_writer_widths.iter().any(|width| {
             PERF_MIN_WRITER_HEAP_PER_THREAD_BYTES.saturating_mul(*width) > writer_heap_bytes
         }) {
@@ -645,6 +685,19 @@ impl Qg1TantivyIncumbentCandidate {
     }
 }
 
+/// Immutable binding between one raw QG-1 observation and the engine,
+/// denominator, and producer identity that emitted it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg1RawObservationBinding {
+    raw_sample_sha256: String,
+    observation_id_sha256: String,
+    engine_id: String,
+    engine_config_sha256: String,
+    work_units: u64,
+    content_bytes: u64,
+}
+
 /// Pilot result for one preregistered Tantivy candidate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -657,12 +710,19 @@ pub struct Qg1TantivyIncumbentPilot {
     pub observed_writer_threads: usize,
     /// Raw paired candidate/control and candidate A/A evidence.
     pub experiment: PairedExperimentResult,
+    /// Sealed bindings for the candidate/control effect records.
+    effect_observations: Vec<Qg1RawObservationBinding>,
+    /// Sealed bindings for the candidate/candidate A/A records.
+    null_observations: Vec<Qg1RawObservationBinding>,
 }
 
 impl Qg1TantivyIncumbentPilot {
     fn recomputed_stream_receipt_sha256(&self) -> Result<String, Qg1TantivyIncumbentError> {
         let experiment = serde_json::to_vec(&self.experiment)
             .map_err(|_| Qg1TantivyIncumbentError::StreamReceiptMismatch)?;
+        let observations =
+            serde_json::to_vec(&(&self.effect_observations, &self.null_observations))
+                .map_err(|_| Qg1TantivyIncumbentError::StreamReceiptMismatch)?;
         let mut hasher = Sha256::new();
         hasher.update(b"frankensearch.quill.qg1-tantivy-pilot-stream.v1\0");
         update_length_framed(&mut hasher, self.candidate.config_sha256.as_bytes());
@@ -671,6 +731,7 @@ impl Qg1TantivyIncumbentPilot {
             self.observed_writer_threads.to_string().as_bytes(),
         );
         update_length_framed(&mut hasher, experiment.as_slice());
+        update_length_framed(&mut hasher, observations.as_slice());
         Ok(finish_sha256_hex(hasher))
     }
 }
@@ -708,12 +769,18 @@ impl Qg1TantivyDecisionStreamKind {
 pub struct Qg1TantivyBoundStream {
     /// Which independent stream this record represents.
     pub kind: Qg1TantivyDecisionStreamKind,
-    /// Tantivy configuration bound to the control arm, if that arm is Tantivy.
-    pub control_tantivy_config_sha256: Option<String>,
-    /// Tantivy configuration bound to the treatment arm, if that arm is Tantivy.
-    pub treatment_tantivy_config_sha256: Option<String>,
+    /// Explicit engine identity bound to the control arm.
+    pub control_engine_id: String,
+    /// Exact configuration receipt bound to the control arm.
+    pub control_engine_config_sha256: String,
+    /// Explicit engine identity bound to the treatment arm.
+    pub treatment_engine_id: String,
+    /// Exact configuration receipt bound to the treatment arm.
+    pub treatment_engine_config_sha256: String,
     /// Raw paired samples for exactly this stream.
     pub samples: Vec<PerfRawSample>,
+    /// Sealed raw-observation bindings parallel to [`Self::samples`].
+    observations: Vec<Qg1RawObservationBinding>,
     /// Domain-separated receipt over kind, configurations, run, and raw samples.
     pub stream_receipt_sha256: String,
 }
@@ -786,10 +853,18 @@ pub enum Qg1TantivyIncumbentError {
     DecisionInvocationMismatch,
     #[error("QG-1 incumbent decision lacks valid eligible throughput evidence")]
     DecisionEvidenceInvalid,
+    #[error("QG-1 incumbent pilots and decision streams must use one estimator configuration")]
+    EstimatorConfigMismatch,
     #[error(
         "QG-1 incumbent decision stream does not bind every raw arm to its expected configuration"
     )]
     DecisionCandidateMismatch,
+    #[error(
+        "QG-1 incumbent raw-observation binding is malformed or no longer matches its raw sample"
+    )]
+    ObservationBindingMismatch,
+    #[error("QG-1 incumbent raw observation is reused across pilots or decision streams")]
+    ObservationReuse,
     #[error("QG-1 incumbent stream receipt is malformed, stale, or reused")]
     StreamReceiptMismatch,
 }
@@ -825,6 +900,25 @@ fn qg1_bulk_cell_resources(
     Ok((threads, writer_heap_bytes))
 }
 
+fn qg1_bulk_work_contract_sha256(
+    cell: &PerfCellSpec,
+    work_units: u64,
+    content_bytes: u64,
+) -> Result<String, Qg1TantivyIncumbentError> {
+    if work_units == 0 || content_bytes == 0 {
+        return Err(Qg1TantivyIncumbentError::InvalidScreenPlan);
+    }
+    let cell_contract = cell
+        .contract_sha256()
+        .map_err(|_| Qg1TantivyIncumbentError::InvalidBulkCell)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"frankensearch.quill.qg1-bulk-work-contract.v1\0");
+    update_length_framed(&mut hasher, cell_contract.as_bytes());
+    update_length_framed(&mut hasher, work_units.to_string().as_bytes());
+    update_length_framed(&mut hasher, content_bytes.to_string().as_bytes());
+    Ok(finish_sha256_hex(hasher))
+}
+
 /// Reconstruct the sole timing scope admitted by the QG-1 incumbent screen.
 ///
 /// The public matrix scope supplies the cell-derived operation identity,
@@ -839,6 +933,189 @@ fn qg1_expected_throughput_scope(
     let mut scope = perf_operation_scope(cell.gate, &cell.fixture, &cell.metric);
     scope.semantics = PerfMetricSemantics::Throughput;
     Ok(scope)
+}
+
+const QG1_TANTIVY_ENGINE_ID: &str = "tantivy";
+const QG1_QUILL_ENGINE_ID: &str = "quill";
+
+fn qg1_valid_engine_identity(engine_id: &str, config_sha256: &str) -> bool {
+    matches!(engine_id, QG1_TANTIVY_ENGINE_ID | QG1_QUILL_ENGINE_ID)
+        && is_lower_hex_digest(config_sha256)
+}
+
+fn qg1_raw_sample_sha256(sample: &PerfRawSample) -> Result<String, Qg1TantivyIncumbentError> {
+    let encoded = serde_json::to_vec(sample)
+        .map_err(|_| Qg1TantivyIncumbentError::ObservationBindingMismatch)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"frankensearch.quill.qg1-raw-observation.v1\0");
+    update_length_framed(&mut hasher, encoded.as_slice());
+    Ok(finish_sha256_hex(hasher))
+}
+
+fn qg1_bind_raw_observations(
+    samples: &[PerfRawSample],
+    control_engine_id: &str,
+    control_engine_config_sha256: &str,
+    treatment_engine_id: &str,
+    treatment_engine_config_sha256: &str,
+    observation_ids: Vec<String>,
+) -> Result<Vec<Qg1RawObservationBinding>, Qg1TantivyIncumbentError> {
+    if samples.len() != observation_ids.len()
+        || !qg1_valid_engine_identity(control_engine_id, control_engine_config_sha256)
+        || !qg1_valid_engine_identity(treatment_engine_id, treatment_engine_config_sha256)
+    {
+        return Err(Qg1TantivyIncumbentError::ObservationBindingMismatch);
+    }
+    samples
+        .iter()
+        .zip(observation_ids)
+        .map(|(sample, observation_id_sha256)| {
+            let (engine_id, engine_config_sha256) = match sample.arm {
+                PerfSampleArm::Control => (control_engine_id, control_engine_config_sha256),
+                PerfSampleArm::Treatment => (treatment_engine_id, treatment_engine_config_sha256),
+            };
+            let (Some(work_units), Some(content_bytes)) = (sample.work_units, sample.byte_count)
+            else {
+                return Err(Qg1TantivyIncumbentError::ObservationBindingMismatch);
+            };
+            if !is_lower_hex_digest(&observation_id_sha256) {
+                return Err(Qg1TantivyIncumbentError::ObservationBindingMismatch);
+            }
+            Ok(Qg1RawObservationBinding {
+                raw_sample_sha256: qg1_raw_sample_sha256(sample)?,
+                observation_id_sha256,
+                engine_id: engine_id.to_owned(),
+                engine_config_sha256: engine_config_sha256.to_owned(),
+                work_units,
+                content_bytes,
+            })
+        })
+        .collect()
+}
+
+fn qg1_validate_raw_observations(
+    samples: &[PerfRawSample],
+    observations: &[Qg1RawObservationBinding],
+    control_engine_id: &str,
+    control_engine_config_sha256: &str,
+    treatment_engine_id: &str,
+    treatment_engine_config_sha256: &str,
+    expected_work_units: u64,
+    expected_content_bytes: u64,
+) -> Result<(), Qg1TantivyIncumbentError> {
+    if samples.len() != observations.len()
+        || !qg1_valid_engine_identity(control_engine_id, control_engine_config_sha256)
+        || !qg1_valid_engine_identity(treatment_engine_id, treatment_engine_config_sha256)
+    {
+        return Err(Qg1TantivyIncumbentError::ObservationBindingMismatch);
+    }
+    for (sample, observation) in samples.iter().zip(observations) {
+        let (engine_id, engine_config_sha256) = match sample.arm {
+            PerfSampleArm::Control => (control_engine_id, control_engine_config_sha256),
+            PerfSampleArm::Treatment => (treatment_engine_id, treatment_engine_config_sha256),
+        };
+        if observation.raw_sample_sha256 != qg1_raw_sample_sha256(sample)?
+            || !is_lower_hex_digest(&observation.observation_id_sha256)
+            || observation.engine_id != engine_id
+            || observation.engine_config_sha256 != engine_config_sha256
+            || observation.work_units != expected_work_units
+            || observation.content_bytes != expected_content_bytes
+            || sample.work_units != Some(expected_work_units)
+            || sample.byte_count != Some(expected_content_bytes)
+        {
+            return Err(Qg1TantivyIncumbentError::ObservationBindingMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn qg1_insert_observation_ids<'a>(
+    observations: impl IntoIterator<Item = &'a Qg1RawObservationBinding>,
+    seen: &mut BTreeSet<String>,
+) -> Result<(), Qg1TantivyIncumbentError> {
+    for observation in observations {
+        if !seen.insert(observation.observation_id_sha256.clone()) {
+            return Err(Qg1TantivyIncumbentError::ObservationReuse);
+        }
+    }
+    Ok(())
+}
+
+impl Qg1TantivyIncumbentPilot {
+    /// Seal one live QG-1 Tantivy pilot without exposing receipt hashing to the
+    /// producer. The caller supplies immutable observation IDs emitted by the
+    /// runner; engine/config and raw-content bindings are derived here.
+    pub fn from_experiment(
+        candidate: Qg1TantivyIncumbentCandidate,
+        observed_writer_threads: usize,
+        shipping_auto_config_sha256: String,
+        experiment: PairedExperimentResult,
+        effect_observation_ids: Vec<String>,
+        null_observation_ids: Vec<String>,
+    ) -> Result<Self, Qg1TantivyIncumbentError> {
+        let effect_observations = qg1_bind_raw_observations(
+            &experiment.effect_samples,
+            QG1_TANTIVY_ENGINE_ID,
+            &shipping_auto_config_sha256,
+            QG1_TANTIVY_ENGINE_ID,
+            &candidate.config_sha256,
+            effect_observation_ids,
+        )?;
+        let null_observations = qg1_bind_raw_observations(
+            &experiment.null_samples,
+            QG1_TANTIVY_ENGINE_ID,
+            &candidate.config_sha256,
+            QG1_TANTIVY_ENGINE_ID,
+            &candidate.config_sha256,
+            null_observation_ids,
+        )?;
+        let mut pilot = Self {
+            candidate,
+            stream_receipt_sha256: String::new(),
+            observed_writer_threads,
+            experiment,
+            effect_observations,
+            null_observations,
+        };
+        pilot.stream_receipt_sha256 = pilot.recomputed_stream_receipt_sha256()?;
+        Ok(pilot)
+    }
+}
+
+impl Qg1TantivyBoundStream {
+    /// Seal one raw decision stream with explicit engine/config identity and
+    /// immutable producer observation IDs. This is the live-producer boundary;
+    /// callers cannot supply an arbitrary stream receipt.
+    pub fn from_raw_samples(
+        kind: Qg1TantivyDecisionStreamKind,
+        control_engine_id: String,
+        control_engine_config_sha256: String,
+        treatment_engine_id: String,
+        treatment_engine_config_sha256: String,
+        samples: Vec<PerfRawSample>,
+        observation_ids: Vec<String>,
+    ) -> Result<Self, Qg1TantivyIncumbentError> {
+        let observations = qg1_bind_raw_observations(
+            &samples,
+            &control_engine_id,
+            &control_engine_config_sha256,
+            &treatment_engine_id,
+            &treatment_engine_config_sha256,
+            observation_ids,
+        )?;
+        let mut stream = Self {
+            kind,
+            control_engine_id,
+            control_engine_config_sha256,
+            treatment_engine_id,
+            treatment_engine_config_sha256,
+            samples,
+            observations,
+            stream_receipt_sha256: String::new(),
+        };
+        stream.stream_receipt_sha256 = stream.recomputed_stream_receipt_sha256()?;
+        Ok(stream)
+    }
 }
 
 /// Build the complete, machine-profile-qualified Tantivy candidate universe for
@@ -876,47 +1153,54 @@ pub fn preregister_qg1_tantivy_incumbents(
     Ok(candidates)
 }
 
-fn qg1_stream_matches_configs(
-    experiment: &PairedExperimentResult,
-    effect_control_config_sha256: Option<&str>,
-    effect_treatment_config_sha256: Option<&str>,
-    null_control_config_sha256: Option<&str>,
-    null_treatment_config_sha256: Option<&str>,
-) -> bool {
-    experiment
-        .effect_samples
-        .iter()
-        .all(|sample| match sample.arm {
-            PerfSampleArm::Control => {
-                sample.tantivy_config_sha256.as_deref() == effect_control_config_sha256
-            }
-            PerfSampleArm::Treatment => {
-                sample.tantivy_config_sha256.as_deref() == effect_treatment_config_sha256
-            }
-        })
-        && experiment
-            .null_samples
-            .iter()
-            .all(|sample| match sample.arm {
-                PerfSampleArm::Control => {
-                    sample.tantivy_config_sha256.as_deref() == null_control_config_sha256
-                }
-                PerfSampleArm::Treatment => {
-                    sample.tantivy_config_sha256.as_deref() == null_treatment_config_sha256
-                }
-            })
-}
-
 fn qg1_valid_throughput_experiment(
     experiment: &PairedExperimentResult,
     expected_scope: &PerfOperationScope,
     expected_provenance: Option<&PerfSampleProvenance>,
+    expected_work_units: u64,
+    expected_content_bytes: u64,
 ) -> bool {
     experiment.verify_recomputed().is_ok()
         && experiment.status == PairedEvidenceStatus::Valid
         && experiment.claim_state == PairedClaimState::EligibleForDecision
         && experiment.scope == *expected_scope
         && expected_provenance.is_none_or(|provenance| experiment.provenance == *provenance)
+        && experiment
+            .effect_samples
+            .iter()
+            .chain(&experiment.null_samples)
+            .all(|sample| {
+                sample.work_units == Some(expected_work_units)
+                    && sample.byte_count == Some(expected_content_bytes)
+            })
+}
+
+fn qg1_validate_pilot_observations(
+    pilot: &Qg1TantivyIncumbentPilot,
+    shipping_auto_config_sha256: &str,
+    expected_work_units: u64,
+    expected_content_bytes: u64,
+) -> Result<(), Qg1TantivyIncumbentError> {
+    qg1_validate_raw_observations(
+        &pilot.experiment.effect_samples,
+        &pilot.effect_observations,
+        QG1_TANTIVY_ENGINE_ID,
+        shipping_auto_config_sha256,
+        QG1_TANTIVY_ENGINE_ID,
+        &pilot.candidate.config_sha256,
+        expected_work_units,
+        expected_content_bytes,
+    )?;
+    qg1_validate_raw_observations(
+        &pilot.experiment.null_samples,
+        &pilot.null_observations,
+        QG1_TANTIVY_ENGINE_ID,
+        &pilot.candidate.config_sha256,
+        QG1_TANTIVY_ENGINE_ID,
+        &pilot.candidate.config_sha256,
+        expected_work_units,
+        expected_content_bytes,
+    )
 }
 
 impl Qg1TantivyIncumbentScreen {
@@ -953,9 +1237,11 @@ impl Qg1TantivyIncumbentScreen {
         }
         let shipping_auto = &candidates[0];
         let mut seen_stream_receipts = BTreeSet::new();
+        let mut seen_observation_ids = BTreeSet::new();
         let mut run_id = None;
         let mut scope = None;
         let mut provenance = None;
+        let mut estimator_config = None;
         for (expected, pilot) in candidates.iter().zip(&pilots) {
             pilot
                 .candidate
@@ -984,18 +1270,36 @@ impl Qg1TantivyIncumbentScreen {
                     "candidate materialized an infeasible writer width",
                 ));
             }
-            if !qg1_valid_throughput_experiment(&pilot.experiment, &expected_scope, None)
-                || !qg1_stream_matches_configs(
-                    &pilot.experiment,
-                    Some(&shipping_auto.config_sha256),
-                    Some(&pilot.candidate.config_sha256),
-                    Some(&pilot.candidate.config_sha256),
-                    Some(&pilot.candidate.config_sha256),
-                )
-            {
+            if !qg1_valid_throughput_experiment(
+                &pilot.experiment,
+                &expected_scope,
+                None,
+                screen_plan.work_units,
+                screen_plan.content_bytes,
+            ) {
                 return Ok(no_decision(
                     "candidate pilot lacks valid configuration-bound throughput evidence",
                 ));
+            }
+            qg1_validate_pilot_observations(
+                pilot,
+                &shipping_auto.config_sha256,
+                screen_plan.work_units,
+                screen_plan.content_bytes,
+            )?;
+            qg1_insert_observation_ids(
+                pilot
+                    .effect_observations
+                    .iter()
+                    .chain(&pilot.null_observations),
+                &mut seen_observation_ids,
+            )?;
+            match &estimator_config {
+                Some(expected_config) if expected_config != &pilot.experiment.config => {
+                    return Err(Qg1TantivyIncumbentError::EstimatorConfigMismatch);
+                }
+                Some(_) => {}
+                None => estimator_config = Some(pilot.experiment.config.clone()),
             }
             match (&run_id, &scope, &provenance) {
                 (Some(expected_run_id), Some(expected_scope), Some(expected_provenance))
@@ -1079,6 +1383,7 @@ impl Qg1TantivyIncumbentScreen {
             .ok_or(Qg1TantivyIncumbentError::ScreenSelectionMismatch)?;
         let expected_scope = &expected_pilot.experiment.scope;
         let expected_provenance = &expected_pilot.experiment.provenance;
+        let expected_estimator_config = &expected_pilot.experiment.config;
         let pilot_receipts = self
             .pilots
             .iter()
@@ -1097,74 +1402,66 @@ impl Qg1TantivyIncumbentScreen {
         }) {
             return Err(Qg1TantivyIncumbentError::StreamReceiptMismatch);
         }
-        decision.recompute_against(selected_candidate, expected_scope, expected_provenance)?;
+        let mut seen_observation_ids = BTreeSet::new();
+        for pilot in &recomputed_screen.pilots {
+            qg1_insert_observation_ids(
+                pilot
+                    .effect_observations
+                    .iter()
+                    .chain(&pilot.null_observations),
+                &mut seen_observation_ids,
+            )?;
+        }
+        decision.recompute_against(
+            selected_candidate,
+            semantic_contract,
+            expected_scope,
+            expected_provenance,
+            expected_estimator_config,
+            recomputed_screen.screen_plan.work_units,
+            recomputed_screen.screen_plan.content_bytes,
+            &mut seen_observation_ids,
+        )?;
         Ok(())
     }
-}
-
-fn qg1_raw_samples_match_configs(
-    samples: &[PerfRawSample],
-    control_config_sha256: Option<&str>,
-    treatment_config_sha256: Option<&str>,
-) -> bool {
-    samples.iter().all(|sample| match sample.arm {
-        PerfSampleArm::Control => sample.tantivy_config_sha256.as_deref() == control_config_sha256,
-        PerfSampleArm::Treatment => {
-            sample.tantivy_config_sha256.as_deref() == treatment_config_sha256
-        }
-    })
 }
 
 impl Qg1TantivyBoundStream {
     fn recomputed_stream_receipt_sha256(&self) -> Result<String, Qg1TantivyIncumbentError> {
         let samples = serde_json::to_vec(&self.samples)
             .map_err(|_| Qg1TantivyIncumbentError::StreamReceiptMismatch)?;
+        let observations = serde_json::to_vec(&self.observations)
+            .map_err(|_| Qg1TantivyIncumbentError::StreamReceiptMismatch)?;
         let mut hasher = Sha256::new();
         hasher.update(b"frankensearch.quill.qg1-tantivy-decision-stream.v1\0");
         update_length_framed(&mut hasher, self.kind.stable_id().as_bytes());
-        match self.control_tantivy_config_sha256.as_deref() {
-            Some(config) => {
-                hasher.update([1]);
-                update_length_framed(&mut hasher, config.as_bytes());
-            }
-            None => hasher.update([0]),
-        }
-        match self.treatment_tantivy_config_sha256.as_deref() {
-            Some(config) => {
-                hasher.update([1]);
-                update_length_framed(&mut hasher, config.as_bytes());
-            }
-            None => hasher.update([0]),
-        }
+        update_length_framed(&mut hasher, self.control_engine_id.as_bytes());
+        update_length_framed(&mut hasher, self.control_engine_config_sha256.as_bytes());
+        update_length_framed(&mut hasher, self.treatment_engine_id.as_bytes());
+        update_length_framed(&mut hasher, self.treatment_engine_config_sha256.as_bytes());
         update_length_framed(&mut hasher, samples.as_slice());
+        update_length_framed(&mut hasher, observations.as_slice());
         Ok(finish_sha256_hex(hasher))
     }
 
     fn validate_against(
         &self,
         kind: Qg1TantivyDecisionStreamKind,
-        control_config_sha256: Option<&str>,
-        treatment_config_sha256: Option<&str>,
+        control_engine_id: &str,
+        control_engine_config_sha256: &str,
+        treatment_engine_id: &str,
+        treatment_engine_config_sha256: &str,
         estimator_config: &PairedEstimatorConfig,
         expected_scope: &PerfOperationScope,
         expected_provenance: &PerfSampleProvenance,
+        expected_work_units: u64,
+        expected_content_bytes: u64,
     ) -> Result<(), Qg1TantivyIncumbentError> {
         if self.kind != kind
-            || self.control_tantivy_config_sha256.as_deref() != control_config_sha256
-            || self.treatment_tantivy_config_sha256.as_deref() != treatment_config_sha256
-            || self
-                .control_tantivy_config_sha256
-                .as_deref()
-                .is_some_and(|config| !is_lower_hex_digest(config))
-            || self
-                .treatment_tantivy_config_sha256
-                .as_deref()
-                .is_some_and(|config| !is_lower_hex_digest(config))
-            || !qg1_raw_samples_match_configs(
-                &self.samples,
-                control_config_sha256,
-                treatment_config_sha256,
-            )
+            || self.control_engine_id != control_engine_id
+            || self.control_engine_config_sha256 != control_engine_config_sha256
+            || self.treatment_engine_id != treatment_engine_id
+            || self.treatment_engine_config_sha256 != treatment_engine_config_sha256
         {
             return Err(Qg1TantivyIncumbentError::DecisionCandidateMismatch);
         }
@@ -1176,104 +1473,115 @@ impl Qg1TantivyBoundStream {
         if self.stream_receipt_sha256 != self.recomputed_stream_receipt_sha256()? {
             return Err(Qg1TantivyIncumbentError::StreamReceiptMismatch);
         }
+        qg1_validate_raw_observations(
+            &self.samples,
+            &self.observations,
+            control_engine_id,
+            control_engine_config_sha256,
+            treatment_engine_id,
+            treatment_engine_config_sha256,
+            expected_work_units,
+            expected_content_bytes,
+        )?;
         validate_paired_stream(&self.samples, estimator_config)
             .map_err(|_| Qg1TantivyIncumbentError::DecisionEvidenceInvalid)?;
         Ok(())
     }
 }
 
-fn qg1_namespaced_samples(
-    samples: &[PerfRawSample],
-    offset: u64,
-) -> Result<Vec<PerfRawSample>, Qg1TantivyIncumbentError> {
-    samples
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(index, mut sample)| {
-            sample.sample_id = offset
-                .checked_add(
-                    u64::try_from(index)
-                        .map_err(|_| Qg1TantivyIncumbentError::DecisionEvidenceInvalid)?,
-                )
-                .ok_or(Qg1TantivyIncumbentError::DecisionEvidenceInvalid)?;
-            Ok(sample)
-        })
-        .collect()
-}
-
 impl Qg1TantivyIncumbentDecision {
     fn recompute_against(
         &self,
         selected_candidate: &Qg1TantivyIncumbentCandidate,
+        semantic_contract: &Qg1TantivySemanticContract,
         expected_scope: &PerfOperationScope,
         expected_provenance: &PerfSampleProvenance,
+        expected_estimator_config: &PairedEstimatorConfig,
+        expected_work_units: u64,
+        expected_content_bytes: u64,
+        seen_observation_ids: &mut BTreeSet<String>,
     ) -> Result<(PairedExperimentResult, PairedExperimentResult), Qg1TantivyIncumbentError> {
-        if self.estimator_config
-            != PairedEstimatorConfig::predeclared(self.estimator_config.bootstrap_seed)
-        {
-            return Err(Qg1TantivyIncumbentError::DecisionEvidenceInvalid);
+        if &self.estimator_config != expected_estimator_config {
+            return Err(Qg1TantivyIncumbentError::EstimatorConfigMismatch);
         }
         let selected_config = selected_candidate.config_sha256.as_str();
         let streams = [
             (
                 &self.tantivy_vs_quill,
                 Qg1TantivyDecisionStreamKind::TantivyVsQuill,
-                Some(selected_config),
-                None,
+                QG1_TANTIVY_ENGINE_ID,
+                selected_config,
+                QG1_QUILL_ENGINE_ID,
+                semantic_contract.quill_config_sha256.as_str(),
             ),
             (
                 &self.tantivy_null,
                 Qg1TantivyDecisionStreamKind::TantivyNull,
-                Some(selected_config),
-                Some(selected_config),
+                QG1_TANTIVY_ENGINE_ID,
+                selected_config,
+                QG1_TANTIVY_ENGINE_ID,
+                selected_config,
             ),
             (
                 &self.quill_null,
                 Qg1TantivyDecisionStreamKind::QuillNull,
-                None,
-                None,
+                QG1_QUILL_ENGINE_ID,
+                semantic_contract.quill_config_sha256.as_str(),
+                QG1_QUILL_ENGINE_ID,
+                semantic_contract.quill_config_sha256.as_str(),
             ),
         ];
         let mut receipts = BTreeSet::new();
-        for (stream, kind, control_config, treatment_config) in streams {
+        for (
+            stream,
+            kind,
+            control_engine_id,
+            control_engine_config_sha256,
+            treatment_engine_id,
+            treatment_engine_config_sha256,
+        ) in streams
+        {
             stream.validate_against(
                 kind,
-                control_config,
-                treatment_config,
+                control_engine_id,
+                control_engine_config_sha256,
+                treatment_engine_id,
+                treatment_engine_config_sha256,
                 &self.estimator_config,
                 expected_scope,
                 expected_provenance,
+                expected_work_units,
+                expected_content_bytes,
             )?;
             if !receipts.insert(stream.stream_receipt_sha256.clone()) {
                 return Err(Qg1TantivyIncumbentError::StreamReceiptMismatch);
             }
+            qg1_insert_observation_ids(stream.observations.iter(), seen_observation_ids)?;
         }
-        let effect = qg1_namespaced_samples(&self.tantivy_vs_quill.samples, 0)?;
-        let tantivy_null = qg1_namespaced_samples(
+        let tantivy_decision = estimate_paired_experiment(
+            &self.tantivy_vs_quill.samples,
             &self.tantivy_null.samples,
-            u64::try_from(effect.len())
-                .map_err(|_| Qg1TantivyIncumbentError::DecisionEvidenceInvalid)?,
-        )?;
-        let quill_null = qg1_namespaced_samples(
+            &self.estimator_config,
+        )
+        .map_err(|_| Qg1TantivyIncumbentError::DecisionEvidenceInvalid)?;
+        let quill_decision = estimate_paired_experiment(
+            &self.tantivy_vs_quill.samples,
             &self.quill_null.samples,
-            u64::try_from(effect.len())
-                .map_err(|_| Qg1TantivyIncumbentError::DecisionEvidenceInvalid)?,
-        )?;
-        let tantivy_decision =
-            estimate_paired_experiment(&effect, &tantivy_null, &self.estimator_config)
-                .map_err(|_| Qg1TantivyIncumbentError::DecisionEvidenceInvalid)?;
-        let quill_decision =
-            estimate_paired_experiment(&effect, &quill_null, &self.estimator_config)
-                .map_err(|_| Qg1TantivyIncumbentError::DecisionEvidenceInvalid)?;
+            &self.estimator_config,
+        )
+        .map_err(|_| Qg1TantivyIncumbentError::DecisionEvidenceInvalid)?;
         if !qg1_valid_throughput_experiment(
             &tantivy_decision,
             expected_scope,
             Some(expected_provenance),
+            expected_work_units,
+            expected_content_bytes,
         ) || !qg1_valid_throughput_experiment(
             &quill_decision,
             expected_scope,
             Some(expected_provenance),
+            expected_work_units,
+            expected_content_bytes,
         ) {
             return Err(Qg1TantivyIncumbentError::DecisionEvidenceInvalid);
         }
@@ -5253,10 +5561,11 @@ mod tests {
             visibility_sha256: "e".repeat(64),
             searchable_terminal_scope_sha256: "f".repeat(64),
             durability_sha256: "0".repeat(64),
+            quill_config_sha256: "1".repeat(64),
         }
     }
 
-    fn qg1_screen_plan(widths: Vec<usize>) -> Qg1TantivyIncumbentScreenPlan {
+    fn qg1_screen_plan(cell: &PerfCellSpec, widths: Vec<usize>) -> Qg1TantivyIncumbentScreenPlan {
         Qg1TantivyIncumbentScreenPlan::new(
             profile_key(
                 HardwareClassId::TrjZen35995wx,
@@ -5264,6 +5573,8 @@ mod tests {
             ),
             2,
             widths,
+            cell,
+            64_000,
         )
         .expect("screen plan")
     }
@@ -5272,53 +5583,69 @@ mod tests {
         qg1_expected_throughput_scope(cell).expect("canonical QG-1 throughput scope")
     }
 
-    fn bind_tantivy_configs(
-        samples: &mut [PerfRawSample],
-        control_config_sha256: Option<&str>,
-        treatment_config_sha256: Option<&str>,
-    ) {
-        for sample in samples {
-            sample.tantivy_config_sha256 = match sample.arm {
-                PerfSampleArm::Control => control_config_sha256.map(str::to_owned),
-                PerfSampleArm::Treatment => treatment_config_sha256.map(str::to_owned),
-            };
+    fn qg1_observation_ids(label: &str, samples: &[PerfRawSample]) -> Vec<String> {
+        samples
+            .iter()
+            .map(|sample| {
+                lower_sha256_hex(
+                    format!("{label}:{}:{}", sample.block_id, sample.sample_id).as_bytes(),
+                )
+            })
+            .collect()
+    }
+
+    fn qg1_duration_stream(
+        scope: &PerfOperationScope,
+        provenance: &PerfSampleProvenance,
+        control_durations: &[u64],
+        treatment_durations: &[u64],
+        sample_id_base: u64,
+        work_units: u64,
+        content_bytes: u64,
+    ) -> Vec<PerfRawSample> {
+        let mut samples = duration_stream(
+            scope,
+            provenance,
+            control_durations,
+            treatment_durations,
+            sample_id_base,
+        );
+        for sample in &mut samples {
+            sample.work_units = Some(work_units);
+            sample.byte_count = Some(content_bytes);
         }
+        samples
     }
 
     fn qg1_pilot(
         candidate: Qg1TantivyIncumbentCandidate,
         shipping_auto: &Qg1TantivyIncumbentCandidate,
         scope: &PerfOperationScope,
+        work_units: u64,
+        content_bytes: u64,
         run_id: &str,
         treatment_duration: u64,
-        receipt_label: &str,
     ) -> Qg1TantivyIncumbentPilot {
         let provenance = provenance(run_id);
         let control_durations = [1_000_000; PERF_MIN_RUNS];
         let treatment_durations = [treatment_duration; PERF_MIN_RUNS];
-        let mut effect = duration_stream(
+        let effect = qg1_duration_stream(
             scope,
             &provenance,
             &control_durations,
             &treatment_durations,
             0,
+            work_units,
+            content_bytes,
         );
-        bind_tantivy_configs(
-            &mut effect,
-            Some(&shipping_auto.config_sha256),
-            Some(&candidate.config_sha256),
-        );
-        let mut null = duration_stream(
+        let null = qg1_duration_stream(
             scope,
             &provenance,
             &control_durations,
             &control_durations,
             10_000,
-        );
-        bind_tantivy_configs(
-            &mut null,
-            Some(&candidate.config_sha256),
-            Some(&candidate.config_sha256),
+            work_units,
+            content_bytes,
         );
         let experiment = estimate_paired_experiment(&effect, &null, &estimator_config())
             .expect("valid QG-1 candidate pilot");
@@ -5326,20 +5653,17 @@ mod tests {
             Qg1TantivyWriterMode::ShippingAuto => 1,
             Qg1TantivyWriterMode::Fixed { writer_threads } => writer_threads,
         };
-        let mut pilot = Qg1TantivyIncumbentPilot {
+        let effect_observation_label = format!("pilot-effect:{}", candidate.config_sha256);
+        let null_observation_label = format!("pilot-null:{}", candidate.config_sha256);
+        Qg1TantivyIncumbentPilot::from_experiment(
             candidate,
-            stream_receipt_sha256: String::new(),
             observed_writer_threads,
+            shipping_auto.config_sha256.clone(),
             experiment,
-        };
-        pilot.stream_receipt_sha256 = pilot
-            .recomputed_stream_receipt_sha256()
-            .expect("pilot receipt");
-        assert_ne!(
-            pilot.stream_receipt_sha256,
-            lower_sha256_hex(receipt_label.as_bytes())
-        );
-        pilot
+            qg1_observation_ids(&effect_observation_label, &effect),
+            qg1_observation_ids(&null_observation_label, &null),
+        )
+        .expect("seal pilot")
     }
 
     fn qg1_complete_pilots(
@@ -5355,8 +5679,7 @@ mod tests {
         candidates
             .iter()
             .cloned()
-            .enumerate()
-            .map(|(index, candidate)| {
+            .map(|candidate| {
                 let treatment_duration = match candidate.writer_mode {
                     Qg1TantivyWriterMode::ShippingAuto => 1_000_000,
                     Qg1TantivyWriterMode::Fixed { writer_threads } => {
@@ -5367,9 +5690,10 @@ mod tests {
                     candidate,
                     shipping_auto,
                     &scope,
+                    screen_plan.work_units,
+                    screen_plan.content_bytes,
                     run_id,
                     treatment_duration,
-                    &format!("pilot-{index}"),
                 )
             })
             .collect()
@@ -5379,36 +5703,48 @@ mod tests {
         cell: &PerfCellSpec,
         kind: Qg1TantivyDecisionStreamKind,
         run_id: &str,
-        control_config_sha256: Option<&str>,
-        treatment_config_sha256: Option<&str>,
+        control_engine_id: &str,
+        control_engine_config_sha256: &str,
+        treatment_engine_id: &str,
+        treatment_engine_config_sha256: &str,
         treatment_duration: u64,
+        work_units: u64,
+        content_bytes: u64,
     ) -> Qg1TantivyBoundStream {
         let scope = qg1_throughput_scope(cell);
         let provenance = provenance(run_id);
         let durations = [1_000_000; PERF_MIN_RUNS];
-        let mut effect = duration_stream(
+        let sample_id_base = match kind {
+            Qg1TantivyDecisionStreamKind::TantivyVsQuill => 100_000,
+            Qg1TantivyDecisionStreamKind::TantivyNull => 200_000,
+            Qg1TantivyDecisionStreamKind::QuillNull => 300_000,
+        };
+        let effect = qg1_duration_stream(
             &scope,
             &provenance,
             &durations,
             &[treatment_duration; PERF_MIN_RUNS],
-            0,
+            sample_id_base,
+            work_units,
+            content_bytes,
         );
-        bind_tantivy_configs(&mut effect, control_config_sha256, treatment_config_sha256);
-        let mut stream = Qg1TantivyBoundStream {
+        let observation_ids = qg1_observation_ids(kind.stable_id(), &effect);
+        Qg1TantivyBoundStream::from_raw_samples(
             kind,
-            control_tantivy_config_sha256: control_config_sha256.map(str::to_owned),
-            treatment_tantivy_config_sha256: treatment_config_sha256.map(str::to_owned),
-            samples: effect,
-            stream_receipt_sha256: String::new(),
-        };
-        stream.stream_receipt_sha256 = stream
-            .recomputed_stream_receipt_sha256()
-            .expect("stream receipt");
-        stream
+            control_engine_id.to_owned(),
+            control_engine_config_sha256.to_owned(),
+            treatment_engine_id.to_owned(),
+            treatment_engine_config_sha256.to_owned(),
+            effect,
+            observation_ids,
+        )
+        .expect("seal bound stream")
     }
 
     fn qg1_decision(
         cell: &PerfCellSpec,
+        screen_plan: &Qg1TantivyIncumbentScreenPlan,
+        semantic_contract: &Qg1TantivySemanticContract,
         selected: &Qg1TantivyIncumbentCandidate,
         run_id: &str,
     ) -> Qg1TantivyIncumbentDecision {
@@ -5418,25 +5754,37 @@ mod tests {
                 cell,
                 Qg1TantivyDecisionStreamKind::TantivyVsQuill,
                 run_id,
-                Some(&selected.config_sha256),
-                None,
+                QG1_TANTIVY_ENGINE_ID,
+                &selected.config_sha256,
+                QG1_QUILL_ENGINE_ID,
+                &semantic_contract.quill_config_sha256,
                 500_000,
+                screen_plan.work_units,
+                screen_plan.content_bytes,
             ),
             tantivy_null: qg1_bound_stream(
                 cell,
                 Qg1TantivyDecisionStreamKind::TantivyNull,
                 run_id,
-                Some(&selected.config_sha256),
-                Some(&selected.config_sha256),
+                QG1_TANTIVY_ENGINE_ID,
+                &selected.config_sha256,
+                QG1_TANTIVY_ENGINE_ID,
+                &selected.config_sha256,
                 1_000_000,
+                screen_plan.work_units,
+                screen_plan.content_bytes,
             ),
             quill_null: qg1_bound_stream(
                 cell,
                 Qg1TantivyDecisionStreamKind::QuillNull,
                 run_id,
-                None,
-                None,
+                QG1_QUILL_ENGINE_ID,
+                &semantic_contract.quill_config_sha256,
+                QG1_QUILL_ENGINE_ID,
+                &semantic_contract.quill_config_sha256,
                 1_000_000,
+                screen_plan.work_units,
+                screen_plan.content_bytes,
             ),
         }
     }
@@ -5445,6 +5793,20 @@ mod tests {
         for sample in &mut stream.samples {
             sample.scope = scope.clone();
         }
+        let observation_ids = stream
+            .observations
+            .iter()
+            .map(|observation| observation.observation_id_sha256.clone())
+            .collect();
+        stream.observations = qg1_bind_raw_observations(
+            &stream.samples,
+            &stream.control_engine_id,
+            &stream.control_engine_config_sha256,
+            &stream.treatment_engine_id,
+            &stream.treatment_engine_config_sha256,
+            observation_ids,
+        )
+        .expect("scope-bound raw observations");
         stream.stream_receipt_sha256 = stream
             .recomputed_stream_receipt_sha256()
             .expect("scope-bound stream receipt");
@@ -5454,12 +5816,26 @@ mod tests {
     fn qg1_incumbent_preregistration_binds_machine_mode_and_keeps_budget_separate_from_widths() {
         let cell = qg1_bulk_cell(4);
         let semantic_contract = qg1_semantic_contract();
-        let screen_plan = qg1_screen_plan(vec![1, 2, 4]);
+        let screen_plan = qg1_screen_plan(&cell, vec![1, 2, 4]);
         let candidates =
             preregister_qg1_tantivy_incumbents(&cell, &screen_plan, &semantic_contract)
                 .expect("candidates");
 
         assert_eq!(screen_plan.external_cpu_budget, 2);
+        assert_eq!(
+            screen_plan.work_units,
+            cell.document_count.expect("bulk docs")
+        );
+        assert_eq!(screen_plan.content_bytes, 64_000);
+        assert_eq!(
+            screen_plan.work_contract_sha256,
+            qg1_bulk_work_contract_sha256(
+                &cell,
+                screen_plan.work_units,
+                screen_plan.content_bytes,
+            )
+            .expect("work contract")
+        );
         assert_eq!(candidates.len(), 4);
         assert_eq!(
             candidates
@@ -5481,7 +5857,7 @@ mod tests {
     fn qg1_incumbent_screen_selects_a_ci_distinct_arm_and_binds_all_three_decision_controls() {
         let cell = qg1_bulk_cell(4);
         let semantic_contract = qg1_semantic_contract();
-        let screen_plan = qg1_screen_plan(vec![1, 2, 4]);
+        let screen_plan = qg1_screen_plan(&cell, vec![1, 2, 4]);
         let pilots = qg1_complete_pilots(
             &cell,
             &screen_plan,
@@ -5501,13 +5877,19 @@ mod tests {
         );
         assert_eq!(screen.tied_fastest_candidates, vec![selected.clone()]);
 
-        let decision = qg1_decision(&cell, selected, "one-live-invocation");
+        let decision = qg1_decision(
+            &cell,
+            &screen.screen_plan,
+            &semantic_contract,
+            selected,
+            "one-live-invocation",
+        );
         screen
             .validate_decision(&cell, &semantic_contract, &decision)
             .expect("same-invocation T/Quill, T/T, and Q/Q streams bind selected candidate");
 
         let mut relabeled = decision.clone();
-        relabeled.tantivy_vs_quill.samples[0].tantivy_config_sha256 = None;
+        relabeled.tantivy_vs_quill.control_engine_id = QG1_QUILL_ENGINE_ID.to_owned();
         assert_eq!(
             screen.validate_decision(&cell, &semantic_contract, &relabeled),
             Err(Qg1TantivyIncumbentError::StreamReceiptMismatch)
@@ -5519,6 +5901,19 @@ mod tests {
             .expect("relabeled receipt");
         assert_eq!(
             screen.validate_decision(&cell, &semantic_contract, &relabeled),
+            Err(Qg1TantivyIncumbentError::DecisionCandidateMismatch)
+        );
+
+        let mut wrong_quill_config = decision.clone();
+        wrong_quill_config
+            .tantivy_vs_quill
+            .treatment_engine_config_sha256 = "2".repeat(64);
+        wrong_quill_config.tantivy_vs_quill.stream_receipt_sha256 = wrong_quill_config
+            .tantivy_vs_quill
+            .recomputed_stream_receipt_sha256()
+            .expect("wrong-Quill-config receipt");
+        assert_eq!(
+            screen.validate_decision(&cell, &semantic_contract, &wrong_quill_config),
             Err(Qg1TantivyIncumbentError::DecisionCandidateMismatch)
         );
 
@@ -5545,7 +5940,7 @@ mod tests {
             .expect("unequal A/A receipt");
         assert_eq!(
             screen.validate_decision(&cell, &semantic_contract, &unequal_tantivy_null),
-            Err(Qg1TantivyIncumbentError::DecisionEvidenceInvalid)
+            Err(Qg1TantivyIncumbentError::ObservationBindingMismatch)
         );
 
         let mut forged_screen = screen.clone();
@@ -5560,7 +5955,7 @@ mod tests {
     fn qg1_incumbent_screen_rejects_cross_invocation_and_unrelated_throughput_scopes() {
         let cell = qg1_bulk_cell(4);
         let semantic_contract = qg1_semantic_contract();
-        let screen_plan = qg1_screen_plan(vec![1, 2, 4]);
+        let screen_plan = qg1_screen_plan(&cell, vec![1, 2, 4]);
         let pilots = qg1_complete_pilots(
             &cell,
             &screen_plan,
@@ -5578,7 +5973,13 @@ mod tests {
             .selected_candidate
             .as_ref()
             .expect("CI-distinct fastest candidate");
-        let decision = qg1_decision(&cell, selected, "one-live-invocation");
+        let decision = qg1_decision(
+            &cell,
+            &screen.screen_plan,
+            &semantic_contract,
+            selected,
+            "one-live-invocation",
+        );
 
         let mut cross_invocation = decision.clone();
         for sample in &mut cross_invocation.tantivy_vs_quill.samples {
@@ -5653,10 +6054,146 @@ mod tests {
     }
 
     #[test]
+    fn qg1_incumbent_screen_binds_denominators_estimator_and_immutable_observations() {
+        let cell = qg1_bulk_cell(4);
+        let semantic_contract = qg1_semantic_contract();
+        let screen_plan = qg1_screen_plan(&cell, vec![1, 2, 4]);
+        let pilots = qg1_complete_pilots(
+            &cell,
+            &screen_plan,
+            &semantic_contract,
+            "one-live-invocation",
+        );
+
+        let mut wrong_work_pilots = pilots.clone();
+        let wrong_work_pilot = &mut wrong_work_pilots[0];
+        let (effect_samples, null_samples) = (
+            &mut wrong_work_pilot.experiment.effect_samples,
+            &mut wrong_work_pilot.experiment.null_samples,
+        );
+        for sample in effect_samples.iter_mut().chain(null_samples.iter_mut()) {
+            sample.work_units = Some(screen_plan.work_units - 1);
+        }
+        wrong_work_pilot.experiment = estimate_paired_experiment(
+            &wrong_work_pilot.experiment.effect_samples,
+            &wrong_work_pilot.experiment.null_samples,
+            &estimator_config(),
+        )
+        .expect("wrong denominator remains generically estimable");
+        wrong_work_pilot.stream_receipt_sha256 = wrong_work_pilot
+            .recomputed_stream_receipt_sha256()
+            .expect("wrong-work pilot receipt");
+        let wrong_work = Qg1TantivyIncumbentScreen::screen(
+            &cell,
+            screen_plan.clone(),
+            &semantic_contract,
+            wrong_work_pilots,
+        )
+        .expect("wrong QG-1 denominator is a fail-closed no-decision receipt");
+        assert!(wrong_work.selected_candidate.is_none());
+
+        let mut mixed_estimator_pilots = pilots.clone();
+        let alternate_config = PairedEstimatorConfig::predeclared(0xa11c_e55e);
+        mixed_estimator_pilots[1].experiment = estimate_paired_experiment(
+            &mixed_estimator_pilots[1].experiment.effect_samples,
+            &mixed_estimator_pilots[1].experiment.null_samples,
+            &alternate_config,
+        )
+        .expect("alternate predeclared estimator remains structurally valid");
+        mixed_estimator_pilots[1].stream_receipt_sha256 = mixed_estimator_pilots[1]
+            .recomputed_stream_receipt_sha256()
+            .expect("alternate-estimator pilot receipt");
+        assert_eq!(
+            Qg1TantivyIncumbentScreen::screen(
+                &cell,
+                screen_plan.clone(),
+                &semantic_contract,
+                mixed_estimator_pilots,
+            ),
+            Err(Qg1TantivyIncumbentError::EstimatorConfigMismatch)
+        );
+
+        let mut reused_pilot_observation = pilots.clone();
+        let reused_pilot_id = reused_pilot_observation[0].effect_observations[0]
+            .observation_id_sha256
+            .clone();
+        reused_pilot_observation[1].effect_observations[0].observation_id_sha256 = reused_pilot_id;
+        reused_pilot_observation[1].stream_receipt_sha256 = reused_pilot_observation[1]
+            .recomputed_stream_receipt_sha256()
+            .expect("reused-observation pilot receipt");
+        assert_eq!(
+            Qg1TantivyIncumbentScreen::screen(
+                &cell,
+                screen_plan.clone(),
+                &semantic_contract,
+                reused_pilot_observation,
+            ),
+            Err(Qg1TantivyIncumbentError::ObservationReuse)
+        );
+
+        let screen =
+            Qg1TantivyIncumbentScreen::screen(&cell, screen_plan, &semantic_contract, pilots)
+                .expect("valid incumbent screen");
+        let selected = screen
+            .selected_candidate
+            .as_ref()
+            .expect("CI-distinct fastest candidate");
+        let decision = qg1_decision(
+            &cell,
+            &screen.screen_plan,
+            &semantic_contract,
+            selected,
+            "one-live-invocation",
+        );
+
+        let mut wrong_bytes = decision.clone();
+        for sample in &mut wrong_bytes.tantivy_null.samples {
+            sample.byte_count = Some(screen.screen_plan.content_bytes - 1);
+        }
+        let observation_ids = wrong_bytes
+            .tantivy_null
+            .observations
+            .iter()
+            .map(|observation| observation.observation_id_sha256.clone())
+            .collect();
+        wrong_bytes.tantivy_null.observations = qg1_bind_raw_observations(
+            &wrong_bytes.tantivy_null.samples,
+            &wrong_bytes.tantivy_null.control_engine_id,
+            &wrong_bytes.tantivy_null.control_engine_config_sha256,
+            &wrong_bytes.tantivy_null.treatment_engine_id,
+            &wrong_bytes.tantivy_null.treatment_engine_config_sha256,
+            observation_ids,
+        )
+        .expect("reseal wrong-byte observations");
+        wrong_bytes.tantivy_null.stream_receipt_sha256 = wrong_bytes
+            .tantivy_null
+            .recomputed_stream_receipt_sha256()
+            .expect("wrong-byte stream receipt");
+        assert_eq!(
+            screen.validate_decision(&cell, &semantic_contract, &wrong_bytes),
+            Err(Qg1TantivyIncumbentError::ObservationBindingMismatch)
+        );
+
+        let mut reused_decision_observation = decision;
+        reused_decision_observation.quill_null.observations[0].observation_id_sha256 =
+            screen.pilots[0].effect_observations[0]
+                .observation_id_sha256
+                .clone();
+        reused_decision_observation.quill_null.stream_receipt_sha256 = reused_decision_observation
+            .quill_null
+            .recomputed_stream_receipt_sha256()
+            .expect("reused decision-observation receipt");
+        assert_eq!(
+            screen.validate_decision(&cell, &semantic_contract, &reused_decision_observation),
+            Err(Qg1TantivyIncumbentError::ObservationReuse)
+        );
+    }
+
+    #[test]
     fn qg1_incumbent_screen_reports_ci_ties_without_a_unique_winner() {
         let cell = qg1_bulk_cell(4);
         let semantic_contract = qg1_semantic_contract();
-        let screen_plan = qg1_screen_plan(vec![1, 2, 4]);
+        let screen_plan = qg1_screen_plan(&cell, vec![1, 2, 4]);
         let mut pilots = qg1_complete_pilots(
             &cell,
             &screen_plan,
@@ -5669,17 +6206,19 @@ mod tests {
             pilots[3].candidate.clone(),
             &shipping_auto,
             &scope,
+            screen_plan.work_units,
+            screen_plan.content_bytes,
             "one-live-invocation",
             500_000,
-            "pilot-3-repeated",
         );
         pilots[2] = qg1_pilot(
             pilots[2].candidate.clone(),
             &shipping_auto,
             &scope,
+            screen_plan.work_units,
+            screen_plan.content_bytes,
             "one-live-invocation",
             500_000,
-            "pilot-2-repeated",
         );
         let screen =
             Qg1TantivyIncumbentScreen::screen(&cell, screen_plan, &semantic_contract, pilots)
@@ -5698,7 +6237,7 @@ mod tests {
     fn qg1_incumbent_screen_fails_closed_for_changed_semantics_or_infeasible_materialization() {
         let cell = qg1_bulk_cell(4);
         let semantic_contract = qg1_semantic_contract();
-        let screen_plan = qg1_screen_plan(vec![1, 2, 4]);
+        let screen_plan = qg1_screen_plan(&cell, vec![1, 2, 4]);
         let mut different_merge_semantics = semantic_contract.clone();
         different_merge_semantics.merge_policy_sha256 = "1".repeat(64);
         let mismatch_pilots = qg1_complete_pilots(
@@ -5743,7 +6282,7 @@ mod tests {
      {
         let cell = qg1_bulk_cell(4);
         let semantic_contract = qg1_semantic_contract();
-        let screen_plan = qg1_screen_plan(vec![1, 2, 4]);
+        let screen_plan = qg1_screen_plan(&cell, vec![1, 2, 4]);
         let mut pilots = qg1_complete_pilots(
             &cell,
             &screen_plan,
@@ -5780,9 +6319,10 @@ mod tests {
             candidates[1].clone(),
             &candidates[0],
             &scope,
+            screen_plan.work_units,
+            screen_plan.content_bytes,
             "different-invocation",
             500_000,
-            "pilot-different-invocation",
         );
         let screen = Qg1TantivyIncumbentScreen::screen(
             &cell,
