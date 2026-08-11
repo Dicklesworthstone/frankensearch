@@ -224,6 +224,9 @@ impl WatcherExecutionPolicy {
 /// Snapshot map used for crash-recovery catch-up.
 pub type FileSnapshot = BTreeMap<PathBuf, u64>;
 
+type SnapshotCollector =
+    dyn Fn(&[PathBuf], &DiscoveryConfig) -> SearchResult<FileSnapshot> + Send + Sync;
+
 /// Public watcher statistics snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatcherStats {
@@ -710,6 +713,7 @@ impl FsWatcher {
                 &ingest_reconciliation,
                 ingest_batch_size,
                 &producer_done_for_task,
+                &collect_snapshot_from_roots,
             )
             .await
         }) {
@@ -887,6 +891,7 @@ impl FsWatcher {
                 &self.ready_batches,
                 &self.stats,
                 self.base_batch_size,
+                &collect_snapshot_from_roots,
             )
             .await?;
         }
@@ -903,9 +908,13 @@ impl FsWatcher {
 
         let mut guard = DirectApplyGuard::new(&self.reconciliation, events);
         let reindexed = self.ingest.apply_batch(cx, &prepared.ops).await?;
-        if let Err(error) =
-            record_successful_events(&self.roots, &self.discovery, &self.reconciliation, events)
-        {
+        if let Err(error) = record_successful_events(
+            &self.roots,
+            &self.discovery,
+            &self.reconciliation,
+            events,
+            &collect_snapshot_from_roots,
+        ) {
             return Err(error);
         }
         guard.commit();
@@ -1339,6 +1348,7 @@ async fn run_ingest_loop(
     reconciliation: &ReconciliationTracker,
     batch_size: usize,
     producer_done: &AtomicBool,
+    snapshot_collector: &SnapshotCollector,
 ) -> SearchResult<()> {
     const IDLE_POLL: Duration = Duration::from_millis(10);
     const MAX_RECONCILIATION_ATTEMPTS: usize = 3;
@@ -1365,6 +1375,7 @@ async fn run_ingest_loop(
                 ready_batches,
                 stats,
                 batch_size,
+                snapshot_collector,
             )
             .await
             {
@@ -1423,11 +1434,13 @@ async fn run_ingest_loop(
             Ok(reindexed) => {
                 let events = lease.events().to_vec();
                 let outcome = prepared.outcome(reindexed);
-                stats.add_reindexed(outcome.reindexed);
-                stats.add_skipped(outcome.skipped);
-                if let Err(error) =
-                    record_successful_events(roots, discovery, reconciliation, &events)
-                {
+                if let Err(error) = record_successful_events(
+                    roots,
+                    discovery,
+                    reconciliation,
+                    &events,
+                    snapshot_collector,
+                ) {
                     stats.add_error();
                     if !is_retryable_error(&error) || cx.is_cancel_requested() {
                         return Err(error);
@@ -1436,6 +1449,8 @@ async fn run_ingest_loop(
                     continue;
                 }
                 lease.commit();
+                stats.add_reindexed(outcome.reindexed);
+                stats.add_skipped(outcome.skipped);
             }
             Err(error) => {
                 stats.add_error();
@@ -1498,6 +1513,7 @@ async fn run_authoritative_reconciliation(
     ready_batches: &ReadyBatchQueue,
     stats: &WatcherStatsInner,
     batch_size: usize,
+    snapshot_collector: &SnapshotCollector,
 ) -> SearchResult<()> {
     let (epoch, indexed_snapshot, affected_paths) = {
         let state = lock_or_recover(reconciliation);
@@ -1512,7 +1528,7 @@ async fn run_authoritative_reconciliation(
     // state, while batches produced after this clear remain queued and are
     // applied after the rescan.
     lock_or_recover(ready_batches).clear();
-    let current = collect_snapshot_from_roots(roots, discovery)?;
+    let current = snapshot_collector(roots, discovery)?;
     let observed_at_ms = now_millis();
     let mount_table = build_mount_table(discovery);
     let mut events = current
@@ -1559,9 +1575,9 @@ async fn run_authoritative_reconciliation(
     }
 
     let mut state = lock_or_recover(reconciliation);
-    state.indexed_snapshot = current;
-    state.baseline_initialized = true;
     if state.epoch == epoch {
+        state.indexed_snapshot = current;
+        state.baseline_initialized = true;
         state.required = false;
         state.affected_paths.clear();
     }
@@ -1573,8 +1589,9 @@ fn record_successful_events(
     discovery: &DiscoveryConfig,
     reconciliation: &ReconciliationTracker,
     events: &[WatchEvent],
+    snapshot_collector: &SnapshotCollector,
 ) -> SearchResult<()> {
-    let current = collect_snapshot_from_roots(roots, discovery)?;
+    let current = snapshot_collector(roots, discovery)?;
     let mut state = lock_or_recover(reconciliation);
     if !state.baseline_initialized {
         state.indexed_snapshot = current.clone();
@@ -2155,8 +2172,9 @@ mod tests {
         PendingBatchLease, PendingEvents, ReadyBatchQueue, ReconciliationState,
         ReconciliationTracker, WatchBatchOutcome, WatchEvent, WatchEventKind, WatchIngestFuture,
         WatchIngestOp, WatchIngestPipeline, WatcherExecutionPolicy, WatcherLifecycle, WatcherStop,
-        drain_notify_channel, flush_pending_batches, normalize_file_key, now_millis,
-        observe_pressure_transition, run_ingest_loop,
+        collect_snapshot_from_roots, drain_notify_channel, flush_pending_batches,
+        normalize_file_key, now_millis, observe_pressure_transition,
+        run_authoritative_reconciliation, run_ingest_loop,
     };
     use crate::config::DiscoveryConfig;
     use crate::pressure::PressureState;
@@ -2279,6 +2297,30 @@ mod tests {
                     value: "poison".to_owned(),
                     reason: "permanent batch failure".to_owned(),
                 })
+            })
+        }
+    }
+
+    struct EpochAdvancingPipeline {
+        reconciliation: ReconciliationTracker,
+        late_event: WatchEvent,
+        advance_once: AtomicBool,
+        attempts: AtomicUsize,
+    }
+
+    impl WatchIngestPipeline for EpochAdvancingPipeline {
+        fn apply_batch<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            batch: &'a [WatchIngestOp],
+        ) -> WatchIngestFuture<'a, usize> {
+            Box::pin(async move {
+                self.attempts.fetch_add(1, Ordering::AcqRel);
+                if self.advance_once.swap(false, Ordering::AcqRel) {
+                    lock_or_recover(&self.reconciliation)
+                        .require_for_events(std::slice::from_ref(&self.late_event));
+                }
+                Ok(batch.len())
             })
         }
     }
@@ -2983,6 +3025,7 @@ mod tests {
                         &reconciliation_for_task,
                         100,
                         &producer_done,
+                        &collect_snapshot_from_roots,
                     )
                     .await
                 })
@@ -3014,6 +3057,157 @@ mod tests {
             assert!(lock_or_recover(&queue).is_empty());
             assert!(!lock_or_recover(&reconciliation).required);
             assert_eq!(stats.snapshot().errors, 1);
+        });
+    }
+
+    #[test]
+    fn retryable_record_failure_counts_only_the_reconciled_commit() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let path = temp.path().join("record-retry.rs");
+            fs::write(&path, "fn retry() {}\n").expect("write retry fixture");
+
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let stop = Arc::new(WatcherStop::default());
+            *lock_or_recover(&pipeline.stop_on_success) = Some(Arc::clone(&stop));
+            let queue: ReadyBatchQueue =
+                Arc::new(Mutex::new(VecDeque::from([vec![WatchEvent::modified(
+                    &path,
+                    200,
+                    Some(14),
+                )]])));
+            let reconciliation: ReconciliationTracker =
+                Arc::new(Mutex::new(ReconciliationState::default()));
+            let stats = Arc::new(super::WatcherStatsInner::default());
+            let producer_done = Arc::new(AtomicBool::new(true));
+            let snapshot_attempts = Arc::new(AtomicUsize::new(0));
+
+            let pipeline_for_task = Arc::clone(&pipeline);
+            let queue_for_task = Arc::clone(&queue);
+            let stop_for_task = Arc::clone(&stop);
+            let reconciliation_for_task = Arc::clone(&reconciliation);
+            let stats_for_task = Arc::clone(&stats);
+            let snapshot_attempts_for_task = Arc::clone(&snapshot_attempts);
+            let root = temp.path().to_path_buf();
+            let mut task = cx
+                .spawn_local(move |child_cx| async move {
+                    let discovery = DiscoveryConfig::default();
+                    let snapshot_collector =
+                        move |roots: &[PathBuf], discovery: &DiscoveryConfig| {
+                            if snapshot_attempts_for_task.fetch_add(1, Ordering::AcqRel) == 0 {
+                                return Err(SearchError::Io(io::Error::other(
+                                    "injected retryable post-commit snapshot failure",
+                                )));
+                            }
+                            collect_snapshot_from_roots(roots, discovery)
+                        };
+                    run_ingest_loop(
+                        &child_cx,
+                        &[root],
+                        &discovery,
+                        pipeline_for_task.as_ref(),
+                        &queue_for_task,
+                        &stop_for_task,
+                        &stats_for_task,
+                        &reconciliation_for_task,
+                        100,
+                        &producer_done,
+                        &snapshot_collector,
+                    )
+                    .await
+                })
+                .expect("spawn retry accounting task");
+
+            task.join(&cx)
+                .await
+                .expect("retry accounting task terminal result")
+                .expect("retryable record failure should reconcile");
+
+            assert_eq!(snapshot_attempts.load(Ordering::Acquire), 2);
+            assert_eq!(lock_or_recover(&pipeline.attempts).len(), 2);
+            let snapshot = stats.snapshot();
+            assert_eq!(snapshot.files_reindexed, 1);
+            assert_eq!(snapshot.files_skipped, 0);
+            assert_eq!(snapshot.errors, 1);
+            assert!(!lock_or_recover(&reconciliation).required);
+        });
+    }
+
+    #[test]
+    fn epoch_mismatch_preserves_baseline_until_the_next_rescan() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let current_path = temp.path().join("current.rs");
+            let late_path = temp.path().join("late.rs");
+            let prior_path = temp.path().join("prior.rs");
+            fs::write(&current_path, "fn current() {}\n").expect("write current fixture");
+
+            let prior_snapshot = FileSnapshot::from([(prior_path.clone(), 7)]);
+            let reconciliation: ReconciliationTracker = Arc::new(Mutex::new(ReconciliationState {
+                indexed_snapshot: prior_snapshot.clone(),
+                baseline_initialized: true,
+                required: true,
+                affected_paths: BTreeSet::from([prior_path.clone()]),
+                epoch: 1,
+            }));
+            let pipeline = EpochAdvancingPipeline {
+                reconciliation: Arc::clone(&reconciliation),
+                late_event: WatchEvent::modified(&late_path, 300, Some(12)),
+                advance_once: AtomicBool::new(true),
+                attempts: AtomicUsize::new(0),
+            };
+            let queue: ReadyBatchQueue = Arc::new(Mutex::new(VecDeque::new()));
+            let stats = super::WatcherStatsInner::default();
+            let roots = vec![temp.path().to_path_buf()];
+            let discovery = DiscoveryConfig::default();
+
+            run_authoritative_reconciliation(
+                &cx,
+                &roots,
+                &discovery,
+                &pipeline,
+                &reconciliation,
+                &queue,
+                &stats,
+                100,
+                &collect_snapshot_from_roots,
+            )
+            .await
+            .expect("first rescan applies before the injected epoch advance");
+
+            {
+                let state = lock_or_recover(&reconciliation);
+                assert_eq!(state.epoch, 2);
+                assert!(state.required);
+                assert_eq!(state.indexed_snapshot, prior_snapshot);
+                assert!(state.baseline_initialized);
+                assert!(state.affected_paths.contains(&prior_path));
+                assert!(state.affected_paths.contains(&late_path));
+            }
+
+            fs::write(&late_path, "fn late() {}\n").expect("write late fixture");
+            let expected_snapshot = collect_snapshot_from_roots(&roots, &discovery)
+                .expect("collect expected second baseline");
+            run_authoritative_reconciliation(
+                &cx,
+                &roots,
+                &discovery,
+                &pipeline,
+                &reconciliation,
+                &queue,
+                &stats,
+                100,
+                &collect_snapshot_from_roots,
+            )
+            .await
+            .expect("second rescan advances the stable epoch");
+
+            let state = lock_or_recover(&reconciliation);
+            assert_eq!(pipeline.attempts.load(Ordering::Acquire), 2);
+            assert_eq!(state.indexed_snapshot, expected_snapshot);
+            assert!(state.baseline_initialized);
+            assert!(!state.required);
+            assert!(state.affected_paths.is_empty());
         });
     }
 
@@ -3243,21 +3437,27 @@ mod tests {
     }
 
     #[test]
-    fn dropping_a_starting_watcher_signals_its_generation() {
-        let stop = Arc::new(WatcherStop::default());
-        let watcher = FsWatcher::new(
-            Vec::new(),
-            DiscoveryConfig::default(),
-            Arc::new(NoopWatchIngestPipeline),
-        );
-        lock_or_recover(&watcher.control).lifecycle = WatcherLifecycle::Starting {
-            generation: 1,
-            stop: Arc::clone(&stop),
-        };
+    fn dropping_a_running_watcher_signals_its_generation() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let watcher = FsWatcher::new(
+                vec![temp.path().to_path_buf()],
+                DiscoveryConfig::default(),
+                Arc::new(NoopWatchIngestPipeline),
+            );
+            watcher.start(&cx).await.expect("start watcher");
+            let stop = {
+                let control = lock_or_recover(&watcher.control);
+                let WatcherLifecycle::Running { stop, .. } = &control.lifecycle else {
+                    panic!("existing root should keep watcher generation running");
+                };
+                Arc::clone(stop)
+            };
 
-        drop(watcher);
+            drop(watcher);
 
-        assert!(stop.is_requested());
+            assert!(stop.is_requested());
+        });
     }
 
     #[test]
