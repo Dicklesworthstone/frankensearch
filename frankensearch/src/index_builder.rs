@@ -34,9 +34,10 @@ use frankensearch_durability::FileProtector;
 #[cfg(feature = "durability")]
 use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FsviProtector};
 use frankensearch_embed::auto_detect::{EmbedderStack, TwoTierAvailability};
+use frankensearch_fusion::SyncTwoTierSearcher;
 use frankensearch_index::{
-    TwoTierIndex, TwoTierIndexBuilder, VECTOR_INDEX_FALLBACK_FILENAME, VECTOR_INDEX_FAST_FILENAME,
-    VECTOR_INDEX_QUALITY_FILENAME,
+    FsviV2IdentityBinding, TwoTierIndex, TwoTierIndexBuilder, TwoTierIndexPaths,
+    VECTOR_INDEX_FALLBACK_FILENAME, VECTOR_INDEX_FAST_FILENAME, VECTOR_INDEX_QUALITY_FILENAME,
 };
 // bd-6281c: this module opens Tantivy in exactly two configurations — the
 // blue-green/direct arms of the `quill` reader, and the standalone
@@ -883,6 +884,57 @@ pub async fn open_hybrid(
     Ok(HybridIndexParts { vectors, lexical })
 }
 
+/// Open the default synchronous product for exactly admitted FSVI v2 tiers.
+///
+/// Unlike [`open_hybrid`], this opener requires the caller's v2 identity
+/// bindings because a v2 artifact has no legitimate path-only open. It
+/// performs the same admitted-product open used by the shipping index API,
+/// then routes the retained owners through the in-memory synchronous product
+/// and its optional generation-keyed residual cache. A missing, corrupt, or
+/// unavailable cache leaves the exact flat scan selected; it does not select a
+/// different retrieval algorithm.
+///
+/// `residual_cache_dir` is shared safely by both tiers because cache artifact
+/// names are generation-keyed. It need not exist: an unavailable optional cache
+/// is a flat-exact fallback rather than an opening error.
+///
+/// # Errors
+///
+/// Returns exact v2 admission errors, including a missing quality binding for a
+/// configured quality path, plus source-vector loading errors from the
+/// synchronous product.
+pub fn open_admitted_v2_sync_with_residual_sidecar_cache(
+    paths: &TwoTierIndexPaths,
+    fast_binding: &FsviV2IdentityBinding,
+    quality_binding: Option<&FsviV2IdentityBinding>,
+    residual_cache_dir: impl AsRef<Path>,
+    config: TwoTierConfig,
+) -> SearchResult<SyncTwoTierSearcher> {
+    let admitted = TwoTierIndex::open_admitted_v2_with_paths(
+        paths,
+        config.clone(),
+        fast_binding,
+        quality_binding,
+    )?;
+    let fast_source = admitted
+        .fast_admitted_owner()
+        .ok_or_else(|| SearchError::InvalidConfig {
+            field: "admitted_v2.fast_owner".to_owned(),
+            value: paths.fast_index().display().to_string(),
+            reason: "exact v2 product open did not retain its fast owner".to_owned(),
+        })?;
+    let cache_dir = residual_cache_dir.as_ref();
+    let quality_source = admitted
+        .quality_admitted_owner()
+        .map(|source| (source, cache_dir));
+    SyncTwoTierSearcher::from_admitted_v2_with_residual_sidecar_cache(
+        fast_source,
+        cache_dir,
+        quality_source,
+        config,
+    )
+}
+
 #[cfg(feature = "quill")]
 async fn open_lexical_reader(cx: &Cx, dir: &Path) -> SearchResult<Option<Arc<dyn LexicalRead>>> {
     // bd-8nqz.2: the Quill path stays bound to the lexical *root*, not the
@@ -1147,6 +1199,8 @@ impl std::fmt::Debug for IndexBuilder {
 mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
+    #[cfg(target_os = "linux")]
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     #[cfg(not(any(feature = "lexical", feature = "quill")))]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1174,6 +1228,30 @@ mod tests {
     use frankensearch_quill::{CurrentPointer, publish_current};
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn owned_admitted_v2_sync_dir() -> std::path::PathBuf {
+        static NONCE: AtomicU64 = AtomicU64::new(0);
+        let parent = std::env::temp_dir().join("frankensearch_admitted_v2_sync_tests");
+        std::fs::create_dir_all(&parent).expect("create durable test parent");
+        for _ in 0..1024 {
+            let nonce = NONCE.fetch_add(1, AtomicOrdering::Relaxed);
+            let dir = parent.join(format!(
+                "{}-{}-{nonce}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return dir,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create unique admitted-v2 sync directory: {error}"),
+            }
+        }
+        panic!("exhausted admitted-v2 sync test directory names")
+    }
 
     struct StubEmbedder {
         id: &'static str,
@@ -2602,5 +2680,70 @@ mod tests {
             assert_eq!(parts.vectors.doc_count(), 1);
             assert!(parts.lexical.is_none());
         });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn admitted_v2_sync_opener_constructs_the_shipping_residual_cache_product() {
+        use frankensearch_core::generation::{
+            ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
+        };
+        use frankensearch_core::{BoundQueryEmbedding, TieredQueryEmbeddings};
+
+        let dir = owned_admitted_v2_sync_dir();
+        let source_path = dir.join("fast.fsvi");
+        let cache_dir = dir.join("residual-cache");
+        std::fs::create_dir(&cache_dir).expect("create a fresh owned cache directory");
+
+        let mut identity = EmbeddingIdentityBundleV1::explicit_test_model("facade-route", 2);
+        "fsvi-v2".clone_into(&mut identity.storage.format);
+        identity.storage.quantization = QuantizationFormat::F16;
+        "little-endian".clone_into(&mut identity.storage.endianness);
+        let binding = FsviV2IdentityBinding::new(
+            ArtifactGenerationIdentityV1::new(91, [0x6d; 16]).expect("create a test generation"),
+            identity.freeze().expect("freeze test identity"),
+        )
+        .expect("create a valid v2 binding");
+        let mut writer = frankensearch_index::VectorIndex::create_v2(&source_path, binding.clone())
+            .expect("create an admitted-v2 fixture");
+        writer
+            .write_record("exact-winner", &[0.0, 1.0])
+            .expect("write winner");
+        writer
+            .write_record("other", &[1.0, 0.0])
+            .expect("write other row");
+        writer.finish().expect("seal fixture");
+
+        let paths = TwoTierIndexPaths::new(&source_path);
+        let searcher = open_admitted_v2_sync_with_residual_sidecar_cache(
+            &paths,
+            &binding,
+            None,
+            &cache_dir,
+            TwoTierConfig {
+                fast_only: true,
+                ..TwoTierConfig::default()
+            },
+        )
+        .expect("the facade opener constructs the shipping sync product");
+        let query = TieredQueryEmbeddings::fast_only(
+            BoundQueryEmbedding::new(
+                vec![0.0, 1.0],
+                EmbeddingIdentityBundleV1::explicit_test_model("facade-route", 2),
+            )
+            .expect("bind v2 query identity"),
+        );
+        let (results, _) = searcher
+            .search_collect(&query, 1)
+            .expect("search through the facade product opener");
+        assert_eq!(results[0].doc_id, "exact-winner");
+        assert_eq!(
+            std::fs::read_dir(&cache_dir)
+                .expect("inspect owned cache directory")
+                .flatten()
+                .count(),
+            1,
+            "the default facade opener must route through residual-cache publication"
+        );
     }
 }

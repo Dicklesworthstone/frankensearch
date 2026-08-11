@@ -393,7 +393,7 @@ pub use frankensearch_rerank::FastEmbedReranker;
 mod index_builder;
 pub use index_builder::{
     HybridIndexParts, IndexBuildStats, IndexBuilder, IndexProgress, IndexSizeBreakdown,
-    LexicalArmReceipt, open_hybrid,
+    LexicalArmReceipt, open_admitted_v2_sync_with_residual_sidecar_cache, open_hybrid,
 };
 
 // ─── Prelude ────────────────────────────────────────────────────────────────
