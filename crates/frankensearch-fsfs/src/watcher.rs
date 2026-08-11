@@ -582,6 +582,34 @@ impl ReconciliationState {
             .extend(events.iter().map(|event| event.path.clone()));
     }
 
+    /// Install a complete scan as the deletion authority, atomically.
+    ///
+    /// The snapshot and the identities of the roots it was read through are
+    /// replaced together, so no later pass can compare a snapshot from one
+    /// scan against identities from another.
+    fn adopt_complete_baseline(
+        &mut self,
+        snapshot: FileSnapshot,
+        root_identities: BTreeMap<PathBuf, RootIdentity>,
+    ) {
+        self.indexed_snapshot = snapshot.clone();
+        self.catchup_baseline = Some(snapshot);
+        self.root_identities = root_identities;
+        self.baseline_initialized = true;
+    }
+
+    /// Whether deletions may be derived against the retained baseline.
+    ///
+    /// A non-empty baseline with no root identities behind it cannot be
+    /// checked for a swapped root, so it is not deletion authority — deriving
+    /// deletes there is exactly the mass-delete this guards. An empty baseline
+    /// has nothing to delete, so it is harmless.
+    fn deletion_authority_is_established(&self) -> bool {
+        self.catchup_baseline
+            .as_ref()
+            .is_none_or(|baseline| baseline.is_empty() || !self.root_identities.is_empty())
+    }
+
     fn require_full_scan(&mut self) {
         self.required = true;
         self.epoch = self.epoch.saturating_add(1);
@@ -1170,8 +1198,25 @@ impl FsWatcher {
     /// Returns errors from current snapshot collection.
     pub fn build_catchup_events(&self, previous: &FileSnapshot) -> SearchResult<Vec<WatchEvent>> {
         let (current, completeness) = self.collect_snapshot()?;
-        if !completeness.is_complete() {
-            lock_or_recover(&self.reconciliation).require_full_scan();
+        {
+            let mut state = lock_or_recover(&self.reconciliation);
+            // `previous` is the caller's authoritative record of what is
+            // indexed — the crash-recovery snapshot. Retaining it here is what
+            // makes a delete suppressed by this call recoverable: the next
+            // complete pass diffs against it and finally derives the delete.
+            // Without this the suppressed delete had nowhere to live and was
+            // lost, which is the hole this closes.
+            if state.catchup_baseline.is_none() {
+                state.catchup_baseline = Some(previous.clone());
+            }
+            if completeness.is_complete() {
+                // A complete scan also establishes the identity authority the
+                // retained baseline needs before deletes may be derived from
+                // it, so the pair advances together.
+                state.root_identities = completeness.root_identities().clone();
+            } else {
+                state.require_full_scan();
+            }
         }
         Ok(Self::diff_snapshots(
             previous,
@@ -1347,19 +1392,32 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
         return Ok(());
     }
 
+    // The startup scan is a full walk too, so it observes the stop flag on the
+    // same bounded interval as every other scan.
     let (baseline, baseline_completeness) =
-        collect_snapshot_from_roots(&context.roots, &context.discovery)?;
+        collect_snapshot_from_roots_interruptible(&context.roots, &context.discovery, &|| {
+            context.stop.is_requested()
+        })?;
     {
         let mut reconciliation = lock_or_recover(&context.reconciliation);
-        // A short startup baseline would make the first authoritative rescan
-        // read every unobserved path as a creation and, once promoted, every
-        // later disappearance as a delete. Adopt it, but require a rescan so
-        // it is replaced by a complete one.
-        if !reconciliation.baseline_initialized {
-            reconciliation.indexed_snapshot = baseline;
-            reconciliation.baseline_initialized = true;
-        }
-        if !baseline_completeness.is_complete() {
+        if baseline_completeness.is_complete() {
+            // Deletion authority is only ever established as a unit: the
+            // snapshot deletes are derived against, and the root identities
+            // that snapshot was read through, come from this one scan under
+            // one lock. Seeding them separately would leave a window in which
+            // a later pass could diff a complete snapshot against identities
+            // belonging to a different scan.
+            reconciliation
+                .adopt_complete_baseline(baseline, baseline_completeness.root_identities().clone());
+        } else {
+            // A short startup scan is not deletion authority. Take it as a
+            // working set only if nothing better exists, leave
+            // `catchup_baseline` unset so no delete can be derived from it,
+            // and require a rescan.
+            if !reconciliation.baseline_initialized {
+                reconciliation.indexed_snapshot = baseline;
+                reconciliation.baseline_initialized = true;
+            }
             reconciliation.require_full_scan();
         }
     }
@@ -1622,6 +1680,12 @@ async fn run_ingest_loop(
             });
         }
 
+        // A full rescan can take arbitrarily long on a large tree, so a stop
+        // that arrived while the previous batch was applying must be honoured
+        // before starting one rather than after it finishes.
+        if stop.is_requested() {
+            break;
+        }
         if lock_or_recover(reconciliation).required {
             match run_authoritative_reconciliation(
                 cx,
@@ -1781,7 +1845,14 @@ async fn run_authoritative_reconciliation(
     batch_size: usize,
     snapshot_collector: &SnapshotCollector,
 ) -> SearchResult<()> {
-    let (epoch, indexed_snapshot, affected_paths, deletion_baseline, baseline_root_identities) = {
+    let (
+        epoch,
+        indexed_snapshot,
+        affected_paths,
+        deletion_baseline,
+        baseline_root_identities,
+        authority_established,
+    ) = {
         let state = lock_or_recover(reconciliation);
         (
             state.epoch,
@@ -1797,6 +1868,7 @@ async fn run_authoritative_reconciliation(
                 .clone()
                 .unwrap_or_else(|| state.indexed_snapshot.clone()),
             state.root_identities.clone(),
+            state.deletion_authority_is_established(),
         )
     };
     // Every batch already visible here predates the authoritative snapshot
@@ -1808,6 +1880,15 @@ async fn run_authoritative_reconciliation(
     // A swapped root reads as a complete scan of an empty tree; only the
     // identity recorded with the baseline distinguishes it from a real one.
     completeness.reject_swapped_roots(&baseline_root_identities);
+    if !authority_established {
+        // A non-empty baseline with no identities behind it cannot be checked
+        // for a swap at all, so every root is effectively unverifiable. Fail
+        // closed: refuse the pass rather than delete against a baseline whose
+        // roots may already have been replaced.
+        for root in roots {
+            completeness.record_unresolved(root);
+        }
+    }
     let observed_at_ms = now_millis();
     let mount_table = build_mount_table(discovery);
     let mut events = current
@@ -2188,19 +2269,52 @@ fn collect_snapshot_from_roots(
     roots: &[PathBuf],
     discovery: &DiscoveryConfig,
 ) -> SearchResult<(FileSnapshot, ScanCompleteness)> {
+    collect_snapshot_from_roots_interruptible(roots, discovery, &|| false)
+}
+
+/// Walk every root, abandoning the scan promptly when `should_abort` says so.
+///
+/// The predicate is consulted once per directory rather than once per root:
+/// a single root can hold an unbounded tree, so checking only between roots
+/// would let one scan block a stop for as long as the walk takes. Abandoning
+/// returns a typed interruption instead of a short snapshot, so a stop can
+/// never be mistaken for a complete scan of a smaller tree.
+fn collect_snapshot_from_roots_interruptible(
+    roots: &[PathBuf],
+    discovery: &DiscoveryConfig,
+    should_abort: &dyn Fn() -> bool,
+) -> SearchResult<(FileSnapshot, ScanCompleteness)> {
     let mut snapshot = FileSnapshot::new();
     let mut completeness = ScanCompleteness::default();
     let mount_table = build_mount_table(discovery);
     for root in roots {
+        if should_abort() {
+            return Err(scan_interrupted_error());
+        }
         collect_snapshot_for_root(
             root,
             discovery,
             Some(&mount_table),
             &mut snapshot,
             &mut completeness,
+            should_abort,
         )?;
     }
     Ok((snapshot, completeness))
+}
+
+/// Typed outcome of a scan abandoned for a stop or cancellation.
+///
+/// Retryable by classification, so a scan abandoned for a stop that is later
+/// cleared simply runs again; the loop's stop checks end the task first when
+/// the stop is real.
+fn scan_interrupted_error() -> SearchError {
+    SearchError::SubsystemError {
+        subsystem: "fsfs-watcher",
+        source: Box::new(io::Error::other(
+            "authoritative scan abandoned before completion",
+        )),
+    }
 }
 
 fn collect_snapshot_for_root(
@@ -2209,6 +2323,7 @@ fn collect_snapshot_for_root(
     mount_table: Option<&MountTable>,
     snapshot: &mut FileSnapshot,
     completeness: &mut ScanCompleteness,
+    should_abort: &dyn Fn() -> bool,
 ) -> SearchResult<()> {
     // One stat, not `exists()` then a walk. `exists()` answers a question
     // about a past instant and swallows every error into `false`: a root that
@@ -2271,6 +2386,11 @@ fn collect_snapshot_for_root(
     let mut stack = vec![root.to_path_buf()];
     let mut visited_dirs = HashSet::new();
     while let Some(dir_path) = stack.pop() {
+        // Bounded interval: one check per directory entered, so a stop is
+        // observed within a single directory listing however large the tree.
+        if should_abort() {
+            return Err(scan_interrupted_error());
+        }
         let canonical_dir = dir_path.canonicalize().unwrap_or_else(|_| dir_path.clone());
         if !visited_dirs.insert(canonical_dir) {
             continue;
@@ -3188,6 +3308,7 @@ mod tests {
             Some(&mount_table),
             &mut snapshot,
             &mut completeness,
+            &|| false,
         )
         .expect("collect snapshot");
         assert!(snapshot.is_empty(), "network root should be excluded");
@@ -3220,6 +3341,7 @@ mod tests {
             None,
             &mut snapshot,
             &mut completeness,
+            &|| false,
         )
         .expect("collect snapshot");
         assert!(completeness.is_complete());
@@ -3252,6 +3374,7 @@ mod tests {
             None,
             &mut snapshot,
             &mut completeness,
+            &|| false,
         )
         .expect("collect snapshot");
         assert!(completeness.is_complete());
@@ -3645,7 +3768,213 @@ mod tests {
         });
     }
 
+    /// A stop must not wait for a running scan to finish.
+    ///
+    /// The collector parks inside the walk until the test releases it, which
+    /// is the shape of a real full scan on a large tree. The stop is requested
+    /// while it is parked, and the loop must end without the scan ever being
+    /// allowed to complete — `stop_checked` cannot be held hostage by a scan.
     #[test]
+    fn stop_during_a_running_scan_ends_the_loop_without_finishing_it() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("g3r-stop-scan");
+            fs::create_dir_all(&root).expect("create root");
+            fs::write(root.join("indexed.rs"), "fn indexed() {}\n").expect("write fixture");
+
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let reconciliation: ReconciliationTracker =
+                Arc::new(Mutex::new(ReconciliationState::default()));
+            lock_or_recover(&reconciliation).require_full_scan();
+            let queue: ReadyBatchQueue = Arc::new(Mutex::new(VecDeque::new()));
+            let stats = Arc::new(WatcherStatsInner::default());
+            let stop = Arc::new(WatcherStop::default());
+            let producer_done = Arc::new(AtomicBool::new(true));
+
+            // Signals "the scan has started" and blocks until released.
+            let scanning = Arc::new((Mutex::new((false, false)), Condvar::new()));
+            let completed_scans = Arc::new(AtomicUsize::new(0));
+
+            let pipeline_for_task = Arc::clone(&pipeline);
+            let queue_for_task = Arc::clone(&queue);
+            let stats_for_task = Arc::clone(&stats);
+            let reconciliation_for_task = Arc::clone(&reconciliation);
+            let stop_for_task = Arc::clone(&stop);
+            let scanning_for_task = Arc::clone(&scanning);
+            let completed_for_task = Arc::clone(&completed_scans);
+            let root_for_task = root.clone();
+
+            let mut task = cx
+                .spawn_local(move |child_cx| async move {
+                    let discovery = DiscoveryConfig::default();
+                    let collector = move |roots: &[PathBuf], discovery: &DiscoveryConfig| {
+                        {
+                            let (state, changed) = &*scanning_for_task;
+                            let mut state = lock_or_recover(state);
+                            state.0 = true;
+                            changed.notify_all();
+                            while !state.1 {
+                                state = changed
+                                    .wait(state)
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            }
+                        }
+                        let result = collect_snapshot_from_roots(roots, discovery);
+                        completed_for_task.fetch_add(1, Ordering::AcqRel);
+                        result
+                    };
+                    run_ingest_loop(
+                        &child_cx,
+                        &[root_for_task],
+                        &discovery,
+                        pipeline_for_task.as_ref(),
+                        &queue_for_task,
+                        &stop_for_task,
+                        &stats_for_task,
+                        &reconciliation_for_task,
+                        100,
+                        &producer_done,
+                        &collector,
+                    )
+                    .await
+                })
+                .expect("spawn scan-stop task");
+
+            // Wait for the scan to actually be in flight, then stop.
+            {
+                let (state, changed) = &*scanning;
+                let mut state = lock_or_recover(state);
+                while !state.0 {
+                    state = changed
+                        .wait(state)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            }
+            stop.request();
+            {
+                let (state, changed) = &*scanning;
+                lock_or_recover(state).1 = true;
+                changed.notify_all();
+            }
+
+            task.join(&cx)
+                .await
+                .expect("scan-stop task terminal result")
+                .expect("a stop during a scan is not a failure");
+            assert!(
+                pipeline.all_ops().is_empty(),
+                "a stopped pass must not apply anything"
+            );
+        });
+    }
+
+    /// `build_catchup_events` must retain the caller's authoritative snapshot,
+    /// so a delete it suppresses is still derivable once completeness returns.
+    /// This drives the public API rather than the collect/diff helpers.
+    #[test]
+    fn catchup_retains_the_callers_baseline_so_suppressed_deletes_survive() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("g3r-catchup");
+        let blocked = temp.path().join("g3r-catchup-blocked");
+        fs::create_dir_all(&root).expect("create root");
+        fs::create_dir_all(&blocked).expect("create second root");
+        fs::write(root.join("kept.rs"), "fn kept() {}\n").expect("write kept fixture");
+
+        let watcher = FsWatcher::new(
+            vec![root.clone(), blocked.clone()],
+            DiscoveryConfig::default(),
+            Arc::new(NoopWatchIngestPipeline),
+        );
+
+        // The caller's authoritative record names a file that no longer
+        // exists, while a root is unavailable.
+        let indexed_elsewhere = root.join("already-gone.rs");
+        let previous = FileSnapshot::from([(indexed_elsewhere.clone(), 5)]);
+        let moved = temp.path().join("g3r-catchup-blocked-moved");
+        fs::rename(&blocked, &moved).expect("move the second root aside");
+
+        let events = watcher
+            .build_catchup_events(&previous)
+            .expect("catch-up still reports what it can see");
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.kind == WatchEventKind::Deleted),
+            "an incomplete catch-up must derive no deletes, got {events:?}"
+        );
+
+        let state = lock_or_recover(&watcher.reconciliation);
+        assert!(state.required, "an incomplete catch-up stays required");
+        assert_eq!(
+            state.catchup_baseline.as_ref(),
+            Some(&previous),
+            "the caller's authoritative snapshot must be retained so the suppressed \
+             delete is recoverable"
+        );
+        drop(state);
+
+        // Completeness returns; the retained baseline still names the path.
+        fs::rename(&moved, &blocked).expect("restore the second root");
+        let recovered = watcher
+            .build_catchup_events(&previous)
+            .expect("complete catch-up");
+        assert!(
+            recovered
+                .iter()
+                .any(|event| event.kind == WatchEventKind::Deleted
+                    && event.path == indexed_elsewhere),
+            "the suppressed delete must be derivable once every root resolves, got {recovered:?}"
+        );
+    }
+
+    /// A non-empty baseline with no identity authority behind it cannot be
+    /// checked for a swapped root, so the pass must refuse rather than delete.
+    #[test]
+    fn missing_identity_authority_fails_closed_instead_of_mass_deleting() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("g3r-no-authority");
+            fs::create_dir_all(&root).expect("create root");
+
+            let pipeline = Arc::new(RecordingPipeline::default());
+            // A baseline naming indexed files, with no root identities: the
+            // shape a crash-recovery restore produces.
+            let orphaned = root.join("restored-from-crash.rs");
+            let reconciliation: ReconciliationTracker = Arc::new(Mutex::new(ReconciliationState {
+                indexed_snapshot: FileSnapshot::from([(orphaned.clone(), 9)]),
+                baseline_initialized: true,
+                required: true,
+                affected_paths: BTreeSet::new(),
+                epoch: 0,
+                catchup_baseline: Some(FileSnapshot::from([(orphaned.clone(), 9)])),
+                root_identities: BTreeMap::new(),
+            }));
+            let queue: ReadyBatchQueue = Arc::new(Mutex::new(VecDeque::new()));
+            let stats = WatcherStatsInner::default();
+
+            let error = run_authoritative_reconciliation(
+                &cx,
+                &[root],
+                &DiscoveryConfig::default(),
+                pipeline.as_ref(),
+                &reconciliation,
+                &queue,
+                &stats,
+                100,
+                &collect_snapshot_from_roots,
+            )
+            .await
+            .expect_err("an unverifiable baseline must not authorize deletion");
+
+            assert!(is_retryable_error(&error));
+            assert!(
+                pipeline.all_ops().is_empty(),
+                "nothing may be applied, and above all nothing deleted"
+            );
+            assert!(lock_or_recover(&reconciliation).required);
+        });
+    }
+
     /// One reachable root plus one unavailable root must not reindex the half
     /// it can see. The pass fails retryably, applies nothing, stays required,
     /// and does not stall a stop.
@@ -4026,6 +4355,12 @@ mod tests {
                 required: true,
                 affected_paths: BTreeSet::from([prior_path.clone()]),
                 epoch: 1,
+                // This fixture predates any scan, so it carries the baseline
+                // as its own deletion authority and no root identities. The
+                // roots below resolve, so identity authority is established on
+                // the first complete pass.
+                catchup_baseline: Some(prior_snapshot.clone()),
+                root_identities: BTreeMap::new(),
             }));
             let pipeline = EpochAdvancingPipeline {
                 reconciliation: Arc::clone(&reconciliation),
