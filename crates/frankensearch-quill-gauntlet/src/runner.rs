@@ -17848,6 +17848,218 @@ mod tests {
         });
     }
 
+    /// Pin the complete collection-checkpoint sequence of the final
+    /// competitive refill, and prove every one of them fails closed.
+    ///
+    /// The late refill admits exactly three collection checkpoints: one seek
+    /// that reaches its single competitive candidate, then one drain per
+    /// cursor that contributes a scored posting to it. Cancelling at the last
+    /// one is the documented final-collection checkpoint; cancelling at the
+    /// earlier seek stage is the planted negative — it must remain
+    /// distinguishable (`Seek`, an unscored candidate, one charged posting
+    /// block) rather than being reported as the final drain, and it must leak
+    /// no hits either.
+    ///
+    /// This is the exactness the assertion cannot get on its own: a cursor
+    /// that admits work only when it enters a new posting block cannot report
+    /// either drain, because draining a scored candidate charges no new block
+    /// and the move that exhausts a cursor charges none at all. Such a build
+    /// reports the seek as the query's last checkpoint and answers a
+    /// cancelled query with a complete result set.
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[test]
+    fn salej_union_horizon_final_refill_checkpoints_are_exact_and_atomic() {
+        use frankensearch_quill::argus::ConformanceQueryWorkPhase;
+
+        let fixture = make_union_horizon_fixture();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (subject, _oracle) =
+                build_tombstoned_union_horizon_single_segment_pair(&cx, &fixture).await;
+            let index = subject
+                .index()
+                .expect("final-refill UNION_HORIZON Quill index");
+            let controller = index.conformance_cancellation_controller();
+            assert_eq!(controller.query_interruption_location(), None);
+            let snapshot_before = index.snapshot();
+            let writer_before = index
+                .conformance_pending_writer_state()
+                .expect("capture final-refill UNION_HORIZON writer state");
+            assert!(!index.has_uncommitted_changes());
+
+            controller
+                .arm(
+                    frankensearch_quill::index::ConformanceCancellationStage::QueryCollection,
+                    u64::MAX,
+                )
+                .expect("arm final-refill UNION_HORIZON checkpoint calibration");
+            let (control_result, control_trace) = index
+                .search_paginated_with_conformance_pruning_trace(
+                    &cx,
+                    UNION_HORIZON_QUERY,
+                    1,
+                    0,
+                    false,
+                )
+                .expect("calibrate final-refill UNION_HORIZON collection checkpoints");
+            let control_checkpoints = controller.observed_checkpoints();
+            assert!(
+                control_checkpoints > 3,
+                "the calibration run must observe more checkpoints than the final refill admits",
+            );
+            assert!(!controller.fired());
+            assert_eq!(controller.query_interruption_location(), None);
+            assert_eq!(control_result.hits.len(), 1);
+            assert_eq!(control_result.hits[0].document_id, "repo:docs/09000.txt");
+            let control_late_trace =
+                union_horizon_late_trace_receipt(1, 0, 8_995, control_trace.segments());
+            assert_eq!(control_late_trace.refills.len(), 3);
+            assert_eq!(
+                control_late_trace.refills[2].candidate_docs(),
+                1,
+                "the final refill admits exactly one competitive candidate",
+            );
+            controller.disarm();
+
+            let mut locations = Vec::new();
+            for trailing_offset in (0..3_u64).rev() {
+                let ordinal = control_checkpoints - trailing_offset;
+                controller
+                    .arm(
+                        frankensearch_quill::index::ConformanceCancellationStage::QueryCollection,
+                        ordinal,
+                    )
+                    .expect("arm a final-refill UNION_HORIZON collection checkpoint");
+                let error = index
+                    .search_paginated_with_conformance_pruning_trace(
+                        &cx,
+                        UNION_HORIZON_QUERY,
+                        1,
+                        0,
+                        false,
+                    )
+                    .expect_err("every final-refill collection checkpoint must cancel");
+                assert!(
+                    matches!(
+                        error,
+                        frankensearch_quill::QuillIndexError::Cancelled { phase: "search" }
+                    ),
+                    "checkpoint {ordinal} returned {error:?} instead of a typed search cancellation",
+                );
+                assert!(controller.fired());
+                assert_eq!(controller.observed_checkpoints(), ordinal);
+                let location = controller
+                    .query_interruption_location()
+                    .expect("a final-refill cancellation binds its exact scorer location");
+                assert_eq!(
+                    controller.recorded_pruning_receipts_at_fire(),
+                    0,
+                    "cancelling inside the final refill must publish no segment receipt",
+                );
+                assert_eq!(controller.discarded_pruning_trace_sessions(), 0);
+                assert!(cx.is_cancel_requested());
+                assert!(Arc::ptr_eq(&snapshot_before, &index.snapshot()));
+                assert_eq!(
+                    index
+                        .conformance_pending_writer_state()
+                        .expect("capture cancelled final-refill writer state"),
+                    writer_before,
+                );
+                assert!(!index.has_uncommitted_changes());
+                locations.push(location);
+                controller.disarm();
+                cx.set_cancel_requested(false);
+                assert!(
+                    !cx.is_cancel_requested(),
+                    "checkpoint {ordinal} must clear the real Cx before the next arm",
+                );
+            }
+
+            let final_location = *locations
+                .last()
+                .expect("the trailing checkpoint window is non-empty");
+            assert_union_horizon_interruption_location(
+                final_location,
+                ConformanceQueryWorkPhase::Drain,
+                true,
+                0,
+                0,
+            );
+            assert_eq!(
+                locations
+                    .iter()
+                    .filter(|location| location.phase() == ConformanceQueryWorkPhase::Seek)
+                    .count(),
+                1,
+                "the final refill seeks its single candidate exactly once",
+            );
+            assert_eq!(
+                locations
+                    .iter()
+                    .filter(|location| location.phase() == ConformanceQueryWorkPhase::Drain)
+                    .count(),
+                2,
+                "both cursors that score the late winner must drain it under their own checkpoint",
+            );
+            for location in &locations {
+                match location.phase() {
+                    // The seek charges the one posting block it enters and has
+                    // not scored its candidate yet; a drain has scored it and
+                    // enters no new block.
+                    ConformanceQueryWorkPhase::Seek => assert_union_horizon_interruption_location(
+                        *location,
+                        ConformanceQueryWorkPhase::Seek,
+                        false,
+                        1,
+                        0,
+                    ),
+                    ConformanceQueryWorkPhase::Drain => assert_union_horizon_interruption_location(
+                        *location,
+                        ConformanceQueryWorkPhase::Drain,
+                        true,
+                        0,
+                        0,
+                    ),
+                    ConformanceQueryWorkPhase::Discovery => panic!(
+                        "candidate discovery precedes the final refill's scored work: {location:?}"
+                    ),
+                }
+            }
+            let seek_location = *locations
+                .iter()
+                .find(|location| location.phase() == ConformanceQueryWorkPhase::Seek)
+                .expect("the final refill must seek its candidate");
+            assert_ne!(
+                seek_location, final_location,
+                "an earlier seek stage must stay distinguishable from the final drain",
+            );
+
+            let (retry_result, retry_trace) = index
+                .search_paginated_with_conformance_pruning_trace(
+                    &cx,
+                    UNION_HORIZON_QUERY,
+                    1,
+                    0,
+                    false,
+                )
+                .expect("clean UNION_HORIZON replay after the final-refill cancellations");
+            assert_eq!(retry_result, control_result);
+            assert_eq!(retry_trace, control_trace);
+            assert_eq!(
+                controller.query_interruption_location(),
+                None,
+                "a clean replay must reset the prior query's interruption receipt",
+            );
+            assert!(Arc::ptr_eq(&snapshot_before, &index.snapshot()));
+            assert_eq!(
+                index
+                    .conformance_pending_writer_state()
+                    .expect("capture replayed final-refill writer state"),
+                writer_before,
+            );
+            assert!(!index.has_uncommitted_changes());
+        });
+    }
+
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     #[test]
     fn salej_union_horizon_minimum_fuel_boundary_is_atomic_and_deterministic() {
