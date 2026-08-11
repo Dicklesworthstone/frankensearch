@@ -5,6 +5,7 @@
 //! embeddings and fully in-memory indices.
 
 use std::collections::VecDeque;
+use std::path::Path;
 
 // The per-query `&str`-keyed score maps + `seen` dedup set are `.get()`/`.insert()`
 // probed only (never iterated for output), so `ahash` is bit-identical to std and
@@ -23,7 +24,9 @@ use frankensearch_core::{
     FusedHit, PhaseMetrics, ScoreSource, ScoredResult, SearchError, SearchPhase, SearchResult,
     TwoTierConfig, TwoTierMetrics, VectorHit, ZeroSignalReason,
 };
-use frankensearch_index::{InMemoryTwoTierIndex, InMemoryVectorIndex, SearchParams};
+use frankensearch_index::{
+    InMemoryTwoTierIndex, InMemoryVectorIndex, SearchParams, ValidatedFsviBytes,
+};
 
 use crate::blend::{blend_two_tier, blend_two_tier_aligned_vector_index, compute_rank_changes};
 use crate::normalize::{AdaptiveNqcDenseWeight, NqcDenseWeight, nqc_cv_iter};
@@ -310,6 +313,30 @@ impl SyncTwoTierSearcher {
             nqc_dense_weight: NqcDenseWeight::new(),
             nqc_adaptive: Some(Mutex::new(AdaptiveNqcDenseWeight::production_default())),
         }
+    }
+
+    /// Construct the shipping synchronous search product directly from
+    /// admitted FSVI-v2 owners and their generation-keyed residual cache
+    /// directories. The in-memory constructor attaches only a bitwise
+    /// source-derived sidecar; missing, stale, corrupt, or unavailable cache
+    /// artifacts leave the existing exact flat route active for that tier.
+    ///
+    /// # Errors
+    ///
+    /// Returns source-vector loading errors. Optional residual-cache failures
+    /// are contained by the in-memory exact flat fallback.
+    pub fn from_admitted_v2_with_residual_sidecar_cache(
+        fast_source: &ValidatedFsviBytes,
+        fast_cache_dir: &Path,
+        quality_source: Option<(&ValidatedFsviBytes, &Path)>,
+        config: TwoTierConfig,
+    ) -> SearchResult<Self> {
+        let index = InMemoryTwoTierIndex::from_admitted_v2_with_residual_sidecar_cache(
+            fast_source,
+            fast_cache_dir,
+            quality_source,
+        )?;
+        Ok(Self::new(Arc::new(index), config))
     }
 
     /// Attach an optional synchronous lexical source for RRF hybrid fusion.

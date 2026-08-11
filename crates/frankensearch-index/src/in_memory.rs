@@ -452,20 +452,18 @@ impl ExactResidualSidecar {
         })
     }
 
-    /// Validate the fixed metadata and integrity trailer without decoding a
-    /// transformed vector. This is the first half of two-phase admission: the
-    /// raw bytes are dropped before deriving the trusted transform, avoiding a
-    /// raw-image + decoded-sidecar + derived-sidecar peak.
-    fn encoded_header_matches_source(
-        bytes: &[u8],
+    /// Validate the fixed metadata that binds a sidecar header to its source.
+    /// The caller separately validates the exact shape and whole-file digest.
+    fn header_matches_source(
+        header: &[u8],
         source: &ResidualSourceBinding,
         count: usize,
         dimension: usize,
     ) -> SearchResult<bool> {
-        if bytes.len() > EXACT_RESIDUAL_SIDECAR_MAX_BYTES {
+        if header.len() != EXACT_RESIDUAL_SIDECAR_HEADER_BYTES {
             return Ok(false);
         }
-        let mut cursor = SidecarCursor::new(bytes);
+        let mut cursor = SidecarCursor::new(header);
         if cursor.take_array::<8>("magic")? != EXACT_RESIDUAL_SIDECAR_MAGIC
             || cursor.u32("version")? != EXACT_RESIDUAL_SIDECAR_VERSION
         {
@@ -493,12 +491,31 @@ impl ExactResidualSidecar {
         {
             return Ok(false);
         }
-        let layout = ExactResidualLayout::for_shape(encoded_count, encoded_dimension)?;
-        let expected_remaining = layout
-            .payload_bytes
-            .checked_add(EXACT_RESIDUAL_SIDECAR_DIGEST_BYTES)
-            .ok_or_else(|| residual_sidecar_error("payload", "length overflow"))?;
-        if bytes.len() != layout.encoded_bytes || cursor.remaining() != expected_remaining {
+        Ok(cursor.is_exhausted())
+    }
+
+    /// Validate a complete byte image's fixed source metadata and integrity
+    /// trailer without decoding transformed vectors. Test-only byte fixtures
+    /// use this; public admission streams from one descriptor instead.
+    fn encoded_header_matches_source(
+        bytes: &[u8],
+        source: &ResidualSourceBinding,
+        count: usize,
+        dimension: usize,
+    ) -> SearchResult<bool> {
+        if bytes.len() > EXACT_RESIDUAL_SIDECAR_MAX_BYTES
+            || bytes.len() < EXACT_RESIDUAL_SIDECAR_HEADER_BYTES
+            || !Self::header_matches_source(
+                &bytes[..EXACT_RESIDUAL_SIDECAR_HEADER_BYTES],
+                source,
+                count,
+                dimension,
+            )?
+        {
+            return Ok(false);
+        }
+        let layout = ExactResidualLayout::for_shape(count, dimension)?;
+        if bytes.len() != layout.encoded_bytes {
             return Ok(false);
         }
         let integrity_start = bytes
@@ -820,31 +837,40 @@ fn open_exact_residual_sidecar_parent(path: &Path) -> SearchResult<(OwnedFd, OsS
 /// races or special files simply decline this optional optimization.
 #[cfg(target_os = "linux")]
 fn read_exact_residual_sidecar(path: &Path) -> SearchResult<Option<Vec<u8>>> {
-    read_exact_residual_sidecar_with_after_stat(path, || {})
+    read_exact_residual_sidecar_from_descriptor(path)
 }
 
-#[cfg(all(test, target_os = "linux"))]
-fn read_exact_residual_sidecar_for_test<F>(
-    path: &Path,
-    after_stat: F,
-) -> SearchResult<Option<Vec<u8>>>
-where
-    F: FnOnce(),
-{
-    read_exact_residual_sidecar_with_after_stat(path, after_stat)
-}
-
-/// The test-only hook provides a deterministic hostile race exactly between
-/// the descriptor size snapshot and the fixed-size read.  Production passes a
-/// no-op closure, so it never reopens the path after descriptor admission.
+/// Read precisely a caller's descriptor-size snapshot. A short stream models
+/// truncation after `fstat`; one trailing byte models growth after `fstat`.
+/// Both fail closed without permitting a capacity-growing `read_to_end` path.
 #[cfg(target_os = "linux")]
-fn read_exact_residual_sidecar_with_after_stat<F>(
-    path: &Path,
-    after_stat: F,
-) -> SearchResult<Option<Vec<u8>>>
-where
-    F: FnOnce(),
-{
+fn read_exact_sidecar_snapshot<R: Read>(
+    reader: &mut R,
+    byte_len: usize,
+) -> SearchResult<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(byte_len)
+        .map_err(|_| residual_sidecar_error("open", "sidecar allocation failed"))?;
+    bytes.resize(byte_len, 0);
+    match reader.read_exact(&mut bytes) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(residual_sidecar_error("open", &error.to_string())),
+    }
+    let mut trailing = [0_u8; 1];
+    if reader
+        .read(&mut trailing)
+        .map_err(|error| residual_sidecar_error("open", &error.to_string()))?
+        != 0
+    {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
+#[cfg(target_os = "linux")]
+fn read_exact_residual_sidecar_from_descriptor(path: &Path) -> SearchResult<Option<Vec<u8>>> {
     use rustix::fs::{FileType, Mode, OFlags, fstat, openat};
     use rustix::io::Errno;
 
@@ -872,26 +898,11 @@ where
     if byte_len > EXACT_RESIDUAL_SIDECAR_MAX_BYTES {
         return Ok(None);
     }
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(byte_len)
-        .map_err(|_| residual_sidecar_error("open", "sidecar allocation failed"))?;
-    bytes.resize(byte_len, 0);
     let mut file = File::from(descriptor);
-    after_stat();
-    match file.read_exact(&mut bytes) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(residual_sidecar_error("open", &error.to_string())),
-    }
-    let mut trailing = [0_u8; 1];
-    if file
-        .read(&mut trailing)
-        .map_err(|error| residual_sidecar_error("open", &error.to_string()))?
-        != 0
-    {
-        return Ok(None);
-    }
+    let bytes = match read_exact_sidecar_snapshot(&mut file, byte_len)? {
+        Some(bytes) => bytes,
+        None => return Ok(None),
+    };
     let after = fstat(&file).map_err(|error| residual_sidecar_error("open", &error.to_string()))?;
     if bytes.len() != byte_len
         || after.st_dev != before.st_dev
@@ -3807,13 +3818,7 @@ mod tests {
             &admitted, &cache_dir, None,
         )
         .expect("cache reader scans past corrupt entries to the valid generation artifact");
-        assert!(
-            reopened
-                .fast_index
-                .exact_residual_sidecar
-                .get()
-                .is_some()
-        );
+        assert!(reopened.fast_index.exact_residual_sidecar.get().is_some());
         assert_eq!(
             reopened
                 .search_fast(&query, 5)
@@ -3824,9 +3829,9 @@ mod tests {
         let entry_count_after_reopen = std::fs::read_dir(&cache_dir)
             .expect("read owned cache after reopening")
             .flatten()
+            .count();
         assert_eq!(
-            entry_count_after_reopen,
-            entry_count_after_publish,
+            entry_count_after_reopen, entry_count_after_publish,
             "reopening selects the existing valid sidecar instead of writing another artifact"
         );
 
@@ -5212,9 +5217,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn exact_residual_sidecar_public_io_rejects_growth_symlinks_and_overwrite_races() {
-        use std::fs::OpenOptions;
-        use std::io::Write as _;
+    fn exact_residual_sidecar_public_io_rejects_snapshot_changes_symlinks_and_overwrite_races() {
         use std::os::unix::fs::symlink;
 
         let dimension = 35;
@@ -5243,18 +5246,26 @@ mod tests {
                 .try_open_exact_residual_sidecar(&sidecar_path)
                 .expect("public no-follow open")
         );
+        let encoded = index
+            .build_exact_residual_sidecar()
+            .expect("derive test sidecar without touching the published file")
+            .encode()
+            .expect("encode test sidecar in memory");
+        let mut truncated_after_stat = std::io::Cursor::new(encoded[..encoded.len() - 1].to_vec());
         assert!(
-            read_exact_residual_sidecar_for_test(&sidecar_path, || {
-                let mut writer = OpenOptions::new()
-                    .append(true)
-                    .open(&sidecar_path)
-                    .expect("append after the descriptor size snapshot");
-                writer.write_all(&[0x5a]).expect("grow sidecar by one byte");
-                writer.sync_all().expect("publish the hostile growth");
-            })
-            .expect("bounded descriptor read")
-            .is_none(),
-            "one-byte probe rejects a sidecar that grows after fstat"
+            read_exact_sidecar_snapshot(&mut truncated_after_stat, encoded.len())
+                .expect("bounded snapshot read")
+                .is_none(),
+            "a stream truncated after its fstat-sized snapshot is rejected"
+        );
+        let mut grown_after_stat = encoded.clone();
+        grown_after_stat.push(0x5a);
+        let mut grown_after_stat = std::io::Cursor::new(grown_after_stat);
+        assert!(
+            read_exact_sidecar_snapshot(&mut grown_after_stat, encoded.len())
+                .expect("bounded snapshot read")
+                .is_none(),
+            "the one-byte probe rejects a stream that grows after fstat"
         );
 
         write_new_owned_file(&occupied_path, b"incumbent destination");
