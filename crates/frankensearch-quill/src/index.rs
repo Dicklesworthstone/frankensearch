@@ -1613,7 +1613,10 @@ impl ParallelIngestTerminal {
         }
     }
 
-    /// Whether the WHOLE operation reached a successful end.
+    /// Whether the WHOLE ingest operation reached a successful end.
+    ///
+    /// True for an empty batch and for a serial-only run: it says the
+    /// operation finished, NOT that anything was fanned out.
     const fn is_success(self) -> bool {
         matches!(
             self,
@@ -1648,12 +1651,12 @@ impl ParallelIngestTerminal {
 ///
 /// Cost is per SHARD, never per document — but it is NOT free, and an earlier
 /// revision of this comment wrongly claimed "two atomic RMWs, non-perturbing".
-/// A successful shard performs about FIVE atomic read-modify-writes
-/// (`started`, `in_flight` up, `peak` fetch_max, `completed`, `in_flight`
-/// down) plus one acquisition of a mutex CONTENDED by every other shard in the
-/// batch. That is cheap relative to accumulating a shard's documents and it
-/// never touches the per-token path, but it has not been measured and no
-/// no-overhead claim is made.
+/// A successful shard performs FIVE atomic read-modify-writes (`started`,
+/// `in_flight` up, `peak` fetch_max, `completed`, `in_flight` down) plus one
+/// acquisition of a mutex CONTENDED by every other shard in the batch. The
+/// work is per shard and never per token. Its cost has NOT been measured, so
+/// no characterisation of it — cheap, negligible, non-perturbing — is made
+/// here or anywhere else.
 #[derive(Debug)]
 struct ParallelBatchObservation {
     run_seq: u64,
@@ -1679,7 +1682,7 @@ struct ParallelBatchObservation {
     /// so a production-path test can force real overlap instead of hoping for
     /// it. Shipping builds do not compile this field.
     #[cfg(test)]
-    rendezvous_width: Option<usize>,
+    rendezvous_width: AtomicUsize,
     #[cfg(test)]
     rendezvous_arrived: AtomicUsize,
 }
@@ -1699,7 +1702,7 @@ impl Default for ParallelBatchObservation {
             shared_nothing_declined: AtomicBool::new(false),
             terminal: AtomicU8::new(ParallelIngestTerminal::Aborted.code()),
             #[cfg(test)]
-            rendezvous_width: None,
+            rendezvous_width: AtomicUsize::new(0),
             #[cfg(test)]
             rendezvous_arrived: AtomicUsize::new(0),
         }
@@ -1740,9 +1743,10 @@ impl ParallelBatchObservation {
     /// assertion loudly instead.
     #[cfg(test)]
     fn rendezvous(&self) {
-        let Some(width) = self.rendezvous_width else {
+        let width = self.rendezvous_width.load(Ordering::Acquire);
+        if width == 0 {
             return;
-        };
+        }
         let arrived = self
             .rendezvous_arrived
             .fetch_add(1, Ordering::AcqRel)
@@ -1750,19 +1754,22 @@ impl ParallelBatchObservation {
         if arrived >= width {
             return;
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(2);
         while self.rendezvous_arrived.load(Ordering::Acquire) < width && Instant::now() < deadline {
             std::thread::yield_now();
         }
     }
 
-    /// Test-only constructor arming the rendezvous for `width` shards.
+    /// Test-only: arm the rendezvous for a fan-out of `width` shards.
+    ///
+    /// Called by the routes from the PLAN, so overlap is forced for any test
+    /// that drives a real fan-out — including one that goes through the public
+    /// shipping driver and therefore cannot reach the observation itself. No
+    /// process-global state is involved, so concurrent tests cannot interfere
+    /// with each other.
     #[cfg(test)]
-    fn with_rendezvous(width: usize) -> Self {
-        Self {
-            rendezvous_width: Some(width),
-            ..Self::default()
-        }
+    fn arm_rendezvous(&self, width: usize) {
+        self.rendezvous_width.store(width, Ordering::Release);
     }
 
     /// Set the terminal state. A SUCCESS terminal is set only after the whole
@@ -1851,7 +1858,7 @@ impl Drop for ParallelObservationRecorder<'_> {
         // The terminal is read, never inferred: the driver classifies it from
         // the typed operation outcome before this runs.
         let terminal = self.observation.terminal();
-        let succeeded = terminal.is_success();
+        let operation_succeeded = terminal.is_success();
         let witness = self.observation.snapshot();
         let worker_ids = self
             .observation
@@ -1894,7 +1901,12 @@ impl Drop for ParallelObservationRecorder<'_> {
             witness.shared_nothing_declined,
         );
         self.span.record("parallel_terminal", terminal.as_str());
-        self.span.record("parallel_succeeded", succeeded);
+        // Deliberately not `parallel_*`: this is the WHOLE ingest operation's
+        // outcome and is true for an empty batch and for a serial-only run,
+        // neither of which fanned out at all. Read `parallel_route`,
+        // `parallel_terminal` and the shard counts for what the fan-out did.
+        self.span
+            .record("ingest_operation_succeeded", operation_succeeded);
     }
 }
 
@@ -5462,6 +5474,8 @@ impl QuillWriterState {
         }
 
         let checkpoint = ParallelIngestCheckpoint::new(&self.reader);
+        #[cfg(test)]
+        observation.arm_rendezvous(plan.active_shards);
         let completed = work
             .into_par_iter()
             .map(|work| {
@@ -5731,6 +5745,8 @@ impl QuillWriterState {
         }
 
         let checkpoint = ParallelIngestCheckpoint::new(&self.reader);
+        #[cfg(test)]
+        observation.arm_rendezvous(plan.active_shards);
         let completed = work
             .into_par_iter()
             .map(|work| {
@@ -5950,7 +5966,7 @@ impl QuillWriterState {
             parallel_pool_local_worker_ids = tracing::field::Empty,
             parallel_identity_degraded = tracing::field::Empty,
             parallel_shared_nothing_declined = tracing::field::Empty,
-            parallel_succeeded = tracing::field::Empty,
+            ingest_operation_succeeded = tracing::field::Empty,
             parallel_terminal = tracing::field::Empty,
             arena_bytes_used_high_water = tracing::field::Empty,
             arena_bytes_reserved_high_water = tracing::field::Empty,
@@ -23451,7 +23467,8 @@ mod tests {
                     .projected_logical_upper_bound;
                 writer.reader.config.scribe_shard_budget_bytes = projected + 1;
 
-                let observation = ParallelBatchObservation::with_rendezvous(plan.active_shards);
+                // The route arms the rendezvous from its own plan.
+                let observation = ParallelBatchObservation::default();
                 let receipt = writer
                     .try_index_documents_parallel(
                         &cx,
@@ -23641,18 +23658,33 @@ mod tests {
         String::from_utf8(captured).expect("captured spans are utf8")
     }
 
+    /// Read one `key=value` field out of a captured span line.
+    ///
+    /// Substring presence is not evidence; every assertion below compares an
+    /// exact parsed value.
+    fn ingest_span_field<'a>(captured: &'a str, key: &str) -> &'a str {
+        let needle = format!("{key}=");
+        let start = captured
+            .find(&needle)
+            .unwrap_or_else(|| panic!("field {key} missing from:\n{captured}"))
+            + needle.len();
+        let rest = &captured[start..];
+        let end = rest
+            .find(|c: char| c == ' ' || c == ',' || c == '}' || c == '\n')
+            .unwrap_or(rest.len());
+        rest[..end].trim_matches('"')
+    }
+
     fn assert_ingest_span_reports(captured: &str, terminal: &str, succeeded: bool) {
-        assert!(
-            captured.contains("parallel_terminal"),
-            "no ingest span was emitted at all:\n{captured}",
+        assert_eq!(
+            ingest_span_field(captured, "parallel_terminal"),
+            terminal,
+            "captured:\n{captured}",
         );
-        assert!(
-            captured.contains(terminal),
-            "expected terminal {terminal} in:\n{captured}",
-        );
-        assert!(
-            captured.contains(&format!("parallel_succeeded={succeeded}")),
-            "expected parallel_succeeded={succeeded} in:\n{captured}",
+        assert_eq!(
+            ingest_span_field(captured, "ingest_operation_succeeded"),
+            succeeded.to_string(),
+            "captured:\n{captured}",
         );
     }
 
@@ -23716,44 +23748,93 @@ mod tests {
     }
 
     #[test]
-    fn shipping_driver_emits_a_success_receipt_with_witness_fields() {
-        let captured = capture_ingest_spans(|| {
-            run_with_cx(|cx| async move {
-                let config = QuillConfig {
-                    max_ingest_shards: 4,
-                    max_visibility_lag_ms: 60_000,
-                    ..QuillConfig::default()
-                };
-                let mut index = QuillIndex::in_memory(config).expect("success receipt index");
-                let documents = (0..250)
-                    .map(|ordinal| {
-                        IndexableDocument::new(
-                            format!("receipt-doc-{ordinal:05}"),
-                            "alpha beta gamma delta",
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                index
-                    .index_documents(&cx, &documents)
-                    .await
-                    .expect("index the success-receipt batch");
-            });
+    fn shipping_driver_success_receipt_binds_route_terminal_and_real_overlap() {
+        // 250 documents at width 4 activate exactly 3 shards, and the route
+        // arms the rendezvous from that plan, so every shard must be in flight
+        // together. Every assertion below is an exact parsed value, never a
+        // substring presence check.
+        const EXPECTED_ACTIVE_SHARDS: &str = "3";
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-thread shipping-driver pool");
+        let captured = pool.install(|| {
+            capture_ingest_spans(|| {
+                run_with_cx(|cx| async move {
+                    let config = QuillConfig {
+                        max_ingest_shards: 4,
+                        max_visibility_lag_ms: 60_000,
+                        // Generous enough that the shared-nothing route is not
+                        // declined on budget, so this exercises the fan-out.
+                        scribe_shard_budget_bytes: 512 * 1024 * 1024,
+                        ..QuillConfig::default()
+                    };
+                    let mut index = QuillIndex::in_memory(config).expect("success receipt index");
+                    let documents = (0..250)
+                        .map(|ordinal| {
+                            IndexableDocument::new(
+                                format!("receipt-doc-{ordinal:05}"),
+                                "alpha beta gamma delta",
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    index
+                        .index_documents(&cx, &documents)
+                        .await
+                        .expect("index the success-receipt batch");
+                });
+            })
         });
-        // Whichever route carried it, the whole operation succeeded and the
-        // witness fields are present on the emitted span.
-        assert!(captured.contains("parallel_succeeded=true"), "{captured}");
-        assert!(captured.contains("parallel_started_shards"), "{captured}");
-        assert!(
-            captured.contains("parallel_peak_shards_in_flight"),
-            "{captured}"
+
+        // Exact route and terminal, not "a success of some kind".
+        assert_eq!(
+            ingest_span_field(&captured, "parallel_route"),
+            "shared_nothing",
+            "captured:\n{captured}",
         );
-        assert!(
-            captured.contains("parallel_identity_degraded=false"),
-            "{captured}"
+        assert_eq!(
+            ingest_span_field(&captured, "parallel_terminal"),
+            "fanout_completed",
+            "captured:\n{captured}",
         );
-        assert!(
-            captured.contains("parallel_shared_nothing_declined"),
-            "{captured}"
+        assert_eq!(
+            ingest_span_field(&captured, "ingest_operation_succeeded"),
+            "true",
+        );
+        assert_eq!(
+            ingest_span_field(&captured, "parallel_active_shards"),
+            EXPECTED_ACTIVE_SHARDS,
+        );
+        // Nonzero started shards, and REAL overlap: peak equals the activated
+        // width because the rendezvous held every shard in flight at once.
+        assert_eq!(
+            ingest_span_field(&captured, "parallel_started_shards"),
+            EXPECTED_ACTIVE_SHARDS,
+        );
+        assert_eq!(
+            ingest_span_field(&captured, "parallel_completed_shards"),
+            EXPECTED_ACTIVE_SHARDS,
+        );
+        assert_eq!(
+            ingest_span_field(&captured, "parallel_peak_shards_in_flight"),
+            EXPECTED_ACTIVE_SHARDS,
+            "the shipping driver must show real overlap, captured:\n{captured}",
+        );
+        // Worker identities were captured, not merely counted.
+        assert_eq!(
+            ingest_span_field(&captured, "parallel_distinct_worker_slots"),
+            EXPECTED_ACTIVE_SHARDS,
+        );
+        let worker_ids = ingest_span_field(&captured, "parallel_pool_local_worker_ids");
+        assert_eq!(worker_ids.split(',').count(), 3, "ids were {worker_ids}");
+        assert!(worker_ids.split(',').all(|id| id.parse::<usize>().is_ok()));
+        assert_eq!(
+            ingest_span_field(&captured, "parallel_identity_degraded"),
+            "false",
+        );
+        assert_eq!(
+            ingest_span_field(&captured, "parallel_unidentified_shards"),
+            "0",
         );
     }
 
@@ -23764,17 +23845,18 @@ mod tests {
         let observation = Arc::new(ParallelBatchObservation::default());
         assert!(!observation.snapshot().identity_degraded);
         let poisoner = Arc::clone(&observation);
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
+        // The panic hook is process-global: silencing it would race every
+        // concurrently running test and leak if this thread unwound before
+        // restoring it. The expected panic message on stderr is the cheaper
+        // price, so the hook is left alone.
         let poisoned = std::thread::spawn(move || {
             let _guard = poisoner
                 .worker_ids
                 .lock()
                 .expect("lock is not yet poisoned");
-            panic!("poison the worker-id lock");
+            panic!("expected: poisoning the worker-id lock for the fail-closed test");
         })
         .join();
-        std::panic::set_hook(previous_hook);
         assert!(poisoned.is_err());
         assert!(observation.worker_ids.is_poisoned());
 
