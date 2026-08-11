@@ -403,6 +403,11 @@ struct WatcherStop {
     /// Invoked while `wait_lock` is held, immediately before parking.
     #[cfg(test)]
     park_observer: Mutex<Option<StopObserver>>,
+    /// Invoked each time the waiter re-evaluates its predicate, which is
+    /// exactly when it has processed a wakeup and is deciding whether to
+    /// re-park.
+    #[cfg(test)]
+    wake_observer: Mutex<Option<StopObserver>>,
 }
 
 impl WatcherStop {
@@ -418,6 +423,29 @@ impl WatcherStop {
     #[cfg(test)]
     fn set_park_observer(&self, observer: StopObserver) {
         *lock_or_recover(&self.park_observer) = Some(observer);
+    }
+
+    /// Observe every predicate re-evaluation, i.e. every processed wakeup.
+    #[cfg(test)]
+    fn set_wake_observer(&self, observer: StopObserver) {
+        *lock_or_recover(&self.wake_observer) = Some(observer);
+    }
+
+    /// Publish the stop flag.
+    ///
+    /// The store lives here, behind a live `wait_lock` guard the caller must
+    /// already hold, and the observation of that store sits in the same
+    /// function. Keeping them together is the point: as two adjacent
+    /// statements in `request`, a change that moved the store out of the lock
+    /// could leave the observer behind and the evidence would still read
+    /// "published under the lock". Moving the store now means removing it from
+    /// a function that cannot be called without a guard.
+    fn publish_requested(&self, publication_guard: &std::sync::MutexGuard<'_, ()>) {
+        // Borrowed purely to make lock ownership a precondition of the store.
+        let () = **publication_guard;
+        #[cfg(test)]
+        self.notify_observer(&self.publish_observer);
+        self.requested.store(true, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -439,10 +467,8 @@ impl WatcherStop {
         // requested. Holding the lock across both serialises this against the
         // waiter's check-then-wait, so the waiter either observes the flag or
         // is already parked and receives the notify.
-        let _publication = lock_or_recover(&self.wait_lock);
-        #[cfg(test)]
-        self.notify_observer(&self.publish_observer);
-        self.requested.store(true, Ordering::Release);
+        let publication = lock_or_recover(&self.wait_lock);
+        self.publish_requested(&publication);
         self.wait_cv.notify_all();
     }
 
@@ -476,7 +502,14 @@ impl WatcherStop {
         self.notify_observer(&self.park_observer);
         let (_guard, _timed_out) = self
             .wait_cv
-            .wait_timeout_while(guard, duration, |()| !self.is_requested())
+            .wait_timeout_while(guard, duration, |()| {
+                // Runs on entry and on every wakeup, under `wait_lock`: the
+                // one point at which the waiter has demonstrably processed a
+                // notification and is choosing whether to re-park.
+                #[cfg(test)]
+                self.notify_observer(&self.wake_observer);
+                !self.is_requested()
+            })
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.is_requested()
     }
@@ -2541,14 +2574,21 @@ mod tests {
         let observed = Arc::new(AtomicUsize::new(0));
         let held_at_publication = Arc::new(AtomicBool::new(false));
 
+        let flag_already_set = Arc::new(AtomicBool::new(false));
+
         {
             let observed = Arc::clone(&observed);
             let held_at_publication = Arc::clone(&held_at_publication);
+            let flag_already_set = Arc::clone(&flag_already_set);
             stop.set_publish_observer(Box::new(move |stop: &WatcherStop| {
                 // `try_lock` from the thread that already owns the mutex
                 // returns `WouldBlock`; an unheld mutex hands the guard over.
                 let unheld = stop.wait_lock.try_lock().is_ok();
                 held_at_publication.store(!unheld, Ordering::Release);
+                // Pins the observation to the store seam from the other side:
+                // an observer that had drifted after the store would see the
+                // flag already true.
+                flag_already_set.store(stop.is_requested(), Ordering::Release);
                 observed.fetch_add(1, Ordering::AcqRel);
             }));
         }
@@ -2564,6 +2604,10 @@ mod tests {
             held_at_publication.load(Ordering::Acquire),
             "the stop flag was published without holding wait_lock; a waiter between its \
              flag check and its park would miss the notify and sleep the entire backoff"
+        );
+        assert!(
+            !flag_already_set.load(Ordering::Acquire),
+            "the observation ran after the store, so it no longer witnesses the seam it claims to"
         );
         assert!(stop.is_requested());
     }
@@ -2602,11 +2646,28 @@ mod tests {
             }));
         }
 
+        // Counts processed wakeups, and records the waiter returning. Both are
+        // published under one lock so the test can wait for either without
+        // sleeping.
+        let progress = Arc::new((Mutex::new((0_usize, false)), Condvar::new()));
+        {
+            let progress = Arc::clone(&progress);
+            stop.set_wake_observer(Box::new(move |_stop: &WatcherStop| {
+                let (state, changed) = &*progress;
+                super::lock_or_recover(state).0 += 1;
+                changed.notify_all();
+            }));
+        }
+
         let waiter = {
             let stop = Arc::clone(&stop);
+            let progress = Arc::clone(&progress);
             thread::spawn(move || {
                 let started = Instant::now();
                 let stopped = stop.wait_or_stopped(BACKOFF);
+                let (state, changed) = &*progress;
+                super::lock_or_recover(state).1 = true;
+                changed.notify_all();
                 (stopped, started.elapsed())
             })
         };
@@ -2629,6 +2690,32 @@ mod tests {
             !stop.is_requested(),
             "the spurious notify must not have requested a stop"
         );
+
+        // Wait for the waiter to acknowledge the synthetic wakeup before the
+        // real stop exists. Without this the real `request()` could land while
+        // the waiter is still reacquiring `wait_lock`, and a one-shot
+        // `wait_timeout` would then observe an already-true flag and report
+        // `stopped` — passing while doing the very thing this rejects. The
+        // acknowledgement is the predicate re-evaluation: one on entry, a
+        // second for the synthetic notify.
+        {
+            let (state, changed) = &*progress;
+            let mut observed = super::lock_or_recover(state);
+            while observed.0 < 2 && !observed.1 {
+                observed = changed
+                    .wait(observed)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            assert!(
+                !observed.1,
+                "the waiter returned from a wakeup that carried no stop; the backoff was cut \
+                 short before a real stop was ever requested"
+            );
+            assert!(
+                observed.0 >= 2,
+                "the synthetic wakeup was never processed, so nothing was exercised"
+            );
+        }
 
         stop.request();
 
