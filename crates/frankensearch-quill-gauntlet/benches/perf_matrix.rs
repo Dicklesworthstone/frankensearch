@@ -2289,16 +2289,19 @@ fn qg1_bulk_metric_continuous(
                 feed_qg1_prepared_batches(context, &index, &prepared_input, None, &mut interval);
             let generation_before_terminal = index.snapshot().loaded_manifest().manifest.generation;
             qg1_terminal_commit(context, &index, &mut interval);
-            let terminal_searchability = qg1_terminal_searchability(context, &index, &mut interval);
-            let terminal_search_completed = interval
-                .terminal_search_attempt_completed_ns
-                .expect("QG-1 terminal search marks its completion before proof bookkeeping");
-            interval.mark_terminal_quiescence_at(terminal_search_completed);
+            // Retain the Quill read owner until its terminal search returns,
+            // matching Tantivy's retained-reader endpoint without inventing a
+            // writer lifecycle that Quill does not have.
+            let retained_search_owner = &index;
+            let terminal_searchability =
+                qg1_terminal_searchability(context, retained_search_owner, &mut interval);
             let generation_delta = generation_before_terminal.saturating_sub(generation_before);
             let (measurement, receipt) = interval.finish(
                 Some(generation_delta),
                 terminal_searchability,
-                Qg1TerminalFact::proven("awaited_quill_inline_publication_and_tier_merges"),
+                Qg1TerminalFact::proven(
+                    "retained_quill_read_owner_returned_tail_after_inline_publication",
+                ),
             );
             emit_qg1_continuous_timing_receipt(spec, receipt);
             eprintln!(
@@ -2335,22 +2338,23 @@ fn qg1_bulk_metric_continuous(
                 &mut interval,
             );
             qg1_terminal_commit(context, &index, &mut interval);
-            let terminal_searchability = qg1_terminal_searchability(context, &index, &mut interval);
-            let terminal_join_receipt = index
-                .benchmark_join_workers()
-                .expect("join QG-1 Tantivy terminal workers without rearming");
+            let (retained_search_owner, terminal_join_receipt) = index
+                .benchmark_join_workers_retaining_reader()
+                .expect("join QG-1 Tantivy terminal workers while retaining a read handle");
             assert!(
                 !terminal_join_receipt.writer_rearmed,
                 "QG-1 terminal Tantivy worker fence must not construct a replacement writer"
             );
-            let terminal_join_completed = interval.mark_terminal_worker_join(terminal_join_receipt);
-            let terminal_quiescence = qg1_tantivy_quiescence_fact(&terminal_join_receipt);
-            interval.mark_terminal_quiescence_at(terminal_join_completed);
+            interval.mark_terminal_worker_join(terminal_join_receipt);
+            let terminal_searchability =
+                qg1_tantivy_terminal_searchability(&retained_search_owner, &mut interval);
+            let terminal_quiescence =
+                qg1_tantivy_quiescence_fact(&terminal_join_receipt, &terminal_searchability);
             let (measurement, receipt) =
                 interval.finish(None, terminal_searchability, terminal_quiescence);
             emit_tantivy_lifecycle_receipt(
                 spec,
-                "qg1_terminal_worker_join_after_search",
+                "qg1_terminal_worker_join_before_retained_tail_search",
                 &terminal_join_receipt,
             );
             emit_qg1_continuous_timing_receipt(spec, receipt);
@@ -3381,6 +3385,15 @@ fn qg1_raw_sample_denominator(
         return Ok(declared);
     };
     continuous.prepared_input.validate()?;
+    continuous.lifecycle_receipt.validate()?;
+    if continuous.lifecycle_receipt.prepared_input != continuous.prepared_input
+        || continuous.lifecycle_receipt.document_count != continuous.work_units
+    {
+        return Err(
+            "QG-1 raw denominator is not bound to the lifecycle receipt produced by this sample"
+                .to_owned(),
+        );
+    }
     let actual = (
         Some(continuous.prepared_input.document_count),
         Some(continuous.prepared_input.content_bytes),
@@ -5950,7 +5963,6 @@ mod tests {
             quill_publication_generation_delta: None,
             terminal_commit_completed_ns: 100,
             pre_search_rearm_join_completed_ns: None,
-            terminal_search_attempt_completed_ns: 125,
             terminal_worker_join_completed_ns: Some(155),
             terminal_tantivy_join: Some(super::BenchmarkWriterJoinReceipt {
                 searchable_segments_before: 1,
@@ -5958,8 +5970,8 @@ mod tests {
                 join_elapsed_ns: 30,
                 writer_rearmed: false,
             }),
-            terminal_quiescence_completed_ns: 155,
-            interval_ended_ns: 155,
+            terminal_searchable_quiescence_completed_ns: 180,
+            interval_ended_ns: 180,
             terminal_searchability: super::Qg1TerminalFact::proven(
                 "exact_prepared_tail_sentinel_visible",
             ),
@@ -5980,9 +5992,9 @@ mod tests {
         // timeline. It still loses every gap between calls, exactly the
         // undercount caused by adding independent `Instant::elapsed()` results.
         let old_summed_call_ns =
-            (20 - 0) + (65 - 40) + (75 - 65) + (100 - 75) + (125 - 100) + (155 - 125);
-        assert_eq!(old_summed_call_ns, 135);
-        assert_eq!(receipt.interval_ended_ns, 155);
+            (20 - 0) + (65 - 40) + (75 - 65) + (100 - 75) + (155 - 100) + (180 - 155);
+        assert_eq!(old_summed_call_ns, 160);
+        assert_eq!(receipt.interval_ended_ns, 180);
         assert!(
             old_summed_call_ns < receipt.interval_ended_ns,
             "summing individually timed calls must not masquerade as continuous wall time"
@@ -6012,11 +6024,11 @@ mod tests {
         let mut retired_rearm = receipt.clone();
         retired_rearm.pre_search_rearm_join_completed_ns = Some(110);
         assert_escape_rejected(retired_rearm);
-        let mut search_escape = receipt.clone();
-        search_escape.terminal_search_attempt_completed_ns = 99;
-        assert_escape_rejected(search_escape);
+        let mut retained_search_escape = receipt.clone();
+        retained_search_escape.terminal_searchable_quiescence_completed_ns = 154;
+        assert_escape_rejected(retained_search_escape);
         let mut terminal_join_escape = receipt.clone();
-        terminal_join_escape.terminal_worker_join_completed_ns = Some(124);
+        terminal_join_escape.terminal_worker_join_completed_ns = Some(99);
         assert_escape_rejected(terminal_join_escape);
         let mut missing_join_api = receipt.clone();
         missing_join_api.terminal_tantivy_join = None;
@@ -6196,8 +6208,9 @@ mod tests {
             );
             assert_eq!(record.timing.batches[0].feed_started_ns, 0);
             assert_eq!(
-                record.timing.interval_ended_ns, record.timing.terminal_quiescence_completed_ns,
-                "the sample must publish exactly the quiescence completion boundary"
+                record.timing.interval_ended_ns,
+                record.timing.terminal_searchable_quiescence_completed_ns,
+                "the sample must publish the one real retained-reader searchable-quiescence boundary"
             );
             assert_eq!(
                 record.timing.pre_search_rearm_join_completed_ns, None,
@@ -6213,19 +6226,22 @@ mod tests {
                     "Quill has no external Tantivy worker join"
                 ),
                 super::EngineArm::Tantivy => {
+                    let terminal_join_completed = record
+                        .timing
+                        .terminal_worker_join_completed_ns
+                        .expect("Tantivy must finish its one nonrearming terminal worker join");
                     assert!(
-                        record.timing.terminal_worker_join_completed_ns.is_some(),
-                        "Tantivy must finish its one nonrearming terminal worker join"
+                        terminal_join_completed
+                            <= record.timing.terminal_searchable_quiescence_completed_ns,
+                        "planted negative: a Tantivy tail search cannot certify a boundary before its actual worker join"
                     );
                     let join = record
                         .timing
                         .terminal_tantivy_join
                         .expect("Tantivy must retain the actual one-shot join API receipt");
                     assert!(
-                        !join.writer_rearmed
-                            && join.searchable_segments_before > 0
-                            && join.searchable_segments_after > 0,
-                        "the retained Tantivy reader must stay searchable across the one nonrearming join"
+                        !join.writer_rearmed,
+                        "the retained Tantivy reader must not rearm a replacement writer"
                     );
                 }
             }
@@ -6279,11 +6295,21 @@ mod tests {
             prepared_input.verify_binding(&unbound_input).is_err(),
             "planted negative: a separately labeled corpus cannot supply the sample denominator"
         );
+        let mut lifecycle_receipt = hostile_tantivy_continuous_receipt();
+        lifecycle_receipt.document_count = prepared_input.binding.document_count;
+        lifecycle_receipt.prepared_input = prepared_input.binding.clone();
+        lifecycle_receipt.batches[0].document_count = 6;
+        lifecycle_receipt.batches[1].document_start = 6;
+        lifecycle_receipt.batches[1].document_count = 6;
+        lifecycle_receipt
+            .validate()
+            .expect("hostile lifecycle receipt is rebound to this measured prepared input");
         let actual_measurement = super::Qg1ContinuousMeasurement {
             work_units: prepared_input.binding.document_count,
             origin: std::time::Instant::now(),
             elapsed_ns: 1,
             prepared_input: prepared_input.binding.clone(),
+            lifecycle_receipt,
         };
         assert_eq!(
             super::qg1_raw_sample_denominator(
@@ -6300,6 +6326,19 @@ mod tests {
             )
             .is_err(),
             "planted negative: raw bytes may not come from a separately regenerated input"
+        );
+        let mut receipt_relabel = actual_measurement.clone();
+        receipt_relabel
+            .lifecycle_receipt
+            .prepared_input
+            .indexed_content_sha256 = "c".repeat(64);
+        assert!(
+            super::qg1_raw_sample_denominator(
+                (Some(12), Some(expected_bytes)),
+                Some(&receipt_relabel),
+            )
+            .is_err(),
+            "planted negative: one sample cannot borrow another lifecycle receipt under its own input"
         );
 
         let mut tokenizer = PerfMatrixSpec::complete()
