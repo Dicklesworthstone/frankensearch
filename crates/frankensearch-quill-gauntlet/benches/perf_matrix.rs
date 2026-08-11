@@ -1197,11 +1197,9 @@ fn qg1_live_sample_binding(
     elapsed_ns: u64,
     scope: &PerfOperationScope,
     provenance: &PerfSampleProvenance,
+    estimator_config: &PairedEstimatorConfig,
     stream_role: &str,
     stream_sequence: u64,
-    expected_stream_row_count: u64,
-    expected_pair_count: u64,
-    trusted_cell_input_sha256: &str,
     sample_id: u64,
     block_id: u64,
     arm: PerfSampleArm,
@@ -1210,6 +1208,8 @@ fn qg1_live_sample_binding(
     let continuous = continuous?;
     let receipt = &continuous.lifecycle_receipt;
     receipt.validate().ok()?;
+    let (lifecycle_authority_sha256, stream_role_identity_sha256) =
+        estimator_config.qg1_lifecycle_receipt_coordinates(scope, provenance, stream_role)?;
     if receipt.interval_ended_ns != elapsed_ns || continuous.elapsed_ns != elapsed_ns {
         return None;
     }
@@ -1278,17 +1278,16 @@ fn qg1_live_sample_binding(
         stream_role: stream_role.to_owned(),
         stream_id_sha256: String::new(),
         stream_sequence,
-        expected_stream_row_count,
-        expected_pair_count,
         raw_sample_id: sample_id,
         raw_block_id: block_id,
         raw_arm: arm,
         raw_order: order,
+        lifecycle_authority_sha256,
+        stream_role_identity_sha256,
         lifecycle_receipt_id_sha256: String::new(),
         lifecycle_receipt_sha256: String::new(),
         prepared_corpus_sha256: provenance.corpus_sha256.clone(),
         prepared_input_sha256: String::new(),
-        trusted_cell_input_sha256: trusted_cell_input_sha256.to_owned(),
         prepared_manifest_sha256: receipt.prepared_input.manifest_sha256.clone(),
         indexed_content_sha256: receipt.prepared_input.indexed_content_sha256.clone(),
         document_count: receipt.prepared_input.document_count,
@@ -1307,21 +1306,10 @@ fn qg1_live_sample_binding(
         terminal_endpoint_ns: receipt.interval_ended_ns,
         lifecycle_witness,
     };
-    let observed_trusted_cell_input_sha256 = Qg1SampleBinding::trusted_cell_input_sha256(
-        scope,
-        provenance,
-        &binding.prepared_manifest_sha256,
-        &binding.indexed_content_sha256,
-        binding.document_count,
-        binding.content_bytes,
-        binding.prepared_batch_count,
-        &binding.batch_coverage,
-        &binding.tail_document_id,
-    );
-    if binding.trusted_cell_input_sha256 != observed_trusted_cell_input_sha256 {
+    binding.seal_lifecycle_receipt(scope, provenance);
+    if !estimator_config.qg1_binding_matches_lifecycle_authority(&binding, scope, provenance) {
         return None;
     }
-    binding.seal_lifecycle_receipt(scope, provenance);
     Some(binding)
 }
 
@@ -3626,17 +3614,20 @@ fn raw_sample_work(context: &BenchContext, spec: &PerfCellSpec) -> (Option<u64>,
     )
 }
 
-/// Freeze the exact prepared QG-1 input before warmup or measurement. The
-/// resulting identity is an expected per-cell value, not a per-row receipt
-/// digest: every lifecycle binding must reproduce it from the input it used.
-fn qg1_prepared_cell_input_identity(
+/// Freeze the exact QG-1 cell plan before warmup or measurement. The returned
+/// authority is retained by the live estimator rather than synthesized from
+/// any raw row.
+fn install_qg1_lifecycle_authority(
+    estimator_config: &mut PairedEstimatorConfig,
     context: &BenchContext,
     spec: &PerfCellSpec,
     scope: &PerfOperationScope,
     provenance: &PerfSampleProvenance,
-) -> Option<String> {
+    expected_pair_count: u64,
+    stream_roles: &[&str],
+) {
     if qg1_producer_coverage(spec) != Some(Qg1ProducerCoverage::EngineIndexingLifecycle) {
-        return None;
+        return;
     }
     let document_count = context
         .scale
@@ -3661,19 +3652,23 @@ fn qg1_prepared_cell_input_identity(
         .collect::<Vec<_>>();
     assert_eq!(
         next_document, prepared.binding.document_count,
-        "QG-1 trusted cell identity must cover the complete prepared input"
+        "QG-1 lifecycle authority must cover the complete prepared input"
     );
-    Some(Qg1SampleBinding::trusted_cell_input_sha256(
-        scope,
-        provenance,
-        &prepared.binding.manifest_sha256,
-        &prepared.binding.indexed_content_sha256,
-        prepared.binding.document_count,
-        prepared.binding.content_bytes,
-        prepared.binding.batch_count,
-        &batch_coverage,
-        &prepared.binding.tail_document_id,
-    ))
+    estimator_config
+        .install_qg1_lifecycle_authority(
+            scope.clone(),
+            provenance.corpus_sha256.clone(),
+            prepared.binding.manifest_sha256.clone(),
+            prepared.binding.indexed_content_sha256.clone(),
+            prepared.binding.document_count,
+            prepared.binding.content_bytes,
+            prepared.binding.batch_count,
+            batch_coverage,
+            prepared.binding.tail_document_id.clone(),
+            expected_pair_count,
+            stream_roles.iter().map(|role| (*role).to_owned()).collect(),
+        )
+        .expect("freeze one complete pre-timing QG-1 lifecycle authority");
 }
 
 /// Resolve a raw QG-1 denominator from the prepared input the continuous
@@ -3846,7 +3841,7 @@ struct PairedStreamRunner<'a> {
     order: Vec<PerfSampleArm>,
     work_units: Option<u64>,
     byte_count: Option<u64>,
-    qg1_trusted_cell_input_sha256: Option<String>,
+    estimator_config: &'a PairedEstimatorConfig,
     samples: Vec<PerfRawSample>,
 }
 
@@ -3858,12 +3853,11 @@ impl<'a> PairedStreamRunner<'a> {
         scope: &'a PerfOperationScope,
         origin: Instant,
         plan: StreamPlan<'a>,
+        estimator_config: &'a PairedEstimatorConfig,
     ) -> Self {
         let order =
             seeded_balanced_pair_order(plan.rounds, plan.seed).expect("paired order schedule");
         let (work_units, byte_count) = raw_sample_work(context, spec);
-        let qg1_trusted_cell_input_sha256 =
-            qg1_prepared_cell_input_identity(context, spec, scope, &evidence.sample_provenance);
         for _ in 0..evidence.policy.warmup_rounds {
             let _ = black_box(measure_metric_with_query(
                 context,
@@ -3889,7 +3883,7 @@ impl<'a> PairedStreamRunner<'a> {
             order,
             work_units,
             byte_count,
-            qg1_trusted_cell_input_sha256,
+            estimator_config,
             samples,
         }
     }
@@ -3988,25 +3982,16 @@ impl<'a> PairedStreamRunner<'a> {
                     })
                 })
                 .expect("QG-1 raw-order stream sequence fits u64");
-            let expected_pair_count =
-                u64::try_from(self.plan.rounds).expect("QG-1 pair count fits u64");
-            let expected_stream_row_count = expected_pair_count
-                .checked_mul(2)
-                .expect("QG-1 stream row count fits u64");
             qg1_live_sample_binding(
                 measurement.continuous.as_ref(),
                 window.ended_ns - window.started_ns,
                 self.scope,
                 &self.evidence.sample_provenance,
+                self.estimator_config,
                 self.plan
                     .qg1_stream_role
                     .expect("QG-1 paired stream has one canonical role"),
                 stream_sequence,
-                expected_stream_row_count,
-                expected_pair_count,
-                self.qg1_trusted_cell_input_sha256
-                    .as_deref()
-                    .expect("QG-1 producer has a pre-timing trusted cell input identity"),
                 sample_id,
                 block_id,
                 sample_arm,
@@ -4082,7 +4067,7 @@ fn validate_qg1_three_stream_prepared_identity(
         })?;
         if binding.prepared_corpus_sha256 != first.prepared_corpus_sha256
             || binding.prepared_input_sha256 != first.prepared_input_sha256
-            || binding.trusted_cell_input_sha256 != first.trusted_cell_input_sha256
+            || binding.lifecycle_authority_sha256 != first.lifecycle_authority_sha256
         {
             return Err(
                 "QG-1 effect and both null streams disagree on frozen trusted prepared input"
@@ -4902,6 +4887,20 @@ fn collect_cell(
     let scope = operation_scope(spec);
     let origin = Instant::now();
     let cell_seed = evidence.config.bootstrap_seed ^ fixture_seed(&spec.fixture);
+    let mut estimator_config = evidence.config.clone();
+    install_qg1_lifecycle_authority(
+        &mut estimator_config,
+        context,
+        spec,
+        &scope,
+        &evidence.sample_provenance,
+        u64::try_from(runs).expect("QG-1 authority pair count fits u64"),
+        &[
+            "qg1.effect.tantivy_vs_quill.v1",
+            "qg1.null.tantivy.v1",
+            "qg1.null.quill.v1",
+        ],
+    );
 
     // Every non-query gate establishes its A/A floor through the exact paired
     // routine. QG-6 uses the prepared four-arm runner so setup is impossible
@@ -4944,6 +4943,7 @@ fn collect_cell(
                 query_override: None,
                 qg1_stream_role: (spec.gate == PerfGate::Qg1).then_some("qg1.null.tantivy.v1"),
             },
+            &estimator_config,
         );
         let mut treatment_null = (spec.gate == PerfGate::Qg1).then(|| {
             PairedStreamRunner::new(
@@ -4963,6 +4963,7 @@ fn collect_cell(
                     query_override: None,
                     qg1_stream_role: Some("qg1.null.quill.v1"),
                 },
+                &estimator_config,
             )
         });
         let mut effect = PairedStreamRunner::new(
@@ -4983,6 +4984,7 @@ fn collect_cell(
                 qg1_stream_role: (spec.gate == PerfGate::Qg1)
                     .then_some("qg1.effect.tantivy_vs_quill.v1"),
             },
+            &estimator_config,
         );
         for round in 0..runs {
             for slot in interleaved_stream_order(cell_seed, round) {
@@ -5073,10 +5075,10 @@ fn collect_cell(
     }
 
     let experiment =
-        estimate_paired_experiment(&effect_samples, &oracle_null_samples, &evidence.config)
+        estimate_paired_experiment(&effect_samples, &oracle_null_samples, &estimator_config)
             .expect("paired estimator rejected harness-produced streams");
     let treatment_null_experiment = treatment_null_samples.as_ref().map(|samples| {
-        estimate_paired_experiment(&effect_samples, samples, &evidence.config)
+        estimate_paired_experiment(&effect_samples, samples, &estimator_config)
             .expect("treatment-arm null estimator rejected harness-produced streams")
     });
     let is_tokenizer_null = spec.metric == "tokenize_docs_per_second";
@@ -6503,31 +6505,43 @@ mod tests {
             worker_id: "hostile-test".to_owned(),
             build_profile: "release-perf".to_owned(),
         };
+        let authority_receipt = hostile_tantivy_continuous_receipt();
+        let mut config = PairedEstimatorConfig::predeclared(0x5147_314c_4946_4543);
+        config
+            .install_qg1_lifecycle_authority(
+                scope.clone(),
+                provenance.corpus_sha256.clone(),
+                authority_receipt.prepared_input.manifest_sha256.clone(),
+                authority_receipt
+                    .prepared_input
+                    .indexed_content_sha256
+                    .clone(),
+                authority_receipt.prepared_input.document_count,
+                authority_receipt.prepared_input.content_bytes,
+                authority_receipt.prepared_input.batch_count,
+                authority_receipt
+                    .batches
+                    .iter()
+                    .map(|batch| Qg1BatchCoverage {
+                        document_start: batch.document_start,
+                        document_count: batch.document_count,
+                    })
+                    .collect(),
+                authority_receipt.prepared_input.tail_document_id.clone(),
+                10,
+                vec![
+                    "qg1.effect.tantivy_vs_quill.v1".to_owned(),
+                    "qg1.null.tantivy.v1".to_owned(),
+                    "qg1.null.quill.v1".to_owned(),
+                ],
+            )
+            .expect("freeze hostile test lifecycle authority");
         let binding_from_receipt = |receipt: super::Qg1ContinuousTimingReceipt,
                                     stream_role: &str,
                                     stream_sequence: u64,
                                     sample_id: u64,
                                     block_id: u64,
                                     arm: PerfSampleArm| {
-            let batch_coverage = receipt
-                .batches
-                .iter()
-                .map(|batch| Qg1BatchCoverage {
-                    document_start: batch.document_start,
-                    document_count: batch.document_count,
-                })
-                .collect::<Vec<_>>();
-            let trusted_cell_input_sha256 = Qg1SampleBinding::trusted_cell_input_sha256(
-                &scope,
-                &provenance,
-                &receipt.prepared_input.manifest_sha256,
-                &receipt.prepared_input.indexed_content_sha256,
-                receipt.prepared_input.document_count,
-                receipt.prepared_input.content_bytes,
-                receipt.prepared_input.batch_count,
-                &batch_coverage,
-                &receipt.prepared_input.tail_document_id,
-            );
             let continuous = super::Qg1ContinuousMeasurement {
                 work_units: receipt.document_count,
                 origin: std::time::Instant::now(),
@@ -6540,11 +6554,9 @@ mod tests {
                 continuous.elapsed_ns,
                 &scope,
                 &provenance,
+                &config,
                 stream_role,
                 stream_sequence,
-                20,
-                10,
-                &trusted_cell_input_sha256,
                 sample_id,
                 block_id,
                 arm,
@@ -6657,7 +6669,6 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let config = PairedEstimatorConfig::predeclared(0x5147_314c_4946_4543);
         let valid_effect = stream(
             Some(hostile_tantivy_continuous_receipt()),
             Some(quill_receipt.clone()),
