@@ -47,7 +47,7 @@ use crate::simd::{dot_4bit_prepared, dot_i8_i8, dot_product_f16_f32, prepare_4bi
 use crate::{FsviV2Witness, ValidatedFsviBytes, VectorIndex};
 
 const EXACT_RESIDUAL_SIDECAR_MAGIC: [u8; 8] = *b"FSRSIDX1";
-const EXACT_RESIDUAL_SIDECAR_VERSION: u32 = 1;
+const EXACT_RESIDUAL_SIDECAR_VERSION: u32 = 2;
 const EXACT_RESIDUAL_BLOCK: usize = 32;
 const EXACT_RESIDUAL_LANES: usize = 8;
 const EXACT_RESIDUAL_SIDECAR_HEADER_BYTES: usize = 8 + 4 + 4 * 32 + 8 + 8 + 4 + 4;
@@ -64,12 +64,67 @@ const EXACT_RESIDUAL_SIDECAR_MAX_DIMENSION: usize = 65_536;
 /// claim: every result still uses the exact f16 scorer.
 const EXACT_RESIDUAL_ADAPTIVE_PROBE_GROUPS: usize = 32;
 /// Bound generation-name collision retries while publishing an optional cache
-/// artifact. Cache discovery deliberately scans every matching immutable entry:
-/// a valid sidecar must not become unreachable merely because arbitrary
-/// directory iteration yielded many stale/corrupt siblings first.
+/// artifact. Discovery has separate fixed entry and comparison budgets; if
+/// either is exhausted, the optional cache simply remains unavailable.
 const EXACT_RESIDUAL_CACHE_ATTEMPTS: usize = 64;
+/// Bound every optional-cache directory walk, including unrelated entries.
+/// Reaching this fixed limit rejects the cache as unavailable for this open;
+/// publication is skipped rather than making an unbounded directory a source
+/// of source-derived allocation or I/O.
+const EXACT_RESIDUAL_CACHE_DIRECTORY_ENTRY_LIMIT: usize = 256;
+/// Bound the number of descriptor-stream comparisons after a candidate passes
+/// the fixed-header admission. This remains above the prior sixty-four-entry
+/// regression while preventing a cache full of tiny corrupt siblings from
+/// turning a product open into unbounded repeated work.
+const EXACT_RESIDUAL_CACHE_COMPARISON_CANDIDATE_LIMIT: usize = 128;
+/// Bound the total bytes that descriptor-stream comparison can read during one
+/// product open. The cap admits one maximum-sized sidecar, but never 1024 of
+/// them. Exhaustion is an optional-cache miss and skips publication.
+const EXACT_RESIDUAL_CACHE_COMPARISON_BYTE_BUDGET: usize = EXACT_RESIDUAL_SIDECAR_MAX_BYTES;
 
 static EXACT_RESIDUAL_CACHE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+std::thread_local! {
+    /// Deterministic seam for the cache-only query-transform allocation path.
+    /// It is thread-local so concurrent tests cannot make another search take
+    /// an unintended fallback.
+    static FAIL_NEXT_RESIDUAL_QUERY_TRANSFORM_ALLOCATION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Independent seam for allocation of the query suffix envelopes.
+    static FAIL_NEXT_RESIDUAL_QUERY_SUFFIX_ALLOCATION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_next_residual_query_transform_allocation() {
+    FAIL_NEXT_RESIDUAL_QUERY_TRANSFORM_ALLOCATION.with(|failure| failure.set(true));
+}
+
+#[cfg(test)]
+fn take_residual_query_transform_allocation_failure() -> bool {
+    FAIL_NEXT_RESIDUAL_QUERY_TRANSFORM_ALLOCATION.with(|failure| failure.replace(false))
+}
+
+#[cfg(test)]
+fn residual_query_transform_allocation_failure_is_pending() -> bool {
+    FAIL_NEXT_RESIDUAL_QUERY_TRANSFORM_ALLOCATION.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn fail_next_residual_query_suffix_allocation() {
+    FAIL_NEXT_RESIDUAL_QUERY_SUFFIX_ALLOCATION.with(|failure| failure.set(true));
+}
+
+#[cfg(test)]
+fn take_residual_query_suffix_allocation_failure() -> bool {
+    FAIL_NEXT_RESIDUAL_QUERY_SUFFIX_ALLOCATION.with(|failure| failure.replace(false))
+}
+
+#[cfg(test)]
+fn residual_query_suffix_allocation_failure_is_pending() -> bool {
+    FAIL_NEXT_RESIDUAL_QUERY_SUFFIX_ALLOCATION.with(std::cell::Cell::get)
+}
 
 #[derive(Clone, Copy, Debug)]
 struct ExactResidualLayout {
@@ -128,6 +183,16 @@ struct ResidualQueryTransform {
 enum ExactResidualPublication {
     Published,
     DestinationExists,
+}
+
+/// An already-open unnamed inode plus the held no-follow parent descriptor.
+/// Acquiring it proves that the optional cache can create an anonymous durable
+/// candidate before source-derived sidecar allocation begins.
+#[cfg(target_os = "linux")]
+struct ExactResidualPublicationCapability {
+    directory: OwnedFd,
+    destination: OsString,
+    file: File,
 }
 
 impl ExactResidualLayout {
@@ -255,6 +320,7 @@ impl ExactResidualSidecar {
         self.dimension.div_ceil(self.block)
     }
 
+    #[cfg(test)]
     fn is_bound_to(&self, source: &ResidualSourceBinding, count: usize, dimension: usize) -> bool {
         self.source == *source
             && self.count == count
@@ -279,6 +345,7 @@ impl ExactResidualSidecar {
         Ok(layout)
     }
 
+    #[cfg(test)]
     fn encode(&self) -> SearchResult<Vec<u8>> {
         let layout = self.validated_layout()?;
         let mut bytes = Vec::new();
@@ -337,6 +404,7 @@ impl ExactResidualSidecar {
         Ok(bytes)
     }
 
+    #[cfg(test)]
     fn decode(bytes: &[u8]) -> SearchResult<Self> {
         if bytes.len() > EXACT_RESIDUAL_SIDECAR_MAX_BYTES {
             return Err(residual_sidecar_error(
@@ -494,80 +562,7 @@ impl ExactResidualSidecar {
         Ok(cursor.is_exhausted())
     }
 
-    /// Validate a complete byte image's fixed source metadata and integrity
-    /// trailer without decoding transformed vectors. Test-only byte fixtures
-    /// use this; public admission streams from one descriptor instead.
-    fn encoded_header_matches_source(
-        bytes: &[u8],
-        source: &ResidualSourceBinding,
-        count: usize,
-        dimension: usize,
-    ) -> SearchResult<bool> {
-        if bytes.len() > EXACT_RESIDUAL_SIDECAR_MAX_BYTES
-            || bytes.len() < EXACT_RESIDUAL_SIDECAR_HEADER_BYTES
-            || !Self::header_matches_source(
-                &bytes[..EXACT_RESIDUAL_SIDECAR_HEADER_BYTES],
-                source,
-                count,
-                dimension,
-            )?
-        {
-            return Ok(false);
-        }
-        let layout = ExactResidualLayout::for_shape(count, dimension)?;
-        if bytes.len() != layout.encoded_bytes {
-            return Ok(false);
-        }
-        let integrity_start = bytes
-            .len()
-            .checked_sub(EXACT_RESIDUAL_SIDECAR_DIGEST_BYTES)
-            .ok_or_else(|| residual_sidecar_error("integrity", "digest is truncated"))?;
-        let supplied_digest: [u8; EXACT_RESIDUAL_SIDECAR_DIGEST_BYTES] = bytes[integrity_start..]
-            .try_into()
-            .map_err(|_| residual_sidecar_error("integrity", "digest is truncated"))?;
-        let expected_digest: [u8; EXACT_RESIDUAL_SIDECAR_DIGEST_BYTES] =
-            Sha256::digest(&bytes[..integrity_start]).into();
-        Ok(supplied_digest == expected_digest)
-    }
-
-    /// Compare an integrity-checked byte image to the source-derived transform
-    /// without allocating decoded payload vectors. The caller first validates
-    /// this header, drops that raw image, derives `expected`, then re-reads and
-    /// invokes this method; a mutation between descriptors therefore fails
-    /// closed instead of being attached.
-    fn encoded_exactly_matches_derived(bytes: &[u8], expected: &Self) -> SearchResult<bool> {
-        if !Self::encoded_header_matches_source(
-            bytes,
-            &expected.source,
-            expected.count,
-            expected.dimension,
-        )? {
-            return Ok(false);
-        }
-        let mut cursor = SidecarCursor::new(bytes);
-        let _ = cursor.take("header", EXACT_RESIDUAL_SIDECAR_HEADER_BYTES)?;
-        for &value in &expected.permutation {
-            if cursor.u32("permutation")? != value {
-                return Ok(false);
-            }
-        }
-        for values in [
-            &expected.centroids,
-            &expected.residuals,
-            &expected.suffix_norms,
-            &expected.correction_norms,
-        ] {
-            for &value in values {
-                let actual = f32::from_le_bytes(cursor.take_array("transformed_payload")?);
-                if actual.to_bits() != value.to_bits() {
-                    return Ok(false);
-                }
-            }
-        }
-        let _ = cursor.take_array::<EXACT_RESIDUAL_SIDECAR_DIGEST_BYTES>("integrity")?;
-        Ok(cursor.is_exhausted())
-    }
-
+    #[cfg(test)]
     fn exactly_matches_derived(&self, expected: &Self) -> bool {
         self.source == expected.source
             && self.count == expected.count
@@ -638,7 +633,7 @@ fn write_sidecar_f32_values(
 
 /// Serialize directly into an owned unnamed inode. Publication never needs a
 /// second `Vec<u8>` alongside the source-derived transform; the exact layout
-/// and whole-file digest are identical to [`ExactResidualSidecar::encode`].
+/// and whole-file digest match the test-only sidecar encoder's wire format.
 #[cfg(target_os = "linux")]
 fn write_exact_residual_sidecar_stream(
     file: &mut File,
@@ -727,6 +722,7 @@ impl<'a> SidecarCursor<'a> {
         Ok(u64::from_le_bytes(self.take_array(field)?))
     }
 
+    #[cfg(test)]
     fn f32_vec(&mut self, field: &str, len: usize, nonnegative: bool) -> SearchResult<Vec<f32>> {
         let byte_len = len
             .checked_mul(std::mem::size_of::<f32>())
@@ -753,6 +749,7 @@ impl<'a> SidecarCursor<'a> {
         self.offset == self.bytes.len()
     }
 
+    #[cfg(test)]
     const fn remaining(&self) -> usize {
         self.bytes.len() - self.offset
     }
@@ -766,6 +763,7 @@ fn residual_sidecar_error(field: &str, reason: &str) -> SearchError {
     }
 }
 
+#[cfg(test)]
 fn f32_bits_equal(left: &[f32], right: &[f32]) -> bool {
     left.len() == right.len()
         && left
@@ -832,45 +830,8 @@ fn open_exact_residual_sidecar_parent(path: &Path) -> SearchResult<(OwnedFd, OsS
     Ok((directory, name.to_os_string()))
 }
 
-/// Read an optional sidecar through one no-follow descriptor.  The size and
-/// descriptor identity are checked before and after the bounded owned read;
-/// races or special files simply decline this optional optimization.
 #[cfg(target_os = "linux")]
-fn read_exact_residual_sidecar(path: &Path) -> SearchResult<Option<Vec<u8>>> {
-    read_exact_residual_sidecar_from_descriptor(path)
-}
-
-/// Read precisely a caller's descriptor-size snapshot. A short stream models
-/// truncation after `fstat`; one trailing byte models growth after `fstat`.
-/// Both fail closed without permitting a capacity-growing `read_to_end` path.
-#[cfg(target_os = "linux")]
-fn read_exact_sidecar_snapshot<R: Read>(
-    reader: &mut R,
-    byte_len: usize,
-) -> SearchResult<Option<Vec<u8>>> {
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(byte_len)
-        .map_err(|_| residual_sidecar_error("open", "sidecar allocation failed"))?;
-    bytes.resize(byte_len, 0);
-    match reader.read_exact(&mut bytes) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(residual_sidecar_error("open", &error.to_string())),
-    }
-    let mut trailing = [0_u8; 1];
-    if reader
-        .read(&mut trailing)
-        .map_err(|error| residual_sidecar_error("open", &error.to_string()))?
-        != 0
-    {
-        return Ok(None);
-    }
-    Ok(Some(bytes))
-}
-
-#[cfg(target_os = "linux")]
-fn read_exact_residual_sidecar_from_descriptor(path: &Path) -> SearchResult<Option<Vec<u8>>> {
+fn open_exact_residual_sidecar_file(path: &Path) -> SearchResult<Option<(File, rustix::fs::Stat)>> {
     use rustix::fs::{FileType, Mode, OFlags, fstat, openat};
     use rustix::io::Errno;
 
@@ -893,51 +854,211 @@ fn read_exact_residual_sidecar_from_descriptor(path: &Path) -> SearchResult<Opti
     if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile || before.st_nlink != 1 {
         return Ok(None);
     }
+    Ok(Some((File::from(descriptor), before)))
+}
+
+#[cfg(target_os = "linux")]
+fn same_exact_residual_sidecar_file(
+    file: &File,
+    before: &rustix::fs::Stat,
+    expected_len: usize,
+) -> SearchResult<bool> {
+    use rustix::fs::fstat;
+
+    let after = fstat(file).map_err(|error| residual_sidecar_error("open", &error.to_string()))?;
+    let actual_len = usize::try_from(after.st_size)
+        .map_err(|_| residual_sidecar_error("open", "sidecar size does not fit this platform"))?;
+    Ok(actual_len == expected_len
+        && after.st_dev == before.st_dev
+        && after.st_ino == before.st_ino
+        && after.st_size == before.st_size
+        && after.st_nlink == before.st_nlink)
+}
+
+#[cfg(target_os = "linux")]
+fn read_sidecar_piece<R: Read>(
+    reader: &mut R,
+    digest: &mut Sha256,
+    expected: &[u8],
+) -> SearchResult<bool> {
+    let mut actual = [0_u8; 4096];
+    let mut offset = 0_usize;
+    while offset < expected.len() {
+        let take = (expected.len() - offset).min(actual.len());
+        match reader.read_exact(&mut actual[..take]) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(error) => return Err(residual_sidecar_error("open", &error.to_string())),
+        }
+        digest.update(&actual[..take]);
+        if actual[..take] != expected[offset..offset + take] {
+            return Ok(false);
+        }
+        offset += take;
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn read_sidecar_u32_values<R: Read>(
+    reader: &mut R,
+    digest: &mut Sha256,
+    values: &[u32],
+) -> SearchResult<bool> {
+    let mut expected = [0_u8; 4096];
+    for values in values.chunks(expected.len() / std::mem::size_of::<u32>()) {
+        for (slot, value) in expected
+            .chunks_exact_mut(std::mem::size_of::<u32>())
+            .zip(values)
+        {
+            slot.copy_from_slice(&value.to_le_bytes());
+        }
+        let byte_len = values.len() * std::mem::size_of::<u32>();
+        if !read_sidecar_piece(reader, digest, &expected[..byte_len])? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn read_sidecar_f32_values<R: Read>(
+    reader: &mut R,
+    digest: &mut Sha256,
+    values: &[f32],
+) -> SearchResult<bool> {
+    let mut expected = [0_u8; 4096];
+    for values in values.chunks(expected.len() / std::mem::size_of::<f32>()) {
+        for (slot, value) in expected
+            .chunks_exact_mut(std::mem::size_of::<f32>())
+            .zip(values)
+        {
+            slot.copy_from_slice(&value.to_le_bytes());
+        }
+        let byte_len = values.len() * std::mem::size_of::<f32>();
+        if !read_sidecar_piece(reader, digest, &expected[..byte_len])? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn exact_residual_sidecar_header_matches_source(
+    path: &Path,
+    source: &ResidualSourceBinding,
+    count: usize,
+    dimension: usize,
+) -> SearchResult<bool> {
+    let layout = ExactResidualLayout::for_shape(count, dimension)?;
+    let Some((mut file, before)) = open_exact_residual_sidecar_file(path)? else {
+        return Ok(false);
+    };
     let byte_len = usize::try_from(before.st_size)
         .map_err(|_| residual_sidecar_error("open", "sidecar size does not fit this platform"))?;
-    if byte_len > EXACT_RESIDUAL_SIDECAR_MAX_BYTES {
-        return Ok(None);
+    if byte_len != layout.encoded_bytes {
+        return Ok(false);
     }
-    let mut file = File::from(descriptor);
-    let bytes = match read_exact_sidecar_snapshot(&mut file, byte_len)? {
-        Some(bytes) => bytes,
-        None => return Ok(None),
-    };
-    let after = fstat(&file).map_err(|error| residual_sidecar_error("open", &error.to_string()))?;
-    if bytes.len() != byte_len
-        || after.st_dev != before.st_dev
-        || after.st_ino != before.st_ino
-        || after.st_size != before.st_size
-        || after.st_nlink != before.st_nlink
-    {
-        return Ok(None);
+    let mut header = [0_u8; EXACT_RESIDUAL_SIDECAR_HEADER_BYTES];
+    match file.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+        Err(error) => return Err(residual_sidecar_error("open", &error.to_string())),
     }
-    Ok(Some(bytes))
+    Ok(
+        ExactResidualSidecar::header_matches_source(&header, source, count, dimension)?
+            && same_exact_residual_sidecar_file(&file, &before, layout.encoded_bytes)?,
+    )
 }
 
-#[cfg(not(target_os = "linux"))]
-fn read_exact_residual_sidecar(_path: &Path) -> SearchResult<Option<Vec<u8>>> {
-    // The sidecar is optional; on platforms without the descriptor contract,
-    // decline it and retain the established flat scan rather than accepting a
-    // weaker path-based admission.
-    Ok(None)
-}
-
-/// Publish an unnamed Linux temporary inode through its still-open descriptor,
-/// then fsync the held parent directory. `linkat` never replaces a destination,
-/// and the unnamed inode is reclaimed automatically on failures before that
-/// link. Once linked, a parent-directory `sync_all` failure is reported but
-/// the visible destination is deliberately left intact: unlinking it would
-/// race the now-published immutable artifact and could erase a durable cache.
-/// There is deliberately no replace fallback: a filesystem without this atomic
-/// no-replace primitive cannot publish the optional cache.
+/// Compare a stream to one source-derived sidecar after the caller has fixed
+/// its descriptor size with `fstat`. Every payload read is exact and the final
+/// one-byte probe rejects growth without materializing a raw sidecar image.
+/// The generic reader is an intentional deterministic truncation-after-fstat
+/// test seam; production passes the held no-follow descriptor itself.
 #[cfg(target_os = "linux")]
-fn publish_exact_residual_sidecar(
+fn exact_residual_sidecar_stream_matches_reader<R: Read>(
+    reader: &mut R,
+    expected: &ExactResidualSidecar,
+) -> SearchResult<bool> {
+    let _ = expected.validated_layout()?;
+    let mut header = [0_u8; EXACT_RESIDUAL_SIDECAR_HEADER_BYTES];
+    match reader.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+        Err(error) => return Err(residual_sidecar_error("open", &error.to_string())),
+    }
+    if !ExactResidualSidecar::header_matches_source(
+        &header,
+        &expected.source,
+        expected.count,
+        expected.dimension,
+    )? {
+        return Ok(false);
+    }
+
+    let mut digest = Sha256::new();
+    digest.update(header);
+    if !read_sidecar_u32_values(reader, &mut digest, &expected.permutation)? {
+        return Ok(false);
+    }
+    for values in [
+        &expected.centroids,
+        &expected.residuals,
+        &expected.suffix_norms,
+        &expected.correction_norms,
+    ] {
+        if !read_sidecar_f32_values(reader, &mut digest, values)? {
+            return Ok(false);
+        }
+    }
+    let mut supplied_digest = [0_u8; EXACT_RESIDUAL_SIDECAR_DIGEST_BYTES];
+    match reader.read_exact(&mut supplied_digest) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+        Err(error) => return Err(residual_sidecar_error("open", &error.to_string())),
+    }
+    let mut trailing = [0_u8; 1];
+    if reader
+        .read(&mut trailing)
+        .map_err(|error| residual_sidecar_error("open", &error.to_string()))?
+        != 0
+    {
+        return Ok(false);
+    }
+    let expected_digest: [u8; EXACT_RESIDUAL_SIDECAR_DIGEST_BYTES] = digest.finalize().into();
+    Ok(supplied_digest == expected_digest)
+}
+
+#[cfg(target_os = "linux")]
+fn exact_residual_sidecar_stream_matches_derived(
     path: &Path,
-    sidecar: &ExactResidualSidecar,
-) -> SearchResult<ExactResidualPublication> {
-    use rustix::fs::{AtFlags, CWD, Mode, OFlags, linkat, openat};
-    use rustix::io::Errno;
+    expected: &ExactResidualSidecar,
+) -> SearchResult<bool> {
+    let layout = expected.validated_layout()?;
+    let Some((mut file, before)) = open_exact_residual_sidecar_file(path)? else {
+        return Ok(false);
+    };
+    let byte_len = usize::try_from(before.st_size)
+        .map_err(|_| residual_sidecar_error("open", "sidecar size does not fit this platform"))?;
+    if byte_len != layout.encoded_bytes {
+        return Ok(false);
+    }
+    Ok(
+        exact_residual_sidecar_stream_matches_reader(&mut file, expected)?
+            && same_exact_residual_sidecar_file(&file, &before, layout.encoded_bytes)?,
+    )
+}
+
+/// Acquire an unnamed inode through a no-follow parent descriptor before any
+/// large source-derived sidecar allocation. Failure proves the optional cache
+/// cannot publish and callers must retain the exact flat route without deriving
+/// a payload that would be discarded.
+#[cfg(target_os = "linux")]
+fn acquire_exact_residual_sidecar_publication(
+    path: &Path,
+) -> SearchResult<ExactResidualPublicationCapability> {
+    use rustix::fs::{Mode, OFlags, openat};
 
     let (directory, destination) = open_exact_residual_sidecar_parent(path)?;
     let descriptor = openat(
@@ -947,7 +1068,28 @@ fn publish_exact_residual_sidecar(
         Mode::RUSR | Mode::WUSR,
     )
     .map_err(|error| residual_sidecar_error("publish", &error.to_string()))?;
-    let mut file = File::from(descriptor);
+    Ok(ExactResidualPublicationCapability {
+        directory,
+        destination,
+        file: File::from(descriptor),
+    })
+}
+
+/// Consume a previously acquired publication capability, then fsync the held
+/// parent directory. `linkat` never replaces a destination, and the unnamed
+/// inode is reclaimed automatically on failures before that link. Once linked,
+/// a parent-directory `sync_all` failure is reported but the visible destination
+/// is deliberately left intact: unlinking it would race the now-published
+/// immutable artifact and could erase a durable cache.
+#[cfg(target_os = "linux")]
+fn publish_exact_residual_sidecar_with_capability(
+    capability: ExactResidualPublicationCapability,
+    sidecar: &ExactResidualSidecar,
+) -> SearchResult<ExactResidualPublication> {
+    use rustix::fs::{AtFlags, CWD, linkat};
+    use rustix::io::Errno;
+
+    let mut file = capability.file;
     write_exact_residual_sidecar_stream(&mut file, sidecar)?;
     file.sync_all()
         .map_err(|error| residual_sidecar_error("publish", &error.to_string()))?;
@@ -959,8 +1101,8 @@ fn publish_exact_residual_sidecar(
     match linkat(
         CWD,
         Path::new(&descriptor_path),
-        &directory,
-        &destination,
+        &capability.directory,
+        &capability.destination,
         AtFlags::SYMLINK_FOLLOW,
     ) {
         Ok(()) => {}
@@ -968,10 +1110,22 @@ fn publish_exact_residual_sidecar(
         Err(error) => return Err(residual_sidecar_error("publish", &error.to_string())),
     }
     drop(file);
-    File::from(directory)
+    File::from(capability.directory)
         .sync_all()
         .map_err(|error| residual_sidecar_error("publish", &error.to_string()))?;
     Ok(ExactResidualPublication::Published)
+}
+
+/// One-shot public writer wrapper. Product construction may acquire and hold
+/// the capability before it derives the sidecar; callers of the explicit write
+/// API simply acquire and consume it in this call.
+#[cfg(target_os = "linux")]
+fn publish_exact_residual_sidecar(
+    path: &Path,
+    sidecar: &ExactResidualSidecar,
+) -> SearchResult<ExactResidualPublication> {
+    let capability = acquire_exact_residual_sidecar_publication(path)?;
+    publish_exact_residual_sidecar_with_capability(capability, sidecar)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1000,11 +1154,25 @@ fn outward_f32_norm(value: f64, field: &str) -> SearchResult<f32> {
     // Persist an outward-rounded envelope, not a rounded-down estimate.  The
     // additional epsilon term covers the f64->f32 conversion and later f32
     // multiplication in a conservative Cauchy--Schwarz upper bound.
-    Ok(narrowed.mul_add(1.0 + 4.0 * f32::EPSILON, 4.0 * f32::EPSILON))
+    let outward = narrowed.mul_add(1.0 + 4.0 * f32::EPSILON, 4.0 * f32::EPSILON);
+    if !outward.is_finite() {
+        return Err(residual_sidecar_error(
+            field,
+            "outward norm does not fit f32",
+        ));
+    }
+    Ok(outward)
 }
 
 impl ResidualQueryTransform {
     fn from_query(query: &[f32], sidecar: &ExactResidualSidecar) -> SearchResult<Self> {
+        #[cfg(test)]
+        if take_residual_query_transform_allocation_failure() {
+            return Err(residual_sidecar_error(
+                "query",
+                "injected transform allocation failure",
+            ));
+        }
         let mut transformed = Vec::new();
         transformed
             .try_reserve_exact(sidecar.dimension)
@@ -1018,16 +1186,23 @@ impl ResidualQueryTransform {
             })?;
             transformed.push(value);
         }
-        let norm_sq: f64 = transformed
+        let norm_sq = transformed
             .iter()
-            .map(|&value| f64::from(value) * f64::from(value))
-            .sum();
-        let norm = norm_sq.sqrt();
+            .try_fold(0.0_f64, |sum, &value| {
+                finite_f64_mul(f64::from(value), f64::from(value))
+                    .and_then(|square| finite_f64_add(sum, square))
+            })
+            .unwrap_or(f64::INFINITY);
+        // This norm multiplies the residual/correction envelopes in the
+        // pruning inequality, so retain an outward f64 value rather than the
+        // nearest-root value used only for presentation.
+        let norm =
+            outward_f64_norm_from_square_sum(norm_sq, sidecar.dimension).unwrap_or(f64::INFINITY);
         // The interval arithmetic itself is f64, but the authoritative scorer
         // is f32. `f32_flat_envelope` bounds the real absolute dot product of
         // this query against any finite f16 row. The standard Higham model for
-        // at most `2d + 2` rounded f32 products/additions gives
-        // `|fl(dot) - dot| <= gamma_(2d + 2) * envelope`, where
+        // at most `2d + 32` rounded f32 products/additions gives
+        // `|fl(dot) - dot| <= gamma_(2d + 32) * envelope`, where
         // `gamma_n = n*u/(1-n*u)` and `u = f32::EPSILON / 2`. The scalar f16
         // fallback and the SIMD reduction both use no more than that operation
         // budget; the bound is intentionally looser than either implementation.
@@ -1036,14 +1211,22 @@ impl ResidualQueryTransform {
         // subnormal for every rounded operation as well.
         // If this envelope could approach f32 overflow, retain the incumbent
         // flat route rather than compare a finite interval to an `inf` tie.
-        let f32_flat_envelope = transformed
-            .iter()
-            .map(|value| f64::from(value.abs()))
-            .sum::<f64>()
-            * f64::from(f16::MAX.to_f32());
+        let f32_flat_sum = transformed.iter().try_fold(0.0_f64, |sum, value| {
+            finite_f64_add(sum, f64::from(value.abs()))
+        });
+        let f32_flat_envelope = f32_flat_sum
+            .and_then(|sum| finite_f64_mul(sum, f64::from(f16::MAX.to_f32())))
+            .unwrap_or(f64::INFINITY);
         let flat_f32_rounding_error = f32_flat_rounding_error(sidecar.dimension, f32_flat_envelope)
             .filter(|error| error.is_finite())
             .unwrap_or(f64::INFINITY);
+        #[cfg(test)]
+        if take_residual_query_suffix_allocation_failure() {
+            return Err(residual_sidecar_error(
+                "query_suffix",
+                "injected suffix allocation failure",
+            ));
+        }
         let mut suffix_norms =
             try_filled_sidecar_vec(sidecar.block_count() + 1, 0.0_f64, "query_suffix")?;
         let mut suffix_sum = 0.0_f64;
@@ -1053,23 +1236,24 @@ impl ResidualQueryTransform {
             for &value in &transformed[start..end] {
                 suffix_sum += f64::from(value) * f64::from(value);
             }
-            suffix_norms[block_index] = suffix_sum.sqrt();
+            suffix_norms[block_index] =
+                outward_f64_norm_from_square_sum(suffix_sum, sidecar.dimension)
+                    .unwrap_or(f64::INFINITY);
         }
         Ok(Self {
             transformed,
             norm,
             suffix_norms,
             flat_f32_rounding_error,
-            f32_flat_envelope_is_finite: f32_flat_envelope.is_finite()
-                && flat_f32_rounding_error.is_finite()
-                && f32_flat_envelope + flat_f32_rounding_error < f64::from(f32::MAX) * 0.5,
+            f32_flat_envelope_is_finite: finite_f64_add(f32_flat_envelope, flat_f32_rounding_error)
+                .is_some_and(|total| total < f64::from(f32::MAX) * 0.5),
         })
     }
 }
 
 #[allow(clippy::cast_precision_loss)]
 fn f32_rounding_gamma(dimension: usize) -> Option<f64> {
-    let operation_count = dimension.checked_mul(2)?.checked_add(2)?;
+    let operation_count = f32_authoritative_dot_operation_count(dimension)?;
     let unit_roundoff = f64::from(f32::EPSILON) * 0.5;
     let rounded_operations = operation_count as f64;
     let numerator = finite_f64_mul(rounded_operations, unit_roundoff)?;
@@ -1083,7 +1267,7 @@ fn f32_rounding_gamma(dimension: usize) -> Option<f64> {
 
 #[allow(clippy::cast_precision_loss)]
 fn f32_flat_rounding_error(dimension: usize, envelope: f64) -> Option<f64> {
-    let operation_count = dimension.checked_mul(2)?.checked_add(2)?;
+    let operation_count = f32_authoritative_dot_operation_count(dimension)?;
     let relative = finite_f64_mul(envelope, f32_rounding_gamma(dimension)?)?;
     // IEEE-754 gradual underflow gives each subnormal-result rounding an
     // absolute error no greater than half the least f32 subnormal. Adding one
@@ -1109,6 +1293,42 @@ fn finite_f64_add(left: f64, right: f64) -> Option<f64> {
     sum.is_finite().then_some(sum)
 }
 
+/// Outward round a finite non-negative norm after its f64 square root. The
+/// residual bound consumes this result as a multiplier, so a nearest-even root
+/// may not be used directly.
+fn outward_f64_sqrt(square: f64) -> Option<f64> {
+    if !square.is_finite() || square < 0.0 {
+        return None;
+    }
+    let root = square.sqrt();
+    root.is_finite().then(|| root.next_up())
+}
+
+/// Conservative scalar-operation budget for the authoritative
+/// [`dot_product_f16_f32`] scorer. Each dimension has a multiply and a SIMD
+/// accumulator add; the four accumulator tree adds 3 × 8 lanes, `reduce_add`
+/// adds 7 lanes, and one spare operation covers dispatch-equivalent tails and
+/// reduction details. Thus this is at least `2d + 32` for every actual route.
+fn f32_authoritative_dot_operation_count(dimension: usize) -> Option<usize> {
+    dimension.checked_mul(2)?.checked_add(32)
+}
+
+/// Copy a source-owned document id without relying on infallible `Clone` or
+/// `to_owned` allocation. The in-memory product must retain ownership after
+/// its file-backed source is dropped, but an allocation failure remains a typed
+/// opening error rather than an abort.
+fn fallible_doc_id_copy(value: &str) -> SearchResult<String> {
+    let mut copy = String::new();
+    copy.try_reserve_exact(value.len())
+        .map_err(|_| SearchError::InvalidConfig {
+            field: "vectors.doc_id".to_owned(),
+            value: value.len().to_string(),
+            reason: "document-id allocation failed".to_owned(),
+        })?;
+    copy.push_str(value);
+    Ok(copy)
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn f64_rounding_gamma(dimension: usize) -> Option<f64> {
     // Centroid and residual partials each have one multiply plus one add per
@@ -1124,6 +1344,19 @@ fn f64_rounding_gamma(dimension: usize) -> Option<f64> {
     }
     let gamma = numerator / denominator;
     gamma.is_finite().then_some(gamma)
+}
+
+/// Convert a rounded f64 sum-of-squares into an outward norm. The f64 gamma
+/// first inflates the finite reduction error, then `outward_f64_sqrt` expands
+/// the final root. This value is consumed by the decomposition magnitude, so
+/// neither nearest-even step is allowed to point inward.
+fn outward_f64_norm_from_square_sum(square_sum: f64, dimension: usize) -> Option<f64> {
+    if !square_sum.is_finite() || square_sum < 0.0 {
+        return None;
+    }
+    let inflation = finite_f64_mul(square_sum, f64_rounding_gamma(dimension)?)?;
+    let outward_square = finite_f64_add(square_sum, inflation)?;
+    outward_f64_sqrt(outward_square)
 }
 
 /// Conservative per-lane upper bound for the exact f16 score before the
@@ -1336,7 +1569,21 @@ impl InMemoryVectorIndex {
             });
         }
         let count = doc_ids.len();
-        let mut flat = Vec::with_capacity(count * dimension);
+        let flat_capacity =
+            count
+                .checked_mul(dimension)
+                .ok_or_else(|| SearchError::InvalidConfig {
+                    field: "vectors".to_owned(),
+                    value: format!("count={count}, dimension={dimension}"),
+                    reason: "vector slab length overflow".to_owned(),
+                })?;
+        let mut flat = Vec::new();
+        flat.try_reserve_exact(flat_capacity)
+            .map_err(|_| SearchError::InvalidConfig {
+                field: "vectors".to_owned(),
+                value: format!("count={count}, dimension={dimension}"),
+                reason: "vector slab allocation failed".to_owned(),
+            })?;
         for (i, vec) in vectors.into_iter().enumerate() {
             if vec.len() != dimension {
                 return Err(SearchError::DimensionMismatch {
@@ -1474,15 +1721,79 @@ impl InMemoryVectorIndex {
         cache_dir: &Path,
     ) -> SearchResult<Self> {
         let index = Self::from_admitted_v2(source)?;
-        if index
-            .try_open_exact_residual_sidecar_cache(cache_dir)
-            .unwrap_or(false)
-        {
-            return Ok(index);
-        }
-        let Ok(sidecar) = index.build_exact_residual_sidecar() else {
-            return Ok(index);
+        let candidates = match index.exact_residual_sidecar_cache_candidates(cache_dir) {
+            Ok(Some(candidates)) => candidates,
+            // A cache directory that cannot be safely enumerated, or exhausts
+            // its fixed discovery/comparison budget, is unavailable. Do not
+            // build a large sidecar merely to discard it after an inevitable
+            // publication failure; flat exact search is already the semantic
+            // default. In this case publication is deliberately skipped.
+            Ok(None) | Err(_) => return Ok(index),
         };
+        // An empty readable directory does not prove the create-only
+        // publication primitive works. Hold the anonymous inode first, before
+        // spending up to the sidecar resource bound on derivation. Candidate
+        // headers are a possible reusable artifact and therefore retain their
+        // comparison-first path below.
+        #[cfg(target_os = "linux")]
+        let mut reserved_publication = if candidates.is_empty() {
+            let candidate = match index.next_exact_residual_sidecar_cache_path(cache_dir) {
+                Ok(candidate) => candidate,
+                Err(_) => return Ok(index),
+            };
+            match acquire_exact_residual_sidecar_publication(&candidate) {
+                Ok(capability) => Some(capability),
+                Err(_) => return Ok(index),
+            }
+        } else {
+            None
+        };
+        let mut derived = None;
+        for candidate in candidates {
+            if derived.is_none() {
+                let Ok(sidecar) = index.build_exact_residual_sidecar() else {
+                    return Ok(index);
+                };
+                derived = Some(sidecar);
+            }
+            #[cfg(target_os = "linux")]
+            let exactly_matches = {
+                let Some(expected) = derived.as_ref() else {
+                    return Ok(index);
+                };
+                exact_residual_sidecar_stream_matches_derived(&candidate, expected).unwrap_or(false)
+            };
+            #[cfg(not(target_os = "linux"))]
+            let exactly_matches = false;
+            if exactly_matches {
+                let Some(sidecar) = derived.take() else {
+                    return Ok(index);
+                };
+                let _ = index.exact_residual_sidecar.set(sidecar);
+                return Ok(index);
+            }
+        }
+        let sidecar = match derived {
+            Some(sidecar) => sidecar,
+            None => match index.build_exact_residual_sidecar() {
+                Ok(sidecar) => sidecar,
+                Err(_) => return Ok(index),
+            },
+        };
+        #[cfg(target_os = "linux")]
+        if let Some(capability) = reserved_publication.take() {
+            match publish_exact_residual_sidecar_with_capability(capability, &sidecar) {
+                Ok(ExactResidualPublication::Published) => {
+                    let _ = index.exact_residual_sidecar.set(sidecar);
+                    return Ok(index);
+                }
+                // A concurrent owner may have claimed the deterministic
+                // generation-keyed name after capability acquisition. The
+                // already-derived sidecar is safe to retry under a new name.
+                Ok(ExactResidualPublication::DestinationExists) => {}
+                Err(_) => return Ok(index),
+            }
+        }
         for _ in 0..EXACT_RESIDUAL_CACHE_ATTEMPTS {
             let candidate = match index.next_exact_residual_sidecar_cache_path(cache_dir) {
                 Ok(candidate) => candidate,
@@ -1528,7 +1839,7 @@ impl InMemoryVectorIndex {
         prefix
             .try_reserve_exact(9 + EXACT_RESIDUAL_SIDECAR_DIGEST_BYTES * 2)
             .map_err(|_| residual_sidecar_error("cache_path", "allocation failed"))?;
-        prefix.push_str("fsrs-v1-");
+        prefix.push_str("fsrs-v2-");
         const HEX: &[u8; 16] = b"0123456789abcdef";
         for byte in digest.finalize() {
             prefix.push(char::from(HEX[usize::from(byte >> 4)]));
@@ -1544,28 +1855,98 @@ impl InMemoryVectorIndex {
         Ok(cache_dir.join(format!("{prefix}{}-{nonce}.fsrs", std::process::id())))
     }
 
-    fn try_open_exact_residual_sidecar_cache(&self, cache_dir: &Path) -> SearchResult<bool> {
-        let prefix = self.exact_residual_generation_cache_prefix()?;
-        let entries = match std::fs::read_dir(cache_dir) {
-            Ok(entries) => entries,
-            Err(_) => return Ok(false),
+    #[cfg(target_os = "linux")]
+    fn exact_residual_sidecar_cache_candidates(
+        &self,
+        cache_dir: &Path,
+    ) -> SearchResult<Option<Vec<PathBuf>>> {
+        // Prove the optional cache root itself is a no-follow directory before
+        // deriving a large payload. This catches a missing path, regular-file
+        // obstacle, or symlinked cache root while the fallback is still free.
+        if open_exact_residual_sidecar_parent(&cache_dir.join(".fsrs-cache-probe")).is_err() {
+            return Ok(None);
+        }
+        let Some(source) = self.residual_source_binding.as_ref() else {
+            return Ok(None);
         };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
+        let prefix = self.exact_residual_generation_cache_prefix()?;
+        let layout = match ExactResidualLayout::for_shape(self.record_count(), self.dimension) {
+            Ok(layout) => layout,
+            Err(_) => return Ok(None),
+        };
+        let comparison_limit = EXACT_RESIDUAL_CACHE_COMPARISON_CANDIDATE_LIMIT
+            .min(EXACT_RESIDUAL_CACHE_COMPARISON_BYTE_BUDGET / layout.encoded_bytes);
+        if comparison_limit == 0 {
+            return Ok(None);
+        }
+        let mut entries = match std::fs::read_dir(cache_dir) {
+            Ok(entries) => entries,
+            Err(_) => return Ok(None),
+        };
+        let mut paths = Vec::new();
+        paths
+            .try_reserve_exact(EXACT_RESIDUAL_CACHE_DIRECTORY_ENTRY_LIMIT)
+            .map_err(|_| residual_sidecar_error("cache", "directory-entry allocation failed"))?;
+        for _ in 0..=EXACT_RESIDUAL_CACHE_DIRECTORY_ENTRY_LIMIT {
+            let entry = match entries.next() {
+                Some(Ok(entry)) => entry,
+                Some(Err(_)) => return Ok(None),
+                None => break,
+            };
+            if paths.len() == EXACT_RESIDUAL_CACHE_DIRECTORY_ENTRY_LIMIT {
+                return Ok(None);
+            }
+            paths.push(entry.path());
+        }
+        // `read_dir` order is filesystem-defined. Sorting the bounded set
+        // makes both candidate selection and the work-budget verdict stable.
+        paths.sort_unstable();
+        let mut candidates = Vec::new();
+        candidates
+            .try_reserve_exact(comparison_limit)
+            .map_err(|_| residual_sidecar_error("cache", "candidate allocation failed"))?;
+        let mut comparison_bytes = 0_usize;
+        for candidate in paths {
+            let Some(name) = candidate.file_name() else {
+                return Ok(None);
+            };
             let Some(name) = name.to_str() else {
                 continue;
             };
             if !name.starts_with(&prefix) || !name.ends_with(".fsrs") {
                 continue;
             }
-            if self
-                .try_open_exact_residual_sidecar(&cache_dir.join(name))
-                .unwrap_or(false)
-            {
-                return Ok(true);
+            let header_matches = exact_residual_sidecar_header_matches_source(
+                &candidate,
+                source,
+                self.record_count(),
+                self.dimension,
+            )
+            .unwrap_or(false);
+            if header_matches {
+                let Some(next_comparison_bytes) =
+                    comparison_bytes.checked_add(layout.encoded_bytes)
+                else {
+                    return Ok(None);
+                };
+                if candidates.len() == comparison_limit
+                    || next_comparison_bytes > EXACT_RESIDUAL_CACHE_COMPARISON_BYTE_BUDGET
+                {
+                    return Ok(None);
+                }
+                comparison_bytes = next_comparison_bytes;
+                candidates.push(candidate);
             }
         }
-        Ok(false)
+        Ok(Some(candidates))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn exact_residual_sidecar_cache_candidates(
+        &self,
+        _cache_dir: &Path,
+    ) -> SearchResult<Option<Vec<PathBuf>>> {
+        Ok(None)
     }
 
     /// Shared load path: read every live row (and any WAL tail) of an opened
@@ -1576,26 +1957,49 @@ impl InMemoryVectorIndex {
     fn from_open_index(index: &VectorIndex) -> SearchResult<Self> {
         let count = index.record_count();
         let dimension = index.dimension();
-        let mut doc_ids = Vec::with_capacity(count);
-        let mut flat = Vec::with_capacity(count * dimension);
+        let capacity = count.checked_add(index.wal_entries.len()).ok_or_else(|| {
+            SearchError::InvalidConfig {
+                field: "vectors".to_owned(),
+                value: format!("main={count}, wal={}", index.wal_entries.len()),
+                reason: "document capacity overflow".to_owned(),
+            }
+        })?;
+        let scalar_capacity =
+            capacity
+                .checked_mul(dimension)
+                .ok_or_else(|| SearchError::InvalidConfig {
+                    field: "vectors".to_owned(),
+                    value: format!("count={capacity}, dimension={dimension}"),
+                    reason: "vector slab length overflow".to_owned(),
+                })?;
+        let mut doc_ids = Vec::new();
+        doc_ids
+            .try_reserve_exact(capacity)
+            .map_err(|_| SearchError::InvalidConfig {
+                field: "vectors".to_owned(),
+                value: capacity.to_string(),
+                reason: "document-id allocation failed".to_owned(),
+            })?;
+        let mut flat = Vec::new();
+        flat.try_reserve_exact(scalar_capacity)
+            .map_err(|_| SearchError::InvalidConfig {
+                field: "vectors".to_owned(),
+                value: scalar_capacity.to_string(),
+                reason: "vector slab allocation failed".to_owned(),
+            })?;
 
         for i in 0..count {
             if index.is_deleted(i) {
                 continue;
             }
-            doc_ids.push(index.doc_id_at(i)?.to_owned());
+            doc_ids.push(fallible_doc_id_copy(index.doc_id_at(i)?)?);
             let f16_vec = index.vector_at_f16(i)?;
             flat.extend_from_slice(&f16_vec);
         }
 
         for entry in &index.wal_entries {
-            doc_ids.push(entry.doc_id.clone());
-            let f16_vec: Vec<half::f16> = entry
-                .embedding
-                .iter()
-                .map(|&v| half::f16::from_f32(v))
-                .collect();
-            flat.extend_from_slice(&f16_vec);
+            doc_ids.push(fallible_doc_id_copy(&entry.doc_id)?);
+            flat.extend(entry.embedding.iter().copied().map(half::f16::from_f32));
         }
 
         // Capture the source's embedding-space identity before the backing
@@ -1682,6 +2086,16 @@ impl InMemoryVectorIndex {
         self.space_identity_attested
     }
 
+    /// Whether this index currently has a source-derived exact-residual
+    /// sidecar attached. `true` means the cache passed descriptor-bound,
+    /// generation-bound, and bitwise re-derivation checks; it says nothing
+    /// about whether a particular query can prune, because non-finite or
+    /// overflow-risk queries deliberately retain the exact flat fallback.
+    #[must_use]
+    pub fn has_exact_residual_sidecar(&self) -> bool {
+        self.exact_residual_sidecar.get().is_some()
+    }
+
     /// Embedder id recorded by this index's source, when the source carried
     /// one (bd-9xuj T2-C2): the FSVI header string on the file-backed load
     /// paths, or the declared space's `logical_model_id` on
@@ -1732,38 +2146,32 @@ impl InMemoryVectorIndex {
     /// established f16 flat scan selected.  The non-error result is intentional:
     /// sidecars are an optional optimization, never part of semantic admission.
     pub fn try_open_exact_residual_sidecar(&self, path: &Path) -> SearchResult<bool> {
-        let bytes = match read_exact_residual_sidecar(path)? {
-            Some(bytes) => bytes,
-            None => return Ok(false),
-        };
         let Some(source) = self.residual_source_binding.as_ref() else {
             return Ok(false);
         };
-        let header_matches = ExactResidualSidecar::encoded_header_matches_source(
-            &bytes,
+        #[cfg(target_os = "linux")]
+        let header_matches = exact_residual_sidecar_header_matches_source(
+            path,
             source,
             self.record_count(),
             self.dimension,
         )
         .unwrap_or(false);
+        #[cfg(not(target_os = "linux"))]
+        let header_matches = false;
         if !header_matches {
             return Ok(false);
         }
-        // Validate fixed metadata and integrity first, then release the raw
-        // image before deriving the trusted sidecar. A second descriptor-bound
-        // read compares directly to that derivation without allocating decoded
-        // transformed vectors, keeping public admission at one full sidecar
-        // plus one transient byte image rather than three full artifacts.
-        drop(bytes);
+        // The header preflight avoids derivation for absent/stale cache entries.
+        // Once it matches, compare every serialized field and whole-file digest
+        // directly from one descriptor with fixed stack buffers. This holds only
+        // the trusted derived sidecar, never a second 512 MiB raw byte image.
         let expected = self.build_exact_residual_sidecar()?;
-        let bytes = match read_exact_residual_sidecar(path)? {
-            Some(bytes) => bytes,
-            None => return Ok(false),
-        };
+        #[cfg(target_os = "linux")]
         let exactly_matches =
-            ExactResidualSidecar::encoded_exactly_matches_derived(&bytes, &expected)
-                .unwrap_or(false);
-        drop(bytes);
+            exact_residual_sidecar_stream_matches_derived(path, &expected).unwrap_or(false);
+        #[cfg(not(target_os = "linux"))]
+        let exactly_matches = false;
         if !exactly_matches {
             return Ok(false);
         }
@@ -1775,6 +2183,7 @@ impl InMemoryVectorIndex {
     /// transform from the admitted f16 source and require bitwise equality before
     /// it is allowed to prune a candidate.  This makes a finite, rehashed payload
     /// mutation fail closed rather than merely look structurally well-formed.
+    #[cfg(test)]
     fn admit_exact_residual_sidecar(&self, sidecar: ExactResidualSidecar) -> SearchResult<bool> {
         let Some(source) = self.residual_source_binding.as_ref() else {
             return Ok(false);
@@ -1875,8 +2284,42 @@ impl InMemoryVectorIndex {
                     let residual = original - centroid;
                     residuals[residual_base + transformed_dimension * EXACT_RESIDUAL_LANES] =
                         residual;
-                    let correction = original - (centroid + residual);
-                    correction_sum += f64::from(correction) * f64::from(correction);
+                    // Keep the entire construction remainder in f64, rather
+                    // than only the rounded f32 subtraction remainder. This
+                    // contains both the residual-construction rounding and
+                    // the later `(centroid + residual)` reconstruction
+                    // rounding, so the Cauchy term bounds the actual f16 row.
+                    let correction = finite_f64_add(
+                        finite_f64_add(f64::from(original), -f64::from(centroid)).ok_or_else(
+                            || {
+                                residual_sidecar_error(
+                                    "correction_norms",
+                                    "construction subtraction overflowed",
+                                )
+                            },
+                        )?,
+                        -f64::from(residual),
+                    )
+                    .ok_or_else(|| {
+                        residual_sidecar_error(
+                            "correction_norms",
+                            "construction subtraction overflowed",
+                        )
+                    })?;
+                    let correction_squared =
+                        finite_f64_mul(correction, correction).ok_or_else(|| {
+                            residual_sidecar_error(
+                                "correction_norms",
+                                "construction square overflowed",
+                            )
+                        })?;
+                    correction_sum = finite_f64_add(correction_sum, correction_squared)
+                        .ok_or_else(|| {
+                            residual_sidecar_error(
+                                "correction_norms",
+                                "construction norm overflowed",
+                            )
+                        })?;
                 }
                 correction_norms[group * EXACT_RESIDUAL_LANES + lane] =
                     outward_f32_norm(correction_sum, "correction_norms")?;
@@ -2376,7 +2819,18 @@ impl InMemoryVectorIndex {
                 census: ResidualPruningCensus::default(),
             });
         }
-        let transformed = ResidualQueryTransform::from_query(query, sidecar)?;
+        let transformed = match ResidualQueryTransform::from_query(query, sidecar) {
+            Ok(transformed) => transformed,
+            // The transform and suffix norms belong exclusively to the
+            // optional cache. Any preparation failure must be indistinguishable
+            // from no cache: run the incumbent sequential exact scan.
+            Err(_) => {
+                return Ok(ResidualScanOutcome {
+                    heap: self.scan_sequential(query, limit, filter)?,
+                    census: ResidualPruningCensus::default(),
+                });
+            }
+        };
         if !transformed.f32_flat_envelope_is_finite {
             return Ok(ResidualScanOutcome {
                 heap: self.scan_sequential(query, limit, filter)?,
@@ -2391,6 +2845,7 @@ impl InMemoryVectorIndex {
             &transformed,
             0,
             sidecar.group_count(),
+            true,
         )
     }
 
@@ -2408,7 +2863,17 @@ impl InMemoryVectorIndex {
                 census: ResidualPruningCensus::default(),
             });
         }
-        let transformed = ResidualQueryTransform::from_query(query, sidecar)?;
+        let transformed = match ResidualQueryTransform::from_query(query, sidecar) {
+            Ok(transformed) => transformed,
+            // See the sequential route: cache-only preparation can never
+            // change the result or error surface of the parallel exact scan.
+            Err(_) => {
+                return Ok(ResidualScanOutcome {
+                    heap: self.scan_parallel(query, limit, filter, row_chunk_size)?,
+                    census: ResidualPruningCensus::default(),
+                });
+            }
+        };
         if !transformed.f32_flat_envelope_is_finite {
             return Ok(ResidualScanOutcome {
                 heap: self.scan_parallel(query, limit, filter, row_chunk_size)?,
@@ -2416,12 +2881,43 @@ impl InMemoryVectorIndex {
             });
         }
         let groups = sidecar.group_count();
+        if limit == 0 || groups == 0 {
+            return Ok(ResidualScanOutcome {
+                heap: BinaryHeap::new(),
+                census: ResidualPruningCensus::default(),
+            });
+        }
+        // Probe exactly once for this query before partitioning work across
+        // Rayon. Per-chunk probes multiply the nonselective penalty by the
+        // chunk count; this shared decision either enables pruning globally or
+        // takes the incumbent exact parallel scan for the whole query.
+        let probe_end = groups.min(EXACT_RESIDUAL_ADAPTIVE_PROBE_GROUPS);
+        let probe = self.scan_exact_residual_sidecar_groups(
+            query,
+            limit,
+            filter,
+            sidecar,
+            &transformed,
+            0,
+            probe_end,
+            false,
+        )?;
+        if probe_end < groups && probe.census.lanes_pruned == 0 {
+            let mut census = probe.census;
+            census.flat_fallback_rows = census.flat_fallback_rows.saturating_add(sidecar.count);
+            census.adaptive_fallbacks = census.adaptive_fallbacks.saturating_add(1);
+            return Ok(ResidualScanOutcome {
+                heap: self.scan_parallel(query, limit, filter, row_chunk_size)?,
+                census,
+            });
+        }
         let groups_per_chunk = row_chunk_size.div_ceil(sidecar.lanes).max(1);
-        let chunk_count = groups.div_ceil(groups_per_chunk);
+        let remaining_groups = groups.saturating_sub(probe_end);
+        let chunk_count = remaining_groups.div_ceil(groups_per_chunk);
         let partials: SearchResult<Vec<ResidualScanOutcome>> = (0..chunk_count)
             .into_par_iter()
             .map(|chunk_index| {
-                let first_group = chunk_index * groups_per_chunk;
+                let first_group = probe_end + chunk_index * groups_per_chunk;
                 let end_group = (first_group + groups_per_chunk).min(groups);
                 self.scan_exact_residual_sidecar_groups(
                     query,
@@ -2431,14 +2927,20 @@ impl InMemoryVectorIndex {
                     &transformed,
                     first_group,
                     end_group,
+                    false,
                 )
             })
             .collect();
-        let mut census = ResidualPruningCensus::default();
+        let mut census = probe.census;
         let mut heaps = Vec::new();
         heaps
-            .try_reserve_exact(chunk_count)
+            .try_reserve_exact(
+                chunk_count
+                    .checked_add(1)
+                    .ok_or_else(|| residual_sidecar_error("parallel", "chunk count overflow"))?,
+            )
             .map_err(|_| residual_sidecar_error("parallel", "partial heap allocation failed"))?;
+        heaps.push(probe.heap);
         for partial in partials? {
             census.merge(partial.census);
             heaps.push(partial.heap);
@@ -2459,6 +2961,7 @@ impl InMemoryVectorIndex {
         transformed: &ResidualQueryTransform,
         first_group: usize,
         end_group: usize,
+        allow_adaptive_fallback: bool,
     ) -> SearchResult<ResidualScanOutcome> {
         let capped_end_group = end_group.min(sidecar.group_count());
         if limit == 0 || first_group >= capped_end_group {
@@ -2480,7 +2983,8 @@ impl InMemoryVectorIndex {
             // the exact heap accumulated so far and finish this work unit with
             // the incumbent scanner. This avoids paying residual arithmetic for
             // a query/cutoff geometry where this cache is not selective.
-            if census.groups_scanned >= EXACT_RESIDUAL_ADAPTIVE_PROBE_GROUPS
+            if allow_adaptive_fallback
+                && census.groups_scanned >= EXACT_RESIDUAL_ADAPTIVE_PROBE_GROUPS
                 && census.lanes_pruned == 0
             {
                 let fallback_start = group * sidecar.lanes;
@@ -2525,7 +3029,12 @@ impl InMemoryVectorIndex {
                 centroid_dot += f64::from(query_value) * f64::from(centroid_value);
                 centroid_norm_sq += f64::from(centroid_value) * f64::from(centroid_value);
             }
-            let centroid_norm = centroid_norm_sq.sqrt();
+            // Like the transformed query norm, this enters a multiplicative
+            // upper-bound term. Round away from zero before it reaches the
+            // pruning predicate.
+            let centroid_norm =
+                outward_f64_norm_from_square_sum(centroid_norm_sq, sidecar.dimension)
+                    .unwrap_or(f64::INFINITY);
             let mut partial = [0.0_f64; EXACT_RESIDUAL_LANES];
             for block_index in 0..sidecar.block_count() {
                 if heap.len() >= limit {
@@ -3476,7 +3985,9 @@ mod tests {
                 centroid_dot += f64::from(query_value) * f64::from(centroid_value);
                 centroid_norm_sq += f64::from(centroid_value) * f64::from(centroid_value);
             }
-            let centroid_norm = centroid_norm_sq.sqrt();
+            let centroid_norm =
+                outward_f64_norm_from_square_sum(centroid_norm_sq, sidecar.dimension)
+                    .expect("finite centroid norm has an outward f64 root");
             let mut partial = [0.0_f64; EXACT_RESIDUAL_LANES];
             for block_index in 0..sidecar.block_count() {
                 for lane in 0..active_lanes {
@@ -3710,11 +4221,7 @@ mod tests {
         // snapshots the containing directory and fails closed with
         // `DirectoryChangedDuringRead` when sibling test files churn it, so
         // the shared test temp dir is not a legal admission site.
-        let dir = std::env::temp_dir()
-            .join("frankensearch_in_memory_tests")
-            .join("admitted_v2_space_identity_dir");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create isolated admission dir");
+        let dir = owned_temp_dir("admitted_v2_space_identity");
         let path = dir.join("admitted_v2_space_identity.fsvi");
         let dim = 8;
         let (doc_ids, vectors) = identity_rows(dim, 4);
@@ -3748,7 +4255,6 @@ mod tests {
         let error = InMemoryVectorIndex::from_fsvi(&path)
             .expect_err("VectorIndex::open must reject v2 bytes");
         assert!(matches!(error, SearchError::IndexVersionMismatch { .. }));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(target_os = "linux")]
@@ -3772,13 +4278,19 @@ mod tests {
         let cache_prefix = flat
             .exact_residual_generation_cache_prefix()
             .expect("derive admitted generation cache key");
+        let mut header_valid_corrupt = flat
+            .build_exact_residual_sidecar()
+            .expect("derive a cache-shaped sidecar")
+            .encode()
+            .expect("encode a cache-shaped sidecar");
+        header_valid_corrupt[EXACT_RESIDUAL_SIDECAR_HEADER_BYTES] ^= 0x01;
         let mut corrupt_paths = Vec::new();
         corrupt_paths
             .try_reserve_exact(EXACT_RESIDUAL_CACHE_ATTEMPTS + 1)
             .expect("reserve bounded corrupt-cache fixture paths");
         for sequence in 0..=EXACT_RESIDUAL_CACHE_ATTEMPTS {
             let corrupt_path = cache_dir.join(format!("{cache_prefix}corrupt-{sequence}.fsrs"));
-            write_new_owned_file(&corrupt_path, b"corrupt immutable cache entry");
+            write_new_owned_file(&corrupt_path, &header_valid_corrupt);
             corrupt_paths.push(corrupt_path);
         }
         let indexed = InMemoryTwoTierIndex::from_admitted_v2_with_residual_sidecar_cache(
@@ -3809,7 +4321,7 @@ mod tests {
         for corrupt_path in &corrupt_paths {
             assert_eq!(
                 std::fs::read(corrupt_path).expect("read planted corrupt cache entry"),
-                b"corrupt immutable cache entry",
+                header_valid_corrupt,
                 "the shipping cache route never overwrites a stale/corrupt artifact"
             );
         }
@@ -3843,6 +4355,107 @@ mod tests {
         )
         .expect("unavailable optional cache retains the admitted flat tier");
         assert!(fallback.fast_index.exact_residual_sidecar.get().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn admitted_v2_cache_discovery_budget_skips_unrelated_and_corrupt_work() {
+        // Each hostile directory is private and create-only. When either
+        // deterministic budget is reached, cache use and publication are both
+        // skipped; the exact flat product remains available.
+        let dir = owned_temp_dir("admitted_v2_residual_cache_budget");
+        let source_path = dir.join("index.fsvi");
+        let dimension = 35;
+        let (doc_ids, vectors) = identity_rows(dimension, 17);
+        let rows: Vec<(String, Vec<f32>)> = doc_ids.into_iter().zip(vectors).collect();
+        let (binding, _) =
+            write_fsvi_v2_fixture(&source_path, "residual-cache-budget", dimension, 41, &rows);
+        let admitted = crate::VectorIndex::open_admitted_v2(&source_path, &binding)
+            .expect("admit private v2 source");
+        let flat = InMemoryVectorIndex::from_admitted_v2(&admitted).expect("open exact baseline");
+        let query = make_normalized_vec(dimension, 6.5);
+        let expected = flat
+            .search_top_k(&query, 5, None)
+            .expect("flat exact baseline");
+
+        let unrelated_dir = dir.join("many-unrelated");
+        std::fs::create_dir(&unrelated_dir).expect("create private unrelated cache directory");
+        for entry in 0..=EXACT_RESIDUAL_CACHE_DIRECTORY_ENTRY_LIMIT {
+            write_new_owned_file(
+                &unrelated_dir.join(format!("unrelated-{entry:04}")),
+                b"not a sidecar",
+            );
+        }
+        let unrelated_entries_before = std::fs::read_dir(&unrelated_dir)
+            .expect("read private unrelated cache directory")
+            .count();
+        let unrelated = InMemoryVectorIndex::from_admitted_v2_with_residual_sidecar_cache(
+            &admitted,
+            &unrelated_dir,
+        )
+        .expect("entry-budget exhaustion remains an exact open");
+        assert!(
+            !unrelated.has_exact_residual_sidecar(),
+            "entry-budget exhaustion must skip optional cache attachment"
+        );
+        assert_eq!(
+            unrelated
+                .search_top_k(&query, 5, None)
+                .expect("unrelated-cache exact search"),
+            expected,
+            "entry-budget exhaustion must retain the exact flat result"
+        );
+        assert_eq!(
+            std::fs::read_dir(&unrelated_dir)
+                .expect("re-read private unrelated cache directory")
+                .count(),
+            unrelated_entries_before,
+            "entry-budget exhaustion skips cache publication"
+        );
+
+        let corrupt_dir = dir.join("many-corrupt");
+        std::fs::create_dir(&corrupt_dir).expect("create private corrupt cache directory");
+        let cache_prefix = flat
+            .exact_residual_generation_cache_prefix()
+            .expect("derive generation-keyed cache prefix");
+        let mut header_valid_corrupt = flat
+            .build_exact_residual_sidecar()
+            .expect("derive cache-shaped sidecar")
+            .encode()
+            .expect("encode cache-shaped sidecar");
+        header_valid_corrupt[EXACT_RESIDUAL_SIDECAR_HEADER_BYTES] ^= 0x01;
+        for entry in 0..=EXACT_RESIDUAL_CACHE_COMPARISON_CANDIDATE_LIMIT {
+            write_new_owned_file(
+                &corrupt_dir.join(format!("{cache_prefix}corrupt-{entry:04}.fsrs")),
+                &header_valid_corrupt,
+            );
+        }
+        let corrupt_entries_before = std::fs::read_dir(&corrupt_dir)
+            .expect("read private corrupt cache directory")
+            .count();
+        let corrupt = InMemoryVectorIndex::from_admitted_v2_with_residual_sidecar_cache(
+            &admitted,
+            &corrupt_dir,
+        )
+        .expect("comparison-budget exhaustion remains an exact open");
+        assert!(
+            !corrupt.has_exact_residual_sidecar(),
+            "comparison-budget exhaustion must skip optional cache attachment"
+        );
+        assert_eq!(
+            corrupt
+                .search_top_k(&query, 5, None)
+                .expect("corrupt-cache exact search"),
+            expected,
+            "comparison-budget exhaustion must retain the exact flat result"
+        );
+        assert_eq!(
+            std::fs::read_dir(&corrupt_dir)
+                .expect("re-read private corrupt cache directory")
+                .count(),
+            corrupt_entries_before,
+            "comparison-budget exhaustion skips cache publication"
+        );
     }
 
     #[test]
@@ -4698,6 +5311,81 @@ mod tests {
     }
 
     #[test]
+    fn exact_residual_preparation_failures_keep_public_search_flat_exact() {
+        let dimension = 35;
+        let count = 17;
+        let mut cached = InMemoryVectorIndex::from_vectors(
+            (0..count).map(|row| format!("fallback-{row}")).collect(),
+            (0..count)
+                .map(|row| make_normalized_vec(dimension, row as f32 + 0.75))
+                .collect(),
+            dimension,
+        )
+        .expect("create finite source");
+        bind_test_residual_source(&mut cached);
+        let uncached = cached.clone();
+        let sidecar = cached
+            .build_exact_residual_sidecar()
+            .expect("build witnessed sidecar");
+        assert!(
+            cached
+                .admit_exact_residual_sidecar(sidecar)
+                .expect("admit verified sidecar")
+        );
+        let query = make_normalized_vec(dimension, 4.25);
+        let modes = [
+            SearchParams {
+                parallel_enabled: false,
+                parallel_threshold: 1,
+                parallel_chunk_size: 8,
+            },
+            SearchParams {
+                parallel_enabled: true,
+                parallel_threshold: 1,
+                parallel_chunk_size: 8,
+            },
+        ];
+
+        let injections: [(&str, fn(), fn() -> bool); 2] = [
+            (
+                "transform",
+                fail_next_residual_query_transform_allocation,
+                residual_query_transform_allocation_failure_is_pending,
+            ),
+            (
+                "suffix",
+                fail_next_residual_query_suffix_allocation,
+                residual_query_suffix_allocation_failure_is_pending,
+            ),
+        ];
+        for params in modes {
+            let expected = uncached
+                .search_top_k_with_params(&query, 3, None, params)
+                .expect("uncached public exact search");
+            for (site, inject, is_pending) in injections {
+                inject();
+                let actual = cached
+                    .search_top_k_with_params(&query, 3, None, params)
+                    .expect("cache-only preparation failure must not escape public search");
+                assert!(
+                    !is_pending(),
+                    "{site} injection must be consumed by the public cached route"
+                );
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in actual.iter().zip(&expected) {
+                    assert_eq!(actual.doc_id, expected.doc_id, "site={site}");
+                    assert_eq!(actual.index, expected.index, "site={site}");
+                    assert_eq!(
+                        actual.score.to_bits(),
+                        expected.score.to_bits(),
+                        "site={site}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn exact_residual_sidecar_rejects_finite_transformed_payload_mutations() {
         // The first group establishes a low exact cutoff.  The second group
         // contains the true winner, so a forged zero residual envelope would
@@ -4941,6 +5629,136 @@ mod tests {
         assert_residual_bounds_cover_exact_scores(&index, &sidecar, &query);
     }
 
+    #[test]
+    fn exact_residual_upper_bound_covers_large_finite_queries_and_tail_construction_error() {
+        // A five-lane tail forces a non-power-of-two centroid division. Its
+        // f32 residuals therefore exercise the f64 construction remainder
+        // persisted in `correction_norms`, while the query magnitude stays
+        // just inside the analytically admitted f32-flat envelope.
+        let dimension = 35;
+        let tail = [
+            f16::MAX.to_f32(),
+            1.0,
+            -1.0,
+            0.0,
+            f16::from_bits(1).to_f32(),
+        ];
+        let vectors: Vec<Vec<f32>> = (0..13)
+            .map(|row| {
+                (0..dimension)
+                    .map(|column| tail[(row + column * 3) % tail.len()])
+                    .collect()
+            })
+            .collect();
+        let large_component =
+            f32::MAX / (f16::MAX.to_f32() * dimension as f32 * EXACT_RESIDUAL_LANES as f32);
+        let query: Vec<f32> = (0..dimension)
+            .map(|column| {
+                if column % 2 == 0 {
+                    large_component
+                } else {
+                    -large_component * 0.5
+                }
+            })
+            .collect();
+        let mut index = InMemoryVectorIndex::from_vectors(
+            (0..vectors.len())
+                .map(|row| format!("construction-{row}"))
+                .collect(),
+            vectors,
+            dimension,
+        )
+        .expect("finite f16 construction source");
+        bind_test_residual_source(&mut index);
+        let sidecar = index
+            .build_exact_residual_sidecar()
+            .expect("construct a tail-aware sidecar");
+        let transformed =
+            ResidualQueryTransform::from_query(&query, &sidecar).expect("finite large transform");
+        assert!(
+            transformed.f32_flat_envelope_is_finite,
+            "the large finite query must exercise the bound rather than its flat fallback"
+        );
+        assert_residual_bounds_cover_exact_scores(&index, &sidecar, &query);
+    }
+
+    #[test]
+    fn exact_residual_near_cutoff_simd_differential_keeps_the_true_winner() {
+        // The first group establishes a cutoff one f16 ULP below the winner.
+        // The query is scaled so the authoritative f16×f32 SIMD score is near
+        // the top finite f32 range while remaining inside the sidecar's flat
+        // envelope. This makes the distinction only a few hundred output ULPs
+        // and exercises the real SIMD accumulation/reduction route, not a
+        // scalar reference sum.
+        let dimension = 35;
+        let high = f16::MAX.to_f32();
+        let one_f16_ulp_lower = f16::from_bits(f16::MAX.to_bits() - 1).to_f32();
+        let query_component = f32::MAX / (high * dimension as f32 * 8.0);
+        let query = vec![query_component; dimension];
+        let mut near_cutoff = vec![high; dimension];
+        near_cutoff[0] = one_f16_ulp_lower;
+        let mut vectors = vec![near_cutoff.clone(); EXACT_RESIDUAL_LANES];
+        vectors.push(vec![high; dimension]); // row 8, the true winner.
+        vectors.extend(vec![near_cutoff; EXACT_RESIDUAL_LANES - 1]);
+        // A uniform negative group gives the eliminator a real safe prune while
+        // the previous group tests that the near-cutoff winner survives.
+        vectors.extend(vec![vec![-high; dimension]; EXACT_RESIDUAL_LANES]);
+        let mut index = InMemoryVectorIndex::from_vectors(
+            (0..vectors.len())
+                .map(|row| format!("simd-near-cutoff-{row}"))
+                .collect(),
+            vectors,
+            dimension,
+        )
+        .expect("finite f16 SIMD differential source");
+        bind_test_residual_source(&mut index);
+        let flat = index.clone();
+        let sidecar = index
+            .build_exact_residual_sidecar()
+            .expect("build witnessed SIMD sidecar");
+        assert_residual_bounds_cover_exact_scores(&index, &sidecar, &query);
+        assert!(
+            index
+                .admit_exact_residual_sidecar(sidecar)
+                .expect("admit exact SIMD sidecar")
+        );
+
+        let incumbent = dot_product_f16_f32(flat.vector_slice(0), &query)
+            .expect("authoritative SIMD incumbent score");
+        let winner = dot_product_f16_f32(flat.vector_slice(EXACT_RESIDUAL_LANES), &query)
+            .expect("authoritative SIMD winner score");
+        assert!(winner.is_finite() && winner > f32::MAX * 0.1);
+        assert!(winner > incumbent, "one f16 ULP must make row 8 win");
+        assert!(
+            winner - incumbent <= (winner.next_up() - winner) * 512.0,
+            "fixture must remain near the authoritative SIMD cutoff"
+        );
+
+        let expected = flat
+            .search_top_k(&query, 1, None)
+            .expect("flat SIMD exact result");
+        let outcome = index
+            .scan_exact_residual_sidecar(
+                &query,
+                1,
+                None,
+                index
+                    .exact_residual_sidecar
+                    .get()
+                    .expect("admitted SIMD sidecar"),
+            )
+            .expect("sidecar SIMD differential");
+        assert!(
+            outcome.census.lanes_pruned > 0,
+            "the fixture must exercise a real sidecar prune as well as the near cutoff"
+        );
+        let actual = index
+            .resolve_heap(outcome.heap)
+            .expect("resolve sidecar SIMD result");
+        assert_eq!(actual, expected);
+        assert_eq!(actual[0].index, EXACT_RESIDUAL_LANES);
+    }
+
     proptest! {
         #[test]
         fn exact_residual_upper_bound_property_never_underestimates_across_shapes(
@@ -5137,6 +5955,139 @@ mod tests {
     }
 
     #[test]
+    fn exact_residual_sidecar_nonselective_parallel_probe_is_global_at_100k() {
+        const COUNT: usize = 100_000;
+        let dimension = 3;
+        let mut index = InMemoryVectorIndex::from_vectors(
+            (0..COUNT)
+                .map(|row| format!("nonselective-{row}"))
+                .collect(),
+            vec![vec![1.0, 0.0, 0.0]; COUNT],
+            dimension,
+        )
+        .expect("create 100k nonselective source");
+        bind_test_residual_source(&mut index);
+        let flat = index.clone();
+        let sidecar = index
+            .build_exact_residual_sidecar()
+            .expect("build nonselective sidecar");
+        assert!(
+            index
+                .admit_exact_residual_sidecar(sidecar)
+                .expect("admit nonselective sidecar")
+        );
+        let params = SearchParams {
+            parallel_enabled: true,
+            ..SearchParams::default()
+        };
+        let query = [1.0, 0.0, 0.0];
+        let outcome = index
+            .scan_exact_residual_sidecar_parallel(
+                &query,
+                1,
+                None,
+                index
+                    .exact_residual_sidecar
+                    .get()
+                    .expect("admitted sidecar"),
+                params.parallel_chunk_size,
+            )
+            .expect("run globally adaptive parallel scan");
+        assert_eq!(
+            outcome.census.groups_scanned, EXACT_RESIDUAL_ADAPTIVE_PROBE_GROUPS,
+            "one query-level probe replaces per-chunk residual work"
+        );
+        assert_eq!(outcome.census.lanes_pruned, 0);
+        assert_eq!(outcome.census.adaptive_fallbacks, 1);
+        assert_eq!(outcome.census.flat_fallback_rows, COUNT);
+        let actual = index
+            .resolve_heap(outcome.heap)
+            .expect("resolve globally adaptive result");
+        let expected = flat
+            .search_top_k_with_params(&query, 1, None, params)
+            .expect("flat exact parallel result");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn exact_residual_sidecar_f32_max_queries_fail_closed_to_exact_sequential_and_parallel() {
+        let dimension = 35;
+        let count = 17;
+        let mut index = InMemoryVectorIndex::from_vectors(
+            (0..count).map(|row| format!("max-query-{row}")).collect(),
+            vec![vec![f16::MAX.to_f32(); dimension]; count],
+            dimension,
+        )
+        .expect("finite f16 source for max-query fallback");
+        bind_test_residual_source(&mut index);
+        let flat = index.clone();
+        let sidecar = index.build_exact_residual_sidecar().expect("build sidecar");
+        assert!(
+            index
+                .admit_exact_residual_sidecar(sidecar)
+                .expect("admit sidecar")
+        );
+        let query = vec![f32::MAX; dimension];
+        let sequential = index
+            .scan_exact_residual_sidecar(
+                &query,
+                3,
+                None,
+                index
+                    .exact_residual_sidecar
+                    .get()
+                    .expect("admitted sidecar"),
+            )
+            .expect("sequential max-query fallback");
+        let parallel = index
+            .scan_exact_residual_sidecar_parallel(
+                &query,
+                3,
+                None,
+                index
+                    .exact_residual_sidecar
+                    .get()
+                    .expect("admitted sidecar"),
+                8,
+            )
+            .expect("parallel max-query fallback");
+        assert_eq!(sequential.census, ResidualPruningCensus::default());
+        assert_eq!(parallel.census, ResidualPruningCensus::default());
+        let sequential = index
+            .resolve_heap(sequential.heap)
+            .expect("resolve sequential fallback");
+        let parallel = index
+            .resolve_heap(parallel.heap)
+            .expect("resolve parallel fallback");
+        let expected_sequential = flat
+            .search_top_k_with_params(
+                &query,
+                3,
+                None,
+                SearchParams {
+                    parallel_enabled: false,
+                    ..SearchParams::default()
+                },
+            )
+            .expect("flat sequential max-query result");
+        let expected_parallel = flat
+            .search_top_k_with_params(
+                &query,
+                3,
+                None,
+                SearchParams {
+                    parallel_enabled: true,
+                    parallel_threshold: 1,
+                    parallel_chunk_size: 8,
+                },
+            )
+            .expect("flat parallel max-query result");
+        assert_eq!(sequential, expected_sequential);
+        assert_eq!(parallel, expected_parallel);
+        assert_eq!(sequential, parallel);
+    }
+
+    #[test]
     fn exact_residual_sidecar_parallel_uses_the_default_10k_to_100k_target_scales() {
         let dimension = 3;
         let params = SearchParams {
@@ -5246,26 +6197,23 @@ mod tests {
                 .try_open_exact_residual_sidecar(&sidecar_path)
                 .expect("public no-follow open")
         );
-        let encoded = index
+        let expected = index
             .build_exact_residual_sidecar()
-            .expect("derive test sidecar without touching the published file")
-            .encode()
-            .expect("encode test sidecar in memory");
+            .expect("derive test sidecar without touching the published file");
+        let encoded = expected.encode().expect("encode test sidecar in memory");
         let mut truncated_after_stat = std::io::Cursor::new(encoded[..encoded.len() - 1].to_vec());
         assert!(
-            read_exact_sidecar_snapshot(&mut truncated_after_stat, encoded.len())
-                .expect("bounded snapshot read")
-                .is_none(),
-            "a stream truncated after its fstat-sized snapshot is rejected"
+            !exact_residual_sidecar_stream_matches_reader(&mut truncated_after_stat, &expected)
+                .expect("bounded reader comparison"),
+            "the production reader seam rejects a stream truncated after fstat"
         );
         let mut grown_after_stat = encoded.clone();
         grown_after_stat.push(0x5a);
         let mut grown_after_stat = std::io::Cursor::new(grown_after_stat);
         assert!(
-            read_exact_sidecar_snapshot(&mut grown_after_stat, encoded.len())
-                .expect("bounded snapshot read")
-                .is_none(),
-            "the one-byte probe rejects a stream that grows after fstat"
+            !exact_residual_sidecar_stream_matches_reader(&mut grown_after_stat, &expected)
+                .expect("bounded reader comparison"),
+            "the production one-byte probe rejects a stream that grows after fstat"
         );
 
         write_new_owned_file(&occupied_path, b"incumbent destination");
