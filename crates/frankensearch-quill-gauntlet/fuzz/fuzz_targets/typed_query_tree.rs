@@ -1,4 +1,4 @@
-#![no_main]
+#![cfg_attr(not(test), no_main)]
 
 use asupersync::{Cx, test_utils::run_test_with_cx};
 use frankensearch_quill::QuillIndexError;
@@ -35,12 +35,18 @@ enum QueryTree {
     TrailingBoolean(u8),
     NonFiniteBoost(u8),
     OversizedToken(u8),
+    MalformedNestedOperator(u8, u8, u8),
+    MalformedOperator(u8, u8),
+    MalformedField(u8),
+    MalformedEscape(u8),
+    MalformedBoost(u8),
+    MalformedSlop(u8, u8),
 }
 
 impl QueryTree {
     fn from_input(input: &[u8]) -> Self {
         let byte = |index| input.get(index).copied().unwrap_or(0);
-        let kind = byte(0) % 15;
+        let kind = byte(0) % 21;
         let first = byte(1);
         let second = byte(2);
         match kind {
@@ -58,7 +64,13 @@ impl QueryTree {
             11 => Self::EscapedTerm(first, second),
             12 => Self::TrailingBoolean(first),
             13 => Self::NonFiniteBoost(first),
-            _ => Self::OversizedToken(first),
+            14 => Self::OversizedToken(first),
+            15 => Self::MalformedNestedOperator(first, second, byte(3)),
+            16 => Self::MalformedOperator(first, second),
+            17 => Self::MalformedField(first),
+            18 => Self::MalformedEscape(first),
+            19 => Self::MalformedBoost(first),
+            _ => Self::MalformedSlop(first, second),
         }
     }
 
@@ -86,13 +98,34 @@ impl QueryTree {
             Self::PhrasePrefix(first, second) => {
                 format!("\"{} {}\"*", word(first), word(second))
             }
-            Self::UnterminatedPhrase(first, second) => format!("\"{} {}", word(first), word(second)),
+            Self::UnterminatedPhrase(first, second) => {
+                format!("\"{} {}", word(first), word(second))
+            }
             Self::EscapedTerm(first, second) => format!(r"{}\:{}", word(first), word(second)),
             Self::TrailingBoolean(term) => format!("{} OR", word(term)),
-            Self::NonFiniteBoost(term) => format!("{} {}^{}", word(term), word(term), "9".repeat(400)),
+            Self::NonFiniteBoost(term) => {
+                format!("{} {}^{}", word(term), word(term), "9".repeat(400))
+            }
             Self::OversizedToken(term) => {
                 let suffix_len = OVERSIZED_TOKEN_BYTES.saturating_sub(word(term).len());
                 format!("{}{}", word(term), "x".repeat(suffix_len))
+            }
+            Self::MalformedNestedOperator(first, second, third) => {
+                format!(
+                    "({} AND ({} OR )) AND {}",
+                    word(first),
+                    word(second),
+                    word(third)
+                )
+            }
+            Self::MalformedOperator(first, second) => {
+                format!("{} AND OR {}", word(first), word(second))
+            }
+            Self::MalformedField(term) => format!(":{}", word(term)),
+            Self::MalformedEscape(term) => format!(r"{}\", word(term)),
+            Self::MalformedBoost(term) => format!("{}^not-a-number", word(term)),
+            Self::MalformedSlop(first, second) => {
+                format!("\"{} {}\"~not-a-number", word(first), word(second))
             }
         }
     }
@@ -113,7 +146,13 @@ impl QueryTree {
             | Self::EscapedTerm(..)
             | Self::TrailingBoolean(..)
             | Self::NonFiniteBoost(..)
-            | Self::OversizedToken(..) => None,
+            | Self::OversizedToken(..)
+            | Self::MalformedNestedOperator(..)
+            | Self::MalformedOperator(..)
+            | Self::MalformedField(..)
+            | Self::MalformedEscape(..)
+            | Self::MalformedBoost(..)
+            | Self::MalformedSlop(..) => None,
         }
     }
 
@@ -123,6 +162,44 @@ impl QueryTree {
 
     const fn is_reviewed_oversized_lowering(self) -> bool {
         matches!(self, Self::OversizedToken(..))
+    }
+
+    const fn is_malformed(self) -> bool {
+        matches!(
+            self,
+            Self::MalformedNestedOperator(..)
+                | Self::MalformedOperator(..)
+                | Self::MalformedField(..)
+                | Self::MalformedEscape(..)
+                | Self::MalformedBoost(..)
+                | Self::MalformedSlop(..)
+        )
+    }
+
+    fn canonical_input(self) -> Vec<u8> {
+        match self {
+            Self::Empty => vec![0],
+            Self::Term(first) => vec![1, first],
+            Self::Phrase(first, second) => vec![2, first, second],
+            Self::NegatedTerm(first) => vec![3, first],
+            Self::Boolean(first, second, connective) => vec![4, first, second, connective],
+            Self::NestedBoolean(first, second, third) => vec![5, first, second, third],
+            Self::Fielded(first) => vec![6, first],
+            Self::BoostedTerm(first) => vec![7, first],
+            Self::Slop(first, second) => vec![8, first, second],
+            Self::PhrasePrefix(first, second) => vec![9, first, second],
+            Self::UnterminatedPhrase(first, second) => vec![10, first, second],
+            Self::EscapedTerm(first, second) => vec![11, first, second],
+            Self::TrailingBoolean(first) => vec![12, first],
+            Self::NonFiniteBoost(first) => vec![13, first],
+            Self::OversizedToken(first) => vec![14, first],
+            Self::MalformedNestedOperator(first, second, third) => vec![15, first, second, third],
+            Self::MalformedOperator(first, second) => vec![16, first, second],
+            Self::MalformedField(first) => vec![17, first],
+            Self::MalformedEscape(first) => vec![18, first],
+            Self::MalformedBoost(first) => vec![19, first],
+            Self::MalformedSlop(first, second) => vec![20, first, second],
+        }
     }
 
     fn shrink_candidates(self) -> Vec<Self> {
@@ -157,27 +234,36 @@ impl QueryTree {
                 Some(Self::Term(term)),
                 (term != 0).then_some(Self::BoostedTerm(0)),
             ],
-            Self::Slop(first, second) => vec![
-                (first != 0 || second != 0).then_some(Self::Slop(0, 0)),
-            ],
-            Self::PhrasePrefix(first, second) => vec![
-                (first != 0 || second != 0).then_some(Self::PhrasePrefix(0, 0)),
-            ],
+            Self::Slop(first, second) => {
+                vec![(first != 0 || second != 0).then_some(Self::Slop(0, 0))]
+            }
+            Self::PhrasePrefix(first, second) => {
+                vec![(first != 0 || second != 0).then_some(Self::PhrasePrefix(0, 0))]
+            }
             Self::UnterminatedPhrase(first, second) => vec![
-                Some(Self::UnterminatedPhrase(0, 0)).filter_not_equal(self, first != 0 || second != 0),
+                Some(Self::UnterminatedPhrase(0, 0))
+                    .filter_not_equal(self, first != 0 || second != 0),
             ],
             Self::EscapedTerm(first, second) => vec![
                 Some(Self::EscapedTerm(0, 0)).filter_not_equal(self, first != 0 || second != 0),
             ],
-            Self::TrailingBoolean(term) => vec![
-                (term != 0).then_some(Self::TrailingBoolean(0)),
+            Self::TrailingBoolean(term) => vec![(term != 0).then_some(Self::TrailingBoolean(0))],
+            Self::NonFiniteBoost(term) => vec![(term != 0).then_some(Self::NonFiniteBoost(0))],
+            Self::OversizedToken(term) => vec![(term != 0).then_some(Self::OversizedToken(0))],
+            Self::MalformedNestedOperator(first, second, third) => vec![
+                Some(Self::MalformedOperator(first, second)),
+                (first != 0 || second != 0 || third != 0)
+                    .then_some(Self::MalformedNestedOperator(0, 0, 0)),
             ],
-            Self::NonFiniteBoost(term) => vec![
-                (term != 0).then_some(Self::NonFiniteBoost(0)),
-            ],
-            Self::OversizedToken(term) => vec![
-                (term != 0).then_some(Self::OversizedToken(0)),
-            ],
+            Self::MalformedOperator(first, second) => {
+                vec![(first != 0 || second != 0).then_some(Self::MalformedOperator(0, 0))]
+            }
+            Self::MalformedField(term) => vec![(term != 0).then_some(Self::MalformedField(0))],
+            Self::MalformedEscape(term) => vec![(term != 0).then_some(Self::MalformedEscape(0))],
+            Self::MalformedBoost(term) => vec![(term != 0).then_some(Self::MalformedBoost(0))],
+            Self::MalformedSlop(first, second) => {
+                vec![(first != 0 || second != 0).then_some(Self::MalformedSlop(0, 0))]
+            }
         }
         .into_iter()
         .flatten()
@@ -195,13 +281,17 @@ trait CandidateOption {
 
 impl CandidateOption for QueryTree {
     fn filter_not_equal(self, original: QueryTree, include: bool) -> Option<QueryTree> {
-        include.then_some(self).filter(|candidate| *candidate != original)
+        include
+            .then_some(self)
+            .filter(|candidate| *candidate != original)
     }
 }
 
 impl CandidateOption for Option<QueryTree> {
     fn filter_not_equal(self, original: QueryTree, include: bool) -> Option<QueryTree> {
-        include.then_some(self?).filter(|candidate| *candidate != original)
+        include
+            .then_some(self?)
+            .filter(|candidate| *candidate != original)
     }
 }
 
@@ -224,13 +314,105 @@ impl FailureFingerprint {
     }
 }
 
+#[derive(Debug)]
+struct MinimizedFuzzReplay {
+    input: Vec<u8>,
+    tree: QueryTree,
+    query: String,
+    fingerprint: FailureFingerprint,
+    divergence_class: DivergenceClass,
+}
+
+impl MinimizedFuzzReplay {
+    fn assert_reconstructs(&self, vocabulary: &[String]) {
+        assert_eq!(
+            QueryTree::from_input(&self.input),
+            self.tree,
+            "persisted minimized bytes must reconstruct the minimized AST"
+        );
+        assert_eq!(
+            self.tree.render(vocabulary),
+            self.query,
+            "persisted minimized query must be the minimized AST rendering"
+        );
+    }
+
+    fn encoded(&self) -> String {
+        format!(
+            "schema=1\nminimized_input_hex={}\nminimized_ast={:?}\nminimized_query={:?}\nminimized_divergence_class={:?}\nminimized_fingerprint={:?}\n",
+            input_hex(&self.input),
+            self.tree,
+            self.query,
+            self.divergence_class,
+            self.fingerprint,
+        )
+    }
+}
+
+fn failure_divergence_class(report: &ComparisonReport) -> DivergenceClass {
+    report
+        .divergences
+        .iter()
+        .find(|divergence| {
+            !matches!(
+                divergence.class,
+                DivergenceClass::ScoreEpsilon | DivergenceClass::TieOrder
+            )
+        })
+        .map(|divergence| divergence.class)
+        .unwrap_or_else(|| {
+            panic!(
+                "failed differential comparison must retain a non-automatic divergence class: {report:?}"
+            )
+        })
+}
+
+fn persist_minimized_replay(replay: &MinimizedFuzzReplay) -> std::path::PathBuf {
+    let directory = std::path::Path::new("artifacts").join("typed_query_tree");
+    std::fs::create_dir_all(&directory).unwrap_or_else(|error| {
+        panic!("cannot create minimized fuzz artifact directory {directory:?}: {error}")
+    });
+    let path = directory.join(format!(
+        "{}-{:?}.replay",
+        input_hex(&replay.input),
+        replay.divergence_class
+    ));
+    let encoded = replay.encoded();
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            use std::io::Write as _;
+
+            file.write_all(encoded.as_bytes()).unwrap_or_else(|error| {
+                panic!("cannot persist minimized fuzz replay {path:?}: {error}")
+            });
+            file.sync_all().unwrap_or_else(|error| {
+                panic!("cannot sync minimized fuzz replay {path:?}: {error}")
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = std::fs::read_to_string(&path).unwrap_or_else(|read_error| {
+                panic!("cannot read existing minimized fuzz replay {path:?}: {read_error}")
+            });
+            assert_eq!(
+                existing, encoded,
+                "a replay path may only name one minimized input/query/fingerprint/class tuple"
+            );
+        }
+        Err(error) => panic!("cannot create minimized fuzz replay {path:?}: {error}"),
+    }
+    path
+}
+
 fn seed_from(input: &[u8]) -> u64 {
-    input.iter().fold(0x6273_6a77_0002_f29b_6a5d_u64, |state, byte| {
-        state
-            .rotate_left(5)
-            .wrapping_mul(0x1000_0000_01b3)
-            ^ u64::from(*byte)
-    })
+    input
+        .iter()
+        .fold(0x6273_6a77_0002_f29b_6a5d_u64, |state, byte| {
+            state.rotate_left(5).wrapping_mul(0x1000_0000_01b3) ^ u64::from(*byte)
+        })
 }
 
 fn input_hex(input: &[u8]) -> String {
@@ -249,8 +431,9 @@ fn seeded_vocabulary(documents: &[GeneratedDocument]) -> Vec<String> {
         .filter(|document| document.pathology.is_none())
         .flat_map(|document| document.content.split_whitespace())
         .filter(|word| {
-            word.strip_prefix("term")
-                .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+            word.strip_prefix("term").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            })
         })
         .map(str::to_owned)
         .collect::<Vec<_>>();
@@ -420,7 +603,7 @@ fuzz_target!(|input: &[u8]| {
     let input_hex = input_hex(input);
     let tree = QueryTree::from_input(input);
     let seed = seed_from(input);
-    run_test_with_cx(|cx| async move {
+    run_test_with_cx(move |cx| async move {
         let corpus = SyntheticCorpus::new(SyntheticCorpusSpec {
             seed,
             document_count: FUZZ_DOCUMENT_COUNT,
@@ -462,11 +645,44 @@ fuzz_target!(|input: &[u8]| {
                         provenance(&input_hex, seed, tree, &corpus_hash)
                     )
                 });
-            let harness_error = DifferentialHarness::new(ComparisonMode::CrossEngine, comparator_config)
+            let harness_error =
+                DifferentialHarness::new(ComparisonMode::CrossEngine, comparator_config)
+                    .run(&cx, &subject, &oracle, &case)
+                    .await
+                    .expect_err("typed Quill refusal must not create a one-sided comparison");
+            assert_exact_refusal(harness_error, expected_detail, "harness observation");
+            return;
+        }
+
+        if tree.is_malformed() {
+            let (subject, oracle) = scalar_g1a_fuzz_pair(&cx, &indexable)
+                .await
+                .expect("fresh committed pair for the malformed grammar lane");
+            let subject_error = GauntletEngine::observe(&subject, &cx, &case)
+                .await
+                .expect_err("malformed AST must refuse in Quill before comparison");
+            let oracle_error = GauntletEngine::observe(&oracle, &cx, &case)
+                .await
+                .expect_err(
+                    "malformed AST must refuse in the pinned Tantivy oracle before comparison",
+                );
+            DifferentialHarness::new(ComparisonMode::CrossEngine, comparator_config)
                 .run(&cx, &subject, &oracle, &case)
                 .await
-                .expect_err("typed Quill refusal must not create a one-sided comparison");
-            assert_exact_refusal(harness_error, expected_detail, "harness observation");
+                .expect_err("malformed AST must not create a one-sided comparison");
+            assert!(
+                matches!(
+                    tree,
+                    QueryTree::MalformedNestedOperator(..)
+                        | QueryTree::MalformedOperator(..)
+                        | QueryTree::MalformedField(..)
+                        | QueryTree::MalformedEscape(..)
+                        | QueryTree::MalformedBoost(..)
+                        | QueryTree::MalformedSlop(..)
+                ),
+                "malformed grammar lane must remain limited to explicit malformed AST variants"
+            );
+            let _ = (subject_error, oracle_error);
             return;
         }
 
@@ -508,6 +724,7 @@ fuzz_target!(|input: &[u8]| {
             ),
             ComparisonStatus::Failed => {
                 let original_fingerprint = FailureFingerprint::from_report(&report);
+                let original_divergence_class = failure_divergence_class(&report);
                 let (minimized_tree, minimized_case, minimized_report, reduction_steps) =
                     shrink_preserving_fingerprint(
                         &cx,
@@ -522,13 +739,82 @@ fuzz_target!(|input: &[u8]| {
                         comparator_config,
                     )
                     .await;
+                let minimized_fingerprint = FailureFingerprint::from_report(&minimized_report);
+                let minimized_divergence_class = failure_divergence_class(&minimized_report);
+                assert_eq!(
+                    minimized_fingerprint, original_fingerprint,
+                    "minimization must retain the exact divergence fingerprint"
+                );
+                assert_eq!(
+                    minimized_divergence_class, original_divergence_class,
+                    "minimization must retain the exact divergence class"
+                );
+                let minimized_replay = MinimizedFuzzReplay {
+                    input: minimized_tree.canonical_input(),
+                    tree: minimized_tree,
+                    query: minimized_case.query.clone(),
+                    fingerprint: minimized_fingerprint,
+                    divergence_class: minimized_divergence_class,
+                };
+                minimized_replay.assert_reconstructs(&vocabulary);
+                let replay_path = persist_minimized_replay(&minimized_replay);
                 panic!(
-                    "unclassified Quill/Tantivy divergence: provenance={} original_fingerprint={original_fingerprint:?} minimized_ast={minimized_tree:?} minimized_query={:?} minimized_fingerprint={:?} shrink_steps={reduction_steps}",
+                    "unclassified Quill/Tantivy divergence: provenance={} original_fingerprint={original_fingerprint:?} original_divergence_class={original_divergence_class:?} minimized_replay_path={replay_path:?} minimized_replay={} shrink_steps={reduction_steps}",
                     provenance(&input_hex, seed, minimized_tree, &corpus_hash),
-                    minimized_case.query,
-                    FailureFingerprint::from_report(&minimized_report),
+                    minimized_replay.encoded(),
                 );
             }
         }
     });
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vocabulary() -> Vec<String> {
+        vec!["term0".to_owned(), "term1".to_owned(), "term2".to_owned()]
+    }
+
+    fn fingerprint() -> FailureFingerprint {
+        FailureFingerprint {
+            status: ComparisonStatus::Failed,
+            rank_class: RankClass::RankMismatch,
+            first_divergence: Some("/comparison/subject/hits/0".to_owned()),
+            divergences: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn minimized_bytes_and_query_reconstruct_every_hostile_malformed_ast() {
+        let vocabulary = vocabulary();
+        for tree in [
+            QueryTree::NestedBoolean(1, 2, 0),
+            QueryTree::MalformedNestedOperator(1, 2, 0),
+            QueryTree::MalformedOperator(1, 2),
+            QueryTree::MalformedField(1),
+            QueryTree::MalformedEscape(1),
+            QueryTree::MalformedBoost(1),
+            QueryTree::MalformedSlop(1, 2),
+        ] {
+            let replay = MinimizedFuzzReplay {
+                input: tree.canonical_input(),
+                tree,
+                query: tree.render(&vocabulary),
+                fingerprint: fingerprint(),
+                divergence_class: DivergenceClass::RankMismatch,
+            };
+            replay.assert_reconstructs(&vocabulary);
+            let encoded = replay.encoded();
+            assert!(encoded.contains("minimized_input_hex="));
+            assert!(encoded.contains("minimized_query="));
+            assert!(encoded.contains("minimized_divergence_class=RankMismatch"));
+            assert!(encoded.contains("minimized_fingerprint="));
+            assert_eq!(
+                tree.is_malformed(),
+                !matches!(tree, QueryTree::NestedBoolean(..)),
+                "only deliberately malformed grammar enters the malformed lane"
+            );
+        }
+    }
+}

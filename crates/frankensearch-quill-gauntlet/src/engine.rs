@@ -2409,12 +2409,11 @@ impl QuillSubject {
                 source_dirty,
             )?) as Box<dyn DifferentialCampaignEngine>)
         });
-        let make_oracle = Box::new(|| {
+        let make_oracle = Box::new(move || {
             Ok(Box::new(TantivyOracle::in_memory_scalar_g1a_with_source(
                 &oracle_revision,
                 source_dirty,
-            )?)
-                as Box<dyn DifferentialCampaignEngine>)
+            )?) as Box<dyn DifferentialCampaignEngine>)
         });
         (make_subject, make_oracle)
     }
