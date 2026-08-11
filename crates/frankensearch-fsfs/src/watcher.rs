@@ -239,6 +239,7 @@ pub type FileSnapshot = BTreeMap<PathBuf, u64>;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanCompleteness {
     unresolved: BTreeSet<PathBuf>,
+    root_identities: BTreeMap<PathBuf, RootIdentity>,
 }
 
 impl ScanCompleteness {
@@ -262,6 +263,40 @@ impl ScanCompleteness {
     /// Record a path whose contents or existence could not be established.
     fn record_unresolved(&mut self, path: impl Into<PathBuf>) {
         self.unresolved.insert(path.into());
+    }
+
+    /// Record the identity a root had while this scan read it.
+    fn record_root_identity(&mut self, root: impl Into<PathBuf>, identity: RootIdentity) {
+        self.root_identities.insert(root.into(), identity);
+    }
+
+    /// Identities observed for the roots this scan resolved.
+    const fn root_identities(&self) -> &BTreeMap<PathBuf, RootIdentity> {
+        &self.root_identities
+    }
+
+    /// Mark every root whose identity differs from the baseline's as
+    /// unresolved.
+    ///
+    /// A replaced root reads as an ordinary, complete, empty directory. Only
+    /// the identity distinguishes "the tree is empty" from "this is not the
+    /// tree the baseline describes", so the comparison happens before any
+    /// deletion is derived. A root absent from `baseline` is new rather than
+    /// swapped and is left alone.
+    fn reject_swapped_roots(&mut self, baseline: &BTreeMap<PathBuf, RootIdentity>) {
+        let swapped = self
+            .root_identities
+            .iter()
+            .filter(|(root, identity)| {
+                baseline
+                    .get(*root)
+                    .is_some_and(|previous| previous != *identity)
+            })
+            .map(|(root, _)| root.clone())
+            .collect::<Vec<_>>();
+        for root in swapped {
+            self.record_unresolved(root);
+        }
     }
 }
 
@@ -454,6 +489,54 @@ struct ReconciliationState {
     required: bool,
     affected_paths: BTreeSet<PathBuf>,
     epoch: u64,
+    /// Last snapshot produced by a scan that resolved every root, and the
+    /// identities those roots had at that moment.
+    ///
+    /// Deletions are derived against this, never against a snapshot taken
+    /// while something was unreadable. Retaining it is what lets a delete that
+    /// was suppressed during an incomplete scan still be synthesized once
+    /// completeness returns: the authoritative baseline still lists the path,
+    /// so the first complete rescan diffs it away.
+    catchup_baseline: Option<FileSnapshot>,
+    root_identities: BTreeMap<PathBuf, RootIdentity>,
+}
+
+/// Identity of a configured root at scan time.
+///
+/// A root that is unmounted and left as a readable empty directory, or renamed
+/// away and replaced by a fresh one, is byte-for-byte a *complete* scan of an
+/// empty tree — and would delete the entire index. Comparing the identity
+/// against the one recorded when the baseline was taken turns that into an
+/// incomplete scan instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RootIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl RootIdentity {
+    /// Read the identity of an existing root, mirroring the device+inode pair
+    /// the publication lease already uses for the same purpose.
+    #[cfg(unix)]
+    fn of(metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+
+    /// Non-Unix targets expose no stable inode pair here. Report a constant so
+    /// identity comparison never *invents* a difference; the root-level error
+    /// classification above still catches disappearance.
+    #[cfg(not(unix))]
+    fn of(_metadata: &fs::Metadata) -> Self {
+        Self {
+            device: 0,
+            inode: 0,
+        }
+    }
 }
 
 type ReconciliationTracker = Arc<Mutex<ReconciliationState>>;
@@ -1527,14 +1610,23 @@ async fn run_ingest_loop(
                 Err(error) => {
                     stats.add_error();
                     reconciliation_attempts = reconciliation_attempts.saturating_add(1);
+                    // A root that stays unavailable fails every attempt, so
+                    // the attempt bound is what stops a persistent
+                    // incompleteness from looping here forever, and the stop
+                    // flag is what keeps `stop_checked` prompt while it does.
                     if !is_retryable_error(&error)
                         || cx.is_cancel_requested()
+                        || stop.is_requested()
                         || reconciliation_attempts >= MAX_RECONCILIATION_ATTEMPTS
                     {
                         return Err(error);
                     }
                     warn!(error = %error, "watcher reconciliation failed; retrying full rescan");
-                    asupersync::time::sleep(cx.now(), IDLE_POLL).await;
+                    // Interruptible and stop-aware: a stop requested during
+                    // the backoff ends the wait instead of serving it out.
+                    if stop.wait_or_stopped(IDLE_POLL) {
+                        return Err(error);
+                    }
                     continue;
                 }
             }
@@ -1656,12 +1748,22 @@ async fn run_authoritative_reconciliation(
     batch_size: usize,
     snapshot_collector: &SnapshotCollector,
 ) -> SearchResult<()> {
-    let (epoch, indexed_snapshot, affected_paths) = {
+    let (epoch, indexed_snapshot, affected_paths, deletion_baseline, baseline_root_identities) = {
         let state = lock_or_recover(reconciliation);
         (
             state.epoch,
             state.indexed_snapshot.clone(),
             state.affected_paths.clone(),
+            // Deletions are derived against the last snapshot that resolved
+            // every root, so a delete suppressed while something was
+            // unreadable is still pending here and is synthesized by the first
+            // complete rescan. Before any complete scan exists there is no
+            // authoritative absence to claim, so the working set stands in.
+            state
+                .catchup_baseline
+                .clone()
+                .unwrap_or_else(|| state.indexed_snapshot.clone()),
+            state.root_identities.clone(),
         )
     };
     // Every batch already visible here predates the authoritative snapshot
@@ -1669,7 +1771,10 @@ async fn run_authoritative_reconciliation(
     // state, while batches produced after this clear remain queued and are
     // applied after the rescan.
     lock_or_recover(ready_batches).clear();
-    let (current, completeness) = snapshot_collector(roots, discovery)?;
+    let (current, mut completeness) = snapshot_collector(roots, discovery)?;
+    // A swapped root reads as a complete scan of an empty tree; only the
+    // identity recorded with the baseline distinguishes it from a real one.
+    completeness.reject_swapped_roots(&baseline_root_identities);
     let observed_at_ms = now_millis();
     let mount_table = build_mount_table(discovery);
     let mut events = current
@@ -1689,22 +1794,45 @@ async fn run_authoritative_reconciliation(
     // reindexes everything it did observe above, but it derives no deletes:
     // a path missing from a short snapshot may simply be one the scan could
     // not read.
-    if completeness.is_complete() {
-        let mut deletion_candidates = indexed_snapshot.keys().cloned().collect::<BTreeSet<_>>();
-        deletion_candidates.extend(affected_paths);
-        events.extend(
-            deletion_candidates
-                .into_iter()
-                .filter(|path| !current.contains_key(path))
-                .map(|path| WatchEvent::deleted(path, observed_at_ms)),
-        );
-    } else {
+    if !completeness.is_complete() {
+        // Applying the visible subset and returning `Ok` was the defect in the
+        // first correction: it reindexed a partial tree, cleared nothing, and
+        // reported success, so the caller had no reason to back off and the
+        // rescan ran again immediately on the next pass. An unresolved rescan
+        // is a retryable failure of the whole pass — no ops are applied here —
+        // and `SubsystemError` is the classification `is_retryable_error`
+        // already honours, so the ingest loop's bounded attempts, its
+        // interruptible sleep, and its stop/cancel checks all apply unchanged.
+        let mut state = lock_or_recover(reconciliation);
+        state.required = true;
+        drop(state);
+        let unresolved = completeness
+            .unresolved_paths()
+            .map(Path::display)
+            .map(|path| path.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         warn!(
             unresolved_paths = completeness.unresolved_count(),
-            "watcher rescan could not resolve every path; deriving no deletions and keeping \
-             reconciliation required"
+            "watcher rescan could not resolve every path; applying nothing and retrying"
         );
+        return Err(SearchError::SubsystemError {
+            subsystem: "fsfs-watcher",
+            source: Box::new(io::Error::other(format!(
+                "authoritative rescan is incomplete; {} unresolved path(s): {unresolved}",
+                completeness.unresolved_count()
+            ))),
+        });
     }
+
+    let mut deletion_candidates = deletion_baseline.keys().cloned().collect::<BTreeSet<_>>();
+    deletion_candidates.extend(affected_paths);
+    events.extend(
+        deletion_candidates
+            .into_iter()
+            .filter(|path| !current.contains_key(path))
+            .map(|path| WatchEvent::deleted(path, observed_at_ms)),
+    );
 
     for event_batch in events.chunks(batch_size.max(1)) {
         if cx.is_cancel_requested() {
@@ -1727,19 +1855,19 @@ async fn run_authoritative_reconciliation(
         stats.add_skipped(outcome.skipped);
     }
 
+    // Only a complete pass reaches here; the incomplete one returned above
+    // before applying anything.
     let mut state = lock_or_recover(reconciliation);
     if state.epoch == epoch {
-        if completeness.is_complete() {
-            state.indexed_snapshot = current;
-            state.baseline_initialized = true;
-            state.required = false;
-            state.affected_paths.clear();
-        } else {
-            // Promoting a short snapshot to the baseline would make the next
-            // complete scan diff against it and delete everything the failed
-            // scan could not see. Keep the old baseline and stay required.
-            state.required = true;
-        }
+        state.indexed_snapshot = current.clone();
+        // The authoritative baseline and the identities it was taken against
+        // advance together: a later scan comparing against one but not the
+        // other could call a swapped root unchanged.
+        state.catchup_baseline = Some(current);
+        state.root_identities = completeness.root_identities().clone();
+        state.baseline_initialized = true;
+        state.required = false;
+        state.affected_paths.clear();
     }
     Ok(())
 }
@@ -2049,13 +2177,22 @@ fn collect_snapshot_for_root(
     snapshot: &mut FileSnapshot,
     completeness: &mut ScanCompleteness,
 ) -> SearchResult<()> {
-    if !root.exists() {
-        // A root that is not there is not the same claim as a root that is
-        // there and empty. An unmounted or not-yet-created root would
-        // otherwise diff as the deletion of everything beneath it.
-        completeness.record_unresolved(root);
-        return Ok(());
-    }
+    // One stat, not `exists()` then a walk. `exists()` answers a question
+    // about a past instant and swallows every error into `false`: a root that
+    // was merely unreadable reported "absent", and between that answer and the
+    // walk the root could be replaced anyway. Classifying this single call is
+    // both the error fix and the TOCTOU fix.
+    let root_metadata = match fs::metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if is_ignorable_walk_error(&error) => {
+            // Absent, unreadable, or interrupted are all "could not look",
+            // never "there is nothing there".
+            completeness.record_unresolved(root);
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    completeness.record_root_identity(root, RootIdentity::of(&root_metadata));
 
     let root_decision = discovery.evaluate_root(root, lookup_mount_category(mount_table, root));
     if matches!(root_decision.scope, DiscoveryScopeDecision::Exclude) {
@@ -2373,9 +2510,9 @@ mod tests {
         PendingBatchLease, PendingEvents, ReadyBatchQueue, ReconciliationState,
         ReconciliationTracker, ScanCompleteness, WatchBatchOutcome, WatchEvent, WatchEventKind,
         WatchIngestFuture, WatchIngestOp, WatchIngestPipeline, WatcherExecutionPolicy,
-        WatcherLifecycle, WatcherStop, collect_snapshot_from_roots, drain_notify_channel,
-        flush_pending_batches, normalize_file_key, now_millis, observe_pressure_transition,
-        run_authoritative_reconciliation, run_ingest_loop,
+        WatcherLifecycle, WatcherStatsInner, WatcherStop, collect_snapshot_from_roots,
+        drain_notify_channel, flush_pending_batches, is_retryable_error, normalize_file_key,
+        now_millis, observe_pressure_transition, run_authoritative_reconciliation, run_ingest_loop,
     };
     use crate::config::DiscoveryConfig;
 
@@ -3418,6 +3555,298 @@ mod tests {
             assert!(lock_or_recover(&queue).is_empty());
             assert!(!lock_or_recover(&reconciliation).required);
             assert_eq!(stats.snapshot().errors, 1);
+        });
+    }
+
+    #[test]
+    /// One reachable root plus one unavailable root must not reindex the half
+    /// it can see. The pass fails retryably, applies nothing, stays required,
+    /// and does not stall a stop.
+    #[test]
+    fn unavailable_root_fails_the_whole_pass_and_stops_promptly() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let present_root = temp.path().join("g3f-present");
+            let absent_root = temp.path().join("g3f-absent");
+            fs::create_dir_all(&present_root).expect("create present root");
+            let visible = present_root.join("visible.rs");
+            fs::write(&visible, "fn visible() {}\n").expect("write visible fixture");
+
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let reconciliation: ReconciliationTracker =
+                Arc::new(Mutex::new(ReconciliationState::default()));
+            let queue: ReadyBatchQueue = Arc::new(Mutex::new(VecDeque::new()));
+            let stats = WatcherStatsInner::default();
+            let roots = vec![present_root.clone(), absent_root];
+
+            let error = run_authoritative_reconciliation(
+                &cx,
+                &roots,
+                &DiscoveryConfig::default(),
+                pipeline.as_ref(),
+                &reconciliation,
+                &queue,
+                &stats,
+                100,
+                &collect_snapshot_from_roots,
+            )
+            .await
+            .expect_err("an unresolved root must fail the pass");
+
+            assert!(
+                is_retryable_error(&error),
+                "the outcome must reach the loop's retry path, got {error:?}"
+            );
+            assert!(
+                pipeline.all_ops().is_empty(),
+                "no subset may be reindexed from an incomplete scan"
+            );
+            let snapshot = stats.snapshot();
+            assert_eq!(snapshot.files_reindexed, 0);
+            let state = lock_or_recover(&reconciliation);
+            assert!(state.required, "an incomplete pass stays required");
+            assert!(
+                state.catchup_baseline.is_none(),
+                "an incomplete pass must not seed the authoritative baseline"
+            );
+        });
+    }
+
+    /// A delete suppressed while a root was unavailable is still synthesized
+    /// once completeness returns, because the authoritative baseline retained
+    /// the path across the incomplete pass.
+    #[test]
+    fn delete_suppressed_during_incompleteness_is_recovered_when_completeness_returns() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("g3f-recover");
+            let blocked = temp.path().join("g3f-recover-blocked");
+            fs::create_dir_all(&root).expect("create root");
+            fs::create_dir_all(&blocked).expect("create second root");
+            let kept = root.join("kept.rs");
+            let doomed = root.join("doomed.rs");
+            fs::write(&kept, "fn kept() {}\n").expect("write kept fixture");
+            fs::write(&doomed, "fn doomed() {}\n").expect("write doomed fixture");
+
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let reconciliation: ReconciliationTracker =
+                Arc::new(Mutex::new(ReconciliationState::default()));
+            let queue: ReadyBatchQueue = Arc::new(Mutex::new(VecDeque::new()));
+            let stats = WatcherStatsInner::default();
+            let discovery = DiscoveryConfig::default();
+            let roots = vec![root.clone(), blocked.clone()];
+
+            // Complete pass: establishes the authoritative baseline.
+            run_authoritative_reconciliation(
+                &cx,
+                &roots,
+                &discovery,
+                pipeline.as_ref(),
+                &reconciliation,
+                &queue,
+                &stats,
+                100,
+                &collect_snapshot_from_roots,
+            )
+            .await
+            .expect("first pass resolves every root");
+            assert!(
+                lock_or_recover(&reconciliation)
+                    .catchup_baseline
+                    .as_ref()
+                    .expect("baseline seeded")
+                    .contains_key(&doomed)
+            );
+
+            // The file goes away while the second root is unavailable, so the
+            // delete cannot be derived yet.
+            let renamed = temp.path().join("g3f-recover-doomed-moved.rs");
+            fs::rename(&doomed, &renamed).expect("move doomed fixture out of the tree");
+            let stolen = temp.path().join("g3f-recover-blocked-moved");
+            fs::rename(&blocked, &stolen).expect("move the second root out of the way");
+
+            let error = run_authoritative_reconciliation(
+                &cx,
+                &roots,
+                &discovery,
+                pipeline.as_ref(),
+                &reconciliation,
+                &queue,
+                &stats,
+                100,
+                &collect_snapshot_from_roots,
+            )
+            .await
+            .expect_err("the missing root makes this pass incomplete");
+            assert!(is_retryable_error(&error));
+
+            // Completeness returns; the retained baseline still lists the
+            // removed path, so this pass finally derives its delete.
+            fs::rename(&stolen, &blocked).expect("restore the second root");
+            lock_or_recover(&pipeline.batches).clear();
+            run_authoritative_reconciliation(
+                &cx,
+                &roots,
+                &discovery,
+                pipeline.as_ref(),
+                &reconciliation,
+                &queue,
+                &stats,
+                100,
+                &collect_snapshot_from_roots,
+            )
+            .await
+            .expect("the restored pass resolves every root");
+
+            let deletes = pipeline
+                .all_ops()
+                .into_iter()
+                .filter_map(|op| match op {
+                    WatchIngestOp::Delete { path, .. } => Some(path),
+                    WatchIngestOp::Upsert { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                deletes.contains(&doomed),
+                "the suppressed delete must be recovered, got {deletes:?}"
+            );
+            assert!(
+                !deletes.contains(&kept),
+                "a surviving file must never be deleted"
+            );
+        });
+    }
+
+    /// A target that disappears between the scan and the apply is a genuine
+    /// absence, not an unresolved path: the pass still completes.
+    #[test]
+    fn target_that_disappears_between_checks_still_completes() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("g3f-vanishing");
+            fs::create_dir_all(&root).expect("create root");
+            let stable = root.join("stable.rs");
+            let vanishing = root.join("vanishing.rs");
+            fs::write(&stable, "fn stable() {}\n").expect("write stable fixture");
+            fs::write(&vanishing, "fn vanishing() {}\n").expect("write vanishing fixture");
+
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let reconciliation: ReconciliationTracker =
+                Arc::new(Mutex::new(ReconciliationState::default()));
+            let queue: ReadyBatchQueue = Arc::new(Mutex::new(VecDeque::new()));
+            let stats = WatcherStatsInner::default();
+            let discovery = DiscoveryConfig::default();
+            let roots = vec![root.clone()];
+
+            // The collector moves the file out of the tree after listing it,
+            // reproducing an entry that is gone by the time it is stat'd.
+            let moved_aside = temp.path().join("g3f-vanishing-moved.rs");
+            let vanishing_for_collector = vanishing.clone();
+            let moved_for_collector = moved_aside.clone();
+            let collector = move |roots: &[PathBuf], discovery: &DiscoveryConfig| {
+                let result = collect_snapshot_from_roots(roots, discovery);
+                if vanishing_for_collector.exists() {
+                    fs::rename(&vanishing_for_collector, &moved_for_collector)
+                        .expect("move the vanishing fixture aside");
+                }
+                result
+            };
+
+            run_authoritative_reconciliation(
+                &cx,
+                &roots,
+                &discovery,
+                pipeline.as_ref(),
+                &reconciliation,
+                &queue,
+                &stats,
+                100,
+                &collector,
+            )
+            .await
+            .expect("a file vanishing mid-pass is a real absence, not an unresolved path");
+
+            let state = lock_or_recover(&reconciliation);
+            assert!(!state.required, "the pass settled");
+            assert!(state.catchup_baseline.is_some());
+        });
+    }
+
+    /// A root replaced by a fresh directory is a different tree, even though
+    /// it reads as a perfectly complete scan of an empty one.
+    #[test]
+    fn swapped_root_identity_is_incomplete_rather_than_a_mass_delete() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("g3f-identity");
+            fs::create_dir_all(&root).expect("create root");
+            let indexed = root.join("indexed.rs");
+            fs::write(&indexed, "fn indexed() {}\n").expect("write indexed fixture");
+
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let reconciliation: ReconciliationTracker =
+                Arc::new(Mutex::new(ReconciliationState::default()));
+            let queue: ReadyBatchQueue = Arc::new(Mutex::new(VecDeque::new()));
+            let stats = WatcherStatsInner::default();
+            let discovery = DiscoveryConfig::default();
+            let roots = vec![root.clone()];
+
+            run_authoritative_reconciliation(
+                &cx,
+                &roots,
+                &discovery,
+                pipeline.as_ref(),
+                &reconciliation,
+                &queue,
+                &stats,
+                100,
+                &collect_snapshot_from_roots,
+            )
+            .await
+            .expect("baseline pass over the original root");
+
+            // Rename the populated root to a vacant name and create a new,
+            // empty directory at the configured path. Nothing is deleted or
+            // overwritten: the original tree is intact under a new name.
+            let vacated = temp.path().join("g3f-identity-original");
+            fs::rename(&root, &vacated).expect("rename the original root aside");
+            fs::create_dir(&root).expect("create the replacement root");
+            assert!(
+                vacated.join("indexed.rs").exists(),
+                "the original tree must survive the rename"
+            );
+
+            lock_or_recover(&pipeline.batches).clear();
+            let error = run_authoritative_reconciliation(
+                &cx,
+                &roots,
+                &discovery,
+                pipeline.as_ref(),
+                &reconciliation,
+                &queue,
+                &stats,
+                100,
+                &collect_snapshot_from_roots,
+            )
+            .await
+            .expect_err("a replaced root is not a complete scan of an empty tree");
+
+            assert!(is_retryable_error(&error));
+            assert!(
+                pipeline.all_ops().is_empty(),
+                "a swapped root must delete nothing, got {:?}",
+                pipeline.all_ops()
+            );
+            let state = lock_or_recover(&reconciliation);
+            assert!(state.required);
+            assert!(
+                state
+                    .catchup_baseline
+                    .as_ref()
+                    .expect("baseline from the first pass")
+                    .contains_key(&indexed),
+                "the authoritative baseline must survive the swap"
+            );
         });
     }
 
