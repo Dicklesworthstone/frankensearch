@@ -1388,6 +1388,14 @@ pub struct PostingCursor<'a> {
     decoded_docs: [u32; POSTINGS_PER_BLOCK],
     decoded_freqs: [u32; POSTINGS_PER_BLOCK],
     decoded_count: usize,
+    /// Blocks actually decoded, counted at the single decode site.
+    ///
+    /// The admission gate charges a block before it is read, so the
+    /// predicates that decide those charges have to be checkable against what
+    /// the cursor really did rather than against a second derivation of the
+    /// same guess. Test builds only.
+    #[cfg(test)]
+    decoded_blocks: usize,
 }
 
 impl<'a> PostingCursor<'a> {
@@ -1413,6 +1421,8 @@ impl<'a> PostingCursor<'a> {
             decoded_docs: [0; POSTINGS_PER_BLOCK],
             decoded_freqs: [0; POSTINGS_PER_BLOCK],
             decoded_count: 0,
+            #[cfg(test)]
+            decoded_blocks: 0,
         };
         if !cursor.blocks.as_slice().is_empty() {
             cursor.load_block(0)?;
@@ -1450,7 +1460,18 @@ impl<'a> PostingCursor<'a> {
         self.decoded_docs = decoded.docs;
         self.decoded_freqs = decoded.freqs;
         self.decoded_count = usize::from(decoded.posting_count);
+        #[cfg(test)]
+        {
+            self.decoded_blocks += 1;
+        }
         Ok(())
+    }
+
+    /// Blocks this cursor has actually decoded.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn decoded_blocks(&self) -> usize {
+        self.decoded_blocks
     }
 
     /// Current posting, including a valid `u32::MAX` docid when present.
@@ -1510,6 +1531,23 @@ impl<'a> PostingCursor<'a> {
             return false;
         }
         block + 1 < self.blocks.as_slice().len()
+    }
+
+    /// Total number of validated posting blocks.
+    #[must_use]
+    pub fn block_count(&self) -> usize {
+        self.blocks.as_slice().len()
+    }
+
+    /// Index of the first block whose validated `last_doc` reaches `target`.
+    ///
+    /// This is the same partition the seek in [`Self::advance`] performs, and
+    /// `None` means no block can hold `target` — a seek there exhausts.
+    #[must_use]
+    pub fn block_containing(&self, target: u32) -> Option<usize> {
+        let blocks = self.blocks.as_slice();
+        let index = blocks.partition_point(|block| block.last_doc < target);
+        (index < blocks.len()).then_some(index)
     }
 
     /// Whether [`Self::advance`] would decode a block, without decoding one.
@@ -4536,6 +4574,87 @@ impl PositionCursor<'_> {
             self.advance_one()?;
         }
         Ok(self.postings.current())
+    }
+
+    /// Number of POSTINGS block decodes [`Self::next`] would perform.
+    ///
+    /// [`Self::advance_one`] touches the paired posting cursor exactly once,
+    /// so a positional step decodes whatever that single step decodes.
+    #[must_use]
+    pub fn next_decode_count(&self) -> u64 {
+        u64::from(self.postings.next_decodes_block())
+    }
+
+    /// POSTINGS blocks the paired posting cursor has actually decoded.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn decoded_blocks(&self) -> usize {
+        self.postings.decoded_blocks()
+    }
+
+    /// Number of POSTINGS block decodes [`Self::advance`] would perform.
+    ///
+    /// A positional seek is two-stage and can decode more than one block, so
+    /// a caller admitting before the work needs the count, not a flag. This
+    /// mirrors [`Self::advance`] stage by stage from block metadata alone:
+    ///
+    /// 1. A satisfied target, an unresolvable positions block index, or a
+    ///    backward destination decode nothing — `advance` returns or fails
+    ///    before touching the posting cursor.
+    /// 2. With no positions block for the target, `advance` seeks the posting
+    ///    cursor straight at the target, decoding at most its landing block.
+    /// 3. A forward destination seeks to that block's `first_doc`, decoding
+    ///    only the block it lands in, because a direct seek skips the blocks
+    ///    between without reading them.
+    /// 4. The remaining walk to `target` steps posting by posting, and
+    ///    stepping decodes *every* block it crosses — which is why this
+    ///    counts the span rather than assuming one.
+    ///
+    /// A conversion that cannot fit `u64` saturates upward: over-admitting is
+    /// a visible over-charge, while under-admitting would let a decode run
+    /// unadmitted.
+    #[must_use]
+    pub fn advance_decode_count(&self, target: u32) -> u64 {
+        let Some(current) = self.postings.current() else {
+            return 0;
+        };
+        if current.doc_id >= target {
+            return 0;
+        }
+        let Some(current_posting_block) = self.postings.block_index() else {
+            return 0;
+        };
+
+        let destination = self
+            .position_blocks
+            .partition_point(|block| block.last_doc < target);
+        let Some(destination_block) = self.position_blocks.get(destination) else {
+            return u64::from(self.postings.advance_decodes_block(target));
+        };
+        let Some(current_block) = self.position_block_index else {
+            return 0;
+        };
+        if destination < current_block {
+            return 0;
+        }
+
+        let mut decodes = 0_u64;
+        let mut block = current_posting_block;
+        if destination > current_block {
+            let Some(landing) = self.postings.block_containing(destination_block.first_doc) else {
+                return decodes;
+            };
+            if landing != block {
+                decodes += 1;
+                block = landing;
+            }
+        }
+
+        let final_block = self
+            .postings
+            .block_containing(target)
+            .unwrap_or_else(|| self.postings.block_count().saturating_sub(1));
+        decodes.saturating_add(u64::try_from(final_block.saturating_sub(block)).unwrap_or(u64::MAX))
     }
 
     fn advance_one(&mut self) -> Result<Option<Posting>, PositionCodecError> {
@@ -13108,6 +13227,104 @@ mod tests {
             predicted_true > 0 && predicted_false > 0,
             "the target matrix must exercise both answers"
         );
+        Ok(())
+    }
+
+    /// The positional decode mirror must equal the decodes that actually
+    /// happened, counted at `load_block` itself.
+    ///
+    /// A positional seek is two-stage — a jump to the destination positions
+    /// block, then a posting-by-posting walk to the target — so its decode
+    /// count is not a flag and is not the change in block index: the jump
+    /// skips blocks without reading them while the walk reads every block it
+    /// crosses. Comparing against `decoded_blocks()` rather than against a
+    /// second derivation is what makes this a check instead of a restatement.
+    #[test]
+    fn positional_advance_decode_mirror_equals_observed_decodes() -> TestResult {
+        // One position per posting keeps the POSITIONS payload aligned with
+        // the posting count; `dense_postings` varies the frequency.
+        let postings: Vec<Posting> = (0..POSTINGS_PER_BLOCK * 3)
+            .map(|index| Ok(Posting::new(u32::try_from(index)?, 1)))
+            .collect::<Result<_, std::num::TryFromIntError>>()?;
+        let values: Vec<u32> = (0..postings.len())
+            .map(|index| u32::try_from(index % 17).unwrap_or(0))
+            .collect();
+        let posting_bytes = EncodedPostingList::encode(&postings)?;
+        let encoded = EncodedPositionList::encode(&postings, &values)?;
+        let last = postings.last().ok_or("non-empty fixture")?.doc_id;
+        let targets = [
+            0,
+            postings[0].doc_id,
+            postings[1].doc_id,
+            postings[POSTINGS_PER_BLOCK - 1].doc_id,
+            postings[POSTINGS_PER_BLOCK].doc_id,
+            postings[POSTINGS_PER_BLOCK + 1].doc_id,
+            postings[POSTINGS_PER_BLOCK * 2].doc_id,
+            last,
+            last.saturating_add(1),
+        ];
+
+        let mut nonzero_predictions = 0_usize;
+        let mut zero_predictions = 0_usize;
+        for target in targets {
+            let posting_list = posting_bytes.posting_list()?;
+            let positions = encoded.position_list(&posting_list)?;
+            let mut cursor = positions.cursor()?;
+            let baseline = cursor.decoded_blocks();
+            let predicted = cursor.advance_decode_count(target);
+            cursor.advance(target)?;
+            let observed = u64::try_from(cursor.decoded_blocks() - baseline)?;
+            assert_eq!(
+                predicted, observed,
+                "positional mirror disagreed for target={target}"
+            );
+            if predicted == 0 {
+                zero_predictions += 1;
+            } else {
+                nonzero_predictions += 1;
+            }
+        }
+        assert!(
+            nonzero_predictions > 0 && zero_predictions > 0,
+            "the target matrix must exercise both a decoding and a non-decoding seek"
+        );
+        Ok(())
+    }
+
+    /// The same obligation for positional stepping, at every step of a scan.
+    #[test]
+    fn positional_next_decode_mirror_equals_observed_decodes() -> TestResult {
+        let postings: Vec<Posting> = (0..POSTINGS_PER_BLOCK * 2 + 5)
+            .map(|index| Ok(Posting::new(u32::try_from(index)?, 1)))
+            .collect::<Result<_, std::num::TryFromIntError>>()?;
+        let values: Vec<u32> = (0..postings.len())
+            .map(|index| u32::try_from(index % 11).unwrap_or(0))
+            .collect();
+        let posting_bytes = EncodedPostingList::encode(&postings)?;
+        let encoded = EncodedPositionList::encode(&postings, &values)?;
+        let posting_list = posting_bytes.posting_list()?;
+        let positions = encoded.position_list(&posting_list)?;
+        let mut cursor = positions.cursor()?;
+
+        let mut total_predicted = 0_u64;
+        let mut steps_that_decoded = 0_usize;
+        loop {
+            let predicted = cursor.next_decode_count();
+            let baseline = cursor.decoded_blocks();
+            let moved = cursor.next()?;
+            let observed = u64::try_from(cursor.decoded_blocks() - baseline)?;
+            assert_eq!(predicted, observed, "positional step mirror disagreed");
+            total_predicted += predicted;
+            steps_that_decoded += usize::from(observed > 0);
+            if moved.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            steps_that_decoded, 2,
+            "a three-block fixture decodes twice after construction"
+        );
+        assert_eq!(total_predicted, 2);
         Ok(())
     }
 
