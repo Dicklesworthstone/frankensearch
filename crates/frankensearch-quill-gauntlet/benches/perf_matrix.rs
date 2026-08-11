@@ -1099,7 +1099,8 @@ impl Qg1ContinuousTimingReceipt {
                                 .to_owned(),
                         );
                     };
-                    if tail_document_id != &self.prepared_input.tail_document_id
+                    if *publication_generation_delta == 0
+                        || tail_document_id != &self.prepared_input.tail_document_id
                         || Some(*publication_generation_delta)
                             != self.quill_publication_generation_delta
                     {
@@ -1125,6 +1126,15 @@ impl Qg1ContinuousTimingReceipt {
                 if self.quill_publication_generation_delta.is_some() || join.writer_rearmed {
                     return Err(
                         "QG-1 Tantivy receipt names an impossible nonrearming join lifecycle"
+                            .to_owned(),
+                    );
+                }
+                if join.searchable_segments_before == 0
+                    || join.searchable_segments_after == 0
+                    || join.join_elapsed_ns == 0
+                {
+                    return Err(
+                        "QG-1 Tantivy receipt lacks authenticated positive searchable/join facts"
                             .to_owned(),
                     );
                 }
@@ -1185,6 +1195,13 @@ impl Qg1ContinuousTimingReceipt {
 fn qg1_live_sample_binding(
     continuous: Option<&Qg1ContinuousMeasurement>,
     elapsed_ns: u64,
+    scope: &PerfOperationScope,
+    provenance: &PerfSampleProvenance,
+    stream_role: &str,
+    stream_sequence: u64,
+    sample_id: u64,
+    block_id: u64,
+    arm: PerfSampleArm,
 ) -> Option<Qg1SampleBinding> {
     let continuous = continuous?;
     let receipt = &continuous.lifecycle_receipt;
@@ -1215,6 +1232,7 @@ fn qg1_live_sample_binding(
             },
         ) if search_tail == &tail_document_id
             && lifecycle_tail == &tail_document_id
+            && *publication_generation_delta > 0
             && receipt.quill_publication_generation_delta
                 == Some(*publication_generation_delta) =>
         {
@@ -1251,7 +1269,18 @@ fn qg1_live_sample_binding(
         }
         _ => return None,
     };
-    Some(Qg1SampleBinding {
+    let mut binding = Qg1SampleBinding {
+        schema_version: Qg1SampleBinding::SCHEMA_VERSION.to_owned(),
+        stream_role: stream_role.to_owned(),
+        stream_id_sha256: String::new(),
+        stream_sequence,
+        raw_sample_id: sample_id,
+        raw_block_id: block_id,
+        raw_arm: arm,
+        lifecycle_receipt_id_sha256: String::new(),
+        lifecycle_receipt_sha256: String::new(),
+        prepared_corpus_sha256: provenance.corpus_sha256.clone(),
+        prepared_input_sha256: String::new(),
         prepared_manifest_sha256: receipt.prepared_input.manifest_sha256.clone(),
         indexed_content_sha256: receipt.prepared_input.indexed_content_sha256.clone(),
         document_count: receipt.prepared_input.document_count,
@@ -1269,7 +1298,9 @@ fn qg1_live_sample_binding(
         tail_document_id,
         terminal_endpoint_ns: receipt.interval_ended_ns,
         lifecycle_witness,
-    })
+    };
+    binding.seal_lifecycle_receipt(scope, provenance);
+    Some(binding)
 }
 
 /// Work completed per elapsed second, derived exactly as
@@ -2476,29 +2507,37 @@ fn qg1_bulk_metric_continuous(
         EngineArm::Quill => {
             let prepared_input = context.qg1_sample_input(count);
             let index = quill_in_memory(spec);
-            let generation_before = index.snapshot().loaded_manifest().manifest.generation;
             let mut interval = Qg1ContinuousInterval::start(arm, prepared_input.binding.clone());
             let periodic_commit_calls =
                 feed_qg1_prepared_batches(context, &index, &prepared_input, None, &mut interval);
             let generation_before_terminal = index.snapshot().loaded_manifest().manifest.generation;
             qg1_terminal_commit(context, &index, &mut interval);
+            let generation_after_terminal = index.snapshot().loaded_manifest().manifest.generation;
             // Retain the Quill read owner until its terminal search returns,
             // matching Tantivy's retained-reader endpoint without inventing a
             // writer lifecycle that Quill does not have.
             let terminal_searchability = qg1_quill_terminal_searchability(&index, &mut interval);
-            let generation_delta = generation_before_terminal.saturating_sub(generation_before);
-            let (measurement, receipt) = interval.finish(
-                Some(generation_delta),
-                terminal_searchability,
+            let generation_delta =
+                generation_after_terminal.saturating_sub(generation_before_terminal);
+            let terminal_quiescence = if generation_delta > 0 {
                 Qg1TerminalFact::quill_publication_then_exact_tail(
                     prepared_input.binding.tail_document_id.clone(),
                     generation_delta,
-                ),
+                )
+            } else {
+                Qg1TerminalFact::no_claim(
+                    "QG-1 Quill terminal publishing commit did not advance generation",
+                )
+            };
+            let (measurement, receipt) = interval.finish(
+                Some(generation_delta),
+                terminal_searchability,
+                terminal_quiescence,
             );
             emit_qg1_continuous_timing_receipt(spec, receipt);
             eprintln!(
                 "[qg-commit-parity] gate={} fixture={} arm=quill cadence_ms={} \
-                 explicit_periodic_commit_calls={} automatic_publication_generation_delta={} \
+                 explicit_periodic_commit_calls={} terminal_publication_generation_delta={} \
                  terminal_commit_calls=1 \
                  pre_search_rearm_join_calls=0 terminal_search_calls=1 \
                  terminal_worker_join_calls=0 \
@@ -3713,6 +3752,7 @@ struct StreamPlan<'a> {
     sample_id_base: u64,
     group_id: Option<u64>,
     query_override: Option<&'a str>,
+    qg1_stream_role: Option<&'a str>,
 }
 
 /// Round-stepping executor for one paired raw-sample stream with a seeded
@@ -3859,10 +3899,27 @@ impl<'a> PairedStreamRunner<'a> {
             continuous,
         )
         .expect("QG sample timing is not publishable");
-        let qg1_sample_binding = qg1_live_sample_binding(
-            measurement.continuous.as_ref(),
-            window.ended_ns - window.started_ns,
-        );
+        let qg1_sample_binding = if qg1_producer_coverage(self.spec)
+            == Some(Qg1ProducerCoverage::EngineIndexingLifecycle)
+        {
+            qg1_live_sample_binding(
+                measurement.continuous.as_ref(),
+                window.ended_ns - window.started_ns,
+                self.scope,
+                &self.evidence.sample_provenance,
+                self.plan
+                    .qg1_stream_role
+                    .expect("QG-1 paired stream has one canonical role"),
+                sample_id
+                    .checked_sub(self.plan.sample_id_base)
+                    .expect("QG-1 sample ID belongs to its stream"),
+                sample_id,
+                block_id,
+                sample_arm,
+            )
+        } else {
+            None
+        };
         if self.scope.semantics == PerfMetricSemantics::Throughput {
             // The published absolutes read `observed_value` while the estimator
             // recomputes the same rate from the published window. A QG-1 row is
@@ -3909,6 +3966,34 @@ enum StreamSlot {
     OracleNull,
     TreatmentNull,
     Effect,
+}
+
+/// The QG-1 effect and both independent A/A streams are one prepared-input
+/// experiment.  The generic estimator verifies each effect/null pair; this
+/// shipping collector also verifies the three-stream bundle before either
+/// result can reach headline evidence.
+fn validate_qg1_three_stream_prepared_identity(
+    effect: &[PerfRawSample],
+    tantivy_null: &[PerfRawSample],
+    quill_null: &[PerfRawSample],
+) -> Result<(), String> {
+    let first = effect
+        .first()
+        .and_then(|sample| sample.qg1_sample_binding.as_ref())
+        .ok_or_else(|| "QG-1 effect stream omitted its lifecycle binding".to_owned())?;
+    for sample in effect.iter().chain(tantivy_null).chain(quill_null) {
+        let binding = sample.qg1_sample_binding.as_ref().ok_or_else(|| {
+            "QG-1 three-stream prepared-input bundle omitted a lifecycle binding".to_owned()
+        })?;
+        if binding.prepared_corpus_sha256 != first.prepared_corpus_sha256
+            || binding.prepared_input_sha256 != first.prepared_input_sha256
+        {
+            return Err(
+                "QG-1 effect and both null streams disagree on frozen prepared input".to_owned(),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Deterministic per-round permutation of the three stream slots so no stream
@@ -4760,6 +4845,7 @@ fn collect_cell(
                 sample_id_base: 1_000_000,
                 group_id: None,
                 query_override: None,
+                qg1_stream_role: (spec.gate == PerfGate::Qg1).then_some("qg1.null.tantivy.v1"),
             },
         );
         let mut treatment_null = (spec.gate == PerfGate::Qg1).then(|| {
@@ -4778,6 +4864,7 @@ fn collect_cell(
                     sample_id_base: 2_000_000,
                     group_id: None,
                     query_override: None,
+                    qg1_stream_role: Some("qg1.null.quill.v1"),
                 },
             )
         });
@@ -4796,6 +4883,8 @@ fn collect_cell(
                 sample_id_base: 0,
                 group_id: None,
                 query_override: None,
+                qg1_stream_role: (spec.gate == PerfGate::Qg1)
+                    .then_some("qg1.effect.tantivy_vs_quill.v1"),
             },
         );
         for round in 0..runs {
@@ -4874,6 +4963,17 @@ fn collect_cell(
                 .rotate_left(17)
             ^ values_checksum(&effect_samples).rotate_left(29),
     );
+
+    if qg1_producer_coverage(spec) == Some(Qg1ProducerCoverage::EngineIndexingLifecycle) {
+        validate_qg1_three_stream_prepared_identity(
+            &effect_samples,
+            &oracle_null_samples,
+            treatment_null_samples
+                .as_deref()
+                .expect("QG-1 requires a Quill/Quill A/A stream"),
+        )
+        .expect("QG-1 harness-produced streams must share one frozen prepared input");
+    }
 
     let experiment =
         estimate_paired_experiment(&effect_samples, &oracle_null_samples, &evidence.config)
@@ -6292,24 +6392,6 @@ mod tests {
             PairedEstimatorConfig, PerfOperationScope, PerfRawSample, PerfSampleArm,
             PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance, estimate_paired_experiment,
         };
-        let binding_from_receipt = |receipt: super::Qg1ContinuousTimingReceipt| {
-            let continuous = super::Qg1ContinuousMeasurement {
-                work_units: receipt.document_count,
-                origin: std::time::Instant::now(),
-                elapsed_ns: receipt.interval_ended_ns,
-                prepared_input: receipt.prepared_input.clone(),
-                lifecycle_receipt: receipt,
-            };
-            super::qg1_live_sample_binding(Some(&continuous), continuous.elapsed_ns)
-        };
-        let proved_binding = binding_from_receipt(hostile_tantivy_continuous_receipt())
-            .expect("a proved terminal lifecycle must create the estimator binding");
-        let no_claim_binding = binding_from_receipt(unproved.clone());
-        assert!(
-            no_claim_binding.is_none(),
-            "NoClaim lifecycle receipts must not create a headline-eligible binding"
-        );
-
         let scope = PerfOperationScope {
             operation_id: "QG-1.bulk/tiny/1/positions_on.docs_per_second".to_owned(),
             version: 1,
@@ -6324,14 +6406,79 @@ mod tests {
             worker_id: "hostile-test".to_owned(),
             build_profile: "release-perf".to_owned(),
         };
-        let stream = |binding: Option<super::Qg1SampleBinding>, sample_id_base: u64| {
+        let binding_from_receipt = |receipt: super::Qg1ContinuousTimingReceipt,
+                                    stream_role: &str,
+                                    stream_sequence: u64,
+                                    sample_id: u64,
+                                    block_id: u64,
+                                    arm: PerfSampleArm| {
+            let continuous = super::Qg1ContinuousMeasurement {
+                work_units: receipt.document_count,
+                origin: std::time::Instant::now(),
+                elapsed_ns: receipt.interval_ended_ns,
+                prepared_input: receipt.prepared_input.clone(),
+                lifecycle_receipt: receipt,
+            };
+            super::qg1_live_sample_binding(
+                Some(&continuous),
+                continuous.elapsed_ns,
+                &scope,
+                &provenance,
+                stream_role,
+                stream_sequence,
+                sample_id,
+                block_id,
+                arm,
+            )
+        };
+        let proved_binding = binding_from_receipt(
+            hostile_tantivy_continuous_receipt(),
+            "qg1.null.tantivy.v1",
+            0,
+            0,
+            0,
+            PerfSampleArm::Control,
+        );
+        assert!(
+            proved_binding.is_some(),
+            "a proved terminal lifecycle must create the estimator binding"
+        );
+        let no_claim_binding = binding_from_receipt(
+            unproved.clone(),
+            "qg1.effect.tantivy_vs_quill.v1",
+            0,
+            0,
+            0,
+            PerfSampleArm::Control,
+        );
+        assert!(
+            no_claim_binding.is_none(),
+            "NoClaim lifecycle receipts must not create a headline-eligible binding"
+        );
+
+        let mut quill_receipt = hostile_tantivy_continuous_receipt();
+        quill_receipt.arm = super::EngineArm::Quill;
+        quill_receipt.terminal_worker_join_completed_ns = None;
+        quill_receipt.terminal_tantivy_join = None;
+        quill_receipt.quill_publication_generation_delta = Some(1);
+        quill_receipt.terminal_quiescence =
+            super::Qg1TerminalFact::quill_publication_then_exact_tail("synthetic-00000019", 1);
+        quill_receipt
+            .validate()
+            .expect("hostile Quill timeline is a valid proved lifecycle");
+        let stream = |control_receipt: Option<super::Qg1ContinuousTimingReceipt>,
+                      treatment_receipt: Option<super::Qg1ContinuousTimingReceipt>,
+                      stream_role: &str,
+                      sample_id_base: u64| {
             (0_u64..10)
                 .flat_map(|block_id| {
                     let base = block_id * 1_000;
+                    let control_sample_id = sample_id_base + block_id * 2;
+                    let treatment_sample_id = control_sample_id + 1;
                     [
                         PerfRawSample {
                             block_id,
-                            sample_id: sample_id_base + block_id * 2,
+                            sample_id: control_sample_id,
                             arm: PerfSampleArm::Control,
                             order: PerfSampleOrder::First,
                             phase: PerfSamplePhase::Measurement,
@@ -6344,12 +6491,21 @@ mod tests {
                             observed_value: None,
                             group_id: None,
                             qg6_sample_binding: None,
-                            qg1_sample_binding: binding.clone(),
+                            qg1_sample_binding: control_receipt.clone().and_then(|receipt| {
+                                binding_from_receipt(
+                                    receipt,
+                                    stream_role,
+                                    block_id * 2,
+                                    control_sample_id,
+                                    block_id,
+                                    PerfSampleArm::Control,
+                                )
+                            }),
                             tantivy_config_sha256: None,
                         },
                         PerfRawSample {
                             block_id,
-                            sample_id: sample_id_base + block_id * 2 + 1,
+                            sample_id: treatment_sample_id,
                             arm: PerfSampleArm::Treatment,
                             order: PerfSampleOrder::Second,
                             phase: PerfSamplePhase::Measurement,
@@ -6362,7 +6518,16 @@ mod tests {
                             observed_value: None,
                             group_id: None,
                             qg6_sample_binding: None,
-                            qg1_sample_binding: binding.clone(),
+                            qg1_sample_binding: treatment_receipt.clone().and_then(|receipt| {
+                                binding_from_receipt(
+                                    receipt,
+                                    stream_role,
+                                    block_id * 2 + 1,
+                                    treatment_sample_id,
+                                    block_id,
+                                    PerfSampleArm::Treatment,
+                                )
+                            }),
                             tantivy_config_sha256: None,
                         },
                     ]
@@ -6370,13 +6535,28 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let config = PairedEstimatorConfig::predeclared(0x5147_314c_4946_4543);
-        let valid_effect = stream(Some(proved_binding.clone()), 0);
-        let valid_null = stream(Some(proved_binding), 10_000);
+        let valid_effect = stream(
+            Some(hostile_tantivy_continuous_receipt()),
+            Some(quill_receipt.clone()),
+            "qg1.effect.tantivy_vs_quill.v1",
+            0,
+        );
+        let valid_null = stream(
+            Some(hostile_tantivy_continuous_receipt()),
+            Some(hostile_tantivy_continuous_receipt()),
+            "qg1.null.tantivy.v1",
+            10_000,
+        );
         assert!(
             estimate_paired_experiment(&valid_effect, &valid_null, &config).is_ok(),
             "proved QG-1 lifecycle bindings must reach the live estimator"
         );
-        let no_claim_effect = stream(no_claim_binding, 20_000);
+        let no_claim_effect = stream(
+            no_claim_binding.map(|_| unproved.clone()),
+            Some(quill_receipt.clone()),
+            "qg1.effect.tantivy_vs_quill.v1",
+            20_000,
+        );
         assert!(
             estimate_paired_experiment(&no_claim_effect, &valid_null, &config).is_err(),
             "NoClaim lifecycle receipts must be rejected by the live estimator before headline generation"
@@ -6385,7 +6565,20 @@ mod tests {
         let mut relabelled = hostile_tantivy_continuous_receipt();
         relabelled.terminal_quiescence =
             super::Qg1TerminalFact::quill_publication_then_exact_tail("synthetic-00000019", 1);
-        let relabelled_effect = stream(binding_from_receipt(relabelled), 30_000);
+        let relabelled_effect = stream(
+            binding_from_receipt(
+                relabelled,
+                "qg1.effect.tantivy_vs_quill.v1",
+                0,
+                30_000,
+                0,
+                PerfSampleArm::Control,
+            )
+            .map(|_| hostile_tantivy_continuous_receipt()),
+            Some(quill_receipt),
+            "qg1.effect.tantivy_vs_quill.v1",
+            30_000,
+        );
         assert!(
             estimate_paired_experiment(&relabelled_effect, &valid_null, &config).is_err(),
             "an arm-relabeled terminal proof must reach and fail the live estimator"
