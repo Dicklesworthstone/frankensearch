@@ -1538,114 +1538,263 @@ struct ParallelShardWork {
     shard: usize,
     assignment: ParallelShardAssignment,
     state: ScribeShardState,
-    /// Pool worker that actually ran this shard's accumulation, stamped by the
-    /// worker itself rather than by the planner. `None` means the item ran on
-    /// a thread outside the pool — rayon's bridge may execute work inline on
-    /// the calling thread — which the witness counts separately instead of
-    /// folding it into a distinct-worker total.
-    observed_worker: Option<usize>,
 }
 
-/// Observed shard-completion facts for one shared-nothing ingest batch.
+/// Monotonic identity for one shared-nothing ingest batch, so worker ids in a
+/// receipt are attributable to a specific run rather than to "some batch".
+static PARALLEL_INGEST_RUN_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// How a shared-nothing batch ended.
 ///
-/// Every count here is over SHARD TASKS, not workers, except
-/// `distinct_worker_slots`. Read the names literally:
-///
-/// - `completed_shards` — shard tasks that returned to the collector. This is
-///   a join witness for the batch; it says nothing about how many workers ran.
-/// - `distinct_worker_slots` — how many different pool worker indices executed
-///   at least one shard. This is worker-thread DIVERSITY. Shards may run
-///   sequentially on several workers, so a value of `N` does NOT mean `N`
-///   shards were ever in flight together; it is an upper bound on peak
-///   concurrency among identified work, never a lower bound.
-/// - `unidentified_shards` — shards rayon ran off-pool (its bridge may execute
-///   work inline on the caller). These are excluded from
-///   `distinct_worker_slots`, which is why that field cannot bound concurrency
-///   from below.
-///
-/// For actual simultaneity use [`ParallelOverlapWitness`] and the
-/// `peak_shards_in_flight` field, which is the only concurrency evidence here.
+/// The default is [`Aborted`](ParallelIngestTerminal::Aborted), NOT success:
+/// the terminal state is only promoted by an explicit `finish`, so every
+/// unwind, `?` early return, and cancelled exit reports honestly without the
+/// exit path having to remember to say so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct ParallelWorkerWitness {
-    completed_shards: usize,
-    distinct_worker_slots: usize,
-    unidentified_shards: usize,
-    peak_shards_in_flight: usize,
+enum ParallelIngestTerminal {
+    #[default]
+    Aborted,
+    Completed,
+    Cancelled,
 }
 
-/// Exact peak-overlap counter for one shared-nothing batch.
+impl ParallelIngestTerminal {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Aborted => "aborted",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    const fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::Completed,
+            2 => Self::Cancelled,
+            _ => Self::Aborted,
+        }
+    }
+
+    const fn code(self) -> u8 {
+        match self {
+            Self::Aborted => 0,
+            Self::Completed => 1,
+            Self::Cancelled => 2,
+        }
+    }
+}
+
+/// Live, batch-scoped observation of one shared-nothing ingest run.
 ///
-/// Each shard increments on entry and decrements on drop, so
-/// `peak_shards_in_flight` is the true high-water mark of shard accumulations
-/// running at the same time — the fact `distinct_worker_slots` cannot supply.
-/// Two atomic RMWs per SHARD (never per document) keep it non-perturbing: the
-/// workers never block on each other and no ordering between them is imposed.
-#[derive(Debug, Default)]
-struct ParallelOverlapWitness {
+/// Workers write into this through [`ParallelShardGuard`]; the driver reads it
+/// through a [`ParallelObservationRecorder`] whose `Drop` publishes it. Because
+/// both sides are RAII, a worker error, a panic, or a cancellation that returns
+/// long before any receipt is built still leaves a complete, published witness
+/// — which is exactly the case the earlier success-path-only counter missed.
+///
+/// Cost is per SHARD, never per document: two atomic RMWs and one short lock
+/// per shard, so nothing here perturbs the tokenizing inner loop.
+#[derive(Debug)]
+struct ParallelBatchObservation {
+    run_seq: u64,
+    pool_threads: usize,
+    started_shards: AtomicUsize,
+    completed_shards: AtomicUsize,
     in_flight: AtomicUsize,
     peak_in_flight: AtomicUsize,
+    unidentified_shards: AtomicUsize,
+    worker_ids: StdMutex<Vec<usize>>,
+    terminal: AtomicU8,
 }
 
-impl ParallelOverlapWitness {
-    /// Mark one shard as in flight until the returned guard is dropped.
-    fn enter(&self) -> ParallelOverlapGuard<'_> {
+impl Default for ParallelBatchObservation {
+    fn default() -> Self {
+        Self {
+            run_seq: PARALLEL_INGEST_RUN_SEQ.fetch_add(1, Ordering::Relaxed),
+            pool_threads: rayon::current_num_threads(),
+            started_shards: AtomicUsize::new(0),
+            completed_shards: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
+            peak_in_flight: AtomicUsize::new(0),
+            unidentified_shards: AtomicUsize::new(0),
+            worker_ids: StdMutex::new(Vec::new()),
+            terminal: AtomicU8::new(ParallelIngestTerminal::Aborted.code()),
+        }
+    }
+}
+
+impl ParallelBatchObservation {
+    /// Mark one shard started and in flight until the returned guard drops.
+    ///
+    /// The worker identity is read here, inside the worker, because that is the
+    /// only place it exists.
+    fn enter_shard(&self) -> ParallelShardGuard<'_> {
+        self.started_shards.fetch_add(1, Ordering::AcqRel);
         let in_flight = self
             .in_flight
             .fetch_add(1, Ordering::AcqRel)
             .saturating_add(1);
         self.peak_in_flight.fetch_max(in_flight, Ordering::AcqRel);
-        ParallelOverlapGuard { witness: self }
+        match rayon::current_thread_index() {
+            Some(worker) => {
+                if let Ok(mut ids) = self.worker_ids.lock() {
+                    ids.push(worker);
+                }
+            }
+            None => {
+                self.unidentified_shards.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        ParallelShardGuard { observation: self }
     }
 
-    fn peak(&self) -> usize {
-        self.peak_in_flight.load(Ordering::Acquire)
+    /// Promote the terminal state. Only ever called on a fully successful
+    /// batch; every other exit keeps the `Aborted` default.
+    fn finish_completed(&self) {
+        self.terminal
+            .store(ParallelIngestTerminal::Completed.code(), Ordering::Release);
     }
-}
 
-/// Decrements the in-flight count on every exit path, including the early
-/// return of a cancelled shard and the unwind of a panicking one.
-struct ParallelOverlapGuard<'witness> {
-    witness: &'witness ParallelOverlapWitness,
-}
-
-impl Drop for ParallelOverlapGuard<'_> {
-    fn drop(&mut self) {
-        self.witness.in_flight.fetch_sub(1, Ordering::AcqRel);
+    /// Record that this batch ended because cancellation was observed.
+    fn finish_cancelled(&self) {
+        self.terminal
+            .store(ParallelIngestTerminal::Cancelled.code(), Ordering::Release);
     }
-}
 
-/// Aggregate the per-shard observations of a completed batch.
-///
-/// Every observation contributes one completed shard. Shards whose worker
-/// could not be identified are counted in `unidentified_shards` and never
-/// inflate `distinct_worker_slots`. Order is irrelevant: shards may complete in
-/// any order. `peak_shards_in_flight` is supplied by the overlap witness rather
-/// than derived here, because completion records cannot recover simultaneity.
-fn parallel_worker_witness<I>(
-    observations: I,
-    peak_shards_in_flight: usize,
-) -> ParallelWorkerWitness
-where
-    I: IntoIterator<Item = Option<usize>>,
-{
-    let mut completed_shards = 0_usize;
-    let mut unidentified_shards = 0_usize;
-    let mut identified = Vec::new();
-    for observation in observations {
-        completed_shards = completed_shards.saturating_add(1);
-        match observation {
-            Some(worker) => identified.push(worker),
-            None => unidentified_shards = unidentified_shards.saturating_add(1),
+    fn snapshot(&self) -> ParallelWorkerWitness {
+        let mut worker_ids = self
+            .worker_ids
+            .lock()
+            .map(|ids| ids.clone())
+            .unwrap_or_default();
+        worker_ids.sort_unstable();
+        worker_ids.dedup();
+        ParallelWorkerWitness {
+            run_seq: self.run_seq,
+            pool_threads: self.pool_threads,
+            started_shards: self.started_shards.load(Ordering::Acquire),
+            completed_shards: self.completed_shards.load(Ordering::Acquire),
+            distinct_worker_slots: worker_ids.len(),
+            unidentified_shards: self.unidentified_shards.load(Ordering::Acquire),
+            peak_shards_in_flight: self.peak_in_flight.load(Ordering::Acquire),
+            terminal: ParallelIngestTerminal::from_code(self.terminal.load(Ordering::Acquire)),
         }
     }
-    identified.sort_unstable();
-    identified.dedup();
-    ParallelWorkerWitness {
-        completed_shards,
-        distinct_worker_slots: identified.len(),
-        unidentified_shards,
-        peak_shards_in_flight,
+
+    /// Sorted, deduplicated, run-scoped worker identities.
+    fn sorted_worker_ids(&self) -> Vec<usize> {
+        let mut ids = self
+            .worker_ids
+            .lock()
+            .map(|ids| ids.clone())
+            .unwrap_or_default();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
     }
+}
+
+/// Per-shard RAII: decrements in-flight on EVERY exit path — normal return,
+/// cancelled early return, and unwind — and counts a completion only when the
+/// shard actually finished.
+struct ParallelShardGuard<'observation> {
+    observation: &'observation ParallelBatchObservation,
+}
+
+impl ParallelShardGuard<'_> {
+    fn completed(&self) {
+        self.observation
+            .completed_shards
+            .fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+impl Drop for ParallelShardGuard<'_> {
+    fn drop(&mut self) {
+        self.observation.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Batch-scoped RAII that publishes the observation onto the ingest span on
+/// EVERY exit, so failure, panic, and cancellation are as well-evidenced as
+/// success.
+struct ParallelObservationRecorder<'observation> {
+    span: tracing::Span,
+    observation: &'observation ParallelBatchObservation,
+}
+
+impl Drop for ParallelObservationRecorder<'_> {
+    fn drop(&mut self) {
+        let witness = self.observation.snapshot();
+        let worker_ids = self
+            .observation
+            .sorted_worker_ids()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        self.span.record("parallel_run_seq", witness.run_seq);
+        self.span.record(
+            "parallel_pool_threads",
+            u64::try_from(witness.pool_threads).unwrap_or(u64::MAX),
+        );
+        self.span.record(
+            "parallel_started_shards",
+            u64::try_from(witness.started_shards).unwrap_or(u64::MAX),
+        );
+        self.span.record(
+            "parallel_completed_shards",
+            u64::try_from(witness.completed_shards).unwrap_or(u64::MAX),
+        );
+        self.span.record(
+            "parallel_distinct_worker_slots",
+            u64::try_from(witness.distinct_worker_slots).unwrap_or(u64::MAX),
+        );
+        self.span.record(
+            "parallel_unidentified_shards",
+            u64::try_from(witness.unidentified_shards).unwrap_or(u64::MAX),
+        );
+        self.span.record(
+            "parallel_peak_shards_in_flight",
+            u64::try_from(witness.peak_shards_in_flight).unwrap_or(u64::MAX),
+        );
+        self.span.record("parallel_worker_ids", worker_ids.as_str());
+        self.span
+            .record("parallel_terminal", witness.terminal.as_str());
+    }
+}
+
+/// Immutable snapshot of a [`ParallelBatchObservation`].
+///
+/// Every count is over SHARD TASKS, not workers, except
+/// `distinct_worker_slots`. Read the names literally:
+///
+/// - `started_shards` / `completed_shards` — shard tasks entered and finished.
+///   A gap between them is the drain witness: shards that started and did not
+///   finish because the batch failed, panicked, or was cancelled.
+/// - `distinct_worker_slots` — how many different pool worker indices executed
+///   at least one shard: worker-thread DIVERSITY. Shards may run sequentially
+///   on several workers, so `N` here does NOT mean `N` shards were ever in
+///   flight together. It is an upper bound on peak concurrency among
+///   identified work, never a lower bound.
+/// - `unidentified_shards` — shards rayon ran off-pool. Excluded from
+///   `distinct_worker_slots`, which is why that field cannot bound concurrency
+///   from below.
+/// - `peak_shards_in_flight` — the ONLY concurrency evidence here: the exact
+///   high-water mark of shard accumulations running at the same time.
+/// - `run_seq` / `pool_threads` — run and pool identity, so worker ids are
+///   attributable and a width is interpretable.
+/// - `terminal` — how the batch ended; `Aborted` unless explicitly promoted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ParallelWorkerWitness {
+    run_seq: u64,
+    pool_threads: usize,
+    started_shards: usize,
+    completed_shards: usize,
+    distinct_worker_slots: usize,
+    unidentified_shards: usize,
+    peak_shards_in_flight: usize,
+    terminal: ParallelIngestTerminal,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5046,6 +5195,7 @@ impl QuillWriterState {
         documents: &[IndexableDocument],
         replacement_ids: &BTreeSet<&str>,
         allow_automatic_publication: bool,
+        observation: &ParallelBatchObservation,
     ) -> Result<Option<ParallelIngestReceipt>, QuillIndexError> {
         if !replacement_ids.is_empty()
             || !self.shard_router.is_deterministic()
@@ -5162,17 +5312,19 @@ impl QuillWriterState {
                     current_lease_base: Some(batch_span.lease_base),
                     scratch_metadata: Vec::new(),
                 },
-                observed_worker: None,
             });
         }
 
         let checkpoint = ParallelIngestCheckpoint::new(&self.reader);
-        let overlap = ParallelOverlapWitness::default();
         let completed = work
             .into_par_iter()
-            .map(|mut work| {
-                let _in_flight = overlap.enter();
-                work.observed_worker = rayon::current_thread_index();
+            .map(|work| {
+                let mut work = work;
+                // Started/in-flight/worker-id are recorded HERE, before any
+                // fallible step, and the guard decrements on every exit — so a
+                // shard that panics or is cancelled still shows up as started
+                // and never as completed.
+                let shard_guard = observation.enter_shard();
                 catch_parallel_ingest_worker(work.shard, || {
                     Self::accumulate_parallel_shard(
                         &mut work.state,
@@ -5182,17 +5334,12 @@ impl QuillWriterState {
                         &checkpoint,
                     )
                 })?;
+                shard_guard.completed();
                 Ok(work)
             })
             .collect::<Result<Vec<_>, QuillIndexError>>()?;
         checkpoint.check(cx)?;
-        // Taken before any consumer moves `completed`: a receipt that cannot
-        // be built after a partial move is a receipt that silently goes
-        // missing on the paths that matter most.
-        let worker_witness = parallel_worker_witness(
-            completed.iter().map(|work| work.observed_worker),
-            overlap.peak(),
-        );
+        let worker_witness = observation.snapshot();
 
         let created_unix_s = self.created_unix_s()?;
         let mut reserved_segment_ids = BTreeSet::new();
@@ -5329,6 +5476,7 @@ impl QuillWriterState {
         documents: &[IndexableDocument],
         replacement_ids: &BTreeSet<&str>,
         allow_automatic_publication: bool,
+        observation: &ParallelBatchObservation,
     ) -> Result<Option<ParallelIngestReceipt>, QuillIndexError> {
         let shard_count = self.shards.len();
         let verified_pool_capacity = rayon::current_num_threads();
@@ -5433,17 +5581,19 @@ impl QuillWriterState {
                     current_lease_base: Some(span.lease_base),
                     scratch_metadata: Vec::new(),
                 },
-                observed_worker: None,
             });
         }
 
         let checkpoint = ParallelIngestCheckpoint::new(&self.reader);
-        let overlap = ParallelOverlapWitness::default();
         let completed = work
             .into_par_iter()
-            .map(|mut work| {
-                let _in_flight = overlap.enter();
-                work.observed_worker = rayon::current_thread_index();
+            .map(|work| {
+                let mut work = work;
+                // Started/in-flight/worker-id are recorded HERE, before any
+                // fallible step, and the guard decrements on every exit — so a
+                // shard that panics or is cancelled still shows up as started
+                // and never as completed.
+                let shard_guard = observation.enter_shard();
                 catch_parallel_ingest_worker(work.shard, || {
                     Self::accumulate_parallel_shard(
                         &mut work.state,
@@ -5453,16 +5603,12 @@ impl QuillWriterState {
                         &checkpoint,
                     )
                 })?;
+                shard_guard.completed();
                 Ok(work)
             })
             .collect::<Result<Vec<_>, QuillIndexError>>()?;
         checkpoint.check(cx)?;
-        // `completed` is moved by the commit table below, so the witness is
-        // taken here rather than beside the receipt literal.
-        let worker_witness = parallel_worker_witness(
-            completed.iter().map(|work| work.observed_worker),
-            overlap.peak(),
-        );
+        let worker_witness = observation.snapshot();
 
         let mut replacements = Vec::new();
         replacements
@@ -5648,10 +5794,15 @@ impl QuillWriterState {
             parallel_batch_logical_upper_bound = tracing::field::Empty,
             parallel_projected_logical_upper_bound = tracing::field::Empty,
             parallel_arena_chunk_bytes = tracing::field::Empty,
+            parallel_run_seq = tracing::field::Empty,
+            parallel_pool_threads = tracing::field::Empty,
+            parallel_started_shards = tracing::field::Empty,
             parallel_completed_shards = tracing::field::Empty,
             parallel_distinct_worker_slots = tracing::field::Empty,
             parallel_unidentified_shards = tracing::field::Empty,
             parallel_peak_shards_in_flight = tracing::field::Empty,
+            parallel_worker_ids = tracing::field::Empty,
+            parallel_terminal = tracing::field::Empty,
             arena_bytes_used_high_water = tracing::field::Empty,
             arena_bytes_reserved_high_water = tracing::field::Empty,
             duration_us = tracing::field::Empty,
@@ -5687,31 +5838,53 @@ impl QuillWriterState {
             // guard is armed, so a refused batch leaves the writer exactly as
             // it found it (bd-quill-rejected-ingest-publishes-partial-batch-aihri).
             self.validate_batch_admission(cx, documents, replacement_ids)?;
+            // The observation outlives every parallel exit path and the
+            // recorder publishes it from `Drop`, so a worker error, a panic, or
+            // a cancellation that returns long before a receipt exists still
+            // emits started/completed/drained/worker-id/terminal evidence.
+            let observation = ParallelBatchObservation::default();
+            let _observation_recorder = ParallelObservationRecorder {
+                span: ingest_span.clone(),
+                observation: &observation,
+            };
             let parallel_receipt = match parallelism_policy {
                 IngestParallelismPolicy::Adaptive => {
-                    if let Some(receipt) = self
+                    let internal = self
                         .try_index_documents_internal_parallel(
                             cx,
                             documents,
                             replacement_ids,
                             allow_automatic_publication,
+                            &observation,
                         )
-                        .await?
-                    {
-                        Some(receipt)
-                    } else {
-                        self.try_index_documents_parallel(
-                            cx,
-                            documents,
-                            replacement_ids,
-                            allow_automatic_publication,
-                        )
-                        .await?
+                        .await;
+                    let routed = match internal {
+                        Ok(Some(receipt)) => Ok(Some(receipt)),
+                        Ok(None) => {
+                            self.try_index_documents_parallel(
+                                cx,
+                                documents,
+                                replacement_ids,
+                                allow_automatic_publication,
+                                &observation,
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    // Classify BEFORE `?` propagates, so the terminal state the
+                    // recorder publishes is the true one.
+                    match &routed {
+                        Ok(_) => observation.finish_completed(),
+                        Err(_) if cx.is_cancel_requested() => observation.finish_cancelled(),
+                        Err(_) => {}
                     }
+                    routed?
                 }
                 #[cfg(feature = "pruning-conformance")]
                 IngestParallelismPolicy::ScalarTopologyConformance => {
                     ingest_span.record("parallel_route", "scalar_topology_conformance");
+                    observation.finish_completed();
                     None
                 }
             };
@@ -5760,26 +5933,6 @@ impl QuillWriterState {
                 ingest_span.record(
                     "parallel_arena_chunk_bytes",
                     u64::try_from(receipt.arena_chunk_bytes).unwrap_or(u64::MAX),
-                );
-                // Observed shard/worker facts, recorded next to the requested
-                // width. Only `peak_shards_in_flight` is concurrency evidence;
-                // `distinct_worker_slots` is worker-thread diversity and can
-                // exceed the number of shards that ever overlapped.
-                ingest_span.record(
-                    "parallel_completed_shards",
-                    u64::try_from(receipt.worker_witness.completed_shards).unwrap_or(u64::MAX),
-                );
-                ingest_span.record(
-                    "parallel_distinct_worker_slots",
-                    u64::try_from(receipt.worker_witness.distinct_worker_slots).unwrap_or(u64::MAX),
-                );
-                ingest_span.record(
-                    "parallel_unidentified_shards",
-                    u64::try_from(receipt.worker_witness.unidentified_shards).unwrap_or(u64::MAX),
-                );
-                ingest_span.record(
-                    "parallel_peak_shards_in_flight",
-                    u64::try_from(receipt.worker_witness.peak_shards_in_flight).unwrap_or(u64::MAX),
                 );
                 ingest_span.record(
                     "arena_bytes_used_high_water",
@@ -22976,7 +23129,13 @@ mod tests {
                     writer.reader.config.scribe_shard_budget_bytes = budget;
                     assert!(
                         writer
-                            .try_index_documents_parallel(&cx, &documents, &BTreeSet::new(), false)
+                            .try_index_documents_parallel(
+                                &cx,
+                                &documents,
+                                &BTreeSet::new(),
+                                false,
+                                &ParallelBatchObservation::default(),
+                            )
                             .await
                             .expect("budget fallback is not an error")
                             .is_none(),
@@ -23027,7 +23186,13 @@ mod tests {
                 writer.reader.config.scribe_shard_budget_bytes = projected + 1;
 
                 let receipt = writer
-                    .try_index_documents_parallel(&cx, &documents, &BTreeSet::new(), false)
+                    .try_index_documents_parallel(
+                        &cx,
+                        &documents,
+                        &BTreeSet::new(),
+                        false,
+                        &ParallelBatchObservation::default(),
+                    )
                     .await
                     .expect("run budget-fit shared-nothing ingest")
                     .expect("budget-fit fixture uses shared-nothing");
@@ -23057,66 +23222,119 @@ mod tests {
     }
 
     #[test]
-    fn parallel_worker_witness_counts_shards_and_worker_diversity() {
-        // Four shards that all landed on one pool worker. `completed_shards`
-        // is a SHARD count, so it is 4 even though exactly one worker ran.
-        let serialized = parallel_worker_witness([Some(3), Some(3), Some(3), Some(3)], 1);
-        assert_eq!(serialized.completed_shards, 4);
-        assert_eq!(serialized.distinct_worker_slots, 1);
-        assert_eq!(serialized.unidentified_shards, 0);
+    fn overlap_witness_records_real_rayon_overlap_and_one_thread_negative() {
+        // POSITIVE — real Rayon concurrency, not nested guards on one thread.
+        // `broadcast` runs the closure exactly once on EVERY pool thread, so a
+        // Barrier sized to the pool cannot deadlock, and no shard can leave
+        // `enter_shard` until all four are inside it. Peak must be exactly 4.
+        let wide = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-thread overlap pool");
+        let overlapped = ParallelBatchObservation::default();
+        let gate = std::sync::Barrier::new(4);
+        let _: Vec<()> = wide.broadcast(|_| {
+            let guard = overlapped.enter_shard();
+            gate.wait();
+            guard.completed();
+        });
+        let witness = overlapped.snapshot();
+        assert_eq!(witness.peak_shards_in_flight, 4);
+        assert_eq!(witness.started_shards, 4);
+        assert_eq!(witness.completed_shards, 4);
+        assert_eq!(witness.distinct_worker_slots, 4);
+        assert_eq!(witness.unidentified_shards, 0);
+        assert_eq!(overlapped.sorted_worker_ids(), vec![0, 1, 2, 3]);
 
-        // Four worker slots, observed out of completion order so the
-        // aggregator cannot depend on ordering.
-        let spread = parallel_worker_witness([Some(2), Some(0), Some(3), Some(1)], 4);
-        assert_eq!(spread.completed_shards, 4);
-        assert_eq!(spread.distinct_worker_slots, 4);
-        assert_eq!(spread.unidentified_shards, 0);
-
-        // Off-pool shards are counted apart and never inflate
-        // `distinct_worker_slots` — which is exactly why that field cannot
-        // bound concurrency from below.
-        let partly_inline = parallel_worker_witness([Some(1), None, Some(1), None], 2);
-        assert_eq!(partly_inline.completed_shards, 4);
-        assert_eq!(partly_inline.distinct_worker_slots, 1);
-        assert_eq!(partly_inline.unidentified_shards, 2);
-
-        assert_eq!(
-            parallel_worker_witness(std::iter::empty::<Option<usize>>(), 0),
-            ParallelWorkerWitness::default(),
-        );
+        // NEGATIVE — the same shard count on a ONE-thread pool. Four shards
+        // still start and complete, but nothing can overlap, so peak stays 1
+        // and only one worker slot is ever used. A witness that inferred
+        // concurrency from shard counts or slot counts would report 4 here.
+        let narrow = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("build one-thread overlap pool");
+        let serial = ParallelBatchObservation::default();
+        narrow.install(|| {
+            (0..4_usize).into_par_iter().for_each(|_| {
+                let guard = serial.enter_shard();
+                guard.completed();
+            });
+        });
+        let serial_witness = serial.snapshot();
+        assert_eq!(serial_witness.started_shards, 4);
+        assert_eq!(serial_witness.completed_shards, 4);
+        assert_eq!(serial_witness.peak_shards_in_flight, 1);
+        assert_eq!(serial_witness.distinct_worker_slots, 1);
     }
 
     #[test]
-    fn overlap_witness_separates_sequential_multi_worker_runs_from_real_overlap() {
-        // THE negative case for the whole telemetry claim. Two shards run on
-        // two DIFFERENT workers, but strictly one after the other: diversity
-        // is 2 while nothing ever overlapped. Peak must stay 1. Reading
-        // `distinct_worker_slots` as concurrency would report 2 here and be
-        // wrong — that misreading is what this witness exists to prevent.
-        let sequential = ParallelOverlapWitness::default();
-        drop(sequential.enter());
-        drop(sequential.enter());
-        assert_eq!(sequential.peak(), 1);
-        let sequential_slots = parallel_worker_witness([Some(0), Some(1)], sequential.peak());
-        assert_eq!(sequential_slots.distinct_worker_slots, 2);
-        assert_eq!(sequential_slots.peak_shards_in_flight, 1);
+    fn observation_publishes_drain_and_terminal_on_every_exit_path() {
+        // A shard that starts and then fails: `completed()` is never reached,
+        // the guard's Drop still drains it, and `started - completed` is the
+        // drain witness the success-path-only counter could not produce.
+        let failed = ParallelBatchObservation::default();
+        drop(failed.enter_shard());
+        let failed_witness = failed.snapshot();
+        assert_eq!(failed_witness.started_shards, 1);
+        assert_eq!(failed_witness.completed_shards, 0);
+        assert_eq!(failed_witness.peak_shards_in_flight, 1);
+        // Terminal is Aborted by DEFAULT, so an exit that never promotes it
+        // cannot silently read as success.
+        assert_eq!(failed_witness.terminal, ParallelIngestTerminal::Aborted);
 
-        // Genuine overlap: both guards alive at once.
-        let overlapped = ParallelOverlapWitness::default();
-        let first = overlapped.enter();
-        let second = overlapped.enter();
-        assert_eq!(overlapped.peak(), 2);
-        drop(second);
-        // Peak is a high-water mark, so it never falls back as shards finish.
-        assert_eq!(overlapped.peak(), 2);
-        drop(first);
-        assert_eq!(overlapped.peak(), 2);
-        // A later lone shard does not raise the mark either.
-        drop(overlapped.enter());
-        assert_eq!(overlapped.peak(), 2);
+        // Panic unwinding drains too, and still reports the shard as started.
+        let panicked = ParallelBatchObservation::default();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = panicked.enter_shard();
+            panic!("shard panics mid-accumulation");
+        }));
+        assert!(outcome.is_err());
+        let panic_witness = panicked.snapshot();
+        assert_eq!(panic_witness.started_shards, 1);
+        assert_eq!(panic_witness.completed_shards, 0);
+        assert_eq!(panic_witness.terminal, ParallelIngestTerminal::Aborted);
 
-        // Nothing ran at all.
-        assert_eq!(ParallelOverlapWitness::default().peak(), 0);
+        let cancelled = ParallelBatchObservation::default();
+        drop(cancelled.enter_shard());
+        cancelled.finish_cancelled();
+        let cancel_witness = cancelled.snapshot();
+        assert_eq!(cancel_witness.started_shards, 1);
+        assert_eq!(cancel_witness.completed_shards, 0);
+        assert_eq!(cancel_witness.terminal, ParallelIngestTerminal::Cancelled);
+
+        let finished = ParallelBatchObservation::default();
+        finished.enter_shard().completed();
+        finished.finish_completed();
+        let finished_witness = finished.snapshot();
+        assert_eq!(finished_witness.started_shards, 1);
+        assert_eq!(finished_witness.completed_shards, 1);
+        assert_eq!(finished_witness.terminal, ParallelIngestTerminal::Completed);
+    }
+
+    #[test]
+    fn observation_binds_run_and_pool_identity() {
+        // Worker ids are only attributable if the run they belong to is
+        // identified, so consecutive batches must not share a run sequence.
+        let first = ParallelBatchObservation::default();
+        let second = ParallelBatchObservation::default();
+        assert_ne!(first.snapshot().run_seq, second.snapshot().run_seq);
+        assert!(first.snapshot().pool_threads >= 1);
+
+        // Repeated ids from one worker collapse; the list stays sorted.
+        let repeated = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("build one-thread identity pool");
+        let observation = ParallelBatchObservation::default();
+        repeated.install(|| {
+            (0..3_usize).into_par_iter().for_each(|_| {
+                observation.enter_shard().completed();
+            });
+        });
+        assert_eq!(observation.sorted_worker_ids(), vec![0]);
+        assert_eq!(observation.snapshot().distinct_worker_slots, 1);
+        assert_eq!(observation.snapshot().started_shards, 3);
     }
 
     #[test]
@@ -23149,11 +23367,23 @@ mod tests {
                     .projected_logical_upper_bound;
                 writer.reader.config.scribe_shard_budget_bytes = projected + 1;
 
+                let observation = ParallelBatchObservation::default();
                 let receipt = writer
-                    .try_index_documents_parallel(&cx, &documents, &BTreeSet::new(), false)
+                    .try_index_documents_parallel(
+                        &cx,
+                        &documents,
+                        &BTreeSet::new(),
+                        false,
+                        &observation,
+                    )
                     .await
                     .expect("run shared-nothing ingest")
                     .expect("250 documents at width 4 take the shared-nothing route");
+                // Identities are retained, not just counted.
+                assert_eq!(
+                    observation.sorted_worker_ids().len(),
+                    receipt.worker_witness.distinct_worker_slots,
+                );
 
                 assert_eq!(receipt.route, ParallelIngestRoute::SharedNothing);
                 // Derived from the plan, not hard-coded: the fixture's active
@@ -23163,26 +23393,27 @@ mod tests {
                 assert_eq!(receipt.active_shards, plan.active_shards);
                 assert!(receipt.active_shards >= 2);
                 let witness = receipt.worker_witness;
-                // Join witness: every started shard returned, so none was
-                // abandoned between fan-out and the commit table. This counts
-                // SHARDS, not workers.
+                // Drain witness: every shard that started also finished, so
+                // none was abandoned between fan-out and the commit table.
+                // These count SHARDS, not workers.
+                assert_eq!(witness.started_shards, receipt.active_shards);
                 assert_eq!(witness.completed_shards, receipt.active_shards);
+                assert_eq!(witness.pool_threads, rayon::current_num_threads());
                 assert!(witness.unidentified_shards <= witness.completed_shards);
                 assert!(
                     witness.distinct_worker_slots
                         <= witness.completed_shards - witness.unidentified_shards,
                 );
-                assert_eq!(
-                    witness.distinct_worker_slots == 0,
-                    witness.unidentified_shards == witness.completed_shards,
-                    "an identified shard must produce a worker slot",
-                );
                 // Overlap is OBSERVED, never assumed. Rayon may legally run
-                // every shard on one worker, so the test pins the invariants
-                // (at least one shard ran; never more in flight than exist)
-                // rather than a scheduling outcome that would be flaky.
+                // every shard on one worker here, so this pins the invariants;
+                // forced-overlap and one-thread cases are proven exactly in
+                // `overlap_witness_records_real_rayon_overlap_and_one_thread_negative`.
                 assert!(witness.peak_shards_in_flight >= 1);
                 assert!(witness.peak_shards_in_flight <= witness.completed_shards);
+                // The receipt snapshot is taken inside the route, before the
+                // driver promotes the terminal state, so a directly-called
+                // route legitimately reports the Aborted default here.
+                assert_eq!(witness.terminal, ParallelIngestTerminal::Aborted);
             });
         });
     }
@@ -23214,7 +23445,13 @@ mod tests {
                     })
                     .expect("initial reserve total fits usize");
                 let first = writer
-                    .try_index_documents_parallel(&cx, &documents, &BTreeSet::new(), false)
+                    .try_index_documents_parallel(
+                        &cx,
+                        &documents,
+                        &BTreeSet::new(),
+                        false,
+                        &ParallelBatchObservation::default(),
+                    )
                     .await
                     .expect("run first default-budget generation")
                     .expect("first default-budget generation uses shared-nothing");
@@ -23300,7 +23537,13 @@ mod tests {
                     document.id = format!("parallel-budget-second-{ordinal:05}");
                 }
                 let second = writer
-                    .try_index_documents_parallel(&cx, &second_documents, &BTreeSet::new(), false)
+                    .try_index_documents_parallel(
+                        &cx,
+                        &second_documents,
+                        &BTreeSet::new(),
+                        false,
+                        &ParallelBatchObservation::default(),
+                    )
                     .await
                     .expect("run second default-budget generation")
                     .expect("second default-budget generation uses shared-nothing");
@@ -23365,7 +23608,13 @@ mod tests {
                 let watermark_before = writer.docid_allocator.watermark();
                 assert!(
                     writer
-                        .try_index_documents_parallel(&cx, &documents, &BTreeSet::new(), false)
+                        .try_index_documents_parallel(
+                            &cx,
+                            &documents,
+                            &BTreeSet::new(),
+                            false,
+                            &ParallelBatchObservation::default(),
+                        )
                         .await
                         .expect("dirty-shard fallback is not an error")
                         .is_none()
