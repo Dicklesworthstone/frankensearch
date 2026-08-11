@@ -1587,6 +1587,11 @@ enum WriterCall {
     /// `Index::writer(heap)` — Tantivy selected the width.
     Auto,
     /// `Index::writer_with_num_threads(threads, heap)`.
+    ///
+    /// Gated exactly as `call_fixed_writer` is: the only thing that can build
+    /// this variant is that helper, so without those features it would be a
+    /// variant nothing constructs.
+    #[cfg(any(feature = "tantivy-oracle", feature = "bench-internals"))]
     Fixed(usize),
 }
 
@@ -6214,6 +6219,14 @@ mod benchmark_writer_mode_tests {
             receipt.materialized_width,
             BenchmarkMaterializedWidth::Authenticated(2)
         );
+        // The receipt states the rearm's intent; this states the call it made.
+        // Carrying the old writer's observation forward instead would leave a
+        // rearmed index reporting Auto, which this rejects.
+        assert_eq!(
+            rearmed.observed_writer_call,
+            super::WriterCall::Fixed(2),
+            "the rearm must observe its own writer_with_num_threads call"
+        );
     }
 
     #[test]
@@ -6307,16 +6320,22 @@ mod benchmark_writer_mode_tests {
         assert!(ordinary.benchmark_writer_receipt().is_none());
         assert!(ordinary.benchmark_materialized_writer_threads().is_none());
 
-        let oracle =
-            TantivyIndex::in_memory_single_threaded_oracle().expect("single-threaded oracle");
-        assert!(
-            oracle.benchmark_writer_receipt().is_none(),
-            "pinning a width is not the same as claiming a screening receipt"
-        );
-        assert!(
-            oracle.benchmark_materialized_writer_threads().is_none(),
-            "an unscreened oracle authenticates no width to a screening consumer"
-        );
+        // The pinned oracle only exists behind `tantivy-oracle`; this module is
+        // gated on `bench-internals` alone, so its negative coverage has to be
+        // conditional or `bench-internals` by itself stops compiling.
+        #[cfg(feature = "tantivy-oracle")]
+        {
+            let oracle =
+                TantivyIndex::in_memory_single_threaded_oracle().expect("single-threaded oracle");
+            assert!(
+                oracle.benchmark_writer_receipt().is_none(),
+                "pinning a width is not the same as claiming a screening receipt"
+            );
+            assert!(
+                oracle.benchmark_materialized_writer_threads().is_none(),
+                "an unscreened oracle authenticates no width to a screening consumer"
+            );
+        }
     }
 
     #[cfg(feature = "tantivy-oracle")]
@@ -6411,6 +6430,28 @@ mod benchmark_writer_mode_tests {
                 .expect("receipt")
                 .positions,
             "the reopened receipt must carry the live schema's positions option"
+        );
+    }
+}
+
+/// Default-feature coverage for the writer-call observation.
+///
+/// Without this the observation is written on every build but only read behind
+/// `bench-internals`, so a default `--all-targets` run would carry a field that
+/// is never read. The fix is a real reader, not an allow: the ordinary
+/// in-memory constructor genuinely must reach `Index::writer`, and that is
+/// worth asserting on its own.
+#[cfg(test)]
+mod writer_call_observation_tests {
+    use super::{TantivyIndex, WriterCall};
+
+    #[test]
+    fn the_ordinary_in_memory_constructor_invokes_the_auto_writer() {
+        let index = TantivyIndex::in_memory().expect("ordinary in-memory index");
+        assert_eq!(
+            index.observed_writer_call,
+            WriterCall::Auto,
+            "the ordinary constructor must reach Index::writer, not a pinned width"
         );
     }
 }
