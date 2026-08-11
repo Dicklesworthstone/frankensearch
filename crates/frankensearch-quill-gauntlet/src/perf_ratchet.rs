@@ -3617,6 +3617,7 @@ mod tests {
                         observed_value: Some(value),
                         group_id: None,
                         qg6_sample_binding: None,
+                        qg1_sample_binding: None,
                         tantivy_config_sha256: None,
                     });
                 }
@@ -3833,6 +3834,7 @@ mod tests {
                             observed_value: Some(value),
                             group_id: Some(group_id),
                             qg6_sample_binding: None,
+                            qg1_sample_binding: None,
                             tantivy_config_sha256: None,
                         });
                     }

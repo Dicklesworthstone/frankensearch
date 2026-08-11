@@ -978,7 +978,12 @@ fn qg1_bind_raw_observations(
             else {
                 return Err(Qg1TantivyIncumbentError::ObservationBindingMismatch);
             };
-            if !is_lower_hex_digest(&observation_id_sha256) {
+            if !is_lower_hex_digest(&observation_id_sha256)
+                || sample
+                    .qg1_sample_binding
+                    .as_ref()
+                    .is_none_or(|binding| binding.engine_id() != engine_id)
+            {
                 return Err(Qg1TantivyIncumbentError::ObservationBindingMismatch);
             }
             Ok(Qg1RawObservationBinding {
@@ -1022,6 +1027,10 @@ fn qg1_validate_raw_observations(
             || observation.content_bytes != expected_content_bytes
             || sample.work_units != Some(expected_work_units)
             || sample.byte_count != Some(expected_content_bytes)
+            || sample
+                .qg1_sample_binding
+                .as_ref()
+                .is_none_or(|binding| binding.engine_id() != engine_id)
         {
             return Err(Qg1TantivyIncumbentError::ObservationBindingMismatch);
         }
@@ -3090,6 +3099,165 @@ impl Qg6SampleBinding {
     }
 }
 
+/// One contiguous prepared-input interval consumed by a QG-1 engine sample.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg1BatchCoverage {
+    /// Zero-based offset of the first prepared document in this batch.
+    pub document_start: u64,
+    /// Number of prepared documents consumed by this batch.
+    pub document_count: u64,
+}
+
+/// The one terminal lifecycle that authenticated a QG-1 engine arm.
+///
+/// This is deliberately an enum rather than a collection of optional fields:
+/// one raw sample must name exactly one engine-specific witness. A Quill
+/// publication receipt cannot be relabelled as a Tantivy writer-join receipt,
+/// and vice versa.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "engine", rename_all = "snake_case")]
+pub enum Qg1LifecycleWitness {
+    /// Quill published the final commit and the retained reader found the
+    /// prepared tail document.
+    Quill {
+        /// Publication generation change observed across the measured work.
+        publication_generation_delta: u64,
+    },
+    /// Tantivy completed one non-rearming writer join before the retained
+    /// reader found the prepared tail document.
+    Tantivy {
+        /// Searchable segment count immediately before the terminal join.
+        searchable_segments_before: usize,
+        /// Searchable segment count after every terminal worker joined.
+        searchable_segments_after: usize,
+        /// Time spent in Tantivy's terminal worker join.
+        join_elapsed_ns: u64,
+        /// Whether the terminal join constructed a replacement writer.
+        writer_rearmed: bool,
+    },
+}
+
+impl Qg1LifecycleWitness {
+    fn validate(&self) -> bool {
+        match self {
+            Self::Quill { .. } => true,
+            Self::Tantivy {
+                searchable_segments_after,
+                writer_rearmed,
+                ..
+            } => *searchable_segments_after > 0 && !writer_rearmed,
+        }
+    }
+
+    fn engine_id(&self) -> &'static str {
+        match self {
+            Self::Quill { .. } => QG1_QUILL_ENGINE_ID,
+            Self::Tantivy { .. } => QG1_TANTIVY_ENGINE_ID,
+        }
+    }
+}
+
+/// Typed lifecycle binding retained with each headline-eligible QG-1 sample.
+///
+/// It joins the exact prepared corpus identities, complete batch schedule,
+/// prepared tail proof, one arm-specific lifecycle witness, and the endpoint
+/// that supplied the throughput denominator. `NoClaim` diagnostics have no
+/// value of this type and therefore cannot enter the paired estimator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg1SampleBinding {
+    /// Exact normalized gate-manifest identity used while preparing the input.
+    pub prepared_manifest_sha256: String,
+    /// Digest of exactly the indexed prepared content.
+    pub indexed_content_sha256: String,
+    /// Number of documents in the prepared input.
+    pub document_count: u64,
+    /// Total UTF-8 content bytes in that prepared input.
+    pub content_bytes: u64,
+    /// Number of batches fixed before timing began.
+    pub prepared_batch_count: usize,
+    /// Number of batch feed calls that completed during this sample.
+    pub recorded_batch_count: usize,
+    /// Complete contiguous coverage of the prepared input.
+    pub batch_coverage: Vec<Qg1BatchCoverage>,
+    /// Exact prepared tail document proved searchable at the endpoint.
+    pub tail_document_id: String,
+    /// Measured terminal searchable-and-quiescent offset from interval start.
+    pub terminal_endpoint_ns: u64,
+    /// Exactly one engine-specific lifecycle witness for this arm.
+    pub lifecycle_witness: Qg1LifecycleWitness,
+}
+
+impl Qg1SampleBinding {
+    fn validate_for_raw(
+        &self,
+        elapsed_ns: u64,
+        work_units: u64,
+        byte_count: Option<u64>,
+    ) -> Result<(), &'static str> {
+        let expected_tail_document_id = self
+            .document_count
+            .checked_sub(1)
+            .map(|ordinal| format!("synthetic-{ordinal:08}"));
+        if !is_lower_hex_digest(&self.prepared_manifest_sha256)
+            || !is_lower_hex_digest(&self.indexed_content_sha256)
+            || self.document_count == 0
+            || self.content_bytes == 0
+            || self.tail_document_id.trim().is_empty()
+            || self.tail_document_id.len() > 256
+            || expected_tail_document_id.as_deref() != Some(&self.tail_document_id)
+        {
+            return Err("QG-1 lifecycle binding has invalid prepared input identity");
+        }
+        if self.prepared_batch_count == 0
+            || self.prepared_batch_count != self.recorded_batch_count
+            || self.prepared_batch_count != self.batch_coverage.len()
+        {
+            return Err(
+                "QG-1 lifecycle binding does not retain one complete prepared batch schedule",
+            );
+        }
+        let mut next_document = 0_u64;
+        for batch in &self.batch_coverage {
+            if batch.document_start != next_document || batch.document_count == 0 {
+                return Err("QG-1 lifecycle binding batch coverage is not contiguous and positive");
+            }
+            next_document = next_document
+                .checked_add(batch.document_count)
+                .ok_or("QG-1 lifecycle binding batch coverage overflowed")?;
+        }
+        if next_document != self.document_count {
+            return Err("QG-1 lifecycle binding batch coverage differs from prepared input");
+        }
+        if work_units != self.document_count || byte_count != Some(self.content_bytes) {
+            return Err("QG-1 raw denominator differs from its lifecycle-bound prepared input");
+        }
+        if self.terminal_endpoint_ns == 0 || self.terminal_endpoint_ns != elapsed_ns {
+            return Err("QG-1 raw interval does not end at its lifecycle-bound terminal endpoint");
+        }
+        if !self.lifecycle_witness.validate() {
+            return Err("QG-1 lifecycle binding has an invalid arm-specific witness");
+        }
+        Ok(())
+    }
+
+    fn same_prepared_input(&self, other: &Self) -> bool {
+        self.prepared_manifest_sha256 == other.prepared_manifest_sha256
+            && self.indexed_content_sha256 == other.indexed_content_sha256
+            && self.document_count == other.document_count
+            && self.content_bytes == other.content_bytes
+            && self.prepared_batch_count == other.prepared_batch_count
+            && self.recorded_batch_count == other.recorded_batch_count
+            && self.batch_coverage == other.batch_coverage
+            && self.tail_document_id == other.tail_document_id
+    }
+
+    fn engine_id(&self) -> &'static str {
+        self.lifecycle_witness.engine_id()
+    }
+}
+
 /// One bounded raw record emitted by the timing harness.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PerfRawSample {
@@ -3125,6 +3293,10 @@ pub struct PerfRawSample {
     /// Compact semantic binding for QG-6 only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qg6_sample_binding: Option<Qg6SampleBinding>,
+    /// Complete prepared-input and terminal-lifecycle binding for a QG-1
+    /// throughput sample. Required for every headline-eligible QG-1 rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qg1_sample_binding: Option<Qg1SampleBinding>,
     /// Exact QG-1 Tantivy candidate configuration for this arm, when the arm
     /// runs Tantivy. Non-Tantivy arms carry no value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3175,6 +3347,32 @@ impl PerfRawSample {
             .ok_or(PairedEstimatorError::InvalidTimestamp {
                 sample_id: self.sample_id,
             })?;
+        if self.scope.semantics == PerfMetricSemantics::Throughput
+            && self.scope.operation_id.starts_with("QG-1.")
+        {
+            let work_units = self.work_units.filter(|value| *value > 0).ok_or_else(|| {
+                PairedEstimatorError::InvalidValue {
+                    sample_id: self.sample_id,
+                    reason: "throughput samples require positive work_units".to_owned(),
+                }
+            })?;
+            let binding = self.qg1_sample_binding.as_ref().ok_or_else(|| {
+                PairedEstimatorError::InvalidProvenance {
+                    reason: "QG-1 throughput samples require one typed prepared-input and lifecycle binding"
+                        .to_owned(),
+                }
+            })?;
+            binding
+                .validate_for_raw(elapsed_ns, work_units, self.byte_count)
+                .map_err(|reason| PairedEstimatorError::InvalidProvenance {
+                    reason: reason.to_owned(),
+                })?;
+        } else if self.qg1_sample_binding.is_some() {
+            return Err(PairedEstimatorError::InvalidProvenance {
+                reason: "non-QG-1-throughput samples cannot carry QG-1 lifecycle bindings"
+                    .to_owned(),
+            });
+        }
         #[allow(clippy::cast_precision_loss)]
         let elapsed_ns = elapsed_ns as f64;
         let value = match self.scope.semantics {
@@ -3332,6 +3530,8 @@ pub enum PairedEstimatorError {
     GroupMismatch { block_id: u64 },
     #[error("paired block {block_id} mixes QG-6 query bindings")]
     Qg6BindingMismatch { block_id: u64 },
+    #[error("paired block {block_id} mixes QG-1 prepared-input lifecycle bindings")]
+    Qg1BindingMismatch { block_id: u64 },
     #[error("paired block {block_id} compares different work or byte denominators")]
     WorkMismatch { block_id: u64 },
     #[error("paired experiment has only {actual} complete blocks; require {required}")]
@@ -3633,6 +3833,15 @@ pub fn validate_paired_blocks(
                 .map(|binding| binding.query_id.as_str())
         {
             return Err(PairedEstimatorError::Qg6BindingMismatch { block_id });
+        }
+        match (
+            control.qg1_sample_binding.as_ref(),
+            treatment.qg1_sample_binding.as_ref(),
+        ) {
+            (Some(control_binding), Some(treatment_binding))
+                if control_binding.same_prepared_input(treatment_binding) => {}
+            (None, None) => {}
+            _ => return Err(PairedEstimatorError::Qg1BindingMismatch { block_id }),
         }
         if control.order == treatment.order {
             return Err(PairedEstimatorError::InvalidOrder { block_id });
@@ -5654,6 +5863,41 @@ mod tests {
         qg1_expected_throughput_scope(cell).expect("canonical QG-1 throughput scope")
     }
 
+    fn qg1_test_sample_binding(
+        work_units: u64,
+        content_bytes: u64,
+        elapsed_ns: u64,
+        engine_id: &str,
+    ) -> Qg1SampleBinding {
+        let lifecycle_witness = match engine_id {
+            QG1_QUILL_ENGINE_ID => Qg1LifecycleWitness::Quill {
+                publication_generation_delta: 1,
+            },
+            QG1_TANTIVY_ENGINE_ID => Qg1LifecycleWitness::Tantivy {
+                searchable_segments_before: 1,
+                searchable_segments_after: 1,
+                join_elapsed_ns: 1,
+                writer_rearmed: false,
+            },
+            _ => panic!("QG-1 test binding requires a known engine ID"),
+        };
+        Qg1SampleBinding {
+            prepared_manifest_sha256: "a".repeat(64),
+            indexed_content_sha256: "b".repeat(64),
+            document_count: work_units,
+            content_bytes,
+            prepared_batch_count: 1,
+            recorded_batch_count: 1,
+            batch_coverage: vec![Qg1BatchCoverage {
+                document_start: 0,
+                document_count: work_units,
+            }],
+            tail_document_id: format!("synthetic-{:08}", work_units.saturating_sub(1)),
+            terminal_endpoint_ns: elapsed_ns,
+            lifecycle_witness,
+        }
+    }
+
     fn qg1_observation_ids(label: &str, samples: &[PerfRawSample]) -> Vec<String> {
         samples
             .iter()
@@ -5673,6 +5917,8 @@ mod tests {
         sample_id_base: u64,
         work_units: u64,
         content_bytes: u64,
+        control_engine_id: &str,
+        treatment_engine_id: &str,
     ) -> Vec<PerfRawSample> {
         let mut samples = duration_stream(
             scope,
@@ -5684,6 +5930,15 @@ mod tests {
         for sample in &mut samples {
             sample.work_units = Some(work_units);
             sample.byte_count = Some(content_bytes);
+            sample.qg1_sample_binding = Some(qg1_test_sample_binding(
+                work_units,
+                content_bytes,
+                sample.ended_ns - sample.started_ns,
+                match sample.arm {
+                    PerfSampleArm::Control => control_engine_id,
+                    PerfSampleArm::Treatment => treatment_engine_id,
+                },
+            ));
         }
         samples
     }
@@ -5708,6 +5963,8 @@ mod tests {
             0,
             work_units,
             content_bytes,
+            QG1_TANTIVY_ENGINE_ID,
+            QG1_TANTIVY_ENGINE_ID,
         );
         let null = qg1_duration_stream(
             scope,
@@ -5717,6 +5974,8 @@ mod tests {
             10_000,
             work_units,
             content_bytes,
+            QG1_TANTIVY_ENGINE_ID,
+            QG1_TANTIVY_ENGINE_ID,
         );
         let experiment = estimate_paired_experiment(&effect, &null, &estimator_config())
             .expect("valid QG-1 candidate pilot");
@@ -5798,6 +6057,8 @@ mod tests {
             sample_id_base,
             work_units,
             content_bytes,
+            control_engine_id,
+            treatment_engine_id,
         );
         let observation_ids = qg1_observation_ids(kind.stable_id(), &effect);
         Qg1TantivyBoundStream::from_raw_samples(
@@ -5881,6 +6142,112 @@ mod tests {
         stream.stream_receipt_sha256 = stream
             .recomputed_stream_receipt_sha256()
             .expect("scope-bound stream receipt");
+    }
+
+    #[test]
+    fn qg1_lifecycle_binding_hostile_mutations_reach_the_live_estimator() {
+        let cell = qg1_bulk_cell(4);
+        let scope = qg1_throughput_scope(&cell);
+        let provenance = provenance("qg1-binding-hostile");
+        let durations = [1_000_000; PERF_MIN_RUNS];
+        let effect = qg1_duration_stream(
+            &scope,
+            &provenance,
+            &durations,
+            &[900_000; PERF_MIN_RUNS],
+            0,
+            500,
+            64_000,
+            QG1_TANTIVY_ENGINE_ID,
+            QG1_QUILL_ENGINE_ID,
+        );
+        let null = qg1_duration_stream(
+            &scope,
+            &provenance,
+            &durations,
+            &durations,
+            10_000,
+            500,
+            64_000,
+            QG1_TANTIVY_ENGINE_ID,
+            QG1_TANTIVY_ENGINE_ID,
+        );
+        assert!(
+            estimate_paired_experiment(&effect, &null, &estimator_config()).is_ok(),
+            "the intact QG-1 lifecycle binding must reach the live estimator"
+        );
+
+        let assert_rejected = |effect: Vec<PerfRawSample>, label: &str| {
+            assert!(
+                estimate_paired_experiment(&effect, &null, &estimator_config()).is_err(),
+                "the live estimator accepted hostile QG-1 lifecycle mutation: {label}"
+            );
+        };
+
+        let mut no_claim = effect.clone();
+        no_claim[0].qg1_sample_binding = None;
+        assert_rejected(no_claim, "NoClaim/missing lifecycle binding");
+
+        let mut different_content = effect.clone();
+        different_content[0]
+            .qg1_sample_binding
+            .as_mut()
+            .expect("binding")
+            .indexed_content_sha256 = "c".repeat(64);
+        assert_rejected(different_content, "prepared content identity");
+
+        let mut incomplete_batches = effect.clone();
+        incomplete_batches[0]
+            .qg1_sample_binding
+            .as_mut()
+            .expect("binding")
+            .recorded_batch_count = 2;
+        assert_rejected(incomplete_batches, "recorded batch count");
+
+        let mut different_tail = effect.clone();
+        different_tail[0]
+            .qg1_sample_binding
+            .as_mut()
+            .expect("binding")
+            .tail_document_id = "synthetic-hostile-tail".to_owned();
+        assert_rejected(different_tail, "exact prepared tail");
+
+        let mut detached_endpoint = effect.clone();
+        detached_endpoint[0]
+            .qg1_sample_binding
+            .as_mut()
+            .expect("binding")
+            .terminal_endpoint_ns = 1;
+        assert_rejected(detached_endpoint, "terminal endpoint");
+
+        let mut rearmed_tantivy = effect.clone();
+        rearmed_tantivy[0]
+            .qg1_sample_binding
+            .as_mut()
+            .expect("binding")
+            .lifecycle_witness = Qg1LifecycleWitness::Tantivy {
+            searchable_segments_before: 1,
+            searchable_segments_after: 1,
+            join_elapsed_ns: 1,
+            writer_rearmed: true,
+        };
+        assert_rejected(rearmed_tantivy, "rearmed Tantivy terminal witness");
+
+        let mut unsearchable_tantivy = effect;
+        unsearchable_tantivy[0]
+            .qg1_sample_binding
+            .as_mut()
+            .expect("binding")
+            .lifecycle_witness = Qg1LifecycleWitness::Tantivy {
+            searchable_segments_before: 1,
+            searchable_segments_after: 0,
+            join_elapsed_ns: 1,
+            writer_rearmed: false,
+        };
+        assert_rejected(
+            unsearchable_tantivy,
+            "unsearchable Tantivy terminal witness",
+        );
     }
 
     #[test]
@@ -6460,6 +6827,7 @@ mod tests {
                 observed_value: None,
                 group_id: None,
                 qg6_sample_binding: None,
+                qg1_sample_binding: None,
                 tantivy_config_sha256: None,
             });
             samples.push(PerfRawSample {
@@ -6477,6 +6845,7 @@ mod tests {
                 observed_value: None,
                 group_id: None,
                 qg6_sample_binding: None,
+                qg1_sample_binding: None,
                 tantivy_config_sha256: None,
             });
         }
@@ -6525,6 +6894,7 @@ mod tests {
                 observed_value: Some(*control),
                 group_id: None,
                 qg6_sample_binding: None,
+                qg1_sample_binding: None,
                 tantivy_config_sha256: None,
             });
             samples.push(PerfRawSample {
@@ -6546,6 +6916,7 @@ mod tests {
                 observed_value: Some(*treatment),
                 group_id: None,
                 qg6_sample_binding: None,
+                qg1_sample_binding: None,
                 tantivy_config_sha256: None,
             });
         }

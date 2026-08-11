@@ -48,8 +48,9 @@ use frankensearch_quill_gauntlet::{
     PerfConcurrencyWitness, PerfCorpus, PerfEvidenceArtifact, PerfGate, PerfGateArtifact,
     PerfInputIdentity, PerfMatrixSpec, PerfMetricSemantics, PerfOperationScope, PerfQueryClass,
     PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
-    PerfTopology, PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg6ArmRole, Qg6Comparison,
-    Qg6Phase, Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleBinding, Qg6SampleOrder, Qg6SearchHit,
+    PerfTopology, PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg1BatchCoverage,
+    Qg1LifecycleWitness, Qg1SampleBinding, Qg6ArmRole, Qg6Comparison, Qg6Phase,
+    Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleBinding, Qg6SampleOrder, Qg6SearchHit,
     Qg6SearchResult, Qg6SemanticContract, RankClass, RankedHit, ScoreEpsilonReason,
     SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent, command_sha256_from_argv,
     compare_observations, estimate_paired_experiment, machine_fingerprint, oracle_version_contract,
@@ -82,9 +83,6 @@ fn qg1_tail_document_id(document_count: u64) -> String {
     format!("synthetic-{tail_ordinal:08}")
 }
 
-fn qg1_tail_query(document_id: &str) -> String {
-    format!("id:\"{document_id}\"")
-}
 // Frozen by a strict-remote full replay on 2026-07-31. The retired per-shard
 // all-count replay generated 4,222,000 documents and took 326,401 ms in the
 // unoptimized audit binary. Each full-scale producer now validates only the
@@ -717,16 +715,65 @@ fn qg1_producer_coverage(spec: &PerfCellSpec) -> Option<Qg1ProducerCoverage> {
     }
 }
 
+/// The successful terminal proof is deliberately typed by its actual
+/// operation.  A generic success string allowed a Quill proof to be relabeled
+/// as the distinct retained-Tantivy-reader proof (and vice versa).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum Qg1TerminalProof {
+    /// An exact prepared-tail membership probe returned the tail alone.
+    ExactPreparedTailVisible { tail_document_id: String },
+    /// Quill committed and retained its reader through the exact tail probe.
+    QuillPublicationThenExactTail {
+        tail_document_id: String,
+        publication_generation_delta: u64,
+    },
+    /// Tantivy completed one non-rearming worker join before the retained
+    /// reader's exact tail probe.
+    TantivyJoinThenExactTail {
+        tail_document_id: String,
+        terminal_join: BenchmarkWriterJoinReceipt,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum Qg1TerminalFact {
-    Proven { proof: &'static str },
+    Proven { proof: Qg1TerminalProof },
     NoClaim { code: &'static str, detail: String },
 }
 
 impl Qg1TerminalFact {
-    const fn proven(proof: &'static str) -> Self {
-        Self::Proven { proof }
+    fn exact_tail_visible(tail_document_id: impl Into<String>) -> Self {
+        Self::Proven {
+            proof: Qg1TerminalProof::ExactPreparedTailVisible {
+                tail_document_id: tail_document_id.into(),
+            },
+        }
+    }
+
+    fn quill_publication_then_exact_tail(
+        tail_document_id: impl Into<String>,
+        publication_generation_delta: u64,
+    ) -> Self {
+        Self::Proven {
+            proof: Qg1TerminalProof::QuillPublicationThenExactTail {
+                tail_document_id: tail_document_id.into(),
+                publication_generation_delta,
+            },
+        }
+    }
+
+    fn tantivy_join_then_exact_tail(
+        tail_document_id: impl Into<String>,
+        terminal_join: BenchmarkWriterJoinReceipt,
+    ) -> Self {
+        Self::Proven {
+            proof: Qg1TerminalProof::TantivyJoinThenExactTail {
+                tail_document_id: tail_document_id.into(),
+                terminal_join,
+            },
+        }
     }
 
     fn no_claim(detail: impl Into<String>) -> Self {
@@ -740,6 +787,15 @@ impl Qg1TerminalFact {
         match self {
             Self::Proven { .. } => None,
             Self::NoClaim { detail, .. } => Some(detail),
+        }
+    }
+
+    fn exact_tail_document_id(&self) -> Option<&str> {
+        match self {
+            Self::Proven {
+                proof: Qg1TerminalProof::ExactPreparedTailVisible { tail_document_id },
+            } => Some(tail_document_id),
+            _ => None,
         }
     }
 }
@@ -957,6 +1013,13 @@ impl Qg1ContinuousTimingReceipt {
                 "QG-1 continuous receipt work differs from its prepared sample input".to_owned(),
             );
         }
+        if let Some(proved_tail) = self.terminal_searchability.exact_tail_document_id()
+            && proved_tail != self.prepared_input.tail_document_id
+        {
+            return Err(
+                "QG-1 terminal exact-tail proof names a different prepared document".to_owned(),
+            );
+        }
         if self.batches.is_empty()
             || self.recorded_batch_count != self.batches.len()
             || self.recorded_batch_count != self.prepared_input.batch_count
@@ -1022,8 +1085,29 @@ impl Qg1ContinuousTimingReceipt {
                 }
                 if self.terminal_searchable_quiescence_completed_ns < cursor {
                     return Err(
-                        "QG-1 retained Quill tail search preceded terminal commit".to_owned(),
+                        "QG-1 retained Quill tail search preceded terminal commit".to_owned()
                     );
+                }
+                if let Qg1TerminalFact::Proven { proof } = &self.terminal_quiescence {
+                    let Qg1TerminalProof::QuillPublicationThenExactTail {
+                        tail_document_id,
+                        publication_generation_delta,
+                    } = proof
+                    else {
+                        return Err(
+                            "QG-1 Quill receipt carries a Tantivy or generic terminal proof"
+                                .to_owned(),
+                        );
+                    };
+                    if tail_document_id != &self.prepared_input.tail_document_id
+                        || Some(*publication_generation_delta)
+                            != self.quill_publication_generation_delta
+                    {
+                        return Err(
+                            "QG-1 Quill lifecycle proof is not bound to this tail/publication"
+                                .to_owned(),
+                        );
+                    }
                 }
             }
             EngineArm::Tantivy => {
@@ -1035,8 +1119,7 @@ impl Qg1ContinuousTimingReceipt {
                 };
                 let Some(joined) = self.terminal_worker_join_completed_ns else {
                     return Err(
-                        "QG-1 Tantivy receipt lacks the terminal worker-join boundary"
-                            .to_owned(),
+                        "QG-1 Tantivy receipt lacks the terminal worker-join boundary".to_owned(),
                     );
                 };
                 if self.quill_publication_generation_delta.is_some() || join.writer_rearmed {
@@ -1053,6 +1136,26 @@ impl Qg1ContinuousTimingReceipt {
                         "QG-1 retained Tantivy tail search preceded the terminal worker join"
                             .to_owned(),
                     );
+                }
+                if let Qg1TerminalFact::Proven { proof } = &self.terminal_quiescence {
+                    let Qg1TerminalProof::TantivyJoinThenExactTail {
+                        tail_document_id,
+                        terminal_join,
+                    } = proof
+                    else {
+                        return Err(
+                            "QG-1 Tantivy receipt carries a Quill or generic terminal proof"
+                                .to_owned(),
+                        );
+                    };
+                    if tail_document_id != &self.prepared_input.tail_document_id
+                        || terminal_join != &join
+                    {
+                        return Err(
+                            "QG-1 Tantivy lifecycle proof is not bound to this tail/join receipt"
+                                .to_owned(),
+                        );
+                    }
                 }
             }
         }
@@ -1073,6 +1176,100 @@ impl Qg1ContinuousTimingReceipt {
         .into_iter()
         .flatten()
     }
+}
+
+/// Convert one verified QG-1 lifecycle receipt into the compact typed binding
+/// retained by the paired estimator.  This is intentionally fallible through
+/// `Option`: terminal diagnostics remain serializable as `NoClaim`, but they
+/// produce no binding and therefore cannot become a throughput headline.
+fn qg1_live_sample_binding(
+    continuous: Option<&Qg1ContinuousMeasurement>,
+    elapsed_ns: u64,
+) -> Option<Qg1SampleBinding> {
+    let continuous = continuous?;
+    let receipt = &continuous.lifecycle_receipt;
+    receipt.validate().ok()?;
+    if receipt.interval_ended_ns != elapsed_ns || continuous.elapsed_ns != elapsed_ns {
+        return None;
+    }
+    let tail_document_id = receipt.prepared_input.tail_document_id.clone();
+    let lifecycle_witness = match (
+        receipt.arm,
+        &receipt.terminal_searchability,
+        &receipt.terminal_quiescence,
+    ) {
+        (
+            EngineArm::Quill,
+            Qg1TerminalFact::Proven {
+                proof:
+                    Qg1TerminalProof::ExactPreparedTailVisible {
+                        tail_document_id: search_tail,
+                    },
+            },
+            Qg1TerminalFact::Proven {
+                proof:
+                    Qg1TerminalProof::QuillPublicationThenExactTail {
+                        tail_document_id: lifecycle_tail,
+                        publication_generation_delta,
+                    },
+            },
+        ) if search_tail == &tail_document_id
+            && lifecycle_tail == &tail_document_id
+            && receipt.quill_publication_generation_delta
+                == Some(*publication_generation_delta) =>
+        {
+            Qg1LifecycleWitness::Quill {
+                publication_generation_delta: *publication_generation_delta,
+            }
+        }
+        (
+            EngineArm::Tantivy,
+            Qg1TerminalFact::Proven {
+                proof:
+                    Qg1TerminalProof::ExactPreparedTailVisible {
+                        tail_document_id: search_tail,
+                    },
+            },
+            Qg1TerminalFact::Proven {
+                proof:
+                    Qg1TerminalProof::TantivyJoinThenExactTail {
+                        tail_document_id: lifecycle_tail,
+                        terminal_join,
+                    },
+            },
+        ) if search_tail == &tail_document_id
+            && lifecycle_tail == &tail_document_id
+            && receipt.terminal_tantivy_join.as_ref() == Some(terminal_join)
+            && !terminal_join.writer_rearmed =>
+        {
+            Qg1LifecycleWitness::Tantivy {
+                searchable_segments_before: terminal_join.searchable_segments_before,
+                searchable_segments_after: terminal_join.searchable_segments_after,
+                join_elapsed_ns: terminal_join.join_elapsed_ns,
+                writer_rearmed: terminal_join.writer_rearmed,
+            }
+        }
+        _ => return None,
+    };
+    Some(Qg1SampleBinding {
+        prepared_manifest_sha256: receipt.prepared_input.manifest_sha256.clone(),
+        indexed_content_sha256: receipt.prepared_input.indexed_content_sha256.clone(),
+        document_count: receipt.prepared_input.document_count,
+        content_bytes: receipt.prepared_input.content_bytes,
+        prepared_batch_count: receipt.prepared_input.batch_count,
+        recorded_batch_count: receipt.recorded_batch_count,
+        batch_coverage: receipt
+            .batches
+            .iter()
+            .map(|batch| Qg1BatchCoverage {
+                document_start: batch.document_start,
+                document_count: batch.document_count,
+            })
+            .collect(),
+        tail_document_id,
+        terminal_endpoint_ns: receipt.interval_ended_ns,
+        lifecycle_witness,
+    })
 }
 
 /// Work completed per elapsed second, derived exactly as
@@ -2177,16 +2374,12 @@ fn qg1_terminal_commit<E: LexicalWrite>(
     interval.mark_terminal_commit();
 }
 
-fn qg1_terminal_searchability<E: LexicalRead>(
-    context: &BenchContext,
-    index: &E,
+fn qg1_quill_terminal_searchability(
+    index: &QuillIndex,
     interval: &mut Qg1ContinuousInterval,
 ) -> Qg1TerminalFact {
-    let terminal_query = qg1_tail_query(&interval.prepared_input.tail_document_id);
     let expected_document_id = interval.prepared_input.tail_document_id.clone();
-    let result = context
-        .runtime
-        .block_on(index.search(&context.cx, &terminal_query, 2));
+    let result = index.benchmark_search_exact_id(&expected_document_id);
     // Capture the one terminal boundary immediately when the retained Quill
     // read owner returns. Converting IDs into a proof record must not move the
     // end of the measured searchable-and-quiescent state.
@@ -2195,13 +2388,13 @@ fn qg1_terminal_searchability<E: LexicalRead>(
         Ok(results) => {
             let document_ids = results
                 .into_iter()
-                .map(|result| String::from(result.doc_id))
+                .map(|document_id| String::from(document_id))
                 .collect::<Vec<_>>();
             let fact = if document_ids == [expected_document_id] {
-                Qg1TerminalFact::proven("exact_prepared_tail_sentinel_visible")
+                Qg1TerminalFact::exact_tail_visible(expected_document_id.clone())
             } else {
                 Qg1TerminalFact::no_claim(format!(
-                    "terminal tail query {terminal_query:?} returned {document_ids:?} instead of \
+                    "terminal exact-ID probe returned {document_ids:?} instead of \
                      [{expected_document_id:?}]"
                 ))
             };
@@ -2209,7 +2402,7 @@ fn qg1_terminal_searchability<E: LexicalRead>(
             fact
         }
         Err(error) => Qg1TerminalFact::no_claim(format!(
-            "terminal tail query {terminal_query:?} failed: {error}"
+            "terminal exact-ID probe for {expected_document_id:?} failed: {error}"
         )),
     }
 }
@@ -2232,7 +2425,7 @@ fn qg1_tantivy_terminal_searchability(
                 .map(String::from)
                 .collect::<Vec<_>>();
             let fact = if observed_document_ids == [expected_document_id] {
-                Qg1TerminalFact::proven("exact_prepared_tail_sentinel_visible_after_tantivy_join")
+                Qg1TerminalFact::exact_tail_visible(expected_document_id.clone())
             } else {
                 Qg1TerminalFact::no_claim(format!(
                     "post-join Tantivy tail lookup returned {observed_document_ids:?} instead of \
@@ -2253,9 +2446,9 @@ fn qg1_tantivy_quiescence_fact(
     terminal_searchability: &Qg1TerminalFact,
 ) -> Qg1TerminalFact {
     if !terminal_join.writer_rearmed
-        && matches!(terminal_searchability, Qg1TerminalFact::Proven { .. })
+        && let Some(tail_document_id) = terminal_searchability.exact_tail_document_id()
     {
-        Qg1TerminalFact::proven("one_nonrearming_tantivy_writer_join_precedes_retained_reader_tail_search")
+        Qg1TerminalFact::tantivy_join_then_exact_tail(tail_document_id, *terminal_join)
     } else {
         Qg1TerminalFact::no_claim(format!(
             "Tantivy terminal lifecycle did not prove one nonrearming worker join followed by \
@@ -2292,15 +2485,14 @@ fn qg1_bulk_metric_continuous(
             // Retain the Quill read owner until its terminal search returns,
             // matching Tantivy's retained-reader endpoint without inventing a
             // writer lifecycle that Quill does not have.
-            let retained_search_owner = &index;
-            let terminal_searchability =
-                qg1_terminal_searchability(context, retained_search_owner, &mut interval);
+            let terminal_searchability = qg1_quill_terminal_searchability(&index, &mut interval);
             let generation_delta = generation_before_terminal.saturating_sub(generation_before);
             let (measurement, receipt) = interval.finish(
                 Some(generation_delta),
                 terminal_searchability,
-                Qg1TerminalFact::proven(
-                    "retained_quill_read_owner_returned_tail_after_inline_publication",
+                Qg1TerminalFact::quill_publication_then_exact_tail(
+                    prepared_input.binding.tail_document_id.clone(),
+                    generation_delta,
                 ),
             );
             emit_qg1_continuous_timing_receipt(spec, receipt);
@@ -3650,12 +3842,15 @@ impl<'a> PairedStreamRunner<'a> {
             measurement.continuous.as_ref(),
         )
         .expect("QG-1 raw sample denominator must bind the prepared measured input");
-        let continuous = measurement.continuous.map(|interval| Qg1IntervalOffsets {
-            work_units: interval.work_units,
-            started_ns: u64::try_from(interval.origin.duration_since(self.origin).as_nanos())
-                .expect("monotonic ns"),
-            elapsed_ns: interval.elapsed_ns,
-        });
+        let continuous = measurement
+            .continuous
+            .as_ref()
+            .map(|interval| Qg1IntervalOffsets {
+                work_units: interval.work_units,
+                started_ns: u64::try_from(interval.origin.duration_since(self.origin).as_nanos())
+                    .expect("monotonic ns"),
+                elapsed_ns: interval.elapsed_ns,
+            });
         let window = qg1_sample_window(
             self.scope.semantics,
             work_units,
@@ -3664,6 +3859,10 @@ impl<'a> PairedStreamRunner<'a> {
             continuous,
         )
         .expect("QG sample timing is not publishable");
+        let qg1_sample_binding = qg1_live_sample_binding(
+            measurement.continuous.as_ref(),
+            window.ended_ns - window.started_ns,
+        );
         if self.scope.semantics == PerfMetricSemantics::Throughput {
             // The published absolutes read `observed_value` while the estimator
             // recomputes the same rate from the published window. A QG-1 row is
@@ -3694,6 +3893,7 @@ impl<'a> PairedStreamRunner<'a> {
             observed_value: Some(measurement.value),
             group_id: self.plan.group_id,
             qg6_sample_binding: None,
+            qg1_sample_binding,
             tantivy_config_sha256: None,
         }
     }
@@ -4046,6 +4246,7 @@ fn qg6_raw_sample(
             query_id: sample.query_id.clone(),
             result_sequence_sha256: sample.result_sha256.clone(),
         }),
+        qg1_sample_binding: None,
         tantivy_config_sha256: None,
     }
 }
@@ -5972,11 +6173,17 @@ mod tests {
             }),
             terminal_searchable_quiescence_completed_ns: 180,
             interval_ended_ns: 180,
-            terminal_searchability: super::Qg1TerminalFact::proven(
-                "exact_prepared_tail_sentinel_visible",
+            terminal_searchability: super::Qg1TerminalFact::exact_tail_visible(
+                "synthetic-00000019",
             ),
-            terminal_quiescence: super::Qg1TerminalFact::proven(
-                "retained_reader_searchable_across_single_nonrearming_worker_join",
+            terminal_quiescence: super::Qg1TerminalFact::tantivy_join_then_exact_tail(
+                "synthetic-00000019",
+                super::BenchmarkWriterJoinReceipt {
+                    searchable_segments_before: 1,
+                    searchable_segments_after: 1,
+                    join_elapsed_ns: 30,
+                    writer_rearmed: false,
+                },
             ),
         }
     }
@@ -6040,6 +6247,19 @@ mod tests {
             .expect("hostile receipt names its actual join API result")
             .writer_rearmed = true;
         assert_escape_rejected(rearmed_join);
+        let mut relabeled_tantivy_proof = receipt.clone();
+        relabeled_tantivy_proof.terminal_quiescence =
+            super::Qg1TerminalFact::quill_publication_then_exact_tail("synthetic-00000019", 1);
+        assert_escape_rejected(relabeled_tantivy_proof);
+        let mut mismatched_tantivy_proof = receipt.clone();
+        mismatched_tantivy_proof.terminal_quiescence =
+            super::Qg1TerminalFact::tantivy_join_then_exact_tail(
+                "synthetic-00000018",
+                mismatched_tantivy_proof
+                    .terminal_tantivy_join
+                    .expect("hostile Tantivy receipt retains its join proof"),
+            );
+        assert_escape_rejected(mismatched_tantivy_proof);
         let mut quiescence_escape = receipt.clone();
         quiescence_escape.interval_ended_ns = 159;
         assert_escape_rejected(quiescence_escape);
@@ -6062,6 +6282,114 @@ mod tests {
         let encoded = serde_json::to_string(&unproved).expect("serialize typed NoClaim receipt");
         assert!(encoded.contains("\"status\":\"no_claim\""));
         assert!(encoded.contains(super::QG1_TERMINAL_NO_CLAIM_CODE));
+
+        // Receipt-level rejection alone is not enough: an attacker could
+        // preserve a serializable `NoClaim` receipt and hope a later layer
+        // still publishes a rate. Convert the receipt through the production
+        // binding factory, then run its hostile absence through the live
+        // paired estimator used by the headline path.
+        use frankensearch_quill_gauntlet::{
+            PairedEstimatorConfig, PerfOperationScope, PerfRawSample, PerfSampleArm,
+            PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance, estimate_paired_experiment,
+        };
+        let binding_from_receipt = |receipt: super::Qg1ContinuousTimingReceipt| {
+            let continuous = super::Qg1ContinuousMeasurement {
+                work_units: receipt.document_count,
+                origin: std::time::Instant::now(),
+                elapsed_ns: receipt.interval_ended_ns,
+                prepared_input: receipt.prepared_input.clone(),
+                lifecycle_receipt: receipt,
+            };
+            super::qg1_live_sample_binding(Some(&continuous), continuous.elapsed_ns)
+        };
+        let proved_binding = binding_from_receipt(hostile_tantivy_continuous_receipt())
+            .expect("a proved terminal lifecycle must create the estimator binding");
+        let no_claim_binding = binding_from_receipt(unproved.clone());
+        assert!(
+            no_claim_binding.is_none(),
+            "NoClaim lifecycle receipts must not create a headline-eligible binding"
+        );
+
+        let scope = PerfOperationScope {
+            operation_id: "QG-1.bulk/tiny/1/positions_on.docs_per_second".to_owned(),
+            version: 1,
+            semantics: frankensearch_quill_gauntlet::PerfMetricSemantics::Throughput,
+            unit: "docs/s".to_owned(),
+        };
+        let provenance = PerfSampleProvenance {
+            run_id: "qg1-hostile-lifecycle-estimator".to_owned(),
+            executable_sha256: "a".repeat(64),
+            corpus_sha256: "b".repeat(64),
+            input_identity: None,
+            worker_id: "hostile-test".to_owned(),
+            build_profile: "release-perf".to_owned(),
+        };
+        let stream = |binding: Option<super::Qg1SampleBinding>, sample_id_base: u64| {
+            (0_u64..10)
+                .flat_map(|block_id| {
+                    let base = block_id * 1_000;
+                    [
+                        PerfRawSample {
+                            block_id,
+                            sample_id: sample_id_base + block_id * 2,
+                            arm: PerfSampleArm::Control,
+                            order: PerfSampleOrder::First,
+                            phase: PerfSamplePhase::Measurement,
+                            scope: scope.clone(),
+                            provenance: provenance.clone(),
+                            started_ns: base,
+                            ended_ns: base + 180,
+                            work_units: Some(20),
+                            byte_count: Some(20_480),
+                            observed_value: None,
+                            group_id: None,
+                            qg6_sample_binding: None,
+                            qg1_sample_binding: binding.clone(),
+                            tantivy_config_sha256: None,
+                        },
+                        PerfRawSample {
+                            block_id,
+                            sample_id: sample_id_base + block_id * 2 + 1,
+                            arm: PerfSampleArm::Treatment,
+                            order: PerfSampleOrder::Second,
+                            phase: PerfSamplePhase::Measurement,
+                            scope: scope.clone(),
+                            provenance: provenance.clone(),
+                            started_ns: base + 181,
+                            ended_ns: base + 361,
+                            work_units: Some(20),
+                            byte_count: Some(20_480),
+                            observed_value: None,
+                            group_id: None,
+                            qg6_sample_binding: None,
+                            qg1_sample_binding: binding.clone(),
+                            tantivy_config_sha256: None,
+                        },
+                    ]
+                })
+                .collect::<Vec<_>>()
+        };
+        let config = PairedEstimatorConfig::predeclared(0x5147_314c_4946_4543);
+        let valid_effect = stream(Some(proved_binding.clone()), 0);
+        let valid_null = stream(Some(proved_binding), 10_000);
+        assert!(
+            estimate_paired_experiment(&valid_effect, &valid_null, &config).is_ok(),
+            "proved QG-1 lifecycle bindings must reach the live estimator"
+        );
+        let no_claim_effect = stream(no_claim_binding, 20_000);
+        assert!(
+            estimate_paired_experiment(&no_claim_effect, &valid_null, &config).is_err(),
+            "NoClaim lifecycle receipts must be rejected by the live estimator before headline generation"
+        );
+
+        let mut relabelled = hostile_tantivy_continuous_receipt();
+        relabelled.terminal_quiescence =
+            super::Qg1TerminalFact::quill_publication_then_exact_tail("synthetic-00000019", 1);
+        let relabelled_effect = stream(binding_from_receipt(relabelled), 30_000);
+        assert!(
+            estimate_paired_experiment(&relabelled_effect, &valid_null, &config).is_err(),
+            "an arm-relabeled terminal proof must reach and fail the live estimator"
+        );
     }
 
     #[test]
@@ -6164,7 +6492,7 @@ mod tests {
             assert!(matches!(
                 &record.timing.terminal_searchability,
                 super::Qg1TerminalFact::Proven {
-                    proof: "exact_prepared_tail_sentinel_visible"
+                    proof: super::Qg1TerminalProof::ExactPreparedTailVisible { .. }
                 }
             ));
             assert!(matches!(
@@ -6633,6 +6961,7 @@ mod tests {
             observed_value: Some(observed_value),
             group_id: None,
             qg6_sample_binding: None,
+            qg1_sample_binding: None,
             tantivy_config_sha256: None,
         };
         // `stored_treatment` is the only lever: `None` stores the honest derived

@@ -9555,6 +9555,31 @@ impl QuillIndex {
         self.search_snapshot().resolve_document_witness(document_id)
     }
 
+    /// Probe the published ID map for one exact identifier in a benchmark-only
+    /// terminal visibility check.
+    ///
+    /// This deliberately has the same exact-ID membership semantics as the
+    /// retained Tantivy terminal-reader probe: it neither parses a user query
+    /// nor scores a broader result set.  The caller owns the expected ID, so a
+    /// live witness is returned as that one ID and an absent/tombstoned ID is
+    /// returned as an empty result.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed IDHASH/IDMAP corruption or an invalid live-Delta
+    /// witness.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub fn benchmark_search_exact_id(
+        &self,
+        document_id: &str,
+    ) -> Result<Vec<DocId>, QuillIndexError> {
+        Ok(self
+            .document_witness(document_id)?
+            .map(|_| vec![document_id.to_owned().into()])
+            .unwrap_or_default())
+    }
+
     /// Durable index directory, or `None` for an owned-buffer index.
     #[must_use]
     pub fn directory(&self) -> Option<&Path> {

@@ -1273,37 +1273,22 @@ impl BenchmarkRetainedTantivyReader {
     ///
     /// # Errors
     ///
-    /// Returns a typed Tantivy search or document-loading failure.
+    /// Returns a typed Tantivy search failure.
     pub fn benchmark_search_exact_id(&self, document_id: &str) -> SearchResult<Vec<DocId>> {
         let query = TermQuery::new(
             Term::from_field_text(self.fields.id, document_id),
             IndexRecordOption::Basic,
         );
         let searcher = self.reader.searcher();
-        let top_docs = search_guarded(
-            &searcher,
-            &query,
-            &TopDocs::with_limit(2).order_by_score(),
-        )?;
+        let top_docs = search_guarded(&searcher, &query, &TopDocs::with_limit(2).order_by_score())?;
 
-        top_docs
+        // The exact `id` term itself authenticates membership.  Do not add a
+        // stored-document hydration that Quill's matching IDHASH probe does
+        // not pay; terminal proof cost is part of the timed lifecycle.
+        Ok(top_docs
             .into_iter()
-            .map(|(_, doc_address)| {
-                let document: TantivyDocument =
-                    searcher
-                        .doc(doc_address)
-                        .map_err(|error| SearchError::SubsystemError {
-                            subsystem: "tantivy",
-                            source: Box::new(error),
-                        })?;
-                let document_id = document
-                    .get_first(self.fields.id)
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default()
-                    .to_owned();
-                Ok(document_id.into())
-            })
-            .collect()
+            .map(|_| document_id.to_owned().into())
+            .collect())
     }
 }
 
