@@ -14260,7 +14260,7 @@ impl FsfsRuntime {
                             Some((&lifecycle_tracker, &storage_paths)),
                         )
                         .await;
-                    stop_watcher_and_finalize(
+                    Self::complete_watcher_shutdown(
                         watcher.stop_checked(cx),
                         self.finalize_shutdown(cx, reason, Some(&vi_handle)),
                     )
@@ -14498,52 +14498,71 @@ impl FsfsRuntime {
         info!(reason = ?reason, "fsfs graceful shutdown finalization completed");
         Ok(())
     }
-}
 
-/// Both stops the watcher and runs required shutdown finalization.
-///
-/// The watcher failure remains the primary cause. If finalization also fails,
-/// the existing subsystem-error wrapper retains both failures in one source.
-async fn stop_watcher_and_finalize<Stop, Finalize>(
-    watcher_stop: Stop,
-    finalization: Finalize,
-) -> SearchResult<()>
-where
-    Stop: Future<Output = SearchResult<()>>,
-    Finalize: Future<Output = SearchResult<()>>,
-{
-    let watcher_result = watcher_stop.await;
-    let finalization_result = finalization.await;
+    /// Complete the live-watcher shutdown sequence used by CLI watch mode.
+    ///
+    /// Once the stop future resolves, this polls finalization exactly once
+    /// before reporting either result. A watcher failure remains primary; a
+    /// simultaneous finalization failure is retained as structured context.
+    ///
+    /// This guarantee requires callers to keep polling the returned future.
+    /// Dropping it before the stop future resolves, or unwinding from either
+    /// future, prevents this method from reaching or completing finalization.
+    /// `FsWatcher::stop_checked` converts joined task panics into a
+    /// `SearchError`, which is handled like any other watcher failure here.
+    async fn complete_watcher_shutdown<Stop, Finalize>(
+        watcher_stop: Stop,
+        finalization: Finalize,
+    ) -> SearchResult<()>
+    where
+        Stop: Future<Output = SearchResult<()>>,
+        Finalize: Future<Output = SearchResult<()>>,
+    {
+        let watcher_result = watcher_stop.await;
+        let finalization_result = finalization.await;
 
-    match (watcher_result, finalization_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(watcher_error), Ok(())) => Err(watcher_error),
-        (Ok(()), Err(finalization_error)) => Err(finalization_error),
-        (Err(watcher_error), Err(finalization_error)) => {
-            tracing::error!(
-                watcher_stop_error = %watcher_error,
-                finalization_error = %finalization_error,
-                "fsfs watcher stop and required shutdown finalization both failed"
-            );
-            Err(SearchError::SubsystemError {
-                subsystem: "fsfs.shutdown",
-                source: Box::new(WatcherStopAndFinalizationError {
-                    watcher_error,
-                    finalization_error,
-                }),
-            })
+        match (watcher_result, finalization_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(watcher_error), Ok(())) => Err(watcher_error),
+            (Ok(()), Err(finalization_error)) => Err(finalization_error),
+            (Err(watcher_error), Err(finalization_error)) => {
+                tracing::error!(
+                    watcher_stop_error = %watcher_error,
+                    finalization_error = %finalization_error,
+                    "fsfs watcher stop and required shutdown finalization both failed"
+                );
+                Err(SearchError::SubsystemError {
+                    subsystem: "fsfs.shutdown",
+                    source: Box::new(WatcherStopAndFinalizationError {
+                        watcher_error,
+                        finalization_error,
+                    }),
+                })
+            }
         }
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "watcher stop failed: {watcher_error}; required shutdown finalization failed: {finalization_error}"
-)]
+#[derive(Debug)]
 struct WatcherStopAndFinalizationError {
-    #[source]
     watcher_error: SearchError,
     finalization_error: SearchError,
+}
+
+impl std::fmt::Display for WatcherStopAndFinalizationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "watcher stop failed: {}; required shutdown finalization failed: {}",
+            self.watcher_error, self.finalization_error
+        )
+    }
+}
+
+impl std::error::Error for WatcherStopAndFinalizationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.watcher_error)
+    }
 }
 
 fn print_cli_help() {
@@ -21763,12 +21782,12 @@ mod tests {
     }
 
     #[test]
-    fn watcher_stop_failure_still_runs_required_shutdown_finalization() {
+    fn runtime_shutdown_sequence_finalizes_once_after_watcher_stop_error() {
         run_test_with_cx(|_cx| async move {
-            let finalization_ran = Arc::new(AtomicBool::new(false));
-            let finalization_ran_for_future = Arc::clone(&finalization_ran);
+            let finalization_calls = Arc::new(AtomicUsize::new(0));
+            let finalization_calls_for_future = Arc::clone(&finalization_calls);
 
-            let result = super::stop_watcher_and_finalize(
+            let error = FsfsRuntime::complete_watcher_shutdown(
                 async {
                     Err(SearchError::InvalidConfig {
                         field: "test.watcher.stop".to_owned(),
@@ -21777,30 +21796,62 @@ mod tests {
                     })
                 },
                 async move {
-                    finalization_ran_for_future.store(true, Ordering::SeqCst);
+                    finalization_calls_for_future.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 },
             )
-            .await;
+            .await
+            .expect_err("watcher stop failure must reach the caller after finalization");
 
-            assert!(
-                finalization_ran.load(Ordering::SeqCst),
-                "a watcher failure must not bypass required shutdown finalization"
+            assert_eq!(
+                finalization_calls.load(Ordering::SeqCst),
+                1,
+                "a watcher failure must finalize exactly once"
             );
             assert!(matches!(
-                result,
-                Err(SearchError::InvalidConfig { field, .. }) if field == "test.watcher.stop"
+                error,
+                SearchError::InvalidConfig { field, .. } if field == "test.watcher.stop"
             ));
         });
     }
 
     #[test]
-    fn watcher_stop_and_finalization_failures_preserve_both_causes() {
+    fn runtime_shutdown_sequence_returns_finalization_error_after_clean_stop() {
         run_test_with_cx(|_cx| async move {
-            let finalization_ran = Arc::new(AtomicBool::new(false));
-            let finalization_ran_for_future = Arc::clone(&finalization_ran);
+            let finalization_calls = Arc::new(AtomicUsize::new(0));
+            let finalization_calls_for_future = Arc::clone(&finalization_calls);
 
-            let error = super::stop_watcher_and_finalize(
+            let error = FsfsRuntime::complete_watcher_shutdown(async { Ok(()) }, async move {
+                finalization_calls_for_future.fetch_add(1, Ordering::SeqCst);
+                Err(SearchError::InvalidConfig {
+                    field: "test.shutdown.finalization".to_owned(),
+                    value: "wal".to_owned(),
+                    reason: "injected compaction failure".to_owned(),
+                })
+            })
+            .await
+            .expect_err("finalization failure must reach the caller after a clean stop");
+
+            assert_eq!(
+                finalization_calls.load(Ordering::SeqCst),
+                1,
+                "a clean watcher stop must finalize exactly once"
+            );
+            assert!(matches!(
+                error,
+                SearchError::InvalidConfig { field, .. }
+                    if field == "test.shutdown.finalization"
+            ));
+        });
+    }
+
+    #[test]
+    fn runtime_shutdown_sequence_preserves_both_failures_with_watcher_precedence() {
+        run_test_with_cx(|_cx| async move {
+            let finalization_calls = Arc::new(AtomicUsize::new(0));
+            let finalization_calls_for_future = Arc::clone(&finalization_calls);
+
+            let error = FsfsRuntime::complete_watcher_shutdown(
                 async {
                     Err(SearchError::InvalidConfig {
                         field: "test.watcher.stop".to_owned(),
@@ -21809,7 +21860,7 @@ mod tests {
                     })
                 },
                 async move {
-                    finalization_ran_for_future.store(true, Ordering::SeqCst);
+                    finalization_calls_for_future.fetch_add(1, Ordering::SeqCst);
                     Err(SearchError::InvalidConfig {
                         field: "test.shutdown.finalization".to_owned(),
                         value: "wal".to_owned(),
@@ -21820,9 +21871,10 @@ mod tests {
             .await
             .expect_err("both shutdown stages must report failure");
 
-            assert!(
-                finalization_ran.load(Ordering::SeqCst),
-                "the finalization future must run after a watcher failure"
+            assert_eq!(
+                finalization_calls.load(Ordering::SeqCst),
+                1,
+                "a watcher failure must still finalize exactly once"
             );
             let SearchError::SubsystemError { subsystem, source } = error else {
                 panic!("dual shutdown failure must retain both causes structurally");
@@ -21831,15 +21883,127 @@ mod tests {
             let combined = source
                 .downcast_ref::<super::WatcherStopAndFinalizationError>()
                 .expect("fsfs.shutdown source must retain both stage errors");
+            let watcher_cause = std::error::Error::source(combined)
+                .expect("watcher failure must remain the primary source");
             assert!(matches!(
-                &combined.watcher_error,
-                SearchError::InvalidConfig { field, .. } if field == "test.watcher.stop"
+                watcher_cause.downcast_ref::<SearchError>(),
+                Some(SearchError::InvalidConfig { field, .. }) if field == "test.watcher.stop"
             ));
             assert!(matches!(
                 &combined.finalization_error,
                 SearchError::InvalidConfig { field, .. }
                     if field == "test.shutdown.finalization"
             ));
+        });
+    }
+
+    #[test]
+    fn runtime_shutdown_sequence_finalizes_once_after_cooperative_watcher_cancellation() {
+        run_test_with_cx(|_cx| async move {
+            let finalization_calls = Arc::new(AtomicUsize::new(0));
+            let finalization_calls_for_future = Arc::clone(&finalization_calls);
+
+            let error = FsfsRuntime::complete_watcher_shutdown(
+                async {
+                    Err(SearchError::Cancelled {
+                        phase: "watch.ingest".to_owned(),
+                        reason: "cooperative cancellation".to_owned(),
+                    })
+                },
+                async move {
+                    finalization_calls_for_future.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("watcher cancellation must reach the caller after finalization");
+
+            assert_eq!(
+                finalization_calls.load(Ordering::SeqCst),
+                1,
+                "cooperative watcher cancellation must finalize exactly once"
+            );
+            assert!(matches!(
+                error,
+                SearchError::Cancelled { phase, .. } if phase == "watch.ingest"
+            ));
+        });
+    }
+
+    #[test]
+    fn runtime_shutdown_sequence_finalizes_once_after_converted_watcher_task_panic() {
+        run_test_with_cx(|_cx| async move {
+            let finalization_calls = Arc::new(AtomicUsize::new(0));
+            let finalization_calls_for_future = Arc::clone(&finalization_calls);
+
+            let error = FsfsRuntime::complete_watcher_shutdown(
+                async {
+                    Err(SearchError::SubsystemError {
+                        subsystem: "fsfs_watcher",
+                        source: Box::new(std::io::Error::other(
+                            "fsfs watcher producer panicked during shutdown: injected",
+                        )),
+                    })
+                },
+                async move {
+                    finalization_calls_for_future.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("converted watcher task panic must reach the caller after finalization");
+
+            assert_eq!(
+                finalization_calls.load(Ordering::SeqCst),
+                1,
+                "a converted watcher task panic must finalize exactly once"
+            );
+            assert!(matches!(
+                error,
+                SearchError::SubsystemError { subsystem, source }
+                    if subsystem == "fsfs_watcher"
+                        && source.to_string().contains("panicked during shutdown")
+            ));
+        });
+    }
+
+    #[test]
+    fn runtime_shutdown_sequence_compacts_a_real_pending_wal() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let vector_path = temp.path().join("shutdown-wal.fsvi");
+            let vector = [0.25_f32, 0.5, 0.75, 1.0];
+            let mut writer = VectorIndex::create(&vector_path, "shutdown-wal-test", vector.len())
+                .expect("create vector index");
+            writer
+                .write_record("sealed.md", &vector)
+                .expect("write sealed vector");
+            writer.finish().expect("finish vector index");
+
+            let mut live_index = VectorIndex::open(&vector_path).expect("open vector index");
+            live_index
+                .append("pending.md", &vector)
+                .expect("append pending WAL vector");
+            assert_eq!(
+                live_index.wal_record_count(),
+                1,
+                "fixture needs one WAL entry"
+            );
+            let vector_handle = Arc::new(Mutex::new(live_index));
+            let runtime = FsfsRuntime::new(FsfsConfig::default());
+
+            FsfsRuntime::complete_watcher_shutdown(
+                async { Ok(()) },
+                runtime.finalize_shutdown(&cx, ShutdownReason::UserRequest, Some(&vector_handle)),
+            )
+            .await
+            .expect("successful watcher shutdown must compact the pending WAL");
+
+            let compacted = vector_handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(compacted.wal_record_count(), 0, "WAL must be compacted");
+            assert_eq!(compacted.record_count(), 2, "both records must be retained");
         });
     }
 
