@@ -13230,63 +13230,153 @@ mod tests {
         Ok(())
     }
 
-    /// The positional decode mirror must equal the decodes that actually
-    /// happened, counted at `load_block` itself.
+    /// Build a term whose POSITIONS blocks are cut off the POSTINGS boundary.
     ///
-    /// A positional seek is two-stage — a jump to the destination positions
-    /// block, then a posting-by-posting walk to the target — so its decode
-    /// count is not a flag and is not the change in block index: the jump
-    /// skips blocks without reading them while the walk reads every block it
-    /// crosses. Comparing against `decoded_blocks()` rather than against a
-    /// second derivation is what makes this a check instead of a restatement.
-    #[test]
-    fn positional_advance_decode_mirror_equals_observed_decodes() -> TestResult {
-        // One position per posting keeps the POSITIONS payload aligned with
-        // the posting count; `dense_postings` varies the frequency.
-        let postings: Vec<Posting> = (0..POSTINGS_PER_BLOCK * 3)
-            .map(|index| Ok(Posting::new(u32::try_from(index)?, 1)))
-            .collect::<Result<_, std::num::TryFromIntError>>()?;
-        let values: Vec<u32> = (0..postings.len())
-            .map(|index| u32::try_from(index % 17).unwrap_or(0))
-            .collect();
-        let posting_bytes = EncodedPostingList::encode(&postings)?;
-        let encoded = EncodedPositionList::encode(&postings, &values)?;
-        let last = postings.last().ok_or("non-empty fixture")?.doc_id;
-        let targets = [
-            0,
-            postings[0].doc_id,
-            postings[1].doc_id,
-            postings[POSTINGS_PER_BLOCK - 1].doc_id,
-            postings[POSTINGS_PER_BLOCK].doc_id,
-            postings[POSTINGS_PER_BLOCK + 1].doc_id,
-            postings[POSTINGS_PER_BLOCK * 2].doc_id,
-            last,
-            last.saturating_add(1),
-        ];
+    /// Many positions per posting force several POSITIONS blocks across a
+    /// span that also crosses several POSTINGS blocks, and the two boundary
+    /// sets do not coincide — which is the only shape in which the two-stage
+    /// seek's first stage actually fires.
+    fn positional_multi_block_fixture() -> (Vec<Posting>, Vec<u32>) {
+        let mut postings = Vec::with_capacity(270);
+        let mut flat = Vec::new();
+        for ordinal in 0_u32..270 {
+            postings.push(Posting::new(10 + ordinal * 3, 24));
+            let base = 70_000 + ordinal * 100;
+            flat.extend((0_u32..24).map(|index| base + index / 2));
+        }
+        (postings, flat)
+    }
 
-        let mut nonzero_predictions = 0_usize;
-        let mut zero_predictions = 0_usize;
-        for target in targets {
+    /// The positional decode mirror must equal the decodes that actually
+    /// happened, counted at `load_block` itself — including on a far jump
+    /// that reads strictly fewer blocks than it crosses.
+    ///
+    /// A positional seek is two-stage: a jump to the destination POSITIONS
+    /// block, then a posting-by-posting walk to the target. The jump skips
+    /// POSTINGS blocks without reading them while the walk reads every block
+    /// it crosses, so the decode count is neither a flag nor the change in
+    /// block index. This test earns that claim instead of asserting it: the
+    /// fixture is asserted to span multiple blocks of *both* kinds, and at
+    /// least one seek must be observed reading fewer blocks than its block
+    /// index moved — which is exactly the case a block-index-delta predictor
+    /// gets wrong. Verification is against `decoded_blocks()`, the counter at
+    /// the single decode site, never against a second derivation.
+    #[test]
+    fn positional_far_jump_reads_fewer_blocks_than_it_crosses() -> TestResult {
+        let (postings, flat) = positional_multi_block_fixture();
+        let posting_bytes = EncodedPostingList::encode(&postings)?;
+        let probe_list = posting_bytes.posting_list()?;
+        let encoded = EncodedPositionList::encode(&postings, &flat)?;
+        let probe_positions = encoded.position_list(&probe_list)?;
+        assert!(
+            probe_list.block_count() >= 3,
+            "fixture must span multiple POSTINGS blocks"
+        );
+        assert!(
+            probe_positions.block_count() >= 2,
+            "fixture must span multiple POSITIONS blocks"
+        );
+
+        let mut skipping_seeks = 0_usize;
+        let mut decoding_seeks = 0_usize;
+        let mut idle_seeks = 0_usize;
+        for step in (0..postings.len()).step_by(17).chain([postings.len() - 1]) {
+            let target = postings[step].doc_id;
             let posting_list = posting_bytes.posting_list()?;
             let positions = encoded.position_list(&posting_list)?;
             let mut cursor = positions.cursor()?;
-            let baseline = cursor.decoded_blocks();
+            let entry_block = cursor.posting_block_index().ok_or("positioned cursor")?;
             let predicted = cursor.advance_decode_count(target);
+            let baseline = cursor.decoded_blocks();
             cursor.advance(target)?;
             let observed = u64::try_from(cursor.decoded_blocks() - baseline)?;
             assert_eq!(
                 predicted, observed,
                 "positional mirror disagreed for target={target}"
             );
-            if predicted == 0 {
-                zero_predictions += 1;
+
+            let landed_block = cursor.posting_block_index().ok_or("landed cursor")?;
+            let crossed = u64::try_from(landed_block.saturating_sub(entry_block))?;
+            if crossed >= 2 && observed < crossed {
+                skipping_seeks += 1;
+            }
+            if observed > 0 {
+                decoding_seeks += 1;
             } else {
-                nonzero_predictions += 1;
+                idle_seeks += 1;
             }
         }
         assert!(
-            nonzero_predictions > 0 && zero_predictions > 0,
-            "the target matrix must exercise both a decoding and a non-decoding seek"
+            skipping_seeks > 0,
+            "the matrix must include a jump that reads fewer POSTINGS blocks than it crosses"
+        );
+        assert!(
+            decoding_seeks > 0 && idle_seeks > 0,
+            "the matrix must exercise both a decoding and a non-decoding seek"
+        );
+        Ok(())
+    }
+
+    /// The mirror must hold from a *later* cursor state, not only from the
+    /// construction state, and must predict nothing once exhausted.
+    ///
+    /// A predicate that happens to be right at block zero can still be wrong
+    /// mid-term, where the positions block index and the posting block index
+    /// have drifted apart, so this walks a seam after a far jump and then
+    /// checks the fused state.
+    #[test]
+    fn positional_mirror_holds_at_a_later_seam_and_when_exhausted() -> TestResult {
+        let (postings, flat) = positional_multi_block_fixture();
+        let posting_bytes = EncodedPostingList::encode(&postings)?;
+        let posting_list = posting_bytes.posting_list()?;
+        let encoded = EncodedPositionList::encode(&postings, &flat)?;
+        let positions = encoded.position_list(&posting_list)?;
+        let mut cursor = positions.cursor()?;
+
+        let midpoint = postings[postings.len() / 2].doc_id;
+        let predicted_jump = cursor.advance_decode_count(midpoint);
+        let baseline = cursor.decoded_blocks();
+        cursor.advance(midpoint)?;
+        assert_eq!(
+            predicted_jump,
+            u64::try_from(cursor.decoded_blocks() - baseline)?,
+            "mirror disagreed on the seek that establishes the later state"
+        );
+
+        let mut seam_decodes = 0_u64;
+        for _ in 0..POSTINGS_PER_BLOCK + 2 {
+            let predicted = cursor.next_decode_count();
+            let before = cursor.decoded_blocks();
+            let moved = cursor.next()?;
+            let observed = u64::try_from(cursor.decoded_blocks() - before)?;
+            assert_eq!(predicted, observed, "mirror disagreed at a later step");
+            seam_decodes += observed;
+            if moved.is_none() {
+                break;
+            }
+        }
+        assert!(
+            seam_decodes > 0,
+            "stepping past a later seam must have crossed a POSTINGS block"
+        );
+
+        while cursor.next()?.is_some() {}
+        assert_eq!(
+            cursor.next_decode_count(),
+            0,
+            "an exhausted cursor predicts no decode"
+        );
+        assert_eq!(
+            cursor.advance_decode_count(u32::MAX),
+            0,
+            "an exhausted cursor predicts no decode for any seek"
+        );
+        let before = cursor.decoded_blocks();
+        assert_eq!(cursor.advance(u32::MAX)?, None);
+        assert_eq!(
+            cursor.decoded_blocks(),
+            before,
+            "a fused cursor must not decode"
         );
         Ok(())
     }
