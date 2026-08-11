@@ -1537,6 +1537,57 @@ struct ParallelShardWork {
     shard: usize,
     assignment: ParallelShardAssignment,
     state: ScribeShardState,
+    /// Pool worker that actually ran this shard's accumulation, stamped by the
+    /// worker itself rather than by the planner. `None` means the item ran on
+    /// a thread outside the pool — rayon's bridge may execute work inline on
+    /// the calling thread — which the witness counts separately instead of
+    /// folding it into a distinct-worker total.
+    observed_worker: Option<usize>,
+}
+
+/// Observed worker lifecycle facts for one shared-nothing ingest batch.
+///
+/// These are OBSERVATIONS, never the plan. `joined` counts the shards that
+/// returned to the collector, so it is the join witness; `distinct` counts how
+/// many different pool workers were actually used. A planner that activates
+/// `N` shards whose work all lands on one thread reports `joined == N` and
+/// `distinct == 1` — exactly the signature this witness exists to expose,
+/// because a configured or even an *activated* width is a request, not
+/// evidence that the fan-out happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ParallelWorkerWitness {
+    joined: usize,
+    distinct: usize,
+    unidentified: usize,
+}
+
+/// Aggregate the per-shard worker observations of a completed batch.
+///
+/// Every observation contributes exactly one join. Shards whose worker could
+/// not be identified are counted in `unidentified` and never inflate
+/// `distinct`, so `distinct` stays a lower bound on real parallelism. Order is
+/// irrelevant: workers may complete in any order.
+fn parallel_worker_witness<I>(observations: I) -> ParallelWorkerWitness
+where
+    I: IntoIterator<Item = Option<usize>>,
+{
+    let mut joined = 0_usize;
+    let mut unidentified = 0_usize;
+    let mut identified = Vec::new();
+    for observation in observations {
+        joined = joined.saturating_add(1);
+        match observation {
+            Some(worker) => identified.push(worker),
+            None => unidentified = unidentified.saturating_add(1),
+        }
+    }
+    identified.sort_unstable();
+    identified.dedup();
+    ParallelWorkerWitness {
+        joined,
+        distinct: identified.len(),
+        unidentified,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1561,6 +1612,10 @@ struct ParallelIngestReceipt {
     arena_chunk_bytes: usize,
     arena_bytes_used_high_water: usize,
     arena_bytes_reserved_high_water: usize,
+    /// Observed join and distinct-worker counts for the batch. Binding this to
+    /// the receipt keeps the planner's *requested* width and the fan-out's
+    /// *realized* width separable at every call site that reads a receipt.
+    worker_witness: ParallelWorkerWitness,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5048,6 +5103,7 @@ impl QuillWriterState {
                     current_lease_base: Some(batch_span.lease_base),
                     scratch_metadata: Vec::new(),
                 },
+                observed_worker: None,
             });
         }
 
@@ -5055,6 +5111,7 @@ impl QuillWriterState {
         let completed = work
             .into_par_iter()
             .map(|mut work| {
+                work.observed_worker = rayon::current_thread_index();
                 catch_parallel_ingest_worker(work.shard, || {
                     Self::accumulate_parallel_shard(
                         &mut work.state,
@@ -5068,6 +5125,11 @@ impl QuillWriterState {
             })
             .collect::<Result<Vec<_>, QuillIndexError>>()?;
         checkpoint.check(cx)?;
+        // Taken before any consumer moves `completed`: a receipt that cannot
+        // be built after a partial move is a receipt that silently goes
+        // missing on the paths that matter most.
+        let worker_witness =
+            parallel_worker_witness(completed.iter().map(|work| work.observed_worker));
 
         let created_unix_s = self.created_unix_s()?;
         let mut reserved_segment_ids = BTreeSet::new();
@@ -5194,6 +5256,7 @@ impl QuillWriterState {
             arena_chunk_bytes,
             arena_bytes_used_high_water,
             arena_bytes_reserved_high_water,
+            worker_witness,
         }))
     }
 
@@ -5307,6 +5370,7 @@ impl QuillWriterState {
                     current_lease_base: Some(span.lease_base),
                     scratch_metadata: Vec::new(),
                 },
+                observed_worker: None,
             });
         }
 
@@ -5314,6 +5378,7 @@ impl QuillWriterState {
         let completed = work
             .into_par_iter()
             .map(|mut work| {
+                work.observed_worker = rayon::current_thread_index();
                 catch_parallel_ingest_worker(work.shard, || {
                     Self::accumulate_parallel_shard(
                         &mut work.state,
@@ -5327,6 +5392,10 @@ impl QuillWriterState {
             })
             .collect::<Result<Vec<_>, QuillIndexError>>()?;
         checkpoint.check(cx)?;
+        // `completed` is moved by the commit table below, so the witness is
+        // taken here rather than beside the receipt literal.
+        let worker_witness =
+            parallel_worker_witness(completed.iter().map(|work| work.observed_worker));
 
         let mut replacements = Vec::new();
         replacements
@@ -5423,6 +5492,7 @@ impl QuillWriterState {
             arena_chunk_bytes: budget_admission.arena_chunk_bytes,
             arena_bytes_used_high_water,
             arena_bytes_reserved_high_water,
+            worker_witness,
         }))
     }
 
@@ -5511,6 +5581,9 @@ impl QuillWriterState {
             parallel_batch_logical_upper_bound = tracing::field::Empty,
             parallel_projected_logical_upper_bound = tracing::field::Empty,
             parallel_arena_chunk_bytes = tracing::field::Empty,
+            parallel_joined_workers = tracing::field::Empty,
+            parallel_distinct_workers = tracing::field::Empty,
+            parallel_unidentified_workers = tracing::field::Empty,
             arena_bytes_used_high_water = tracing::field::Empty,
             arena_bytes_reserved_high_water = tracing::field::Empty,
             duration_us = tracing::field::Empty,
@@ -5619,6 +5692,21 @@ impl QuillWriterState {
                 ingest_span.record(
                     "parallel_arena_chunk_bytes",
                     u64::try_from(receipt.arena_chunk_bytes).unwrap_or(u64::MAX),
+                );
+                // Realized fan-out, recorded next to the requested width so a
+                // reader can see both. `distinct < active_shards` means the
+                // route activated but did not parallelize.
+                ingest_span.record(
+                    "parallel_joined_workers",
+                    u64::try_from(receipt.worker_witness.joined).unwrap_or(u64::MAX),
+                );
+                ingest_span.record(
+                    "parallel_distinct_workers",
+                    u64::try_from(receipt.worker_witness.distinct).unwrap_or(u64::MAX),
+                );
+                ingest_span.record(
+                    "parallel_unidentified_workers",
+                    u64::try_from(receipt.worker_witness.unidentified).unwrap_or(u64::MAX),
                 );
                 ingest_span.record(
                     "arena_bytes_used_high_water",
@@ -22756,6 +22844,102 @@ mod tests {
                     .await
                     .expect("publish budget-fit shared-nothing batch");
                 assert_eq!(writer.snapshot().doc_count(), 250);
+            });
+        });
+    }
+
+    #[test]
+    fn parallel_worker_witness_separates_joins_from_realized_workers() {
+        // A fan-out whose shards all landed on one pool worker: the join count
+        // still matches the activated width, but realized parallelism is 1.
+        // An implementation that reported the PLANNED width would say 4 here,
+        // which is exactly the false-activation reading this witness exists to
+        // refuse.
+        let serialized = parallel_worker_witness([Some(3), Some(3), Some(3), Some(3)]);
+        assert_eq!(serialized.joined, 4);
+        assert_eq!(serialized.distinct, 1);
+        assert_eq!(serialized.unidentified, 0);
+
+        // Genuine fan-out across four workers, observed out of completion
+        // order so the aggregator cannot depend on ordering.
+        let fanned_out = parallel_worker_witness([Some(2), Some(0), Some(3), Some(1)]);
+        assert_eq!(fanned_out.joined, 4);
+        assert_eq!(fanned_out.distinct, 4);
+        assert_eq!(fanned_out.unidentified, 0);
+
+        // Unidentified workers are counted apart and never inflate `distinct`,
+        // keeping it a lower bound on real parallelism.
+        let partly_inline = parallel_worker_witness([Some(1), None, Some(1), None]);
+        assert_eq!(partly_inline.joined, 4);
+        assert_eq!(partly_inline.distinct, 1);
+        assert_eq!(partly_inline.unidentified, 2);
+
+        assert_eq!(
+            parallel_worker_witness(std::iter::empty::<Option<usize>>()),
+            ParallelWorkerWitness::default(),
+        );
+    }
+
+    #[test]
+    fn shared_nothing_receipt_binds_join_and_realized_worker_counts() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-worker witness pool");
+        pool.install(|| {
+            run_with_cx(|cx| async move {
+                let config = QuillConfig {
+                    max_ingest_shards: 4,
+                    max_visibility_lag_ms: 60_000,
+                    ..QuillConfig::default()
+                };
+                let mut index = QuillIndex::in_memory(config).expect("worker witness index");
+                let documents = parallel_budget_fixture_documents(250);
+                let writer = index.writer_mut();
+                let plan = plan_parallel_ingest(
+                    documents.len(),
+                    writer.shard_router.shard_count(),
+                    rayon::current_num_threads(),
+                )
+                .expect("plan worker witness fixture");
+                assert_eq!(plan.route, ParallelIngestRoute::SharedNothing);
+                let projected = writer
+                    .parallel_budget_admission(&cx, &documents, plan.active_shards)
+                    .expect("estimate worker witness fixture")
+                    .expect("default budget fits fixture")
+                    .projected_logical_upper_bound;
+                writer.reader.config.scribe_shard_budget_bytes = projected + 1;
+
+                let receipt = writer
+                    .try_index_documents_parallel(&cx, &documents, &BTreeSet::new(), false)
+                    .await
+                    .expect("run shared-nothing ingest")
+                    .expect("250 documents at width 4 take the shared-nothing route");
+
+                assert_eq!(receipt.route, ParallelIngestRoute::SharedNothing);
+                // Derived from the plan, not hard-coded: the fixture's active
+                // width is a function of the configured shard count, and this
+                // test is about the witness, not the planner arithmetic that
+                // `adaptive_parallel_planner_v1_covers_frozen_matrix` pins.
+                assert_eq!(receipt.active_shards, plan.active_shards);
+                assert!(receipt.active_shards >= 2);
+                // Join witness: every started worker returned its shard, so no
+                // shard was abandoned between fan-out and the commit table.
+                assert_eq!(receipt.worker_witness.joined, receipt.active_shards);
+                // Realized parallelism is OBSERVED, never assumed. Rayon may
+                // legally run several shards on one worker, so this pins the
+                // witness invariants rather than a scheduling outcome that
+                // would make the test flaky.
+                assert!(receipt.worker_witness.unidentified <= receipt.worker_witness.joined);
+                assert!(
+                    receipt.worker_witness.distinct
+                        <= receipt.worker_witness.joined - receipt.worker_witness.unidentified,
+                );
+                assert_eq!(
+                    receipt.worker_witness.distinct == 0,
+                    receipt.worker_witness.unidentified == receipt.worker_witness.joined,
+                    "an identified worker must produce a distinct-worker count",
+                );
             });
         });
     }
