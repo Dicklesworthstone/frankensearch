@@ -70,10 +70,19 @@ const SMOKE_SEGMENTS: usize = 4;
 const QG6_TIE_EXPANSION_LIMIT: usize = 1_000_000;
 const QG6_TIMED_SEARCHES_PER_SAMPLE: usize = 128;
 const QG1_CORPUS_GENERATOR_REVISION: &str = "frankensearch-quill-qg1-synthetic-corpus-v1";
-const QG1_TERMINAL_QUERY: &str = "singleton";
-const QG1_TERMINAL_DOCUMENT_ID: &str = "synthetic-00000002";
 const QG1_TERMINAL_NO_CLAIM_CODE: &str = "qg1.terminal_fact_unproved";
 const QG1_TIMING_DIAGNOSTIC_NO_CLAIM_CODE: &str = "qg1.continuous_timing_unbound_diagnostic";
+
+fn qg1_tail_document_id(document_count: u64) -> String {
+    let tail_ordinal = document_count
+        .checked_sub(1)
+        .expect("QG-1 terminal tail requires one or more documents");
+    format!("synthetic-{tail_ordinal:08}")
+}
+
+fn qg1_tail_query(document_id: &str) -> String {
+    format!("id:\"{document_id}\"")
+}
 // Frozen by a strict-remote full replay on 2026-07-31. The retired per-shard
 // all-count replay generated 4,222,000 documents and took 326,401 ms in the
 // unoptimized audit binary. Each full-scale producer now validates only the
@@ -755,6 +764,10 @@ struct Qg1PreparedSampleBinding {
     document_count: u64,
     content_bytes: u64,
     batch_count: usize,
+    /// The actual final prepared document.  A terminal search must prove this
+    /// tail rather than an early corpus pathology that would be visible even
+    /// after a truncated feed.
+    tail_document_id: String,
 }
 
 impl Qg1PreparedSampleBinding {
@@ -770,10 +783,11 @@ impl Qg1PreparedSampleBinding {
             || self.document_count <= 2
             || self.content_bytes == 0
             || self.batch_count == 0
+            || self.tail_document_id != qg1_tail_document_id(self.document_count)
         {
             return Err(
                 "QG-1 prepared sample binding requires exact corpus identities, positive bytes, \
-                 a terminal sentinel, and at least one prebuilt batch"
+                 a tail terminal sentinel, and at least one prebuilt batch"
                     .to_owned(),
             );
         }
@@ -817,12 +831,18 @@ impl<'a> Qg1PreparedSampleInput<'a> {
         })?;
         let observed_content_sha256 = qg1_indexed_content_sha256(document_count, documents.iter())?;
         let batches = documents.chunks(batch_documents).collect::<Vec<_>>();
+        let tail_document_id = documents
+            .last()
+            .ok_or_else(|| "QG-1 prepared input requires a tail document".to_owned())?
+            .id
+            .to_string();
         let binding = Qg1PreparedSampleBinding {
             manifest_sha256: prefix.manifest_sha256.clone(),
             indexed_content_sha256: prefix.indexed_content_sha256.clone(),
             document_count,
             content_bytes,
             batch_count: batches.len(),
+            tail_document_id,
         };
         let prepared = Self {
             documents,
@@ -892,6 +912,10 @@ struct Qg1ContinuousTimingReceipt {
     prepared_input: Qg1PreparedSampleBinding,
     interval_started_ns: u64,
     batches: Vec<Qg1BatchTiming>,
+    /// Number of batches that actually returned from the engine feed call.
+    /// This is deliberately distinct from the scheduled batch vector so a
+    /// receipt cannot name a prepared schedule that was never fully fed.
+    recorded_batch_count: usize,
     quill_publication_generation_delta: Option<u64>,
     terminal_commit_completed_ns: u64,
     /// The retired pre-search Tantivy rearm join is retained only so old
@@ -899,6 +923,9 @@ struct Qg1ContinuousTimingReceipt {
     pre_search_rearm_join_completed_ns: Option<u64>,
     terminal_search_attempt_completed_ns: u64,
     terminal_worker_join_completed_ns: Option<u64>,
+    /// The exact receipt returned by Tantivy's one-shot, non-rearming worker
+    /// join. Quill has no corresponding external writer API.
+    terminal_tantivy_join: Option<BenchmarkWriterJoinReceipt>,
     terminal_quiescence_completed_ns: u64,
     interval_ended_ns: u64,
     terminal_searchability: Qg1TerminalFact,
@@ -925,7 +952,10 @@ impl Qg1ContinuousTimingReceipt {
                 "QG-1 continuous receipt work differs from its prepared sample input".to_owned(),
             );
         }
-        if self.batches.is_empty() {
+        if self.batches.is_empty()
+            || self.recorded_batch_count != self.batches.len()
+            || self.recorded_batch_count != self.prepared_input.batch_count
+        {
             return Err("QG-1 continuous interval contains no prebuilt/feed batches".to_owned());
         }
         if self.batches[0].feed_started_ns != self.interval_started_ns {
@@ -985,13 +1015,17 @@ impl Qg1ContinuousTimingReceipt {
             cursor = joined;
         }
         if self.terminal_quiescence_completed_ns < cursor
-            || self.interval_ended_ns < self.terminal_quiescence_completed_ns
+            || self.interval_ended_ns != self.terminal_quiescence_completed_ns
         {
-            return Err("QG-1 terminal quiescence escaped the continuous interval".to_owned());
+            return Err(
+                "QG-1 continuous interval must end exactly when terminal quiescence completes"
+                    .to_owned(),
+            );
         }
         match self.arm {
             EngineArm::Quill => {
                 if self.terminal_worker_join_completed_ns.is_some()
+                    || self.terminal_tantivy_join.is_some()
                     || self.quill_publication_generation_delta.is_none()
                 {
                     return Err(
@@ -1001,11 +1035,21 @@ impl Qg1ContinuousTimingReceipt {
                 }
             }
             EngineArm::Tantivy => {
+                let Some(join) = self.terminal_tantivy_join else {
+                    return Err(
+                        "QG-1 Tantivy receipt lacks the actual terminal worker-join API receipt"
+                            .to_owned(),
+                    );
+                };
                 if self.terminal_worker_join_completed_ns.is_none()
                     || self.quill_publication_generation_delta.is_some()
+                    || join.writer_rearmed
+                    || join.searchable_segments_before == 0
+                    || join.searchable_segments_after == 0
                 {
                     return Err(
-                        "QG-1 Tantivy receipt lacks its single terminal worker join".to_owned()
+                        "QG-1 Tantivy receipt lacks one retained-reader, nonrearming terminal worker join"
+                            .to_owned(),
                     );
                 }
             }
@@ -1076,9 +1120,11 @@ struct Qg1ContinuousInterval {
     arm: EngineArm,
     prepared_input: Qg1PreparedSampleBinding,
     batches: Vec<Qg1BatchTiming>,
+    recorded_batch_count: usize,
     terminal_commit_completed_ns: Option<u64>,
     terminal_search_attempt_completed_ns: Option<u64>,
     terminal_worker_join_completed_ns: Option<u64>,
+    terminal_tantivy_join: Option<BenchmarkWriterJoinReceipt>,
     terminal_quiescence_completed_ns: Option<u64>,
 }
 
@@ -1092,9 +1138,11 @@ impl Qg1ContinuousInterval {
             arm,
             prepared_input,
             batches: Vec::new(),
+            recorded_batch_count: 0,
             terminal_commit_completed_ns: None,
             terminal_search_attempt_completed_ns: None,
             terminal_worker_join_completed_ns: None,
+            terminal_tantivy_join: None,
             terminal_quiescence_completed_ns: None,
         }
     }
@@ -1110,8 +1158,22 @@ impl Qg1ContinuousInterval {
     }
 
     fn begin_batch(&mut self, document_start: u64, document_count: u64) -> u64 {
-        let origin = *self.origin.get_or_insert_with(Instant::now);
-        let feed_started_ns = u64::try_from(origin.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        // Push the first bookkeeping record *before* starting the clock. The
+        // first feed is therefore exactly zero, without an `elapsed()` read or
+        // any record mutation between its timestamp and the engine call.
+        let feed_started_ns = if let Some(origin) = self.origin {
+            u64::try_from(origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
+        } else {
+            self.batches.push(Qg1BatchTiming {
+                document_start,
+                document_count,
+                feed_started_ns: 0,
+                feed_completed_ns: None,
+                visibility_commit_completed_ns: None,
+            });
+            self.origin = Some(Instant::now());
+            return 0;
+        };
         self.batches.push(Qg1BatchTiming {
             document_start,
             document_count,
@@ -1132,6 +1194,10 @@ impl Qg1ContinuousInterval {
             batch.feed_completed_ns.replace(completed).is_none(),
             "QG-1 batch feed boundary repeated"
         );
+        self.recorded_batch_count = self
+            .recorded_batch_count
+            .checked_add(1)
+            .expect("QG-1 completed batch count fits usize");
     }
 
     fn mark_visibility_commit(&mut self) {
@@ -1159,7 +1225,7 @@ impl Qg1ContinuousInterval {
         );
     }
 
-    fn mark_terminal_search_attempt(&mut self) {
+    fn mark_terminal_search_attempt(&mut self) -> u64 {
         let completed = self.elapsed_ns();
         assert!(
             self.terminal_search_attempt_completed_ns
@@ -1167,9 +1233,10 @@ impl Qg1ContinuousInterval {
                 .is_none(),
             "QG-1 terminal search boundary repeated"
         );
+        completed
     }
 
-    fn mark_terminal_worker_join(&mut self) {
+    fn mark_terminal_worker_join(&mut self, receipt: BenchmarkWriterJoinReceipt) -> u64 {
         let completed = self.elapsed_ns();
         assert!(
             self.terminal_worker_join_completed_ns
@@ -1177,10 +1244,14 @@ impl Qg1ContinuousInterval {
                 .is_none(),
             "QG-1 terminal worker join boundary repeated"
         );
+        assert!(
+            self.terminal_tantivy_join.replace(receipt).is_none(),
+            "QG-1 terminal Tantivy worker-join receipt repeated"
+        );
+        completed
     }
 
-    fn mark_terminal_quiescence(&mut self) {
-        let completed = self.elapsed_ns();
+    fn mark_terminal_quiescence_at(&mut self, completed: u64) {
         assert!(
             self.terminal_quiescence_completed_ns
                 .replace(completed)
@@ -1199,7 +1270,9 @@ impl Qg1ContinuousInterval {
             .origin
             .expect("QG-1 continuous interval includes at least one engine feed");
         let work_units = self.prepared_input.document_count;
-        let interval_ended_ns = u64::try_from(origin.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let interval_ended_ns = self
+            .terminal_quiescence_completed_ns
+            .expect("QG-1 continuous interval includes terminal quiescence");
         let receipt = Qg1ContinuousTimingReceipt {
             producer_coverage: Qg1ProducerCoverage::EngineIndexingLifecycle,
             arm: self.arm,
@@ -1207,6 +1280,7 @@ impl Qg1ContinuousInterval {
             prepared_input: self.prepared_input.clone(),
             interval_started_ns: 0,
             batches: self.batches,
+            recorded_batch_count: self.recorded_batch_count,
             quill_publication_generation_delta,
             terminal_commit_completed_ns: self
                 .terminal_commit_completed_ns
@@ -1216,9 +1290,8 @@ impl Qg1ContinuousInterval {
                 .terminal_search_attempt_completed_ns
                 .expect("QG-1 continuous interval includes terminal search"),
             terminal_worker_join_completed_ns: self.terminal_worker_join_completed_ns,
-            terminal_quiescence_completed_ns: self
-                .terminal_quiescence_completed_ns
-                .expect("QG-1 continuous interval includes terminal quiescence"),
+            terminal_tantivy_join: self.terminal_tantivy_join,
+            terminal_quiescence_completed_ns: interval_ended_ns,
             interval_ended_ns,
             terminal_searchability,
             terminal_quiescence,
@@ -2048,10 +2121,18 @@ fn feed_qg1_prepared_batches<E: LexicalWrite>(
     let mut start = 0_u64;
     for documents in &prepared_input.batches {
         let count_u64 = u64::try_from(documents.len()).expect("QG-1 batch count fits u64");
-        interval.begin_batch(start, count_u64);
-        if cadence_ns.is_some() {
-            unpublished_since_ns.get_or_insert(interval.elapsed_ns());
+        if cadence_ns.is_some() && unpublished_since_ns.is_none() {
+            // The first in-flight batch starts with the same exact zero as its
+            // feed boundary. Do this before `begin_batch` arms the clock, so
+            // no cadence bookkeeping appears between first-feed=0 and the
+            // engine call.
+            unpublished_since_ns = Some(if interval.origin.is_none() {
+                0
+            } else {
+                interval.elapsed_ns()
+            });
         }
+        interval.begin_batch(start, count_u64);
         context.runtime.block_on(async {
             index
                 .index_documents(&context.cx, documents)
@@ -2103,36 +2184,45 @@ fn qg1_terminal_commit<E: LexicalWrite>(
 fn qg1_terminal_searchability<E: LexicalRead>(
     context: &BenchContext,
     index: &E,
+    interval: &mut Qg1ContinuousInterval,
 ) -> Qg1TerminalFact {
-    match context
+    let terminal_query = qg1_tail_query(&interval.prepared_input.tail_document_id);
+    let expected_document_id = interval.prepared_input.tail_document_id.clone();
+    let result = context
         .runtime
-        .block_on(index.search(&context.cx, QG1_TERMINAL_QUERY, 3))
-    {
+        .block_on(index.search(&context.cx, &terminal_query, 2));
+    // Capture the boundary immediately when the engine's search call returns;
+    // converting result IDs into a proof record must not move the measured end.
+    interval.mark_terminal_search_attempt();
+    match result {
         Ok(results) => {
             let document_ids = results
                 .into_iter()
                 .map(|result| String::from(result.doc_id))
                 .collect::<Vec<_>>();
-            let fact = if document_ids == [QG1_TERMINAL_DOCUMENT_ID] {
-                Qg1TerminalFact::proven("exact_immutable_sentinel_visible")
+            let fact = if document_ids == [expected_document_id] {
+                Qg1TerminalFact::proven("exact_prepared_tail_sentinel_visible")
             } else {
                 Qg1TerminalFact::no_claim(format!(
-                    "terminal query {QG1_TERMINAL_QUERY:?} returned {document_ids:?} instead of \
-                     [{QG1_TERMINAL_DOCUMENT_ID:?}]"
+                    "terminal tail query {terminal_query:?} returned {document_ids:?} instead of \
+                     [{expected_document_id:?}]"
                 ))
             };
             black_box(document_ids);
             fact
         }
         Err(error) => Qg1TerminalFact::no_claim(format!(
-            "terminal query {QG1_TERMINAL_QUERY:?} failed: {error}"
+            "terminal tail query {terminal_query:?} failed: {error}"
         )),
     }
 }
 
 fn qg1_tantivy_quiescence_fact(terminal_join: &BenchmarkWriterJoinReceipt) -> Qg1TerminalFact {
-    if !terminal_join.writer_rearmed && terminal_join.searchable_segments_after > 0 {
-        Qg1TerminalFact::proven("terminal_search_then_single_nonrearming_worker_join")
+    if !terminal_join.writer_rearmed
+        && terminal_join.searchable_segments_before > 0
+        && terminal_join.searchable_segments_after > 0
+    {
+        Qg1TerminalFact::proven("retained_reader_searchable_across_single_nonrearming_worker_join")
     } else {
         Qg1TerminalFact::no_claim(format!(
             "Tantivy terminal lifecycle did not prove one nonrearming worker join after search: \
@@ -2165,9 +2255,11 @@ fn qg1_bulk_metric_continuous(
                 feed_qg1_prepared_batches(context, &index, &prepared_input, None, &mut interval);
             let generation_before_terminal = index.snapshot().loaded_manifest().manifest.generation;
             qg1_terminal_commit(context, &index, &mut interval);
-            let terminal_searchability = qg1_terminal_searchability(context, &index);
-            interval.mark_terminal_search_attempt();
-            interval.mark_terminal_quiescence();
+            let terminal_searchability = qg1_terminal_searchability(context, &index, &mut interval);
+            let terminal_search_completed = interval
+                .terminal_search_attempt_completed_ns
+                .expect("QG-1 terminal search marks its completion before proof bookkeeping");
+            interval.mark_terminal_quiescence_at(terminal_search_completed);
             let generation_delta = generation_before_terminal.saturating_sub(generation_before);
             let (measurement, receipt) = interval.finish(
                 Some(generation_delta),
@@ -2209,8 +2301,7 @@ fn qg1_bulk_metric_continuous(
                 &mut interval,
             );
             qg1_terminal_commit(context, &index, &mut interval);
-            let terminal_searchability = qg1_terminal_searchability(context, &index);
-            interval.mark_terminal_search_attempt();
+            let terminal_searchability = qg1_terminal_searchability(context, &index, &mut interval);
             let terminal_join_receipt = index
                 .benchmark_join_workers()
                 .expect("join QG-1 Tantivy terminal workers without rearming");
@@ -2218,9 +2309,9 @@ fn qg1_bulk_metric_continuous(
                 !terminal_join_receipt.writer_rearmed,
                 "QG-1 terminal Tantivy worker fence must not construct a replacement writer"
             );
-            interval.mark_terminal_worker_join();
+            let terminal_join_completed = interval.mark_terminal_worker_join(terminal_join_receipt);
             let terminal_quiescence = qg1_tantivy_quiescence_fact(&terminal_join_receipt);
-            interval.mark_terminal_quiescence();
+            interval.mark_terminal_quiescence_at(terminal_join_completed);
             let (measurement, receipt) =
                 interval.finish(None, terminal_searchability, terminal_quiescence);
             emit_tantivy_lifecycle_receipt(
@@ -5802,6 +5893,7 @@ mod tests {
                 document_count: 20,
                 content_bytes: 20_480,
                 batch_count: 2,
+                tail_document_id: "synthetic-00000019".to_owned(),
             },
             interval_started_ns: 0,
             batches: vec![
@@ -5820,18 +5912,25 @@ mod tests {
                     visibility_commit_completed_ns: Some(75),
                 },
             ],
+            recorded_batch_count: 2,
             quill_publication_generation_delta: None,
             terminal_commit_completed_ns: 100,
             pre_search_rearm_join_completed_ns: None,
             terminal_search_attempt_completed_ns: 125,
             terminal_worker_join_completed_ns: Some(155),
-            terminal_quiescence_completed_ns: 160,
-            interval_ended_ns: 170,
+            terminal_tantivy_join: Some(super::BenchmarkWriterJoinReceipt {
+                searchable_segments_before: 1,
+                searchable_segments_after: 1,
+                join_elapsed_ns: 30,
+                writer_rearmed: false,
+            }),
+            terminal_quiescence_completed_ns: 155,
+            interval_ended_ns: 155,
             terminal_searchability: super::Qg1TerminalFact::proven(
-                "exact_immutable_sentinel_visible",
+                "exact_prepared_tail_sentinel_visible",
             ),
             terminal_quiescence: super::Qg1TerminalFact::proven(
-                "terminal_search_then_single_nonrearming_worker_join",
+                "retained_reader_searchable_across_single_nonrearming_worker_join",
             ),
         }
     }
@@ -5849,7 +5948,7 @@ mod tests {
         let old_summed_call_ns =
             (20 - 0) + (65 - 40) + (75 - 65) + (100 - 75) + (125 - 100) + (155 - 125);
         assert_eq!(old_summed_call_ns, 135);
-        assert_eq!(receipt.interval_ended_ns, 170);
+        assert_eq!(receipt.interval_ended_ns, 155);
         assert!(
             old_summed_call_ns < receipt.interval_ended_ns,
             "summing individually timed calls must not masquerade as continuous wall time"
@@ -5864,6 +5963,12 @@ mod tests {
         let mut first_feed_escape = receipt.clone();
         first_feed_escape.batches[0].feed_started_ns = 1;
         assert_escape_rejected(first_feed_escape);
+        let mut batch_count_escape = receipt.clone();
+        batch_count_escape.recorded_batch_count = 1;
+        assert_escape_rejected(batch_count_escape);
+        let mut tail_escape = receipt.clone();
+        tail_escape.prepared_input.tail_document_id = "synthetic-00000018".to_owned();
+        assert_escape_rejected(tail_escape);
         let mut feed_escape = receipt.clone();
         feed_escape.batches[1].feed_completed_ns = Some(171);
         assert_escape_rejected(feed_escape);
@@ -5879,6 +5984,16 @@ mod tests {
         let mut terminal_join_escape = receipt.clone();
         terminal_join_escape.terminal_worker_join_completed_ns = Some(124);
         assert_escape_rejected(terminal_join_escape);
+        let mut missing_join_api = receipt.clone();
+        missing_join_api.terminal_tantivy_join = None;
+        assert_escape_rejected(missing_join_api);
+        let mut rearmed_join = receipt.clone();
+        rearmed_join
+            .terminal_tantivy_join
+            .as_mut()
+            .expect("hostile receipt names its actual join API result")
+            .writer_rearmed = true;
+        assert_escape_rejected(rearmed_join);
         let mut quiescence_escape = receipt.clone();
         quiescence_escape.interval_ended_ns = 159;
         assert_escape_rejected(quiescence_escape);
@@ -6003,7 +6118,7 @@ mod tests {
             assert!(matches!(
                 &record.timing.terminal_searchability,
                 super::Qg1TerminalFact::Proven {
-                    proof: "exact_immutable_sentinel_visible"
+                    proof: "exact_prepared_tail_sentinel_visible"
                 }
             ));
             assert!(matches!(
@@ -6033,23 +6148,52 @@ mod tests {
             );
             assert_eq!(record.timing.document_count, continuous.work_units);
             assert_eq!(
+                record.timing.recorded_batch_count, record.timing.prepared_input.batch_count,
+                "the receipt must bind batches that completed the real engine feed"
+            );
+            assert_eq!(
+                record.timing.prepared_input.tail_document_id,
+                super::qg1_tail_document_id(continuous.work_units),
+                "terminal search must name the final document in this exact measured corpus"
+            );
+            assert_eq!(
                 record.timing.prepared_input, continuous.prepared_input,
                 "the receipt and raw-rate interval must name the exact prepared input"
             );
             assert_eq!(record.timing.batches[0].feed_started_ns, 0);
+            assert_eq!(
+                record.timing.interval_ended_ns, record.timing.terminal_quiescence_completed_ns,
+                "the sample must publish exactly the quiescence completion boundary"
+            );
             assert_eq!(
                 record.timing.pre_search_rearm_join_completed_ns, None,
                 "the old replacement-writer rearm is never part of QG-1 timing"
             );
             match arm {
                 super::EngineArm::Quill => assert_eq!(
-                    record.timing.terminal_worker_join_completed_ns, None,
+                    (
+                        record.timing.terminal_worker_join_completed_ns,
+                        record.timing.terminal_tantivy_join,
+                    ),
+                    (None, None),
                     "Quill has no external Tantivy worker join"
                 ),
-                super::EngineArm::Tantivy => assert!(
-                    record.timing.terminal_worker_join_completed_ns.is_some(),
-                    "Tantivy must finish its one nonrearming terminal worker join"
-                ),
+                super::EngineArm::Tantivy => {
+                    assert!(
+                        record.timing.terminal_worker_join_completed_ns.is_some(),
+                        "Tantivy must finish its one nonrearming terminal worker join"
+                    );
+                    let join = record
+                        .timing
+                        .terminal_tantivy_join
+                        .expect("Tantivy must retain the actual one-shot join API receipt");
+                    assert!(
+                        !join.writer_rearmed
+                            && join.searchable_segments_before > 0
+                            && join.searchable_segments_after > 0,
+                        "the retained Tantivy reader must stay searchable across the one nonrearming join"
+                    );
+                }
             }
         }
     }
@@ -6347,15 +6491,15 @@ mod tests {
             }
         );
 
-        // The retired summed-call form, applied to the hostile fixture: 100 ns
-        // of individually timed calls inside a 170 ns interval reports a rate
-        // 1.7x too high for the very same 20 documents.
+        // The retired summed-call form drops the gaps between calls. With the
+        // corrected end-at-quiescence fixture it reports 135 ns of work inside
+        // the actual 155 ns interval, still inflating the same 20 documents.
         let receipt = hostile_tantivy_continuous_receipt();
         let continuous_rate =
             super::throughput_per_second(receipt.document_count, receipt.interval_ended_ns);
-        let summed_rate = super::throughput_per_second(receipt.document_count, 100);
+        let summed_rate = super::throughput_per_second(receipt.document_count, 135);
         assert!(
-            summed_rate > continuous_rate * 1.69 && summed_rate < continuous_rate * 1.71,
+            summed_rate > continuous_rate * 1.14 && summed_rate < continuous_rate * 1.15,
             "summed-call timing must overstate the rate: {summed_rate} vs {continuous_rate}"
         );
     }
