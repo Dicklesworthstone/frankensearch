@@ -63,8 +63,10 @@ const EXACT_RESIDUAL_SIDECAR_MAX_DIMENSION: usize = 65_536;
 /// flat scanner. This is a semantic-preserving adaptive fallback, not a speed
 /// claim: every result still uses the exact f16 scorer.
 const EXACT_RESIDUAL_ADAPTIVE_PROBE_GROUPS: usize = 32;
-/// Bound directory probing and collision retries for optional cache artifacts.
-/// Hitting either bound declines the cache and retains the exact flat route.
+/// Bound generation-name collision retries while publishing an optional cache
+/// artifact. Cache discovery deliberately scans every matching immutable entry:
+/// a valid sidecar must not become unreachable merely because arbitrary
+/// directory iteration yielded many stale/corrupt siblings first.
 const EXACT_RESIDUAL_CACHE_ATTEMPTS: usize = 64;
 
 static EXACT_RESIDUAL_CACHE_NONCE: AtomicU64 = AtomicU64::new(0);
@@ -1059,21 +1061,41 @@ fn f32_rounding_gamma(dimension: usize) -> Option<f64> {
     let operation_count = dimension.checked_mul(2)?.checked_add(2)?;
     let unit_roundoff = f64::from(f32::EPSILON) * 0.5;
     let rounded_operations = operation_count as f64;
-    let denominator = 1.0 - rounded_operations * unit_roundoff;
-    (denominator > 0.0).then_some(rounded_operations * unit_roundoff / denominator)
+    let numerator = finite_f64_mul(rounded_operations, unit_roundoff)?;
+    let denominator = 1.0 - numerator;
+    if !denominator.is_finite() || denominator <= 0.0 {
+        return None;
+    }
+    let gamma = numerator / denominator;
+    gamma.is_finite().then_some(gamma)
 }
 
 #[allow(clippy::cast_precision_loss)]
 fn f32_flat_rounding_error(dimension: usize, envelope: f64) -> Option<f64> {
     let operation_count = dimension.checked_mul(2)?.checked_add(2)?;
-    let relative = envelope.checked_mul(f32_rounding_gamma(dimension)?)?;
+    let relative = finite_f64_mul(envelope, f32_rounding_gamma(dimension)?)?;
     // IEEE-754 gradual underflow gives each subnormal-result rounding an
     // absolute error no greater than half the least f32 subnormal. Adding one
     // such quantum per multiply/add covers the part the classic relative
     // gamma model deliberately excludes.
     let subnormal_quantum = f64::from(f32::from_bits(1)) * 0.5;
-    let subnormal_error = (operation_count as f64) * subnormal_quantum;
-    relative.checked_add(subnormal_error)
+    let subnormal_error = finite_f64_mul(operation_count as f64, subnormal_quantum)?;
+    finite_f64_add(relative, subnormal_error)
+}
+
+/// Perform a floating-point product only when the resulting interval endpoint
+/// stays finite. `f64` intentionally has no `checked_mul`; callers use this
+/// helper to fail closed to the flat scan rather than admitting an overflowed
+/// pruning bound.
+fn finite_f64_mul(left: f64, right: f64) -> Option<f64> {
+    let product = left * right;
+    product.is_finite().then_some(product)
+}
+
+/// As [`finite_f64_mul`], but for a conservative interval sum.
+fn finite_f64_add(left: f64, right: f64) -> Option<f64> {
+    let sum = left + right;
+    sum.is_finite().then_some(sum)
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -1084,8 +1106,13 @@ fn f64_rounding_gamma(dimension: usize) -> Option<f64> {
     let operation_count = dimension.checked_mul(4)?.checked_add(16)?;
     let unit_roundoff = f64::EPSILON * 0.5;
     let rounded_operations = operation_count as f64;
-    let denominator = 1.0 - rounded_operations * unit_roundoff;
-    (denominator > 0.0).then_some(rounded_operations * unit_roundoff / denominator)
+    let numerator = finite_f64_mul(rounded_operations, unit_roundoff)?;
+    let denominator = 1.0 - numerator;
+    if !denominator.is_finite() || denominator <= 0.0 {
+        return None;
+    }
+    let gamma = numerator / denominator;
+    gamma.is_finite().then_some(gamma)
 }
 
 /// Conservative per-lane upper bound for the exact f16 score before the
@@ -1512,7 +1539,6 @@ impl InMemoryVectorIndex {
             Ok(entries) => entries,
             Err(_) => return Ok(false),
         };
-        let mut inspected_candidates = 0_usize;
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
@@ -1521,10 +1547,6 @@ impl InMemoryVectorIndex {
             if !name.starts_with(&prefix) || !name.ends_with(".fsrs") {
                 continue;
             }
-            if inspected_candidates >= EXACT_RESIDUAL_CACHE_ATTEMPTS {
-                break;
-            }
-            inspected_candidates = inspected_candidates.saturating_add(1);
             if self
                 .try_open_exact_residual_sidecar(&cache_dir.join(name))
                 .unwrap_or(false)
@@ -3366,6 +3388,19 @@ mod tests {
         dir
     }
 
+    fn write_new_owned_file(path: &Path, bytes: &[u8]) {
+        use std::io::Write as _;
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("create a unique owned test file without replacement");
+        file.write_all(bytes)
+            .expect("write a unique owned test file");
+        file.sync_all().expect("sync a unique owned test file");
+    }
+
     fn cleanup(path: &Path) {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(path.with_extension("fsvi.wal"));
@@ -3707,7 +3742,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn admitted_v2_two_tier_cache_route_replaces_corrupt_generation_without_overwrite() {
+    fn admitted_v2_two_tier_shipping_cache_skips_corrupt_entries_without_overwrite() {
         // Use a private directory because v2 admission snapshots the parent;
         // sidecar publication and discovery must share that same held-directory
         // model without test-suite sibling churn or cross-process path reuse.
@@ -3723,6 +3758,18 @@ mod tests {
             crate::VectorIndex::open_admitted_v2(&path, &binding).expect("admit private v2 source");
         let query = make_normalized_vec(dimension, 3.25);
         let flat = InMemoryVectorIndex::from_admitted_v2(&admitted).expect("flat admitted index");
+        let cache_prefix = flat
+            .exact_residual_generation_cache_prefix()
+            .expect("derive admitted generation cache key");
+        let mut corrupt_paths = Vec::new();
+        corrupt_paths
+            .try_reserve_exact(EXACT_RESIDUAL_CACHE_ATTEMPTS + 1)
+            .expect("reserve bounded corrupt-cache fixture paths");
+        for sequence in 0..=EXACT_RESIDUAL_CACHE_ATTEMPTS {
+            let corrupt_path = cache_dir.join(format!("{cache_prefix}corrupt-{sequence}.fsrs"));
+            write_new_owned_file(&corrupt_path, b"corrupt immutable cache entry");
+            corrupt_paths.push(corrupt_path);
+        }
         let indexed = InMemoryTwoTierIndex::from_admitted_v2_with_residual_sidecar_cache(
             &admitted, &cache_dir, None,
         )
@@ -3739,46 +3786,48 @@ mod tests {
                 .expect("flat product search")
         );
 
-        let mut first_generation_paths: Vec<PathBuf> = std::fs::read_dir(&cache_dir)
-            .expect("read owned cache")
+        let entry_count_after_publish = std::fs::read_dir(&cache_dir)
+            .expect("read owned cache after publication")
             .flatten()
-            .map(|entry| entry.path())
-            .collect();
-        first_generation_paths.sort();
-        assert_eq!(first_generation_paths.len(), 1, "one immutable cache entry");
-        let corrupt_path = first_generation_paths.pop().expect("published cache entry");
-        std::fs::write(&corrupt_path, b"corrupt owned sidecar").expect("corrupt owned cache entry");
-        let replacement = InMemoryTwoTierIndex::from_admitted_v2_with_residual_sidecar_cache(
+            .count();
+        assert_eq!(
+            entry_count_after_publish,
+            corrupt_paths.len() + 1,
+            "publication retains every corrupt immutable entry and adds one generation-matched artifact"
+        );
+        for corrupt_path in &corrupt_paths {
+            assert_eq!(
+                std::fs::read(corrupt_path).expect("read planted corrupt cache entry"),
+                b"corrupt immutable cache entry",
+                "the shipping cache route never overwrites a stale/corrupt artifact"
+            );
+        }
+
+        let reopened = InMemoryTwoTierIndex::from_admitted_v2_with_residual_sidecar_cache(
             &admitted, &cache_dir, None,
         )
-        .expect("corrupt generation receives a new immutable candidate");
+        .expect("cache reader scans past corrupt entries to the valid generation artifact");
         assert!(
-            replacement
+            reopened
                 .fast_index
                 .exact_residual_sidecar
                 .get()
                 .is_some()
         );
         assert_eq!(
-            replacement
+            reopened
                 .search_fast(&query, 5)
-                .expect("replacement product search"),
+                .expect("reopened product search"),
             flat.search_top_k(&query, 5, None)
                 .expect("baseline flat search")
         );
-        let generation_entries: Vec<PathBuf> = std::fs::read_dir(&cache_dir)
-            .expect("read owned replacement cache")
+        let entry_count_after_reopen = std::fs::read_dir(&cache_dir)
+            .expect("read owned cache after reopening")
             .flatten()
-            .map(|entry| entry.path())
-            .collect();
         assert_eq!(
-            generation_entries.len(),
-            2,
-            "corrupt entry is never overwritten"
-        );
-        assert_eq!(
-            std::fs::read(&corrupt_path).expect("read corrupt owned cache entry"),
-            b"corrupt owned sidecar"
+            entry_count_after_reopen,
+            entry_count_after_publish,
+            "reopening selects the existing valid sidecar instead of writing another artifact"
         );
 
         let unavailable_cache = dir.join("unavailable-cache");
@@ -3789,8 +3838,6 @@ mod tests {
         )
         .expect("unavailable optional cache retains the admitted flat tier");
         assert!(fallback.fast_index.exact_residual_sidecar.get().is_none());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5210,7 +5257,7 @@ mod tests {
             "one-byte probe rejects a sidecar that grows after fstat"
         );
 
-        std::fs::write(&occupied_path, b"incumbent destination").expect("create incumbent");
+        write_new_owned_file(&occupied_path, b"incumbent destination");
         for _ in 0..3 {
             assert!(
                 index.write_exact_residual_sidecar(&occupied_path).is_err(),
@@ -5266,7 +5313,7 @@ mod tests {
             "anonymous O_TMPFILE failures create no visible temporary paths"
         );
 
-        std::fs::write(&target_path, b"symlink target").expect("create symlink target");
+        write_new_owned_file(&target_path, b"symlink target");
         symlink(&target_path, &symlink_path).expect("create final-component symlink");
         assert!(
             !index
@@ -5281,7 +5328,5 @@ mod tests {
             std::fs::read(&target_path).expect("read symlink target"),
             b"symlink target"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
