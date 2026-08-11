@@ -60,7 +60,7 @@ jobs:
           set -euo pipefail
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
           asupersync_ref="3b34c9b0a14c55eb814cf4aaeceeba3be0c0a72e"
-          frankensqlite_ref="500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d"
+          frankensqlite_ref="68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690"
           fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
@@ -229,7 +229,7 @@ jobs:
           set -euo pipefail
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
           asupersync_ref="3b34c9b0a14c55eb814cf4aaeceeba3be0c0a72e"
-          frankensqlite_ref="500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d"
+          frankensqlite_ref="68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690"
           fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
@@ -1152,7 +1152,7 @@ jobs:
           set -euo pipefail
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
           asupersync_ref="3b34c9b0a14c55eb814cf4aaeceeba3be0c0a72e"
-          frankensqlite_ref="500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d"
+          frankensqlite_ref="68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690"
           fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
@@ -1276,7 +1276,7 @@ jobs:
           set -euo pipefail
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
           asupersync_ref="3b34c9b0a14c55eb814cf4aaeceeba3be0c0a72e"
-          frankensqlite_ref="500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d"
+          frankensqlite_ref="68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690"
           fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
@@ -1348,7 +1348,7 @@ jobs:
           set -euo pipefail
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
           asupersync_ref="3b34c9b0a14c55eb814cf4aaeceeba3be0c0a72e"
-          frankensqlite_ref="500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d"
+          frankensqlite_ref="68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690"
           fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_at_ref() {
@@ -1459,7 +1459,7 @@ jobs:
           set -euo pipefail
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
           asupersync_ref="3b34c9b0a14c55eb814cf4aaeceeba3be0c0a72e"
-          frankensqlite_ref="500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d"
+          frankensqlite_ref="68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690"
           fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
@@ -1520,7 +1520,7 @@ jobs:
           set -euo pipefail
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
           asupersync_ref="3b34c9b0a14c55eb814cf4aaeceeba3be0c0a72e"
-          frankensqlite_ref="500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d"
+          frankensqlite_ref="68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690"
           fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
@@ -1716,7 +1716,7 @@ jobs:
           set -euo pipefail
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
           asupersync_ref="3b34c9b0a14c55eb814cf4aaeceeba3be0c0a72e"
-          frankensqlite_ref="500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d"
+          frankensqlite_ref="68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690"
           fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
@@ -1920,7 +1920,7 @@ jobs:
           set -euo pipefail
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
           asupersync_ref="3b34c9b0a14c55eb814cf4aaeceeba3be0c0a72e"
-          frankensqlite_ref="500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d"
+          frankensqlite_ref="68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690"
           fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {
@@ -2200,7 +2200,7 @@ jobs:
           set -euo pipefail
           deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
           asupersync_ref="3b34c9b0a14c55eb814cf4aaeceeba3be0c0a72e"
-          frankensqlite_ref="500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d"
+          frankensqlite_ref="68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690"
           fast_cmaes_ref="9406d5ec9512767106c9639628e30902ef7eae32"
 
           clone_or_update() {

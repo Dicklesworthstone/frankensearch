@@ -41,7 +41,7 @@ ASUPERSYNC_REPO="https://github.com/Dicklesworthstone/asupersync.git"
 ASUPERSYNC_REF="3b34c9b0a14c55eb814cf4aaeceeba3be0c0a72e"
 
 FRANKENSQLITE_REPO="https://github.com/Dicklesworthstone/frankensqlite.git"
-FRANKENSQLITE_REF="500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d"
+FRANKENSQLITE_REF="68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690"
 
 FAST_CMAES_REPO="https://github.com/Dicklesworthstone/fast_cmaes.git"
 FAST_CMAES_REF="9406d5ec9512767106c9639628e30902ef7eae32"

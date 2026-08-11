@@ -187,15 +187,22 @@ ftui-tty = "0.2.1"
 ftui-backend = "0.2.1"
 ftui-extras = "0.2.1"
 
-# Bind the directly consumed FrankenSQLite 0.1.19 crates to HFDT's audited
-# synchronous publication branch, advanced to Asupersync 0.4.3, so downstream
-# workspaces retain the reviewed API and resolve one runtime universe.
+# Frankensearch deliberately spans two FrankenSQLite API lines: fsfs and
+# durability still consume the synchronous 0.1.19 contract used by HFDT,
+# while storage and ops consume the async 0.2.1 contract. Patch both exact
+# lines to audited commits that use Asupersync 0.4.3 so Cargo cannot recreate
+# a hidden 0.3.x runtime through either substrate edge.
 [patch.crates-io]
-fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
-fsqlite-core = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
-fsqlite-error = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
-fsqlite-ext-fts5 = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
-fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
+fsqlite-hfdt = { package = "fsqlite", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
+fsqlite-core-hfdt = { package = "fsqlite-core", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
+fsqlite-error-hfdt = { package = "fsqlite-error", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
+fsqlite-ext-fts5-hfdt = { package = "fsqlite-ext-fts5", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
+fsqlite-types-hfdt = { package = "fsqlite-types", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
+fsqlite-main = { package = "fsqlite", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690" }
+fsqlite-core-main = { package = "fsqlite-core", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690" }
+fsqlite-error-main = { package = "fsqlite-error", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690" }
+fsqlite-ext-fts5-main = { package = "fsqlite-ext-fts5", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690" }
+fsqlite-types-main = { package = "fsqlite-types", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690" }
 
 [workspace.lints.rust]
 # `deny` instead of `forbid` so crates that need unsafe (e.g. mmap) can opt in.
