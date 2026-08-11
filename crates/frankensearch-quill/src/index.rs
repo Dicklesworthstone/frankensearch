@@ -12902,20 +12902,23 @@ fn open_sealed_term_cursor<'a>(
         .field(field_ord)
         .ok_or_else(|| invalid_state(format!("DOCLEN has no field {field_ord}")))?;
     let dictionary = open_dictionary(segment, schema)?;
-    let Some(found) = dictionary.lookup(field_ord, term)? else {
-        // A term absent from this segment decodes nothing, so it is charged
-        // nothing: the empty list below has no blocks to load.
+    let found = dictionary.lookup(field_ord, term)?;
+    // The lookup has to come first — it is what tells us whether a block will
+    // be decoded at all — but the permit still precedes every decode below,
+    // because construction is what reads the term's first posting block. An
+    // absent term admits zero units rather than skipping the call, so even a
+    // term that decodes nothing still observes cancellation here.
+    CheckpointPostingCursor::admit_initial_block(
+        checkpoint.as_ref(),
+        found
+            .as_ref()
+            .is_some_and(|found| found.metadata.doc_freq > 0),
+    )?;
+    let Some(found) = found else {
         let postings = PostingList::parse(&[], 0)?.into_cursor()?;
         let cursor = SealedPostingCursor::from_owned(postings, 0, segment.doc_count());
         return Ok((cursor, fieldnorms));
     };
-    // Every construction path below decodes the term's first posting block
-    // while building its cursor, so the permit for that block is admitted
-    // here — before the decode — and `CheckpointPostingCursor` no longer
-    // charges for it afterwards.
-    if found.metadata.doc_freq > 0 {
-        checkpoint.admit(QueryWorkKind::PostingBlock, 1)?;
-    }
 
     let postings_section = required_section(segment, SectionKind::POSTINGS)?;
     let postings_bytes = span(postings_section, found.metadata.postings, "POSTINGS")?;

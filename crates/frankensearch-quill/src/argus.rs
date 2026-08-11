@@ -1363,9 +1363,14 @@ impl<'a> DeltaPostingCursor<'a> {
     /// move walks all of it. Admitting only at the end would leave that walk
     /// uncancellable and charge its blocks after the fact, so the admission
     /// happens *inside* the loop, before each physical step: zero units
-    /// within a logical block, one unit when the step opens a new one. The
-    /// unit total is therefore unchanged — one per logical block entered —
-    /// while cancellation is observed every posting.
+    /// within a logical block, one unit when the step opens a new one.
+    ///
+    /// The charge is over **physical** blocks walked. For a tombstone-free
+    /// term that is the same total as before, because every step is live. For
+    /// a term with tombstones it is higher, and deliberately so: the blocks a
+    /// walk reads to skip superseded postings are work the query performed,
+    /// and charging only the live positions understated it while leaving the
+    /// walk itself unobservable.
     fn pull_next_live(
         &mut self,
         checkpoint: Option<&dyn QueryWorkCheckpoint>,
@@ -6675,6 +6680,170 @@ mod tests {
             1,
             "the repeated refusal must come from the cursor, not from a fresh admission"
         );
+        Ok(())
+    }
+
+    const DELTA_TOMBSTONE_FIELDS: [FieldDescriptor; 1] = [FieldDescriptor {
+        id: 0,
+        name: "positioned",
+        kind: FieldKind::Text {
+            analyzer: crate::schema::Analyzer::FrankensearchDefault,
+            positions: true,
+        },
+        stored: false,
+    }];
+    const DELTA_TOMBSTONE_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+        name: "argus-delta-tombstone-tests",
+        fields: &DELTA_TOMBSTONE_FIELDS,
+    };
+    /// Physical postings after the first live one, all superseded but one.
+    const DELTA_TOMBSTONE_RUN: u32 = 300;
+
+    /// One live posting, then a long run of superseded ones, then one live.
+    ///
+    /// Re-applying the same document id supersedes its previous posting, so
+    /// the term's physical list holds `DELTA_TOMBSTONE_RUN - 1` tombstones
+    /// between the two live postings — the shape whose walk used to run
+    /// unadmitted from end to end.
+    fn delta_tombstone_snapshot() -> Result<DeltaSnapshot, Box<dyn std::error::Error>> {
+        let mut delta = crate::delta::DeltaSegment::new(DELTA_TOMBSTONE_SCHEMA, 0, usize::MAX)?;
+        let norms = [crate::delta::DeltaFieldNorm {
+            field_ord: 0,
+            raw_length: 1,
+            fieldnorm_id: fieldnorm_to_id(1),
+        }];
+        let mut apply =
+            |global_docid: u32, document_id: &str| -> Result<(), Box<dyn std::error::Error>> {
+                let position = [global_docid];
+                delta.apply_document(
+                    global_docid,
+                    DocId::from(document_id),
+                    &norms,
+                    &[crate::delta::DeltaTermPosting {
+                        field_ord: 0,
+                        term: b"alpha",
+                        frequency: 1,
+                        positions: Some(&position),
+                    }],
+                )?;
+                Ok(())
+            };
+        apply(0, "first-live")?;
+        for ordinal in 1..=DELTA_TOMBSTONE_RUN {
+            apply(ordinal, "superseded")?;
+        }
+        Ok(delta.freeze(1))
+    }
+
+    /// A Delta walk over a tombstone run admits every physical step, so it
+    /// can be refused in the middle of the run and stops there.
+    ///
+    /// This is the case no wrapper-level admission could reach: the whole run
+    /// is traversed inside a single `next`, so admitting per move would have
+    /// left it uncancellable and charged its blocks afterwards. The counts
+    /// below are the accounting this walk actually produces — one poll per
+    /// physical step and one unit per logical block the run crosses.
+    #[test]
+    fn delta_tombstone_walk_is_admitted_and_refusable_mid_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = delta_tombstone_snapshot()?;
+
+        let recorder = Arc::new(UnitSequenceCheckpoint::default());
+        let recorder_handle: Arc<dyn QueryWorkCheckpoint> = recorder.clone();
+        let cursor =
+            DeltaPostingCursor::new_admitted(&snapshot, 0, b"alpha", recorder_handle.as_ref())?;
+        let mut cursor = CheckpointPostingCursor::new(cursor, Arc::clone(&recorder_handle))?;
+        // Construction pulls the first live posting: one physical step, whose
+        // ordinal opens the first logical block.
+        {
+            let units = recorder
+                .units
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(units.as_slice(), [1].as_slice());
+        }
+
+        assert!(cursor.next()?.is_some(), "the run ends at a live posting");
+        let units = recorder
+            .units
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        // One construction step, one pre-move poll, then one admission per
+        // physical step of the run.
+        assert_eq!(
+            units.len(),
+            usize::try_from(DELTA_TOMBSTONE_RUN)? + 2,
+            "every physical step of the tombstone run must admit"
+        );
+        assert_eq!(
+            units.iter().sum::<u64>(),
+            3,
+            "ordinals 0, 128 and 256 each open a logical block"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn delta_tombstone_walk_refused_mid_run_makes_no_further_progress()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = delta_tombstone_snapshot()?;
+        // Admission 1 is construction's step at ordinal 0, admission 2 is the
+        // wrapper's pre-move poll, and the walk's step at physical ordinal N
+        // is admission N + 2. Refuse at ordinal 128 — a block boundary in the
+        // middle of the tombstone run.
+        let checkpoint = Arc::new(CancelOnNthAdmission::new(130));
+        let handle: Arc<dyn QueryWorkCheckpoint> = checkpoint.clone();
+        let inner = DeltaPostingCursor::new_admitted(&snapshot, 0, b"alpha", handle.as_ref())?;
+        let mut cursor = CheckpointPostingCursor::new(inner, Arc::clone(&handle))?;
+        let doc_before = PostingCursor::doc(&cursor);
+        let block_before = PostingCursor::current_work_block(&cursor);
+
+        let error = cursor
+            .next()
+            .expect_err("the walk must observe the refusal mid-run");
+        assert!(
+            matches!(
+                error,
+                ArgusError::QueryCancelled {
+                    phase: "checkpoint_cursor_unit_test"
+                }
+            ),
+            "expected the checkpoint's typed refusal, got {error:?}"
+        );
+        assert_eq!(
+            checkpoint
+                .units_at_fire
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the refused step is the one that opens a logical block"
+        );
+        let admissions_at_refusal = checkpoint
+            .admissions
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(admissions_at_refusal, 130);
+        assert_eq!(
+            PostingCursor::doc(&cursor),
+            doc_before,
+            "a refused walk must not publish a new current posting"
+        );
+        assert_eq!(
+            PostingCursor::current_work_block(&cursor),
+            block_before,
+            "a refused walk must not advance the logical block"
+        );
+
+        // Sticky: the refusal repeats without walking or admitting again.
+        assert!(cursor.next().is_err());
+        assert!(cursor.advance(u32::MAX).is_err());
+        assert_eq!(
+            checkpoint
+                .admissions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            admissions_at_refusal,
+            "a refused Delta cursor must not resume walking"
+        );
+        assert_eq!(PostingCursor::doc(&cursor), doc_before);
         Ok(())
     }
 
