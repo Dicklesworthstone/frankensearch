@@ -13236,15 +13236,53 @@ mod tests {
     /// span that also crosses several POSTINGS blocks, and the two boundary
     /// sets do not coincide — which is the only shape in which the two-stage
     /// seek's first stage actually fires.
+    /// Positions per posting, chosen so a run is 31 bytes and the POSITIONS
+    /// boundaries land at ordinals 0/132/264 while POSTINGS land at 0/128/256.
+    /// The two sets must not coincide, or the seek's first stage never fires.
+    const DISPLACED_POSITIONS_PER_POSTING: u32 = 29;
+
     fn positional_multi_block_fixture() -> (Vec<Posting>, Vec<u32>) {
         let mut postings = Vec::with_capacity(270);
         let mut flat = Vec::new();
         for ordinal in 0_u32..270 {
-            postings.push(Posting::new(10 + ordinal * 3, 24));
+            postings.push(Posting::new(
+                10 + ordinal * 3,
+                DISPLACED_POSITIONS_PER_POSTING,
+            ));
             let base = 70_000 + ordinal * 100;
-            flat.extend((0_u32..24).map(|index| base + index / 2));
+            flat.extend((0..DISPLACED_POSITIONS_PER_POSTING).map(|index| base + index / 2));
         }
         (postings, flat)
+    }
+
+    /// Assert the displaced boundary layout both tests depend on.
+    ///
+    /// These are stated exactly rather than probed, because the whole point
+    /// of the fixture is a specific misalignment: if the encoder's run size
+    /// ever shifts the POSITIONS cuts, the seek being exercised is no longer
+    /// the one these tests claim to exercise, and that must fail loudly here
+    /// instead of quietly weakening the evidence downstream.
+    fn assert_displaced_layout(posting_list: &PostingList<'_>, positions: &PositionList<'_>) {
+        let posting_starts: Vec<u32> = posting_list
+            .blocks()
+            .iter()
+            .map(|block| block.base_posting_ordinal)
+            .collect();
+        let position_starts: Vec<u32> = positions
+            .blocks()
+            .iter()
+            .map(PositionBlockMeta::base_posting_ordinal)
+            .collect();
+        assert_eq!(
+            posting_starts,
+            vec![0, 128, 256],
+            "POSTINGS layout moved: {posting_starts:?}"
+        );
+        assert_eq!(
+            position_starts,
+            vec![0, 132, 264],
+            "POSITIONS layout moved: {position_starts:?}"
+        );
     }
 
     /// The positional decode mirror must equal the decodes that actually
@@ -13265,55 +13303,44 @@ mod tests {
     fn positional_far_jump_reads_fewer_blocks_than_it_crosses() -> TestResult {
         let (postings, flat) = positional_multi_block_fixture();
         let posting_bytes = EncodedPostingList::encode(&postings)?;
-        let probe_list = posting_bytes.posting_list()?;
+        let posting_list = posting_bytes.posting_list()?;
         let encoded = EncodedPositionList::encode(&postings, &flat)?;
-        let probe_positions = encoded.position_list(&probe_list)?;
-        assert!(
-            probe_list.block_count() >= 3,
-            "fixture must span multiple POSTINGS blocks"
-        );
-        assert!(
-            probe_positions.block_count() >= 2,
-            "fixture must span multiple POSITIONS blocks"
-        );
+        let positions = encoded.position_list(&posting_list)?;
+        assert_displaced_layout(&posting_list, &positions);
 
-        let mut skipping_seeks = 0_usize;
-        let mut decoding_seeks = 0_usize;
-        let mut idle_seeks = 0_usize;
-        for step in (0..postings.len()).step_by(17).chain([postings.len() - 1]) {
-            let target = postings[step].doc_id;
-            let posting_list = posting_bytes.posting_list()?;
-            let positions = encoded.position_list(&posting_list)?;
-            let mut cursor = positions.cursor()?;
-            let entry_block = cursor.posting_block_index().ok_or("positioned cursor")?;
-            let predicted = cursor.advance_decode_count(target);
-            let baseline = cursor.decoded_blocks();
-            cursor.advance(target)?;
-            let observed = u64::try_from(cursor.decoded_blocks() - baseline)?;
-            assert_eq!(
-                predicted, observed,
-                "positional mirror disagreed for target={target}"
-            );
+        // Ordinal 269 sits in POSTINGS block 2, and its POSITIONS block
+        // starts at ordinal 264 — also in POSTINGS block 2. The seek
+        // therefore jumps straight from block 0 into block 2, reading one
+        // block while crossing two, and the walk that follows stays inside
+        // that block. This is the exact case a block-index-delta predictor
+        // gets wrong.
+        let target = postings[269].doc_id;
+        let mut cursor = positions.cursor()?;
+        let entry_block = cursor.posting_block_index().ok_or("positioned cursor")?;
+        let predicted = cursor.advance_decode_count(target);
+        let baseline = cursor.decoded_blocks();
+        cursor.advance(target)?;
+        let observed = u64::try_from(cursor.decoded_blocks() - baseline)?;
+        let landed_block = cursor.posting_block_index().ok_or("landed cursor")?;
+        let crossed = u64::try_from(landed_block.saturating_sub(entry_block))?;
 
-            let landed_block = cursor.posting_block_index().ok_or("landed cursor")?;
-            let crossed = u64::try_from(landed_block.saturating_sub(entry_block))?;
-            if crossed >= 2 && observed < crossed {
-                skipping_seeks += 1;
-            }
-            if observed > 0 {
-                decoding_seeks += 1;
-            } else {
-                idle_seeks += 1;
-            }
-        }
-        assert!(
-            skipping_seeks > 0,
-            "the matrix must include a jump that reads fewer POSTINGS blocks than it crosses"
+        assert_eq!(entry_block, 0);
+        assert_eq!(landed_block, 2);
+        assert_eq!(crossed, 2, "the seek must cross two POSTINGS blocks");
+        assert_eq!(
+            observed, 1,
+            "a direct jump reads only the block it lands in"
         );
-        assert!(
-            decoding_seeks > 0 && idle_seeks > 0,
-            "the matrix must exercise both a decoding and a non-decoding seek"
-        );
+        assert_eq!(predicted, observed, "the mirror must match the observation");
+
+        // A seek that stays inside the decoded block reads nothing, so the
+        // mirror is exercised in both directions.
+        let mut idle = positions.cursor()?;
+        let idle_baseline = idle.decoded_blocks();
+        let idle_predicted = idle.advance_decode_count(postings[0].doc_id);
+        idle.advance(postings[0].doc_id)?;
+        assert_eq!(idle_predicted, 0);
+        assert_eq!(idle.decoded_blocks(), idle_baseline);
         Ok(())
     }
 
@@ -13331,36 +13358,46 @@ mod tests {
         let posting_list = posting_bytes.posting_list()?;
         let encoded = EncodedPositionList::encode(&postings, &flat)?;
         let positions = encoded.position_list(&posting_list)?;
+        assert_displaced_layout(&posting_list, &positions);
         let mut cursor = positions.cursor()?;
 
-        let midpoint = postings[postings.len() / 2].doc_id;
-        let predicted_jump = cursor.advance_decode_count(midpoint);
-        let baseline = cursor.decoded_blocks();
-        cursor.advance(midpoint)?;
-        assert_eq!(
-            predicted_jump,
-            u64::try_from(cursor.decoded_blocks() - baseline)?,
-            "mirror disagreed on the seek that establishes the later state"
-        );
+        // Land just short of the POSTINGS seam at ordinal 128, which sits
+        // inside the first POSITIONS block (0..132) — a later state whose two
+        // block indices have already drifted apart.
+        cursor.advance(postings[127].doc_id)?;
+        assert_eq!(cursor.posting_block_index(), Some(0));
 
-        let mut seam_decodes = 0_u64;
-        for _ in 0..POSTINGS_PER_BLOCK + 2 {
-            let predicted = cursor.next_decode_count();
-            let before = cursor.decoded_blocks();
-            let moved = cursor.next()?;
-            let observed = u64::try_from(cursor.decoded_blocks() - before)?;
-            assert_eq!(predicted, observed, "mirror disagreed at a later step");
-            seam_decodes += observed;
-            if moved.is_none() {
-                break;
-            }
-        }
-        assert!(
-            seam_decodes > 0,
-            "stepping past a later seam must have crossed a POSTINGS block"
+        // Cross the POSTINGS seam precisely: one step, one block.
+        let predicted_seam = cursor.next_decode_count();
+        let before_seam = cursor.decoded_blocks();
+        assert_eq!(
+            cursor.next()?.map(|posting| posting.doc_id),
+            Some(postings[128].doc_id)
         );
+        let observed_seam = u64::try_from(cursor.decoded_blocks() - before_seam)?;
+        assert_eq!(observed_seam, 1, "stepping onto ordinal 128 enters a block");
+        assert_eq!(predicted_seam, observed_seam);
+        assert_eq!(cursor.posting_block_index(), Some(1));
+
+        // Cross the displaced POSITIONS seam at ordinal 132, which enters no
+        // POSTINGS block: the mirror must predict zero there.
+        cursor.advance(postings[131].doc_id)?;
+        let predicted_positions_seam = cursor.next_decode_count();
+        let before_positions_seam = cursor.decoded_blocks();
+        assert_eq!(
+            cursor.next()?.map(|posting| posting.doc_id),
+            Some(postings[132].doc_id)
+        );
+        assert_eq!(
+            u64::try_from(cursor.decoded_blocks() - before_positions_seam)?,
+            0,
+            "a POSITIONS seam alone decodes no POSTINGS block"
+        );
+        assert_eq!(predicted_positions_seam, 0);
+        assert_eq!(cursor.posting_block_index(), Some(1));
 
         while cursor.next()?.is_some() {}
+        assert_eq!(cursor.posting_block_index(), None, "cursor must be fused");
         assert_eq!(
             cursor.next_decode_count(),
             0,
@@ -13371,11 +13408,12 @@ mod tests {
             0,
             "an exhausted cursor predicts no decode for any seek"
         );
-        let before = cursor.decoded_blocks();
+        let before_fused = cursor.decoded_blocks();
+        assert_eq!(cursor.next()?, None);
         assert_eq!(cursor.advance(u32::MAX)?, None);
         assert_eq!(
             cursor.decoded_blocks(),
-            before,
+            before_fused,
             "a fused cursor must not decode"
         );
         Ok(())
