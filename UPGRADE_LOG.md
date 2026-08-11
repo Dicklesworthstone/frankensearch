@@ -1,5 +1,48 @@
 # Dependency Upgrade Log
 
+## 2026-08-11 — Phase 1: Asupersync family (batch-test-pending)
+
+**Scope:** only the root `asupersync` workspace constraint. This is a
+manifest-only Phase 1 batch: Cargo/RCH/UBS, GitHub Actions, and any lockfile
+resolution are intentionally deferred to the central verifier.
+
+### Asupersync: `0.3.10` → `0.4.3`
+
+- **Target provenance:** stable `v0.4.3` tag and source changelog, plus the
+  local registry/lock baseline at `0.3.10`.
+- **Constraint:** `>=0.3.10, <0.4` → `>=0.4.3, <0.5`; retains
+  `default-features = false` and the production `proc-macros` feature exactly.
+- **Breaking-change review:** v0.4.0 correctly re-anchors the earlier
+  tracked-session-channel break: `TrackedSender::try_reserve` now receives
+  `&Cx`, and `TrackedPermit::try_send` returns `CommittedProof<SendPermit>`.
+  A repository-wide source search found no use of `TrackedSender`,
+  `TrackedPermit`, `try_reserve`, or `try_send`, so the migration needs **zero
+  Rust source-file edits** (within the ten-file limit).
+- **Feature/API review:** the required `proc-macros`, `test-internals`, `tls`,
+  and `tls-webpki-roots` feature names remain available at the target. The
+  existing production/test feature-unification boundary is unchanged.
+- **Tests:** **batch-test-pending**. No Cargo build/test/check/clippy,
+  RCH, UBS, GitHub Actions, or manual `Cargo.lock` editing occurred in this
+  phase. `Cargo.lock` remains reserved and records `asupersync 0.3.10` until
+  central Cargo resolution and validation produce the target graph.
+
+### FrankenSQLite / `fsqlite`: research complete, intentionally deferred
+
+- **Target researched:** `fsqlite`, `fsqlite-types`, and `fsqlite-ext-fts5`
+  `0.1.19` (resolved baseline for the manifest's `0.1.2` range) → `0.2.1`.
+- **Why deferred:** v0.2.0 makes `Connection::open`, execution, query, row,
+  and statement APIs async end-to-end, requiring `.await` and executor/context
+  migration across more than ten source files. Existing Porter FTS5 indexes
+  also need a data migration/rebuild. This must be a separately authorized,
+  source-and-data migration rather than part of the Asupersync batch.
+
+### Primary sources
+
+- Asupersync [`v0.4.3` changelog](https://github.com/Dicklesworthstone/asupersync/blob/v0.4.3/CHANGELOG.md)
+  and [tagged source](https://github.com/Dicklesworthstone/asupersync/tree/v0.4.3).
+- FrankenSQLite [`v0.2.1` changelog](https://github.com/Dicklesworthstone/frankensqlite/blob/v0.2.1/CHANGELOG.md)
+  and [tagged source](https://github.com/Dicklesworthstone/frankensqlite/tree/v0.2.1).
+
 ## 2026-06-17 — straggler third-party majors
 
 Two leftovers from earlier passes, finished now. `Cargo.lock` is gitignored in
