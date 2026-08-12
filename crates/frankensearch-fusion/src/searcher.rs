@@ -5357,7 +5357,9 @@ mod tests {
 
             assert!(matches!(
                 error,
-                SearchError::Cancelled { phase, .. } if phase == "quality_embed_to_prf"
+                SearchError::Cancelled { phase, reason }
+                    if phase == "quality_embed_to_prf"
+                        && reason == "user: cancel after quality embed"
             ));
             assert_eq!(phases, vec!["initial"]);
             assert_eq!(
