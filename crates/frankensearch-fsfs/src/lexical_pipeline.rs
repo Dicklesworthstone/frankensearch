@@ -1328,7 +1328,9 @@ mod tests {
                     .await
                     .expect("flush partial prefix");
                 assert_eq!(
-                    partial.doc_count(),
+                    partial
+                        .doc_count()
+                        .expect("partial bulk count is authoritative"),
                     u64::try_from(published_prefix).expect("prefix fits u64"),
                     "prefix={published_prefix}: cadence publication must be durable"
                 );

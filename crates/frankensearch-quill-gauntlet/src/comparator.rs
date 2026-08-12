@@ -1310,7 +1310,7 @@ fn capture_cancellation_snapshot(
     index: &QuillIndex,
     documents: &[IndexableDocument],
 ) -> Result<CancellationSnapshotCapture, GauntletError> {
-    let snapshot = index.search_snapshot();
+    let snapshot = index.search_snapshot()?;
     let keeper = snapshot.keeper_snapshot();
     let manifest = &keeper.loaded_manifest().manifest;
     let mut hasher = Sha256::new();
@@ -1881,7 +1881,7 @@ pub async fn observe_live_quill_cancellation_receipt(
         .map_err(|error| GauntletError::InvalidObservation {
             reason: format!("commit cancellation retry failed: {error}"),
         })?;
-    let published_after_retry = index.search_snapshot();
+    let published_after_retry = index.search_snapshot()?;
     if published_after_retry.snapshot_epoch() != snapshot_before.snapshot_epoch.saturating_add(1)
         || published_after_retry.keeper_generation()
             != snapshot_before.keeper_generation.saturating_add(1)

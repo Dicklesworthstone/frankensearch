@@ -148,6 +148,7 @@ async fn build_index(cx: &Cx, shape: &Shape, seed: u64) -> QuillIndex {
     }
     let segment_doc_counts: Vec<u32> = index
         .snapshot()
+        .expect("benchmark snapshot is authoritative")
         .segments()
         .iter()
         .map(|segment| segment.doc_count())

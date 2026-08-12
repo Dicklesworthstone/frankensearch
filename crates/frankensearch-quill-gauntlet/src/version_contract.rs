@@ -365,7 +365,7 @@ async fn run_q1_concat_merge_fixture(cx: &Cx) -> Result<Vec<String>, GauntletErr
             .map_err(|error| q1_merge_error("commit source batch", error))?;
         if batch_index == 1 {
             let first_stage_source_ids = index
-                .snapshot()
+                .snapshot()?
                 .segments()
                 .iter()
                 .map(|segment| segment.manifest().segment_id)
@@ -405,7 +405,7 @@ async fn run_q1_concat_merge_fixture(cx: &Cx) -> Result<Vec<String>, GauntletErr
     }
 
     let source_ids = index
-        .snapshot()
+        .snapshot()?
         .segments()
         .iter()
         .map(|segment| segment.manifest().segment_id)
@@ -418,21 +418,21 @@ async fn run_q1_concat_merge_fixture(cx: &Cx) -> Result<Vec<String>, GauntletErr
             ),
         });
     }
-    for segment in index.snapshot().segments() {
+    for segment in index.snapshot()?.segments() {
         segment
             .verify()
             .map_err(|error| q1_merge_error("verify source segment", error))?;
     }
 
-    let before_snapshot = index.snapshot();
+    let before_snapshot = index.snapshot()?;
     let before_manifest = &before_snapshot.loaded_manifest().manifest;
     let before_generation = before_manifest.generation;
     let before_watermark = before_manifest.docid_high_watermark;
     let before_field_stats = before_manifest.field_stats.clone();
-    let before_at_seal_doc_count = index.snapshot().at_seal_doc_count();
-    let before_live_doc_count = index.snapshot().doc_count();
+    let before_at_seal_doc_count = index.snapshot()?.at_seal_doc_count();
+    let before_live_doc_count = index.snapshot()?.doc_count();
     let first_hole = index
-        .snapshot()
+        .snapshot()?
         .segments()
         .windows(2)
         .find_map(|pair| {
@@ -443,8 +443,8 @@ async fn run_q1_concat_merge_fixture(cx: &Cx) -> Result<Vec<String>, GauntletErr
         .ok_or_else(|| GauntletError::InvalidContract {
             reason: "Q1 E3.5 did not construct an interior burned lease tail".to_owned(),
         })?;
-    let merged_docid_lo = index.snapshot().segments()[0].manifest().docid_lo;
-    let merged_docid_hi = index.snapshot().segments()[2].manifest().docid_hi;
+    let merged_docid_lo = index.snapshot()?.segments()[0].manifest().docid_lo;
+    let merged_docid_hi = index.snapshot()?.segments()[2].manifest().docid_hi;
 
     const DOCUMENT_IDS: [&str; 8] = [
         "merge-a1", "merge-a2", "merge-b1", "merge-b2", "merge-c1", "merge-c2", "merge-d1",
@@ -453,7 +453,7 @@ async fn run_q1_concat_merge_fixture(cx: &Cx) -> Result<Vec<String>, GauntletErr
     let mut identity_rows = Vec::with_capacity(DOCUMENT_IDS.len());
     for document_id in DOCUMENT_IDS {
         let resolved = index
-            .snapshot()
+            .snapshot()?
             .resolve_document_id(document_id)
             .map_err(|error| q1_merge_error("resolve source identity", error))?
             .ok_or_else(|| GauntletError::InvalidContract {
@@ -516,9 +516,9 @@ async fn run_q1_concat_merge_fixture(cx: &Cx) -> Result<Vec<String>, GauntletErr
             });
         }
     }
-    if index.snapshot().loaded_manifest().manifest.generation != before_generation
+    if index.snapshot()?.loaded_manifest().manifest.generation != before_generation
         || index
-            .snapshot()
+            .snapshot()?
             .segments()
             .iter()
             .map(|segment| segment.manifest().segment_id)
@@ -586,14 +586,14 @@ async fn run_q1_concat_merge_fixture(cx: &Cx) -> Result<Vec<String>, GauntletErr
 
     for (document_id, global_docid) in identity_rows {
         let resolved = index
-            .snapshot()
+            .snapshot()?
             .resolve_document_id(document_id)
             .map_err(|error| q1_merge_error("resolve merged identity", error))?
             .ok_or_else(|| GauntletError::InvalidContract {
                 reason: format!("Q1-OB2c merged identity {document_id:?} is missing"),
             })?;
         let materialized = index
-            .snapshot()
+            .snapshot()?
             .materialize_document_id(global_docid)
             .map(|value| value.to_string());
         if resolved.global_docid != global_docid
@@ -611,7 +611,7 @@ async fn run_q1_concat_merge_fixture(cx: &Cx) -> Result<Vec<String>, GauntletErr
         reason: "Q1 E3.5 source hole does not fit the public docid domain".to_owned(),
     })?;
     if index
-        .snapshot()
+        .snapshot()?
         .materialize_document_id(first_hole)
         .is_some()
     {

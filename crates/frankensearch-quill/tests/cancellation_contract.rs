@@ -372,13 +372,18 @@ async fn two_segment_pruning_trace_fixture(cx: &Cx) -> QuillIndex {
             .expect("seal one pruning-trace segment");
     }
     assert_eq!(
-        index.snapshot().segments().len(),
+        index
+            .snapshot()
+            .expect("fixture snapshot is authoritative")
+            .segments()
+            .len(),
         2,
         "fixture commit boundaries must remain observable"
     );
     assert_eq!(
         index
             .snapshot()
+            .expect("fixture snapshot is authoritative")
             .segments()
             .iter()
             .map(|segment| segment.doc_count())
@@ -387,12 +392,15 @@ async fn two_segment_pruning_trace_fixture(cx: &Cx) -> QuillIndex {
         "each committed boundary must contain one real scored document"
     );
     assert_eq!(
-        index.snapshot().doc_count(),
+        index
+            .snapshot()
+            .expect("fixture snapshot is authoritative")
+            .doc_count(),
         2,
         "Keeper must expose both committed documents"
     );
     assert_eq!(
-        index.doc_count(),
+        index.doc_count().expect("fixture count is authoritative"),
         2,
         "the public composite view must expose the same two live documents"
     );
@@ -409,7 +417,9 @@ fn assert_sync_boundary_cancels<T: std::fmt::Debug>(
     expected_phase: &str,
     call: impl Fn(&QuillIndex, &Cx) -> Result<T, QuillIndexError>,
 ) -> T {
-    let snapshot_before = index.search_snapshot();
+    let snapshot_before = index
+        .search_snapshot()
+        .expect("published snapshot is authoritative");
 
     cx.set_cancel_requested(true);
     let error = call(index, cx).expect_err(&format!("{boundary}: cancelled Cx must be rejected"));
@@ -421,7 +431,12 @@ fn assert_sync_boundary_cancels<T: std::fmt::Debug>(
         "{boundary}: cancellation phase is part of the contract"
     );
     assert!(
-        Arc::ptr_eq(&snapshot_before, &index.search_snapshot()),
+        Arc::ptr_eq(
+            &snapshot_before,
+            &index
+                .search_snapshot()
+                .expect("published snapshot is authoritative"),
+        ),
         "{boundary}: a cancelled query must not perturb the published snapshot"
     );
 
@@ -429,7 +444,12 @@ fn assert_sync_boundary_cancels<T: std::fmt::Debug>(
     let value = call(index, cx)
         .unwrap_or_else(|error| panic!("{boundary}: fresh retry must succeed, got {error:?}"));
     assert!(
-        Arc::ptr_eq(&snapshot_before, &index.search_snapshot()),
+        Arc::ptr_eq(
+            &snapshot_before,
+            &index
+                .search_snapshot()
+                .expect("published snapshot is authoritative"),
+        ),
         "{boundary}: a successful retry reads the same published snapshot"
     );
     value
@@ -536,7 +556,9 @@ fn every_sync_search_boundary_rejects_a_cancelled_cx_and_retries_clean() {
 fn async_lexical_boundaries_reject_a_cancelled_cx_and_retry_clean() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let index = fixture_index(&cx).await;
-        let snapshot_before = index.search_snapshot();
+        let snapshot_before = index
+            .search_snapshot()
+            .expect("published snapshot is authoritative");
 
         // Control results for the trait-level search boundary.
         let control = LexicalRead::search(&index, &cx, QUERY, LIMIT)
@@ -609,7 +631,12 @@ fn async_lexical_boundaries_reject_a_cancelled_cx_and_retry_clean() {
         );
 
         assert!(
-            Arc::ptr_eq(&snapshot_before, &index.search_snapshot()),
+            Arc::ptr_eq(
+                &snapshot_before,
+                &index
+                    .search_snapshot()
+                    .expect("published snapshot is authoritative"),
+            ),
             "no async boundary, cancelled or retried, may swap the snapshot"
         );
     });
@@ -625,7 +652,9 @@ fn cancelled_cx_still_rejects_on_an_empty_query_class_matrix() {
     // would pass whichever way the precedence ran, and so would pin nothing.
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let index = fixture_index(&cx).await;
-        let snapshot_before = index.search_snapshot();
+        let snapshot_before = index
+            .search_snapshot()
+            .expect("published snapshot is authoritative");
 
         cx.set_cancel_requested(true);
         for (label, result) in [
@@ -655,7 +684,12 @@ fn cancelled_cx_still_rejects_on_an_empty_query_class_matrix() {
         cx.set_cancel_requested(false);
 
         assert!(
-            Arc::ptr_eq(&snapshot_before, &index.search_snapshot()),
+            Arc::ptr_eq(
+                &snapshot_before,
+                &index
+                    .search_snapshot()
+                    .expect("published snapshot is authoritative"),
+            ),
             "degenerate cancelled requests must not perturb the snapshot"
         );
     });
@@ -667,7 +701,9 @@ fn real_public_search_methods_cancel_during_collection_and_retry_exactly() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let index = fixture_index(&cx).await;
         let controller = index.conformance_cancellation_controller();
-        let snapshot_before = index.search_snapshot();
+        let snapshot_before = index
+            .search_snapshot()
+            .expect("published snapshot is authoritative");
         let control = LexicalRead::search(&index, &cx, QUERY, LIMIT)
             .await
             .expect("full-search control");
@@ -718,7 +754,12 @@ fn real_public_search_methods_cancel_during_collection_and_retry_exactly() {
                     cx.is_cancel_requested(),
                     "the deterministic checkpoint must request cancellation on the real Cx"
                 );
-                assert!(Arc::ptr_eq(&snapshot_before, &index.search_snapshot()));
+                assert!(Arc::ptr_eq(
+                    &snapshot_before,
+                    &index
+                        .search_snapshot()
+                        .expect("published snapshot is authoritative"),
+                ));
                 assert_eq!(
                     index
                         .conformance_pending_writer_state()
@@ -754,7 +795,9 @@ fn real_public_search_methods_cancel_during_collection_and_retry_exactly() {
 fn pruning_conformance_traced_public_search_discards_partial_receipt_and_replays_exactly() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let index = two_segment_pruning_trace_fixture(&cx).await;
-        let snapshot_before = index.search_snapshot();
+        let snapshot_before = index
+            .search_snapshot()
+            .expect("published snapshot is authoritative");
         let (control_page, control_receipt) = index
             .search_paginated_with_conformance_pruning_trace(&cx, QUERY, LIMIT, 0, false)
             .expect("noncancelled traced control");
@@ -804,7 +847,12 @@ fn pruning_conformance_traced_public_search_discards_partial_receipt_and_replays
             "the typed segment boundary must cancel the real request Cx"
         );
         assert!(
-            Arc::ptr_eq(&snapshot_before, &index.search_snapshot()),
+            Arc::ptr_eq(
+                &snapshot_before,
+                &index
+                    .search_snapshot()
+                    .expect("published snapshot is authoritative"),
+            ),
             "failed tracing must not perturb the published snapshot"
         );
 
@@ -824,7 +872,9 @@ fn real_public_hydration_cancels_with_exact_retained_prefix_and_replays() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let index = fixture_index(&cx).await;
         let controller = index.conformance_cancellation_controller();
-        let snapshot_before = index.search_snapshot();
+        let snapshot_before = index
+            .search_snapshot()
+            .expect("published snapshot is authoritative");
 
         let (mut control, control_context) = candidate_parts(&index, &cx).await;
         LexicalRead::hydrate_candidates(&index, &cx, control_context.as_ref(), &mut control)
@@ -892,7 +942,12 @@ fn real_public_hydration_cancels_with_exact_retained_prefix_and_replays() {
                 }
             }
             let cancelled_state = first.clone();
-            assert!(Arc::ptr_eq(&snapshot_before, &index.search_snapshot()));
+            assert!(Arc::ptr_eq(
+                &snapshot_before,
+                &index
+                    .search_snapshot()
+                    .expect("published snapshot is authoritative"),
+            ));
             assert_eq!(
                 index
                     .conformance_pending_writer_state()
@@ -957,10 +1012,12 @@ fn real_public_commit_cancels_before_publication_and_retains_pending_state() {
             .expect("noncancelled commit control");
 
         let controller = index.conformance_cancellation_controller();
-        let snapshot_before = index.search_snapshot();
+        let snapshot_before = index
+            .search_snapshot()
+            .expect("published snapshot is authoritative");
         let snapshot_epoch_before = snapshot_before.snapshot_epoch();
         let keeper_generation_before = snapshot_before.keeper_generation();
-        let doc_count_before = index.doc_count();
+        let doc_count_before = index.doc_count().expect("published count is authoritative");
 
         controller
             .arm(ConformanceCancellationStage::CommitPublication, 1)
@@ -979,8 +1036,16 @@ fn real_public_commit_cancels_before_publication_and_retains_pending_state() {
             cx.is_cancel_requested(),
             "the publication checkpoint must request cancellation on the real Cx"
         );
-        assert!(Arc::ptr_eq(&snapshot_before, &index.search_snapshot()));
-        assert_eq!(index.doc_count(), doc_count_before);
+        assert!(Arc::ptr_eq(
+            &snapshot_before,
+            &index
+                .search_snapshot()
+                .expect("published snapshot is authoritative"),
+        ));
+        assert_eq!(
+            index.doc_count().expect("published count is authoritative"),
+            doc_count_before
+        );
         assert!(index.has_uncommitted_changes());
         let pending_writer_state = index
             .conformance_pending_writer_state()
@@ -1017,7 +1082,12 @@ fn real_public_commit_cancels_before_publication_and_retains_pending_state() {
             "cancellation replay must retain the exact pending FSLX and MANIFEST transaction"
         );
         assert!(
-            Arc::ptr_eq(&snapshot_before, &index.search_snapshot()),
+            Arc::ptr_eq(
+                &snapshot_before,
+                &index
+                    .search_snapshot()
+                    .expect("published snapshot is authoritative"),
+            ),
             "replayed pre-publication cancellation must not install the prepared successor"
         );
 
@@ -1027,7 +1097,9 @@ fn real_public_commit_cancels_before_publication_and_retains_pending_state() {
             .await
             .expect("commit retry publishes pending state");
         assert!(!index.has_uncommitted_changes());
-        let snapshot_after = index.search_snapshot();
+        let snapshot_after = index
+            .search_snapshot()
+            .expect("published snapshot is authoritative");
         assert_eq!(
             snapshot_after.snapshot_epoch(),
             snapshot_epoch_before + 1,

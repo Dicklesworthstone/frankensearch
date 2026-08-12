@@ -2527,9 +2527,19 @@ fn qg1_bulk_metric_continuous(
             let mut interval = Qg1ContinuousInterval::start(arm, prepared_input.binding.clone());
             let periodic_commit_calls =
                 feed_qg1_prepared_batches(context, &index, &prepared_input, None, &mut interval);
-            let generation_before_terminal = index.snapshot().loaded_manifest().manifest.generation;
+            let generation_before_terminal = index
+                .snapshot()
+                .expect("benchmark snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
             qg1_terminal_commit(context, &index, &mut interval);
-            let generation_after_terminal = index.snapshot().loaded_manifest().manifest.generation;
+            let generation_after_terminal = index
+                .snapshot()
+                .expect("benchmark snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
             // Retain the Quill read owner until its terminal search returns,
             // matching Tantivy's retained-reader endpoint without inventing a
             // writer lifecycle that Quill does not have.
@@ -2649,7 +2659,12 @@ fn bulk_metric_unpooled(
     let elapsed = match arm {
         EngineArm::Quill => {
             let index = quill_in_memory(spec);
-            let generation_before = index.snapshot().loaded_manifest().manifest.generation;
+            let generation_before = index
+                .snapshot()
+                .expect("benchmark snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
             let mut elapsed = prepared_qg1_documents.map_or_else(
                 || {
                     index_batches(
@@ -2664,7 +2679,12 @@ fn bulk_metric_unpooled(
                 },
                 |documents| index_prepared_qg1_batches(context, &index, documents),
             );
-            let generation_after = index.snapshot().loaded_manifest().manifest.generation;
+            let generation_after = index
+                .snapshot()
+                .expect("benchmark snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
             elapsed += commit(context, &index);
             if spec.gate == PerfGate::Qg1 {
                 eprintln!(
@@ -6208,6 +6228,7 @@ fn run_memory_child() {
             // in-memory indexes too.
             let bytes: u64 = index
                 .snapshot()
+                .expect("benchmark snapshot is authoritative")
                 .loaded_manifest()
                 .manifest
                 .segments

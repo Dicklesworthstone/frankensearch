@@ -7686,7 +7686,7 @@ impl DifferentialCampaignEngine for crate::engine::QuillSubject {
                 ));
             }
             self.claim_fresh_campaign()?;
-            if self.index()?.doc_count() != 0 || self.index()?.has_uncommitted_changes() {
+            if self.index()?.doc_count()? != 0 || self.index()?.has_uncommitted_changes() {
                 return Err(campaign_error(
                     "Quill campaign adapter must own a fresh empty index",
                 ));
@@ -7721,7 +7721,7 @@ impl DifferentialCampaignEngine for crate::engine::QuillSubject {
         Box::pin(async move {
             self.require_ingesting()?;
             self.index_mut()?.commit(cx).await?;
-            let actual_count = self.index()?.doc_count();
+            let actual_count = self.index()?.doc_count()?;
             if actual_count != manifest.document_count {
                 return Err(campaign_error(
                     "Quill committed document count differs from the corpus manifest",
@@ -13515,7 +13515,8 @@ mod tests {
         let snapshot = subject
             .index()
             .expect("tombstoned UNION_HORIZON Quill index")
-            .snapshot();
+            .snapshot()
+            .expect("tombstoned UNION_HORIZON snapshot is authoritative");
         assert_eq!(snapshot.segments().len(), 1);
         assert_eq!(snapshot.segments()[0].at_seal_doc_count(), 9_001);
         assert_eq!(snapshot.segments()[0].tombstone_count(), 6);
@@ -13527,7 +13528,8 @@ mod tests {
             subject
                 .index()
                 .expect("tombstoned UNION_HORIZON Quill index")
-                .doc_count(),
+                .doc_count()
+                .expect("tombstoned UNION_HORIZON count is authoritative"),
             8_995,
         );
         assert!(
@@ -14418,7 +14420,8 @@ mod tests {
         let snapshot = subject
             .index()
             .expect("UNION_HORIZON Quill index")
-            .snapshot();
+            .snapshot()
+            .expect("UNION_HORIZON snapshot is authoritative");
         let actual_segment_doc_counts = snapshot
             .segments()
             .iter()
@@ -17725,7 +17728,9 @@ mod tests {
                 .expect("cancellation UNION_HORIZON Quill index");
             let controller = index.conformance_cancellation_controller();
             assert_eq!(controller.query_interruption_location(), None);
-            let snapshot_before = index.snapshot();
+            let snapshot_before = index
+                .snapshot()
+                .expect("cancellation snapshot is authoritative");
             let writer_before = index
                 .conformance_pending_writer_state()
                 .expect("capture cancellation UNION_HORIZON writer state");
@@ -17805,7 +17810,12 @@ mod tests {
                 assert_eq!(controller.recorded_pruning_receipts_at_fire(), 0);
                 assert_eq!(controller.discarded_pruning_trace_sessions(), 0);
                 assert!(cx.is_cancel_requested());
-                assert!(Arc::ptr_eq(&snapshot_before, &index.snapshot()));
+                assert!(Arc::ptr_eq(
+                    &snapshot_before,
+                    &index
+                        .snapshot()
+                        .expect("cancellation snapshot is authoritative"),
+                ));
                 assert_eq!(
                     index
                         .conformance_pending_writer_state()
@@ -17837,7 +17847,12 @@ mod tests {
                 None,
                 "a clean replay must reset the prior query's interruption receipt",
             );
-            assert!(Arc::ptr_eq(&snapshot_before, &index.snapshot()));
+            assert!(Arc::ptr_eq(
+                &snapshot_before,
+                &index
+                    .snapshot()
+                    .expect("replayed cancellation snapshot is authoritative"),
+            ));
             assert_eq!(
                 index
                     .conformance_pending_writer_state()
@@ -17880,7 +17895,9 @@ mod tests {
                 .expect("final-refill UNION_HORIZON Quill index");
             let controller = index.conformance_cancellation_controller();
             assert_eq!(controller.query_interruption_location(), None);
-            let snapshot_before = index.snapshot();
+            let snapshot_before = index
+                .snapshot()
+                .expect("final-refill snapshot is authoritative");
             let writer_before = index
                 .conformance_pending_writer_state()
                 .expect("capture final-refill UNION_HORIZON writer state");
@@ -17957,7 +17974,12 @@ mod tests {
                 );
                 assert_eq!(controller.discarded_pruning_trace_sessions(), 0);
                 assert!(cx.is_cancel_requested());
-                assert!(Arc::ptr_eq(&snapshot_before, &index.snapshot()));
+                assert!(Arc::ptr_eq(
+                    &snapshot_before,
+                    &index
+                        .snapshot()
+                        .expect("final-refill snapshot is authoritative"),
+                ));
                 assert_eq!(
                     index
                         .conformance_pending_writer_state()
@@ -18049,7 +18071,12 @@ mod tests {
                 None,
                 "a clean replay must reset the prior query's interruption receipt",
             );
-            assert!(Arc::ptr_eq(&snapshot_before, &index.snapshot()));
+            assert!(Arc::ptr_eq(
+                &snapshot_before,
+                &index
+                    .snapshot()
+                    .expect("replayed final-refill snapshot is authoritative"),
+            ));
             assert_eq!(
                 index
                     .conformance_pending_writer_state()
@@ -18068,7 +18095,9 @@ mod tests {
             let (subject, _oracle) =
                 build_tombstoned_union_horizon_single_segment_pair(&cx, &fixture).await;
             let index = subject.index().expect("fuel UNION_HORIZON Quill index");
-            let source_snapshot = index.snapshot();
+            let source_snapshot = index
+                .snapshot()
+                .expect("fuel source snapshot is authoritative");
             let (control_result, control_trace) = index
                 .search_paginated_with_conformance_pruning_trace(
                     &cx,
@@ -18141,7 +18170,9 @@ mod tests {
             .expect("bind UNION_HORIZON failing fuel snapshot");
             let failing_controller = failing_index.conformance_cancellation_controller();
             assert_eq!(failing_controller.query_interruption_location(), None);
-            let failing_snapshot_before = failing_index.snapshot();
+            let failing_snapshot_before = failing_index
+                .snapshot()
+                .expect("failing fuel snapshot is authoritative");
             let failing_writer_before = failing_index
                 .conformance_pending_writer_state()
                 .expect("capture UNION_HORIZON failing fuel writer state");
@@ -18172,7 +18203,9 @@ mod tests {
             );
             assert!(Arc::ptr_eq(
                 &failing_snapshot_before,
-                &failing_index.snapshot(),
+                &failing_index
+                    .snapshot()
+                    .expect("first failing fuel snapshot is authoritative"),
             ));
             assert_eq!(
                 failing_index
@@ -18206,7 +18239,9 @@ mod tests {
             );
             assert!(Arc::ptr_eq(
                 &failing_snapshot_before,
-                &failing_index.snapshot(),
+                &failing_index
+                    .snapshot()
+                    .expect("repeated failing fuel snapshot is authoritative"),
             ));
             assert_eq!(
                 failing_index

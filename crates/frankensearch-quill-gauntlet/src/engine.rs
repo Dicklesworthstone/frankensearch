@@ -5111,7 +5111,9 @@ mod tests {
         seed: u64,
         corpus_hash: u64,
     ) -> E55CaseEvidence {
-        let snapshot = index.search_snapshot();
+        let snapshot = index
+            .search_snapshot()
+            .expect("E5.5 published snapshot is authoritative");
         let query_text = match &query.input {
             E55QueryInput::Source(source) => (*source).to_owned(),
             E55QueryInput::Preparsed(_) => format!("<preparsed:{}>", query.id),
@@ -5220,7 +5222,9 @@ mod tests {
             docids.windows(2).all(|window| window[0] < window[1]),
             "E5.5 docset is sorted and unique"
         );
-        let snapshot = index.search_snapshot();
+        let snapshot = index
+            .search_snapshot()
+            .expect("E5.5 published snapshot is authoritative");
         let hits = docids
             .into_iter()
             .map(|global_docid| RankedHit {
@@ -5272,7 +5276,10 @@ mod tests {
         let config = e55_config();
         let index = QuillIndex::in_memory_with_schema(E55_SCHEMA, config)
             .expect("construct historical E5.5 index");
-        let generation = index.search_snapshot().keeper_generation();
+        let generation = index
+            .search_snapshot()
+            .expect("historical E5.5 snapshot is authoritative")
+            .keeper_generation();
         let mut historical = E55DeltaBuilder::new(0);
         let (historical_docid, replaced) = historical.add(E55Document::new(
             E55_HISTORICAL_ID,
@@ -5300,17 +5307,25 @@ mod tests {
         assert_eq!(
             index
                 .search_snapshot()
+                .expect("historical E5.5 snapshot is authoritative")
                 .materialize_document_id(historical_docid)
                 .as_deref(),
             Some(E55_HISTORICAL_ID),
             "the sealed upsert source remains live until its replacement is staged"
         );
-        let baseline_history_segments = index.snapshot().segments().len();
+        let baseline_history_segments = index
+            .snapshot()
+            .expect("historical E5.5 snapshot is authoritative")
+            .segments()
+            .len();
         (index, baseline_history_segments, historical_docid)
     }
 
     fn e55_tombstone_sealed_upsert_source(index: &QuillIndex, historical_docid: u32) -> QuillIndex {
-        let committed = index.snapshot().clone();
+        let committed = index
+            .snapshot()
+            .expect("sealed upsert source snapshot is authoritative")
+            .clone();
         assert_eq!(
             committed
                 .materialize_document_id(historical_docid)
@@ -5421,6 +5436,7 @@ mod tests {
     ) -> E55LiveCorpus {
         let lease_base = index
             .snapshot()
+            .expect("E5.5 live corpus snapshot is authoritative")
             .loaded_manifest()
             .manifest
             .docid_high_watermark;
@@ -5436,7 +5452,10 @@ mod tests {
             extras_per_delta + 16 < DOC_ORDS_PER_LEASE as usize,
             "seeded E5.5 fixture stays within each Q1 lease"
         );
-        let generation = index.search_snapshot().keeper_generation();
+        let generation = index
+            .search_snapshot()
+            .expect("E5.5 published snapshot is authoritative")
+            .keeper_generation();
         let mut random = seed;
 
         let mut first = E55DeltaBuilder::new(lease_base);
@@ -5451,6 +5470,7 @@ mod tests {
         assert_eq!(
             index
                 .search_snapshot()
+                .expect("E5.5 published snapshot is authoritative")
                 .materialize_document_id(historical_docid)
                 .as_deref(),
             Some(E55_HISTORICAL_ID),
@@ -5471,6 +5491,7 @@ mod tests {
         assert_eq!(
             index
                 .search_snapshot()
+                .expect("E5.5 published snapshot is authoritative")
                 .materialize_document_id(historical_docid)
                 .as_deref(),
             Some(E55_HISTORICAL_ID),
@@ -5603,7 +5624,9 @@ mod tests {
     }
 
     fn e55_stats_witness(index: &QuillIndex) -> E55StatsWitness {
-        let snapshot = index.search_snapshot();
+        let snapshot = index
+            .search_snapshot()
+            .expect("E5.5 published snapshot is authoritative");
         let fields = [
             E55_ID_FIELD,
             E55_CONTENT_FIELD,
@@ -5650,7 +5673,9 @@ mod tests {
     }
 
     fn e55_live_leaf_ranges(index: &QuillIndex, baseline_dead_segments: usize) -> Vec<(u64, u64)> {
-        let snapshot = index.search_snapshot();
+        let snapshot = index
+            .search_snapshot()
+            .expect("E5.5 published snapshot is authoritative");
         let mut ranges = snapshot
             .keeper_snapshot()
             .segments()
@@ -5685,7 +5710,9 @@ mod tests {
         retired_docids: &[u32],
         replacement_docid: u32,
     ) {
-        let snapshot = index.search_snapshot();
+        let snapshot = index
+            .search_snapshot()
+            .expect("E5.5 published snapshot is authoritative");
         for (document_id, &global_docid) in expected_live {
             assert_eq!(
                 snapshot
@@ -5734,7 +5761,9 @@ mod tests {
         expected_delta_leaves: usize,
         context: &E55CaptureContext<'_>,
     ) -> E55ResidencyEvidence {
-        let snapshot = index.search_snapshot();
+        let snapshot = index
+            .search_snapshot()
+            .expect("E5.5 published snapshot is authoritative");
         let raw_keeper_segments = snapshot.keeper_snapshot().segments().len();
         let new_keeper_segments = raw_keeper_segments
             .checked_sub(context.baseline_dead_segments)
@@ -5807,7 +5836,9 @@ mod tests {
         state: &'static str,
         expected: E410EdgeStateShape,
     ) -> BTreeMap<String, E55CaseEvidence> {
-        let snapshot = index.search_snapshot();
+        let snapshot = index
+            .search_snapshot()
+            .expect("E4.10 published snapshot is authoritative");
         let keeper = snapshot.keeper_snapshot();
         assert_eq!(
             keeper.segments().len(),
@@ -5962,7 +5993,10 @@ mod tests {
     fn e410_delta_only_index() -> QuillIndex {
         let index = QuillIndex::in_memory_with_schema(E55_SCHEMA, e55_config())
             .expect("construct strict E4.10 Delta-only index");
-        let generation = index.search_snapshot().keeper_generation();
+        let generation = index
+            .search_snapshot()
+            .expect("strict E4.10 snapshot is authoritative")
+            .keeper_generation();
         let mut delta = E55DeltaBuilder::new(0);
         let (_, replaced) = delta.add(E55Document::new(
             E55_HISTORICAL_ID,
@@ -6124,7 +6158,10 @@ mod tests {
             e55_index_with_live_history(cx).await;
         let mut corpus = e55_build_live_corpus(&index, seed, extras_per_delta, historical_docid);
         let index = e55_tombstone_sealed_upsert_source(&index, historical_docid);
-        let successor_generation = index.search_snapshot().keeper_generation();
+        let successor_generation = index
+            .search_snapshot()
+            .expect("sealed-upsert successor snapshot is authoritative")
+            .keeper_generation();
         corpus.first = Arc::new(corpus.first.rebind_keeper_generation(successor_generation));
         corpus.second = Arc::new(corpus.second.rebind_keeper_generation(successor_generation));
         let mut retired_docids = corpus.retired_docids.clone();
@@ -6157,6 +6194,7 @@ mod tests {
 
         let mixed_generation = index
             .search_snapshot()
+            .expect("mixed-residency snapshot is authoritative")
             .keeper_generation()
             .checked_add(1)
             .expect("mixed E5.5 Keeper generation fits u64");
@@ -9741,7 +9779,8 @@ mod tests {
                     rejected
                         .index()
                         .expect("E6.3 read rejected duplicate lifecycle campaign")
-                        .doc_count(),
+                        .doc_count()
+                        .expect("E6.3 rejected campaign count is authoritative"),
                     0,
                     "E6.3 seed {seed:#x} a rejected ingest must not publish part of its batch"
                 );

@@ -192,7 +192,13 @@ async fn build_index(cx: &Cx, shape: &Shape, seed: u64) -> QuillIndex {
     }
     let expected_documents = shape.batches * shape.docs_per_batch;
     assert_eq!(
-        usize::try_from(index.snapshot().doc_count()).expect("snapshot document count fits usize"),
+        usize::try_from(
+            index
+                .snapshot()
+                .expect("benchmark snapshot is authoritative")
+                .doc_count(),
+        )
+        .expect("snapshot document count fits usize"),
         expected_documents,
         "every benchmark document must be live before timing"
     );
@@ -373,7 +379,11 @@ fn main() {
                 "[setup] shape={} docs={} physical_segments={} build_ms={:.1}",
                 shape.name,
                 shape.batches * shape.docs_per_batch,
-                index.snapshot().segments().len(),
+                index
+                    .snapshot()
+                    .expect("benchmark snapshot is authoritative")
+                    .segments()
+                    .len(),
                 built_at.elapsed().as_secs_f64() * 1_000.0,
             );
             run_shape(&cx, shape, rounds, &limits, &index);

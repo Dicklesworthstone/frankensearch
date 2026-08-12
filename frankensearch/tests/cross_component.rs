@@ -1497,6 +1497,7 @@ mod four_engine_generation_receipts {
 
             let lexical = index
                 .snapshot()
+                .expect("committed Quill snapshot is authoritative")
                 .exact_lexical_component_receipt(checkpoint)
                 .expect("lexical receipt from the committed keeper snapshot");
 
@@ -1607,7 +1608,9 @@ mod four_engine_generation_receipts {
                 .expect("index the shared document set into Quill");
             index.commit(&cx).await.expect("commit the Quill segment");
 
-            let snapshot = index.snapshot();
+            let snapshot = index
+                .snapshot()
+                .expect("committed Quill snapshot is authoritative");
             let lexical = snapshot
                 .exact_lexical_component_receipt(checkpoint)
                 .expect("lexical receipt");
@@ -1742,6 +1745,7 @@ mod four_engine_generation_receipts {
             index.commit(&cx).await.expect("commit the Quill segment");
             let lexical = index
                 .snapshot()
+                .expect("committed Quill snapshot is authoritative")
                 .exact_lexical_component_receipt(checkpoint)
                 .expect("lexical receipt");
 
