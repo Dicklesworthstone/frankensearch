@@ -15808,6 +15808,28 @@ mod tests {
         )?)
     }
 
+    fn reseal_test_segment_file_witness(
+        bytes: &mut [u8],
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        const FILE_WITNESS_LEN: usize = std::mem::size_of::<u64>();
+        const TRAILER_CRC_LEN: usize = std::mem::size_of::<u32>();
+        const TRAILER_LEN: usize = FILE_WITNESS_LEN + TRAILER_CRC_LEN;
+
+        let trailer_start =
+            bytes
+                .len()
+                .checked_sub(TRAILER_LEN)
+                .ok_or_else(|| QuillError::Invariant {
+                    detail: "test FSLX segment was shorter than its trailer".to_owned(),
+                })?;
+        let file_xxh3 = xxhash_rust::xxh3::xxh3_64(&bytes[..trailer_start]);
+        bytes[trailer_start..trailer_start + FILE_WITNESS_LEN]
+            .copy_from_slice(&file_xxh3.to_le_bytes());
+        let trailer_crc = crc32fast::hash(&bytes[trailer_start..trailer_start + FILE_WITNESS_LEN]);
+        bytes[trailer_start + FILE_WITNESS_LEN..].copy_from_slice(&trailer_crc.to_le_bytes());
+        Ok(file_xxh3)
+    }
+
     fn write_identity_test_segment(
         directory: &Path,
         segment_id: u64,
@@ -18596,12 +18618,13 @@ mod tests {
         let doclen_offset = usize::try_from(doclen.offset)?;
         let mut bytes = encoded.as_bytes().to_vec();
         bytes[doclen_offset] ^= 0x80;
+        let file_xxh3 = reseal_test_segment_file_witness(&mut bytes)?;
         std::fs::write(directory.path().join(canonical_segment_name(0xabc)), bytes)?;
         let segment = ManifestSegment {
             segment_id: 0xabc,
             seal_seq: 1,
             file_len: encoded.file_len(),
-            file_xxh3: encoded.file_xxh3(),
+            file_xxh3,
             docid_lo: 10,
             docid_hi: 20,
             doc_count: 1,
@@ -18814,6 +18837,7 @@ mod tests {
         let term_dictionary_offset = usize::try_from(term_dictionary.offset)?;
         let mut bytes = encoded.as_bytes().to_vec();
         bytes[term_dictionary_offset] ^= 0x80;
+        let file_xxh3 = reseal_test_segment_file_witness(&mut bytes)?;
         std::fs::write(directory.path().join(canonical_segment_name(0xacd)), bytes)?;
         let manifest = durable_test_manifest(
             1,
@@ -18821,7 +18845,7 @@ mod tests {
                 segment_id: 0xacd,
                 seal_seq: 1,
                 file_len: encoded.file_len(),
-                file_xxh3: encoded.file_xxh3(),
+                file_xxh3,
                 docid_lo: 10,
                 docid_hi: 20,
                 doc_count: 1,
@@ -18842,6 +18866,76 @@ mod tests {
             directory_bytes(directory.path())?,
             before,
             "read-only recovery must not mutate after rejecting TERMDICT"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_witness_rejects_resealed_segment_with_stale_manifest() -> TestResult {
+        let directory = tempdir()?;
+        let encoded = encoded_test_segment(0xace, 10, 20, 1)?;
+        let doclen = encoded
+            .section_entries()
+            .iter()
+            .find(|entry| entry.kind == SectionKind::DOCLEN)
+            .expect("doclen entry");
+        let doclen_offset = usize::try_from(doclen.offset)?;
+        let mut bytes = encoded.as_bytes().to_vec();
+        bytes[doclen_offset] ^= 0x80;
+        let resealed_file_xxh3 = reseal_test_segment_file_witness(&mut bytes)?;
+        assert_ne!(resealed_file_xxh3, encoded.file_xxh3());
+        assert_eq!(
+            SegmentReader::from_owned(bytes.clone(), DEFAULT_SCHEMA)?.verify_file_witness()?,
+            resealed_file_xxh3,
+            "the hostile fixture must retain a self-consistent FSLX trailer"
+        );
+        std::fs::write(directory.path().join(canonical_segment_name(0xace)), bytes)?;
+
+        let mut manifest = durable_test_manifest(
+            1,
+            vec![ManifestSegment {
+                segment_id: 0xace,
+                seal_seq: 1,
+                file_len: encoded.file_len(),
+                file_xxh3: encoded.file_xxh3(),
+                docid_lo: 10,
+                docid_hi: 20,
+                doc_count: 1,
+                tombstones: TombstoneSet::new(),
+            }],
+        );
+        let manifest_path = directory.path().join("MANIFEST");
+        write_manifest(&manifest_path, &manifest)?;
+        let before_rejection = directory_bytes(directory.path())?;
+
+        assert!(matches!(
+            KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA),
+            Err(KeeperError::SegmentMetadataMismatch { detail, .. })
+                if detail
+                    == format!(
+                        "actual file_xxh3 {resealed_file_xxh3:#018x} != manifest {:#018x}",
+                        encoded.file_xxh3()
+                    )
+        ));
+        assert_eq!(
+            directory_bytes(directory.path())?,
+            before_rejection,
+            "read-only rejection must not mutate the stale-manifest fixture"
+        );
+
+        manifest.segments[0].file_xxh3 = resealed_file_xxh3;
+        write_manifest(&manifest_path, &manifest)?;
+        let before_control_open = directory_bytes(directory.path())?;
+        let snapshot = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+        assert_eq!(snapshot.segments().len(), 1);
+        assert_eq!(
+            snapshot.segments()[0].term_dictionary_cache_counts(),
+            (1, 0)
+        );
+        assert_eq!(
+            directory_bytes(directory.path())?,
+            before_control_open,
+            "read-only control open must not mutate the matching-manifest fixture"
         );
         Ok(())
     }
