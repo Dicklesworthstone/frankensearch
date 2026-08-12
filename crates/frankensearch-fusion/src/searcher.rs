@@ -277,6 +277,7 @@ pub struct TwoTierSearcher {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CancellationTestBoundary {
     RefinedResultConstruction,
+    #[cfg(feature = "rerank")]
     Phase3Explanation,
 }
 
@@ -5575,6 +5576,64 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "rerank")]
+    #[test]
+    fn public_search_cancellation_after_reranker_stops_before_score_mutation() {
+        let rerank_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index_with_quality(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let quality = Arc::new(StubEmbedder::new("quality", 4));
+            let adapter = Arc::new(RecordingHostAdapter::new("post_reranker_cancellation"));
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                .with_quality_embedder(quality)
+                .with_reranker(Arc::new(CountingReranker::cancelling(rerank_calls.clone())))
+                .with_host_adapter(adapter.clone());
+
+            let mut phases = Vec::new();
+            let mut refined_results = Vec::new();
+            let error = searcher
+                .search(
+                    &cx,
+                    "test query",
+                    5,
+                    |_| Some("rerank text".to_owned()),
+                    |phase| match phase {
+                        SearchPhase::Initial { .. } => phases.push("initial"),
+                        SearchPhase::Refined { results, .. } => {
+                            phases.push("refined");
+                            refined_results = results;
+                        }
+                        SearchPhase::Reranked { .. } => phases.push("reranked"),
+                        SearchPhase::RefinementFailed { .. } => phases.push("refinement_failed"),
+                    },
+                )
+                .await
+                .expect_err("reranker-originated Cx cancellation must stop before mutation");
+
+            assert!(matches!(
+                error,
+                SearchError::Cancelled { phase, reason }
+                    if phase == "reranker_to_score_validation"
+                        && reason == "user: cancel after reranker scores"
+            ));
+            assert_eq!(phases, vec!["initial", "refined"]);
+            assert_eq!(
+                rerank_calls.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "the controlled reranker must return scores after cancelling the real Cx"
+            );
+            assert!(
+                refined_results.iter().all(|result| {
+                    result.rerank_score.is_none() && result.source != ScoreSource::Reranked
+                }),
+                "no reranked score mutation may reach a public phase"
+            );
+            assert_single_cancelled_session_stop(&adapter, "reranker_to_score_validation");
+        });
+    }
+
     #[test]
     fn public_search_cancellation_at_refined_construction_stops_before_publication() {
         for re_fusion in [false, true] {
@@ -7838,12 +7897,23 @@ mod tests {
     #[cfg(feature = "rerank")]
     struct CountingReranker {
         calls: Arc<std::sync::atomic::AtomicUsize>,
+        cancel_after_scores: bool,
     }
 
     #[cfg(feature = "rerank")]
     impl CountingReranker {
         fn new(calls: Arc<std::sync::atomic::AtomicUsize>) -> Self {
-            Self { calls }
+            Self {
+                calls,
+                cancel_after_scores: false,
+            }
+        }
+
+        fn cancelling(calls: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            Self {
+                calls,
+                cancel_after_scores: true,
+            }
         }
     }
 
@@ -7851,25 +7921,40 @@ mod tests {
     impl Reranker for CountingReranker {
         fn rerank<'a>(
             &'a self,
-            _cx: &'a Cx,
+            cx: &'a Cx,
             _query: &'a str,
             docs: &'a [frankensearch_core::traits::RerankDocument],
         ) -> SearchFuture<'a, Vec<frankensearch_core::traits::RerankScore>> {
             self.calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let cancel_after_scores = self.cancel_after_scores;
             let scores = docs
                 .iter()
                 .enumerate()
                 .map(
                     |(original_rank, doc)| frankensearch_core::traits::RerankScore {
                         doc_id: doc.doc_id.clone(),
-                        score: 1.0 - original_rank as f32 * 0.1,
+                        score: if cancel_after_scores {
+                            // Ascending scores would reverse the reranked
+                            // window if mutation proceeded after cancellation.
+                            original_rank as f32
+                        } else {
+                            1.0 - original_rank as f32 * 0.1
+                        },
                         original_rank,
                         raw_logit: None,
                     },
                 )
                 .collect();
-            Box::pin(async move { Ok(scores) })
+            Box::pin(async move {
+                if cancel_after_scores {
+                    cx.cancel_with(
+                        asupersync::CancelKind::User,
+                        Some("cancel after reranker scores"),
+                    );
+                }
+                Ok(scores)
+            })
         }
 
         fn id(&self) -> &str {

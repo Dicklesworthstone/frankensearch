@@ -190,6 +190,16 @@ pub async fn rerank_step_with_combine(
         }
     };
 
+    // A reranker may cancel the supplied invocation context while still
+    // successfully returning scores. Observe that authority before score
+    // validation, candidate mutation, or reordering begins.
+    cx.checkpoint().map_err(|error| SearchError::Cancelled {
+        phase: "reranker_to_score_validation".to_owned(),
+        reason: cx
+            .cancel_reason()
+            .map_or_else(|| error.to_string(), |reason| reason.to_string()),
+    })?;
+
     // Validate score count matches
     if scores.len() != rerank_docs.len() {
         tracing::warn!(
@@ -961,21 +971,32 @@ mod tests {
         assert_eq!(DEFAULT_MIN_CANDIDATES, 5);
     }
 
-    /// Reranker that returns `SearchError::Cancelled`.
+    /// Reranker that cancels the real invocation context but still returns scores.
     struct CancellingReranker;
 
     impl Reranker for CancellingReranker {
         fn rerank<'a>(
             &'a self,
-            _cx: &'a Cx,
+            cx: &'a Cx,
             _query: &'a str,
-            _documents: &'a [RerankDocument],
+            documents: &'a [RerankDocument],
         ) -> SearchFuture<'a, Vec<RerankScore>> {
-            Box::pin(async {
-                Err(SearchError::Cancelled {
-                    phase: "rerank".into(),
-                    reason: "test cancellation".into(),
+            let scores = documents
+                .iter()
+                .enumerate()
+                .map(|(original_rank, document)| RerankScore {
+                    doc_id: document.doc_id.clone(),
+                    score: if original_rank == 0 { 0.0 } else { 1.0 },
+                    original_rank,
+                    raw_logit: None,
                 })
+                .collect();
+            Box::pin(async move {
+                cx.cancel_with(
+                    asupersync::CancelKind::User,
+                    Some("cancel after reranker scores"),
+                );
+                Ok(scores)
             })
         }
 
@@ -993,6 +1014,14 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let reranker = CancellingReranker;
             let mut candidates = make_candidates(10);
+            let original_ids: Vec<_> = candidates
+                .iter()
+                .map(|candidate| candidate.doc_id.clone())
+                .collect();
+            let original_scores: Vec<_> = candidates
+                .iter()
+                .map(|candidate| candidate.score.to_bits())
+                .collect();
 
             let err = rerank_step(
                 &cx,
@@ -1006,9 +1035,33 @@ mod tests {
             .await
             .expect_err("cancellation should propagate");
 
+            assert!(matches!(
+                err,
+                SearchError::Cancelled { phase, reason }
+                    if phase == "reranker_to_score_validation"
+                        && reason == "user: cancel after reranker scores"
+            ));
+            assert_eq!(
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.doc_id.clone())
+                    .collect::<Vec<_>>(),
+                original_ids,
+                "cancellation before score validation must preserve candidate order"
+            );
+            assert_eq!(
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.score.to_bits())
+                    .collect::<Vec<_>>(),
+                original_scores,
+                "cancellation before score validation must preserve score bits"
+            );
             assert!(
-                matches!(err, SearchError::Cancelled { .. }),
-                "should be Cancelled, got: {err:?}"
+                candidates.iter().all(|candidate| {
+                    candidate.rerank_score.is_none() && candidate.source == ScoreSource::Hybrid
+                }),
+                "cancellation before score validation must not mutate rerank state"
             );
         });
     }
