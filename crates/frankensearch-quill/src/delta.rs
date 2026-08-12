@@ -840,6 +840,16 @@ impl DeltaSnapshot {
         &self.segment
     }
 
+    /// Number of physical rows retained by this immutable delta generation.
+    ///
+    /// Tombstoned rows remain physical work for posting scans and therefore
+    /// remain part of admission and fuel accounting even though they are not
+    /// included in [`Self::live_document_count`].
+    #[must_use]
+    pub fn physical_document_count(&self) -> usize {
+        self.segment.physical_document_count()
+    }
+
     /// Keeper MANIFEST generation this delta epoch was derived from.
     #[must_use]
     pub const fn keeper_generation(&self) -> u64 {
@@ -3898,6 +3908,10 @@ mod tests {
         assert_eq!(delta.physical_document_count(), 3);
         assert_eq!(delta.live_document_count(), 1);
         assert_eq!(delta.live_total_tokens(1), Some(1));
+
+        let frozen = delta.freeze(7);
+        assert_eq!(frozen.physical_document_count(), 3);
+        assert_eq!(frozen.live_document_count(), 1);
 
         let term = delta.find_term(1, b"term").expect("term view");
         assert_eq!(term.physical_doc_freq(), 3);
