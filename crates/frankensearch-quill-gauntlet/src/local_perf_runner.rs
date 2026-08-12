@@ -49,7 +49,10 @@ use crate::machine_class_registry::{
     RunnerExecutionRequest, RunnerExecutionSnapshot, RunnerHardware, RunnerProducer, RunnerReceipt,
     VerifiedRunnerIdentity, seal_runner_receipt, sha256_hex,
 };
-use crate::perf::Qg1AuthorityRegisterEntryV1;
+use crate::perf::{
+    Qg1AuthorityRegisterEntryV1, Qg1AuthorityRoleV1, Qg1ExpectedAuthority,
+    Qg1PinnedAuthorityTargetV1, Qg1TargetPinV1,
+};
 use crate::{
     EvidenceArtifactError, PerfApplicabilityPlan, PerfApplicabilityPlanBinding,
     PerfEvidenceArtifact, PerfGate, PerfGateArtifact, PerfMatrixSpec, command_sha256_from_argv,
@@ -496,17 +499,129 @@ struct Qg1AuthorityForwarder {
 }
 
 #[derive(Debug)]
+/// Role-qualified accepted authorities for one frozen QG-1 selection.
+///
+/// One cell now carries SEVERAL independent authorities — every preregistered
+/// pilot screen plus exactly one fresh decision — so a cell-keyed map can no
+/// longer represent an accepted set. The key is `(cell_id, role)` and the value
+/// is the set of authenticated digests admitted under it.
+///
+/// Both halves of the key come from [`Qg1AuthorityRegisterEntryV1::verified_registration`],
+/// which derives them from the SEALED authority: the role from its canonical
+/// stream-role set and the digest from its content address. Nothing a producer
+/// can label reaches this map, so relabeling an unchanged authority cannot move
+/// it between roles — it would have to seal a different authority, which is a
+/// different digest.
+///
+/// `seen_digests` spans every cell and role at once: an authority already
+/// admitted anywhere is a replay, even under a key that has room for it.
 struct AcceptedQg1Authorities {
     directory: Option<PinnedDirectory>,
-    cell_digests: BTreeMap<String, String>,
+    role_digests: BTreeMap<(String, Qg1AuthorityRoleV1), BTreeSet<String>>,
+    seen_digests: BTreeSet<String>,
+    entries: BTreeMap<String, Qg1AuthorityRegisterEntryV1>,
+    expected_authorities: BTreeMap<String, Qg1ExpectedAuthority>,
 }
 
 impl AcceptedQg1Authorities {
     const fn new() -> Self {
         Self {
             directory: None,
-            cell_digests: BTreeMap::new(),
+            role_digests: BTreeMap::new(),
+            seen_digests: BTreeSet::new(),
+            entries: BTreeMap::new(),
+            expected_authorities: BTreeMap::new(),
         }
+    }
+
+    /// Digests admitted for one exact `(cell, role)` key.
+    fn digests_for(&self, cell_id: &str, role: Qg1AuthorityRoleV1) -> usize {
+        self.role_digests
+            .get(&(cell_id.to_owned(), role))
+            .map_or(0, BTreeSet::len)
+    }
+
+    /// Total admitted authorities across every cell and role.
+    fn total(&self) -> usize {
+        self.seen_digests.len()
+    }
+
+    /// Bind the retained verified register entries through the exact durable
+    /// target pin that was written before the child received its final ACK.
+    fn bind_expected_authorities(&mut self, pin: &Qg1TargetPinV1) -> Result<(), LocalPerfRunError> {
+        pin.verify().map_err(|error| {
+            LocalPerfRunError::Invalid(format!(
+                "persisted QG-1 target pin was rejected before authority binding: {error}"
+            ))
+        })?;
+        if !self.expected_authorities.is_empty()
+            || self.entries.len() != self.total()
+            || self
+                .entries
+                .keys()
+                .any(|digest| !self.seen_digests.contains(digest))
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "QG-1 retained register entries do not match the accepted authority set".to_owned(),
+            ));
+        }
+        let mut expected_authorities = BTreeMap::new();
+        for (digest, entry) in &self.entries {
+            if entry.digest() != digest.as_str() {
+                return Err(LocalPerfRunError::Invalid(
+                    "QG-1 retained register entry changed its content-addressed digest".to_owned(),
+                ));
+            }
+            let expected = entry.to_expected_authority(pin).map_err(|error| {
+                LocalPerfRunError::Invalid(format!(
+                    "QG-1 retained register entry is not bound by the persisted target pin: {error}"
+                ))
+            })?;
+            if expected.digest() != digest.as_str()
+                || expected_authorities
+                    .insert(digest.clone(), expected)
+                    .is_some()
+            {
+                return Err(LocalPerfRunError::Invalid(
+                    "QG-1 target pin did not bind one unique retained expected authority"
+                        .to_owned(),
+                ));
+            }
+        }
+        let pinned_digests = pin
+            .targets()
+            .map(|(_, target)| target.authority_sha256.clone())
+            .collect::<BTreeSet<_>>();
+        if pinned_digests != self.seen_digests || expected_authorities.len() != pin.target_count() {
+            return Err(LocalPerfRunError::Invalid(
+                "QG-1 persisted target pin and retained register entries name different authority sets"
+                    .to_owned(),
+            ));
+        }
+        self.expected_authorities = expected_authorities;
+        Ok(())
+    }
+
+    /// Borrow the independently retained expectations used to authenticate a
+    /// persisted QG-1 artifact. Empty is valid only for a non-QG-1 run.
+    fn expected_authority_refs(&self) -> Result<Vec<&Qg1ExpectedAuthority>, LocalPerfRunError> {
+        if self.total() == 0 && self.entries.is_empty() && self.expected_authorities.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.entries.len() != self.total()
+            || self.expected_authorities.len() != self.entries.len()
+            || self.expected_authorities.keys().any(|digest| {
+                self.entries
+                    .get(digest)
+                    .is_none_or(|entry| entry.digest() != digest.as_str())
+            })
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "QG-1 expected authority set is absent, incomplete, or not derived from retained registers"
+                    .to_owned(),
+            ));
+        }
+        Ok(self.expected_authorities.values().collect())
     }
 }
 
@@ -1207,6 +1322,23 @@ impl LocalPerfAttemptReceipt {
         &self,
         bound_evidence_bytes: &[u8],
     ) -> Result<(), LocalPerfRunError> {
+        self.verify_bound_evidence_against_qg1_authorities(bound_evidence_bytes, &[])
+    }
+
+    /// Prove that exact completed bound-evidence bytes are the object named by
+    /// this process receipt, authenticating QG-1 evidence only through the
+    /// independently retained authority set supplied by the caller.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a failed-attempt receipt, a substituted or malformed artifact,
+    /// or QG-1 evidence whose retained external authority is absent or does
+    /// not authenticate the replay.
+    pub fn verify_bound_evidence_against_qg1_authorities(
+        &self,
+        bound_evidence_bytes: &[u8],
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+    ) -> Result<(), LocalPerfRunError> {
         let expected = self.bound_evidence_sha256.as_deref().ok_or_else(|| {
             LocalPerfRunError::Invalid(
                 "failed attempt receipt cannot bind completed evidence".to_owned(),
@@ -1217,7 +1349,10 @@ impl LocalPerfAttemptReceipt {
                 "bound-evidence bytes differ from the sealed process receipt".to_owned(),
             ));
         }
-        let evidence = PerfEvidenceArtifact::from_verified_slice(bound_evidence_bytes)?;
+        let evidence = PerfEvidenceArtifact::from_verified_slice_against_qg1_authorities(
+            bound_evidence_bytes,
+            external_qg1_authorities,
+        )?;
         if evidence.gate.label() != self.gate
             || evidence.applicability_plan != self.applicability_plan
             || evidence.provenance.run_id != self.run_id
@@ -2016,6 +2151,9 @@ fn run_local_perf_command_inner(
             qg1_startup_deadline.expect("QG-1 startup deadline is armed before the child spawn"),
             forwarder,
             &mut handshake_log,
+            &config.run_id,
+            &captured_build.revision,
+            !captured_build.receipt.producer.source_git_dirty,
         )?;
         (
             status,
@@ -2217,6 +2355,14 @@ fn run_local_perf_command_inner(
         // persisted evidence and prove complete selected-cell coverage.
         return Err(post_exit_rejection(stage)?);
     }
+    let qg1_expected_authorities = match qg1_accepted_authorities.expected_authority_refs() {
+        Ok(authorities) => authorities,
+        Err(_) => {
+            return Err(post_exit_rejection(
+                LocalPerfRejectionStage::ArtifactVerification,
+            )?);
+        }
+    };
     if let Some(error_kind) = recovered_wait_error {
         let outcome = LocalPerfAttemptOutcome::WaitRecoveredByKill { error_kind };
         let attempt_path = write_failed_attempt_receipt(
@@ -2348,7 +2494,7 @@ fn run_local_perf_command_inner(
             )?);
         }
     };
-    let evidence = match read_canonical_evidence(&evidence_bytes) {
+    let evidence = match read_canonical_evidence(&evidence_bytes, &qg1_expected_authorities) {
         Ok(evidence) => evidence,
         Err(_) => {
             return Err(post_exit_rejection(
@@ -2479,7 +2625,12 @@ fn run_local_perf_command_inner(
             )?);
         }
     };
-    if PerfEvidenceArtifact::from_verified_slice(&bound_evidence_bytes).is_err() {
+    if PerfEvidenceArtifact::from_verified_slice_against_qg1_authorities(
+        &bound_evidence_bytes,
+        &qg1_expected_authorities,
+    )
+    .is_err()
+    {
         return Err(post_exit_rejection(
             LocalPerfRejectionStage::ArtifactVerification,
         )?);
@@ -2533,6 +2684,7 @@ fn run_local_perf_command_inner(
         &end,
         &lease_identity,
         &bound_evidence_bytes,
+        &qg1_expected_authorities,
         &run_log_bytes,
         process_lifecycle,
         root_process_identity,
@@ -2664,7 +2816,11 @@ fn run_local_perf_command_inner(
         }
     };
     if persisted_bound != bound_evidence_bytes
-        || PerfEvidenceArtifact::from_verified_slice(&persisted_bound).is_err()
+        || PerfEvidenceArtifact::from_verified_slice_against_qg1_authorities(
+            &persisted_bound,
+            &qg1_expected_authorities,
+        )
+        .is_err()
     {
         return Err(post_exit_rejection(
             LocalPerfRejectionStage::PersistedPairVerification,
@@ -2681,7 +2837,10 @@ fn run_local_perf_command_inner(
         };
     if completed_attempt.verify_run_log(&run_log_bytes).is_err()
         || completed_attempt
-            .verify_bound_evidence(&persisted_bound)
+            .verify_bound_evidence_against_qg1_authorities(
+                &persisted_bound,
+                &qg1_expected_authorities,
+            )
             .is_err()
         || verify_external_paths(&external_paths).is_err()
         || verify_run_directories(config, &run_directories).is_err()
@@ -2721,7 +2880,12 @@ fn run_local_perf_command_inner(
         })?;
     if persisted_attempt != completed_attempt_bytes
         || LocalPerfAttemptReceipt::from_verified_slice(&persisted_attempt)
-            .and_then(|receipt| receipt.verify_bound_evidence(&persisted_bound))
+            .and_then(|receipt| {
+                receipt.verify_bound_evidence_against_qg1_authorities(
+                    &persisted_bound,
+                    &qg1_expected_authorities,
+                )
+            })
             .is_err()
     {
         return Err(LocalPerfRunError::AttemptCommitFailed {
@@ -3188,22 +3352,16 @@ fn create_qg1_authority_directory(
     Ok(authority_directory)
 }
 
+/// Map one verified registration's sealed operation scope onto exactly one
+/// frozen selected cell.
+///
+/// The operation id arrives already verified from
+/// [`Qg1AuthorityRegisterEntryV1::verified_registration`], so this no longer
+/// re-encodes the entry and re-parses JSON to recover it.
 fn qg1_selected_cell_id_for_authority(
-    entry: &Qg1AuthorityRegisterEntryV1,
+    operation_id: &str,
     selection: &ResolvedRunSelection,
 ) -> Result<String, LocalPerfRunError> {
-    let canonical = entry.to_json_bytes().map_err(|error| {
-        LocalPerfRunError::Invalid(format!("QG-1 authority did not re-encode: {error}"))
-    })?;
-    let value: serde_json::Value = serde_json::from_slice(&canonical)?;
-    let operation_id = value
-        .pointer("/authority/scope/operation_id")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            LocalPerfRunError::Invalid(
-                "verified QG-1 authority lacks its canonical operation scope identifier".to_owned(),
-            )
-        })?;
     if operation_id.is_empty()
         || operation_id.len() > MAX_IDENTITY_COMPONENT_BYTES * 4
         || operation_id.bytes().any(|byte| byte.is_ascii_control())
@@ -3281,13 +3439,20 @@ fn qg1_authority_rejection_stage(
     if gate != PerfGate::Qg1 {
         return None;
     }
-    let accepted_cell_ids = accepted
-        .cell_digests
-        .keys()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let set_complete = qg1_expected_authority_cell_ids(selection)
-        .is_ok_and(|expected| expected == accepted_cell_ids);
+    // Role-qualified: a cell is only complete when it carries its single
+    // decision authority and at least one pilot, which is the same rule the
+    // pre-ACK validator applies.
+    let set_complete = qg1_expected_authority_cell_ids(selection).is_ok_and(|expected| {
+        !expected.is_empty()
+            && expected.iter().all(|cell_id| {
+                accepted.digests_for(cell_id, Qg1AuthorityRoleV1::Decision) == 1
+                    && accepted.digests_for(cell_id, Qg1AuthorityRoleV1::Pilot) != 0
+            })
+            && accepted
+                .role_digests
+                .keys()
+                .all(|(cell_id, _)| expected.contains(cell_id))
+    });
     (handshake_failure.is_some() || !set_complete)
         .then_some(LocalPerfRejectionStage::AuthorityHandshake)
 }
@@ -3347,11 +3512,31 @@ fn publish_qg1_authority_entry(
             "QG-1 authority register entry is not the exact canonical producer frame".to_owned(),
         ));
     }
-    let cell_id = qg1_selected_cell_id_for_authority(&entry, selection)?;
-    let digest = entry.digest().to_owned();
-    if accepted.cell_digests.contains_key(&cell_id) {
+    // Cell, role, and digest come from ONE verified derivation over the sealed
+    // authority. `verified_registration` re-verifies the entry and accepts a
+    // role only when the stream-role set is exactly the canonical pilot pair or
+    // the canonical fresh-decision triple, so a producer cannot label an
+    // authority into the role it did not seal.
+    let registration = entry.verified_registration().map_err(|error| {
+        LocalPerfRunError::Invalid(format!(
+            "QG-1 authority register entry did not authenticate its role: {error}"
+        ))
+    })?;
+    let cell_id = qg1_selected_cell_id_for_authority(&registration.operation_id, selection)?;
+    let role = registration.role;
+    let digest = registration.authority_sha256.clone();
+    if digest != entry.digest() {
+        return Err(LocalPerfRunError::Invalid(
+            "QG-1 authority register digest disagrees with its verified registration".to_owned(),
+        ));
+    }
+    // Replay is refused across the WHOLE accepted set, not per key: the same
+    // authority resent under the other role, or under another cell, is the
+    // duplicate this rejects.
+    if !accepted.seen_digests.insert(digest.clone()) {
         return Err(LocalPerfRunError::Invalid(format!(
-            "QG-1 authority register repeated frozen cell {cell_id:?}"
+            "QG-1 authority register replayed authority {digest} for {cell_id:?} as {}",
+            role_label(role)
         )));
     }
     let directory = match accepted.directory.as_ref() {
@@ -3386,8 +3571,133 @@ fn publish_qg1_authority_entry(
                 .to_owned(),
         ));
     }
-    accepted.cell_digests.insert(cell_id, digest.clone());
+    if accepted.entries.insert(digest.clone(), reloaded).is_some() {
+        return Err(LocalPerfRunError::Invalid(
+            "QG-1 authority register digest was retained more than once".to_owned(),
+        ));
+    }
+    accepted
+        .role_digests
+        .entry((cell_id, role))
+        .or_default()
+        .insert(digest.clone());
     Ok(digest)
+}
+
+/// Persist the complete role-qualified authority set as one durable target pin
+/// BEFORE the final acknowledgement is sent.
+///
+/// Ordering is the point. The child treats the ACK as permission to begin
+/// timing, so a pin written after it would leave a window where sampling has
+/// started against a set no durable artifact names. Writing, syncing, rereading
+/// and re-verifying first means the ACK is only ever sent once the retained set
+/// exists on disk and reads back exactly as written.
+///
+/// The map is built from `role_digests` in sorted order, so the pin is
+/// canonical for a given accepted set regardless of arrival order. Each target
+/// carries the role that the sealed authority authenticated, so a later
+/// consumer cannot reinterpret a pilot as the decision.
+fn persist_qg1_target_pin(
+    run: &PinnedDirectory,
+    accepted: &AcceptedQg1Authorities,
+    campaign_run_id: &str,
+    source_git_revision: &str,
+    source_worktree_clean: bool,
+) -> Result<Qg1TargetPinV1, LocalPerfRunError> {
+    let mut target_authorities = BTreeMap::new();
+    for ((cell_id, role), digests) in &accepted.role_digests {
+        // Canonical target ids, exactly as `Qg1TargetPinV1::verify` requires:
+        // pilots are indexed in sorted-digest order as `{op}#pilot/{index}`,
+        // and the sole decision is `{op}#decision`. `role_digests` values are
+        // `BTreeSet`s, so the pilot order here is already digest-sorted and the
+        // pin is canonical for a given accepted set regardless of arrival
+        // order.
+        for (index, digest) in digests.iter().enumerate() {
+            let entry = accepted.entries.get(digest).ok_or_else(|| {
+                LocalPerfRunError::Invalid(format!(
+                    "QG-1 accepted {} authority {digest} for {cell_id:?} has no retained register entry",
+                    role_label(*role)
+                ))
+            })?;
+            let registration = entry.verified_registration().map_err(|error| {
+                LocalPerfRunError::Invalid(format!(
+                    "QG-1 retained register entry for {cell_id:?} did not re-verify while pinning: {error}"
+                ))
+            })?;
+            if registration.role != *role
+                || registration.authority_sha256.as_str() != digest.as_str()
+            {
+                return Err(LocalPerfRunError::Invalid(format!(
+                    "QG-1 retained register entry for {cell_id:?} changed its authenticated role or digest while pinning"
+                )));
+            }
+            let target_id = match role {
+                Qg1AuthorityRoleV1::Pilot => format!("{}#pilot/{index}", registration.operation_id),
+                Qg1AuthorityRoleV1::Decision => format!("{}#decision", registration.operation_id),
+            };
+            let target = Qg1PinnedAuthorityTargetV1 {
+                operation_id: registration.operation_id,
+                role: *role,
+                authority_sha256: digest.clone(),
+            };
+            if target_authorities
+                .insert(target_id.clone(), target)
+                .is_some()
+            {
+                return Err(LocalPerfRunError::Invalid(format!(
+                    "QG-1 target pin repeated target {target_id:?}"
+                )));
+            }
+        }
+    }
+    // The pin refuses a dirty or noncanonical source, an empty target set, a
+    // duplicate digest, and any operation without at least one pilot and
+    // exactly one decision, so this construction is itself a completeness gate.
+    // The cleanliness bit is the independently captured build/source truth, not
+    // an assumption. A dirty worktree is never admissible, so passing the real
+    // value lets the pin refuse rather than certifying a source it cannot.
+    let pin = Qg1TargetPinV1::new(
+        campaign_run_id.to_owned(),
+        source_git_revision.to_owned(),
+        source_worktree_clean,
+        target_authorities,
+    )
+    .map_err(|error| {
+        LocalPerfRunError::Invalid(format!("QG-1 target pin was rejected: {error}"))
+    })?;
+    let canonical = serde_json::to_vec(&pin)?;
+    verify_pinned_directory(run)?;
+    write_new_sync_at(&run.handle, QG1_TARGET_PIN_FILE_NAME, &canonical)?;
+    run.handle.sync_all()?;
+    let persisted = read_file_at(&run.handle, QG1_TARGET_PIN_FILE_NAME)?;
+    if persisted != canonical {
+        return Err(LocalPerfRunError::Invalid(
+            "QG-1 target pin changed before descriptor-relative reread".to_owned(),
+        ));
+    }
+    let reloaded: Qg1TargetPinV1 = serde_json::from_slice(&persisted)?;
+    reloaded.verify().map_err(|error| {
+        LocalPerfRunError::Invalid(format!(
+            "QG-1 target pin failed descriptor-relative verification: {error}"
+        ))
+    })?;
+    if reloaded != pin {
+        return Err(LocalPerfRunError::Invalid(
+            "QG-1 target pin did not round-trip to the exact retained set".to_owned(),
+        ));
+    }
+    Ok(reloaded)
+}
+
+/// Run-root file name for the durable QG-1 authority pin.
+const QG1_TARGET_PIN_FILE_NAME: &str = "qg1-target-pin.json";
+
+/// Stable role identity for accepted keys, refusals, and persisted records.
+const fn role_label(role: Qg1AuthorityRoleV1) -> &'static str {
+    match role {
+        Qg1AuthorityRoleV1::Pilot => "pilot",
+        Qg1AuthorityRoleV1::Decision => "decision",
+    }
 }
 
 fn qg1_validate_complete_authority_set(
@@ -3396,12 +3706,7 @@ fn qg1_validate_complete_authority_set(
     received_register_count: u64,
     completed_register_count: u64,
 ) -> Result<(), String> {
-    let accepted_cell_ids = accepted
-        .cell_digests
-        .keys()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let accepted_count = u64::try_from(accepted_cell_ids.len())
+    let accepted_count = u64::try_from(accepted.total())
         .map_err(|_| "QG-1 accepted authority count does not fit u64".to_owned())?;
     if completed_register_count != received_register_count
         || completed_register_count != accepted_count
@@ -3410,12 +3715,35 @@ fn qg1_validate_complete_authority_set(
             "QG-1 startup COMPLETE count {completed_register_count} does not match received {received_register_count} or accepted {accepted_count}"
         ));
     }
+    // Per frozen engine-lifecycle cell: exactly one Decision authority, and at
+    // least one Pilot. The pilot count is deliberately NOT pinned here. The
+    // later screen recomputation enforces the exact candidate universe, so an
+    // omitted pilot can only reach NoDecision — never a false green — whereas
+    // pinning a count here would refuse legitimate sets whenever the frozen
+    // width list and the produced screens disagree for a benign reason.
     let expected = qg1_expected_authority_cell_ids(selection).map_err(|error| error.to_string())?;
-    (accepted_cell_ids == expected).then_some(()).ok_or_else(|| {
-        format!(
-            "QG-1 startup authority cell map is incomplete or contains an unexpected entry; expected {expected:?}, accepted {accepted_cell_ids:?}"
-        )
-    })
+    for cell_id in &expected {
+        let pilots = accepted.digests_for(cell_id, Qg1AuthorityRoleV1::Pilot);
+        let decisions = accepted.digests_for(cell_id, Qg1AuthorityRoleV1::Decision);
+        if decisions != 1 || pilots == 0 {
+            return Err(format!(
+                "QG-1 startup authority set for {cell_id:?} is not complete: expected exactly 1 \
+                 decision and at least 1 pilot authority, accepted {pilots} pilot and \
+                 {decisions} decision"
+            ));
+        }
+    }
+    // Every accepted key must name a frozen selected cell. A surplus entry for
+    // an unselected cell is invisible to the per-cell loop above.
+    for (cell_id, role) in accepted.role_digests.keys() {
+        if !expected.contains(cell_id) {
+            return Err(format!(
+                "QG-1 startup authority set contains unexpected {} entry for {cell_id:?}",
+                role_label(*role)
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn qg1_forward_child_stdout(
@@ -3573,6 +3901,9 @@ fn wait_for_qg1_authority_child(
     startup_deadline: Instant,
     forwarder: Qg1AuthorityForwarder,
     run_log: &mut File,
+    campaign_run_id: &str,
+    source_git_revision: &str,
+    source_worktree_clean: bool,
 ) -> Result<
     (
         ExitStatus,
@@ -3741,6 +4072,34 @@ fn wait_for_qg1_authority_child(
                 register_count,
             ) {
                 Ok(()) => {
+                    // The pin is durable BEFORE the ACK: the child treats the
+                    // acknowledgement as permission to begin timing, so a pin
+                    // written afterwards would leave sampling running against a
+                    // set no retained artifact names. A pin failure refuses the
+                    // handshake exactly like an incomplete set.
+                    let pin = match persist_qg1_target_pin(
+                        &run_directories.run,
+                        &accepted,
+                        campaign_run_id,
+                        source_git_revision,
+                        source_worktree_clean,
+                    ) {
+                        Ok(pin) => pin,
+                        Err(error) => {
+                            handshake_failure = Some(format!(
+                                "QG-1 authority set could not be pinned before acknowledgement: {error}"
+                            ));
+                            let _ = response.send(Qg1AuthorityForwarderResponse::Refuse);
+                            continue;
+                        }
+                    };
+                    if let Err(error) = accepted.bind_expected_authorities(&pin) {
+                        handshake_failure = Some(format!(
+                            "QG-1 retained authorities could not be bound by the persisted target pin before acknowledgement: {error}"
+                        ));
+                        let _ = response.send(Qg1AuthorityForwarderResponse::Refuse);
+                        continue;
+                    }
                     if response
                         .send(Qg1AuthorityForwarderResponse::FinalAcknowledge)
                         .is_err()
@@ -5299,8 +5658,14 @@ fn read_canonical_threshold(bytes: &[u8]) -> Result<PerfGateArtifact, LocalPerfR
         .map_err(|error| LocalPerfRunError::Invalid(error.to_string()))
 }
 
-fn read_canonical_evidence(bytes: &[u8]) -> Result<PerfEvidenceArtifact, LocalPerfRunError> {
-    let artifact = PerfEvidenceArtifact::from_verified_slice(bytes)?;
+fn read_canonical_evidence(
+    bytes: &[u8],
+    external_qg1_authorities: &[&Qg1ExpectedAuthority],
+) -> Result<PerfEvidenceArtifact, LocalPerfRunError> {
+    let artifact = PerfEvidenceArtifact::from_verified_slice_against_qg1_authorities(
+        bytes,
+        external_qg1_authorities,
+    )?;
     if serde_json::to_vec_pretty(&artifact)? != bytes {
         return Err(LocalPerfRunError::Invalid(
             "evidence artifact is not exact canonical pretty JSON".to_owned(),
@@ -5904,13 +6269,17 @@ fn completed_attempt_receipt_bytes(
     end: &PlatformCapture,
     lease_file_identity: &LeaseFileIdentity,
     bound_evidence_bytes: &[u8],
+    external_qg1_authorities: &[&Qg1ExpectedAuthority],
     run_log_bytes: &[u8],
     process_lifecycle: LocalPerfProcessLifecycle,
     root_process_identity: LocalPerfRootProcessIdentity,
     started_at_utc: &str,
     finished_at_utc: &str,
 ) -> Result<Vec<u8>, LocalPerfRunError> {
-    let evidence = PerfEvidenceArtifact::from_verified_slice(bound_evidence_bytes)?;
+    let evidence = PerfEvidenceArtifact::from_verified_slice_against_qg1_authorities(
+        bound_evidence_bytes,
+        external_qg1_authorities,
+    )?;
     if evidence.gate != config.gate
         || evidence.applicability_plan != *run_profile.applicability_plan.binding()
         || evidence.provenance.run_id != config.run_id
@@ -5958,6 +6327,7 @@ fn completed_attempt_receipt_bytes(
         root_process_identity,
         Some(run_log_bytes),
         Some(bound_evidence_bytes),
+        external_qg1_authorities,
         started_at_utc,
         finished_at_utc,
         None,
@@ -6004,6 +6374,7 @@ fn persist_attempt_receipt(
         root_process_identity,
         run_log_bytes,
         completed_bound_evidence,
+        &[],
         started_at_utc,
         finished_at_utc,
         finished_timestamp_error,
@@ -6037,6 +6408,7 @@ fn build_attempt_receipt_bytes(
     root_process_identity: LocalPerfRootProcessIdentity,
     run_log_bytes: Option<&[u8]>,
     completed_bound_evidence: Option<&[u8]>,
+    external_qg1_authorities: &[&Qg1ExpectedAuthority],
     started_at_utc: &str,
     finished_at_utc: &str,
     finished_timestamp_error: Option<String>,
@@ -6044,7 +6416,10 @@ fn build_attempt_receipt_bytes(
     let (retry, unavailable) = attempt_derived_facts(outcome)?;
     let (bound_evidence_sha256, runner_receipt_sha256, runner_artifact_manifest_sha256) =
         if let Some(bound_evidence_bytes) = completed_bound_evidence {
-            let evidence = PerfEvidenceArtifact::from_verified_slice(bound_evidence_bytes)?;
+            let evidence = PerfEvidenceArtifact::from_verified_slice_against_qg1_authorities(
+                bound_evidence_bytes,
+                external_qg1_authorities,
+            )?;
             let identity = evidence.machine_class.identity().ok_or_else(|| {
                 LocalPerfRunError::Invalid(
                     "completed attempt evidence has no admitted runner identity".to_owned(),
@@ -6115,7 +6490,10 @@ fn build_attempt_receipt_bytes(
         verified.verify_run_log(run_log_bytes)?;
     }
     if let Some(bound_evidence_bytes) = completed_bound_evidence {
-        verified.verify_bound_evidence(bound_evidence_bytes)?;
+        verified.verify_bound_evidence_against_qg1_authorities(
+            bound_evidence_bytes,
+            external_qg1_authorities,
+        )?;
     }
     Ok(receipt_bytes)
 }
@@ -7254,15 +7632,23 @@ mod tests {
         };
         let selected =
             qg1_register_entry_for_target("QG-1.bulk/tiny/1/positions_on.docs_per_second");
+        let selected_operation_id = selected
+            .verified_registration()
+            .expect("test register entry verifies")
+            .operation_id;
         assert_eq!(
-            qg1_selected_cell_id_for_authority(&selected, &selection)
+            qg1_selected_cell_id_for_authority(&selected_operation_id, &selection)
                 .expect("exact selected authority target"),
             "QG-1/bulk/tiny/1/positions_on/docs_per_second"
         );
         let unselected =
             qg1_register_entry_for_target("QG-1.bulk/tiny/2/positions_on.docs_per_second");
+        let unselected_operation_id = unselected
+            .verified_registration()
+            .expect("test register entry verifies")
+            .operation_id;
         assert!(
-            qg1_selected_cell_id_for_authority(&unselected, &selection).is_err(),
+            qg1_selected_cell_id_for_authority(&unselected_operation_id, &selection).is_err(),
             "an operation scope absent from the frozen selected target set must refuse before ACK"
         );
         assert_eq!(
@@ -7302,10 +7688,16 @@ mod tests {
                 &selection,
                 &AcceptedQg1Authorities {
                     directory: None,
-                    cell_digests: BTreeMap::from([(
-                        "QG-1/bulk/tiny/1/positions_on/docs_per_second".to_owned(),
-                        "a".repeat(64),
+                    role_digests: BTreeMap::from([(
+                        (
+                            "QG-1/bulk/tiny/1/positions_on/docs_per_second".to_owned(),
+                            Qg1AuthorityRoleV1::Decision,
+                        ),
+                        BTreeSet::from(["a".repeat(64)]),
                     )]),
+                    seen_digests: BTreeSet::from(["a".repeat(64)]),
+                    entries: BTreeMap::new(),
+                    expected_authorities: BTreeMap::new(),
                 },
                 None,
             )
@@ -7325,9 +7717,18 @@ mod tests {
         };
         let first = qg1_register_entry_for_target("QG-1.bulk/tiny/1/positions_on.docs_per_second");
         let second = qg1_register_entry_for_target("QG-1.bulk/tiny/2/positions_on.docs_per_second");
+        let first_operation_id = first
+            .verified_registration()
+            .expect("first test register entry verifies")
+            .operation_id;
+        let second_operation_id = second
+            .verified_registration()
+            .expect("second test register entry verifies")
+            .operation_id;
         assert_ne!(
-            qg1_selected_cell_id_for_authority(&first, &selection).expect("first selected cell"),
-            qg1_selected_cell_id_for_authority(&second, &selection)
+            qg1_selected_cell_id_for_authority(&first_operation_id, &selection)
+                .expect("first selected cell"),
+            qg1_selected_cell_id_for_authority(&second_operation_id, &selection)
                 .expect("distinct selected cell"),
             "the replay is not relying on the same cell or the same authority file name"
         );
@@ -7766,6 +8167,9 @@ mod tests {
                 startup_deadline,
                 forwarder,
                 &mut handshake_log,
+                "qg1-authority-handshake-test-run",
+                EMBEDDED_PRODUCER_GIT_REVISION,
+                EMBEDDED_PRODUCER_GIT_DIRTY == "false",
             )
             .expect("drive the real QG-1 parent wait/kill/reap boundary");
         descendant_scope
@@ -7811,9 +8215,9 @@ mod tests {
         );
         assert_eq!(
             accepted
-                .cell_digests
+                .role_digests
                 .keys()
-                .cloned()
+                .map(|(cell_id, _)| cell_id.clone())
                 .collect::<BTreeSet<_>>(),
             qg1_expected_authority_cell_ids(&one_engine_selection)
                 .expect("one-engine expected authority set"),
@@ -7886,7 +8290,7 @@ mod tests {
             "replayed startup sequence must execute the real bounded kill/reap path before the failed receipt"
         );
         assert_eq!(
-            accepted.cell_digests.len(),
+            accepted.total(),
             1,
             "replayed sequence is refused before second publication"
         );
@@ -7917,7 +8321,7 @@ mod tests {
             "zero-producer COMPLETE is exact and accepted"
         );
         assert!(
-            accepted.cell_digests.is_empty(),
+            accepted.role_digests.is_empty(),
             "tokenizer-only selection publishes no producers"
         );
         assert!(
@@ -7977,7 +8381,7 @@ mod tests {
             Some("QG-1 child exited before the exact startup COMPLETE/final-ACK exchange")
         );
         assert!(
-            accepted.cell_digests.is_empty(),
+            accepted.role_digests.is_empty(),
             "the naturally exited child must not publish startup authority"
         );
 
