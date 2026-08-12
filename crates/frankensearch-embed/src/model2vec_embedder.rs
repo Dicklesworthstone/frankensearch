@@ -561,6 +561,7 @@ fn has_required_files(dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::simd::{Model2VecAccumulationRoute, last_model2vec_accumulation_route_for_test};
     use std::fs;
 
     /// Create a minimal `Model2Vec` model in a temp directory for testing.
@@ -834,12 +835,10 @@ mod tests {
             let index = token_id as usize;
             if index < embedder.vocab_size {
                 let start = index * embedder.dimensions;
-                for (value, row_value) in sum
-                    .iter_mut()
-                    .zip(&embedder.embeddings[start..start + embedder.dimensions])
-                {
-                    *value += *row_value;
-                }
+                crate::simd::accumulate_f32_into(
+                    &mut sum,
+                    &embedder.embeddings[start..start + embedder.dimensions],
+                );
                 count += 1;
             }
         }
@@ -870,6 +869,27 @@ mod tests {
         );
     }
 
+    fn expected_native_256_route(token_count: usize) -> Model2VecAccumulationRoute {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if token_count < 512 {
+                if std::is_x86_feature_detected!("avx2") {
+                    Model2VecAccumulationRoute::Native256ShortAvx2
+                } else {
+                    Model2VecAccumulationRoute::Base
+                }
+            } else {
+                Model2VecAccumulationRoute::Prefetched
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = token_count;
+            Model2VecAccumulationRoute::Base
+        }
+    }
+
     #[test]
     fn native_256_embed_sync_matches_former_pool_and_finish_bits() {
         const DIMENSIONS: usize = 256;
@@ -877,7 +897,7 @@ mod tests {
         create_test_model(dir.path(), 12, DIMENSIONS);
         let mut embedder = Model2VecEmbedder::load(dir.path()).unwrap();
 
-        for &tokens in &[0_usize, 1, 2, 3, 4, 8, 16, 32, 64] {
+        for &tokens in &[0_usize, 1, 2, 3, 4, 8, 16, 32, 64, 511, 512, 513] {
             let text = (0..tokens)
                 .map(|position| match position % 4 {
                     0 => "hello",
@@ -890,6 +910,14 @@ mod tests {
             let expected = former_embed_sync(&embedder, &text);
             let actual = embedder.embed_sync(&text).unwrap();
             assert_f32_bits_eq(&actual, &expected, &format!("tokens={tokens}"));
+            if !text.is_empty() {
+                let token_count = embedder.tokenizer.encode(&text, false).unwrap().len();
+                assert_eq!(
+                    last_model2vec_accumulation_route_for_test(),
+                    expected_native_256_route(token_count),
+                    "shipping embed_sync route for {tokens} input words ({token_count} token IDs)"
+                );
+            }
         }
 
         for text in [

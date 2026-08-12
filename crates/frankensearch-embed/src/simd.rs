@@ -55,10 +55,11 @@ const MODEL2VEC_FUSED_ROWS: usize = 4;
 /// Mean-pool Model2Vec rows into `sum`, returning the number of in-vocabulary rows.
 ///
 /// This is the production gather loop and the benchmark's candidate arm. On
-/// native-256 sequences shorter than [`MODEL2VEC_PREFETCH_MIN_TOKENS`] keep each
-/// sum lane live while adding at most four valid rows in token order. On x86-64,
-/// sequences at or above that threshold retain the existing full-row prefetch
-/// loop. All other dimensions retain the original no-prefetch loop exactly.
+/// x86-64 CPUs with AVX2, native-256 sequences shorter than
+/// [`MODEL2VEC_PREFETCH_MIN_TOKENS`] keep each vector lane live while adding at
+/// most four valid rows in token order. Portable builds, non-AVX2 x86-64 CPUs,
+/// all other dimensions, and sequences at or above that threshold retain their
+/// original accumulation paths exactly.
 #[doc(hidden)]
 #[inline]
 pub fn accumulate_model2vec_rows(
@@ -74,22 +75,49 @@ pub fn accumulate_model2vec_rows(
     );
 
     if sum.len() == MODEL2VEC_NATIVE_DIMENSIONS && token_ids.len() < MODEL2VEC_PREFETCH_MIN_TOKENS {
-        return accumulate_model2vec_rows_native_256_short(sum, embeddings, token_ids, vocab_size);
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: the runtime feature check above proves the required AVX2 ISA.
+            #[allow(unsafe_code)]
+            unsafe {
+                #[cfg(test)]
+                record_model2vec_accumulation_route(Model2VecAccumulationRoute::Native256ShortAvx2);
+                return accumulate_model2vec_rows_native_256_short_avx2(
+                    sum, embeddings, token_ids, vocab_size,
+                );
+            }
+        }
+
+        #[cfg(test)]
+        record_model2vec_accumulation_route(Model2VecAccumulationRoute::Base);
+        return accumulate_model2vec_rows_base(sum, embeddings, token_ids, vocab_size);
     }
 
     #[cfg(target_arch = "x86_64")]
-    if token_ids.len() >= MODEL2VEC_PREFETCH_MIN_TOKENS {
-        return accumulate_model2vec_rows_prefetched(sum, embeddings, token_ids, vocab_size);
+    {
+        if token_ids.len() >= MODEL2VEC_PREFETCH_MIN_TOKENS {
+            #[cfg(test)]
+            record_model2vec_accumulation_route(Model2VecAccumulationRoute::Prefetched);
+            return accumulate_model2vec_rows_prefetched(sum, embeddings, token_ids, vocab_size);
+        }
     }
 
+    #[cfg(test)]
+    record_model2vec_accumulation_route(Model2VecAccumulationRoute::Base);
     accumulate_model2vec_rows_base(sum, embeddings, token_ids, vocab_size)
 }
 
-/// Accumulate short native-256 sequences without reloading/storing `sum` for
-/// every valid token row. Each lane adds the gathered rows in exactly the
-/// original token order; invalid token IDs do not consume a fused-row slot.
-#[inline]
-fn accumulate_model2vec_rows_native_256_short(
+/// Accumulate short native-256 sequences with AVX2 vectors that remain live
+/// across one to four gathered rows. Each lane adds its rows in original token
+/// order; invalid token IDs do not consume a fused-row slot.
+///
+/// # Safety
+///
+/// The caller must prove AVX2 is available with a runtime feature check.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
+unsafe fn accumulate_model2vec_rows_native_256_short_avx2(
     sum: &mut [f32],
     embeddings: &[f32],
     token_ids: &[u32],
@@ -114,13 +142,68 @@ fn accumulate_model2vec_rows_native_256_short(
             }
         }
 
-        for (dimension, value) in sum.iter_mut().enumerate() {
-            for row in rows.iter().take(row_count) {
-                *value += row[dimension];
+        if row_count != 0 {
+            // SAFETY: `sum` and every selected row have exactly 256 f32 values.
+            // The loop loads and stores eight values at offsets below 256, and
+            // `row_count` is constrained to the 1..=4 range above.
+            unsafe {
+                accumulate_model2vec_rows_fused_avx2(sum, &rows, row_count);
             }
         }
     }
     count
+}
+
+/// Add one to four 256-wide rows to `sum` without spilling the running AVX2
+/// vector between rows. The explicit match gives each case a fixed ordered add
+/// sequence; there is no reduction across vector lanes.
+///
+/// # Safety
+///
+/// `sum` and the first `row_count` entries of `rows` must each have 256 values,
+/// `row_count` must be in 1..=4, and the caller must provide AVX2 support.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
+unsafe fn accumulate_model2vec_rows_fused_avx2(
+    sum: &mut [f32],
+    rows: &[&[f32]; MODEL2VEC_FUSED_ROWS],
+    row_count: usize,
+) {
+    use core::arch::x86_64::{_mm256_add_ps, _mm256_loadu_ps, _mm256_storeu_ps};
+
+    for offset in (0..MODEL2VEC_NATIVE_DIMENSIONS).step_by(8) {
+        // SAFETY: guaranteed by this function's contract and the eight-wide loop.
+        unsafe {
+            let sum_vector = _mm256_loadu_ps(sum.as_ptr().add(offset));
+            let result = match row_count {
+                1 => _mm256_add_ps(sum_vector, _mm256_loadu_ps(rows[0].as_ptr().add(offset))),
+                2 => {
+                    let with_first =
+                        _mm256_add_ps(sum_vector, _mm256_loadu_ps(rows[0].as_ptr().add(offset)));
+                    _mm256_add_ps(with_first, _mm256_loadu_ps(rows[1].as_ptr().add(offset)))
+                }
+                3 => {
+                    let with_first =
+                        _mm256_add_ps(sum_vector, _mm256_loadu_ps(rows[0].as_ptr().add(offset)));
+                    let with_second =
+                        _mm256_add_ps(with_first, _mm256_loadu_ps(rows[1].as_ptr().add(offset)));
+                    _mm256_add_ps(with_second, _mm256_loadu_ps(rows[2].as_ptr().add(offset)))
+                }
+                4 => {
+                    let with_first =
+                        _mm256_add_ps(sum_vector, _mm256_loadu_ps(rows[0].as_ptr().add(offset)));
+                    let with_second =
+                        _mm256_add_ps(with_first, _mm256_loadu_ps(rows[1].as_ptr().add(offset)));
+                    let with_third =
+                        _mm256_add_ps(with_second, _mm256_loadu_ps(rows[2].as_ptr().add(offset)));
+                    _mm256_add_ps(with_third, _mm256_loadu_ps(rows[3].as_ptr().add(offset)))
+                }
+                _ => unreachable!("the caller constrains row_count to 1..=4"),
+            };
+            _mm256_storeu_ps(sum.as_mut_ptr().add(offset), result);
+        }
+    }
 }
 
 #[inline]
@@ -218,28 +301,72 @@ fn accumulate_f32_into_avx2(sum: &mut [f32], row: &[f32]) {
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Model2VecAccumulationRoute {
+    Native256ShortAvx2,
+    Prefetched,
+    Base,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_MODEL2VEC_ACCUMULATION_ROUTE: std::cell::Cell<Option<Model2VecAccumulationRoute>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+#[inline]
+fn record_model2vec_accumulation_route(route: Model2VecAccumulationRoute) {
+    LAST_MODEL2VEC_ACCUMULATION_ROUTE.with(|last_route| last_route.set(Some(route)));
+}
+
+#[cfg(test)]
+pub(crate) fn last_model2vec_accumulation_route_for_test() -> Model2VecAccumulationRoute {
+    LAST_MODEL2VEC_ACCUMULATION_ROUTE.with(|last_route| {
+        last_route
+            .get()
+            .expect("a Model2Vec accumulation route must have been observed")
+    })
+}
+
+#[cfg(test)]
 mod tests {
-    use super::{accumulate_f32_into, accumulate_model2vec_rows};
+    use super::{
+        Model2VecAccumulationRoute, accumulate_f32_into, accumulate_model2vec_rows,
+        last_model2vec_accumulation_route_for_test,
+    };
 
     fn former_model2vec_gather(
-        dimensions: usize,
+        sum: &mut [f32],
         embeddings: &[f32],
         ids: &[u32],
         vocab: usize,
-    ) -> (usize, Vec<f32>) {
-        let mut sum = vec![0.0_f32; dimensions];
+    ) -> usize {
+        let dimensions = sum.len();
         let mut count = 0_usize;
         for &token_id in ids {
             let index = token_id as usize;
             if index < vocab {
                 let start = index * dimensions;
-                for (value, row) in sum.iter_mut().zip(&embeddings[start..start + dimensions]) {
-                    *value += *row;
-                }
+                accumulate_f32_into(sum, &embeddings[start..start + dimensions]);
                 count += 1;
             }
         }
-        (count, sum)
+        count
+    }
+
+    fn assert_f32_bits_eq(actual: &[f32], expected: &[f32], scenario: &str) {
+        assert_eq!(
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "{scenario}"
+        );
     }
 
     #[test]
@@ -293,20 +420,8 @@ mod tests {
                     })
                     .collect();
                 let mut expected = vec![0.0_f32; dimensions];
-                let mut expected_count = 0_usize;
-                for &token_id in &ids {
-                    let idx = token_id as usize;
-                    if idx < VOCAB {
-                        let start = idx * dimensions;
-                        for (sum, value) in expected
-                            .iter_mut()
-                            .zip(&embeddings[start..start + dimensions])
-                        {
-                            *sum += *value;
-                        }
-                        expected_count += 1;
-                    }
-                }
+                let expected_count =
+                    former_model2vec_gather(&mut expected, &embeddings, &ids, VOCAB);
 
                 let mut actual = vec![0.0_f32; dimensions];
                 let actual_count = accumulate_model2vec_rows(&mut actual, &embeddings, &ids, VOCAB);
@@ -314,25 +429,21 @@ mod tests {
                     actual_count, expected_count,
                     "dim={dimensions}, tokens={tokens}"
                 );
-                assert_eq!(
-                    actual
-                        .iter()
-                        .map(|value| value.to_bits())
-                        .collect::<Vec<_>>(),
-                    expected
-                        .iter()
-                        .map(|value| value.to_bits())
-                        .collect::<Vec<_>>(),
-                    "dim={dimensions}, tokens={tokens}"
+                assert_f32_bits_eq(
+                    &actual,
+                    &expected,
+                    &format!("dim={dimensions}, tokens={tokens}"),
                 );
             }
         }
     }
 
     #[test]
-    fn model2vec_native_256_short_fuses_only_valid_rows_in_token_order() {
+    fn model2vec_native_256_short_matches_the_actual_former_route_bit_for_bit() {
         const VOCAB: usize = 7;
         const DIMENSIONS: usize = 256;
+        const OOV_TOKEN: u32 = VOCAB as u32 + 1;
+
         let mut embeddings: Vec<f32> = (0..VOCAB * DIMENSIONS)
             .map(|index| {
                 #[allow(clippy::cast_precision_loss)]
@@ -340,37 +451,117 @@ mod tests {
                 value.mul_add(0.000_976_562_5, -0.5)
             })
             .collect();
-        embeddings[DIMENSIONS] = -0.0;
+        embeddings[0] = -0.0;
+        embeddings[DIMENSIONS] = 0.0;
         embeddings[DIMENSIONS * 2 + 1] = f32::INFINITY;
-        embeddings[DIMENSIONS * 3 + 2] = f32::NAN;
-        const OOV_TOKEN: u32 = 8;
-        const VALID_TOKENS: [u32; 4] = [0, 1, 2, 3];
+        embeddings[DIMENSIONS * 3 + 1] = f32::NEG_INFINITY;
+        embeddings[DIMENSIONS * 4 + 2] = f32::from_bits(0x7fc0_0123);
+        embeddings[DIMENSIONS * 5 + 3] = f32::INFINITY;
+        embeddings[DIMENSIONS * 6 + 3] = f32::NEG_INFINITY;
 
-        for &tokens in &[0_usize, 1, 2, 3, 4, 8, 16, 32, 64, 511, 512, 513] {
-            let ids: Vec<u32> = (0..tokens)
-                .map(|position| {
-                    if position % 5 == 0 {
-                        OOV_TOKEN
-                    } else {
-                        VALID_TOKENS[position % VALID_TOKENS.len()]
-                    }
-                })
-                .collect();
-            let (expected_count, expected) =
-                former_model2vec_gather(DIMENSIONS, &embeddings, &ids, VOCAB);
-            let mut actual = vec![0.0_f32; DIMENSIONS];
-            let actual_count = accumulate_model2vec_rows(&mut actual, &embeddings, &ids, VOCAB);
-            assert_eq!(actual_count, expected_count, "tokens={tokens}");
+        let special_initial_sum: Vec<f32> = (0..DIMENSIONS)
+            .map(|dimension| match dimension % 8 {
+                0 => -0.0,
+                1 => 0.0,
+                2 => f32::INFINITY,
+                3 => f32::NEG_INFINITY,
+                4 => f32::from_bits(0x7fc0_0456),
+                5 => 1.25,
+                6 => -3.5,
+                _ => f32::MIN_POSITIVE,
+            })
+            .collect();
+
+        for (initial_name, initial_sum) in [
+            ("zero-initial", vec![0.0_f32; DIMENSIONS]),
+            ("arbitrary-initial", special_initial_sum),
+        ] {
+            for &tokens in &[1_usize, 2, 3, 4, 8, 16, 32, 64, 511, 512, 513] {
+                let all_oov = vec![OOV_TOKEN; tokens];
+                let interleaved: Vec<u32> = (0..tokens)
+                    .map(|position| match position % 13 {
+                        0 | 2 | 4 | 5 | 8 | 10 => OOV_TOKEN,
+                        1 => 0,
+                        3 => 1,
+                        6 => 2,
+                        7 => 3,
+                        9 => 4,
+                        11 => 5,
+                        _ => 6,
+                    })
+                    .collect();
+
+                for (pattern_name, ids) in [("all-oov", all_oov), ("interleaved", interleaved)] {
+                    let mut expected = initial_sum.clone();
+                    let expected_count =
+                        former_model2vec_gather(&mut expected, &embeddings, &ids, VOCAB);
+                    let mut actual = initial_sum.clone();
+                    let actual_count =
+                        accumulate_model2vec_rows(&mut actual, &embeddings, &ids, VOCAB);
+
+                    let scenario = format!("{initial_name}, {pattern_name}, tokens={tokens}");
+                    assert_eq!(actual_count, expected_count, "{scenario}");
+                    assert_f32_bits_eq(&actual, &expected, &scenario);
+                }
+            }
+        }
+    }
+
+    fn expected_model2vec_accumulation_route(
+        dimensions: usize,
+        token_count: usize,
+    ) -> Model2VecAccumulationRoute {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if dimensions == 256 && token_count < MODEL2VEC_PREFETCH_MIN_TOKENS {
+                if std::is_x86_feature_detected!("avx2") {
+                    Model2VecAccumulationRoute::Native256ShortAvx2
+                } else {
+                    Model2VecAccumulationRoute::Base
+                }
+            } else if token_count >= MODEL2VEC_PREFETCH_MIN_TOKENS {
+                Model2VecAccumulationRoute::Prefetched
+            } else {
+                Model2VecAccumulationRoute::Base
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (dimensions, token_count);
+            Model2VecAccumulationRoute::Base
+        }
+    }
+
+    #[test]
+    fn model2vec_route_observer_rejects_boundary_misroutes() {
+        const VOCAB: usize = 3;
+        for &(dimensions, token_count) in &[
+            (256_usize, 1_usize),
+            (256, 2),
+            (256, 3),
+            (256, 4),
+            (256, 511),
+            (256, 512),
+            (256, 513),
+            (255, 511),
+            (255, 512),
+            (257, 511),
+            (257, 512),
+        ] {
+            let embeddings = vec![0.25_f32; VOCAB * dimensions];
+            let ids = vec![0_u32; token_count];
+            let mut sum = vec![0.0_f32; dimensions];
+            let count = accumulate_model2vec_rows(&mut sum, &embeddings, &ids, VOCAB);
+
             assert_eq!(
-                actual
-                    .iter()
-                    .map(|value| value.to_bits())
-                    .collect::<Vec<_>>(),
-                expected
-                    .iter()
-                    .map(|value| value.to_bits())
-                    .collect::<Vec<_>>(),
-                "tokens={tokens}"
+                count, token_count,
+                "dimensions={dimensions}, tokens={token_count}"
+            );
+            assert_eq!(
+                last_model2vec_accumulation_route_for_test(),
+                expected_model2vec_accumulation_route(dimensions, token_count),
+                "dimensions={dimensions}, tokens={token_count}"
             );
         }
     }

@@ -36,7 +36,7 @@ use std::time::Duration;
 use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use frankensearch_core::bench_support::paired_median_ratio;
+use frankensearch_core::bench_support::{paired_median_ratio, print_bench_elf_sha256};
 use frankensearch_embed::simd::{accumulate_f32_into, accumulate_model2vec_rows};
 
 const VOCAB: usize = 30_000; // potion-base-8M-class vocab
@@ -138,15 +138,27 @@ enum Arm {
     ShippingCandidate,
 }
 
-fn run_corpus(emb: &[f32], ids: &[u32], tokens_per_doc: usize, sum: &mut [f32], arm: Arm) {
+fn fingerprint_document(fingerprint: &mut u64, sum: &[f32], count: usize) {
+    for &value in sum {
+        *fingerprint ^= u64::from(value.to_bits());
+        *fingerprint = fingerprint.wrapping_mul(0x1000_0000_01b3);
+    }
+    *fingerprint ^= u64::try_from(count).expect("document token count fits u64");
+    *fingerprint = fingerprint.wrapping_mul(0x1000_0000_01b3);
+}
+
+fn run_corpus(emb: &[f32], ids: &[u32], tokens_per_doc: usize, sum: &mut [f32], arm: Arm) -> u64 {
+    let mut fingerprint = 0xcbf2_9ce4_8422_2325_u64;
     for doc_ids in ids.chunks_exact(tokens_per_doc) {
         let count = match arm {
             Arm::Original => gather_base(emb, doc_ids, sum),
             Arm::ShippingCandidate => gather_gated(emb, doc_ids, sum),
         };
         finish_mean_pool(sum, count);
+        fingerprint_document(&mut fingerprint, sum, count);
         black_box(&*sum);
     }
+    fingerprint
 }
 
 fn corpus_ids(tokens_per_doc: usize) -> Vec<u32> {
@@ -157,19 +169,19 @@ fn corpus_ids(tokens_per_doc: usize) -> Vec<u32> {
 }
 
 fn paired_shipping_gate(emb_original: &[f32], emb_candidate: &[f32]) {
-    for &tokens_per_doc in &[1_usize, 2, 3, 4, 8, 16, 32, 64, 128, 256, 512] {
+    for &tokens_per_doc in &[1_usize, 2, 3, 4, 8, 16, 32, 64, 128, 256, 511, 512, 513] {
         let ids = corpus_ids(tokens_per_doc);
 
         let mut parity_original = vec![0.0_f32; DIM];
         let mut parity_candidate = vec![0.0_f32; DIM];
-        run_corpus(
+        let original_fingerprint = run_corpus(
             emb_original,
             &ids,
             tokens_per_doc,
             &mut parity_original,
             Arm::Original,
         );
-        run_corpus(
+        let candidate_fingerprint = run_corpus(
             emb_original,
             &ids,
             tokens_per_doc,
@@ -177,15 +189,8 @@ fn paired_shipping_gate(emb_original: &[f32], emb_candidate: &[f32]) {
             Arm::ShippingCandidate,
         );
         assert_eq!(
-            parity_original
-                .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>(),
-            parity_candidate
-                .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>(),
-            "gated production path changed pooled output at {tokens_per_doc} tokens"
+            original_fingerprint, candidate_fingerprint,
+            "gated production path changed a finished pooled document at {tokens_per_doc} tokens"
         );
 
         let mut null_original = vec![0.0_f32; DIM];
@@ -194,23 +199,57 @@ fn paired_shipping_gate(emb_original: &[f32], emb_candidate: &[f32]) {
             31,
             1,
             || {
-                run_corpus(
+                black_box(run_corpus(
                     black_box(emb_original),
                     black_box(&ids),
                     tokens_per_doc,
                     black_box(&mut null_original),
                     Arm::Original,
-                );
+                ));
             },
             || {
-                run_corpus(
+                black_box(run_corpus(
                     black_box(emb_candidate),
                     black_box(&ids),
                     tokens_per_doc,
                     black_box(&mut null_clone),
                     Arm::Original,
-                );
+                ));
             },
+        );
+
+        assert!(
+            null.is_admissible_null(),
+            "A/A null is inadmissible at {tokens_per_doc} tokens: {null:?}"
+        );
+
+        let mut candidate_a = vec![0.0_f32; DIM];
+        let mut candidate_b = vec![0.0_f32; DIM];
+        let candidate_null = paired_median_ratio(
+            31,
+            1,
+            || {
+                black_box(run_corpus(
+                    black_box(emb_original),
+                    black_box(&ids),
+                    tokens_per_doc,
+                    black_box(&mut candidate_a),
+                    Arm::ShippingCandidate,
+                ));
+            },
+            || {
+                black_box(run_corpus(
+                    black_box(emb_candidate),
+                    black_box(&ids),
+                    tokens_per_doc,
+                    black_box(&mut candidate_b),
+                    Arm::ShippingCandidate,
+                ));
+            },
+        );
+        assert!(
+            candidate_null.is_admissible_null(),
+            "B/B null is inadmissible at {tokens_per_doc} tokens: {candidate_null:?}"
         );
 
         let mut lever_original = vec![0.0_f32; DIM];
@@ -219,38 +258,33 @@ fn paired_shipping_gate(emb_original: &[f32], emb_candidate: &[f32]) {
             31,
             1,
             || {
-                run_corpus(
+                black_box(run_corpus(
                     black_box(emb_original),
                     black_box(&ids),
                     tokens_per_doc,
                     black_box(&mut lever_original),
                     Arm::Original,
-                );
+                ));
             },
             || {
-                run_corpus(
+                black_box(run_corpus(
                     black_box(emb_candidate),
                     black_box(&ids),
                     tokens_per_doc,
                     black_box(&mut lever_candidate),
                     Arm::ShippingCandidate,
-                );
+                ));
             },
         );
-        let verdict = if tokens_per_doc < 512 {
-            if lever.median > null.p95 {
-                "SHORT_REGRESSION"
-            } else {
-                "SHORT_PRESERVED"
-            }
-        } else if lever.median < null.p5 {
-            "LONG_WIN"
-        } else {
-            "INSIDE_NULL_FLOOR"
-        };
+        let decidable = lever.decidable_against(&null) && lever.decidable_against(&candidate_null);
+        // This is a regression tripwire, not a win gate: a sub-one median is
+        // reported as no-claim until release codegen and live evidence exist.
+        assert!(
+            !(decidable && lever.median > 1.0),
+            "native-256 fused arm regressed at {tokens_per_doc} tokens: A/A={null:?}, B/B={candidate_null:?}, A/B={lever:?}"
+        );
         eprintln!(
-            "[paired-gate] tokens={tokens_per_doc} null median={:.6} p5={:.6} p95={:.6} gated/original median={:.6} p5={:.6} p95={:.6} verdict={verdict}",
-            null.median, null.p5, null.p95, lever.median, lever.p5, lever.p95,
+            "[paired-gate] tokens={tokens_per_doc} AA={null:?} BB={candidate_null:?} AB={lever:?} decidable={decidable} no_claim=true",
         );
     }
 }
@@ -283,6 +317,7 @@ fn ids_fixture(t: usize) -> Vec<u32> {
 }
 
 fn bench(c: &mut Criterion) {
+    print_bench_elf_sha256().expect("executing benchmark ELF identity");
     let mut group = c.benchmark_group("model2vec_gather_prefetch");
     group.sample_size(30);
     group.warm_up_time(Duration::from_millis(300));
