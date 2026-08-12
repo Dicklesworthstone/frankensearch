@@ -268,6 +268,16 @@ pub struct TwoTierSearcher {
     /// When set, `with_quality_embedder` auto-wraps with `CachedEmbedder`.
     embedding_cache_capacity: Option<usize>,
     resource_cpu_state: Mutex<Option<CpuJiffiesSnapshot>>,
+    #[cfg(test)]
+    cancellation_test_hook: Option<Arc<dyn Fn(&Cx, CancellationTestBoundary) + Send + Sync>>,
+}
+
+/// Test-only seam for cancelling the real invocation context at a publication boundary.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CancellationTestBoundary {
+    RefinedResultConstruction,
+    Phase3Explanation,
 }
 
 /// Candidate pools retained from Phase 1 for Phase-2 refinement.
@@ -391,6 +401,24 @@ impl TwoTierSearcher {
             hubness_table: None,
             embedding_cache_capacity: None,
             resource_cpu_state: Mutex::new(None),
+            #[cfg(test)]
+            cancellation_test_hook: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_cancellation_test_hook(
+        mut self,
+        hook: Arc<dyn Fn(&Cx, CancellationTestBoundary) + Send + Sync>,
+    ) -> Self {
+        self.cancellation_test_hook = Some(hook);
+        self
+    }
+
+    #[cfg(test)]
+    fn run_cancellation_test_hook(&self, cx: &Cx, boundary: CancellationTestBoundary) {
+        if let Some(hook) = &self.cancellation_test_hook {
+            hook(cx, boundary);
         }
     }
 
@@ -1260,6 +1288,25 @@ impl TwoTierSearcher {
                             },
                             rank_changes: metrics.rank_changes.clone(),
                         });
+
+                        // Refined is a public phase boundary. A consumer may
+                        // cancel after accepting it, before phase-3 hydration
+                        // calls text_fn or invokes the reranker.
+                        if let Err(SearchError::Cancelled { phase, reason }) =
+                            cancellation_checkpoint(cx, "refined_to_rerank")
+                        {
+                            if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
+                                self.emit_session_stop_telemetry(
+                                    root_request_id,
+                                    telemetry_last_event_id.clone(),
+                                    LifecycleState::Degraded,
+                                    LifecycleSeverity::Warn,
+                                    Some(format!("cancelled:{phase}:{reason}")),
+                                    search_started_at.elapsed(),
+                                );
+                            }
+                            return Err(SearchError::Cancelled { phase, reason });
+                        }
 
                         // Phase 3: Reranking (optional, only if feature enabled and reranker present)
                         #[cfg(feature = "rerank")]
@@ -2494,6 +2541,12 @@ impl TwoTierSearcher {
                     &initial_fused_rank,
                 );
             }
+            #[cfg(test)]
+            self.run_cancellation_test_hook(
+                cx,
+                CancellationTestBoundary::RefinedResultConstruction,
+            );
+            cancellation_checkpoint(cx, "quality_result_construction_to_publish")?;
             return Ok(results);
         }
 
@@ -2547,6 +2600,9 @@ impl TwoTierSearcher {
             })
             .collect();
 
+        #[cfg(test)]
+        self.run_cancellation_test_hook(cx, CancellationTestBoundary::RefinedResultConstruction);
+        cancellation_checkpoint(cx, "quality_result_construction_to_publish")?;
         Ok(results)
     }
 
@@ -2658,6 +2714,9 @@ impl TwoTierSearcher {
             }
         }
 
+        #[cfg(test)]
+        self.run_cancellation_test_hook(cx, CancellationTestBoundary::Phase3Explanation);
+        cancellation_checkpoint(cx, "explanation_to_publish")?;
         Ok(results)
     }
 
@@ -4288,6 +4347,58 @@ mod tests {
         }
     }
 
+    fn assert_single_cancelled_session_stop(adapter: &RecordingHostAdapter, phase: &str) {
+        let lifecycle_hooks = adapter.lifecycle_events();
+        assert_eq!(
+            lifecycle_hooks
+                .iter()
+                .filter(|event| matches!(event, AdapterLifecycleEvent::SessionStart { .. }))
+                .count(),
+            1,
+            "the search must start exactly one host session"
+        );
+        assert_eq!(
+            lifecycle_hooks
+                .iter()
+                .filter(|event| matches!(event, AdapterLifecycleEvent::SessionStop { .. }))
+                .count(),
+            1,
+            "cancellation must terminalize the host session exactly once"
+        );
+
+        let lifecycle_events = adapter.telemetry_events();
+        assert!(
+            !lifecycle_events.iter().any(|envelope| {
+                matches!(
+                    &envelope.event,
+                    TelemetryEvent::Lifecycle {
+                        state: LifecycleState::Stopped,
+                        ..
+                    }
+                )
+            }),
+            "cancelled search must not also emit a normal stopped lifecycle event"
+        );
+        assert_eq!(
+            lifecycle_events
+                .iter()
+                .filter(|envelope| {
+                    matches!(
+                        &envelope.event,
+                        TelemetryEvent::Lifecycle {
+                            state: LifecycleState::Degraded,
+                            severity: LifecycleSeverity::Warn,
+                            reason: Some(reason),
+                            ..
+                        } if reason.starts_with(&format!("cancelled:{phase}:"))
+                    )
+                })
+                .count(),
+            1,
+            "cancellation must emit one typed terminal lifecycle event"
+        );
+    }
+
     #[derive(Debug, Default)]
     struct RecordingExporter {
         search: Mutex<Vec<SearchMetrics>>,
@@ -5397,6 +5508,197 @@ mod tests {
                 1,
                 "quality-embed cancellation must emit one terminal lifecycle telemetry event"
             );
+        });
+    }
+
+    #[cfg(feature = "rerank")]
+    #[test]
+    fn public_search_cancellation_after_refined_stops_before_rerank_hydration() {
+        let rerank_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let text_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index_with_quality(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let quality = Arc::new(StubEmbedder::new("quality", 4));
+            let adapter = Arc::new(RecordingHostAdapter::new("post_refined_cancellation"));
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                .with_quality_embedder(quality)
+                .with_reranker(Arc::new(CountingReranker::new(rerank_calls.clone())))
+                .with_host_adapter(adapter.clone());
+
+            let text_calls_for_search = text_calls.clone();
+            let mut phases = Vec::new();
+            let error = searcher
+                .search(
+                    &cx,
+                    "test query",
+                    5,
+                    move |_| {
+                        text_calls_for_search.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        Some("rerank text".to_owned())
+                    },
+                    |phase| match phase {
+                        SearchPhase::Initial { .. } => phases.push("initial"),
+                        SearchPhase::Refined { .. } => {
+                            phases.push("refined");
+                            cx.cancel_with(
+                                asupersync::CancelKind::User,
+                                Some("cancel after refined callback"),
+                            );
+                        }
+                        SearchPhase::Reranked { .. } => phases.push("reranked"),
+                        SearchPhase::RefinementFailed { .. } => phases.push("refinement_failed"),
+                    },
+                )
+                .await
+                .expect_err("post-Refined Cx cancellation must stop rerank hydration");
+
+            assert!(matches!(
+                error,
+                SearchError::Cancelled { phase, reason }
+                    if phase == "refined_to_rerank"
+                        && reason == "user: cancel after refined callback"
+            ));
+            assert_eq!(phases, vec!["initial", "refined"]);
+            assert_eq!(
+                text_calls.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "phase-3 text hydration must not start after Refined cancels the real Cx"
+            );
+            assert_eq!(
+                rerank_calls.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "the reranker must not start after Refined cancels the real Cx"
+            );
+            assert_single_cancelled_session_stop(&adapter, "refined_to_rerank");
+        });
+    }
+
+    #[test]
+    fn public_search_cancellation_at_refined_construction_stops_before_publication() {
+        for re_fusion in [false, true] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let index = build_test_index_with_quality(4);
+                let fast = Arc::new(StubEmbedder::new("fast", 4));
+                let quality = Arc::new(StubEmbedder::new("quality", 4));
+                let adapter = Arc::new(RecordingHostAdapter::new(
+                    "refined_construction_cancellation",
+                ));
+                let hook: Arc<dyn Fn(&Cx, CancellationTestBoundary) + Send + Sync> =
+                    Arc::new(|cx: &Cx, boundary: CancellationTestBoundary| {
+                        if boundary == CancellationTestBoundary::RefinedResultConstruction {
+                            cx.cancel_with(
+                                asupersync::CancelKind::User,
+                                Some("cancel at refined result construction"),
+                            );
+                        }
+                    });
+                let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                    .with_quality_embedder(quality)
+                    .with_host_adapter(adapter.clone())
+                    .with_cancellation_test_hook(hook);
+                let searcher = if re_fusion {
+                    searcher.with_lexical(Arc::new(StubLexical))
+                } else {
+                    searcher
+                };
+
+                let mut phases = Vec::new();
+                let error = searcher
+                    .search(
+                        &cx,
+                        "test query",
+                        5,
+                        |_| None,
+                        |phase| match phase {
+                            SearchPhase::Initial { .. } => phases.push("initial"),
+                            SearchPhase::Refined { .. } => phases.push("refined"),
+                            SearchPhase::Reranked { .. } => phases.push("reranked"),
+                            SearchPhase::RefinementFailed { .. } => {
+                                phases.push("refinement_failed");
+                            }
+                        },
+                    )
+                    .await
+                    .expect_err(
+                        "construction-boundary cancellation must prevent Refined publication",
+                    );
+
+                assert!(matches!(
+                    error,
+                    SearchError::Cancelled { phase, reason }
+                        if phase == "quality_result_construction_to_publish"
+                            && reason == "user: cancel at refined result construction"
+                ));
+                assert_eq!(phases, vec!["initial"], "re_fusion={re_fusion}");
+                assert_single_cancelled_session_stop(
+                    &adapter,
+                    "quality_result_construction_to_publish",
+                );
+            });
+        }
+    }
+
+    #[cfg(feature = "rerank")]
+    #[test]
+    fn public_search_cancellation_after_phase3_explanation_stops_before_reranked_publication() {
+        let rerank_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index_with_quality(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let quality = Arc::new(StubEmbedder::new("quality", 4));
+            let adapter = Arc::new(RecordingHostAdapter::new("phase3_explanation_cancellation"));
+            let hook: Arc<dyn Fn(&Cx, CancellationTestBoundary) + Send + Sync> =
+                Arc::new(|cx: &Cx, boundary: CancellationTestBoundary| {
+                    if boundary == CancellationTestBoundary::Phase3Explanation {
+                        cx.cancel_with(
+                            asupersync::CancelKind::User,
+                            Some("cancel after phase3 explanation"),
+                        );
+                    }
+                });
+            let config = TwoTierConfig {
+                explain: true,
+                ..TwoTierConfig::default()
+            };
+            let searcher = TwoTierSearcher::new(index, fast, config)
+                .with_quality_embedder(quality)
+                .with_reranker(Arc::new(CountingReranker::new(rerank_calls.clone())))
+                .with_host_adapter(adapter.clone())
+                .with_cancellation_test_hook(hook);
+
+            let mut phases = Vec::new();
+            let error = searcher
+                .search(
+                    &cx,
+                    "test query",
+                    5,
+                    |_| Some("rerank text".to_owned()),
+                    |phase| match phase {
+                        SearchPhase::Initial { .. } => phases.push("initial"),
+                        SearchPhase::Refined { .. } => phases.push("refined"),
+                        SearchPhase::Reranked { .. } => phases.push("reranked"),
+                        SearchPhase::RefinementFailed { .. } => phases.push("refinement_failed"),
+                    },
+                )
+                .await
+                .expect_err("post-explanation cancellation must prevent Reranked publication");
+
+            assert!(matches!(
+                error,
+                SearchError::Cancelled { phase, reason }
+                    if phase == "explanation_to_publish"
+                        && reason == "user: cancel after phase3 explanation"
+            ));
+            assert_eq!(phases, vec!["initial", "refined"]);
+            assert_eq!(
+                rerank_calls.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "the test must reach the phase-3 explanation tail"
+            );
+            assert_single_cancelled_session_stop(&adapter, "explanation_to_publish");
         });
     }
 
@@ -7530,6 +7832,52 @@ mod tests {
 
         fn category(&self) -> ModelCategory {
             ModelCategory::StaticEmbedder
+        }
+    }
+
+    #[cfg(feature = "rerank")]
+    struct CountingReranker {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(feature = "rerank")]
+    impl CountingReranker {
+        fn new(calls: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            Self { calls }
+        }
+    }
+
+    #[cfg(feature = "rerank")]
+    impl Reranker for CountingReranker {
+        fn rerank<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _query: &'a str,
+            docs: &'a [frankensearch_core::traits::RerankDocument],
+        ) -> SearchFuture<'a, Vec<frankensearch_core::traits::RerankScore>> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let scores = docs
+                .iter()
+                .enumerate()
+                .map(
+                    |(original_rank, doc)| frankensearch_core::traits::RerankScore {
+                        doc_id: doc.doc_id.clone(),
+                        score: 1.0 - original_rank as f32 * 0.1,
+                        original_rank,
+                        raw_logit: None,
+                    },
+                )
+                .collect();
+            Box::pin(async move { Ok(scores) })
+        }
+
+        fn id(&self) -> &str {
+            "counting-reranker"
+        }
+
+        fn model_name(&self) -> &str {
+            "counting-reranker"
         }
     }
 
