@@ -49,11 +49,12 @@ use frankensearch_quill_gauntlet::{
     PerfInputIdentity, PerfMatrixSpec, PerfMetricSemantics, PerfOperationScope, PerfQueryClass,
     PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
     PerfTopology, PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg1BatchCoverage,
-    Qg1LifecycleWitness, Qg1SampleBinding, Qg6ArmRole, Qg6Comparison, Qg6Phase,
-    Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleBinding, Qg6SampleOrder, Qg6SearchHit,
+    Qg1LifecycleProducer, Qg1LifecycleWitness, Qg1SampleBinding, Qg6ArmRole, Qg6Comparison,
+    Qg6Phase, Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleBinding, Qg6SampleOrder, Qg6SearchHit,
     Qg6SearchResult, Qg6SemanticContract, RankClass, RankedHit, ScoreEpsilonReason,
     SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent, command_sha256_from_argv,
-    compare_observations, estimate_paired_experiment, machine_fingerprint, oracle_version_contract,
+    compare_observations, estimate_paired_experiment,
+    estimate_paired_experiment_against_qg1_authority, machine_fingerprint, oracle_version_contract,
     peak_rss_bytes, perf_manifest_contract_sha256, seeded_balanced_pair_order, validate_matrix,
 };
 use serde::{Deserialize, Serialize};
@@ -1198,6 +1199,7 @@ fn qg1_live_sample_binding(
     scope: &PerfOperationScope,
     provenance: &PerfSampleProvenance,
     estimator_config: &PairedEstimatorConfig,
+    producer: &Qg1LifecycleProducer,
     stream_role: &str,
     stream_sequence: u64,
     sample_id: u64,
@@ -1208,17 +1210,6 @@ fn qg1_live_sample_binding(
     let continuous = continuous?;
     let receipt = &continuous.lifecycle_receipt;
     receipt.validate().ok()?;
-    let (lifecycle_authority_sha256, stream_role_identity_sha256, issued_slot_sha256) =
-        estimator_config.qg1_lifecycle_receipt_coordinates(
-            scope,
-            provenance,
-            stream_role,
-            stream_sequence,
-            sample_id,
-            block_id,
-            arm,
-            order,
-        )?;
     if receipt.interval_ended_ns != elapsed_ns || continuous.elapsed_ns != elapsed_ns {
         return None;
     }
@@ -1282,7 +1273,7 @@ fn qg1_live_sample_binding(
         }
         _ => return None,
     };
-    let mut binding = Qg1SampleBinding {
+    let binding = Qg1SampleBinding {
         schema_version: Qg1SampleBinding::SCHEMA_VERSION.to_owned(),
         stream_role: stream_role.to_owned(),
         stream_id_sha256: String::new(),
@@ -1291,9 +1282,10 @@ fn qg1_live_sample_binding(
         raw_block_id: block_id,
         raw_arm: arm,
         raw_order: order,
-        lifecycle_authority_sha256,
-        stream_role_identity_sha256,
-        issued_slot_sha256,
+        lifecycle_authority_sha256: String::new(),
+        stream_role_identity_sha256: String::new(),
+        producer_capability_sha256: String::new(),
+        producer_capability_tag_sha256: String::new(),
         lifecycle_receipt_id_sha256: String::new(),
         lifecycle_receipt_sha256: String::new(),
         prepared_corpus_sha256: provenance.corpus_sha256.clone(),
@@ -1316,11 +1308,10 @@ fn qg1_live_sample_binding(
         terminal_endpoint_ns: receipt.interval_ended_ns,
         lifecycle_witness,
     };
-    binding.seal_lifecycle_receipt(scope, provenance);
-    if !estimator_config.qg1_binding_matches_lifecycle_authority(&binding, scope, provenance) {
-        return None;
-    }
-    Some(binding)
+    let binding = producer.consume_lifecycle_receipt(scope, provenance, binding)?;
+    estimator_config
+        .qg1_binding_matches_lifecycle_authority(&binding, scope, provenance)
+        .then_some(binding)
 }
 
 /// Work completed per elapsed second, derived exactly as
@@ -3651,9 +3642,9 @@ fn install_qg1_lifecycle_authority(
     provenance: &PerfSampleProvenance,
     expected_pair_count: u64,
     issued_streams: Vec<(String, u64, u64, Vec<PerfSampleArm>)>,
-) {
+) -> Option<Qg1LifecycleProducer> {
     if qg1_producer_coverage(spec) != Some(Qg1ProducerCoverage::EngineIndexingLifecycle) {
-        return;
+        return None;
     }
     let document_count = context
         .scale
@@ -3680,21 +3671,23 @@ fn install_qg1_lifecycle_authority(
         next_document, prepared.binding.document_count,
         "QG-1 lifecycle authority must cover the complete prepared input"
     );
-    estimator_config
-        .install_qg1_lifecycle_authority(
-            scope.clone(),
-            provenance.corpus_sha256.clone(),
-            prepared.binding.manifest_sha256.clone(),
-            prepared.binding.indexed_content_sha256.clone(),
-            prepared.binding.document_count,
-            prepared.binding.content_bytes,
-            prepared.binding.batch_count,
-            batch_coverage,
-            prepared.binding.tail_document_id.clone(),
-            expected_pair_count,
-            issued_streams,
-        )
-        .expect("freeze one complete pre-timing QG-1 lifecycle authority");
+    Some(
+        estimator_config
+            .install_qg1_lifecycle_authority(
+                scope.clone(),
+                provenance.corpus_sha256.clone(),
+                prepared.binding.manifest_sha256.clone(),
+                prepared.binding.indexed_content_sha256.clone(),
+                prepared.binding.document_count,
+                prepared.binding.content_bytes,
+                prepared.binding.batch_count,
+                batch_coverage,
+                prepared.binding.tail_document_id.clone(),
+                expected_pair_count,
+                issued_streams,
+            )
+            .expect("freeze one complete pre-timing QG-1 lifecycle authority"),
+    )
 }
 
 /// Resolve a raw QG-1 denominator from the prepared input the continuous
@@ -3868,6 +3861,7 @@ struct PairedStreamRunner<'a> {
     work_units: Option<u64>,
     byte_count: Option<u64>,
     estimator_config: &'a PairedEstimatorConfig,
+    qg1_producer: Option<&'a Qg1LifecycleProducer>,
     consumed_qg1_sequences: BTreeSet<u64>,
     samples: Vec<PerfRawSample>,
 }
@@ -3881,6 +3875,7 @@ impl<'a> PairedStreamRunner<'a> {
         origin: Instant,
         plan: StreamPlan<'a>,
         estimator_config: &'a PairedEstimatorConfig,
+        qg1_producer: Option<&'a Qg1LifecycleProducer>,
     ) -> Self {
         let order =
             seeded_balanced_pair_order(plan.rounds, plan.seed).expect("paired order schedule");
@@ -3911,6 +3906,7 @@ impl<'a> PairedStreamRunner<'a> {
             work_units,
             byte_count,
             estimator_config,
+            qg1_producer,
             consumed_qg1_sequences: BTreeSet::new(),
             samples,
         }
@@ -4020,6 +4016,8 @@ impl<'a> PairedStreamRunner<'a> {
                 self.scope,
                 &self.evidence.sample_provenance,
                 self.estimator_config,
+                self.qg1_producer
+                    .expect("QG-1 runner retains the live producer"),
                 self.plan
                     .qg1_stream_role
                     .expect("QG-1 paired stream has one canonical role"),
@@ -4941,7 +4939,7 @@ fn collect_cell(
     let cell_seed = evidence.config.bootstrap_seed ^ fixture_seed(&spec.fixture);
     let mut estimator_config = evidence.config.clone();
     let qg1_issued_streams = qg1_issued_streams(runs, cell_seed);
-    install_qg1_lifecycle_authority(
+    let qg1_lifecycle_producer = install_qg1_lifecycle_authority(
         &mut estimator_config,
         context,
         spec,
@@ -4993,6 +4991,7 @@ fn collect_cell(
                 qg1_stream_role: (spec.gate == PerfGate::Qg1).then_some("qg1.null.tantivy.v1"),
             },
             &estimator_config,
+            qg1_lifecycle_producer.as_ref(),
         );
         let mut treatment_null = (spec.gate == PerfGate::Qg1).then(|| {
             PairedStreamRunner::new(
@@ -5013,6 +5012,7 @@ fn collect_cell(
                     qg1_stream_role: Some("qg1.null.quill.v1"),
                 },
                 &estimator_config,
+                qg1_lifecycle_producer.as_ref(),
             )
         });
         let mut effect = PairedStreamRunner::new(
@@ -5034,6 +5034,7 @@ fn collect_cell(
                     .then_some("qg1.effect.tantivy_vs_quill.v1"),
             },
             &estimator_config,
+            qg1_lifecycle_producer.as_ref(),
         );
         for round in 0..runs {
             for slot in interleaved_stream_order(cell_seed, round) {
@@ -5123,12 +5124,24 @@ fn collect_cell(
         .expect("QG-1 harness-produced streams must share one frozen prepared input");
     }
 
-    let experiment =
-        estimate_paired_experiment(&effect_samples, &oracle_null_samples, &estimator_config)
-            .expect("paired estimator rejected harness-produced streams");
+    let qg1_expected_authority = qg1_lifecycle_producer
+        .as_ref()
+        .map(Qg1LifecycleProducer::expected_authority);
+    let experiment = estimate_paired_experiment_against_qg1_authority(
+        &effect_samples,
+        &oracle_null_samples,
+        &estimator_config,
+        qg1_expected_authority,
+    )
+    .expect("paired estimator rejected harness-produced streams");
     let treatment_null_experiment = treatment_null_samples.as_ref().map(|samples| {
-        estimate_paired_experiment(&effect_samples, samples, &estimator_config)
-            .expect("treatment-arm null estimator rejected harness-produced streams")
+        estimate_paired_experiment_against_qg1_authority(
+            &effect_samples,
+            samples,
+            &estimator_config,
+            qg1_expected_authority,
+        )
+        .expect("treatment-arm null estimator rejected harness-produced streams")
     });
     let is_tokenizer_null = spec.metric == "tokenize_docs_per_second";
     let cold_cache = take_cold_cache_evidence(spec);
@@ -6556,7 +6569,7 @@ mod tests {
         };
         let authority_receipt = hostile_tantivy_continuous_receipt();
         let mut config = PairedEstimatorConfig::predeclared(0x5147_314c_4946_4543);
-        config
+        let producer = config
             .install_qg1_lifecycle_authority(
                 scope.clone(),
                 provenance.corpus_sha256.clone(),
@@ -6613,6 +6626,7 @@ mod tests {
                 &scope,
                 &provenance,
                 &config,
+                &producer,
                 stream_role,
                 stream_sequence,
                 sample_id,
@@ -6628,13 +6642,25 @@ mod tests {
             hostile_tantivy_continuous_receipt(),
             "qg1.null.tantivy.v1",
             0,
-            0,
+            10_000,
             0,
             PerfSampleArm::Control,
         );
         assert!(
             proved_binding.is_some(),
             "a proved terminal lifecycle must create the estimator binding"
+        );
+        assert!(
+            binding_from_receipt(
+                hostile_tantivy_continuous_receipt(),
+                "qg1.null.tantivy.v1",
+                0,
+                10_000,
+                0,
+                PerfSampleArm::Control,
+            )
+            .is_none(),
+            "a consumed QG-1 producer capability must not be reissued"
         );
         let no_claim_binding = binding_from_receipt(
             unproved.clone(),
