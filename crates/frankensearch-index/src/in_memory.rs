@@ -434,7 +434,7 @@ impl ExactResidualSidecar {
         }
         debug_assert_eq!(
             bytes.len(),
-            layout.encoded_bytes - EXACT_RESIDUAL_SIDECAR_DIGEST_BYTES
+            EXACT_RESIDUAL_SIDECAR_HEADER_BYTES + layout.payload_bytes
         );
         let digest = Sha256::digest(&bytes);
         bytes.extend_from_slice(&digest);
