@@ -3962,7 +3962,7 @@ impl PublicationAuthorityTransition {
             before
                 .generation()
                 .checked_add(1)
-                .ok_or(KeeperError::GenerationExhausted {
+                .ok_or_else(|| KeeperError::GenerationExhausted {
                     current: before.generation(),
                 })?;
         if proposed_generation != expected_proposed {

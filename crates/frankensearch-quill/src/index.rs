@@ -4921,7 +4921,7 @@ impl QuillWriterState {
 
     /// Reject a successor that cannot be represented by the shared
     /// reader-visible publication word before mutating an owned Keeper.
-    fn preflight_successor_generation(&self, generation: u64) -> Result<(), QuillIndexError> {
+    fn preflight_successor_generation(generation: u64) -> Result<(), QuillIndexError> {
         PublicationReadState::validate_generation(generation)?;
         Ok(())
     }
@@ -4930,10 +4930,9 @@ impl QuillWriterState {
     /// publication boundary shared by seal, scalar, bulk, concat, and delete
     /// mutation paths.
     fn preflight_prepared_publication(
-        &self,
         prepared: &PreparedSealedPublication,
     ) -> Result<(), QuillIndexError> {
-        self.preflight_successor_generation(prepared.expected_keeper_generation)
+        Self::preflight_successor_generation(prepared.expected_keeper_generation)
     }
 
     /// Return authority only when Keeper and the published process-local view
@@ -5305,7 +5304,7 @@ impl QuillWriterState {
                 memory_owned,
             )
         };
-        self.preflight_prepared_publication(
+        Self::preflight_prepared_publication(
             &self
                 .pending_delta_seal
                 .as_ref()
@@ -7025,7 +7024,7 @@ impl QuillWriterState {
         let prepared_publication = self
             .published_snapshot
             .prepare_sealed_manifest(self.schema, &manifest)?;
-        self.preflight_prepared_publication(&prepared_publication)?;
+        Self::preflight_prepared_publication(&prepared_publication)?;
         let commit_span = tracing::info_span!(
             target: crate::tracing_conventions::TARGET,
             crate::tracing_conventions::KEEPER_LIFECYCLE,
@@ -7190,7 +7189,7 @@ impl QuillWriterState {
         let prepared = self
             .published_snapshot
             .prepare_sealed_manifest(self.schema, &manifest)?;
-        self.preflight_prepared_publication(&prepared)?;
+        Self::preflight_prepared_publication(&prepared)?;
         check_cancel(cx, "bulk completion publish")?;
         match &mut self.backend {
             IndexBackend::Durable(writer) => {
@@ -7241,7 +7240,7 @@ impl QuillWriterState {
         let prepared_publication = self
             .published_snapshot
             .prepare_equivalent_sealed_successor()?;
-        self.preflight_prepared_publication(&prepared_publication)?;
+        Self::preflight_prepared_publication(&prepared_publication)?;
         match &mut self.backend {
             IndexBackend::Durable(writer) => {
                 writer
@@ -7474,7 +7473,7 @@ impl QuillWriterState {
         let prepared = self
             .published_snapshot
             .prepare_sealed_manifest(self.schema, &manifest)?;
-        self.preflight_prepared_publication(&prepared)?;
+        Self::preflight_prepared_publication(&prepared)?;
         check_cancel(cx, "delete document publish")?;
         match &mut self.backend {
             IndexBackend::Durable(writer) => {
@@ -7511,7 +7510,7 @@ impl QuillWriterState {
         let prepared = self
             .published_snapshot
             .prepare_sealed_manifest(self.schema, &manifest)?;
-        self.preflight_prepared_publication(&prepared)?;
+        Self::preflight_prepared_publication(&prepared)?;
         check_cancel(cx, "delete all publish")?;
         match &mut self.backend {
             IndexBackend::Durable(writer) => {
@@ -8075,7 +8074,9 @@ impl QuillReader {
             self.pause_after_pinned_snapshot_for_test();
             let after = self.publication_read_state.load();
             last_generation = snapshot.keeper_generation();
-            if before == after && snapshot.keeper_generation() == before.generation() {
+            let stable_authority = before == after;
+            let generation_matches = last_generation == before.generation();
+            if stable_authority && generation_matches {
                 return Ok(snapshot);
             }
             if attempt == 1 {
@@ -10224,7 +10225,6 @@ impl QuillIndex {
     ///
     /// Returns a typed reconciliation-required failure when publication may
     /// have advanced durable authority beyond this process-local view.
-    #[must_use]
     pub fn snapshot(&self) -> Result<Arc<KeeperSnapshot>, QuillIndexError> {
         Ok(self.checked_published_snapshot()?.keeper_snapshot_arc())
     }
@@ -10235,7 +10235,6 @@ impl QuillIndex {
     ///
     /// Returns a typed reconciliation-required failure when publication may
     /// have advanced durable authority beyond this process-local view.
-    #[must_use]
     pub fn search_snapshot(&self) -> Result<Arc<QuillSearchSnapshot>, QuillIndexError> {
         self.checked_published_snapshot()
     }
@@ -10351,7 +10350,11 @@ impl QuillIndex {
     }
 
     /// Number of live documents in the published Keeper-plus-Delta view.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed reconciliation-required failure when publication
+    /// authority cannot prove the process-local snapshot readable.
     pub fn doc_count(&self) -> Result<u64, QuillIndexError> {
         Ok(self.checked_published_snapshot()?.live_doc_count())
     }
@@ -10419,6 +10422,11 @@ impl QuillIndex {
     /// This reopens Keeper authority, installs the matching process-local
     /// composite, and only then releases strict public reads. A failed proof
     /// deliberately retains its operation-specific retry state.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, writer-lock, durable reopen, snapshot
+    /// installation, or publication-authority validation failures.
     pub async fn reconcile_publication(
         &self,
         cx: &Cx,
