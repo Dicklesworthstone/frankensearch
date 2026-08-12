@@ -50,7 +50,6 @@ use frankensearch_storage::{
     PersistentJobQueue, PipelineConfig, Storage, StorageBackedJobRunner,
     StorageConfig as PipelineStorageConfig,
 };
-use fsqlite_types::value::SqliteValue;
 use ftui_backend::{Backend, BackendEventSource, BackendFeatures, BackendPresenter};
 use ftui_core::event::{Event, KeyCode, Modifiers};
 use ftui_extras::markdown::{
@@ -2120,17 +2119,7 @@ impl LiveIngestPipeline {
         let Some(storage_ctx) = storage_ctx else {
             return Ok(());
         };
-        storage_ctx.storage.transaction(|conn| {
-            conn.execute_with_params(
-                "DELETE FROM documents WHERE doc_id = ?1;",
-                &[SqliteValue::Text(rel_key.to_owned().into())],
-            )
-            .map_err(|error| SearchError::SubsystemError {
-                subsystem: "fsfs.watch.storage",
-                source: Box::new(std::io::Error::other(error.to_string())),
-            })?;
-            Ok(())
-        })
+        storage_ctx.storage.delete_document(rel_key).map(|_| ())
     }
 
     fn plan_live_vector_upsert(
@@ -14788,6 +14777,7 @@ impl FtuiSession {
     fn enter() -> SearchResult<Self> {
         let options = TtySessionOptions {
             alternate_screen: true,
+            intercept_signals: true,
             features: BackendFeatures {
                 mouse_capture: true,
                 ..BackendFeatures::default()

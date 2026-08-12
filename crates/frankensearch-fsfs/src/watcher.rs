@@ -837,7 +837,11 @@ impl FsWatcher {
     /// have been joined.
     pub async fn stop_checked(&self, cx: &Cx) -> SearchResult<()> {
         loop {
-            match lock_or_recover(&self.control).stop_decision() {
+            let decision = {
+                let mut control = lock_or_recover(&self.control);
+                control.stop_decision()
+            };
+            match decision {
                 StopDecision::Done => return Ok(()),
                 StopDecision::Wait => {
                     asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;

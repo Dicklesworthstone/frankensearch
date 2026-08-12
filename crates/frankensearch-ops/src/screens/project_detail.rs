@@ -377,7 +377,7 @@ impl ProjectDetailScreen {
     fn phase_latency_lines(
         instances: &[&crate::state::InstanceInfo],
         fleet: &crate::state::FleetSnapshot,
-    ) -> Vec<Line> {
+    ) -> Vec<Line<'static>> {
         let mut weighted_count = 0_u64;
         let mut weighted_avg_sum = 0_u128;
         let mut weighted_p95_sum = 0_u128;
@@ -434,7 +434,7 @@ impl ProjectDetailScreen {
     fn anomaly_lines(
         instances: &[&crate::state::InstanceInfo],
         fleet: &crate::state::FleetSnapshot,
-    ) -> Vec<Line> {
+    ) -> Vec<Line<'static>> {
         let mut cards: Vec<(u32, String, String)> = Vec::new();
         for instance in instances {
             let mut score = 0_u32;

@@ -135,6 +135,7 @@ struct ExactResidualLayout {
     residual_len: usize,
     suffix_len: usize,
     lane_len: usize,
+    #[cfg(test)]
     payload_bytes: usize,
     encoded_bytes: usize,
 }
@@ -257,6 +258,7 @@ impl ExactResidualLayout {
             residual_len,
             suffix_len,
             lane_len,
+            #[cfg(test)]
             payload_bytes,
             encoded_bytes,
         })
@@ -5756,7 +5758,10 @@ mod tests {
             .resolve_heap(outcome.heap)
             .expect("resolve sidecar SIMD result");
         assert_eq!(actual, expected);
-        assert_eq!(actual[0].index, EXACT_RESIDUAL_LANES);
+        assert_eq!(
+            actual[0].index,
+            u32::try_from(EXACT_RESIDUAL_LANES).expect("lane count fits in result index")
+        );
     }
 
     proptest! {

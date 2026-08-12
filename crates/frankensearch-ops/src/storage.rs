@@ -6,6 +6,7 @@
 
 use std::collections::BTreeSet;
 use std::io;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -15,7 +16,7 @@ use frankensearch_core::{
     SearchError, SearchEventPhase as TelemetrySearchEventPhase, SearchResult,
     TELEMETRY_SCHEMA_VERSION, TelemetryEnvelope, TelemetryEvent, TelemetryQueryClass,
 };
-use fsqlite::{Connection, Row};
+use fsqlite::{AsyncConnection, Row};
 use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 
@@ -1279,18 +1280,14 @@ impl OpsIngestionMetrics {
 /// The counter is a *reservation*, not a gauge: a batch adds its record count
 /// on entry so concurrent batches see it for backpressure, and removes it when
 /// the batch reaches a terminal state. The removal has to happen on **every**
-/// exit, and after the ingest path became `async` the ordinary early-return
-/// and error paths stopped being the only ones — a caller that drops the
-/// in-flight future (request cancellation, a timeout race, a `select!` losing
-/// arm) unwinds nothing and returns through no `?`, and a panic inside the
-/// transaction unwinds straight past a bare `fetch_sub`. Either one used to
-/// strand the reservation on the counter forever, and because backpressure
-/// compares against that counter, a few stranded batches wedge ingest closed
-/// permanently for the life of the process.
+/// exit. In particular, a panic inside the transaction unwinds straight past
+/// a bare `fetch_sub`; that used to strand the reservation on the counter, and
+/// because backpressure compares against that counter, a few stranded batches
+/// could wedge ingest closed permanently for the life of the process.
 ///
 /// Binding the decrement to `Drop` makes every exit identical: normal return,
-/// `?`, panic, and future-drop all run it exactly once. [`Self::release`] is
-/// the success path — it performs the same single decrement and hands back the
+/// `?`, and panic all run it exactly once. [`Self::release`] is the ordinary
+/// terminal path — it performs the same single decrement and hands back the
 /// pre-decrement depth the caller needs for its telemetry, then disarms `Drop`
 /// so the counter cannot be decremented twice.
 #[derive(Debug)]
@@ -1343,10 +1340,10 @@ impl Drop for PendingEventsReservation {
             return;
         }
         let _ = self.decrement();
-        // Reaching here means the batch never got to its release point: the
-        // future was dropped mid-ingest or a panic is unwinding. The counter
-        // is restored either way; log it so a wedged-looking queue can be
-        // traced back to the abandoned batch instead of to backpressure.
+        // Reaching here means the batch never got to its release point, most
+        // commonly because a panic is unwinding. The counter is restored; log
+        // it so a wedged-looking queue can be traced back to the abandoned
+        // batch instead of to backpressure.
         tracing::warn!(
             target: "frankensearch.ops.storage",
             event = "search_events_ingest_abandoned",
@@ -1358,7 +1355,7 @@ impl Drop for PendingEventsReservation {
 
 /// Connection wrapper for ops telemetry storage.
 pub struct OpsStorage {
-    conn: Connection,
+    conn: AsyncConnection,
     config: OpsStorageConfig,
     ingestion_metrics: Arc<OpsIngestionMetrics>,
 }
@@ -1395,8 +1392,8 @@ impl OpsStorage {
             "opening ops storage connection"
         );
 
-        let conn =
-            Connection::open(config.db_path.to_string_lossy().to_string()).map_err(ops_error)?;
+        let conn = AsyncConnection::open_sync(config.db_path.to_string_lossy().to_string())
+            .map_err(ops_error)?;
         let storage = Self {
             conn,
             config,
@@ -1418,7 +1415,7 @@ impl OpsStorage {
 
     /// Underlying database connection.
     #[must_use]
-    pub const fn connection(&self) -> &Connection {
+    pub const fn connection(&self) -> &AsyncConnection {
         &self.conn
     }
 
@@ -1717,9 +1714,9 @@ impl OpsStorage {
             SqliteValue::Text(sample.instance_id.clone().into()),
             SqliteValue::Integer(sample.ts_ms),
         ];
-        conn.execute_with_params(
+        conn.execute_with_params_sync(
             "DELETE FROM resource_samples \
-             WHERE project_key = ?1 AND instance_id = ?2 AND ts_ms = ?3;",
+         WHERE project_key = ?1 AND instance_id = ?2 AND ts_ms = ?3;",
             &key_params,
         )
         .map_err(ops_error)?;
@@ -1734,11 +1731,11 @@ impl OpsStorage {
             optional_u64(sample.queue_depth, "queue_depth")?,
             SqliteValue::Integer(sample.ts_ms),
         ];
-        conn.execute_with_params(
+        conn.execute_with_params_sync(
             "INSERT INTO resource_samples(\
-                project_key, instance_id, cpu_pct, rss_bytes, io_read_bytes, io_write_bytes, \
-                queue_depth, ts_ms\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);",
+            project_key, instance_id, cpu_pct, rss_bytes, io_read_bytes, io_write_bytes, \
+            queue_depth, ts_ms\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);",
             &params,
         )
         .map_err(ops_error)?;
@@ -1757,9 +1754,9 @@ impl OpsStorage {
         self.with_transaction(|conn| {
             let alert_params = [SqliteValue::Text(link.alert_id.clone().into())];
             let alert_rows = conn
-                .query_with_params(
+                .query_with_params_sync(
                     "SELECT project_key FROM alerts_timeline \
-                     WHERE alert_id = ?1 LIMIT 1;",
+             WHERE alert_id = ?1 LIMIT 1;",
                     &alert_params,
                 )
                 .map_err(ops_error)?;
@@ -1787,9 +1784,9 @@ impl OpsStorage {
                 SqliteValue::Text(link.evidence_uri.clone().into()),
             ];
             let duplicate_rows = conn
-                .query_with_params(
+                .query_with_params_sync(
                     "SELECT link_id FROM evidence_links \
-                     WHERE alert_id = ?1 AND evidence_uri = ?2 LIMIT 1;",
+             WHERE alert_id = ?1 AND evidence_uri = ?2 LIMIT 1;",
                     &duplicate_params,
                 )
                 .map_err(ops_error)?;
@@ -1816,11 +1813,11 @@ impl OpsStorage {
                     .map_or(SqliteValue::Null, |s| SqliteValue::Text(s.into())),
                 SqliteValue::Integer(link.created_at_ms),
             ];
-            conn.execute_with_params(
+            conn.execute_with_params_sync(
                 "INSERT INTO evidence_links(\
-                    link_id, project_key, alert_id, evidence_type, evidence_uri, \
-                    evidence_hash, created_at_ms\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
+                link_id, project_key, alert_id, evidence_type, evidence_uri, \
+                evidence_hash, created_at_ms\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
                 &params,
             )
             .map_err(ops_error)?;
@@ -2000,14 +1997,14 @@ impl OpsStorage {
         ensure_non_empty(scope_key, "scope_key")?;
         let rows = self
             .connection()
-            .query_with_params(
+            .query_with_params_sync(
                 "SELECT scope, scope_key, project_key, window, window_start_ms, window_end_ms, \
-                        total_requests, failed_requests, p95_latency_us, target_p95_latency_us, \
-                        error_budget_ratio, error_rate, error_budget_burn, remaining_budget_ratio, \
-                        health, reason_code, generated_at_ms \
-                 FROM slo_rollups \
-                 WHERE scope = ?1 AND scope_key = ?2 AND window = ?3 \
-                 ORDER BY window_start_ms DESC LIMIT 1;",
+                total_requests, failed_requests, p95_latency_us, target_p95_latency_us, \
+                error_budget_ratio, error_rate, error_budget_burn, remaining_budget_ratio, \
+                health, reason_code, generated_at_ms \
+         FROM slo_rollups \
+         WHERE scope = ?1 AND scope_key = ?2 AND window = ?3 \
+         ORDER BY window_start_ms DESC LIMIT 1;",
                 &[
                     SqliteValue::Text(scope.as_str().to_owned().into()),
                     SqliteValue::Text(scope_key.to_owned().into()),
@@ -2032,14 +2029,14 @@ impl OpsStorage {
         ensure_non_empty(scope_key, "scope_key")?;
         let rows = self
             .connection()
-            .query_with_params(
+            .query_with_params_sync(
                 "SELECT scope, scope_key, project_key, window, window_start_ms, window_end_ms, \
-                        total_requests, failed_requests, p95_latency_us, target_p95_latency_us, \
-                        error_budget_ratio, error_rate, error_budget_burn, remaining_budget_ratio, \
-                        health, reason_code, generated_at_ms \
-                 FROM slo_rollups \
-                 WHERE scope = ?1 AND scope_key = ?2 \
-                 ORDER BY window_start_ms DESC, window ASC LIMIT ?3;",
+                total_requests, failed_requests, p95_latency_us, target_p95_latency_us, \
+                error_budget_ratio, error_rate, error_budget_burn, remaining_budget_ratio, \
+                health, reason_code, generated_at_ms \
+         FROM slo_rollups \
+         WHERE scope = ?1 AND scope_key = ?2 \
+         ORDER BY window_start_ms DESC, window ASC LIMIT ?3;",
                 &[
                     SqliteValue::Text(scope.as_str().to_owned().into()),
                     SqliteValue::Text(scope_key.to_owned().into()),
@@ -2064,21 +2061,21 @@ impl OpsStorage {
         ensure_non_empty(scope_key, "scope_key")?;
         let rows = self
             .connection()
-            .query_with_params(
+            .query_with_params_sync(
                 "SELECT anomaly_id, scope, scope_key, project_key, window, window_start_ms, \
-                        metric_name, baseline_value, observed_value, deviation_ratio, severity, \
-                        reason_code, correlation_id, state, opened_at_ms, updated_at_ms, \
-                        resolved_at_ms \
-                 FROM anomaly_materializations \
-                 WHERE scope = ?1 AND scope_key = ?2 AND state = 'open' \
-                 ORDER BY CASE severity \
-                            WHEN 'critical' THEN 4 \
-                            WHEN 'error' THEN 3 \
-                            WHEN 'warn' THEN 2 \
-                            WHEN 'info' THEN 1 \
-                            ELSE 0 \
-                          END DESC, \
-                          updated_at_ms DESC LIMIT ?3;",
+                metric_name, baseline_value, observed_value, deviation_ratio, severity, \
+                reason_code, correlation_id, state, opened_at_ms, updated_at_ms, \
+                resolved_at_ms \
+         FROM anomaly_materializations \
+         WHERE scope = ?1 AND scope_key = ?2 AND state = 'open' \
+         ORDER BY CASE severity \
+                    WHEN 'critical' THEN 4 \
+                    WHEN 'error' THEN 3 \
+                    WHEN 'warn' THEN 2 \
+                    WHEN 'info' THEN 1 \
+                    ELSE 0 \
+                  END DESC, \
+                  updated_at_ms DESC LIMIT ?3;",
                 &[
                     SqliteValue::Text(scope.as_str().to_owned().into()),
                     SqliteValue::Text(scope_key.to_owned().into()),
@@ -2102,14 +2099,14 @@ impl OpsStorage {
         let rows = if let Some(project_key) = project_key {
             ensure_non_empty(project_key, "project_key")?;
             self.connection()
-                .query_with_params(
+                .query_with_params_sync(
                     "SELECT anomaly_id, scope, scope_key, project_key, window, window_start_ms, \
-                            metric_name, baseline_value, observed_value, deviation_ratio, severity, \
-                            reason_code, correlation_id, state, opened_at_ms, updated_at_ms, \
-                            resolved_at_ms \
-                     FROM anomaly_materializations \
-                     WHERE project_key = ?1 \
-                     ORDER BY opened_at_ms DESC LIMIT ?2;",
+                    metric_name, baseline_value, observed_value, deviation_ratio, severity, \
+                    reason_code, correlation_id, state, opened_at_ms, updated_at_ms, \
+                    resolved_at_ms \
+             FROM anomaly_materializations \
+             WHERE project_key = ?1 \
+             ORDER BY opened_at_ms DESC LIMIT ?2;",
                     &[
                         SqliteValue::Text(project_key.to_owned().into()),
                         SqliteValue::Integer(usize_to_i64(limit, "limit")?),
@@ -2118,13 +2115,13 @@ impl OpsStorage {
                 .map_err(ops_error)?
         } else {
             self.connection()
-                .query_with_params(
+                .query_with_params_sync(
                     "SELECT anomaly_id, scope, scope_key, project_key, window, window_start_ms, \
-                            metric_name, baseline_value, observed_value, deviation_ratio, severity, \
-                            reason_code, correlation_id, state, opened_at_ms, updated_at_ms, \
-                            resolved_at_ms \
-                     FROM anomaly_materializations \
-                     ORDER BY opened_at_ms DESC LIMIT ?1;",
+                    metric_name, baseline_value, observed_value, deviation_ratio, severity, \
+                    reason_code, correlation_id, state, opened_at_ms, updated_at_ms, \
+                    resolved_at_ms \
+             FROM anomaly_materializations \
+             ORDER BY opened_at_ms DESC LIMIT ?1;",
                     &[SqliteValue::Integer(usize_to_i64(limit, "limit")?)],
                 )
                 .map_err(ops_error)?
@@ -2152,12 +2149,12 @@ impl OpsStorage {
         ];
         let rows = self
             .connection()
-            .query_with_params(
+            .query_with_params_sync(
                 "SELECT window_start_ms, search_count, p50_latency_us, p95_latency_us, \
-                        p99_latency_us, avg_result_count \
-                 FROM search_summaries \
-                 WHERE project_key = ?1 AND instance_id = ?2 AND window = ?3 \
-                 ORDER BY window_start_ms DESC LIMIT 1;",
+                p99_latency_us, avg_result_count \
+         FROM search_summaries \
+         WHERE project_key = ?1 AND instance_id = ?2 AND window = ?3 \
+         ORDER BY window_start_ms DESC LIMIT 1;",
                 &params,
             )
             .map_err(ops_error)?;
@@ -2228,11 +2225,11 @@ impl OpsStorage {
         ];
         let rows = self
             .connection()
-            .query_with_params(
+            .query_with_params_sync(
                 "SELECT ts_ms, cpu_pct, rss_bytes, io_read_bytes, io_write_bytes, queue_depth \
-                 FROM resource_samples \
-                 WHERE project_key = ?1 AND instance_id = ?2 AND ts_ms >= ?3 AND ts_ms <= ?4 \
-                 ORDER BY ts_ms DESC LIMIT ?5;",
+         FROM resource_samples \
+         WHERE project_key = ?1 AND instance_id = ?2 AND ts_ms >= ?3 AND ts_ms <= ?4 \
+         ORDER BY ts_ms DESC LIMIT ?5;",
                 &params,
             )
             .map_err(ops_error)?;
@@ -2292,11 +2289,11 @@ impl OpsStorage {
         ];
         let rows = self
             .connection()
-            .query_with_params(
+            .query_with_params_sync(
                 "SELECT completed_jobs, failed_jobs, retried_jobs, ts_ms \
-                 FROM embedding_job_snapshots \
-                 WHERE project_key = ?1 AND instance_id = ?2 AND ts_ms >= ?3 AND ts_ms <= ?4 \
-                 ORDER BY ts_ms ASC;",
+         FROM embedding_job_snapshots \
+         WHERE project_key = ?1 AND instance_id = ?2 AND ts_ms >= ?3 AND ts_ms <= ?4 \
+         ORDER BY ts_ms ASC;",
                 &params,
             )
             .map_err(ops_error)?;
@@ -2394,9 +2391,9 @@ impl OpsStorage {
         let downsample_cutoff = now_ms.saturating_sub(policy.resource_downsample_after_ms);
 
         let downsampled_resource_samples = if policy.resource_downsample_stride > 1 {
-            conn.execute_with_params(
+            conn.execute_with_params_sync(
                 "DELETE FROM resource_samples \
-                 WHERE ts_ms < ?1 AND (sample_id % ?2) != 0;",
+             WHERE ts_ms < ?1 AND (sample_id % ?2) != 0;",
                 &[
                     SqliteValue::Integer(downsample_cutoff),
                     SqliteValue::Integer(i64::from(policy.resource_downsample_stride)),
@@ -2408,19 +2405,19 @@ impl OpsStorage {
         };
 
         let deleted_search_events = conn
-            .execute_with_params(
+            .execute_with_params_sync(
                 "DELETE FROM search_events WHERE ts_ms < ?1;",
                 &[SqliteValue::Integer(search_cutoff)],
             )
             .map_err(ops_error)?;
         let deleted_search_summaries = conn
-            .execute_with_params(
+            .execute_with_params_sync(
                 "DELETE FROM search_summaries WHERE window_start_ms < ?1;",
                 &[SqliteValue::Integer(summary_cutoff)],
             )
             .map_err(ops_error)?;
         let deleted_resource_samples = conn
-            .execute_with_params(
+            .execute_with_params_sync(
                 "DELETE FROM resource_samples WHERE ts_ms < ?1;",
                 &[SqliteValue::Integer(resource_cutoff)],
             )
@@ -2436,31 +2433,31 @@ impl OpsStorage {
 
     fn apply_pragmas(&self) -> SearchResult<()> {
         self.conn
-            .execute("PRAGMA foreign_keys=ON;")
+            .execute_sync("PRAGMA foreign_keys=ON;")
             .map_err(ops_error)?;
         if self.config.wal_mode {
             self.conn
-                .execute("PRAGMA journal_mode=WAL;")
+                .execute_sync("PRAGMA journal_mode=WAL;")
                 .map_err(ops_error)?;
-        } else if let Err(error) = self.conn.execute("PRAGMA journal_mode=DELETE;") {
+        } else if let Err(error) = self.conn.execute_sync("PRAGMA journal_mode=DELETE;") {
             tracing::warn!(
                 target: "frankensearch.ops.storage",
                 ?error,
                 "journal_mode=DELETE was not accepted; falling back to WAL"
             );
             self.conn
-                .execute("PRAGMA journal_mode=WAL;")
+                .execute_sync("PRAGMA journal_mode=WAL;")
                 .map_err(ops_error)?;
         }
 
         self.conn
-            .execute(&format!(
+            .execute_sync(&format!(
                 "PRAGMA busy_timeout={};",
                 self.config.busy_timeout_ms
             ))
             .map_err(ops_error)?;
         self.conn
-            .execute(&format!(
+            .execute_sync(&format!(
                 "PRAGMA cache_size={};",
                 self.config.cache_size_pages
             ))
@@ -2471,26 +2468,28 @@ impl OpsStorage {
 
     fn with_transaction<T, F>(&self, operation: F) -> SearchResult<T>
     where
-        F: FnOnce(&Connection) -> SearchResult<T>,
+        F: FnOnce(&AsyncConnection) -> SearchResult<T>,
     {
-        self.connection().execute("BEGIN;").map_err(ops_error)?;
-        let result = operation(self.connection());
+        self.connection()
+            .begin_transaction_sync()
+            .map_err(ops_error)?;
+        let result = catch_unwind(AssertUnwindSafe(|| operation(self.connection())));
         match result {
-            Ok(value) => {
-                self.connection().execute("COMMIT;").map_err(|commit_err| {
-                    if let Err(rollback_err) = self.connection().execute("ROLLBACK;") {
+            Ok(Ok(value)) => {
+                if let Err(commit_err) = self.connection().commit_transaction_sync() {
+                    if let Err(rollback_err) = self.connection().rollback_transaction_sync() {
                         tracing::warn!(
                             target: "frankensearch.ops.storage",
                             error = %rollback_err,
                             "rollback failed after operations storage commit error"
                         );
                     }
-                    ops_error(commit_err)
-                })?;
+                    return Err(ops_error(commit_err));
+                }
                 Ok(value)
             }
-            Err(error) => {
-                if let Err(rollback_err) = self.connection().execute("ROLLBACK;") {
+            Ok(Err(error)) => {
+                if let Err(rollback_err) = self.connection().rollback_transaction_sync() {
                     tracing::warn!(
                         target: "frankensearch.ops.storage",
                         error = %rollback_err,
@@ -2498,6 +2497,16 @@ impl OpsStorage {
                     );
                 }
                 Err(error)
+            }
+            Err(payload) => {
+                if let Err(rollback_err) = self.connection().rollback_transaction_sync() {
+                    tracing::warn!(
+                        target: "frankensearch.ops.storage",
+                        error = %rollback_err,
+                        "rollback failed while an operations storage transaction panic was unwinding"
+                    );
+                }
+                resume_unwind(payload)
             }
         }
     }
@@ -2530,8 +2539,8 @@ impl OpsIngestBatchResult {
 ///
 /// Returns an error if migration metadata cannot be read, any migration fails,
 /// checksums do not match, or an unsupported schema version is detected.
-pub fn bootstrap(conn: &Connection) -> SearchResult<()> {
-    conn.execute(OPS_SCHEMA_MIGRATIONS_TABLE_SQL)
+pub fn bootstrap(conn: &AsyncConnection) -> SearchResult<()> {
+    conn.execute_sync(OPS_SCHEMA_MIGRATIONS_TABLE_SQL)
         .map_err(ops_error)?;
 
     let mut version = current_version_optional(conn)?.unwrap_or(0);
@@ -2562,7 +2571,7 @@ pub fn bootstrap(conn: &Connection) -> SearchResult<()> {
 ///
 /// Returns an error if migration metadata cannot be queried or no versions
 /// have been recorded.
-pub fn current_version(conn: &Connection) -> SearchResult<i64> {
+pub fn current_version(conn: &AsyncConnection) -> SearchResult<i64> {
     current_version_optional(conn)?.ok_or_else(|| SearchError::SubsystemError {
         subsystem: "ops-storage",
         source: Box::new(io::Error::other(
@@ -2571,7 +2580,7 @@ pub fn current_version(conn: &Connection) -> SearchResult<i64> {
     })
 }
 
-fn apply_migration(conn: &Connection, migration: &OpsMigration) -> SearchResult<()> {
+fn apply_migration(conn: &AsyncConnection, migration: &OpsMigration) -> SearchResult<()> {
     tracing::debug!(
         target: "frankensearch.ops.storage",
         migration_version = migration.version,
@@ -2584,7 +2593,7 @@ fn apply_migration(conn: &Connection, migration: &OpsMigration) -> SearchResult<
     // the sqlite_master btree page from overflowing when the accumulated
     // DDL text exceeds the 4 KiB page size.
     for statement in migration.statements {
-        conn.execute(statement).map_err(ops_error)?;
+        conn.execute_sync(statement).map_err(ops_error)?;
     }
 
     // Record the migration metadata.
@@ -2595,18 +2604,18 @@ fn apply_migration(conn: &Connection, migration: &OpsMigration) -> SearchResult<
         SqliteValue::Text(migration.checksum.to_owned().into()),
         SqliteValue::Integer(i64::from(migration.reversible)),
     ];
-    conn.execute_with_params(
+    conn.execute_with_params_sync(
         "INSERT INTO ops_schema_migrations(version, name, applied_at_ms, checksum, reversible) \
-         VALUES (?1, ?2, ?3, ?4, ?5);",
+     VALUES (?1, ?2, ?3, ?4, ?5);",
         &params,
     )
     .map_err(ops_error)?;
     Ok(())
 }
 
-fn validate_migration_checksums(conn: &Connection) -> SearchResult<()> {
+fn validate_migration_checksums(conn: &AsyncConnection) -> SearchResult<()> {
     let rows = conn
-        .query("SELECT version, checksum FROM ops_schema_migrations ORDER BY version ASC;")
+        .query_sync("SELECT version, checksum FROM ops_schema_migrations ORDER BY version ASC;")
         .map_err(ops_error)?;
     for row in &rows {
         let version = row_i64(row, 0, "ops_schema_migrations.version")?;
@@ -2632,9 +2641,9 @@ fn validate_migration_checksums(conn: &Connection) -> SearchResult<()> {
     Ok(())
 }
 
-fn current_version_optional(conn: &Connection) -> SearchResult<Option<i64>> {
+fn current_version_optional(conn: &AsyncConnection) -> SearchResult<Option<i64>> {
     let rows = conn
-        .query("SELECT version FROM ops_schema_migrations ORDER BY version DESC LIMIT 1;")
+        .query_sync("SELECT version FROM ops_schema_migrations ORDER BY version DESC LIMIT 1;")
         .map_err(ops_error)?;
     let Some(row) = rows.first() else {
         return Ok(None);
@@ -2710,14 +2719,14 @@ fn evidence_link_id(alert_id: &str, evidence_uri: &str) -> String {
     reason = "the cache must be populated only after its database ensure succeeds"
 )]
 fn insert_search_event_row<'a>(
-    conn: &Connection,
+    conn: &AsyncConnection,
     event: &'a SearchEventRecord,
     ensured_project_keys: &mut BTreeSet<&'a str>,
     ensured_instance_ids: &mut BTreeSet<&'a str>,
 ) -> SearchResult<usize> {
     // Manual dedup: FrankenSQLite does not support INSERT OR IGNORE reliably.
     let existing = conn
-        .query_with_params(
+        .query_with_params_sync(
             "SELECT 1 FROM search_events WHERE event_id = ?1;",
             &[SqliteValue::Text(event.event_id.clone().into())],
         )
@@ -2752,28 +2761,32 @@ fn insert_search_event_row<'a>(
         SqliteValue::Integer(event.ts_ms),
     ];
 
-    conn.execute_with_params(
+    conn.execute_with_params_sync(
         "INSERT INTO search_events(\
-            event_id, project_key, instance_id, correlation_id, query_hash, query_class, \
-            phase, latency_us, result_count, memory_bytes, ts_ms\
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11);",
+        event_id, project_key, instance_id, correlation_id, query_hash, query_class, \
+        phase, latency_us, result_count, memory_bytes, ts_ms\
+     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11);",
         &params,
     )
     .map_err(ops_error)
 }
 
 /// Ensure the `projects` table has a row for `project_key`.
-fn ensure_project_exists(conn: &Connection, project_key: &str, ts_ms: i64) -> SearchResult<()> {
+fn ensure_project_exists(
+    conn: &AsyncConnection,
+    project_key: &str,
+    ts_ms: i64,
+) -> SearchResult<()> {
     let existing = conn
-        .query_with_params(
+        .query_with_params_sync(
             "SELECT 1 FROM projects WHERE project_key = ?1;",
             &[SqliteValue::Text(project_key.to_owned().into())],
         )
         .map_err(ops_error)?;
     if existing.is_empty() {
-        conn.execute_with_params(
+        conn.execute_with_params_sync(
             "INSERT INTO projects(project_key, display_name, created_at_ms, updated_at_ms) \
-             VALUES (?1, ?2, ?3, ?4);",
+         VALUES (?1, ?2, ?3, ?4);",
             &[
                 SqliteValue::Text(project_key.to_owned().into()),
                 SqliteValue::Text(project_key.to_owned().into()),
@@ -2788,23 +2801,23 @@ fn ensure_project_exists(conn: &Connection, project_key: &str, ts_ms: i64) -> Se
 
 /// Ensure the `instances` table has a row for `instance_id` under `project_key`.
 fn ensure_instance_exists(
-    conn: &Connection,
+    conn: &AsyncConnection,
     instance_id: &str,
     project_key: &str,
     ts_ms: i64,
 ) -> SearchResult<()> {
     let existing = conn
-        .query_with_params(
+        .query_with_params_sync(
             "SELECT 1 FROM instances WHERE instance_id = ?1;",
             &[SqliteValue::Text(instance_id.to_owned().into())],
         )
         .map_err(ops_error)?;
     if existing.is_empty() {
-        conn.execute_with_params(
+        conn.execute_with_params_sync(
             "INSERT INTO instances(\
-                 instance_id, project_key, host_name, pid, version, \
-                 first_seen_ms, last_heartbeat_ms, state\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);",
+             instance_id, project_key, host_name, pid, version, \
+             first_seen_ms, last_heartbeat_ms, state\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);",
             &[
                 SqliteValue::Text(instance_id.to_owned().into()),
                 SqliteValue::Text(project_key.to_owned().into()),
@@ -2822,7 +2835,7 @@ fn ensure_instance_exists(
 }
 
 fn upsert_search_summary_row(
-    conn: &Connection,
+    conn: &AsyncConnection,
     project_key: &str,
     instance_id: &str,
     window: SummaryWindow,
@@ -2836,19 +2849,19 @@ fn upsert_search_summary_row(
         SqliteValue::Integer(window_start_ms),
     ];
     let existing = conn
-        .query_with_params(
+        .query_with_params_sync(
             "SELECT 1 FROM search_summaries \
-             WHERE project_key = ?1 AND instance_id = ?2 AND window = ?3 AND window_start_ms = ?4;",
+     WHERE project_key = ?1 AND instance_id = ?2 AND window = ?3 AND window_start_ms = ?4;",
             &key_params,
         )
         .map_err(ops_error)?;
 
     if existing.is_empty() {
-        conn.execute_with_params(
+        conn.execute_with_params_sync(
             "INSERT INTO search_summaries(\
-                project_key, instance_id, window, window_start_ms, search_count, \
-                p50_latency_us, p95_latency_us, p99_latency_us, avg_result_count\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);",
+            project_key, instance_id, window, window_start_ms, search_count, \
+            p50_latency_us, p95_latency_us, p99_latency_us, avg_result_count\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);",
             &[
                 SqliteValue::Text(project_key.to_owned().into()),
                 SqliteValue::Text(instance_id.to_owned().into()),
@@ -2863,11 +2876,11 @@ fn upsert_search_summary_row(
         )
         .map_err(ops_error)?;
     } else {
-        conn.execute_with_params(
+        conn.execute_with_params_sync(
             "UPDATE search_summaries SET \
-                search_count = ?1, p50_latency_us = ?2, p95_latency_us = ?3, \
-                p99_latency_us = ?4, avg_result_count = ?5 \
-             WHERE project_key = ?6 AND instance_id = ?7 AND window = ?8 AND window_start_ms = ?9;",
+            search_count = ?1, p50_latency_us = ?2, p95_latency_us = ?3, \
+            p99_latency_us = ?4, avg_result_count = ?5 \
+         WHERE project_key = ?6 AND instance_id = ?7 AND window = ?8 AND window_start_ms = ?9;",
             &[
                 SqliteValue::Integer(u64_to_i64(stats.search_count, "search_count")?),
                 optional_u64(stats.p50_latency_us, "p50_latency_us")?,
@@ -2887,18 +2900,18 @@ fn upsert_search_summary_row(
 
 #[allow(clippy::cast_precision_loss)]
 fn compute_window_event_stats(
-    conn: &Connection,
+    conn: &AsyncConnection,
     project_key: &str,
     instance_id: &str,
     window_start_ms: i64,
     window_end_ms: i64,
 ) -> SearchResult<WindowEventStats> {
     let rows = conn
-        .query_with_params(
+        .query_with_params_sync(
             "SELECT latency_us, result_count, memory_bytes \
-             FROM search_events \
-             WHERE project_key = ?1 AND instance_id = ?2 AND ts_ms >= ?3 AND ts_ms <= ?4 \
-             ORDER BY latency_us ASC;",
+     FROM search_events \
+     WHERE project_key = ?1 AND instance_id = ?2 AND ts_ms >= ?3 AND ts_ms <= ?4 \
+     ORDER BY latency_us ASC;",
             &[
                 SqliteValue::Text(project_key.to_owned().into()),
                 SqliteValue::Text(instance_id.to_owned().into()),
@@ -2958,9 +2971,9 @@ fn compute_window_event_stats(
     })
 }
 
-fn list_distinct_project_keys(conn: &Connection) -> SearchResult<Vec<String>> {
+fn list_distinct_project_keys(conn: &AsyncConnection) -> SearchResult<Vec<String>> {
     let rows = conn
-        .query("SELECT DISTINCT project_key FROM search_events ORDER BY project_key ASC;")
+        .query_sync("SELECT DISTINCT project_key FROM search_events ORDER BY project_key ASC;")
         .map_err(ops_error)?;
     rows.iter()
         .map(|row| row_text(row, 0, "search_events.project_key").map(ToOwned::to_owned))
@@ -2968,17 +2981,17 @@ fn list_distinct_project_keys(conn: &Connection) -> SearchResult<Vec<String>> {
 }
 
 fn compute_slo_window_stats(
-    conn: &Connection,
+    conn: &AsyncConnection,
     project_key: Option<&str>,
     window_start_ms: i64,
     window_end_ms: i64,
 ) -> SearchResult<SloWindowStats> {
     let rows = if let Some(project_key) = project_key {
-        conn.query_with_params(
+        conn.query_with_params_sync(
             "SELECT phase, latency_us \
-             FROM search_events \
-             WHERE project_key = ?1 AND ts_ms >= ?2 AND ts_ms <= ?3 \
-             ORDER BY latency_us ASC;",
+         FROM search_events \
+         WHERE project_key = ?1 AND ts_ms >= ?2 AND ts_ms <= ?3 \
+         ORDER BY latency_us ASC;",
             &[
                 SqliteValue::Text(project_key.to_owned().into()),
                 SqliteValue::Integer(window_start_ms),
@@ -2987,11 +3000,11 @@ fn compute_slo_window_stats(
         )
         .map_err(ops_error)?
     } else {
-        conn.query_with_params(
+        conn.query_with_params_sync(
             "SELECT phase, latency_us \
-             FROM search_events \
-             WHERE ts_ms >= ?1 AND ts_ms <= ?2 \
-             ORDER BY latency_us ASC;",
+         FROM search_events \
+         WHERE ts_ms >= ?1 AND ts_ms <= ?2 \
+         ORDER BY latency_us ASC;",
             &[
                 SqliteValue::Integer(window_start_ms),
                 SqliteValue::Integer(window_end_ms),
@@ -3198,7 +3211,7 @@ const fn budget_fraction_for_window(window: SummaryWindow) -> f64 {
     }
 }
 
-fn upsert_slo_rollup_row(conn: &Connection, evaluation: &SloEvaluation) -> SearchResult<()> {
+fn upsert_slo_rollup_row(conn: &AsyncConnection, evaluation: &SloEvaluation) -> SearchResult<()> {
     let rollup_id = format!(
         "slo:{}:{}:{}:{}",
         evaluation.scope.as_str(),
@@ -3213,60 +3226,58 @@ fn upsert_slo_rollup_row(conn: &Connection, evaluation: &SloEvaluation) -> Searc
         SqliteValue::Integer(evaluation.window_start_ms),
     ];
     let existing = conn
-        .query_with_params(
+        .query_with_params_sync(
             "SELECT 1 FROM slo_rollups \
-             WHERE scope = ?1 AND scope_key = ?2 AND window = ?3 AND window_start_ms = ?4;",
+     WHERE scope = ?1 AND scope_key = ?2 AND window = ?3 AND window_start_ms = ?4;",
             &key_params,
         )
         .map_err(ops_error)?;
 
     if existing.is_empty() {
-        conn.execute_with_params(
-            "INSERT INTO slo_rollups(\
-                rollup_id, scope, scope_key, project_key, window, window_start_ms, window_end_ms, \
-                total_requests, failed_requests, p95_latency_us, target_p95_latency_us, \
-                error_budget_ratio, error_rate, error_budget_burn, remaining_budget_ratio, \
-                health, reason_code, generated_at_ms\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18);",
-            &[
-                SqliteValue::Text(rollup_id.into()),
-                SqliteValue::Text(evaluation.scope.as_str().to_owned().into()),
-                SqliteValue::Text(evaluation.scope_key.clone().into()),
-                optional_text(evaluation.project_key.as_deref()),
-                SqliteValue::Text(evaluation.window.as_label().to_owned().into()),
-                SqliteValue::Integer(evaluation.window_start_ms),
-                SqliteValue::Integer(evaluation.window_end_ms),
-                SqliteValue::Integer(u64_to_i64(
-                    evaluation.total_requests,
-                    "slo_rollups.total_requests",
-                )?),
-                SqliteValue::Integer(u64_to_i64(
-                    evaluation.failed_requests,
-                    "slo_rollups.failed_requests",
-                )?),
-                optional_u64(evaluation.p95_latency_us, "slo_rollups.p95_latency_us")?,
-                SqliteValue::Integer(u64_to_i64(
-                    evaluation.target_p95_latency_us,
-                    "slo_rollups.target_p95_latency_us",
-                )?),
-                SqliteValue::Float(evaluation.error_budget_ratio),
-                optional_f64(evaluation.error_rate),
-                optional_f64(evaluation.error_budget_burn),
-                optional_f64(evaluation.remaining_budget_ratio),
-                SqliteValue::Text(evaluation.health.as_str().to_owned().into()),
-                SqliteValue::Text(evaluation.reason_code.clone().into()),
-                SqliteValue::Integer(evaluation.generated_at_ms),
-            ],
-        )
+        conn.execute_with_params_sync("INSERT INTO slo_rollups(\
+            rollup_id, scope, scope_key, project_key, window, window_start_ms, window_end_ms, \
+            total_requests, failed_requests, p95_latency_us, target_p95_latency_us, \
+            error_budget_ratio, error_rate, error_budget_burn, remaining_budget_ratio, \
+            health, reason_code, generated_at_ms\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18);",
+        &[
+            SqliteValue::Text(rollup_id.into()),
+            SqliteValue::Text(evaluation.scope.as_str().to_owned().into()),
+            SqliteValue::Text(evaluation.scope_key.clone().into()),
+            optional_text(evaluation.project_key.as_deref()),
+            SqliteValue::Text(evaluation.window.as_label().to_owned().into()),
+            SqliteValue::Integer(evaluation.window_start_ms),
+            SqliteValue::Integer(evaluation.window_end_ms),
+            SqliteValue::Integer(u64_to_i64(
+                evaluation.total_requests,
+                "slo_rollups.total_requests",
+            )?),
+            SqliteValue::Integer(u64_to_i64(
+                evaluation.failed_requests,
+                "slo_rollups.failed_requests",
+            )?),
+            optional_u64(evaluation.p95_latency_us, "slo_rollups.p95_latency_us")?,
+            SqliteValue::Integer(u64_to_i64(
+                evaluation.target_p95_latency_us,
+                "slo_rollups.target_p95_latency_us",
+            )?),
+            SqliteValue::Float(evaluation.error_budget_ratio),
+            optional_f64(evaluation.error_rate),
+            optional_f64(evaluation.error_budget_burn),
+            optional_f64(evaluation.remaining_budget_ratio),
+            SqliteValue::Text(evaluation.health.as_str().to_owned().into()),
+            SqliteValue::Text(evaluation.reason_code.clone().into()),
+            SqliteValue::Integer(evaluation.generated_at_ms),
+        ],)
         .map_err(ops_error)?;
     } else {
-        conn.execute_with_params(
+        conn.execute_with_params_sync(
             "UPDATE slo_rollups SET \
-                project_key = ?1, window_end_ms = ?2, total_requests = ?3, failed_requests = ?4, \
-                p95_latency_us = ?5, target_p95_latency_us = ?6, error_budget_ratio = ?7, \
-                error_rate = ?8, error_budget_burn = ?9, remaining_budget_ratio = ?10, \
-                health = ?11, reason_code = ?12, generated_at_ms = ?13 \
-             WHERE scope = ?14 AND scope_key = ?15 AND window = ?16 AND window_start_ms = ?17;",
+            project_key = ?1, window_end_ms = ?2, total_requests = ?3, failed_requests = ?4, \
+            p95_latency_us = ?5, target_p95_latency_us = ?6, error_budget_ratio = ?7, \
+            error_rate = ?8, error_budget_burn = ?9, remaining_budget_ratio = ?10, \
+            health = ?11, reason_code = ?12, generated_at_ms = ?13 \
+         WHERE scope = ?14 AND scope_key = ?15 AND window = ?16 AND window_start_ms = ?17;",
             &[
                 optional_text(evaluation.project_key.as_deref()),
                 SqliteValue::Integer(evaluation.window_end_ms),
@@ -3302,18 +3313,18 @@ fn upsert_slo_rollup_row(conn: &Connection, evaluation: &SloEvaluation) -> Searc
 }
 
 fn resolve_stale_anomaly_rows(
-    conn: &Connection,
+    conn: &AsyncConnection,
     scope: SloScope,
     scope_key: &str,
     window: SummaryWindow,
     active_window_start_ms: i64,
     now_ms: i64,
 ) -> SearchResult<usize> {
-    conn.execute_with_params(
+    conn.execute_with_params_sync(
         "UPDATE anomaly_materializations \
-         SET state = 'resolved', resolved_at_ms = COALESCE(resolved_at_ms, ?1), updated_at_ms = ?1 \
-         WHERE scope = ?2 AND scope_key = ?3 AND window = ?4 AND state = 'open' \
-           AND window_start_ms < ?5;",
+     SET state = 'resolved', resolved_at_ms = COALESCE(resolved_at_ms, ?1), updated_at_ms = ?1 \
+     WHERE scope = ?2 AND scope_key = ?3 AND window = ?4 AND state = 'open' \
+       AND window_start_ms < ?5;",
         &[
             SqliteValue::Integer(now_ms),
             SqliteValue::Text(scope.as_str().to_owned().into()),
@@ -3327,7 +3338,7 @@ fn resolve_stale_anomaly_rows(
 
 #[allow(clippy::too_many_lines)]
 fn sync_rollup_anomaly(
-    conn: &Connection,
+    conn: &AsyncConnection,
     evaluation: &SloEvaluation,
     now_ms: i64,
 ) -> SearchResult<(usize, usize)> {
@@ -3340,11 +3351,11 @@ fn sync_rollup_anomaly(
     );
     let Some(candidate) = &evaluation.anomaly else {
         let resolved = conn
-            .execute_with_params(
+            .execute_with_params_sync(
                 "UPDATE anomaly_materializations \
-                 SET state = 'resolved', resolved_at_ms = COALESCE(resolved_at_ms, ?1), \
-                     updated_at_ms = ?1 \
-                 WHERE anomaly_id = ?2 AND state = 'open';",
+         SET state = 'resolved', resolved_at_ms = COALESCE(resolved_at_ms, ?1), \
+             updated_at_ms = ?1 \
+         WHERE anomaly_id = ?2 AND state = 'open';",
                 &[
                     SqliteValue::Integer(now_ms),
                     SqliteValue::Text(anomaly_id.clone().into()),
@@ -3355,7 +3366,7 @@ fn sync_rollup_anomaly(
     };
 
     let rows = conn
-        .query_with_params(
+        .query_with_params_sync(
             "SELECT state FROM anomaly_materializations WHERE anomaly_id = ?1;",
             &[SqliteValue::Text(anomaly_id.clone().into())],
         )
@@ -3367,39 +3378,37 @@ fn sync_rollup_anomaly(
 
     match existing_state {
         None => {
-            conn.execute_with_params(
-                "INSERT INTO anomaly_materializations(\
-                    anomaly_id, scope, scope_key, project_key, window, window_start_ms, \
-                    metric_name, baseline_value, observed_value, deviation_ratio, severity, \
-                    reason_code, correlation_id, state, opened_at_ms, updated_at_ms, resolved_at_ms\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'open', ?14, ?14, NULL);",
-                &[
-                    SqliteValue::Text(anomaly_id.into()),
-                    SqliteValue::Text(evaluation.scope.as_str().to_owned().into()),
-                    SqliteValue::Text(evaluation.scope_key.clone().into()),
-                    optional_text(evaluation.project_key.as_deref()),
-                    SqliteValue::Text(evaluation.window.as_label().to_owned().into()),
-                    SqliteValue::Integer(evaluation.window_start_ms),
-                    SqliteValue::Text(candidate.metric_name.clone().into()),
-                    SqliteValue::Float(candidate.baseline_value),
-                    SqliteValue::Float(candidate.observed_value),
-                    SqliteValue::Float(candidate.deviation_ratio),
-                    SqliteValue::Text(candidate.severity.as_str().to_owned().into()),
-                    SqliteValue::Text(candidate.reason_code.clone().into()),
-                    SqliteValue::Null,
-                    SqliteValue::Integer(now_ms),
-                ],
-            )
+            conn.execute_with_params_sync("INSERT INTO anomaly_materializations(\
+                anomaly_id, scope, scope_key, project_key, window, window_start_ms, \
+                metric_name, baseline_value, observed_value, deviation_ratio, severity, \
+                reason_code, correlation_id, state, opened_at_ms, updated_at_ms, resolved_at_ms\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'open', ?14, ?14, NULL);",
+            &[
+                SqliteValue::Text(anomaly_id.into()),
+                SqliteValue::Text(evaluation.scope.as_str().to_owned().into()),
+                SqliteValue::Text(evaluation.scope_key.clone().into()),
+                optional_text(evaluation.project_key.as_deref()),
+                SqliteValue::Text(evaluation.window.as_label().to_owned().into()),
+                SqliteValue::Integer(evaluation.window_start_ms),
+                SqliteValue::Text(candidate.metric_name.clone().into()),
+                SqliteValue::Float(candidate.baseline_value),
+                SqliteValue::Float(candidate.observed_value),
+                SqliteValue::Float(candidate.deviation_ratio),
+                SqliteValue::Text(candidate.severity.as_str().to_owned().into()),
+                SqliteValue::Text(candidate.reason_code.clone().into()),
+                SqliteValue::Null,
+                SqliteValue::Integer(now_ms),
+            ],)
             .map_err(ops_error)?;
             Ok((1, 0))
         }
         Some("resolved") => {
-            conn.execute_with_params(
+            conn.execute_with_params_sync(
                 "UPDATE anomaly_materializations SET \
-                    project_key = ?1, metric_name = ?2, baseline_value = ?3, observed_value = ?4, \
-                    deviation_ratio = ?5, severity = ?6, reason_code = ?7, correlation_id = ?8, \
-                    state = 'open', opened_at_ms = ?9, updated_at_ms = ?9, resolved_at_ms = NULL \
-                 WHERE anomaly_id = ?10;",
+                project_key = ?1, metric_name = ?2, baseline_value = ?3, observed_value = ?4, \
+                deviation_ratio = ?5, severity = ?6, reason_code = ?7, correlation_id = ?8, \
+                state = 'open', opened_at_ms = ?9, updated_at_ms = ?9, resolved_at_ms = NULL \
+             WHERE anomaly_id = ?10;",
                 &[
                     optional_text(evaluation.project_key.as_deref()),
                     SqliteValue::Text(candidate.metric_name.clone().into()),
@@ -3417,12 +3426,12 @@ fn sync_rollup_anomaly(
             Ok((1, 0))
         }
         Some("open") => {
-            conn.execute_with_params(
+            conn.execute_with_params_sync(
                 "UPDATE anomaly_materializations SET \
-                    project_key = ?1, metric_name = ?2, baseline_value = ?3, observed_value = ?4, \
-                    deviation_ratio = ?5, severity = ?6, reason_code = ?7, correlation_id = ?8, \
-                    updated_at_ms = ?9 \
-                 WHERE anomaly_id = ?10;",
+                project_key = ?1, metric_name = ?2, baseline_value = ?3, observed_value = ?4, \
+                deviation_ratio = ?5, severity = ?6, reason_code = ?7, correlation_id = ?8, \
+                updated_at_ms = ?9 \
+             WHERE anomaly_id = ?10;",
                 &[
                     optional_text(evaluation.project_key.as_deref()),
                     SqliteValue::Text(candidate.metric_name.clone().into()),
@@ -3709,6 +3718,7 @@ where
 mod tests {
     use std::io;
     use std::io::Write;
+    use std::panic::{self, AssertUnwindSafe};
     use std::sync::{Arc, LazyLock, Mutex};
 
     use super::{
@@ -3720,12 +3730,12 @@ mod tests {
     };
     use frankensearch_core::{
         LifecycleSeverity, LifecycleState, SearchError,
-        SearchEventPhase as TelemetrySearchEventPhase, TELEMETRY_SCHEMA_VERSION,
+        SearchEventPhase as TelemetrySearchEventPhase, SearchResult, TELEMETRY_SCHEMA_VERSION,
         TelemetryCorrelation, TelemetryEnvelope, TelemetryEvent, TelemetryInstance,
         TelemetryQueryClass, TelemetryResourceSample, TelemetrySearchMetrics, TelemetrySearchQuery,
         TelemetrySearchResults,
     };
-    use fsqlite::Connection;
+    use fsqlite::AsyncConnection;
     use fsqlite_types::value::SqliteValue;
 
     // ----------------------------------------------------------------------
@@ -3787,8 +3797,8 @@ mod tests {
 
     #[test]
     fn pending_events_reservation_reclaims_on_drop_without_release() {
-        // Stands in for the cancellation exit: the in-flight ingest future is
-        // dropped at its await point, so no return path and no `?` ever runs.
+        // Proves the guard itself reclaims an abandoned reservation even when
+        // no explicit terminal path gets a chance to call `release`.
         let metrics = Arc::new(OpsIngestionMetrics::default());
         {
             let (_reservation, _) = PendingEventsReservation::acquire(&metrics, 9);
@@ -3859,28 +3869,60 @@ mod tests {
         assert_eq!(pending_events(&metrics), 0);
     }
 
-    fn table_exists(conn: &Connection, table_name: &str) -> bool {
+    #[test]
+    fn transaction_rolls_back_on_panic_and_connection_remains_usable() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+
+        let panicking = panic::catch_unwind(AssertUnwindSafe(|| {
+            let _: SearchResult<()> = storage.with_transaction(|conn| {
+                conn.execute_sync(
+                    "INSERT INTO projects(project_key, display_name, created_at_ms, updated_at_ms) \
+                     VALUES ('panic-project', 'panic-project', 1, 1);",
+                )
+                .map_err(ops_error)?;
+                panic!("forced transaction panic");
+            });
+        }));
+
+        assert!(panicking.is_err(), "the transaction panic must propagate");
+        assert_eq!(
+            table_row_count(storage.connection(), "projects"),
+            0,
+            "the write performed before the panic must be rolled back"
+        );
+
+        storage
+            .connection()
+            .execute_sync(
+                "INSERT INTO projects(project_key, display_name, created_at_ms, updated_at_ms) \
+                 VALUES ('recovery-project', 'recovery-project', 2, 2);",
+            )
+            .expect("the connection should accept a new write after panic rollback");
+        assert_eq!(table_row_count(storage.connection(), "projects"), 1);
+    }
+
+    fn table_exists(conn: &AsyncConnection, table_name: &str) -> bool {
         // Probe table existence with a zero-row SELECT instead of
         // querying sqlite_master: FrankenSQLite's VDBE cannot open a
         // storage cursor on sqlite_master's btree root page.
-        conn.query(&format!("SELECT 1 FROM \"{table_name}\" LIMIT 0"))
+        conn.query_sync(&format!("SELECT 1 FROM \"{table_name}\" LIMIT 0"))
             .is_ok()
     }
 
-    fn index_exists(conn: &Connection, table_name: &str, index_name: &str) -> bool {
+    fn index_exists(conn: &AsyncConnection, table_name: &str, index_name: &str) -> bool {
         // Probe index existence via INDEXED BY hint instead of querying
         // sqlite_master: FrankenSQLite's VDBE cannot open a storage
         // cursor on sqlite_master's btree root page. If the index
         // doesn't exist, the query errors with "no such index".
-        conn.query(&format!(
+        conn.query_sync(&format!(
             "SELECT 1 FROM \"{table_name}\" INDEXED BY \"{index_name}\" LIMIT 0"
         ))
         .is_ok()
     }
 
-    fn migration_row_count(conn: &Connection) -> i64 {
+    fn migration_row_count(conn: &AsyncConnection) -> i64 {
         let rows = conn
-            .query("SELECT COUNT(*) FROM ops_schema_migrations;")
+            .query_sync("SELECT COUNT(*) FROM ops_schema_migrations;")
             .map_err(ops_error)
             .expect("count query should succeed");
         let Some(row) = rows.first() else {
@@ -3892,9 +3934,9 @@ mod tests {
         }
     }
 
-    fn search_event_count(conn: &Connection) -> i64 {
+    fn search_event_count(conn: &AsyncConnection) -> i64 {
         let rows = conn
-            .query("SELECT COUNT(*) FROM search_events;")
+            .query_sync("SELECT COUNT(*) FROM search_events;")
             .map_err(ops_error)
             .expect("count query should succeed");
         let Some(row) = rows.first() else {
@@ -3906,10 +3948,10 @@ mod tests {
         }
     }
 
-    fn table_row_count(conn: &Connection, table: &str) -> i64 {
+    fn table_row_count(conn: &AsyncConnection, table: &str) -> i64 {
         let query = format!("SELECT COUNT(*) FROM {table};");
         let rows = conn
-            .query(&query)
+            .query_sync(&query)
             .map_err(ops_error)
             .expect("count query should succeed");
         let Some(row) = rows.first() else {
@@ -3921,9 +3963,9 @@ mod tests {
         }
     }
 
-    fn single_integer_value(conn: &Connection, query: &str) -> Option<i64> {
+    fn single_integer_value(conn: &AsyncConnection, query: &str) -> Option<i64> {
         let rows = conn
-            .query(query)
+            .query_sync(query)
             .map_err(ops_error)
             .expect("integer query should succeed");
         match rows.first()?.get(0) {
@@ -3932,12 +3974,12 @@ mod tests {
         }
     }
 
-    fn search_event_order(conn: &Connection) -> Vec<(String, i64)> {
+    fn search_event_order(conn: &AsyncConnection) -> Vec<(String, i64)> {
         let rows = conn
-            .query(
+            .query_sync(
                 "SELECT event_id, ts_ms \
-                 FROM search_events \
-                 ORDER BY ts_ms ASC, event_id ASC;",
+         FROM search_events \
+         ORDER BY ts_ms ASC, event_id ASC;",
             )
             .map_err(ops_error)
             .expect("ordered search event query should succeed");
@@ -3957,11 +3999,11 @@ mod tests {
             .collect()
     }
 
-    fn latest_resource_queue_depth(conn: &Connection) -> i64 {
+    fn latest_resource_queue_depth(conn: &AsyncConnection) -> i64 {
         let rows = conn
-            .query(
+            .query_sync(
                 "SELECT queue_depth FROM resource_samples \
-                 ORDER BY ts_ms DESC LIMIT 1;",
+         ORDER BY ts_ms DESC LIMIT 1;",
             )
             .map_err(ops_error)
             .expect("queue depth query should succeed");
@@ -3974,9 +4016,9 @@ mod tests {
         }
     }
 
-    fn anomaly_state(conn: &Connection, anomaly_id: &str) -> Option<String> {
+    fn anomaly_state(conn: &AsyncConnection, anomaly_id: &str) -> Option<String> {
         let rows = conn
-            .query_with_params(
+            .query_with_params_sync(
                 "SELECT state FROM anomaly_materializations WHERE anomaly_id = ?1 LIMIT 1;",
                 &[SqliteValue::Text(anomaly_id.to_owned().into())],
             )
@@ -3989,11 +4031,11 @@ mod tests {
         }
     }
 
-    fn anomaly_resolved_at(conn: &Connection, anomaly_id: &str) -> Option<i64> {
+    fn anomaly_resolved_at(conn: &AsyncConnection, anomaly_id: &str) -> Option<i64> {
         let rows = conn
-            .query_with_params(
+            .query_with_params_sync(
                 "SELECT resolved_at_ms FROM anomaly_materializations \
-                 WHERE anomaly_id = ?1 LIMIT 1;",
+         WHERE anomaly_id = ?1 LIMIT 1;",
                 &[SqliteValue::Text(anomaly_id.to_owned().into())],
             )
             .map_err(ops_error)
@@ -4140,12 +4182,16 @@ mod tests {
         (result, logs)
     }
 
-    fn seed_project_and_instance_named(conn: &Connection, project_key: &str, instance_id: &str) {
+    fn seed_project_and_instance_named(
+        conn: &AsyncConnection,
+        project_key: &str,
+        instance_id: &str,
+    ) {
         let project_insert = format!(
             "INSERT INTO projects(project_key, display_name, created_at_ms, updated_at_ms) \
              VALUES ('{project_key}', '{project_key}', 1, 1);"
         );
-        conn.execute(&project_insert)
+        conn.execute_sync(&project_insert)
             .expect("project row should insert");
 
         let instance_insert = format!(
@@ -4156,21 +4202,21 @@ mod tests {
                 '{instance_id}', '{project_key}', 'host-a', 123, '0.1.0', 1, 1, 'healthy'\
              );"
         );
-        conn.execute(&instance_insert)
+        conn.execute_sync(&instance_insert)
             .expect("instance row should insert");
     }
 
-    fn seed_project_and_instance(conn: &Connection) {
+    fn seed_project_and_instance(conn: &AsyncConnection) {
         seed_project_and_instance_named(conn, "project-a", "instance-a");
     }
 
-    fn seed_second_project_and_instance(conn: &Connection) {
+    fn seed_second_project_and_instance(conn: &AsyncConnection) {
         seed_project_and_instance_named(conn, "project-b", "instance-b");
     }
 
     #[test]
     fn bootstrap_creates_schema_tables_and_indexes() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
 
         bootstrap(&conn).expect("bootstrap should succeed");
         assert_eq!(
@@ -4224,7 +4270,7 @@ mod tests {
 
     #[test]
     fn bootstrap_is_idempotent() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
 
         bootstrap(&conn).expect("first bootstrap should succeed");
         bootstrap(&conn).expect("second bootstrap should succeed");
@@ -4242,12 +4288,12 @@ mod tests {
 
     #[test]
     fn bootstrap_rejects_newer_schema_versions() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
-        conn.execute(OPS_SCHEMA_MIGRATIONS_TABLE_SQL)
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
+        conn.execute_sync(OPS_SCHEMA_MIGRATIONS_TABLE_SQL)
             .expect("migrations table creation should succeed");
-        conn.execute(
+        conn.execute_sync(
             "INSERT INTO ops_schema_migrations(version, name, applied_at_ms, checksum, reversible) \
-             VALUES (99, 'future', 0, 'future-checksum', 0);",
+         VALUES (99, 'future', 0, 'future-checksum', 0);",
         )
         .expect("future migration row should insert");
 
@@ -4261,12 +4307,12 @@ mod tests {
 
     #[test]
     fn bootstrap_detects_checksum_mismatch() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
-        conn.execute(OPS_SCHEMA_MIGRATIONS_TABLE_SQL)
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
+        conn.execute_sync(OPS_SCHEMA_MIGRATIONS_TABLE_SQL)
             .expect("migrations table creation should succeed");
-        conn.execute(
+        conn.execute_sync(
             "INSERT INTO ops_schema_migrations(version, name, applied_at_ms, checksum, reversible) \
-             VALUES (1, 'ops_telemetry_storage_v1', 0, 'bad-checksum', 1);",
+         VALUES (1, 'ops_telemetry_storage_v1', 0, 'bad-checksum', 1);",
         )
         .expect("mismatch migration row should insert");
 
@@ -4465,7 +4511,7 @@ mod tests {
         assert!(
             storage
                 .connection()
-                .query("SELECT 1 FROM projects WHERE project_key = 'project-retry-decoy';")
+                .query_sync("SELECT 1 FROM projects WHERE project_key = 'project-retry-decoy';")
                 .expect("project lookup should succeed")
                 .is_empty(),
             "a database retry must not create a project from its changed payload"
@@ -4473,7 +4519,7 @@ mod tests {
         assert!(
             storage
                 .connection()
-                .query("SELECT 1 FROM instances WHERE instance_id = 'instance-retry-decoy';")
+                .query_sync("SELECT 1 FROM instances WHERE instance_id = 'instance-retry-decoy';")
                 .expect("instance lookup should succeed")
                 .is_empty(),
             "a database retry must not create an instance from its changed payload"
@@ -4785,24 +4831,24 @@ mod tests {
 
         storage
             .connection()
-            .execute(
+            .execute_sync(
                 "INSERT INTO embedding_job_snapshots(\
-                    snapshot_id, project_key, instance_id, embedder_id, pending_jobs, \
-                    processing_jobs, completed_jobs, failed_jobs, retried_jobs, batch_latency_us, ts_ms\
-                 ) VALUES (\
-                    'snap-1', 'project-a', 'instance-a', 'model-a', 10, 2, 100, 5, 3, 1000, 1000\
-                 );",
+            snapshot_id, project_key, instance_id, embedder_id, pending_jobs, \
+            processing_jobs, completed_jobs, failed_jobs, retried_jobs, batch_latency_us, ts_ms\
+         ) VALUES (\
+            'snap-1', 'project-a', 'instance-a', 'model-a', 10, 2, 100, 5, 3, 1000, 1000\
+         );",
             )
             .expect("first embedding snapshot should insert");
         storage
             .connection()
-            .execute(
+            .execute_sync(
                 "INSERT INTO embedding_job_snapshots(\
-                    snapshot_id, project_key, instance_id, embedder_id, pending_jobs, \
-                    processing_jobs, completed_jobs, failed_jobs, retried_jobs, batch_latency_us, ts_ms\
-                 ) VALUES (\
-                    'snap-2', 'project-a', 'instance-a', 'model-a', 4, 1, 160, 11, 9, 900, 7000\
-                 );",
+            snapshot_id, project_key, instance_id, embedder_id, pending_jobs, \
+            processing_jobs, completed_jobs, failed_jobs, retried_jobs, batch_latency_us, ts_ms\
+         ) VALUES (\
+            'snap-2', 'project-a', 'instance-a', 'model-a', 4, 1, 160, 11, 9, 900, 7000\
+         );",
             )
             .expect("second embedding snapshot should insert");
 
@@ -5290,7 +5336,7 @@ mod tests {
     #[test]
     #[ignore = "FrankenSQLite does not yet enforce CHECK constraints on direct SQL writes"]
     fn search_summaries_window_check_rejects_invalid_values() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
         bootstrap(&conn).expect("bootstrap should succeed");
         seed_project_and_instance(&conn);
 
@@ -5305,11 +5351,11 @@ mod tests {
             SqliteValue::Integer(300),
             SqliteValue::Float(4.2),
         ];
-        let result = conn.execute_with_params(
+        let result = conn.execute_with_params_sync(
             "INSERT INTO search_summaries(\
-                project_key, instance_id, window, window_start_ms, search_count, \
-                p50_latency_us, p95_latency_us, p99_latency_us, avg_result_count\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);",
+            project_key, instance_id, window, window_start_ms, search_count, \
+            p50_latency_us, p95_latency_us, p99_latency_us, avg_result_count\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);",
             &params,
         );
         assert!(
@@ -5320,7 +5366,7 @@ mod tests {
 
     #[test]
     fn search_summaries_accepts_all_supported_windows() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
         bootstrap(&conn).expect("bootstrap should succeed");
         seed_project_and_instance(&conn);
 
@@ -5339,11 +5385,11 @@ mod tests {
                 SqliteValue::Integer(300),
                 SqliteValue::Float(5.0),
             ];
-            conn.execute_with_params(
+            conn.execute_with_params_sync(
                 "INSERT INTO search_summaries(\
-                    project_key, instance_id, window, window_start_ms, search_count, \
-                    p50_latency_us, p95_latency_us, p99_latency_us, avg_result_count\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);",
+                project_key, instance_id, window, window_start_ms, search_count, \
+                p50_latency_us, p95_latency_us, p99_latency_us, avg_result_count\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);",
                 &params,
             )
             .expect("supported window should insert");
@@ -5356,14 +5402,14 @@ mod tests {
         seed_project_and_instance(storage.connection());
         storage
             .connection()
-            .execute(
+            .execute_sync(
                 "INSERT INTO alerts_timeline(\
-                alert_id, project_key, instance_id, category, severity, reason_code, summary, \
-                state, opened_at_ms, updated_at_ms\
-             ) VALUES (\
-                'alert-1', 'project-a', 'instance-a', 'latency', 'warn', 'latency.spike', \
-                'spike', 'open', 1, 1\
-             );",
+        alert_id, project_key, instance_id, category, severity, reason_code, summary, \
+        state, opened_at_ms, updated_at_ms\
+                     ) VALUES (\
+        'alert-1', 'project-a', 'instance-a', 'latency', 'warn', 'latency.spike', \
+        'spike', 'open', 1, 1\
+                     );",
             )
             .expect("alert row should insert");
 
@@ -5396,15 +5442,12 @@ mod tests {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
         seed_project_and_instance(storage.connection());
         storage
-            .connection()
-            .execute(
-                "INSERT INTO alerts_timeline(\
-                alert_id, project_key, instance_id, category, severity, reason_code, summary, \
-                state, opened_at_ms, updated_at_ms\
-             ) VALUES \
-                ('alert-1', 'project-a', 'instance-a', 'latency', 'warn', 'latency.spike', 'spike', 'open', 1, 1), \
-                ('alert-2', 'project-a', 'instance-a', 'latency', 'warn', 'latency.spike', 'spike', 'open', 2, 2);",
-            )
+            .connection().execute_sync("INSERT INTO alerts_timeline(\
+        alert_id, project_key, instance_id, category, severity, reason_code, summary, \
+        state, opened_at_ms, updated_at_ms\
+                     ) VALUES \
+        ('alert-1', 'project-a', 'instance-a', 'latency', 'warn', 'latency.spike', 'spike', 'open', 1, 1), \
+        ('alert-2', 'project-a', 'instance-a', 'latency', 'warn', 'latency.spike', 'spike', 'open', 2, 2);",)
             .expect("alert rows should insert");
 
         let shared_uri = "file:///tmp/shared-evidence.jsonl";
@@ -5433,10 +5476,10 @@ mod tests {
 
         let rows = storage
             .connection()
-            .query_with_params(
+            .query_with_params_sync(
                 "SELECT link_id FROM evidence_links \
-                 WHERE project_key = ?1 AND evidence_uri = ?2 \
-                 ORDER BY alert_id ASC;",
+         WHERE project_key = ?1 AND evidence_uri = ?2 \
+         ORDER BY alert_id ASC;",
                 &[
                     SqliteValue::Text("project-a".to_owned().into()),
                     SqliteValue::Text(shared_uri.to_owned().into()),
@@ -5503,14 +5546,14 @@ mod tests {
         seed_second_project_and_instance(storage.connection());
         storage
             .connection()
-            .execute(
+            .execute_sync(
                 "INSERT INTO alerts_timeline(\
-                    alert_id, project_key, instance_id, category, severity, reason_code, summary, \
-                    state, opened_at_ms, updated_at_ms\
-                 ) VALUES (\
-                    'alert-project-a', 'project-a', 'instance-a', 'latency', 'warn', 'latency.spike', \
-                    'spike', 'open', 1, 1\
-                 );",
+            alert_id, project_key, instance_id, category, severity, reason_code, summary, \
+            state, opened_at_ms, updated_at_ms\
+         ) VALUES (\
+            'alert-project-a', 'project-a', 'instance-a', 'latency', 'warn', 'latency.spike', \
+            'spike', 'open', 1, 1\
+         );",
             )
             .expect("alert row should insert");
 
@@ -5538,14 +5581,14 @@ mod tests {
         seed_project_and_instance(storage.connection());
         storage
             .connection()
-            .execute(
+            .execute_sync(
                 "INSERT INTO alerts_timeline(\
-                    alert_id, project_key, instance_id, category, severity, reason_code, summary, \
-                    state, opened_at_ms, updated_at_ms\
-                 ) VALUES (\
-                    'alert-stable-id', 'project-a', 'instance-a', 'latency', 'warn', 'latency.spike', \
-                    'spike', 'open', 1, 1\
-                 );",
+            alert_id, project_key, instance_id, category, severity, reason_code, summary, \
+            state, opened_at_ms, updated_at_ms\
+         ) VALUES (\
+            'alert-stable-id', 'project-a', 'instance-a', 'latency', 'warn', 'latency.spike', \
+            'spike', 'open', 1, 1\
+         );",
             )
             .expect("alert row should insert");
 
@@ -5564,9 +5607,9 @@ mod tests {
 
         let rows = storage
             .connection()
-            .query_with_params(
+            .query_with_params_sync(
                 "SELECT link_id FROM evidence_links \
-                 WHERE alert_id = ?1 AND evidence_uri = ?2 LIMIT 1;",
+         WHERE alert_id = ?1 AND evidence_uri = ?2 LIMIT 1;",
                 &[
                     SqliteValue::Text(link.alert_id.into()),
                     SqliteValue::Text(link.evidence_uri.into()),

@@ -400,7 +400,10 @@ impl CachedLayout {
             constraints.push(Constraint::Fixed(1));
         }
 
-        self.chunks = Flex::vertical().constraints(constraints).split(area);
+        self.chunks = Flex::vertical()
+            .constraints(constraints)
+            .split(area)
+            .into_vec();
         self.area = area;
         self.show_breadcrumbs = breadcrumbs_visible;
         self.show_status_bar = show_status_bar;

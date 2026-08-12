@@ -59,11 +59,7 @@ use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::traits::{LexicalCandidateBatch, LexicalHydrationContext, SearchFuture};
 use frankensearch_core::types::{DocId, IndexableDocument, ScoreSource, ScoredResult};
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "bench-internals")]
-use tantivy::HasLen;
 use tantivy::collector::DocSetCollector;
-#[cfg(feature = "bench-internals")]
-use tantivy::directory::Directory;
 use tantivy::query::QueryParser;
 use tantivy::schema::{FAST, STORED, STRING, TextFieldIndexing, TextOptions};
 use tantivy::tokenizer::{TextAnalyzer, Token, TokenStream, Tokenizer};
@@ -1850,29 +1846,16 @@ impl TantivyIndex {
     #[cfg(feature = "bench-internals")]
     #[doc(hidden)]
     pub fn benchmark_index_layout(&self) -> SearchResult<(usize, u64)> {
-        let segment_metas =
-            self.index
-                .searchable_segment_metas()
+        let usage =
+            self.reader
+                .searcher()
+                .space_usage()
                 .map_err(|e| SearchError::SubsystemError {
                     subsystem: "tantivy",
                     source: Box::new(e),
                 })?;
-        let segment_count = segment_metas.len();
-        let managed_files = self.index.directory().list_managed_files();
-        let mut index_bytes = 0u64;
-        for path in segment_metas
-            .iter()
-            .flat_map(|segment_meta| segment_meta.list_files())
-            .filter(|path| managed_files.contains(path))
-        {
-            let file = self.index.directory().open_read(&path).map_err(|e| {
-                SearchError::SubsystemError {
-                    subsystem: "tantivy",
-                    source: Box::new(e),
-                }
-            })?;
-            index_bytes = index_bytes.saturating_add(u64::try_from(file.len()).unwrap_or(u64::MAX));
-        }
+        let segment_count = usage.segments().len();
+        let index_bytes = usage.total().get_bytes();
         Ok((segment_count, index_bytes))
     }
 
@@ -4397,10 +4380,7 @@ mod tests {
                 .benchmark_search_exact_id("terminal-join")
                 .expect("search the prepared terminal tail after worker join");
             assert_eq!(
-                tail_ids
-                    .iter()
-                    .map(DocId::as_str)
-                    .collect::<Vec<_>>(),
+                tail_ids.iter().map(DocId::as_str).collect::<Vec<_>>(),
                 ["terminal-join"],
                 "a counted segment is not accepted in place of a post-join tail search"
             );
