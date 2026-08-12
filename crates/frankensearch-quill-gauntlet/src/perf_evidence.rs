@@ -36,9 +36,9 @@ use crate::perf::{
     PerfExecutionProvenance, PerfGate, PerfGateArtifact, PerfInputIdentity, PerfMatrixSpec,
     PerfRawSample, PerfSampleArm, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg1ExpectedAuthority,
     Qg1TantivyIncumbentDecision, Qg1TantivyIncumbentError, Qg1TantivyIncumbentScreen,
-    Qg1TantivySemanticContract, median_sorted, parse_cpu_list_ids, percentile, perf_metric_unit,
-    perf_operation_scope, resolve_qg1_expected_authority_for_replay, splitmix64,
-    validate_paired_blocks,
+    Qg1TantivySemanticContract, Qg1TantivyWriterMode, median_sorted, parse_cpu_list_ids,
+    percentile, perf_metric_unit, perf_operation_scope, resolve_qg1_expected_authority_for_replay,
+    splitmix64, validate_paired_blocks,
 };
 use crate::qg6_prepared::{
     Qg6ArmRole, Qg6QueryIdentityReceipt, Qg6QuerySpec, Qg6SemanticContract,
@@ -1812,6 +1812,10 @@ impl Qg1IncumbentScreenEvidence {
                 ),
             })
         };
+        // The frozen incumbent width must be the width this cell actually
+        // materialized, proven per engine, before its streams are allowed to
+        // stand in for the cell's result.
+        self.verify_selected_width_witness(named)?;
         let effect = estimator(
             &decision.tantivy_vs_quill.samples,
             &decision.tantivy_null.samples,
@@ -1855,10 +1859,103 @@ impl Qg1IncumbentScreenEvidence {
             })
     }
 
+    /// The frozen Tantivy writer width this screen selected, when it selected
+    /// one at all.
+    ///
+    /// A `ShippingAuto` selection is refused here rather than reported: its
+    /// materialized width is chosen by Tantivy at runtime and is typed
+    /// unobservable, so it can never satisfy the frozen observed-width
+    /// requirement. Such a screen must be recorded as NoDecision — accepting it
+    /// with a relaxed or absent witness is exactly the weakening this refuses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvidenceArtifactError::InconsistentArtifact`] when the
+    /// selection is `ShippingAuto`.
+    fn selected_writer_threads(&self) -> Result<Option<usize>, EvidenceArtifactError> {
+        let Some(selected) = self.screen.selected_candidate.as_ref() else {
+            return Ok(None);
+        };
+        match selected.writer_mode {
+            Qg1TantivyWriterMode::Fixed { writer_threads } => Ok(Some(writer_threads)),
+            Qg1TantivyWriterMode::ShippingAuto => {
+                Err(EvidenceArtifactError::InconsistentArtifact {
+                    reason: format!(
+                        "QG-1 incumbent screen for {} selected the shipping-auto arm, whose \
+                     materialized writer width is unobservable; an unobservable width is a \
+                     NoDecision, never a relaxed witness",
+                        self.cell_id
+                    ),
+                })
+            }
+        }
+    }
+
+    /// Require the named cell's per-engine witness to prove the exact widths
+    /// this screen froze.
+    ///
+    /// Quill must have materialized the matrix width, and Tantivy must have
+    /// materialized the selected candidate's fixed writer width. The generic
+    /// both-equal witness rule that QG-8 and unscreened QG-1 cells pass through
+    /// is untouched and still applies; this runs in addition to it, so a screen
+    /// that froze a width the cell never ran at is rejected here rather than
+    /// silently accepted.
+    fn verify_selected_width_witness(
+        &self,
+        named: &EvidenceCell,
+    ) -> Result<(), EvidenceArtifactError> {
+        let Some(writer_threads) = self.selected_writer_threads()? else {
+            return Ok(());
+        };
+        let Some(witness) = named.spec.concurrency_witness.as_ref() else {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: format!(
+                    "screen-bound QG-1 cell {} has no concurrency witness to prove its frozen \
+                     incumbent width",
+                    self.cell_id
+                ),
+            });
+        };
+        let observed = |engine: PerfConcurrencyEngine| {
+            witness
+                .observations
+                .iter()
+                .find(|observation| observation.engine == engine)
+        };
+        let proves = |engine: PerfConcurrencyEngine, expected: usize| {
+            observed(engine).is_some_and(|observation| {
+                observation.min_observed_worker_pool_threads == expected
+                    && observation.max_observed_worker_pool_threads == expected
+            })
+        };
+        if !proves(PerfConcurrencyEngine::Quill, witness.configured_threads) {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: format!(
+                    "screen-bound QG-1 cell {} did not materialize the configured Quill width {}",
+                    self.cell_id, witness.configured_threads
+                ),
+            });
+        }
+        if !proves(PerfConcurrencyEngine::Tantivy, writer_threads) {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: format!(
+                    "screen-bound QG-1 cell {} froze Tantivy writer width {writer_threads}, which \
+                     its concurrency witness does not prove was materialized",
+                    self.cell_id
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Reject a screen whose outcome is neither a selection nor a valid
     /// NoDecision, before any authority work is attempted.
     fn validate_shape(&self) -> Result<(), EvidenceArtifactError> {
         let inconsistent = |reason: String| EvidenceArtifactError::InconsistentArtifact { reason };
+        // Refuse an unobservable selected width before anything else, so a
+        // shipping-auto selection is rejected on its own terms rather than
+        // incidentally through a downstream witness or decision rule.
+        self.selected_writer_threads()?;
         self.semantic_contract.contract_sha256().map_err(|error| {
             inconsistent(format!(
                 "QG-1 incumbent semantic contract is not fully pinned: {error}"
@@ -2387,6 +2484,16 @@ impl PerfEvidenceArtifact {
             });
         }
         for screen in &screens {
+            // Width first: an unobservable or unmaterialized frozen width is a
+            // defect in its own right, and must be reported as one rather than
+            // as whatever downstream shape rule happens to trip next.
+            if let Some(named) = self
+                .cells
+                .iter()
+                .find(|candidate| candidate.cell_id == screen.cell_id)
+            {
+                screen.verify_selected_width_witness(named)?;
+            }
             screen.validate_shape()?;
         }
         if !Self::qg1_screen_coverage_is_exact(&self.cells, &screens) {
@@ -7288,6 +7395,123 @@ mod tests {
         );
         assert_eq!(reloaded.gate_status, EvidenceDecisionStatus::NoDecision);
         assert!(!reloaded.ratchet_admissible());
+    }
+
+    /// Planted width negatives. A shipping-auto selection has no observable
+    /// materialized writer width, so it is a NoDecision and never an excuse for
+    /// a relaxed witness; and a frozen fixed width the cell's witness does not
+    /// prove was materialized is rejected rather than accepted.
+    #[test]
+    fn qg1_screen_selected_width_must_be_observable_and_materialized() {
+        let baseline = qg1_screen_artifact();
+        let screen = qg1_screen_projection(&baseline)
+            .into_iter()
+            .next()
+            .expect("the projection screens one required cell");
+        let shipping_auto = screen
+            .screen
+            .candidates
+            .first()
+            .expect("the preregistered universe leads with the shipping-auto arm")
+            .clone();
+        assert_eq!(
+            shipping_auto.writer_mode,
+            Qg1TantivyWriterMode::ShippingAuto,
+            "the first preregistered candidate is the shipping-auto arm"
+        );
+        let fixed = screen
+            .screen
+            .candidates
+            .iter()
+            .find(|candidate| matches!(candidate.writer_mode, Qg1TantivyWriterMode::Fixed { .. }))
+            .expect("the preregistered universe carries a fixed-width arm")
+            .clone();
+        let Qg1TantivyWriterMode::Fixed {
+            writer_threads: frozen_width,
+        } = fixed.writer_mode
+        else {
+            unreachable!("the fixed arm was matched above");
+        };
+
+        let mut unobservable = screen.clone();
+        unobservable.screen.selected_candidate = Some(shipping_auto);
+        unobservable.screen.no_decision_reason = None;
+        assert!(
+            matches!(
+                qg1_screen_artifact().attach_qg1_incumbent_screens(vec![unobservable]),
+                Err(EvidenceArtifactError::InconsistentArtifact { .. })
+            ),
+            "a shipping-auto selection has an unobservable width and must be NoDecision"
+        );
+
+        let mut selected = screen;
+        selected.screen.selected_candidate = Some(fixed);
+        selected.screen.no_decision_reason = None;
+        let mut mismatched = qg1_screen_artifact();
+        let witness = mismatched
+            .cells
+            .first_mut()
+            .expect("the QG-1 artifact carries its required engine cell")
+            .spec
+            .concurrency_witness
+            .as_mut()
+            .expect("required QG-1 cells carry a concurrency witness");
+        let unmaterialized = frozen_width.saturating_add(1);
+        for observation in &mut witness.observations {
+            if observation.engine == PerfConcurrencyEngine::Tantivy {
+                observation.min_observed_worker_pool_threads = unmaterialized;
+                observation.max_observed_worker_pool_threads = unmaterialized;
+            }
+        }
+        assert!(
+            matches!(
+                mismatched.attach_qg1_incumbent_screens(vec![selected]),
+                Err(EvidenceArtifactError::InconsistentArtifact { .. })
+            ),
+            "a frozen Tantivy width the witness never materialized must reject"
+        );
+    }
+
+    /// QG-8 keeps its exact prior both-equal witness contract: the screen-bound
+    /// QG-1 rule is additional, not a replacement.
+    #[test]
+    fn qg8_concurrency_witness_contract_is_unchanged() {
+        let spec = cell_spec(PerfGate::Qg8, EvidenceRole::Required);
+        let witness = spec
+            .concurrency_witness
+            .as_ref()
+            .expect("QG-8 scaling cells carry a concurrency witness");
+        assert!(
+            witness.observations.iter().all(|observation| {
+                observation.min_observed_worker_pool_threads == witness.configured_threads
+                    && observation.max_observed_worker_pool_threads == witness.configured_threads
+            }),
+            "QG-8 requires both engines at the configured width"
+        );
+        let mut relaxed = spec.clone();
+        let relaxed_witness = relaxed
+            .concurrency_witness
+            .as_mut()
+            .expect("QG-8 witness is present");
+        for observation in &mut relaxed_witness.observations {
+            if observation.engine == PerfConcurrencyEngine::Tantivy {
+                observation.min_observed_worker_pool_threads =
+                    relaxed_witness.configured_threads.saturating_add(1);
+                observation.max_observed_worker_pool_threads =
+                    relaxed_witness.configured_threads.saturating_add(1);
+            }
+        }
+        assert!(
+            matches!(
+                EvidenceCell::evaluate(
+                    relaxed.clone(),
+                    valid_experiment_for_spec(&relaxed, 1.10),
+                    &policy()
+                ),
+                Err(EvidenceArtifactError::InconsistentArtifact { .. })
+            ),
+            "QG-8 must still reject a Tantivy width that differs from the configured width"
+        );
     }
 
     /// Planted coverage negatives: the projection must name every required

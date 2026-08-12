@@ -15,12 +15,14 @@ use frankensearch_quill_gauntlet::{
     ExecutionProfileId, HardwareClassId, MachineClassAdmissionContext, MachineClassRegistry,
     MachineProfileKey, PERF_ARTIFACT_SCHEMA_VERSION, PERF_EVIDENCE_SCHEMA_VERSION,
     PERF_HISTORY_POINTER_SCHEMA_VERSION, PerfEvidenceArtifact, PerfEvidenceFile, PerfGate,
-    PerfGateArtifact, PerfGateDecision, PerfRatchetMode, PerfRatchetRequest,
-    VerifiedRunnerIdentity, evaluate_perf_ratchet, is_explicit_bootstrap,
-    is_explicit_bootstrap_for, perf_manifest_contract_sha256,
+    PerfGateArtifact, PerfGateDecision, PerfRatchetMode, PerfRatchetQg1AuthoritySets,
+    PerfRatchetRequest, Qg1AuthorityRegisterEntryV1, Qg1ExpectedAuthority, Qg1StartupHandshakeV1,
+    Qg1TargetPinV1, VerifiedRunnerIdentity, evaluate_perf_ratchet_against_qg1_authorities,
+    is_explicit_bootstrap, is_explicit_bootstrap_for, perf_manifest_contract_sha256,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 
 const USAGE: &str = "\
 Usage:
@@ -79,6 +81,15 @@ struct Args {
     promote_dir: Option<PathBuf>,
     machine_profile: Option<MachineProfileKey>,
     date: Option<String>,
+    /// Per-arm QG-1 trust roots. Each pin arrives on its own argument and is
+    /// never derived from the evidence it authenticates; an arm that supplies
+    /// evidence without its pin admits no QG-1 authority at all.
+    baseline_target_pin: Option<PathBuf>,
+    baseline_authority_dir: Option<PathBuf>,
+    candidate_target_pin: Option<PathBuf>,
+    candidate_authority_dir: Option<PathBuf>,
+    rerun_target_pin: Option<PathBuf>,
+    rerun_authority_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +113,213 @@ struct LoadedBaseline {
     evidence: Option<LoadedEvidence>,
     evidence_path: Option<PathBuf>,
     pointer: Option<(PathBuf, Vec<u8>)>,
+}
+
+/// Load one arm's complete QG-1 authority set from a pin plus its register
+/// directory, binding both to the evidence that will be authenticated.
+///
+/// Authority is never inferred from evidence. The pin is the trust root: it
+/// arrives on its own argument, names the complete required-target set before
+/// timing, and every register entry must be one it already expected. The
+/// evidence only supplies the run and source identity the pin must agree with,
+/// which is why both are parameters here rather than being read back out of the
+/// artifacts this set will later admit.
+///
+/// Descriptor-safe: the register directory is opened once with `O_NOFOLLOW |
+/// O_DIRECTORY`, and every entry is opened relative to that descriptor with
+/// `O_NOFOLLOW`, so a symlink planted between the scan and the read cannot
+/// redirect a load, and the directory cannot be swapped underneath the set.
+///
+/// Missing, extra, duplicate, and wrong-run sets are all rejected:
+/// * extra — an entry the pin does not name refuses inside
+///   `to_expected_authority`, which is the pin check itself;
+/// * missing — the admitted count is compared against the pin's complete
+///   required-target set;
+/// * duplicate — a repeated authority digest is refused before conversion;
+/// * wrong run/source — the pin's campaign run and source revision must equal
+///   the evidence identity supplied by the caller.
+fn load_qg1_authority_set(
+    pin_path: &Path,
+    authority_dir: &Path,
+    evidence_run_id: &str,
+    evidence_git_revision: &str,
+) -> Result<Vec<Qg1ExpectedAuthority>, Box<dyn Error>> {
+    use rustix::fs::{Mode, OFlags};
+
+    let pin_bytes = read_no_follow(pin_path, MAX_TARGET_PIN_BYTES)?;
+    let pin: Qg1TargetPinV1 = serde_json::from_slice(&pin_bytes).map_err(|error| {
+        format!(
+            "QG-1 target pin {} does not parse: {error}",
+            pin_path.display()
+        )
+    })?;
+    pin.verify()?;
+
+    // Bind the pin to the evidence identity BEFORE any entry is converted. A
+    // pin cut for another run or another source tree can never authenticate
+    // this arm, and discovering that after reconstituting authorities would
+    // mean the refusal came too late to be meaningful.
+    if pin.campaign_run_id() != evidence_run_id {
+        return Err(format!(
+            "QG-1 target pin names campaign run {} but the evidence was produced by run \
+             {evidence_run_id}",
+            pin.campaign_run_id()
+        )
+        .into());
+    }
+    if pin.source_git_revision() != evidence_git_revision {
+        return Err(format!(
+            "QG-1 target pin names source revision {} but the evidence was built from \
+             {evidence_git_revision}",
+            pin.source_git_revision()
+        )
+        .into());
+    }
+
+    let directory = rustix::fs::open(
+        authority_dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        format!(
+            "QG-1 authority directory {} is not an openable directory: {error}",
+            authority_dir.display()
+        )
+    })?;
+
+    // Census through the SAME pinned descriptor the reads use. A path-based
+    // `read_dir` here would enumerate one directory and open entries in
+    // whatever directory the path resolved to a moment later; sharing the
+    // descriptor is what makes "the set I counted" and "the set I read" the
+    // same set.
+    let mut names = Vec::new();
+    let mut census = rustix::fs::Dir::read_from(&directory).map_err(|error| {
+        format!(
+            "QG-1 authority directory {} is not enumerable: {error}",
+            authority_dir.display()
+        )
+    })?;
+    while let Some(entry) = census.read() {
+        let entry = entry.map_err(|error| {
+            format!(
+                "QG-1 authority directory {} enumeration failed: {error}",
+                authority_dir.display()
+            )
+        })?;
+        let name = entry.file_name().to_str().map_err(|_| {
+            format!(
+                "QG-1 authority directory {} holds a non-UTF-8 entry",
+                authority_dir.display()
+            )
+        })?;
+        if name == "." || name == ".." {
+            continue;
+        }
+        // Every remaining entry must be a register file. Silently skipping
+        // unexpected entries while claiming a COMPLETE pinned set is the same
+        // class of lie as admitting an extra one: the set would be reported
+        // complete without the operator ever learning what else was there.
+        if !name.ends_with(".json") {
+            return Err(format!(
+                "QG-1 authority directory {} holds unexpected entry {name}; a pinned register \
+                 directory may contain only its register files",
+                authority_dir.display()
+            )
+            .into());
+        }
+        names.push(name.to_owned());
+    }
+    names.sort_unstable();
+
+    let mut authorities = Vec::with_capacity(names.len());
+    let mut seen_digests = BTreeSet::new();
+    for name in &names {
+        let file = rustix::fs::openat(
+            &directory,
+            name.as_str(),
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| {
+            format!("QG-1 authority register entry {name} is not a regular readable file: {error}")
+        })?;
+        // Bounded: one byte past the register cap, so an oversized file is
+        // REFUSED rather than truncated into something that might still parse.
+        let bytes = read_bounded(
+            std::fs::File::from(file),
+            Qg1StartupHandshakeV1::MAX_REGISTER_BYTES,
+            &format!("QG-1 authority register entry {name}"),
+        )?;
+
+        let entry = Qg1AuthorityRegisterEntryV1::from_verified_slice(&bytes)?;
+        if !seen_digests.insert(entry.digest().to_owned()) {
+            return Err(format!(
+                "QG-1 authority register directory {} presents authority {} twice",
+                authority_dir.display(),
+                entry.digest()
+            )
+            .into());
+        }
+        // The pin check lives here: an entry the pin does not name cannot
+        // become an expectation, so an extra register file is refused rather
+        // than silently widening the admitted set.
+        authorities.push(entry.to_expected_authority(&pin)?);
+    }
+
+    let required = pin.required_targets().count();
+    if authorities.len() != required {
+        return Err(format!(
+            "QG-1 authority set for run {} admitted {} of {required} pinned required targets",
+            pin.campaign_run_id(),
+            authorities.len()
+        )
+        .into());
+    }
+    Ok(authorities)
+}
+
+/// A QG-1 target pin is a small fixed record: run identity, source revision,
+/// and one digest per required target. This cap is generous for the canonical
+/// matrix and still refuses anything that is not a pin.
+const MAX_TARGET_PIN_BYTES: usize = 256 * 1024;
+
+/// Read one file without following a final symlink, bounded.
+fn read_no_follow(path: &Path, limit: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+    use rustix::fs::{Mode, OFlags};
+
+    let file = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| format!("{} is not a regular readable file: {error}", path.display()))?;
+    read_bounded(
+        std::fs::File::from(file),
+        limit,
+        &path.display().to_string(),
+    )
+}
+
+/// Read at most `limit` bytes, refusing anything larger.
+///
+/// Reads `limit + 1` and refuses on overflow rather than truncating: a
+/// truncated register or pin could still parse into a SHORTER valid-looking
+/// set, which would silently narrow the admitted authorities.
+fn read_bounded(
+    mut file: std::fs::File,
+    limit: usize,
+    context: &str,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(&mut file, limit as u64 + 1),
+        &mut bytes,
+    )?;
+    if bytes.len() > limit {
+        return Err(format!("{context} exceeds its {limit}-byte bound").into());
+    }
+    Ok(bytes)
 }
 
 const REBASELINE_RETRY_PREDICATE: &str = "rerun the paired candidate and same-window reproduction with the current interleaved-runner schema, then promote the resulting current-schema history pointer";
@@ -355,23 +573,59 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
         }
     }
 
-    let mut evaluation = evaluate_perf_ratchet(PerfRatchetRequest {
-        baseline: Some(&baseline),
-        baseline_evidence: baseline_evidence.as_ref().map(|(artifact, _)| artifact),
-        candidate: &candidate,
-        rerun: rerun.as_ref().map(|(artifact, _)| artifact),
-        candidate_evidence: candidate_evidence.as_ref().map(|(artifact, _)| artifact),
-        rerun_evidence: rerun_evidence.as_ref().map(|(artifact, _)| artifact),
-        expected_machine_profile: args.machine_profile,
-        candidate_runner_identity: candidate_runner
-            .as_ref()
-            .map(|(identity, _, _, _)| identity),
-        rerun_runner_identity: rerun_runner.as_ref().map(|(identity, _, _, _)| identity),
-        gate_activated: activated,
-        mode: args.mode,
-        expected_manifest_sha256: &manifest_sha256,
-        evidence: evidence_files,
-    });
+    // Each arm's authority set is resolved from its OWN pin/directory pair and
+    // bound to that arm's evidence identity. The ratchet is handed the sets; it
+    // never derives authority from the artifacts it is about to admit.
+    let baseline_authorities = resolve_arm_authorities(
+        "baseline",
+        args.baseline_target_pin.as_ref(),
+        args.baseline_authority_dir.as_ref(),
+        &baseline.run_id,
+        &baseline.source_git_revision,
+    )?;
+    let candidate_authorities = resolve_arm_authorities(
+        "candidate",
+        args.candidate_target_pin.as_ref(),
+        args.candidate_authority_dir.as_ref(),
+        &candidate.run_id,
+        &candidate.source_git_revision,
+    )?;
+    let rerun_authorities = match rerun.as_ref() {
+        Some((artifact, _)) => resolve_arm_authorities(
+            "rerun",
+            args.rerun_target_pin.as_ref(),
+            args.rerun_authority_dir.as_ref(),
+            &artifact.run_id,
+            &artifact.source_git_revision,
+        )?,
+        None => Vec::new(),
+    };
+    let qg1_authorities = PerfRatchetQg1AuthoritySets {
+        baseline: baseline_authorities.iter().collect(),
+        candidate: candidate_authorities.iter().collect(),
+        rerun: rerun_authorities.iter().collect(),
+    };
+
+    let mut evaluation = evaluate_perf_ratchet_against_qg1_authorities(
+        &qg1_authorities,
+        PerfRatchetRequest {
+            baseline: Some(&baseline),
+            baseline_evidence: baseline_evidence.as_ref().map(|(artifact, _)| artifact),
+            candidate: &candidate,
+            rerun: rerun.as_ref().map(|(artifact, _)| artifact),
+            candidate_evidence: candidate_evidence.as_ref().map(|(artifact, _)| artifact),
+            rerun_evidence: rerun_evidence.as_ref().map(|(artifact, _)| artifact),
+            expected_machine_profile: args.machine_profile,
+            candidate_runner_identity: candidate_runner
+                .as_ref()
+                .map(|(identity, _, _, _)| identity),
+            rerun_runner_identity: rerun_runner.as_ref().map(|(identity, _, _, _)| identity),
+            gate_activated: activated,
+            mode: args.mode,
+            expected_manifest_sha256: &manifest_sha256,
+            evidence: evidence_files,
+        },
+    );
 
     let history_plan = plan_history_if_allowed(
         &args,
@@ -428,6 +682,12 @@ where
     let mut hardware_class = None;
     let mut execution_profile = None;
     let mut date = None;
+    let mut baseline_target_pin = None;
+    let mut baseline_authority_dir = None;
+    let mut candidate_target_pin = None;
+    let mut candidate_authority_dir = None;
+    let mut rerun_target_pin = None;
+    let mut rerun_authority_dir = None;
 
     while let Some(flag) = values.next() {
         match flag.to_string_lossy().as_ref() {
@@ -438,6 +698,46 @@ where
                 baseline_evidence = Some(PathBuf::from(next_value(
                     &mut values,
                     "--baseline-evidence",
+                )?));
+            }
+            // Each arm's QG-1 trust root arrives on its own pair of arguments.
+            // Pin and register directory are deliberately separate flags: a
+            // single combined argument would let one path supply both the
+            // expectation and the evidence it authenticates.
+            "--baseline-target-pin" => {
+                baseline_target_pin = Some(PathBuf::from(next_value(
+                    &mut values,
+                    "--baseline-target-pin",
+                )?));
+            }
+            "--baseline-authority-dir" => {
+                baseline_authority_dir = Some(PathBuf::from(next_value(
+                    &mut values,
+                    "--baseline-authority-dir",
+                )?));
+            }
+            "--candidate-target-pin" => {
+                candidate_target_pin = Some(PathBuf::from(next_value(
+                    &mut values,
+                    "--candidate-target-pin",
+                )?));
+            }
+            "--candidate-authority-dir" => {
+                candidate_authority_dir = Some(PathBuf::from(next_value(
+                    &mut values,
+                    "--candidate-authority-dir",
+                )?));
+            }
+            "--rerun-target-pin" => {
+                rerun_target_pin = Some(PathBuf::from(next_value(
+                    &mut values,
+                    "--rerun-target-pin",
+                )?));
+            }
+            "--rerun-authority-dir" => {
+                rerun_authority_dir = Some(PathBuf::from(next_value(
+                    &mut values,
+                    "--rerun-authority-dir",
                 )?));
             }
             "--candidate" => {
@@ -618,7 +918,38 @@ where
         promote_dir,
         machine_profile,
         date,
+        baseline_target_pin,
+        baseline_authority_dir,
+        candidate_target_pin,
+        candidate_authority_dir,
+        rerun_target_pin,
+        rerun_authority_dir,
     })
+}
+
+/// Resolve one arm's QG-1 authority set from its pin/directory pair.
+///
+/// Both flags are required together. A pin without its register directory has
+/// nothing to admit, and a register directory without its pin has no trust
+/// root — accepting either alone would let an arm present authorities that no
+/// pre-timing pin ever named, which is the inference this whole path exists to
+/// forbid. Supplying neither is honest no-claim: the arm contributes no QG-1
+/// authority and downstream admission fails closed on its own terms.
+fn resolve_arm_authorities(
+    arm: &str,
+    pin: Option<&PathBuf>,
+    authority_dir: Option<&PathBuf>,
+    evidence_run_id: &str,
+    evidence_git_revision: &str,
+) -> Result<Vec<Qg1ExpectedAuthority>, Box<dyn Error>> {
+    match (pin, authority_dir) {
+        (Some(pin), Some(directory)) => {
+            load_qg1_authority_set(pin, directory, evidence_run_id, evidence_git_revision)
+        }
+        (None, None) => Ok(Vec::new()),
+        (Some(_), None) => Err(format!("--{arm}-target-pin requires --{arm}-authority-dir").into()),
+        (None, Some(_)) => Err(format!("--{arm}-authority-dir requires --{arm}-target-pin").into()),
+    }
 }
 
 fn next_value<I>(values: &mut I, flag: &str) -> Result<OsString, Box<dyn Error>>
