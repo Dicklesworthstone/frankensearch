@@ -14587,9 +14587,9 @@ type WatcherShutdownTestSessionFactory = Box<
 #[cfg(test)]
 thread_local! {
     static WATCHER_SHUTDOWN_TEST_SESSION_FACTORY:
-        RefCell<Option<WatcherShutdownTestSessionFactory>> = RefCell::new(None);
+        RefCell<Option<WatcherShutdownTestSessionFactory>> = const { RefCell::new(None) };
     static WATCHER_SHUTDOWN_TEST_FINALIZATION_CALLS:
-        RefCell<Option<Arc<std::sync::atomic::AtomicUsize>>> = RefCell::new(None);
+        RefCell<Option<Arc<std::sync::atomic::AtomicUsize>>> = const { RefCell::new(None) };
 }
 
 #[cfg(test)]
