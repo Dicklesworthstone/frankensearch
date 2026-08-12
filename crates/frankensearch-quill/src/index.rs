@@ -22857,13 +22857,21 @@ mod tests {
                 .await
                 .expect("accumulate sealed corpus");
             sealed.commit(&cx).await.expect("seal corpus");
-            let snapshot = sealed.snapshot().expect("sealed snapshot is authoritative");
+            // `lower_leaf_term` reads composite statistics, so it takes the
+            // composed search snapshot rather than the Keeper snapshot the
+            // segments come from. The Keeper handle is cloned rather than moved
+            // because the sealed leaf borrows a segment out of it.
+            let keeper = sealed.snapshot().expect("sealed snapshot is authoritative");
+            let composed = QuillSearchSnapshot::compose(0, Arc::clone(&keeper), Vec::new())
+                .expect("composed sealed snapshot");
             let checkpoint =
-                sealed.query_checkpoint(&cx, "arrival_path_lowering", u64::MAX, u64::MAX);
+                sealed
+                    .reader
+                    .query_checkpoint(&cx, "arrival_path_lowering", u64::MAX, u64::MAX);
 
             let sealed_scorer = lower_leaf_term(
-                QueryLeaf::Sealed(&snapshot.segments()[0]),
-                &snapshot,
+                QueryLeaf::Sealed(&keeper.segments()[0]),
+                &composed,
                 DEFAULT_SCHEMA,
                 CONTENT_FIELD,
                 b"alpha",
@@ -22887,8 +22895,12 @@ mod tests {
             let frozen = Arc::new(delta.freeze(generation));
             let composite = QuillSearchSnapshot::compose(0, keeper, vec![Arc::clone(&frozen)])
                 .expect("composite snapshot");
-            let delta_checkpoint =
-                sealed.query_checkpoint(&cx, "arrival_path_lowering_delta", u64::MAX, u64::MAX);
+            let delta_checkpoint = sealed.reader.query_checkpoint(
+                &cx,
+                "arrival_path_lowering_delta",
+                u64::MAX,
+                u64::MAX,
+            );
             let delta_scorer = lower_leaf_term(
                 QueryLeaf::Delta(&frozen),
                 &composite,
