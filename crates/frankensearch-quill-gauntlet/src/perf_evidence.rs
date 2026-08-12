@@ -840,17 +840,37 @@ pub struct EngineConcurrencyObservation {
 }
 
 /// Exact per-cell witness that configured scaling knobs materialized.
+///
+/// For QG-8 both engines materialize the matrix width. For QG-1 the Quill arm
+/// materializes the matrix width while the Tantivy arm materializes whichever
+/// writer width its incumbent screen froze, so the two observations there are
+/// not required to be equal to each other — see [`Self::validate`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PerfConcurrencyWitness {
-    /// Thread-width knob declared by the normative matrix cell.
+    /// Thread-width knob declared by the normative matrix cell. Always the
+    /// Quill width; also the Tantivy width outside QG-1.
     pub configured_threads: usize,
     /// Exactly one Quill and one Tantivy observation, in engine order.
     pub observations: Vec<EngineConcurrencyObservation>,
 }
 
 impl PerfConcurrencyWitness {
-    fn validate(&self) -> Result<(), EvidenceArtifactError> {
+    /// Validate the witness against the contract its gate actually has.
+    ///
+    /// QG-8 is a scaling gate: both engines run at the matrix width, and both
+    /// observations must equal `configured_threads` exactly. This is unchanged.
+    ///
+    /// QG-1 screens a Tantivy incumbent, and the frozen arm may legitimately be
+    /// a different writer width from the Quill width the cell was configured
+    /// with. Quill therefore still binds to `configured_threads`, while Tantivy
+    /// is required here only to be positive and stable across the run; its
+    /// exact value is bound to the screen's selected fixed width by
+    /// [`Qg1IncumbentScreenEvidence::verify_selected_width_witness`]. That is a
+    /// division of labour, not a relaxation: QG-1 evidence must screen every
+    /// required engine cell to be admissible at all, so a witness that only
+    /// reached the positive-and-stable bar can never ratchet unscreened.
+    fn validate(&self, gate: PerfGate) -> Result<(), EvidenceArtifactError> {
         let expected = [
             (
                 PerfConcurrencyEngine::Quill,
@@ -869,17 +889,23 @@ impl PerfConcurrencyWitness {
             });
         }
         for (observation, (engine, observer)) in self.observations.iter().zip(expected) {
+            // The screened Tantivy arm is the one width this witness does not
+            // pin here; every other property, including stability across the
+            // run, is required of both engines exactly as before.
+            let binds_configured_width =
+                engine == PerfConcurrencyEngine::Quill || gate != PerfGate::Qg1;
+            let width = observation.min_observed_worker_pool_threads;
             if observation.engine != engine
                 || observation.observer != observer
                 || observation.observation_count == 0
-                || observation.min_observed_worker_pool_threads != self.configured_threads
-                || observation.max_observed_worker_pool_threads != self.configured_threads
+                || width == 0
+                || observation.max_observed_worker_pool_threads != width
+                || (binds_configured_width && width != self.configured_threads)
             {
                 return Err(EvidenceArtifactError::InconsistentArtifact {
-                    reason:
-                        "scaling concurrency witness is missing, duplicated, or disagrees with \
-                         the configured pool width"
-                            .to_owned(),
+                    reason: "scaling concurrency witness is missing, duplicated, unstable, or \
+                         disagrees with the configured pool width"
+                        .to_owned(),
                 });
             }
         }
@@ -1237,7 +1263,7 @@ impl EvidenceCell {
             requires_concurrency_witness,
             spec.concurrency_witness.as_ref(),
         ) {
-            (true, Some(witness)) => witness.validate()?,
+            (true, Some(witness)) => witness.validate(spec.gate)?,
             (true, None) => {
                 return Err(EvidenceArtifactError::InconsistentArtifact {
                     reason: "QG-1/QG-8 scaling evidence requires a per-engine concurrency witness"
@@ -1895,11 +1921,12 @@ impl Qg1IncumbentScreenEvidence {
     /// this screen froze.
     ///
     /// Quill must have materialized the matrix width, and Tantivy must have
-    /// materialized the selected candidate's fixed writer width. The generic
-    /// both-equal witness rule that QG-8 and unscreened QG-1 cells pass through
-    /// is untouched and still applies; this runs in addition to it, so a screen
-    /// that froze a width the cell never ran at is rejected here rather than
-    /// silently accepted.
+    /// materialized the selected candidate's fixed writer width. This is the
+    /// only place the screened Tantivy width is pinned to an exact value:
+    /// [`PerfConcurrencyWitness::validate`] deliberately requires only a
+    /// positive, stable Tantivy width for QG-1, because the width that arm
+    /// legitimately ran at is the frozen one, which the witness alone cannot
+    /// know. QG-8 keeps its both-equal contract there and never reaches here.
     fn verify_selected_width_witness(
         &self,
         named: &EvidenceCell,
@@ -7472,8 +7499,71 @@ mod tests {
         );
     }
 
-    /// QG-8 keeps its exact prior both-equal witness contract: the screen-bound
-    /// QG-1 rule is additional, not a replacement.
+    /// The screened Tantivy arm may legitimately run at a different width from
+    /// the Quill width its cell was configured with. The witness admits that
+    /// for QG-1, and the screen is what pins it to the exact frozen value —
+    /// which is why a differing width constructs here and a wrong one still
+    /// rejects. This drives the binding directly because a selected screen
+    /// otherwise requires a decision object that only a live producer can seal.
+    #[test]
+    fn qg1_screen_binds_a_tantivy_width_that_differs_from_the_configured_quill_width() {
+        let mut spec = cell_spec(PerfGate::Qg1, EvidenceRole::Required);
+        let witness = spec
+            .concurrency_witness
+            .as_mut()
+            .expect("required QG-1 cells carry a concurrency witness");
+        let configured = witness.configured_threads;
+        let screened_width = configured.saturating_add(2);
+        for observation in &mut witness.observations {
+            if observation.engine == PerfConcurrencyEngine::Tantivy {
+                observation.min_observed_worker_pool_threads = screened_width;
+                observation.max_observed_worker_pool_threads = screened_width;
+            }
+        }
+        let cell = EvidenceCell::evaluate(
+            spec.clone(),
+            valid_experiment_for_spec(&spec, 1.10),
+            &policy(),
+        )
+        .expect("QG-1 admits a screened Tantivy width that differs from the Quill width");
+
+        let screen = qg1_screen_projection(&qg1_screen_artifact())
+            .into_iter()
+            .next()
+            .expect("the projection screens one required cell");
+        let mut candidate = screen
+            .screen
+            .candidates
+            .iter()
+            .find(|candidate| matches!(candidate.writer_mode, Qg1TantivyWriterMode::Fixed { .. }))
+            .expect("the preregistered universe carries a fixed-width arm")
+            .clone();
+        candidate.writer_mode = Qg1TantivyWriterMode::Fixed {
+            writer_threads: screened_width,
+        };
+        let mut selected = screen;
+        selected.screen.selected_candidate = Some(candidate.clone());
+        selected.screen.no_decision_reason = None;
+        selected
+            .verify_selected_width_witness(&cell)
+            .expect("the screen binds Tantivy to exactly the width it froze");
+
+        candidate.writer_mode = Qg1TantivyWriterMode::Fixed {
+            writer_threads: configured,
+        };
+        let mut mismatched = selected;
+        mismatched.screen.selected_candidate = Some(candidate);
+        assert!(
+            matches!(
+                mismatched.verify_selected_width_witness(&cell),
+                Err(EvidenceArtifactError::InconsistentArtifact { .. })
+            ),
+            "a frozen width the witness never materialized still rejects"
+        );
+    }
+
+    /// QG-8 keeps its exact prior both-equal witness contract: the QG-1
+    /// division of labour never reaches it.
     #[test]
     fn qg8_concurrency_witness_contract_is_unchanged() {
         let spec = cell_spec(PerfGate::Qg8, EvidenceRole::Required);
