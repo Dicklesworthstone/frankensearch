@@ -3069,6 +3069,20 @@ pub struct TypedQueryFuzzReplay {
     pub divergence_class: DivergenceClass,
 }
 
+/// An owned, descriptor-bound typed-query replay.
+///
+/// This capability deliberately exposes replay reconstruction rather than an
+/// authenticated filesystem path. Its held sidecar-directory and regular-file
+/// descriptors remain the authority when a consumer asks to reconstruct the
+/// minimized workload.
+#[cfg(feature = "fuzz-harness")]
+pub struct TypedQueryFuzzReplayArtifact {
+    replay: TypedQueryFuzzReplay,
+    replay_directory: PinnedDirectory,
+    filename: std::ffi::OsString,
+    file: PinnedRegularFile,
+}
+
 #[cfg(feature = "fuzz-harness")]
 const TYPED_QUERY_FUZZ_REPLAY_EXTENSION: &str = "json";
 #[cfg(feature = "fuzz-harness")]
@@ -3082,6 +3096,9 @@ const MAX_TYPED_QUERY_FUZZ_REPLAY_BYTES: u64 = 1024 * 1024;
 #[cfg(all(test, feature = "fuzz-harness"))]
 thread_local! {
     static TYPED_QUERY_FUZZ_REPLAY_FINAL_BINDING_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce(&std::path::Path)>>> =
+            std::cell::RefCell::new(None);
+    static TYPED_QUERY_FUZZ_REPLAY_POST_DISPLAY_VERIFICATION_HOOK:
         std::cell::RefCell<Option<Box<dyn FnOnce(&std::path::Path)>>> =
             std::cell::RefCell::new(None);
 }
@@ -3101,6 +3118,21 @@ fn typed_query_fuzz_replay_before_final_binding(path: &std::path::Path) {
     let _ = path;
 }
 
+/// Test-only interlock after the ambient display-path check and before the
+/// final descriptor-relative entry authentication. Production performs no
+/// callback at this point.
+#[cfg(feature = "fuzz-harness")]
+fn typed_query_fuzz_replay_after_display_verification(path: &std::path::Path) {
+    #[cfg(all(test, feature = "fuzz-harness"))]
+    TYPED_QUERY_FUZZ_REPLAY_POST_DISPLAY_VERIFICATION_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(path);
+        }
+    });
+    #[cfg(not(test))]
+    let _ = path;
+}
+
 #[cfg(all(test, feature = "fuzz-harness"))]
 fn install_typed_query_fuzz_replay_final_binding_hook(
     hook: impl FnOnce(&std::path::Path) + 'static,
@@ -3109,6 +3141,19 @@ fn install_typed_query_fuzz_replay_final_binding_hook(
         assert!(
             slot.borrow().is_none(),
             "typed-query replay binding hook must be consumed before replacement"
+        );
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(all(test, feature = "fuzz-harness"))]
+fn install_typed_query_fuzz_replay_post_display_verification_hook(
+    hook: impl FnOnce(&std::path::Path) + 'static,
+) {
+    TYPED_QUERY_FUZZ_REPLAY_POST_DISPLAY_VERIFICATION_HOOK.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "typed-query replay post-display hook must be consumed before replacement"
         );
         *slot.borrow_mut() = Some(Box::new(hook));
     });
@@ -3246,17 +3291,33 @@ impl TypedQueryFuzzReplay {
     }
 }
 
+#[cfg(feature = "fuzz-harness")]
+impl TypedQueryFuzzReplayArtifact {
+    /// Reconstruct the minimized workload through the still-owned descriptor
+    /// binding, rejecting a later replacement of the original sidecar entry.
+    pub fn replay_workload(&self) -> Result<TypedQueryFuzzWorkload, GauntletError> {
+        self.replay_directory
+            .authenticate_regular_child(&self.filename, &self.file)?;
+        self.replay.replay_workload()
+    }
+
+    /// Return the content-addressed key for diagnostics without exposing an
+    /// ambient path as an authenticated replay handle.
+    pub fn artifact_key(&self) -> Result<String, GauntletError> {
+        self.replay.artifact_key()
+    }
+}
+
 /// Persist a replay under a key that includes corpus and failure identity.
 ///
-/// Immediately before this function returns, the held regular-file descriptor
-/// is bound to the canonical no-follow directory entry.  That is the checked
-/// boundary of this call; a returned `PathBuf` is not a lasting capability, so
-/// later consumers must enter through [`load_typed_query_fuzz_replay`].
+/// The returned capability owns the canonical no-follow directory and regular
+/// file descriptors. Consumers must use its replay method rather than treating
+/// an ambient path as authenticated after this call returns.
 #[cfg(feature = "fuzz-harness")]
 pub fn persist_typed_query_fuzz_replay(
     root: &std::path::Path,
     replay: &TypedQueryFuzzReplay,
-) -> Result<std::path::PathBuf, GauntletError> {
+) -> Result<TypedQueryFuzzReplayArtifact, GauntletError> {
     let bytes = replay.canonical_bytes()?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_TYPED_QUERY_FUZZ_REPLAY_BYTES {
         return Err(GauntletError::InvalidCase {
@@ -3297,14 +3358,20 @@ pub fn persist_typed_query_fuzz_replay(
         &file,
         &path,
     )?;
-    Ok(path)
+    Ok(TypedQueryFuzzReplayArtifact {
+        replay: replay.clone(),
+        replay_directory,
+        filename: filename.into(),
+        file,
+    })
 }
 
-/// Load and validate a minimized replay before returning it to a runner.
+/// Load and validate a minimized replay into an owned descriptor-bound
+/// capability before returning it to a runner.
 #[cfg(feature = "fuzz-harness")]
 pub fn load_typed_query_fuzz_replay(
     path: &std::path::Path,
-) -> Result<TypedQueryFuzzReplay, GauntletError> {
+) -> Result<TypedQueryFuzzReplayArtifact, GauntletError> {
     let filename = path
         .file_name()
         .ok_or_else(|| GauntletError::ManifestMismatch {
@@ -3326,7 +3393,7 @@ pub fn load_typed_query_fuzz_replay(
         });
     }
     let replay_directory = PinnedDirectory::open_path(parent)?;
-    load_typed_query_fuzz_replay_from_directory(&replay_directory, filename, path)
+    load_typed_query_fuzz_replay_from_directory(replay_directory, filename, path)
 }
 
 /// Authenticate a replay through an already-owned sidecar-directory capability.
@@ -3334,10 +3401,10 @@ pub fn load_typed_query_fuzz_replay(
 /// walk before reaching this shared validation path.
 #[cfg(feature = "fuzz-harness")]
 fn load_typed_query_fuzz_replay_from_directory(
-    replay_directory: &PinnedDirectory,
+    replay_directory: PinnedDirectory,
     filename: &std::ffi::OsStr,
     path: &std::path::Path,
-) -> Result<TypedQueryFuzzReplay, GauntletError> {
+) -> Result<TypedQueryFuzzReplayArtifact, GauntletError> {
     let (stored_bytes, file) =
         replay_directory.read_regular_bounded_open(filename, MAX_TYPED_QUERY_FUZZ_REPLAY_BYTES)?;
     let replay = serde_json::from_slice::<TypedQueryFuzzReplay>(&stored_bytes)?;
@@ -3361,8 +3428,13 @@ fn load_typed_query_fuzz_replay_from_directory(
             ),
         });
     }
-    bind_typed_query_fuzz_replay_final_entry(replay_directory, filename, &file, path)?;
-    Ok(replay)
+    bind_typed_query_fuzz_replay_final_entry(&replay_directory, filename, &file, path)?;
+    Ok(TypedQueryFuzzReplayArtifact {
+        replay,
+        replay_directory,
+        filename: filename.to_owned(),
+        file,
+    })
 }
 
 /// Bind the just-read or just-created replay FD to the exact final sidecar
@@ -3379,6 +3451,7 @@ fn bind_typed_query_fuzz_replay_final_entry(
     typed_query_fuzz_replay_before_final_binding(path);
     replay_directory.authenticate_regular_child(filename, file)?;
     replay_directory.verify_display_path_identity()?;
+    typed_query_fuzz_replay_after_display_verification(path);
     replay_directory.authenticate_regular_child(filename, file)
 }
 
@@ -10755,8 +10828,7 @@ mod tests {
 
     #[cfg(all(
         feature = "fuzz-harness",
-        unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        any(target_vendor = "apple", target_os = "android", target_os = "linux")
     ))]
     fn typed_query_replay_test_root(label: &str) -> std::path::PathBuf {
         static DIRECTORY_NONCE: AtomicUsize = AtomicUsize::new(0);
@@ -10772,8 +10844,7 @@ mod tests {
 
     #[cfg(all(
         feature = "fuzz-harness",
-        unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        any(target_vendor = "apple", target_os = "android", target_os = "linux")
     ))]
     fn typed_query_write_new_owned_file(path: &std::path::Path, bytes: &[u8]) {
         use std::io::Write as _;
@@ -10787,6 +10858,47 @@ mod tests {
             .expect("write one new owned hostile replay artifact");
         file.sync_all()
             .expect("sync one new owned hostile replay artifact");
+    }
+
+    #[cfg(all(
+        feature = "fuzz-harness",
+        any(target_vendor = "apple", target_os = "android", target_os = "linux")
+    ))]
+    fn typed_query_replay_path(
+        root: &std::path::Path,
+        replay: &TypedQueryFuzzReplay,
+    ) -> std::path::PathBuf {
+        root.join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY)
+            .join(typed_query_fuzz_replay_filename(
+                &replay
+                    .artifact_key()
+                    .expect("canonical typed-query replay key"),
+            ))
+    }
+
+    #[cfg(all(
+        feature = "fuzz-harness",
+        any(target_vendor = "apple", target_os = "android", target_os = "linux")
+    ))]
+    fn typed_query_rewrite_owned_file_same_length(path: &std::path::Path, bytes: &[u8]) {
+        use std::io::Write as _;
+
+        let original_len = std::fs::metadata(path)
+            .expect("owned replay artifact exists before hostile rewrite")
+            .len();
+        assert_eq!(
+            u64::try_from(bytes.len()).expect("hostile bytes fit u64"),
+            original_len,
+            "hostile rewrite must retain the original file length"
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open one owned replay artifact for hostile same-inode rewrite");
+        file.write_all(bytes)
+            .expect("rewrite one owned replay artifact at the same length");
+        file.sync_all()
+            .expect("sync hostile same-inode replay rewrite");
     }
 
     #[cfg(feature = "fuzz-harness")]
@@ -10854,32 +10966,48 @@ mod tests {
 
     #[cfg(all(
         feature = "fuzz-harness",
-        unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        any(target_vendor = "apple", target_os = "android", target_os = "linux")
     ))]
     #[test]
     fn typed_query_public_replay_persistence_authenticates_canonical_filename() {
         let replay = typed_query_test_replay(&[22, 1, 7, 99], TypedQueryTree::MixedHitMiss(1, 7));
         let root = typed_query_replay_test_root("public-persistence");
-        let path = persist_typed_query_fuzz_replay(&root, &replay)
+        let artifact = persist_typed_query_fuzz_replay(&root, &replay)
             .expect("persist with create-new in an owned directory");
         let canonical_bytes = replay.canonical_bytes().expect("canonical replay bytes");
         let artifact_key = replay.artifact_key().expect("canonical artifact key");
         let expected_filename = typed_query_fuzz_replay_filename(&artifact_key);
+        let path = typed_query_replay_path(&root, &replay);
         assert_eq!(
             path.file_name().and_then(std::ffi::OsStr::to_str),
             Some(expected_filename.as_str()),
-            "the persisted final path component must be the canonical content-addressed name"
+            "the caller-supplied load locator must use the canonical content-addressed name"
         );
         assert_eq!(
-            load_typed_query_fuzz_replay(&path).expect("load canonical persisted replay"),
-            replay,
-            "the public load entrypoint must reconstruct the persisted replay"
+            artifact
+                .replay_workload()
+                .expect("persisted descriptor capability reconstructs the replay")
+                .case
+                .query,
+            replay.minimized_query,
+            "the public persist entrypoint must return a consumable descriptor capability"
+        );
+        assert_eq!(
+            load_typed_query_fuzz_replay(&path)
+                .expect("load canonical persisted replay")
+                .replay_workload()
+                .expect("loaded descriptor capability reconstructs the replay")
+                .case
+                .query,
+            replay.minimized_query,
+            "the public load entrypoint must return a consumable descriptor capability"
         );
         assert_eq!(
             persist_typed_query_fuzz_replay(&root, &replay)
-                .expect("authenticate an already-created canonical replay without overwrite"),
-            path,
+                .expect("authenticate an already-created canonical replay without overwrite")
+                .artifact_key()
+                .expect("duplicate descriptor capability has the canonical key"),
+            artifact_key,
             "a duplicate persist may only reuse the same authenticated create-new artifact"
         );
 
@@ -11008,16 +11136,20 @@ mod tests {
             b"unrelated existing replay"
         );
         assert_eq!(
-            load_typed_query_fuzz_replay(&path).expect("original replay remains loadable"),
-            replay,
+            load_typed_query_fuzz_replay(&path)
+                .expect("original replay remains loadable")
+                .replay_workload()
+                .expect("original descriptor capability remains consumable")
+                .case
+                .query,
+            replay.minimized_query,
             "hostile cases must not overwrite the original persisted artifact"
         );
     }
 
     #[cfg(all(
         feature = "fuzz-harness",
-        unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        any(target_vendor = "apple", target_os = "android", target_os = "linux")
     ))]
     #[test]
     fn typed_query_replay_sidecar_rejects_symlinks_and_nonregular_entries() {
@@ -11030,8 +11162,17 @@ mod tests {
         );
 
         let final_target_root = typed_query_replay_test_root("final-symlink-target");
-        let final_target = persist_typed_query_fuzz_replay(&final_target_root, &replay)
+        let final_target_artifact = persist_typed_query_fuzz_replay(&final_target_root, &replay)
             .expect("persist final-symlink target");
+        assert_eq!(
+            final_target_artifact
+                .replay_workload()
+                .expect("final-symlink target capability remains consumable")
+                .case
+                .query,
+            replay.minimized_query
+        );
+        let final_target = typed_query_replay_path(&final_target_root, &replay);
         let final_symlink_root = typed_query_replay_test_root("final-symlink");
         let final_symlink_directory = final_symlink_root.join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY);
         std::fs::create_dir(&final_symlink_directory).expect("create final-symlink directory");
@@ -11057,8 +11198,18 @@ mod tests {
         );
 
         let directory_target_root = typed_query_replay_test_root("directory-symlink-target");
-        let directory_target = persist_typed_query_fuzz_replay(&directory_target_root, &replay)
-            .expect("persist directory-symlink target");
+        let directory_target_artifact =
+            persist_typed_query_fuzz_replay(&directory_target_root, &replay)
+                .expect("persist directory-symlink target");
+        assert_eq!(
+            directory_target_artifact
+                .replay_workload()
+                .expect("directory-symlink target capability remains consumable")
+                .case
+                .query,
+            replay.minimized_query
+        );
+        let directory_target = typed_query_replay_path(&directory_target_root, &replay);
         let directory_symlink_root = typed_query_replay_test_root("directory-symlink");
         let directory_symlink = directory_symlink_root.join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY);
         symlink(
@@ -11085,8 +11236,12 @@ mod tests {
         );
         assert_eq!(
             load_typed_query_fuzz_replay(&directory_target)
-                .expect("directory symlink target remains loadable"),
-            replay
+                .expect("directory symlink target remains loadable")
+                .replay_workload()
+                .expect("directory symlink target descriptor remains consumable")
+                .case
+                .query,
+            replay.minimized_query
         );
 
         let nonregular_root = typed_query_replay_test_root("nonregular-collision");
@@ -11107,8 +11262,7 @@ mod tests {
 
     #[cfg(all(
         feature = "fuzz-harness",
-        unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        any(target_vendor = "apple", target_os = "android", target_os = "linux")
     ))]
     #[test]
     fn typed_query_public_replay_rejects_post_io_final_and_parent_substitution() {
@@ -11146,8 +11300,17 @@ mod tests {
         );
 
         let load_root = typed_query_replay_test_root("load-final-substitution");
-        let load_path =
+        let load_artifact =
             persist_typed_query_fuzz_replay(&load_root, &replay).expect("persist load source");
+        assert_eq!(
+            load_artifact
+                .replay_workload()
+                .expect("load source descriptor capability remains consumable")
+                .case
+                .query,
+            replay.minimized_query
+        );
+        let load_path = typed_query_replay_path(&load_root, &replay);
         let load_displaced = load_path.with_file_name(format!("{filename}.displaced-load"));
         let load_bytes = canonical_bytes.clone();
         let load_displaced_for_hook = load_displaced.clone();
@@ -11170,8 +11333,17 @@ mod tests {
         );
 
         let parent_root = typed_query_replay_test_root("load-parent-substitution");
-        let parent_path = persist_typed_query_fuzz_replay(&parent_root, &replay)
+        let parent_artifact = persist_typed_query_fuzz_replay(&parent_root, &replay)
             .expect("persist parent-substitution source");
+        assert_eq!(
+            parent_artifact
+                .replay_workload()
+                .expect("parent-substitution source descriptor remains consumable")
+                .case
+                .query,
+            replay.minimized_query
+        );
+        let parent_path = typed_query_replay_path(&parent_root, &replay);
         let parent_directory = parent_path
             .parent()
             .expect("parent-substitution source has sidecar directory")
@@ -11199,6 +11371,114 @@ mod tests {
         assert_eq!(
             std::fs::read(&parent_path).expect("substituted parent artifact remains intact"),
             canonical_bytes
+        );
+    }
+
+    #[cfg(all(
+        feature = "fuzz-harness",
+        any(target_vendor = "apple", target_os = "android", target_os = "linux")
+    ))]
+    #[test]
+    fn typed_query_public_replay_capability_handles_late_substitution_and_rejects_same_inode_rewrite()
+     {
+        let replay = typed_query_test_replay(&[22, 1, 7, 99], TypedQueryTree::MixedHitMiss(1, 7));
+        let canonical_bytes = replay.canonical_bytes().expect("canonical replay bytes");
+        let filename = typed_query_fuzz_replay_filename(
+            &replay.artifact_key().expect("canonical artifact key"),
+        );
+
+        let persist_root = typed_query_replay_test_root("late-persist-path-substitution");
+        let persist_path = typed_query_replay_path(&persist_root, &replay);
+        let persist_directory = persist_path
+            .parent()
+            .expect("persist path has a sidecar directory")
+            .to_path_buf();
+        let persist_displaced = persist_root.join("typed_query_tree-displaced-late-persist");
+        let persist_decoy = vec![b'~'; canonical_bytes.len()];
+        let persist_directory_for_hook = persist_directory.clone();
+        let persist_displaced_for_hook = persist_displaced.clone();
+        install_typed_query_fuzz_replay_post_display_verification_hook(move |path| {
+            std::fs::rename(&persist_directory_for_hook, &persist_displaced_for_hook)
+                .expect("move owned sidecar after display verification without deletion");
+            std::fs::create_dir(&persist_directory_for_hook)
+                .expect("create substituted owned sidecar directory");
+            typed_query_write_new_owned_file(path, &persist_decoy);
+        });
+        let persisted = persist_typed_query_fuzz_replay(&persist_root, &replay)
+            .expect("late display-path substitution must not replace the returned capability");
+        assert_eq!(
+            persisted
+                .replay_workload()
+                .expect("persisted capability must consume its original descriptor binding")
+                .case
+                .query,
+            replay.minimized_query
+        );
+        assert_eq!(
+            std::fs::read(persist_displaced.join(&filename))
+                .expect("original late-persist artifact remains intact"),
+            canonical_bytes
+        );
+        assert_eq!(
+            std::fs::read(&persist_path).expect("ambient late-persist path resolves to the decoy"),
+            vec![b'~'; canonical_bytes.len()],
+            "the old PathBuf-returning API would have exposed this substituted entry"
+        );
+
+        let load_root = typed_query_replay_test_root("late-load-path-substitution");
+        persist_typed_query_fuzz_replay(&load_root, &replay)
+            .expect("persist late-load source descriptor capability");
+        let load_path = typed_query_replay_path(&load_root, &replay);
+        let load_directory = load_path
+            .parent()
+            .expect("load path has a sidecar directory")
+            .to_path_buf();
+        let load_displaced = load_root.join("typed_query_tree-displaced-late-load");
+        let load_decoy = vec![b'!'; canonical_bytes.len()];
+        let load_directory_for_hook = load_directory.clone();
+        let load_displaced_for_hook = load_displaced.clone();
+        install_typed_query_fuzz_replay_post_display_verification_hook(move |path| {
+            std::fs::rename(&load_directory_for_hook, &load_displaced_for_hook)
+                .expect("move owned load sidecar after display verification without deletion");
+            std::fs::create_dir(&load_directory_for_hook)
+                .expect("create substituted owned load sidecar directory");
+            typed_query_write_new_owned_file(path, &load_decoy);
+        });
+        let loaded = load_typed_query_fuzz_replay(&load_path)
+            .expect("late display-path substitution must not replace the loaded capability");
+        assert_eq!(
+            loaded
+                .replay_workload()
+                .expect("loaded capability must consume its original descriptor binding")
+                .case
+                .query,
+            replay.minimized_query
+        );
+        assert_eq!(
+            std::fs::read(load_displaced.join(&filename))
+                .expect("original late-load artifact remains intact"),
+            canonical_bytes
+        );
+        assert_eq!(
+            std::fs::read(&load_path).expect("ambient late-load path resolves to the decoy"),
+            vec![b'!'; canonical_bytes.len()]
+        );
+
+        let mutation_root = typed_query_replay_test_root("same-inode-equal-length-mutation");
+        persist_typed_query_fuzz_replay(&mutation_root, &replay)
+            .expect("persist same-inode mutation source descriptor capability");
+        let mutation_path = typed_query_replay_path(&mutation_root, &replay);
+        let mutation_bytes = vec![b'x'; canonical_bytes.len()];
+        install_typed_query_fuzz_replay_post_display_verification_hook(move |path| {
+            typed_query_rewrite_owned_file_same_length(path, &mutation_bytes);
+        });
+        assert!(matches!(
+            load_typed_query_fuzz_replay(&mutation_path),
+            Err(GauntletError::UnsafeStorePath { path }) if path == mutation_path
+        ));
+        assert_eq!(
+            std::fs::read(&mutation_path).expect("same-inode hostile rewrite remains intact"),
+            vec![b'x'; canonical_bytes.len()]
         );
     }
 

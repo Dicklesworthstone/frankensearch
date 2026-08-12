@@ -122,8 +122,8 @@ pub use engine::{CassQuillSubject, CassTantivyOracle, TantivyOracle};
 pub use engine::{
     TYPED_QUERY_FUZZ_GENERATOR_ID, TYPED_QUERY_FUZZ_MAX_INPUT_BYTES,
     TYPED_QUERY_FUZZ_REPLAY_SCHEMA_VERSION, TYPED_QUERY_FUZZ_SHRINK_FUEL,
-    TypedQueryFailureFingerprint, TypedQueryFuzzReplay, TypedQueryFuzzWorkload,
-    TypedQueryLenientAsymmetry, TypedQueryOracleBehavior, TypedQueryTree,
+    TypedQueryFailureFingerprint, TypedQueryFuzzReplay, TypedQueryFuzzReplayArtifact,
+    TypedQueryFuzzWorkload, TypedQueryLenientAsymmetry, TypedQueryOracleBehavior, TypedQueryTree,
     load_typed_query_fuzz_replay, materialize_typed_query_fuzz_workload,
     persist_typed_query_fuzz_replay, scalar_g1a_fuzz_pair, typed_query_failure_divergence_class,
     typed_query_fuzz_corpus_spec, typed_query_fuzz_seed, typed_query_fuzz_vocabulary,

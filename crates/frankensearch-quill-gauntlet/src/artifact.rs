@@ -4180,56 +4180,43 @@ fn canonical_json_matches<T: Serialize>(value: &T, expected: &[u8]) -> Result<bo
     Ok(matcher.matches && matcher.offset == expected.len())
 }
 
-/// Rustix exposes the `openat`/`statat(AT_SYMLINK_NOFOLLOW)` and
-/// `O_DIRECTORY|O_NOFOLLOW` capability set on Unix targets other than its
-/// explicit ESP-IDF, Horizon, and Redox exclusions.  Other targets receive a
+/// This capability needs Rustix `openat`/`statat(AT_SYMLINK_NOFOLLOW)`,
+/// `flock`, and `renameat_with(RENAME_NOREPLACE)`. Rustix 1.1.4 exposes that
+/// full set on Apple and Linux-kernel targets only. Other targets receive a
 /// typed `Unsupported` I/O error instead of a path-based fallback.
-#[cfg(all(
-    unix,
-    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
-))]
+#[cfg(any(target_vendor = "apple", target_os = "android", target_os = "linux"))]
 pub struct PinnedDirectory {
     file: File,
     display_path: PathBuf,
 }
 
-#[cfg(all(
-    unix,
-    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
-))]
+#[cfg(any(target_vendor = "apple", target_os = "android", target_os = "linux"))]
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct PinnedRegularFileIdentity {
     device: u64,
     inode: u64,
     mode: u32,
     size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
 }
 
-#[cfg(all(
-    unix,
-    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
-))]
+#[cfg(any(target_vendor = "apple", target_os = "android", target_os = "linux"))]
 pub(crate) struct PinnedRegularFile {
     file: File,
     post_io_identity: PinnedRegularFileIdentity,
+    post_io_sha256: [u8; 32],
 }
 
-#[cfg(not(all(
-    unix,
-    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
-)))]
+#[cfg(not(any(target_vendor = "apple", target_os = "android", target_os = "linux")))]
 pub struct PinnedDirectory;
 
-#[cfg(not(all(
-    unix,
-    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
-)))]
+#[cfg(not(any(target_vendor = "apple", target_os = "android", target_os = "linux")))]
 pub(crate) struct PinnedRegularFile;
 
-#[cfg(all(
-    unix,
-    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
-))]
+#[cfg(any(target_vendor = "apple", target_os = "android", target_os = "linux"))]
 impl PinnedDirectory {
     pub(crate) fn open_path(path: &Path) -> Result<Self, GauntletError> {
         Self::walk_path(path, false)
@@ -4441,18 +4428,22 @@ impl PinnedDirectory {
                 path: self.display_path.join(name),
             });
         }
+        let post_io_sha256: [u8; 32] = Sha256::digest(&bytes).into();
         Ok((
             bytes,
             PinnedRegularFile {
                 file,
                 post_io_identity: self.regular_file_identity(name, &after)?,
+                post_io_sha256,
             },
         ))
     }
 
     /// Bind a regular child name to a still-open descriptor after I/O.  Both
     /// descriptor stats and the final `statat(..., SYMLINK_NOFOLLOW)` dirent
-    /// stat must match the post-I/O device, inode, type, and size.
+    /// stat must match the post-I/O device, inode, type, size, and timestamps.
+    /// The descriptor is then re-read and compared to its post-I/O SHA-256 so
+    /// an equal-length rewrite of the same inode cannot pass as authentic.
     pub(crate) fn authenticate_regular_child(
         &self,
         name: &OsStr,
@@ -4476,6 +4467,11 @@ impl PinnedDirectory {
         }
         let after_dirent = fstat(&file.file).map_err(std::io::Error::from)?;
         if self.regular_file_identity(name, &after_dirent)? != file.post_io_identity {
+            return Err(GauntletError::UnsafeStorePath {
+                path: self.display_path.join(name),
+            });
+        }
+        if self.regular_file_sha256(name, file)? != file.post_io_sha256 {
             return Err(GauntletError::UnsafeStorePath {
                 path: self.display_path.join(name),
             });
@@ -4585,13 +4581,59 @@ impl PinnedDirectory {
                 path: self.display_path.join(name),
             });
         }
+        let post_io_sha256: [u8; 32] = Sha256::digest(&read_back).into();
         Ok(Some((
             read_back,
             PinnedRegularFile {
                 file,
                 post_io_identity: self.regular_file_identity(name, &after_read)?,
+                post_io_sha256,
             },
         )))
+    }
+
+    fn regular_file_sha256(
+        &self,
+        name: &OsStr,
+        file: &PinnedRegularFile,
+    ) -> Result<[u8; 32], GauntletError> {
+        use rustix::fs::fstat;
+
+        let before = fstat(&file.file).map_err(std::io::Error::from)?;
+        if self.regular_file_identity(name, &before)? != file.post_io_identity {
+            return Err(GauntletError::UnsafeStorePath {
+                path: self.display_path.join(name),
+            });
+        }
+        let mut reader = file.file.try_clone()?;
+        reader.seek(SeekFrom::Start(0))?;
+        let mut remaining = file.post_io_identity.size;
+        let mut buffer = [0_u8; 8 * 1024];
+        let mut hasher = Sha256::new();
+        while remaining > 0 {
+            let limit = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+            let read = reader.read(&mut buffer[..limit])?;
+            if read == 0 {
+                return Err(GauntletError::UnsafeStorePath {
+                    path: self.display_path.join(name),
+                });
+            }
+            hasher.update(&buffer[..read]);
+            remaining = remaining.saturating_sub(u64::try_from(read).unwrap_or(u64::MAX));
+        }
+        let mut extra = [0_u8; 1];
+        if reader.read(&mut extra)? != 0 {
+            return Err(GauntletError::UnsafeStorePath {
+                path: self.display_path.join(name),
+            });
+        }
+        let after = fstat(&file.file).map_err(std::io::Error::from)?;
+        if self.regular_file_identity(name, &after)? != file.post_io_identity {
+            return Err(GauntletError::UnsafeStorePath {
+                path: self.display_path.join(name),
+            });
+        }
+        Ok(hasher.finalize().into())
     }
 
     fn regular_file_identity(
@@ -4613,6 +4655,14 @@ impl PinnedDirectory {
             mode: u32::try_from(stat.st_mode)
                 .map_err(|_| GauntletError::UnsafeStorePath { path: path.clone() })?,
             size: u64::try_from(stat.st_size)
+                .map_err(|_| GauntletError::UnsafeStorePath { path: path.clone() })?,
+            modified_seconds: i64::try_from(stat.st_mtime)
+                .map_err(|_| GauntletError::UnsafeStorePath { path: path.clone() })?,
+            modified_nanoseconds: i64::try_from(stat.st_mtime_nsec)
+                .map_err(|_| GauntletError::UnsafeStorePath { path: path.clone() })?,
+            changed_seconds: i64::try_from(stat.st_ctime)
+                .map_err(|_| GauntletError::UnsafeStorePath { path: path.clone() })?,
+            changed_nanoseconds: i64::try_from(stat.st_ctime_nsec)
                 .map_err(|_| GauntletError::UnsafeStorePath { path })?,
         })
     }
@@ -4984,10 +5034,7 @@ impl PinnedDirectory {
     }
 }
 
-#[cfg(all(
-    unix,
-    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
-))]
+#[cfg(any(target_vendor = "apple", target_os = "android", target_os = "linux"))]
 fn directory_open_flags() -> rustix::fs::OFlags {
     rustix::fs::OFlags::RDONLY
         | rustix::fs::OFlags::CLOEXEC
@@ -5020,15 +5067,12 @@ fn gauntlet_to_io(error: &GauntletError) -> std::io::Error {
     std::io::Error::other(error.to_string())
 }
 
-#[cfg(not(all(
-    unix,
-    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
-)))]
+#[cfg(not(any(target_vendor = "apple", target_os = "android", target_os = "linux")))]
 impl PinnedDirectory {
     fn unsupported<T>() -> Result<T, GauntletError> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "descriptor-relative artifact storage requires Unix openat/statat with O_NOFOLLOW and is unsupported on this target",
+            "descriptor-relative artifact storage requires Rustix openat/statat, flock, and renameat_with no-replace support and is unsupported on this target",
         )
         .into())
     }
