@@ -1588,7 +1588,10 @@ impl PerfEvidenceAssemblyArtifact {
         attempts: Vec<VerifiedLocalPerfAttemptBundle>,
     ) -> Result<Self, PerfEvidenceAssemblyError> {
         Self::assemble_against_qg1_authorities(
-            attempts.into_iter().map(|attempt| (attempt, &[])).collect(),
+            attempts
+                .into_iter()
+                .map(|attempt| (attempt, &[] as &[&Qg1ExpectedAuthority]))
+                .collect(),
         )
     }
 
