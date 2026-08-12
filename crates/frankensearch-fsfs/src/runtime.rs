@@ -12505,6 +12505,40 @@ impl FsfsRuntime {
         Ok((pipeline, vi_handle))
     }
 
+    /// Build the watcher and vector-index handle that share one CLI watch
+    /// shutdown boundary.
+    ///
+    /// Keeping their construction together makes the production
+    /// `run_mode_with_shutdown -> run_cli_with_shutdown -> stop_checked ->
+    /// finalize_shutdown` path explicit. The test-only factory changes only
+    /// the owned ingest fixture; production always builds the durable ingest
+    /// pipeline directly.
+    async fn build_live_watcher_shutdown(
+        &self,
+        cx: &Cx,
+    ) -> SearchResult<(FsWatcher, Arc<std::sync::Mutex<VectorIndex>>)> {
+        let target_root = self.resolve_target_root()?;
+
+        #[cfg(test)]
+        if let Some(factory) = take_watcher_shutdown_test_session_factory() {
+            let (ingest, vector_index) = factory(self)?;
+            return Ok((
+                FsWatcher::new(vec![target_root], self.config.discovery.clone(), ingest),
+                vector_index,
+            ));
+        }
+
+        let (pipeline, vector_index) = self.build_live_ingest_pipeline(cx).await?;
+        Ok((
+            FsWatcher::new(
+                vec![target_root],
+                self.config.discovery.clone(),
+                Arc::new(pipeline),
+            ),
+            vector_index,
+        ))
+    }
+
     async fn repair_quarantined_lexical_gap(
         &self,
         cx: &Cx,
@@ -14232,14 +14266,8 @@ impl FsfsRuntime {
             );
 
         if watch_enabled_for_command {
-            match self.build_live_ingest_pipeline(cx).await {
-                Ok((pipeline, vi_handle)) => {
-                    let target_root = self.resolve_target_root()?;
-                    let watcher = FsWatcher::new(
-                        vec![target_root],
-                        self.config.discovery.clone(),
-                        Arc::new(pipeline),
-                    );
+            match self.build_live_watcher_shutdown(cx).await {
+                Ok((watcher, vi_handle)) => {
                     watcher.start(cx).await?;
                     let policy = watcher.execution_policy();
                     let storage_paths = self.default_index_storage_paths();
@@ -14464,6 +14492,9 @@ impl FsfsRuntime {
         reason: ShutdownReason,
         vector_index: Option<&Arc<std::sync::Mutex<VectorIndex>>>,
     ) -> SearchResult<()> {
+        #[cfg(test)]
+        observe_watcher_shutdown_test_finalization();
+
         if let Some(vi_handle) = vector_index {
             let mut vi = vi_handle
                 .lock()
@@ -14533,7 +14564,7 @@ impl FsfsRuntime {
                 );
                 Err(SearchError::SubsystemError {
                     subsystem: "fsfs.shutdown",
-                    source: Box::new(WatcherStopAndFinalizationError {
+                    source: Box::new(WatcherShutdownFailure {
                         watcher_error,
                         finalization_error,
                     }),
@@ -14543,13 +14574,96 @@ impl FsfsRuntime {
     }
 }
 
-#[derive(Debug)]
-struct WatcherStopAndFinalizationError {
-    watcher_error: SearchError,
-    finalization_error: SearchError,
+#[cfg(test)]
+type WatcherShutdownTestSessionFactory = Box<
+    dyn FnOnce(
+        &FsfsRuntime,
+    ) -> SearchResult<(
+        Arc<dyn WatchIngestPipeline>,
+        Arc<std::sync::Mutex<VectorIndex>>,
+    )>,
+>;
+
+#[cfg(test)]
+thread_local! {
+    static WATCHER_SHUTDOWN_TEST_SESSION_FACTORY:
+        RefCell<Option<WatcherShutdownTestSessionFactory>> = RefCell::new(None);
+    static WATCHER_SHUTDOWN_TEST_FINALIZATION_CALLS:
+        RefCell<Option<Arc<std::sync::atomic::AtomicUsize>>> = RefCell::new(None);
 }
 
-impl std::fmt::Display for WatcherStopAndFinalizationError {
+#[cfg(test)]
+fn take_watcher_shutdown_test_session_factory() -> Option<WatcherShutdownTestSessionFactory> {
+    WATCHER_SHUTDOWN_TEST_SESSION_FACTORY.with(|slot| slot.borrow_mut().take())
+}
+
+#[cfg(test)]
+fn observe_watcher_shutdown_test_finalization() {
+    WATCHER_SHUTDOWN_TEST_FINALIZATION_CALLS.with(|slot| {
+        if let Some(calls) = slot.borrow().as_ref() {
+            calls.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+}
+
+#[cfg(test)]
+fn install_watcher_shutdown_test_seam(
+    factory: impl FnOnce(
+        &FsfsRuntime,
+    ) -> SearchResult<(
+        Arc<dyn WatchIngestPipeline>,
+        Arc<std::sync::Mutex<VectorIndex>>,
+    )> + 'static,
+    finalization_calls: Arc<std::sync::atomic::AtomicUsize>,
+) -> WatcherShutdownTestSeamGuard {
+    WATCHER_SHUTDOWN_TEST_SESSION_FACTORY.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "watcher shutdown test session factory must be consumed before replacement"
+        );
+        *slot.borrow_mut() = Some(Box::new(factory));
+    });
+    WATCHER_SHUTDOWN_TEST_FINALIZATION_CALLS.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "watcher shutdown finalization observer must be cleared before replacement"
+        );
+        *slot.borrow_mut() = Some(finalization_calls);
+    });
+    WatcherShutdownTestSeamGuard
+}
+
+#[cfg(test)]
+struct WatcherShutdownTestSeamGuard;
+
+#[cfg(test)]
+impl Drop for WatcherShutdownTestSeamGuard {
+    fn drop(&mut self) {
+        WATCHER_SHUTDOWN_TEST_SESSION_FACTORY.with(|slot| {
+            let _ = slot.borrow_mut().take();
+        });
+        WATCHER_SHUTDOWN_TEST_FINALIZATION_CALLS.with(|slot| {
+            let _ = slot.borrow_mut().take();
+        });
+    }
+}
+
+/// Public structured context for a failed watcher stop and failed required
+/// shutdown finalization.
+///
+/// It is carried by `SearchError::SubsystemError` with subsystem
+/// `"fsfs.shutdown"`. Callers can downcast that error's boxed `source` to
+/// this public type and inspect both stage errors. The watcher error remains
+/// primary and is also this type's [`std::error::Error::source`].
+#[derive(Debug)]
+pub struct WatcherShutdownFailure {
+    /// Terminal error returned by [`FsWatcher::stop_checked`].
+    pub watcher_error: SearchError,
+    /// Required WAL-compaction/finalization failure, retained with the primary error.
+    pub finalization_error: SearchError,
+}
+
+impl std::fmt::Display for WatcherShutdownFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
@@ -14559,7 +14673,7 @@ impl std::fmt::Display for WatcherStopAndFinalizationError {
     }
 }
 
-impl std::error::Error for WatcherStopAndFinalizationError {
+impl std::error::Error for WatcherShutdownFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.watcher_error)
     }
@@ -21733,6 +21847,28 @@ mod tests {
         );
     }
 
+    #[derive(Debug)]
+    struct TerminalWatchIngest {
+        apply_calls: Arc<AtomicUsize>,
+    }
+
+    impl WatchIngestPipeline for TerminalWatchIngest {
+        fn apply_batch<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            batch: &'a [WatchIngestOp],
+        ) -> crate::watcher::WatchIngestFuture<'a, usize> {
+            Box::pin(async move {
+                self.apply_calls.fetch_add(1, Ordering::SeqCst);
+                Err(SearchError::InvalidConfig {
+                    field: "test.watcher.terminal".to_owned(),
+                    value: batch.len().to_string(),
+                    reason: "terminal ingest failure after a real watcher event".to_owned(),
+                })
+            })
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn runtime_collect_pressure_signal_reads_host_metrics() {
@@ -21881,8 +22017,12 @@ mod tests {
             };
             assert_eq!(subsystem, "fsfs.shutdown");
             let combined = source
-                .downcast_ref::<super::WatcherStopAndFinalizationError>()
+                .downcast_ref::<super::WatcherShutdownFailure>()
                 .expect("fsfs.shutdown source must retain both stage errors");
+            assert!(matches!(
+                &combined.watcher_error,
+                SearchError::InvalidConfig { field, .. } if field == "test.watcher.stop"
+            ));
             let watcher_cause = std::error::Error::source(combined)
                 .expect("watcher failure must remain the primary source");
             assert!(matches!(
@@ -21968,42 +22108,132 @@ mod tests {
     }
 
     #[test]
-    fn runtime_shutdown_sequence_compacts_a_real_pending_wal() {
+    fn run_mode_terminal_watcher_error_compacts_authoritative_wal_once() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
-            let vector_path = temp.path().join("shutdown-wal.fsvi");
-            let vector = [0.25_f32, 0.5, 0.75, 1.0];
-            let mut writer = VectorIndex::create(&vector_path, "shutdown-wal-test", vector.len())
-                .expect("create vector index");
-            writer
-                .write_record("sealed.md", &vector)
-                .expect("write sealed vector");
-            writer.finish().expect("finish vector index");
+            let project = temp.path().join("project");
+            let source_dir = project.join("src");
+            fs::create_dir_all(&source_dir).expect("create project source directory");
+            fs::write(source_dir.join("lib.rs"), "pub fn seeded() {}\n")
+                .expect("write initial indexed source");
 
-            let mut live_index = VectorIndex::open(&vector_path).expect("open vector index");
-            live_index
-                .append("pending.md", &vector)
-                .expect("append pending WAL vector");
-            assert_eq!(
-                live_index.wal_record_count(),
-                1,
-                "fixture needs one WAL entry"
+            let finalization_calls = Arc::new(AtomicUsize::new(0));
+            let terminal_apply_calls = Arc::new(AtomicUsize::new(0));
+            let session_prepared = Arc::new(AtomicBool::new(false));
+            let authoritative_vector_path = Arc::new(Mutex::new(None::<PathBuf>));
+            let terminal_pipeline: Arc<dyn WatchIngestPipeline> = Arc::new(TerminalWatchIngest {
+                apply_calls: Arc::clone(&terminal_apply_calls),
+            });
+
+            let session_prepared_for_factory = Arc::clone(&session_prepared);
+            let authoritative_vector_path_for_factory = Arc::clone(&authoritative_vector_path);
+            let _seam = super::install_watcher_shutdown_test_seam(
+                move |runtime| {
+                    let target_root = runtime.resolve_target_root()?;
+                    let index_root = runtime.resolve_index_root(&target_root)?;
+                    let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+                    let mut vector_index = VectorIndex::open(&vector_path)?;
+                    let pending_embedding = vec![0.5_f32; vector_index.dimension()];
+                    vector_index.append("shutdown-pending.rs", &pending_embedding)?;
+                    assert_eq!(
+                        vector_index.wal_record_count(),
+                        1,
+                        "the production finalizer must receive one real pending WAL record"
+                    );
+                    *authoritative_vector_path_for_factory
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(vector_path);
+                    session_prepared_for_factory.store(true, Ordering::SeqCst);
+                    Ok((terminal_pipeline, Arc::new(Mutex::new(vector_index))))
+                },
+                Arc::clone(&finalization_calls),
             );
-            let vector_handle = Arc::new(Mutex::new(live_index));
-            let runtime = FsfsRuntime::new(FsfsConfig::default());
 
-            FsfsRuntime::complete_watcher_shutdown(
-                async { Ok(()) },
-                runtime.finalize_shutdown(&cx, ShutdownReason::UserRequest, Some(&vector_handle)),
-            )
-            .await
-            .expect("successful watcher shutdown must compact the pending WAL");
+            let mut config = FsfsConfig::default();
+            config.indexing.watch_mode = true;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Watch,
+                target_path: Some(project.clone()),
+                watch: true,
+                ..CliInput::default()
+            });
+            let coordinator = Arc::new(ShutdownCoordinator::new());
+            let mutation_path = source_dir.join("terminal.rs");
+            let session_prepared_for_writer = Arc::clone(&session_prepared);
+            let terminal_apply_calls_for_writer = Arc::clone(&terminal_apply_calls);
+            let coordinator_for_writer = Arc::clone(&coordinator);
+            let mutator = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !session_prepared_for_writer.load(Ordering::SeqCst) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "watch shutdown test session was not constructed"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
 
-            let compacted = vector_handle
+                // The real watcher is constructed immediately after the test
+                // seam returns. Repeated writes cross its baseline/setup race
+                // without faking an event or a stop result.
+                thread::sleep(Duration::from_millis(50));
+                for sequence in 0..200 {
+                    fs::write(
+                        &mutation_path,
+                        format!("pub const TERMINAL_EVENT_{sequence}: usize = {sequence};\n"),
+                    )
+                    .expect("write watcher mutation");
+                    if terminal_apply_calls_for_writer.load(Ordering::SeqCst) > 0 {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+
+                coordinator_for_writer.request_shutdown(ShutdownReason::UserRequest);
+            });
+
+            let error = runtime
+                .run_mode_with_shutdown(&cx, InterfaceMode::Cli, &coordinator)
+                .await
+                .expect_err("terminal watcher failure must escape after finalization");
+            mutator.join().expect("watcher mutation thread");
+
+            assert!(
+                terminal_apply_calls.load(Ordering::SeqCst) > 0,
+                "a real filesystem event must reach the terminal ingest pipeline"
+            );
+            assert!(matches!(
+                error,
+                SearchError::InvalidConfig { field, .. } if field == "test.watcher.terminal"
+            ));
+            assert_eq!(
+                finalization_calls.load(Ordering::SeqCst),
+                1,
+                "the production shutdown seam must invoke finalization exactly once"
+            );
+
+            let vector_path = authoritative_vector_path
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert_eq!(compacted.wal_record_count(), 0, "WAL must be compacted");
-            assert_eq!(compacted.record_count(), 2, "both records must be retained");
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .expect("test seam records the authoritative vector path")
+                .clone();
+
+            let mut reopened = VectorIndex::open_read_only(&vector_path)
+                .expect("reopen authoritative compacted vector artifact");
+            assert_eq!(
+                reopened.wal_record_count(),
+                0,
+                "the durable reopened artifact must not retain pending WAL records"
+            );
+            let query = vec![0.5_f32; reopened.dimension()];
+            assert!(
+                reopened
+                    .search_top_k(&query, 16, None)
+                    .expect("search reopened compacted artifact")
+                    .iter()
+                    .any(|hit| hit.doc_id == "shutdown-pending.rs"),
+                "the pending WAL record must survive in the authoritative compacted artifact"
+            );
         });
     }
 
