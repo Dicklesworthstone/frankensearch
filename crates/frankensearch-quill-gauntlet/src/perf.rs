@@ -4985,7 +4985,11 @@ impl PairedExperimentResult {
                 field: "operation scope",
             });
         }
-        if self.config != other.config {
+        // Two independent invocations must declare the same estimator policy,
+        // but they can never seal the same QG-1 lifecycle authority: each has
+        // its own producer. Requiring authority equality here would reject
+        // exactly the independent reproduction this method exists to measure.
+        if !self.config.matches_estimator_policy(&other.config) {
             return Err(PairedEstimatorError::ReproductionMismatch {
                 field: "estimator configuration",
             });
