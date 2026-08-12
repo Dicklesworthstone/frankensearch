@@ -85,6 +85,7 @@ const QG6_TIE_EXPANSION_LIMIT: usize = 1_000_000;
 const QG6_TIMED_SEARCHES_PER_SAMPLE: usize = 128;
 const QG1_CORPUS_GENERATOR_REVISION: &str = "frankensearch-quill-qg1-synthetic-corpus-v1";
 const QG1_TERMINAL_NO_CLAIM_CODE: &str = "qg1.terminal_fact_unproved";
+const QG1_INCUMBENT_SCREEN_NO_CLAIM_CODE: &str = "qg1.incumbent_screen_incomplete";
 const QG1_TIMING_DIAGNOSTIC_NO_CLAIM_CODE: &str = "qg1.continuous_timing_unbound_diagnostic";
 const QG1_LIVE_STARTUP_DISCRIMINATOR_ENV: &str = "QUILL_PERF_QG1_LIVE_STARTUP_DISCRIMINATOR";
 const QG1_LIVE_STARTUP_ORDINARY_MARKER: &[u8] = b"qg1-live-startup-work-after-ack\n";
@@ -5857,11 +5858,11 @@ fn qg1_live_observation_ids(label: &str, samples: &[PerfRawSample]) -> Vec<Strin
         .collect()
 }
 
-fn qg1_run_incumbent_stream(
-    context: &BenchContext,
-    spec: &PerfCellSpec,
-    evidence: &EvidenceContext,
-    scope: &PerfOperationScope,
+fn qg1_incumbent_stream_runner<'a>(
+    context: &'a BenchContext,
+    spec: &'a PerfCellSpec,
+    evidence: &'a EvidenceContext,
+    scope: &'a PerfOperationScope,
     origin: Instant,
     rounds: usize,
     seed: u64,
@@ -5872,10 +5873,10 @@ fn qg1_run_incumbent_stream(
     treatment: EngineArm,
     control_writer_mode: Option<Qg1TantivyWriterMode>,
     treatment_writer_mode: Option<Qg1TantivyWriterMode>,
-    estimator_config: &PairedEstimatorConfig,
-    producer: &Qg1LifecycleProducer,
-) -> Vec<PerfRawSample> {
-    let mut runner = PairedStreamRunner::new(
+    estimator_config: &'a PairedEstimatorConfig,
+    producer: &'a Qg1LifecycleProducer,
+) -> PairedStreamRunner<'a> {
+    PairedStreamRunner::new(
         context,
         spec,
         evidence,
@@ -5896,11 +5897,20 @@ fn qg1_run_incumbent_stream(
         },
         estimator_config,
         Some(producer),
-    );
+    )
+}
+
+fn qg1_run_incumbent_streams_round_interleaved<'a, const N: usize>(
+    mut runners: [PairedStreamRunner<'a>; N],
+    rounds: usize,
+) -> [Vec<PerfRawSample>; N] {
+    assert!(N >= 2, "QG-1 interleaving requires multiple streams");
     for round in 0..rounds {
-        runner.run_round(round);
+        for runner in &mut runners {
+            runner.run_round(round);
+        }
     }
-    runner.into_samples()
+    runners.map(PairedStreamRunner::into_samples)
 }
 
 struct Qg1LiveIncumbentCollection {
@@ -6042,41 +6052,46 @@ fn qg1_collect_live_incumbent(
                 ^ u64::try_from(candidate_index)
                     .expect("QG-1 candidate index fits u64")
                     .wrapping_mul(0x9e37_79b9_7f4a_7c15);
-            let effect = qg1_run_incumbent_stream(
-                context,
-                spec,
-                evidence,
-                &scope,
-                origin,
+            let [effect, null] = qg1_run_incumbent_streams_round_interleaved(
+                [
+                    qg1_incumbent_stream_runner(
+                        context,
+                        spec,
+                        evidence,
+                        &scope,
+                        origin,
+                        runs,
+                        seed,
+                        0,
+                        0,
+                        QG1_STREAM_ROLE_TANTIVY_PILOT_EFFECT,
+                        EngineArm::Tantivy,
+                        EngineArm::Tantivy,
+                        Some(Qg1TantivyWriterMode::ShippingAuto),
+                        Some(candidate.writer_mode),
+                        &pilot_startup.authority.estimator_config,
+                        &pilot_startup.authority.producer,
+                    ),
+                    qg1_incumbent_stream_runner(
+                        context,
+                        spec,
+                        evidence,
+                        &scope,
+                        origin,
+                        runs,
+                        seed ^ 0xaa,
+                        2_000_000,
+                        2_000_000,
+                        QG1_STREAM_ROLE_TANTIVY_PILOT_NULL,
+                        EngineArm::Tantivy,
+                        EngineArm::Tantivy,
+                        Some(candidate.writer_mode),
+                        Some(candidate.writer_mode),
+                        &pilot_startup.authority.estimator_config,
+                        &pilot_startup.authority.producer,
+                    ),
+                ],
                 runs,
-                seed,
-                0,
-                0,
-                QG1_STREAM_ROLE_TANTIVY_PILOT_EFFECT,
-                EngineArm::Tantivy,
-                EngineArm::Tantivy,
-                Some(Qg1TantivyWriterMode::ShippingAuto),
-                Some(candidate.writer_mode),
-                &pilot_startup.authority.estimator_config,
-                &pilot_startup.authority.producer,
-            );
-            let null = qg1_run_incumbent_stream(
-                context,
-                spec,
-                evidence,
-                &scope,
-                origin,
-                runs,
-                seed ^ 0xaa,
-                2_000_000,
-                2_000_000,
-                QG1_STREAM_ROLE_TANTIVY_PILOT_NULL,
-                EngineArm::Tantivy,
-                EngineArm::Tantivy,
-                Some(candidate.writer_mode),
-                Some(candidate.writer_mode),
-                &pilot_startup.authority.estimator_config,
-                &pilot_startup.authority.producer,
             );
             let expected_authority = pilot_startup.authority.producer.expected_authority();
             let experiment = estimate_paired_experiment_against_qg1_authority(
@@ -6116,59 +6131,64 @@ fn qg1_collect_live_incumbent(
     let decision = screen.selected_candidate.as_ref().map(|selected| {
         let selected_receipt = qg1_attest_writer_constructor(spec, selected.writer_mode);
         qg1_validate_writer_receipt(spec, selected.writer_mode, &selected_receipt);
-        let effect = qg1_run_incumbent_stream(
-            context,
-            spec,
-            evidence,
-            &scope,
-            origin,
+        let [effect, tantivy_null, quill_null] = qg1_run_incumbent_streams_round_interleaved(
+            [
+                qg1_incumbent_stream_runner(
+                    context,
+                    spec,
+                    evidence,
+                    &scope,
+                    origin,
+                    runs,
+                    cell_seed,
+                    0,
+                    0,
+                    QG1_STREAM_ROLE_EFFECT,
+                    EngineArm::Tantivy,
+                    EngineArm::Quill,
+                    Some(selected.writer_mode),
+                    None,
+                    &startup.estimator_config,
+                    &startup.producer,
+                ),
+                qg1_incumbent_stream_runner(
+                    context,
+                    spec,
+                    evidence,
+                    &scope,
+                    origin,
+                    runs,
+                    cell_seed ^ 0xaa,
+                    0,
+                    1_000_000,
+                    QG1_STREAM_ROLE_TANTIVY_NULL,
+                    EngineArm::Tantivy,
+                    EngineArm::Tantivy,
+                    Some(selected.writer_mode),
+                    Some(selected.writer_mode),
+                    &startup.estimator_config,
+                    &startup.producer,
+                ),
+                qg1_incumbent_stream_runner(
+                    context,
+                    spec,
+                    evidence,
+                    &scope,
+                    origin,
+                    runs,
+                    cell_seed ^ 0x55,
+                    2_000_000,
+                    2_000_000,
+                    QG1_STREAM_ROLE_QUILL_NULL,
+                    EngineArm::Quill,
+                    EngineArm::Quill,
+                    None,
+                    None,
+                    &startup.estimator_config,
+                    &startup.producer,
+                ),
+            ],
             runs,
-            cell_seed,
-            0,
-            0,
-            QG1_STREAM_ROLE_EFFECT,
-            EngineArm::Tantivy,
-            EngineArm::Quill,
-            Some(selected.writer_mode),
-            None,
-            &startup.estimator_config,
-            &startup.producer,
-        );
-        let tantivy_null = qg1_run_incumbent_stream(
-            context,
-            spec,
-            evidence,
-            &scope,
-            origin,
-            runs,
-            cell_seed ^ 0xaa,
-            0,
-            1_000_000,
-            QG1_STREAM_ROLE_TANTIVY_NULL,
-            EngineArm::Tantivy,
-            EngineArm::Tantivy,
-            Some(selected.writer_mode),
-            Some(selected.writer_mode),
-            &startup.estimator_config,
-            &startup.producer,
-        );
-        let quill_null = qg1_run_incumbent_stream(
-            context,
-            spec,
-            evidence,
-            &scope,
-            origin,
-            runs,
-            cell_seed ^ 0x55,
-            2_000_000,
-            2_000_000,
-            QG1_STREAM_ROLE_QUILL_NULL,
-            EngineArm::Quill,
-            EngineArm::Quill,
-            None,
-            None,
-            &startup.estimator_config,
-            &startup.producer,
         );
         let bind = |kind,
                     control_engine_id: &str,
@@ -7562,29 +7582,79 @@ fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
             cells,
         )
         .expect("assemble QG evidence artifact");
-        if gate == PerfGate::Qg1 && !qg1_incumbent_evidence.is_empty() {
+        let retained_qg1_authorities = qg1_startup_producers.retained_authorities();
+        let authority_bound_qg1 = gate == PerfGate::Qg1 && !retained_qg1_authorities.is_empty();
+        let incumbent_screens = if gate == PerfGate::Qg1 {
+            std::mem::take(&mut qg1_incumbent_evidence)
+                .into_values()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let required_screen_cell_ids = artifact
+            .cells
+            .iter()
+            .filter(|cell| {
+                cell.spec.gate == PerfGate::Qg1 && cell.spec.role == EvidenceRole::Required
+            })
+            .map(|cell| cell.cell_id.clone())
+            .collect::<BTreeSet<_>>();
+        let observed_screen_cell_ids = incumbent_screens
+            .iter()
+            .map(|screen| screen.cell_id.clone())
+            .collect::<BTreeSet<_>>();
+        let qg1_screen_coverage_exact = gate == PerfGate::Qg1
+            && selection_complete
+            && !required_screen_cell_ids.is_empty()
+            && incumbent_screens.len() == observed_screen_cell_ids.len()
+            && observed_screen_cell_ids == required_screen_cell_ids;
+        let attach_qg1_screens =
+            qg1_screen_coverage_exact && authority_bound_qg1 && !incumbent_screens.is_empty();
+        if attach_qg1_screens {
             artifact
-                .attach_qg1_incumbent_screens(
-                    std::mem::take(&mut qg1_incumbent_evidence)
-                        .into_values()
-                        .collect(),
-                )
+                .attach_qg1_incumbent_screens(incumbent_screens)
                 .expect("attach complete live QG-1 incumbent screens to durable evidence");
         }
         let selection_no_claim = partial_shard_no_claim(gate, selection_complete);
+        let incumbent_no_claim = (gate == PerfGate::Qg1 && !attach_qg1_screens).then(|| {
+            (
+                QG1_INCUMBENT_SCREEN_NO_CLAIM_CODE,
+                if required_screen_cell_ids.is_empty() {
+                    "the QG-1 selection contains no required engine lifecycle cells; tokenizer-only evidence cannot claim"
+                        .to_owned()
+                } else if !authority_bound_qg1 {
+                    "QG-1 incumbent screens have no retained engine authority set and were omitted"
+                        .to_owned()
+                } else {
+                    format!(
+                        "QG-1 incumbent screen coverage is partial; expected {required_screen_cell_ids:?}, observed {observed_screen_cell_ids:?}"
+                    )
+                },
+            )
+        });
         let terminal_no_claim = (gate == PerfGate::Qg1)
             .then(qg1_terminal_no_claim_detail)
             .flatten();
-        match (selection_no_claim, terminal_no_claim) {
-            (Some((code, detail)), Some(terminal_detail)) => {
-                artifact.force_no_claim(code, format!("{detail}; additionally, {terminal_detail}"));
-            }
-            (Some((code, detail)), None) => artifact.force_no_claim(code, detail),
-            (None, Some(detail)) => artifact.force_no_claim(QG1_TERMINAL_NO_CLAIM_CODE, detail),
-            (None, None) => {}
+        let mut no_claim_reasons = Vec::new();
+        if let Some((code, detail)) = selection_no_claim {
+            no_claim_reasons.push((code, detail.to_owned()));
         }
-        let retained_qg1_authorities = qg1_startup_producers.retained_authorities();
-        let authority_bound_qg1 = gate == PerfGate::Qg1 && !retained_qg1_authorities.is_empty();
+        if let Some(reason) = incumbent_no_claim {
+            no_claim_reasons.push(reason);
+        }
+        if let Some(detail) = terminal_no_claim {
+            no_claim_reasons.push((QG1_TERMINAL_NO_CLAIM_CODE, detail));
+        }
+        if let Some((code, _)) = no_claim_reasons.first() {
+            artifact.force_no_claim(
+                code,
+                no_claim_reasons
+                    .iter()
+                    .map(|(_, detail)| detail.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; additionally, "),
+            );
+        }
         if gate == PerfGate::Qg1 && artifact.qg1_incumbent_screens.is_empty() {
             assert!(
                 !artifact.ratchet_admissible(),
@@ -7600,10 +7670,6 @@ fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
                 &retained_qg1_authorities,
             )
             .expect("reload QG-1 incumbent evidence with the retained authority set");
-            assert_eq!(
-                reloaded.qg1_incumbent_screens, artifact.qg1_incumbent_screens,
-                "every selected candidate and fresh decision must survive strict reload"
-            );
             (paths, reloaded)
         } else {
             let paths = artifact
@@ -7611,12 +7677,14 @@ fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
                 .expect("write QG evidence artifact");
             let reloaded = PerfEvidenceArtifact::load_verified(&paths.json)
                 .expect("reload and verify persisted QG evidence artifact");
-            assert_eq!(
-                reloaded, artifact,
-                "persisted QG evidence artifact must reload as the exact sealed source object"
-            );
             (paths, reloaded)
         };
+        let mut normalized_reloaded = reloaded.clone();
+        normalized_reloaded.artifact_sha256 = artifact.artifact_sha256.clone();
+        assert_eq!(
+            normalized_reloaded, artifact,
+            "persisted QG evidence must match every source field except its writer-computed seal"
+        );
         black_box(reloaded);
         eprintln!(
             "[quill-evidence] gate={gate} status={} ratchet_admissible={} json={} table={}",

@@ -1250,6 +1250,60 @@ fn qg1_validate_pilot_observations(
     )
 }
 
+fn qg1_measurement_epochs(samples: &[PerfRawSample]) -> Option<Vec<(u64, u64)>> {
+    let mut blocks = BTreeMap::<u64, Vec<&PerfRawSample>>::new();
+    for sample in samples {
+        if sample.phase != PerfSamplePhase::Measurement || sample.ended_ns <= sample.started_ns {
+            return None;
+        }
+        blocks.entry(sample.block_id).or_default().push(sample);
+    }
+    if blocks.is_empty() {
+        return None;
+    }
+    blocks
+        .into_values()
+        .map(|mut pair| {
+            if pair.len() != 2 {
+                return None;
+            }
+            pair.sort_by_key(|sample| sample.started_ns);
+            if pair[0].ended_ns > pair[1].started_ns {
+                return None;
+            }
+            Some((pair[0].started_ns, pair[1].ended_ns))
+        })
+        .collect()
+}
+
+fn qg1_streams_are_round_interleaved(streams: &[&[PerfRawSample]]) -> bool {
+    if streams.len() < 2 {
+        return false;
+    }
+    let Some(epochs) = streams
+        .iter()
+        .map(|samples| qg1_measurement_epochs(samples))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    let round_count = epochs[0].len();
+    if round_count == 0 || epochs.iter().any(|stream| stream.len() != round_count) {
+        return false;
+    }
+    let mut previous_end = None;
+    for round in 0..round_count {
+        for stream in &epochs {
+            let (started_ns, ended_ns) = stream[round];
+            if previous_end.is_some_and(|previous| previous > started_ns) {
+                return false;
+            }
+            previous_end = Some(ended_ns);
+        }
+    }
+    true
+}
+
 impl Qg1TantivyIncumbentScreen {
     /// Validate a complete pilot set and report the fastest configuration or an
     /// explicit confidence-interval tie/no-decision result.
@@ -1356,6 +1410,14 @@ impl Qg1TantivyIncumbentScreen {
                 return Ok(no_decision(
                     "candidate pilot lacks valid configuration-bound throughput evidence"
                         .to_owned(),
+                ));
+            }
+            if !qg1_streams_are_round_interleaved(&[
+                &pilot.experiment.effect_samples,
+                &pilot.experiment.null_samples,
+            ]) {
+                return Ok(no_decision(
+                    "candidate pilot effect and null were not round-interleaved".to_owned(),
                 ));
             }
             qg1_validate_pilot_observations(
@@ -1688,6 +1750,13 @@ impl Qg1TantivyIncumbentDecision {
                 return Err(Qg1TantivyIncumbentError::StreamReceiptMismatch);
             }
             qg1_insert_observation_ids(stream.observations.iter(), seen_observation_ids)?;
+        }
+        if !qg1_streams_are_round_interleaved(&[
+            &self.tantivy_vs_quill.samples,
+            &self.tantivy_null.samples,
+            &self.quill_null.samples,
+        ]) {
+            return Err(Qg1TantivyIncumbentError::DecisionEvidenceInvalid);
         }
         // Both decisions are QG-1 by construction, so they are estimated
         // through the authority-bearing entry: the generic estimator refuses
@@ -8327,6 +8396,7 @@ mod tests {
         control_durations: &[u64],
         treatment_durations: &[u64],
         sample_id_base: u64,
+        timeline_lane: u64,
         work_units: u64,
         content_bytes: u64,
         authority: &Qg1LifecycleAuthority,
@@ -8341,6 +8411,11 @@ mod tests {
             treatment_durations,
             sample_id_base,
         );
+        let timeline_offset = timeline_lane.saturating_mul(10_000_000);
+        for sample in &mut samples {
+            sample.started_ns = sample.started_ns.saturating_add(timeline_offset);
+            sample.ended_ns = sample.ended_ns.saturating_add(timeline_offset);
+        }
         let expected_stream_row_count =
             u64::try_from(samples.len()).expect("QG-1 test stream row count fits u64");
         assert_eq!(
@@ -8449,6 +8524,7 @@ mod tests {
             &control_durations,
             &treatment_durations,
             sample_id_base,
+            0,
             work_units,
             content_bytes,
             &authority,
@@ -8462,6 +8538,7 @@ mod tests {
             &control_durations,
             &control_durations,
             sample_id_base + 10_000,
+            1,
             work_units,
             content_bytes,
             &authority,
@@ -8559,6 +8636,11 @@ mod tests {
             &durations,
             &[treatment_duration; PERF_MIN_RUNS],
             sample_id_base,
+            match kind {
+                Qg1TantivyDecisionStreamKind::TantivyVsQuill => 0,
+                Qg1TantivyDecisionStreamKind::TantivyNull => 1,
+                Qg1TantivyDecisionStreamKind::QuillNull => 2,
+            },
             work_units,
             content_bytes,
             authority,
@@ -8701,6 +8783,7 @@ mod tests {
             &durations,
             &treatment_durations,
             0,
+            0,
             500,
             64_000,
             &authority,
@@ -8714,6 +8797,7 @@ mod tests {
             &durations,
             &durations,
             10_000,
+            1,
             500,
             64_000,
             &authority,
@@ -9530,6 +9614,7 @@ mod tests {
             &control,
             &treatment,
             0,
+            0,
             500,
             64_000,
             &authority,
@@ -9543,6 +9628,7 @@ mod tests {
             &control,
             &control,
             10_000,
+            1,
             500,
             64_000,
             &authority,
@@ -9556,6 +9642,7 @@ mod tests {
             &treatment,
             &treatment,
             20_000,
+            2,
             500,
             64_000,
             &authority,
@@ -10171,6 +10258,81 @@ mod tests {
             ),
             Err(Qg1TantivyIncumbentError::EstimatorConfigMismatch),
             "a differing estimator threshold must still be an exact policy mismatch"
+        );
+    }
+
+    #[test]
+    fn qg1_incumbent_timeline_rejects_whole_stream_sequencing() {
+        let cell = qg1_bulk_cell(4);
+        let semantic_contract = qg1_semantic_contract();
+        let screen_plan = qg1_screen_plan(&cell, vec![1, 2, 4]);
+        let mut pilots = qg1_complete_pilots(
+            &cell,
+            &screen_plan,
+            &semantic_contract,
+            "qg1-round-interleaving",
+        );
+        let original = pilots[0].clone();
+        assert!(qg1_streams_are_round_interleaved(&[
+            &original.experiment.effect_samples,
+            &original.experiment.null_samples,
+        ]));
+        let last_effect_end = original
+            .experiment
+            .effect_samples
+            .iter()
+            .map(|sample| sample.ended_ns)
+            .max()
+            .expect("effect rows");
+        let first_null_start = original
+            .experiment
+            .null_samples
+            .iter()
+            .map(|sample| sample.started_ns)
+            .min()
+            .expect("null rows");
+        let timeline_offset = last_effect_end + 10_000_000 - first_null_start;
+        let mut serial_null = original.experiment.null_samples.clone();
+        for sample in &mut serial_null {
+            sample.started_ns += timeline_offset;
+            sample.ended_ns += timeline_offset;
+        }
+        assert!(!qg1_streams_are_round_interleaved(&[
+            &original.experiment.effect_samples,
+            &serial_null,
+        ]));
+        let experiment = estimate_paired_experiment_against_qg1_authority(
+            &original.experiment.effect_samples,
+            &serial_null,
+            &original.experiment.config,
+            original.experiment.config.qg1_expected_authority.as_ref(),
+        )
+        .expect("whole-stream scheduling remains individually valid paired evidence");
+        pilots[0] = Qg1TantivyIncumbentPilot::from_experiment(
+            original.candidate,
+            original.observed_writer_threads,
+            original.writer_constructor_receipt_sha256,
+            original.shipping_auto_config_sha256,
+            experiment,
+            original
+                .effect_observations
+                .into_iter()
+                .map(|observation| observation.observation_id_sha256)
+                .collect(),
+            original
+                .null_observations
+                .into_iter()
+                .map(|observation| observation.observation_id_sha256)
+                .collect(),
+        )
+        .expect("reseal the planted serial timeline without changing its authorities");
+        let screen =
+            Qg1TantivyIncumbentScreen::screen(&cell, screen_plan, &semantic_contract, pilots)
+                .expect("serial pilot scheduling is an explicit fail-closed outcome");
+        assert!(screen.selected_candidate.is_none());
+        assert_eq!(
+            screen.no_decision_reason.as_deref(),
+            Some("candidate pilot effect and null were not round-interleaved")
         );
     }
 
