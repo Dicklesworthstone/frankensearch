@@ -19,7 +19,7 @@ use crate::{
     MachineClassRegistry, MachineProfileKey, PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS,
     PerfApplicabilityPlan, PerfApplicabilityPlanBinding, PerfCellApplicability, PerfCellResult,
     PerfEvidenceArtifact, PerfExecutionProvenance, PerfGate, PerfGateArtifact, PerfMatrixSpec,
-    VerifiedRunnerIdentity,
+    Qg1ExpectedAuthority, VerifiedRunnerIdentity,
 };
 
 /// Version of the machine-readable ratchet decision artifact.
@@ -169,6 +169,65 @@ pub struct PerfRatchetRequest<'a> {
     pub expected_manifest_sha256: &'a str,
     /// Content-addressed evidence paths.
     pub evidence: Vec<PerfEvidenceFile>,
+}
+
+/// Externally retained QG-1 lifecycle authorities for each ratchet role.
+///
+/// The slices are deliberately independent: QG-1 receipts are issued for one
+/// raw stream in one invocation and must never be admitted under another
+/// ratchet role's authority set.
+#[derive(Debug, Clone, Copy)]
+pub struct PerfRatchetQg1AuthoritySets<'a> {
+    /// Authorities retained for the committed baseline invocation.
+    pub baseline: &'a [&'a Qg1ExpectedAuthority],
+    /// Authorities retained for the first candidate invocation.
+    pub candidate: &'a [&'a Qg1ExpectedAuthority],
+    /// Authorities retained for the same-revision rerun invocation.
+    pub rerun: &'a [&'a Qg1ExpectedAuthority],
+}
+
+impl<'a> PerfRatchetQg1AuthoritySets<'a> {
+    /// No external authority is available. QG-1 evidence consequently fails
+    /// closed while non-QG-1 evidence retains its normal integrity checks.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            baseline: &[],
+            candidate: &[],
+            rerun: &[],
+        }
+    }
+
+    fn for_role(self, role: PerfRatchetEvidenceRole) -> &'a [&'a Qg1ExpectedAuthority] {
+        match role {
+            PerfRatchetEvidenceRole::Baseline => self.baseline,
+            PerfRatchetEvidenceRole::Candidate => self.candidate,
+            PerfRatchetEvidenceRole::Rerun => self.rerun,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PerfRatchetEvidenceRole {
+    Baseline,
+    Candidate,
+    Rerun,
+}
+
+impl PerfRatchetEvidenceRole {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Candidate => "candidate",
+            Self::Rerun => "rerun",
+        }
+    }
+}
+
+impl fmt::Display for PerfRatchetEvidenceRole {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.label())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -397,6 +456,16 @@ fn validate_threshold_plan_scope(
 /// Evaluate a candidate against the committed pass-over-pass baseline.
 #[must_use]
 pub fn evaluate_perf_ratchet(request: PerfRatchetRequest<'_>) -> PerfRatchetEvaluation {
+    evaluate_perf_ratchet_against_qg1_authorities(request, PerfRatchetQg1AuthoritySets::empty())
+}
+
+/// Evaluate a candidate against the committed baseline with externally
+/// retained QG-1 lifecycle authorities for each independent invocation.
+#[must_use]
+pub fn evaluate_perf_ratchet_against_qg1_authorities(
+    request: PerfRatchetRequest<'_>,
+    qg1_authority_sets: PerfRatchetQg1AuthoritySets<'_>,
+) -> PerfRatchetEvaluation {
     let gate = request.candidate.gate;
     let mut state = DecisionState::default();
     let Some(plan) = candidate_applicability_plan(&request, &mut state) else {
@@ -410,7 +479,7 @@ pub fn evaluate_perf_ratchet(request: PerfRatchetRequest<'_>) -> PerfRatchetEval
         );
     };
     if request.mode == PerfRatchetMode::Promotion {
-        validate_machine_profile_promotion(&request, &plan, &mut state);
+        validate_machine_profile_promotion(&request, &plan, qg1_authority_sets, &mut state);
         if state.fatal || state.blocked || state.quarantined {
             return finish_evaluation(
                 gate,
@@ -429,7 +498,7 @@ pub fn evaluate_perf_ratchet(request: PerfRatchetRequest<'_>) -> PerfRatchetEval
         );
     }
     let require_current_evidence = request.mode == PerfRatchetMode::Promotion;
-    evaluate_perf_ratchet_inner(request, state, require_current_evidence)
+    evaluate_perf_ratchet_inner(request, qg1_authority_sets, state, require_current_evidence)
 }
 
 /// The append-only quarantine register, embedded at build time.
@@ -488,6 +557,7 @@ fn reject_quarantined_revision(
 fn validate_machine_profile_promotion(
     request: &PerfRatchetRequest<'_>,
     plan: &PerfApplicabilityPlan,
+    qg1_authority_sets: PerfRatchetQg1AuthoritySets<'_>,
     state: &mut DecisionState,
 ) {
     let Some(expected_profile) = request.expected_machine_profile else {
@@ -516,7 +586,7 @@ fn validate_machine_profile_promotion(
     });
     let roles = [
         (
-            "baseline",
+            PerfRatchetEvidenceRole::Baseline,
             request.baseline,
             request.baseline_evidence,
             request
@@ -524,13 +594,13 @@ fn validate_machine_profile_promotion(
                 .and_then(|evidence| evidence.machine_class.identity()),
         ),
         (
-            "candidate",
+            PerfRatchetEvidenceRole::Candidate,
             Some(request.candidate),
             request.candidate_evidence,
             request.candidate_runner_identity,
         ),
         (
-            "rerun",
+            PerfRatchetEvidenceRole::Rerun,
             request.rerun,
             request.rerun_evidence,
             request.rerun_runner_identity,
@@ -538,7 +608,7 @@ fn validate_machine_profile_promotion(
     ];
     let mut admitted = Vec::with_capacity(roles.len());
     for (role, artifact, evidence, external_identity) in roles {
-        if role == "baseline" && baseline_is_bootstrap {
+        if role == PerfRatchetEvidenceRole::Baseline && baseline_is_bootstrap {
             if evidence.is_some() || external_identity.is_some() {
                 state.fatal(
                     "perf.ratchet.bootstrap_identity_fabricated",
@@ -560,7 +630,7 @@ fn validate_machine_profile_promotion(
             );
             continue;
         };
-        validate_threshold_plan_scope(artifact, plan, role, state);
+        validate_threshold_plan_scope(artifact, plan, role.label(), state);
         if evidence.applicability_plan != plan.binding {
             state.fatal(
                 "perf.ratchet.evidence_applicability_plan_mismatch",
@@ -632,7 +702,9 @@ fn validate_machine_profile_promotion(
             );
             continue;
         }
-        if let Err(error) = evidence.verify_integrity() {
+        if let Err(error) =
+            evidence.verify_integrity_against_qg1_authorities(qg1_authority_sets.for_role(role))
+        {
             state.fatal(
                 "perf.ratchet.machine_evidence_integrity_failed",
                 format!("{role} current evidence no longer verifies: {error}"),
@@ -641,7 +713,7 @@ fn validate_machine_profile_promotion(
         }
         // Screened immediately after integrity, because a quarantined artifact
         // passes that check: it is intact evidence of an invalid measurement.
-        reject_quarantined_revision(role, evidence, state);
+        reject_quarantined_revision(role.label(), evidence, state);
         let Some(bound_identity) = evidence.machine_class.identity() else {
             state.quarantine(
                 "perf.ratchet.machine_identity_unverified",
@@ -670,7 +742,7 @@ fn validate_machine_profile_promotion(
             continue;
         }
         validate_execution_projection_binding(
-            role,
+            role.label(),
             artifact,
             evidence,
             external_identity,
@@ -724,11 +796,11 @@ fn validate_machine_profile_promotion(
     }
     let candidate_producer = admitted
         .iter()
-        .find(|(role, _)| *role == "candidate")
+        .find(|(role, _)| *role == PerfRatchetEvidenceRole::Candidate)
         .and_then(|(_, identity)| identity.build().get("producer"));
     let rerun_producer = admitted
         .iter()
-        .find(|(role, _)| *role == "rerun")
+        .find(|(role, _)| *role == PerfRatchetEvidenceRole::Rerun)
         .and_then(|(_, identity)| identity.build().get("producer"));
     if let (Some(candidate_producer), Some(rerun_producer)) = (candidate_producer, rerun_producer)
         && candidate_producer != rerun_producer
@@ -741,12 +813,12 @@ fn validate_machine_profile_promotion(
     }
     let candidate_benchmark_executable = admitted
         .iter()
-        .find(|(role, _)| *role == "candidate")
+        .find(|(role, _)| *role == PerfRatchetEvidenceRole::Candidate)
         .and_then(|(_, identity)| identity.build().get("executable_sha256"))
         .and_then(Value::as_str);
     let rerun_benchmark_executable = admitted
         .iter()
-        .find(|(role, _)| *role == "rerun")
+        .find(|(role, _)| *role == PerfRatchetEvidenceRole::Rerun)
         .and_then(|(_, identity)| identity.build().get("executable_sha256"))
         .and_then(Value::as_str);
     if let (Some(candidate_benchmark_executable), Some(rerun_benchmark_executable)) =
@@ -1015,6 +1087,7 @@ fn validate_execution_projection_binding(
 
 fn evaluate_perf_ratchet_inner(
     request: PerfRatchetRequest<'_>,
+    qg1_authority_sets: PerfRatchetQg1AuthoritySets<'_>,
     mut state: DecisionState,
     require_current_evidence: bool,
 ) -> PerfRatchetEvaluation {
@@ -1077,7 +1150,8 @@ fn evaluate_perf_ratchet_inner(
                 &candidate_cells,
                 &plan,
                 request.expected_manifest_sha256,
-                "candidate",
+                PerfRatchetEvidenceRole::Candidate,
+                qg1_authority_sets.for_role(PerfRatchetEvidenceRole::Candidate),
                 &mut state,
             ) {
                 return finish_evaluation(
@@ -1128,7 +1202,8 @@ fn evaluate_perf_ratchet_inner(
                     &baseline_cells,
                     &plan,
                     request.expected_manifest_sha256,
-                    "baseline",
+                    PerfRatchetEvidenceRole::Baseline,
+                    qg1_authority_sets.for_role(PerfRatchetEvidenceRole::Baseline),
                     &mut state,
                 ) {
                     return finish_evaluation(
@@ -1188,7 +1263,8 @@ fn evaluate_perf_ratchet_inner(
                         &rerun_cells,
                         &plan,
                         request.expected_manifest_sha256,
-                        "rerun",
+                        PerfRatchetEvidenceRole::Rerun,
+                        qg1_authority_sets.for_role(PerfRatchetEvidenceRole::Rerun),
                         &mut state,
                     ) {
                         return finish_evaluation(
@@ -1467,9 +1543,11 @@ fn validate_current_evidence(
     legacy_cells: &BTreeMap<CellKey, &PerfCellResult>,
     plan: &PerfApplicabilityPlan,
     expected_manifest_sha256: &str,
-    role: &str,
+    role: PerfRatchetEvidenceRole,
+    qg1_authorities: &[&Qg1ExpectedAuthority],
     state: &mut DecisionState,
 ) -> bool {
+    let role = role.label();
     if evidence.applicability_plan != plan.binding {
         state.fatal(
             "perf.ratchet.evidence_applicability_plan_mismatch",
@@ -1479,7 +1557,7 @@ fn validate_current_evidence(
         );
         return false;
     }
-    if let Err(error) = evidence.verify_integrity() {
+    if let Err(error) = evidence.verify_integrity_against_qg1_authorities(qg1_authorities) {
         let (code, message) = if is_lower_hex_sha256(&evidence.artifact_sha256) {
             (
                 "perf.ratchet.current_evidence_integrity_failed",
@@ -4083,6 +4161,7 @@ mod tests {
                 expected_manifest_sha256: &normalized_manifest_sha256(),
                 evidence: Vec::new(),
             },
+            PerfRatchetQg1AuthoritySets::empty(),
             DecisionState::default(),
             false,
         )
@@ -4111,6 +4190,7 @@ mod tests {
                 expected_manifest_sha256: &normalized_manifest_sha256(),
                 evidence: Vec::new(),
             },
+            PerfRatchetQg1AuthoritySets::empty(),
             DecisionState::default(),
             false,
         )
@@ -5432,6 +5512,7 @@ mod tests {
                 expected_manifest_sha256: &normalized_manifest_sha256(),
                 evidence: Vec::new(),
             },
+            PerfRatchetQg1AuthoritySets::empty(),
             DecisionState::default(),
             true,
         );
