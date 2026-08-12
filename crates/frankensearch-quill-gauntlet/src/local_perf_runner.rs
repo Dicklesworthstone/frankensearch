@@ -6605,12 +6605,17 @@ fn validate_process_lifecycle(
         ));
     }
     let recovery_matches_outcome = match outcome {
-        LocalPerfAttemptOutcome::WaitRecoveredByKill { .. }
-        | LocalPerfAttemptOutcome::PostExitRejected {
+        LocalPerfAttemptOutcome::WaitRecoveredByKill { .. } => matches!(
+            lifecycle.process_group_recovery,
+            LocalPerfProcessGroupRecovery::SignaledOwnedGroup
+                | LocalPerfProcessGroupRecovery::DirectChildFallback
+        ),
+        LocalPerfAttemptOutcome::PostExitRejected {
             stage: LocalPerfRejectionStage::AuthorityHandshake,
         } => matches!(
             lifecycle.process_group_recovery,
-            LocalPerfProcessGroupRecovery::SignaledOwnedGroup
+            LocalPerfProcessGroupRecovery::NotRequired
+                | LocalPerfProcessGroupRecovery::SignaledOwnedGroup
                 | LocalPerfProcessGroupRecovery::DirectChildFallback
         ),
         _ => lifecycle.process_group_recovery == LocalPerfProcessGroupRecovery::NotRequired,
@@ -7616,6 +7621,7 @@ mod tests {
                 qg1_read_wait_test_ack();
                 println!("qg1-wait-tokenizer-work-after-ack");
             }
+            "natural_exit" => {}
             unexpected => panic!("unexpected QG-1 wait-boundary child case {unexpected:?}"),
         }
     }
@@ -7733,6 +7739,21 @@ mod tests {
         let root_process_identity = capture_root_process_identity(&child);
         let forwarder = start_qg1_authority_forwarder(&mut child, run_log)
             .expect("start production QG-1 authority forwarder");
+        if case == "natural_exit" {
+            let mut exited = false;
+            for _ in 0..WAIT_RECOVERY_POLL_ATTEMPTS {
+                if child
+                    .try_wait()
+                    .expect("observe natural QG-1 child exit")
+                    .is_some()
+                {
+                    exited = true;
+                    break;
+                }
+                std::thread::sleep(WAIT_RECOVERY_POLL_INTERVAL);
+            }
+            assert!(exited, "QG-1 natural-exit helper did not terminate");
+        }
         if !post_spawn_setup_delay.is_zero() {
             std::thread::sleep(post_spawn_setup_delay);
         }
@@ -7936,6 +7957,36 @@ mod tests {
         assert!(
             started.elapsed() < budget + Duration::from_secs(1),
             "an expired pre-spawn deadline must be consumed immediately after setup rather than restarted"
+        );
+    }
+
+    #[test]
+    fn qg1_natural_child_exit_before_handshake_seals_a_valid_failed_attempt_receipt() {
+        let selection = ResolvedRunSelection {
+            fixture: None,
+            selected_cell_ids: vec!["QG-1/bulk/tiny/1/positions_on/docs_per_second".to_owned()],
+        };
+        let (status, recovery, accepted, failure, _) =
+            qg1_wait_result_for_test("natural_exit", &selection);
+        assert!(status.success(), "the helper must exit naturally");
+        assert_eq!(recovery, LocalPerfProcessGroupRecovery::NotRequired);
+
+        let outcome = qg1_authority_handshake_outcome(
+            PerfGate::Qg1,
+            &selection,
+            &accepted,
+            failure.as_deref(),
+        )
+        .expect("natural exit before COMPLETE is an authority-handshake rejection");
+        let (mut receipt, _, _) = attempt_fixture(outcome, None);
+        receipt.process_lifecycle.process_group_recovery = recovery;
+        let bytes = seal_attempt_receipt(receipt).expect("seal natural-exit failed attempt");
+        let persisted = LocalPerfAttemptReceipt::from_verified_slice(&bytes)
+            .expect("natural-exit authority rejection must validate");
+        assert_eq!(persisted.outcome(), outcome);
+        assert_eq!(
+            persisted.process_lifecycle().process_group_recovery(),
+            LocalPerfProcessGroupRecovery::NotRequired
         );
     }
 
