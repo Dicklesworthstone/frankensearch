@@ -1985,18 +1985,12 @@ impl RecoveredSegmentBacking {
         manifest: &ManifestSegment,
     ) -> Result<(), KeeperError> {
         match self {
-            Self::Mapped(reader) => validate_segment_witnesses(
-                path,
-                manifest,
-                reader,
-                verified_file_witness(path, reader)?,
-            ),
-            Self::Owned(reader) => validate_segment_witnesses(
-                path,
-                manifest,
-                reader,
-                verified_file_witness(path, reader)?,
-            ),
+            Self::Mapped(reader) => validate_segment_witnesses(path, manifest, reader, || {
+                verified_file_witness(path, reader)
+            }),
+            Self::Owned(reader) => validate_segment_witnesses(path, manifest, reader, || {
+                verified_file_witness(path, reader)
+            }),
         }
     }
 }
@@ -2331,8 +2325,9 @@ impl RecoveredSegment {
                 source,
             }
         })?;
-        let file_xxh3 = verified_file_witness(&path, &reader)?;
-        validate_segment_witnesses(&path, &manifest, &reader, file_xxh3)?;
+        validate_segment_witnesses(&path, &manifest, &reader, || {
+            verified_file_witness(&path, &reader)
+        })?;
         Self::bind_backing(
             path,
             manifest,
@@ -3048,8 +3043,9 @@ impl KeeperSnapshot {
                     source,
                 }
             })?;
-            let file_xxh3 = verified_file_witness(&path, &reader)?;
-            validate_segment_witnesses(&path, manifest_segment, &reader, file_xxh3)?;
+            validate_segment_witnesses(&path, manifest_segment, &reader, || {
+                verified_file_witness(&path, &reader)
+            })?;
             segments.push(RecoveredSegment::bind(
                 path,
                 manifest_segment.clone(),
@@ -8213,7 +8209,9 @@ fn recover_durable_segment(
             return Ok(DurableSegmentRecovery::Unrepairable { error });
         }
     };
-    if let Err(error) = validate_segment_witnesses(&path, manifest_segment, &reader, file_xxh3) {
+    if let Err(error) =
+        validate_segment_witnesses(&path, manifest_segment, &reader, || Ok(file_xxh3))
+    {
         return Ok(DurableSegmentRecovery::Unrepairable { error });
     }
     let label = format!("segment-{:016x}", manifest_segment.segment_id);
@@ -8361,7 +8359,7 @@ fn recompute_manifest_field_stats(
             }
         })?;
         let file_xxh3 = fully_verified_file_witness(&path, &reader)?;
-        validate_segment_witnesses(&path, segment, &reader, file_xxh3)?;
+        validate_segment_witnesses(&path, segment, &reader, || Ok(file_xxh3))?;
         let stats = reader
             .section(SectionKind::STATS)
             .map_err(|source| KeeperError::SegmentOpen {
@@ -8418,7 +8416,7 @@ fn open_verified_segment(
             source,
         })?;
     let file_xxh3 = fully_verified_file_witness(path, &reader)?;
-    validate_segment_witnesses(path, manifest, &reader, file_xxh3)
+    validate_segment_witnesses(path, manifest, &reader, || Ok(file_xxh3))
 }
 
 #[cfg(feature = "durability")]
@@ -9829,7 +9827,7 @@ fn validate_proposed_manifest_segments(
             }
         })?;
         let file_xxh3 = fully_verified_file_witness(&path, &reader)?;
-        validate_segment_witnesses(&path, manifest_segment, &reader, file_xxh3)?;
+        validate_segment_witnesses(&path, manifest_segment, &reader, || Ok(file_xxh3))?;
         #[cfg(feature = "durability")]
         if let WriterProtection::Enabled { protector, .. } = protection {
             let sidecar = FileProtector::sidecar_path(&path);
@@ -9886,12 +9884,15 @@ fn fully_verified_file_witness(
         })
 }
 
-fn validate_segment_witnesses(
+fn validate_segment_witnesses<F>(
     path: &Path,
     manifest: &ManifestSegment,
     reader: &SegmentReader<impl AsRef<[u8]>>,
-    actual_file_xxh3: u64,
-) -> Result<(), KeeperError> {
+    retained_file_witness: F,
+) -> Result<(), KeeperError>
+where
+    F: FnOnce() -> Result<u64, KeeperError>,
+{
     let header = reader.header();
     if header.segment_id != manifest.segment_id {
         return Err(KeeperError::SegmentMetadataMismatch {
@@ -9912,6 +9913,7 @@ fn validate_segment_witnesses(
             ),
         });
     }
+    let actual_file_xxh3 = retained_file_witness()?;
     let mismatch = if actual_file_xxh3 != manifest.file_xxh3 {
         Some(format!(
             "actual file_xxh3 {actual_file_xxh3:#018x} != manifest {:#018x}",
@@ -18866,6 +18868,60 @@ mod tests {
             directory_bytes(directory.path())?,
             before,
             "read-only recovery must not mutate after rejecting TERMDICT"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_rejects_manifest_length_before_corrupt_file_witness() -> TestResult {
+        let directory = tempdir()?;
+        let encoded = encoded_test_segment(0xacd, 10, 20, 1)?;
+        let doclen = encoded
+            .section_entries()
+            .iter()
+            .find(|entry| entry.kind == SectionKind::DOCLEN)
+            .expect("doclen entry");
+        let doclen_offset = usize::try_from(doclen.offset)?;
+        let mut bytes = encoded.as_bytes().to_vec();
+        bytes[doclen_offset] ^= 0x80;
+        assert!(
+            SegmentReader::from_owned(bytes.clone(), DEFAULT_SCHEMA)?
+                .verify_file_witness()
+                .is_err(),
+            "fixture must fail a whole-file witness verification"
+        );
+        std::fs::write(directory.path().join(canonical_segment_name(0xacd)), bytes)?;
+
+        let manifest_file_len = encoded.file_len() + 1;
+        let manifest = durable_test_manifest(
+            1,
+            vec![ManifestSegment {
+                segment_id: 0xacd,
+                seal_seq: 1,
+                file_len: manifest_file_len,
+                file_xxh3: encoded.file_xxh3(),
+                docid_lo: 10,
+                docid_hi: 20,
+                doc_count: 1,
+                tombstones: TombstoneSet::new(),
+            }],
+        );
+        write_manifest(&directory.path().join("MANIFEST"), &manifest)?;
+        let before = directory_bytes(directory.path())?;
+
+        assert!(matches!(
+            KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA),
+            Err(KeeperError::SegmentMetadataMismatch { detail, .. })
+                if detail
+                    == format!(
+                        "file length {} != manifest {manifest_file_len}",
+                        encoded.file_len()
+                    )
+        ));
+        assert_eq!(
+            directory_bytes(directory.path())?,
+            before,
+            "read-only recovery must not mutate after rejecting manifest metadata"
         );
         Ok(())
     }
