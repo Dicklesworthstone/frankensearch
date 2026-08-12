@@ -1176,12 +1176,13 @@ pub fn preregister_qg1_tantivy_incumbents(
 
 fn qg1_valid_throughput_experiment(
     experiment: &PairedExperimentResult,
+    external_qg1_authority: Option<&Qg1ExpectedAuthority>,
     expected_scope: &PerfOperationScope,
     expected_provenance: Option<&PerfSampleProvenance>,
     expected_work_units: u64,
     expected_content_bytes: u64,
 ) -> bool {
-    experiment.recomputes_from_live_authority_config()
+    experiment.recomputes_against_qg1_authority(external_qg1_authority)
         && experiment.status == PairedEvidenceStatus::Valid
         && experiment.claim_state == PairedClaimState::EligibleForDecision
         && experiment.scope == *expected_scope
@@ -1236,6 +1237,28 @@ impl Qg1TantivyIncumbentScreen {
         screen_plan: Qg1TantivyIncumbentScreenPlan,
         semantic_contract: &Qg1TantivySemanticContract,
         pilots: Vec<Qg1TantivyIncumbentPilot>,
+    ) -> Result<Self, Qg1TantivyIncumbentError> {
+        Self::screen_against_qg1_authorities(cell, screen_plan, semantic_contract, pilots, &[])
+    }
+
+    /// Screen pilots that no longer carry their live producer, using the
+    /// expectations their consumer retained.
+    ///
+    /// Reloaded pilots lose the never-serialized producer expectation, so this
+    /// is the only entry that can admit persisted QG-1 screen evidence. Each
+    /// pilot selects the retained expectation that issued its own sealed
+    /// authority; live callers keep passing an empty set and remain bound by
+    /// the expectation the producer installed in their configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::screen`].
+    pub fn screen_against_qg1_authorities(
+        cell: &PerfCellSpec,
+        screen_plan: Qg1TantivyIncumbentScreenPlan,
+        semantic_contract: &Qg1TantivySemanticContract,
+        pilots: Vec<Qg1TantivyIncumbentPilot>,
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
     ) -> Result<Self, Qg1TantivyIncumbentError> {
         let candidates = preregister_qg1_tantivy_incumbents(cell, &screen_plan, semantic_contract)?;
         let expected_scope = qg1_expected_throughput_scope(cell)?;
@@ -1293,6 +1316,7 @@ impl Qg1TantivyIncumbentScreen {
             }
             if !qg1_valid_throughput_experiment(
                 &pilot.experiment,
+                select_qg1_expected_authority(external_qg1_authorities, &pilot.experiment.config),
                 &expected_scope,
                 None,
                 screen_plan.work_units,
@@ -1385,11 +1409,32 @@ impl Qg1TantivyIncumbentScreen {
         semantic_contract: &Qg1TantivySemanticContract,
         decision: &Qg1TantivyIncumbentDecision,
     ) -> Result<(), Qg1TantivyIncumbentError> {
-        let recomputed_screen = Self::screen(
+        self.validate_decision_against_qg1_authorities(cell, semantic_contract, decision, &[])
+    }
+
+    /// Validate a persisted screen and decision against the QG-1 expectations
+    /// their consumer retained outside the artifact.
+    ///
+    /// Pilot streams and decision streams are issued by separate producers, so
+    /// the retained set is matched per stream configuration rather than
+    /// assumed to be one authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::validate_decision`].
+    pub fn validate_decision_against_qg1_authorities(
+        &self,
+        cell: &PerfCellSpec,
+        semantic_contract: &Qg1TantivySemanticContract,
+        decision: &Qg1TantivyIncumbentDecision,
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+    ) -> Result<(), Qg1TantivyIncumbentError> {
+        let recomputed_screen = Self::screen_against_qg1_authorities(
             cell,
             self.screen_plan.clone(),
             semantic_contract,
             self.pilots.clone(),
+            external_qg1_authorities,
         )?;
         if &recomputed_screen != self {
             return Err(Qg1TantivyIncumbentError::ScreenSelectionMismatch);
@@ -1439,6 +1484,7 @@ impl Qg1TantivyIncumbentScreen {
             expected_scope,
             expected_provenance,
             expected_estimator_config,
+            select_qg1_expected_authority(external_qg1_authorities, &decision.estimator_config),
             recomputed_screen.screen_plan.work_units,
             recomputed_screen.screen_plan.content_bytes,
             &mut seen_observation_ids,
@@ -1518,6 +1564,7 @@ impl Qg1TantivyIncumbentDecision {
         expected_scope: &PerfOperationScope,
         expected_provenance: &PerfSampleProvenance,
         expected_estimator_config: &PairedEstimatorConfig,
+        external_qg1_authority: Option<&Qg1ExpectedAuthority>,
         expected_work_units: u64,
         expected_content_bytes: u64,
         seen_observation_ids: &mut BTreeSet<String>,
@@ -1525,6 +1572,8 @@ impl Qg1TantivyIncumbentDecision {
         if &self.estimator_config != expected_estimator_config {
             return Err(Qg1TantivyIncumbentError::EstimatorConfigMismatch);
         }
+        let expected_qg1_authority =
+            external_qg1_authority.or(self.estimator_config.qg1_expected_authority.as_ref());
         let selected_config = selected_candidate.config_sha256.as_str();
         let streams = [
             (
@@ -1579,26 +1628,33 @@ impl Qg1TantivyIncumbentDecision {
             }
             qg1_insert_observation_ids(stream.observations.iter(), seen_observation_ids)?;
         }
-        let tantivy_decision = estimate_paired_experiment(
+        // Both decisions are QG-1 by construction, so they are estimated
+        // through the authority-bearing entry: the generic estimator refuses
+        // canonical QG-1 scopes precisely so a resealed row cannot reach here.
+        let tantivy_decision = estimate_paired_experiment_against_qg1_authority(
             &self.tantivy_vs_quill.samples,
             &self.tantivy_null.samples,
             &self.estimator_config,
+            expected_qg1_authority,
         )
         .map_err(|_| Qg1TantivyIncumbentError::DecisionEvidenceInvalid)?;
-        let quill_decision = estimate_paired_experiment(
+        let quill_decision = estimate_paired_experiment_against_qg1_authority(
             &self.tantivy_vs_quill.samples,
             &self.quill_null.samples,
             &self.estimator_config,
+            expected_qg1_authority,
         )
         .map_err(|_| Qg1TantivyIncumbentError::DecisionEvidenceInvalid)?;
         if !qg1_valid_throughput_experiment(
             &tantivy_decision,
+            external_qg1_authority,
             expected_scope,
             Some(expected_provenance),
             expected_work_units,
             expected_content_bytes,
         ) || !qg1_valid_throughput_experiment(
             &quill_decision,
+            external_qg1_authority,
             expected_scope,
             Some(expected_provenance),
             expected_work_units,
@@ -3684,7 +3740,14 @@ impl Qg1ExpectedAuthority {
         &self.authority.authority_sha256
     }
 
-    fn matches_config(&self, config: &PairedEstimatorConfig) -> bool {
+    /// Whether this retained expectation is the one that issued `config`'s
+    /// sealed authority.
+    ///
+    /// Evidence replay uses this to select, per cell, the single retained
+    /// expectation a persisted QG-1 cell was measured under. A non-QG-1
+    /// configuration never matches, so a mixed artifact keeps its exact
+    /// generic behavior.
+    pub(crate) fn matches_config(&self, config: &PairedEstimatorConfig) -> bool {
         config.qg1_lifecycle_authority.as_ref() == Some(&self.authority)
     }
 
@@ -4821,8 +4884,11 @@ impl PairedExperimentResult {
                 });
             }
         }
-        let recomputed =
-            estimate_paired_experiment(&self.effect_samples, &self.null_samples, &self.config)?;
+        let recomputed = estimate_paired_experiment_inner(
+            &self.effect_samples,
+            &self.null_samples,
+            &self.config,
+        )?;
         if recomputed == *self {
             Ok(())
         } else {
@@ -4830,14 +4896,27 @@ impl PairedExperimentResult {
         }
     }
 
-    fn recomputes_from_live_authority_config(&self) -> bool {
+    /// Whether this result recomputes against a proven QG-1 expectation.
+    ///
+    /// A live producer supplies it through the configuration it installed; a
+    /// reloaded artifact cannot, so its consumer passes the retained
+    /// expectation as `external`. Canonical QG-1 evidence with neither is
+    /// refused by the authority-bearing estimator, never silently admitted.
+    fn recomputes_against_qg1_authority(
+        &self,
+        external_qg1_authority: Option<&Qg1ExpectedAuthority>,
+    ) -> bool {
+        // A live producer supplies the expectation through the configuration
+        // it installed; a consumer supplies the one it retained. Neither can
+        // be absent for canonical QG-1 evidence without failing closed below.
+        let expected = external_qg1_authority.or(self.config.qg1_expected_authority.as_ref());
         self.config.has_predeclared_thresholds()
             && self.config.validate().is_ok()
             && estimate_paired_experiment_against_qg1_authority(
                 &self.effect_samples,
                 &self.null_samples,
                 &self.config,
-                self.config.qg1_expected_authority.as_ref(),
+                expected,
             )
             .is_ok_and(|recomputed| recomputed == *self)
     }
@@ -5376,11 +5455,40 @@ fn push_reason(reasons: &mut Vec<PairedEstimatorReason>, code: &str, message: im
 /// invalidity returns a replayable [`PairedExperimentResult`] whose
 /// [`PairedClaimState`] is [`PairedClaimState::NoDecision`].
 ///
+/// Canonical QG-1 throughput evidence is refused here. Its receipts are only
+/// authenticated by a producer-retained capability, so admitting it through an
+/// authority-free entry would let a fully resealed row estimate itself; such
+/// callers must use [`estimate_paired_experiment_against_qg1_authority`].
+///
 /// # Errors
 ///
 /// Returns a typed fail-closed error for malformed pairs, mixed scopes or
-/// provenance, undersampling, and invalid raw values.
+/// provenance, undersampling, invalid raw values, and any canonical QG-1
+/// throughput sample.
 pub fn estimate_paired_experiment(
+    effect_samples: &[PerfRawSample],
+    null_samples: &[PerfRawSample],
+    config: &PairedEstimatorConfig,
+) -> Result<PairedExperimentResult, PairedEstimatorError> {
+    if effect_samples
+        .iter()
+        .chain(null_samples.iter())
+        .any(|sample| is_canonical_qg1_throughput_scope(&sample.scope))
+    {
+        return Err(PairedEstimatorError::InvalidProvenance {
+            reason: "canonical QG-1 throughput evidence must be estimated against an \
+                     independently retained expected authority"
+                .to_owned(),
+        });
+    }
+    estimate_paired_experiment_inner(effect_samples, null_samples, config)
+}
+
+/// Shared estimator body reached only after the caller's QG-1 admission
+/// decision. It performs no authority check of its own by design: every public
+/// entry above it either refuses canonical QG-1 scopes outright or has already
+/// matched the retained producer capabilities.
+fn estimate_paired_experiment_inner(
     effect_samples: &[PerfRawSample],
     null_samples: &[PerfRawSample],
     config: &PairedEstimatorConfig,
@@ -5652,7 +5760,7 @@ pub fn estimate_paired_experiment_against_qg1_authority(
             });
         }
     }
-    estimate_paired_experiment(effect_samples, null_samples, config)
+    estimate_paired_experiment_inner(effect_samples, null_samples, config)
 }
 
 /// Produce a deterministic, balanced randomized first-arm schedule.
@@ -7598,8 +7706,13 @@ mod tests {
         let mut estimator_config = estimator_config();
         estimator_config.qg1_lifecycle_authority = Some(authority.clone());
         estimator_config.qg1_expected_authority = Some(qg1_test_expected_authority(&authority));
-        let experiment = estimate_paired_experiment(&effect, &null, &estimator_config)
-            .expect("valid QG-1 candidate pilot");
+        let experiment = estimate_paired_experiment_against_qg1_authority(
+            &effect,
+            &null,
+            &estimator_config,
+            estimator_config.qg1_expected_authority.as_ref(),
+        )
+        .expect("valid QG-1 candidate pilot");
         let observed_writer_threads = match candidate.writer_mode {
             Qg1TantivyWriterMode::ShippingAuto => 1,
             Qg1TantivyWriterMode::Fixed { writer_threads } => writer_threads,
@@ -7839,32 +7952,46 @@ mod tests {
             QG1_TANTIVY_ENGINE_ID,
             QG1_STREAM_ROLE_TANTIVY_NULL,
         );
-        let intact_experiment = estimate_paired_experiment(&effect, &null, &config)
-            .expect("the intact QG-1 lifecycle binding must reach the live estimator");
-        assert!(
-            intact_experiment.verify_recomputed().is_err(),
-            "a persisted QG-1 artifact must not authenticate itself from its embedded authority"
-        );
         let expected_authority = qg1_test_expected_authority(&authority);
-        intact_experiment
-            .verify_recomputed_against_qg1_authority(Some(&expected_authority))
-            .expect(
-                "persisted QG-1 evidence recomputes against the independently retained authority",
-            );
-        estimate_paired_experiment_against_qg1_authority(
+        // The public authority-free estimator refuses canonical QG-1 scopes
+        // outright, so every hostile case below is exercised through the
+        // authority-bearing entry and cannot pass for the trivial reason.
+        assert!(
+            matches!(
+                estimate_paired_experiment(&effect, &null, &config),
+                Err(PairedEstimatorError::InvalidProvenance { .. })
+            ),
+            "the authority-free estimator must refuse canonical QG-1 throughput evidence"
+        );
+        let intact_experiment = estimate_paired_experiment_against_qg1_authority(
             &effect,
             &null,
             &config,
             Some(&expected_authority),
         )
-        .expect("the live estimator compares QG-1 rows to the independently retained authority");
+        .expect("the intact QG-1 lifecycle binding must reach the authority-bearing estimator");
+        assert!(
+            intact_experiment.verify_recomputed().is_err(),
+            "a persisted QG-1 artifact must not authenticate itself from its embedded authority"
+        );
+        intact_experiment
+            .verify_recomputed_against_qg1_authority(Some(&expected_authority))
+            .expect(
+                "persisted QG-1 evidence recomputes against the independently retained authority",
+            );
         let mut live_config = config.clone();
         live_config.qg1_expected_authority = Some(expected_authority.clone());
-        let live_intact_experiment = estimate_paired_experiment(&effect, &null, &live_config)
-            .expect("the intact QG-1 lifecycle binding reaches the screen and decision guard");
+        let live_intact_experiment = estimate_paired_experiment_against_qg1_authority(
+            &effect,
+            &null,
+            &live_config,
+            live_config.qg1_expected_authority.as_ref(),
+        )
+        .expect("the intact QG-1 lifecycle binding reaches the screen and decision guard");
         assert!(
             qg1_valid_throughput_experiment(
                 &live_intact_experiment,
+                None,
                 &scope,
                 Some(&provenance),
                 500,
@@ -7872,17 +7999,51 @@ mod tests {
             ),
             "the shared QG-1 screen and decision guard admits live producer-authenticated evidence"
         );
+        assert!(
+            qg1_valid_throughput_experiment(
+                &intact_experiment,
+                Some(&expected_authority),
+                &scope,
+                Some(&provenance),
+                500,
+                64_000,
+            ),
+            "a reloaded QG-1 experiment is admitted by the externally supplied retained authority"
+        );
+        assert!(
+            !qg1_valid_throughput_experiment(
+                &intact_experiment,
+                None,
+                &scope,
+                Some(&provenance),
+                500,
+                64_000,
+            ),
+            "removing the external authority must fail the guard closed, never admit or panic"
+        );
 
         let assert_rejected = |effect: Vec<PerfRawSample>, label: &str| {
             assert!(
-                estimate_paired_experiment(&effect, &null, &config).is_err(),
+                estimate_paired_experiment_against_qg1_authority(
+                    &effect,
+                    &null,
+                    &config,
+                    Some(&expected_authority),
+                )
+                .is_err(),
                 "the live estimator accepted hostile QG-1 lifecycle mutation: {label}"
             );
         };
         let assert_streams_rejected =
             |effect: Vec<PerfRawSample>, null: Vec<PerfRawSample>, label: &str| {
                 assert!(
-                    estimate_paired_experiment(&effect, &null, &config).is_err(),
+                    estimate_paired_experiment_against_qg1_authority(
+                        &effect,
+                        &null,
+                        &config,
+                        Some(&expected_authority),
+                    )
+                    .is_err(),
                     "the live estimator accepted hostile QG-1 stream mutation: {label}"
                 );
             };
@@ -7964,8 +8125,11 @@ mod tests {
             sample.qg1_sample_binding = Some(forged_binding);
         }
         assert!(
-            estimate_paired_experiment(&cloned_fast_pair, &null, &config).is_ok(),
-            "a fully resealed artifact can copy the visible destination commitment without the retained producer capability"
+            matches!(
+                estimate_paired_experiment(&cloned_fast_pair, &null, &config),
+                Err(PairedEstimatorError::InvalidProvenance { .. })
+            ),
+            "a fully resealed destination-ID clone must not reach any authority-free public estimator"
         );
         assert!(
             estimate_paired_experiment_against_qg1_authority(
@@ -7977,18 +8141,35 @@ mod tests {
             .is_err(),
             "independent authority must reject exact suffix slots copied from fast rows after full resealing"
         );
+        // The forged rows stay publicly self-consistent, so the guard is
+        // proved against a result the private estimator body will still
+        // produce. Building it here deliberately bypasses the public
+        // admission that already refused it above: the screen and decision
+        // guard is the second, independent line of defence.
         let forged_live_experiment =
-            estimate_paired_experiment(&cloned_fast_pair, &null, &live_config)
+            estimate_paired_experiment_inner(&cloned_fast_pair, &null, &live_config)
                 .expect("the public receipt fields remain self-consistent after full resealing");
         assert!(
             !qg1_valid_throughput_experiment(
                 &forged_live_experiment,
+                None,
                 &scope,
                 Some(&provenance),
                 500,
                 64_000,
             ),
             "the shared QG-1 screen and decision guard must consume retained authority, not self-sealed receipt fields"
+        );
+        assert!(
+            !qg1_valid_throughput_experiment(
+                &forged_live_experiment,
+                Some(&expected_authority),
+                &scope,
+                Some(&provenance),
+                500,
+                64_000,
+            ),
+            "an externally supplied retained authority must reject the resealed clone at the guard too"
         );
         assert!(
             forged_live_experiment
@@ -8026,10 +8207,11 @@ mod tests {
         let mut lowered_min_pairs_config = config.clone();
         lowered_min_pairs_config.min_pairs = 4;
         assert!(
-            estimate_paired_experiment(
+            estimate_paired_experiment_against_qg1_authority(
                 &coordinated_suffix_effect,
                 &coordinated_suffix_null,
-                &lowered_min_pairs_config
+                &lowered_min_pairs_config,
+                Some(&expected_authority),
             )
             .is_err(),
             "the live estimator accepted both-arm suffix truncation with lowered/resealed row authority counts"
@@ -8301,9 +8483,15 @@ mod tests {
         );
         let mut substituted_config = config.clone();
         substituted_config.qg1_lifecycle_authority = Some(substituted_authority);
-        let substituted_experiment =
-            estimate_paired_experiment(&substituted_effect, &substituted_null, &substituted_config)
-                .expect("coordinated artifact substitution remains self-consistent");
+        // Built through the private body on purpose: a coordinated substitution
+        // is self-consistent, so the point of the assertions below is that the
+        // independently retained authority rejects it anyway.
+        let substituted_experiment = estimate_paired_experiment_inner(
+            &substituted_effect,
+            &substituted_null,
+            &substituted_config,
+        )
+        .expect("coordinated artifact substitution remains self-consistent");
         assert!(
             estimate_paired_experiment_against_qg1_authority(
                 &substituted_effect,
@@ -8406,6 +8594,210 @@ mod tests {
         assert_rejected(
             unsearchable_tantivy,
             "unsearchable Tantivy terminal witness",
+        );
+    }
+
+    /// Traverse the seams a live QG-1 cell actually uses: one producer issues
+    /// the effect stream, the oracle null, and the treatment-arm null; the
+    /// cell attaches that null, is persisted, reloaded, and replayed against
+    /// the expectation its consumer retained. The producer expectation is
+    /// never serialized, so replay must receive it from outside the artifact.
+    #[test]
+    fn qg1_live_cell_attaches_persists_and_replays_against_retained_authority() {
+        use crate::perf_evidence::{EvidenceCell, EvidenceCellSpec, EvidencePolicy, EvidenceRole};
+
+        let cell = qg1_bulk_cell(4);
+        let scope = qg1_throughput_scope(&cell);
+        let provenance = provenance("qg1-live-cell-replay");
+        let control = [1_000_000; PERF_MIN_RUNS];
+        let mut treatment = [900_000; PERF_MIN_RUNS];
+        treatment[PERF_MIN_RUNS - 1] = 940_000;
+        let authority = qg1_test_authority(
+            &scope,
+            &provenance,
+            500,
+            64_000,
+            u64::try_from(PERF_MIN_RUNS).expect("QG-1 cell pair count fits u64"),
+            &[
+                (QG1_STREAM_ROLE_EFFECT, 0),
+                (QG1_STREAM_ROLE_TANTIVY_NULL, 10_000),
+                (QG1_STREAM_ROLE_QUILL_NULL, 20_000),
+            ],
+        );
+        let expected_authority = qg1_test_expected_authority(&authority);
+        let mut config = estimator_config();
+        config.qg1_lifecycle_authority = Some(authority.clone());
+        config.qg1_expected_authority = Some(expected_authority.clone());
+
+        let effect = qg1_duration_stream(
+            &scope,
+            &provenance,
+            &control,
+            &treatment,
+            0,
+            500,
+            64_000,
+            &authority,
+            QG1_TANTIVY_ENGINE_ID,
+            QG1_QUILL_ENGINE_ID,
+            QG1_STREAM_ROLE_EFFECT,
+        );
+        let oracle_null = qg1_duration_stream(
+            &scope,
+            &provenance,
+            &control,
+            &control,
+            10_000,
+            500,
+            64_000,
+            &authority,
+            QG1_TANTIVY_ENGINE_ID,
+            QG1_TANTIVY_ENGINE_ID,
+            QG1_STREAM_ROLE_TANTIVY_NULL,
+        );
+        let treatment_null = qg1_duration_stream(
+            &scope,
+            &provenance,
+            &treatment,
+            &treatment,
+            20_000,
+            500,
+            64_000,
+            &authority,
+            QG1_QUILL_ENGINE_ID,
+            QG1_QUILL_ENGINE_ID,
+            QG1_STREAM_ROLE_QUILL_NULL,
+        );
+
+        let live_expected = config.qg1_expected_authority.clone();
+        let experiment = estimate_paired_experiment_against_qg1_authority(
+            &effect,
+            &oracle_null,
+            &config,
+            live_expected.as_ref(),
+        )
+        .expect("the live cell's A/B stream estimates under its producer authority");
+        let treatment_null_experiment = estimate_paired_experiment_against_qg1_authority(
+            &effect,
+            &treatment_null,
+            &config,
+            live_expected.as_ref(),
+        )
+        .expect("the treatment-arm null shares the same producer authority");
+
+        let policy = EvidencePolicy::predeclared();
+        // Diagnostic role: a required QG-1 cell additionally demands a
+        // concurrency witness, which is orthogonal to the authority seams.
+        let spec = EvidenceCellSpec {
+            gate: PerfGate::Qg1,
+            fixture: cell.fixture.clone(),
+            metric: cell.metric.clone(),
+            unit: "docs/s".to_owned(),
+            role: EvidenceRole::Diagnostic,
+            input_identity: None,
+            qg6_semantic_contract: None,
+            cold_cache: None,
+            concurrency_witness: None,
+        };
+        let mut live_cell = EvidenceCell::evaluate(spec, experiment, &policy)
+            .expect("a QG-1 paired cell evaluates from authority-bearing evidence");
+
+        // Planted negative: the authority-free attach is a typed reject, and
+        // the real cell no longer panics when the producer hands its retained
+        // expectation to the same seam.
+        assert!(
+            live_cell
+                .clone()
+                .attach_treatment_arm_null(treatment_null_experiment.clone(), &policy)
+                .is_err(),
+            "authority-free attachment must keep refusing an embedded QG-1 authority"
+        );
+        live_cell
+            .attach_treatment_arm_null_against_qg1_authority(
+                treatment_null_experiment.clone(),
+                &policy,
+                Some(&expected_authority),
+            )
+            .expect("the live QG-1 treatment-arm null attaches under its retained authority");
+        live_cell
+            .verify_recomputed_against_qg1_authorities(&policy, &[&expected_authority])
+            .expect("the live cell recomputes against the retained authority");
+        assert!(
+            live_cell.verify_recomputed(&policy).is_err(),
+            "a QG-1 cell must never authenticate itself without an external authority"
+        );
+
+        let encoded = serde_json::to_string(&live_cell).expect("QG-1 evidence cell serializes");
+        assert!(
+            !encoded.contains("capability_preimage") && !encoded.contains("expected_authority"),
+            "producer capability preimages must never reach a persisted artifact"
+        );
+        let reloaded: EvidenceCell =
+            serde_json::from_str(&encoded).expect("QG-1 evidence cell reloads");
+        reloaded
+            .verify_recomputed_against_qg1_authorities(&policy, &[&expected_authority])
+            .expect("reloaded QG-1 evidence replays against the externally retained authority");
+        assert!(
+            reloaded
+                .verify_recomputed_against_qg1_authorities(&policy, &[])
+                .is_err(),
+            "removing the external authority must be a typed reject, never a green replay"
+        );
+
+        // A destination-ID resealed suffix row is rejected at every seam that
+        // consumes the retained authority: estimate, attach, and replay.
+        let mut forged_null = treatment_null.clone();
+        let source_binding = forged_null[0]
+            .qg1_sample_binding
+            .clone()
+            .expect("the source row retains its issued binding");
+        let destination = forged_null
+            .last()
+            .expect("the treatment-arm null retains a suffix row")
+            .clone();
+        let mut forged_binding = source_binding;
+        forged_binding.stream_sequence = destination
+            .qg1_sample_binding
+            .as_ref()
+            .expect("the destination row retains its issued binding")
+            .stream_sequence;
+        forged_binding.raw_sample_id = destination.sample_id;
+        forged_binding.raw_block_id = destination.block_id;
+        forged_binding.raw_arm = destination.arm;
+        forged_binding.raw_order = destination.order;
+        forged_binding.producer_capability_sha256 = authority
+            .issued_row_for(
+                &forged_binding.stream_role,
+                forged_binding.stream_sequence,
+                forged_binding.raw_block_id,
+                forged_binding.raw_sample_id,
+                forged_binding.raw_arm,
+                forged_binding.raw_order,
+            )
+            .expect("the destination suffix slot is issued")
+            .producer_capability_sha256
+            .clone();
+        forged_binding.seal_lifecycle_receipt(&scope, &provenance);
+        let forged_index = forged_null.len() - 1;
+        forged_null[forged_index].qg1_sample_binding = Some(forged_binding);
+        let forged_experiment = estimate_paired_experiment_inner(&effect, &forged_null, &config)
+            .expect("the forged null stays publicly self-consistent after resealing");
+        assert!(
+            live_cell
+                .clone()
+                .attach_treatment_arm_null_against_qg1_authority(
+                    forged_experiment.clone(),
+                    &policy,
+                    Some(&expected_authority),
+                )
+                .is_err(),
+            "the attach seam must reject a destination-ID resealed suffix row"
+        );
+        assert!(
+            forged_experiment
+                .verify_recomputed_against_qg1_authority(Some(&expected_authority))
+                .is_err(),
+            "the replay seam must reject a destination-ID resealed suffix row"
         );
     }
 
@@ -8515,6 +8907,117 @@ mod tests {
                 && candidate.config_sha256
                     == candidate.recomputed_config_sha256().expect("config hash")
         }));
+    }
+
+    /// A reloaded screen and decision have lost the never-serialized producer
+    /// expectation their live configuration carried. They must therefore fail
+    /// closed on the authority-free entries and be admitted only through the
+    /// entries their consumer supplies the retained expectation to.
+    #[test]
+    fn qg1_reloaded_screen_and_decision_require_an_externally_supplied_authority() {
+        let cell = qg1_bulk_cell(4);
+        let semantic_contract = qg1_semantic_contract();
+        let screen_plan = qg1_screen_plan(&cell, vec![1, 2, 4]);
+        let mut pilots = qg1_complete_pilots(
+            &cell,
+            &screen_plan,
+            &semantic_contract,
+            "one-live-invocation",
+        );
+        let pilot_authority = qg1_test_expected_authority(
+            pilots[0]
+                .experiment
+                .config
+                .qg1_lifecycle_authority
+                .as_ref()
+                .expect("live pilots carry their sealed lifecycle authority"),
+        );
+        let live_screen = Qg1TantivyIncumbentScreen::screen(
+            &cell,
+            screen_plan.clone(),
+            &semantic_contract,
+            pilots.clone(),
+        )
+        .expect("live pilots screen from their own producer expectation");
+        let selected = live_screen
+            .selected_candidate
+            .as_ref()
+            .expect("CI-distinct fastest candidate");
+        let mut decision = qg1_decision(
+            &cell,
+            &live_screen.screen_plan,
+            &semantic_contract,
+            selected,
+            "one-live-invocation",
+        );
+
+        // Pilot and decision streams are issued by separate producers, so the
+        // consumer retains both expectations and each seam selects its own.
+        let decision_authority = qg1_test_expected_authority(
+            decision
+                .estimator_config
+                .qg1_lifecycle_authority
+                .as_ref()
+                .expect("the live decision carries its sealed lifecycle authority"),
+        );
+        let retained = [&pilot_authority, &decision_authority];
+
+        // Reload drops exactly the field serde never wrote.
+        for pilot in &mut pilots {
+            pilot.experiment.config.qg1_expected_authority = None;
+        }
+        decision.estimator_config.qg1_expected_authority = None;
+        for stream in [
+            &decision.tantivy_vs_quill,
+            &decision.tantivy_null,
+            &decision.quill_null,
+        ] {
+            assert!(
+                stream
+                    .samples
+                    .iter()
+                    .all(|sample| sample.qg1_sample_binding.is_some()),
+                "every reloaded decision row keeps its serialized lifecycle receipt"
+            );
+        }
+
+        let reloaded_without_authority = Qg1TantivyIncumbentScreen::screen(
+            &cell,
+            screen_plan.clone(),
+            &semantic_contract,
+            pilots.clone(),
+        )
+        .expect("a reloaded screen is a typed no-decision receipt, never a panic");
+        assert!(
+            reloaded_without_authority.selected_candidate.is_none(),
+            "reloaded QG-1 pilots must not select an arm without their retained authority"
+        );
+        let reloaded_screen = Qg1TantivyIncumbentScreen::screen_against_qg1_authorities(
+            &cell,
+            screen_plan,
+            &semantic_contract,
+            pilots,
+            &retained,
+        )
+        .expect("reloaded pilots screen against the externally supplied authority");
+        assert!(
+            reloaded_screen.selected_candidate.is_some(),
+            "the externally supplied retained authority admits reloaded QG-1 pilots"
+        );
+        assert!(
+            reloaded_screen
+                .validate_decision(&cell, &semantic_contract, &decision)
+                .is_err(),
+            "the authority-free decision entry must keep refusing reloaded QG-1 evidence"
+        );
+        reloaded_screen
+            .validate_decision_against_qg1_authorities(
+                &cell,
+                &semantic_contract,
+                &decision,
+                &retained,
+            )
+            .expect("reloaded decision validates against the externally supplied authority");
     }
 
     #[test]
@@ -8738,7 +9241,10 @@ mod tests {
         for sample in effect_samples.iter_mut().chain(null_samples.iter_mut()) {
             sample.work_units = Some(screen_plan.work_units - 1);
         }
-        wrong_work_pilot.experiment = estimate_paired_experiment(
+        // Deliberately degraded fixture: the samples keep their canonical QG-1
+        // scope, which the public estimator now refuses outright, so the
+        // private body builds the pilot the screen must still reject.
+        wrong_work_pilot.experiment = estimate_paired_experiment_inner(
             &wrong_work_pilot.experiment.effect_samples,
             &wrong_work_pilot.experiment.null_samples,
             &estimator_config(),
@@ -8758,7 +9264,7 @@ mod tests {
 
         let mut mixed_estimator_pilots = pilots.clone();
         let alternate_config = PairedEstimatorConfig::predeclared(0xa11c_e55e);
-        mixed_estimator_pilots[1].experiment = estimate_paired_experiment(
+        mixed_estimator_pilots[1].experiment = estimate_paired_experiment_inner(
             &mixed_estimator_pilots[1].experiment.effect_samples,
             &mixed_estimator_pilots[1].experiment.null_samples,
             &alternate_config,

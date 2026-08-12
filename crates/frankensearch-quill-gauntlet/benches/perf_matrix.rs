@@ -5168,8 +5168,17 @@ fn collect_cell(
     )
     .expect("evidence cell evaluation");
     if let Some(treatment_null_experiment) = treatment_null_experiment {
-        cell.attach_treatment_arm_null(treatment_null_experiment, &evidence.policy)
-            .expect("attach treatment-arm A/A null");
+        // The QG-1 null is authenticated by the same retained producer
+        // expectation as the effect stream. Authority-free attachment refuses
+        // a config that carries a sealed QG-1 authority, so the live producer
+        // hands its expectation to the attach seam exactly as it does to the
+        // estimator above.
+        cell.attach_treatment_arm_null_against_qg1_authority(
+            treatment_null_experiment,
+            &evidence.policy,
+            qg1_expected_authority,
+        )
+        .expect("attach treatment-arm A/A null");
     }
 
     let absolute_engine = if is_tokenizer_null {
@@ -6668,6 +6677,87 @@ mod tests {
             .is_none(),
             "a consumed QG-1 producer capability must not be reissued"
         );
+
+        // A producer that did not issue this invocation's authority is refused
+        // before any capability is removed, so the wrong authority can never
+        // burn a live slot. The foreign producer's own slot must therefore
+        // still be consumable afterwards.
+        let mut foreign_config = PairedEstimatorConfig::predeclared(0x5147_314c_4946_4544);
+        let foreign_producer = foreign_config
+            .install_qg1_lifecycle_authority(
+                scope.clone(),
+                provenance.corpus_sha256.clone(),
+                authority_receipt.prepared_input.manifest_sha256.clone(),
+                authority_receipt
+                    .prepared_input
+                    .indexed_content_sha256
+                    .clone(),
+                authority_receipt.prepared_input.document_count,
+                authority_receipt.prepared_input.content_bytes,
+                authority_receipt.prepared_input.batch_count,
+                authority_receipt
+                    .batches
+                    .iter()
+                    .map(|batch| Qg1BatchCoverage {
+                        document_start: batch.document_start,
+                        document_count: batch.document_count,
+                    })
+                    .collect(),
+                authority_receipt.prepared_input.tail_document_id.clone(),
+                10,
+                vec![
+                    (
+                        "qg1.effect.tantivy_vs_quill.v1".to_owned(),
+                        0,
+                        0,
+                        vec![PerfSampleArm::Control; 10],
+                    ),
+                    (
+                        "qg1.null.tantivy.v1".to_owned(),
+                        0,
+                        10_000,
+                        vec![PerfSampleArm::Control; 10],
+                    ),
+                ],
+            )
+            .expect("freeze an independent foreign lifecycle authority");
+        assert!(
+            !config.qg1_expected_authority_matches(foreign_producer.expected_authority()),
+            "two independently issued producers must never be interchangeable"
+        );
+        let foreign_binding = |producer_config: &PairedEstimatorConfig,
+                               producer: &Qg1LifecycleProducer| {
+            let receipt = hostile_tantivy_continuous_receipt();
+            let continuous = super::Qg1ContinuousMeasurement {
+                work_units: receipt.document_count,
+                origin: std::time::Instant::now(),
+                elapsed_ns: receipt.interval_ended_ns,
+                prepared_input: receipt.prepared_input.clone(),
+                lifecycle_receipt: receipt,
+            };
+            super::qg1_live_sample_binding(
+                Some(&continuous),
+                continuous.elapsed_ns,
+                &scope,
+                &provenance,
+                producer_config,
+                producer,
+                "qg1.effect.tantivy_vs_quill.v1",
+                0,
+                0,
+                0,
+                PerfSampleArm::Control,
+                PerfSampleOrder::First,
+            )
+        };
+        assert!(
+            foreign_binding(&config, &foreign_producer).is_none(),
+            "a foreign producer must be refused against this invocation's authority"
+        );
+        assert!(
+            foreign_binding(&foreign_config, &foreign_producer).is_some(),
+            "the refused attempt must not have consumed the foreign producer's slot"
+        );
         let no_claim_binding = binding_from_receipt(
             unproved.clone(),
             "qg1.effect.tantivy_vs_quill.v1",
@@ -6772,7 +6862,17 @@ mod tests {
             10_000,
         );
         assert!(
-            estimate_paired_experiment(&valid_effect, &valid_null, &config).is_ok(),
+            estimate_paired_experiment(&valid_effect, &valid_null, &config).is_err(),
+            "the authority-free estimator must refuse canonical QG-1 throughput evidence"
+        );
+        assert!(
+            estimate_paired_experiment_against_qg1_authority(
+                &valid_effect,
+                &valid_null,
+                &config,
+                Some(producer.expected_authority()),
+            )
+            .is_ok(),
             "proved QG-1 lifecycle bindings must reach the live estimator"
         );
         let no_claim_effect = stream(
@@ -6782,7 +6882,13 @@ mod tests {
             20_000,
         );
         assert!(
-            estimate_paired_experiment(&no_claim_effect, &valid_null, &config).is_err(),
+            estimate_paired_experiment_against_qg1_authority(
+                &no_claim_effect,
+                &valid_null,
+                &config,
+                Some(producer.expected_authority()),
+            )
+            .is_err(),
             "NoClaim lifecycle receipts must be rejected by the live estimator before headline generation"
         );
 
@@ -6804,7 +6910,13 @@ mod tests {
             30_000,
         );
         assert!(
-            estimate_paired_experiment(&relabelled_effect, &valid_null, &config).is_err(),
+            estimate_paired_experiment_against_qg1_authority(
+                &relabelled_effect,
+                &valid_null,
+                &config,
+                Some(producer.expected_authority()),
+            )
+            .is_err(),
             "an arm-relabeled terminal proof must reach and fail the live estimator"
         );
     }
