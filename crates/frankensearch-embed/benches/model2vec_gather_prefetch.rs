@@ -37,6 +37,7 @@ use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_core::bench_support::{paired_median_ratio, print_bench_elf_sha256};
+use frankensearch_embed::Model2VecEmbedder;
 use frankensearch_embed::simd::{accumulate_f32_into, accumulate_model2vec_rows};
 
 const VOCAB: usize = 30_000; // potion-base-8M-class vocab
@@ -136,6 +137,12 @@ fn finish_mean_pool(sum: &mut [f32], count: usize) {
 enum Arm {
     Original,
     ShippingCandidate,
+}
+
+#[derive(Clone, Copy)]
+enum FullEmbedArm {
+    FormerEncode,
+    ShippingEncodeFast,
 }
 
 fn fingerprint_document(fingerprint: &mut u64, sum: &[f32], count: usize) {
@@ -289,6 +296,215 @@ fn paired_shipping_gate(emb_original: &[f32], emb_candidate: &[f32]) {
     }
 }
 
+fn fingerprint_embedding(vector: &[f32]) -> u64 {
+    let mut fingerprint = 0xcbf2_9ce4_8422_2325_u64;
+    for &value in vector {
+        fingerprint ^= u64::from(value.to_bits());
+        fingerprint = fingerprint.wrapping_mul(0x1000_0000_01b3);
+    }
+    fingerprint
+}
+
+fn run_full_embed_sync_corpus(
+    embedder: &Model2VecEmbedder,
+    texts: &[String],
+    arm: FullEmbedArm,
+) -> u64 {
+    let mut corpus_fingerprint = 0xcbf2_9ce4_8422_2325_u64;
+    for text in texts {
+        let vector = match arm {
+            FullEmbedArm::FormerEncode => embedder
+                .benchmark_embed_sync_former_encode(text)
+                .expect("former full embed_sync route"),
+            FullEmbedArm::ShippingEncodeFast => embedder
+                .embed_sync(text)
+                .expect("shipping full embed_sync route"),
+        };
+        let fingerprint = fingerprint_embedding(&vector);
+        corpus_fingerprint ^= fingerprint;
+        corpus_fingerprint = corpus_fingerprint.wrapping_mul(0x1000_0000_01b3);
+        black_box(vector);
+    }
+    corpus_fingerprint
+}
+
+fn full_embed_sync_fingerprints(
+    embedder: &Model2VecEmbedder,
+    texts: &[String],
+    arm: FullEmbedArm,
+) -> Vec<u64> {
+    texts
+        .iter()
+        .map(|text| match arm {
+            FullEmbedArm::FormerEncode => embedder
+                .benchmark_embed_sync_former_encode(text)
+                .expect("former full embed_sync route"),
+            FullEmbedArm::ShippingEncodeFast => embedder
+                .embed_sync(text)
+                .expect("shipping full embed_sync route"),
+        })
+        .map(|vector| fingerprint_embedding(&vector))
+        .collect()
+}
+
+fn full_embed_sync_corpora() -> Vec<(&'static str, Vec<String>)> {
+    let interactive = vec![
+        "Rust safe concurrent search index".to_owned(),
+        "How should tokenization preserve Unicode combining marks?".to_owned(),
+        "café 東京 résumé Model2Vec".to_owned(),
+        "exact semantic search result ordering".to_owned(),
+    ];
+
+    let mut indexing_batch = (0..16)
+        .map(|index| {
+            format!(
+                "Document {index}: structured concurrency, durable indexing, and lexical semantic fusion."
+            )
+        })
+        .collect::<Vec<_>>();
+    indexing_batch.push(
+        std::iter::repeat_n("tokenizer gather pooling", 513)
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+
+    vec![
+        ("interactive", interactive),
+        ("indexing_batch", indexing_batch),
+    ]
+}
+
+fn paired_full_embed_sync_gate(embedder: &Model2VecEmbedder, label: &str, texts: &[String]) {
+    let former_fingerprints =
+        full_embed_sync_fingerprints(embedder, texts, FullEmbedArm::FormerEncode);
+    let shipping_fingerprints =
+        full_embed_sync_fingerprints(embedder, texts, FullEmbedArm::ShippingEncodeFast);
+    assert_eq!(
+        shipping_fingerprints, former_fingerprints,
+        "full embed_sync output fingerprint drift in {label}"
+    );
+
+    let aa = paired_median_ratio(
+        31,
+        1,
+        || {
+            black_box(run_full_embed_sync_corpus(
+                embedder,
+                texts,
+                FullEmbedArm::FormerEncode,
+            ));
+        },
+        || {
+            black_box(run_full_embed_sync_corpus(
+                embedder,
+                texts,
+                FullEmbedArm::FormerEncode,
+            ));
+        },
+    );
+    assert!(
+        aa.is_admissible_null(),
+        "full embed_sync A/A null is inadmissible for {label}: {aa:?}"
+    );
+
+    let bb = paired_median_ratio(
+        31,
+        1,
+        || {
+            black_box(run_full_embed_sync_corpus(
+                embedder,
+                texts,
+                FullEmbedArm::ShippingEncodeFast,
+            ));
+        },
+        || {
+            black_box(run_full_embed_sync_corpus(
+                embedder,
+                texts,
+                FullEmbedArm::ShippingEncodeFast,
+            ));
+        },
+    );
+    assert!(
+        bb.is_admissible_null(),
+        "full embed_sync B/B null is inadmissible for {label}: {bb:?}"
+    );
+
+    let ab = paired_median_ratio(
+        31,
+        1,
+        || {
+            black_box(run_full_embed_sync_corpus(
+                embedder,
+                texts,
+                FullEmbedArm::FormerEncode,
+            ));
+        },
+        || {
+            black_box(run_full_embed_sync_corpus(
+                embedder,
+                texts,
+                FullEmbedArm::ShippingEncodeFast,
+            ));
+        },
+    );
+    let decidable = ab.decidable_against(&aa) && ab.decidable_against(&bb);
+    eprintln!(
+        "[full-embed-sync] distribution={label} AA={aa:?} BB={bb:?} AB={ab:?} \
+         decidable={decidable} no_claim=true"
+    );
+}
+
+fn bench_full_embed_sync(c: &mut Criterion) {
+    let model_dir = match std::env::var("POTION_FIXTURE_DIR") {
+        Ok(path) => path,
+        Err(_) => {
+            eprintln!(
+                "[full-embed-sync] skipped: set POTION_FIXTURE_DIR to a verified Potion model; \
+                 arithmetic-only gather timing is not a tokenizer result"
+            );
+            return;
+        }
+    };
+    let embedder = Model2VecEmbedder::load(&model_dir)
+        .expect("POTION_FIXTURE_DIR must pass the registered Potion manifest verification");
+    let mut group = c.benchmark_group("model2vec_full_embed_sync");
+    group.sample_size(30);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1000));
+
+    for (label, texts) in full_embed_sync_corpora() {
+        paired_full_embed_sync_gate(&embedder, label, &texts);
+        group.bench_with_input(
+            BenchmarkId::new("former_encode", label),
+            &texts,
+            |bench, texts| {
+                bench.iter(|| {
+                    black_box(run_full_embed_sync_corpus(
+                        &embedder,
+                        texts,
+                        FullEmbedArm::FormerEncode,
+                    ));
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("shipping_encode_fast", label),
+            &texts,
+            |bench, texts| {
+                bench.iter(|| {
+                    black_box(run_full_embed_sync_corpus(
+                        &embedder,
+                        texts,
+                        FullEmbedArm::ShippingEncodeFast,
+                    ));
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 fn emb_fixture() -> Vec<f32> {
     let mut out = vec![0.0f32; VOCAB * DIM];
     let mut s = 0x9e37_79b9_7f4a_7c15_u64;
@@ -379,6 +595,7 @@ fn bench(c: &mut Criterion) {
         });
     }
     group.finish();
+    bench_full_embed_sync(c);
 }
 
 criterion_group!(benches, bench);

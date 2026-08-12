@@ -14,6 +14,8 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use asupersync::Cx;
 use rayon::prelude::*;
@@ -77,6 +79,9 @@ pub struct Model2VecEmbedder {
     model_dir: PathBuf,
     /// Complete identity derived from the verified frozen manifest.
     identity: EmbeddingIdentityBundleV1,
+    /// Test-only witness that the shipping tokenizer returned the offset-free encoding shape.
+    #[cfg(test)]
+    last_tokenizer_route_was_offset_free: AtomicBool,
 }
 
 impl fmt::Debug for Model2VecEmbedder {
@@ -252,6 +257,8 @@ impl Model2VecEmbedder {
             name: name.to_owned(),
             model_dir: model_dir.to_owned(),
             identity,
+            #[cfg(test)]
+            last_tokenizer_route_was_offset_free: AtomicBool::new(false),
         })
     }
 
@@ -276,18 +283,35 @@ impl Model2VecEmbedder {
             return Ok(vec![0.0; self.dimensions]);
         }
 
-        // Tokenize
+        // `Model2Vec` consumes token IDs only. Avoid constructing offsets, token strings, and
+        // word IDs that this private boundary immediately discards.
         let encoding =
             self.tokenizer
-                .encode(text, false)
+                .encode_fast(text, false)
                 .map_err(|e| SearchError::EmbeddingFailed {
                     model: self.name.clone(),
                     source: format!("tokenization failed: {e}").into(),
                 })?;
 
-        let token_ids = encoding.get_ids();
+        #[cfg(test)]
+        self.last_tokenizer_route_was_offset_free.store(
+            !encoding.get_ids().is_empty()
+                && encoding.get_tokens().iter().all(String::is_empty)
+                && encoding
+                    .get_offsets()
+                    .iter()
+                    .all(|&offset| offset == (0, 0))
+                && encoding.get_word_ids().iter().all(Option::is_none),
+            Ordering::Relaxed,
+        );
+
+        Ok(self.embed_token_ids(encoding.get_ids()))
+    }
+
+    #[inline]
+    fn embed_token_ids(&self, token_ids: &[u32]) -> Vec<f32> {
         if token_ids.is_empty() {
-            return Ok(vec![0.0; self.dimensions]);
+            return vec![0.0; self.dimensions];
         }
 
         // Mean pool: accumulate embeddings for in-vocabulary tokens
@@ -301,7 +325,7 @@ impl Model2VecEmbedder {
 
         if count == 0 {
             // All tokens were OOV — return zero vector
-            return Ok(vec![0.0; self.dimensions]);
+            return vec![0.0; self.dimensions];
         }
 
         // Compute mean
@@ -313,7 +337,31 @@ impl Model2VecEmbedder {
 
         // L2 normalize to unit length
         normalize_in_place(&mut sum);
-        Ok(sum)
+        sum
+    }
+
+    #[cfg(test)]
+    fn last_tokenizer_route_was_offset_free(&self) -> bool {
+        self.last_tokenizer_route_was_offset_free
+            .load(Ordering::Relaxed)
+    }
+
+    /// Former pre-lever `encode` route retained only for the existing internal benchmark.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub fn benchmark_embed_sync_former_encode(&self, text: &str) -> SearchResult<Vec<f32>> {
+        if text.is_empty() {
+            return Ok(vec![0.0; self.dimensions]);
+        }
+
+        let encoding =
+            self.tokenizer
+                .encode(text, false)
+                .map_err(|e| SearchError::EmbeddingFailed {
+                    model: self.name.clone(),
+                    source: format!("tokenization failed: {e}").into(),
+                })?;
+        Ok(self.embed_token_ids(encoding.get_ids()))
     }
 
     /// Embed a batch of texts, dispatching per-document `embed_sync` across Rayon
@@ -610,6 +658,76 @@ mod tests {
         create_test_safetensors(dir, vocab_size, dimensions);
     }
 
+    /// Create a tokenizer fixture that exercises added tokens and truncation while retaining
+    /// enough rows to pool every emitted ID.
+    fn create_tokenizer_parity_model(dir: &Path) {
+        let mut vocab = create_test_vocab(16)
+            .as_object()
+            .expect("test vocabulary is an object")
+            .clone();
+        vocab.insert("café".to_owned(), serde_json::Value::from(11));
+
+        let tokenizer_json = serde_json::json!({
+            "version": "1.0",
+            "truncation": {
+                "direction": "Right",
+                "max_length": 512,
+                "strategy": "LongestFirst",
+                "stride": 0
+            },
+            "padding": null,
+            "added_tokens": [
+                {
+                    "id": 0,
+                    "content": "[UNK]",
+                    "single_word": false,
+                    "lstrip": false,
+                    "rstrip": false,
+                    "normalized": false,
+                    "special": true
+                },
+                {
+                    "id": 12,
+                    "content": "<added>",
+                    "single_word": false,
+                    "lstrip": false,
+                    "rstrip": false,
+                    "normalized": true,
+                    "special": false
+                },
+                {
+                    "id": 13,
+                    "content": "[SPECIAL]",
+                    "single_word": false,
+                    "lstrip": false,
+                    "rstrip": false,
+                    "normalized": false,
+                    "special": true
+                }
+            ],
+            "normalizer": {
+                "type": "Lowercase"
+            },
+            "pre_tokenizer": {
+                "type": "Whitespace"
+            },
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": vocab,
+                "unk_token": "[UNK]"
+            }
+        });
+
+        fs::write(
+            dir.join("tokenizer.json"),
+            serde_json::to_string_pretty(&tokenizer_json).unwrap(),
+        )
+        .unwrap();
+        create_test_safetensors(dir, 16, 256);
+    }
+
     /// Create a test vocabulary mapping words to token IDs.
     fn create_test_vocab(vocab_size: usize) -> serde_json::Value {
         let mut vocab = serde_json::Map::new();
@@ -711,15 +829,16 @@ mod tests {
 
             let serial: Vec<Vec<f32>> = texts
                 .iter()
-                .map(|t| embedder.embed_sync(t).unwrap())
+                .map(|t| former_embed_sync(&embedder, t))
                 .collect();
             let batched = embedder.embed_batch_sync(&texts).unwrap();
 
             assert_eq!(batched.len(), serial.len(), "len at n={batch_size}");
-            for (b, s) in batched.iter().zip(&serial) {
-                assert_eq!(
-                    b, s,
-                    "embed_batch_sync diverged from serial at n={batch_size}"
+            for (index, (batched, former)) in batched.iter().zip(&serial).enumerate() {
+                assert_f32_bits_eq(
+                    batched,
+                    former,
+                    &format!("batch order or output diverged at n={batch_size}, index={index}"),
                 );
             }
         }
@@ -821,6 +940,88 @@ mod tests {
         assert_ne!(a, b, "different inputs should produce different embeddings");
     }
 
+    #[test]
+    fn embed_sync_observes_offset_free_tokenizer_route() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_model(dir.path(), 12, 8);
+        let embedder = Model2VecEmbedder::load(dir.path()).unwrap();
+
+        let former = embedder.tokenizer.encode("hello world", false).unwrap();
+        assert!(
+            former.get_tokens().iter().any(|token| !token.is_empty()),
+            "the former encode route must materialize token text for this planted route witness"
+        );
+
+        embedder.embed_sync("hello world").unwrap();
+        assert!(
+            embedder.last_tokenizer_route_was_offset_free(),
+            "shipping Model2Vec must retain the encode_fast offset-free tokenizer route"
+        );
+    }
+
+    #[test]
+    fn encode_fast_token_ids_and_vectors_match_former_oracle() {
+        let dir = tempfile::tempdir().unwrap();
+        create_tokenizer_parity_model(dir.path());
+        let embedder = Model2VecEmbedder::load(dir.path()).unwrap();
+
+        let mut inputs = crate::model_manifest::MODEL_CONFORMANCE_TEXTS_V1
+            .iter()
+            .map(|text| (*text).to_owned())
+            .collect::<Vec<_>>();
+        inputs.extend([
+            String::new(),
+            "HELLO world".to_owned(),
+            "CAFÉ cafe\u{301}".to_owned(),
+            "hello 東京 world".to_owned(),
+            "definitely-oov-token".to_owned(),
+            "hello <ADDED> [SPECIAL] world".to_owned(),
+        ]);
+
+        for tokens in [511_usize, 512, 513] {
+            inputs.push(
+                std::iter::repeat_n("hello", tokens)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+        }
+
+        for input in &inputs {
+            assert_fast_ids_and_former_vector_bits(&embedder, input, input);
+        }
+
+        let special_ids = former_token_ids(&embedder, "hello <ADDED> [SPECIAL] world");
+        assert!(
+            special_ids.contains(&12) && special_ids.contains(&13),
+            "fixture must exercise both the normalized added token and the added special token"
+        );
+        for tokens in [511_usize, 512, 513] {
+            let input = std::iter::repeat_n("hello", tokens)
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(
+                former_token_ids(&embedder, &input).len(),
+                512,
+                "former tokenizer truncation at {tokens} input tokens"
+            );
+        }
+
+        let texts = inputs.iter().map(String::as_str).collect::<Vec<_>>();
+        let former = texts
+            .iter()
+            .map(|text| former_embed_sync(&embedder, text))
+            .collect::<Vec<_>>();
+        let batched = embedder.embed_batch_sync(&texts).unwrap();
+        assert_eq!(batched.len(), former.len());
+        for (index, (actual, expected)) in batched.iter().zip(&former).enumerate() {
+            assert_f32_bits_eq(
+                actual,
+                expected,
+                &format!("batch order or vector bits changed at index={index}"),
+            );
+        }
+    }
+
     /// The former `embed_sync` pooling and finish sequence, retained independently
     /// of the production gather helper for exact native-256 parity checks.
     fn former_embed_sync(embedder: &Model2VecEmbedder, text: &str) -> Vec<f32> {
@@ -828,10 +1029,10 @@ mod tests {
             return vec![0.0; embedder.dimensions];
         }
 
-        let encoding = embedder.tokenizer.encode(text, false).unwrap();
+        let token_ids = former_token_ids(embedder, text);
         let mut sum = vec![0.0_f32; embedder.dimensions];
         let mut count = 0_usize;
-        for &token_id in encoding.get_ids() {
+        for &token_id in &token_ids {
             let index = token_id as usize;
             if index < embedder.vocab_size {
                 let start = index * embedder.dimensions;
@@ -853,6 +1054,34 @@ mod tests {
         }
         normalize_in_place(&mut sum);
         sum
+    }
+
+    fn former_token_ids(embedder: &Model2VecEmbedder, text: &str) -> Vec<u32> {
+        embedder
+            .tokenizer
+            .encode(text, false)
+            .unwrap()
+            .get_ids()
+            .to_vec()
+    }
+
+    fn assert_fast_ids_and_former_vector_bits(
+        embedder: &Model2VecEmbedder,
+        text: &str,
+        scenario: &str,
+    ) {
+        let former_ids = former_token_ids(embedder, text);
+        let fast_ids = embedder
+            .tokenizer
+            .encode_fast(text, false)
+            .unwrap()
+            .get_ids()
+            .to_vec();
+        assert_eq!(fast_ids, former_ids, "token IDs diverged for {scenario}");
+
+        let expected = former_embed_sync(embedder, text);
+        let actual = embedder.embed_sync(text).unwrap();
+        assert_f32_bits_eq(&actual, &expected, scenario);
     }
 
     fn assert_f32_bits_eq(actual: &[f32], expected: &[f32], scenario: &str) {
@@ -910,6 +1139,15 @@ mod tests {
             let expected = former_embed_sync(&embedder, &text);
             let actual = embedder.embed_sync(&text).unwrap();
             assert_f32_bits_eq(&actual, &expected, &format!("tokens={tokens}"));
+            assert_eq!(
+                embedder
+                    .tokenizer
+                    .encode_fast(&text, false)
+                    .unwrap()
+                    .get_ids(),
+                former_token_ids(&embedder, &text),
+                "token IDs at native-256 boundary tokens={tokens}"
+            );
             if !text.is_empty() {
                 let token_count = embedder.tokenizer.encode(&text, false).unwrap().len();
                 assert_eq!(
@@ -1044,9 +1282,28 @@ mod tests {
         .expect("load verified potion embedder");
         assert_eq!(embedder.identity().unwrap(), &expected_identity);
         let texts = &crate::model_manifest::MODEL_CONFORMANCE_TEXTS_V1;
+        let former_vectors = texts
+            .iter()
+            .map(|text| {
+                assert_fast_ids_and_former_vector_bits(
+                    &embedder,
+                    text,
+                    "verified Potion conformance input",
+                );
+                former_embed_sync(&embedder, text)
+            })
+            .collect::<Vec<_>>();
         let vectors = embedder
             .embed_batch_sync(texts)
             .expect("embed bounded conformance corpus");
+        assert_eq!(vectors.len(), former_vectors.len());
+        for (index, (actual, expected)) in vectors.iter().zip(&former_vectors).enumerate() {
+            assert_f32_bits_eq(
+                actual,
+                expected,
+                &format!("verified Potion batch order or vector bits changed at index={index}"),
+            );
+        }
         let observed = frankensearch_core::generation::GoldenVectorCertificateV1::from_exact_f32(
             texts, &vectors,
         )
