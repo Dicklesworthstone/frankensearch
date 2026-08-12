@@ -446,6 +446,12 @@ impl<'a> ValidatedArrivalCursor<'a> {
         }
     }
 
+    /// Blocks the underlying sealed cursor has physically decoded.
+    #[cfg(test)]
+    pub(crate) fn decoded_blocks(&self) -> usize {
+        self.sealed.sealed_decoded_blocks()
+    }
+
     #[cfg(test)]
     fn record(&self, select: fn(&CursorWork) -> &std::cell::Cell<u64>) {
         if let Some(work) = &self.work {
@@ -1536,13 +1542,24 @@ impl<'a> SealedPostingCursor<'a> {
     ///
     /// Returns a typed error if a selected validated block cannot be decoded,
     /// and refuses for a POSITIONS-backed cursor, which has no block table.
-    pub(crate) fn sealed_doc_before(&self, target: u32) -> Result<Option<u32>, ArgusError> {
-        let SealedCursorInner::Docs(cursor) = &self.inner else {
+    pub(crate) fn sealed_doc_before(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+        let SealedCursorInner::Docs(cursor) = &mut self.inner else {
             return Err(ArgusError::CursorInvariant(
                 "a POSITIONS-backed sealed cursor has no validated arrival metadata",
             ));
         };
         Ok(cursor.doc_before(target)?)
+    }
+
+    /// Blocks this cursor has physically decoded, forward loads and backward
+    /// reads alike. Test builds only.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn sealed_decoded_blocks(&self) -> usize {
+        let SealedCursorInner::Docs(cursor) = &self.inner else {
+            return 0;
+        };
+        cursor.decoded_blocks()
     }
 
     /// Blocks [`Self::sealed_doc_before`] would decode, determined without
@@ -5917,13 +5934,12 @@ impl<'a> BufferedUnionScorer<'a> {
     /// horizon, so their *moves* are seeks rather than one step per posting.
     ///
     /// That is a statement about moves only. The order reconstruction this fill
-    /// depends on issues predecessor probes, and a probe that descends below its
-    /// cursor's parked block re-decodes that block every time
-    /// ([`Self::refine_arrival_group`] documents the amplification). Whether
-    /// this path is cheaper than the walk it replaces therefore depends on
-    /// physical decodes and fuel that nothing here measures, and no such claim
-    /// is made. The property this fill exists to hold is the *order*: pruned
-    /// windows accumulate in the same doc-major sequence as exhaustive ones.
+    /// depends on also issues predecessor probes; those probes decode at most
+    /// one block per block they descend into, and are charged for exactly that
+    /// ([`Self::refine_arrival_group`]). Whether the total is *cheaper* than the
+    /// walk it replaces is still unmeasured, and no such claim is made here. The
+    /// property this fill exists to hold is the *order*: pruned windows
+    /// accumulate in the same doc-major sequence as exhaustive ones.
     ///
     /// The order is rebuilt at each pivot by [`Self::sort_active_by_arrival`]
     /// against a `floor` — the most recent document at which the vector order
@@ -6044,17 +6060,20 @@ impl<'a> BufferedUnionScorer<'a> {
     /// exhaustive fill would have stepped through, and it is one probe per
     /// clause whenever the tied clauses hold different documents in the gap.
     ///
-    /// A probe count is not a cost bound, and nothing here should be read as
-    /// one. A probe is free only while it lands in the block its cursor is
-    /// parked in; a descent that crosses below that block re-decodes the block
-    /// it reads, once per probe, because the read is stateless. A tie walking a
-    /// shared run through one 128-posting block can therefore decode that block
-    /// up to once per posting in it, where a forward walk pays one decode for
-    /// the whole block. That amplification is real, unfixed, and unmeasured
-    /// here: no test in this file bounds physical decodes or fuel for this path.
-    /// Fixing it needs the retained backward-block state tracked separately, and
-    /// until then neither this function nor its callers may claim a skip-cost
-    /// advantage.
+    /// A probe count is still not a cost bound, but the cost it used to hide is
+    /// now bounded and measured. A probe is free in the block its cursor is
+    /// parked in; a descent below that block used to re-decode the block it read
+    /// on *every* probe, so a tie walking a shared run through one 128-posting
+    /// block cost up to one decode per posting where a forward walk costs one
+    /// for the block. The cursor now retains the block a backward read lands in,
+    /// and because the descent is monotone the rest of that block is served from
+    /// it: `deep_backward_descent_is_charged_once` pins 32+ probes to one
+    /// physical decode and one admitted posting block.
+    ///
+    /// What is still unproven is the comparison that matters operationally —
+    /// whether this path is *cheaper* than the walk it replaces. That needs a
+    /// live measurement, not a decode count, so neither this function nor its
+    /// callers may claim a skip-cost advantage.
     ///
     /// A key of `None` settles a clause: either its history ended, or it
     /// reached the floor, where the order the vector already holds is
@@ -13577,7 +13596,7 @@ mod tests {
         /// Nothing can: there is no arrival method on [`PostingCursor`]. The
         /// method exists so the fixture can prove the two lists really disagree,
         /// which is what makes the negative non-vacuous.
-        fn shadow_doc_before(&self, target: u32) -> Result<Option<u32>, ArgusError> {
+        fn shadow_doc_before(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
             self.shadow.sealed_doc_before(target)
         }
     }
@@ -13857,15 +13876,109 @@ mod tests {
         }
     }
 
-    /// A refused arrival probe is terminal for the cursor that saw it
-    /// (`bd-quill-pruned-topdocs-term-order-9wu3p`, correction slice 1).
+    /// A deep backward descent is charged for the block it decodes and for
+    /// nothing else (`bd-quill-pruned-topdocs-term-order-9wu3p`).
     ///
-    /// The probe used to admit through the checkpoint directly from `&self`,
-    /// on the reasoning that a probe never moves and so leaves the cursor
-    /// nowhere a refusal has to freeze. That defends the wrong invariant. The
-    /// doctrine is about admission: a refused cursor "decodes nothing, mutates
-    /// nothing, and admits nothing again". Without a latch the next move
-    /// polled and charged a query already told to stop.
+    /// The retained block is only worth having if the *charge* follows the
+    /// decode: a permit predicate that still reported "decodes" for every probe
+    /// would bill a query for work the cache elided, and one that reported
+    /// "free" for the first probe would let a decode run unadmitted. Both are
+    /// impossible by construction now — the read and its permit are written
+    /// against the same `ArrivalPlan` — and this pins the observable behaviour
+    /// of that: a parked-block control that costs nothing at all, then many
+    /// probes descending through one block for one physical decode and one
+    /// admitted posting block.
+    ///
+    /// This is a cost unit and proves nothing about ordering. The semantic
+    /// control lives in the full `TopDocs` fixtures, which compare a pruned arm
+    /// bit-for-bit against an exhaustive oracle:
+    /// `pruned_topdocs_window_rebuilds_arrival_order_without_walking`,
+    /// `empty_block_max_wand_window_costs_seeks_not_steps` and
+    /// `randomized_pruned_topdocs_matches_stepped_arrival_order`.
+    #[test]
+    fn deep_backward_descent_is_charged_once() -> Result<(), Box<dyn std::error::Error>> {
+        let postings = (0..=300)
+            .map(|docid| Posting::new(docid, 1))
+            .collect::<Vec<_>>();
+        let encoded = EncodedPostingList::encode(&postings)?;
+        let list = encoded.posting_list()?;
+        let checkpoint = Arc::new(CountingCheckpoint::default());
+        let checkpoint_for_cursor: Arc<dyn QueryWorkCheckpoint> = checkpoint.clone();
+        let segment_num_docs = u32::try_from(postings.len())?;
+        let sealed = SealedPostingCursor::new(&list, segment_num_docs)?;
+        let mut cursor = ValidatedArrivalCursor::new(sealed, checkpoint_for_cursor);
+
+        cursor.advance(300)?;
+        let decoded_after_seek = cursor.decoded_blocks();
+        let admitted_after_seek = checkpoint
+            .admitted_units
+            .load(std::sync::atomic::Ordering::SeqCst);
+
+        // Negative control: probes answered inside the parked block cost
+        // nothing at all. Without this the descent's "one decode, one unit"
+        // would be equally satisfied by a cursor that charged for every probe
+        // and happened to decode once.
+        for probe in [299_u32, 298, 280, 257] {
+            assert_eq!(
+                cursor.arrival_doc_before(probe)?,
+                Some(probe - 1),
+                "parked probe={probe}"
+            );
+        }
+        assert_eq!(
+            cursor.decoded_blocks(),
+            decoded_after_seek,
+            "a probe inside the parked block must not decode"
+        );
+        assert_eq!(
+            checkpoint
+                .admitted_units
+                .load(std::sync::atomic::Ordering::SeqCst),
+            admitted_after_seek,
+            "a probe inside the parked block must not be charged"
+        );
+
+        // Descend out of the parked block, one posting at a time.
+        let mut probes = 0_usize;
+        let mut probe = 256_u32;
+        while probe > 128 {
+            let answer = cursor
+                .arrival_doc_before(probe)?
+                .expect("a dense fixture always has an earlier posting");
+            assert_eq!(answer, probe - 1, "probe={probe}");
+            probes += 1;
+            probe = answer;
+        }
+
+        assert!(
+            probes >= 32,
+            "the descent must probe deeply enough to expose re-decoding: {probes} probes"
+        );
+        assert_eq!(
+            cursor.decoded_blocks() - decoded_after_seek,
+            1,
+            "a descent through one retained block must decode it exactly once"
+        );
+        assert_eq!(
+            checkpoint
+                .admitted_units
+                .load(std::sync::atomic::Ordering::SeqCst)
+                - admitted_after_seek,
+            1,
+            "exactly the decoded block may be charged"
+        );
+        Ok(())
+    }
+
+    /// A refused arrival probe is terminal for the cursor that saw it
+    /// (`bd-quill-pruned-topdocs-term-order-9wu3p`).
+    ///
+    /// The probe once admitted through the checkpoint directly from `&self`, on
+    /// the reasoning that a probe never moves and so leaves the cursor nowhere a
+    /// refusal has to freeze. That defends the wrong invariant. The doctrine is
+    /// about admission: a refused cursor "decodes nothing, mutates nothing, and
+    /// admits nothing again". Without a latch the next move polled and charged a
+    /// query already told to stop.
     ///
     /// The admission count is what proves the latch. A second refusal with
     /// identical fields could be a fresh refusal from a deterministic

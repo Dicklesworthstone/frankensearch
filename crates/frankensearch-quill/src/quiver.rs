@@ -1388,14 +1388,63 @@ pub struct PostingCursor<'a> {
     decoded_docs: [u32; POSTINGS_PER_BLOCK],
     decoded_freqs: [u32; POSTINGS_PER_BLOCK],
     decoded_count: usize,
-    /// Blocks actually decoded, counted at the single decode site.
+    /// One block retained behind the cursor for backward predecessor reads.
     ///
-    /// The admission gate charges a block before it is read, so the
-    /// predicates that decide those charges have to be checkable against what
-    /// the cursor really did rather than against a second derivation of the
-    /// same guess. Test builds only.
+    /// A doc-major union resolving an equal-document tie walks *backwards*
+    /// through a clause's history, and the read that serves it is otherwise
+    /// stateless: descending through one 128-posting block decoded that block
+    /// once per posting, where a forward walk pays one decode for the whole
+    /// block. Retaining the block a backward read lands in collapses that to
+    /// one decode, because the descent is monotone and every later probe in the
+    /// same block is served from here.
+    ///
+    /// Documents only. Frequencies are never read backwards — an arrival order
+    /// is decided by document identity alone — so caching them would double the
+    /// footprint to answer a question nobody asks.
+    ///
+    /// `None` until a backward read first leaves the parked block, so a cursor
+    /// driven only forwards never allocates.
+    back: Option<BackwardBlock>,
+    /// Blocks actually decoded, counted at the decode itself.
+    ///
+    /// The admission gate charges a block before it is read, so the predicates
+    /// that decide those charges have to be checkable against what the cursor
+    /// really did rather than against a second derivation of the same guess.
+    /// This counts at the successful decode seam so it sees *every* decode,
+    /// including a backward read's; counting at `load_block` alone made the
+    /// backward path invisible to exactly the tests meant to bound it. Test
+    /// builds only.
     #[cfg(test)]
     decoded_blocks: usize,
+}
+
+/// The one block retained behind a cursor for backward predecessor reads.
+///
+/// `Clone` because [`PostingCursor`] is: a pruning fork copies the cursor, and a
+/// fork inheriting the retained block simply starts warm.
+#[derive(Clone)]
+struct BackwardBlock {
+    index: usize,
+    docs: Vec<u32>,
+}
+
+/// How one backward predecessor read will be answered.
+///
+/// Both [`PostingCursor::doc_before`] and
+/// [`PostingCursor::doc_before_decodes_block`] are written against this single
+/// value. They used to derive the same decision separately, which is the shape
+/// that lets a permit predicate drift from the work it is predicting: one
+/// charging for a decode that never happens, or worse, a decode running
+/// unadmitted.
+enum ArrivalPlan {
+    /// Answerable from the validated block table alone.
+    Metadata(Option<u32>),
+    /// Served by the block the cursor is parked in.
+    Parked { earlier: Option<u32> },
+    /// Served by the retained backward block.
+    Retained { earlier: Option<u32> },
+    /// Requires decoding `index`, and is the only plan that costs a block.
+    Decode { index: usize, earlier: Option<u32> },
 }
 
 impl<'a> PostingCursor<'a> {
@@ -1421,6 +1470,7 @@ impl<'a> PostingCursor<'a> {
             decoded_docs: [0; POSTINGS_PER_BLOCK],
             decoded_freqs: [0; POSTINGS_PER_BLOCK],
             decoded_count: 0,
+            back: None,
             #[cfg(test)]
             decoded_blocks: 0,
         };
@@ -1439,7 +1489,7 @@ impl<'a> PostingCursor<'a> {
     /// The metadata cross-check is the same one [`Self::load_block`] applies,
     /// because a read-only probe reads the same durable bytes and must refuse
     /// the same drift.
-    fn decode_block(&self, block_index: usize) -> Result<DecodedBlock, PostingCodecError> {
+    fn decode_block(&mut self, block_index: usize) -> Result<DecodedBlock, PostingCodecError> {
         let block = self.blocks.as_slice().get(block_index).ok_or(
             PostingCodecError::ArithmeticOverflow {
                 block_offset: self.bytes.len(),
@@ -1462,6 +1512,12 @@ impl<'a> PostingCursor<'a> {
                 field: "validated block metadata",
             });
         }
+        // Counted here, at the decode that actually happened, so a forward load
+        // and a backward read are both visible to the same counter.
+        #[cfg(test)]
+        {
+            self.decoded_blocks = self.decoded_blocks.saturating_add(1);
+        }
         Ok(decoded)
     }
 
@@ -1470,10 +1526,6 @@ impl<'a> PostingCursor<'a> {
         self.decoded_docs = decoded.docs;
         self.decoded_freqs = decoded.freqs;
         self.decoded_count = usize::from(decoded.posting_count);
-        #[cfg(test)]
-        {
-            self.decoded_blocks += 1;
-        }
         Ok(())
     }
 
@@ -1705,15 +1757,91 @@ impl<'a> PostingCursor<'a> {
     /// `advance(target)` the cursor is parked in the block that holds `target`,
     /// whose docids are already decoded, so the answer is the neighbouring
     /// decoded docid — or, when `target` is that block's first posting, the
-    /// previous block's validated `last_doc`. Only a probe into a block the
-    /// cursor is not parked in decodes, which is why
-    /// [`Self::doc_before_decodes_block`] exists: the caller admits that block
-    /// before this call performs it.
+    /// previous block's validated `last_doc`.
+    ///
+    /// Descending *below* the parked block is the case that has to retain
+    /// state. A tie walk asks for the predecessor of the predecessor and so on,
+    /// so a stateless read decoded the same block again for every posting it
+    /// held. The block a backward read lands in is retained, and because the
+    /// descent is monotone every later probe inside it is then free. Only the
+    /// first read of a block costs one, which is exactly what
+    /// [`Self::doc_before_decodes_block`] reports — both are written against the
+    /// same [`ArrivalPlan`], so the charge cannot drift from the work.
     ///
     /// # Errors
     ///
     /// Returns a typed error if a selected validated block cannot be decoded.
-    pub fn doc_before(&self, target: u32) -> Result<Option<u32>, PostingCodecError> {
+    pub fn doc_before(&mut self, target: u32) -> Result<Option<u32>, PostingCodecError> {
+        match self.arrival_plan(target) {
+            ArrivalPlan::Metadata(answer) => Ok(answer),
+            ArrivalPlan::Parked { earlier } => {
+                let within =
+                    self.decoded_docs[..self.decoded_count].partition_point(|doc| *doc < target);
+                Ok(match within.checked_sub(1) {
+                    Some(previous) => Some(self.decoded_docs[previous]),
+                    None => earlier,
+                })
+            }
+            ArrivalPlan::Retained { earlier } => {
+                // The plan only names this arm when the retained block matches,
+                // so an absent one is a broken invariant. Answering from an
+                // empty slice would silently return the wrong predecessor, and a
+                // wrong predecessor is a silently wrong equal-document order —
+                // precisely the failure this whole path exists to prevent.
+                let back = self
+                    .back
+                    .as_ref()
+                    .ok_or(PostingCodecError::ArithmeticOverflow {
+                        block_offset: self.bytes.len(),
+                        field: "retained backward block",
+                    })?;
+                let within = back.docs.partition_point(|doc| *doc < target);
+                Ok(match within.checked_sub(1) {
+                    Some(previous) => Some(back.docs[previous]),
+                    None => earlier,
+                })
+            }
+            ArrivalPlan::Decode { index, earlier } => {
+                let decoded = self.decode_block(index)?;
+                let count = usize::from(decoded.posting_count);
+                let answer = {
+                    let within = decoded.docs[..count].partition_point(|doc| *doc < target);
+                    match within.checked_sub(1) {
+                        Some(previous) => Some(decoded.docs[previous]),
+                        None => earlier,
+                    }
+                };
+                // Retaining the block is an optimisation, so it is allowed to
+                // fail: a cursor that cannot reserve keeps answering, and simply
+                // decodes again next time rather than refusing a read the caller
+                // has already been charged for.
+                let mut docs = Vec::new();
+                if docs.try_reserve_exact(count).is_ok() {
+                    docs.extend_from_slice(&decoded.docs[..count]);
+                    self.back = Some(BackwardBlock { index, docs });
+                }
+                Ok(answer)
+            }
+        }
+    }
+
+    /// Whether [`Self::doc_before`] would decode a block, determined without
+    /// decoding one.
+    ///
+    /// This carries the same obligation as [`Self::advance_decodes_block`]: it
+    /// mirrors the branch it predicts so a caller can admit the block before the
+    /// read performs it. It cannot drift from that branch, because both read the
+    /// same [`ArrivalPlan`]. Three answers cost nothing — a target no block can
+    /// hold, the block the cursor is parked in, and the block retained behind it.
+    #[must_use]
+    pub fn doc_before_decodes_block(&self, target: u32) -> bool {
+        matches!(self.arrival_plan(target), ArrivalPlan::Decode { .. })
+    }
+
+    /// Decide how a backward read for `target` will be answered.
+    ///
+    /// This is the single decision both the read and its permit are built on.
+    fn arrival_plan(&self, target: u32) -> ArrivalPlan {
         let blocks = self.blocks.as_slice();
         // The first block that can hold a docid at or above `target`; every
         // earlier block lies wholly below it and is summarized by `last_doc`.
@@ -1724,46 +1852,20 @@ impl<'a> PostingCursor<'a> {
             .map(|block| block.last_doc);
         let Some(block) = blocks.get(index) else {
             // Every posting is below `target`.
-            return Ok(earlier);
+            return ArrivalPlan::Metadata(earlier);
         };
         if block.first_doc >= target {
             // The straddling block starts at or above `target`, so it holds
             // nothing below it.
-            return Ok(earlier);
+            return ArrivalPlan::Metadata(earlier);
         }
         if self.block_index() == Some(index) {
-            let within =
-                self.decoded_docs[..self.decoded_count].partition_point(|doc| *doc < target);
-            return Ok(match within.checked_sub(1) {
-                Some(previous) => Some(self.decoded_docs[previous]),
-                None => earlier,
-            });
+            return ArrivalPlan::Parked { earlier };
         }
-        let decoded = self.decode_block(index)?;
-        let count = usize::from(decoded.posting_count);
-        let within = decoded.docs[..count].partition_point(|doc| *doc < target);
-        Ok(match within.checked_sub(1) {
-            Some(previous) => Some(decoded.docs[previous]),
-            None => earlier,
-        })
-    }
-
-    /// Whether [`Self::doc_before`] would decode a block, determined without
-    /// decoding one.
-    ///
-    /// This carries the same obligation as [`Self::advance_decodes_block`]: it
-    /// mirrors the branch it predicts so a caller can admit the block before
-    /// the probe reads it. Both decode-free answers — a target past every
-    /// block, and a straddling block the cursor is already parked in — are
-    /// reported as free here.
-    #[must_use]
-    pub fn doc_before_decodes_block(&self, target: u32) -> bool {
-        let blocks = self.blocks.as_slice();
-        let index = blocks.partition_point(|block| block.last_doc < target);
-        let Some(block) = blocks.get(index) else {
-            return false;
-        };
-        block.first_doc < target && self.block_index() != Some(index)
+        if self.back.as_ref().is_some_and(|back| back.index == index) {
+            return ArrivalPlan::Retained { earlier };
+        }
+        ArrivalPlan::Decode { index, earlier }
     }
 }
 
@@ -13603,6 +13705,99 @@ mod tests {
                 assert_eq!(cursor.posting_ordinal(), expected_ordinal);
             }
         }
+        Ok(())
+    }
+
+    /// A backward descent through one block must decode it once, not once per
+    /// posting (`bd-quill-pruned-topdocs-term-order-9wu3p`).
+    ///
+    /// This is the amplification the retained block exists to remove. A
+    /// doc-major union resolving an equal-document tie walks a clause's history
+    /// backwards, and the read serving it used to be stateless: every probe into
+    /// a block the cursor was not parked in decoded that whole block again, so a
+    /// descent through 128 postings cost 128 decodes where a forward walk costs
+    /// one.
+    ///
+    /// The test descends from the last posting of the final block to the first
+    /// posting of the block before it, which is a probe per posting, and pins
+    /// the physical decode count at one. It also checks each answer against a
+    /// linear scan, because a cache that returned stale documents would satisfy
+    /// a decode bound perfectly.
+    #[test]
+    fn backward_descent_decodes_a_block_once() -> TestResult {
+        let expected = (0..=300)
+            .map(|doc| Posting::new(doc, 1))
+            .collect::<Vec<_>>();
+        let encoded = EncodedPostingList::encode(&expected)?;
+        let list = encoded.posting_list()?;
+        let mut cursor = list.cursor()?;
+        assert!(
+            cursor.block_count() >= 3,
+            "fixture must have a block behind the parked one"
+        );
+
+        // Park in the last block, then walk backwards out of it.
+        cursor.advance(300)?;
+        let parked_block = cursor.block_index().expect("cursor is positioned");
+        assert!(parked_block >= 2, "the descent must leave the parked block");
+        let decoded_after_seek = cursor.decoded_blocks();
+
+        let doc_before_linear = |target: u32| {
+            expected
+                .iter()
+                .rev()
+                .find(|posting| posting.doc_id < target)
+                .map(|posting| posting.doc_id)
+        };
+
+        // Descend one posting at a time from the start of the parked block into
+        // the block behind it. Every probe below `first_doc` of the parked block
+        // reads the retained block.
+        let parked_first = 256_u32;
+        let mut probes = 0_usize;
+        let mut probe = parked_first;
+        while probe > 128 {
+            let answer = cursor.doc_before(probe)?;
+            assert_eq!(answer, doc_before_linear(probe), "probe={probe}");
+            probes += 1;
+            probe = answer.expect("a dense fixture always has an earlier posting");
+        }
+        assert!(
+            probes >= 32,
+            "the descent must probe deeply enough to expose re-decoding: {probes} probes"
+        );
+        assert_eq!(
+            cursor.decoded_blocks() - decoded_after_seek,
+            1,
+            "a descent through one retained block must decode it exactly once"
+        );
+        Ok(())
+    }
+
+    /// A probe answered by the parked block or by validated metadata decodes
+    /// nothing and is charged nothing.
+    #[test]
+    fn parked_and_metadata_probes_are_free() -> TestResult {
+        let expected = (0..=300)
+            .map(|doc| Posting::new(doc, 1))
+            .collect::<Vec<_>>();
+        let encoded = EncodedPostingList::encode(&expected)?;
+        let list = encoded.posting_list()?;
+        let mut cursor = list.cursor()?;
+        cursor.advance(300)?;
+        let baseline = cursor.decoded_blocks();
+
+        // Inside the parked block.
+        assert!(!cursor.doc_before_decodes_block(299));
+        assert_eq!(cursor.doc_before(299)?, Some(298));
+        // Below every posting: answered from the block table alone.
+        assert!(!cursor.doc_before_decodes_block(0));
+        assert_eq!(cursor.doc_before(0)?, None);
+        assert_eq!(
+            cursor.decoded_blocks(),
+            baseline,
+            "parked and metadata probes must not decode"
+        );
         Ok(())
     }
 
