@@ -1062,7 +1062,7 @@ mod tests {
             let former_ids = former_token_ids(&embedder, &input);
             let fast_ids = embedder
                 .tokenizer
-                .encode_fast(&input, false)
+                .encode_fast(input.as_str(), false)
                 .unwrap()
                 .get_ids()
                 .to_vec();
@@ -1213,14 +1213,14 @@ mod tests {
             assert_eq!(
                 embedder
                     .tokenizer
-                    .encode_fast(&text, false)
+                    .encode_fast(text.as_str(), false)
                     .unwrap()
                     .get_ids(),
                 former_token_ids(&embedder, &text),
                 "token IDs at native-256 boundary tokens={tokens}"
             );
             if !text.is_empty() {
-                let token_count = embedder.tokenizer.encode(&text, false).unwrap().len();
+                let token_count = embedder.tokenizer.encode(text.as_str(), false).unwrap().len();
                 assert_eq!(
                     last_model2vec_accumulation_route_for_test(),
                     expected_native_256_route(token_count),
@@ -1508,11 +1508,11 @@ mod tests {
         );
         let former_long = embedder
             .tokenizer
-            .encode(&long_over_512_text, false)
+            .encode(long_over_512_text.as_str(), false)
             .expect("encode long verified Potion input");
         let fast_long = embedder
             .tokenizer
-            .encode_fast(&long_over_512_text, false)
+            .encode_fast(long_over_512_text.as_str(), false)
             .expect("encode_fast long verified Potion input");
         assert!(
             embedder.tokenizer.get_truncation().is_none(),

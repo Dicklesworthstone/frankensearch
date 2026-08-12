@@ -391,7 +391,7 @@ pub(crate) fn last_model2vec_accumulation_route_for_test() -> Model2VecAccumulat
 mod tests {
     use super::{
         accumulate_f32_into, accumulate_model2vec_rows, last_model2vec_accumulation_route_for_test,
-        Model2VecAccumulationRoute,
+        Model2VecAccumulationRoute, MODEL2VEC_PREFETCH_MIN_TOKENS,
     };
 
     fn former_model2vec_gather(
