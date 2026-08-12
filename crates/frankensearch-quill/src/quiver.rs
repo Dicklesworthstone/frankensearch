@@ -1434,7 +1434,12 @@ impl<'a> PostingCursor<'a> {
         Ok(cursor)
     }
 
-    fn load_block(&mut self, block_index: usize) -> Result<(), PostingCodecError> {
+    /// Decode one validated block without disturbing the cursor's position.
+    ///
+    /// The metadata cross-check is the same one [`Self::load_block`] applies,
+    /// because a read-only probe reads the same durable bytes and must refuse
+    /// the same drift.
+    fn decode_block(&self, block_index: usize) -> Result<DecodedBlock, PostingCodecError> {
         let block = self.blocks.as_slice().get(block_index).ok_or(
             PostingCodecError::ArithmeticOverflow {
                 block_offset: self.bytes.len(),
@@ -1457,6 +1462,11 @@ impl<'a> PostingCursor<'a> {
                 field: "validated block metadata",
             });
         }
+        Ok(decoded)
+    }
+
+    fn load_block(&mut self, block_index: usize) -> Result<(), PostingCodecError> {
+        let decoded = self.decode_block(block_index)?;
         self.decoded_docs = decoded.docs;
         self.decoded_freqs = decoded.freqs;
         self.decoded_count = usize::from(decoded.posting_count);
@@ -1667,6 +1677,93 @@ impl<'a> PostingCursor<'a> {
         }
         self.state = CursorState::Positioned { block, within };
         Ok(self.current())
+    }
+
+    /// Inclusive last docid this term holds, read from validated block
+    /// metadata without decoding and without moving.
+    ///
+    /// A doc-major union uses this to decide, before it moves anything,
+    /// whether a scorer can survive a whole window: a term that exhausts
+    /// mid-window is removed by a positional `swap_remove`, and that removal
+    /// permutes the scorer vector in a way no per-term metadata can rebuild.
+    #[must_use]
+    pub fn final_doc(&self) -> Option<u32> {
+        self.blocks.as_slice().last().map(|block| block.last_doc)
+    }
+
+    /// Greatest docid this term holds strictly below `target`.
+    ///
+    /// This is the *arrival predecessor* Tantivy's stable doc-major term union
+    /// needs to reconstruct an equal-document order without walking to it.
+    /// That traversal sorts by current docid, sums the equal-document prefix,
+    /// steps it, and stably re-sorts, so a scorer that steps onto a document
+    /// lands ahead of everyone already parked there: equal-document order is
+    /// decreasing previous posting. A seek that jumps a block loses the steps
+    /// but not this value.
+    ///
+    /// The probe is decode-free exactly where the union needs it. Right after
+    /// `advance(target)` the cursor is parked in the block that holds `target`,
+    /// whose docids are already decoded, so the answer is the neighbouring
+    /// decoded docid — or, when `target` is that block's first posting, the
+    /// previous block's validated `last_doc`. Only a probe into a block the
+    /// cursor is not parked in decodes, which is why
+    /// [`Self::doc_before_decodes_block`] exists: the caller admits that block
+    /// before this call performs it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error if a selected validated block cannot be decoded.
+    pub fn doc_before(&self, target: u32) -> Result<Option<u32>, PostingCodecError> {
+        let blocks = self.blocks.as_slice();
+        // The first block that can hold a docid at or above `target`; every
+        // earlier block lies wholly below it and is summarized by `last_doc`.
+        let index = blocks.partition_point(|block| block.last_doc < target);
+        let earlier = index
+            .checked_sub(1)
+            .and_then(|previous| blocks.get(previous))
+            .map(|block| block.last_doc);
+        let Some(block) = blocks.get(index) else {
+            // Every posting is below `target`.
+            return Ok(earlier);
+        };
+        if block.first_doc >= target {
+            // The straddling block starts at or above `target`, so it holds
+            // nothing below it.
+            return Ok(earlier);
+        }
+        if self.block_index() == Some(index) {
+            let within =
+                self.decoded_docs[..self.decoded_count].partition_point(|doc| *doc < target);
+            return Ok(match within.checked_sub(1) {
+                Some(previous) => Some(self.decoded_docs[previous]),
+                None => earlier,
+            });
+        }
+        let decoded = self.decode_block(index)?;
+        let count = usize::from(decoded.posting_count);
+        let within = decoded.docs[..count].partition_point(|doc| *doc < target);
+        Ok(match within.checked_sub(1) {
+            Some(previous) => Some(decoded.docs[previous]),
+            None => earlier,
+        })
+    }
+
+    /// Whether [`Self::doc_before`] would decode a block, determined without
+    /// decoding one.
+    ///
+    /// This carries the same obligation as [`Self::advance_decodes_block`]: it
+    /// mirrors the branch it predicts so a caller can admit the block before
+    /// the probe reads it. Both decode-free answers — a target past every
+    /// block, and a straddling block the cursor is already parked in — are
+    /// reported as free here.
+    #[must_use]
+    pub fn doc_before_decodes_block(&self, target: u32) -> bool {
+        let blocks = self.blocks.as_slice();
+        let index = blocks.partition_point(|block| block.last_doc < target);
+        let Some(block) = blocks.get(index) else {
+            return false;
+        };
+        block.first_doc < target && self.block_index() != Some(index)
     }
 }
 
