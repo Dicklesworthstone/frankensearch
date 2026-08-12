@@ -10146,8 +10146,8 @@ mod tests {
             })
         }
 
-        fn doc_count(&self) -> usize {
-            2
+        fn doc_count(&self) -> frankensearch_core::SearchResult<usize> {
+            Ok(2)
         }
     }
 

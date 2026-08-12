@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use frankensearch_core::SearchResult;
+
 /// Point-in-time Quill segment and footprint statistics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SegmentStats {
@@ -92,8 +94,14 @@ impl SegmentStats {
 
 /// Implemented by an index handle once Keeper owns a published snapshot.
 pub trait SegmentStatsProvider {
-    /// Read lock-free point-in-time segment statistics.
-    fn segment_stats(&self) -> SegmentStats;
+    /// Read lock-free point-in-time segment statistics from a proven readable
+    /// publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider cannot prove that its statistics
+    /// describe a currently readable publication.
+    fn segment_stats(&self) -> SearchResult<SegmentStats>;
 }
 
 #[cfg(test)]

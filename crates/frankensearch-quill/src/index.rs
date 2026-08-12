@@ -41,7 +41,7 @@ use asupersync::runtime::yield_now;
 use asupersync::sync::{LockError, Mutex, OwnedMutexGuard, TryLockError};
 use frankensearch_core::{
     DocId, IndexableDocument, LexicalCandidateBatch, LexicalHydrationContext, LexicalRead,
-    LexicalWrite, ScoreSource, ScoredResult, SearchError, SearchFuture,
+    LexicalWrite, ScoreSource, ScoredResult, SearchError, SearchFuture, SearchResult,
 };
 #[cfg(feature = "durability")]
 use frankensearch_durability::FileProtector;
@@ -4400,7 +4400,7 @@ impl Drop for PublicationReadPauseControl {
 /// let full = index.search_results(cx, "lexical", 10)?;
 /// let ids = index.search_doc_ids(cx, "lexical", 10)?;
 /// let enriched = index.search_with_snippets(cx, "lexical", 10, &SnippetConfig::default())?;
-/// let stats = index.segment_stats();
+/// let stats = index.segment_stats()?;
 /// assert_eq!(page.total_count, Some(1));
 /// assert_eq!(full.len(), ids.len());
 /// assert_eq!(enriched.len(), ids.len());
@@ -4956,12 +4956,6 @@ impl QuillWriterState {
         Ok(snapshot)
     }
 
-    /// Return the already-installed process-local view only after proving it
-    /// matches durable Keeper authority.
-    fn checked_published_snapshot(&self) -> Result<Arc<QuillSearchSnapshot>, QuillIndexError> {
-        self.reader.checked_published_snapshot()
-    }
-
     /// Whether an abandoned or incompletely surfaced publication must be
     /// reconciled before another mutation may plan against this writer.
     fn publication_awaits_reconciliation(&self) -> bool {
@@ -5034,7 +5028,7 @@ impl QuillWriterState {
         if durable_generation == local_generation {
             self.reader
                 .publication_read_state
-                .stabilize(local_generation)?;
+                .stabilize_reconciled_same_generation(local_generation)?;
             return Ok(local);
         }
 
@@ -8140,9 +8134,7 @@ impl QuillReader {
         keeper: Arc<KeeperSnapshot>,
         prepared: PreparedSealedPublication,
     ) -> Result<Arc<QuillSearchSnapshot>, QuillIndexError> {
-        PublicationReadState::validate_generation(
-            keeper.loaded_manifest().manifest.generation,
-        )?;
+        PublicationReadState::validate_generation(keeper.loaded_manifest().manifest.generation)?;
         let installed = self
             .published_snapshot
             .install_validated_prepared_sealed(keeper, prepared);
@@ -8158,9 +8150,7 @@ impl QuillReader {
         keeper: Arc<KeeperSnapshot>,
         deltas: Vec<Arc<DeltaSnapshot>>,
     ) -> Result<Arc<QuillSearchSnapshot>, QuillIndexError> {
-        PublicationReadState::validate_generation(
-            keeper.loaded_manifest().manifest.generation,
-        )?;
+        PublicationReadState::validate_generation(keeper.loaded_manifest().manifest.generation)?;
         let installed = self.published_snapshot.publish_complete(keeper, deltas)?;
         self.publication_read_state
             .stabilize(installed.keeper_generation())?;
@@ -9711,19 +9701,37 @@ impl QuillReader {
         Ok(results)
     }
 
-    fn segment_stats(&self) -> SegmentStats {
-        let snapshot = self.published_snapshot.load();
-        let mut stats = snapshot.keeper_snapshot().segment_stats();
+    fn segment_stats(&self) -> SearchResult<SegmentStats> {
+        let snapshot = self
+            .checked_published_snapshot()
+            .map_err(SearchError::from)?;
+        let mut stats = snapshot.keeper_snapshot().segment_stats()?;
         stats.delta_segments = snapshot.delta_count();
-        stats.live_docs = usize::try_from(snapshot.live_doc_count()).unwrap_or(usize::MAX);
-        stats.delta_memory_bytes = snapshot
-            .delta_snapshots()
-            .iter()
-            .fold(0_u64, |total, delta| {
-                total
-                    .saturating_add(u64::try_from(delta.segment().bytes_used()).unwrap_or(u64::MAX))
-            });
-        stats
+        stats.live_docs = usize::try_from(snapshot.live_doc_count()).map_err(|_| {
+            SearchError::SubsystemError {
+                subsystem: "quill",
+                source: "published Quill live-document count does not fit usize".into(),
+            }
+        })?;
+        stats.delta_memory_bytes =
+            snapshot
+                .delta_snapshots()
+                .iter()
+                .try_fold(0_u64, |total, delta| {
+                    let bytes = u64::try_from(delta.segment().bytes_used()).map_err(|_| {
+                        SearchError::SubsystemError {
+                            subsystem: "quill",
+                            source: "Quill Delta memory footprint does not fit u64".into(),
+                        }
+                    })?;
+                    total
+                        .checked_add(bytes)
+                        .ok_or_else(|| SearchError::SubsystemError {
+                            subsystem: "quill",
+                            source: "Quill Delta memory footprint overflowed u64".into(),
+                        })
+                })?;
+        Ok(stats)
     }
 }
 
@@ -9829,10 +9837,14 @@ impl QuillSearchIndex {
         &self.directory
     }
 
-    /// Number of live documents in this published snapshot.
-    #[must_use]
-    pub fn doc_count(&self) -> u64 {
-        self.reader.published_snapshot.load().live_doc_count()
+    /// Number of live documents in the proven-readable published snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed reconciliation-required failure when publication
+    /// authority cannot prove the process-local snapshot readable.
+    pub fn doc_count(&self) -> Result<u64, QuillIndexError> {
+        Ok(self.reader.checked_published_snapshot()?.live_doc_count())
     }
 
     /// Clone the deterministic real-`Cx` cancellation requester used by the
@@ -10986,22 +10998,21 @@ impl RootBoundQuillSearchIndex {
 }
 
 impl SegmentStatsProvider for QuillIndex {
-    /// Return non-authoritative process-local telemetry. Callers that need a
-    /// durable authority read must use [`QuillIndex::snapshot`] instead.
-    fn segment_stats(&self) -> SegmentStats {
+    fn segment_stats(&self) -> SearchResult<SegmentStats> {
         self.reader.segment_stats()
     }
 }
 
 impl SegmentStatsProvider for QuillSearchIndex {
-    fn segment_stats(&self) -> SegmentStats {
+    fn segment_stats(&self) -> SearchResult<SegmentStats> {
         self.reader.segment_stats()
     }
 }
 
 impl SegmentStatsProvider for RootBoundQuillSearchIndex {
-    fn segment_stats(&self) -> SegmentStats {
-        self.state.load().reader.segment_stats()
+    fn segment_stats(&self) -> SearchResult<SegmentStats> {
+        let state = self.state.load_full();
+        SegmentStatsProvider::segment_stats(state.reader.as_ref())
     }
 }
 
@@ -11163,13 +11174,12 @@ impl LexicalRead for QuillIndex {
         quill_hydrate_candidates(cx, context, results)
     }
 
-    fn doc_count(&self) -> usize {
-        // `LexicalRead::doc_count` is an infallible capacity/telemetry hint,
-        // not a durable authority read. Its trait contract cannot represent a
-        // reconciliation-required failure; authority-sensitive callers use
-        // `QuillIndex::doc_count` instead.
-        let snapshot = self.reader.published_snapshot.load();
-        usize::try_from(snapshot.live_doc_count()).unwrap_or(usize::MAX)
+    fn doc_count(&self) -> SearchResult<usize> {
+        let count = Self::doc_count(self).map_err(SearchError::from)?;
+        usize::try_from(count).map_err(|_| SearchError::SubsystemError {
+            subsystem: "quill",
+            source: "published Quill document count does not fit usize".into(),
+        })
     }
 }
 
@@ -11242,8 +11252,12 @@ impl LexicalRead for QuillSearchIndex {
         quill_hydrate_candidates(cx, context, results)
     }
 
-    fn doc_count(&self) -> usize {
-        usize::try_from(Self::doc_count(self)).unwrap_or(usize::MAX)
+    fn doc_count(&self) -> SearchResult<usize> {
+        let count = Self::doc_count(self).map_err(SearchError::from)?;
+        usize::try_from(count).map_err(|_| SearchError::SubsystemError {
+            subsystem: "quill",
+            source: "published Quill document count does not fit usize".into(),
+        })
     }
 }
 
@@ -11285,8 +11299,9 @@ impl LexicalRead for RootBoundQuillSearchIndex {
         })
     }
 
-    fn doc_count(&self) -> usize {
-        usize::try_from(self.state.load().reader.doc_count()).unwrap_or(usize::MAX)
+    fn doc_count(&self) -> SearchResult<usize> {
+        let state = self.state.load_full();
+        LexicalRead::doc_count(state.reader.as_ref())
     }
 }
 
@@ -17930,7 +17945,10 @@ mod tests {
             LexicalWrite::commit(&index, &cx)
                 .await
                 .expect("commit through lexical trait");
-            assert_eq!(LexicalRead::doc_count(&index), 1);
+            assert_eq!(
+                LexicalRead::doc_count(&index).expect("read lexical document count"),
+                1
+            );
 
             let full = LexicalRead::search(&index, &cx, "ownership", 10)
                 .await
@@ -18017,7 +18035,10 @@ mod tests {
                 replacement_hits[0].metadata.as_deref(),
                 Some(&serde_json::json!({"lang": "python"}))
             );
-            assert_eq!(index.segment_stats().live_docs, 1);
+            assert_eq!(
+                index.segment_stats().expect("read segment stats").live_docs,
+                1
+            );
 
             assert!(
                 index
@@ -18119,7 +18140,10 @@ mod tests {
             LexicalWrite::commit(&index, &cx)
                 .await
                 .expect("publish seed generation");
-            let seed_generation = index.segment_stats().published_generation;
+            let seed_generation = index
+                .segment_stats()
+                .expect("read seed segment stats")
+                .published_generation;
 
             let replacements = [
                 IndexableDocument::new("first", "new alpha"),
@@ -18130,7 +18154,10 @@ mod tests {
                 .await
                 .expect("publish replacement batch");
             assert_eq!(
-                index.segment_stats().published_generation,
+                index
+                    .segment_stats()
+                    .expect("read replacement segment stats")
+                    .published_generation,
                 seed_generation.saturating_add(1),
                 "one upsert batch must publish tombstones and replacements together"
             );
@@ -18147,7 +18174,10 @@ mod tests {
                 .await
                 .expect("commit after replacement is a no-op");
             assert_eq!(
-                index.segment_stats().published_generation,
+                index
+                    .segment_stats()
+                    .expect("read committed segment stats")
+                    .published_generation,
                 seed_generation.saturating_add(1)
             );
             assert_eq!(
@@ -18642,7 +18672,7 @@ mod tests {
             let pinned = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
                 .await
                 .expect("open read-only handle while writer lease is live");
-            assert_eq!(pinned.doc_count(), 1);
+            assert_eq!(pinned.doc_count().expect("read pinned count"), 1);
             assert_eq!(
                 pinned
                     .search_doc_ids(&cx, "alpha", 10)
@@ -18669,7 +18699,7 @@ mod tests {
                     .is_empty()
             );
             assert!(pinned.refresh(&cx).await.expect("refresh publication"));
-            assert_eq!(pinned.doc_count(), 2);
+            assert_eq!(pinned.doc_count().expect("read refreshed count"), 2);
             assert_eq!(
                 pinned
                     .search_doc_ids(&cx, "beta", 10)
@@ -18678,7 +18708,12 @@ mod tests {
                 "second"
             );
             assert!(!pinned.refresh(&cx).await.expect("idempotent refresh"));
-            assert!(pinned.segment_stats().live_writer);
+            assert!(
+                pinned
+                    .segment_stats()
+                    .expect("read pinned segment stats")
+                    .live_writer
+            );
         });
     }
 
@@ -22257,6 +22292,15 @@ mod tests {
         )
     }
 
+    fn is_search_reconciliation_required(error: &SearchError) -> bool {
+        match error {
+            SearchError::SubsystemError { subsystem, source } if *subsystem == "quill" => source
+                .downcast_ref::<QuillIndexError>()
+                .is_some_and(is_reconciliation_required),
+            _ => false,
+        }
+    }
+
     async fn assert_public_authority_refuses_stale_publication(
         index: &QuillIndex,
         cx: &Cx,
@@ -22292,6 +22336,18 @@ mod tests {
             "search_with_snippets"
         );
         assert_refused!(index.collect_docids(cx, query), "collect_docids");
+        let count_error =
+            LexicalRead::doc_count(index).expect_err("LexicalRead::doc_count must fail closed");
+        assert!(
+            is_search_reconciliation_required(&count_error),
+            "LexicalRead::doc_count must retain the typed reconciliation failure: {count_error:?}"
+        );
+        let stats_error = SegmentStatsProvider::segment_stats(index)
+            .expect_err("SegmentStatsProvider must fail closed");
+        assert!(
+            is_search_reconciliation_required(&stats_error),
+            "SegmentStatsProvider must retain the typed reconciliation failure: {stats_error:?}"
+        );
         assert!(
             LexicalRead::search(index, cx, query, 10).await.is_err(),
             "LexicalRead::search must not return the retained stale view"
@@ -22326,6 +22382,17 @@ mod tests {
                 .doc_count()
                 .expect("reconciled document count is authoritative"),
             expected_live_docs
+        );
+        assert_eq!(
+            LexicalRead::doc_count(index).expect("reconciled trait count is authoritative"),
+            usize::try_from(expected_live_docs).expect("test count fits usize")
+        );
+        let stats = SegmentStatsProvider::segment_stats(index)
+            .expect("reconciled segment stats are authoritative");
+        assert_eq!(stats.published_generation, generation);
+        assert_eq!(
+            stats.live_docs,
+            usize::try_from(expected_live_docs).expect("test count fits usize")
         );
 
         let page = index
@@ -22363,7 +22430,10 @@ mod tests {
         assert_eq!(collected.len(), expected_hits);
         assert_eq!(lexical.len(), expected_hits);
         assert_eq!(candidates.len(), expected_hits);
-        assert_eq!(LexicalRead::doc_count(index), expected_hits);
+        assert_eq!(
+            LexicalRead::doc_count(index).expect("reconciled trait count remains authoritative"),
+            expected_hits
+        );
         if expected_live_docs == 0 {
             assert!(
                 index
@@ -22591,6 +22661,15 @@ mod tests {
                     .expect("live writer public count linearizes before publication"),
                 0
             );
+            assert_eq!(
+                LexicalRead::doc_count(&index)
+                    .expect("live writer trait count retains readable predecessor"),
+                0
+            );
+            let stats = SegmentStatsProvider::segment_stats(&index)
+                .expect("live writer stats retain readable predecessor");
+            assert_eq!(stats.published_generation, generation);
+            assert_eq!(stats.live_docs, 0);
             assert!(
                 LexicalRead::search(&index, &cx, "alpha", 10)
                     .await
@@ -22671,11 +22750,9 @@ mod tests {
     fn public_in_memory_commit_rejects_unrepresentable_successor_without_mutation() {
         run_with_cx(|cx| async move {
             let generation = PublicationReadState::MAX_GENERATION;
-            let snapshot = KeeperSnapshot::in_memory_with_generation_for_test(
-                DEFAULT_SCHEMA,
-                generation,
-            )
-            .expect("construct maximum-generation in-memory Keeper fixture");
+            let snapshot =
+                KeeperSnapshot::in_memory_with_generation_for_test(DEFAULT_SCHEMA, generation)
+                    .expect("construct maximum-generation in-memory Keeper fixture");
             let mut index = QuillIndex::from_backend(
                 IndexBackend::Memory(snapshot),
                 DEFAULT_SCHEMA,
@@ -22774,6 +22851,101 @@ mod tests {
                     .generation,
                 generation + 1
             );
+        });
+    }
+
+    #[test]
+    fn claimed_publish_failure_requires_proven_same_generation_reconciliation() {
+        let _pause_serial = crate::keeper::manifest_publish_pause_test_serial_guard();
+        run_with_blocking_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("temporary claimed-failure directory");
+            let index = QuillIndex::create(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("create durable claimed-failure fixture");
+            let generation = index
+                .snapshot()
+                .expect("fresh claimed-failure snapshot")
+                .loaded_manifest()
+                .manifest
+                .generation;
+            index
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("claimed-failure", "alpha claimed failure"),
+                )
+                .await
+                .expect("stage claimed-failure document");
+            let fault = crate::keeper::fail_manifest_publish_at_checkpoint_for_test(
+                directory.path(),
+                crate::keeper::PublishCheckpoint::GenerationClaimed,
+            );
+
+            assert!(matches!(
+                index.commit(&cx).await,
+                Err(QuillIndexError::Keeper(KeeperError::InvalidTransition { detail }))
+                    if detail.contains("test-only MANIFEST publisher failure")
+            ));
+            assert_eq!(
+                KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)
+                    .expect("reopen pre-slot durable generation")
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                generation,
+                "GenerationClaimed failure must precede every MANIFEST slot move"
+            );
+            assert_public_authority_refuses_stale_publication(
+                &index,
+                &cx,
+                "alpha",
+                "claimed-failure",
+            )
+            .await;
+
+            let reconciled = index
+                .reconcile_publication(&cx)
+                .await
+                .expect("reopen proves the predecessor remains durable authority");
+            assert_eq!(reconciled.keeper_generation(), generation);
+            assert!(
+                index
+                    .writer
+                    .try_lock()
+                    .expect("inspect retained claimed-failure proposal")
+                    .pending_manifest
+                    .is_some(),
+                "same-generation reconciliation must retain the exact retry proposal"
+            );
+            assert_public_authority_observes_reconciled_single_document(
+                &index,
+                &cx,
+                generation,
+                "alpha",
+                "claimed-failure",
+                0,
+            )
+            .await;
+
+            drop(fault);
+            assert_eq!(
+                index
+                    .commit(&cx)
+                    .await
+                    .expect("retry retained claimed-failure proposal")
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                generation + 1
+            );
+            assert_public_authority_observes_reconciled_single_document(
+                &index,
+                &cx,
+                generation + 1,
+                "alpha",
+                "claimed-failure",
+                1,
+            )
+            .await;
         });
     }
 

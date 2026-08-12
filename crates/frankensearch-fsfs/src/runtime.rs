@@ -1915,7 +1915,7 @@ impl LiveIngestPipeline {
             IndexFreshnessAuditInput {
                 run_id: format!(
                     "quill-quarantine-generation-{}",
-                    self.lexical_index.segment_stats().published_generation
+                    self.lexical_index.segment_stats()?.published_generation
                 ),
                 filesystem,
                 catalog,
@@ -1952,7 +1952,7 @@ impl LiveIngestPipeline {
         let ack = FsfsFlushAck {
             request_id: request.request_id,
             index_freshness: FsfsRuntime::index_freshness_payload(
-                self.lexical_index.segment_stats(),
+                self.lexical_index.segment_stats()?,
             ),
         };
         write_durable_json(&ack_path, &ack, "fsfs.flush.ack.write")?;
@@ -7323,10 +7323,12 @@ impl FsfsRuntime {
     ) -> SearchResult<Vec<SearchPhaseArtifact>> {
         self.rebind_search_resources_if_generation_changed(cx, mode, resources)
             .await?;
-        let index_freshness = resources
+        let lexical_stats = resources
             .lexical_index
             .as_ref()
-            .map(|index| Self::index_freshness_payload(index.segment_stats()));
+            .map(SegmentStatsProvider::segment_stats)
+            .transpose()?;
+        let index_freshness = lexical_stats.map(Self::index_freshness_payload);
         let normalized_query = Self::normalize_search_query(query);
         let filter_expr = SearchFilterExpr::parse(self.cli_input.filter.as_deref().unwrap_or(""))?;
         if normalized_query.is_empty() {
@@ -7346,10 +7348,7 @@ impl FsfsRuntime {
             return Ok(vec![artifact]);
         }
 
-        let lexical_doc_count = resources
-            .lexical_index
-            .as_ref()
-            .map(|index| index.segment_stats().live_docs);
+        let lexical_doc_count = lexical_stats.map(|stats| stats.live_docs);
         let vector_doc_count = resources.vector_index.as_ref().map(|index| {
             index
                 .record_count()
@@ -8391,7 +8390,7 @@ impl FsfsRuntime {
                     lexical.commit(cx).await?;
                     drop(lexical);
                     Self::index_freshness_payload(
-                        KeeperSnapshot::open(&lexical_path, DEFAULT_SCHEMA)?.segment_stats(),
+                        KeeperSnapshot::open(&lexical_path, DEFAULT_SCHEMA)?.segment_stats()?,
                     )
                 }
                 Err(QuillIndexError::Keeper(KeeperError::WriterBusy { .. })) => {
@@ -8465,7 +8464,8 @@ impl FsfsRuntime {
             if let Some(ack) = read_durable_json::<FsfsFlushAck>(&ack_path, "fsfs.flush.ack.read")?
                 && ack.request_id == request.request_id
             {
-                let observed = KeeperSnapshot::open(lexical_path, DEFAULT_SCHEMA)?.segment_stats();
+                let observed =
+                    KeeperSnapshot::open(lexical_path, DEFAULT_SCHEMA)?.segment_stats()?;
                 if observed.published_generation >= ack.index_freshness.published_generation {
                     return Ok(Self::index_freshness_payload(observed));
                 }
@@ -9363,7 +9363,7 @@ impl FsfsRuntime {
 
         let (stats, quill_degraded) = if active_engine == BlueGreenEngine::Quill {
             let snapshot = KeeperSnapshot::open(&active_dir, DEFAULT_SCHEMA)?;
-            let stats = snapshot.segment_stats();
+            let stats = snapshot.segment_stats()?;
             let (fec_protected, fec_artifacts) = Self::quill_fec_coverage(&active_dir)?;
             (
                 format!(
@@ -9873,7 +9873,7 @@ impl FsfsRuntime {
             if lexical_stats.is_some() || lexical_layout.engine() != Some(BlueGreenEngine::Quill) {
                 lexical_stats
             } else if let Some(engine_dir) = lexical_layout.engine_dir() {
-                Some(KeeperSnapshot::open(&engine_dir, DEFAULT_SCHEMA)?.segment_stats())
+                Some(KeeperSnapshot::open(&engine_dir, DEFAULT_SCHEMA)?.segment_stats()?)
             } else {
                 None
             };
@@ -11305,7 +11305,7 @@ impl FsfsRuntime {
             catalog_files: vec![PathBuf::from(&self.config.storage.db_path)],
             embedding_cache_roots: vec![index_root.join("cache")],
         })?;
-        storage_usage.lexical_index_bytes = lexical_index.segment_stats().managed_disk_bytes;
+        storage_usage.lexical_index_bytes = lexical_index.segment_stats()?.managed_disk_bytes;
         let elapsed_ms = total_start.elapsed().as_millis();
 
         let final_stage = indexing_final_stage(embedder_degraded, generation_complete);
@@ -12545,7 +12545,7 @@ impl FsfsRuntime {
         index_root: &Path,
         pipeline: &LiveIngestPipeline,
     ) -> SearchResult<()> {
-        let degraded = pipeline.lexical_index.segment_stats();
+        let degraded = pipeline.lexical_index.segment_stats()?;
         if !degraded.degraded {
             return Ok(());
         }
@@ -13703,22 +13703,13 @@ impl FsfsRuntime {
                 let lexical_stats = resources
                     .lexical_index
                     .as_ref()
-                    .map(SegmentStatsProvider::segment_stats);
-                match self.collect_status_payload_with_lexical_stats(lexical_stats) {
-                    Ok(payload) => {
-                        state.status_payload = payload;
-                        state.mode_hint = self.search_mode_hint()?;
-                        last_status_refresh = Instant::now();
-                        render_pending = true;
-                    }
-                    Err(error) => {
-                        warn!(
-                            error = %error,
-                            "search dashboard status refresh failed; keeping previous snapshot"
-                        );
-                        last_status_refresh = Instant::now();
-                    }
-                }
+                    .map(SegmentStatsProvider::segment_stats)
+                    .transpose()?;
+                state.status_payload =
+                    self.collect_status_payload_with_lexical_stats(lexical_stats)?;
+                state.mode_hint = self.search_mode_hint()?;
+                last_status_refresh = Instant::now();
+                render_pending = true;
             }
 
             // Keep interaction responsive by prioritizing input and then executing
@@ -13773,7 +13764,8 @@ impl FsfsRuntime {
             let lexical_stats = resources
                 .lexical_index
                 .as_ref()
-                .map(SegmentStatsProvider::segment_stats);
+                .map(SegmentStatsProvider::segment_stats)
+                .transpose()?;
             state.status_payload = self.collect_status_payload_with_lexical_stats(lexical_stats)?;
             state.mode_hint = self.search_mode_hint()?;
 
@@ -22283,7 +22275,13 @@ mod tests {
                 .directory()
                 .expect("durable lexical directory")
                 .to_path_buf();
-            assert!(!protected.lexical_index.segment_stats().degraded);
+            assert!(
+                !protected
+                    .lexical_index
+                    .segment_stats()
+                    .expect("read protected lexical stats")
+                    .degraded
+            );
             drop(protected);
             drop(vector_handle);
 
@@ -22310,7 +22308,10 @@ mod tests {
                 .build_live_ingest_pipeline(&cx)
                 .await
                 .expect("quarantine, audit, and reindex before watch start");
-            let stats = recovered.lexical_index.segment_stats();
+            let stats = recovered
+                .lexical_index
+                .segment_stats()
+                .expect("read recovered lexical stats");
             assert!(stats.degraded);
             assert_eq!(stats.quarantined_segments, 1);
             assert!(
@@ -22357,8 +22358,11 @@ mod tests {
             let search_only = QuillSearchIndex::open(&cx, &lexical_path, QuillConfig::default())
                 .await
                 .expect("open search-only degraded topology");
-            let search_only_freshness =
-                FsfsRuntime::index_freshness_payload(search_only.segment_stats());
+            let search_only_freshness = FsfsRuntime::index_freshness_payload(
+                search_only
+                    .segment_stats()
+                    .expect("read search-only lexical stats"),
+            );
             assert!(search_only_freshness.degraded);
             assert_eq!(search_only_freshness.quarantined_segments, 1);
             let search_json =
@@ -23619,7 +23623,13 @@ mod tests {
                 .expect("open fsvi");
             assert!(vector_index.record_count() >= 1);
             let lexical_index = open_test_quill(&cx, &index_root.join("lexical")).await;
-            assert!(lexical_index.segment_stats().live_docs >= 1);
+            assert!(
+                lexical_index
+                    .segment_stats()
+                    .expect("read indexed lexical stats")
+                    .live_docs
+                    >= 1
+            );
             let hits = lexical_index
                 .search(&cx, "index", 5)
                 .await
@@ -26150,7 +26160,8 @@ mod tests {
             drop(lexical);
             let lexical_stats = KeeperSnapshot::open(&lexical_root, DEFAULT_SCHEMA)
                 .expect("open status Quill snapshot")
-                .segment_stats();
+                .segment_stats()
+                .expect("read status Quill stats");
             let expected_lexical_bytes = lexical_stats.managed_disk_bytes;
             let expected_generation = lexical_stats.published_generation;
             let expected_last_publish_unix = lexical_stats.last_publish_unix;
@@ -26292,7 +26303,10 @@ mod tests {
                 .commit(&cx)
                 .await
                 .expect("commit initial Quill generation");
-            let initial_generation = lexical.segment_stats().published_generation;
+            let initial_generation = lexical
+                .segment_stats()
+                .expect("read initial published generation")
+                .published_generation;
             drop(lexical);
 
             let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
@@ -26313,7 +26327,11 @@ mod tests {
 
             let lexical = open_test_quill(&cx, &lexical_root).await;
             assert!(
-                lexical.segment_stats().published_generation >= initial_generation,
+                lexical
+                    .segment_stats()
+                    .expect("read post-flush published generation")
+                    .published_generation
+                    >= initial_generation,
                 "flush must preserve or advance the published generation"
             );
         });
@@ -26342,7 +26360,10 @@ mod tests {
                 )
                 .await
                 .expect("stage unpublished document");
-            let generation_before = lexical.segment_stats().published_generation;
+            let generation_before = lexical
+                .segment_stats()
+                .expect("read pre-flush published generation")
+                .published_generation;
             let pipeline = LiveIngestPipeline::new(
                 target_root,
                 lexical,

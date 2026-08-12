@@ -4041,8 +4041,8 @@ mod tests {
             })
         }
 
-        fn doc_count(&self) -> usize {
-            3
+        fn doc_count(&self) -> SearchResult<usize> {
+            Ok(3)
         }
     }
 
@@ -4113,8 +4113,8 @@ mod tests {
             })
         }
 
-        fn doc_count(&self) -> usize {
-            3
+        fn doc_count(&self) -> SearchResult<usize> {
+            Ok(3)
         }
     }
 
@@ -4135,8 +4135,8 @@ mod tests {
             })
         }
 
-        fn doc_count(&self) -> usize {
-            0
+        fn doc_count(&self) -> SearchResult<usize> {
+            Ok(0)
         }
     }
 
@@ -5666,12 +5666,16 @@ mod tests {
                 "the cancellation must originate in the second, post-embed identity call"
             );
             assert!(
-                adapter.telemetry_events().iter().filter_map(|envelope| {
-                    match &envelope.event {
-                        TelemetryEvent::Search { query, .. } => Some(query.phase),
-                        _ => None,
-                    }
-                }).eq([SearchEventPhase::Initial]),
+                adapter
+                    .telemetry_events()
+                    .iter()
+                    .filter_map(|envelope| {
+                        match &envelope.event {
+                            TelemetryEvent::Search { query, .. } => Some(query.phase),
+                            _ => None,
+                        }
+                    })
+                    .eq([SearchEventPhase::Initial]),
                 "cancellation before owner activation must not publish Refined or RefinementFailed"
             );
             assert_single_cancelled_session_stop(&adapter, "quality_identity_to_activation");

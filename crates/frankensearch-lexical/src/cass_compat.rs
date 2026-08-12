@@ -1312,12 +1312,18 @@ impl CassTantivyIndex {
         });
         materialized.truncate(top_len);
 
+        let doc_count =
+            usize::try_from(searcher.num_docs()).map_err(|_| SearchError::SubsystemError {
+                subsystem: "tantivy",
+                source: "current Tantivy reader document count does not fit usize".into(),
+            })?;
+
         Ok(crate::OracleQueryObservation {
             hits: materialized,
             cutoff_tie_group,
             cutoff_tie_complete,
             total_count: search_result.total_count,
-            doc_count: usize::try_from(searcher.num_docs()).unwrap_or(usize::MAX),
+            doc_count,
         })
     }
 

@@ -26,7 +26,7 @@ use frankensearch_core::generation::{
     CanonicalDocsetV1, ExactComponentReceiptV1, GenerationComponentReceiptV1,
     GenerationComponentRole, SourceCheckpointV1,
 };
-use frankensearch_core::{DocId, SearchError};
+use frankensearch_core::{DocId, SearchError, SearchResult};
 #[cfg(feature = "durability")]
 use frankensearch_durability::{FileProtector, FileRecoveryOutcome, FileSourceWitness};
 use frankensearch_index::mapped_file::ReadOnlyMappedFile;
@@ -3762,7 +3762,7 @@ pub(crate) enum PublicationAuthorityPhase {
 }
 
 impl PublicationAuthorityPhase {
-    const fn from_bits(bits: u64) -> Self {
+    fn from_bits(bits: u64) -> Self {
         match bits {
             0 => Self::Stable,
             1 => Self::Preparing,
@@ -3792,13 +3792,13 @@ impl PublicationAuthorityState {
 
     /// Publication phase carried with [`Self::generation`].
     #[must_use]
-    pub(crate) const fn phase(self) -> PublicationAuthorityPhase {
+    pub(crate) fn phase(self) -> PublicationAuthorityPhase {
         PublicationAuthorityPhase::from_bits(self.packed & 0b11)
     }
 
     /// Whether a process-local snapshot at this generation remains readable.
     #[must_use]
-    pub(crate) const fn is_readable(self) -> bool {
+    pub(crate) fn is_readable(self) -> bool {
         matches!(
             self.phase(),
             PublicationAuthorityPhase::Stable | PublicationAuthorityPhase::Preparing
@@ -3865,17 +3865,26 @@ impl PublicationReadState {
         loop {
             let observed = self.load();
             if generation < observed.generation() {
+                return Ok(());
+            }
+            if generation == observed.generation() {
+                if observed.phase() == PublicationAuthorityPhase::Stable {
+                    return Ok(());
+                }
                 return Err(KeeperError::InvalidTransition {
                     detail: format!(
-                        "cannot stabilize generation {generation} behind observed publication authority generation {}",
-                        observed.generation()
+                        "generic stabilization cannot clear same-generation {:?} publication authority at generation {generation}",
+                        observed.phase()
                     ),
                 });
             }
-            if generation == observed.generation()
-                && observed.phase() == PublicationAuthorityPhase::Stable
-            {
-                return Ok(());
+            if observed.phase() == PublicationAuthorityPhase::Preparing {
+                return Err(KeeperError::InvalidTransition {
+                    detail: format!(
+                        "cannot stabilize generation {generation} while generation {} has an active publication",
+                        observed.generation()
+                    ),
+                });
             }
             if self
                 .authority
@@ -3888,6 +3897,36 @@ impl PublicationReadState {
                 .is_ok()
             {
                 return Ok(());
+            }
+        }
+    }
+
+    /// Clear same-generation indeterminacy only after Keeper reopened the
+    /// durable MANIFEST and proved that the retained process-local generation
+    /// is still authoritative.
+    pub(crate) fn stabilize_reconciled_same_generation(
+        &self,
+        generation: u64,
+    ) -> Result<(), KeeperError> {
+        let stable = Self::pack(generation, PublicationAuthorityPhase::Stable)?;
+        let indeterminate = Self::pack(generation, PublicationAuthorityPhase::Indeterminate)?;
+        match self.authority.compare_exchange(
+            indeterminate,
+            stable,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(observed) if observed == stable => Ok(()),
+            Err(observed) => {
+                let observed = PublicationAuthorityState { packed: observed };
+                Err(KeeperError::InvalidTransition {
+                    detail: format!(
+                        "same-generation reconciliation for {generation} cannot clear {:?} authority at generation {}",
+                        observed.phase(),
+                        observed.generation()
+                    ),
+                })
             }
         }
     }
@@ -3934,10 +3973,7 @@ impl PublicationAuthorityTransition {
                 ),
             });
         }
-        let _ = PublicationReadState::pack(
-            proposed_generation,
-            PublicationAuthorityPhase::Stable,
-        )?;
+        let _ = PublicationReadState::pack(proposed_generation, PublicationAuthorityPhase::Stable)?;
         let stable =
             PublicationReadState::pack(before.generation(), PublicationAuthorityPhase::Stable)?;
         let preparing =
@@ -12114,7 +12150,8 @@ fn manifest_publish_pauses() -> &'static std::sync::Mutex<BTreeMap<PathBuf, Mani
 }
 
 #[cfg(test)]
-fn manifest_publish_failures() -> &'static std::sync::Mutex<BTreeMap<PathBuf, ManifestPublishFailure>> {
+fn manifest_publish_failures()
+-> &'static std::sync::Mutex<BTreeMap<PathBuf, ManifestPublishFailure>> {
     MANIFEST_PUBLISH_FAILURES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
@@ -12147,14 +12184,18 @@ pub(crate) fn pause_manifest_publish_at_checkpoint_for_test(
         event: Arc::clone(&event),
         released: Arc::clone(&released),
     };
-    let previous = manifest_publish_pauses()
+    let mut pauses = manifest_publish_pauses()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(directory.clone(), pause);
-    assert!(
-        previous.is_none(),
-        "only one MANIFEST checkpoint pause may be armed per directory"
-    );
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match pauses.entry(directory.clone()) {
+        std::collections::btree_map::Entry::Vacant(slot) => {
+            slot.insert(pause);
+        }
+        std::collections::btree_map::Entry::Occupied(_) => {
+            panic!("only one MANIFEST checkpoint pause may be armed per directory");
+        }
+    }
+    drop(pauses);
     ManifestPublishPauseControl {
         directory,
         checkpoint,
@@ -12172,14 +12213,18 @@ pub(crate) fn fail_manifest_publish_at_checkpoint_for_test(
     checkpoint: PublishCheckpoint,
 ) -> ManifestPublishFailureControl {
     let directory = normalize_publish_directory(directory.to_path_buf());
-    let previous = manifest_publish_failures()
+    let mut failures = manifest_publish_failures()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(directory.clone(), ManifestPublishFailure { checkpoint });
-    assert!(
-        previous.is_none(),
-        "only one MANIFEST checkpoint failure may be armed per directory"
-    );
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match failures.entry(directory.clone()) {
+        std::collections::btree_map::Entry::Vacant(slot) => {
+            slot.insert(ManifestPublishFailure { checkpoint });
+        }
+        std::collections::btree_map::Entry::Occupied(_) => {
+            panic!("only one MANIFEST checkpoint failure may be armed per directory");
+        }
+    }
+    drop(failures);
     ManifestPublishFailureControl { directory }
 }
 
@@ -14933,20 +14978,30 @@ fn detect_live_writer(directory: &Path) -> bool {
 }
 
 impl SegmentStatsProvider for KeeperSnapshot {
-    fn segment_stats(&self) -> SegmentStats {
+    fn segment_stats(&self) -> SearchResult<SegmentStats> {
         let manifest = &self.loaded.manifest;
         let (managed_disk_bytes, live_writer) =
             self.directory.as_ref().map_or((0, false), |directory| {
                 (managed_disk_bytes(directory), detect_live_writer(directory))
             });
-        SegmentStats {
+        let live_docs =
+            usize::try_from(self.live_doc_count).map_err(|_| SearchError::SubsystemError {
+                subsystem: "quill",
+                source: "Keeper live-document count does not fit usize".into(),
+            })?;
+        let tombstones =
+            usize::try_from(self.tombstone_count).map_err(|_| SearchError::SubsystemError {
+                subsystem: "quill",
+                source: "Keeper tombstone count does not fit usize".into(),
+            })?;
+        Ok(SegmentStats {
             schema_id: manifest.schema_id,
             published_generation: manifest.generation,
             sealed_segments: self.segments.len(),
             // The searchable delta segment is E5; nothing pre-delta exists yet.
             delta_segments: 0,
-            live_docs: usize::try_from(self.live_doc_count).unwrap_or(usize::MAX),
-            tombstones: usize::try_from(self.tombstone_count).unwrap_or(usize::MAX),
+            live_docs,
+            tombstones,
             managed_disk_bytes,
             delta_memory_bytes: 0,
             last_publish_unix: (manifest.last_publish_unix_s != 0)
@@ -14960,16 +15015,19 @@ impl SegmentStatsProvider for KeeperSnapshot {
                 .iter()
                 .filter(|segment| segment.estimated_missing_docs.is_none())
                 .count(),
-        }
+        })
     }
 }
 
 impl SegmentStatsProvider for KeeperWriter {
-    fn segment_stats(&self) -> SegmentStats {
-        let mut stats = self.snapshot.segment_stats();
+    fn segment_stats(&self) -> SearchResult<SegmentStats> {
+        let mut stats = self
+            .snapshot()
+            .map_err(SearchError::from)?
+            .segment_stats()?;
         // The writer holds LOCK by construction; no probe is needed.
         stats.live_writer = true;
-        stats
+        Ok(stats)
     }
 }
 
@@ -15100,29 +15158,83 @@ mod tests {
             .stabilize(9)
             .expect("install the newer process-local successor");
 
-        let Err(error) = state.stabilize(8) else {
-            panic!("a stale process-local successor must not lower publication authority");
-        };
-        assert!(matches!(error, KeeperError::InvalidTransition { .. }));
+        state
+            .stabilize(8)
+            .expect("a stale stabilizer is superseded without lowering authority");
         let observed = state.load();
         assert_eq!(observed.generation(), 9);
         assert_eq!(observed.phase(), PublicationAuthorityPhase::Stable);
+
+        let transition = PublicationAuthorityTransition::begin(state.clone(), 10)
+            .expect("begin the next publication");
+        state
+            .stabilize(8)
+            .expect("a stale stabilizer must also preserve a newer active publication");
+        let observed = state.load();
+        assert_eq!(observed.generation(), 9);
+        assert_eq!(observed.phase(), PublicationAuthorityPhase::Preparing);
+        transition.restore_known_pre_rename_failure();
     }
 
     #[test]
-    fn publication_stabilize_recovers_same_generation_indeterminate() {
+    fn generic_stabilize_never_clears_same_generation_preparing() {
+        let state = PublicationReadState::new(7).expect("pack initial authority generation");
+        let transition = PublicationAuthorityTransition::begin(state.clone(), 8)
+            .expect("begin publication transition");
+
+        assert!(matches!(
+            state.stabilize(7),
+            Err(KeeperError::InvalidTransition { .. })
+        ));
+        assert!(matches!(
+            state.stabilize(8),
+            Err(KeeperError::InvalidTransition { .. })
+        ));
+        let observed = state.load();
+        assert_eq!(observed.generation(), 7);
+        assert_eq!(observed.phase(), PublicationAuthorityPhase::Preparing);
+        transition.restore_known_pre_rename_failure();
+    }
+
+    #[test]
+    fn only_reconciliation_clears_same_generation_indeterminate() {
         let state = PublicationReadState::new(7).expect("pack initial authority generation");
         let transition = PublicationAuthorityTransition::begin(state.clone(), 8)
             .expect("begin publication transition");
         transition.mark_indeterminate();
         drop(transition);
 
+        assert!(matches!(
+            state.stabilize(7),
+            Err(KeeperError::InvalidTransition { .. })
+        ));
         state
-            .stabilize(7)
-            .expect("restore the already-installed generation to stable");
+            .stabilize_reconciled_same_generation(7)
+            .expect("proven reconciliation restores the same generation");
         let observed = state.load();
         assert_eq!(observed.generation(), 7);
         assert_eq!(observed.phase(), PublicationAuthorityPhase::Stable);
+    }
+
+    #[test]
+    fn reconciliation_never_clears_same_generation_durable_ahead() {
+        let state = PublicationReadState::new(7).expect("pack initial authority generation");
+        let transition = PublicationAuthorityTransition::begin(state.clone(), 8)
+            .expect("begin publication transition");
+        transition.mark_durable_ahead();
+        drop(transition);
+
+        assert!(matches!(
+            state.stabilize(7),
+            Err(KeeperError::InvalidTransition { .. })
+        ));
+        assert!(matches!(
+            state.stabilize_reconciled_same_generation(7),
+            Err(KeeperError::InvalidTransition { .. })
+        ));
+        let observed = state.load();
+        assert_eq!(observed.generation(), 7);
+        assert_eq!(observed.phase(), PublicationAuthorityPhase::DurableAhead);
     }
 
     fn tier_test_segment(segment_id: u64, docid_lo: u64, docid_hi: u64) -> ManifestSegment {
@@ -21594,6 +21706,23 @@ mod tests {
                     proposed_generation: 2,
                 })
             ));
+            let stats_error = SegmentStatsProvider::segment_stats(&writer)
+                .expect_err("writer stats must fail closed with its authority snapshot");
+            assert!(
+                matches!(
+                    &stats_error,
+                    SearchError::SubsystemError { subsystem, source }
+                        if *subsystem == "quill"
+                            && matches!(
+                                source.downcast_ref::<KeeperError>(),
+                                Some(KeeperError::PublicationReconciliationRequired {
+                                    retained_generation: 1,
+                                    proposed_generation: 2,
+                                })
+                            )
+                ),
+                "writer stats must retain the typed reconciliation failure: {stats_error:?}"
+            );
             assert!(
                 writer.publication_awaits_reconciliation(),
                 "marker observation alone is not authority; the checked reader must fail closed"
@@ -21611,6 +21740,12 @@ mod tests {
                 .generation;
             assert_eq!(advanced, 3);
             assert!(!writer.publication_awaits_reconciliation());
+            assert_eq!(
+                SegmentStatsProvider::segment_stats(&writer)
+                    .expect("reconciled writer stats are authoritative")
+                    .published_generation,
+                3
+            );
 
             let reopened =
                 KeeperSnapshot::open(&directory, DEFAULT_SCHEMA).expect("reopen published index");
@@ -22192,7 +22327,12 @@ mod tests {
                         .map_err(|error| error.to_string())?
                         .len(),
                 );
-            if snapshot.segment_stats().managed_disk_bytes < retained_bytes {
+            if snapshot
+                .segment_stats()
+                .map_err(|error| error.to_string())?
+                .managed_disk_bytes
+                < retained_bytes
+            {
                 return Err("managed disk accounting omitted quarantine artifacts".to_owned());
             }
             drop(writer);
@@ -23917,7 +24057,8 @@ mod tests {
             let writer = KeeperWriter::create(&cx, directory.path(), DEFAULT_SCHEMA)
                 .await
                 .expect("create index");
-            let writer_stats = SegmentStatsProvider::segment_stats(&writer);
+            let writer_stats = SegmentStatsProvider::segment_stats(&writer)
+                .expect("read live-writer segment stats");
             assert_eq!(writer_stats.published_generation, 1);
             assert_eq!(writer_stats.sealed_segments, 0);
             assert_eq!(writer_stats.live_docs, 0);
@@ -23939,7 +24080,8 @@ mod tests {
             // D1 LOCK record (same pid, demonstrably alive).
             let snapshot =
                 KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA).expect("open snapshot");
-            let snapshot_stats = SegmentStatsProvider::segment_stats(&snapshot);
+            let snapshot_stats = SegmentStatsProvider::segment_stats(&snapshot)
+                .expect("read concurrent snapshot segment stats");
             assert_eq!(snapshot_stats.published_generation, 1);
             assert!(snapshot_stats.last_publish_unix.is_some());
             assert!(snapshot_stats.live_writer, "LOCK record names a live pid");
@@ -23949,7 +24091,8 @@ mod tests {
             drop(writer);
             let snapshot =
                 KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA).expect("reopen snapshot");
-            let released = SegmentStatsProvider::segment_stats(&snapshot);
+            let released = SegmentStatsProvider::segment_stats(&snapshot)
+                .expect("read released snapshot segment stats");
             assert!(
                 !released.live_writer,
                 "released LOCK reports no live writer"

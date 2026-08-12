@@ -7798,7 +7798,7 @@ impl DifferentialCampaignEngine for crate::engine::TantivyOracle {
         Box::pin(async move {
             use frankensearch_core::LexicalRead;
 
-            if self.index().doc_count() != 0 {
+            if self.index().doc_count()? != 0 {
                 return Err(campaign_error(
                     "Tantivy campaign adapter must own a fresh empty index",
                 ));
@@ -7838,7 +7838,8 @@ impl DifferentialCampaignEngine for crate::engine::TantivyOracle {
 
             self.require_ingesting()?;
             self.index().commit(cx).await?;
-            let actual_count = u64::try_from(self.index().doc_count()).unwrap_or(u64::MAX);
+            let actual_count = u64::try_from(self.index().doc_count()?)
+                .map_err(|_| campaign_error("Tantivy committed document count does not fit u64"))?;
             if actual_count != manifest.document_count {
                 return Err(campaign_error(
                     "Tantivy committed document count differs from the corpus manifest",
@@ -13546,7 +13547,13 @@ mod tests {
         assert_eq!(oracle_segments.len(), 1);
         assert_eq!(oracle_segments[0].max_doc, 9_001);
         assert_eq!(oracle_segments[0].num_docs, 8_995);
-        assert_eq!(oracle.index().doc_count(), expected_live_documents);
+        assert_eq!(
+            oracle
+                .index()
+                .doc_count()
+                .expect("Tantivy reader document count is authoritative"),
+            expected_live_documents
+        );
         (subject, oracle)
     }
 
@@ -19474,7 +19481,13 @@ mod tests {
                 .await
                 .expect("delete old document");
             oracle.index().commit(&cx).await.expect("commit deletion");
-            assert_eq!(oracle.index().doc_count(), 0);
+            assert_eq!(
+                oracle
+                    .index()
+                    .doc_count()
+                    .expect("Tantivy reader document count is authoritative"),
+                0
+            );
             assert!(
                 oracle
                     .begin_corpus(&cx, &fixture.corpus_manifest, &contract)

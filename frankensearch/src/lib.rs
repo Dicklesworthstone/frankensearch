@@ -755,7 +755,8 @@ mod feature_matrix_smoke {
                 "full-fts5",
                 "real_fts5_index_search",
                 &serde_json::json!({
-                    "documents": LexicalRead::doc_count(&adapter),
+                    "documents": LexicalRead::doc_count(&adapter)
+                        .expect("read FTS5 document count"),
                     "hits": hits.len(),
                 }),
             );

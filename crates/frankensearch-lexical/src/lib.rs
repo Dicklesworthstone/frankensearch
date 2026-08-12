@@ -1296,7 +1296,7 @@ impl BenchmarkWriterAttestation {
     /// Mint an attestation only after its writer constructor has succeeded.
     fn mint(receipt: BenchmarkWriterReceipt) -> Self {
         let construction_id = NEXT_BENCHMARK_WRITER_CONSTRUCTION_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
             .expect("benchmark writer construction IDs exhausted");
@@ -1683,13 +1683,23 @@ fn call_fixed_writer(
 impl std::fmt::Debug for TantivyIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TantivyIndex")
-            .field("doc_count", &self.doc_count.load(Ordering::Relaxed))
+            .field(
+                "staged_doc_count_hint",
+                &self.doc_count.load(Ordering::Relaxed),
+            )
             .field("path", &self.path)
             .finish_non_exhaustive()
     }
 }
 
 impl TantivyIndex {
+    fn checked_searcher_doc_count(searcher: &Searcher) -> SearchResult<usize> {
+        usize::try_from(searcher.num_docs()).map_err(|_| SearchError::SubsystemError {
+            subsystem: "tantivy",
+            source: "current Tantivy reader document count does not fit usize".into(),
+        })
+    }
+
     fn map_writer_lock_error(phase: &str, error: asupersync::sync::LockError) -> SearchError {
         match error {
             asupersync::sync::LockError::Poisoned => SearchError::SubsystemError {
@@ -2803,18 +2813,19 @@ impl TantivyIndex {
         snippet_config: &SnippetConfig,
     ) -> SearchResult<OracleQueryObservation> {
         let query = Self::truncate_query(query);
+        let searcher = self.reader.searcher();
+        let doc_count = Self::checked_searcher_doc_count(&searcher)?;
         if query.trim().is_empty() {
             return Ok(OracleQueryObservation {
                 hits: Vec::new(),
                 cutoff_tie_group: Vec::new(),
                 cutoff_tie_complete: true,
                 total_count: 0,
-                doc_count: self.doc_count.load(Ordering::Relaxed),
+                doc_count,
             });
         }
 
         let parsed = self.parse_query_lenient(query);
-        let searcher = self.reader.searcher();
         let fetch_limit = if limit == 0 {
             0
         } else {
@@ -2891,7 +2902,7 @@ impl TantivyIndex {
             cutoff_tie_group,
             cutoff_tie_complete,
             total_count,
-            doc_count: self.doc_count.load(Ordering::Relaxed),
+            doc_count,
         })
     }
 
@@ -2917,16 +2928,17 @@ impl TantivyIndex {
         offset: usize,
     ) -> SearchResult<OraclePageObservation> {
         let query = Self::truncate_query(query);
+        let searcher = self.reader.searcher();
+        let doc_count = Self::checked_searcher_doc_count(&searcher)?;
         if query.trim().is_empty() {
             return Ok(OraclePageObservation {
                 hits: Vec::new(),
                 total_count: 0,
-                doc_count: self.doc_count.load(Ordering::Relaxed),
+                doc_count,
             });
         }
 
         let parsed = self.parse_query_lenient(query);
-        let searcher = self.reader.searcher();
         let search_result = execute_query_with_offset(&searcher, &*parsed, limit, offset)?;
         let mut hits = Vec::with_capacity(search_result.hits.len());
         for hit in search_result.hits {
@@ -2955,7 +2967,7 @@ impl TantivyIndex {
         Ok(OraclePageObservation {
             hits,
             total_count: search_result.total_count,
-            doc_count: self.doc_count.load(Ordering::Relaxed),
+            doc_count,
         })
     }
 
@@ -3502,8 +3514,8 @@ impl frankensearch_core::traits::LexicalRead for TantivyIndex {
         })
     }
 
-    fn doc_count(&self) -> usize {
-        self.doc_count.load(Ordering::Relaxed)
+    fn doc_count(&self) -> SearchResult<usize> {
+        Self::checked_searcher_doc_count(&self.reader.searcher())
     }
 }
 
@@ -4564,14 +4576,14 @@ mod tests {
     #[test]
     fn create_in_memory() {
         let idx = TantivyIndex::in_memory().expect("create");
-        assert_eq!(idx.doc_count(), 0);
+        assert_eq!(idx.doc_count().expect("document count"), 0);
     }
 
     #[test]
     fn create_on_disk() {
         let dir = tempfile::tempdir().expect("tempdir");
         let idx = TantivyIndex::create(dir.path()).expect("create");
-        assert_eq!(idx.doc_count(), 0);
+        assert_eq!(idx.doc_count().expect("document count"), 0);
         assert_eq!(idx.path(), Some(dir.path()));
     }
 
@@ -4787,7 +4799,7 @@ mod tests {
             let doc = IndexableDocument::new("doc-1", "Hello world");
             idx.index_document(&cx, &doc).await.expect("index");
             idx.commit(&cx).await.expect("commit");
-            assert_eq!(idx.doc_count(), 1);
+            assert_eq!(idx.doc_count().expect("document count"), 1);
         });
     }
 
@@ -4798,7 +4810,7 @@ mod tests {
             let docs = sample_docs();
             idx.index_documents(&cx, &docs).await.expect("batch index");
             idx.commit(&cx).await.expect("commit");
-            assert_eq!(idx.doc_count(), 5);
+            assert_eq!(idx.doc_count().expect("document count"), 5);
         });
     }
 
@@ -5244,6 +5256,13 @@ mod tests {
             idx.index_documents(&cx, &docs).await.expect("index");
             idx.commit(&cx).await.expect("commit");
 
+            idx.index_document(
+                &cx,
+                &IndexableDocument::new("staged-doc", "shared counted-page term document staged"),
+            )
+            .await
+            .expect("stage uncommitted document");
+
             let count_only = idx
                 .oracle_observe_page(&cx, "counted-page", 0, 0)
                 .expect("count-only page");
@@ -5259,11 +5278,22 @@ mod tests {
             let past_end = idx
                 .oracle_observe_page(&cx, "counted-page", 3, 100)
                 .expect("past-end page");
+            let ranked = idx
+                .oracle_observe_query(&cx, "counted-page", 3, 16, &SnippetConfig::default())
+                .expect("ranked observation");
 
             for page in [&count_only, &first, &second, &prefix, &past_end] {
                 assert_eq!(page.total_count, 9, "exact Count must ignore k and offset");
-                assert_eq!(page.doc_count, 9, "snapshot document count must be stable");
+                assert_eq!(
+                    page.doc_count, 9,
+                    "oracle document count must share the page searcher's generation"
+                );
             }
+            assert_eq!(ranked.total_count, 9);
+            assert_eq!(
+                ranked.doc_count, 9,
+                "ranked oracle document count must ignore staged writer state"
+            );
             assert!(
                 count_only.hits.is_empty(),
                 "limit zero must retain Count only"
@@ -5334,7 +5364,7 @@ mod tests {
             let docs = sample_docs();
             idx.index_documents(&cx, &docs).await.expect("index");
             idx.commit(&cx).await.expect("commit");
-            assert_eq!(idx.doc_count(), 5);
+            assert_eq!(idx.doc_count().expect("document count"), 5);
 
             idx.delete_document(&cx, "doc-1").await.expect("delete");
             idx.commit(&cx).await.expect("commit after delete");
@@ -5396,21 +5426,26 @@ mod tests {
     fn doc_count_accurate_after_operations() {
         let idx = TantivyIndex::in_memory().expect("create");
         run_with_cx(|cx| async move {
-            assert_eq!(idx.doc_count(), 0);
+            assert_eq!(idx.doc_count().expect("document count"), 0);
 
             let doc = IndexableDocument::new("doc-1", "first");
             idx.index_document(&cx, &doc).await.expect("index");
+            assert_eq!(
+                idx.doc_count().expect("pre-commit document count"),
+                0,
+                "the count must describe the current searcher, not staged writer state"
+            );
             idx.commit(&cx).await.expect("commit");
-            assert_eq!(idx.doc_count(), 1);
+            assert_eq!(idx.doc_count().expect("document count"), 1);
 
             let doc = IndexableDocument::new("doc-2", "second");
             idx.index_document(&cx, &doc).await.expect("index");
             idx.commit(&cx).await.expect("commit");
-            assert_eq!(idx.doc_count(), 2);
+            assert_eq!(idx.doc_count().expect("document count"), 2);
 
             idx.delete_document(&cx, "doc-1").await.expect("delete");
             idx.commit(&cx).await.expect("commit delete");
-            assert_eq!(idx.doc_count(), 1);
+            assert_eq!(idx.doc_count().expect("document count"), 1);
         });
     }
 
@@ -6141,9 +6176,10 @@ mod benchmark_writer_mode_tests {
             .expect("successful benchmark writer mints one live attestation");
         let receipt = index
             .benchmark_writer_receipt()
+            .cloned()
             .expect("shipping-auto stamps a receipt");
 
-        assert_eq!(attestation.receipt(), receipt);
+        assert_eq!(attestation.receipt(), &receipt);
         assert!(
             index.take_benchmark_writer_attestation().is_none(),
             "the live attestation is a one-shot capability"
