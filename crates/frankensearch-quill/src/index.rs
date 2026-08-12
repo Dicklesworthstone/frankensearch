@@ -4140,12 +4140,18 @@ fn clone_query_checkpoint_for_argus<'a>(
 struct QueryWorkShape {
     posting_streams: u64,
     dictionary_scans: u64,
+    string_range_expansions: u64,
     phrase_streams: u64,
     phrase_fields: u64,
 }
 
 impl QueryWorkShape {
-    fn visit(&mut self, query: &Query, glob_expansion_limit: usize) {
+    fn visit(
+        &mut self,
+        query: &Query,
+        schema: SchemaDescriptor,
+        glob_expansion_limit: usize,
+    ) -> Result<(), QuillIndexError> {
         match query {
             Query::Empty | Query::All => {}
             Query::Term { fields, .. } => {
@@ -4162,23 +4168,17 @@ impl QueryWorkShape {
             }
             Query::Boolean { clauses, .. } => {
                 for clause in clauses {
-                    self.visit(&clause.query, glob_expansion_limit);
+                    self.visit(&clause.query, schema, glob_expansion_limit)?;
                 }
             }
-            Query::Boost { query, .. } => self.visit(query, glob_expansion_limit),
-            Query::Range { lower, upper, .. } => {
-                let string_range = matches!(
-                    lower,
-                    Bound::Included(QueryValue::Str(_)) | Bound::Excluded(QueryValue::Str(_))
-                ) || matches!(
-                    upper,
-                    Bound::Included(QueryValue::Str(_)) | Bound::Excluded(QueryValue::Str(_))
-                );
-                if string_range {
+            Query::Boost { query, .. } => self.visit(query, schema, glob_expansion_limit)?,
+            Query::Range { field_id, .. } => {
+                if matches!(
+                    query_field_kind(schema, *field_id)?,
+                    FieldKind::Keyword | FieldKind::Text { .. }
+                ) {
                     self.dictionary_scans = self.dictionary_scans.saturating_add(1);
-                    self.posting_streams = self
-                        .posting_streams
-                        .saturating_add(u64::try_from(glob_expansion_limit).unwrap_or(u64::MAX));
+                    self.string_range_expansions = self.string_range_expansions.saturating_add(1);
                 }
             }
             Query::Glob { field_ids, .. } => {
@@ -4197,6 +4197,7 @@ impl QueryWorkShape {
                 self.posting_streams = self.posting_streams.saturating_add(strings);
             }
         }
+        Ok(())
     }
 }
 
@@ -8322,8 +8323,12 @@ impl QuillReader {
         let rank_pruning = topdocs_root
             && rank_pruning.unwrap_or_else(|| query_has_prunable_root_union(&parsed.query, 1.0));
         let mut collector = TopDocsCollector::new(limit, 0)?;
-        let work_upper_bound =
-            query_work_upper_bound(&parsed.query, snapshot, self.config.glob_expansion_limit)?;
+        let work_upper_bound = query_work_upper_bound(
+            &parsed.query,
+            snapshot,
+            self.schema,
+            self.config.glob_expansion_limit,
+        )?;
         let concrete_checkpoint = self.query_checkpoint(
             cx,
             "search",
@@ -8395,8 +8400,12 @@ impl QuillReader {
         #[cfg(feature = "profile-internals")] profile: Option<&QuillProfileSession>,
     ) -> Result<QuillSearchResult, QuillIndexError> {
         validate_query_lowering(query, 1.0, self.schema)?;
-        let work_upper_bound =
-            query_work_upper_bound(query, snapshot, self.config.glob_expansion_limit)?;
+        let work_upper_bound = query_work_upper_bound(
+            query,
+            snapshot,
+            self.schema,
+            self.config.glob_expansion_limit,
+        )?;
         #[cfg(feature = "profile-internals")]
         let concrete_checkpoint = profile.map_or_else(
             || {
@@ -8835,8 +8844,12 @@ impl QuillReader {
         let published = self.published_snapshot.load();
         let snapshot = published.as_ref();
         let mut collector = DocSetCollector::new();
-        let work_upper_bound =
-            query_work_upper_bound(&parsed.query, snapshot, self.config.glob_expansion_limit)?;
+        let work_upper_bound = query_work_upper_bound(
+            &parsed.query,
+            snapshot,
+            self.schema,
+            self.config.glob_expansion_limit,
+        )?;
         let concrete_checkpoint = self.query_checkpoint(
             cx,
             "collect_docids",
@@ -8863,8 +8876,12 @@ impl QuillReader {
         snapshot: &QuillSearchSnapshot,
     ) -> Result<Vec<u32>, QuillIndexError> {
         validate_query_lowering(query, 1.0, self.schema)?;
-        let work_upper_bound =
-            query_work_upper_bound(query, snapshot, self.config.glob_expansion_limit)?;
+        let work_upper_bound = query_work_upper_bound(
+            query,
+            snapshot,
+            self.schema,
+            self.config.glob_expansion_limit,
+        )?;
         let concrete_checkpoint = self.query_checkpoint(
             cx,
             "collect_docids",
@@ -9343,8 +9360,12 @@ impl QuillIndex {
         topdocs_root: bool,
         fan_out: bool,
     ) -> Result<(), QuillIndexError> {
-        let work_upper_bound =
-            query_work_upper_bound(query, snapshot, self.reader.config.glob_expansion_limit)?;
+        let work_upper_bound = query_work_upper_bound(
+            query,
+            snapshot,
+            self.reader.schema,
+            self.reader.config.glob_expansion_limit,
+        )?;
         let concrete_checkpoint = self.reader.query_checkpoint(
             cx,
             "search",
@@ -10549,10 +10570,11 @@ const fn sealed_segment_fanout(segment_count: usize, total_sealed_docs: u64) -> 
 fn query_work_upper_bound(
     query: &Query,
     snapshot: &QuillSearchSnapshot,
+    schema: SchemaDescriptor,
     glob_expansion_limit: usize,
 ) -> Result<u64, QuillIndexError> {
     let mut shape = QueryWorkShape::default();
-    shape.visit(query, glob_expansion_limit);
+    shape.visit(query, schema, glob_expansion_limit)?;
 
     let keeper = snapshot.keeper_snapshot();
     let segment_count = keeper
@@ -10565,6 +10587,7 @@ fn query_work_upper_bound(
     let mut physical_docs = 0_u64;
     let mut posting_blocks_per_stream = 0_u64;
     let mut dictionary_blocks = 0_u64;
+    let mut string_range_term_ceiling = 0_u64;
     for segment in keeper.segments() {
         let docs = u64::from(segment.doc_count());
         physical_docs = physical_docs.saturating_add(docs);
@@ -10580,6 +10603,10 @@ fn query_work_upper_bound(
             count_bytes[3],
         ]);
         dictionary_blocks = dictionary_blocks.saturating_add(u64::from(count));
+        if shape.string_range_expansions != 0 {
+            let terms = u64::from(open_dictionary(segment, schema)?.term_count());
+            string_range_term_ceiling = string_range_term_ceiling.saturating_add(terms);
+        }
     }
     for delta in snapshot.delta_snapshots() {
         // A Delta walk is charged over the physical rows it reads, tombstones
@@ -10591,13 +10618,27 @@ fn query_work_upper_bound(
         posting_blocks_per_stream = posting_blocks_per_stream.saturating_add(docs.div_ceil(128));
         let terms = u64::try_from(delta.segment().term_count()).unwrap_or(u64::MAX);
         dictionary_blocks = dictionary_blocks.saturating_add(terms.div_ceil(16));
+        if shape.string_range_expansions != 0 {
+            string_range_term_ceiling = string_range_term_ceiling.saturating_add(terms);
+        }
     }
+
+    // Unlike glob expansion, string ranges deliberately have no truncation
+    // limit: a matching term becomes a real scorer stream. Their ceiling must
+    // therefore come from the finite immutable snapshot, including terms that
+    // the range's field or endpoints will later exclude. This over-count is
+    // intentional; it keeps fuel admission conservative without changing a
+    // range's result set.
+    let posting_streams = shape.posting_streams.saturating_add(
+        shape
+            .string_range_expansions
+            .saturating_mul(string_range_term_ceiling),
+    );
 
     // A rank-pruning fork can traverse a sealed posting stream independently
     // of the scorer-owned cursor. Two full traversals are therefore a safe
     // ceiling for every syntactic stream.
-    let posting_blocks = shape
-        .posting_streams
+    let posting_blocks = posting_streams
         .saturating_mul(posting_blocks_per_stream)
         .saturating_mul(2);
     // Snapshot-level expansions run while each segment scorer is lowered.
@@ -10612,7 +10653,7 @@ fn query_work_upper_bound(
     // sealed dictionaries for snapshot statistics and then the leaf-local
     // dictionary, so use the complete stream ceiling rather than only the
     // syntactic exact-term count.
-    let indexed_dictionary_blocks = shape.posting_streams.saturating_mul(
+    let indexed_dictionary_blocks = posting_streams.saturating_mul(
         segment_count
             .saturating_mul(keeper_count)
             .saturating_add(keeper_count),
@@ -14740,6 +14781,7 @@ mod tests {
         let work_budget = query_work_upper_bound(
             &query,
             &snapshot,
+            DEFAULT_SCHEMA,
             QuillConfig::default().glob_expansion_limit,
         )
         .expect("bound tombstone-heavy public query");
@@ -15926,6 +15968,7 @@ mod tests {
         let work_upper_bound = query_work_upper_bound(
             &parsed.query,
             &snapshot,
+            index.reader.schema,
             index.reader.config.glob_expansion_limit,
         )
         .expect("bound sealed docid work");
@@ -23012,6 +23055,108 @@ mod tests {
                     .execute_docid_query(&cx, query, &default_snapshot)
                     .expect("default fuel budget must cover fixture docset collection");
             }
+        });
+    }
+
+    #[test]
+    fn public_string_ranges_use_snapshot_term_ceiling_for_fuel_admission() {
+        run_with_cx(|cx| async move {
+            const FUEL_BUDGET: u64 = 6;
+            let documents = ["atlas", "boreal", "cinder", "dynamo"]
+                .into_iter()
+                .map(|term| IndexableDocument::new(format!("range-{term}"), term))
+                .collect::<Vec<_>>();
+            let public_ranges = ["content:[a TO *]", "content:[a TO z]"];
+
+            let exact = QuillIndex::in_memory(deterministic_config())
+                .expect("create exact string-range index");
+            exact
+                .index_documents(&cx, &documents)
+                .await
+                .expect("accumulate exact string-range fixture");
+            exact
+                .commit(&cx)
+                .await
+                .expect("publish exact string-range fixture");
+            for raw_query in public_ranges {
+                let result = exact
+                    .search_paginated(&cx, raw_query, 10, 0, true)
+                    .expect("range results must not be truncated by the fuel correction");
+                assert_eq!(result.total_count, Some(4), "query={raw_query}");
+                assert_eq!(result.hits.len(), 4, "query={raw_query}");
+            }
+
+            let limited = QuillIndex::in_memory(QuillConfig {
+                deterministic_ingest: true,
+                glob_expansion_limit: 1,
+                query_fuel_budget: FUEL_BUDGET,
+                ..QuillConfig::default()
+            })
+            .expect("create low-fuel string-range index");
+            limited
+                .index_documents(&cx, &documents)
+                .await
+                .expect("accumulate low-fuel string-range fixture");
+            limited
+                .commit(&cx)
+                .await
+                .expect("publish low-fuel string-range fixture");
+            let snapshot = limited.search_snapshot();
+
+            for raw_query in public_ranges {
+                let mut parsed = limited
+                    .reader
+                    .default_parser()
+                    .expect("public string-range parser")
+                    .parse_lenient(raw_query);
+                let _ = canonicalize_query(&mut parsed.query);
+                let upper_bound = query_work_upper_bound(
+                    &parsed.query,
+                    &snapshot,
+                    limited.reader.schema,
+                    limited.reader.config.glob_expansion_limit,
+                )
+                .expect("bound public string-range query");
+                assert!(
+                    upper_bound > FUEL_BUDGET,
+                    "the finite snapshot term ceiling must enable metering for {raw_query}"
+                );
+
+                let first = limited
+                    .search_paginated(&cx, raw_query, 10, 0, true)
+                    .expect_err("low-fuel public string range must exhaust rather than truncate");
+                let second = limited
+                    .search_paginated(&cx, raw_query, 10, 0, true)
+                    .expect_err("repeated low-fuel public string range must exhaust identically");
+                assert_eq!(fuel_diagnostics(&first), fuel_diagnostics(&second));
+                assert!(matches!(first, QuillIndexError::QueryFuelExhausted { .. }));
+            }
+
+            // The language parser intentionally drops a fully-unbounded range.
+            // Exercise the same production lower-and-collect path for a
+            // preparsed tree: neither endpoint can proxy its cardinality, so
+            // the snapshot ceiling is required.
+            let fully_unbounded = Query::Range {
+                field_id: CONTENT_FIELD,
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            };
+            let upper_bound = query_work_upper_bound(
+                &fully_unbounded,
+                &snapshot,
+                limited.reader.schema,
+                limited.reader.config.glob_expansion_limit,
+            )
+            .expect("bound fully-unbounded preparsed string range");
+            assert!(upper_bound > FUEL_BUDGET);
+            let first = limited
+                .execute_ranked_query(&cx, &fully_unbounded, &snapshot, 10, 0, true, Vec::new())
+                .expect_err("fully-unbounded range must also exhaust low fuel");
+            let second = limited
+                .execute_ranked_query(&cx, &fully_unbounded, &snapshot, 10, 0, true, Vec::new())
+                .expect_err("fully-unbounded range must exhaust identically");
+            assert_eq!(fuel_diagnostics(&first), fuel_diagnostics(&second));
+            assert!(matches!(first, QuillIndexError::QueryFuelExhausted { .. }));
         });
     }
 
