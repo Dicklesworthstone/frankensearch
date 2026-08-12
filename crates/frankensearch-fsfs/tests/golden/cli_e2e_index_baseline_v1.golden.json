@@ -45,11 +45,16 @@
       "artifacts": [
         {
           "file": "artifacts_index.json",
-          "checksum": "sha256:ce0c8e67d39a69565040691aa6eeb228b898c9f4c2f925399f74d893f63a4ca0"
+          "checksum": "sha256:6cfeb62eac32afccddbe47444d7b5f4b633563d998b7c05859fb30bd86d5868a"
         },
         {
           "file": "env.json",
           "checksum": "sha256:f5469feb95a6f6c504503ae8edb56ee9b07c1ab1131f7fa88be4f6f44505e7d9"
+        },
+        {
+          "file": "replay.jsonl",
+          "checksum": "sha256:c015c926febc5c9cf61c5faa1b48dd96af1b673c7837ce550e2165b3e80acef2",
+          "line_count": 1
         },
         {
           "file": "replay_command.txt",

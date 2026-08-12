@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 use frankensearch_core::{
     E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_ENV_JSON, E2E_ARTIFACT_REPLAY_COMMAND_TXT,
-    E2E_ARTIFACT_REPRO_LOCK, E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL, E2eOutcome, ExitStatus,
+    E2E_ARTIFACT_REPLAY_JSONL, E2E_ARTIFACT_REPRO_LOCK, E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL,
+    E2eOutcome, ExitStatus,
 };
 use frankensearch_fsfs::{
     CLI_E2E_SCHEMA_VERSION, CliE2eArtifactBundle, CliE2eRunConfig, CliE2eScenarioKind,
@@ -83,6 +84,10 @@ fn assert_manifest_contains_required_artifacts(artifact_files: &[&str]) {
     assert!(
         artifact_files.contains(&E2E_ARTIFACT_REPLAY_COMMAND_TXT),
         "manifest must list replay command artifact"
+    );
+    assert!(
+        artifact_files.contains(&E2E_ARTIFACT_REPLAY_JSONL),
+        "manifest must list replay.jsonl artifact"
     );
 }
 

@@ -36,6 +36,8 @@ pub const E2E_ARTIFACT_REPRO_LOCK: &str = "repro.lock";
 pub const E2E_ARTIFACT_ARTIFACTS_INDEX_JSON: &str = "artifacts_index.json";
 /// Mandatory replay command pointer for failed runs.
 pub const E2E_ARTIFACT_REPLAY_COMMAND_TXT: &str = "replay_command.txt";
+/// Canonical replay stream filename for deterministic e2e packs.
+pub const E2E_ARTIFACT_REPLAY_JSONL: &str = "replay.jsonl";
 /// Mandatory terminal transcript for failed ops/ui lanes.
 pub const E2E_ARTIFACT_TERMINAL_TRANSCRIPT_TXT: &str = "terminal_transcript.txt";
 
@@ -1755,6 +1757,7 @@ mod tests {
         assert_eq!(E2E_SCHEMA_ORACLE_REPORT, "e2e-oracle-report-v1");
         assert_eq!(E2E_SCHEMA_REPLAY, "e2e-replay-v1");
         assert_eq!(E2E_SCHEMA_SNAPSHOT_DIFF, "e2e-snapshot-diff-v1");
+        assert_eq!(E2E_ARTIFACT_REPLAY_JSONL, "replay.jsonl");
     }
 
     #[test]

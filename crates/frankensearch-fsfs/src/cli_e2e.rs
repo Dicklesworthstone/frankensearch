@@ -10,11 +10,11 @@ use std::collections::BTreeMap;
 use frankensearch_core::{
     ArtifactEmissionInput, ArtifactEntry, ClockMode, Correlation, DeterminismTier,
     E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_ENV_JSON, E2E_ARTIFACT_REPLAY_COMMAND_TXT,
-    E2E_ARTIFACT_REPRO_LOCK, E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL, E2E_SCHEMA_EVENT,
-    E2E_SCHEMA_MANIFEST, E2E_SCHEMA_REPLAY, E2eEnvelope, E2eEventType, E2eOutcome, E2eSeverity,
-    EventBody, ExitStatus, ManifestBody, ModelVersion, Platform, ReplayBody, ReplayEventType,
-    Suite, build_artifact_entries, render_artifacts_index, sha256_checksum, validate_envelope,
-    validate_event_envelope, validate_manifest_envelope,
+    E2E_ARTIFACT_REPLAY_JSONL, E2E_ARTIFACT_REPRO_LOCK, E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL,
+    E2E_SCHEMA_EVENT, E2E_SCHEMA_MANIFEST, E2E_SCHEMA_REPLAY, E2eEnvelope, E2eEventType,
+    E2eOutcome, E2eSeverity, EventBody, ExitStatus, ManifestBody, ModelVersion, Platform,
+    ReplayBody, ReplayEventType, Suite, build_artifact_entries, render_artifacts_index,
+    sha256_checksum, validate_envelope, validate_event_envelope, validate_manifest_envelope,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Number;
@@ -198,7 +198,7 @@ impl CliE2eArtifactBundle {
                 platform: config.platform.clone(),
                 clock_mode: ClockMode::Simulated,
                 tie_break_policy: "doc_id_lexical".to_owned(),
-                artifacts: artifact_entries(&replay_command, &events),
+                artifacts: artifact_entries(&replay_command, &events, &replay),
                 duration_ms: 250,
                 exit_status,
             },
@@ -245,7 +245,10 @@ impl CliE2eArtifactBundle {
             }
         }
 
-        let expected_artifacts = artifact_entries(&self.replay_command, &self.events);
+        if self.replay.is_empty() {
+            return Err("replay.jsonl must contain at least one envelope".to_owned());
+        }
+        let expected_artifacts = artifact_entries(&self.replay_command, &self.events, &self.replay);
         if self.manifest.body.artifacts != expected_artifacts {
             return Err(
                 "manifest artifact entries do not match the bundle's current payloads".to_owned(),
@@ -451,17 +454,27 @@ const fn scenario_exit_status(scenario: &CliE2eScenario) -> ExitStatus {
     }
 }
 
-fn artifact_entries(replay_command: &str, events: &[E2eEnvelope<EventBody>]) -> Vec<ArtifactEntry> {
-    let structured_events_jsonl = render_events_jsonl(events);
+fn artifact_entries(
+    replay_command: &str,
+    events: &[E2eEnvelope<EventBody>],
+    replay: &[E2eEnvelope<ReplayBody>],
+) -> Vec<ArtifactEntry> {
+    let structured_events_jsonl = render_envelopes_jsonl(events);
+    let replay_jsonl = render_envelopes_jsonl(replay);
     let env_json = cli_env_json_payload();
     let repro_lock = cli_repro_lock_payload(events.len(), replay_command);
-    #[allow(clippy::cast_possible_truncation)]
-    let line_count = u64::try_from(events.len()).expect("event count must fit in u64");
+    let event_line_count = u64::try_from(events.len()).expect("event count must fit in u64");
+    let replay_line_count = u64::try_from(replay.len()).expect("replay count must fit in u64");
     let mut entries = build_artifact_entries([
         ArtifactEmissionInput {
             file: E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL,
             bytes: structured_events_jsonl.as_bytes(),
-            line_count: Some(line_count),
+            line_count: Some(event_line_count),
+        },
+        ArtifactEmissionInput {
+            file: E2E_ARTIFACT_REPLAY_JSONL,
+            bytes: replay_jsonl.as_bytes(),
+            line_count: Some(replay_line_count),
         },
         ArtifactEmissionInput {
             file: E2E_ARTIFACT_ENV_JSON,
@@ -507,10 +520,12 @@ fn cli_repro_lock_payload(event_count: usize, replay_command: &str) -> String {
     )
 }
 
-fn render_events_jsonl(events: &[E2eEnvelope<EventBody>]) -> String {
-    events
+fn render_envelopes_jsonl<B: Serialize>(envelopes: &[E2eEnvelope<B>]) -> String {
+    envelopes
         .iter()
-        .map(|event| serde_json::to_string(event).expect("event envelope serialization must work"))
+        .map(|envelope| {
+            serde_json::to_string(envelope).expect("e2e envelope serialization must work")
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -622,7 +637,7 @@ mod tests {
 
     use frankensearch_core::{
         ArtifactEntry, E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_ENV_JSON,
-        E2E_ARTIFACT_REPLAY_COMMAND_TXT, E2E_ARTIFACT_REPRO_LOCK,
+        E2E_ARTIFACT_REPLAY_COMMAND_TXT, E2E_ARTIFACT_REPLAY_JSONL, E2E_ARTIFACT_REPRO_LOCK,
         E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL, E2eOutcome, render_artifacts_index, sha256_checksum,
     };
 
@@ -734,6 +749,106 @@ mod tests {
                 .expect_err("replay-body drift must fail closed"),
             "bundle does not match the deterministic artifact derivation for its scenario"
         );
+
+        let mut empty_replay =
+            super::CliE2eArtifactBundle::build(&config, &scenario, ExitStatus::Pass);
+        empty_replay.replay.clear();
+        assert_eq!(
+            empty_replay
+                .validate()
+                .expect_err("empty replay stream must fail closed"),
+            "replay.jsonl must contain at least one envelope"
+        );
+
+        let mut missing_replay =
+            super::CliE2eArtifactBundle::build(&config, &scenario, ExitStatus::Pass);
+        missing_replay
+            .manifest
+            .body
+            .artifacts
+            .retain(|artifact| artifact.file != E2E_ARTIFACT_REPLAY_JSONL);
+        assert_eq!(
+            missing_replay
+                .validate()
+                .expect_err("omitted replay.jsonl must fail closed"),
+            "manifest artifact entries do not match the bundle's current payloads"
+        );
+
+        let mut checksum_altered =
+            super::CliE2eArtifactBundle::build(&config, &scenario, ExitStatus::Pass);
+        let replay_slot = checksum_altered
+            .manifest
+            .body
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.file == E2E_ARTIFACT_REPLAY_JSONL)
+            .expect("replay.jsonl attested");
+        replay_slot.checksum =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
+        assert_eq!(
+            checksum_altered
+                .validate()
+                .expect_err("altered replay checksum must fail closed"),
+            "manifest artifact entries do not match the bundle's current payloads"
+        );
+
+        let mut line_count_altered =
+            super::CliE2eArtifactBundle::build(&config, &scenario, ExitStatus::Pass);
+        let replay_slot = line_count_altered
+            .manifest
+            .body
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.file == E2E_ARTIFACT_REPLAY_JSONL)
+            .expect("replay.jsonl attested");
+        replay_slot.line_count = Some(99);
+        assert_eq!(
+            line_count_altered
+                .validate()
+                .expect_err("altered replay line_count must fail closed"),
+            "manifest artifact entries do not match the bundle's current payloads"
+        );
+
+        let mut newline_padded =
+            super::CliE2eArtifactBundle::build(&config, &scenario, ExitStatus::Pass);
+        let replay_bytes = format!(
+            "{}\n",
+            super::render_envelopes_jsonl(&newline_padded.replay)
+        );
+        let replay_slot = newline_padded
+            .manifest
+            .body
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.file == E2E_ARTIFACT_REPLAY_JSONL)
+            .expect("replay.jsonl attested");
+        replay_slot.checksum = sha256_checksum(replay_bytes.as_bytes());
+        assert_eq!(
+            newline_padded
+                .validate()
+                .expect_err("trailing-newline replay bytes must fail closed"),
+            "manifest artifact entries do not match the bundle's current payloads"
+        );
+
+        let mut same_line_count_substitution =
+            super::CliE2eArtifactBundle::build(&config, &scenario, ExitStatus::Pass);
+        same_line_count_substitution.replay[0].body.seq = 99;
+        let substituted = super::render_envelopes_jsonl(&same_line_count_substitution.replay);
+        let replay_slot = same_line_count_substitution
+            .manifest
+            .body
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.file == E2E_ARTIFACT_REPLAY_JSONL)
+            .expect("replay.jsonl attested");
+        replay_slot.checksum = sha256_checksum(substituted.as_bytes());
+        replay_slot.line_count = Some(1);
+        assert_eq!(
+            same_line_count_substitution
+                .validate()
+                .expect_err("same-line-count payload substitution must fail closed"),
+            "bundle does not match the deterministic artifact derivation for its scenario"
+        );
     }
 
     #[test]
@@ -753,6 +868,7 @@ mod tests {
             .collect();
 
         assert!(artifact_files.contains(&"structured_events.jsonl"));
+        assert!(artifact_files.contains(&"replay.jsonl"));
         assert!(artifact_files.contains(&"env.json"));
         assert!(artifact_files.contains(&"repro.lock"));
         assert!(artifact_files.contains(&"artifacts_index.json"));
@@ -780,13 +896,32 @@ mod tests {
             .map(|artifact| (artifact.file.as_str(), artifact.checksum.as_str()))
             .collect();
 
-        let events_jsonl = super::render_events_jsonl(&bundle.events);
+        let events_jsonl = super::render_envelopes_jsonl(&bundle.events);
         let expected_events_checksum = sha256_checksum(events_jsonl.as_bytes());
         assert_eq!(
             artifact_checksums
                 .get(E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL)
                 .copied(),
             Some(expected_events_checksum.as_str())
+        );
+
+        let replay_jsonl = super::render_envelopes_jsonl(&bundle.replay);
+        assert!(
+            !replay_jsonl.is_empty() && !replay_jsonl.ends_with('\n'),
+            "replay.jsonl bytes must be nonempty and have no trailing newline"
+        );
+        let expected_replay_jsonl_checksum = sha256_checksum(replay_jsonl.as_bytes());
+        let replay_entry = bundle
+            .manifest
+            .body
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.file == E2E_ARTIFACT_REPLAY_JSONL)
+            .expect("replay.jsonl must be attested");
+        assert_eq!(replay_entry.checksum, expected_replay_jsonl_checksum);
+        assert_eq!(
+            replay_entry.line_count,
+            Some(u64::try_from(bundle.replay.len()).expect("replay count fits u64"))
         );
 
         let expected_replay_checksum = sha256_checksum(bundle.replay_command.as_bytes());
