@@ -5999,7 +5999,10 @@ mod tests {
             .resolve_heap(outcome.heap)
             .expect("resolve sidecar SIMD result");
         assert_eq!(actual, expected);
-        assert_eq!(actual[0].index, EXACT_RESIDUAL_LANES);
+        assert_eq!(
+            actual[0].index,
+            u32::try_from(EXACT_RESIDUAL_LANES).expect("residual lane count fits u32")
+        );
     }
 
     proptest! {
