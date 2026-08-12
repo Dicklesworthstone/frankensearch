@@ -138,15 +138,30 @@ struct LoadedBaseline {
 /// * duplicate — a repeated authority digest is refused before conversion;
 /// * wrong run/source — the pin's campaign run and source revision must equal
 ///   the evidence identity supplied by the caller.
+/// Returns the verified authorities AND a content-addressed evidence entry for
+/// the pin and every register file, in canonical order (pin first, then
+/// registers by sorted name).
+///
+/// The bytes are not discarded after verification on purpose. These are
+/// external trust inputs the ratchet decision depends on, so a decision that
+/// hashed the artifacts but not the authorities admitting them would archive an
+/// incomplete account of what it trusted. Returning them lets the caller
+/// attach them to the evaluation under arm-qualified roles.
 fn load_qg1_authority_set(
+    arm: &str,
     pin_path: &Path,
     authority_dir: &Path,
     evidence_run_id: &str,
     evidence_git_revision: &str,
-) -> Result<Vec<Qg1ExpectedAuthority>, Box<dyn Error>> {
+) -> Result<(Vec<Qg1ExpectedAuthority>, Vec<PerfEvidenceFile>), Box<dyn Error>> {
     use rustix::fs::{Mode, OFlags};
 
     let pin_bytes = read_no_follow(pin_path, MAX_TARGET_PIN_BYTES)?;
+    let mut evidence_files = vec![evidence(
+        &format!("{arm}-qg1-target-pin"),
+        pin_path,
+        &pin_bytes,
+    )];
     let pin: Qg1TargetPinV1 = serde_json::from_slice(&pin_bytes).map_err(|error| {
         format!(
             "QG-1 target pin {} does not parse: {error}",
@@ -252,6 +267,12 @@ fn load_qg1_authority_set(
             &format!("QG-1 authority register entry {name}"),
         )?;
 
+        evidence_files.push(evidence(
+            &format!("{arm}-qg1-authority-register:{name}"),
+            &authority_dir.join(name),
+            &bytes,
+        ));
+
         let entry = Qg1AuthorityRegisterEntryV1::from_verified_slice(&bytes)?;
         if !seen_digests.insert(entry.digest().to_owned()) {
             return Err(format!(
@@ -276,7 +297,7 @@ fn load_qg1_authority_set(
         )
         .into());
     }
-    Ok(authorities)
+    Ok((authorities, evidence_files))
 }
 
 /// A QG-1 target pin is a small fixed record: run identity, source revision,
@@ -576,21 +597,21 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
     // Each arm's authority set is resolved from its OWN pin/directory pair and
     // bound to that arm's evidence identity. The ratchet is handed the sets; it
     // never derives authority from the artifacts it is about to admit.
-    let baseline_authorities = resolve_arm_authorities(
+    let (baseline_authorities, baseline_authority_evidence) = resolve_arm_authorities(
         "baseline",
         args.baseline_target_pin.as_ref(),
         args.baseline_authority_dir.as_ref(),
         &baseline.run_id,
         &baseline.source_git_revision,
     )?;
-    let candidate_authorities = resolve_arm_authorities(
+    let (candidate_authorities, candidate_authority_evidence) = resolve_arm_authorities(
         "candidate",
         args.candidate_target_pin.as_ref(),
         args.candidate_authority_dir.as_ref(),
         &candidate.run_id,
         &candidate.source_git_revision,
     )?;
-    let rerun_authorities = match rerun.as_ref() {
+    let (rerun_authorities, rerun_authority_evidence) = match rerun.as_ref() {
         Some((artifact, _)) => resolve_arm_authorities(
             "rerun",
             args.rerun_target_pin.as_ref(),
@@ -598,7 +619,7 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
             &artifact.run_id,
             &artifact.source_git_revision,
         )?,
-        None => Vec::new(),
+        None => (Vec::new(), Vec::new()),
     };
     let qg1_authorities = PerfRatchetQg1AuthoritySets {
         baseline: baseline_authorities.iter().collect(),
@@ -626,6 +647,19 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
             evidence: evidence_files,
         },
     );
+
+    // Archive the trust inputs alongside the artifacts they admitted, in
+    // canonical arm order. Without this the decision record would hash every
+    // artifact it judged and none of the authorities that let it judge them.
+    evaluation
+        .evidence
+        .extend(baseline_authority_evidence.into_iter());
+    evaluation
+        .evidence
+        .extend(candidate_authority_evidence.into_iter());
+    evaluation
+        .evidence
+        .extend(rerun_authority_evidence.into_iter());
 
     let history_plan = plan_history_if_allowed(
         &args,
@@ -941,12 +975,12 @@ fn resolve_arm_authorities(
     authority_dir: Option<&PathBuf>,
     evidence_run_id: &str,
     evidence_git_revision: &str,
-) -> Result<Vec<Qg1ExpectedAuthority>, Box<dyn Error>> {
+) -> Result<(Vec<Qg1ExpectedAuthority>, Vec<PerfEvidenceFile>), Box<dyn Error>> {
     match (pin, authority_dir) {
         (Some(pin), Some(directory)) => {
-            load_qg1_authority_set(pin, directory, evidence_run_id, evidence_git_revision)
+            load_qg1_authority_set(arm, pin, directory, evidence_run_id, evidence_git_revision)
         }
-        (None, None) => Ok(Vec::new()),
+        (None, None) => Ok((Vec::new(), Vec::new())),
         (Some(_), None) => Err(format!("--{arm}-target-pin requires --{arm}-authority-dir").into()),
         (None, Some(_)) => Err(format!("--{arm}-authority-dir requires --{arm}-target-pin").into()),
     }
@@ -2547,5 +2581,74 @@ mod tests {
 
         args.output = directory.path().join("decision.json");
         assert!(validate_decision_output_is_separate(&args).is_err());
+    }
+
+    /// A pin without its register directory has nothing to admit, and a
+    /// register directory without its pin has no trust root. Accepting either
+    /// alone would let an arm present authorities no pre-timing pin named,
+    /// which is exactly the inference this path forbids.
+    #[test]
+    fn a_half_supplied_authority_pair_is_refused_per_arm() {
+        for arm in ["baseline", "candidate", "rerun"] {
+            let pin_only = resolve_arm_authorities(
+                arm,
+                Some(&PathBuf::from("pin.json")),
+                None,
+                "run-1",
+                "a".repeat(40).as_str(),
+            )
+            .expect_err("a pin without its authority directory must refuse");
+            assert!(
+                pin_only
+                    .to_string()
+                    .contains(&format!("--{arm}-authority-dir")),
+                "the refusal must name the missing flag, got: {pin_only}"
+            );
+
+            let dir_only = resolve_arm_authorities(
+                arm,
+                None,
+                Some(&PathBuf::from("authorities")),
+                "run-1",
+                "a".repeat(40).as_str(),
+            )
+            .expect_err("an authority directory without its pin must refuse");
+            assert!(
+                dir_only
+                    .to_string()
+                    .contains(&format!("--{arm}-target-pin")),
+                "the refusal must name the missing flag, got: {dir_only}"
+            );
+        }
+    }
+
+    /// Supplying neither flag is honest no-claim, not an error: the arm
+    /// contributes no QG-1 authority and no evidence rows, and downstream
+    /// admission fails closed on its own terms rather than here.
+    #[test]
+    fn an_arm_with_no_authority_inputs_contributes_nothing() {
+        let (authorities, evidence_files) =
+            resolve_arm_authorities("candidate", None, None, "run-1", "a".repeat(40).as_str())
+                .expect("absent authority inputs are honest no-claim");
+        assert!(authorities.is_empty());
+        assert!(
+            evidence_files.is_empty(),
+            "an arm that admitted nothing must not archive phantom evidence rows"
+        );
+    }
+
+    /// The loader must refuse a directory it cannot pin open, rather than
+    /// treating an unreadable or absent register directory as an empty one.
+    /// An empty admitted set would otherwise read as "no authorities needed".
+    #[test]
+    fn an_unopenable_authority_directory_is_refused_not_treated_as_empty() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let missing = directory.path().join("absent-authorities");
+        let pin = directory.path().join("pin.json");
+        std::fs::write(&pin, b"{}").expect("write a placeholder pin");
+        assert!(
+            load_qg1_authority_set("candidate", &pin, &missing, "run-1", &"a".repeat(40)).is_err(),
+            "an absent authority directory must refuse, never admit an empty set"
+        );
     }
 }
