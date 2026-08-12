@@ -436,16 +436,17 @@ fn paired_full_embed_sync_gate(
         },
     );
     let decidable = ab.decidable_against(&aa) && ab.decidable_against(&bb);
+    let no_claim = !fail_on_decidable_regression;
+    eprintln!(
+        "[full-embed-sync] comparison={comparison} distribution={label} AA={aa:?} BB={bb:?} AB={ab:?} \
+         decidable={decidable} no_claim={no_claim}"
+    );
     if fail_on_decidable_regression {
         assert!(
             !(decidable && ab.median > 1.0),
             "full embed_sync {comparison} regressed in {label}: A/A={aa:?}, B/B={bb:?}, A/B={ab:?}"
         );
     }
-    eprintln!(
-        "[full-embed-sync] comparison={comparison} distribution={label} AA={aa:?} BB={bb:?} AB={ab:?} \
-         decidable={decidable} no_claim=true"
-    );
 }
 
 fn bench_full_embed_sync(c: &mut Criterion) {
