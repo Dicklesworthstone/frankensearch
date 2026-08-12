@@ -22138,6 +22138,7 @@ mod tests {
 
     #[test]
     fn dropped_delta_seal_after_manifest_install_reconciles_exact_generation() {
+        let _pause_serial = crate::keeper::manifest_publish_pause_test_serial_guard();
         // This fixture intentionally pauses inside real blocking filesystem
         // choreography. A configured blocking pool keeps the executor free to
         // observe and release that checkpoint; the lightweight default test
@@ -22179,17 +22180,13 @@ mod tests {
                     engine_version: CURRENT_ENGINE_VERSION,
                 },
             ));
-            let pending = std::future::poll_fn(|task_cx| {
-                Poll::Ready(matches!(seal.as_mut().poll(task_cx), Poll::Pending))
-            })
-            .await;
-            assert!(
-                pending,
-                "Delta seal completed before the armed DirectorySynced checkpoint"
-            );
-            pause
-                .wait_until_reached(Duration::from_secs(2))
-                .expect("reach the bounded durable Delta-seal rendezvous");
+            crate::keeper::drive_manifest_publish_to_checkpoint_for_test(
+                &mut seal,
+                &pause,
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("reach the bounded durable Delta-seal rendezvous");
             drop(seal);
 
             assert!(
@@ -22279,6 +22276,7 @@ mod tests {
 
     #[test]
     fn live_commit_writer_reads_linearize_to_the_pinned_prepublication_view() {
+        let _pause_serial = crate::keeper::manifest_publish_pause_test_serial_guard();
         run_with_blocking_cx(|cx| async move {
             let directory = tempfile::tempdir().expect("temporary live-writer Keeper directory");
             let index = QuillIndex::create(&cx, directory.path(), deterministic_config())
@@ -22303,17 +22301,13 @@ mod tests {
                 crate::keeper::PublishCheckpoint::TempWritten,
             );
             let mut commit = Box::pin(index.commit(&cx));
-            let pending = std::future::poll_fn(|task_cx| {
-                Poll::Ready(matches!(commit.as_mut().poll(task_cx), Poll::Pending))
-            })
-            .await;
-            assert!(
-                pending,
-                "commit completed before the armed live-writer checkpoint"
-            );
-            pause
-                .wait_until_reached(Duration::from_secs(2))
-                .expect("reach bounded live-writer rendezvous");
+            crate::keeper::drive_manifest_publish_to_checkpoint_for_test(
+                &mut commit,
+                &pause,
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("reach bounded live-writer rendezvous");
 
             assert_eq!(
                 index
@@ -22375,6 +22369,7 @@ mod tests {
 
     #[test]
     fn dropped_ordinary_commit_requires_public_reconciliation_before_reads() {
+        let _pause_serial = crate::keeper::manifest_publish_pause_test_serial_guard();
         run_with_blocking_cx(|cx| async move {
             let directory = tempfile::tempdir().expect("temporary dropped-commit Keeper directory");
             let index = QuillIndex::create(&cx, directory.path(), deterministic_config())
@@ -22399,17 +22394,13 @@ mod tests {
                 crate::keeper::PublishCheckpoint::DirectorySynced,
             );
             let mut commit = Box::pin(index.commit(&cx));
-            let pending = std::future::poll_fn(|task_cx| {
-                Poll::Ready(matches!(commit.as_mut().poll(task_cx), Poll::Pending))
-            })
-            .await;
-            assert!(
-                pending,
-                "commit completed before the armed durable checkpoint"
-            );
-            pause
-                .wait_until_reached(Duration::from_secs(2))
-                .expect("reach bounded dropped-commit rendezvous");
+            crate::keeper::drive_manifest_publish_to_checkpoint_for_test(
+                &mut commit,
+                &pause,
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("reach bounded dropped-commit rendezvous");
             drop(commit);
 
             assert_public_authority_refuses_stale_publication(
@@ -22454,6 +22445,7 @@ mod tests {
 
     #[test]
     fn dropped_ordinary_delete_requires_public_reconciliation_before_reads() {
+        let _pause_serial = crate::keeper::manifest_publish_pause_test_serial_guard();
         run_with_blocking_cx(|cx| async move {
             let directory = tempfile::tempdir().expect("temporary dropped-delete Keeper directory");
             let index = QuillIndex::create(&cx, directory.path(), deterministic_config())
@@ -22482,17 +22474,13 @@ mod tests {
                 crate::keeper::PublishCheckpoint::DirectorySynced,
             );
             let mut delete = Box::pin(index.delete_document(&cx, "dropped-delete"));
-            let pending = std::future::poll_fn(|task_cx| {
-                Poll::Ready(matches!(delete.as_mut().poll(task_cx), Poll::Pending))
-            })
-            .await;
-            assert!(
-                pending,
-                "delete completed before the armed durable checkpoint"
-            );
-            pause
-                .wait_until_reached(Duration::from_secs(2))
-                .expect("reach bounded dropped-delete rendezvous");
+            crate::keeper::drive_manifest_publish_to_checkpoint_for_test(
+                &mut delete,
+                &pause,
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("reach bounded dropped-delete rendezvous");
             drop(delete);
 
             assert_public_authority_refuses_stale_publication(
@@ -22537,6 +22525,7 @@ mod tests {
 
     #[test]
     fn dropped_ordinary_compaction_requires_public_reconciliation_before_reads() {
+        let _pause_serial = crate::keeper::manifest_publish_pause_test_serial_guard();
         run_with_blocking_cx(|cx| async move {
             let directory =
                 tempfile::tempdir().expect("temporary dropped-compaction Keeper directory");
@@ -22575,17 +22564,13 @@ mod tests {
                 crate::keeper::PublishCheckpoint::DirectorySynced,
             );
             let mut compact = Box::pin(index.compact(&cx, CompactionPolicy::default()));
-            let pending = std::future::poll_fn(|task_cx| {
-                Poll::Ready(matches!(compact.as_mut().poll(task_cx), Poll::Pending))
-            })
-            .await;
-            assert!(
-                pending,
-                "compaction completed before the armed durable checkpoint"
-            );
-            pause
-                .wait_until_reached(Duration::from_secs(2))
-                .expect("reach bounded dropped-compaction rendezvous");
+            crate::keeper::drive_manifest_publish_to_checkpoint_for_test(
+                &mut compact,
+                &pause,
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("reach bounded dropped-compaction rendezvous");
             drop(compact);
 
             assert_public_authority_refuses_stale_publication(&index, &cx, "shared", "q1-ob2a-005")
@@ -24914,6 +24899,7 @@ mod tests {
 
     #[test]
     fn durable_compaction_crash_boundary_keeps_old_manifest_authoritative() {
+        let _pause_serial = crate::keeper::manifest_publish_pause_test_serial_guard();
         run_with_blocking_cx(|cx| async move {
             let directory = tempfile::tempdir().expect("temporary Q1-OB4 Keeper directory");
             let documents = q1_ob2a_documents();
@@ -24976,19 +24962,13 @@ mod tests {
                 crate::keeper::PublishCheckpoint::TempWritten,
             );
             let mut compact = Box::pin(index.compact(&cx, CompactionPolicy::default()));
-            std::future::poll_fn(|task_cx| {
-                if pause.is_reached() {
-                    return Poll::Ready(());
-                }
-                match compact.as_mut().poll(task_cx) {
-                    Poll::Pending => {
-                        task_cx.waker().wake_by_ref();
-                        Poll::Pending
-                    }
-                    Poll::Ready(_) => panic!("compaction completed before crash checkpoint"),
-                }
-            })
-            .await;
+            crate::keeper::drive_manifest_publish_to_checkpoint_for_test(
+                &mut compact,
+                &pause,
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("reach bounded durable compaction crash rendezvous");
 
             let on_disk = Manifest::from_bytes(
                 &std::fs::read(directory.path().join("MANIFEST"))

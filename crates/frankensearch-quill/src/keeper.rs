@@ -11625,9 +11625,18 @@ pub(crate) enum PublishCheckpoint {
 #[derive(Clone)]
 struct ManifestPublishPause {
     checkpoint: PublishCheckpoint,
-    reached: Arc<std::sync::atomic::AtomicBool>,
-    arrived: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    event: Arc<std::sync::Mutex<ManifestPublishCheckpointEvent>>,
     released: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+/// Test-only checkpoint state shared by the blocking publisher and its async
+/// observer. The observer retains a task waker so a blocking filesystem phase
+/// can resume the test executor without a scheduler-yield assumption.
+#[cfg(test)]
+#[derive(Default)]
+struct ManifestPublishCheckpointEvent {
+    reached: bool,
+    waker: Option<std::task::Waker>,
 }
 
 /// One-shot control for pausing real MANIFEST choreography in cancellation
@@ -11636,8 +11645,7 @@ struct ManifestPublishPause {
 pub(crate) struct ManifestPublishPauseControl {
     directory: PathBuf,
     checkpoint: PublishCheckpoint,
-    reached: Arc<std::sync::atomic::AtomicBool>,
-    arrived: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    event: Arc<std::sync::Mutex<ManifestPublishCheckpointEvent>>,
     released: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 }
 
@@ -11646,9 +11654,29 @@ static MANIFEST_PUBLISH_PAUSES: OnceLock<
     std::sync::Mutex<BTreeMap<PathBuf, ManifestPublishPause>>,
 > = OnceLock::new();
 
+/// Serializes tests that arm the global MANIFEST publisher pause. The
+/// production publisher itself is process-serialized; this test-only guard
+/// prevents independently scheduled test runtimes from waiting behind a
+/// different paused publisher before they can reach their own checkpoint.
+#[cfg(test)]
+static MANIFEST_PUBLISH_PAUSE_TEST_SERIAL: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+
 #[cfg(test)]
 fn manifest_publish_pauses() -> &'static std::sync::Mutex<BTreeMap<PathBuf, ManifestPublishPause>> {
     MANIFEST_PUBLISH_PAUSES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// Hold the shared test-only MANIFEST pause serialization guard.
+///
+/// Callers must acquire this before arming a pause and keep it until after the
+/// publisher is released, so every paused public-operation test shares one
+/// deterministic rendezvous lane.
+#[cfg(test)]
+pub(crate) fn manifest_publish_pause_test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
+    MANIFEST_PUBLISH_PAUSE_TEST_SERIAL
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Arm one real MANIFEST publisher checkpoint for a single directory.
@@ -11658,13 +11686,13 @@ pub(crate) fn pause_manifest_publish_at_checkpoint_for_test(
     checkpoint: PublishCheckpoint,
 ) -> ManifestPublishPauseControl {
     let directory = normalize_publish_directory(directory.to_path_buf());
-    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let arrived = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let event = Arc::new(std::sync::Mutex::new(
+        ManifestPublishCheckpointEvent::default(),
+    ));
     let released = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let pause = ManifestPublishPause {
         checkpoint,
-        reached: Arc::clone(&reached),
-        arrived: Arc::clone(&arrived),
+        event: Arc::clone(&event),
         released: Arc::clone(&released),
     };
     let previous = manifest_publish_pauses()
@@ -11678,51 +11706,31 @@ pub(crate) fn pause_manifest_publish_at_checkpoint_for_test(
     ManifestPublishPauseControl {
         directory,
         checkpoint,
-        reached,
-        arrived,
+        event,
         released,
     }
 }
 
 #[cfg(test)]
 impl ManifestPublishPauseControl {
-    /// Whether the blocking publisher has completed the armed checkpoint.
-    pub(crate) fn is_reached(&self) -> bool {
-        self.reached.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// Wait for the blocked filesystem choreography to signal its real
-    /// checkpoint, with a wall-clock diagnostic bound rather than scheduler
-    /// polling. This remains test-only and never participates in production
-    /// publication.
-    pub(crate) fn wait_until_reached(&self, timeout: Duration) -> Result<(), String> {
-        let deadline = std::time::Instant::now()
-            .checked_add(timeout)
-            .ok_or_else(|| "MANIFEST checkpoint wait timeout overflowed".to_owned())?;
-        let (arrived, wake) = self.arrived.as_ref();
-        let mut arrived = arrived
+    /// Poll the checkpoint event, retaining this task's waker until the real
+    /// blocking choreography completes the checkpoint.
+    fn poll_reached(&self, task_cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        let mut event = self
+            .event
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while !*arrived {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(format!(
-                    "publication did not reach {:?} within {timeout:?}",
-                    self.checkpoint
-                ));
-            }
-            let (next, result) = wake
-                .wait_timeout(arrived, remaining)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            arrived = next;
-            if result.timed_out() && !*arrived {
-                return Err(format!(
-                    "publication did not reach {:?} within {timeout:?}",
-                    self.checkpoint
-                ));
-            }
+        if event.reached {
+            return std::task::Poll::Ready(());
         }
-        Ok(())
+        if !event
+            .waker
+            .as_ref()
+            .is_some_and(|waker| waker.will_wake(task_cx.waker()))
+        {
+            event.waker = Some(task_cx.waker().clone());
+        }
+        std::task::Poll::Pending
     }
 
     /// Release the blocked choreography. Calling this more than once is safe.
@@ -11746,6 +11754,48 @@ impl Drop for ManifestPublishPauseControl {
     }
 }
 
+/// Co-poll a real public publication with its armed filesystem checkpoint.
+///
+/// Publication can await earlier blocking preflight work before the pauseable
+/// choreography. This helper therefore keeps polling the whole future while
+/// also waiting on the checkpoint's registered waker. The timeout is an
+/// asupersync timer diagnostic rather than a synchronous wait that would park
+/// the current-thread executor and suppress the preflight wake-up.
+#[cfg(test)]
+pub(crate) async fn drive_manifest_publish_to_checkpoint_for_test<F: std::future::Future>(
+    publish: &mut std::pin::Pin<Box<F>>,
+    pause: &ManifestPublishPauseControl,
+    timeout: Duration,
+) -> Result<(), String> {
+    let rendezvous = std::future::poll_fn(|task_cx| {
+        if pause.poll_reached(task_cx).is_ready() {
+            return std::task::Poll::Ready(Ok(()));
+        }
+
+        match publish.as_mut().poll(task_cx) {
+            std::task::Poll::Ready(_) => std::task::Poll::Ready(Err(format!(
+                "publication completed before the armed {:?} checkpoint",
+                pause.checkpoint
+            ))),
+            std::task::Poll::Pending => {
+                if pause.poll_reached(task_cx).is_ready() {
+                    std::task::Poll::Ready(Ok(()))
+                } else {
+                    std::task::Poll::Pending
+                }
+            }
+        }
+    });
+
+    match asupersync::time::timeout(asupersync::time::wall_now(), timeout, rendezvous).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "publication did not reach {:?} within {timeout:?}",
+            pause.checkpoint
+        )),
+    }
+}
+
 #[cfg(test)]
 fn observe_manifest_publish_checkpoint_for_test(directory: &Path, checkpoint: PublishCheckpoint) {
     let pause = manifest_publish_pauses()
@@ -11757,14 +11807,17 @@ fn observe_manifest_publish_checkpoint_for_test(directory: &Path, checkpoint: Pu
     let Some(pause) = pause else {
         return;
     };
-    pause
-        .reached
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    let (arrived, arrived_wake) = pause.arrived.as_ref();
-    *arrived
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-    arrived_wake.notify_all();
+    let task_waker = {
+        let mut event = pause
+            .event
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        event.reached = true;
+        event.waker.take()
+    };
+    if let Some(task_waker) = task_waker {
+        task_waker.wake();
+    }
     let (released, wake) = pause.released.as_ref();
     let mut released = released
         .lock()
@@ -20921,33 +20974,9 @@ mod tests {
     /// an OS directory fsync.
     const DURABLE_PUBLISH_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(2);
 
-    /// Drive the public publisher to its existing durable checkpoint.
-    ///
-    /// One poll starts the real publisher. Its dedicated blocking lane then
-    /// signals the armed checkpoint through a condition-variable event. A
-    /// completion before that checkpoint or the wall-clock bound is a
-    /// diagnostic failure, never a self-waking hang.
-    async fn drive_publish_to_durable_checkpoint<F: std::future::Future>(
-        publish: &mut std::pin::Pin<Box<F>>,
-        pause: &ManifestPublishPauseControl,
-    ) -> Result<(), String> {
-        let pending = std::future::poll_fn(|task_cx| {
-            std::task::Poll::Ready(matches!(
-                std::future::Future::poll(publish.as_mut(), task_cx),
-                std::task::Poll::Pending
-            ))
-        })
-        .await;
-        if !pending {
-            return Err(
-                "publication completed before the armed DirectorySynced checkpoint".to_owned(),
-            );
-        }
-        pause.wait_until_reached(DURABLE_PUBLISH_CHECKPOINT_TIMEOUT)
-    }
-
     #[test]
     fn dropped_publish_future_after_durable_install_advances_the_next_publication() -> TestResult {
+        let _pause_serial = manifest_publish_pause_test_serial_guard();
         let index = tempdir()?;
         let directory = index.path().to_path_buf();
         run_with_blocking_cx(move |cx| async move {
@@ -20975,9 +21004,13 @@ mod tests {
                 PublishCheckpoint::DirectorySynced,
             );
             let mut publish = Box::pin(writer.publish(&cx, &successor));
-            drive_publish_to_durable_checkpoint(&mut publish, &pause)
-                .await
-                .expect("reach the bounded durable-publish rendezvous");
+            drive_manifest_publish_to_checkpoint_for_test(
+                &mut publish,
+                &pause,
+                DURABLE_PUBLISH_CHECKPOINT_TIMEOUT,
+            )
+            .await
+            .expect("reach the bounded durable-publish rendezvous");
             drop(publish);
             pause.release();
 
@@ -21040,6 +21073,7 @@ mod tests {
     #[test]
     fn abandoned_publication_is_adopted_by_its_identical_retry_and_by_reconciliation() -> TestResult
     {
+        let _pause_serial = manifest_publish_pause_test_serial_guard();
         let index = tempdir()?;
         let directory = index.path().to_path_buf();
         run_with_blocking_cx(move |cx| async move {
@@ -21056,9 +21090,13 @@ mod tests {
                 PublishCheckpoint::DirectorySynced,
             );
             let mut publish = Box::pin(writer.publish(&cx, &second));
-            drive_publish_to_durable_checkpoint(&mut publish, &pause)
-                .await
-                .expect("reach the bounded durable-publish rendezvous");
+            drive_manifest_publish_to_checkpoint_for_test(
+                &mut publish,
+                &pause,
+                DURABLE_PUBLISH_CHECKPOINT_TIMEOUT,
+            )
+            .await
+            .expect("reach the bounded durable-publish rendezvous");
             drop(publish);
             pause.release();
 
@@ -21091,9 +21129,13 @@ mod tests {
                 PublishCheckpoint::DirectorySynced,
             );
             let mut publish = Box::pin(writer.publish(&cx, &third));
-            drive_publish_to_durable_checkpoint(&mut publish, &pause)
-                .await
-                .expect("reach the bounded durable-publish rendezvous");
+            drive_manifest_publish_to_checkpoint_for_test(
+                &mut publish,
+                &pause,
+                DURABLE_PUBLISH_CHECKPOINT_TIMEOUT,
+            )
+            .await
+            .expect("reach the bounded durable-publish rendezvous");
             drop(publish);
             pause.release();
 
