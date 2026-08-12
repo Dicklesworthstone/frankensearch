@@ -547,6 +547,17 @@ pub enum KeeperError {
         /// Last representable generation.
         current: u64,
     },
+    /// The retained writer view may lag a durable publication whose future was abandoned.
+    #[error(
+        "Keeper snapshot requires reconciliation: retained generation {retained_generation}, \
+         abandoned proposed generation {proposed_generation}"
+    )]
+    PublicationReconciliationRequired {
+        /// Generation in the retained, non-authoritative view.
+        retained_generation: u64,
+        /// Generation that the abandoned future may have made durable.
+        proposed_generation: u64,
+    },
     /// A proposed generation would roll back durable index identity or state.
     #[error("invalid manifest transition: {detail}")]
     InvalidTransition {
@@ -3971,15 +3982,33 @@ impl KeeperWriter {
         })
     }
 
-    /// Current immutable reader view held by this writer.
+    /// Return this writer's current authoritative immutable reader view.
     ///
-    /// This view is never ahead of durable authority, but it can lag it: a
-    /// publication future dropped after its generation became durable leaves
-    /// the successor uninstalled here. [`Self::publication_awaits_reconciliation`]
-    /// reports that state and [`Self::reconcile_publication`] resolves it; every
-    /// mutating entry point resolves it before reading this view as authority.
+    /// A dropped [`Self::publish`] future can leave a durable successor on disk
+    /// before this writer refreshes its retained view. In that state this method
+    /// fails closed; call [`Self::reconcile_publication`] and retry instead of
+    /// treating the retained generation as authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeeperError::PublicationReconciliationRequired`] when a prior
+    /// publication must be reconciled before this view can be used as authority.
+    pub fn snapshot(&self) -> Result<&KeeperSnapshot, KeeperError> {
+        let Some(pending) = self.pending_publication else {
+            return Ok(&self.snapshot);
+        };
+        Err(KeeperError::PublicationReconciliationRequired {
+            retained_generation: self.snapshot.loaded_manifest().manifest.generation,
+            proposed_generation: pending.proposed_generation,
+        })
+    }
+
+    /// Retained writer view for crate-internal bookkeeping only.
+    ///
+    /// This is deliberately not a public authority reader. In particular, it
+    /// can lag disk while [`Self::publication_awaits_reconciliation`] is true.
     #[must_use]
-    pub const fn snapshot(&self) -> &KeeperSnapshot {
+    pub(crate) const fn retained_snapshot_for_bookkeeping(&self) -> &KeeperSnapshot {
         &self.snapshot
     }
 
@@ -4007,7 +4036,7 @@ impl KeeperWriter {
     /// reconciliation cannot be mistaken for an installed successor.
     pub async fn reconcile_publication(&mut self, cx: &Cx) -> Result<&KeeperSnapshot, KeeperError> {
         self.reconcile_pending_publication(cx).await?;
-        Ok(&self.snapshot)
+        Ok(self.retained_snapshot_for_bookkeeping())
     }
 
     /// Adopt the durable generation an abandoned publication may have
@@ -4076,7 +4105,7 @@ impl KeeperWriter {
         if self.reconcile_pending_publication(cx).await?
             && manifest_matches_proposal(&self.snapshot.loaded_manifest().manifest, manifest)
         {
-            return Ok(&self.snapshot);
+            return Ok(self.retained_snapshot_for_bookkeeping());
         }
         validate_manifest_successor(&self.snapshot.loaded_manifest().manifest, manifest)?;
         let directory = self.admission.directory.clone();
@@ -4134,7 +4163,7 @@ impl KeeperWriter {
         if let Err(error) = publish_result {
             if self.reconcile_manifest_proposal(cx, manifest).await? {
                 self.pending_publication = None;
-                return Ok(&self.snapshot);
+                return Ok(self.retained_snapshot_for_bookkeeping());
             }
             // The proposal did not win, but recovery may still have advanced
             // durable authority past the retained snapshot. Keep the marker so
@@ -4143,11 +4172,9 @@ impl KeeperWriter {
             return Err(error);
         }
         self.admission.ensure_directory_identity()?;
-        #[cfg(test)]
-        await_publish_refresh_park_for_test(&directory).await;
         self.snapshot = open_snapshot_blocking(directory, self.snapshot.schema()).await?;
         self.pending_publication = None;
-        Ok(&self.snapshot)
+        Ok(self.retained_snapshot_for_bookkeeping())
     }
 
     async fn reconcile_manifest_proposal(
@@ -4405,104 +4432,6 @@ impl KeeperWriter {
         })
         .await
     }
-}
-
-/// One-shot park for the seam between a durable MANIFEST publication and the
-/// retained-snapshot refresh that installs it.
-///
-/// [`pause_manifest_publish_at_checkpoint_for_test`] blocks a publisher thread
-/// inside filesystem choreography; this parks the owning future itself, which
-/// is the only way a test can drop `KeeperWriter::publish` exactly after
-/// generation N+1 is durable and before the successor snapshot is assigned.
-#[cfg(test)]
-struct PublishRefreshPark {
-    reached: std::sync::atomic::AtomicBool,
-    released: std::sync::atomic::AtomicBool,
-}
-
-#[cfg(test)]
-static PUBLISH_REFRESH_PARKS: OnceLock<
-    std::sync::Mutex<BTreeMap<PathBuf, Arc<PublishRefreshPark>>>,
-> = OnceLock::new();
-
-#[cfg(test)]
-fn publish_refresh_parks() -> &'static std::sync::Mutex<BTreeMap<PathBuf, Arc<PublishRefreshPark>>>
-{
-    PUBLISH_REFRESH_PARKS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
-}
-
-/// Handle for one armed post-publication refresh park.
-#[cfg(test)]
-struct PublishRefreshParkControl {
-    directory: PathBuf,
-    park: Arc<PublishRefreshPark>,
-}
-
-/// Arm the post-publication refresh park for a single directory.
-#[cfg(test)]
-fn park_publish_refresh_for_test(directory: &Path) -> PublishRefreshParkControl {
-    let directory = normalize_publish_directory(directory.to_path_buf());
-    let park = Arc::new(PublishRefreshPark {
-        reached: std::sync::atomic::AtomicBool::new(false),
-        released: std::sync::atomic::AtomicBool::new(false),
-    });
-    let previous = publish_refresh_parks()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(directory.clone(), Arc::clone(&park));
-    assert!(
-        previous.is_none(),
-        "only one publication refresh park may be armed per directory"
-    );
-    PublishRefreshParkControl { directory, park }
-}
-
-#[cfg(test)]
-impl PublishRefreshParkControl {
-    /// Whether a publication future is parked at the refresh seam.
-    fn is_reached(&self) -> bool {
-        self.park.reached.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// Disarm the park and release any parked future. Repeated calls are safe.
-    fn release(&self) {
-        publish_refresh_parks()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.directory);
-        self.park
-            .released
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-#[cfg(test)]
-impl Drop for PublishRefreshParkControl {
-    fn drop(&mut self) {
-        self.release();
-    }
-}
-
-#[cfg(test)]
-async fn await_publish_refresh_park_for_test(directory: &Path) {
-    let park = publish_refresh_parks()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(directory)
-        .map(Arc::clone);
-    let Some(park) = park else {
-        return;
-    };
-    park.reached
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    std::future::poll_fn(move |task_cx| {
-        if park.released.load(std::sync::atomic::Ordering::SeqCst) {
-            return std::task::Poll::Ready(());
-        }
-        task_cx.waker().wake_by_ref();
-        std::task::Poll::Pending
-    })
-    .await;
 }
 
 struct ConcatMergeArtifact {
@@ -14920,7 +14849,7 @@ mod tests {
                 .await
                 .map_err(|error| error.to_string())?;
             let next = writer
-                .snapshot()
+                .retained_snapshot_for_bookkeeping()
                 .next_manifest()
                 .map_err(|error| error.to_string())?;
             writer
@@ -16162,7 +16091,14 @@ mod tests {
                 .publish(&cx, &durable_test_manifest(3, Vec::new()))
                 .await
                 .expect("retry durable generation three");
-            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 3);
+            assert_eq!(
+                writer
+                    .retained_snapshot_for_bookkeeping()
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                3
+            );
             assert_eq!(
                 std::fs::read(&retired).expect("retain first retirement artifact"),
                 retired_bytes
@@ -18149,19 +18085,22 @@ mod tests {
             assert!(original.is_live(0), "older mmap snapshot stays visible");
 
             let high_watermark = writer
-                .snapshot()
+                .retained_snapshot_for_bookkeeping()
                 .loaded_manifest()
                 .manifest
                 .docid_high_watermark;
             let segment_paths = writer
-                .snapshot()
+                .retained_snapshot_for_bookkeeping()
                 .segments()
                 .iter()
                 .map(|segment| segment.path().to_path_buf())
                 .collect::<Vec<_>>();
-            let mut empty = writer.snapshot().next_manifest().expect("empty successor");
+            let mut empty = writer
+                .retained_snapshot_for_bookkeeping()
+                .next_manifest()
+                .expect("empty successor");
             writer
-                .snapshot()
+                .retained_snapshot_for_bookkeeping()
                 .delete_all(&mut empty)
                 .expect("stage delete_all");
             assert!(empty.segments.is_empty());
@@ -18336,7 +18275,10 @@ mod tests {
                 .await
                 .expect("open writer");
             let before = std::fs::read(&manifest_path).expect("read initial manifest");
-            let mut proposed = writer.snapshot().next_manifest().expect("next generation");
+            let mut proposed = writer
+                .retained_snapshot_for_bookkeeping()
+                .next_manifest()
+                .expect("next generation");
             assert!(
                 proposed.segments[0]
                     .tombstones
@@ -18357,7 +18299,14 @@ mod tests {
                 before,
                 "preflight rejection must leave the current MANIFEST untouched"
             );
-            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 1);
+            assert_eq!(
+                writer
+                    .retained_snapshot_for_bookkeeping()
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                1
+            );
             assert_eq!(
                 KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)
                     .expect("reopen prior snapshot")
@@ -18997,7 +18946,7 @@ mod tests {
                 .await
                 .map_err(|error| error.to_string())?;
             if !writer
-                .snapshot()
+                .retained_snapshot_for_bookkeeping()
                 .loaded_manifest()
                 .manifest
                 .segments
@@ -19008,11 +18957,11 @@ mod tests {
             }
 
             let mut publish_two = writer
-                .snapshot()
+                .retained_snapshot_for_bookkeeping()
                 .next_manifest()
                 .map_err(|error| error.to_string())?;
             writer
-                .snapshot()
+                .retained_snapshot_for_bookkeeping()
                 .delete_all(&mut publish_two)
                 .map_err(|error| error.to_string())?;
             publish_two.last_publish_unix_s = 0;
@@ -19058,7 +19007,7 @@ mod tests {
             }
 
             let mut publish_three = writer
-                .snapshot()
+                .retained_snapshot_for_bookkeeping()
                 .next_manifest()
                 .map_err(|error| error.to_string())?;
             publish_three.last_publish_unix_s = 0;
@@ -19084,7 +19033,7 @@ mod tests {
             let third_publish_floor = segment_unreachability_floor_at(
                 &directory_file,
                 &directory,
-                writer.snapshot(),
+                writer.retained_snapshot_for_bookkeeping(),
                 SystemTime::now(),
             )
             .map_err(|error| error.to_string())?
@@ -19102,7 +19051,7 @@ mod tests {
 
             std::thread::sleep(Duration::from_millis(10));
             let mut publish_four = writer
-                .snapshot()
+                .retained_snapshot_for_bookkeeping()
                 .next_manifest()
                 .map_err(|error| error.to_string())?;
             publish_four.last_publish_unix_s = 0;
@@ -19115,7 +19064,7 @@ mod tests {
             let fourth_publish_floor = segment_unreachability_floor_at(
                 &directory_file,
                 &directory,
-                writer.snapshot(),
+                writer.retained_snapshot_for_bookkeeping(),
                 SystemTime::now(),
             )
             .map_err(|error| error.to_string())?
@@ -20252,6 +20201,19 @@ mod tests {
             .expect("test runtime produced a result")
     }
 
+    fn run_with_blocking_cx<F, Fut>(operation: F)
+    where
+        F: FnOnce(Cx) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let cx = Cx::for_testing();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 4)
+            .build()
+            .expect("build test runtime with a blocking pool");
+        runtime.block_on(operation(cx));
+    }
+
     #[cfg(unix)]
     struct WriterChild {
         child: Option<std::process::Child>,
@@ -20790,7 +20752,14 @@ mod tests {
                 .await
                 .map_err(|error| error.to_string())?;
             assert!(!directory.join("gen-2.claim").exists());
-            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 2);
+            assert_eq!(
+                writer
+                    .retained_snapshot_for_bookkeeping()
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                2
+            );
             drop(writer);
             Ok(())
         });
@@ -20806,14 +20775,28 @@ mod tests {
             let mut writer = KeeperWriter::open(&cx, &directory, DEFAULT_SCHEMA)
                 .await
                 .map_err(|error| error.to_string())?;
-            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 2);
+            assert_eq!(
+                writer
+                    .retained_snapshot_for_bookkeeping()
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                2
+            );
             assert!(!directory.join(".tmp-manifest-3").exists());
             assert!(!directory.join("gen-3.claim").exists());
             writer
                 .publish(&cx, &Manifest::empty(3, schema_id, 0))
                 .await
                 .map_err(|error| error.to_string())?;
-            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 3);
+            assert_eq!(
+                writer
+                    .retained_snapshot_for_bookkeeping()
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                3
+            );
             Ok(())
         });
         recovered.map_err(io::Error::other)?;
@@ -20826,54 +20809,86 @@ mod tests {
         Ok(())
     }
 
-    /// Drive `publish` until the armed refresh park holds the owning future,
-    /// which happens only after the real publisher made generation N+1 durable.
+    /// A deterministic upper bound for reaching the real durable-publish seam.
     ///
-    /// Panics instead of returning if the publication completes: a future that
-    /// finished installed its snapshot, so the hostile drop below would prove
-    /// nothing.
-    async fn drive_publish_to_refresh_park<F: std::future::Future>(
+    /// The bound prevents a regression from turning this hostile-drop probe
+    /// into an indefinitely self-waking test. The production path reaches the
+    /// existing `DirectorySynced` checkpoint after its blocking publisher has
+    /// durably installed the new MANIFEST.
+    const MAX_DURABLE_PUBLISH_CHECKPOINT_POLLS: usize = 256;
+
+    /// Drive the public publisher to its existing durable checkpoint.
+    ///
+    /// The bounded poll loop is intentionally a test-only diagnostic
+    /// rendezvous: a completion before the checkpoint or exhaustion of the
+    /// bound is a deterministic test failure, never a hang.
+    async fn drive_publish_to_durable_checkpoint<F: std::future::Future>(
         publish: &mut std::pin::Pin<Box<F>>,
-        park: &PublishRefreshParkControl,
-    ) {
-        std::future::poll_fn(|task_cx| {
-            if park.is_reached() {
-                return std::task::Poll::Ready(());
+        pause: &ManifestPublishPauseControl,
+    ) -> Result<(), String> {
+        for _ in 1..=MAX_DURABLE_PUBLISH_CHECKPOINT_POLLS {
+            if pause.is_reached() {
+                return Ok(());
             }
-            match std::future::Future::poll(publish.as_mut(), task_cx) {
-                std::task::Poll::Pending => {
-                    task_cx.waker().wake_by_ref();
+            let pending = std::future::poll_fn(|task_cx| {
+                std::task::Poll::Ready(matches!(
+                    std::future::Future::poll(publish.as_mut(), task_cx),
                     std::task::Poll::Pending
-                }
-                std::task::Poll::Ready(_) => {
-                    panic!("publication completed before the armed refresh seam")
-                }
+                ))
+            })
+            .await;
+            if !pending {
+                return Err(
+                    "publication completed before the armed DirectorySynced checkpoint".to_owned(),
+                );
             }
-        })
-        .await;
+            // Let the dedicated blocking lane make observable progress before
+            // consuming another virtual poll from the fixed diagnostic budget.
+            yield_now().await;
+            if pause.is_reached() {
+                return Ok(());
+            }
+        }
+        Err(format!(
+            "publication did not reach DirectorySynced within \
+             {MAX_DURABLE_PUBLISH_CHECKPOINT_POLLS} bounded polls"
+        ))
     }
 
     #[test]
     fn dropped_publish_future_after_durable_install_advances_the_next_publication() -> TestResult {
         let index = tempdir()?;
         let directory = index.path().to_path_buf();
-        run_with_test_cx(move |cx| async move {
+        run_with_blocking_cx(move |cx| async move {
             let mut writer = KeeperWriter::create(&cx, &directory, DEFAULT_SCHEMA)
                 .await
                 .expect("create genesis index");
             let schema_id = DEFAULT_SCHEMA.schema_id().expect("default schema identity");
-            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 1);
+            assert_eq!(
+                writer
+                    .snapshot()
+                    .expect("fresh writer snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                1
+            );
             assert!(!writer.publication_awaits_reconciliation());
 
-            // Let the real durable publication of generation 2 complete, then
-            // abandon the future at the exact seam before it can assign the
-            // successor snapshot.
-            let park = park_publish_refresh_for_test(&directory);
+            // Use the pre-existing production choreography checkpoint: after
+            // its directory fsync generation 2 is durable, but the future has
+            // not yet resumed to install its refreshed retained snapshot.
             let successor = Manifest::empty(2, schema_id, 0);
+            let pause = pause_manifest_publish_at_checkpoint_for_test(
+                &directory,
+                PublishCheckpoint::DirectorySynced,
+            );
             let mut publish = Box::pin(writer.publish(&cx, &successor));
-            drive_publish_to_refresh_park(&mut publish, &park).await;
+            drive_publish_to_durable_checkpoint(&mut publish, &pause)
+                .await
+                .expect("reach the bounded durable-publish rendezvous");
             drop(publish);
-            drop(park);
+            pause.release();
 
             let installed = Manifest::from_bytes(
                 &std::fs::read(directory.join("MANIFEST")).expect("read installed MANIFEST"),
@@ -20883,20 +20898,22 @@ mod tests {
                 installed.generation, 2,
                 "the real publisher must have made generation N+1 durable before the drop"
             );
-            assert_eq!(
-                writer.snapshot().loaded_manifest().manifest.generation,
-                1,
-                "the dropped future cannot have installed the successor snapshot"
-            );
+            assert!(matches!(
+                writer.snapshot(),
+                Err(KeeperError::PublicationReconciliationRequired {
+                    retained_generation: 1,
+                    proposed_generation: 2,
+                })
+            ));
             assert!(
                 writer.publication_awaits_reconciliation(),
-                "durable authority ahead of the retained snapshot must stay reconcilable"
+                "marker observation alone is not authority; the checked reader must fail closed"
             );
 
-            // The next publication is the authority read that must reconcile
-            // first: validating generation 3 against the abandoned generation-1
-            // view rejects it as a gap, and republishing generation 2 would
-            // collide with the claim that already won.
+            // This is parent-red through an existing public path, not a missing
+            // test symbol: before this correction the same generation-3
+            // `KeeperWriter::publish` call validates against retained generation
+            // 1 and rejects the valid successor as a gap.
             let advanced = writer
                 .publish(&cx, &Manifest::empty(3, schema_id, 0))
                 .await
@@ -20910,7 +20927,11 @@ mod tests {
             let reopened =
                 KeeperSnapshot::open(&directory, DEFAULT_SCHEMA).expect("reopen published index");
             assert_eq!(
-                writer.snapshot().loaded_manifest().manifest,
+                writer
+                    .snapshot()
+                    .expect("reconciled writer snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest,
                 reopened.loaded_manifest().manifest,
                 "the retained handle and a fresh reopen must agree exactly"
             );
@@ -20931,7 +20952,7 @@ mod tests {
     {
         let index = tempdir()?;
         let directory = index.path().to_path_buf();
-        run_with_test_cx(move |cx| async move {
+        run_with_blocking_cx(move |cx| async move {
             let mut writer = KeeperWriter::create(&cx, &directory, DEFAULT_SCHEMA)
                 .await
                 .expect("create genesis index");
@@ -20939,12 +20960,17 @@ mod tests {
 
             // An owner that retries the exact abandoned proposal adopts the
             // durable generation instead of publishing a second successor.
-            let park = park_publish_refresh_for_test(&directory);
             let second = Manifest::empty(2, schema_id, 0);
+            let pause = pause_manifest_publish_at_checkpoint_for_test(
+                &directory,
+                PublishCheckpoint::DirectorySynced,
+            );
             let mut publish = Box::pin(writer.publish(&cx, &second));
-            drive_publish_to_refresh_park(&mut publish, &park).await;
+            drive_publish_to_durable_checkpoint(&mut publish, &pause)
+                .await
+                .expect("reach the bounded durable-publish rendezvous");
             drop(publish);
-            drop(park);
+            pause.release();
 
             let adopted = writer
                 .publish(&cx, &second)
@@ -20969,14 +20995,25 @@ mod tests {
 
             // An owner that never retries still gets an honest view: explicit
             // reconciliation proves the retained snapshot against disk.
-            let park = park_publish_refresh_for_test(&directory);
             let third = Manifest::empty(3, schema_id, 0);
+            let pause = pause_manifest_publish_at_checkpoint_for_test(
+                &directory,
+                PublishCheckpoint::DirectorySynced,
+            );
             let mut publish = Box::pin(writer.publish(&cx, &third));
-            drive_publish_to_refresh_park(&mut publish, &park).await;
+            drive_publish_to_durable_checkpoint(&mut publish, &pause)
+                .await
+                .expect("reach the bounded durable-publish rendezvous");
             drop(publish);
-            drop(park);
+            pause.release();
 
-            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 2);
+            assert!(matches!(
+                writer.snapshot(),
+                Err(KeeperError::PublicationReconciliationRequired {
+                    retained_generation: 2,
+                    proposed_generation: 3,
+                })
+            ));
             let reconciled = writer
                 .reconcile_publication(&cx)
                 .await
@@ -21112,7 +21149,13 @@ mod tests {
                 .publish(&cx, &proposed)
                 .await
                 .map_err(|error| error.to_string())?;
-            if writer.snapshot().loaded_manifest().manifest.generation != 1 {
+            if writer
+                .retained_snapshot_for_bookkeeping()
+                .loaded_manifest()
+                .manifest
+                .generation
+                != 1
+            {
                 return Err("writer snapshot unexpectedly advanced before retry".to_owned());
             }
 
@@ -21121,7 +21164,10 @@ mod tests {
                 .await
                 .map_err(|error| error.to_string())?;
 
-            let installed = &writer.snapshot().loaded_manifest().manifest;
+            let installed = &writer
+                .retained_snapshot_for_bookkeeping()
+                .loaded_manifest()
+                .manifest;
             if installed.generation != 2 {
                 return Err("exact installed proposal was not reconciled".to_owned());
             }
@@ -21164,7 +21210,13 @@ mod tests {
                 }
                 Ok(_) => return Err("differing installed MANIFEST was reconciled".to_owned()),
             }
-            if writer.snapshot().loaded_manifest().manifest.generation != 1 {
+            if writer
+                .retained_snapshot_for_bookkeeping()
+                .loaded_manifest()
+                .manifest
+                .generation
+                != 1
+            {
                 return Err("writer snapshot advanced after differing proposal".to_owned());
             }
             let on_disk = load_manifest_pair(&directory)
@@ -21201,7 +21253,13 @@ mod tests {
             if after != before {
                 return Err("MANIFEST changed before segment preflight failed".to_owned());
             }
-            if writer.snapshot().loaded_manifest().manifest.generation != 1 {
+            if writer
+                .retained_snapshot_for_bookkeeping()
+                .loaded_manifest()
+                .manifest
+                .generation
+                != 1
+            {
                 return Err("writer snapshot advanced after rejected publication".to_owned());
             }
             Ok(())
@@ -21273,7 +21331,13 @@ mod tests {
             if after != before {
                 return Err("MANIFEST changed before segment preflight failed".to_owned());
             }
-            if writer.snapshot().loaded_manifest().manifest.generation != 1 {
+            if writer
+                .retained_snapshot_for_bookkeeping()
+                .loaded_manifest()
+                .manifest
+                .generation
+                != 1
+            {
                 return Err("writer snapshot advanced after rejected publication".to_owned());
             }
             Ok(())
@@ -21355,7 +21419,7 @@ mod tests {
                 .await
                 .map_err(|error| error.to_string())?;
             let mut next = writer
-                .snapshot()
+                .retained_snapshot_for_bookkeeping()
                 .next_manifest()
                 .map_err(|error| error.to_string())?;
             next.docid_high_watermark = manifest_segment.docid_hi;
@@ -21394,7 +21458,7 @@ mod tests {
             )
             .await
             .map_err(|error| error.to_string())?;
-            let snapshot = writer.snapshot();
+            let snapshot = writer.retained_snapshot_for_bookkeeping();
             if snapshot.loaded_manifest().manifest.generation != 3
                 || !snapshot.loaded_manifest().manifest.segments.is_empty()
                 || !snapshot.is_degraded()
@@ -21744,7 +21808,14 @@ mod tests {
             let mut writer = KeeperWriter::open(&cx, &directory, DEFAULT_SCHEMA)
                 .await
                 .map_err(|error| error.to_string())?;
-            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 1);
+            assert_eq!(
+                writer
+                    .retained_snapshot_for_bookkeeping()
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                1
+            );
             let schema_id = DEFAULT_SCHEMA
                 .schema_id()
                 .map_err(|error| error.to_string())?;
@@ -21809,7 +21880,14 @@ mod tests {
                 KeeperWriter::open_durable(&cx, directory, DEFAULT_SCHEMA, corrupt_protector)
                     .await
                     .map_err(|error| error.to_string())?;
-            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 2);
+            assert_eq!(
+                writer
+                    .retained_snapshot_for_bookkeeping()
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                2
+            );
             Ok(())
         });
         recovered_corrupt.map_err(io::Error::other)?;
@@ -21827,7 +21905,14 @@ mod tests {
                 KeeperWriter::create_durable(&cx, directory, DEFAULT_SCHEMA, missing_protector)
                     .await
                     .map_err(|error| error.to_string())?;
-            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 2);
+            assert_eq!(
+                writer
+                    .retained_snapshot_for_bookkeeping()
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                2
+            );
             Ok(())
         });
         recovered_missing.map_err(io::Error::other)?;
@@ -22022,7 +22107,13 @@ mod tests {
                 KeeperWriter::open_durable(&cx, &directory, DEFAULT_SCHEMA, repair_protector)
                     .await
                     .map_err(|error| error.to_string())?;
-            if writer.snapshot().loaded_manifest().manifest.generation != 1 {
+            if writer
+                .retained_snapshot_for_bookkeeping()
+                .loaded_manifest()
+                .manifest
+                .generation
+                != 1
+            {
                 return Err("unrecoverable reconstructed current displaced previous".to_owned());
             }
             Ok(())
@@ -22112,7 +22203,13 @@ mod tests {
                 KeeperWriter::open_durable(&cx, &directory, DEFAULT_SCHEMA, repair_protector)
                     .await
                     .map_err(|error| error.to_string())?;
-            if writer.snapshot().loaded_manifest().manifest.generation != 3 {
+            if writer
+                .retained_snapshot_for_bookkeeping()
+                .loaded_manifest()
+                .manifest
+                .generation
+                != 3
+            {
                 return Err("unusable optional fallback displaced healthy current".to_owned());
             }
             Ok(())
@@ -22167,7 +22264,13 @@ mod tests {
                 KeeperWriter::open_durable(&cx, &directory, DEFAULT_SCHEMA, repair_protector)
                     .await
                     .map_err(|error| error.to_string())?;
-            if writer.snapshot().loaded_manifest().manifest.generation != 2 {
+            if writer
+                .retained_snapshot_for_bookkeeping()
+                .loaded_manifest()
+                .manifest
+                .generation
+                != 2
+            {
                 return Err("stale optional fallback displaced healthy current".to_owned());
             }
             Ok(())
@@ -22285,7 +22388,13 @@ mod tests {
                 KeeperWriter::open_durable(&cx, &directory, DEFAULT_SCHEMA, repair_protector)
                     .await
                     .map_err(|error| error.to_string())?;
-            if writer.snapshot().loaded_manifest().manifest.generation != 1 {
+            if writer
+                .retained_snapshot_for_bookkeeping()
+                .loaded_manifest()
+                .manifest
+                .generation
+                != 1
+            {
                 return Err("malformed current sidecar blocked previous fallback".to_owned());
             }
             Ok(())
@@ -22337,7 +22446,13 @@ mod tests {
                 KeeperWriter::open_durable(&cx, &directory, DEFAULT_SCHEMA, repair_protector)
                     .await
                     .map_err(|error| error.to_string())?;
-            if writer.snapshot().loaded_manifest().manifest.generation != 2 {
+            if writer
+                .retained_snapshot_for_bookkeeping()
+                .loaded_manifest()
+                .manifest
+                .generation
+                != 2
+            {
                 return Err("malformed optional fallback blocked healthy current".to_owned());
             }
             Ok(())
@@ -22405,7 +22520,14 @@ mod tests {
                 KeeperWriter::open_durable(&cx, &directory, DEFAULT_SCHEMA, repair_protector)
                     .await
                     .map_err(|error| error.to_string())?;
-            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 2);
+            assert_eq!(
+                writer
+                    .retained_snapshot_for_bookkeeping()
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                2
+            );
             Ok(())
         });
         repaired.map_err(io::Error::other)?;

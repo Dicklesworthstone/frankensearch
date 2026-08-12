@@ -4441,7 +4441,7 @@ enum IndexBackend {
 impl IndexBackend {
     const fn snapshot(&self) -> &KeeperSnapshot {
         match self {
-            Self::Durable(writer) => writer.snapshot(),
+            Self::Durable(writer) => writer.retained_snapshot_for_bookkeeping(),
             Self::Memory(snapshot) => snapshot,
         }
     }
