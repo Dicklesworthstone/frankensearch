@@ -157,3 +157,6 @@ repro_*.rs
 # Janitor-skill run artifacts (machine-local audit trails, never tracked)
 .stash_janitor_workspace/
 .worktree_branch_rationalization_workspace/
+
+# Accidental empty file created as a literal name `...` at repo root.
+/...
