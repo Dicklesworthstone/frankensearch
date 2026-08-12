@@ -558,6 +558,36 @@ struct ReconciliationState {
     probationary_identities: Option<BTreeMap<PathBuf, RootIdentity>>,
 }
 
+/// How a completed pass concluded, and therefore what it may commit.
+///
+/// The previous shape decided this implicitly and then committed
+/// unconditionally, so a pass that had deliberately derived no deletes still
+/// adopted its own snapshot as the new authority — destroying the legacy
+/// baseline it was created to preserve and silently discarding every stale
+/// delete. Making the outcome explicit is what stops the epilogue from
+/// contradicting the decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassOutcome {
+    /// An established authority adjudicated this pass; deletes were derived.
+    Authorized,
+    /// First trustworthy observation of these roots. No deletes were derived
+    /// and the legacy baseline must survive untouched for the second pass.
+    Probationary,
+    /// A second trustworthy observation matched the first, so the retained
+    /// legacy baseline was adjudicated and may now be replaced.
+    Confirmed,
+    /// The platform cannot supply trustworthy root identity. Upserts only,
+    /// never authority.
+    Degraded,
+}
+
+impl PassOutcome {
+    /// Whether this pass may install its snapshot as the new authority.
+    const fn may_adopt_authority(self) -> bool {
+        matches!(self, Self::Authorized | Self::Confirmed)
+    }
+}
+
 /// A snapshot plus the exact root identities it was observed through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DeletionAuthority {
@@ -1048,7 +1078,6 @@ impl FsWatcher {
                 ingest_batch_size,
                 &producer_done_for_task,
                 &collect_snapshot_from_roots,
-                &|| false,
             )
             .await
         }) {
@@ -1297,26 +1326,41 @@ impl FsWatcher {
                 }
                 None => {
                     if completeness.is_complete() && completeness.identity_is_trustworthy() {
-                        // First complete observation of these roots. The
-                        // caller's record becomes the retained baseline, but a
-                        // single observation cannot rule out that the roots
-                        // were already swapped before this call, so it enters
-                        // probation and derives no deletes yet.
+                        // The caller's record is retained on the FIRST
+                        // observation, paired with the identities seen here,
+                        // so a later call — even one passing an empty
+                        // `previous` — still adjudicates the original
+                        // baseline. Storing only identities is what lost it.
                         if state.probation_confirmed_by(completeness.root_identities()) {
+                            let retained = state
+                                .catchup_baseline
+                                .as_ref()
+                                .map_or_else(|| previous.clone(), |held| held.snapshot.clone());
                             state.adopt_complete_baseline(
-                                previous.clone(),
+                                retained.clone(),
                                 completeness.root_identities().clone(),
                             );
+                            state.required = false;
+                            retained
                         } else {
                             state.begin_probation(completeness.root_identities().clone());
+                            // Retain the caller's snapshot as the pending
+                            // authority for the confirming pass.
+                            state.catchup_baseline = Some(DeletionAuthority {
+                                snapshot: previous.clone(),
+                                root_identities: completeness.root_identities().clone(),
+                                generation: 0,
+                            });
+                            // Probationary: derive nothing this call.
                             for root in &self.roots {
                                 completeness.record_unresolved(root);
                             }
+                            previous.clone()
                         }
                     } else {
                         state.require_full_scan();
+                        previous.clone()
                     }
-                    previous.clone()
                 }
             }
         };
@@ -1341,7 +1385,11 @@ impl FsWatcher {
         observed_at_ms: u64,
         completeness: &ScanCompleteness,
     ) -> Vec<WatchEvent> {
-        let derive_deletes = completeness.is_complete();
+        // Completeness alone is not enough. A scan on a platform that cannot
+        // identify its roots is a truthful listing of what it saw, but it can
+        // never rule out that the roots were replaced, so absence in it is not
+        // evidence of deletion.
+        let derive_deletes = completeness.is_complete() && completeness.identity_is_trustworthy();
         let mut events = Vec::new();
         let mut prev_iter = previous.iter();
         let mut curr_iter = current.iter();
@@ -2044,22 +2092,26 @@ async fn run_authoritative_reconciliation(
     // on whether an authority exists to compare it against.
     let scan_identities = completeness.root_identities().clone();
     let identity_trustworthy = completeness.identity_is_trustworthy();
-    let deletion_baseline = match authority.as_ref() {
-        // Established authority: deletes derive against its snapshot.
-        Some(authority) => Some(authority.snapshot.clone()),
-        None if !identity_trustworthy => {
+    let (deletion_baseline, outcome) = match authority.as_ref() {
+        // Established authority, but only if THIS scan could also verify the
+        // roots. A degraded scan cannot rule out a swap, so an authority does
+        // not rescue it.
+        Some(authority) if identity_trustworthy => {
+            (Some(authority.snapshot.clone()), PassOutcome::Authorized)
+        }
+        _ if !identity_trustworthy => {
             // No trustworthy identity on this platform: upsert what was seen,
             // never delete, and say so rather than silently degrading.
             warn!("watcher has no trustworthy root identity; upserting without deletion authority");
-            None
+            (None, PassOutcome::Degraded)
         }
-        None => {
+        _ => {
             let mut state = lock_or_recover(reconciliation);
             if state.probation_confirmed_by(&scan_identities) {
                 // Second complete scan, identical identities: the roots did
                 // not change between the two observations, so the retained
                 // legacy baseline may finally be adjudicated.
-                Some(legacy_baseline.clone())
+                (Some(legacy_baseline.clone()), PassOutcome::Confirmed)
             } else {
                 // First complete scan. Record what the roots were, keep the
                 // legacy baseline, and require another pass. No deletes.
@@ -2068,7 +2120,7 @@ async fn run_authoritative_reconciliation(
                 warn!(
                     "watcher captured probationary root identities; a second complete scan must confirm them before deletions are derived"
                 );
-                None
+                (None, PassOutcome::Probationary)
             }
         }
     };
@@ -2120,12 +2172,18 @@ async fn run_authoritative_reconciliation(
     // before applying anything.
     let mut state = lock_or_recover(reconciliation);
     if state.epoch == epoch {
-        if identity_trustworthy {
+        if outcome.may_adopt_authority() {
             // Snapshot and identities advance as one value, so no later scan
             // can compare one against the other's.
             state.adopt_complete_baseline(current, scan_identities);
             state.probationary_identities = None;
             state.required = false;
+        } else if outcome == PassOutcome::Probationary {
+            // The whole point of probation: the legacy baseline and the
+            // probation record must both survive this pass untouched, and a
+            // second scan is still owed. Adopting here is what silently
+            // discarded every stale delete.
+            state.required = true;
         } else {
             // Degraded: the listing is usable as a working set, but it never
             // becomes deletion authority and a later trustworthy pass is still
@@ -2134,7 +2192,12 @@ async fn run_authoritative_reconciliation(
             state.baseline_initialized = true;
             state.required = true;
         }
-        state.affected_paths.clear();
+        // Only a pass that actually adjudicated them may forget them; a
+        // probationary or degraded pass leaves the pending candidates for the
+        // pass that can.
+        if outcome.may_adopt_authority() {
+            state.affected_paths.clear();
+        }
     }
     Ok(())
 }
@@ -4260,9 +4323,17 @@ mod tests {
 
         let state = lock_or_recover(&watcher.reconciliation);
         assert!(state.required, "an incomplete catch-up stays required");
+        let retained = state
+            .catchup_baseline
+            .as_ref()
+            .expect("the caller's snapshot must be retained as authority");
+        assert!(
+            retained.root_identities.contains_key(&root)
+                && retained.root_identities.contains_key(&blocked),
+            "a retained baseline must carry the identities of every configured root"
+        );
         assert_eq!(
-            state.catchup_baseline.as_ref(),
-            Some(&previous),
+            &retained.snapshot, &previous,
             "the caller's authoritative snapshot must be retained so the suppressed \
              delete is recoverable"
         );
@@ -4297,6 +4368,80 @@ mod tests {
             "the suppressed delete must come from the retained baseline, not the argument, \
              got {recovered:?}"
         );
+    }
+
+    /// A probationary pass must leave the legacy baseline and the probation
+    /// record exactly as it found them.
+    ///
+    /// This is the assertion whose absence let the epilogue adopt the current
+    /// snapshot on the very pass that had deliberately derived no deletes,
+    /// destroying the baseline holding every stale delete. It checks what the
+    /// pass did *not* change, which no other test here did.
+    #[test]
+    fn probationary_pass_preserves_the_legacy_baseline_and_stays_owed() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("g3s-probation");
+            fs::create_dir_all(&root).expect("create root");
+            fs::write(root.join("present.rs"), "fn present() {}\n").expect("write fixture");
+
+            // Legacy baseline naming a file that is already gone, with no
+            // identities behind it: the crash-recovery shape.
+            let stale = root.join("gone-before-restart.rs");
+            let legacy = FileSnapshot::from([(stale.clone(), 3)]);
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let reconciliation: ReconciliationTracker = Arc::new(Mutex::new(ReconciliationState {
+                indexed_snapshot: legacy.clone(),
+                baseline_initialized: true,
+                required: true,
+                affected_paths: BTreeSet::from([stale.clone()]),
+                epoch: 0,
+                catchup_baseline: None,
+                probationary_identities: None,
+            }));
+            let queue: ReadyBatchQueue = Arc::new(Mutex::new(VecDeque::new()));
+            let stats = WatcherStatsInner::default();
+            let roots = vec![root.clone()];
+
+            run_authoritative_reconciliation(
+                &cx,
+                &roots,
+                &DiscoveryConfig::default(),
+                pipeline.as_ref(),
+                &reconciliation,
+                &queue,
+                &stats,
+                100,
+                &collect_snapshot_from_roots,
+                &|| false,
+            )
+            .await
+            .expect("a probationary pass still succeeds; it simply derives no deletes");
+
+            let state = lock_or_recover(&reconciliation);
+            assert!(
+                !pipeline
+                    .all_ops()
+                    .iter()
+                    .any(|op| matches!(op, WatchIngestOp::Delete { .. })),
+                "a first observation must derive no deletes, got {:?}",
+                pipeline.all_ops()
+            );
+            assert_eq!(
+                state.indexed_snapshot, legacy,
+                "the legacy baseline must survive the probationary pass untouched"
+            );
+            assert!(
+                state.probationary_identities.is_some(),
+                "the probation record must survive for the confirming pass"
+            );
+            assert!(state.required, "a second scan is still owed");
+            assert!(
+                state.affected_paths.contains(&stale),
+                "pending delete candidates must not be forgotten by a pass that could not \
+                 adjudicate them"
+            );
+        });
     }
 
     /// A non-empty baseline with no identity authority behind it cannot be
@@ -4453,6 +4598,7 @@ mod tests {
                     .catchup_baseline
                     .as_ref()
                     .expect("baseline seeded")
+                    .snapshot
                     .contains_key(&doomed)
             );
 
@@ -4661,6 +4807,7 @@ mod tests {
                     .catchup_baseline
                     .as_ref()
                     .expect("baseline from the first pass")
+                    .snapshot
                     .contains_key(&indexed),
                 "the authoritative baseline must survive the swap"
             );
