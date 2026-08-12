@@ -1963,8 +1963,18 @@ impl PerfEvidenceArtifact {
                 ),
             });
         }
-        if paired.config != crate::PairedEstimatorConfig::predeclared(paired.config.bootstrap_seed)
-        {
+        // A QG-1 cell's configuration carries the sealed lifecycle authority
+        // its producer issued, which no predeclared template can equal. Its
+        // estimator policy must still be exactly predeclared; the authority
+        // itself is authenticated separately, against the expectation the
+        // consumer retained. Every other gate keeps full equality.
+        let predeclared = crate::PairedEstimatorConfig::predeclared(paired.config.bootstrap_seed);
+        let policy_matches = if cell.spec.gate == PerfGate::Qg1 {
+            paired.config.matches_estimator_policy(&predeclared)
+        } else {
+            paired.config == predeclared
+        };
+        if !policy_matches {
             return Err(EvidenceArtifactError::InvalidProvenance {
                 reason: format!(
                     "cell {} does not use the exact predeclared estimator configuration",
@@ -2878,6 +2888,25 @@ impl PerfEvidenceArtifact {
     ///
     /// Returns the specific [`EvidenceArtifactError`] for each defect class.
     pub fn from_verified_slice(contents: &[u8]) -> Result<Self, EvidenceArtifactError> {
+        Self::from_verified_slice_against_qg1_authorities(contents, &[])
+    }
+
+    /// Parse exact artifact bytes and verify them against the QG-1
+    /// expectations their consumer retained outside the artifact.
+    ///
+    /// Strict canonical parsing is identical; only the integrity pass differs,
+    /// so a persisted QG-1 artifact is verifiable exactly once its retained
+    /// authority set is supplied. An empty set is [`Self::from_verified_slice`],
+    /// under which a QG-1 cell still fails closed and non-QG-1 evidence is
+    /// unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns the specific [`EvidenceArtifactError`] for each defect class.
+    pub fn from_verified_slice_against_qg1_authorities(
+        contents: &[u8],
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+    ) -> Result<Self, EvidenceArtifactError> {
         let probe =
             crate::machine_class_registry::parse_strict_json(contents).map_err(|error| {
                 EvidenceArtifactError::Malformed {
@@ -2909,7 +2938,7 @@ impl PerfEvidenceArtifact {
                 reason: "artifact bytes are not exact canonical pretty JSON".to_owned(),
             });
         }
-        artifact.verify_integrity()?;
+        artifact.verify_integrity_against_qg1_authorities(external_qg1_authorities)?;
         Ok(artifact)
     }
 
@@ -2923,8 +2952,21 @@ impl PerfEvidenceArtifact {
     ///
     /// Returns the specific [`EvidenceArtifactError`] for each defect class.
     pub fn load_verified(path: &Path) -> Result<Self, EvidenceArtifactError> {
+        Self::load_verified_against_qg1_authorities(path, &[])
+    }
+
+    /// Load one artifact and verify it against the QG-1 expectations its
+    /// consumer retained outside the artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns the specific [`EvidenceArtifactError`] for each defect class.
+    pub fn load_verified_against_qg1_authorities(
+        path: &Path,
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+    ) -> Result<Self, EvidenceArtifactError> {
         let contents = fs::read(path)?;
-        Self::from_verified_slice(&contents)
+        Self::from_verified_slice_against_qg1_authorities(&contents, external_qg1_authorities)
     }
 
     /// Load one artifact as ADMISSIBLE EVIDENCE: verified exactly as
@@ -2948,7 +2990,21 @@ impl PerfEvidenceArtifact {
         path: &Path,
         register: &PerfQuarantineRegister,
     ) -> Result<Self, EvidenceArtifactError> {
-        let artifact = Self::load_verified(path)?;
+        Self::load_admissible_evidence_against_qg1_authorities(path, register, &[])
+    }
+
+    /// Load admissible evidence whose QG-1 cells are authenticated against the
+    /// expectations their consumer retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns every error [`Self::load_admissible_evidence`] can.
+    pub fn load_admissible_evidence_against_qg1_authorities(
+        path: &Path,
+        register: &PerfQuarantineRegister,
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+    ) -> Result<Self, EvidenceArtifactError> {
+        let artifact = Self::load_verified_against_qg1_authorities(path, external_qg1_authorities)?;
         register.screen(&artifact)?;
         Ok(artifact)
     }

@@ -1339,8 +1339,13 @@ impl Qg1TantivyIncumbentScreen {
                     .chain(&pilot.null_observations),
                 &mut seen_observation_ids,
             )?;
+            // Pilots are independent producer invocations: identical policy,
+            // necessarily different sealed authorities. Each pilot's authority
+            // is authenticated separately above.
             match &estimator_config {
-                Some(expected_config) if expected_config != &pilot.experiment.config => {
+                Some(expected_config)
+                    if !expected_config.matches_estimator_policy(&pilot.experiment.config) =>
+                {
                     return Err(Qg1TantivyIncumbentError::EstimatorConfigMismatch);
                 }
                 Some(_) => {}
@@ -1569,7 +1574,12 @@ impl Qg1TantivyIncumbentDecision {
         expected_content_bytes: u64,
         seen_observation_ids: &mut BTreeSet<String>,
     ) -> Result<(PairedExperimentResult, PairedExperimentResult), Qg1TantivyIncumbentError> {
-        if &self.estimator_config != expected_estimator_config {
+        // The decision is its own producer invocation, so it shares the
+        // pilots' estimator policy but never their sealed authority.
+        if !self
+            .estimator_config
+            .matches_estimator_policy(expected_estimator_config)
+        {
             return Err(Qg1TantivyIncumbentError::EstimatorConfigMismatch);
         }
         let expected_qg1_authority =
@@ -3787,6 +3797,26 @@ impl Qg1ExpectedAuthority {
     }
 }
 
+/// Select the one retained expectation that issued `config`'s sealed authority.
+///
+/// Pilot streams, decision streams, and evidence cells come from separate
+/// producer invocations, so a consumer retains a set and each seam resolves
+/// its own. Selection is deliberately unambiguous: no match and more than one
+/// match both return `None`, because an ambiguous retained set cannot name the
+/// single producer that issued a stream. Every caller treats `None` as the
+/// fail-closed case, so neither outcome can silently admit evidence.
+pub(crate) fn select_qg1_expected_authority<'a>(
+    authorities: &[&'a Qg1ExpectedAuthority],
+    config: &PairedEstimatorConfig,
+) -> Option<&'a Qg1ExpectedAuthority> {
+    let mut matching = authorities
+        .iter()
+        .copied()
+        .filter(|expected| expected.matches_config(config));
+    let selected = matching.next()?;
+    matching.next().is_none().then_some(selected)
+}
+
 /// The only live producer able to attach a QG-1 lifecycle receipt. It owns
 /// opaque capability preimages and removes one before returning each binding.
 #[derive(Debug)]
@@ -4576,6 +4606,25 @@ impl PairedEstimatorConfig {
         let producer = Qg1LifecycleProducer::new(authority, capabilities);
         self.qg1_expected_authority = Some(producer.expected_authority().clone());
         Ok(producer)
+    }
+
+    /// Whether two configurations declare the same estimator policy.
+    ///
+    /// Every field is compared except the two QG-1 authority slots. Separate
+    /// producer invocations — one per pilot candidate, one per decision —
+    /// necessarily seal different entropy-backed lifecycle authorities, so
+    /// authority identity is authenticated per stream against its own retained
+    /// expectation and must never be mistaken for policy disagreement. Blanking
+    /// the slots on clones keeps this exact as fields are added.
+    #[must_use]
+    pub(crate) fn matches_estimator_policy(&self, other: &Self) -> bool {
+        let mut left = self.clone();
+        let mut right = other.clone();
+        for config in [&mut left, &mut right] {
+            config.qg1_lifecycle_authority = None;
+            config.qg1_expected_authority = None;
+        }
+        left == right
     }
 
     /// Compare one QG-1 raw receipt against this configuration's authority.
@@ -7662,10 +7711,14 @@ mod tests {
         content_bytes: u64,
         run_id: &str,
         treatment_duration: u64,
+        sample_id_base: u64,
     ) -> Qg1TantivyIncumbentPilot {
         let provenance = provenance(run_id);
         let control_durations = [1_000_000; PERF_MIN_RUNS];
         let treatment_durations = [treatment_duration; PERF_MIN_RUNS];
+        // Each candidate is its own producer invocation, so each pilot seals a
+        // distinct lifecycle authority. Sharing one across candidates would
+        // hide the policy-versus-authority separation the screen relies on.
         let authority = qg1_test_authority(
             scope,
             &provenance,
@@ -7673,8 +7726,8 @@ mod tests {
             content_bytes,
             u64::try_from(PERF_MIN_RUNS).expect("QG-1 pilot pair count fits u64"),
             &[
-                (QG1_STREAM_ROLE_TANTIVY_PILOT_EFFECT, 0),
-                (QG1_STREAM_ROLE_TANTIVY_PILOT_NULL, 10_000),
+                (QG1_STREAM_ROLE_TANTIVY_PILOT_EFFECT, sample_id_base),
+                (QG1_STREAM_ROLE_TANTIVY_PILOT_NULL, sample_id_base + 10_000),
             ],
         );
         let effect = qg1_duration_stream(
@@ -7682,7 +7735,7 @@ mod tests {
             &provenance,
             &control_durations,
             &treatment_durations,
-            0,
+            sample_id_base,
             work_units,
             content_bytes,
             &authority,
@@ -7695,7 +7748,7 @@ mod tests {
             &provenance,
             &control_durations,
             &control_durations,
-            10_000,
+            sample_id_base + 10_000,
             work_units,
             content_bytes,
             &authority,
@@ -7743,7 +7796,8 @@ mod tests {
         candidates
             .iter()
             .cloned()
-            .map(|candidate| {
+            .enumerate()
+            .map(|(index, candidate)| {
                 let treatment_duration = match candidate.writer_mode {
                     Qg1TantivyWriterMode::ShippingAuto => 1_000_000,
                     Qg1TantivyWriterMode::Fixed { writer_threads } => {
@@ -7758,6 +7812,7 @@ mod tests {
                     screen_plan.content_bytes,
                     run_id,
                     treatment_duration,
+                    u64::try_from(index).expect("candidate index fits u64") * 100_000,
                 )
             })
             .collect()
@@ -9018,6 +9073,36 @@ mod tests {
                 &retained,
             )
             .expect("reloaded decision validates against the externally supplied authority");
+
+        // Planted negative: a swapped set authenticates neither stream, because
+        // each seam selects by the sealed authority its own producer issued.
+        let swapped = [&decision_authority];
+        assert!(
+            reloaded_screen
+                .validate_decision_against_qg1_authorities(
+                    &cell,
+                    &semantic_contract,
+                    &decision,
+                    &swapped,
+                )
+                .is_err(),
+            "a set missing the pilots' own authority must not validate the decision"
+        );
+
+        // Planted negative: policy is still compared exactly. Only the sealed
+        // authority slots are exempt from configuration equality.
+        let mut other_policy = decision.clone();
+        other_policy.estimator_config.min_pairs += 1;
+        assert_eq!(
+            reloaded_screen.validate_decision_against_qg1_authorities(
+                &cell,
+                &semantic_contract,
+                &other_policy,
+                &retained,
+            ),
+            Err(Qg1TantivyIncumbentError::EstimatorConfigMismatch),
+            "a differing estimator threshold must still be an exact policy mismatch"
+        );
     }
 
     #[test]
@@ -9380,6 +9465,7 @@ mod tests {
             screen_plan.content_bytes,
             "one-live-invocation",
             500_000,
+            300_000,
         );
         pilots[2] = qg1_pilot(
             pilots[2].candidate.clone(),
@@ -9389,6 +9475,7 @@ mod tests {
             screen_plan.content_bytes,
             "one-live-invocation",
             500_000,
+            200_000,
         );
         let screen =
             Qg1TantivyIncumbentScreen::screen(&cell, screen_plan, &semantic_contract, pilots)
@@ -9493,6 +9580,7 @@ mod tests {
             screen_plan.content_bytes,
             "different-invocation",
             500_000,
+            100_000,
         );
         let screen = Qg1TantivyIncumbentScreen::screen(
             &cell,
