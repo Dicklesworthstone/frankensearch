@@ -1089,6 +1089,72 @@ fn exact_residual_sidecar_stream_matches_derived(
     )
 }
 
+/// Reject a corrupt candidate using only its own trailing digest.
+///
+/// Candidate discovery already filters on the header, so a corrupt body reaches
+/// the byte-exact comparison and forces a full source derivation — up to
+/// [`EXACT_RESIDUAL_SIDECAR_MAX_BYTES`] — purely to learn the candidate was
+/// never reusable. That derivation is then discarded whenever the optional
+/// cache also cannot publish, which is exactly the read-only and
+/// `O_TMPFILE`-unsupported case.
+///
+/// [`write_exact_residual_sidecar_stream`] digests every byte it writes before
+/// appending the digest itself, so bytes `[0, encoded_bytes - DIGEST)` are
+/// self-covering and one bounded streaming read decides corruption with zero
+/// derivation. This is an admission gate, not an authentication: passing it
+/// proves internal consistency only, and the derived byte-exact comparison
+/// remains the sole basis for reuse.
+#[cfg(target_os = "linux")]
+fn exact_residual_sidecar_stream_is_self_consistent(
+    path: &Path,
+    layout: &ExactResidualLayout,
+) -> SearchResult<bool> {
+    /// Bounded stack chunk: the read is streaming precisely so an untrusted
+    /// candidate never turns into a second full-size heap image.
+    const CHUNK_BYTES: usize = 64 * 1024;
+
+    let Some((mut file, before)) = open_exact_residual_sidecar_file(path)? else {
+        return Ok(false);
+    };
+    let byte_len = usize::try_from(before.st_size)
+        .map_err(|_| residual_sidecar_error("open", "sidecar size does not fit this platform"))?;
+    if byte_len != layout.encoded_bytes {
+        return Ok(false);
+    }
+    let Some(digested_bytes) = layout
+        .encoded_bytes
+        .checked_sub(EXACT_RESIDUAL_SIDECAR_DIGEST_BYTES)
+    else {
+        return Ok(false);
+    };
+
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; CHUNK_BYTES];
+    let mut remaining = digested_bytes;
+    while remaining != 0 {
+        let wanted = remaining.min(CHUNK_BYTES);
+        match file.read_exact(&mut buffer[..wanted]) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(error) => return Err(residual_sidecar_error("open", &error.to_string())),
+        }
+        digest.update(&buffer[..wanted]);
+        remaining -= wanted;
+    }
+
+    let mut supplied_digest = [0_u8; EXACT_RESIDUAL_SIDECAR_DIGEST_BYTES];
+    match file.read_exact(&mut supplied_digest) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+        Err(error) => return Err(residual_sidecar_error("open", &error.to_string())),
+    }
+    if !same_exact_residual_sidecar_file(&file, &before, layout.encoded_bytes)? {
+        return Ok(false);
+    }
+    let expected_digest: [u8; EXACT_RESIDUAL_SIDECAR_DIGEST_BYTES] = digest.finalize().into();
+    Ok(supplied_digest == expected_digest)
+}
+
 /// Acquire an unnamed inode through a no-follow parent descriptor before any
 /// large source-derived sidecar allocation. Failure proves the optional cache
 /// cannot publish and callers must retain the exact flat route without deriving
@@ -1781,8 +1847,27 @@ impl InMemoryVectorIndex {
         // sidecar must remain reusable from a read-only cache root. Its full
         // source-derived comparison is necessary before attachment, but must
         // not require a publication capability that reuse never consumes.
+        #[cfg(target_os = "linux")]
+        let candidate_layout =
+            match ExactResidualLayout::for_shape(index.record_count(), index.dimension) {
+                Ok(layout) => layout,
+                Err(_) => return Ok(index),
+            };
         let mut derived = None;
         for candidate in candidates {
+            // Fail-cheap admission. Discovery filters on the header alone, so a
+            // corrupt body would otherwise reach the byte-exact comparison and
+            // force a full source derivation solely to learn the candidate was
+            // never reusable — work that is discarded whenever the optional
+            // cache also cannot publish. One bounded streaming read over the
+            // candidate's own self-covering digest decides that without
+            // deriving anything, which is what lets the reservation-before-
+            // derivation ordering below hold even when candidates exist.
+            #[cfg(target_os = "linux")]
+            match exact_residual_sidecar_stream_is_self_consistent(&candidate, &candidate_layout) {
+                Ok(true) => {}
+                Ok(false) | Err(_) => continue,
+            }
             if derived.is_none() {
                 let sidecar = match index.build_exact_residual_sidecar() {
                     Ok(sidecar) => sidecar,
@@ -4599,6 +4684,87 @@ mod tests {
                 .count(),
             0,
             "failed capability acquisition must leave no visible temporary artifact"
+        );
+    }
+
+    /// A header-matching candidate whose body is corrupt must be rejected from
+    /// its own trailing digest, never by deriving the source sidecar and
+    /// discovering the byte-exact comparison fails.
+    ///
+    /// Discovery filters on the header alone, so before the cheap admission
+    /// this exact input forced a derivation of up to
+    /// `EXACT_RESIDUAL_SIDECAR_MAX_BYTES` and then discarded it the moment the
+    /// unavailable optional cache refused publication. The build counter is the
+    /// discriminating assertion: it reads 1 without the admission gate and 0
+    /// with it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_residual_corrupt_candidate_derives_nothing_when_publication_is_unavailable() {
+        let directory = owned_temp_dir("exact_residual_corrupt_capability");
+        let source_path = directory.join("index.fsvi");
+        let cache_dir = directory.join("residual-cache");
+        std::fs::create_dir(&cache_dir).expect("create private corrupt-candidate cache directory");
+        let dimension = 35;
+        let (doc_ids, vectors) = identity_rows(dimension, 17);
+        let rows: Vec<(String, Vec<f32>)> = doc_ids.into_iter().zip(vectors).collect();
+        let (binding, _) = write_fsvi_v2_fixture(
+            &source_path,
+            "residual-corrupt-capability",
+            dimension,
+            57,
+            &rows,
+        );
+        let admitted = crate::VectorIndex::open_admitted_v2(&source_path, &binding)
+            .expect("admit private v2 source");
+        let flat =
+            InMemoryVectorIndex::from_admitted_v2(&admitted).expect("load flat admitted source");
+        let cache_prefix = flat
+            .exact_residual_generation_cache_prefix()
+            .expect("derive generation cache prefix");
+        let mut header_valid_corrupt = flat
+            .build_exact_residual_sidecar()
+            .expect("derive cache-shaped fixture")
+            .encode()
+            .expect("encode cache-shaped fixture");
+        // Leave the header byte-identical so discovery still admits this as a
+        // candidate, and corrupt the first payload byte so nothing but the
+        // self-covering trailing digest can reject it.
+        header_valid_corrupt[EXACT_RESIDUAL_SIDECAR_HEADER_BYTES] ^= 0x01;
+        write_new_owned_file(
+            &cache_dir.join(format!("{cache_prefix}corrupt.fsrs")),
+            &header_valid_corrupt,
+        );
+        let entries_before = std::fs::read_dir(&cache_dir)
+            .expect("read private corrupt-candidate cache directory")
+            .count();
+
+        reset_exact_residual_sidecar_build_count();
+        fail_next_exact_residual_publication_acquisition();
+        let fallback = InMemoryVectorIndex::from_admitted_v2_with_residual_sidecar_cache(
+            &admitted, &cache_dir,
+        )
+        .expect("a corrupt optional candidate must retain an exact flat source");
+
+        assert_eq!(
+            exact_residual_sidecar_build_count(),
+            0,
+            "a corrupt header-matching candidate must be rejected from its own digest \
+             before any source derivation"
+        );
+        assert!(
+            !exact_residual_publication_acquisition_failure_is_pending(),
+            "the no-reusable-candidate path must still reserve publication before deriving"
+        );
+        assert!(
+            !fallback.has_exact_residual_sidecar(),
+            "a corrupt candidate must never attach"
+        );
+        assert_eq!(
+            std::fs::read_dir(&cache_dir)
+                .expect("re-read private corrupt-candidate cache directory")
+                .count(),
+            entries_before,
+            "an unavailable optional cache must leave no visible artifact"
         );
     }
 
