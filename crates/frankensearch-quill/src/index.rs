@@ -22849,7 +22849,7 @@ mod tests {
             let keeper = sealed.snapshot().expect("sealed snapshot is authoritative");
             let composed = QuillSearchSnapshot::compose(0, Arc::clone(&keeper), Vec::new())
                 .expect("composed sealed snapshot");
-            let checkpoint =
+            let checkpoint: QueryCheckpointHandle<'_> =
                 sealed
                     .reader
                     .query_checkpoint(&cx, "arrival_path_lowering", u64::MAX, u64::MAX);
@@ -22880,7 +22880,7 @@ mod tests {
             let frozen = Arc::new(delta.freeze(generation));
             let composite = QuillSearchSnapshot::compose(0, keeper, vec![Arc::clone(&frozen)])
                 .expect("composite snapshot");
-            let delta_checkpoint = sealed.reader.query_checkpoint(
+            let delta_checkpoint: QueryCheckpointHandle<'_> = sealed.reader.query_checkpoint(
                 &cx,
                 "arrival_path_lowering_delta",
                 u64::MAX,
