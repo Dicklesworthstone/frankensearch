@@ -32,11 +32,13 @@ use thiserror::Error;
 use crate::perf::{
     DistributionSummary, LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3, PairedClaimState,
     PairedEstimatorConfig, PairedEstimatorError, PairedEvidenceStatus, PairedExperimentResult,
-    PerfApplicabilityPlan, PerfApplicabilityPlanBinding, PerfCellApplicability,
+    PerfApplicabilityPlan, PerfApplicabilityPlanBinding, PerfCellApplicability, PerfCellSpec,
     PerfExecutionProvenance, PerfGate, PerfGateArtifact, PerfInputIdentity, PerfMatrixSpec,
     PerfRawSample, PerfSampleArm, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg1ExpectedAuthority,
-    median_sorted, parse_cpu_list_ids, percentile, perf_metric_unit, perf_operation_scope,
-    resolve_qg1_expected_authority_for_replay, splitmix64, validate_paired_blocks,
+    Qg1TantivyIncumbentDecision, Qg1TantivyIncumbentError, Qg1TantivyIncumbentScreen,
+    Qg1TantivySemanticContract, median_sorted, parse_cpu_list_ids, percentile, perf_metric_unit,
+    perf_operation_scope, resolve_qg1_expected_authority_for_replay, splitmix64,
+    validate_paired_blocks,
 };
 use crate::qg6_prepared::{
     Qg6ArmRole, Qg6QueryIdentityReceipt, Qg6QuerySpec, Qg6SemanticContract,
@@ -1726,6 +1728,258 @@ impl EvidenceCell {
     }
 }
 
+/// Durable QG-1 fastest-incumbent screen outcome and the decision it bound.
+///
+/// The screen is the part of QG-1 that decides *which* Tantivy arm a headline
+/// may be measured against, so an artifact that omits it cannot be audited for
+/// weaker-headline substitution afterwards. Persisting it here puts the
+/// selection, its full preregistered candidate universe, and the same-invocation
+/// decision streams inside the same hash-sealed object as the cells.
+///
+/// Replay is authority-bearing exactly like a QG-1 cell: the never-serialized
+/// producer expectations are supplied by the consumer that retained them, and
+/// every component — each pilot stream and the decision — must be named by that
+/// retained set exactly once. A screen that cannot re-derive under the supplied
+/// expectations fails closed rather than being admitted on its own say-so.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg1IncumbentScreenEvidence {
+    /// Canonical `gate/fixture/metric` identity of the screened QG-1 bulk cell.
+    pub cell_id: String,
+    /// Exact non-writer semantics held constant across every candidate.
+    pub semantic_contract: Qg1TantivySemanticContract,
+    /// Screen outcome: one uniquely fastest candidate, or an explicit
+    /// NoDecision carrying its stable reason.
+    pub screen: Qg1TantivyIncumbentScreen,
+    /// Same-invocation T/Quill, T/T, and Q/Q decision. Required exactly when
+    /// the screen selected a candidate; forbidden when it did not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<Qg1TantivyIncumbentDecision>,
+}
+
+impl Qg1IncumbentScreenEvidence {
+    /// Whether this screen froze one uniquely fastest incumbent arm.
+    ///
+    /// An incomplete screen is not a failure of the run — it is a valid
+    /// NoDecision — but it can never headline, which is what the gate fold
+    /// consumes this for.
+    #[must_use]
+    pub fn has_selection(&self) -> bool {
+        self.screen.selected_candidate.is_some()
+    }
+
+    /// Require the decision streams to be the very evidence the artifact's
+    /// named required cell was computed from.
+    ///
+    /// Without this a screen and a decision could merely *coexist* with an
+    /// unrelated cell measured in some other invocation, which is precisely the
+    /// substitution the incumbent screen exists to prevent. The named cell is
+    /// therefore rebuilt from the decision's own raw streams — T/Quill against
+    /// the real T/T null, and the same T/Quill against the real Q/Q null for
+    /// the treatment-arm null — under the artifact's own policy, and must equal
+    /// the stored cell exactly. An absent named cell rejects.
+    fn verify_decision_binds_named_cell(
+        &self,
+        decision: &Qg1TantivyIncumbentDecision,
+        decision_authority: &Qg1ExpectedAuthority,
+        cells: &[EvidenceCell],
+        policy: &EvidencePolicy,
+    ) -> Result<(), EvidenceArtifactError> {
+        let Some(named) = cells.iter().find(|candidate| {
+            candidate.cell_id == self.cell_id
+                && candidate.spec.gate == PerfGate::Qg1
+                && candidate.spec.role == EvidenceRole::Required
+        }) else {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: format!(
+                    "QG-1 incumbent decision names required cell {:?}, which this artifact does \
+                     not carry",
+                    self.cell_id
+                ),
+            });
+        };
+        let estimator = |effect: &[PerfRawSample], null: &[PerfRawSample], role: &str| {
+            crate::perf::estimate_paired_experiment_against_qg1_authority(
+                effect,
+                null,
+                &decision.estimator_config,
+                Some(decision_authority),
+            )
+            .map_err(|error| EvidenceArtifactError::InconsistentArtifact {
+                reason: format!(
+                    "QG-1 incumbent decision {role} stream does not estimate under its retained \
+                     authority: {error}"
+                ),
+            })
+        };
+        let effect = estimator(
+            &decision.tantivy_vs_quill.samples,
+            &decision.tantivy_null.samples,
+            "effect",
+        )?;
+        let treatment_arm_null = estimator(
+            &decision.tantivy_vs_quill.samples,
+            &decision.quill_null.samples,
+            "treatment-arm null",
+        )?;
+        let mut rebuilt = EvidenceCell::evaluate(named.spec.clone(), effect, policy)?;
+        rebuilt.attach_treatment_arm_null_against_qg1_authority(
+            treatment_arm_null,
+            policy,
+            Some(decision_authority),
+        )?;
+        if rebuilt != *named {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: format!(
+                    "required cell {:?} is not the cell this QG-1 incumbent decision measured",
+                    self.cell_id
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Resolve the canonical cell this screen names from the frozen matrix.
+    fn resolved_cell(&self) -> Result<PerfCellSpec, EvidenceArtifactError> {
+        PerfMatrixSpec::complete()
+            .for_gate(PerfGate::Qg1)
+            .into_iter()
+            .find(|cell| {
+                format!("{}/{}/{}", PerfGate::Qg1, cell.fixture, cell.metric) == self.cell_id
+            })
+            .ok_or_else(|| EvidenceArtifactError::InconsistentArtifact {
+                reason: format!(
+                    "QG-1 incumbent screen names cell {:?}, which is not in the frozen matrix",
+                    self.cell_id
+                ),
+            })
+    }
+
+    /// Reject a screen whose outcome is neither a selection nor a valid
+    /// NoDecision, before any authority work is attempted.
+    fn validate_shape(&self) -> Result<(), EvidenceArtifactError> {
+        let inconsistent = |reason: String| EvidenceArtifactError::InconsistentArtifact { reason };
+        self.semantic_contract.contract_sha256().map_err(|error| {
+            inconsistent(format!(
+                "QG-1 incumbent semantic contract is not fully pinned: {error}"
+            ))
+        })?;
+        match (
+            self.screen.selected_candidate.as_ref(),
+            self.screen.no_decision_reason.as_ref(),
+            self.decision.as_ref(),
+        ) {
+            (Some(_), Some(_), _) => Err(inconsistent(
+                "QG-1 incumbent screen cannot both select a candidate and declare NoDecision"
+                    .to_owned(),
+            )),
+            (Some(_), None, None) => Err(inconsistent(
+                "a selected QG-1 incumbent screen must carry its same-invocation decision evidence"
+                    .to_owned(),
+            )),
+            (Some(_), None, Some(_)) => Ok(()),
+            (None, Some(_), Some(_)) => Err(inconsistent(
+                "a NoDecision QG-1 incumbent screen must not carry decision evidence".to_owned(),
+            )),
+            (None, Some(reason), None) => {
+                if reason.trim().is_empty() || reason.len() > EVIDENCE_MAX_REASON_MESSAGE_BYTES {
+                    return Err(inconsistent(
+                        "QG-1 incumbent NoDecision reason must be non-empty and bounded".to_owned(),
+                    ));
+                }
+                Ok(())
+            }
+            (None, None, _) => Err(inconsistent(
+                "QG-1 incumbent screen has neither a selected candidate nor a NoDecision reason"
+                    .to_owned(),
+            )),
+        }
+    }
+
+    /// Re-derive this screen and decision under the expectations their consumer
+    /// retained outside the artifact.
+    ///
+    /// Every QG-1 component is authenticated separately because pilots and the
+    /// decision are issued by separate producer invocations: a set that names
+    /// only some of them is an incomplete retention, not a partial success.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvidenceArtifactError::InvalidProvenance`] when any single
+    /// component is missing from the retained set, named by a foreign
+    /// expectation, or named more than once, and
+    /// [`EvidenceArtifactError::InconsistentArtifact`] when the screen or
+    /// decision no longer re-derives from its persisted pilots and streams.
+    pub fn verify_against_qg1_authorities(
+        &self,
+        cells: &[EvidenceCell],
+        policy: &EvidencePolicy,
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+    ) -> Result<(), EvidenceArtifactError> {
+        self.validate_shape()?;
+        let cell = self.resolved_cell()?;
+        let missing = |component: String| EvidenceArtifactError::InvalidProvenance {
+            reason: format!(
+                "QG-1 incumbent {component} is not named exactly once by the retained \
+                 expectation set; replay cannot authenticate it"
+            ),
+        };
+        let rederive =
+            |error: Qg1TantivyIncumbentError| EvidenceArtifactError::InconsistentArtifact {
+                reason: format!(
+                    "QG-1 incumbent screen does not re-derive from its evidence: {error}"
+                ),
+            };
+        for (index, pilot) in self.screen.pilots.iter().enumerate() {
+            if resolve_qg1_expected_authority_for_replay(
+                external_qg1_authorities,
+                &pilot.experiment.config,
+            )
+            .is_none()
+            {
+                return Err(missing(format!("pilot stream {index}")));
+            }
+        }
+        if let Some(decision) = self.decision.as_ref() {
+            let Some(decision_authority) = resolve_qg1_expected_authority_for_replay(
+                external_qg1_authorities,
+                &decision.estimator_config,
+            ) else {
+                return Err(missing("decision stream set".to_owned()));
+            };
+            self.screen
+                .validate_decision_against_qg1_authorities(
+                    &cell,
+                    &self.semantic_contract,
+                    decision,
+                    external_qg1_authorities,
+                )
+                .map_err(rederive)?;
+            return self.verify_decision_binds_named_cell(
+                decision,
+                decision_authority,
+                cells,
+                policy,
+            );
+        }
+        let recomputed = Qg1TantivyIncumbentScreen::screen_against_qg1_authorities(
+            &cell,
+            self.screen.screen_plan.clone(),
+            &self.semantic_contract,
+            self.screen.pilots.clone(),
+            external_qg1_authorities,
+        )
+        .map_err(rederive)?;
+        if recomputed != self.screen {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: "QG-1 incumbent screen outcome does not recompute from its pilots"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Paths written by one atomic artifact persistence pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvidenceArtifactPaths {
@@ -1756,6 +2010,14 @@ pub struct PerfEvidenceArtifact {
     pub machine_class: MachineClassEvidenceBinding,
     /// Decision-grade cells.
     pub cells: Vec<EvidenceCell>,
+    /// Durable QG-1 fastest-incumbent screen outcome and its bound decision.
+    ///
+    /// Absent on every non-QG-1 artifact, and on QG-1 artifacts produced before
+    /// a screen was attached, so those artifacts keep their exact persisted
+    /// bytes and seal. When present, the gate fold, ratchet admissibility, and
+    /// every authority-bearing verification consume it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qg1_incumbent_screen: Option<Qg1IncumbentScreenEvidence>,
     /// Deterministic fold of required-cell statuses.
     pub gate_status: EvidenceDecisionStatus,
     /// Promotion decision recorded by a downstream validator, if any.
@@ -2039,7 +2301,7 @@ impl PerfEvidenceArtifact {
             &selected_widths,
         )?;
         let admission_no_claim = None;
-        let (gate_status, reasons) = Self::fold(&cells, admission_no_claim.as_ref());
+        let (gate_status, reasons) = Self::fold(gate, &cells, admission_no_claim.as_ref(), None);
         Ok(Self {
             schema_version: PERF_EVIDENCE_SCHEMA_VERSION.to_owned(),
             gate,
@@ -2050,6 +2312,7 @@ impl PerfEvidenceArtifact {
                 "sealed runner receipt has not been bound",
             ),
             cells,
+            qg1_incumbent_screen: None,
             gate_status,
             gate_decision: None,
             admission_no_claim,
@@ -2058,10 +2321,54 @@ impl PerfEvidenceArtifact {
         })
     }
 
+    /// Attach the durable QG-1 incumbent screen outcome to this artifact.
+    ///
+    /// The screen is pre-binding content: attaching it changes the bytes a
+    /// runner receipt would have to cover, so any existing verified binding and
+    /// gate decision are discarded exactly as [`Self::force_no_claim`] does, and
+    /// the seal is cleared for a fresh one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvidenceArtifactError::InconsistentArtifact`] for a non-QG-1
+    /// artifact or a screen whose outcome is neither a unique selection nor a
+    /// valid NoDecision.
+    pub fn attach_qg1_incumbent_screen(
+        &mut self,
+        screen: Qg1IncumbentScreenEvidence,
+    ) -> Result<(), EvidenceArtifactError> {
+        if self.gate != PerfGate::Qg1 {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: format!(
+                    "a QG-1 incumbent screen cannot be attached to {} evidence",
+                    self.gate
+                ),
+            });
+        }
+        screen.validate_shape()?;
+        if self.machine_class.identity().is_some() {
+            self.machine_class = MachineClassEvidenceBinding::unverified(
+                "evidence changed after runner binding; a fresh receipt is required",
+            );
+        }
+        self.qg1_incumbent_screen = Some(screen);
+        self.gate_decision = None;
+        (self.gate_status, self.reasons) = Self::fold(
+            self.gate,
+            &self.cells,
+            self.admission_no_claim.as_ref(),
+            self.qg1_incumbent_screen.as_ref(),
+        );
+        self.artifact_sha256.clear();
+        Ok(())
+    }
+
     /// Deterministic severity-precedence fold of required cells.
     fn fold(
+        gate: PerfGate,
         cells: &[EvidenceCell],
         admission_no_claim: Option<&EvidenceReason>,
+        qg1_incumbent_screen: Option<&Qg1IncumbentScreenEvidence>,
     ) -> (EvidenceDecisionStatus, Vec<EvidenceReason>) {
         let mut reasons = Vec::new();
         let mut any_invalid_null = false;
@@ -2091,6 +2398,34 @@ impl PerfEvidenceArtifact {
                 }
                 _ => {}
             }
+        }
+        // A QG-1 artifact that carries no screen at all is the same refusal as
+        // an incomplete one, and must be, or omitting the screen would be the
+        // cheapest way to ratchet without ever naming an incumbent. Other gates
+        // never screen an incumbent and are untouched.
+        if gate == PerfGate::Qg1 && any_required && qg1_incumbent_screen.is_none() {
+            any_no_decision = true;
+            reasons.push(EvidenceReason::new(
+                "evidence.qg1_incumbent_screen_missing",
+                "QG-1 evidence carries no incumbent screen, so no frozen Tantivy arm backs it",
+                EvidenceSeverity::NoClaim,
+            ));
+        }
+        // An incomplete incumbent screen yields NoDecision: without a uniquely
+        // fastest validated Tantivy arm there is no admissible thing to compare
+        // against, so otherwise-measured cells still cannot headline.
+        if let Some(screen) = qg1_incumbent_screen
+            && !screen.has_selection()
+        {
+            any_no_decision = true;
+            reasons.push(EvidenceReason::new(
+                "evidence.qg1_incumbent_screen_no_decision",
+                screen.screen.no_decision_reason.as_deref().map_or_else(
+                    || "QG-1 incumbent screen selected no candidate".to_owned(),
+                    |reason| format!("QG-1 incumbent screen made no selection: {reason}"),
+                ),
+                EvidenceSeverity::NoClaim,
+            ));
         }
         if let Some(reason) = admission_no_claim {
             any_no_decision = true;
@@ -2189,6 +2524,14 @@ impl PerfEvidenceArtifact {
     #[must_use]
     pub fn ratchet_admissible(&self) -> bool {
         self.gate_status == EvidenceDecisionStatus::MeasuredProvisional
+            && match self.qg1_incumbent_screen.as_ref() {
+                // An omitted screen is not neutral for QG-1: without a frozen
+                // fastest incumbent there is nothing admissible to have been
+                // measured against, so the artifact cannot ratchet. Every other
+                // gate keeps its exact prior behaviour.
+                None => self.gate != PerfGate::Qg1,
+                Some(screen) => screen.has_selection() && screen.decision.is_some(),
+            }
             && self.has_exact_runnable_plan_coverage()
             && self
                 .machine_class
@@ -2457,7 +2800,36 @@ impl PerfEvidenceArtifact {
         threshold_artifact_bytes: &[u8],
         prebinding_evidence_bytes: &[u8],
     ) -> Result<(), EvidenceArtifactError> {
-        let source = Self::from_verified_slice(prebinding_evidence_bytes)?;
+        self.bind_machine_class_identity_against_qg1_authorities(
+            identity,
+            threshold_artifact_bytes,
+            prebinding_evidence_bytes,
+            &[],
+        )
+    }
+
+    /// Bind a runner identity to evidence whose QG-1 components are
+    /// authenticated against the expectations their consumer retained.
+    ///
+    /// Binding re-parses the exact pre-binding bytes, and that parse is a
+    /// replay: QG-1 evidence cannot be re-admitted there without the retained
+    /// set, so honest QG-1 evidence can only be bound through this entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::bind_machine_class_identity`],
+    /// including the fail-closed refusal of an incomplete retained set.
+    pub fn bind_machine_class_identity_against_qg1_authorities(
+        &mut self,
+        identity: VerifiedRunnerIdentity,
+        threshold_artifact_bytes: &[u8],
+        prebinding_evidence_bytes: &[u8],
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+    ) -> Result<(), EvidenceArtifactError> {
+        let source = Self::from_verified_slice_against_qg1_authorities(
+            prebinding_evidence_bytes,
+            external_qg1_authorities,
+        )?;
         if source != *self {
             return Err(EvidenceArtifactError::InvalidProvenance {
                 reason: "in-memory evidence differs from the exact pre-binding source bytes"
@@ -2548,17 +2920,44 @@ impl PerfEvidenceArtifact {
         threshold_artifact_bytes: &[u8],
         prebinding_evidence_bytes: &[u8],
     ) -> Result<Vec<u8>, EvidenceArtifactError> {
-        let mut bound = self.clone();
-        bound.bind_machine_class_identity(
+        self.bind_machine_class_identity_and_seal_against_qg1_authorities(
             identity,
             threshold_artifact_bytes,
             prebinding_evidence_bytes,
+            &[],
+        )
+    }
+
+    /// Bind and seal evidence whose QG-1 components are authenticated against
+    /// the expectations their consumer retained.
+    ///
+    /// The newly sealed bytes are re-verified under the same retained set
+    /// before they are returned, so a seal can never be handed back for an
+    /// object that its own replay entry would refuse.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as
+    /// [`Self::bind_machine_class_identity_and_seal`].
+    pub fn bind_machine_class_identity_and_seal_against_qg1_authorities(
+        &mut self,
+        identity: VerifiedRunnerIdentity,
+        threshold_artifact_bytes: &[u8],
+        prebinding_evidence_bytes: &[u8],
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+    ) -> Result<Vec<u8>, EvidenceArtifactError> {
+        let mut bound = self.clone();
+        bound.bind_machine_class_identity_against_qg1_authorities(
+            identity,
+            threshold_artifact_bytes,
+            prebinding_evidence_bytes,
+            external_qg1_authorities,
         )?;
         bound.artifact_sha256.clear();
         let unsealed = serde_json::to_string_pretty(&bound)?;
         bound.artifact_sha256 = lower_hex(&Sha256::digest(unsealed.as_bytes()));
         let sealed = serde_json::to_vec_pretty(&bound)?;
-        bound.verify_integrity()?;
+        bound.verify_integrity_against_qg1_authorities(external_qg1_authorities)?;
         *self = bound;
         Ok(sealed)
     }
@@ -2581,8 +2980,12 @@ impl PerfEvidenceArtifact {
             EvidenceSeverity::NoClaim,
         ));
         self.gate_decision = None;
-        (self.gate_status, self.reasons) =
-            Self::fold(&self.cells, self.admission_no_claim.as_ref());
+        (self.gate_status, self.reasons) = Self::fold(
+            self.gate,
+            &self.cells,
+            self.admission_no_claim.as_ref(),
+            self.qg1_incumbent_screen.as_ref(),
+        );
         self.artifact_sha256.clear();
     }
 
@@ -2752,8 +3155,27 @@ impl PerfEvidenceArtifact {
             self.verify_cell_provenance(cell)?;
             cell.verify_recomputed_against_qg1_authorities(&self.policy, external_qg1_authorities)?;
         }
-        let (expected_status, expected_reasons) =
-            Self::fold(&self.cells, self.admission_no_claim.as_ref());
+        if let Some(screen) = self.qg1_incumbent_screen.as_ref() {
+            if self.gate != PerfGate::Qg1 {
+                return Err(EvidenceArtifactError::InconsistentArtifact {
+                    reason: format!(
+                        "{} evidence carries a QG-1 incumbent screen it can never have measured",
+                        self.gate
+                    ),
+                });
+            }
+            screen.verify_against_qg1_authorities(
+                &self.cells,
+                &self.policy,
+                external_qg1_authorities,
+            )?;
+        }
+        let (expected_status, expected_reasons) = Self::fold(
+            self.gate,
+            &self.cells,
+            self.admission_no_claim.as_ref(),
+            self.qg1_incumbent_screen.as_ref(),
+        );
         if expected_status != self.gate_status || expected_reasons != self.reasons {
             return Err(EvidenceArtifactError::InconsistentArtifact {
                 reason: "gate fold does not recompute from the stored cells".to_owned(),
@@ -2868,6 +3290,48 @@ impl PerfEvidenceArtifact {
     ///
     /// Returns typed serialization and I/O errors.
     pub fn write_atomic(
+        &self,
+        output_dir: &Path,
+    ) -> Result<EvidenceArtifactPaths, EvidenceArtifactError> {
+        if self.qg1_incumbent_screen.is_some() {
+            return Err(EvidenceArtifactError::InvalidProvenance {
+                reason: "evidence carrying a QG-1 incumbent screen may only be persisted through \
+                         write_atomic_against_qg1_authorities with its complete retained set"
+                    .to_owned(),
+            });
+        }
+        self.write_atomic_unchecked(output_dir)
+    }
+
+    /// Persist evidence whose QG-1 components are proven against the
+    /// expectations their consumer retained.
+    ///
+    /// Writing is where evidence stops being a live object and becomes
+    /// something a later process must replay, so the complete retained set is
+    /// required here rather than only at load: a screen-bearing artifact that
+    /// no retained set can authenticate must never reach disk looking intact.
+    ///
+    /// # Errors
+    ///
+    /// Returns every failure [`Self::verify_integrity_against_qg1_authorities`]
+    /// can, plus typed serialization and I/O errors.
+    pub fn write_atomic_against_qg1_authorities(
+        &self,
+        output_dir: &Path,
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+    ) -> Result<EvidenceArtifactPaths, EvidenceArtifactError> {
+        // Verify the sealed form, which is exactly what reaches disk. Checking
+        // the in-memory copy instead would refuse an artifact whose seal is
+        // legitimately pending, and would prove nothing about the bytes.
+        let mut sealed = self.clone();
+        sealed.artifact_sha256.clear();
+        let unsealed = serde_json::to_string_pretty(&sealed)?;
+        sealed.artifact_sha256 = lower_hex(&Sha256::digest(unsealed.as_bytes()));
+        sealed.verify_integrity_against_qg1_authorities(external_qg1_authorities)?;
+        sealed.write_atomic_unchecked(output_dir)
+    }
+
+    fn write_atomic_unchecked(
         &self,
         output_dir: &Path,
     ) -> Result<EvidenceArtifactPaths, EvidenceArtifactError> {
@@ -6560,5 +7024,245 @@ mod tests {
             artifact.apply_gate_decision(EvidenceDecisionStatus::MeasuredProvisional),
             Err(EvidenceArtifactError::InconsistentArtifact { .. })
         ));
+    }
+
+    fn qg1_bulk_screen_cell() -> PerfCellSpec {
+        PerfMatrixSpec::complete()
+            .for_gate(PerfGate::Qg1)
+            .into_iter()
+            .find(|cell| cell.metric == "docs_per_second" && cell.threads == Some(1))
+            .expect("the frozen matrix carries a single-writer QG-1 bulk throughput cell")
+    }
+
+    fn qg1_semantic_contract() -> Qg1TantivySemanticContract {
+        Qg1TantivySemanticContract {
+            tantivy_version: crate::perf::QG1_TANTIVY_INCUMBENT_TANTIVY_VERSION.to_owned(),
+            schema_sha256: "1".repeat(64),
+            analyzer_sha256: "2".repeat(64),
+            indexed_fields_sha256: "3".repeat(64),
+            merge_policy_sha256: "4".repeat(64),
+            visibility_sha256: "5".repeat(64),
+            searchable_terminal_scope_sha256: "6".repeat(64),
+            durability_sha256: "7".repeat(64),
+            quill_config_sha256: "8".repeat(64),
+        }
+    }
+
+    /// A screen that preregistered its candidate universe and retained no
+    /// pilots at all. This is the incomplete-screen outcome the H3 contract
+    /// names, and it carries no authority-bearing component, so it is the one
+    /// screen shape whose evidence is constructible without a live producer.
+    fn qg1_no_decision_screen_evidence() -> Qg1IncumbentScreenEvidence {
+        let cell = qg1_bulk_screen_cell();
+        let semantic_contract = qg1_semantic_contract();
+        let plan = crate::perf::Qg1TantivyIncumbentScreenPlan::new(
+            test_profile(),
+            1,
+            vec![1],
+            &cell,
+            64_000,
+        )
+        .expect("QG-1 incumbent screen plan");
+        let screen = Qg1TantivyIncumbentScreen::screen(&cell, plan, &semantic_contract, Vec::new())
+            .expect("QG-1 incumbent screen");
+        assert!(
+            screen.selected_candidate.is_none() && screen.no_decision_reason.is_some(),
+            "a screen with no retained pilots is a valid NoDecision"
+        );
+        Qg1IncumbentScreenEvidence {
+            cell_id: format!("{}/{}/{}", PerfGate::Qg1, cell.fixture, cell.metric),
+            semantic_contract,
+            screen,
+            decision: None,
+        }
+    }
+
+    fn qg1_screen_artifact() -> PerfEvidenceArtifact {
+        PerfEvidenceArtifact::assemble(
+            PerfGate::Qg1,
+            plan_binding(PerfGate::Qg1),
+            policy(),
+            evidence_provenance(PerfGate::Qg1),
+            vec![provisional_cell()],
+        )
+        .expect("QG-1 screen-bearing artifact")
+    }
+
+    /// The attached screen is durable and is *consumed*: an incomplete screen
+    /// turns otherwise-measured evidence into NoDecision, which is what stops a
+    /// convenient Tantivy arm from headlining before the screen has frozen one.
+    /// Planted omission negative: QG-1 evidence that never names an incumbent
+    /// screen is inadmissible, and omitting the field is not a way around the
+    /// screen. Non-QG-1 evidence keeps its exact prior admissibility.
+    #[test]
+    fn omitted_qg1_incumbent_screen_is_no_decision_and_never_ratchets() {
+        let mut omitted = qg1_screen_artifact();
+        assert!(omitted.qg1_incumbent_screen.is_none());
+        assert_eq!(
+            omitted.gate_status,
+            EvidenceDecisionStatus::NoDecision,
+            "QG-1 evidence without an incumbent screen can support no claim"
+        );
+        assert!(
+            omitted
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "evidence.qg1_incumbent_screen_missing"),
+            "the fold names the omission: {:?}",
+            omitted.reasons
+        );
+        assert!(!omitted.ratchet_admissible());
+        assert!(matches!(
+            omitted.apply_gate_decision(EvidenceDecisionStatus::Allow),
+            Err(EvidenceArtifactError::NotClaimEligible)
+        ));
+
+        let directory = tempfile::tempdir().expect("omitted-screen evidence directory");
+        let paths = omitted
+            .write_atomic(directory.path())
+            .expect("evidence with no screen still persists durably");
+        let reloaded = PerfEvidenceArtifact::load_verified(&paths.json)
+            .expect("reload evidence with no screen");
+        assert_eq!(reloaded.gate_status, EvidenceDecisionStatus::NoDecision);
+        assert!(!reloaded.ratchet_admissible());
+
+        assert!(
+            provisional_artifact().ratchet_admissible(),
+            "the QG-1 omission rule must not change any other gate"
+        );
+    }
+
+    #[test]
+    fn attached_qg1_incumbent_screen_is_durable_and_forces_no_decision() {
+        let mut artifact = qg1_screen_artifact();
+        let screen = qg1_no_decision_screen_evidence();
+        artifact
+            .attach_qg1_incumbent_screen(screen.clone())
+            .expect("attach the QG-1 incumbent screen");
+        assert_eq!(
+            artifact.gate_status,
+            EvidenceDecisionStatus::NoDecision,
+            "an incomplete incumbent screen yields NoDecision"
+        );
+        assert!(
+            artifact
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "evidence.qg1_incumbent_screen_no_decision"),
+            "the fold records why the screen refused: {:?}",
+            artifact.reasons
+        );
+        assert!(!artifact.ratchet_admissible());
+        assert!(matches!(
+            artifact.apply_gate_decision(EvidenceDecisionStatus::Allow),
+            Err(EvidenceArtifactError::NotClaimEligible)
+        ));
+
+        let directory = tempfile::tempdir().expect("QG-1 screen evidence directory");
+        assert!(
+            matches!(
+                artifact.write_atomic(directory.path()),
+                Err(EvidenceArtifactError::InvalidProvenance { .. })
+            ),
+            "screen-bearing evidence may not be persisted through the authority-free writer"
+        );
+
+        let paths = artifact
+            .write_atomic_against_qg1_authorities(directory.path(), &[])
+            .expect("persist the screen-bearing artifact");
+        let reloaded =
+            PerfEvidenceArtifact::load_verified_against_qg1_authorities(&paths.json, &[])
+                .expect("reload the screen-bearing artifact");
+        assert_eq!(
+            reloaded.qg1_incumbent_screen.as_ref(),
+            Some(&screen),
+            "the screen outcome survives write and reload exactly"
+        );
+        assert_eq!(reloaded.gate_status, EvidenceDecisionStatus::NoDecision);
+        assert!(!reloaded.ratchet_admissible());
+    }
+
+    /// Planted negatives on the attachment boundary: a screen that is neither a
+    /// selection nor a valid NoDecision, one that claims both, one that selects
+    /// without its decision, and one attached to evidence that never measured
+    /// a QG-1 incumbent at all.
+    #[test]
+    fn incomplete_or_foreign_qg1_incumbent_screens_fail_closed() {
+        let screen = qg1_no_decision_screen_evidence();
+
+        let mut foreign = provisional_artifact();
+        assert_eq!(foreign.gate, PerfGate::Qg2);
+        assert!(
+            matches!(
+                foreign.attach_qg1_incumbent_screen(screen.clone()),
+                Err(EvidenceArtifactError::InconsistentArtifact { .. })
+            ),
+            "non-QG-1 evidence can never carry a QG-1 incumbent screen"
+        );
+        assert!(foreign.qg1_incumbent_screen.is_none());
+
+        let mut neither = screen.clone();
+        neither.screen.no_decision_reason = None;
+        assert!(matches!(
+            qg1_screen_artifact().attach_qg1_incumbent_screen(neither),
+            Err(EvidenceArtifactError::InconsistentArtifact { .. })
+        ));
+
+        let mut both = screen.clone();
+        both.screen.selected_candidate = Some(
+            both.screen
+                .candidates
+                .first()
+                .expect("preregistered candidate universe")
+                .clone(),
+        );
+        assert!(
+            matches!(
+                qg1_screen_artifact().attach_qg1_incumbent_screen(both.clone()),
+                Err(EvidenceArtifactError::InconsistentArtifact { .. })
+            ),
+            "a screen cannot both select a candidate and declare NoDecision"
+        );
+
+        let mut selected_without_decision = both;
+        selected_without_decision.screen.no_decision_reason = None;
+        assert!(
+            matches!(
+                qg1_screen_artifact().attach_qg1_incumbent_screen(selected_without_decision),
+                Err(EvidenceArtifactError::InconsistentArtifact { .. })
+            ),
+            "a selected incumbent must carry its same-invocation decision evidence"
+        );
+
+        let mut unknown_cell = screen;
+        unknown_cell.cell_id = "qg1/bulk/nonexistent/1/positions_on/docs_per_second".to_owned();
+        assert!(
+            matches!(
+                unknown_cell.verify_against_qg1_authorities(&[], &policy(), &[]),
+                Err(EvidenceArtifactError::InconsistentArtifact { .. })
+            ),
+            "a screen naming a cell outside the frozen matrix cannot be verified"
+        );
+    }
+
+    /// A non-QG-1 artifact is byte-identical to what it was before the field
+    /// existed: the absent screen is skipped on serialization, so its seal and
+    /// its canonical bytes are unchanged.
+    #[test]
+    fn absent_qg1_incumbent_screen_leaves_non_qg_artifacts_exact() {
+        let artifact = provisional_artifact();
+        assert!(artifact.qg1_incumbent_screen.is_none());
+        let json = artifact.canonical_json().expect("canonical JSON");
+        assert!(
+            !json.contains("qg1_incumbent_screen"),
+            "an absent screen must not appear in persisted bytes"
+        );
+
+        let directory = tempfile::tempdir().expect("non-QG evidence directory");
+        let paths = artifact
+            .write_atomic(directory.path())
+            .expect("the authority-free writer still serves non-QG evidence");
+        let reloaded = PerfEvidenceArtifact::load_verified(&paths.json).expect("reload");
+        assert_eq!(reloaded, artifact);
     }
 }
