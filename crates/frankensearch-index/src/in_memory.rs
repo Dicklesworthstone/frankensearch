@@ -172,6 +172,7 @@ struct ExactResidualLayout {
     residual_len: usize,
     suffix_len: usize,
     lane_len: usize,
+    #[cfg(test)]
     payload_bytes: usize,
     encoded_bytes: usize,
 }
@@ -294,6 +295,7 @@ impl ExactResidualLayout {
             residual_len,
             suffix_len,
             lane_len,
+            #[cfg(test)]
             payload_bytes,
             encoded_bytes,
         })
