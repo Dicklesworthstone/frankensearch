@@ -1316,7 +1316,7 @@ impl Qg1TantivyIncumbentScreen {
             }
             if !qg1_valid_throughput_experiment(
                 &pilot.experiment,
-                select_qg1_expected_authority(external_qg1_authorities, &pilot.experiment.config),
+                resolve_qg1_expected_authority(external_qg1_authorities, &pilot.experiment.config),
                 &expected_scope,
                 None,
                 screen_plan.work_units,
@@ -1489,7 +1489,7 @@ impl Qg1TantivyIncumbentScreen {
             expected_scope,
             expected_provenance,
             expected_estimator_config,
-            select_qg1_expected_authority(external_qg1_authorities, &decision.estimator_config),
+            external_qg1_authorities,
             recomputed_screen.screen_plan.work_units,
             recomputed_screen.screen_plan.content_bytes,
             &mut seen_observation_ids,
@@ -1569,7 +1569,7 @@ impl Qg1TantivyIncumbentDecision {
         expected_scope: &PerfOperationScope,
         expected_provenance: &PerfSampleProvenance,
         expected_estimator_config: &PairedEstimatorConfig,
-        external_qg1_authority: Option<&Qg1ExpectedAuthority>,
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
         expected_work_units: u64,
         expected_content_bytes: u64,
         seen_observation_ids: &mut BTreeSet<String>,
@@ -1582,8 +1582,11 @@ impl Qg1TantivyIncumbentDecision {
         {
             return Err(Qg1TantivyIncumbentError::EstimatorConfigMismatch);
         }
+        // The decision resolves its own producer from the retained set: the
+        // pilots' expectations never authenticate it, and a supplied set that
+        // cannot name it must not fall back to its embedded copy.
         let expected_qg1_authority =
-            external_qg1_authority.or(self.estimator_config.qg1_expected_authority.as_ref());
+            resolve_qg1_expected_authority(external_qg1_authorities, &self.estimator_config);
         let selected_config = selected_candidate.config_sha256.as_str();
         let streams = [
             (
@@ -1657,14 +1660,14 @@ impl Qg1TantivyIncumbentDecision {
         .map_err(|_| Qg1TantivyIncumbentError::DecisionEvidenceInvalid)?;
         if !qg1_valid_throughput_experiment(
             &tantivy_decision,
-            external_qg1_authority,
+            expected_qg1_authority,
             expected_scope,
             Some(expected_provenance),
             expected_work_units,
             expected_content_bytes,
         ) || !qg1_valid_throughput_experiment(
             &quill_decision,
-            external_qg1_authority,
+            expected_qg1_authority,
             expected_scope,
             Some(expected_provenance),
             expected_work_units,
@@ -3797,24 +3800,62 @@ impl Qg1ExpectedAuthority {
     }
 }
 
-/// Select the one retained expectation that issued `config`'s sealed authority.
+/// Outcome of resolving which retained expectation authenticates one stream.
+///
+/// The three cases are deliberately distinct. A caller that supplies no
+/// external set is asking to be bound by whatever its live producer installed;
+/// a caller that supplies a set is asserting it retained the right one, and a
+/// set that fails to name this producer exactly once is a failure of that
+/// assertion, never an invitation to fall back to the artifact's own copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Qg1AuthoritySelection<'a> {
+    /// No external set was supplied at all.
+    NoExternalSet,
+    /// Exactly one supplied expectation issued this configuration's authority.
+    Selected(&'a Qg1ExpectedAuthority),
+    /// A nonempty set was supplied that does not name this stream's producer
+    /// exactly once: missing, foreign, duplicated, or otherwise ambiguous.
+    Unresolved,
+}
+
+/// Classify a retained expectation set against one stream's configuration.
 ///
 /// Pilot streams, decision streams, and evidence cells come from separate
 /// producer invocations, so a consumer retains a set and each seam resolves
-/// its own. Selection is deliberately unambiguous: no match and more than one
-/// match both return `None`, because an ambiguous retained set cannot name the
-/// single producer that issued a stream. Every caller treats `None` as the
-/// fail-closed case, so neither outcome can silently admit evidence.
+/// its own. Duplicates count as ambiguity: two matches cannot name a single
+/// producer, even when they are equal.
 pub(crate) fn select_qg1_expected_authority<'a>(
     authorities: &[&'a Qg1ExpectedAuthority],
     config: &PairedEstimatorConfig,
-) -> Option<&'a Qg1ExpectedAuthority> {
+) -> Qg1AuthoritySelection<'a> {
+    if authorities.is_empty() {
+        return Qg1AuthoritySelection::NoExternalSet;
+    }
     let mut matching = authorities
         .iter()
         .copied()
         .filter(|expected| expected.matches_config(config));
-    let selected = matching.next()?;
-    matching.next().is_none().then_some(selected)
+    match (matching.next(), matching.next()) {
+        (Some(selected), None) => Qg1AuthoritySelection::Selected(selected),
+        _ => Qg1AuthoritySelection::Unresolved,
+    }
+}
+
+/// Resolve the expectation one authority-bearing seam must use.
+///
+/// The embedded live expectation stands in only when the caller supplied no
+/// external set. A supplied set that cannot name this producer resolves to
+/// `None`, which every seam treats as fail-closed: a wrong or duplicated set
+/// must never be rescued by the configuration the artifact carries.
+pub(crate) fn resolve_qg1_expected_authority<'a>(
+    authorities: &[&'a Qg1ExpectedAuthority],
+    config: &'a PairedEstimatorConfig,
+) -> Option<&'a Qg1ExpectedAuthority> {
+    match select_qg1_expected_authority(authorities, config) {
+        Qg1AuthoritySelection::Selected(selected) => Some(selected),
+        Qg1AuthoritySelection::NoExternalSet => config.qg1_expected_authority.as_ref(),
+        Qg1AuthoritySelection::Unresolved => None,
+    }
 }
 
 /// The only live producer able to attach a QG-1 lifecycle receipt. It owns
@@ -4947,25 +4988,22 @@ impl PairedExperimentResult {
 
     /// Whether this result recomputes against a proven QG-1 expectation.
     ///
-    /// A live producer supplies it through the configuration it installed; a
-    /// reloaded artifact cannot, so its consumer passes the retained
-    /// expectation as `external`. Canonical QG-1 evidence with neither is
-    /// refused by the authority-bearing estimator, never silently admitted.
+    /// The caller resolves which expectation applies — including whether the
+    /// configuration's embedded one may stand in — through
+    /// [`resolve_qg1_expected_authority`], so this uses exactly what it was
+    /// given. Canonical QG-1 evidence with `None` is refused by the
+    /// authority-bearing estimator, never silently admitted.
     fn recomputes_against_qg1_authority(
         &self,
-        external_qg1_authority: Option<&Qg1ExpectedAuthority>,
+        expected_qg1_authority: Option<&Qg1ExpectedAuthority>,
     ) -> bool {
-        // A live producer supplies the expectation through the configuration
-        // it installed; a consumer supplies the one it retained. Neither can
-        // be absent for canonical QG-1 evidence without failing closed below.
-        let expected = external_qg1_authority.or(self.config.qg1_expected_authority.as_ref());
         self.config.has_predeclared_thresholds()
             && self.config.validate().is_ok()
             && estimate_paired_experiment_against_qg1_authority(
                 &self.effect_samples,
                 &self.null_samples,
                 &self.config,
-                expected,
+                expected_qg1_authority,
             )
             .is_ok_and(|recomputed| recomputed == *self)
     }
@@ -4985,11 +5023,18 @@ impl PairedExperimentResult {
                 field: "operation scope",
             });
         }
-        // Two independent invocations must declare the same estimator policy,
-        // but they can never seal the same QG-1 lifecycle authority: each has
-        // its own producer. Requiring authority equality here would reject
-        // exactly the independent reproduction this method exists to measure.
-        if !self.config.matches_estimator_policy(&other.config) {
+        // Two independent QG-1 invocations must declare the same estimator
+        // policy, but they can never seal the same lifecycle authority: each
+        // has its own producer. Requiring authority equality would reject
+        // exactly the independent reproduction this method measures. The
+        // relaxation is scoped to actual QG-1 results — the scopes were proven
+        // equal above — so every other gate keeps exact configuration equality.
+        let configuration_matches = if is_canonical_qg1_throughput_scope(&self.scope) {
+            self.config.matches_estimator_policy(&other.config)
+        } else {
+            self.config == other.config
+        };
+        if !configuration_matches {
             return Err(PairedEstimatorError::ReproductionMismatch {
                 field: "estimator configuration",
             });
@@ -8653,6 +8698,81 @@ mod tests {
         assert_rejected(
             unsearchable_tantivy,
             "unsearchable Tantivy terminal witness",
+        );
+    }
+
+    /// The three selection outcomes are distinct, and only an absent set may
+    /// fall back to the expectation a configuration still carries.
+    #[test]
+    fn qg1_authority_selection_separates_absent_from_wrong_duplicate_and_ambiguous() {
+        let cell = qg1_bulk_cell(4);
+        let scope = qg1_throughput_scope(&cell);
+        let provenance = provenance("qg1-authority-selection");
+        let authority = qg1_test_authority(
+            &scope,
+            &provenance,
+            500,
+            64_000,
+            u64::try_from(PERF_MIN_RUNS).expect("QG-1 selection pair count fits u64"),
+            &[
+                (QG1_STREAM_ROLE_EFFECT, 0),
+                (QG1_STREAM_ROLE_TANTIVY_NULL, 10_000),
+            ],
+        );
+        let foreign = qg1_test_authority(
+            &scope,
+            &provenance,
+            500,
+            64_000,
+            u64::try_from(PERF_MIN_RUNS).expect("QG-1 selection pair count fits u64"),
+            &[
+                (QG1_STREAM_ROLE_EFFECT, 100_000),
+                (QG1_STREAM_ROLE_TANTIVY_NULL, 110_000),
+            ],
+        );
+        let expected = qg1_test_expected_authority(&authority);
+        let foreign_expected = qg1_test_expected_authority(&foreign);
+        let mut config = estimator_config();
+        config.qg1_lifecycle_authority = Some(authority.clone());
+        config.qg1_expected_authority = Some(expected.clone());
+
+        assert_eq!(
+            select_qg1_expected_authority(&[], &config),
+            Qg1AuthoritySelection::NoExternalSet
+        );
+        assert_eq!(
+            select_qg1_expected_authority(&[&expected], &config),
+            Qg1AuthoritySelection::Selected(&expected)
+        );
+        assert_eq!(
+            select_qg1_expected_authority(&[&foreign_expected], &config),
+            Qg1AuthoritySelection::Unresolved,
+            "a wrong retained set names no producer for this configuration"
+        );
+        assert_eq!(
+            select_qg1_expected_authority(&[&expected, &expected], &config),
+            Qg1AuthoritySelection::Unresolved,
+            "a duplicated expectation cannot name a single producer"
+        );
+
+        assert_eq!(
+            resolve_qg1_expected_authority(&[], &config),
+            Some(&expected),
+            "an absent set falls back to the expectation the live producer installed"
+        );
+        assert_eq!(
+            resolve_qg1_expected_authority(&[&expected], &config),
+            Some(&expected)
+        );
+        assert_eq!(
+            resolve_qg1_expected_authority(&[&foreign_expected], &config),
+            None,
+            "a supplied wrong set must never be rescued by the embedded expectation"
+        );
+        assert_eq!(
+            resolve_qg1_expected_authority(&[&expected, &expected], &config),
+            None,
+            "a supplied duplicate set must never be rescued by the embedded expectation"
         );
     }
 
