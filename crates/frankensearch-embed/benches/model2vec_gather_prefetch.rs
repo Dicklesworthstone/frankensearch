@@ -143,6 +143,8 @@ enum Arm {
 enum FullEmbedArm {
     FormerEncode,
     ShippingEncodeFast,
+    FormerFinish,
+    ShippingFusedFinish,
 }
 
 fn fingerprint_document(fingerprint: &mut u64, sum: &[f32], count: usize) {
@@ -312,14 +314,7 @@ fn run_full_embed_sync_corpus(
 ) -> u64 {
     let mut corpus_fingerprint = 0xcbf2_9ce4_8422_2325_u64;
     for text in texts {
-        let vector = match arm {
-            FullEmbedArm::FormerEncode => embedder
-                .benchmark_embed_sync_former_encode(text)
-                .expect("former full embed_sync route"),
-            FullEmbedArm::ShippingEncodeFast => embedder
-                .embed_sync(text)
-                .expect("shipping full embed_sync route"),
-        };
+        let vector = full_embed_sync_vector(embedder, text, arm);
         let fingerprint = fingerprint_embedding(&vector);
         corpus_fingerprint ^= fingerprint;
         corpus_fingerprint = corpus_fingerprint.wrapping_mul(0x1000_0000_01b3);
@@ -335,16 +330,26 @@ fn full_embed_sync_fingerprints(
 ) -> Vec<u64> {
     texts
         .iter()
-        .map(|text| match arm {
-            FullEmbedArm::FormerEncode => embedder
-                .benchmark_embed_sync_former_encode(text)
-                .expect("former full embed_sync route"),
-            FullEmbedArm::ShippingEncodeFast => embedder
-                .embed_sync(text)
-                .expect("shipping full embed_sync route"),
-        })
+        .map(|text| full_embed_sync_vector(embedder, text, arm))
         .map(|vector| fingerprint_embedding(&vector))
         .collect()
+}
+
+fn full_embed_sync_vector(embedder: &Model2VecEmbedder, text: &str, arm: FullEmbedArm) -> Vec<f32> {
+    match arm {
+        FullEmbedArm::FormerEncode => embedder
+            .benchmark_embed_sync_former_encode(text)
+            .expect("former encode full embed_sync route"),
+        FullEmbedArm::ShippingEncodeFast => embedder
+            .embed_sync(text)
+            .expect("shipping encode_fast full embed_sync route"),
+        FullEmbedArm::FormerFinish => embedder
+            .benchmark_embed_sync_former_finish(text)
+            .expect("former finish full embed_sync route"),
+        FullEmbedArm::ShippingFusedFinish => embedder
+            .embed_sync(text)
+            .expect("shipping fused-finish full embed_sync route"),
+    }
 }
 
 fn full_embed_sync_corpora() -> Vec<(&'static str, Vec<String>)> {
@@ -374,32 +379,30 @@ fn full_embed_sync_corpora() -> Vec<(&'static str, Vec<String>)> {
     ]
 }
 
-fn paired_full_embed_sync_gate(embedder: &Model2VecEmbedder, label: &str, texts: &[String]) {
-    let former_fingerprints =
-        full_embed_sync_fingerprints(embedder, texts, FullEmbedArm::FormerEncode);
-    let shipping_fingerprints =
-        full_embed_sync_fingerprints(embedder, texts, FullEmbedArm::ShippingEncodeFast);
+fn paired_full_embed_sync_gate(
+    embedder: &Model2VecEmbedder,
+    label: &str,
+    texts: &[String],
+    former: FullEmbedArm,
+    shipping: FullEmbedArm,
+    comparison: &str,
+    fail_on_decidable_regression: bool,
+) {
+    let former_fingerprints = full_embed_sync_fingerprints(embedder, texts, former);
+    let shipping_fingerprints = full_embed_sync_fingerprints(embedder, texts, shipping);
     assert_eq!(
         shipping_fingerprints, former_fingerprints,
-        "full embed_sync output fingerprint drift in {label}"
+        "full embed_sync output fingerprint drift in {comparison} {label}"
     );
 
     let aa = paired_median_ratio(
         31,
         1,
         || {
-            black_box(run_full_embed_sync_corpus(
-                embedder,
-                texts,
-                FullEmbedArm::FormerEncode,
-            ));
+            black_box(run_full_embed_sync_corpus(embedder, texts, former));
         },
         || {
-            black_box(run_full_embed_sync_corpus(
-                embedder,
-                texts,
-                FullEmbedArm::FormerEncode,
-            ));
+            black_box(run_full_embed_sync_corpus(embedder, texts, former));
         },
     );
     assert!(
@@ -411,18 +414,10 @@ fn paired_full_embed_sync_gate(embedder: &Model2VecEmbedder, label: &str, texts:
         31,
         1,
         || {
-            black_box(run_full_embed_sync_corpus(
-                embedder,
-                texts,
-                FullEmbedArm::ShippingEncodeFast,
-            ));
+            black_box(run_full_embed_sync_corpus(embedder, texts, shipping));
         },
         || {
-            black_box(run_full_embed_sync_corpus(
-                embedder,
-                texts,
-                FullEmbedArm::ShippingEncodeFast,
-            ));
+            black_box(run_full_embed_sync_corpus(embedder, texts, shipping));
         },
     );
     assert!(
@@ -434,23 +429,21 @@ fn paired_full_embed_sync_gate(embedder: &Model2VecEmbedder, label: &str, texts:
         31,
         1,
         || {
-            black_box(run_full_embed_sync_corpus(
-                embedder,
-                texts,
-                FullEmbedArm::FormerEncode,
-            ));
+            black_box(run_full_embed_sync_corpus(embedder, texts, former));
         },
         || {
-            black_box(run_full_embed_sync_corpus(
-                embedder,
-                texts,
-                FullEmbedArm::ShippingEncodeFast,
-            ));
+            black_box(run_full_embed_sync_corpus(embedder, texts, shipping));
         },
     );
     let decidable = ab.decidable_against(&aa) && ab.decidable_against(&bb);
+    if fail_on_decidable_regression {
+        assert!(
+            !(decidable && ab.median > 1.0),
+            "full embed_sync {comparison} regressed in {label}: A/A={aa:?}, B/B={bb:?}, A/B={ab:?}"
+        );
+    }
     eprintln!(
-        "[full-embed-sync] distribution={label} AA={aa:?} BB={bb:?} AB={ab:?} \
+        "[full-embed-sync] comparison={comparison} distribution={label} AA={aa:?} BB={bb:?} AB={ab:?} \
          decidable={decidable} no_claim=true"
     );
 }
@@ -474,7 +467,24 @@ fn bench_full_embed_sync(c: &mut Criterion) {
     group.measurement_time(Duration::from_millis(1000));
 
     for (label, texts) in full_embed_sync_corpora() {
-        paired_full_embed_sync_gate(&embedder, label, &texts);
+        paired_full_embed_sync_gate(
+            &embedder,
+            label,
+            &texts,
+            FullEmbedArm::FormerEncode,
+            FullEmbedArm::ShippingEncodeFast,
+            "encode_fast",
+            false,
+        );
+        paired_full_embed_sync_gate(
+            &embedder,
+            label,
+            &texts,
+            FullEmbedArm::FormerFinish,
+            FullEmbedArm::ShippingFusedFinish,
+            "mean_norm_fused",
+            true,
+        );
         group.bench_with_input(
             BenchmarkId::new("former_encode", label),
             &texts,
@@ -497,6 +507,32 @@ fn bench_full_embed_sync(c: &mut Criterion) {
                         &embedder,
                         texts,
                         FullEmbedArm::ShippingEncodeFast,
+                    ));
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("former_mean_norm_finish", label),
+            &texts,
+            |bench, texts| {
+                bench.iter(|| {
+                    black_box(run_full_embed_sync_corpus(
+                        &embedder,
+                        texts,
+                        FullEmbedArm::FormerFinish,
+                    ));
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("shipping_mean_norm_fused", label),
+            &texts,
+            |bench, texts| {
+                bench.iter(|| {
+                    black_box(run_full_embed_sync_corpus(
+                        &embedder,
+                        texts,
+                        FullEmbedArm::ShippingFusedFinish,
                     ));
                 });
             },

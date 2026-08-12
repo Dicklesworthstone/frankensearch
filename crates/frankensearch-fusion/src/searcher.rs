@@ -123,6 +123,19 @@ fn scaled_budget(base_candidates: usize, multiplier: f32) -> usize {
     scaled.max(1)
 }
 
+/// Observe cancellation at a boundary between synchronous search stages.
+///
+/// This does not preempt the stage that just ran or the opaque call that
+/// preceded it; it stops the next material stage from starting.
+fn cancellation_checkpoint(cx: &Cx, phase: &'static str) -> SearchResult<()> {
+    cx.checkpoint().map_err(|error| SearchError::Cancelled {
+        phase: phase.to_owned(),
+        reason: cx
+            .cancel_reason()
+            .map_or_else(|| error.to_string(), |reason| reason.to_string()),
+    })
+}
+
 /// Join one configured embedder against the identity its tier was admitted
 /// under, with no vector in hand (bd-ctzo C1).
 ///
@@ -1301,6 +1314,21 @@ impl TwoTierSearcher {
                                         },
                                     });
                                 }
+                                Err(SearchError::Cancelled { phase, reason }) => {
+                                    if let Some(root_request_id) =
+                                        telemetry_root_request_id.as_deref()
+                                    {
+                                        self.emit_session_stop_telemetry(
+                                            root_request_id,
+                                            telemetry_last_event_id.clone(),
+                                            LifecycleState::Degraded,
+                                            LifecycleSeverity::Warn,
+                                            Some(format!("cancelled:{phase}:{reason}")),
+                                            search_started_at.elapsed(),
+                                        );
+                                    }
+                                    return Err(SearchError::Cancelled { phase, reason });
+                                }
                                 Err(err) => {
                                     self.export_error(&err);
                                     tracing::warn!(error = %err, "reranking phase failed");
@@ -2020,10 +2048,14 @@ impl TwoTierSearcher {
             }
         };
 
+        cancellation_checkpoint(cx, "quality_embed_to_prf")?;
+
         if self.prf_config.should_expand(&query_class) {
             let mut feedback_embeddings = Vec::new();
             for result in initial_results.iter().take(self.prf_config.top_k_feedback) {
-                match self.index.semantic_vector_for_doc_id(&result.doc_id) {
+                let feedback = self.index.semantic_vector_for_doc_id(&result.doc_id);
+                cancellation_checkpoint(cx, "prf_vector_lookup")?;
+                match feedback {
                     Ok(Some(embedding)) => {
                         let weight = if self.prf_config.score_weighted {
                             f64::from(result.score.max(0.0))
@@ -2045,6 +2077,7 @@ impl TwoTierSearcher {
             }
 
             if feedback_embeddings.len() >= self.prf_config.min_feedback_docs {
+                cancellation_checkpoint(cx, "prf_lookup_to_expansion")?;
                 let refs = feedback_embeddings
                     .iter()
                     .map(|(embedding, weight)| (embedding.as_slice(), *weight))
@@ -2056,6 +2089,8 @@ impl TwoTierSearcher {
                 }
             }
         }
+
+        cancellation_checkpoint(cx, "prf_to_fast_pool")?;
 
         // Get quality scores for the full retained semantic pool (not just
         // the displayed page): quality can promote candidates that never
@@ -2105,6 +2140,7 @@ impl TwoTierSearcher {
         // here therefore means "phase 1's real fast pool ∪ the quality owner's
         // own top-k", which is strictly more than either arm alone.
         let quality_budget = fast_hits.len().max(k);
+        cancellation_checkpoint(cx, "fast_pool_to_quality_search")?;
         let quality_pool = match admission {
             SemanticAdmission::OwnerBacked { quality: true } => {
                 // The PRF-expanded vector stays inside this space by
@@ -2117,7 +2153,9 @@ impl TwoTierSearcher {
                 )?;
                 let embeddings = TieredQueryEmbeddings::quality_only(bound);
                 let activated = self.index.activate_owner_backed_search(&embeddings)?;
+                cancellation_checkpoint(cx, "quality_activation_to_search")?;
                 let hits = activated.search_quality(quality_budget)?;
+                cancellation_checkpoint(cx, "quality_search_to_coverage")?;
                 // bd-ctzo C4: the coverage receipt is built from the retained
                 // owner's witness and the candidates this tier ACTUALLY
                 // returned, then carried on the metrics so a caller can read
@@ -2139,6 +2177,8 @@ impl TwoTierSearcher {
             ),
         };
         metrics.quality_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
+
+        cancellation_checkpoint(cx, "quality_search_to_calibration")?;
 
         // Calibration is a pure per-element score transform, so it is applied
         // in whichever shape the pool arrived in — never by converting between
@@ -2173,6 +2213,8 @@ impl TwoTierSearcher {
         }
         let quality_pool = quality_pool;
 
+        cancellation_checkpoint(cx, "quality_calibration_to_evidence")?;
+
         // Quality evidence, keyed by canonical document identity so the two
         // pools can disagree about which documents exist at all.
         let quality_scores_by_doc: AHashMap<&str, f32> = match &quality_pool {
@@ -2195,6 +2237,8 @@ impl TwoTierSearcher {
             .filter(|hit| !quality_scores_by_doc.contains_key(hit.doc_id.as_str()))
             .count();
         metrics.phase2_vectors_searched = quality_scores_by_doc.len();
+
+        cancellation_checkpoint(cx, "quality_evidence_to_blend")?;
 
         // Blend fast + quality scores.
         let blend_start = Instant::now();
@@ -2230,6 +2274,8 @@ impl TwoTierSearcher {
         };
         metrics.blend_ms = blend_start.elapsed().as_secs_f64() * 1000.0;
 
+        cancellation_checkpoint(cx, "quality_blend_to_rank")?;
+
         // Compute rank changes (initial vs refined).
         // Precompute rank maps once, then pass to both functions.
         let initial_rank = build_borrowed_rank_map(&fast_hits);
@@ -2248,6 +2294,8 @@ impl TwoTierSearcher {
             let _ = adaptive_fusion.update_blend(query_class, success, signal);
         }
         self.maybe_update_adaptive_conformal(tau);
+
+        cancellation_checkpoint(cx, "quality_rank_to_result_construction")?;
 
         let initial_by_doc: AHashMap<&str, &ScoredResult> = initial_results
             .iter()
@@ -2393,6 +2441,7 @@ impl TwoTierSearcher {
                 semantic_weight: self.effective_semantic_weight(lexical_pool),
                 tiebreak: self.rrf_tiebreak,
             };
+            cancellation_checkpoint(cx, "quality_rank_to_refusion")?;
             let fused = fuse_by_strategy(
                 self.config.fusion_strategy,
                 lexical_pool,
@@ -2403,6 +2452,7 @@ impl TwoTierSearcher {
                 0,
                 &rrf_config,
             );
+            cancellation_checkpoint(cx, "quality_refusion_to_result_construction")?;
             let mut results = fused_hits_to_scored_results(
                 &fused,
                 lexical_pool,
@@ -2446,6 +2496,8 @@ impl TwoTierSearcher {
             }
             return Ok(results);
         }
+
+        cancellation_checkpoint(cx, "quality_result_preparation_to_construction")?;
 
         #[allow(unused_mut)] // mut needed when `rerank` feature is enabled
         let mut results: Vec<ScoredResult> = blended
@@ -2528,6 +2580,8 @@ impl TwoTierSearcher {
             metrics.rerank_ms = rerank_start.elapsed().as_secs_f64() * 1000.0;
         }
 
+        cancellation_checkpoint(cx, "rerank_to_mmr")?;
+
         if self.mmr_config.enabled && results.len() > 1 {
             let pool = results.len().min(self.mmr_config.candidate_pool.max(1));
             if pool > 1 {
@@ -2536,9 +2590,9 @@ impl TwoTierSearcher {
                 let mut complete_pool = true;
 
                 for result in results.iter().take(pool) {
-                    if let Some(embedding) =
-                        self.index.semantic_vector_for_doc_id(&result.doc_id)?
-                    {
+                    let embedding = self.index.semantic_vector_for_doc_id(&result.doc_id)?;
+                    cancellation_checkpoint(cx, "mmr_vector_lookup")?;
+                    if let Some(embedding) = embedding {
                         embeddings.push(embedding);
                         scores.push(f64::from(result.score));
                     } else {
@@ -2548,6 +2602,7 @@ impl TwoTierSearcher {
                 }
 
                 if complete_pool {
+                    cancellation_checkpoint(cx, "mmr_lookup_to_rerank")?;
                     let refs = embeddings
                         .iter()
                         .map(std::vec::Vec::as_slice)
@@ -2575,6 +2630,8 @@ impl TwoTierSearcher {
                 }
             }
         }
+
+        cancellation_checkpoint(cx, "mmr_to_explanation")?;
 
         if self.config.explain {
             for (final_rank, result) in results.iter_mut().enumerate() {
@@ -5261,6 +5318,87 @@ mod tests {
     }
 
     #[test]
+    fn public_search_cancellation_after_quality_embed_stops_before_vector_search() {
+        let quality_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // This vector has the embedder's declared dimension but the wrong
+        // returned length. `quality_scores_for_hits` would reject it if the
+        // post-embed checkpoint did not stop vector work first.
+        let quality = Arc::new(CancellingEmbedder::new(
+            "quality",
+            4,
+            vec![1.0, 0.0, 0.0],
+            quality_calls.clone(),
+        ));
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index_with_quality(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let adapter = Arc::new(RecordingHostAdapter::new("quality_embed_cancellation"));
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                .with_quality_embedder(quality)
+                .with_host_adapter(adapter.clone());
+
+            let mut phases = Vec::new();
+            let error = searcher
+                .search(
+                    &cx,
+                    "test query",
+                    5,
+                    |_| None,
+                    |phase| match phase {
+                        SearchPhase::Initial { .. } => phases.push("initial"),
+                        SearchPhase::Refined { .. } => phases.push("refined"),
+                        SearchPhase::Reranked { .. } => phases.push("reranked"),
+                        SearchPhase::RefinementFailed { .. } => phases.push("refinement_failed"),
+                    },
+                )
+                .await
+                .expect_err("a real Cx cancellation after quality embedding must stop vector work");
+
+            assert!(matches!(
+                error,
+                SearchError::Cancelled { phase, .. } if phase == "quality_embed_to_prf"
+            ));
+            assert_eq!(phases, vec!["initial"]);
+            assert_eq!(
+                quality_calls.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "the controlled quality embedder must be the stage that cancels the real Cx"
+            );
+
+            let lifecycle_hooks = adapter.lifecycle_events();
+            assert!(matches!(
+                lifecycle_hooks.as_slice(),
+                [
+                    AdapterLifecycleEvent::SessionStart { .. },
+                    AdapterLifecycleEvent::HealthTick { .. },
+                    AdapterLifecycleEvent::SessionStop { .. },
+                ]
+            ));
+            let terminal_lifecycle_events: Vec<_> = adapter
+                .telemetry_events()
+                .into_iter()
+                .filter(|envelope| {
+                    matches!(
+                        &envelope.event,
+                        TelemetryEvent::Lifecycle {
+                            state: LifecycleState::Degraded,
+                            severity: LifecycleSeverity::Warn,
+                            reason: Some(reason),
+                            ..
+                        } if reason.starts_with("cancelled:quality_embed_to_prf:")
+                    )
+                })
+                .collect();
+            assert_eq!(
+                terminal_lifecycle_events.len(),
+                1,
+                "quality-embed cancellation must emit one terminal lifecycle telemetry event"
+            );
+        });
+    }
+
+    #[test]
     fn configured_quality_embedder_without_quality_index_stays_initial() {
         let quality_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let quality = Arc::new(CountingEmbedder::new("quality", 4, quality_calls.clone()));
@@ -7309,6 +7447,66 @@ mod tests {
                     vec[0] = 1.0;
                 }
                 Ok(vec)
+            })
+        }
+
+        fn dimension(&self) -> usize {
+            self.dimension
+        }
+
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn model_name(&self) -> &str {
+            self.id
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
+    /// Successful quality embedder that cancels its real invocation context
+    /// immediately before returning a controlled vector.
+    struct CancellingEmbedder {
+        id: &'static str,
+        dimension: usize,
+        vector: Vec<f32>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CancellingEmbedder {
+        fn new(
+            id: &'static str,
+            dimension: usize,
+            vector: Vec<f32>,
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        ) -> Self {
+            Self {
+                id,
+                dimension,
+                vector,
+                calls,
+            }
+        }
+    }
+
+    impl Embedder for CancellingEmbedder {
+        fn embed<'a>(&'a self, cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let vector = self.vector.clone();
+            Box::pin(async move {
+                cx.cancel_with(
+                    asupersync::CancelKind::User,
+                    Some("cancel after quality embed"),
+                );
+                Ok(vector)
             })
         }
 

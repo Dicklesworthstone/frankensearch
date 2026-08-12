@@ -328,15 +328,9 @@ impl Model2VecEmbedder {
             return vec![0.0; self.dimensions];
         }
 
-        // Compute mean
-        #[allow(clippy::cast_precision_loss)]
-        let inv = 1.0 / count as f32;
-        for s in &mut sum {
-            *s *= inv;
-        }
-
-        // L2 normalize to unit length
-        normalize_in_place(&mut sum);
+        // Store each rounded mean value before adding its square in the same strict
+        // left-to-right `Iterator::sum()` order, starting from 0.0, as the former pass.
+        finish_mean_pool_and_normalize(&mut sum, count);
         sum
     }
 
@@ -362,6 +356,45 @@ impl Model2VecEmbedder {
                     source: format!("tokenization failed: {e}").into(),
                 })?;
         Ok(self.embed_token_ids(encoding.get_ids()))
+    }
+
+    /// Former pre-lever mean-pool finish retained only for the internal paired benchmark.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub fn benchmark_embed_sync_former_finish(&self, text: &str) -> SearchResult<Vec<f32>> {
+        if text.is_empty() {
+            return Ok(vec![0.0; self.dimensions]);
+        }
+
+        let encoding =
+            self.tokenizer
+                .encode_fast(text, false)
+                .map_err(|e| SearchError::EmbeddingFailed {
+                    model: self.name.clone(),
+                    source: format!("tokenization failed: {e}").into(),
+                })?;
+        Ok(self.embed_token_ids_with_former_finish(encoding.get_ids()))
+    }
+
+    #[cfg(feature = "bench-internals")]
+    fn embed_token_ids_with_former_finish(&self, token_ids: &[u32]) -> Vec<f32> {
+        if token_ids.is_empty() {
+            return vec![0.0; self.dimensions];
+        }
+
+        let mut sum = vec![0.0_f32; self.dimensions];
+        let count = crate::simd::accumulate_model2vec_rows(
+            &mut sum,
+            &self.embeddings,
+            token_ids,
+            self.vocab_size,
+        );
+        if count == 0 {
+            return vec![0.0; self.dimensions];
+        }
+
+        finish_mean_pool_and_normalize_former(&mut sum, count);
+        sum
     }
 
     /// Embed a batch of texts, dispatching per-document `embed_sync` across Rayon
@@ -398,15 +431,41 @@ impl Model2VecEmbedder {
     }
 }
 
-fn normalize_in_place(vec: &mut [f32]) {
-    let norm_sq: f32 = vec.iter().map(|x| x * x).sum();
+#[inline]
+fn finish_mean_pool_and_normalize(sum: &mut [f32], count: usize) {
+    #[allow(clippy::cast_precision_loss)]
+    let inv = 1.0 / count as f32;
+    let mut norm_sq = 0.0_f32;
+    for value in sum.iter_mut() {
+        *value *= inv;
+        norm_sq += *value * *value;
+    }
     if norm_sq.is_finite() && norm_sq > f32::EPSILON {
         let inv_norm = 1.0 / norm_sq.sqrt();
-        for x in vec {
-            *x *= inv_norm;
+        for value in sum {
+            *value *= inv_norm;
         }
     } else {
-        vec.fill(0.0);
+        sum.fill(0.0);
+    }
+}
+
+/// Exact former finish sequence retained only as an independently callable oracle.
+#[cfg(any(test, feature = "bench-internals"))]
+fn finish_mean_pool_and_normalize_former(sum: &mut [f32], count: usize) {
+    #[allow(clippy::cast_precision_loss)]
+    let inv = 1.0 / count as f32;
+    for value in sum.iter_mut() {
+        *value *= inv;
+    }
+    let norm_sq: f32 = sum.iter().map(|value| value * value).sum();
+    if norm_sq.is_finite() && norm_sq > f32::EPSILON {
+        let inv_norm = 1.0 / norm_sq.sqrt();
+        for value in sum {
+            *value *= inv_norm;
+        }
+    } else {
+        sum.fill(0.0);
     }
 }
 
@@ -1043,9 +1102,13 @@ mod tests {
         }
 
         let token_ids = former_token_ids(embedder, text);
+        former_embed_token_ids(embedder, &token_ids)
+    }
+
+    fn former_embed_token_ids(embedder: &Model2VecEmbedder, token_ids: &[u32]) -> Vec<f32> {
         let mut sum = vec![0.0_f32; embedder.dimensions];
         let mut count = 0_usize;
-        for &token_id in &token_ids {
+        for &token_id in token_ids {
             let index = token_id as usize;
             if index < embedder.vocab_size {
                 let start = index * embedder.dimensions;
@@ -1060,12 +1123,7 @@ mod tests {
             return vec![0.0; embedder.dimensions];
         }
 
-        #[allow(clippy::cast_precision_loss)]
-        let inv = 1.0 / count as f32;
-        for value in &mut sum {
-            *value *= inv;
-        }
-        normalize_in_place(&mut sum);
+        finish_mean_pool_and_normalize_former(&mut sum, count);
         sum
     }
 
@@ -1201,6 +1259,125 @@ mod tests {
         let expected = former_embed_sync(&embedder, "hello world hello");
         let actual = embedder.embed_sync("hello world hello").unwrap();
         assert_f32_bits_eq(&actual, &expected, "non-finite pooled row");
+    }
+
+    #[test]
+    fn fused_mean_and_ordered_norm_finish_matches_former_bits() {
+        let arbitrary_initial_sum = (0_u32..256)
+            .map(|index| {
+                let value = f32::from_bits(0x3f80_0000 + index);
+                if index % 2 == 0 { value } else { -value }
+            })
+            .collect::<Vec<_>>();
+        let cases = vec![
+            ("arbitrary finite sum", arbitrary_initial_sum),
+            (
+                "normalization guard boundary",
+                vec![f32::MIN_POSITIVE, f32::EPSILON.sqrt(), -f32::EPSILON.sqrt()],
+            ),
+            ("signed zero", vec![-0.0, 0.0, -0.0, 0.0]),
+            (
+                "non-finite values",
+                vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX],
+            ),
+        ];
+
+        for (label, initial_sum) in cases {
+            for &count in &[1_usize, 2, 3, 4, 511, 512, 513] {
+                let mut former = initial_sum.clone();
+                let mut fused = initial_sum.clone();
+                finish_mean_pool_and_normalize_former(&mut former, count);
+                finish_mean_pool_and_normalize(&mut fused, count);
+                assert_f32_bits_eq(&fused, &former, &format!("{label}, count={count}"));
+            }
+        }
+    }
+
+    #[test]
+    fn full_embed_sync_fused_finish_matches_former_bits_across_shapes_and_values() {
+        for &dimensions in &[1_usize, 255, 256, 257] {
+            let dir = tempfile::tempdir().unwrap();
+            create_test_model(dir.path(), 12, dimensions);
+            let mut embedder = Model2VecEmbedder::load(dir.path()).unwrap();
+
+            let mut full_embed_sync_corpus =
+                vec![String::new(), "hello definitely-oov-token hello".to_owned()];
+            for token_count in [1_usize, 2, 3, 4, 511, 512, 513] {
+                full_embed_sync_corpus.push(
+                    std::iter::repeat_n("hello", token_count)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+            }
+
+            let oov_grouping_ids = former_token_ids(&embedder, &full_embed_sync_corpus[1]);
+            assert!(
+                oov_grouping_ids.contains(&0),
+                "the full embed_sync OOV grouping corpus must emit the [UNK] token at dim={dimensions}"
+            );
+
+            let hello = dimensions..dimensions * 2;
+            for (lane, value) in embedder.embeddings[hello.clone()].iter_mut().enumerate() {
+                let lane = u32::try_from(lane).expect("fixture dimension fits u32");
+                let magnitude = f32::from_bits(0x3f80_0000 + lane);
+                *value = if lane % 2 == 0 { magnitude } else { -magnitude };
+            }
+            for text in &full_embed_sync_corpus {
+                assert_fast_ids_and_former_vector_bits(
+                    &embedder,
+                    text,
+                    &format!("finite full embed_sync corpus dim={dimensions}"),
+                );
+            }
+
+            #[allow(clippy::cast_precision_loss)]
+            let guard_center = (f32::EPSILON / dimensions as f32).sqrt();
+            let below_guard = f32::from_bits(guard_center.to_bits() - 1);
+            let above_guard = f32::from_bits(guard_center.to_bits() + 1);
+            for (scenario, value) in [
+                ("subnormal", f32::from_bits(1)),
+                ("below guard", below_guard),
+                ("above guard", above_guard),
+                ("signed zero", -0.0),
+                ("NaN", f32::from_bits(0x7fc0_0001)),
+                ("infinity", f32::INFINITY),
+            ] {
+                embedder.embeddings[hello.clone()].fill(value);
+                for text in &full_embed_sync_corpus {
+                    assert_fast_ids_and_former_vector_bits(
+                        &embedder,
+                        text,
+                        &format!("{scenario} full embed_sync corpus dim={dimensions}"),
+                    );
+                }
+            }
+
+            let invalid_token_ids = [
+                1_u32,
+                u32::try_from(embedder.vocab_size).expect("fixture vocabulary fits u32"),
+                u32::MAX,
+                2_u32,
+            ];
+            let former = former_embed_token_ids(&embedder, &invalid_token_ids);
+            let fused = embedder.embed_token_ids(&invalid_token_ids);
+            assert_f32_bits_eq(
+                &fused,
+                &former,
+                &format!("mixed valid/OOV token IDs dim={dimensions}"),
+            );
+
+            let all_oov_token_ids = [
+                u32::try_from(embedder.vocab_size).expect("fixture vocabulary fits u32"),
+                u32::MAX,
+            ];
+            let former = former_embed_token_ids(&embedder, &all_oov_token_ids);
+            let fused = embedder.embed_token_ids(&all_oov_token_ids);
+            assert_f32_bits_eq(
+                &fused,
+                &former,
+                &format!("all OOV token IDs dim={dimensions}"),
+            );
+        }
     }
 
     // ── OOV Handling ───────────────────────────────────────────────────
