@@ -17,8 +17,9 @@
 //!
 //! Historical Criterion arms retain `base`, `pf_head`, and `pf_row`. The shipping
 //! gate additionally compares the exact former production loop with
-//! `accumulate_model2vec_rows`: no prefetch below 512 tokens, full-row prefetch at
-//! 512+, and mean-scaling plus L2 normalization included. Each timed arm traverses
+//! `accumulate_model2vec_rows`: native-256 rows are fused in ordered groups of at
+//! most four below 512 tokens, while the existing full-row prefetch remains at
+//! 512+. Mean-scaling plus L2 normalization are included. Each timed arm traverses
 //! a full 30 MB table copy so repeated sampling cannot turn the long-document
 //! workload into an L2-resident microbenchmark.
 //!
@@ -134,14 +135,14 @@ fn finish_mean_pool(sum: &mut [f32], count: usize) {
 #[derive(Clone, Copy)]
 enum Arm {
     Original,
-    GatedPrefetch,
+    ShippingCandidate,
 }
 
 fn run_corpus(emb: &[f32], ids: &[u32], tokens_per_doc: usize, sum: &mut [f32], arm: Arm) {
     for doc_ids in ids.chunks_exact(tokens_per_doc) {
         let count = match arm {
             Arm::Original => gather_base(emb, doc_ids, sum),
-            Arm::GatedPrefetch => gather_gated(emb, doc_ids, sum),
+            Arm::ShippingCandidate => gather_gated(emb, doc_ids, sum),
         };
         finish_mean_pool(sum, count);
         black_box(&*sum);
@@ -156,7 +157,7 @@ fn corpus_ids(tokens_per_doc: usize) -> Vec<u32> {
 }
 
 fn paired_shipping_gate(emb_original: &[f32], emb_candidate: &[f32]) {
-    for &tokens_per_doc in &[128_usize, 256, 512] {
+    for &tokens_per_doc in &[1_usize, 2, 3, 4, 8, 16, 32, 64, 128, 256, 512] {
         let ids = corpus_ids(tokens_per_doc);
 
         let mut parity_original = vec![0.0_f32; DIM];
@@ -173,7 +174,7 @@ fn paired_shipping_gate(emb_original: &[f32], emb_candidate: &[f32]) {
             &ids,
             tokens_per_doc,
             &mut parity_candidate,
-            Arm::GatedPrefetch,
+            Arm::ShippingCandidate,
         );
         assert_eq!(
             parity_original
@@ -232,7 +233,7 @@ fn paired_shipping_gate(emb_original: &[f32], emb_candidate: &[f32]) {
                     black_box(&ids),
                     tokens_per_doc,
                     black_box(&mut lever_candidate),
-                    Arm::GatedPrefetch,
+                    Arm::ShippingCandidate,
                 );
             },
         );

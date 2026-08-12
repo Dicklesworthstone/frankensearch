@@ -820,6 +820,110 @@ mod tests {
         assert_ne!(a, b, "different inputs should produce different embeddings");
     }
 
+    /// The former `embed_sync` pooling and finish sequence, retained independently
+    /// of the production gather helper for exact native-256 parity checks.
+    fn former_embed_sync(embedder: &Model2VecEmbedder, text: &str) -> Vec<f32> {
+        if text.is_empty() {
+            return vec![0.0; embedder.dimensions];
+        }
+
+        let encoding = embedder.tokenizer.encode(text, false).unwrap();
+        let mut sum = vec![0.0_f32; embedder.dimensions];
+        let mut count = 0_usize;
+        for &token_id in encoding.get_ids() {
+            let index = token_id as usize;
+            if index < embedder.vocab_size {
+                let start = index * embedder.dimensions;
+                for (value, row_value) in sum
+                    .iter_mut()
+                    .zip(&embedder.embeddings[start..start + embedder.dimensions])
+                {
+                    *value += *row_value;
+                }
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return vec![0.0; embedder.dimensions];
+        }
+
+        #[allow(clippy::cast_precision_loss)]
+        let inv = 1.0 / count as f32;
+        for value in &mut sum {
+            *value *= inv;
+        }
+        normalize_in_place(&mut sum);
+        sum
+    }
+
+    fn assert_f32_bits_eq(actual: &[f32], expected: &[f32], scenario: &str) {
+        assert_eq!(
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "{scenario}"
+        );
+    }
+
+    #[test]
+    fn native_256_embed_sync_matches_former_pool_and_finish_bits() {
+        const DIMENSIONS: usize = 256;
+        let dir = tempfile::tempdir().unwrap();
+        create_test_model(dir.path(), 12, DIMENSIONS);
+        let mut embedder = Model2VecEmbedder::load(dir.path()).unwrap();
+
+        for &tokens in &[0_usize, 1, 2, 3, 4, 8, 16, 32, 64] {
+            let text = (0..tokens)
+                .map(|position| match position % 4 {
+                    0 => "hello",
+                    1 => "world",
+                    2 => "missing-token",
+                    _ => "hello",
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let expected = former_embed_sync(&embedder, &text);
+            let actual = embedder.embed_sync(&text).unwrap();
+            assert_f32_bits_eq(&actual, &expected, &format!("tokens={tokens}"));
+        }
+
+        for text in [
+            "hello caf\u{e9} world",
+            "hello \u{6771}\u{4eac} hello",
+            "HELLO hello HELLO",
+        ] {
+            let expected = former_embed_sync(&embedder, text);
+            let actual = embedder.embed_sync(text).unwrap();
+            assert_f32_bits_eq(&actual, &expected, text);
+        }
+
+        let hello = DIMENSIONS..DIMENSIONS * 2;
+        embedder.embeddings[hello.clone()].fill(-0.0);
+        let expected = former_embed_sync(&embedder, "hello hello");
+        let actual = embedder.embed_sync("hello hello").unwrap();
+        assert_f32_bits_eq(&actual, &expected, "signed-zero row");
+
+        embedder.embeddings[hello.clone()].fill(1.0e-20);
+        let expected = former_embed_sync(&embedder, "hello");
+        let actual = embedder.embed_sync("hello").unwrap();
+        assert_f32_bits_eq(&actual, &expected, "below normalization guard");
+
+        embedder.embeddings[hello.clone()].fill(1.0e-4);
+        let expected = former_embed_sync(&embedder, "hello");
+        let actual = embedder.embed_sync("hello").unwrap();
+        assert_f32_bits_eq(&actual, &expected, "above normalization guard");
+
+        embedder.embeddings[hello].fill(f32::NAN);
+        let expected = former_embed_sync(&embedder, "hello world hello");
+        let actual = embedder.embed_sync("hello world hello").unwrap();
+        assert_f32_bits_eq(&actual, &expected, "non-finite pooled row");
+    }
+
     // ── OOV Handling ───────────────────────────────────────────────────
 
     #[test]
