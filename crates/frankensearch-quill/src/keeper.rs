@@ -3762,13 +3762,13 @@ pub(crate) enum PublicationAuthorityPhase {
 }
 
 impl PublicationAuthorityPhase {
-    fn from_bits(bits: u64) -> Self {
+    const fn from_bits(bits: u64) -> Self {
         match bits {
             0 => Self::Stable,
             1 => Self::Preparing,
             2 => Self::DurableAhead,
             3 => Self::Indeterminate,
-            _ => unreachable!("two publication phase bits have four states"),
+            _ => unreachable!(),
         }
     }
 }
@@ -3792,13 +3792,13 @@ impl PublicationAuthorityState {
 
     /// Publication phase carried with [`Self::generation`].
     #[must_use]
-    pub(crate) fn phase(self) -> PublicationAuthorityPhase {
+    pub(crate) const fn phase(self) -> PublicationAuthorityPhase {
         PublicationAuthorityPhase::from_bits(self.packed & 0b11)
     }
 
     /// Whether a process-local snapshot at this generation remains readable.
     #[must_use]
-    pub(crate) fn is_readable(self) -> bool {
+    pub(crate) const fn is_readable(self) -> bool {
         matches!(
             self.phase(),
             PublicationAuthorityPhase::Stable | PublicationAuthorityPhase::Preparing
@@ -15114,6 +15114,26 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
     const EMPTY_TERM_DICTIONARY: [u8; 4] = 0_u32.to_le_bytes();
+
+    #[test]
+    fn publication_authority_phase_decodes_in_const_context() {
+        const PHASES: [PublicationAuthorityPhase; 4] = [
+            PublicationAuthorityPhase::from_bits(0),
+            PublicationAuthorityPhase::from_bits(1),
+            PublicationAuthorityPhase::from_bits(2),
+            PublicationAuthorityPhase::from_bits(3),
+        ];
+
+        assert_eq!(
+            PHASES,
+            [
+                PublicationAuthorityPhase::Stable,
+                PublicationAuthorityPhase::Preparing,
+                PublicationAuthorityPhase::DurableAhead,
+                PublicationAuthorityPhase::Indeterminate,
+            ]
+        );
+    }
 
     #[test]
     fn publication_transition_unwind_marks_preparing_authority_indeterminate() {
