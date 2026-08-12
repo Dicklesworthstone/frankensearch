@@ -687,6 +687,10 @@ struct PassPlan {
     /// Generation of the established authority the plan was made against.
     /// Continuity is proven by this value still being current at the commit.
     expected_generation: Option<u64>,
+    /// Reconciliation epoch the plan was made against. An operation applied
+    /// after another writer advanced this epoch is debt, not permission to
+    /// install this pass's authority conclusion.
+    expected_epoch: u64,
 }
 
 impl PassPlan {
@@ -694,6 +698,91 @@ impl PassPlan {
     /// unapplied events named.
     const fn adjudicates(&self) -> bool {
         matches!(self.outcome, PassOutcome::Adjudicated)
+    }
+}
+
+/// Catch-up operations coupled to the authority conclusion that produced
+/// them.
+///
+/// The operations are only evidence until their sink reports success. Call
+/// [`Self::acknowledge_applied`] after applying [`Self::events`]. Dropping an
+/// unacknowledged value deliberately leaves a fresh authoritative pass owed,
+/// so a failed or forgotten stale delete is derived again rather than erased
+/// from the retained baseline.
+#[must_use = "catch-up operations must be acknowledged after their successful apply"]
+pub struct CatchupEvents {
+    events: Vec<WatchEvent>,
+    commitment: Option<CatchupCommitment>,
+}
+
+struct CatchupCommitment {
+    reconciliation: ReconciliationTracker,
+    plan: PassPlan,
+    snapshot: FileSnapshot,
+    identities: BTreeMap<PathBuf, RootIdentity>,
+}
+
+impl CatchupEvents {
+    /// Operations that must be applied before the authority conclusion can be
+    /// committed.
+    #[must_use]
+    pub fn events(&self) -> &[WatchEvent] {
+        &self.events
+    }
+
+    /// Commit the authority conclusion after every returned operation applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when another reconciliation writer changed the state
+    /// while the caller was applying this batch. The batch is then retained as
+    /// reconciliation debt and must be derived again from a fresh scan.
+    pub fn acknowledge_applied(mut self) -> SearchResult<()> {
+        let Some(commitment) = self.commitment.take() else {
+            return Ok(());
+        };
+        let mut state = lock_or_recover(&commitment.reconciliation);
+        if state.epoch != commitment.plan.expected_epoch
+            || !state.commit_complete_pass(
+                &commitment.plan,
+                commitment.snapshot,
+                commitment.identities,
+            )
+        {
+            state.require_full_scan();
+            return Err(SearchError::SubsystemError {
+                subsystem: WATCHER_SUBSYSTEM,
+                source: Box::new(io::Error::other(
+                    "catch-up authority changed while operations were applying",
+                )),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for CatchupEvents {
+    type Target = [WatchEvent];
+
+    fn deref(&self) -> &Self::Target {
+        self.events()
+    }
+}
+
+impl std::fmt::Debug for CatchupEvents {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.events.fmt(formatter)
+    }
+}
+
+impl Drop for CatchupEvents {
+    fn drop(&mut self) {
+        if let Some(commitment) = self.commitment.take() {
+            // The caller either discarded the operations or its apply failed.
+            // The plan has not committed authority or cleared retained legacy,
+            // so explicitly owing a fresh pass is sufficient to rederive it.
+            lock_or_recover(&commitment.reconciliation).require_full_scan();
+        }
     }
 }
 
@@ -847,6 +936,11 @@ impl ReconciliationState {
                 }
             }
         };
+        // A pending catch-up acknowledgement must not settle this newer
+        // legacy record through an earlier grant. Advancing the epoch makes
+        // every plan made before this import fail closed at its acknowledgement
+        // point, and leaves a fresh complete pass owed for the merged record.
+        self.require_full_scan();
     }
 
     /// Grant one-shot permission to adjudicate the currently held inherited
@@ -876,12 +970,14 @@ impl ReconciliationState {
     /// the operations were being applied.
     fn plan_complete_pass(&self, roots: &[PathBuf], completeness: &ScanCompleteness) -> PassPlan {
         let expected_generation = self.established_generation();
+        let expected_epoch = self.epoch;
         if !completeness.identity_is_trustworthy() {
             return PassPlan {
                 outcome: PassOutcome::Degraded,
                 deletion_baseline: None,
                 adjudicates_legacy: false,
                 expected_generation,
+                expected_epoch,
             };
         }
         let identities = completeness.root_identities();
@@ -896,6 +992,7 @@ impl ReconciliationState {
                 deletion_baseline: Some(deletion_baseline),
                 adjudicates_legacy,
                 expected_generation,
+                expected_epoch,
             }
         };
         match &self.authority {
@@ -926,6 +1023,7 @@ impl ReconciliationState {
                 deletion_baseline: None,
                 adjudicates_legacy: false,
                 expected_generation,
+                expected_epoch,
             },
         }
     }
@@ -942,7 +1040,9 @@ impl ReconciliationState {
         snapshot: FileSnapshot,
         identities: BTreeMap<PathBuf, RootIdentity>,
     ) -> bool {
-        if self.established_generation() != plan.expected_generation {
+        if self.epoch != plan.expected_epoch
+            || self.established_generation() != plan.expected_generation
+        {
             return false;
         }
         let generation = plan
@@ -1745,12 +1845,16 @@ impl FsWatcher {
     /// [`Self::authorize_deletion_authority_rebuild`] says the roots are the
     /// same ones.
     ///
+    /// The returned [`CatchupEvents`] retains the planned authority conclusion
+    /// until the caller acknowledges that every event applied. Dropping it
+    /// leaves the scan owed, so a failed stale delete remains derivable.
+    ///
     /// # Errors
     ///
     /// Returns errors from current snapshot collection.
-    pub fn build_catchup_events(&self, previous: &FileSnapshot) -> SearchResult<Vec<WatchEvent>> {
+    pub fn build_catchup_events(&self, previous: &FileSnapshot) -> SearchResult<CatchupEvents> {
         let (current, mut completeness) = self.collect_snapshot()?;
-        let baseline = {
+        let (baseline, commitment) = {
             let mut state = lock_or_recover(&self.reconciliation);
             state.inherit_legacy(previous);
             if let Some(authority) = state.established_authority(&self.roots) {
@@ -1762,31 +1866,29 @@ impl FsWatcher {
             if completeness.is_complete() && completeness.identity_is_trustworthy() {
                 let plan = state.plan_complete_pass(&self.roots, &completeness);
                 let baseline = plan.deletion_baseline.clone().unwrap_or_default();
-                // Nothing has been applied between the plan and here, so the
-                // lineage cannot have moved and the commit cannot be refused;
-                // the state still decides, not this call site.
-                let committed = state.commit_complete_pass(
-                    &plan,
-                    current.clone(),
-                    completeness.root_identities().clone(),
-                );
-                if !committed {
-                    state.require_full_scan();
-                }
-                baseline
+                // The returned events are not yet applied. Deferring this
+                // commit is what keeps a stale delete owed if a caller drops
+                // the batch or its sink fails partway through it.
+                (
+                    baseline,
+                    Some(CatchupCommitment {
+                        reconciliation: Arc::clone(&self.reconciliation),
+                        plan,
+                        snapshot: current.clone(),
+                        identities: completeness.root_identities().clone(),
+                    }),
+                )
             } else {
                 // Short or unidentifiable: report what was seen, adjudicate
                 // nothing, and leave a complete pass owed.
                 state.require_full_scan();
-                FileSnapshot::new()
+                (FileSnapshot::new(), None)
             }
         };
-        Ok(Self::diff_snapshots(
-            &baseline,
-            &current,
-            now_millis(),
-            &completeness,
-        ))
+        Ok(CatchupEvents {
+            events: Self::diff_snapshots(&baseline, &current, now_millis(), &completeness),
+            commitment,
+        })
     }
 
     /// Deterministically diff two snapshots into create/modify/delete events.
@@ -2366,19 +2468,17 @@ async fn run_ingest_loop(
             Ok(reindexed) => {
                 let events = lease.events().to_vec();
                 let outcome = prepared.outcome(reindexed);
-                // A stop already visible here belongs to the completed apply,
-                // not to an in-flight bookkeeping walk. The collector still
-                // runs so a genuine post-apply failure can take the existing
-                // authoritative reconciliation path; a stop that arrives
-                // after the walk begins interrupts it promptly.
-                let stop_before_record = stop.is_requested();
                 match record_successful_events(
                     roots,
                     discovery,
                     reconciliation,
                     &events,
                     snapshot_collector,
-                    &|| cx.is_cancel_requested() || (!stop_before_record && stop.is_requested()),
+                    // A stop published at any point after the sink mutation,
+                    // including before bookkeeping enters the collector, is
+                    // reconciliation debt rather than permission to start an
+                    // unbounded tree walk.
+                    &|| stop.is_requested() || cx.is_cancel_requested(),
                     // Never commit a successful bookkeeping result after a
                     // stop or cancellation, even if it was already visible
                     // before the walk entered.
@@ -2402,64 +2502,14 @@ async fn run_ingest_loop(
                     }
                     Err(error) => {
                         // A real collector failure is different from an
-                        // interrupted walk. It leaves the apply debt behind,
-                        // then a clean stop performs the established
-                        // authoritative reconciliation rather than silently
-                        // skipping this fixture's retry path.
+                        // interrupted walk. It leaves the apply debt behind;
+                        // the normal retry/reconciliation path below settles
+                        // it unless stop/cancel wins first.
                         drop(lease);
                         if cx.is_cancel_requested() {
                             return Err(cancelled_ingest_error(cx));
                         }
                         stats.add_error();
-                        if stop.is_requested() && is_retryable_error(&error) {
-                            match run_authoritative_reconciliation(
-                                cx,
-                                roots,
-                                discovery,
-                                ingest,
-                                reconciliation,
-                                ready_batches,
-                                stats,
-                                batch_size,
-                                snapshot_collector,
-                                // This recovery follows a real bookkeeping
-                                // failure. The stop is graceful here; caller
-                                // cancellation remains abortive.
-                                &|| cx.is_cancel_requested(),
-                            )
-                            .await
-                            {
-                                Ok(()) => {
-                                    return drain_final_batches(
-                                        cx,
-                                        roots,
-                                        discovery,
-                                        ingest,
-                                        ready_batches,
-                                        stop,
-                                        stats,
-                                        reconciliation,
-                                        producer_done,
-                                        snapshot_collector,
-                                    )
-                                    .await;
-                                }
-                                Err(reconciliation_error) => {
-                                    if cx.is_cancel_requested() {
-                                        return Err(cancelled_ingest_error(cx));
-                                    }
-                                    stats.add_error();
-                                    if is_retryable_error(&reconciliation_error) {
-                                        fold_queue_into_reconciliation(
-                                            ready_batches,
-                                            reconciliation,
-                                        );
-                                        return Ok(());
-                                    }
-                                    return Err(reconciliation_error);
-                                }
-                            }
-                        }
                         if !is_retryable_error(&error) {
                             return Err(error);
                         }
@@ -2820,13 +2870,7 @@ async fn run_authoritative_reconciliation(
     let mut staged_skipped = 0_usize;
     for event_batch in events.chunks(batch_size.max(1)) {
         if cx.is_cancel_requested() || abort() {
-            return Err(SearchError::Cancelled {
-                phase: "watch.reconcile".to_owned(),
-                reason: cx.cancel_reason().map_or_else(
-                    || "watcher reconciliation cancelled".to_owned(),
-                    |reason| reason.to_string(),
-                ),
-            });
+            return Err(reconciliation_abort_error(cx));
         }
         // The epoch must hold through the apply, not merely at the commit: a
         // concurrent mutation that advanced it means these events describe a
@@ -2844,7 +2888,37 @@ async fn run_authoritative_reconciliation(
             staged_skipped = staged_skipped.saturating_add(prepared.skipped);
             continue;
         }
-        let reindexed = ingest.apply_batch(cx, &prepared.ops).await?;
+        let reindexed = match ingest.apply_batch(cx, &prepared.ops).await {
+            Ok(reindexed) => reindexed,
+            Err(error) => {
+                // A sink error can arrive after a partial mutation. Treat the
+                // whole chunk as debt instead of assuming the error means no
+                // operation landed.
+                lock_or_recover(reconciliation).require_for_events(event_batch);
+                return Err(error);
+            }
+        };
+        {
+            // `apply_batch` is a mutation boundary. A stop or caller
+            // cancellation that lands while it is pending must be observed
+            // again while the reconciliation state is locked, before this
+            // applied chunk can advance authority, clear debt, or contribute
+            // to the staged publication below.
+            let mut state = lock_or_recover(reconciliation);
+            if cx.is_cancel_requested() || abort() {
+                state.require_for_events(event_batch);
+                return Err(reconciliation_abort_error(cx));
+            }
+            if state.epoch != epoch {
+                state.require_for_events(event_batch);
+                return Err(SearchError::SubsystemError {
+                    subsystem: "fsfs-watcher",
+                    source: Box::new(io::Error::other(
+                        "reconciliation epoch advanced during apply; rescanning",
+                    )),
+                });
+            }
+        }
         let outcome = prepared.outcome(reindexed);
         staged_reindexed = staged_reindexed.saturating_add(outcome.reindexed);
         staged_skipped = staged_skipped.saturating_add(outcome.skipped);
@@ -2853,6 +2927,13 @@ async fn run_authoritative_reconciliation(
     // Only a complete pass reaches here; the incomplete one returned above
     // before applying anything.
     let mut state = lock_or_recover(reconciliation);
+    if cx.is_cancel_requested() || abort() {
+        // The last apply may have returned just before this lock. Retain every
+        // operation from this pass as debt so no authority or telemetry is
+        // published after cancellation.
+        state.require_for_events(&events);
+        return Err(reconciliation_abort_error(cx));
+    }
     if state.epoch != epoch {
         // The tree moved under this pass. Its operations landed, but its
         // conclusion describes a state that no longer exists, so nothing is
@@ -2869,6 +2950,27 @@ async fn run_authoritative_reconciliation(
     stats.add_reindexed(staged_reindexed);
     stats.add_skipped(staged_skipped);
     Ok(())
+}
+
+fn reconciliation_abort_error(cx: &Cx) -> SearchError {
+    if cx.is_cancel_requested() {
+        return SearchError::Cancelled {
+            phase: "watch.reconcile".to_owned(),
+            reason: cx.cancel_reason().map_or_else(
+                || "watcher reconciliation cancelled".to_owned(),
+                |reason| reason.to_string(),
+            ),
+        };
+    }
+    // A generation stop is graceful. Keep it in the retryable class so the
+    // ingest loop reaches its stop drain rather than surfacing a terminal
+    // watcher failure after a post-apply abort.
+    SearchError::SubsystemError {
+        subsystem: "fsfs-watcher",
+        source: Box::new(io::Error::other(
+            "watcher reconciliation interrupted by stop request",
+        )),
+    }
 }
 
 /// Whether successful post-apply bookkeeping reached a commit point.
@@ -2894,6 +2996,13 @@ fn record_successful_events(
     // `apply_batch` has already crossed its mutation boundary. From here a
     // stop or cancellation must leave reconciliation owed, not install a
     // freshly scanned authority or publish success statistics.
+    // Check before even invoking the collector. The built-in collector polls
+    // again per directory entry, but this admission check is what makes an
+    // already-published stop refuse the entire bookkeeping walk rather than
+    // depending on any particular collector implementation to notice it.
+    if scan_abort() {
+        return Ok(RecordSuccessfulEventsOutcome::Aborted);
+    }
     // Read the lineage this batch is being recorded against *before* the scan,
     // so the checks below compare the authority that was in force when the
     // batch was applied against the one still in force now.
@@ -2962,6 +3071,15 @@ fn record_successful_events(
         // Establishing authority is a pass's job, not a batch's: this path
         // applies no deletes and cannot adjudicate anything, so it may only
         // advance an authority that already exists and is still the same one.
+        //
+        // A probationary candidate stops automatically re-arming after the
+        // configured number of changing observations. A real successful
+        // event is new evidence, though: it must re-arm the confirming pass
+        // without promoting that candidate to deletion authority.
+        if !state.required && matches!(state.authority, DeletionAuthorityState::Probationary { .. })
+        {
+            state.require_for_events(events);
+        }
         return Ok(RecordSuccessfulEventsOutcome::Recorded);
     }
     // A successful batch over a complete, trustworthy scan advances the
@@ -3977,7 +4095,8 @@ mod tests {
         batches: Mutex<Vec<Vec<WatchIngestOp>>>,
         attempts: Mutex<Vec<Vec<WatchIngestOp>>>,
         fail_next: AtomicBool,
-        stop_on_success: Mutex<Option<Arc<WatcherStop>>>,
+        stop_after_success: Mutex<Option<(Arc<WatcherStop>, usize)>>,
+        stop_on_flush_barrier: Mutex<Option<Arc<WatcherStop>>>,
         /// Cancellation state of the `Cx` the sink was actually handed.
         observed_cancelled: AtomicBool,
     }
@@ -4011,10 +4130,50 @@ mod tests {
                     });
                 }
 
-                lock_or_recover(&self.batches).push(batch.to_vec());
-                if let Some(stop) = lock_or_recover(&self.stop_on_success).as_ref() {
+                let successful_applies = {
+                    let mut batches = lock_or_recover(&self.batches);
+                    batches.push(batch.to_vec());
+                    batches.len()
+                };
+                if let Some((stop, threshold)) = lock_or_recover(&self.stop_after_success).as_ref()
+                {
+                    if successful_applies >= *threshold {
+                        stop.request();
+                    }
+                }
+                Ok(batch.len())
+            })
+        }
+
+        fn poll_flush_barrier<'a>(&'a self, _cx: &'a Cx) -> WatchIngestFuture<'a, bool> {
+            Box::pin(async move {
+                if let Some(stop) = lock_or_recover(&self.stop_on_flush_barrier).as_ref() {
                     stop.request();
                 }
+                Ok(false)
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct ParkedApplyPipeline {
+        entered: AtomicBool,
+        released: AtomicBool,
+        applied: Mutex<Vec<Vec<WatchIngestOp>>>,
+    }
+
+    impl WatchIngestPipeline for ParkedApplyPipeline {
+        fn apply_batch<'a>(
+            &'a self,
+            cx: &'a Cx,
+            batch: &'a [WatchIngestOp],
+        ) -> WatchIngestFuture<'a, usize> {
+            Box::pin(async move {
+                self.entered.store(true, Ordering::Release);
+                while !self.released.load(Ordering::Acquire) {
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+                lock_or_recover(&self.applied).push(batch.to_vec());
                 Ok(batch.len())
             })
         }
@@ -5174,6 +5333,9 @@ mod tests {
                 watcher.holds_unverified_legacy_baseline(),
                 "the inherited name must still be retained after pass {pass}"
             );
+            observed
+                .acknowledge_applied()
+                .expect("the applied catch-up observation commits its non-deleting state");
         }
 
         // The operator states that the configured roots really are the roots
@@ -5190,6 +5352,9 @@ mod tests {
             "the retained name must be settled by the explicit grant, and it can only \
              have come from retention because the argument was empty, got {recovered:?}"
         );
+        recovered
+            .acknowledge_applied()
+            .expect("the applied stale delete settles the explicitly granted record");
         assert!(
             !watcher.holds_unverified_legacy_baseline(),
             "a settled record is no longer held, so the one-shot grant cannot be replayed"
@@ -5206,6 +5371,83 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == WatchEventKind::Deleted && event.path == later),
             "the spent grant must not authorize the next inherited name, got {refused:?}"
+        );
+    }
+
+    /// A catch-up delete is only a proposal until its returned operations have
+    /// applied. Dropping that proposal must retain the inherited name and make
+    /// the next public catch-up derive it again.
+    #[test]
+    fn discarded_catchup_delete_remains_owed_and_is_rederived() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("g4-catchup-transactional");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("kept.rs"), "fn kept() {}\n").expect("write kept fixture");
+        let stale = root.join("stale.rs");
+        let previous = FileSnapshot::from([(stale.clone(), 7)]);
+        let watcher = FsWatcher::new(
+            vec![root.clone()],
+            DiscoveryConfig::default(),
+            Arc::new(NoopWatchIngestPipeline),
+        );
+
+        // Settle the two observations that establish current-root authority,
+        // while retaining the inherited record as deletion-ineligible legacy.
+        let first = watcher
+            .build_catchup_events(&previous)
+            .expect("first public catch-up");
+        assert!(
+            !first
+                .iter()
+                .any(|event| event.kind == WatchEventKind::Deleted),
+            "the first inherited observation cannot delete stale state"
+        );
+        first
+            .acknowledge_applied()
+            .expect("first applied catch-up commits its probationary observation");
+        let confirmation = watcher
+            .build_catchup_events(&FileSnapshot::new())
+            .expect("confirming public catch-up");
+        confirmation
+            .acknowledge_applied()
+            .expect("confirming applied catch-up establishes current-root authority");
+        assert!(watcher.holds_unverified_legacy_baseline());
+
+        watcher.authorize_deletion_authority_rebuild();
+        let discarded = watcher
+            .build_catchup_events(&FileSnapshot::new())
+            .expect("stale delete proposal");
+        assert!(
+            discarded
+                .iter()
+                .any(|event| { event.kind == WatchEventKind::Deleted && event.path == stale }),
+            "the explicit grant must propose the retained stale delete"
+        );
+        drop(discarded);
+
+        assert!(
+            watcher.holds_unverified_legacy_baseline(),
+            "discarding an unapplied delete must not clear its legacy record"
+        );
+        assert!(
+            lock_or_recover(&watcher.reconciliation).required,
+            "discarding an unapplied delete must leave reconciliation owed"
+        );
+        let rederived = watcher
+            .build_catchup_events(&FileSnapshot::new())
+            .expect("rederive the discarded stale delete");
+        assert!(
+            rederived
+                .iter()
+                .any(|event| { event.kind == WatchEventKind::Deleted && event.path == stale }),
+            "the dropped delete must be rederived from retained legacy"
+        );
+        rederived
+            .acknowledge_applied()
+            .expect("the retried delete now acknowledges its successful apply");
+        assert!(
+            !watcher.holds_unverified_legacy_baseline(),
+            "only the acknowledged retry may settle the retained stale delete"
         );
     }
 
@@ -5727,6 +5969,115 @@ mod tests {
         });
     }
 
+    /// A reconciliation apply is a mutation boundary too. A stop that lands
+    /// while its future is parked must retain debt under the reconciliation
+    /// lock and suppress the pass's authority and staged statistics.
+    #[test]
+    fn stopped_reconciliation_after_parked_apply_keeps_debt_and_authority() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("g4-reconcile-post-apply-stop");
+            fs::create_dir_all(&root).expect("create root");
+            let baseline_file = root.join("baseline.rs");
+            fs::write(&baseline_file, "fn baseline() {}\n").expect("write baseline");
+            let roots = vec![root.clone()];
+            let discovery = DiscoveryConfig::default();
+            let (baseline, completeness) =
+                collect_snapshot_from_roots(&roots, &discovery, &|| false)
+                    .expect("collect baseline");
+            assert!(completeness.is_complete());
+            let reconciliation: ReconciliationTracker =
+                Arc::new(Mutex::new(ReconciliationState::default()));
+            {
+                let mut state = lock_or_recover(&reconciliation);
+                assert!(state.seed_initial_authority(
+                    baseline.clone(),
+                    completeness.root_identities().clone(),
+                ));
+                state.require_full_scan();
+            }
+            let (before_snapshot, before_generation) = {
+                let state = lock_or_recover(&reconciliation);
+                let authority = state.authority.established().expect("baseline authority");
+                (authority.snapshot.clone(), authority.generation)
+            };
+            let changed = root.join("changed.rs");
+            fs::write(&changed, "fn changed() {}\n").expect("write changed fixture");
+            let pipeline = Arc::new(ParkedApplyPipeline::default());
+            let queue: ReadyBatchQueue = Arc::new(Mutex::new(VecDeque::new()));
+            let stats = Arc::new(WatcherStatsInner::default());
+            let stop = Arc::new(WatcherStop::default());
+
+            let pipeline_for_task = Arc::clone(&pipeline);
+            let reconciliation_for_task = Arc::clone(&reconciliation);
+            let queue_for_task = Arc::clone(&queue);
+            let stats_for_task = Arc::clone(&stats);
+            let roots_for_task = roots.clone();
+            let stop_for_task = Arc::clone(&stop);
+            let mut task = cx
+                .spawn_local(move |child_cx| async move {
+                    run_authoritative_reconciliation(
+                        &child_cx,
+                        &roots_for_task,
+                        &discovery,
+                        pipeline_for_task.as_ref(),
+                        &reconciliation_for_task,
+                        &queue_for_task,
+                        &stats_for_task,
+                        100,
+                        &collect_snapshot_from_roots,
+                        &|| stop_for_task.is_requested(),
+                    )
+                    .await
+                })
+                .expect("spawn parked reconciliation");
+
+            for _ in 0..1_000 {
+                if pipeline.entered.load(Ordering::Acquire) {
+                    break;
+                }
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            assert!(
+                pipeline.entered.load(Ordering::Acquire),
+                "the reconciliation never reached the parked apply boundary"
+            );
+            stop.request();
+            pipeline.released.store(true, Ordering::Release);
+
+            let error = task
+                .join(&cx)
+                .await
+                .expect("parked reconciliation task terminal result")
+                .expect_err("a stop after apply must reject the reconciliation commit");
+            assert!(
+                is_retryable_error(&error),
+                "a public stop must remain a graceful reconciliation interruption, got {error}"
+            );
+            assert_eq!(
+                lock_or_recover(&pipeline.applied).len(),
+                1,
+                "the parked sink must really have crossed its apply boundary"
+            );
+            let state = lock_or_recover(&reconciliation);
+            let authority = state.authority.established().expect("retained authority");
+            assert_eq!(authority.snapshot, before_snapshot);
+            assert_eq!(authority.generation, before_generation);
+            assert!(
+                state.required,
+                "post-apply stop must retain reconciliation debt"
+            );
+            assert!(
+                state.affected_paths.contains(&changed),
+                "the applied chunk must be remembered for the next pass"
+            );
+            drop(state);
+            let snapshot = stats.snapshot();
+            assert_eq!(snapshot.files_reindexed, 0);
+            assert_eq!(snapshot.files_skipped, 0);
+        });
+    }
+
     /// A root replaced by a fresh directory is a different tree, even though
     /// it reads as a perfectly complete scan of an empty one.
     #[test]
@@ -5976,6 +6327,120 @@ mod tests {
         });
     }
 
+    /// A successful public event is fresh evidence after the bounded
+    /// probation hold. It must re-arm one confirmation pass without treating
+    /// the unconfirmed candidate as deletion authority itself.
+    #[test]
+    fn successful_public_event_rearms_held_probation_for_stable_confirmation() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("g4-probation-rearm");
+            fs::create_dir_all(&root).expect("create first root");
+            let first_file = root.join("first.rs");
+            fs::write(&first_file, "fn first() {}\n").expect("write first fixture");
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let watcher = FsWatcher::new(
+                vec![root.clone()],
+                DiscoveryConfig::default(),
+                Arc::clone(&pipeline) as Arc<dyn WatchIngestPipeline>,
+            );
+            let legacy = root.join("legacy-from-crash.rs");
+            {
+                let mut state = lock_or_recover(&watcher.reconciliation);
+                state.inherit_legacy(&FileSnapshot::from([(legacy, 1)]));
+                state.require_full_scan();
+            }
+
+            // First unverified observation becomes a candidate. Replacing the
+            // root forces the second changing observation, which reaches the
+            // bounded hold rather than self-rearming forever.
+            run_authoritative_reconciliation(
+                &cx,
+                &watcher.roots,
+                &watcher.discovery,
+                watcher.ingest.as_ref(),
+                &watcher.reconciliation,
+                &watcher.ready_batches,
+                &watcher.stats,
+                watcher.base_batch_size,
+                &collect_snapshot_from_roots,
+                &|| false,
+            )
+            .await
+            .expect("first probationary pass");
+            let moved = temp.path().join("g4-probation-rearm-original");
+            fs::rename(&root, &moved).expect("move first root aside");
+            fs::create_dir(&root).expect("create replacement root");
+            let replacement = root.join("replacement.rs");
+            fs::write(&replacement, "fn replacement() {}\n").expect("write replacement");
+            run_authoritative_reconciliation(
+                &cx,
+                &watcher.roots,
+                &watcher.discovery,
+                watcher.ingest.as_ref(),
+                &watcher.reconciliation,
+                &watcher.ready_batches,
+                &watcher.stats,
+                watcher.base_batch_size,
+                &collect_snapshot_from_roots,
+                &|| false,
+            )
+            .await
+            .expect("second changing probationary pass");
+            {
+                let state = lock_or_recover(&watcher.reconciliation);
+                assert!(
+                    matches!(state.authority, DeletionAuthorityState::Probationary { .. }),
+                    "changing observations must not grant deletion authority"
+                );
+                assert_eq!(state.unsettled_passes, MAX_UNSETTLED_PASSES);
+                assert!(
+                    !state.required,
+                    "the bounded changing-observation hold must stop self-rearming"
+                );
+            }
+
+            let outcome = watcher
+                .process_events_now(&cx, &[WatchEvent::modified(&replacement, 300, Some(21))])
+                .await
+                .expect("successful public event after the hold");
+            assert_eq!(outcome.reindexed, 1);
+            {
+                let state = lock_or_recover(&watcher.reconciliation);
+                assert!(state.required, "the fresh event must owe confirmation");
+                assert_eq!(state.unsettled_passes, 0);
+                assert!(
+                    state.authority.established().is_none(),
+                    "rearming confirmation must not promote deletion authority"
+                );
+            }
+
+            // The replacement root did not move after its candidate scan, so
+            // the rearmed authoritative pass can now confirm it.
+            run_authoritative_reconciliation(
+                &cx,
+                &watcher.roots,
+                &watcher.discovery,
+                watcher.ingest.as_ref(),
+                &watcher.reconciliation,
+                &watcher.ready_batches,
+                &watcher.stats,
+                watcher.base_batch_size,
+                &collect_snapshot_from_roots,
+                &|| false,
+            )
+            .await
+            .expect("stable confirmation after public-event rearm");
+            let state = lock_or_recover(&watcher.reconciliation);
+            assert!(state.authority.established().is_some());
+            assert!(!state.required);
+            assert!(
+                state.authority.legacy().is_some(),
+                "confirmation establishes only current-root authority, not deletion over legacy"
+            );
+        });
+    }
+
     /// A successful batch may advance authority, never rebind it.
     ///
     /// The bookkeeping scan behind a batch runs with no epoch or generation
@@ -6106,6 +6571,120 @@ mod tests {
             assert_eq!(authority.generation, before_generation + 1);
             drop(state);
             assert_eq!(watcher.stats().files_reindexed, 1);
+        });
+    }
+
+    /// A stop that is already visible when bookkeeping would begin must abort
+    /// *before* the collector starts a flat-directory walk. The
+    /// observer is scoped to this public watcher path; it counts the work the
+    /// old pre-stop exemption would have performed rather than inferring it
+    /// from elapsed time.
+    #[test]
+    fn public_pre_scan_stop_never_starts_flat_bookkeeping_walk() {
+        run_on_runtime_task(|cx| async move {
+            const FLAT_FILES: usize = 128;
+
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("g4-stop-before-bookkeeping");
+            fs::create_dir_all(&root).expect("create root");
+            for entry in 0..FLAT_FILES {
+                let path = root.join(format!("entry-{entry:03}.rs"));
+                fs::write(&path, "fn fixture() {}\n").expect("write flat fixture");
+            }
+            let first_file = root.join("entry-000.rs");
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let watcher = Arc::new(FsWatcher::new(
+                vec![root.clone()],
+                DiscoveryConfig::default(),
+                Arc::clone(&pipeline) as Arc<dyn WatchIngestPipeline>,
+            ));
+            watcher.start(&cx).await.expect("start watcher");
+            for _ in 0..1_000 {
+                if lock_or_recover(&watcher.reconciliation)
+                    .authority
+                    .established()
+                    .is_some()
+                {
+                    break;
+                }
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            let (before_snapshot, before_generation) = {
+                let state = lock_or_recover(&watcher.reconciliation);
+                let authority = state.authority.established().expect("startup authority");
+                (authority.snapshot.clone(), authority.generation)
+            };
+            let before_stats = watcher.stats();
+            let stop = {
+                let control = lock_or_recover(&watcher.control);
+                assert!(
+                    matches!(&control.lifecycle, WatcherLifecycle::Running { .. }),
+                    "watcher must publish a running lifecycle"
+                );
+                let WatcherLifecycle::Running { stop, .. } = &control.lifecycle else {
+                    return;
+                };
+                Arc::clone(stop)
+            };
+            *lock_or_recover(&pipeline.stop_after_success) = Some((Arc::clone(&stop), 1));
+
+            let collector_probes = Arc::new(AtomicUsize::new(0));
+            let _probe = {
+                let owned_root = root.clone();
+                let collector_probes = Arc::clone(&collector_probes);
+                install_scan_observer(Arc::new(move |probe: ScanProbe, path: &Path| {
+                    if matches!(probe, ScanProbe::DirectoryEntered | ScanProbe::EntryListed)
+                        && path.starts_with(&owned_root)
+                    {
+                        collector_probes.fetch_add(1, Ordering::AcqRel);
+                    }
+                }))
+            };
+            lock_or_recover(&watcher.ready_batches).push_back(vec![WatchEvent::modified(
+                first_file,
+                500,
+                Some(15),
+            )]);
+
+            for _ in 0..1_000 {
+                if stop.is_requested() || watcher.has_terminal_task_outcome() {
+                    break;
+                }
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            assert!(
+                stop.is_requested(),
+                "the applied public batch must publish the bounded stop before bookkeeping"
+            );
+            watcher
+                .stop_checked(&cx)
+                .await
+                .expect("pre-scan stop is an ordinary typed shutdown");
+
+            assert_eq!(
+                pipeline.all_ops().len(),
+                1,
+                "the sink still applied the event"
+            );
+            assert_eq!(
+                collector_probes.load(Ordering::Acquire),
+                0,
+                "an already-requested stop must not invoke the flat bookkeeping collector"
+            );
+            let state = lock_or_recover(&watcher.reconciliation);
+            let authority = state.authority.established().expect("retained authority");
+            assert_eq!(authority.snapshot, before_snapshot);
+            assert_eq!(authority.generation, before_generation);
+            assert!(
+                state.required,
+                "the applied batch must remain reconciliation debt"
+            );
+            drop(state);
+            assert_eq!(
+                watcher.stats().files_reindexed,
+                before_stats.files_reindexed
+            );
+            assert_eq!(watcher.stats().files_skipped, before_stats.files_skipped);
         });
     }
 
@@ -6755,7 +7334,11 @@ mod tests {
 
             let pipeline = Arc::new(RecordingPipeline::default());
             let stop = Arc::new(WatcherStop::default());
-            *lock_or_recover(&pipeline.stop_on_success) = Some(Arc::clone(&stop));
+            // The first successful mutation must still enter bookkeeping and
+            // observe the injected retryable collector error. Request stop
+            // from the next flush barrier, after the authoritative retry has
+            // recorded and published its one reconciled success.
+            *lock_or_recover(&pipeline.stop_on_flush_barrier) = Some(Arc::clone(&stop));
             let queue: ReadyBatchQueue =
                 Arc::new(Mutex::new(VecDeque::from([vec![WatchEvent::modified(
                     &path,
