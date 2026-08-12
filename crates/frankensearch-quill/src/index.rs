@@ -79,8 +79,9 @@ use crate::keeper::{
     BlueGreenEngine, CURRENT_ENGINE_VERSION, CompactionPolicy, CompactionReport, CurrentPointer,
     CurrentPointerError, KeeperError, KeeperSnapshot, KeeperWriter, LexicalLayout,
     MANIFEST_FLAG_BULK_MODE_IN_PROGRESS, Manifest, ManifestFieldStats, ManifestSegment,
-    RecoveredSegment, TierMergePolicy, TierPolicyError, TombstoneSet, inspect_lexical_layout,
-    plan_tier_merge, validate_manifest_successor,
+    PublicationAuthorityPhase, PublicationAuthorityState, PublicationReadState, RecoveredSegment,
+    TierMergePolicy, TierPolicyError, TombstoneSet, inspect_lexical_layout, plan_tier_merge,
+    validate_manifest_successor,
 };
 use crate::query::{
     BooleanOperator, DefaultQueryParser, Occur, Query, QueryCapabilityError, QueryDiagnostic,
@@ -1397,11 +1398,11 @@ impl SnapshotPublisher {
                 .or_else(|| manifest.segments.is_empty().then_some(0));
             let mut delta_total_tokens = 0_u64;
             for delta in &prepared.deltas {
-                let delta_tokens = delta
-                    .live_total_tokens(expected.field_ord)
-                    .ok_or(SnapshotError::MissingDeltaFieldStats {
+                let delta_tokens = delta.live_total_tokens(expected.field_ord).ok_or(
+                    SnapshotError::MissingDeltaFieldStats {
                         field_ord: expected.field_ord,
-                    })?;
+                    },
+                )?;
                 delta_total_tokens = delta_total_tokens.checked_add(delta_tokens).ok_or(
                     SnapshotError::CounterOverflow {
                         counter: "retained Delta field token count",
@@ -4296,14 +4297,83 @@ struct PendingDeltaSeal {
     successor_watermark: u64,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct PublicationReadPauseState {
+    armed: bool,
+    consumed: bool,
+    reached: bool,
+    released: bool,
+}
+
+/// Test-only rendezvous immediately after pinning an `Arc` and before the
+/// second packed-authority load. It makes the double-read retry parent-red.
+#[cfg(test)]
+#[derive(Default)]
+struct PublicationReadPause {
+    state: StdMutex<PublicationReadPauseState>,
+    wake: std::sync::Condvar,
+}
+
+#[cfg(test)]
+struct PublicationReadPauseControl {
+    pause: Arc<PublicationReadPause>,
+}
+
 #[derive(Clone)]
 struct QuillReader {
     config: QuillConfig,
     schema: SchemaDescriptor,
     parser: Option<DefaultQueryParser>,
     published_snapshot: Arc<SnapshotPublisher>,
+    publication_read_state: PublicationReadState,
+    #[cfg(test)]
+    publication_read_pause: Arc<PublicationReadPause>,
     #[cfg(feature = "conformance-internals")]
     conformance_controller: Arc<ConformanceCancellationController>,
+}
+
+#[cfg(test)]
+impl PublicationReadPauseControl {
+    fn wait_until_reached(&self, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self
+            .pause
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !state.reached {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err("reader did not reach the authority double-read pause".to_owned());
+            }
+            let (next, _) = self
+                .pause
+                .wake
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+        }
+        Ok(())
+    }
+
+    fn release(&self) {
+        let mut state = self
+            .pause
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.released = true;
+        state.armed = false;
+        self.pause.wake.notify_all();
+    }
+}
+
+#[cfg(test)]
+impl Drop for PublicationReadPauseControl {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 /// Shared Quill index handle with lock-free readers and one cancel-aware writer.
@@ -4518,6 +4588,12 @@ impl IndexBackend {
         match self {
             Self::Durable(writer) => writer.publication_awaits_reconciliation(),
             Self::Memory(_) => false,
+        }
+    }
+
+    fn bind_publication_read_state(&mut self, state: PublicationReadState) {
+        if let Self::Durable(writer) = self {
+            writer.bind_publication_read_state(state);
         }
     }
 }
@@ -4760,15 +4836,14 @@ impl QuillWriterState {
     }
 
     fn from_backend(
-        backend: IndexBackend,
+        mut backend: IndexBackend,
         schema: SchemaDescriptor,
         config: QuillConfig,
     ) -> Result<Self, QuillIndexError> {
         let parser = Some(DefaultQueryParser::new(schema)?);
-        let manifest = &backend
-            .retained_snapshot_for_bookkeeping()
-            .loaded_manifest()
-            .manifest;
+        let initial_snapshot = backend.retained_snapshot_for_bookkeeping().clone();
+        let manifest = &initial_snapshot.loaded_manifest().manifest;
+        let initial_generation = manifest.generation;
         let next_lease_base = next_lease_boundary(manifest.docid_high_watermark)?;
         let detected_parallelism = std::thread::available_parallelism().map_or(1, usize::from);
         let shard_router = ShardRouter::from_config(&config, detected_parallelism);
@@ -4794,8 +4869,10 @@ impl QuillWriterState {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or_else(|| invalid_state("seal sequence exhausted"))?;
+        let publication_read_state = PublicationReadState::new(initial_generation)?;
+        backend.bind_publication_read_state(publication_read_state.clone());
         let published_snapshot = Arc::new(SnapshotPublisher::new(
-            Arc::new(backend.retained_snapshot_for_bookkeeping().clone()),
+            Arc::new(initial_snapshot),
             Vec::new(),
         )?);
         Ok(Self {
@@ -4804,6 +4881,9 @@ impl QuillWriterState {
                 schema,
                 parser,
                 published_snapshot,
+                publication_read_state,
+                #[cfg(test)]
+                publication_read_pause: Arc::default(),
                 #[cfg(feature = "conformance-internals")]
                 conformance_controller: Arc::default(),
             },
@@ -4846,8 +4926,9 @@ impl QuillWriterState {
     /// closed when either the durable writer or the process-local published
     /// view needs reconciliation after a publication future drop.
     fn authority_snapshot(&self) -> Result<&KeeperSnapshot, QuillIndexError> {
+        let published = self.reader.checked_published_snapshot()?;
         let snapshot = self.proven_authority_snapshot()?;
-        let published_generation = self.published_snapshot.load().keeper_generation();
+        let published_generation = published.keeper_generation();
         let durable_generation = snapshot.loaded_manifest().manifest.generation;
         if published_generation != durable_generation {
             return Err(QuillIndexError::PublicationReconciliationRequired {
@@ -4861,14 +4942,17 @@ impl QuillWriterState {
     /// Return the already-installed process-local view only after proving it
     /// matches durable Keeper authority.
     fn checked_published_snapshot(&self) -> Result<Arc<QuillSearchSnapshot>, QuillIndexError> {
-        self.authority_snapshot()?;
-        Ok(self.published_snapshot.load())
+        self.reader.checked_published_snapshot()
     }
 
     /// Whether an abandoned or incompletely surfaced publication must be
     /// reconciled before another mutation may plan against this writer.
     fn publication_awaits_reconciliation(&self) -> bool {
         self.backend.publication_awaits_reconciliation()
+            || matches!(
+                self.reader.publication_read_state.load().phase(),
+                PublicationAuthorityPhase::DurableAhead | PublicationAuthorityPhase::Indeterminate
+            )
             || self.published_snapshot.load().keeper_generation()
                 != self
                     .backend
@@ -4931,6 +5015,9 @@ impl QuillWriterState {
             )));
         }
         if durable_generation == local_generation {
+            self.reader
+                .publication_read_state
+                .stabilize(local_generation)?;
             return Ok(local);
         }
 
@@ -4950,8 +5037,8 @@ impl QuillWriterState {
                 .take()
                 .expect("validated pending Delta seal remains present");
             let installed = self
-                .published_snapshot
-                .install_validated_prepared_sealed(authority, pending.prepared);
+                .reader
+                .install_validated_prepared_sealed(authority, pending.prepared)?;
             self.next_seal_seq = pending.next_seal_seq;
             self.next_lease_base = next_lease_base;
             self.docid_allocator = docid_allocator;
@@ -4965,8 +5052,8 @@ impl QuillWriterState {
             self.published_snapshot
                 .validate_prepared_sealed(authority.as_ref(), &prepared)?;
             let installed = self
-                .published_snapshot
-                .install_validated_prepared_sealed(authority, prepared);
+                .reader
+                .install_validated_prepared_sealed(authority, prepared)?;
             self.finish_published_pending_segments();
             return Ok(installed);
         }
@@ -5005,9 +5092,7 @@ impl QuillWriterState {
         let docid_allocator =
             DocIdAllocator::open(next_lease_base, self.shard_router.shard_count())
                 .map_err(|error| invalid_state(error.to_string()))?;
-        let installed = self
-            .published_snapshot
-            .publish_complete(authority, Vec::new())?;
+        let installed = self.reader.publish_complete(authority, Vec::new())?;
         self.next_seal_seq = self.next_seal_seq.max(recovered_next_seal);
         self.next_lease_base = next_lease_base;
         self.docid_allocator = docid_allocator;
@@ -5039,9 +5124,8 @@ impl QuillWriterState {
                 "Delta publication requires the scalar writer to be fully committed",
             ));
         }
-        Ok(self
-            .published_snapshot
-            .publish_complete(Arc::new(self.authority_snapshot()?.clone()), deltas)?)
+        self.reader
+            .publish_complete(Arc::new(self.authority_snapshot()?.clone()), deltas)
     }
 
     /// Seal one already-published Delta epoch into Keeper and atomically
@@ -5256,8 +5340,8 @@ impl QuillWriterState {
             .take()
             .expect("published Delta seal retains its prepared local swap");
         let installed = self
-            .published_snapshot
-            .install_validated_prepared_sealed(authority, pending.prepared);
+            .reader
+            .install_validated_prepared_sealed(authority, pending.prepared)?;
         self.next_seal_seq = pending.next_seal_seq;
         self.next_lease_base = next_lease_base;
         self.docid_allocator = docid_allocator;
@@ -6975,8 +7059,8 @@ impl QuillWriterState {
                 let authority = Arc::new(self.proven_authority_snapshot()?.clone());
                 self.published_snapshot
                     .validate_prepared_sealed(authority.as_ref(), &prepared_publication)?;
-                self.published_snapshot
-                    .install_validated_prepared_sealed(authority, prepared_publication);
+                self.reader
+                    .install_validated_prepared_sealed(authority, prepared_publication)?;
                 record_snapshot_fields(&open_span, self.authority_snapshot()?);
                 Ok::<(), QuillIndexError>(())
             }
@@ -7099,8 +7183,8 @@ impl QuillWriterState {
         let authority = Arc::new(self.proven_authority_snapshot()?.clone());
         self.published_snapshot
             .validate_prepared_sealed(authority.as_ref(), &prepared)?;
-        self.published_snapshot
-            .install_validated_prepared_sealed(authority, prepared);
+        self.reader
+            .install_validated_prepared_sealed(authority, prepared)?;
         Ok(())
     }
 
@@ -7166,8 +7250,8 @@ impl QuillWriterState {
         let authority = Arc::new(self.proven_authority_snapshot()?.clone());
         self.published_snapshot
             .validate_prepared_sealed(authority.as_ref(), &prepared_publication)?;
-        self.published_snapshot
-            .install_validated_prepared_sealed(authority, prepared_publication);
+        self.reader
+            .install_validated_prepared_sealed(authority, prepared_publication)?;
         self.next_seal_seq = next_seal_seq;
         self.authority_snapshot()
     }
@@ -7259,10 +7343,10 @@ impl QuillWriterState {
                 .prepare_sealed_manifest(self.schema, &authority.loaded_manifest().manifest)?;
             self.published_snapshot
                 .validate_prepared_sealed(authority, &prepared_publication)?;
-            self.published_snapshot.install_validated_prepared_sealed(
+            self.reader.install_validated_prepared_sealed(
                 Arc::new(authority.clone()),
                 prepared_publication,
-            );
+            )?;
             self.next_seal_seq = self
                 .authority_snapshot()?
                 .segments()
@@ -7378,8 +7462,8 @@ impl QuillWriterState {
         let authority = Arc::new(self.proven_authority_snapshot()?.clone());
         self.published_snapshot
             .validate_prepared_sealed(authority.as_ref(), &prepared)?;
-        self.published_snapshot
-            .install_validated_prepared_sealed(authority, prepared);
+        self.reader
+            .install_validated_prepared_sealed(authority, prepared)?;
         Ok(deleted)
     }
 
@@ -7414,8 +7498,8 @@ impl QuillWriterState {
         let authority = Arc::new(self.proven_authority_snapshot()?.clone());
         self.published_snapshot
             .validate_prepared_sealed(authority.as_ref(), &prepared)?;
-        self.published_snapshot
-            .install_validated_prepared_sealed(authority, prepared);
+        self.reader
+            .install_validated_prepared_sealed(authority, prepared)?;
         Ok(())
     }
 
@@ -7946,6 +8030,105 @@ impl QuillWriterState {
 }
 
 impl QuillReader {
+    /// Return the only `Arc` that was validated against one stable authority
+    /// word. Two bounded attempts cover a publication completing between the
+    /// first authority load and the pinned `Arc` load without turning a read
+    /// into an unbounded spin.
+    fn checked_published_snapshot(&self) -> Result<Arc<QuillSearchSnapshot>, QuillIndexError> {
+        let mut last_generation = self.published_snapshot.load().keeper_generation();
+        for attempt in 0..2 {
+            let before = self.publication_read_state.load();
+            if !before.is_readable() {
+                return Err(publication_state_reconciliation_required(
+                    before,
+                    last_generation,
+                ));
+            }
+            let snapshot = self.published_snapshot.load();
+            #[cfg(test)]
+            self.pause_after_pinned_snapshot_for_test();
+            let after = self.publication_read_state.load();
+            last_generation = snapshot.keeper_generation();
+            if before == after && snapshot.keeper_generation() == before.generation() {
+                return Ok(snapshot);
+            }
+            if attempt == 1 {
+                return Err(publication_state_reconciliation_required(
+                    after,
+                    last_generation,
+                ));
+            }
+        }
+        unreachable!("two bounded publication-read attempts always return")
+    }
+
+    #[cfg(test)]
+    fn arm_publication_read_pause_for_test(&self) -> PublicationReadPauseControl {
+        let mut state = self
+            .publication_read_pause
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!state.armed, "only one publication-read pause may be armed");
+        state.armed = true;
+        state.consumed = false;
+        state.reached = false;
+        state.released = false;
+        PublicationReadPauseControl {
+            pause: Arc::clone(&self.publication_read_pause),
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_after_pinned_snapshot_for_test(&self) {
+        let mut state = self
+            .publication_read_pause
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.armed || state.consumed {
+            return;
+        }
+        state.consumed = true;
+        state.reached = true;
+        self.publication_read_pause.wake.notify_all();
+        while !state.released {
+            state = self
+                .publication_read_pause
+                .wake
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// Store a fully validated sealed successor and only then make its
+    /// generation readable through the shared authority word.
+    fn install_validated_prepared_sealed(
+        &self,
+        keeper: Arc<KeeperSnapshot>,
+        prepared: PreparedSealedPublication,
+    ) -> Result<Arc<QuillSearchSnapshot>, QuillIndexError> {
+        let installed = self
+            .published_snapshot
+            .install_validated_prepared_sealed(keeper, prepared);
+        self.publication_read_state
+            .stabilize(installed.keeper_generation())?;
+        Ok(installed)
+    }
+
+    /// Publish one complete process-local composition and then expose that
+    /// exact installed `Arc` through the shared authority word.
+    fn publish_complete(
+        &self,
+        keeper: Arc<KeeperSnapshot>,
+        deltas: Vec<Arc<DeltaSnapshot>>,
+    ) -> Result<Arc<QuillSearchSnapshot>, QuillIndexError> {
+        let installed = self.published_snapshot.publish_complete(keeper, deltas)?;
+        self.publication_read_state
+            .stabilize(installed.keeper_generation())?;
+        Ok(installed)
+    }
+
     #[cfg(not(feature = "conformance-internals"))]
     #[inline]
     #[allow(
@@ -8391,7 +8574,8 @@ impl QuillReader {
         hydrate_metadata: bool,
     ) -> Result<(Vec<ScoredResult>, Arc<QuillSearchSnapshot>), QuillIndexError> {
         let published = self.published_snapshot.load();
-        let results = self.scored_results_on(cx, query, limit, hydrate_metadata, published.as_ref())?;
+        let results =
+            self.scored_results_on(cx, query, limit, hydrate_metadata, published.as_ref())?;
         Ok((results, published))
     }
 
@@ -8531,7 +8715,14 @@ impl QuillReader {
         exact_count: bool,
     ) -> Result<QuillSearchResult, QuillIndexError> {
         let published = self.published_snapshot.load();
-        self.search_preparsed_paginated_on(cx, query, limit, offset, exact_count, published.as_ref())
+        self.search_preparsed_paginated_on(
+            cx,
+            query,
+            limit,
+            offset,
+            exact_count,
+            published.as_ref(),
+        )
     }
 
     #[cfg(feature = "bench-internals")]
@@ -9511,6 +9702,8 @@ impl PreparsedQuillIndex {
     ) -> Result<Self, QuillIndexError> {
         validate_config(&config)?;
         let schema = snapshot.schema();
+        let generation = snapshot.loaded_manifest().manifest.generation;
+        let publication_read_state = PublicationReadState::new(generation)?;
         let published_snapshot = Arc::new(SnapshotPublisher::new(Arc::new(snapshot), Vec::new())?);
         Ok(Self {
             reader: QuillReader {
@@ -9518,6 +9711,9 @@ impl PreparsedQuillIndex {
                 schema,
                 parser: None,
                 published_snapshot,
+                publication_read_state,
+                #[cfg(test)]
+                publication_read_pause: Arc::default(),
                 #[cfg(feature = "conformance-internals")]
                 conformance_controller: Arc::default(),
             },
@@ -9570,6 +9766,8 @@ impl QuillSearchIndex {
         let snapshot =
             spawn_blocking(move || KeeperSnapshot::open(open_directory, DEFAULT_SCHEMA)).await?;
         check_cancel(cx, "read-only index open")?;
+        let generation = snapshot.loaded_manifest().manifest.generation;
+        let publication_read_state = PublicationReadState::new(generation)?;
         let published_snapshot = Arc::new(SnapshotPublisher::new(Arc::new(snapshot), Vec::new())?);
         Ok(Self {
             reader: QuillReader {
@@ -9577,6 +9775,9 @@ impl QuillSearchIndex {
                 config,
                 schema: DEFAULT_SCHEMA,
                 published_snapshot,
+                publication_read_state,
+                #[cfg(test)]
+                publication_read_pause: Arc::default(),
                 #[cfg(feature = "conformance-internals")]
                 conformance_controller: Arc::default(),
             },
@@ -9635,7 +9836,6 @@ impl QuillSearchIndex {
             return Ok(false);
         }
         self.reader
-            .published_snapshot
             .publish_complete(Arc::new(snapshot), Vec::new())?;
         Ok(true)
     }
@@ -9960,20 +10160,12 @@ impl QuillIndex {
 
     /// Return one exact process-local snapshot for a facade read.
     ///
-    /// If the writer is unlocked, the same locked critical section proves the
-    /// Keeper marker and compares this exact `Arc` to durable generation. If a
-    /// live writer owns the lock, this read linearizes immediately before that
-    /// not-yet-returned mutation and may safely retain the currently published
-    /// `Arc`. A dropped future releases the lock, so the next read observes the
-    /// Keeper marker or generation mismatch and fails closed.
+    /// The reader validates the one pinned `Arc` between two `Acquire` loads
+    /// of the shared packed publication state. It never treats the writer lock
+    /// as an authority proxy: `Preparing` remains readable, while
+    /// `DurableAhead` and `Indeterminate` refuse synchronously.
     fn checked_published_snapshot(&self) -> Result<Arc<QuillSearchSnapshot>, QuillIndexError> {
-        match self.writer.try_lock() {
-            Ok(writer) => writer.checked_published_snapshot(),
-            Err(TryLockError::Locked) => Ok(self.reader.published_snapshot.load()),
-            Err(TryLockError::Poisoned) => {
-                Err(invalid_state("Quill writer is poisoned; refusing authority read"))
-            }
-        }
+        self.reader.checked_published_snapshot()
     }
 
     /// Current authoritative immutable Keeper snapshot.
@@ -10026,14 +10218,15 @@ impl QuillIndex {
         exact_count: bool,
     ) -> Result<(QuillSearchResult, ConformancePruningTraceReceipt), QuillIndexError> {
         let snapshot = self.checked_published_snapshot()?;
-        self.reader.search_paginated_with_conformance_pruning_trace_on(
-            cx,
-            query,
-            limit,
-            offset,
-            exact_count,
-            snapshot.as_ref(),
-        )
+        self.reader
+            .search_paginated_with_conformance_pruning_trace_on(
+                cx,
+                query,
+                limit,
+                offset,
+                exact_count,
+                snapshot.as_ref(),
+            )
     }
 
     /// Capture a fixed-size digest receipt for the complete retained scalar
@@ -10886,7 +11079,9 @@ impl LexicalRead for QuillIndex {
         limit: usize,
     ) -> SearchFuture<'a, Vec<ScoredResult>> {
         Box::pin(async move {
-            let snapshot = self.checked_published_snapshot().map_err(SearchError::from)?;
+            let snapshot = self
+                .checked_published_snapshot()
+                .map_err(SearchError::from)?;
             self.reader
                 .scored_results_on(cx, query, limit, true, snapshot.as_ref())
                 .map_err(SearchError::from)
@@ -10900,14 +11095,15 @@ impl LexicalRead for QuillIndex {
         limit: usize,
     ) -> SearchFuture<'a, LexicalCandidateBatch> {
         Box::pin(async move {
-            let snapshot = self.checked_published_snapshot().map_err(SearchError::from)?;
+            let snapshot = self
+                .checked_published_snapshot()
+                .map_err(SearchError::from)?;
             let results = self
                 .reader
                 .scored_results_on(cx, query, limit, false, snapshot.as_ref())
                 .map_err(SearchError::from)?;
             #[cfg(not(feature = "conformance-internals"))]
-            let context =
-                LexicalHydrationContext::new(QUILL_LEXICAL_BACKEND, Box::new(snapshot));
+            let context = LexicalHydrationContext::new(QUILL_LEXICAL_BACKEND, Box::new(snapshot));
             #[cfg(feature = "conformance-internals")]
             let context = LexicalHydrationContext::new(
                 QUILL_LEXICAL_BACKEND,
@@ -11410,6 +11606,25 @@ fn map_lock_error_for_index(error: LockError, phase: &'static str) -> QuillIndex
 
 fn map_try_lock_error(error: TryLockError) -> QuillIndexError {
     invalid_state(format!("Quill writer is unavailable: {error}"))
+}
+
+fn publication_state_reconciliation_required(
+    state: PublicationAuthorityState,
+    published_generation: u64,
+) -> QuillIndexError {
+    // `DurableAhead(g)` is the one phase that proves a particular successor:
+    // the blocking publisher writes it immediately after `MANIFEST` names
+    // g+1. `Indeterminate(g)` deliberately reports only g, because claiming
+    // that g+1 won before reopening would overstate durability.
+    let durable_generation = if state.phase() == PublicationAuthorityPhase::DurableAhead {
+        state.generation().saturating_add(1)
+    } else {
+        state.generation()
+    };
+    QuillIndexError::PublicationReconciliationRequired {
+        published_generation,
+        durable_generation,
+    }
 }
 
 fn invalid_state(detail: impl Into<String>) -> QuillIndexError {
@@ -22168,7 +22383,7 @@ mod tests {
 
             let pause = crate::keeper::pause_manifest_publish_at_checkpoint_for_test(
                 directory.path(),
-                crate::keeper::PublishCheckpoint::DirectorySynced,
+                crate::keeper::PublishCheckpoint::TempMovedToCurrent,
             );
             let mut seal = Box::pin(index.seal_delta_snapshot(
                 &cx,
@@ -22195,12 +22410,10 @@ mod tests {
             );
             assert!(matches!(
                 index.snapshot(),
-                Err(QuillIndexError::Keeper(
-                    KeeperError::PublicationReconciliationRequired {
-                        retained_generation,
-                        proposed_generation,
-                    }
-                )) if retained_generation == generation && proposed_generation == generation + 1
+                Err(QuillIndexError::PublicationReconciliationRequired {
+                    published_generation,
+                    durable_generation,
+                }) if published_generation == generation && durable_generation == generation + 1
             ));
             assert_public_authority_refuses_stale_publication(
                 &index,
@@ -22368,6 +22581,160 @@ mod tests {
     }
 
     #[test]
+    fn claimed_live_publication_refuses_reads_before_any_manifest_slot_moves() {
+        let _pause_serial = crate::keeper::manifest_publish_pause_test_serial_guard();
+        run_with_blocking_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("temporary claimed-publication directory");
+            let index = QuillIndex::create(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("create claimed-publication fixture");
+            let generation = index
+                .snapshot()
+                .expect("fresh claimed-publication snapshot")
+                .loaded_manifest()
+                .manifest
+                .generation;
+            index
+                .index_document(&cx, &IndexableDocument::new("claimed", "alpha claimed"))
+                .await
+                .expect("stage claimed-publication document");
+            let pause = crate::keeper::pause_manifest_publish_at_checkpoint_for_test(
+                directory.path(),
+                crate::keeper::PublishCheckpoint::GenerationClaimed,
+            );
+            let mut commit = Box::pin(index.commit(&cx));
+            crate::keeper::drive_manifest_publish_to_checkpoint_for_test(
+                &mut commit,
+                &pause,
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("reach pre-slot claimed-publication rendezvous");
+            assert_eq!(
+                Manifest::from_bytes(
+                    &std::fs::read(directory.path().join("MANIFEST"))
+                        .expect("read pre-slot MANIFEST"),
+                )
+                .expect("decode pre-slot MANIFEST")
+                .generation,
+                generation,
+                "GenerationClaimed pause must precede every MANIFEST slot rename"
+            );
+            assert_public_authority_refuses_stale_publication(&index, &cx, "alpha", "claimed")
+                .await;
+            pause.release();
+            commit
+                .await
+                .expect("finish publication after the pre-slot refusal proof");
+        });
+    }
+
+    #[test]
+    fn known_pre_rename_publish_failure_restores_the_readable_predecessor() {
+        let _pause_serial = crate::keeper::manifest_publish_pause_test_serial_guard();
+        run_with_blocking_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("temporary pre-rename failure directory");
+            let mut index = QuillIndex::create(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("create durable pre-rename failure fixture");
+            let generation = index
+                .snapshot()
+                .expect("fresh pre-rename snapshot")
+                .loaded_manifest()
+                .manifest
+                .generation;
+            index
+                .index_document(&cx, &IndexableDocument::new("pre-rename", "alpha retained"))
+                .await
+                .expect("stage pre-rename document");
+            let fault = crate::keeper::fail_manifest_publish_at_checkpoint_for_test(
+                directory.path(),
+                crate::keeper::PublishCheckpoint::TempWritten,
+            );
+            assert!(matches!(
+                index.commit(&cx).await,
+                Err(QuillIndexError::Keeper(KeeperError::InvalidTransition { detail }))
+                    if detail.contains("test-only MANIFEST publisher failure")
+            ));
+            assert_eq!(
+                index
+                    .snapshot()
+                    .expect("known pre-rename failure leaves predecessor readable")
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                generation
+            );
+            assert!(
+                index.writer_mut().pending_manifest.is_some(),
+                "known pre-rename failure must retain the exact retry proposal"
+            );
+            drop(fault);
+            assert_eq!(
+                index
+                    .commit(&cx)
+                    .await
+                    .expect("retry retained pre-rename proposal")
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                generation + 1
+            );
+        });
+    }
+
+    #[test]
+    fn reader_retries_when_publish_completes_between_authority_loads() {
+        run_with_blocking_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("temporary reader-retry directory");
+            let index = Arc::new(
+                QuillIndex::create(&cx, directory.path(), deterministic_config())
+                    .await
+                    .expect("create durable reader-retry fixture"),
+            );
+            let generation = index
+                .snapshot()
+                .expect("fresh reader-retry snapshot")
+                .loaded_manifest()
+                .manifest
+                .generation;
+            index
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("reader-retry", "alpha successor"),
+                )
+                .await
+                .expect("stage reader-retry document");
+            let pause = index.reader.arm_publication_read_pause_for_test();
+            let reader_index = Arc::clone(&index);
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let reader = std::thread::spawn(move || {
+                sender
+                    .send(
+                        reader_index
+                            .search_snapshot()
+                            .map(|snapshot| snapshot.keeper_generation()),
+                    )
+                    .expect("return reader authority result");
+            });
+            pause
+                .wait_until_reached(Duration::from_secs(2))
+                .expect("reader reaches the authority double-read rendezvous");
+            index
+                .commit(&cx)
+                .await
+                .expect("publish while reader holds its first authority observation");
+            pause.release();
+            let observed = receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("reader completes after publication")
+                .expect("reader must retry to one authoritative Arc");
+            reader.join().expect("reader thread does not panic");
+            assert_eq!(observed, generation + 1);
+        });
+    }
+
+    #[test]
     fn dropped_ordinary_commit_requires_public_reconciliation_before_reads() {
         let _pause_serial = crate::keeper::manifest_publish_pause_test_serial_guard();
         run_with_blocking_cx(|cx| async move {
@@ -22391,7 +22758,7 @@ mod tests {
 
             let pause = crate::keeper::pause_manifest_publish_at_checkpoint_for_test(
                 directory.path(),
-                crate::keeper::PublishCheckpoint::DirectorySynced,
+                crate::keeper::PublishCheckpoint::TempMovedToCurrent,
             );
             let mut commit = Box::pin(index.commit(&cx));
             crate::keeper::drive_manifest_publish_to_checkpoint_for_test(
@@ -22401,6 +22768,14 @@ mod tests {
             )
             .await
             .expect("reach bounded dropped-commit rendezvous");
+
+            assert_public_authority_refuses_stale_publication(
+                &index,
+                &cx,
+                "alpha",
+                "dropped-commit",
+            )
+            .await;
             drop(commit);
 
             assert_public_authority_refuses_stale_publication(
