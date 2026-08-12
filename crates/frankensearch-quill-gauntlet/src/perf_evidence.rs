@@ -2010,14 +2010,19 @@ pub struct PerfEvidenceArtifact {
     pub machine_class: MachineClassEvidenceBinding,
     /// Decision-grade cells.
     pub cells: Vec<EvidenceCell>,
-    /// Durable QG-1 fastest-incumbent screen outcome and its bound decision.
+    /// Durable QG-1 fastest-incumbent screens, one per required engine cell.
     ///
-    /// Absent on every non-QG-1 artifact, and on QG-1 artifacts produced before
-    /// a screen was attached, so those artifacts keep their exact persisted
-    /// bytes and seal. When present, the gate fold, ratchet admissibility, and
-    /// every authority-bearing verification consume it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub qg1_incumbent_screen: Option<Qg1IncumbentScreenEvidence>,
+    /// This is the complete matrix projection, not a single optional screen:
+    /// every runnable required QG-1 engine-indexing-lifecycle cell in
+    /// [`Self::cells`] must be screened exactly once, tokenizer diagnostic cells
+    /// are never screened, and the vector is held in strictly ascending
+    /// `cell_id` order so duplicates and a noncanonical persisted shape are
+    /// rejected rather than tolerated.
+    ///
+    /// Empty on every non-QG-1 artifact and skipped on serialization there, so
+    /// those artifacts keep their exact persisted bytes and seal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub qg1_incumbent_screens: Vec<Qg1IncumbentScreenEvidence>,
     /// Deterministic fold of required-cell statuses.
     pub gate_status: EvidenceDecisionStatus,
     /// Promotion decision recorded by a downstream validator, if any.
@@ -2312,7 +2317,7 @@ impl PerfEvidenceArtifact {
                 "sealed runner receipt has not been bound",
             ),
             cells,
-            qg1_incumbent_screen: None,
+            qg1_incumbent_screens: Vec::new(),
             gate_status,
             gate_decision: None,
             admission_no_claim,
@@ -2321,43 +2326,94 @@ impl PerfEvidenceArtifact {
         })
     }
 
-    /// Attach the durable QG-1 incumbent screen outcome to this artifact.
+    /// Canonical `cell_id` set this artifact's QG-1 screens must cover exactly.
     ///
-    /// The screen is pre-binding content: attaching it changes the bytes a
+    /// Only required engine-indexing-lifecycle cells are screened. Tokenizer
+    /// and every other diagnostic cell never freeze an incumbent, so a screen
+    /// naming one is an extra screen, not a bonus.
+    fn required_qg1_screen_cell_ids(cells: &[EvidenceCell]) -> BTreeSet<String> {
+        cells
+            .iter()
+            .filter(|cell| {
+                cell.spec.gate == PerfGate::Qg1 && cell.spec.role == EvidenceRole::Required
+            })
+            .map(|cell| cell.cell_id.clone())
+            .collect()
+    }
+
+    /// Whether the screens cover the required engine cells exactly once each,
+    /// in canonical order.
+    fn qg1_screen_coverage_is_exact(
+        cells: &[EvidenceCell],
+        screens: &[Qg1IncumbentScreenEvidence],
+    ) -> bool {
+        screens
+            .windows(2)
+            .all(|pair| pair[0].cell_id < pair[1].cell_id)
+            && screens
+                .iter()
+                .map(|screen| screen.cell_id.clone())
+                .collect::<BTreeSet<_>>()
+                == Self::required_qg1_screen_cell_ids(cells)
+    }
+
+    /// Attach the complete durable QG-1 incumbent screen projection.
+    ///
+    /// The screens are pre-binding content: attaching them changes the bytes a
     /// runner receipt would have to cover, so any existing verified binding and
     /// gate decision are discarded exactly as [`Self::force_no_claim`] does, and
     /// the seal is cleared for a fresh one.
     ///
+    /// Coverage must be exact — one screen per required engine cell, none for
+    /// diagnostic cells — because a partial projection is precisely how a
+    /// screened headline could be paired with an unscreened one.
+    ///
     /// # Errors
     ///
     /// Returns [`EvidenceArtifactError::InconsistentArtifact`] for a non-QG-1
-    /// artifact or a screen whose outcome is neither a unique selection nor a
-    /// valid NoDecision.
-    pub fn attach_qg1_incumbent_screen(
+    /// artifact, a screen whose outcome is neither a unique selection nor a
+    /// valid NoDecision, or a projection that is missing, extra, duplicated, or
+    /// out of canonical `cell_id` order.
+    pub fn attach_qg1_incumbent_screens(
         &mut self,
-        screen: Qg1IncumbentScreenEvidence,
+        screens: Vec<Qg1IncumbentScreenEvidence>,
     ) -> Result<(), EvidenceArtifactError> {
         if self.gate != PerfGate::Qg1 {
             return Err(EvidenceArtifactError::InconsistentArtifact {
                 reason: format!(
-                    "a QG-1 incumbent screen cannot be attached to {} evidence",
+                    "QG-1 incumbent screens cannot be attached to {} evidence",
                     self.gate
                 ),
             });
         }
-        screen.validate_shape()?;
+        for screen in &screens {
+            screen.validate_shape()?;
+        }
+        if !Self::qg1_screen_coverage_is_exact(&self.cells, &screens) {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: format!(
+                    "QG-1 incumbent screens must cover every required engine cell exactly once in \
+                     canonical order; expected {:?}, observed {:?}",
+                    Self::required_qg1_screen_cell_ids(&self.cells),
+                    screens
+                        .iter()
+                        .map(|screen| screen.cell_id.as_str())
+                        .collect::<Vec<_>>()
+                ),
+            });
+        }
         if self.machine_class.identity().is_some() {
             self.machine_class = MachineClassEvidenceBinding::unverified(
                 "evidence changed after runner binding; a fresh receipt is required",
             );
         }
-        self.qg1_incumbent_screen = Some(screen);
+        self.qg1_incumbent_screens = screens;
         self.gate_decision = None;
         (self.gate_status, self.reasons) = Self::fold(
             self.gate,
             &self.cells,
             self.admission_no_claim.as_ref(),
-            self.qg1_incumbent_screen.as_ref(),
+            &self.qg1_incumbent_screens,
         );
         self.artifact_sha256.clear();
         Ok(())
@@ -2368,7 +2424,7 @@ impl PerfEvidenceArtifact {
         gate: PerfGate,
         cells: &[EvidenceCell],
         admission_no_claim: Option<&EvidenceReason>,
-        qg1_incumbent_screen: Option<&Qg1IncumbentScreenEvidence>,
+        qg1_incumbent_screens: &[Qg1IncumbentScreenEvidence],
     ) -> (EvidenceDecisionStatus, Vec<EvidenceReason>) {
         let mut reasons = Vec::new();
         let mut any_invalid_null = false;
@@ -2399,30 +2455,44 @@ impl PerfEvidenceArtifact {
                 _ => {}
             }
         }
-        // A QG-1 artifact that carries no screen at all is the same refusal as
-        // an incomplete one, and must be, or omitting the screen would be the
-        // cheapest way to ratchet without ever naming an incumbent. Other gates
-        // never screen an incumbent and are untouched.
-        if gate == PerfGate::Qg1 && any_required && qg1_incumbent_screen.is_none() {
+        // Incomplete coverage is the same refusal as an incomplete screen, and
+        // must be: omitting a screen — or screening only some required engine
+        // cells — would otherwise be the cheapest way to ratchet without ever
+        // naming an incumbent. Other gates never screen and are untouched.
+        if gate == PerfGate::Qg1
+            && any_required
+            && !Self::qg1_screen_coverage_is_exact(cells, qg1_incumbent_screens)
+        {
             any_no_decision = true;
             reasons.push(EvidenceReason::new(
                 "evidence.qg1_incumbent_screen_missing",
-                "QG-1 evidence carries no incumbent screen, so no frozen Tantivy arm backs it",
+                "QG-1 evidence does not screen every required engine cell exactly once",
                 EvidenceSeverity::NoClaim,
             ));
         }
-        // An incomplete incumbent screen yields NoDecision: without a uniquely
-        // fastest validated Tantivy arm there is no admissible thing to compare
-        // against, so otherwise-measured cells still cannot headline.
-        if let Some(screen) = qg1_incumbent_screen
-            && !screen.has_selection()
+        // One incomplete screen folds the whole gate to no-claim: the cells are
+        // a single projection, so a headline anywhere in it needs every engine
+        // cell to have frozen its incumbent.
+        for screen in qg1_incumbent_screens
+            .iter()
+            .filter(|screen| !screen.has_selection())
         {
             any_no_decision = true;
             reasons.push(EvidenceReason::new(
                 "evidence.qg1_incumbent_screen_no_decision",
                 screen.screen.no_decision_reason.as_deref().map_or_else(
-                    || "QG-1 incumbent screen selected no candidate".to_owned(),
-                    |reason| format!("QG-1 incumbent screen made no selection: {reason}"),
+                    || {
+                        format!(
+                            "QG-1 incumbent screen for {} selected no candidate",
+                            screen.cell_id
+                        )
+                    },
+                    |reason| {
+                        format!(
+                            "QG-1 incumbent screen for {} made no selection: {reason}",
+                            screen.cell_id
+                        )
+                    },
                 ),
                 EvidenceSeverity::NoClaim,
             ));
@@ -2524,14 +2594,15 @@ impl PerfEvidenceArtifact {
     #[must_use]
     pub fn ratchet_admissible(&self) -> bool {
         self.gate_status == EvidenceDecisionStatus::MeasuredProvisional
-            && match self.qg1_incumbent_screen.as_ref() {
-                // An omitted screen is not neutral for QG-1: without a frozen
-                // fastest incumbent there is nothing admissible to have been
-                // measured against, so the artifact cannot ratchet. Every other
-                // gate keeps its exact prior behaviour.
-                None => self.gate != PerfGate::Qg1,
-                Some(screen) => screen.has_selection() && screen.decision.is_some(),
-            }
+            // For QG-1 every required engine cell must have frozen an incumbent
+            // and carry its decision; anything less is not admissible evidence
+            // to ratchet on. Every other gate keeps its exact prior behaviour.
+            && (self.gate != PerfGate::Qg1
+                || (Self::qg1_screen_coverage_is_exact(&self.cells, &self.qg1_incumbent_screens)
+                    && self
+                        .qg1_incumbent_screens
+                        .iter()
+                        .all(|screen| screen.has_selection() && screen.decision.is_some())))
             && self.has_exact_runnable_plan_coverage()
             && self
                 .machine_class
@@ -2984,7 +3055,7 @@ impl PerfEvidenceArtifact {
             self.gate,
             &self.cells,
             self.admission_no_claim.as_ref(),
-            self.qg1_incumbent_screen.as_ref(),
+            &self.qg1_incumbent_screens,
         );
         self.artifact_sha256.clear();
     }
@@ -3155,26 +3226,40 @@ impl PerfEvidenceArtifact {
             self.verify_cell_provenance(cell)?;
             cell.verify_recomputed_against_qg1_authorities(&self.policy, external_qg1_authorities)?;
         }
-        if let Some(screen) = self.qg1_incumbent_screen.as_ref() {
+        if !self.qg1_incumbent_screens.is_empty() {
             if self.gate != PerfGate::Qg1 {
                 return Err(EvidenceArtifactError::InconsistentArtifact {
                     reason: format!(
-                        "{} evidence carries a QG-1 incumbent screen it can never have measured",
+                        "{} evidence carries QG-1 incumbent screens it can never have measured",
                         self.gate
                     ),
                 });
             }
-            screen.verify_against_qg1_authorities(
-                &self.cells,
-                &self.policy,
-                external_qg1_authorities,
-            )?;
+            // Coverage is verified here as well as at attachment, because these
+            // bytes may have been produced anywhere: a persisted artifact that
+            // dropped or duplicated one screen must not verify.
+            if !Self::qg1_screen_coverage_is_exact(&self.cells, &self.qg1_incumbent_screens) {
+                return Err(EvidenceArtifactError::InconsistentArtifact {
+                    reason: format!(
+                        "persisted QG-1 incumbent screens do not cover every required engine cell \
+                         exactly once in canonical order; expected {:?}",
+                        Self::required_qg1_screen_cell_ids(&self.cells)
+                    ),
+                });
+            }
+            for screen in &self.qg1_incumbent_screens {
+                screen.verify_against_qg1_authorities(
+                    &self.cells,
+                    &self.policy,
+                    external_qg1_authorities,
+                )?;
+            }
         }
         let (expected_status, expected_reasons) = Self::fold(
             self.gate,
             &self.cells,
             self.admission_no_claim.as_ref(),
-            self.qg1_incumbent_screen.as_ref(),
+            &self.qg1_incumbent_screens,
         );
         if expected_status != self.gate_status || expected_reasons != self.reasons {
             return Err(EvidenceArtifactError::InconsistentArtifact {
@@ -3293,9 +3378,9 @@ impl PerfEvidenceArtifact {
         &self,
         output_dir: &Path,
     ) -> Result<EvidenceArtifactPaths, EvidenceArtifactError> {
-        if self.qg1_incumbent_screen.is_some() {
+        if !self.qg1_incumbent_screens.is_empty() {
             return Err(EvidenceArtifactError::InvalidProvenance {
-                reason: "evidence carrying a QG-1 incumbent screen may only be persisted through \
+                reason: "evidence carrying QG-1 incumbent screens may only be persisted through \
                          write_atomic_against_qg1_authorities with its complete retained set"
                     .to_owned(),
             });
@@ -7026,12 +7111,12 @@ mod tests {
         ));
     }
 
-    fn qg1_bulk_screen_cell() -> PerfCellSpec {
+    fn qg1_screen_cell_for(cell_id: &str) -> PerfCellSpec {
         PerfMatrixSpec::complete()
             .for_gate(PerfGate::Qg1)
             .into_iter()
-            .find(|cell| cell.metric == "docs_per_second" && cell.threads == Some(1))
-            .expect("the frozen matrix carries a single-writer QG-1 bulk throughput cell")
+            .find(|cell| format!("{}/{}/{}", PerfGate::Qg1, cell.fixture, cell.metric) == cell_id)
+            .expect("the screened cell is a frozen QG-1 matrix cell")
     }
 
     fn qg1_semantic_contract() -> Qg1TantivySemanticContract {
@@ -7052,8 +7137,8 @@ mod tests {
     /// pilots at all. This is the incomplete-screen outcome the H3 contract
     /// names, and it carries no authority-bearing component, so it is the one
     /// screen shape whose evidence is constructible without a live producer.
-    fn qg1_no_decision_screen_evidence() -> Qg1IncumbentScreenEvidence {
-        let cell = qg1_bulk_screen_cell();
+    fn qg1_no_decision_screen_evidence(cell_id: &str) -> Qg1IncumbentScreenEvidence {
+        let cell = qg1_screen_cell_for(cell_id);
         let semantic_contract = qg1_semantic_contract();
         let plan = crate::perf::Qg1TantivyIncumbentScreenPlan::new(
             test_profile(),
@@ -7070,11 +7155,33 @@ mod tests {
             "a screen with no retained pilots is a valid NoDecision"
         );
         Qg1IncumbentScreenEvidence {
-            cell_id: format!("{}/{}/{}", PerfGate::Qg1, cell.fixture, cell.metric),
+            cell_id: cell_id.to_owned(),
             semantic_contract,
             screen,
             decision: None,
         }
+    }
+
+    /// The exact projection an artifact's required engine cells demand: one
+    /// screen each, in canonical `cell_id` order.
+    fn qg1_screen_projection(artifact: &PerfEvidenceArtifact) -> Vec<Qg1IncumbentScreenEvidence> {
+        let mut cell_ids = artifact
+            .cells
+            .iter()
+            .filter(|cell| {
+                cell.spec.gate == PerfGate::Qg1 && cell.spec.role == EvidenceRole::Required
+            })
+            .map(|cell| cell.cell_id.clone())
+            .collect::<Vec<_>>();
+        cell_ids.sort();
+        assert!(
+            !cell_ids.is_empty(),
+            "the screen projection fixture needs at least one required engine cell"
+        );
+        cell_ids
+            .iter()
+            .map(|cell_id| qg1_no_decision_screen_evidence(cell_id))
+            .collect()
     }
 
     fn qg1_screen_artifact() -> PerfEvidenceArtifact {
@@ -7088,16 +7195,14 @@ mod tests {
         .expect("QG-1 screen-bearing artifact")
     }
 
-    /// The attached screen is durable and is *consumed*: an incomplete screen
-    /// turns otherwise-measured evidence into NoDecision, which is what stops a
-    /// convenient Tantivy arm from headlining before the screen has frozen one.
-    /// Planted omission negative: QG-1 evidence that never names an incumbent
-    /// screen is inadmissible, and omitting the field is not a way around the
-    /// screen. Non-QG-1 evidence keeps its exact prior admissibility.
+    /// Planted omission negative: QG-1 evidence that does not screen every
+    /// required engine cell is inadmissible, and omitting the projection is not
+    /// a way around the screen. Non-QG-1 evidence keeps its exact prior
+    /// admissibility.
     #[test]
     fn omitted_qg1_incumbent_screen_is_no_decision_and_never_ratchets() {
         let mut omitted = qg1_screen_artifact();
-        assert!(omitted.qg1_incumbent_screen.is_none());
+        assert!(omitted.qg1_incumbent_screens.is_empty());
         assert_eq!(
             omitted.gate_status,
             EvidenceDecisionStatus::NoDecision,
@@ -7132,13 +7237,17 @@ mod tests {
         );
     }
 
+    /// The attached projection is durable and is *consumed*: one incomplete
+    /// screen folds the whole gate to no-claim, which is what stops a
+    /// convenient Tantivy arm from headlining before every engine cell has
+    /// frozen its incumbent.
     #[test]
     fn attached_qg1_incumbent_screen_is_durable_and_forces_no_decision() {
         let mut artifact = qg1_screen_artifact();
-        let screen = qg1_no_decision_screen_evidence();
+        let screens = qg1_screen_projection(&artifact);
         artifact
-            .attach_qg1_incumbent_screen(screen.clone())
-            .expect("attach the QG-1 incumbent screen");
+            .attach_qg1_incumbent_screens(screens.clone())
+            .expect("attach the QG-1 incumbent screen projection");
         assert_eq!(
             artifact.gate_status,
             EvidenceDecisionStatus::NoDecision,
@@ -7174,12 +7283,75 @@ mod tests {
             PerfEvidenceArtifact::load_verified_against_qg1_authorities(&paths.json, &[])
                 .expect("reload the screen-bearing artifact");
         assert_eq!(
-            reloaded.qg1_incumbent_screen.as_ref(),
-            Some(&screen),
-            "the screen outcome survives write and reload exactly"
+            reloaded.qg1_incumbent_screens, screens,
+            "the complete screen projection survives write and reload exactly"
         );
         assert_eq!(reloaded.gate_status, EvidenceDecisionStatus::NoDecision);
         assert!(!reloaded.ratchet_admissible());
+    }
+
+    /// Planted coverage negatives: the projection must name every required
+    /// engine cell exactly once. A duplicate, an extra screen for a cell this
+    /// artifact never measured, and an empty projection all reject, and a
+    /// persisted artifact whose projection was edited fails verification.
+    #[test]
+    fn qg1_incumbent_screen_coverage_must_be_exact() {
+        let artifact = qg1_screen_artifact();
+        let screens = qg1_screen_projection(&artifact);
+
+        let mut duplicated = screens.clone();
+        duplicated.push(
+            screens
+                .first()
+                .expect("the projection screens one required cell")
+                .clone(),
+        );
+        assert!(
+            matches!(
+                qg1_screen_artifact().attach_qg1_incumbent_screens(duplicated),
+                Err(EvidenceArtifactError::InconsistentArtifact { .. })
+            ),
+            "a duplicated cell_id is not canonical coverage"
+        );
+
+        let mut extra = screens.clone();
+        let unscreened = PerfMatrixSpec::complete()
+            .for_gate(PerfGate::Qg1)
+            .into_iter()
+            .map(|cell| format!("{}/{}/{}", PerfGate::Qg1, cell.fixture, cell.metric))
+            .find(|cell_id| screens.iter().all(|screen| &screen.cell_id != cell_id))
+            .expect("the frozen QG-1 matrix has more than one cell");
+        extra.push(qg1_no_decision_screen_evidence(&unscreened));
+        extra.sort_by(|left, right| left.cell_id.cmp(&right.cell_id));
+        assert!(
+            matches!(
+                qg1_screen_artifact().attach_qg1_incumbent_screens(extra),
+                Err(EvidenceArtifactError::InconsistentArtifact { .. })
+            ),
+            "screening a cell this artifact never measured is extra coverage, not bonus coverage"
+        );
+
+        assert!(
+            matches!(
+                qg1_screen_artifact().attach_qg1_incumbent_screens(Vec::new()),
+                Err(EvidenceArtifactError::InconsistentArtifact { .. })
+            ),
+            "an empty projection cannot cover a required engine cell"
+        );
+
+        let mut attached = qg1_screen_artifact();
+        attached
+            .attach_qg1_incumbent_screens(screens)
+            .expect("attach the canonical projection");
+        let mut dropped = attached;
+        dropped.qg1_incumbent_screens.clear();
+        assert!(
+            matches!(
+                dropped.verify_integrity_against_qg1_authorities(&[]),
+                Err(EvidenceArtifactError::InconsistentArtifact { .. })
+            ),
+            "an artifact whose projection was dropped after folding must not verify"
+        );
     }
 
     /// Planted negatives on the attachment boundary: a screen that is neither a
@@ -7188,23 +7360,26 @@ mod tests {
     /// a QG-1 incumbent at all.
     #[test]
     fn incomplete_or_foreign_qg1_incumbent_screens_fail_closed() {
-        let screen = qg1_no_decision_screen_evidence();
+        let screen = qg1_screen_projection(&qg1_screen_artifact())
+            .into_iter()
+            .next()
+            .expect("the projection screens one required cell");
 
         let mut foreign = provisional_artifact();
         assert_eq!(foreign.gate, PerfGate::Qg2);
         assert!(
             matches!(
-                foreign.attach_qg1_incumbent_screen(screen.clone()),
+                foreign.attach_qg1_incumbent_screens(vec![screen.clone()]),
                 Err(EvidenceArtifactError::InconsistentArtifact { .. })
             ),
             "non-QG-1 evidence can never carry a QG-1 incumbent screen"
         );
-        assert!(foreign.qg1_incumbent_screen.is_none());
+        assert!(foreign.qg1_incumbent_screens.is_empty());
 
         let mut neither = screen.clone();
         neither.screen.no_decision_reason = None;
         assert!(matches!(
-            qg1_screen_artifact().attach_qg1_incumbent_screen(neither),
+            qg1_screen_artifact().attach_qg1_incumbent_screens(vec![neither]),
             Err(EvidenceArtifactError::InconsistentArtifact { .. })
         ));
 
@@ -7218,7 +7393,7 @@ mod tests {
         );
         assert!(
             matches!(
-                qg1_screen_artifact().attach_qg1_incumbent_screen(both.clone()),
+                qg1_screen_artifact().attach_qg1_incumbent_screens(vec![both.clone()]),
                 Err(EvidenceArtifactError::InconsistentArtifact { .. })
             ),
             "a screen cannot both select a candidate and declare NoDecision"
@@ -7228,7 +7403,7 @@ mod tests {
         selected_without_decision.screen.no_decision_reason = None;
         assert!(
             matches!(
-                qg1_screen_artifact().attach_qg1_incumbent_screen(selected_without_decision),
+                qg1_screen_artifact().attach_qg1_incumbent_screens(vec![selected_without_decision]),
                 Err(EvidenceArtifactError::InconsistentArtifact { .. })
             ),
             "a selected incumbent must carry its same-invocation decision evidence"
@@ -7251,7 +7426,7 @@ mod tests {
     #[test]
     fn absent_qg1_incumbent_screen_leaves_non_qg_artifacts_exact() {
         let artifact = provisional_artifact();
-        assert!(artifact.qg1_incumbent_screen.is_none());
+        assert!(artifact.qg1_incumbent_screens.is_empty());
         let json = artifact.canonical_json().expect("canonical JSON");
         assert!(
             !json.contains("qg1_incumbent_screen"),
