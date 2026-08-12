@@ -1775,33 +1775,16 @@ impl InMemoryVectorIndex {
             // default. In this case publication is deliberately skipped.
             Ok(None) | Err(_) => return Ok(index),
         };
-        // Enumeration says nothing about create-only publication capability.
-        // Hold an anonymous no-replace inode before *any* source-derived
-        // sidecar build, including the build needed to authenticate a
-        // header-matching candidate. A reusable candidate drops this inode;
-        // corrupt candidates consume it for publication. Either way, an
-        // unavailable optional cache never causes a discarded large build.
-        #[cfg(target_os = "linux")]
-        let reserved_publication = {
-            let candidate = match index.next_exact_residual_sidecar_cache_path(cache_dir) {
-                Ok(candidate) => candidate,
-                Err(_) => return Ok(index),
-            };
-            match acquire_exact_residual_sidecar_publication(&candidate) {
-                Ok(capability) => capability,
-                Err(_) => return Ok(index),
-            }
-        };
+        // Candidate verification is a read-only path: a valid immutable
+        // sidecar must remain reusable from a read-only cache root. Its full
+        // source-derived comparison is necessary before attachment, but must
+        // not require a publication capability that reuse never consumes.
         let mut derived = None;
         for candidate in candidates {
             if derived.is_none() {
                 let sidecar = match index.build_exact_residual_sidecar() {
                     Ok(sidecar) => sidecar,
-                    Err(_) => {
-                        #[cfg(target_os = "linux")]
-                        drop(reserved_publication);
-                        return Ok(index);
-                    }
+                    Err(_) => return Ok(index),
                 };
                 derived = Some(sidecar);
             }
@@ -1818,21 +1801,32 @@ impl InMemoryVectorIndex {
                 let Some(sidecar) = derived.take() else {
                     return Ok(index);
                 };
-                #[cfg(target_os = "linux")]
-                drop(reserved_publication);
                 let _ = index.exact_residual_sidecar.set(sidecar);
                 return Ok(index);
             }
         }
+        // No reusable candidate was attached. Reserve the create-only
+        // publication primitive before a no-candidate derivation so an
+        // unavailable optional cache cannot cause a discarded large build.
+        // A corrupt header-matching candidate may already have required one
+        // derivation for read-only authentication above; that work is never
+        // repeated here.
+        #[cfg(target_os = "linux")]
+        let reserved_publication = {
+            let candidate = match index.next_exact_residual_sidecar_cache_path(cache_dir) {
+                Ok(candidate) => candidate,
+                Err(_) => return Ok(index),
+            };
+            match acquire_exact_residual_sidecar_publication(&candidate) {
+                Ok(capability) => capability,
+                Err(_) => return Ok(index),
+            }
+        };
         let sidecar = match derived {
             Some(sidecar) => sidecar,
             None => match index.build_exact_residual_sidecar() {
                 Ok(sidecar) => sidecar,
-                Err(_) => {
-                    #[cfg(target_os = "linux")]
-                    drop(reserved_publication);
-                    return Ok(index);
-                }
+                Err(_) => return Ok(index),
             },
         };
         #[cfg(target_os = "linux")]
@@ -2232,27 +2226,13 @@ impl InMemoryVectorIndex {
         if !header_matches {
             return Ok(false);
         }
-        // Even an explicitly requested reusable sidecar must prove that this
-        // cache directory can create the no-replace publication primitive
-        // before re-derivation. The held anonymous inode is dropped after the
-        // candidate verifies; a read-only or unsupported cache simply remains
-        // an exact-flat fallback rather than allocating a sidecar in vain.
-        #[cfg(target_os = "linux")]
-        let _publication_capability = match acquire_exact_residual_sidecar_publication(path) {
-            Ok(capability) => capability,
-            Err(_) => return Ok(false),
-        };
         // The header preflight avoids derivation for absent/stale cache entries.
         // Once it matches, compare every serialized field and whole-file digest
         // directly from one descriptor with fixed stack buffers. This holds only
         // the trusted derived sidecar, never a second 512 MiB raw byte image.
         let expected = match self.build_exact_residual_sidecar() {
             Ok(expected) => expected,
-            Err(error) => {
-                #[cfg(target_os = "linux")]
-                drop(_publication_capability);
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         #[cfg(target_os = "linux")]
         let exactly_matches =
@@ -2260,12 +2240,8 @@ impl InMemoryVectorIndex {
         #[cfg(not(target_os = "linux"))]
         let exactly_matches = false;
         if !exactly_matches {
-            #[cfg(target_os = "linux")]
-            drop(_publication_capability);
             return Ok(false);
         }
-        #[cfg(target_os = "linux")]
-        drop(_publication_capability);
         Ok(self.exact_residual_sidecar.set(expected).is_ok())
     }
 
@@ -4496,16 +4472,26 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn exact_residual_capability_failure_precedes_corrupt_cache_recovery_derivation() {
-        let directory = owned_temp_dir("exact_residual_corrupt_capability");
+    fn valid_exact_residual_candidate_attaches_and_prunes_without_publication_capability() {
+        let directory = owned_temp_dir("exact_residual_read_only_candidate");
         let source_path = directory.join("index.fsvi");
         let cache_dir = directory.join("residual-cache");
         std::fs::create_dir(&cache_dir).expect("create private cache directory");
         let dimension = 35;
-        let (doc_ids, vectors) = identity_rows(dimension, 17);
+        let count = 17;
+        let mut vectors = vec![vec![0.0_f32; dimension]; count];
+        for vector in vectors.iter_mut().take(EXACT_RESIDUAL_LANES) {
+            vector[0] = 1.0;
+        }
+        for vector in vectors.iter_mut().skip(EXACT_RESIDUAL_LANES) {
+            vector[0] = -1.0;
+        }
+        let doc_ids = (0..count)
+            .map(|row| format!("read-only-candidate-{row}"))
+            .collect::<Vec<_>>();
         let rows: Vec<(String, Vec<f32>)> = doc_ids.into_iter().zip(vectors).collect();
         let (binding, _) =
-            write_fsvi_v2_fixture(&source_path, "residual-capability", dimension, 57, &rows);
+            write_fsvi_v2_fixture(&source_path, "residual-read-only", dimension, 57, &rows);
         let admitted = crate::VectorIndex::open_admitted_v2(&source_path, &binding)
             .expect("admit private v2 source");
         let flat =
@@ -4513,14 +4499,78 @@ mod tests {
         let cache_prefix = flat
             .exact_residual_generation_cache_prefix()
             .expect("derive generation cache prefix");
-        let mut corrupt = flat
+        let valid = flat
             .build_exact_residual_sidecar()
-            .expect("derive cache-shaped corruption fixture")
+            .expect("derive cache-shaped valid fixture")
             .encode()
-            .expect("encode cache-shaped corruption fixture");
-        corrupt[EXACT_RESIDUAL_SIDECAR_HEADER_BYTES] ^= 0x01;
-        let corrupt_path = cache_dir.join(format!("{cache_prefix}corrupt.fsrs"));
-        write_new_owned_file(&corrupt_path, &corrupt);
+            .expect("encode cache-shaped valid fixture");
+        let valid_path = cache_dir.join(format!("{cache_prefix}valid.fsrs"));
+        write_new_owned_file(&valid_path, &valid);
+
+        reset_exact_residual_sidecar_build_count();
+        fail_next_exact_residual_publication_acquisition();
+        let cached = InMemoryVectorIndex::from_admitted_v2_with_residual_sidecar_cache(
+            &admitted, &cache_dir,
+        )
+        .expect("read-only reusable cache candidate must retain the exact source");
+        assert!(
+            exact_residual_publication_acquisition_failure_is_pending(),
+            "a reusable immutable candidate must attach without acquiring publication capability"
+        );
+        assert_eq!(
+            exact_residual_sidecar_build_count(),
+            1,
+            "the sidecar must be derived exactly once to authenticate the read-only candidate"
+        );
+        assert!(
+            cached.has_exact_residual_sidecar(),
+            "a valid immutable candidate must remain attached when publication is unavailable"
+        );
+        let mut query = vec![0.0_f32; dimension];
+        query[0] = 1.0;
+        let outcome = cached
+            .scan_exact_residual_sidecar(
+                &query,
+                1,
+                None,
+                cached
+                    .exact_residual_sidecar
+                    .get()
+                    .expect("read-only candidate is attached"),
+            )
+            .expect("scan attached read-only candidate");
+        assert!(
+            outcome.census.lanes_pruned > 0,
+            "the reused candidate must retain real exact-residual pruning"
+        );
+        assert_eq!(
+            cached
+                .resolve_heap(outcome.heap)
+                .expect("resolve read-only candidate result"),
+            flat.search_top_k(&query, 1, None)
+                .expect("flat exact baseline"),
+            "read-only candidate pruning preserves the exact result"
+        );
+        assert!(
+            take_exact_residual_publication_acquisition_failure(),
+            "clear the planted unavailable-publication seam after proving reuse bypassed it"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_residual_capability_failure_precedes_empty_cache_derivation() {
+        let directory = owned_temp_dir("exact_residual_empty_capability");
+        let source_path = directory.join("index.fsvi");
+        let cache_dir = directory.join("residual-cache");
+        std::fs::create_dir(&cache_dir).expect("create empty private cache directory");
+        let dimension = 35;
+        let (doc_ids, vectors) = identity_rows(dimension, 17);
+        let rows: Vec<(String, Vec<f32>)> = doc_ids.into_iter().zip(vectors).collect();
+        let (binding, _) =
+            write_fsvi_v2_fixture(&source_path, "residual-capability", dimension, 57, &rows);
+        let admitted = crate::VectorIndex::open_admitted_v2(&source_path, &binding)
+            .expect("admit private v2 source");
 
         reset_exact_residual_sidecar_build_count();
         fail_next_exact_residual_publication_acquisition();
@@ -4530,28 +4580,23 @@ mod tests {
         .expect("optional cache failure must retain an exact flat source");
         assert!(
             !exact_residual_publication_acquisition_failure_is_pending(),
-            "corrupt-candidate recovery must consume the acquisition-failure seam"
+            "an empty cache must consume the publication-capability failure seam"
         );
         assert_eq!(
             exact_residual_sidecar_build_count(),
             0,
-            "corrupt/header-matching recovery must acquire capability before derivation"
+            "an unavailable empty cache must acquire capability before deriving a sidecar"
         );
         assert!(
             !fallback.has_exact_residual_sidecar(),
-            "an unavailable optional cache must stay on the exact flat route"
+            "an unavailable optional empty cache must stay on the exact flat route"
         );
         assert_eq!(
             std::fs::read_dir(&cache_dir)
-                .expect("inspect private corrupt-cache directory")
+                .expect("inspect private empty cache directory")
                 .count(),
-            1,
+            0,
             "failed capability acquisition must leave no visible temporary artifact"
-        );
-        assert_eq!(
-            std::fs::read(&corrupt_path).expect("read planted immutable corruption"),
-            corrupt,
-            "fallback must not overwrite the corrupt immutable cache artifact"
         );
     }
 
