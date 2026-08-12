@@ -3683,11 +3683,33 @@ enum WriterProtection {
     },
 }
 
+/// Retained evidence that one MANIFEST publication may have become durable
+/// without its owning future surviving to install the successor snapshot.
+///
+/// A durable publication finishes inside a blocking closure that outlives a
+/// dropped future, so `rename`+`fsync` can install generation N+1 while the
+/// caller's future never resumes to assign the refreshed snapshot. The marker
+/// is written synchronously in the same poll that reaches the publication, so
+/// a drop, panic, or cancellation anywhere below it cannot erase the fact that
+/// disk may now be ahead of the retained view.
+#[derive(Debug, Clone, Copy)]
+struct PendingPublication {
+    /// Generation the retained snapshot held when the attempt began.
+    from_generation: u64,
+    /// Generation the attempt proposed to install.
+    proposed_generation: u64,
+}
+
 /// Sole cross-process mutation capability for one Quill index directory.
 ///
 /// This type is intentionally not `Clone`. Its internal admission token may be
 /// retained by an in-flight blocking publication so cancellation cannot release
 /// the OS lock while filesystem mutation is still running.
+///
+/// For the same reason a successful publication can outlive the future that
+/// awaited it. This writer therefore retains a pending-publication marker
+/// across such a drop, and every later authority read reconciles the durable
+/// MANIFEST before [`Self::snapshot`] is used as publication authority.
 ///
 /// Every process that mutates the index directory must honor Quill's `LOCK`.
 /// Crash consistency does not cover an out-of-band process replacing admitted
@@ -3697,6 +3719,10 @@ pub struct KeeperWriter {
     snapshot: KeeperSnapshot,
     garbage_options: GarbageCollectionOptions,
     protection: WriterProtection,
+    /// Set synchronously before a publication is awaited; cleared only once the
+    /// retained snapshot has been proven against the durable generation that
+    /// attempt may have installed.
+    pending_publication: Option<PendingPublication>,
 }
 
 impl KeeperWriter {
@@ -3941,13 +3967,80 @@ impl KeeperWriter {
             snapshot,
             garbage_options,
             protection,
+            pending_publication: None,
         })
     }
 
     /// Current immutable reader view held by this writer.
+    ///
+    /// This view is never ahead of durable authority, but it can lag it: a
+    /// publication future dropped after its generation became durable leaves
+    /// the successor uninstalled here. [`Self::publication_awaits_reconciliation`]
+    /// reports that state and [`Self::reconcile_publication`] resolves it; every
+    /// mutating entry point resolves it before reading this view as authority.
     #[must_use]
     pub const fn snapshot(&self) -> &KeeperSnapshot {
         &self.snapshot
+    }
+
+    /// Whether a publication may have become durable without this writer
+    /// installing its successor snapshot.
+    ///
+    /// True only between an abandoned [`Self::publish`] future and the next
+    /// authority read that proves the retained snapshot against disk.
+    #[must_use]
+    pub const fn publication_awaits_reconciliation(&self) -> bool {
+        self.pending_publication.is_some()
+    }
+
+    /// Prove the retained snapshot against the durable MANIFEST.
+    ///
+    /// This is a no-op when no publication was abandoned. Otherwise durable
+    /// authority is re-read under the publication guard — so an abandoned
+    /// attempt whose blocking choreography is still running cannot be observed
+    /// mid-rename — and adopted. Authority never moves backwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, admission-identity, snapshot-open, or
+    /// rollback failures. The marker survives every one of them, so a failed
+    /// reconciliation cannot be mistaken for an installed successor.
+    pub async fn reconcile_publication(&mut self, cx: &Cx) -> Result<&KeeperSnapshot, KeeperError> {
+        self.reconcile_pending_publication(cx).await?;
+        Ok(&self.snapshot)
+    }
+
+    /// Adopt the durable generation an abandoned publication may have
+    /// installed, and report whether a marker was reconciled.
+    ///
+    /// The publication guard is taken first: a dropped future leaves its
+    /// blocking closure holding that guard until the choreography ends, so
+    /// acquiring it is what makes the following read an authority read rather
+    /// than a sighting of a half-renamed directory.
+    async fn reconcile_pending_publication(&mut self, cx: &Cx) -> Result<bool, KeeperError> {
+        let Some(pending) = self.pending_publication else {
+            return Ok(false);
+        };
+        let guard = writer_mutation_guard(cx).await?;
+        self.admission.ensure_directory_identity()?;
+        let directory = self.admission.directory.clone();
+        let installed = open_snapshot_blocking(directory, self.snapshot.schema()).await?;
+        drop(guard);
+        let retained_generation = self.snapshot.loaded_manifest().manifest.generation;
+        let installed_generation = installed.loaded_manifest().manifest.generation;
+        if installed_generation < retained_generation {
+            return Err(KeeperError::InvalidTransition {
+                detail: format!(
+                    "durable generation {installed_generation} is behind the retained writer \
+                     snapshot at {retained_generation} after an abandoned publication of \
+                     generation {} from generation {}",
+                    pending.proposed_generation, pending.from_generation
+                ),
+            });
+        }
+        self.snapshot = installed;
+        self.pending_publication = None;
+        Ok(true)
     }
 
     /// Publish exactly the next MANIFEST generation through an `O_EXCL` claim.
@@ -3974,6 +4067,17 @@ impl KeeperWriter {
         manifest
             .validate()
             .map_err(|source| KeeperError::InvalidManifest { source })?;
+        // An earlier attempt may have become durable after its future was
+        // dropped. Prove the retained snapshot against disk before this
+        // proposal is validated against it, otherwise a stale successor check
+        // would admit a proposal for a generation that already exists. When the
+        // abandoned attempt is exactly what won, adopt it instead of
+        // republishing the same generation.
+        if self.reconcile_pending_publication(cx).await?
+            && manifest_matches_proposal(&self.snapshot.loaded_manifest().manifest, manifest)
+        {
+            return Ok(&self.snapshot);
+        }
         validate_manifest_successor(&self.snapshot.loaded_manifest().manifest, manifest)?;
         let directory = self.admission.directory.clone();
         let preflight_directory = directory.clone();
@@ -3996,6 +4100,15 @@ impl KeeperWriter {
         }
         let claim_admission = Arc::clone(&self.admission);
         let publisher = ManifestPublisher::new(&directory);
+        // Written in the same poll that reaches the publication and never
+        // behind an await: dropping, unwinding, or cancelling out of anything
+        // below cannot erase it, so the durable generation this attempt may
+        // install stays reconcilable through the next authority read.
+        let from_generation = self.snapshot.loaded_manifest().manifest.generation;
+        self.pending_publication = Some(PendingPublication {
+            from_generation,
+            proposed_generation: manifest.generation,
+        });
         let publish_result = match &self.protection {
             WriterProtection::Disabled => {
                 publisher
@@ -4020,12 +4133,20 @@ impl KeeperWriter {
         };
         if let Err(error) = publish_result {
             if self.reconcile_manifest_proposal(cx, manifest).await? {
+                self.pending_publication = None;
                 return Ok(&self.snapshot);
             }
+            // The proposal did not win, but recovery may still have advanced
+            // durable authority past the retained snapshot. Keep the marker so
+            // the next authority read reconciles rather than assuming this
+            // failure left disk where the retained view says it is.
             return Err(error);
         }
         self.admission.ensure_directory_identity()?;
+        #[cfg(test)]
+        await_publish_refresh_park_for_test(&directory).await;
         self.snapshot = open_snapshot_blocking(directory, self.snapshot.schema()).await?;
+        self.pending_publication = None;
         Ok(&self.snapshot)
     }
 
@@ -4178,6 +4299,9 @@ impl KeeperWriter {
         if cx.is_cancel_requested() {
             return Err(ConcatMergeError::Cancelled.into());
         }
+        // Plan against proven authority: an abandoned publication may have
+        // advanced disk past the retained snapshot these source ids name.
+        self.reconcile_pending_publication(cx).await?;
         let mut source_ids = Vec::new();
         source_ids
             .try_reserve_exact(source_segment_ids.len())
@@ -4230,6 +4354,10 @@ impl KeeperWriter {
         if cx.is_cancel_requested() {
             return Err(CompactionError::Cancelled.into());
         }
+        // Rewrite against proven authority: a compaction planned from a
+        // snapshot that an abandoned publication already superseded would
+        // propose a generation that exists.
+        self.reconcile_pending_publication(cx).await?;
         let snapshot = self.snapshot.clone();
         let artifact =
             spawn_blocking(move || build_compaction(&snapshot, policy, created_unix_s)).await?;
@@ -4277,6 +4405,104 @@ impl KeeperWriter {
         })
         .await
     }
+}
+
+/// One-shot park for the seam between a durable MANIFEST publication and the
+/// retained-snapshot refresh that installs it.
+///
+/// [`pause_manifest_publish_at_checkpoint_for_test`] blocks a publisher thread
+/// inside filesystem choreography; this parks the owning future itself, which
+/// is the only way a test can drop `KeeperWriter::publish` exactly after
+/// generation N+1 is durable and before the successor snapshot is assigned.
+#[cfg(test)]
+struct PublishRefreshPark {
+    reached: std::sync::atomic::AtomicBool,
+    released: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+static PUBLISH_REFRESH_PARKS: OnceLock<
+    std::sync::Mutex<BTreeMap<PathBuf, Arc<PublishRefreshPark>>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn publish_refresh_parks() -> &'static std::sync::Mutex<BTreeMap<PathBuf, Arc<PublishRefreshPark>>>
+{
+    PUBLISH_REFRESH_PARKS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// Handle for one armed post-publication refresh park.
+#[cfg(test)]
+struct PublishRefreshParkControl {
+    directory: PathBuf,
+    park: Arc<PublishRefreshPark>,
+}
+
+/// Arm the post-publication refresh park for a single directory.
+#[cfg(test)]
+fn park_publish_refresh_for_test(directory: &Path) -> PublishRefreshParkControl {
+    let directory = normalize_publish_directory(directory.to_path_buf());
+    let park = Arc::new(PublishRefreshPark {
+        reached: std::sync::atomic::AtomicBool::new(false),
+        released: std::sync::atomic::AtomicBool::new(false),
+    });
+    let previous = publish_refresh_parks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(directory.clone(), Arc::clone(&park));
+    assert!(
+        previous.is_none(),
+        "only one publication refresh park may be armed per directory"
+    );
+    PublishRefreshParkControl { directory, park }
+}
+
+#[cfg(test)]
+impl PublishRefreshParkControl {
+    /// Whether a publication future is parked at the refresh seam.
+    fn is_reached(&self) -> bool {
+        self.park.reached.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Disarm the park and release any parked future. Repeated calls are safe.
+    fn release(&self) {
+        publish_refresh_parks()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.directory);
+        self.park
+            .released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+impl Drop for PublishRefreshParkControl {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[cfg(test)]
+async fn await_publish_refresh_park_for_test(directory: &Path) {
+    let park = publish_refresh_parks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(directory)
+        .map(Arc::clone);
+    let Some(park) = park else {
+        return;
+    };
+    park.reached
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    std::future::poll_fn(move |task_cx| {
+        if park.released.load(std::sync::atomic::Ordering::SeqCst) {
+            return std::task::Poll::Ready(());
+        }
+        task_cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    })
+    .await;
 }
 
 struct ConcatMergeArtifact {
@@ -20450,6 +20676,190 @@ mod tests {
                 .and_then(|entry| entry.file_name().into_string().ok())
                 .is_some_and(|name| name.starts_with(".tmp-abandoned-manifest-3-"))
         }));
+        Ok(())
+    }
+
+    /// Drive `publish` until the armed refresh park holds the owning future,
+    /// which happens only after the real publisher made generation N+1 durable.
+    ///
+    /// Panics instead of returning if the publication completes: a future that
+    /// finished installed its snapshot, so the hostile drop below would prove
+    /// nothing.
+    async fn drive_publish_to_refresh_park<F: std::future::Future>(
+        publish: &mut std::pin::Pin<Box<F>>,
+        park: &PublishRefreshParkControl,
+    ) {
+        std::future::poll_fn(|task_cx| {
+            if park.is_reached() {
+                return std::task::Poll::Ready(());
+            }
+            match std::future::Future::poll(publish.as_mut(), task_cx) {
+                std::task::Poll::Pending => {
+                    task_cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+                std::task::Poll::Ready(_) => {
+                    panic!("publication completed before the armed refresh seam")
+                }
+            }
+        })
+        .await;
+    }
+
+    #[test]
+    fn dropped_publish_future_after_durable_install_advances_the_next_publication() -> TestResult {
+        let index = tempdir()?;
+        let directory = index.path().to_path_buf();
+        run_with_test_cx(move |cx| async move {
+            let mut writer = KeeperWriter::create(&cx, &directory, DEFAULT_SCHEMA)
+                .await
+                .expect("create genesis index");
+            let schema_id = DEFAULT_SCHEMA.schema_id().expect("default schema identity");
+            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 1);
+            assert!(!writer.publication_awaits_reconciliation());
+
+            // Let the real durable publication of generation 2 complete, then
+            // abandon the future at the exact seam before it can assign the
+            // successor snapshot.
+            let park = park_publish_refresh_for_test(&directory);
+            let successor = Manifest::empty(2, schema_id, 0);
+            let mut publish = Box::pin(writer.publish(&cx, &successor));
+            drive_publish_to_refresh_park(&mut publish, &park).await;
+            drop(publish);
+            drop(park);
+
+            let installed = Manifest::from_bytes(
+                &std::fs::read(directory.join("MANIFEST")).expect("read installed MANIFEST"),
+            )
+            .expect("decode installed MANIFEST");
+            assert_eq!(
+                installed.generation, 2,
+                "the real publisher must have made generation N+1 durable before the drop"
+            );
+            assert_eq!(
+                writer.snapshot().loaded_manifest().manifest.generation,
+                1,
+                "the dropped future cannot have installed the successor snapshot"
+            );
+            assert!(
+                writer.publication_awaits_reconciliation(),
+                "durable authority ahead of the retained snapshot must stay reconcilable"
+            );
+
+            // The next publication is the authority read that must reconcile
+            // first: validating generation 3 against the abandoned generation-1
+            // view rejects it as a gap, and republishing generation 2 would
+            // collide with the claim that already won.
+            let advanced = writer
+                .publish(&cx, &Manifest::empty(3, schema_id, 0))
+                .await
+                .expect("the next publication reconciles the abandoned generation")
+                .loaded_manifest()
+                .manifest
+                .generation;
+            assert_eq!(advanced, 3);
+            assert!(!writer.publication_awaits_reconciliation());
+
+            let reopened =
+                KeeperSnapshot::open(&directory, DEFAULT_SCHEMA).expect("reopen published index");
+            assert_eq!(
+                writer.snapshot().loaded_manifest().manifest,
+                reopened.loaded_manifest().manifest,
+                "the retained handle and a fresh reopen must agree exactly"
+            );
+            let previous = Manifest::from_bytes(
+                &std::fs::read(directory.join("MANIFEST.prev")).expect("read previous MANIFEST"),
+            )
+            .expect("decode previous MANIFEST");
+            assert_eq!(
+                previous.generation, 2,
+                "the abandoned generation is retained as the previous slot, never rolled back"
+            );
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn abandoned_publication_is_adopted_by_its_identical_retry_and_by_reconciliation() -> TestResult
+    {
+        let index = tempdir()?;
+        let directory = index.path().to_path_buf();
+        run_with_test_cx(move |cx| async move {
+            let mut writer = KeeperWriter::create(&cx, &directory, DEFAULT_SCHEMA)
+                .await
+                .expect("create genesis index");
+            let schema_id = DEFAULT_SCHEMA.schema_id().expect("default schema identity");
+
+            // An owner that retries the exact abandoned proposal adopts the
+            // durable generation instead of publishing a second successor.
+            let park = park_publish_refresh_for_test(&directory);
+            let second = Manifest::empty(2, schema_id, 0);
+            let mut publish = Box::pin(writer.publish(&cx, &second));
+            drive_publish_to_refresh_park(&mut publish, &park).await;
+            drop(publish);
+            drop(park);
+
+            let adopted = writer
+                .publish(&cx, &second)
+                .await
+                .expect("the identical retry adopts the durable generation")
+                .loaded_manifest()
+                .manifest
+                .generation;
+            assert_eq!(
+                adopted, 2,
+                "an identical retry must reconcile generation N+1, not publish N+2"
+            );
+            assert!(!writer.publication_awaits_reconciliation());
+            let previous = Manifest::from_bytes(
+                &std::fs::read(directory.join("MANIFEST.prev")).expect("read previous MANIFEST"),
+            )
+            .expect("decode previous MANIFEST");
+            assert_eq!(
+                previous.generation, 1,
+                "adoption must not publish a second successor over the abandoned one"
+            );
+
+            // An owner that never retries still gets an honest view: explicit
+            // reconciliation proves the retained snapshot against disk.
+            let park = park_publish_refresh_for_test(&directory);
+            let third = Manifest::empty(3, schema_id, 0);
+            let mut publish = Box::pin(writer.publish(&cx, &third));
+            drive_publish_to_refresh_park(&mut publish, &park).await;
+            drop(publish);
+            drop(park);
+
+            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 2);
+            let reconciled = writer
+                .reconcile_publication(&cx)
+                .await
+                .expect("reconcile the abandoned publication")
+                .loaded_manifest()
+                .manifest
+                .clone();
+            assert_eq!(reconciled.generation, 3);
+            assert!(!writer.publication_awaits_reconciliation());
+            let reopened =
+                KeeperSnapshot::open(&directory, DEFAULT_SCHEMA).expect("reopen published index");
+            assert_eq!(
+                reconciled,
+                reopened.loaded_manifest().manifest,
+                "reconciliation must install exactly what durable authority holds"
+            );
+            // Reconciling again is inert, and publication continues monotonically.
+            writer
+                .reconcile_publication(&cx)
+                .await
+                .expect("reconciliation without an abandoned publication is a no-op");
+            let advanced = writer
+                .publish(&cx, &Manifest::empty(4, schema_id, 0))
+                .await
+                .expect("publish the reconciled successor")
+                .loaded_manifest()
+                .manifest
+                .generation;
+            assert_eq!(advanced, 4);
+        });
         Ok(())
     }
 
