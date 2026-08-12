@@ -32,7 +32,7 @@ use crate::{
     PerfApplicabilityPlanError, PerfCellApplicability, PerfCellApplicabilityReason, PerfCellResult,
     PerfCellSpec, PerfEvidenceArtifact, PerfExecutionProvenance, PerfGate, PerfGateArtifact,
     PerfMatrixSpec, PerfMetricSemantics, PerfProducerOs, PerfRawSample, PerfSampleArm,
-    VerifiedRunnerIdentity,
+    Qg1ExpectedAuthority, VerifiedRunnerIdentity,
 };
 
 #[cfg(test)]
@@ -865,6 +865,24 @@ impl VerifiedLocalPerfAttemptBundle {
     /// Rejects path aliases, symlinks, hard links, oversized inputs,
     /// noncanonical bytes, substitutions, or any cross-object mismatch.
     pub fn load_verified(attempt_dir: &Path) -> Result<Self, PerfEvidenceAssemblyError> {
+        Self::load_verified_against_qg1_authorities(attempt_dir, &[])
+    }
+
+    /// Load one canonical attempt directory against the QG-1 expectations
+    /// retained for that exact attempt input.
+    ///
+    /// An empty authority slice is the legacy authority-free path and therefore
+    /// rejects a completed shard carrying authority-bound QG-1 evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same strict path, receipt, and evidence failures as
+    /// [`Self::load_verified`], including missing, foreign, or duplicate
+    /// retained QG-1 authority.
+    pub fn load_verified_against_qg1_authorities(
+        attempt_dir: &Path,
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+    ) -> Result<Self, PerfEvidenceAssemblyError> {
         let directory = open_pinned_assembly_directory(attempt_dir, true)?;
         let directory_identity = verify_pinned_assembly_directory(attempt_dir, &directory, true)?;
         let attempt_bytes = read_bounded_owned_regular_at(
@@ -894,7 +912,11 @@ impl VerifiedLocalPerfAttemptBundle {
         };
         process.verify()?;
         let completed = if process.receipt.outcome() == LocalPerfAttemptOutcome::Completed {
-            Some(load_completed_attempt(&directory, &process)?)
+            Some(load_completed_attempt(
+                &directory,
+                &process,
+                external_qg1_authorities,
+            )?)
         } else {
             None
         };
@@ -904,7 +926,7 @@ impl VerifiedLocalPerfAttemptBundle {
             ));
         }
         let bundle = Self { process, completed };
-        bundle.verify()?;
+        bundle.verify_against_qg1_authorities(external_qg1_authorities)?;
         Ok(bundle)
     }
 
@@ -914,11 +936,14 @@ impl VerifiedLocalPerfAttemptBundle {
         &self.process
     }
 
-    fn verify(&self) -> Result<(), PerfEvidenceAssemblyError> {
+    fn verify_against_qg1_authorities(
+        &self,
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+    ) -> Result<(), PerfEvidenceAssemblyError> {
         self.process.verify()?;
         match (self.process.receipt.outcome(), &self.completed) {
             (LocalPerfAttemptOutcome::Completed, Some(completed)) => {
-                verify_completed_inputs(&self.process, completed)
+                verify_completed_inputs(&self.process, completed, external_qg1_authorities)
             }
             (LocalPerfAttemptOutcome::Completed, None) => {
                 Err(PerfEvidenceAssemblyError::InvalidAttemptBundle {
@@ -1142,6 +1167,7 @@ fn verify_threshold_evidence_join(
 fn load_completed_attempt(
     directory: &File,
     process: &PerfAssemblyProcessReceipt,
+    external_qg1_authorities: &[&Qg1ExpectedAuthority],
 ) -> Result<PerfAssemblyCompletedInputs, PerfEvidenceAssemblyError> {
     let run_log = process.run_log_bytes.as_deref().ok_or_else(|| {
         PerfEvidenceAssemblyError::InvalidAttemptBundle {
@@ -1175,14 +1201,20 @@ fn load_completed_attempt(
         PERF_ASSEMBLY_MAX_ARTIFACT_BYTES,
     )?;
 
-    let artifact = PerfEvidenceArtifact::from_verified_slice(&bound_bytes)?;
+    let artifact = PerfEvidenceArtifact::from_verified_slice_against_qg1_authorities(
+        &bound_bytes,
+        external_qg1_authorities,
+    )?;
     if canonical_evidence_bytes(&artifact)? != bound_bytes {
         return Err(PerfEvidenceAssemblyError::InvalidAttemptBundle {
             reason: "bound evidence is not exact canonical pretty JSON".to_owned(),
         });
     }
     process.receipt.verify_bound_evidence(&bound_bytes)?;
-    let prebinding_artifact = PerfEvidenceArtifact::from_verified_slice(&prebinding_bytes)?;
+    let prebinding_artifact = PerfEvidenceArtifact::from_verified_slice_against_qg1_authorities(
+        &prebinding_bytes,
+        external_qg1_authorities,
+    )?;
     if canonical_evidence_bytes(&prebinding_artifact)? != prebinding_bytes
         || artifact.reconstructed_prebinding_bytes()? != prebinding_bytes
     {
@@ -1266,7 +1298,14 @@ fn load_completed_attempt(
 fn verify_completed_inputs(
     process: &PerfAssemblyProcessReceipt,
     completed: &PerfAssemblyCompletedInputs,
+    external_qg1_authorities: &[&Qg1ExpectedAuthority],
 ) -> Result<(), PerfEvidenceAssemblyError> {
+    completed
+        .artifact
+        .verify_integrity_against_qg1_authorities(external_qg1_authorities)?;
+    completed
+        .prebinding_artifact
+        .verify_integrity_against_qg1_authorities(external_qg1_authorities)?;
     let bound_bytes = canonical_evidence_bytes(&completed.artifact)?;
     let prebinding_bytes = canonical_evidence_bytes(&completed.prebinding_artifact)?;
     let threshold_bytes = canonical_threshold_bytes(&completed.threshold_artifact)?;
@@ -1548,6 +1587,31 @@ impl PerfEvidenceAssemblyArtifact {
     pub fn assemble(
         attempts: Vec<VerifiedLocalPerfAttemptBundle>,
     ) -> Result<Self, PerfEvidenceAssemblyError> {
+        Self::assemble_against_qg1_authorities(
+            attempts.into_iter().map(|attempt| (attempt, &[])).collect(),
+        )
+    }
+
+    /// Assemble exact H2 attempt bundles against their separately retained
+    /// QG-1 authorities.
+    ///
+    /// Each tuple binds one exact input bundle to only the authority slice
+    /// retained for that bundle. This deliberately rejects positional or
+    /// role-string authority routing: an authority set cannot be borrowed from
+    /// a neighboring shard. The authority-free [`Self::assemble`] entry passes
+    /// empty slices and consequently fails closed for authority-bearing QG-1
+    /// evidence while preserving ordinary non-QG behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed structural or provenance error for invalid inputs,
+    /// including absent, foreign, or duplicate retained QG-1 authority.
+    pub fn assemble_against_qg1_authorities<'authority>(
+        attempts: Vec<(
+            VerifiedLocalPerfAttemptBundle,
+            &'authority [&'authority Qg1ExpectedAuthority],
+        )>,
+    ) -> Result<Self, PerfEvidenceAssemblyError> {
         let total = attempts.len();
         if total == 0 {
             return Err(PerfEvidenceAssemblyError::EmptyAssembly);
@@ -1556,23 +1620,41 @@ impl PerfEvidenceAssemblyArtifact {
             return Err(PerfEvidenceAssemblyError::TooManyShards);
         }
 
-        for attempt in &attempts {
-            attempt.verify()?;
+        for (attempt, external_qg1_authorities) in &attempts {
+            attempt.verify_against_qg1_authorities(external_qg1_authorities)?;
         }
         let first = attempts
             .first()
             .ok_or(PerfEvidenceAssemblyError::EmptyAssembly)?;
-        let applicability_plan = first.process.receipt.applicability_plan().clone();
-        let run_window = first.process.receipt.run_window().to_owned();
+        let applicability_plan = first.0.process.receipt.applicability_plan().clone();
+        let run_window = first.0.process.receipt.run_window().to_owned();
         let contract = PlanContract::reconstruct(&applicability_plan)?;
         let matrix_manifest = PerfEvidenceAssemblyMatrixManifest::derive(&contract)?;
 
         let mut source_shards = Vec::new();
         let mut failed_shards = Vec::new();
-        for attempt in attempts {
+        let mut source_authorities = BTreeMap::new();
+        for (attempt, external_qg1_authorities) in attempts {
             let VerifiedLocalPerfAttemptBundle { process, completed } = attempt;
             if let Some(completed) = completed {
-                source_shards.push(source_from_completed_inputs(process, completed, &contract)?);
+                let source = source_from_completed_inputs(
+                    process,
+                    completed,
+                    &contract,
+                    external_qg1_authorities,
+                )?;
+                if source_authorities
+                    .insert(
+                        source.bound_evidence_file_sha256.clone(),
+                        external_qg1_authorities,
+                    )
+                    .is_some()
+                {
+                    return Err(PerfEvidenceAssemblyError::InconsistentAssembly {
+                        reason: "assembly repeats one exact bound-evidence source input".to_owned(),
+                    });
+                }
+                source_shards.push(source);
             } else {
                 failed_shards.push(PerfEvidenceAssemblyFailedAttempt { process });
             }
@@ -1590,12 +1672,17 @@ impl PerfEvidenceAssemblyArtifact {
                     right.process.process_receipt_sha256.as_str(),
                 ))
         });
+        let source_authorities = source_authorities
+            .iter()
+            .map(|(source_sha256, authorities)| (source_sha256.as_str(), *authorities))
+            .collect::<Vec<_>>();
 
         let derived = derive_assembly(
             &applicability_plan,
             &run_window,
             &source_shards,
             &failed_shards,
+            &source_authorities,
         )?;
         let semantic_cell_set = semantic_cell_set_seal(
             &applicability_plan,
@@ -1902,6 +1989,25 @@ impl PerfEvidenceAssemblyArtifact {
     ///
     /// Returns a typed schema, hash, provenance, or structural error.
     pub fn from_verified_slice(contents: &[u8]) -> Result<Self, PerfEvidenceAssemblyError> {
+        Self::from_verified_slice_against_qg1_authorities(contents, &[])
+    }
+
+    /// Parse strict assembly bytes against authority slices keyed by each
+    /// source shard's exact bound-evidence SHA-256.
+    ///
+    /// A source may occur at most once in `source_authorities`; an unknown or
+    /// duplicate key is rejected before replay. This identity key is the
+    /// retained shard input itself, never a role label or positional index.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::from_verified_slice`], including
+    /// fail-closed replay of authority-bearing QG-1 sources without their
+    /// exact retained authority slice.
+    pub fn from_verified_slice_against_qg1_authorities(
+        contents: &[u8],
+        source_authorities: &[(&str, &[&Qg1ExpectedAuthority])],
+    ) -> Result<Self, PerfEvidenceAssemblyError> {
         let probe =
             crate::machine_class_registry::parse_strict_json(contents).map_err(|error| {
                 PerfEvidenceAssemblyError::Malformed {
@@ -1935,7 +2041,7 @@ impl PerfEvidenceAssemblyArtifact {
                 reason: "assembly bytes are not the canonical exact encoding".to_owned(),
             });
         }
-        artifact.verify_integrity()?;
+        artifact.verify_integrity_against_qg1_authorities(source_authorities)?;
         Ok(artifact)
     }
 
@@ -1945,7 +2051,20 @@ impl PerfEvidenceAssemblyArtifact {
     ///
     /// Returns a typed I/O or verification error.
     pub fn load_verified(path: &Path) -> Result<Self, PerfEvidenceAssemblyError> {
-        Self::from_verified_slice(&fs::read(path)?)
+        Self::load_verified_against_qg1_authorities(path, &[])
+    }
+
+    /// Load one exact assembly file against source-authority slices keyed by
+    /// each retained bound-evidence file SHA-256.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::load_verified`].
+    pub fn load_verified_against_qg1_authorities(
+        path: &Path,
+        source_authorities: &[(&str, &[&Qg1ExpectedAuthority])],
+    ) -> Result<Self, PerfEvidenceAssemblyError> {
+        Self::from_verified_slice_against_qg1_authorities(&fs::read(path)?, source_authorities)
     }
 
     /// Verify this in-memory assembly and all retained source artifacts.
@@ -1955,6 +2074,21 @@ impl PerfEvidenceAssemblyArtifact {
     /// Returns a typed error for schema drift, a stale seal, changed source
     /// evidence, or any derived-field mismatch.
     pub fn verify_integrity(&self) -> Result<(), PerfEvidenceAssemblyError> {
+        self.verify_integrity_against_qg1_authorities(&[])
+    }
+
+    /// Verify this assembly and every source artifact against authority slices
+    /// keyed by each source's exact retained bound-evidence file SHA-256.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::verify_integrity`], including the
+    /// fail-closed rejection of an authority-bearing QG-1 source whose slice
+    /// is absent, foreign, or duplicated.
+    pub fn verify_integrity_against_qg1_authorities(
+        &self,
+        source_authorities: &[(&str, &[&Qg1ExpectedAuthority])],
+    ) -> Result<(), PerfEvidenceAssemblyError> {
         if self.schema_version != PERF_EVIDENCE_ASSEMBLY_SCHEMA_VERSION
             || self.gate != PerfGate::Qg1
         {
@@ -1997,6 +2131,7 @@ impl PerfEvidenceAssemblyArtifact {
             &self.run_window,
             &self.source_shards,
             &self.failed_shards,
+            source_authorities,
         )?;
         if derived.completeness != self.completeness
             || derived.readiness != self.readiness
@@ -2299,9 +2434,10 @@ fn source_from_completed_inputs(
     process: PerfAssemblyProcessReceipt,
     completed: PerfAssemblyCompletedInputs,
     contract: &PlanContract,
+    external_qg1_authorities: &[&Qg1ExpectedAuthority],
 ) -> Result<PerfEvidenceAssemblySource, PerfEvidenceAssemblyError> {
     process.verify()?;
-    verify_completed_inputs(&process, &completed)?;
+    verify_completed_inputs(&process, &completed, external_qg1_authorities)?;
     let PerfAssemblyCompletedInputs {
         threshold_artifact_sha256,
         threshold_artifact,
@@ -2315,7 +2451,7 @@ fn source_from_completed_inputs(
         run_id,
         cell_ids: retained_cell_ids,
     } = completed;
-    artifact.verify_integrity()?;
+    artifact.verify_integrity_against_qg1_authorities(external_qg1_authorities)?;
     let identity = artifact.machine_class.identity().ok_or_else(|| {
         PerfEvidenceAssemblyError::IncompatibleShard {
             field: "runner_receipt",
@@ -2379,6 +2515,7 @@ fn source_from_completed_inputs(
 fn reconstruct_source(
     source: &PerfEvidenceAssemblySource,
     contract: &PlanContract,
+    external_qg1_authorities: &[&Qg1ExpectedAuthority],
 ) -> Result<PerfEvidenceAssemblySource, PerfEvidenceAssemblyError> {
     let completed = PerfAssemblyCompletedInputs {
         threshold_artifact_sha256: source.threshold_artifact_sha256.clone(),
@@ -2393,7 +2530,12 @@ fn reconstruct_source(
         run_id: source.run_id.clone(),
         cell_ids: source.cell_ids.clone(),
     };
-    source_from_completed_inputs(source.process.clone(), completed, contract)
+    source_from_completed_inputs(
+        source.process.clone(),
+        completed,
+        contract,
+        external_qg1_authorities,
+    )
 }
 
 fn source_sort_key<'a>(
@@ -2409,11 +2551,50 @@ fn source_sort_key<'a>(
     (first, source.bound_evidence_file_sha256.as_str())
 }
 
+fn validate_source_authority_sets(
+    sources: &[PerfEvidenceAssemblySource],
+    source_authorities: &[(&str, &[&Qg1ExpectedAuthority])],
+) -> Result<(), PerfEvidenceAssemblyError> {
+    let known_sources = sources
+        .iter()
+        .map(|source| source.bound_evidence_file_sha256.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut supplied_sources = BTreeSet::new();
+    for (source_sha256, _) in source_authorities {
+        if !known_sources.contains(source_sha256) {
+            return Err(PerfEvidenceAssemblyError::InconsistentAssembly {
+                reason: format!(
+                    "authority set names unknown bound-evidence source {source_sha256:?}"
+                ),
+            });
+        }
+        if !supplied_sources.insert(*source_sha256) {
+            return Err(PerfEvidenceAssemblyError::InconsistentAssembly {
+                reason: format!("authority sets repeat bound-evidence source {source_sha256:?}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn authorities_for_source<'a>(
+    source: &PerfEvidenceAssemblySource,
+    source_authorities: &[(&str, &'a [&'a Qg1ExpectedAuthority])],
+) -> &'a [&'a Qg1ExpectedAuthority] {
+    source_authorities
+        .iter()
+        .find_map(|(source_sha256, authorities)| {
+            (*source_sha256 == source.bound_evidence_file_sha256).then_some(*authorities)
+        })
+        .unwrap_or(&[])
+}
+
 fn derive_assembly(
     applicability_plan: &PerfApplicabilityPlanBinding,
     run_window: &str,
     sources: &[PerfEvidenceAssemblySource],
     failed: &[PerfEvidenceAssemblyFailedAttempt],
+    source_authorities: &[(&str, &[&Qg1ExpectedAuthority])],
 ) -> Result<AssemblyDerived, PerfEvidenceAssemblyError> {
     let total = sources
         .len()
@@ -2430,6 +2611,7 @@ fn derive_assembly(
             reason: "assembly requires a non-empty run window".to_owned(),
         });
     }
+    validate_source_authority_sets(sources, source_authorities)?;
     let contract = PlanContract::reconstruct(applicability_plan)?;
     let mut run_ids = BTreeSet::new();
     let mut measured = BTreeMap::<usize, PerfEvidenceCellSource>::new();
@@ -2443,7 +2625,11 @@ fn derive_assembly(
         .count();
 
     for source in sources {
-        let reconstructed = reconstruct_source(source, &contract)?;
+        let reconstructed = reconstruct_source(
+            source,
+            &contract,
+            authorities_for_source(source, source_authorities),
+        )?;
         if reconstructed != *source {
             return Err(PerfEvidenceAssemblyError::InconsistentAssembly {
                 reason: format!("source wrapper for run {} is stale", source.run_id),
@@ -3476,8 +3662,10 @@ mod tests {
     use crate::{
         EngineConcurrencyObservation, EvidenceCellSpec, ExecutionProfileId, HardwareClassId,
         PairedExperimentResult, PerfConcurrencyEngine, PerfConcurrencyObserver,
-        PerfConcurrencyWitness, PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase,
-        PerfSampleProvenance, estimate_paired_experiment, seeded_balanced_pair_order,
+        PerfConcurrencyWitness, PerfOperationScope, PerfRawSample, PerfSampleArm, PerfSampleOrder,
+        PerfSamplePhase, PerfSampleProvenance, Qg1BatchCoverage, Qg1ExpectedAuthority,
+        Qg1LifecycleProducer, Qg1LifecycleWitness, Qg1SampleBinding, estimate_paired_experiment,
+        estimate_paired_experiment_against_qg1_authority, seeded_balanced_pair_order,
     };
 
     const RUN_WINDOW: &str = "qg1-h4-test-window";
@@ -4021,6 +4209,313 @@ mod tests {
         PerfEvidenceArtifact::from_verified_slice(&sealed).expect("reload split test evidence")
     }
 
+    fn authority_bound_qg1_stream(
+        run_id: &str,
+        identity: TestIdentity,
+        scope: &PerfOperationScope,
+        producer: &Qg1LifecycleProducer,
+        stream_role: &str,
+        control_elapsed_ns: u64,
+        treatment_elapsed_ns: u64,
+        sample_id_base: u64,
+        work_units: u64,
+        content_bytes: u64,
+    ) -> Vec<PerfRawSample> {
+        let mut samples = throughput_stream(
+            run_id,
+            identity,
+            control_elapsed_ns,
+            treatment_elapsed_ns,
+            sample_id_base,
+        );
+        for sample in &mut samples {
+            sample.scope = scope.clone();
+            sample.work_units = Some(work_units);
+            sample.byte_count = Some(content_bytes);
+            let stream_sequence = sample.block_id.saturating_mul(2)
+                + if sample.order == PerfSampleOrder::Second {
+                    1
+                } else {
+                    0
+                };
+            let tantivy_witness = stream_role == crate::perf::QG1_STREAM_ROLE_TANTIVY_NULL
+                || (stream_role == crate::perf::QG1_STREAM_ROLE_EFFECT
+                    && sample.arm == PerfSampleArm::Control);
+            let lifecycle_witness = if tantivy_witness {
+                Qg1LifecycleWitness::Tantivy {
+                    searchable_segments_before: 1,
+                    searchable_segments_after: 1,
+                    join_elapsed_ns: 1,
+                    writer_rearmed: false,
+                }
+            } else {
+                Qg1LifecycleWitness::Quill {
+                    publication_generation_delta: 1,
+                }
+            };
+            let binding = Qg1SampleBinding {
+                schema_version: Qg1SampleBinding::SCHEMA_VERSION.to_owned(),
+                stream_role: stream_role.to_owned(),
+                stream_id_sha256: String::new(),
+                stream_sequence,
+                raw_sample_id: sample.sample_id,
+                raw_block_id: sample.block_id,
+                raw_arm: sample.arm,
+                raw_order: sample.order,
+                lifecycle_authority_sha256: String::new(),
+                stream_role_identity_sha256: String::new(),
+                producer_capability_sha256: String::new(),
+                producer_capability_tag_sha256: String::new(),
+                lifecycle_receipt_id_sha256: String::new(),
+                lifecycle_receipt_sha256: String::new(),
+                prepared_corpus_sha256: sample.provenance.corpus_sha256.clone(),
+                prepared_input_sha256: String::new(),
+                prepared_manifest_sha256: "a".repeat(64),
+                indexed_content_sha256: "b".repeat(64),
+                document_count: work_units,
+                content_bytes,
+                prepared_batch_count: 1,
+                recorded_batch_count: 1,
+                batch_coverage: vec![Qg1BatchCoverage {
+                    document_start: 0,
+                    document_count: work_units,
+                }],
+                tail_document_id: format!("synthetic-{:08}", work_units.saturating_sub(1)),
+                terminal_endpoint_ns: sample.ended_ns.saturating_sub(sample.started_ns),
+                lifecycle_witness,
+            };
+            sample.qg1_sample_binding = Some(
+                producer
+                    .consume_lifecycle_receipt(&sample.scope, &sample.provenance, binding)
+                    .expect("producer consumes exactly one QG-1 receipt per raw row"),
+            );
+        }
+        samples
+    }
+
+    fn authority_bound_qg1_shard(run_id: &str) -> (PerfEvidenceArtifact, Qg1ExpectedAuthority) {
+        const PAIRS: usize = 30;
+        const CONTENT_BYTES: u64 = 64_000;
+
+        let identity = TestIdentity::PRIMARY;
+        let contract = PlanContract::reconstruct(&test_plan()).expect("test plan contract");
+        let contract_cell = contract
+            .cells
+            .iter()
+            .find(|cell| {
+                cell.spec.fixture == "bulk/tiny/1/positions_on"
+                    && cell.spec.metric == "docs_per_second"
+            })
+            .expect("canonical QG-1 tiny throughput cell");
+        let work_units = contract_cell
+            .spec
+            .document_count
+            .expect("QG-1 throughput cell has a document count");
+        let scope = crate::perf::perf_operation_scope(
+            PerfGate::Qg1,
+            &contract_cell.spec.fixture,
+            &contract_cell.spec.metric,
+        );
+        let sample_provenance = sample_provenance(run_id, identity);
+        let schedule =
+            seeded_balanced_pair_order(PAIRS, 0x4834_5eed).expect("QG-1 authority schedule");
+        let mut estimator = estimator_config();
+        let producer = estimator
+            .install_qg1_lifecycle_authority(
+                scope.clone(),
+                sample_provenance.corpus_sha256.clone(),
+                "a".repeat(64),
+                "b".repeat(64),
+                work_units,
+                CONTENT_BYTES,
+                1,
+                vec![Qg1BatchCoverage {
+                    document_start: 0,
+                    document_count: work_units,
+                }],
+                format!("synthetic-{:08}", work_units.saturating_sub(1)),
+                u64::try_from(PAIRS).expect("QG-1 pair count fits u64"),
+                vec![
+                    (
+                        crate::perf::QG1_STREAM_ROLE_EFFECT.to_owned(),
+                        0,
+                        0,
+                        schedule.clone(),
+                    ),
+                    (
+                        crate::perf::QG1_STREAM_ROLE_TANTIVY_NULL.to_owned(),
+                        0,
+                        10_000,
+                        schedule.clone(),
+                    ),
+                    (
+                        crate::perf::QG1_STREAM_ROLE_QUILL_NULL.to_owned(),
+                        0,
+                        20_000,
+                        schedule,
+                    ),
+                ],
+            )
+            .expect("mint QG-1 authority before the first raw row");
+        let expected_authority = producer.expected_authority().clone();
+        let effect = authority_bound_qg1_stream(
+            run_id,
+            identity,
+            &scope,
+            &producer,
+            crate::perf::QG1_STREAM_ROLE_EFFECT,
+            100_000,
+            80_000,
+            0,
+            work_units,
+            CONTENT_BYTES,
+        );
+        let tantivy_null = authority_bound_qg1_stream(
+            run_id,
+            identity,
+            &scope,
+            &producer,
+            crate::perf::QG1_STREAM_ROLE_TANTIVY_NULL,
+            100_000,
+            100_000,
+            10_000,
+            work_units,
+            CONTENT_BYTES,
+        );
+        let quill_null = authority_bound_qg1_stream(
+            run_id,
+            identity,
+            &scope,
+            &producer,
+            crate::perf::QG1_STREAM_ROLE_QUILL_NULL,
+            80_000,
+            80_000,
+            20_000,
+            work_units,
+            CONTENT_BYTES,
+        );
+        let paired = estimate_paired_experiment_against_qg1_authority(
+            &effect,
+            &tantivy_null,
+            &estimator,
+            Some(&expected_authority),
+        )
+        .expect("authority-bound QG-1 effect estimates");
+        let treatment_arm_null = estimate_paired_experiment_against_qg1_authority(
+            &effect,
+            &quill_null,
+            &estimator,
+            Some(&expected_authority),
+        )
+        .expect("authority-bound QG-1 treatment null estimates");
+        let mut cell = EvidenceCell::evaluate(
+            EvidenceCellSpec {
+                gate: PerfGate::Qg1,
+                fixture: contract_cell.spec.fixture.clone(),
+                metric: contract_cell.spec.metric.clone(),
+                unit: "docs/s".to_owned(),
+                role: EvidenceRole::Required,
+                input_identity: None,
+                qg6_semantic_contract: None,
+                cold_cache: None,
+                concurrency_witness: Some(PerfConcurrencyWitness {
+                    configured_threads: contract_cell.configured_threads,
+                    observations: vec![
+                        EngineConcurrencyObservation {
+                            engine: PerfConcurrencyEngine::Quill,
+                            observer: PerfConcurrencyObserver::RayonCurrentPoolWidth,
+                            observation_count: PAIRS,
+                            min_observed_worker_pool_threads: contract_cell.configured_threads,
+                            max_observed_worker_pool_threads: contract_cell.configured_threads,
+                        },
+                        EngineConcurrencyObservation {
+                            engine: PerfConcurrencyEngine::Tantivy,
+                            observer: PerfConcurrencyObserver::TantivyWriterConstruction,
+                            observation_count: PAIRS,
+                            min_observed_worker_pool_threads: contract_cell.configured_threads,
+                            max_observed_worker_pool_threads: contract_cell.configured_threads,
+                        },
+                    ],
+                }),
+            },
+            paired,
+            &test_policy(),
+        )
+        .expect("authority-bound QG-1 cell evaluates");
+        cell.attach_treatment_arm_null_against_qg1_authority(
+            treatment_arm_null,
+            &test_policy(),
+            Some(&expected_authority),
+        )
+        .expect("authority-bound QG-1 treatment null attaches");
+        let mut artifact = PerfEvidenceArtifact::assemble(
+            PerfGate::Qg1,
+            test_plan(),
+            test_policy(),
+            evidence_provenance(
+                run_id,
+                vec![contract_cell.configured_threads],
+                work_units,
+                identity,
+            ),
+            vec![cell],
+        )
+        .expect("assemble authority-bound QG-1 source artifact");
+        artifact.force_no_claim(
+            PERF_ASSEMBLY_PARTIAL_SHARD_NO_CLAIM_CODE,
+            PERF_ASSEMBLY_PARTIAL_SHARD_NO_CLAIM_DETAIL,
+        );
+        artifact.artifact_sha256.clear();
+        let unsealed = serde_json::to_string_pretty(&artifact).expect("authority prebinding JSON");
+        artifact.artifact_sha256 = sha256_hex(unsealed.as_bytes());
+        let prebinding_bytes =
+            serde_json::to_vec_pretty(&artifact).expect("authority prebinding bytes");
+        artifact
+            .verify_integrity_against_qg1_authorities(&[&expected_authority])
+            .expect("authority-bound prebinding artifact verifies");
+        let threshold_bytes = canonical_threshold_bytes(&threshold_artifact_for(&artifact))
+            .expect("authority-bound threshold bytes");
+        let runner = crate::machine_class_registry::admitted_test_identity_for_artifacts(
+            PerfGate::Qg1.label(),
+            &artifact.provenance.build.git_revision,
+            artifact
+                .provenance
+                .build
+                .cargo_lock_sha256
+                .as_deref()
+                .expect("Cargo.lock hash"),
+            &artifact.provenance.build.executable_sha256,
+            &artifact.provenance.build.command_sha256,
+            artifact
+                .provenance
+                .build
+                .environment_sha256
+                .as_deref()
+                .expect("environment hash"),
+            run_id,
+            run_id,
+            RUN_WINDOW,
+            &threshold_bytes,
+            &prebinding_bytes,
+        );
+        let sealed = artifact
+            .bind_machine_class_identity_and_seal_against_qg1_authorities(
+                runner,
+                &threshold_bytes,
+                &prebinding_bytes,
+                &[&expected_authority],
+            )
+            .expect("seal authority-bound QG-1 source artifact");
+        (
+            PerfEvidenceArtifact::from_verified_slice_against_qg1_authorities(
+                &sealed,
+                &[&expected_authority],
+            )
+            .expect("reload authority-bound QG-1 source artifact"),
+            expected_authority,
+        )
+    }
+
     fn normalize_h2_test_artifact(artifact: PerfEvidenceArtifact) -> Vec<PerfEvidenceArtifact> {
         let runnable_count = runnable_ordinals().len();
         let fixtures = artifact
@@ -4194,6 +4689,62 @@ mod tests {
             .collect::<Vec<_>>();
         attempts.extend(failed);
         PerfEvidenceAssemblyArtifact::assemble(attempts)
+    }
+
+    #[test]
+    fn authority_aware_assembly_binds_each_qg1_shard_to_its_retained_authorities() {
+        let (artifact, expected_authority) = authority_bound_qg1_shard("assembly-authority-good");
+        let directory = completed_test_attempt_directory(&artifact);
+        assert!(
+            VerifiedLocalPerfAttemptBundle::load_verified(directory.path()).is_err(),
+            "the authority-free H2 loader must refuse an authority-bearing QG-1 shard"
+        );
+
+        let exact_authorities = [&expected_authority];
+        let bundle = VerifiedLocalPerfAttemptBundle::load_verified_against_qg1_authorities(
+            directory.path(),
+            &exact_authorities,
+        )
+        .expect("the retained authority authenticates its exact H2 input");
+        assert!(
+            PerfEvidenceAssemblyArtifact::assemble(vec![bundle.clone()]).is_err(),
+            "the authority-free assembly entry must fail closed for the QG-1 shard"
+        );
+
+        let assembly = PerfEvidenceAssemblyArtifact::assemble_against_qg1_authorities(vec![(
+            bundle.clone(),
+            &exact_authorities,
+        )])
+        .expect("the authority-aware assembly admits the honest QG-1 shard");
+        let source_sha256 = assembly.source_shards()[0].bound_evidence_file_sha256();
+        assembly
+            .verify_integrity_against_qg1_authorities(&[(source_sha256, &exact_authorities)])
+            .expect("the assembled source replays only against its retained authority slice");
+        assert!(
+            assembly.verify_integrity().is_err(),
+            "the authority-free assembly replay must fail closed"
+        );
+
+        let (_foreign_artifact, foreign_authority) =
+            authority_bound_qg1_shard("assembly-authority-foreign");
+        let wrong_authorities = [&foreign_authority];
+        assert!(
+            PerfEvidenceAssemblyArtifact::assemble_against_qg1_authorities(vec![(
+                bundle.clone(),
+                &wrong_authorities
+            ),])
+            .is_err(),
+            "a foreign QG-1 authority must not authenticate this shard"
+        );
+        let duplicate_authorities = [&expected_authority, &expected_authority];
+        assert!(
+            PerfEvidenceAssemblyArtifact::assemble_against_qg1_authorities(vec![(
+                bundle,
+                &duplicate_authorities
+            ),])
+            .is_err(),
+            "duplicate candidate authorities must remain ambiguous and fail closed"
+        );
     }
 
     fn failed_test_attempt_bundle(
