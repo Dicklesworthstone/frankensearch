@@ -3768,7 +3768,7 @@ impl PublicationAuthorityPhase {
             1 => Self::Preparing,
             2 => Self::DurableAhead,
             3 => Self::Indeterminate,
-            _ => unreachable!("two publication phase bits have four states"),
+            _ => unreachable!(),
         }
     }
 }
@@ -15056,6 +15056,26 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
     const EMPTY_TERM_DICTIONARY: [u8; 4] = 0_u32.to_le_bytes();
+
+    #[test]
+    fn publication_authority_phase_decodes_in_const_context() {
+        const PHASES: [PublicationAuthorityPhase; 4] = [
+            PublicationAuthorityPhase::from_bits(0),
+            PublicationAuthorityPhase::from_bits(1),
+            PublicationAuthorityPhase::from_bits(2),
+            PublicationAuthorityPhase::from_bits(3),
+        ];
+
+        assert_eq!(
+            PHASES,
+            [
+                PublicationAuthorityPhase::Stable,
+                PublicationAuthorityPhase::Preparing,
+                PublicationAuthorityPhase::DurableAhead,
+                PublicationAuthorityPhase::Indeterminate,
+            ]
+        );
+    }
 
     #[test]
     fn publication_transition_unwind_marks_preparing_authority_indeterminate() {
