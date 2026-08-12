@@ -546,6 +546,15 @@ impl AcceptedQg1Authorities {
         self.seen_digests.len()
     }
 
+    /// Whether this run retained no lifecycle authority whatsoever.
+    fn is_empty(&self) -> bool {
+        self.directory.is_none()
+            && self.role_digests.is_empty()
+            && self.seen_digests.is_empty()
+            && self.entries.is_empty()
+            && self.expected_authorities.is_empty()
+    }
+
     /// Bind the retained verified register entries through the exact durable
     /// target pin that was written before the child received its final ACK.
     fn bind_expected_authorities(&mut self, pin: &Qg1TargetPinV1) -> Result<(), LocalPerfRunError> {
@@ -603,9 +612,10 @@ impl AcceptedQg1Authorities {
     }
 
     /// Borrow the independently retained expectations used to authenticate a
-    /// persisted QG-1 artifact. Empty is valid only for a non-QG-1 run.
+    /// persisted QG-1 artifact. Empty is valid only for a non-QG-1 run or a
+    /// tokenizer-only QG-1 no-claim run.
     fn expected_authority_refs(&self) -> Result<Vec<&Qg1ExpectedAuthority>, LocalPerfRunError> {
-        if self.total() == 0 && self.entries.is_empty() && self.expected_authorities.is_empty() {
+        if self.is_empty() {
             return Ok(Vec::new());
         }
         if self.entries.len() != self.total()
@@ -3443,15 +3453,17 @@ fn qg1_authority_rejection_stage(
     // decision authority and at least one pilot, which is the same rule the
     // pre-ACK validator applies.
     let set_complete = qg1_expected_authority_cell_ids(selection).is_ok_and(|expected| {
-        !expected.is_empty()
-            && expected.iter().all(|cell_id| {
+        if expected.is_empty() {
+            accepted.is_empty()
+        } else {
+            expected.iter().all(|cell_id| {
                 accepted.digests_for(cell_id, Qg1AuthorityRoleV1::Decision) == 1
                     && accepted.digests_for(cell_id, Qg1AuthorityRoleV1::Pilot) != 0
-            })
-            && accepted
+            }) && accepted
                 .role_digests
                 .keys()
                 .all(|(cell_id, _)| expected.contains(cell_id))
+        }
     });
     (handshake_failure.is_some() || !set_complete)
         .then_some(LocalPerfRejectionStage::AuthorityHandshake)
@@ -3722,6 +3734,12 @@ fn qg1_validate_complete_authority_set(
     // pinning a count here would refuse legitimate sets whenever the frozen
     // width list and the produced screens disagree for a benign reason.
     let expected = qg1_expected_authority_cell_ids(selection).map_err(|error| error.to_string())?;
+    if expected.is_empty() {
+        return accepted.is_empty().then_some(()).ok_or_else(|| {
+            "QG-1 tokenizer-only startup must complete with exactly zero retained lifecycle authorities"
+                .to_owned()
+        });
+    }
     for cell_id in &expected {
         let pilots = accepted.digests_for(cell_id, Qg1AuthorityRoleV1::Pilot);
         let decisions = accepted.digests_for(cell_id, Qg1AuthorityRoleV1::Decision);
@@ -4072,33 +4090,37 @@ fn wait_for_qg1_authority_child(
                 register_count,
             ) {
                 Ok(()) => {
-                    // The pin is durable BEFORE the ACK: the child treats the
-                    // acknowledgement as permission to begin timing, so a pin
-                    // written afterwards would leave sampling running against a
-                    // set no retained artifact names. A pin failure refuses the
-                    // handshake exactly like an incomplete set.
-                    let pin = match persist_qg1_target_pin(
-                        &run_directories.run,
-                        &accepted,
-                        campaign_run_id,
-                        source_git_revision,
-                        source_worktree_clean,
-                    ) {
-                        Ok(pin) => pin,
-                        Err(error) => {
+                    if !accepted.is_empty() {
+                        // The pin is durable BEFORE the ACK: the child treats the
+                        // acknowledgement as permission to begin timing, so a pin
+                        // written afterwards would leave sampling running against a
+                        // set no retained artifact names. A pin failure refuses the
+                        // handshake exactly like an incomplete set. A tokenizer-only
+                        // selection has no lifecycle authority and therefore no pin:
+                        // its exact empty/empty COMPLETE is an admitted no-claim run.
+                        let pin = match persist_qg1_target_pin(
+                            &run_directories.run,
+                            &accepted,
+                            campaign_run_id,
+                            source_git_revision,
+                            source_worktree_clean,
+                        ) {
+                            Ok(pin) => pin,
+                            Err(error) => {
+                                handshake_failure = Some(format!(
+                                    "QG-1 authority set could not be pinned before acknowledgement: {error}"
+                                ));
+                                let _ = response.send(Qg1AuthorityForwarderResponse::Refuse);
+                                continue;
+                            }
+                        };
+                        if let Err(error) = accepted.bind_expected_authorities(&pin) {
                             handshake_failure = Some(format!(
-                                "QG-1 authority set could not be pinned before acknowledgement: {error}"
+                                "QG-1 retained authorities could not be bound by the persisted target pin before acknowledgement: {error}"
                             ));
                             let _ = response.send(Qg1AuthorityForwarderResponse::Refuse);
                             continue;
                         }
-                    };
-                    if let Err(error) = accepted.bind_expected_authorities(&pin) {
-                        handshake_failure = Some(format!(
-                            "QG-1 retained authorities could not be bound by the persisted target pin before acknowledgement: {error}"
-                        ));
-                        let _ = response.send(Qg1AuthorityForwarderResponse::Refuse);
-                        continue;
                     }
                     if response
                         .send(Qg1AuthorityForwarderResponse::FinalAcknowledge)
@@ -8022,6 +8044,12 @@ mod tests {
                 qg1_read_wait_test_ack();
                 println!("qg1-wait-tokenizer-work-after-ack");
             }
+            "tokenizer_surplus" => {
+                qg1_write_wait_test_register("QG-1.bulk/tiny/1/positions_on.docs_per_second", 1);
+                qg1_write_wait_test_complete(1);
+                qg1_read_wait_test_ack();
+                println!("qg1-wait-tokenizer-work-after-ack");
+            }
             "natural_exit" => {}
             unexpected => panic!("unexpected QG-1 wait-boundary child case {unexpected:?}"),
         }
@@ -8321,14 +8349,55 @@ mod tests {
             "zero-producer COMPLETE is exact and accepted"
         );
         assert!(
-            accepted.role_digests.is_empty(),
-            "tokenizer-only selection publishes no producers"
+            accepted.is_empty(),
+            "tokenizer-only selection retains exactly zero lifecycle authorities"
+        );
+        assert!(
+            accepted
+                .expected_authority_refs()
+                .expect("empty tokenizer authority set remains replayable as no-claim")
+                .is_empty(),
+            "tokenizer-only selection has no external QG-1 expectation to self-authenticate"
         );
         assert!(
             run_log
                 .windows(b"qg1-wait-tokenizer-work-after-ack".len())
                 .any(|window| window == b"qg1-wait-tokenizer-work-after-ack"),
             "tokenizer-only work begins only after the final ACK"
+        );
+        let (status, recovery, accepted, failure, run_log) =
+            qg1_wait_result_for_test("tokenizer_surplus", &tokenizer_selection);
+        assert!(
+            matches!(
+                recovery,
+                LocalPerfProcessGroupRecovery::SignaledOwnedGroup
+                    | LocalPerfProcessGroupRecovery::DirectChildFallback
+            ),
+            "a planted lifecycle authority must be killed and reaped before a tokenizer-only run can ACK"
+        );
+        assert!(
+            accepted.is_empty(),
+            "the planted tokenizer-only authority is rejected before any lifecycle authority is retained"
+        );
+        assert!(
+            failure.is_some(),
+            "the planted tokenizer-only authority must leave an observable rejected handshake"
+        );
+        assert!(
+            qg1_authority_handshake_outcome(
+                PerfGate::Qg1,
+                &tokenizer_selection,
+                &accepted,
+                failure.as_deref(),
+            )
+            .is_some(),
+            "a tokenizer-only selection rejects any non-empty lifecycle authority set"
+        );
+        assert!(
+            !run_log
+                .windows(b"qg1-wait-tokenizer-work-after-ack".len())
+                .any(|window| window == b"qg1-wait-tokenizer-work-after-ack"),
+            "the planted tokenizer-only authority must never receive a final ACK; terminal status: {status}"
         );
     }
 
