@@ -43,7 +43,7 @@ jobs:
         gate: ${{ fromJSON(github.event_name == 'pull_request' && '["QG-2"]' || '["QG-1","QG-2","QG-3","QG-4","QG-5","QG-6","QG-7","QG-8","QG-9","QG-10"]') }}
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -78,12 +78,12 @@ jobs:
           )" = "${expected_blob}"
 
       - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
         with:
           toolchain: nightly-2026-07-20
           components: rustfmt, clippy
 
-      - name: Prepare pinned sibling dependencies
+      - name: Prepare pinned path dependency
         shell: bash
         run: |
           set -euo pipefail
@@ -99,23 +99,15 @@ jobs:
           }
 
           clone_at \
-            "https://github.com/Dicklesworthstone/asupersync.git" \
-            "${deps_dir}/asupersync" \
-            "15e6b6920fa0ad3e6d843ea55186eed754389ad2"
-          clone_at \
-            "https://github.com/Dicklesworthstone/frankensqlite.git" \
-            "${deps_dir}/frankensqlite" \
-            "5c99eeb93d789c1309d5c46a540289369ff39535"
-          clone_at \
             "https://github.com/Dicklesworthstone/fast_cmaes.git" \
             "${deps_dir}/fast_cmaes" \
-            "17f633e2c24bdd0c358310949066e5922b9e17b5"
+            "3bf11b7601b54a08ffabb55821289ecb235a504d"
 
           find "${GITHUB_WORKSPACE}" -name Cargo.toml -exec \
             sed -i -e "s|/data/projects/|${deps_dir}/|g" {} +
 
       - name: Cache Cargo registry and target
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: quill-perf-ratchet-${{ matrix.gate }}
           cache-targets: true
@@ -194,7 +186,7 @@ jobs:
 
       - name: Upload QG fail-closed rehearsal artifacts and decision
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: quill-perf-${{ matrix.gate }}-${{ steps.ratchet.outputs.decision || 'error' }}
           if-no-files-found: error

@@ -20,36 +20,43 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
+        with:
+          toolchain: nightly
 
-      - name: Prepare path dependencies under /dp
+      - name: Prepare pinned path dependency
         shell: bash
         run: |
           set -euo pipefail
-          sudo mkdir -p /dp
-          sudo chown -R "$USER":"$(id -gn)" /dp
+          deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
+          fast_cmaes_ref="3bf11b7601b54a08ffabb55821289ecb235a504d"
 
           clone_or_update() {
             local repo_url="$1"
             local dest_path="$2"
+            local ref="$3"
             if [[ -d "${dest_path}/.git" ]]; then
-              git -C "${dest_path}" fetch --depth 1 origin main
-              git -C "${dest_path}" checkout main
-              git -C "${dest_path}" pull --ff-only origin main
+              git -C "${dest_path}" fetch --depth 1 origin "${ref}"
             else
-              git clone --depth 1 "${repo_url}" "${dest_path}"
+              git clone --no-checkout "${repo_url}" "${dest_path}"
+              git -C "${dest_path}" fetch --depth 1 origin "${ref}"
             fi
+            git -C "${dest_path}" checkout --detach FETCH_HEAD
           }
 
-          clone_or_update "https://github.com/Dicklesworthstone/asupersync.git" "/dp/asupersync"
-          clone_or_update "https://github.com/Dicklesworthstone/frankensqlite.git" "/dp/frankensqlite"
-          clone_or_update "https://github.com/Dicklesworthstone/fast_cmaes.git" "/dp/fast_cmaes"
+          clone_or_update \
+            "https://github.com/Dicklesworthstone/fast_cmaes.git" \
+            "${deps_dir}/fast_cmaes" \
+            "${fast_cmaes_ref}"
+
+          find "$GITHUB_WORKSPACE" -name Cargo.toml -exec \
+            sed -i -e "s|/data/projects/|${deps_dir}/|g" {} +
 
       - name: Cache cargo registry + target
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: interaction-matrix-nightly
           cache-targets: true
@@ -201,7 +208,7 @@ jobs:
 
       - name: Upload interaction matrix artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: interaction-matrix-gate-${{ github.run_id }}
           path: ci_artifacts/*
