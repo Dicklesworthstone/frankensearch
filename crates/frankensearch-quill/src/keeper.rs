@@ -1947,12 +1947,12 @@ impl RecoveredSegmentBacking {
         }
     }
 
-    /// Trailer-verified xxh3-64 over the file prefix, recorded at parse time.
+    /// Actual-byte-verified xxh3-64 over the file prefix.
     ///
     /// This is the content-identity witness for the whole immutable backing:
-    /// it was checked against the actual bytes when the reader was
-    /// constructed, and [`validate_segment_witnesses`] re-checks it against
-    /// every manifest generation that binds this backing.
+    /// [`validate_segment_witnesses`] recomputes it from the backing bytes
+    /// before each manifest binding, then compares it with both the trailer
+    /// witness and that manifest generation.
     fn file_xxh3(&self) -> u64 {
         match self {
             Self::Mapped(reader) => reader.file_xxh3(),
@@ -2459,10 +2459,10 @@ impl RecoveredSegment {
                 metadata
             }
         };
-        // The reader's trailer hash was verified against the actual bytes at
-        // parse time; on reuse it was just proven equal to the predecessor's
-        // recorded witness, so recording it preserves the anchor to the
-        // originally validated content across rebind chains.
+        // Manifest admission just recomputed this trailer witness from the
+        // actual backing bytes. On reuse it was also proven equal to the
+        // predecessor's recorded witness, so recording it preserves the
+        // anchor to the originally validated content across rebind chains.
         let term_dictionary_file_xxh3 = reader.file_xxh3();
         Ok(Self {
             path,
@@ -9571,21 +9571,35 @@ fn validate_segment_witnesses(
     reader: &SegmentReader<impl AsRef<[u8]>>,
 ) -> Result<(), KeeperError> {
     let header = reader.header();
-    let mismatch = if header.segment_id != manifest.segment_id {
+    if header.segment_id != manifest.segment_id {
+        return Err(KeeperError::SegmentMetadataMismatch {
+            path: path.to_path_buf(),
+            detail: format!(
+                "header segment_id {:#018x} != manifest {:#018x}",
+                header.segment_id, manifest.segment_id
+            ),
+        });
+    }
+    if reader.file_len() != manifest.file_len {
+        return Err(KeeperError::SegmentMetadataMismatch {
+            path: path.to_path_buf(),
+            detail: format!(
+                "file length {} != manifest {}",
+                reader.file_len(),
+                manifest.file_len
+            ),
+        });
+    }
+    let actual_file_xxh3 =
+        reader
+            .verify_file_witness()
+            .map_err(|source| KeeperError::SegmentOpen {
+                path: path.to_path_buf(),
+                source,
+            })?;
+    let mismatch = if actual_file_xxh3 != manifest.file_xxh3 {
         Some(format!(
-            "header segment_id {:#018x} != manifest {:#018x}",
-            header.segment_id, manifest.segment_id
-        ))
-    } else if reader.file_len() != manifest.file_len {
-        Some(format!(
-            "file length {} != manifest {}",
-            reader.file_len(),
-            manifest.file_len
-        ))
-    } else if reader.file_xxh3() != manifest.file_xxh3 {
-        Some(format!(
-            "trailer file_xxh3 {:#018x} != manifest {:#018x}",
-            reader.file_xxh3(),
+            "actual file_xxh3 {actual_file_xxh3:#018x} != manifest {:#018x}",
             manifest.file_xxh3
         ))
     } else if header.docid_lo != manifest.docid_lo || header.docid_hi != manifest.docid_hi {
@@ -14478,11 +14492,17 @@ mod tests {
     use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FileHealth};
     use tempfile::tempdir;
 
-    use crate::quiver::{EncodedIdHashSection, EncodedIdMapSection, IdMapEntryInput};
+    use crate::grimoire::{
+        ByteSpan, EncodedTermDictionary, TermInput, TermMetadata, TermSectionLengths,
+    };
+    use crate::quiver::{
+        EncodedBlockMax, EncodedIdHashSection, EncodedIdMapSection, EncodedPostingList,
+        IdMapEntryInput, Posting,
+    };
     use crate::schema::{DEFAULT_SCHEMA, FSFS_CHUNK_SCHEMA};
     #[cfg(feature = "durability")]
     use crate::segment::SegmentWriteCheckpoint;
-    use crate::segment::{EncodedSegment, SectionInput, SegmentHeaderInput};
+    use crate::segment::{EncodedSegment, SectionInput, SegmentHeaderInput, SegmentReader};
 
     use super::*;
 
@@ -14957,6 +14977,26 @@ mod tests {
         document_ids: &[Option<&str>],
         term_dictionary: &[u8],
     ) -> Result<EncodedSegment, Box<dyn std::error::Error>> {
+        encoded_identity_test_segment_with_term_sections(
+            segment_id,
+            docid_lo,
+            document_ids,
+            term_dictionary,
+            &[],
+            &[],
+            &[],
+        )
+    }
+
+    fn encoded_identity_test_segment_with_term_sections(
+        segment_id: u64,
+        docid_lo: u64,
+        document_ids: &[Option<&str>],
+        term_dictionary: &[u8],
+        postings: &[u8],
+        positions: &[u8],
+        blockmax: &[u8],
+    ) -> Result<EncodedSegment, Box<dyn std::error::Error>> {
         let docid_hi = docid_lo
             .checked_add(u64::try_from(document_ids.len())?)
             .ok_or_else(|| QuillError::Invariant {
@@ -15007,9 +15047,9 @@ mod tests {
             },
             &[
                 SectionInput::new(SectionKind::TERMDICT, term_dictionary),
-                SectionInput::new(SectionKind::POSTINGS, &[]),
-                SectionInput::new(SectionKind::POSITIONS, &[]),
-                SectionInput::new(SectionKind::BLOCKMAX, &[]),
+                SectionInput::new(SectionKind::POSTINGS, postings),
+                SectionInput::new(SectionKind::POSITIONS, positions),
+                SectionInput::new(SectionKind::BLOCKMAX, blockmax),
                 SectionInput::new(SectionKind::DOCLEN, b"doclen"),
                 SectionInput::new(SectionKind::IDMAP, id_map.as_bytes()),
                 SectionInput::new(SectionKind::IDHASH, id_hash.as_bytes()),
@@ -17861,6 +17901,113 @@ mod tests {
         assert!(matches!(
             KeeperSnapshot::open(directory.path(), FSFS_CHUNK_SCHEMA),
             Err(KeeperError::SchemaMismatch { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn keeper_open_recomputes_actual_prefix_witness_before_lazy_postings_bind() -> TestResult {
+        const FILE_PREFIX_LEN: usize = 16;
+        const FIXED_HEADER_LEN: usize = 56;
+        const SECTION_ENTRY_LEN: usize = 28;
+        const SECTION_ENTRY_XXH3_OFFSET: usize = 20;
+        const TRAILER_LEN: usize = 12;
+
+        let directory = tempdir()?;
+        let encoded_postings = EncodedPostingList::encode(&[Posting::new(0, 1)])?;
+        let posting_list = encoded_postings.posting_list()?;
+        let encoded_blockmax = EncodedBlockMax::encode(&posting_list, |_| Some(1))?;
+        let term_dictionary = EncodedTermDictionary::encode_sorted(
+            DEFAULT_SCHEMA,
+            TermSectionLengths {
+                postings: u64::try_from(encoded_postings.as_bytes().len())?,
+                positions: Some(0),
+                blockmax: u64::try_from(encoded_blockmax.as_bytes().len())?,
+            },
+            &[TermInput::new(
+                0,
+                b"witness",
+                TermMetadata::without_positions(
+                    1,
+                    ByteSpan::new(0, u64::try_from(encoded_postings.as_bytes().len())?),
+                    ByteSpan::new(0, u64::try_from(encoded_blockmax.as_bytes().len())?),
+                ),
+            )],
+        )?;
+        let encoded = encoded_identity_test_segment_with_term_sections(
+            0x6e11,
+            0,
+            &[Some("witness-doc")],
+            term_dictionary.as_bytes(),
+            encoded_postings.as_bytes(),
+            &[],
+            encoded_blockmax.as_bytes(),
+        )?;
+        let pending = encoded.write_temp(directory.path())?;
+        let path = publish_pending_segment(pending)?;
+        let manifest = durable_test_manifest(1, vec![manifest_segment(&encoded, 1)]);
+        let manifest_path = directory.path().join("MANIFEST");
+        write_manifest(&manifest_path, &manifest)?;
+        let original_manifest = std::fs::read(&manifest_path)?;
+
+        let baseline = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+        assert_eq!(
+            baseline.segments().len(),
+            1,
+            "fixture publishes cleanly first"
+        );
+        drop(baseline);
+
+        let postings_entry = encoded
+            .section_entries()
+            .iter()
+            .position(|entry| entry.kind == SectionKind::POSTINGS)
+            .expect("encoded fixture has POSTINGS");
+        let postings_offset = usize::try_from(encoded.section_entries()[postings_entry].offset)?;
+        let postings_len = usize::try_from(encoded.section_entries()[postings_entry].len)?;
+        assert!(postings_len > 0, "fixture has a concrete POSTINGS stream");
+
+        let mut bytes = std::fs::read(&path)?;
+        let trailer_start = bytes.len() - TRAILER_LEN;
+        let original_trailer = bytes[trailer_start..].to_vec();
+        bytes[postings_offset] ^= 0x80;
+        let section_xxh3_offset = FILE_PREFIX_LEN
+            + FIXED_HEADER_LEN
+            + postings_entry * SECTION_ENTRY_LEN
+            + SECTION_ENTRY_XXH3_OFFSET;
+        let postings_xxh3 =
+            xxhash_rust::xxh3::xxh3_64(&bytes[postings_offset..postings_offset + postings_len]);
+        bytes[section_xxh3_offset..section_xxh3_offset + std::mem::size_of::<u64>()]
+            .copy_from_slice(&postings_xxh3.to_le_bytes());
+        let header_len = usize::try_from(u32::from_le_bytes(bytes[12..16].try_into()?))?;
+        let header_crc_offset = FILE_PREFIX_LEN + header_len;
+        let header_crc = crc32fast::hash(&bytes[FILE_PREFIX_LEN..header_crc_offset]);
+        bytes[header_crc_offset..header_crc_offset + std::mem::size_of::<u32>()]
+            .copy_from_slice(&header_crc.to_le_bytes());
+
+        let lazy_reader = SegmentReader::from_owned(bytes.clone(), DEFAULT_SCHEMA)?;
+        assert_eq!(
+            lazy_reader.section(SectionKind::POSTINGS)?,
+            Some(&bytes[postings_offset..postings_offset + postings_len]),
+            "the recomputed section witness preserves lazy POSTINGS parsing"
+        );
+        let actual_prefix_xxh3 = xxhash_rust::xxh3::xxh3_64(&bytes[..trailer_start]);
+        assert_ne!(actual_prefix_xxh3, encoded.file_xxh3());
+        assert_eq!(lazy_reader.file_xxh3(), encoded.file_xxh3());
+        assert_eq!(&bytes[trailer_start..], original_trailer.as_slice());
+        assert!(matches!(
+            lazy_reader.verify_file_witness(),
+            Err(QuillError::IndexCorrupted { .. })
+        ));
+
+        std::fs::write(&path, &bytes)?;
+        assert_eq!(std::fs::read(&manifest_path)?, original_manifest);
+        assert!(matches!(
+            KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA),
+            Err(KeeperError::SegmentOpen {
+                source: QuillError::IndexCorrupted { detail, .. },
+                ..
+            }) if detail.contains("file checksum mismatch")
         ));
         Ok(())
     }
