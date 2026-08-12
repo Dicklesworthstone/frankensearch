@@ -208,8 +208,7 @@ impl PrivateArtifactKey {
     /// Returns an error when the operating system random source is unavailable.
     pub fn generate() -> Result<Self, ArtifactPrivacyError> {
         let mut bytes = [0_u8; 32];
-        getrandom::getrandom(&mut bytes)
-            .map_err(|_| ArtifactPrivacyError::RandomSourceUnavailable)?;
+        getrandom::fill(&mut bytes).map_err(|_| ArtifactPrivacyError::RandomSourceUnavailable)?;
         Ok(Self::from_bytes(bytes))
     }
 
@@ -348,11 +347,12 @@ impl ArtifactPrivacyContext {
                     .private_key
                     .as_ref()
                     .ok_or(ArtifactPrivacyError::MissingPrivateKey)?;
-                let cipher = XChaCha20Poly1305::new(Key::from_slice(key.expose()));
+                let key: &Key = key.expose().into();
+                let cipher = XChaCha20Poly1305::new(key);
                 let mut nonce_bytes = [0_u8; 24];
-                getrandom::getrandom(&mut nonce_bytes)
+                getrandom::fill(&mut nonce_bytes)
                     .map_err(|_| ArtifactPrivacyError::RandomSourceUnavailable)?;
-                let nonce = XNonce::from_slice(&nonce_bytes);
+                let nonce: &XNonce = (&nonce_bytes).into();
                 let ciphertext = cipher
                     .encrypt(
                         nonce,
@@ -458,10 +458,12 @@ impl ArtifactPrivacyContext {
                     .try_into()
                     .map_err(|_| ArtifactPrivacyError::InvalidEnvelope)?;
                 let ciphertext = decode_lower_hex(ciphertext_hex)?;
-                let cipher = XChaCha20Poly1305::new(Key::from_slice(key.expose()));
+                let key: &Key = key.expose().into();
+                let cipher = XChaCha20Poly1305::new(key);
+                let nonce: &XNonce = (&nonce).into();
                 cipher
                     .decrypt(
-                        XNonce::from_slice(&nonce),
+                        nonce,
                         Payload {
                             msg: &ciphertext,
                             aad: &aad_bytes,

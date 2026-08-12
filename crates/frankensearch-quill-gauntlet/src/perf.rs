@@ -1236,7 +1236,7 @@ impl Qg1TantivyIncumbentScreen {
     ) -> Result<Self, Qg1TantivyIncumbentError> {
         let candidates = preregister_qg1_tantivy_incumbents(cell, &screen_plan, semantic_contract)?;
         let expected_scope = qg1_expected_throughput_scope(cell)?;
-        let no_decision = |reason: impl Into<String>| Self {
+        let no_decision = |reason: String| Self {
             schema_version: QG1_TANTIVY_INCUMBENT_SCREEN_SCHEMA_VERSION.to_owned(),
             screen_plan: screen_plan.clone(),
             candidates: candidates.clone(),
@@ -1244,7 +1244,7 @@ impl Qg1TantivyIncumbentScreen {
             run_id: String::new(),
             tied_fastest_candidates: Vec::new(),
             selected_candidate: None,
-            no_decision_reason: Some(reason.into()),
+            no_decision_reason: Some(reason),
         };
         if pilots.len() != candidates.len() {
             return Ok(no_decision(format!(
@@ -1269,7 +1269,8 @@ impl Qg1TantivyIncumbentScreen {
                 || !seen_stream_receipts.insert(pilot.stream_receipt_sha256.clone())
             {
                 return Ok(no_decision(
-                    "pilot candidates or stream receipts do not match the preregistered screen",
+                    "pilot candidates or stream receipts do not match the preregistered screen"
+                        .to_owned(),
                 ));
             }
             let (_, writer_heap_bytes) = qg1_bulk_cell_resources(cell)?;
@@ -1285,7 +1286,7 @@ impl Qg1TantivyIncumbentScreen {
                     > writer_heap_bytes
             {
                 return Ok(no_decision(
-                    "candidate materialized an infeasible writer width",
+                    "candidate materialized an infeasible writer width".to_owned(),
                 ));
             }
             if !qg1_valid_throughput_experiment(
@@ -1296,7 +1297,8 @@ impl Qg1TantivyIncumbentScreen {
                 screen_plan.content_bytes,
             ) {
                 return Ok(no_decision(
-                    "candidate pilot lacks valid configuration-bound throughput evidence",
+                    "candidate pilot lacks valid configuration-bound throughput evidence"
+                        .to_owned(),
                 ));
             }
             qg1_validate_pilot_observations(
@@ -1326,7 +1328,8 @@ impl Qg1TantivyIncumbentScreen {
                         || expected_provenance != &pilot.experiment.provenance =>
                 {
                     return Ok(no_decision(
-                        "candidate pilots used different process invocations or semantic identities",
+                        "candidate pilots used different process invocations or semantic identities"
+                            .to_owned(),
                     ));
                 }
                 (None, None, None) => {
@@ -1334,7 +1337,11 @@ impl Qg1TantivyIncumbentScreen {
                     scope = Some(pilot.experiment.scope.clone());
                     provenance = Some(pilot.experiment.provenance.clone());
                 }
-                _ => return Ok(no_decision("candidate pilot identity state is incomplete")),
+                _ => {
+                    return Ok(no_decision(
+                        "candidate pilot identity state is incomplete".to_owned(),
+                    ));
+                }
             }
         }
         let fastest = pilots

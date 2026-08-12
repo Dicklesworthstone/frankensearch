@@ -15,6 +15,7 @@ const SOURCE_VERIFICATION_GIT: &str = "git_checkout_verified";
 const SOURCE_VERIFICATION_EXPLICIT: &str = "explicit_unverified";
 const SOURCE_VERIFICATION_UNAVAILABLE: &str = "unavailable";
 const CRATES_IO_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+const TANTIVY_GIT_SOURCE_PREFIX: &str = "git+https://github.com/quickwit-oss/tantivy?rev=";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -41,7 +42,7 @@ fn main() {
         "Cargo.lock must not be empty when sealing producer dependencies"
     );
     let cargo_lock_sha256 = sha256_hex(&cargo_lock_bytes);
-    let tantivy = locked_registry_package(&cargo_lock_bytes, "tantivy");
+    let tantivy = locked_package(&cargo_lock_bytes, "tantivy");
     let lexical_crate_version = manifest_package_version(&lexical_manifest);
     let repository_identity_is_exact = git_output(&repository, &["rev-parse", "--show-toplevel"])
         .and_then(|path| fs::canonicalize(path).ok())
@@ -139,13 +140,13 @@ fn main() {
     println!("cargo:rustc-env=FRANKENSEARCH_LEXICAL_CRATE_VERSION={lexical_crate_version}");
 }
 
-struct LockedRegistryPackage {
+struct LockedPackage {
     version: String,
     source: String,
     checksum: String,
 }
 
-fn locked_registry_package(cargo_lock_bytes: &[u8], package_name: &str) -> LockedRegistryPackage {
+fn locked_package(cargo_lock_bytes: &[u8], package_name: &str) -> LockedPackage {
     let cargo_lock = std::str::from_utf8(cargo_lock_bytes)
         .expect("Cargo.lock must be UTF-8 for dependency provenance");
     let document = cargo_lock
@@ -174,16 +175,36 @@ fn locked_registry_package(cargo_lock_bytes: &[u8], package_name: &str) -> Locke
     };
     let version = required("version");
     let source = required("source");
-    let checksum = required("checksum");
-    assert_eq!(
-        source, CRATES_IO_REGISTRY_SOURCE,
-        "the Tantivy oracle must resolve from the crates.io registry, never a patch or Git source"
-    );
+    let checksum = if let Some(checksum) = package.get("checksum").and_then(toml::Value::as_str) {
+        assert_eq!(
+            source, CRATES_IO_REGISTRY_SOURCE,
+            "a checksummed Tantivy oracle must resolve from the canonical crates.io registry"
+        );
+        checksum.to_owned()
+    } else {
+        let (locator, resolved_revision) = source.rsplit_once('#').unwrap_or_else(|| {
+            panic!("locked Git {package_name} source must carry a resolved revision fragment")
+        });
+        assert!(
+            is_lower_git_revision(resolved_revision),
+            "locked Git {package_name} source must resolve to a full lowercase Git SHA-1"
+        );
+        assert_eq!(
+            locator,
+            format!("{TANTIVY_GIT_SOURCE_PREFIX}{resolved_revision}"),
+            "the Tantivy oracle Git source must be the canonical upstream URL with identical requested and resolved revisions"
+        );
+        // Cargo registry packages carry a content checksum. Exact Git packages
+        // do not, so v3 records the SHA-256 of Cargo.lock's canonical source
+        // identity instead. That identity includes both the requested and the
+        // resolved full commit and is accepted only for the upstream URL above.
+        sha256_hex(source.as_bytes())
+    };
     assert!(
         is_lower_hex(&checksum, 64),
         "locked {package_name} checksum must be canonical lowercase SHA-256"
     );
-    LockedRegistryPackage {
+    LockedPackage {
         version,
         source,
         checksum,
