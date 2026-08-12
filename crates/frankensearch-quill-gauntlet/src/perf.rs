@@ -62,11 +62,16 @@ pub const PAIRED_ESTIMATOR_SCHEMA_VERSION: &str = "quill-paired-estimator-v1";
 const QG1_LIFECYCLE_AUTHORITY_SCHEMA_VERSION: &str =
     "frankensearch.quill.qg1-lifecycle-authority.v3";
 const QG1_LIFECYCLE_BINDING_SCHEMA_VERSION: &str = "frankensearch.quill.qg1-lifecycle-binding.v6";
-const QG1_STREAM_ROLE_EFFECT: &str = "qg1.effect.tantivy_vs_quill.v1";
-const QG1_STREAM_ROLE_TANTIVY_NULL: &str = "qg1.null.tantivy.v1";
-const QG1_STREAM_ROLE_QUILL_NULL: &str = "qg1.null.quill.v1";
-const QG1_STREAM_ROLE_TANTIVY_PILOT_EFFECT: &str = "qg1.pilot.tantivy_effect.v1";
-const QG1_STREAM_ROLE_TANTIVY_PILOT_NULL: &str = "qg1.pilot.tantivy_null.v1";
+/// Canonical fresh-decision T/Quill stream role.
+pub const QG1_STREAM_ROLE_EFFECT: &str = "qg1.effect.tantivy_vs_quill.v1";
+/// Canonical fresh-decision Tantivy/Tantivy null stream role.
+pub const QG1_STREAM_ROLE_TANTIVY_NULL: &str = "qg1.null.tantivy.v1";
+/// Canonical fresh-decision Quill/Quill null stream role.
+pub const QG1_STREAM_ROLE_QUILL_NULL: &str = "qg1.null.quill.v1";
+/// Canonical candidate-pilot ShippingAuto/candidate stream role.
+pub const QG1_STREAM_ROLE_TANTIVY_PILOT_EFFECT: &str = "qg1.pilot.tantivy_effect.v1";
+/// Canonical candidate-pilot candidate/candidate null stream role.
+pub const QG1_STREAM_ROLE_TANTIVY_PILOT_NULL: &str = "qg1.pilot.tantivy_null.v1";
 /// Exact ordered query groups required by every normative QG-6 class cell.
 ///
 /// One group is one independent frozen query identity. Leaves collected for a
@@ -360,7 +365,7 @@ impl PerfCellSpec {
 pub const QG1_TANTIVY_INCUMBENT_TANTIVY_VERSION: &str = "0.26.1";
 /// Wire schema for the provisional QG-1 Tantivy incumbent screen.
 pub const QG1_TANTIVY_INCUMBENT_SCREEN_SCHEMA_VERSION: &str =
-    "quill-qg1-tantivy-incumbent-screen-v2";
+    "quill-qg1-tantivy-incumbent-screen-v3";
 
 /// Tantivy writer construction admitted to the QG-1 incumbent screen.
 ///
@@ -718,8 +723,15 @@ pub struct Qg1TantivyIncumbentPilot {
     pub candidate: Qg1TantivyIncumbentCandidate,
     /// Receipt identity for this complete pilot stream; unique per invocation.
     pub stream_receipt_sha256: String,
-    /// Live Tantivy worker count materialized by this candidate.
-    pub observed_writer_threads: usize,
+    /// Authenticated Tantivy worker count, when the constructor exposes it.
+    ///
+    /// Shipping Tantivy chooses its width inside `Index::writer` and exposes
+    /// no accessor, so that candidate must retain `None` rather than inventing
+    /// a materialized width. Fixed-width constructors retain `Some(width)`.
+    pub observed_writer_threads: Option<usize>,
+    /// Digest of the typed receipt minted by the constructor that was
+    /// exercised for this pilot.
+    pub writer_constructor_receipt_sha256: String,
     /// Raw paired candidate/control and candidate A/A evidence.
     pub experiment: PairedExperimentResult,
     /// Sealed bindings for the candidate/control effect records.
@@ -740,7 +752,13 @@ impl Qg1TantivyIncumbentPilot {
         update_length_framed(&mut hasher, self.candidate.config_sha256.as_bytes());
         update_length_framed(
             &mut hasher,
-            self.observed_writer_threads.to_string().as_bytes(),
+            serde_json::to_string(&self.observed_writer_threads)
+                .map_err(|_| Qg1TantivyIncumbentError::StreamReceiptMismatch)?
+                .as_bytes(),
+        );
+        update_length_framed(
+            &mut hasher,
+            self.writer_constructor_receipt_sha256.as_bytes(),
         );
         update_length_framed(&mut hasher, experiment.as_slice());
         update_length_framed(&mut hasher, observations.as_slice());
@@ -947,8 +965,10 @@ fn qg1_expected_throughput_scope(
     Ok(scope)
 }
 
-const QG1_TANTIVY_ENGINE_ID: &str = "tantivy";
-const QG1_QUILL_ENGINE_ID: &str = "quill";
+/// Canonical QG-1 Tantivy engine identity.
+pub const QG1_TANTIVY_ENGINE_ID: &str = "tantivy";
+/// Canonical QG-1 Quill engine identity.
+pub const QG1_QUILL_ENGINE_ID: &str = "quill";
 
 fn qg1_valid_engine_identity(engine_id: &str, config_sha256: &str) -> bool {
     matches!(engine_id, QG1_TANTIVY_ENGINE_ID | QG1_QUILL_ENGINE_ID)
@@ -1068,7 +1088,8 @@ impl Qg1TantivyIncumbentPilot {
     /// runner; engine/config and raw-content bindings are derived here.
     pub fn from_experiment(
         candidate: Qg1TantivyIncumbentCandidate,
-        observed_writer_threads: usize,
+        observed_writer_threads: Option<usize>,
+        writer_constructor_receipt_sha256: String,
         shipping_auto_config_sha256: String,
         experiment: PairedExperimentResult,
         effect_observation_ids: Vec<String>,
@@ -1090,10 +1111,14 @@ impl Qg1TantivyIncumbentPilot {
             &candidate.config_sha256,
             null_observation_ids,
         )?;
+        if !is_lower_hex_digest(&writer_constructor_receipt_sha256) {
+            return Err(Qg1TantivyIncumbentError::StreamReceiptMismatch);
+        }
         let mut pilot = Self {
             candidate,
             stream_receipt_sha256: String::new(),
             observed_writer_threads,
+            writer_constructor_receipt_sha256,
             experiment,
             effect_observations,
             null_observations,
@@ -1292,6 +1317,7 @@ impl Qg1TantivyIncumbentScreen {
                 .validate_against(cell, &screen_plan, semantic_contract)?;
             if &pilot.candidate != expected
                 || pilot.stream_receipt_sha256 != pilot.recomputed_stream_receipt_sha256()?
+                || !is_lower_hex_digest(&pilot.writer_constructor_receipt_sha256)
                 || !seen_stream_receipts.insert(pilot.stream_receipt_sha256.clone())
             {
                 return Ok(no_decision(
@@ -1301,15 +1327,16 @@ impl Qg1TantivyIncumbentScreen {
             }
             let (_, writer_heap_bytes) = qg1_bulk_cell_resources(cell)?;
             let width_matches = match pilot.candidate.writer_mode {
-                Qg1TantivyWriterMode::ShippingAuto => pilot.observed_writer_threads > 0,
+                Qg1TantivyWriterMode::ShippingAuto => pilot.observed_writer_threads.is_none(),
                 Qg1TantivyWriterMode::Fixed { writer_threads } => {
-                    pilot.observed_writer_threads == writer_threads
+                    pilot.observed_writer_threads == Some(writer_threads)
                 }
             };
             if !width_matches
-                || PERF_MIN_WRITER_HEAP_PER_THREAD_BYTES
-                    .saturating_mul(pilot.observed_writer_threads)
-                    > writer_heap_bytes
+                || pilot.observed_writer_threads.is_some_and(|writer_threads| {
+                    PERF_MIN_WRITER_HEAP_PER_THREAD_BYTES.saturating_mul(writer_threads)
+                        > writer_heap_bytes
+                })
             {
                 return Ok(no_decision(
                     "candidate materialized an infeasible writer width".to_owned(),
@@ -1384,25 +1411,34 @@ impl Qg1TantivyIncumbentScreen {
             .max_by(|left, right| {
                 left.experiment
                     .effect
-                    .treatment
-                    .p50
-                    .total_cmp(&right.experiment.effect.treatment.p50)
+                    .treatment_over_control
+                    .total_cmp(&right.experiment.effect.treatment_over_control)
             })
             .expect("complete preregistered candidate set");
         let tied_fastest_candidates = pilots
             .iter()
             .filter(|pilot| {
-                pilot.experiment.effect.treatment.median_ci95_high
-                    >= fastest.experiment.effect.treatment.median_ci95_low
+                pilot.experiment.effect.ci95_high_ratio >= fastest.experiment.effect.ci95_low_ratio
             })
             .map(|pilot| pilot.candidate.clone())
             .collect::<Vec<_>>();
-        let selected_candidate =
+        let unique_fastest =
             (tied_fastest_candidates.len() == 1).then(|| tied_fastest_candidates[0].clone());
-        let no_decision_reason = selected_candidate.is_none().then_some(
-            "fastest candidate is tied within the predeclared 95% median confidence intervals"
-                .to_owned(),
-        );
+        let selected_candidate = unique_fastest
+            .as_ref()
+            .filter(|candidate| matches!(candidate.writer_mode, Qg1TantivyWriterMode::Fixed { .. }))
+            .cloned();
+        let no_decision_reason = selected_candidate.is_none().then(|| {
+            if unique_fastest.as_ref().is_some_and(|candidate| {
+                candidate.writer_mode == Qg1TantivyWriterMode::ShippingAuto
+            }) {
+                "uniquely fastest ShippingAuto candidate has no authenticated materialized writer width"
+                    .to_owned()
+            } else {
+                "fastest candidate is tied within the predeclared 95% median confidence intervals"
+                    .to_owned()
+            }
+        });
         Ok(Self {
             schema_version: QG1_TANTIVY_INCUMBENT_SCREEN_SCHEMA_VERSION.to_owned(),
             screen_plan,
@@ -3888,31 +3924,47 @@ pub(crate) fn resolve_qg1_expected_authority_for_replay<'a>(
 }
 
 /// Stable schema identity for one pinned all-required-target authority set.
-pub const QG1_TARGET_PIN_SCHEMA_VERSION: &str = "frankensearch.quill.qg1-target-pin.v1";
+pub const QG1_TARGET_PIN_SCHEMA_VERSION: &str = "frankensearch.quill.qg1-target-pin.v2";
 
-/// The external pin that makes a register entry usable.
+/// One canonical target in an independently supplied QG-1 pin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg1PinnedAuthorityTargetV1 {
+    /// Exact canonical operation/cell identity carried by the authority.
+    pub operation_id: String,
+    /// Role authenticated by the authority's complete sealed stream-role set.
+    pub role: Qg1AuthorityRoleV1,
+    /// Exact content address expected for this target.
+    pub authority_sha256: String,
+}
+
+/// Role of one verified QG-1 register entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Qg1AuthorityRoleV1 {
+    /// A ShippingAuto-versus-candidate plus candidate/candidate pilot.
+    Pilot,
+    /// The fresh selected-candidate T/Q, T/T, and Q/Q decision bundle.
+    Decision,
+}
+
+/// Registration identity derived only after the entry and its sealed stream
+/// roles have verified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qg1VerifiedAuthorityRegistrationV1 {
+    /// Canonical operation/cell identity sealed by the authority.
+    pub operation_id: String,
+    /// Role derived from the exact sealed stream-role set.
+    pub role: Qg1AuthorityRoleV1,
+    /// Content address of the complete authority.
+    pub authority_sha256: String,
+}
+
+/// External complete-set pin that makes self-consistent register entries
+/// usable as evidence for one clean source revision and campaign run.
 ///
-/// A register entry is SELF-CONSISTENT by construction: whoever wrote it wrote
-/// both the commitments and the preimages that open them, so verifying one
-/// proves internal coherence and nothing about provenance. That makes the
-/// register a transport substrate, never a trust root, and this type is the
-/// root it is missing.
-///
-/// The pin is separate evidence, pinned before timing, that names the complete
-/// required-target set, the campaign/run it belongs to, the clean canonical
-/// source revision it was cut from, and the authority digest expected for each
-/// target. An entry can only be reconstituted into a
-/// [`Qg1ExpectedAuthority`] when a pin names its digest, so a hand-minted
-/// entry authenticates nothing: the attacker would also have to be named by a
-/// pin they do not control.
-///
-/// # What it still does not do
-///
-/// Nothing here signs the pin. A holder of the pin file can rewrite it, so
-/// this establishes SEPARATION (the evidence cannot vouch for itself) and
-/// PRECEDENCE (the pin predates the run), not unforgeability. Consumers must
-/// obtain the pin from a channel independent of the evidence they are
-/// authenticating; no claim beyond that may be made from this type.
+/// The pin establishes separation and precedence, not unforgeability: a
+/// consumer must obtain it independently from the evidence it authenticates.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Qg1TargetPinV1 {
@@ -3922,12 +3974,38 @@ pub struct Qg1TargetPinV1 {
     campaign_run_id: String,
     /// Clean canonical lowercase 40-hex source revision.
     source_git_revision: String,
-    /// Canonical required-target id to expected authority digest, in canonical
+    /// Whether the independently observed source worktree was clean when this
+    /// pin was cut. A false value is never admissible.
+    source_worktree_clean: bool,
+    /// Canonical target id to role-qualified expected authority, in canonical
     /// order. A target missing here is a target this pin cannot authorize.
-    target_authority_digests: BTreeMap<String, String>,
+    target_authorities: BTreeMap<String, Qg1PinnedAuthorityTargetV1>,
 }
 
 impl Qg1TargetPinV1 {
+    /// Construct a complete campaign target pin and validate it immediately.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a dirty/noncanonical source, empty target set, duplicate digest,
+    /// or any operation without at least one pilot and exactly one decision.
+    pub fn new(
+        campaign_run_id: String,
+        source_git_revision: String,
+        source_worktree_clean: bool,
+        target_authorities: BTreeMap<String, Qg1PinnedAuthorityTargetV1>,
+    ) -> Result<Self, PairedEstimatorError> {
+        let pin = Self {
+            schema_version: QG1_TARGET_PIN_SCHEMA_VERSION.to_owned(),
+            campaign_run_id,
+            source_git_revision,
+            source_worktree_clean,
+            target_authorities,
+        };
+        pin.verify()?;
+        Ok(pin)
+    }
+
     /// Verify schema, run identity, source cleanliness, and digest shape.
     ///
     /// # Errors
@@ -3946,7 +4024,8 @@ impl Qg1TargetPinV1 {
                 "QG-1 target pin requires one bounded campaign/run identity".to_owned(),
             ));
         }
-        if self.source_git_revision.len() != 40
+        if !self.source_worktree_clean
+            || self.source_git_revision.len() != 40
             || !self
                 .source_git_revision
                 .bytes()
@@ -3958,19 +4037,41 @@ impl Qg1TargetPinV1 {
                 self.source_git_revision
             )));
         }
-        if self.target_authority_digests.is_empty() {
+        if self.target_authorities.is_empty() {
             return Err(invalid(
                 "QG-1 target pin names no required target; an empty pin can authorize nothing"
                     .to_owned(),
             ));
         }
-        for (target, digest) in &self.target_authority_digests {
-            if target.trim().is_empty() || !is_lower_hex_digest(digest) {
+        let mut roles_by_operation = BTreeMap::<&str, (usize, usize)>::new();
+        let mut digests = BTreeSet::new();
+        for (target, pinned) in &self.target_authorities {
+            if target.trim().is_empty()
+                || pinned.operation_id.trim().is_empty()
+                || !is_lower_hex_digest(&pinned.authority_sha256)
+                || !digests.insert(pinned.authority_sha256.as_str())
+            {
                 return Err(invalid(format!(
                     "QG-1 target pin entry for {target:?} is not a named target bound to a \
-                     lowercase SHA-256 authority digest"
+                     unique role-qualified lowercase SHA-256 authority digest"
                 )));
             }
+            let counts = roles_by_operation
+                .entry(pinned.operation_id.as_str())
+                .or_default();
+            match pinned.role {
+                Qg1AuthorityRoleV1::Pilot => counts.0 += 1,
+                Qg1AuthorityRoleV1::Decision => counts.1 += 1,
+            }
+        }
+        if roles_by_operation
+            .values()
+            .any(|(pilots, decisions)| *pilots == 0 || *decisions != 1)
+        {
+            return Err(invalid(
+                "QG-1 target pin must name at least one pilot and exactly one decision for every operation"
+                    .to_owned(),
+            ));
         }
         Ok(())
     }
@@ -3981,10 +4082,41 @@ impl Qg1TargetPinV1 {
         &self.campaign_run_id
     }
 
+    /// Clean canonical source revision this pin authenticates.
+    #[must_use]
+    pub fn source_git_revision(&self) -> &str {
+        &self.source_git_revision
+    }
+
+    /// Whether the independently observed source worktree was clean.
+    #[must_use]
+    pub const fn source_worktree_clean(&self) -> bool {
+        self.source_worktree_clean
+    }
+
+    /// Exact number of role-qualified targets in this complete pin.
+    #[must_use]
+    pub fn target_count(&self) -> usize {
+        self.target_authorities.len()
+    }
+
+    /// Look up one canonical role-qualified target by its stable target ID.
+    #[must_use]
+    pub fn target(&self, target_id: &str) -> Option<&Qg1PinnedAuthorityTargetV1> {
+        self.target_authorities.get(target_id)
+    }
+
+    /// Iterate the complete canonical target map in stable key order.
+    pub fn targets(&self) -> impl Iterator<Item = (&str, &Qg1PinnedAuthorityTargetV1)> {
+        self.target_authorities
+            .iter()
+            .map(|(target, pinned)| (target.as_str(), pinned))
+    }
+
     /// The complete required-target set this pin names.
     #[must_use]
     pub fn required_targets(&self) -> impl Iterator<Item = &str> {
-        self.target_authority_digests.keys().map(String::as_str)
+        self.target_authorities.keys().map(String::as_str)
     }
 
     /// Refuse an entry whose authority digest this pin does not name.
@@ -4002,11 +4134,17 @@ impl Qg1TargetPinV1 {
         &self,
         entry: &Qg1AuthorityRegisterEntryV1,
     ) -> Result<(), PairedEstimatorError> {
-        if self
-            .target_authority_digests
+        let registration = entry.verified_registration()?;
+        let matches = self
+            .target_authorities
             .values()
-            .any(|digest| digest == entry.digest())
-        {
+            .filter(|pinned| {
+                pinned.operation_id == registration.operation_id
+                    && pinned.role == registration.role
+                    && pinned.authority_sha256 == registration.authority_sha256
+            })
+            .count();
+        if matches == 1 {
             return Ok(());
         }
         Err(PairedEstimatorError::InvalidConfig {
@@ -4066,6 +4204,50 @@ impl Qg1AuthorityRegisterEntryV1 {
     #[must_use]
     pub fn digest(&self) -> &str {
         &self.authority.authority_sha256
+    }
+
+    /// Verify the entry and derive its cell, role, and digest from the sealed
+    /// authority itself.
+    ///
+    /// A caller cannot label an authority as a pilot or decision. The role is
+    /// accepted only when the authority authenticates exactly the canonical
+    /// two pilot roles or exactly the canonical three fresh-decision roles.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-configuration error for an invalid entry or any
+    /// incomplete, mixed, or otherwise noncanonical role set.
+    pub fn verified_registration(
+        &self,
+    ) -> Result<Qg1VerifiedAuthorityRegistrationV1, PairedEstimatorError> {
+        self.verify()?;
+        let role = match self.authority.stream_roles.as_slice() {
+            [effect, null]
+                if effect == QG1_STREAM_ROLE_TANTIVY_PILOT_EFFECT
+                    && null == QG1_STREAM_ROLE_TANTIVY_PILOT_NULL =>
+            {
+                Qg1AuthorityRoleV1::Pilot
+            }
+            [effect, quill_null, tantivy_null]
+                if effect == QG1_STREAM_ROLE_EFFECT
+                    && quill_null == QG1_STREAM_ROLE_QUILL_NULL
+                    && tantivy_null == QG1_STREAM_ROLE_TANTIVY_NULL =>
+            {
+                Qg1AuthorityRoleV1::Decision
+            }
+            roles => {
+                return Err(PairedEstimatorError::InvalidConfig {
+                    reason: format!(
+                        "QG-1 authority register entry authenticates noncanonical role set {roles:?}"
+                    ),
+                });
+            }
+        };
+        Ok(Qg1VerifiedAuthorityRegistrationV1 {
+            operation_id: self.authority.scope.operation_id.clone(),
+            role,
+            authority_sha256: self.authority.authority_sha256.clone(),
+        })
     }
 
     /// Canonical bytes used for durable publication.
@@ -8220,8 +8402,32 @@ mod tests {
         treatment_duration: u64,
         sample_id_base: u64,
     ) -> Qg1TantivyIncumbentPilot {
+        qg1_pilot_with_control(
+            candidate,
+            shipping_auto,
+            scope,
+            work_units,
+            content_bytes,
+            run_id,
+            1_000_000,
+            treatment_duration,
+            sample_id_base,
+        )
+    }
+
+    fn qg1_pilot_with_control(
+        candidate: Qg1TantivyIncumbentCandidate,
+        shipping_auto: &Qg1TantivyIncumbentCandidate,
+        scope: &PerfOperationScope,
+        work_units: u64,
+        content_bytes: u64,
+        run_id: &str,
+        control_duration: u64,
+        treatment_duration: u64,
+        sample_id_base: u64,
+    ) -> Qg1TantivyIncumbentPilot {
         let provenance = provenance(run_id);
-        let control_durations = [1_000_000; PERF_MIN_RUNS];
+        let control_durations = [control_duration; PERF_MIN_RUNS];
         let treatment_durations = [treatment_duration; PERF_MIN_RUNS];
         // Each candidate is its own producer invocation, so each pilot seals a
         // distinct lifecycle authority. Sharing one across candidates would
@@ -8274,14 +8480,15 @@ mod tests {
         )
         .expect("valid QG-1 candidate pilot");
         let observed_writer_threads = match candidate.writer_mode {
-            Qg1TantivyWriterMode::ShippingAuto => 1,
-            Qg1TantivyWriterMode::Fixed { writer_threads } => writer_threads,
+            Qg1TantivyWriterMode::ShippingAuto => None,
+            Qg1TantivyWriterMode::Fixed { writer_threads } => Some(writer_threads),
         };
         let effect_observation_label = format!("pilot-effect:{}", candidate.config_sha256);
         let null_observation_label = format!("pilot-null:{}", candidate.config_sha256);
         Qg1TantivyIncumbentPilot::from_experiment(
             candidate,
             observed_writer_threads,
+            "9".repeat(64),
             shipping_auto.config_sha256.clone(),
             experiment,
             qg1_observation_ids(&effect_observation_label, &effect),
@@ -9585,7 +9792,13 @@ mod tests {
                 u64::try_from(PERF_MIN_RUNS).expect("QG-1 pair count fits u64"),
                 vec![
                     (QG1_STREAM_ROLE_EFFECT.to_owned(), 0, 0, schedule.clone()),
-                    (QG1_STREAM_ROLE_TANTIVY_NULL.to_owned(), 0, 10_000, schedule),
+                    (
+                        QG1_STREAM_ROLE_QUILL_NULL.to_owned(),
+                        0,
+                        10_000,
+                        schedule.clone(),
+                    ),
+                    (QG1_STREAM_ROLE_TANTIVY_NULL.to_owned(), 0, 20_000, schedule),
                 ],
             )
             .expect("mint one pre-timing lifecycle authority");
@@ -9620,22 +9833,49 @@ mod tests {
         assert_eq!(reloaded, entry, "the entry survives serialization exactly");
         // The entry alone is not enough: reconstitution requires an external
         // pin that already named this authority digest for this run.
-        let pin = Qg1TargetPinV1 {
-            schema_version: QG1_TARGET_PIN_SCHEMA_VERSION.to_owned(),
-            campaign_run_id: "qg1-register-roundtrip".to_owned(),
-            source_git_revision: "c".repeat(40),
-            target_authority_digests: BTreeMap::from([(
-                "qg1.bulk/medium/1/positions_on.docs_per_second".to_owned(),
-                entry.digest().to_owned(),
-            )]),
+        let operation_id = entry
+            .verified_registration()
+            .expect("derive the sealed decision role")
+            .operation_id;
+        let targets = |decision_digest: String| {
+            BTreeMap::from([
+                (
+                    format!("{operation_id}#pilot/0"),
+                    Qg1PinnedAuthorityTargetV1 {
+                        operation_id: operation_id.clone(),
+                        role: Qg1AuthorityRoleV1::Pilot,
+                        authority_sha256: "b".repeat(64),
+                    },
+                ),
+                (
+                    format!("{operation_id}#decision"),
+                    Qg1PinnedAuthorityTargetV1 {
+                        operation_id: operation_id.clone(),
+                        role: Qg1AuthorityRoleV1::Decision,
+                        authority_sha256: decision_digest,
+                    },
+                ),
+            ])
         };
-        let unpinned = Qg1TargetPinV1 {
-            target_authority_digests: BTreeMap::from([(
-                "qg1.bulk/medium/1/positions_on.docs_per_second".to_owned(),
-                "d".repeat(64),
-            )]),
-            ..pin.clone()
-        };
+        let pin = Qg1TargetPinV1::new(
+            "qg1-register-roundtrip".to_owned(),
+            "c".repeat(40),
+            true,
+            targets(entry.digest().to_owned()),
+        )
+        .expect("construct complete clean target pin");
+        assert_eq!(pin.source_git_revision(), "c".repeat(40));
+        assert!(pin.source_worktree_clean());
+        assert_eq!(pin.target_count(), 2);
+        assert_eq!(pin.targets().count(), pin.target_count());
+        assert!(pin.target(&format!("{operation_id}#decision")).is_some());
+        let unpinned = Qg1TargetPinV1::new(
+            "qg1-register-roundtrip".to_owned(),
+            "c".repeat(40),
+            true,
+            targets("d".repeat(64)),
+        )
+        .expect("construct a complete pin that names the wrong decision");
         assert!(
             matches!(
                 reloaded.to_expected_authority(&unpinned),
@@ -9786,14 +10026,19 @@ mod tests {
             &semantic_contract,
             "one-live-invocation",
         );
-        let pilot_authority = qg1_test_expected_authority(
-            pilots[0]
-                .experiment
-                .config
-                .qg1_lifecycle_authority
-                .as_ref()
-                .expect("live pilots carry their sealed lifecycle authority"),
-        );
+        let pilot_authorities = pilots
+            .iter()
+            .map(|pilot| {
+                qg1_test_expected_authority(
+                    pilot
+                        .experiment
+                        .config
+                        .qg1_lifecycle_authority
+                        .as_ref()
+                        .expect("live pilots carry distinct sealed lifecycle authorities"),
+                )
+            })
+            .collect::<Vec<_>>();
         let live_screen = Qg1TantivyIncumbentScreen::screen(
             &cell,
             screen_plan.clone(),
@@ -9822,7 +10067,10 @@ mod tests {
                 .as_ref()
                 .expect("the live decision carries its sealed lifecycle authority"),
         );
-        let retained = [&pilot_authority, &decision_authority];
+        let retained = pilot_authorities
+            .iter()
+            .chain(std::iter::once(&decision_authority))
+            .collect::<Vec<_>>();
 
         // Reload drops exactly the field serde never wrote.
         for pilot in &mut pilots {
@@ -9883,18 +10131,32 @@ mod tests {
 
         // Planted negative: a swapped set authenticates neither stream, because
         // each seam selects by the sealed authority its own producer issued.
-        let swapped = [&decision_authority];
-        assert!(
-            reloaded_screen
-                .validate_decision_against_qg1_authorities(
-                    &cell,
-                    &semantic_contract,
-                    &decision,
-                    &swapped,
-                )
-                .is_err(),
-            "a set missing the pilots' own authority must not validate the decision"
-        );
+        for (label, rejected_set) in [
+            ("missing", retained[1..].to_vec()),
+            ("wrong", vec![&decision_authority]),
+            (
+                "duplicate",
+                retained
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(retained[0]))
+                    .collect(),
+            ),
+        ] {
+            let rejected = Qg1TantivyIncumbentScreen::screen_against_qg1_authorities(
+                &cell,
+                reloaded_screen.screen_plan.clone(),
+                &semantic_contract,
+                reloaded_screen.pilots.clone(),
+                &rejected_set,
+            )
+            .expect("bad retained sets produce a valid fail-closed screen outcome");
+            assert!(
+                rejected.selected_candidate.is_none(),
+                "{label} retained authority must produce NoDecision, never a winner"
+            );
+            assert!(rejected.no_decision_reason.is_some());
+        }
 
         // Planted negative: policy is still compared exactly. Only the sealed
         // authority slots are exempt from configuration equality.
@@ -9917,11 +10179,44 @@ mod tests {
         let cell = qg1_bulk_cell(4);
         let semantic_contract = qg1_semantic_contract();
         let screen_plan = qg1_screen_plan(&cell, vec![1, 2, 4]);
-        let pilots = qg1_complete_pilots(
+        let mut pilots = qg1_complete_pilots(
             &cell,
             &screen_plan,
             &semantic_contract,
             "one-live-invocation",
+        );
+        let shipping_auto = pilots[0].candidate.clone();
+        let scope = qg1_throughput_scope(&cell);
+        pilots[2] = qg1_pilot_with_control(
+            pilots[2].candidate.clone(),
+            &shipping_auto,
+            &scope,
+            screen_plan.work_units,
+            screen_plan.content_bytes,
+            "one-live-invocation",
+            1_000_000,
+            200_000,
+            200_000,
+        );
+        pilots[3] = qg1_pilot_with_control(
+            pilots[3].candidate.clone(),
+            &shipping_auto,
+            &scope,
+            screen_plan.work_units,
+            screen_plan.content_bytes,
+            "one-live-invocation",
+            10_000_000,
+            1_000_000,
+            300_000,
+        );
+        assert!(
+            pilots[2].experiment.effect.treatment.p50 > pilots[3].experiment.effect.treatment.p50,
+            "planted drift makes marginal treatment p50 choose the wrong incumbent"
+        );
+        assert!(
+            pilots[3].experiment.effect.treatment_over_control
+                > pilots[2].experiment.effect.treatment_over_control,
+            "the paired ShippingAuto-controlled estimand must recover the fixed_4 incumbent"
         );
         let screen =
             Qg1TantivyIncumbentScreen::screen(&cell, screen_plan, &semantic_contract, pilots)
@@ -10289,10 +10584,51 @@ mod tests {
                 .expect("tied screen remains replayable");
         assert!(screen.selected_candidate.is_none());
         assert_eq!(screen.tied_fastest_candidates.len(), 2);
+        assert!(
+            screen.pilots[2].experiment.effect.ci95_high_ratio
+                >= screen.pilots[3].experiment.effect.ci95_low_ratio
+                && screen.pilots[3].experiment.effect.ci95_high_ratio
+                    >= screen.pilots[2].experiment.effect.ci95_low_ratio,
+            "tie recovery is defined by overlap of paired ratio intervals"
+        );
         assert_eq!(
             screen.no_decision_reason.as_deref(),
             Some(
                 "fastest candidate is tied within the predeclared 95% median confidence intervals"
+            )
+        );
+    }
+
+    #[test]
+    fn qg1_incumbent_screen_refuses_unobservable_shipping_auto_winner() {
+        let cell = qg1_bulk_cell(4);
+        let semantic_contract = qg1_semantic_contract();
+        let screen_plan = qg1_screen_plan(&cell, vec![1, 2, 4]);
+        let mut pilots = qg1_complete_pilots(
+            &cell,
+            &screen_plan,
+            &semantic_contract,
+            "one-live-invocation",
+        );
+        let shipping_auto = pilots[0].candidate.clone();
+        pilots[0] = qg1_pilot(
+            shipping_auto.clone(),
+            &shipping_auto,
+            &qg1_throughput_scope(&cell),
+            screen_plan.work_units,
+            screen_plan.content_bytes,
+            "one-live-invocation",
+            100_000,
+            0,
+        );
+        let screen =
+            Qg1TantivyIncumbentScreen::screen(&cell, screen_plan, &semantic_contract, pilots)
+                .expect("unobservable winner produces a valid screen receipt");
+        assert!(screen.selected_candidate.is_none());
+        assert_eq!(
+            screen.no_decision_reason.as_deref(),
+            Some(
+                "uniquely fastest ShippingAuto candidate has no authenticated materialized writer width"
             )
         );
     }
@@ -10326,7 +10662,7 @@ mod tests {
             &semantic_contract,
             "one-live-invocation",
         );
-        infeasible_pilots[0].observed_writer_threads = 5;
+        infeasible_pilots[0].observed_writer_threads = Some(5);
         let screen = Qg1TantivyIncumbentScreen::screen(
             &cell,
             screen_plan,

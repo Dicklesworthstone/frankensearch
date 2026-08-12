@@ -32,7 +32,8 @@ use criterion::Criterion;
 use frankensearch_core::bench_support::BenchExecutableIdentity;
 use frankensearch_core::{IndexableDocument, LexicalRead, LexicalWrite};
 use frankensearch_lexical::{
-    BenchmarkRetainedTantivyReader, BenchmarkWriterJoinReceipt, SnippetConfig, TantivyIndex,
+    BenchmarkMaterializedWidth, BenchmarkRetainedTantivyReader, BenchmarkWriterJoinReceipt,
+    BenchmarkWriterMode, BenchmarkWriterReceipt, SnippetConfig, TantivyIndex,
 };
 use frankensearch_quill::scribe::{FrankensearchTokenizer, TokenAnalyzer};
 use frankensearch_quill::{
@@ -42,22 +43,28 @@ use frankensearch_quill::{
 use frankensearch_quill_gauntlet::{
     BuildIdentity, ColdCacheEvidence, ComparatorConfig, ComparisonStatus, CorpusIdentity,
     CorpusManifest, CountState, DistributionSummary, EngineConcurrencyObservation,
-    EngineObservation, EvidenceCell, EvidenceCellSpec, EvidencePolicy, EvidenceProvenance,
-    EvidenceRole, ExecutionProfileId, HardwareClassId, MachineClassRegistry, MachineIdentity,
-    MachineProfileKey, NativeTieKey, PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS,
+    EngineObservation, EvidenceCell, EvidenceCellBody, EvidenceCellSpec, EvidencePolicy,
+    EvidenceProvenance, EvidenceRole, ExecutionProfileId, HardwareClassId, MachineClassRegistry,
+    MachineIdentity, MachineProfileKey, NativeTieKey, PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS,
     PairedEstimatorConfig, PeakRssEvidence, PerfApplicabilityPlan, PerfCellApplicability,
     PerfCellResult, PerfCellSpec, PerfConcurrencyEngine, PerfConcurrencyObserver,
     PerfConcurrencyWitness, PerfCorpus, PerfEvidenceArtifact, PerfGate, PerfGateArtifact,
     PerfInputIdentity, PerfMatrixSpec, PerfMetricSemantics, PerfOperationScope, PerfQueryClass,
     PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
-    PerfTopology, PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg1AuthorityRegisterEntryV1,
-    Qg1BatchCoverage, Qg1LifecycleProducer, Qg1LifecycleWitness, Qg1SampleBinding,
-    Qg1StartupHandshakeV1, Qg6ArmRole, Qg6Comparison, Qg6Phase, Qg6PreparedExperiment,
-    Qg6QuerySpec, Qg6SampleBinding, Qg6SampleOrder, Qg6SearchHit, Qg6SearchResult,
-    Qg6SemanticContract, RankClass, RankedHit, ScoreEpsilonReason, SyntheticCorpus,
-    SyntheticCorpusSpec, ZipfExponent, command_sha256_from_argv, compare_observations,
-    estimate_paired_experiment, estimate_paired_experiment_against_qg1_authority,
-    machine_fingerprint, oracle_version_contract, peak_rss_bytes, perf_manifest_contract_sha256,
+    PerfTopology, PositionMode, QG1_QUILL_ENGINE_ID, QG1_STREAM_ROLE_EFFECT,
+    QG1_STREAM_ROLE_QUILL_NULL, QG1_STREAM_ROLE_TANTIVY_NULL, QG1_STREAM_ROLE_TANTIVY_PILOT_EFFECT,
+    QG1_STREAM_ROLE_TANTIVY_PILOT_NULL, QG1_TANTIVY_ENGINE_ID, QG6_QUERY_GROUP_IDS,
+    QG6_QUERY_GROUPS, Qg1AuthorityRegisterEntryV1, Qg1BatchCoverage, Qg1ExpectedAuthority,
+    Qg1IncumbentScreenEvidence, Qg1LifecycleProducer, Qg1LifecycleWitness, Qg1SampleBinding,
+    Qg1StartupHandshakeV1, Qg1TantivyBoundStream, Qg1TantivyDecisionStreamKind,
+    Qg1TantivyIncumbentDecision, Qg1TantivyIncumbentPilot, Qg1TantivyIncumbentScreen,
+    Qg1TantivyIncumbentScreenPlan, Qg1TantivySemanticContract, Qg1TantivyWriterMode, Qg6ArmRole,
+    Qg6Comparison, Qg6Phase, Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleBinding, Qg6SampleOrder,
+    Qg6SearchHit, Qg6SearchResult, Qg6SemanticContract, RankClass, RankedHit, ScoreEpsilonReason,
+    SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent, command_sha256_from_argv,
+    compare_observations, estimate_paired_experiment,
+    estimate_paired_experiment_against_qg1_authority, machine_fingerprint, oracle_version_contract,
+    peak_rss_bytes, perf_manifest_contract_sha256, preregister_qg1_tantivy_incumbents,
     seeded_balanced_pair_order, validate_matrix,
 };
 use serde::{Deserialize, Serialize};
@@ -425,6 +432,16 @@ fn take_concurrency_witness(spec: &PerfCellSpec) -> Option<PerfConcurrencyWitnes
             ),
         ],
     })
+}
+
+fn discard_concurrency_observations(spec: &PerfCellSpec) {
+    let cell_id = format!("{}/{}/{}", spec.gate, spec.fixture, spec.metric);
+    let mut observations = CONCURRENCY_OBSERVATIONS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("lock concurrency observations");
+    observations.remove(&(cell_id.clone(), EngineArm::Quill.label().to_owned()));
+    observations.remove(&(cell_id, EngineArm::Tantivy.label().to_owned()));
 }
 
 const NO_POSITION_FIELDS: [FieldDescriptor; 5] = [
@@ -2000,6 +2017,79 @@ fn tantivy_in_memory(spec: &PerfCellSpec) -> TantivyIndex {
     .expect("QG Tantivy oracle")
 }
 
+fn qg1_tantivy_in_memory(spec: &PerfCellSpec, writer_mode: Qg1TantivyWriterMode) -> TantivyIndex {
+    let writer_heap_bytes = spec.writer_heap_bytes.unwrap_or(50_000_000);
+    let positions = spec.positions.unwrap_or(PositionMode::On).enabled();
+    match writer_mode {
+        Qg1TantivyWriterMode::ShippingAuto => {
+            TantivyIndex::in_memory_with_shipping_auto_writer(writer_heap_bytes, positions)
+                .expect("construct QG-1 Tantivy ShippingAuto incumbent")
+        }
+        Qg1TantivyWriterMode::Fixed { writer_threads } => {
+            TantivyIndex::in_memory_with_benchmark_config(
+                writer_heap_bytes,
+                writer_threads,
+                positions,
+            )
+            .expect("construct QG-1 fixed-width Tantivy incumbent")
+        }
+    }
+}
+
+fn qg1_expected_materialized_width(writer_mode: Qg1TantivyWriterMode) -> Option<usize> {
+    match writer_mode {
+        Qg1TantivyWriterMode::ShippingAuto => None,
+        Qg1TantivyWriterMode::Fixed { writer_threads } => Some(writer_threads),
+    }
+}
+
+fn qg1_validate_writer_receipt(
+    spec: &PerfCellSpec,
+    writer_mode: Qg1TantivyWriterMode,
+    receipt: &BenchmarkWriterReceipt,
+) {
+    let expected_mode = match writer_mode {
+        Qg1TantivyWriterMode::ShippingAuto => BenchmarkWriterMode::ShippingAuto,
+        Qg1TantivyWriterMode::Fixed { writer_threads } => BenchmarkWriterMode::Fixed {
+            threads: writer_threads,
+        },
+    };
+    assert_eq!(
+        receipt.mode, expected_mode,
+        "QG-1 writer constructor drifted"
+    );
+    assert_eq!(
+        receipt.writer_heap_bytes,
+        spec.writer_heap_bytes.unwrap_or(50_000_000),
+        "QG-1 writer heap drifted"
+    );
+    match (writer_mode, receipt.materialized_width) {
+        (Qg1TantivyWriterMode::ShippingAuto, BenchmarkMaterializedWidth::Unobservable { .. }) => {}
+        (
+            Qg1TantivyWriterMode::Fixed { writer_threads },
+            BenchmarkMaterializedWidth::Authenticated(observed),
+        ) if observed == writer_threads => {}
+        _ => panic!("QG-1 writer materialized-width receipt does not match its constructor"),
+    }
+}
+
+fn qg1_attest_writer_constructor(
+    spec: &PerfCellSpec,
+    writer_mode: Qg1TantivyWriterMode,
+) -> BenchmarkWriterReceipt {
+    let mut index = qg1_tantivy_in_memory(spec, writer_mode);
+    let attestation = index
+        .take_benchmark_writer_attestation()
+        .expect("QG-1 benchmark constructor must mint a one-shot attestation");
+    qg1_validate_writer_receipt(spec, writer_mode, attestation.receipt());
+    let receipt = attestation.receipt().clone();
+    black_box(attestation.construction_id());
+    index
+        .benchmark_join_workers()
+        .expect("join QG-1 constructor-attestation writer");
+    receipt
+}
+
 fn tantivy_create(path: &Path, spec: &PerfCellSpec) -> TantivyIndex {
     TantivyIndex::create_with_benchmark_config(
         path,
@@ -2576,6 +2666,7 @@ fn qg1_bulk_metric_continuous(
     spec: &PerfCellSpec,
     arm: EngineArm,
     count: u64,
+    tantivy_writer_mode: Option<Qg1TantivyWriterMode>,
 ) -> MetricMeasurement {
     assert_eq!(
         qg1_producer_coverage(spec),
@@ -2642,11 +2733,22 @@ fn qg1_bulk_metric_continuous(
         }
         EngineArm::Tantivy => {
             let prepared_input = context.qg1_sample_input(count);
-            let index = tantivy_in_memory(spec);
-            let observed_threads = index
-                .benchmark_materialized_writer_threads()
-                .expect("QG-1 Tantivy arm uses the benchmark writer constructor");
-            record_concurrency(spec, arm, observed_threads);
+            let writer_mode = tantivy_writer_mode.unwrap_or(Qg1TantivyWriterMode::Fixed {
+                writer_threads: spec.threads.unwrap_or(1),
+            });
+            let index = qg1_tantivy_in_memory(spec, writer_mode);
+            let receipt = index
+                .benchmark_writer_receipt()
+                .expect("QG-1 Tantivy arm uses an authenticated benchmark constructor");
+            qg1_validate_writer_receipt(spec, writer_mode, receipt);
+            assert_eq!(
+                index.benchmark_materialized_writer_threads(),
+                qg1_expected_materialized_width(writer_mode),
+                "QG-1 constructor width accessor disagrees with its typed receipt"
+            );
+            if let Some(observed_threads) = index.benchmark_materialized_writer_threads() {
+                record_concurrency(spec, arm, observed_threads);
+            }
             let mut interval = Qg1ContinuousInterval::start(arm, prepared_input.binding.clone());
             let periodic_commits = feed_qg1_prepared_batches(
                 context,
@@ -2710,11 +2812,12 @@ fn bulk_metric_unpooled(
     context: &BenchContext,
     spec: &PerfCellSpec,
     arm: EngineArm,
+    qg1_tantivy_writer_mode: Option<Qg1TantivyWriterMode>,
 ) -> MetricMeasurement {
     let requested = spec.document_count.expect("bulk document count");
     let count = context.scale.document_count(requested);
     if spec.gate == PerfGate::Qg1 {
-        return qg1_bulk_metric_continuous(context, spec, arm, count);
+        return qg1_bulk_metric_continuous(context, spec, arm, count, qg1_tantivy_writer_mode);
     }
     let prepared_qg1_documents = (spec.gate == PerfGate::Qg1).then(|| context.qg1_prefix(count).1);
     let generated_corpus = (spec.gate != PerfGate::Qg1).then(|| corpus_for(count));
@@ -2810,8 +2913,17 @@ fn bulk_metric_unpooled(
 }
 
 fn bulk_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> MetricMeasurement {
+    bulk_metric_with_qg1_writer_mode(context, spec, arm, None)
+}
+
+fn bulk_metric_with_qg1_writer_mode(
+    context: &BenchContext,
+    spec: &PerfCellSpec,
+    arm: EngineArm,
+    qg1_tantivy_writer_mode: Option<Qg1TantivyWriterMode>,
+) -> MetricMeasurement {
     if !matches!(spec.gate, PerfGate::Qg1 | PerfGate::Qg8) || arm != EngineArm::Quill {
-        return bulk_metric_unpooled(context, spec, arm);
+        return bulk_metric_unpooled(context, spec, arm, qg1_tantivy_writer_mode);
     }
 
     let threads = spec.threads.expect("QG-1/QG-8 thread count");
@@ -2826,7 +2938,7 @@ fn bulk_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> M
                 "QG-1/QG-8 Quill cell escaped its pinned Rayon pool"
             );
             record_concurrency(spec, arm, observed_threads);
-            bulk_metric_unpooled(context, spec, arm)
+            bulk_metric_unpooled(context, spec, arm, qg1_tantivy_writer_mode)
         })
 }
 
@@ -3613,11 +3725,24 @@ fn measure_metric_with_query(
     arm: EngineArm,
     query_override: Option<&str>,
 ) -> MetricMeasurement {
+    measure_metric_with_query_and_qg1_writer_mode(context, spec, arm, query_override, None)
+}
+
+fn measure_metric_with_query_and_qg1_writer_mode(
+    context: &BenchContext,
+    spec: &PerfCellSpec,
+    arm: EngineArm,
+    query_override: Option<&str>,
+    qg1_tantivy_writer_mode: Option<Qg1TantivyWriterMode>,
+) -> MetricMeasurement {
     match spec.gate {
         PerfGate::Qg1 if spec.metric == "tokenize_docs_per_second" => {
             MetricMeasurement::gauge(tokenize_metric(context, spec))
         }
-        PerfGate::Qg1 | PerfGate::Qg2 | PerfGate::Qg8 => bulk_metric(context, spec, arm),
+        PerfGate::Qg1 => {
+            bulk_metric_with_qg1_writer_mode(context, spec, arm, qg1_tantivy_writer_mode)
+        }
+        PerfGate::Qg2 | PerfGate::Qg8 => bulk_metric(context, spec, arm),
         PerfGate::Qg3 if spec.metric == "docs_per_second" => bulk_metric(context, spec, arm),
         PerfGate::Qg3 => MetricMeasurement::gauge(watch_metric(context, spec, arm)),
         PerfGate::Qg4 => MetricMeasurement::gauge(commit_metric(context, spec, arm)),
@@ -3722,6 +3847,43 @@ fn qg1_issued_streams(runs: usize, cell_seed: u64) -> Vec<(String, u64, u64, Vec
     ]
 }
 
+fn qg1_pilot_issued_streams(
+    runs: usize,
+    candidate_seed: u64,
+) -> Vec<(String, u64, u64, Vec<PerfSampleArm>)> {
+    vec![
+        (
+            QG1_STREAM_ROLE_TANTIVY_PILOT_EFFECT.to_owned(),
+            0,
+            0,
+            seeded_balanced_pair_order(runs, candidate_seed)
+                .expect("QG-1 pilot effect issued order"),
+        ),
+        (
+            QG1_STREAM_ROLE_TANTIVY_PILOT_NULL.to_owned(),
+            2_000_000,
+            2_000_000,
+            seeded_balanced_pair_order(runs, candidate_seed ^ 0xaa)
+                .expect("QG-1 pilot null issued order"),
+        ),
+    ]
+}
+
+struct Qg1IncumbentAuthorityProducer {
+    estimator_config: PairedEstimatorConfig,
+    producer: Qg1LifecycleProducer,
+}
+
+struct Qg1IncumbentPilotProducer {
+    writer_mode: Qg1TantivyWriterMode,
+    authority: Qg1IncumbentAuthorityProducer,
+}
+
+struct Qg1IncumbentStartup {
+    screen_plan: Qg1TantivyIncumbentScreenPlan,
+    pilots: Vec<Qg1IncumbentPilotProducer>,
+}
+
 /// The child freezes every engine-cell producer before it performs any
 /// preflight, warmup, or timed work.  Keeping the estimator configuration with
 /// the producer prevents `collect_cell` from minting a second authority after
@@ -3730,6 +3892,7 @@ struct Qg1StartupProducer {
     operation_id: String,
     estimator_config: PairedEstimatorConfig,
     producer: Qg1LifecycleProducer,
+    incumbent: Option<Qg1IncumbentStartup>,
 }
 
 struct Qg1StartupProducers {
@@ -3746,6 +3909,22 @@ impl Qg1StartupProducers {
             .iter()
             .find(|producer| producer.operation_id == operation_id)
     }
+
+    fn retained_authorities(&self) -> Vec<&Qg1ExpectedAuthority> {
+        self.engine_cells
+            .iter()
+            .flat_map(|startup| {
+                std::iter::once(startup.producer.expected_authority()).chain(
+                    startup.incumbent.iter().flat_map(|incumbent| {
+                        incumbent
+                            .pilots
+                            .iter()
+                            .map(|pilot| pilot.authority.producer.expected_authority())
+                    }),
+                )
+            })
+            .collect()
+    }
 }
 
 fn construct_qg1_startup_producers(
@@ -3753,6 +3932,9 @@ fn construct_qg1_startup_producers(
     selected: &[PerfCellSpec],
     runs: usize,
     evidence: &EvidenceContext,
+    machine_profile: MachineProfileKey,
+    external_cpu_budget: usize,
+    preregistered_widths: &[usize],
 ) -> Qg1StartupProducers {
     let mut engine_cells = Vec::new();
     for spec in selected {
@@ -3772,10 +3954,78 @@ fn construct_qg1_startup_producers(
             qg1_issued_streams(runs, cell_seed),
         )
         .expect("selected engine QG-1 cell must mint one startup authority producer");
+        let screen_this_cell = context.scale.is_full();
+        let incumbent = screen_this_cell.then(|| {
+            let prepared = context.qg1_sample_input(
+                spec.document_count
+                    .expect("QG-1 incumbent requires a document count"),
+            );
+            let writer_heap_bytes = spec.writer_heap_bytes.unwrap_or(50_000_000);
+            let mut widths = preregistered_widths
+                .iter()
+                .copied()
+                .filter(|width| {
+                    frankensearch_quill_gauntlet::PERF_MIN_WRITER_HEAP_PER_THREAD_BYTES
+                        .saturating_mul(*width)
+                        <= writer_heap_bytes
+                })
+                .collect::<Vec<_>>();
+            widths.sort_unstable();
+            widths.dedup();
+            assert!(!widths.is_empty(), "QG-1 incumbent width universe is empty");
+            let screen_plan = Qg1TantivyIncumbentScreenPlan::new(
+                machine_profile,
+                external_cpu_budget,
+                widths.clone(),
+                spec,
+                prepared.binding.content_bytes,
+            )
+            .expect("freeze live QG-1 Tantivy incumbent screen plan");
+            let writer_modes = std::iter::once(Qg1TantivyWriterMode::ShippingAuto)
+                .chain(
+                    widths
+                        .into_iter()
+                        .map(|writer_threads| Qg1TantivyWriterMode::Fixed { writer_threads }),
+                )
+                .collect::<Vec<_>>();
+            let pilots = writer_modes
+                .into_iter()
+                .enumerate()
+                .map(|(candidate_index, writer_mode)| {
+                    let mut estimator_config = evidence.config.clone();
+                    let candidate_seed = cell_seed
+                        ^ u64::try_from(candidate_index)
+                            .expect("QG-1 candidate index fits u64")
+                            .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                    let producer = install_qg1_lifecycle_authority(
+                        &mut estimator_config,
+                        context,
+                        spec,
+                        &scope,
+                        &evidence.sample_provenance,
+                        u64::try_from(runs).expect("QG-1 pilot pair count fits u64"),
+                        qg1_pilot_issued_streams(runs, candidate_seed),
+                    )
+                    .expect("freeze one distinct QG-1 candidate-pilot authority");
+                    Qg1IncumbentPilotProducer {
+                        writer_mode,
+                        authority: Qg1IncumbentAuthorityProducer {
+                            estimator_config,
+                            producer,
+                        },
+                    }
+                })
+                .collect::<Vec<_>>();
+            Qg1IncumbentStartup {
+                screen_plan,
+                pilots,
+            }
+        });
         engine_cells.push(Qg1StartupProducer {
             operation_id: scope.operation_id,
             estimator_config,
             producer,
+            incumbent,
         });
     }
     let expected_count = selected
@@ -3787,7 +4037,7 @@ fn construct_qg1_startup_producers(
     assert_eq!(
         engine_cells.len(),
         expected_count,
-        "every selected engine QG-1 cell must contribute exactly one startup producer"
+        "every selected engine QG-1 cell must contribute one fresh-decision startup producer"
     );
     Qg1StartupProducers { engine_cells }
 }
@@ -3829,9 +4079,24 @@ fn require_qg1_pre_timing_authority_ack(selected_qg1: bool, producers: &[Qg1Star
         "typed QG-1 producer requires the exact stdio authority handshake mode"
     );
 
+    let registered_producers = producers
+        .iter()
+        .flat_map(|startup| {
+            startup
+                .incumbent
+                .iter()
+                .flat_map(|incumbent| {
+                    incumbent
+                        .pilots
+                        .iter()
+                        .map(|pilot| &pilot.authority.producer)
+                })
+                .chain(std::iter::once(&startup.producer))
+        })
+        .collect::<Vec<_>>();
     let mut stdout = std::io::stdout().lock();
-    for (offset, startup_producer) in producers.iter().enumerate() {
-        let entry = startup_producer.producer.register_entry();
+    for (offset, producer) in registered_producers.iter().enumerate() {
+        let entry = producer.register_entry();
         entry
             .verify()
             .expect("producer must emit one complete verified QG-1 authority register entry");
@@ -3849,7 +4114,7 @@ fn require_qg1_pre_timing_authority_ack(selected_qg1: bool, producers: &[Qg1Star
             .expect("write QG-1 authority register frame to parent");
     }
     let register_count =
-        u64::try_from(producers.len()).expect("QG-1 startup register count fits u64");
+        u64::try_from(registered_producers.len()).expect("QG-1 startup register count fits u64");
     stdout
         .write_all(&Qg1StartupHandshakeV1::complete_frame(register_count))
         .expect("write QG-1 authority COMPLETE frame to parent");
@@ -4463,6 +4728,8 @@ fn fixture_seed(fixture: &str) -> u64 {
 struct StreamPlan<'a> {
     control: EngineArm,
     treatment: EngineArm,
+    control_qg1_tantivy_writer_mode: Option<Qg1TantivyWriterMode>,
+    treatment_qg1_tantivy_writer_mode: Option<Qg1TantivyWriterMode>,
     rounds: usize,
     seed: u64,
     block_id_base: u64,
@@ -4512,17 +4779,19 @@ impl<'a> PairedStreamRunner<'a> {
             seeded_balanced_pair_order(plan.rounds, plan.seed).expect("paired order schedule");
         let (work_units, byte_count) = raw_sample_work(context, spec);
         for _ in 0..evidence.policy.warmup_rounds {
-            let _ = black_box(measure_metric_with_query(
+            let _ = black_box(measure_metric_with_query_and_qg1_writer_mode(
                 context,
                 spec,
                 plan.control,
                 plan.query_override,
+                plan.control_qg1_tantivy_writer_mode,
             ));
-            let _ = black_box(measure_metric_with_query(
+            let _ = black_box(measure_metric_with_query_and_qg1_writer_mode(
                 context,
                 spec,
                 plan.treatment,
                 plan.query_override,
+                plan.treatment_qg1_tantivy_writer_mode,
             ));
         }
         let samples = Vec::with_capacity(plan.rounds * 2);
@@ -4551,6 +4820,7 @@ impl<'a> PairedStreamRunner<'a> {
         if self.order[round] == PerfSampleArm::Control {
             let first = self.execute(
                 self.plan.control,
+                self.plan.control_qg1_tantivy_writer_mode,
                 PerfSampleArm::Control,
                 PerfSampleOrder::First,
                 block_id,
@@ -4559,6 +4829,7 @@ impl<'a> PairedStreamRunner<'a> {
             self.samples.push(first);
             let second = self.execute(
                 self.plan.treatment,
+                self.plan.treatment_qg1_tantivy_writer_mode,
                 PerfSampleArm::Treatment,
                 PerfSampleOrder::Second,
                 block_id,
@@ -4568,6 +4839,7 @@ impl<'a> PairedStreamRunner<'a> {
         } else {
             let first = self.execute(
                 self.plan.treatment,
+                self.plan.treatment_qg1_tantivy_writer_mode,
                 PerfSampleArm::Treatment,
                 PerfSampleOrder::First,
                 block_id,
@@ -4576,6 +4848,7 @@ impl<'a> PairedStreamRunner<'a> {
             self.samples.push(first);
             let second = self.execute(
                 self.plan.control,
+                self.plan.control_qg1_tantivy_writer_mode,
                 PerfSampleArm::Control,
                 PerfSampleOrder::Second,
                 block_id,
@@ -4588,6 +4861,7 @@ impl<'a> PairedStreamRunner<'a> {
     fn execute(
         &mut self,
         engine: EngineArm,
+        qg1_tantivy_writer_mode: Option<Qg1TantivyWriterMode>,
         sample_arm: PerfSampleArm,
         sample_order: PerfSampleOrder,
         block_id: u64,
@@ -4595,11 +4869,12 @@ impl<'a> PairedStreamRunner<'a> {
     ) -> PerfRawSample {
         let call_started_ns =
             u64::try_from(self.origin.elapsed().as_nanos()).expect("monotonic ns");
-        let measurement = black_box(measure_metric_with_query(
+        let measurement = black_box(measure_metric_with_query_and_qg1_writer_mode(
             self.context,
             self.spec,
             engine,
             self.plan.query_override,
+            qg1_tantivy_writer_mode,
         ));
         let call_ended_ns = u64::try_from(self.origin.elapsed().as_nanos()).expect("monotonic ns");
         let (work_units, byte_count) = qg1_raw_sample_denominator(
@@ -5520,9 +5795,550 @@ fn prepared_qg6_streams(
     )
 }
 
+fn qg1_incumbent_digest<T: Serialize>(domain: &str, value: &T) -> String {
+    let encoded = serde_json::to_vec(value).expect("serialize QG-1 incumbent receipt input");
+    let mut hasher = Sha256::new();
+    hasher.update(b"frankensearch.quill.qg1-live-incumbent.v1\0");
+    hasher.update(domain.as_bytes());
+    hasher.update([0]);
+    hasher.update(encoded);
+    lower_hex(&hasher.finalize())
+}
+
+fn qg1_live_semantic_contract(
+    spec: &PerfCellSpec,
+    shipping_receipt: &BenchmarkWriterReceipt,
+) -> Qg1TantivySemanticContract {
+    let quill = quill_config(spec);
+    Qg1TantivySemanticContract {
+        tantivy_version: frankensearch_quill_gauntlet::QG1_TANTIVY_INCUMBENT_TANTIVY_VERSION
+            .to_owned(),
+        schema_sha256: qg1_incumbent_digest("tantivy.schema", &shipping_receipt.schema_fields),
+        analyzer_sha256: qg1_incumbent_digest("tantivy.analyzer", &shipping_receipt.tokenizer_name),
+        indexed_fields_sha256: qg1_incumbent_digest(
+            "tantivy.indexed-fields",
+            &(
+                shipping_receipt.schema_fields.as_slice(),
+                shipping_receipt.positions,
+            ),
+        ),
+        merge_policy_sha256: qg1_incumbent_digest(
+            "tantivy.merge-policy",
+            &("Index::writer default", shipping_receipt.writer_rearmed),
+        ),
+        visibility_sha256: qg1_incumbent_digest(
+            "shared.visibility",
+            &(quill.max_visibility_lag_ms, "periodic-plus-terminal-commit"),
+        ),
+        searchable_terminal_scope_sha256: qg1_incumbent_digest(
+            "shared.searchable-terminal-scope",
+            &"worker-join-then-retained-tail-search",
+        ),
+        durability_sha256: qg1_incumbent_digest("shared.durability", &"in-memory"),
+        quill_config_sha256: qg1_incumbent_digest("quill.config", &format!("{quill:?}")),
+    }
+}
+
+fn qg1_live_observation_ids(label: &str, samples: &[PerfRawSample]) -> Vec<String> {
+    samples
+        .iter()
+        .map(|sample| {
+            qg1_incumbent_digest(
+                "raw-observation",
+                &(
+                    label,
+                    sample.block_id,
+                    sample.sample_id,
+                    sample.arm,
+                    sample.order,
+                ),
+            )
+        })
+        .collect()
+}
+
+fn qg1_run_incumbent_stream(
+    context: &BenchContext,
+    spec: &PerfCellSpec,
+    evidence: &EvidenceContext,
+    scope: &PerfOperationScope,
+    origin: Instant,
+    rounds: usize,
+    seed: u64,
+    block_id_base: u64,
+    sample_id_base: u64,
+    stream_role: &'static str,
+    control: EngineArm,
+    treatment: EngineArm,
+    control_writer_mode: Option<Qg1TantivyWriterMode>,
+    treatment_writer_mode: Option<Qg1TantivyWriterMode>,
+    estimator_config: &PairedEstimatorConfig,
+    producer: &Qg1LifecycleProducer,
+) -> Vec<PerfRawSample> {
+    let mut runner = PairedStreamRunner::new(
+        context,
+        spec,
+        evidence,
+        scope,
+        origin,
+        StreamPlan {
+            control,
+            treatment,
+            control_qg1_tantivy_writer_mode: control_writer_mode,
+            treatment_qg1_tantivy_writer_mode: treatment_writer_mode,
+            rounds,
+            seed,
+            block_id_base,
+            sample_id_base,
+            group_id: None,
+            query_override: None,
+            qg1_stream_role: Some(stream_role),
+        },
+        estimator_config,
+        Some(producer),
+    );
+    for round in 0..rounds {
+        runner.run_round(round);
+    }
+    runner.into_samples()
+}
+
+struct Qg1LiveIncumbentCollection {
+    screen: Qg1TantivyIncumbentScreen,
+    decision: Option<Qg1TantivyIncumbentDecision>,
+    selected_cell: Option<EvidenceCell>,
+    selected_results: Vec<PerfCellResult>,
+}
+
+fn assert_qg1_selected_outputs_share_decision_source(
+    spec: &PerfCellSpec,
+    screen: &Qg1TantivyIncumbentScreen,
+    decision: &Qg1TantivyIncumbentDecision,
+    cell: &EvidenceCell,
+    results: &[PerfCellResult],
+) {
+    assert!(
+        matches!(
+            screen
+                .selected_candidate
+                .as_ref()
+                .map(|candidate| candidate.writer_mode),
+            Some(Qg1TantivyWriterMode::Fixed { .. })
+        ),
+        "only an authenticated fixed-width selection may emit required QG-1 outputs"
+    );
+    let EvidenceCellBody::Paired {
+        paired,
+        treatment_arm_null: Some(treatment_arm_null),
+        ..
+    } = &cell.body
+    else {
+        panic!("selected QG-1 evidence must retain both decision nulls");
+    };
+    assert_eq!(paired.effect_samples, decision.tantivy_vs_quill.samples);
+    assert_eq!(paired.null_samples, decision.tantivy_null.samples);
+    assert_eq!(
+        treatment_arm_null.effect_samples,
+        decision.tantivy_vs_quill.samples
+    );
+    assert_eq!(treatment_arm_null.null_samples, decision.quill_null.samples);
+    let expected_distributions = [
+        DistributionSummary::from_samples(&arm_values(
+            &decision.tantivy_vs_quill.samples,
+            PerfSampleArm::Treatment,
+        ))
+        .expect("decision Quill threshold distribution"),
+        DistributionSummary::from_samples(&arm_values(
+            &decision.tantivy_vs_quill.samples,
+            PerfSampleArm::Control,
+        ))
+        .expect("decision Tantivy threshold distribution"),
+        DistributionSummary::from_samples(&block_ratios_treatment_over_control(
+            &decision.tantivy_vs_quill.samples,
+        ))
+        .expect("decision paired threshold distribution"),
+        DistributionSummary::from_samples(&block_ratios_treatment_over_control(
+            &decision.tantivy_null.samples,
+        ))
+        .expect("decision T/T threshold distribution"),
+        DistributionSummary::from_samples(&block_ratios_treatment_over_control(
+            &decision.quill_null.samples,
+        ))
+        .expect("decision Q/Q threshold distribution"),
+    ];
+    assert!(
+        results
+            .iter()
+            .zip(expected_distributions)
+            .all(|(result, expected)| result.distribution == expected),
+        "selected fixed mode must replace threshold and evidence sources together"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| (result.metric.clone(), result.engine.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (spec.metric.clone(), EngineArm::Quill.label().to_owned()),
+            (spec.metric.clone(), EngineArm::Tantivy.label().to_owned()),
+            (
+                format!("{}_quill_over_tantivy", spec.metric),
+                "paired_ab".to_owned(),
+            ),
+            (
+                format!("{}_tantivy_over_tantivy", spec.metric),
+                "paired_null".to_owned(),
+            ),
+            (
+                format!("{}_quill_over_quill", spec.metric),
+                "paired_null_quill".to_owned(),
+            ),
+        ],
+        "selected decision must replace threshold rows without changing canonical keys"
+    );
+}
+
+fn qg1_collect_live_incumbent(
+    context: &BenchContext,
+    spec: &PerfCellSpec,
+    role: EvidenceRole,
+    runs: usize,
+    evidence: &EvidenceContext,
+    startup: &Qg1StartupProducer,
+) -> Qg1LiveIncumbentCollection {
+    let incumbent = startup
+        .incumbent
+        .as_ref()
+        .expect("live QG-1 incumbent collection requires a preregistered screen");
+    let scope = operation_scope(spec);
+    let cell_seed = evidence.config.bootstrap_seed ^ fixture_seed(&spec.fixture);
+    let candidates = preregister_qg1_tantivy_incumbents(
+        spec,
+        &incumbent.screen_plan,
+        &qg1_live_semantic_contract(
+            spec,
+            &qg1_attest_writer_constructor(spec, Qg1TantivyWriterMode::ShippingAuto),
+        ),
+    )
+    .expect("preregister live QG-1 Tantivy incumbents");
+    assert_eq!(
+        candidates.len(),
+        incumbent.pilots.len(),
+        "every preregistered candidate must own one pre-issued pilot authority"
+    );
+    let semantic_contract = candidates[0].semantic_contract.clone();
+    let shipping_auto_config_sha256 = candidates[0].config_sha256.clone();
+    let origin = Instant::now();
+    let pilots = candidates
+        .into_iter()
+        .zip(&incumbent.pilots)
+        .enumerate()
+        .map(|(candidate_index, (candidate, pilot_startup))| {
+            assert_eq!(candidate.writer_mode, pilot_startup.writer_mode);
+            let constructor_receipt = qg1_attest_writer_constructor(spec, candidate.writer_mode);
+            let constructor_receipt_sha256 =
+                qg1_incumbent_digest("tantivy.writer-constructor", &constructor_receipt);
+            let seed = cell_seed
+                ^ u64::try_from(candidate_index)
+                    .expect("QG-1 candidate index fits u64")
+                    .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let effect = qg1_run_incumbent_stream(
+                context,
+                spec,
+                evidence,
+                &scope,
+                origin,
+                runs,
+                seed,
+                0,
+                0,
+                QG1_STREAM_ROLE_TANTIVY_PILOT_EFFECT,
+                EngineArm::Tantivy,
+                EngineArm::Tantivy,
+                Some(Qg1TantivyWriterMode::ShippingAuto),
+                Some(candidate.writer_mode),
+                &pilot_startup.authority.estimator_config,
+                &pilot_startup.authority.producer,
+            );
+            let null = qg1_run_incumbent_stream(
+                context,
+                spec,
+                evidence,
+                &scope,
+                origin,
+                runs,
+                seed ^ 0xaa,
+                2_000_000,
+                2_000_000,
+                QG1_STREAM_ROLE_TANTIVY_PILOT_NULL,
+                EngineArm::Tantivy,
+                EngineArm::Tantivy,
+                Some(candidate.writer_mode),
+                Some(candidate.writer_mode),
+                &pilot_startup.authority.estimator_config,
+                &pilot_startup.authority.producer,
+            );
+            let expected_authority = pilot_startup.authority.producer.expected_authority();
+            let experiment = estimate_paired_experiment_against_qg1_authority(
+                &effect,
+                &null,
+                &pilot_startup.authority.estimator_config,
+                Some(expected_authority),
+            )
+            .expect("estimate producer-backed QG-1 candidate pilot");
+            Qg1TantivyIncumbentPilot::from_experiment(
+                candidate,
+                constructor_receipt.materialized_width.authenticated(),
+                constructor_receipt_sha256,
+                shipping_auto_config_sha256.clone(),
+                experiment,
+                qg1_live_observation_ids(&format!("pilot-effect-{candidate_index}"), &effect),
+                qg1_live_observation_ids(&format!("pilot-null-{candidate_index}"), &null),
+            )
+            .expect("seal live QG-1 candidate pilot")
+        })
+        .collect::<Vec<_>>();
+    let retained_authorities = incumbent
+        .pilots
+        .iter()
+        .map(|pilot| pilot.authority.producer.expected_authority())
+        .chain(std::iter::once(startup.producer.expected_authority()))
+        .collect::<Vec<&Qg1ExpectedAuthority>>();
+    let screen = Qg1TantivyIncumbentScreen::screen_against_qg1_authorities(
+        spec,
+        incumbent.screen_plan.clone(),
+        &semantic_contract,
+        pilots,
+        &retained_authorities,
+    )
+    .expect("screen live QG-1 Tantivy incumbents");
+    discard_concurrency_observations(spec);
+    let decision = screen.selected_candidate.as_ref().map(|selected| {
+        let selected_receipt = qg1_attest_writer_constructor(spec, selected.writer_mode);
+        qg1_validate_writer_receipt(spec, selected.writer_mode, &selected_receipt);
+        let effect = qg1_run_incumbent_stream(
+            context,
+            spec,
+            evidence,
+            &scope,
+            origin,
+            runs,
+            cell_seed,
+            0,
+            0,
+            QG1_STREAM_ROLE_EFFECT,
+            EngineArm::Tantivy,
+            EngineArm::Quill,
+            Some(selected.writer_mode),
+            None,
+            &startup.estimator_config,
+            &startup.producer,
+        );
+        let tantivy_null = qg1_run_incumbent_stream(
+            context,
+            spec,
+            evidence,
+            &scope,
+            origin,
+            runs,
+            cell_seed ^ 0xaa,
+            0,
+            1_000_000,
+            QG1_STREAM_ROLE_TANTIVY_NULL,
+            EngineArm::Tantivy,
+            EngineArm::Tantivy,
+            Some(selected.writer_mode),
+            Some(selected.writer_mode),
+            &startup.estimator_config,
+            &startup.producer,
+        );
+        let quill_null = qg1_run_incumbent_stream(
+            context,
+            spec,
+            evidence,
+            &scope,
+            origin,
+            runs,
+            cell_seed ^ 0x55,
+            2_000_000,
+            2_000_000,
+            QG1_STREAM_ROLE_QUILL_NULL,
+            EngineArm::Quill,
+            EngineArm::Quill,
+            None,
+            None,
+            &startup.estimator_config,
+            &startup.producer,
+        );
+        let bind = |kind,
+                    control_engine_id: &str,
+                    control_config: String,
+                    treatment_engine_id: &str,
+                    treatment_config: String,
+                    samples: Vec<PerfRawSample>| {
+            let observation_ids = qg1_live_observation_ids(&format!("decision-{kind:?}"), &samples);
+            Qg1TantivyBoundStream::from_raw_samples(
+                kind,
+                control_engine_id.to_owned(),
+                control_config,
+                treatment_engine_id.to_owned(),
+                treatment_config,
+                samples,
+                observation_ids,
+            )
+            .expect("seal fresh selected-candidate decision stream")
+        };
+        let decision = Qg1TantivyIncumbentDecision {
+            estimator_config: startup.estimator_config.clone(),
+            tantivy_vs_quill: bind(
+                Qg1TantivyDecisionStreamKind::TantivyVsQuill,
+                QG1_TANTIVY_ENGINE_ID,
+                selected.config_sha256.clone(),
+                QG1_QUILL_ENGINE_ID,
+                semantic_contract.quill_config_sha256.clone(),
+                effect,
+            ),
+            tantivy_null: bind(
+                Qg1TantivyDecisionStreamKind::TantivyNull,
+                QG1_TANTIVY_ENGINE_ID,
+                selected.config_sha256.clone(),
+                QG1_TANTIVY_ENGINE_ID,
+                selected.config_sha256.clone(),
+                tantivy_null,
+            ),
+            quill_null: bind(
+                Qg1TantivyDecisionStreamKind::QuillNull,
+                QG1_QUILL_ENGINE_ID,
+                semantic_contract.quill_config_sha256.clone(),
+                QG1_QUILL_ENGINE_ID,
+                semantic_contract.quill_config_sha256.clone(),
+                quill_null,
+            ),
+        };
+        screen
+            .validate_decision_against_qg1_authorities(
+                spec,
+                &semantic_contract,
+                &decision,
+                &retained_authorities,
+            )
+            .expect("validate fresh selected-candidate decision");
+        decision
+    });
+    let (selected_cell, selected_results) = decision.as_ref().map_or_else(
+        || (None, Vec::new()),
+        |decision| {
+            let expected_authority = startup.producer.expected_authority();
+            let experiment = estimate_paired_experiment_against_qg1_authority(
+                &decision.tantivy_vs_quill.samples,
+                &decision.tantivy_null.samples,
+                &decision.estimator_config,
+                Some(expected_authority),
+            )
+            .expect("estimate selected-candidate T/Q against its fresh T/T null");
+            let treatment_null = estimate_paired_experiment_against_qg1_authority(
+                &decision.tantivy_vs_quill.samples,
+                &decision.quill_null.samples,
+                &decision.estimator_config,
+                Some(expected_authority),
+            )
+            .expect("estimate selected-candidate T/Q against its fresh Q/Q null");
+            let mut cell = EvidenceCell::evaluate(
+                EvidenceCellSpec {
+                    gate: spec.gate,
+                    fixture: spec.fixture.clone(),
+                    metric: spec.metric.clone(),
+                    unit: unit(spec).to_owned(),
+                    role,
+                    input_identity: None,
+                    qg6_semantic_contract: None,
+                    cold_cache: None,
+                    concurrency_witness: take_concurrency_witness(spec),
+                },
+                experiment,
+                &evidence.policy,
+            )
+            .expect("evaluate required QG-1 cell from the selected fresh decision");
+            cell.attach_treatment_arm_null_against_qg1_authority(
+                treatment_null,
+                &evidence.policy,
+                Some(expected_authority),
+            )
+            .expect("attach fresh selected-decision Q/Q null");
+            let effect = &decision.tantivy_vs_quill.samples;
+            let tantivy_null = &decision.tantivy_null.samples;
+            let quill_null = &decision.quill_null.samples;
+            let quill_distribution =
+                DistributionSummary::from_samples(&arm_values(effect, PerfSampleArm::Treatment))
+                    .expect("selected-decision Quill distribution");
+            let tantivy_distribution =
+                DistributionSummary::from_samples(&arm_values(effect, PerfSampleArm::Control))
+                    .expect("selected-decision Tantivy distribution");
+            let results = vec![
+                PerfCellResult {
+                    fixture: spec.fixture.clone(),
+                    metric: spec.metric.clone(),
+                    engine: EngineArm::Quill.label().to_owned(),
+                    unit: unit(spec).to_owned(),
+                    distribution: quill_distribution,
+                },
+                PerfCellResult {
+                    fixture: spec.fixture.clone(),
+                    metric: spec.metric.clone(),
+                    engine: EngineArm::Tantivy.label().to_owned(),
+                    unit: unit(spec).to_owned(),
+                    distribution: tantivy_distribution,
+                },
+                PerfCellResult {
+                    fixture: spec.fixture.clone(),
+                    metric: format!("{}_quill_over_tantivy", spec.metric),
+                    engine: "paired_ab".to_owned(),
+                    unit: "ratio".to_owned(),
+                    distribution: DistributionSummary::from_samples(
+                        &block_ratios_treatment_over_control(effect),
+                    )
+                    .expect("selected-decision paired distribution"),
+                },
+                PerfCellResult {
+                    fixture: spec.fixture.clone(),
+                    metric: format!("{}_tantivy_over_tantivy", spec.metric),
+                    engine: "paired_null".to_owned(),
+                    unit: "ratio".to_owned(),
+                    distribution: DistributionSummary::from_samples(
+                        &block_ratios_treatment_over_control(tantivy_null),
+                    )
+                    .expect("selected-decision T/T distribution"),
+                },
+                PerfCellResult {
+                    fixture: spec.fixture.clone(),
+                    metric: format!("{}_quill_over_quill", spec.metric),
+                    engine: "paired_null_quill".to_owned(),
+                    unit: "ratio".to_owned(),
+                    distribution: DistributionSummary::from_samples(
+                        &block_ratios_treatment_over_control(quill_null),
+                    )
+                    .expect("selected-decision Q/Q distribution"),
+                },
+            ];
+            assert_qg1_selected_outputs_share_decision_source(
+                spec, &screen, decision, &cell, &results,
+            );
+            (Some(cell), results)
+        },
+    );
+    Qg1LiveIncumbentCollection {
+        screen,
+        decision,
+        selected_cell,
+        selected_results,
+    }
+}
+
 struct CellCollection {
     results: Vec<PerfCellResult>,
     evidence: Option<EvidenceCell>,
+    qg1_incumbent_screen: Option<Qg1TantivyIncumbentScreen>,
+    qg1_incumbent_decision: Option<Qg1TantivyIncumbentDecision>,
 }
 
 fn collect_cell(
@@ -5563,7 +6379,35 @@ fn collect_cell(
         return CellCollection {
             results,
             evidence: Some(cell),
+            qg1_incumbent_screen: None,
+            qg1_incumbent_decision: None,
         };
+    }
+
+    let mut qg1_no_decision_screen = None;
+    if let Some(startup) = qg1_startup_producer
+        && startup.incumbent.is_some()
+    {
+        let incumbent = qg1_collect_live_incumbent(context, spec, role, runs, evidence, startup);
+        if let Some(selected_cell) = incumbent.selected_cell {
+            assert!(
+                incumbent.decision.is_some() && incumbent.screen.selected_candidate.is_some(),
+                "a selected required cell must come from a fresh selected-candidate decision"
+            );
+            return CellCollection {
+                results: incumbent.selected_results,
+                evidence: Some(selected_cell),
+                qg1_incumbent_screen: Some(incumbent.screen),
+                qg1_incumbent_decision: incumbent.decision,
+            };
+        }
+        assert!(
+            incumbent.decision.is_none()
+                && incumbent.screen.selected_candidate.is_none()
+                && incumbent.screen.no_decision_reason.is_some(),
+            "an incomplete QG-1 screen must be an explicit NoDecision"
+        );
+        qg1_no_decision_screen = Some(incumbent.screen);
     }
 
     let scope = operation_scope(spec);
@@ -5620,6 +6464,8 @@ fn collect_cell(
             StreamPlan {
                 control: EngineArm::Tantivy,
                 treatment: EngineArm::Tantivy,
+                control_qg1_tantivy_writer_mode: None,
+                treatment_qg1_tantivy_writer_mode: None,
                 rounds: runs,
                 seed: cell_seed ^ 0xaa,
                 block_id_base: 0,
@@ -5641,6 +6487,8 @@ fn collect_cell(
                 StreamPlan {
                     control: EngineArm::Quill,
                     treatment: EngineArm::Quill,
+                    control_qg1_tantivy_writer_mode: None,
+                    treatment_qg1_tantivy_writer_mode: None,
                     rounds: runs,
                     seed: cell_seed ^ 0x55,
                     block_id_base: 2_000_000,
@@ -5662,6 +6510,8 @@ fn collect_cell(
             StreamPlan {
                 control: EngineArm::Tantivy,
                 treatment: EngineArm::Quill,
+                control_qg1_tantivy_writer_mode: None,
+                treatment_qg1_tantivy_writer_mode: None,
                 rounds: runs,
                 seed: cell_seed,
                 block_id_base: 0,
@@ -5863,6 +6713,8 @@ fn collect_cell(
     CellCollection {
         results,
         evidence: Some(cell),
+        qg1_incumbent_screen: qg1_no_decision_screen,
+        qg1_incumbent_decision: None,
     }
 }
 
@@ -6585,6 +7437,7 @@ fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
             build_profile: build_profile.clone(),
         },
     };
+    let configured_widths = configured_engine_widths(&selected);
     // The selected-cell order is the canonical startup transcript order.  All
     // engine producers are frozen and parent-acknowledged before preflight can
     // perform indexing work; tokenizer-only QG-1 diagnostics contribute none.
@@ -6593,6 +7446,9 @@ fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
         &selected_specs,
         configured_runs,
         &evidence_context,
+        runner.profile,
+        usize::try_from(runner.execution_capacity).expect("QG-1 execution capacity fits usize"),
+        &configured_widths,
     );
     let selected_qg1 = runner.plan.binding().gate == PerfGate::Qg1;
     require_qg1_pre_timing_authority_ack(selected_qg1, &qg1_startup_producers.engine_cells);
@@ -6624,7 +7480,6 @@ fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
         return;
     }
     preflight_indexing_fixtures(&context, &matrix, &selected_specs);
-    let configured_widths = configured_engine_widths(&selected);
     let mut machine = MachineIdentity::capture(
         runner.execution_capacity,
         runner.max_exercised_cell_width,
@@ -6637,6 +7492,7 @@ fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
 
     let mut by_gate: BTreeMap<PerfGate, Vec<PerfCellResult>> = BTreeMap::new();
     let mut evidence_by_gate: BTreeMap<PerfGate, Vec<EvidenceCell>> = BTreeMap::new();
+    let mut qg1_incumbent_evidence = BTreeMap::new();
     for planned in &selected {
         let spec = &planned.spec;
         let collection = collect_cell(
@@ -6647,12 +7503,39 @@ fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
             &evidence_context,
             qg1_startup_producers.for_spec(spec),
         );
-        by_gate
-            .entry(spec.gate)
-            .or_default()
-            .extend(collection.results);
-        if let Some(cell) = collection.evidence {
+        let CellCollection {
+            results,
+            evidence,
+            qg1_incumbent_screen,
+            qg1_incumbent_decision,
+        } = collection;
+        by_gate.entry(spec.gate).or_default().extend(results);
+        if let Some(cell) = evidence {
             evidence_by_gate.entry(spec.gate).or_default().push(cell);
+        }
+        if let Some(screen) = qg1_incumbent_screen {
+            let semantic_contract = screen
+                .candidates
+                .first()
+                .expect("QG-1 screen retains its candidate universe")
+                .semantic_contract
+                .clone();
+            let cell_id = format!("{}/{}/{}", spec.gate, spec.fixture, spec.metric);
+            let previous = qg1_incumbent_evidence.insert(
+                cell_id.clone(),
+                Qg1IncumbentScreenEvidence {
+                    cell_id,
+                    semantic_contract,
+                    screen,
+                    decision: qg1_incumbent_decision,
+                },
+            );
+            assert!(
+                previous.is_none(),
+                "every required QG-1 engine cell must contribute exactly one screen"
+            );
+        } else {
+            assert!(qg1_incumbent_decision.is_none());
         }
         register_criterion_cell(c, &context, spec);
     }
@@ -6679,6 +7562,15 @@ fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
             cells,
         )
         .expect("assemble QG evidence artifact");
+        if gate == PerfGate::Qg1 && !qg1_incumbent_evidence.is_empty() {
+            artifact
+                .attach_qg1_incumbent_screens(
+                    std::mem::take(&mut qg1_incumbent_evidence)
+                        .into_values()
+                        .collect(),
+                )
+                .expect("attach complete live QG-1 incumbent screens to durable evidence");
+        }
         let selection_no_claim = partial_shard_no_claim(gate, selection_complete);
         let terminal_no_claim = (gate == PerfGate::Qg1)
             .then(qg1_terminal_no_claim_detail)
@@ -6691,15 +7583,41 @@ fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
             (None, Some(detail)) => artifact.force_no_claim(QG1_TERMINAL_NO_CLAIM_CODE, detail),
             (None, None) => {}
         }
-        let paths = artifact
-            .write_atomic(&output_dir)
-            .expect("write QG evidence artifact");
-        let reloaded = PerfEvidenceArtifact::load_verified(&paths.json)
-            .expect("reload and verify persisted QG evidence artifact");
-        assert_eq!(
-            reloaded, artifact,
-            "persisted QG evidence artifact must reload as the exact sealed source object"
-        );
+        let retained_qg1_authorities = qg1_startup_producers.retained_authorities();
+        let authority_bound_qg1 = gate == PerfGate::Qg1 && !retained_qg1_authorities.is_empty();
+        if gate == PerfGate::Qg1 && artifact.qg1_incumbent_screens.is_empty() {
+            assert!(
+                !artifact.ratchet_admissible(),
+                "screenless partial or tokenizer-only QG-1 evidence cannot claim"
+            );
+        }
+        let (paths, reloaded) = if authority_bound_qg1 {
+            let paths = artifact
+                .write_atomic_against_qg1_authorities(&output_dir, &retained_qg1_authorities)
+                .expect("write authority-bound QG-1 evidence artifact");
+            let reloaded = PerfEvidenceArtifact::load_verified_against_qg1_authorities(
+                &paths.json,
+                &retained_qg1_authorities,
+            )
+            .expect("reload QG-1 incumbent evidence with the retained authority set");
+            assert_eq!(
+                reloaded.qg1_incumbent_screens, artifact.qg1_incumbent_screens,
+                "every selected candidate and fresh decision must survive strict reload"
+            );
+            (paths, reloaded)
+        } else {
+            let paths = artifact
+                .write_atomic(&output_dir)
+                .expect("write QG evidence artifact");
+            let reloaded = PerfEvidenceArtifact::load_verified(&paths.json)
+                .expect("reload and verify persisted QG evidence artifact");
+            assert_eq!(
+                reloaded, artifact,
+                "persisted QG evidence artifact must reload as the exact sealed source object"
+            );
+            (paths, reloaded)
+        };
+        black_box(reloaded);
         eprintln!(
             "[quill-evidence] gate={gate} status={} ratchet_admissible={} json={} table={}",
             artifact.gate_status,
@@ -7090,6 +8008,7 @@ mod tests {
                 0x5147_3148_534b_5445,
             ),
             producer,
+            incumbent: None,
         };
         super::require_qg1_pre_timing_authority_ack(true, &[startup]);
         let mut stdout = std::io::stdout().lock();
