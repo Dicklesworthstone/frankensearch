@@ -117,7 +117,7 @@ case "$SCOPE" in
     ;;
 esac
 
-for tool in cargo git jq; do
+for tool in cargo git jq python3; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "ERROR: required command not found: $tool" >&2
     exit 2
@@ -204,7 +204,10 @@ run_source_cleanliness_self_test() {
 
 run_self_test() {
   local temp_dir metadata_path census_path positive_receipt negative_metadata negative_census
-  local negative_receipt script_path source_root source_sha
+  local negative_receipt negative_lock_receipt duplicate_asupersync_receipt unexpected_patch_receipt
+  local comment_only_rev_receipt notrev_only_receipt quoted_hash_receipt evil_git_patch_receipt
+  local wrong_asupersync_source_receipt invalid_fsqlite_source_receipt
+  local script_path source_root source_sha
   temp_dir="$(mktemp -d /tmp/frankensearch-publish-contract-self-test.XXXXXX)"
   metadata_path="${temp_dir}/metadata-positive.json"
   census_path="${temp_dir}/census-positive.json"
@@ -212,6 +215,15 @@ run_self_test() {
   negative_metadata="${temp_dir}/metadata-negative.json"
   negative_census="${temp_dir}/census-negative.json"
   negative_receipt="${temp_dir}/receipt-negative.json"
+  negative_lock_receipt="${temp_dir}/receipt-lock-negative.json"
+  duplicate_asupersync_receipt="${temp_dir}/receipt-asupersync-duplicate.json"
+  unexpected_patch_receipt="${temp_dir}/receipt-fsqlite-patch-unexpected.json"
+  comment_only_rev_receipt="${temp_dir}/receipt-fsqlite-comment-only-rev.json"
+  notrev_only_receipt="${temp_dir}/receipt-fsqlite-notrev-only.json"
+  quoted_hash_receipt="${temp_dir}/receipt-fsqlite-quoted-hash.json"
+  evil_git_patch_receipt="${temp_dir}/receipt-fsqlite-evil-git.json"
+  wrong_asupersync_source_receipt="${temp_dir}/receipt-asupersync-source-invalid.json"
+  invalid_fsqlite_source_receipt="${temp_dir}/receipt-fsqlite-source-invalid.json"
   script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
   source_root="${temp_dir}/source-cleanliness-repo"
   source_sha="1111111111111111111111111111111111111111"
@@ -220,12 +232,32 @@ run_self_test() {
   cp "$script_path" "${source_root}/scripts/check_crates_publish_contract.sh"
   script_path="${source_root}/scripts/check_crates_publish_contract.sh"
   printf '*.ignored\n' >"${source_root}/.gitignore"
-  printf '# Synthetic lockfile for publication-contract self-tests.\n' >"${source_root}/Cargo.lock"
+  printf '%s\n' \
+    '[patch.crates-io]' \
+    'fsqlite-hfdt={package="fsqlite",git="https://github.com/Dicklesworthstone/frankensqlite",rev="500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d"}' \
+    'fsqlite-main={package="fsqlite",git="https://github.com/Dicklesworthstone/frankensqlite",rev="4d09168fff2fdf5d7f8ede1607db5e040bca724b"}' >"${source_root}/Cargo.toml"
+  printf '%s\n' \
+    'version = 4' \
+    '' \
+    '[[package]]' \
+    'name = "asupersync"' \
+    'version = "0.4.3"' \
+    'source = "registry+https://github.com/rust-lang/crates.io-index"' \
+    '' \
+    '[[package]]' \
+    'name = "fsqlite"' \
+    'version = "0.1.19"' \
+    'source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d#500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d"' \
+    '' \
+    '[[package]]' \
+    'name = "fsqlite"' \
+    'version = "0.3.0"' \
+    'source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=4d09168fff2fdf5d7f8ede1607db5e040bca724b#4d09168fff2fdf5d7f8ede1607db5e040bca724b"' >"${source_root}/Cargo.lock"
 
   git -C "$source_root" init -q
   git -C "$source_root" config user.name "Frankensearch Publish Contract"
   git -C "$source_root" config user.email "publish-contract@example.invalid"
-  git -C "$source_root" add .gitignore Cargo.lock scripts/check_crates_publish_contract.sh
+  git -C "$source_root" add .gitignore Cargo.toml Cargo.lock scripts/check_crates_publish_contract.sh
   git -C "$source_root" -c commit.gpgsign=false commit -qm "seed clean source fixture"
 
   jq -n --arg root "$temp_dir" '{
@@ -392,6 +424,263 @@ run_self_test() {
     "$source_root" \
     "$script_path"
 
+  printf '%s\n' \
+    'fsqlite-unexpected={package="fsqlite",git="https://github.com/Dicklesworthstone/frankensqlite",rev="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' >>"${source_root}/Cargo.toml"
+
+  if bash "$script_path" \
+    --mode gate \
+    --scope facade \
+    --metadata "$metadata_path" \
+    --registry-census "$census_path" \
+    --release-tag "crates-v0.4.0" \
+    --source-sha "$source_sha" \
+    --allow-dirty \
+    --output "$unexpected_patch_receipt"; then
+    echo "ERROR: unexpected FrankenSQLite patch revision self-test unexpectedly passed" >&2
+    return 1
+  fi
+
+  jq -e '
+    .blocker_codes == ["FRANKENSQLITE_PATCH_REVISION_SET_INVALID"]
+  ' "$unexpected_patch_receipt" >/dev/null
+
+  printf '%s\n' \
+    '[patch.crates-io]' \
+    'fsqlite-hfdt={package="fsqlite",git="https://github.com/Dicklesworthstone/frankensqlite"} # rev="500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d"' \
+    'fsqlite-main={package="fsqlite",git="https://github.com/Dicklesworthstone/frankensqlite",rev="4d09168fff2fdf5d7f8ede1607db5e040bca724b"}' >"${source_root}/Cargo.toml"
+
+  if bash "$script_path" \
+    --mode gate \
+    --scope facade \
+    --metadata "$metadata_path" \
+    --registry-census "$census_path" \
+    --release-tag "crates-v0.4.0" \
+    --source-sha "$source_sha" \
+    --allow-dirty \
+    --output "$comment_only_rev_receipt"; then
+    echo "ERROR: comment-only FrankenSQLite revision self-test unexpectedly passed" >&2
+    return 1
+  fi
+
+  jq -e '
+    .blocker_codes == ["FRANKENSQLITE_PATCH_REVISION_SET_INVALID"]
+  ' "$comment_only_rev_receipt" >/dev/null
+
+  printf '%s\n' \
+    '[patch.crates-io]' \
+    'fsqlite-hfdt={package="fsqlite",git="https://github.com/Dicklesworthstone/frankensqlite",notrev="500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d",note='\''rev="500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d"'\''}' \
+    'fsqlite-main={package="fsqlite",git="https://github.com/Dicklesworthstone/frankensqlite",rev="4d09168fff2fdf5d7f8ede1607db5e040bca724b"}' >"${source_root}/Cargo.toml"
+
+  if bash "$script_path" \
+    --mode gate \
+    --scope facade \
+    --metadata "$metadata_path" \
+    --registry-census "$census_path" \
+    --release-tag "crates-v0.4.0" \
+    --source-sha "$source_sha" \
+    --allow-dirty \
+    --output "$notrev_only_receipt"; then
+    echo "ERROR: non-rev FrankenSQLite field self-test unexpectedly passed" >&2
+    return 1
+  fi
+
+  jq -e '
+    .blocker_codes == ["FRANKENSQLITE_PATCH_REVISION_SET_INVALID"]
+  ' "$notrev_only_receipt" >/dev/null
+
+  printf '%s\n' \
+    '[patch.crates-io]' \
+    'fsqlite-hfdt={package="fsqlite",git="https://github.com/Dicklesworthstone/frankensqlite",rev="500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d",note="unrelated # value"}' \
+    'fsqlite-main={package="fsqlite",git="https://github.com/Dicklesworthstone/frankensqlite",rev="4d09168fff2fdf5d7f8ede1607db5e040bca724b"}' >"${source_root}/Cargo.toml"
+
+  bash "$script_path" \
+    --mode gate \
+    --scope facade \
+    --metadata "$metadata_path" \
+    --registry-census "$census_path" \
+    --release-tag "crates-v0.4.0" \
+    --source-sha "$source_sha" \
+    --allow-dirty \
+    --output "$quoted_hash_receipt"
+
+  jq -e '
+    .status == "ready"
+    and .blocker_codes == []
+  ' "$quoted_hash_receipt" >/dev/null
+
+  printf '%s\n' \
+    '[patch.crates-io]' \
+    'fsqlite-unused-alias={package="not-fsqlite",git="https://example.invalid/evil",rev="500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d"}' \
+    'unused-package-alias={package="fsqlite-unused-package",git="https://example.invalid/evil",rev="4d09168fff2fdf5d7f8ede1607db5e040bca724b"}' >"${source_root}/Cargo.toml"
+
+  if bash "$script_path" \
+    --mode gate \
+    --scope facade \
+    --metadata "$metadata_path" \
+    --registry-census "$census_path" \
+    --release-tag "crates-v0.4.0" \
+    --source-sha "$source_sha" \
+    --allow-dirty \
+    --output "$evil_git_patch_receipt"; then
+    echo "ERROR: evil FrankenSQLite patch source self-test unexpectedly passed" >&2
+    return 1
+  fi
+
+  jq -e '
+    .blocker_codes == ["FRANKENSQLITE_PATCH_REVISION_SET_INVALID"]
+  ' "$evil_git_patch_receipt" >/dev/null
+
+  printf '%s\n' \
+    '[patch.crates-io]' \
+    'fsqlite-hfdt = { package = "fsqlite", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }' \
+    'fsqlite-main = { package = "fsqlite", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4d09168fff2fdf5d7f8ede1607db5e040bca724b" }' >"${source_root}/Cargo.toml"
+  printf '%s\n' \
+    'version = 4' \
+    '' \
+    '[[package]]' \
+    'name = "asupersync"' \
+    'version = "0.4.3"' \
+    'source = "registry+https://example.invalid/index"' \
+    '' \
+    '[[package]]' \
+    'name = "fsqlite"' \
+    'version = "0.1.19"' \
+    'source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d#500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d"' \
+    '' \
+    '[[package]]' \
+    'name = "fsqlite"' \
+    'version = "0.3.0"' \
+    'source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=4d09168fff2fdf5d7f8ede1607db5e040bca724b#4d09168fff2fdf5d7f8ede1607db5e040bca724b"' >"${source_root}/Cargo.lock"
+
+  if bash "$script_path" \
+    --mode gate \
+    --scope facade \
+    --metadata "$metadata_path" \
+    --registry-census "$census_path" \
+    --release-tag "crates-v0.4.0" \
+    --source-sha "$source_sha" \
+    --allow-dirty \
+    --output "$wrong_asupersync_source_receipt"; then
+    echo "ERROR: wrong Asupersync source self-test unexpectedly passed" >&2
+    return 1
+  fi
+
+  jq -e '
+    .blocker_codes == ["DEPENDENCY_UNIVERSE_ASUPERSYNC_LOCK_IDENTITY_INVALID"]
+  ' "$wrong_asupersync_source_receipt" >/dev/null
+
+  printf '%s\n' \
+    'version = 4' \
+    '' \
+    '[[package]]' \
+    'name = "asupersync"' \
+    'version = "0.4.3"' \
+    'source = "registry+https://github.com/rust-lang/crates.io-index"' \
+    '' \
+    '[[package]]' \
+    'name = "fsqlite"' \
+    'version = "0.1.19"' \
+    'source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=0000000000000000000000000000000000000000#0000000000000000000000000000000000000000"' \
+    '' \
+    '[[package]]' \
+    'name = "fsqlite"' \
+    'version = "0.3.0"' \
+    'source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=4d09168fff2fdf5d7f8ede1607db5e040bca724b#4d09168fff2fdf5d7f8ede1607db5e040bca724b"' >"${source_root}/Cargo.lock"
+
+  if bash "$script_path" \
+    --mode gate \
+    --scope facade \
+    --metadata "$metadata_path" \
+    --registry-census "$census_path" \
+    --release-tag "crates-v0.4.0" \
+    --source-sha "$source_sha" \
+    --allow-dirty \
+    --output "$invalid_fsqlite_source_receipt"; then
+    echo "ERROR: invalid FrankenSQLite source self-test unexpectedly passed" >&2
+    return 1
+  fi
+
+  jq -e '
+    .blocker_codes == ["DEPENDENCY_UNIVERSE_FSQLITE_LOCK_SOURCE_INVALID"]
+  ' "$invalid_fsqlite_source_receipt" >/dev/null
+
+  printf '%s\n' \
+    'version = 4' \
+    '' \
+    '[[package]]' \
+    'name = "asupersync"' \
+    'version = "0.4.3"' \
+    'source = "registry+https://github.com/rust-lang/crates.io-index"' \
+    '' \
+    '[[package]]' \
+    'name = "fsqlite"' \
+    'version = "0.1.19"' \
+    'source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d#500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d"' \
+    '' \
+    '[[package]]' \
+    'name = "fsqlite"' \
+    'version = "0.3.0"' \
+    'source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=4d09168fff2fdf5d7f8ede1607db5e040bca724b#4d09168fff2fdf5d7f8ede1607db5e040bca724b"' >"${source_root}/Cargo.lock"
+  printf '%s\n' \
+    '' \
+    '[[package]]' \
+    'name = "asupersync"' \
+    'version = "0.4.3"' \
+    'source = "registry+https://github.com/rust-lang/crates.io-index"' >>"${source_root}/Cargo.lock"
+
+  if bash "$script_path" \
+    --mode gate \
+    --scope facade \
+    --metadata "$metadata_path" \
+    --registry-census "$census_path" \
+    --release-tag "crates-v0.4.0" \
+    --source-sha "$source_sha" \
+    --allow-dirty \
+    --output "$duplicate_asupersync_receipt"; then
+    echo "ERROR: duplicate Asupersync identity self-test unexpectedly passed" >&2
+    return 1
+  fi
+
+  jq -e '
+    .blocker_codes == ["DEPENDENCY_UNIVERSE_ASUPERSYNC_LOCK_IDENTITY_INVALID"]
+  ' "$duplicate_asupersync_receipt" >/dev/null
+
+  printf '%s\n' \
+    'version = 4' \
+    '' \
+    '[[package]]' \
+    'name = "asupersync"' \
+    'version = "0.4.2"' \
+    'source = "registry+https://github.com/rust-lang/crates.io-index"' \
+    '' \
+    '[[package]]' \
+    'name = "fsqlite"' \
+    'version = "0.1.19"' \
+    'source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=0000000000000000000000000000000000000000#0000000000000000000000000000000000000000"' \
+    '' \
+    '[[package]]' \
+    'name = "fsqlite"' \
+    'version = "0.3.0"' \
+    'source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=4d09168fff2fdf5d7f8ede1607db5e040bca724b#4d09168fff2fdf5d7f8ede1607db5e040bca724b"' >"${source_root}/Cargo.lock"
+
+  if bash "$script_path" \
+    --mode gate \
+    --scope facade \
+    --metadata "$metadata_path" \
+    --registry-census "$census_path" \
+    --release-tag "crates-v0.4.0" \
+    --source-sha "$source_sha" \
+    --allow-dirty \
+    --output "$negative_lock_receipt"; then
+    echo "ERROR: dependency-universe lock self-test unexpectedly passed" >&2
+    return 1
+  fi
+
+  jq -e '
+    ([.blockers[].code] | index("DEPENDENCY_UNIVERSE_ASUPERSYNC_LOCK_IDENTITY_INVALID")) != null
+    and ([.blockers[].code] | index("DEPENDENCY_UNIVERSE_FSQLITE_LOCK_SOURCE_INVALID")) != null
+  ' "$negative_lock_receipt" >/dev/null
+
   echo "publish-contract self-test passed"
   echo "positive receipt: $positive_receipt"
   echo "negative receipt: $negative_receipt"
@@ -434,6 +723,167 @@ add_blocker() {
       message: $message,
       remediation: $remediation
     }' >>"$BLOCKERS_FILE"
+}
+
+validate_dependency_universe_lock() {
+  local asupersync_identity_csv fsqlite_patch_revision_csv fsqlite_source_csv
+  local fsqlite_source fsqlite_package fsqlite_source_entry
+  local legacy_seen=false main_seen=false
+  local -a asupersync_identities fsqlite_patch_revisions fsqlite_lock_sources invalid_fsqlite_sources
+  invalid_fsqlite_sources=()
+  local legacy_revision="500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d"
+  local main_revision="4d09168fff2fdf5d7f8ede1607db5e040bca724b"
+  local registry_source="registry+https://github.com/rust-lang/crates.io-index"
+  local frankensqlite_source="git+https://github.com/Dicklesworthstone/frankensqlite"
+
+  mapfile -t asupersync_identities < <(
+    awk '
+      BEGIN { RS = ""; FS = "\\n" }
+      $1 == "[[package]]" {
+        name = ""
+        version = ""
+        source = ""
+        for (i = 2; i <= NF; i++) {
+          if ($i ~ /^name = "/) {
+            name = $i
+            sub(/^name = "/, "", name)
+            sub(/"$/, "", name)
+          } else if ($i ~ /^version = "/) {
+            version = $i
+            sub(/^version = "/, "", version)
+            sub(/"$/, "", version)
+          } else if ($i ~ /^source = "/) {
+            source = $i
+            sub(/^source = "/, "", source)
+            sub(/"$/, "", source)
+          }
+        }
+        if (name == "asupersync") {
+          printf "%s@%s|%s\n", name, version, source
+        }
+      }
+    ' "$LOCKFILE"
+  )
+  if (( ${#asupersync_identities[@]} != 1 )) \
+    || [[ "${asupersync_identities[0]:-}" != "asupersync@0.4.3|${registry_source}" ]]; then
+    asupersync_identity_csv="$(IFS=,; printf '%s' "${asupersync_identities[*]:-<none>}")"
+    add_blocker \
+      "DEPENDENCY_UNIVERSE_ASUPERSYNC_LOCK_IDENTITY_INVALID" \
+      "" \
+      "asupersync" \
+      "bd-3h229" \
+      "Cargo.lock must resolve exactly one Asupersync identity, asupersync@0.4.3|${registry_source}; found ${asupersync_identity_csv}." \
+      "Regenerate the lockfile only after restoring the audited Asupersync 0.4.3 registry identity."
+  fi
+
+  mapfile -t fsqlite_patch_revisions < <(
+    python3 - "${ROOT_DIR}/Cargo.toml" <<'PY' | LC_ALL=C sort -u
+import re
+import sys
+import tomllib
+
+sentinel = "<invalid-fsqlite-patch>"
+source = "https://github.com/Dicklesworthstone/frankensqlite"
+
+try:
+    with open(sys.argv[1], "rb") as manifest_file:
+        manifest = tomllib.load(manifest_file)
+except (OSError, tomllib.TOMLDecodeError):
+    print(f"{sentinel}:parse")
+    raise SystemExit
+
+patch = manifest.get("patch")
+if patch is None:
+    print(f"{sentinel}:missing")
+    raise SystemExit
+if not isinstance(patch, dict):
+    print(f"{sentinel}:type")
+    raise SystemExit
+if "crates-io" not in patch:
+    print(f"{sentinel}:missing")
+    raise SystemExit
+if not isinstance(patch["crates-io"], dict):
+    print(f"{sentinel}:type")
+    raise SystemExit
+patches = patch["crates-io"]
+
+for alias, spec in patches.items():
+    package = spec.get("package") if isinstance(spec, dict) else None
+    if not (
+        isinstance(alias, str) and alias.startswith("fsqlite")
+        or isinstance(package, str) and package.startswith("fsqlite")
+    ):
+        continue
+    if not isinstance(spec, dict):
+        print(f"{sentinel}:type")
+    elif "git" not in spec or "rev" not in spec:
+        print(f"{sentinel}:missing")
+    elif spec["git"] != source:
+        print(f"{sentinel}:wrong-git")
+    elif not isinstance(spec["rev"], str) or not re.fullmatch(r"[0-9a-f]{40}", spec["rev"]):
+        print(f"{sentinel}:invalid-rev")
+    else:
+        print(spec["rev"])
+PY
+  )
+  if (( ${#fsqlite_patch_revisions[@]} != 2 )) \
+    || [[ "${fsqlite_patch_revisions[0]:-}" != "$main_revision" ]] \
+    || [[ "${fsqlite_patch_revisions[1]:-}" != "$legacy_revision" ]]; then
+    fsqlite_patch_revision_csv="$(IFS=,; printf '%s' "${fsqlite_patch_revisions[*]:-<none>}")"
+    add_blocker \
+      "FRANKENSQLITE_PATCH_REVISION_SET_INVALID" \
+      "" \
+      "fsqlite" \
+      "bd-3h229" \
+      "Cargo.toml must declare only the audited FrankenSQLite patch revisions ${legacy_revision} and ${main_revision}; found ${fsqlite_patch_revision_csv}." \
+      "Restore the two audited FrankenSQLite revisions in [patch.crates-io] before regenerating Cargo.lock."
+  fi
+
+  mapfile -t fsqlite_lock_sources < <(
+    awk '
+      BEGIN { RS = ""; FS = "\\n" }
+      $1 == "[[package]]" {
+        name = ""
+        source = ""
+        for (i = 2; i <= NF; i++) {
+          if ($i ~ /^name = "/) {
+            name = $i
+            sub(/^name = "/, "", name)
+            sub(/"$/, "", name)
+          } else if ($i ~ /^source = "/) {
+            source = $i
+            sub(/^source = "/, "", source)
+            sub(/"$/, "", source)
+          }
+        }
+        if (name ~ /^fsqlite/) {
+          printf "%s|%s\n", name, source
+        }
+      }
+    ' "$LOCKFILE"
+  )
+  for fsqlite_source_entry in "${fsqlite_lock_sources[@]}"; do
+    fsqlite_package="${fsqlite_source_entry%%|*}"
+    fsqlite_source="${fsqlite_source_entry#*|}"
+    case "$fsqlite_source" in
+      "${frankensqlite_source}?rev=${legacy_revision}#${legacy_revision}") legacy_seen=true ;;
+      "${frankensqlite_source}?rev=${main_revision}#${main_revision}") main_seen=true ;;
+      *) invalid_fsqlite_sources+=("${fsqlite_package}|${fsqlite_source}") ;;
+    esac
+  done
+  if (( ${#fsqlite_lock_sources[@]} == 0 )) \
+    || [[ "$legacy_seen" != true ]] \
+    || [[ "$main_seen" != true ]] \
+    || (( ${#invalid_fsqlite_sources[@]} > 0 )); then
+    fsqlite_source_csv="$(IFS=,; printf '%s' "${invalid_fsqlite_sources[*]:-<none>}")"
+    add_blocker \
+      "DEPENDENCY_UNIVERSE_FSQLITE_LOCK_SOURCE_INVALID" \
+      "" \
+      "fsqlite" \
+      "bd-3h229" \
+      "Cargo.lock must resolve every fsqlite* package to an audited FrankenSQLite source identity at ${legacy_revision} or ${main_revision}; invalid entries: ${fsqlite_source_csv}." \
+      "Regenerate Cargo.lock only from the audited [patch.crates-io] FrankenSQLite revisions."
+  fi
 }
 
 dependency_bead() {
@@ -517,6 +967,7 @@ LOCKFILE="${ROOT_DIR}/Cargo.lock"
 LOCKFILE_SHA=""
 if [[ -f "$LOCKFILE" ]]; then
   LOCKFILE_SHA="$(sha256_file "$LOCKFILE")"
+  validate_dependency_universe_lock
 else
   add_blocker \
     "CARGO_LOCK_MISSING" \
