@@ -6395,6 +6395,11 @@ impl QuillWriterState {
                         "arena_bytes_reserved_high_water",
                         u64::try_from(receipt.arena_bytes_reserved_high_water).unwrap_or(u64::MAX),
                     );
+                    debug_assert_eq!(
+                        receipt.worker_witness,
+                        observation.snapshot(),
+                        "committed parallel receipt must match the batch observation"
+                    );
                     self.ingest_retry_required = false;
                     // The whole operation is finished here: the fan-out published
                     // a receipt and nothing further can fail.
@@ -25425,7 +25430,7 @@ mod tests {
         // moved above the early exits this emitted NOTHING.
         let captured = capture_ingest_spans(|| {
             run_with_cx(|cx| async move {
-                let mut index =
+                let index =
                     QuillIndex::in_memory(QuillConfig::default()).expect("empty-batch index");
                 index
                     .index_documents(&cx, &[])
@@ -25442,7 +25447,7 @@ mod tests {
         // another exit that used to precede the recorder.
         let captured = capture_ingest_spans(|| {
             run_with_cx(|cx| async move {
-                let mut index =
+                let index =
                     QuillIndex::in_memory(QuillConfig::default()).expect("admission-error index");
                 let duplicate = vec![
                     IndexableDocument::new("duplicate-id", "alpha"),
@@ -25463,7 +25468,7 @@ mod tests {
         // live flag read at drop time.
         let captured = capture_ingest_spans(|| {
             run_with_cx(|cx| async move {
-                let mut index =
+                let index =
                     QuillIndex::in_memory(QuillConfig::default()).expect("cancellation index");
                 let cancelled = cx.clone();
                 cancelled.set_cancel_requested(true);
