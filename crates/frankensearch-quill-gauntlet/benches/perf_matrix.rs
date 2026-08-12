@@ -1207,6 +1207,12 @@ fn qg1_live_sample_binding(
     arm: PerfSampleArm,
     order: PerfSampleOrder,
 ) -> Option<Qg1SampleBinding> {
+    // Refuse a foreign producer before removing its one-shot capability. This
+    // applies equally to the Tantivy null stream: attach-null must consume the
+    // same independently retained authority as the effect stream.
+    if !estimator_config.qg1_expected_authority_matches(producer.expected_authority()) {
+        return None;
+    }
     let continuous = continuous?;
     let receipt = &continuous.lifecycle_receipt;
     receipt.validate().ok()?;

@@ -4528,6 +4528,13 @@ impl PairedEstimatorConfig {
             .is_some_and(|authority| binding.matches_authority(authority, scope, provenance))
     }
 
+    /// Confirm that a live producer is the retained authority for this exact
+    /// QG-1 invocation before it consumes a one-shot capability.
+    #[must_use]
+    pub fn qg1_expected_authority_matches(&self, expected: &Qg1ExpectedAuthority) -> bool {
+        self.qg1_expected_authority.as_ref() == Some(expected)
+    }
+
     /// Return the exact number of pre-issued rows for one QG-1 stream role.
     #[must_use]
     pub fn qg1_issued_stream_row_count(
@@ -7792,7 +7799,7 @@ mod tests {
         let provenance = provenance("qg1-binding-hostile");
         let durations = [1_000_000; PERF_MIN_RUNS];
         let mut treatment_durations = [900_000; PERF_MIN_RUNS];
-        treatment_durations[PERF_MIN_RUNS - 1] = 1_200_000;
+        treatment_durations[PERF_MIN_RUNS - 1] = 940_000;
         let authority = qg1_test_authority(
             &scope,
             &provenance,
@@ -7851,6 +7858,20 @@ mod tests {
             Some(&expected_authority),
         )
         .expect("the live estimator compares QG-1 rows to the independently retained authority");
+        let mut live_config = config.clone();
+        live_config.qg1_expected_authority = Some(expected_authority.clone());
+        let live_intact_experiment = estimate_paired_experiment(&effect, &null, &live_config)
+            .expect("the intact QG-1 lifecycle binding reaches the screen and decision guard");
+        assert!(
+            qg1_valid_throughput_experiment(
+                &live_intact_experiment,
+                &scope,
+                Some(&provenance),
+                500,
+                64_000,
+            ),
+            "the shared QG-1 screen and decision guard admits live producer-authenticated evidence"
+        );
 
         let assert_rejected = |effect: Vec<PerfRawSample>, label: &str| {
             assert!(
@@ -7955,6 +7976,25 @@ mod tests {
             )
             .is_err(),
             "independent authority must reject exact suffix slots copied from fast rows after full resealing"
+        );
+        let forged_live_experiment =
+            estimate_paired_experiment(&cloned_fast_pair, &null, &live_config)
+                .expect("the public receipt fields remain self-consistent after full resealing");
+        assert!(
+            !qg1_valid_throughput_experiment(
+                &forged_live_experiment,
+                &scope,
+                Some(&provenance),
+                500,
+                64_000,
+            ),
+            "the shared QG-1 screen and decision guard must consume retained authority, not self-sealed receipt fields"
+        );
+        assert!(
+            forged_live_experiment
+                .verify_recomputed_against_qg1_authority(Some(&expected_authority))
+                .is_err(),
+            "persisted replay must reject an exact fast-suffix substitution even after complete public resealing"
         );
 
         let lowered_authority = qg1_test_authority(
