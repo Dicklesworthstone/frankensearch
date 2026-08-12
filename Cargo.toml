@@ -95,7 +95,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 rayon = "1.10"
 
 # Compact strings and POD casts used by Quill's ingest/SIMD paths.
-compact_str = "0.9"
+compact_str = "0.10"
 bytemuck = "1"
 
 # SIMD and f16 quantization (unconditional for frankensearch-index)
@@ -112,10 +112,10 @@ memmap2 = "0.9"
 # Default features pull in native-tls and network stacks that transitively
 # depend on forbidden Tokio ecosystem crates. Keep only ORT's rustls-backed
 # binary acquisition path; model provisioning is owned by frankensearch.
-fastembed = { version = "=5.17.2", default-features = false, features = [
+fastembed = { version = "=5.17.4", default-features = false, features = [
     "ort-download-binaries-rustls-tls",
 ] }
-safetensors = "0.7.0"
+safetensors = "0.8.0"
 tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
 # frankentorch (pure-Rust tensor lib) backing the frankensearch-rerank `native`
 # feature (cross-encoder reranker + MiniLM embedder). Pinned by GIT REV so downstream
@@ -126,17 +126,20 @@ tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-
 # crate), so a git rev is the consumable pin. For local frankentorch development, add a
 # `[patch."https://github.com/Dicklesworthstone/frankentorch"]` block pointing ft-api /
 # ft-autograd / ft-core at ../frankentorch/crates/* locally (do NOT commit it).
-ft-api = { git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c305306b251753099620ad5fe02e78c07c167cf6" }
-ft-autograd = { git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c305306b251753099620ad5fe02e78c07c167cf6" }
-ft-core = { git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c305306b251753099620ad5fe02e78c07c167cf6" }
+ft-api = { git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c5d2ede1b1644ed439a00b9e814bfcf205bbe1c0" }
+ft-autograd = { git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c5d2ede1b1644ed439a00b9e814bfcf205bbe1c0" }
+ft-core = { git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c5d2ede1b1644ed439a00b9e814bfcf205bbe1c0" }
 
 # Full-text search
-tantivy = "=0.26.1"
+# Tantivy 0.26.1 (the latest crates.io release as of 2026-08-11) still pins
+# unsound lru 0.16.x (RUSTSEC-2026-0253). Pin the exact upstream 0.27 commit
+# that has moved to patched lru 0.18.2 until the next stable release lands.
+tantivy = { git = "https://github.com/quickwit-oss/tantivy", rev = "1f32c1a8af0eb9d68bd3f5576caf20941364b657" }
 
 ndarray = "0.17"
 
 # HNSW approximate nearest neighbors
-hnsw_rs = { git = "https://github.com/Dicklesworthstone/hnswlib-rs", rev = "18a5a1a9982138822c34d4c3fb29f4c883715069", default-features = false }
+hnsw_rs = { git = "https://github.com/Dicklesworthstone/hnswlib-rs", rev = "fe44c6b717628997812da671848b046668451216", default-features = false }
 
 # CRC32 checksums for FSVI index integrity
 crc32fast = "1"
@@ -159,13 +162,13 @@ toml = "1.0.3"
 sha2 = "0.11.0"
 
 # Authenticated encryption and keyed digests for private evidence artifacts (bd-fttb)
-chacha20poly1305 = "=0.10.1"
-getrandom = "=0.2.17"
+chacha20poly1305 = "=0.11.0"
+getrandom = "=0.4.3"
 hmac = "=0.13.0"
 zeroize = "=1.9.0"
 
 # PDF text extraction (digital PDFs with selectable text)
-pdf-extract = "0.10"
+pdf-extract = "0.12.0"
 
 # Benchmarking
 criterion = { version = "0.8.2", features = ["html_reports"] }
@@ -174,35 +177,35 @@ proptest = "1.6"
 # Date/time formatting/parsing for telemetry RFC3339 timestamps
 
 # System information (CPU, memory, etc.)
-sysinfo = "0.38.2"
+sysinfo = "0.39.6"
 
 # FrankenTUI terminal UI framework
-ftui-core = "0.2.1"
-ftui-render = "0.2.1"
-ftui-style = "0.2.1"
-ftui-text = "0.2.1"
-ftui-layout = "0.2.1"
-ftui-widgets = "0.2.1"
-ftui-tty = "0.2.1"
-ftui-backend = "0.2.1"
-ftui-extras = "0.2.1"
+ftui-core = "0.5.0"
+ftui-render = "0.5.0"
+ftui-style = "0.5.0"
+ftui-text = "0.5.0"
+ftui-layout = "0.5.1"
+ftui-widgets = "0.5.0"
+ftui-tty = "0.5.0"
+ftui-backend = "0.5.0"
+ftui-extras = "0.5.0"
 
-# Frankensearch deliberately spans two FrankenSQLite API lines: fsfs and
+# Frankensearch temporarily spans two FrankenSQLite API lines: fsfs and
 # durability still consume the synchronous 0.1.19 contract used by HFDT,
-# while storage and ops consume the async 0.2.1 contract. Patch both exact
-# lines to audited commits that use Asupersync 0.4.3 so Cargo cannot recreate
-# a hidden 0.3.x runtime through either substrate edge.
+# while storage and ops consume the current async 0.3.0 contract. Patch both
+# exact lines to audited commits that use Asupersync 0.4.3 so Cargo cannot
+# recreate a hidden 0.3.x runtime through either substrate edge.
 [patch.crates-io]
 fsqlite-hfdt = { package = "fsqlite", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
 fsqlite-core-hfdt = { package = "fsqlite-core", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
 fsqlite-error-hfdt = { package = "fsqlite-error", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
 fsqlite-ext-fts5-hfdt = { package = "fsqlite-ext-fts5", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
 fsqlite-types-hfdt = { package = "fsqlite-types", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
-fsqlite-main = { package = "fsqlite", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690" }
-fsqlite-core-main = { package = "fsqlite-core", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690" }
-fsqlite-error-main = { package = "fsqlite-error", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690" }
-fsqlite-ext-fts5-main = { package = "fsqlite-ext-fts5", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690" }
-fsqlite-types-main = { package = "fsqlite-types", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690" }
+fsqlite-main = { package = "fsqlite", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4d09168fff2fdf5d7f8ede1607db5e040bca724b" }
+fsqlite-core-main = { package = "fsqlite-core", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4d09168fff2fdf5d7f8ede1607db5e040bca724b" }
+fsqlite-error-main = { package = "fsqlite-error", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4d09168fff2fdf5d7f8ede1607db5e040bca724b" }
+fsqlite-ext-fts5-main = { package = "fsqlite-ext-fts5", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4d09168fff2fdf5d7f8ede1607db5e040bca724b" }
+fsqlite-types-main = { package = "fsqlite-types", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4d09168fff2fdf5d7f8ede1607db5e040bca724b" }
 
 [workspace.lints.rust]
 # `deny` instead of `forbid` so crates that need unsafe (e.g. mmap) can opt in.

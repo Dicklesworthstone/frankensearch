@@ -1,47 +1,43 @@
 # Dependency Upgrade Log
 
-## 2026-08-11 — Asupersync 0.4.3 resolution barrier: REJECTED
+## 2026-08-11 — Asupersync 0.4.3 and FrankenSQLite 0.3 migration: IN PROGRESS
 
-**Scope:** the root `asupersync` workspace constraint was tested as an isolated
-family update. The central lock-resolution barrier rejected it before any
-build, test, performance claim, or downstream dependency update.
+**Scope:** the workspace now resolves one Asupersync runtime family at 0.4.3.
+The earlier resolution barrier was removed by lifting FrankenSearch's production
+FrankenSQLite edge from the synchronous 0.1 API to the asynchronous 0.3 API.
 
-### Asupersync: attempted `0.3.10` → `0.4.3`; retained `0.3.10`
+### Asupersync: `0.3.10` → `0.4.3`
 
-- **Target provenance:** stable `v0.4.3` tag and source changelog, plus the
-  local registry/lock baseline at `0.3.10`.
-- **Attempted constraint:** `>=0.3.10, <0.4` → `>=0.4.3, <0.5`, retaining
-  `default-features = false` and the production `proc-macros` feature exactly.
-- **Breaking-change review:** v0.4.0 correctly re-anchors the earlier
-  tracked-session-channel break: `TrackedSender::try_reserve` now receives
-  `&Cx`, and `TrackedPermit::try_send` returns `CommittedProof<SendPermit>`.
-  A repository-wide source search found no use of `TrackedSender`,
-  `TrackedPermit`, `try_reserve`, or `try_send`, so the migration needs **zero
-  Rust source-file edits** (within the ten-file limit).
-- **Feature/API review:** the required `proc-macros`, `test-internals`, `tls`,
-  and `tls-webpki-roots` feature names remain available at the target. The
-  existing production/test feature-unification boundary is unchanged.
-- **Resolution result:** **REJECT**. Normal lock resolution retained
-  FrankenSQLite 0.1.19 on Asupersync 0.3.10 and added Asupersync 0.4.3 for the
-  workspace, producing two runtime, kernel, decision, and evidence universes.
-  Forcing the Asupersync package replacement instead downgraded the entire
-  FrankenSQLite family to 0.1.2 and introduced Asupersync 0.2.9 alongside
-  0.4.3. Both graphs violate the single-runtime contract.
-- **Disposition:** restored the `>=0.3.10, <0.4` constraint and the original
-  lockfile. No Cargo build/test/check/clippy, RCH, UBS, GitHub Actions, or
-  performance run was attempted because dependency resolution itself failed.
-  Asupersync 0.4.3 may be retried only with the separately authorized
-  FrankenSQLite 0.2.1 async/data migration.
+- **Target provenance:** stable `v0.4.3` crates.io release and tagged upstream
+  source/changelog.
+- **Constraint:** `>=0.4.3, <0.5`, with `default-features = false` and the
+  production `proc-macros` feature retained. Test-only crates opt into
+  `test-internals` explicitly.
+- **Graph result:** the root workspace, FrankenSQLite 0.3 production edge, and
+  retained FrankenSQLite 0.1 compatibility edge all resolve Asupersync 0.4.3;
+  `cargo tree -d` shows no second Asupersync version.
+- **Contract updates:** dependency-identity assertions and the separately rooted
+  gauntlet fuzz workspace now bind 0.4.3 instead of the stale 0.3.10 identity.
 
-### FrankenSQLite / `fsqlite`: research complete, intentionally deferred
+### FrankenSQLite / `fsqlite`: production edge `0.1.19` → `0.3.0`
 
-- **Target researched:** `fsqlite`, `fsqlite-types`, and `fsqlite-ext-fts5`
-  `0.1.19` (resolved baseline for the manifest's `0.1.2` range) → `0.2.1`.
-- **Why deferred:** v0.2.0 makes `Connection::open`, execution, query, row,
-  and statement APIs async end-to-end, requiring `.await` and executor/context
-  migration across more than ten source files. Existing Porter FTS5 indexes
-  also need a data migration/rebuild. This must be a separately authorized,
-  source-and-data migration rather than part of the Asupersync batch.
+- Storage operations were migrated to the async connection, statement, row,
+  transaction, and FTS5 APIs.
+- FrankenSearch's synchronous public storage contract is preserved through
+  FrankenSQLite 0.3's `AsyncConnection` synchronous facade. The connection owns
+  its worker boundary; FrankenSearch does not create an ambient runtime or mint
+  test contexts in production storage code.
+- Commit and rollback now execute the real FrankenSQLite transaction operations;
+  a dropped or panicking transaction is rolled back before the worker accepts
+  another request.
+- The legacy 0.1 package remains only where the current FrankenSQLite extension
+  graph still exposes that audited compatibility edge. Both package lines share
+  Asupersync 0.4.3, so they no longer split the runtime universe.
+
+### Validation
+
+Remote workspace/profile checks, focused storage tests, fuzz-workspace compile,
+dependency audit, and CI validation are recorded with the completing commit.
 
 ### Primary sources
 

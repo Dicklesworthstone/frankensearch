@@ -89,7 +89,7 @@ ftui-backend = { workspace = true }
 ftui-extras = { workspace = true, features = ["markdown"] }
 # MIGRATION SHIM (temporary): fsfs's binary entrypoints still mint ambient
 # contexts via Cx::for_request() (main.rs:188, runtime.rs:1563, runtime.rs:6880),
-# which asupersync 0.3.2+ cfg-gates behind test-internals. fsfs is a LEAF
+# which Asupersync 0.4.3 cfg-gates behind test-internals. fsfs is a LEAF
 # binary crate — no lib crate or external consumer (e.g. HFDT) has it in
 # their graph, so this does NOT re-leak test-internals downstream. Proper fix:
 # migrate the three sites to runtime-injected contexts (spawn_with_cx /
@@ -99,7 +99,7 @@ ahash = { workspace = true }
 # compact_str: SSO short-string type (inline <=24 bytes, zero heap alloc) for
 # lexical token text — the per-token to_ascii_lowercase heap alloc dominated
 # tokenize_lexical emission. Already resolved in the workspace lock (fusion dep).
-compact_str = "0.9"
+compact_str = "0.10"
 fsqlite = "0.1.2"
 fsqlite-types = "0.1.2"
 serde = { workspace = true }
@@ -126,7 +126,7 @@ frankensearch-lexical = { workspace = true }
 proptest = { workspace = true }
 # Fixtures are in-memory/local; the default HTTP resolver pulls the forbidden
 # reqwest/hyper/Tokio stack without providing any test coverage value.
-jsonschema = { version = "0.46", default-features = false }
+jsonschema = { version = "0.49", default-features = false }
 criterion = { workspace = true }
 
 [[bench]]
