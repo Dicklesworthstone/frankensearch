@@ -15874,10 +15874,10 @@ mod tests {
     }
 
     #[test]
-    fn public_snippet_search_low_fuel_glob_refuses_before_tail_dictionary_work() {
+    fn public_snippet_search_low_fuel_exact_term_refuses_before_tail_dictionary_work() {
         run_with_cx(|cx| async move {
             let mut index = QuillIndex::in_memory(deterministic_config())
-                .expect("create public low-fuel snippet index");
+                .expect("create public low-fuel exact-term snippet index");
             let content = (0..64)
                 .map(|ordinal| format!("tailx{ordinal:03}"))
                 .collect::<Vec<_>>()
@@ -15885,14 +15885,15 @@ mod tests {
             index
                 .index_document(&cx, &IndexableDocument::new("snippet-fuel", content))
                 .await
-                .expect("index adversarial snippet glob fixture");
+                .expect("index adversarial snippet exact-term fixture");
             index
                 .commit(&cx)
                 .await
-                .expect("publish adversarial snippet glob fixture");
+                .expect("publish adversarial snippet exact-term fixture");
 
+            let query = "content:tailx000";
             let ranked = index
-                .search_paginated(&cx, "content:tailx*", 10, 0, false)
+                .search_paginated(&cx, query, 10, 0, false)
                 .expect("prime the public ranked-search cache");
             assert_eq!(
                 ranked.hits.len(),
@@ -15902,20 +15903,23 @@ mod tests {
 
             // The cache hit makes this invocation start exactly at the snippet
             // tail. A zero budget must therefore refuse the first admitted
-            // dictionary unit rather than returning an unmetered snippet.
+            // exact-term dictionary unit rather than returning an unmetered
+            // snippet.
             index.reader.config.query_fuel_budget = 0;
             let first = index
-                .search_with_snippets(&cx, "content:tailx*", 10, &crate::SnippetConfig::default())
-                .expect_err("public low-fuel glob must not bypass the snippet-tail checkpoint");
+                .search_with_snippets(&cx, query, 10, &crate::SnippetConfig::default())
+                .expect_err(
+                    "public low-fuel exact-term must not bypass the snippet-tail checkpoint",
+                );
             let second = index
-                .search_with_snippets(&cx, "content:tailx*", 10, &crate::SnippetConfig::default())
-                .expect_err("repeated public low-fuel glob must fail at the same boundary");
+                .search_with_snippets(&cx, query, 10, &crate::SnippetConfig::default())
+                .expect_err("repeated public low-fuel exact-term must fail at the same boundary");
 
             assert_eq!(fuel_diagnostics(&first), fuel_diagnostics(&second));
             assert_eq!(
                 fuel_diagnostics(&first),
                 (0, 0, 0, 0, 0, 0),
-                "the first tail dictionary admission must refuse before any work is recorded"
+                "the first exact-term tail dictionary admission must refuse before any work is recorded"
             );
         });
     }
@@ -15960,10 +15964,19 @@ mod tests {
                 DeltaSegment::new(DEFAULT_SCHEMA, lease_base, usize::MAX).expect("first Delta");
             apply_sealable_delta_document(&mut first, base, "delta-alpha-one", "alpha", 1);
             apply_sealable_delta_document(&mut first, base + 1, "delta-gamma", "gamma", 1);
-            let mut second = DeltaSegment::new(DEFAULT_SCHEMA, lease_base + 2, usize::MAX)
+            let second_lease_base = first.lease_end();
+            let second_base =
+                u32::try_from(second_lease_base).expect("second Delta docid base fits u32");
+            let mut second = DeltaSegment::new(DEFAULT_SCHEMA, second_lease_base, usize::MAX)
                 .expect("second Delta");
-            apply_sealable_delta_document(&mut second, base + 2, "delta-beta", "beta", 1);
-            apply_sealable_delta_document(&mut second, base + 3, "delta-alpha-two", "alpha", 1);
+            apply_sealable_delta_document(&mut second, second_base, "delta-beta", "beta", 1);
+            apply_sealable_delta_document(
+                &mut second,
+                second_base + 1,
+                "delta-alpha-two",
+                "alpha",
+                1,
+            );
             index
                 .publish_delta_table(vec![
                     Arc::new(first.freeze(generation)),
