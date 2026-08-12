@@ -78,17 +78,13 @@ harness = false
 [dependencies]
 frankensearch-core = { workspace = true }
 frankensearch-tui = { workspace = true }
-# FrankenSQLite 0.2.1 made every `Connection` method `async fn`, so the ops
-# telemetry store drives the `async-api` facade (`AsyncConnection`) and threads
-# a FrankenSQLite `Cx` for cancellation. `async-api` is not a default feature.
-fsqlite = { version = "0.2.1", features = ["async-api"] }
-fsqlite-types = "0.2.1"
-
-# Runtime for the async telemetry store. Every `AsyncConnection` call requires
-# a live asupersync runtime on the calling thread (`Runtime::current_handle`),
-# so the ops binary owns one. The workspace and patched FrankenSQLite 0.2.1
-# revision both resolve the same Asupersync 0.4.3 runtime.
-asupersync = { workspace = true }
+# FrankenSQLite 0.3 removed the old caller-thread `Connection` facade. The ops
+# telemetry store keeps its documented synchronous API by using
+# `AsyncConnection`'s native dedicated-worker `*_sync` entry points; no private
+# executor or compatibility wrapper is involved. `async-api` is not a default
+# feature.
+fsqlite = { version = "0.3.0", features = ["async-api"] }
+fsqlite-types = "0.3.0"
 
 # Terminal UI rendering (FrankenTUI)
 ftui-core = { workspace = true }

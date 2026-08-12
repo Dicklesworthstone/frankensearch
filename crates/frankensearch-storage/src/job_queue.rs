@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use frankensearch_core::{SearchError, SearchResult};
-use fsqlite::{Connection, Row};
+use fsqlite::{AsyncConnection, Row};
 use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 
@@ -345,22 +345,19 @@ impl PersistentJobQueue {
         // prevent duplicate assignments.
         let claimed = self.storage.immediate_transaction(|conn| {
             let claim_params = [SqliteValue::Integer(now_ms), SqliteValue::Integer(limit)];
-            let candidates = conn
-                .query_with_params(
-                    "SELECT job_id, doc_id, embedder_id, priority, retry_count, max_retries, content_hash, submitted_at \
-                     FROM embedding_jobs \
-                     WHERE status = 'pending' \
-                       AND submitted_at <= ?1 \
-                       AND NOT EXISTS ( \
-                           SELECT 1 FROM embedding_jobs active \
-                           WHERE active.doc_id = embedding_jobs.doc_id \
-                             AND active.embedder_id = embedding_jobs.embedder_id \
-                             AND active.status = 'processing' \
-                       ) \
-                     ORDER BY priority DESC, submitted_at ASC \
-                     LIMIT ?2;",
-                    &claim_params,
-                )
+            let candidates = conn.query_with_params_sync("SELECT job_id, doc_id, embedder_id, priority, retry_count, max_retries, content_hash, submitted_at \
+             FROM embedding_jobs \
+             WHERE status = 'pending' \
+               AND submitted_at <= ?1 \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM embedding_jobs active \
+                   WHERE active.doc_id = embedding_jobs.doc_id \
+                     AND active.embedder_id = embedding_jobs.embedder_id \
+                     AND active.status = 'processing' \
+               ) \
+             ORDER BY priority DESC, submitted_at ASC \
+             LIMIT ?2;",
+            &claim_params,)
                 .map_err(map_storage_error)?;
 
             let mut claimed = Vec::with_capacity(candidates.len());
@@ -372,13 +369,10 @@ impl PersistentJobQueue {
                     SqliteValue::Text(worker_id.to_owned().into()),
                     SqliteValue::Integer(job_id),
                 ];
-                let updated = conn
-                    .execute_with_params(
-                        "UPDATE embedding_jobs \
-                         SET status = ?1, started_at = ?2, worker_id = ?3, error_message = NULL \
-                         WHERE job_id = ?4 AND status = 'pending';",
-                        &update_params,
-                    )
+                let updated = conn.execute_with_params_sync("UPDATE embedding_jobs \
+                 SET status = ?1, started_at = ?2, worker_id = ?3, error_message = NULL \
+                 WHERE job_id = ?4 AND status = 'pending';",
+                &update_params,)
                     .map_err(map_storage_error)?;
                 if updated != 1 {
                     continue;
@@ -437,9 +431,9 @@ impl PersistentJobQueue {
                 SqliteValue::Text(state.embedder_id.clone().into()),
                 SqliteValue::Text(target_status.to_owned().into()),
             ];
-            conn.execute_with_params(
+            conn.execute_with_params_sync(
                 "DELETE FROM embedding_jobs \
-                 WHERE doc_id = ?1 AND embedder_id = ?2 AND status = ?3;",
+             WHERE doc_id = ?1 AND embedder_id = ?2 AND status = ?3;",
                 &delete_params,
             )
             .map_err(map_storage_error)?;
@@ -450,10 +444,10 @@ impl PersistentJobQueue {
                 SqliteValue::Integer(job_id),
             ];
             let updated = conn
-                .execute_with_params(
+                .execute_with_params_sync(
                     "UPDATE embedding_jobs \
-                     SET status = ?1, completed_at = ?2, worker_id = NULL, error_message = NULL \
-                     WHERE job_id = ?3 AND status = 'processing';",
+             SET status = ?1, completed_at = ?2, worker_id = NULL, error_message = NULL \
+             WHERE job_id = ?3 AND status = 'processing';",
                     &params,
                 )
                 .map_err(map_storage_error)?;
@@ -508,11 +502,9 @@ impl PersistentJobQueue {
                     SqliteValue::Text(state.embedder_id.clone().into()),
                     SqliteValue::Text(target_status.to_owned().into()),
                 ];
-                conn.execute_with_params(
-                    "DELETE FROM embedding_jobs \
-                     WHERE doc_id = ?1 AND embedder_id = ?2 AND status = ?3;",
-                    &delete_params,
-                )
+                conn.execute_with_params_sync("DELETE FROM embedding_jobs \
+                 WHERE doc_id = ?1 AND embedder_id = ?2 AND status = ?3;",
+                &delete_params,)
                 .map_err(map_storage_error)?;
 
                 let params = [
@@ -522,13 +514,10 @@ impl PersistentJobQueue {
                     SqliteValue::Text(error.to_owned().into()),
                     SqliteValue::Integer(job_id),
                 ];
-                let updated = conn
-                    .execute_with_params(
-                        "UPDATE embedding_jobs \
-                         SET status = ?1, retry_count = ?2, completed_at = ?3, error_message = ?4, worker_id = NULL \
-                         WHERE job_id = ?5 AND status = 'processing';",
-                        &params,
-                    )
+                let updated = conn.execute_with_params_sync("UPDATE embedding_jobs \
+                 SET status = ?1, retry_count = ?2, completed_at = ?3, error_message = ?4, worker_id = NULL \
+                 WHERE job_id = ?5 AND status = 'processing';",
+                &params,)
                     .map_err(map_storage_error)?;
                 if updated != 1 {
                     return Err(conflict_error(format!(
@@ -542,14 +531,11 @@ impl PersistentJobQueue {
                 SqliteValue::Text(state.doc_id.clone().into()),
                 SqliteValue::Text(state.embedder_id.clone().into()),
             ];
-            let pending_exists = !conn
-                .query_with_params(
-                    "SELECT job_id \
-                     FROM embedding_jobs \
-                     WHERE doc_id = ?1 AND embedder_id = ?2 AND status = 'pending' \
-                     LIMIT 1;",
-                    &pending_params,
-                )
+            let pending_exists = !conn.query_with_params_sync("SELECT job_id \
+             FROM embedding_jobs \
+             WHERE doc_id = ?1 AND embedder_id = ?2 AND status = 'pending' \
+             LIMIT 1;",
+            &pending_params,)
                 .map_err(map_storage_error)?
                 .is_empty();
 
@@ -557,11 +543,8 @@ impl PersistentJobQueue {
                 // This processing job has been superseded by a newer pending job.
                 // Do not retry the old job. Delete it to allow the newer one to proceed.
                 let delete_params = [SqliteValue::Integer(job_id)];
-                let deleted = conn
-                    .execute_with_params(
-                        "DELETE FROM embedding_jobs WHERE job_id = ?1 AND status = 'processing';",
-                        &delete_params,
-                    )
+                let deleted = conn.execute_with_params_sync("DELETE FROM embedding_jobs WHERE job_id = ?1 AND status = 'processing';",
+                &delete_params,)
                     .map_err(map_storage_error)?;
                 if deleted != 1 {
                     return Err(conflict_error(format!(
@@ -582,11 +565,9 @@ impl PersistentJobQueue {
                 SqliteValue::Text(state.embedder_id.clone().into()),
                 SqliteValue::Text(JobStatus::Pending.as_str().to_owned().into()),
             ];
-            conn.execute_with_params(
-                "DELETE FROM embedding_jobs \
-                 WHERE doc_id = ?1 AND embedder_id = ?2 AND status = ?3;",
-                &delete_params,
-            )
+            conn.execute_with_params_sync("DELETE FROM embedding_jobs \
+             WHERE doc_id = ?1 AND embedder_id = ?2 AND status = ?3;",
+            &delete_params,)
             .map_err(map_storage_error)?;
 
             let params = [
@@ -596,14 +577,11 @@ impl PersistentJobQueue {
                 SqliteValue::Text(error.to_owned().into()),
                 SqliteValue::Integer(job_id),
             ];
-            let updated = conn
-                .execute_with_params(
-                    "UPDATE embedding_jobs \
-                     SET status = ?1, retry_count = ?2, submitted_at = ?3, started_at = NULL, completed_at = NULL, \
-                         error_message = ?4, worker_id = NULL \
-                     WHERE job_id = ?5 AND status = 'processing';",
-                    &params,
-                )
+            let updated = conn.execute_with_params_sync("UPDATE embedding_jobs \
+             SET status = ?1, retry_count = ?2, submitted_at = ?3, started_at = NULL, completed_at = NULL, \
+                 error_message = ?4, worker_id = NULL \
+             WHERE job_id = ?5 AND status = 'processing';",
+            &params,)
                 .map_err(map_storage_error)?;
             if updated != 1 {
                 return Err(conflict_error(format!(
@@ -657,9 +635,9 @@ impl PersistentJobQueue {
                 SqliteValue::Text(state.embedder_id.clone().into()),
                 SqliteValue::Text(target_status.to_owned().into()),
             ];
-            conn.execute_with_params(
+            conn.execute_with_params_sync(
                 "DELETE FROM embedding_jobs \
-                 WHERE doc_id = ?1 AND embedder_id = ?2 AND status = ?3;",
+             WHERE doc_id = ?1 AND embedder_id = ?2 AND status = ?3;",
                 &delete_params,
             )
             .map_err(map_storage_error)?;
@@ -671,10 +649,10 @@ impl PersistentJobQueue {
                 SqliteValue::Integer(job_id),
             ];
             let updated = conn
-                .execute_with_params(
+                .execute_with_params_sync(
                     "UPDATE embedding_jobs \
-                     SET status = ?1, completed_at = ?2, worker_id = NULL, error_message = ?3 \
-                     WHERE job_id = ?4 AND status IN ('pending', 'processing');",
+             SET status = ?1, completed_at = ?2, worker_id = NULL, error_message = ?3 \
+             WHERE job_id = ?4 AND status IN ('pending', 'processing');",
                     &params,
                 )
                 .map_err(map_storage_error)?;
@@ -705,14 +683,11 @@ impl PersistentJobQueue {
         let cutoff = now_ms.saturating_sub(i64::try_from(reclaim_after_ms).unwrap_or(i64::MAX));
         let (reclaimed_pending, superseded) = self.storage.transaction(|conn| {
             let stale_params = [SqliteValue::Integer(cutoff)];
-            let stale_rows = conn
-                .query_with_params(
-                    "SELECT job_id, doc_id, embedder_id \
-                     FROM embedding_jobs \
-                     WHERE status = 'processing' \
-                       AND (started_at IS NULL OR started_at <= ?1);",
-                    &stale_params,
-                )
+            let stale_rows = conn.query_with_params_sync("SELECT job_id, doc_id, embedder_id \
+             FROM embedding_jobs \
+             WHERE status = 'processing' \
+               AND (started_at IS NULL OR started_at <= ?1);",
+            &stale_params,)
                 .map_err(map_storage_error)?;
 
             let mut reclaimed_pending = 0_usize;
@@ -726,25 +701,19 @@ impl PersistentJobQueue {
                     SqliteValue::Text(doc_id.clone().into()),
                     SqliteValue::Text(embedder_id.clone().into()),
                 ];
-                let pending_exists = !conn
-                    .query_with_params(
-                        "SELECT job_id \
-                         FROM embedding_jobs \
-                         WHERE doc_id = ?1 AND embedder_id = ?2 AND status = 'pending' \
-                         LIMIT 1;",
-                        &pending_params,
-                    )
+                let pending_exists = !conn.query_with_params_sync("SELECT job_id \
+                 FROM embedding_jobs \
+                 WHERE doc_id = ?1 AND embedder_id = ?2 AND status = 'pending' \
+                 LIMIT 1;",
+                &pending_params,)
                     .map_err(map_storage_error)?
                     .is_empty();
 
                 if pending_exists {
                     let delete_params = [SqliteValue::Integer(job_id)];
-                    let deleted = conn
-                        .execute_with_params(
-                            "DELETE FROM embedding_jobs \
-                             WHERE job_id = ?1 AND status = 'processing';",
-                            &delete_params,
-                        )
+                    let deleted = conn.execute_with_params_sync("DELETE FROM embedding_jobs \
+                     WHERE job_id = ?1 AND status = 'processing';",
+                    &delete_params,)
                         .map_err(map_storage_error)?;
                     if deleted == 1 {
                         superseded += 1;
@@ -756,14 +725,11 @@ impl PersistentJobQueue {
                         SqliteValue::Text("reclaimed stale lease".to_owned().into()),
                         SqliteValue::Integer(job_id),
                     ];
-                    let updated = conn
-                        .execute_with_params(
-                            "UPDATE embedding_jobs \
-                             SET status = ?1, submitted_at = ?2, started_at = NULL, worker_id = NULL, error_message = ?3, \
-                                 retry_count = retry_count + 1 \
-                             WHERE job_id = ?4 AND status = 'processing';",
-                            &update_params,
-                        )
+                    let updated = conn.execute_with_params_sync("UPDATE embedding_jobs \
+                     SET status = ?1, submitted_at = ?2, started_at = NULL, worker_id = NULL, error_message = ?3, \
+                         retry_count = retry_count + 1 \
+                     WHERE job_id = ?4 AND status = 'processing';",
+                    &update_params,)
                         .map_err(map_storage_error)?;
                     if updated == 1 {
                         reclaimed_pending += 1;
@@ -826,11 +792,11 @@ impl PersistentJobQueue {
                 SqliteValue::Integer(now_ms),
             ];
             let count = conn
-                .execute_with_params(
+                .execute_with_params_sync(
                     "UPDATE embedding_jobs \
-                     SET status = 'pending', retry_count = 0, error_message = NULL, \
-                         started_at = NULL, submitted_at = ?2 \
-                     WHERE embedder_id = ?1 AND status = 'failed';",
+             SET status = 'pending', retry_count = 0, error_message = NULL, \
+                 started_at = NULL, submitted_at = ?2 \
+             WHERE embedder_id = ?1 AND status = 'failed';",
                     &params,
                 )
                 .map_err(map_storage_error)?;
@@ -864,10 +830,10 @@ impl PersistentJobQueue {
     }
 }
 
-pub(crate) fn fetch_queue_depth(conn: &Connection) -> SearchResult<QueueDepth> {
+pub(crate) fn fetch_queue_depth(conn: &AsyncConnection) -> SearchResult<QueueDepth> {
     let mut depth = QueueDepth::default();
     let rows = conn
-        .query("SELECT status, COUNT(*) FROM embedding_jobs GROUP BY status;")
+        .query_sync("SELECT status, COUNT(*) FROM embedding_jobs GROUP BY status;")
         .map_err(map_storage_error)?;
     for row in &rows {
         let status = row_text(row, 0, "embedding_jobs.status")?;
@@ -890,7 +856,7 @@ pub(crate) fn fetch_queue_depth(conn: &Connection) -> SearchResult<QueueDepth> {
     let now_ms = unix_timestamp_ms()?;
     let ready_params = [SqliteValue::Integer(now_ms)];
     let ready_rows = conn
-        .query_with_params(
+        .query_with_params_sync(
             "SELECT COUNT(*) FROM embedding_jobs WHERE status = 'pending' AND submitted_at <= ?1;",
             &ready_params,
         )
@@ -932,7 +898,7 @@ struct JobState {
 }
 
 pub(crate) fn enqueue_inner(
-    conn: &Connection,
+    conn: &AsyncConnection,
     request: &EnqueueRequest,
     submitted_at: i64,
     max_retries: u32,
@@ -953,10 +919,10 @@ pub(crate) fn enqueue_inner(
         SqliteValue::Text(request.embedder_id.clone().into()),
     ];
     let active_rows = conn
-        .query_with_params(
+        .query_with_params_sync(
             "SELECT job_id, content_hash \
-             FROM embedding_jobs \
-             WHERE doc_id = ?1 AND embedder_id = ?2 AND status IN ('pending', 'processing');",
+     FROM embedding_jobs \
+     WHERE doc_id = ?1 AND embedder_id = ?2 AND status IN ('pending', 'processing');",
             &active_params,
         )
         .map_err(map_storage_error)?;
@@ -971,9 +937,9 @@ pub(crate) fn enqueue_inner(
     }
 
     if has_active_job {
-        conn.execute_with_params(
+        conn.execute_with_params_sync(
             "DELETE FROM embedding_jobs \
-             WHERE doc_id = ?1 AND embedder_id = ?2 AND status = 'pending';",
+         WHERE doc_id = ?1 AND embedder_id = ?2 AND status = 'pending';",
             &active_params,
         )
         .map_err(map_storage_error)?;
@@ -987,10 +953,10 @@ pub(crate) fn enqueue_inner(
         SqliteValue::Integer(i64::from(max_retries)),
         SqliteValue::Blob(request.content_hash.to_vec().into()),
     ];
-    conn.execute_with_params(
+    conn.execute_with_params_sync(
         "INSERT INTO embedding_jobs (\
-            doc_id, embedder_id, priority, submitted_at, status, retry_count, max_retries, content_hash\
-         ) VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6);",
+        doc_id, embedder_id, priority, submitted_at, status, retry_count, max_retries, content_hash\
+     ) VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6);",
         &insert_params,
     )
     .map_err(map_storage_error)?;
@@ -1002,14 +968,14 @@ pub(crate) fn enqueue_inner(
     })
 }
 
-fn load_job_state(conn: &Connection, job_id: i64) -> SearchResult<Option<JobState>> {
+fn load_job_state(conn: &AsyncConnection, job_id: i64) -> SearchResult<Option<JobState>> {
     let params = [SqliteValue::Integer(job_id)];
     let rows = conn
-        .query_with_params(
+        .query_with_params_sync(
             "SELECT status, retry_count, max_retries, started_at, doc_id, embedder_id \
-             FROM embedding_jobs \
-             WHERE job_id = ?1 \
-             LIMIT 1;",
+     FROM embedding_jobs \
+     WHERE job_id = ?1 \
+     LIMIT 1;",
             &params,
         )
         .map_err(map_storage_error)?;
@@ -1035,10 +1001,10 @@ fn load_job_state(conn: &Connection, job_id: i64) -> SearchResult<Option<JobStat
     }))
 }
 
-fn document_exists(conn: &Connection, doc_id: &str) -> SearchResult<bool> {
+fn document_exists(conn: &AsyncConnection, doc_id: &str) -> SearchResult<bool> {
     let params = [SqliteValue::Text(doc_id.to_owned().into())];
     let rows = conn
-        .query_with_params(
+        .query_with_params_sync(
             "SELECT doc_id FROM documents WHERE doc_id = ?1 LIMIT 1;",
             &params,
         )
@@ -1313,7 +1279,7 @@ mod tests {
     fn status_counts(storage: &Storage) -> QueueDepth {
         let rows = storage
             .connection()
-            .query("SELECT status, COUNT(*) FROM embedding_jobs GROUP BY status;")
+            .query_sync("SELECT status, COUNT(*) FROM embedding_jobs GROUP BY status;")
             .expect("status query should succeed");
         let mut depth = QueueDepth::default();
         for row in &rows {
@@ -1407,11 +1373,8 @@ mod tests {
 
         let params = [SqliteValue::Text("doc-2".to_owned().into())];
         let rows = storage
-            .connection()
-            .query_with_params(
-                "SELECT content_hash FROM embedding_jobs WHERE doc_id = ?1 AND status = 'pending' LIMIT 1;",
-                &params,
-            )
+            .connection().query_with_params_sync("SELECT content_hash FROM embedding_jobs WHERE doc_id = ?1 AND status = 'pending' LIMIT 1;",
+        &params,)
             .expect("pending row query should succeed");
         assert_eq!(rows.len(), 1);
         let pending_hash = rows[0]
@@ -1605,7 +1568,7 @@ mod tests {
         ];
         storage
             .connection()
-            .execute_with_params(
+            .execute_with_params_sync(
                 "UPDATE embedding_jobs SET started_at = ?1 WHERE job_id = ?2;",
                 &params,
             )
@@ -1648,7 +1611,7 @@ mod tests {
         ];
         storage
             .connection()
-            .execute_with_params(
+            .execute_with_params_sync(
                 "UPDATE embedding_jobs SET started_at = ?1 WHERE job_id = ?2;",
                 &params,
             )
@@ -1688,7 +1651,7 @@ mod tests {
         ];
         storage_a
             .connection()
-            .execute_with_params(
+            .execute_with_params_sync(
                 "UPDATE embedding_jobs SET started_at = ?1 WHERE job_id = ?2;",
                 &params,
             )
@@ -1741,7 +1704,7 @@ mod tests {
         ];
         storage
             .connection()
-            .execute_with_params(
+            .execute_with_params_sync(
                 "UPDATE embedding_jobs SET started_at = ?1 WHERE job_id = ?2;",
                 &params,
             )
@@ -2016,10 +1979,10 @@ mod tests {
     /// that all `claim_batch` calls MUST flow through a single
     /// `PersistentJobQueue` instance backed by one `Storage` connection.
     ///
-    /// Since `Storage` is `!Send` (`FrankenSQLite` `Connection` uses `Rc`),
-    /// the test uses a channel pattern: worker threads send claim requests
-    /// to a dispatcher thread that owns the queue, matching the production
-    /// pattern where an asupersync event loop owns the storage.
+    /// The test uses a channel pattern: worker threads send claim requests
+    /// to a dispatcher that serializes queue operations through the storage
+    /// instance's dedicated FrankenSQLite worker, matching the production
+    /// single-queue ownership contract.
     #[test]
     fn concurrent_claim_once_through_shared_queue_has_no_double_assignment() {
         const JOB_COUNT: usize = 50;
@@ -2509,7 +2472,7 @@ mod tests {
         // Get job_id from the pending row
         let rows = storage
             .connection()
-            .query("SELECT job_id FROM embedding_jobs WHERE status = 'pending' LIMIT 1;")
+            .query_sync("SELECT job_id FROM embedding_jobs WHERE status = 'pending' LIMIT 1;")
             .expect("query should succeed");
         let job_id = match rows[0].get(0) {
             Some(SqliteValue::Integer(id)) => *id,
@@ -2588,7 +2551,7 @@ mod tests {
         // Get job_id from pending row
         let rows = storage
             .connection()
-            .query("SELECT job_id FROM embedding_jobs WHERE status = 'pending' LIMIT 1;")
+            .query_sync("SELECT job_id FROM embedding_jobs WHERE status = 'pending' LIMIT 1;")
             .expect("query should succeed");
         let job_id = match rows[0].get(0) {
             Some(SqliteValue::Integer(id)) => *id,

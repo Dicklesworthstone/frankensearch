@@ -386,10 +386,10 @@ impl StorageDataSource {
         let rows = self
             .storage
             .connection()
-            .query(
+            .query_sync(
                 "SELECT project_key, instance_id, host_name, pid, version, last_heartbeat_ms \
-                 FROM instances \
-                 ORDER BY instance_id ASC;",
+         FROM instances \
+         ORDER BY instance_id ASC;",
             )
             .map_err(data_source_error)?;
         rows.iter().map(parse_instance_row).collect()
@@ -404,11 +404,11 @@ impl StorageDataSource {
         let rows = self
             .storage
             .connection()
-            .query_with_params(
+            .query_with_params_sync(
                 "SELECT cpu_pct, rss_bytes, io_read_bytes, io_write_bytes, queue_depth, ts_ms \
-                 FROM resource_samples \
-                 WHERE project_key = ?1 AND instance_id = ?2 \
-                 ORDER BY rowid DESC LIMIT 1;",
+         FROM resource_samples \
+         WHERE project_key = ?1 AND instance_id = ?2 \
+         ORDER BY rowid DESC LIMIT 1;",
                 &[
                     SqliteValue::Text(project_key.to_owned().into()),
                     SqliteValue::Text(instance_id.to_owned().into()),
@@ -455,10 +455,10 @@ impl StorageDataSource {
         let rows = self
             .storage
             .connection()
-            .query_with_params(
+            .query_with_params_sync(
                 "SELECT record_count FROM index_inventory_snapshots \
-                 WHERE project_key = ?1 AND instance_id = ?2 \
-                 ORDER BY ts_ms DESC LIMIT 1;",
+         WHERE project_key = ?1 AND instance_id = ?2 \
+         ORDER BY ts_ms DESC LIMIT 1;",
                 &[
                     SqliteValue::Text(project_key.to_owned().into()),
                     SqliteValue::Text(instance_id.to_owned().into()),
@@ -1239,55 +1239,55 @@ mod tests {
         let now_ms = i64::try_from(unix_timestamp_ms_u64().expect("now ms")).expect("i64 now");
         storage
             .connection()
-            .execute(
+            .execute_sync(
                 "INSERT INTO projects(project_key, display_name, created_at_ms, updated_at_ms) \
-                 VALUES ('proj-a', 'proj-a', 1, 1);",
+         VALUES ('proj-a', 'proj-a', 1, 1);",
             )
             .expect("insert project");
         let first_seen_ms = now_ms.saturating_sub(1_000);
         let summary_start_ms = now_ms.saturating_sub(3_600_000);
         storage
             .connection()
-            .execute(&format!(
+            .execute_sync(&format!(
                 "INSERT INTO instances(\
-                    instance_id, project_key, host_name, pid, version, first_seen_ms, \
-                    last_heartbeat_ms, state\
-                 ) VALUES (\
-                    'inst-a', 'proj-a', 'host-a', 123, '0.1.0', {first_seen_ms}, {now_ms}, 'healthy'\
-                 );"
+                instance_id, project_key, host_name, pid, version, first_seen_ms, \
+                last_heartbeat_ms, state\
+             ) VALUES (\
+                'inst-a', 'proj-a', 'host-a', 123, '0.1.0', {first_seen_ms}, {now_ms}, 'healthy'\
+             );"
             ))
             .expect("insert instance");
         storage
             .connection()
-            .execute(&format!(
+            .execute_sync(&format!(
                 "INSERT INTO search_summaries(\
-                    project_key, instance_id, window, window_start_ms, search_count, \
-                    p50_latency_us, p95_latency_us, p99_latency_us, avg_result_count\
-                 ) VALUES (\
-                    'proj-a', 'inst-a', '1h', {summary_start_ms}, 42, 1200, 2400, 3600, 6.0\
-                 );"
+                project_key, instance_id, window, window_start_ms, search_count, \
+                p50_latency_us, p95_latency_us, p99_latency_us, avg_result_count\
+             ) VALUES (\
+                'proj-a', 'inst-a', '1h', {summary_start_ms}, 42, 1200, 2400, 3600, 6.0\
+             );"
             ))
             .expect("insert summary");
         storage
             .connection()
-            .execute(&format!(
+            .execute_sync(&format!(
                 "INSERT INTO resource_samples(\
-                    project_key, instance_id, cpu_pct, rss_bytes, io_read_bytes, io_write_bytes, \
-                    queue_depth, ts_ms\
-                 ) VALUES (\
-                    'proj-a', 'inst-a', 22.5, 4096, 1024, 2048, 3, {now_ms}\
-                 );"
+                project_key, instance_id, cpu_pct, rss_bytes, io_read_bytes, io_write_bytes, \
+                queue_depth, ts_ms\
+             ) VALUES (\
+                'proj-a', 'inst-a', 22.5, 4096, 1024, 2048, 3, {now_ms}\
+             );"
             ))
             .expect("insert resource sample");
         storage
             .connection()
-            .execute(&format!(
+            .execute_sync(&format!(
                 "INSERT INTO index_inventory_snapshots(\
-                    snapshot_id, project_key, instance_id, index_name, index_type, record_count, \
-                    file_size_bytes, file_hash, is_stale, ts_ms\
-                 ) VALUES (\
-                    'snap-a', 'proj-a', 'inst-a', 'vector', 'fsvi', 9001, 0, NULL, 0, {now_ms}\
-                 );"
+                snapshot_id, project_key, instance_id, index_name, index_type, record_count, \
+                file_size_bytes, file_hash, is_stale, ts_ms\
+             ) VALUES (\
+                'snap-a', 'proj-a', 'inst-a', 'vector', 'fsvi', 9001, 0, NULL, 0, {now_ms}\
+             );"
             ))
             .expect("insert inventory");
 
@@ -1319,23 +1319,23 @@ mod tests {
         let now_ms = i64::try_from(unix_timestamp_ms_u64().expect("now ms")).expect("i64 now");
         storage
             .connection()
-            .execute(
+            .execute_sync(
                 "INSERT INTO projects(project_key, display_name, created_at_ms, updated_at_ms) \
-                 VALUES ('proj-stale', 'proj-stale', 1, 1);",
+         VALUES ('proj-stale', 'proj-stale', 1, 1);",
             )
             .expect("insert project");
         let first_seen_ms = now_ms.saturating_sub(120_000);
         let last_heartbeat_ms = now_ms.saturating_sub(90_000);
         storage
             .connection()
-            .execute(&format!(
+            .execute_sync(&format!(
                 "INSERT INTO instances(\
-                    instance_id, project_key, host_name, pid, version, first_seen_ms, \
-                    last_heartbeat_ms, state\
-                 ) VALUES (\
-                    'inst-stale', 'proj-stale', 'host-z', 555, '0.1.0', {first_seen_ms}, \
-                    {last_heartbeat_ms}, 'healthy'\
-                 );"
+                instance_id, project_key, host_name, pid, version, first_seen_ms, \
+                last_heartbeat_ms, state\
+             ) VALUES (\
+                'inst-stale', 'proj-stale', 'host-z', 555, '0.1.0', {first_seen_ms}, \
+                {last_heartbeat_ms}, 'healthy'\
+             );"
             ))
             .expect("insert instance");
 

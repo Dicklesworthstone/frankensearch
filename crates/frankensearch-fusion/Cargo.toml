@@ -44,7 +44,7 @@ frankensearch-index = { workspace = true }
 rayon = { workspace = true }
 # compact_str: SSO-string clone-cost probe for the limit_all doc_id materialization
 # lever (dev-only; already a transitive workspace dep). See doc_id_clone_sso bench.
-compact_str = "0.9"
+compact_str = "0.10"
 tempfile = "3"
 tracing-test = "0.2"
 criterion = { workspace = true }

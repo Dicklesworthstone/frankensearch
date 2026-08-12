@@ -1784,7 +1784,11 @@ impl FsWatcher {
     async fn stop_checked_bounded(&self, cx: &Cx, max_waits: usize) -> SearchResult<()> {
         let mut waits = 0_usize;
         loop {
-            match lock_or_recover(&self.control).stop_decision() {
+            let decision = {
+                let mut control = lock_or_recover(&self.control);
+                control.stop_decision()
+            };
+            match decision {
                 StopDecision::Done => return Ok(()),
                 StopDecision::Wait => {
                     // Bounded, for the same reason the start path is: the

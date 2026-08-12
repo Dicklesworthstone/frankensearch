@@ -2312,8 +2312,7 @@ const QG6_R1_RESIDUAL_RANKED_MISS_SEMANTICS_VERSION: &str =
     "frankensearch-qg6-r1-residual-ranked-miss-semantics-v1";
 const QG6_R1_RESIDUAL_BOUNDARY_EFFECT_VERSION: &str =
     "frankensearch-qg6-r1-residual-boundary-effect-v1";
-const QG6_R1_RESIDUAL_INVOCATION_VERSION: &str =
-    "frankensearch-qg6-r1-residual-invocation-v1";
+const QG6_R1_RESIDUAL_INVOCATION_VERSION: &str = "frankensearch-qg6-r1-residual-invocation-v1";
 const QG6_R1_RESIDUAL_REBIND_TRANSITION_VERSION: &str =
     "frankensearch-qg6-r1-residual-rebind-transition-v1";
 const QG6_R1_RESIDUAL_COMPLETED_OUTCOME_CODE: &str = "completed";
@@ -2663,7 +2662,8 @@ impl Qg6ResidualProducerAuthority {
         for leaf in observations {
             if trusted_leaves.insert(leaf.leaf_id, leaf.clone()).is_some() {
                 return Err(Qg6ResidualValidationError::InvalidLeaf {
-                    reason: "residual producer test fixture contains a duplicate leaf ID".to_owned(),
+                    reason: "residual producer test fixture contains a duplicate leaf ID"
+                        .to_owned(),
                 });
             }
         }
@@ -3189,6 +3189,16 @@ fn admit_qg6_residual_schedule_meta_block_with_authority(
     })
 }
 
+// Keep the authority-bearing core type-checked in ordinary builds even while
+// the public entry point deliberately fails closed. This is a signature pin,
+// not a production authority constructor: only the test module can mint the
+// capability until the real residual runner owns the required observations.
+const _: fn(
+    Vec<Qg6ResidualLeafObservation>,
+    &Qg6ResidualProducerAuthority,
+) -> Result<Qg6ResidualScheduleAdmission, Qg6ResidualValidationError> =
+    admit_qg6_residual_schedule_meta_block_with_authority;
+
 fn canonical_residual_williams_schedule(
     meta_block_id: u64,
 ) -> Result<Vec<Qg6ResidualWilliamsLeaf>, Qg6ResidualValidationError> {
@@ -3426,8 +3436,9 @@ fn validate_residual_leaf_shape(
         (Qg6ResidualStratum::GenerationRebind, None)
         | (Qg6ResidualStratum::FirstTouch | Qg6ResidualStratum::SteadyRankedCacheMiss, Some(_)) => {
             return Err(Qg6ResidualValidationError::InvalidLeaf {
-                reason: "residual generation-rebind evidence is missing or appears in the wrong stratum"
-                    .to_owned(),
+                reason:
+                    "residual generation-rebind evidence is missing or appears in the wrong stratum"
+                        .to_owned(),
             });
         }
         (Qg6ResidualStratum::FirstTouch | Qg6ResidualStratum::SteadyRankedCacheMiss, None) => {}
@@ -3748,8 +3759,8 @@ fn validate_residual_generation_rebind_evidence(
         })?
         .mutation_plan_sha256
         .as_str();
-    let mut by_role: [Option<&Qg6ResidualGenerationRebindEvidence>;
-        QG6_R1_RESIDUAL_ROLE_COUNT] = std::array::from_fn(|_| None);
+    let mut by_role: [Option<&Qg6ResidualGenerationRebindEvidence>; QG6_R1_RESIDUAL_ROLE_COUNT] =
+        std::array::from_fn(|_| None);
     let mut mutation_receipts = BTreeSet::new();
     let mut parity_receipts = BTreeSet::new();
     for leaf in ordered {
@@ -3767,8 +3778,9 @@ fn validate_residual_generation_rebind_evidence(
         if let Some(existing) = slot {
             if *existing != evidence {
                 return Err(Qg6ResidualValidationError::InvalidLeaf {
-                    reason: "one residual role changed rebind transition evidence within a meta-block"
-                        .to_owned(),
+                    reason:
+                        "one residual role changed rebind transition evidence within a meta-block"
+                            .to_owned(),
                 });
             }
         } else {
@@ -3835,7 +3847,7 @@ fn validate_residual_boundary_effects(
 fn residual_joint_contrast_vector(
     ordered: &[Qg6ResidualLeafObservation],
 ) -> Qg6ResidualJointContrastVector {
-    let means = std::array::from_fn(|index| {
+    let means: [f64; QG6_R1_RESIDUAL_ROLE_COUNT] = std::array::from_fn(|index| {
         let role = Qg6ResidualArmRole::ALL[index];
         let total = ordered
             .iter()
@@ -4815,7 +4827,7 @@ mod tests {
         let ranked_cache_key_sha256 = residual_digest(400 + u64::from(execution_ordinal));
         let result_envelope_sha256 = residual_digest(72);
         let boundary_effect_limit_ns = 10;
-        Qg6ResidualLeafObservation {
+        let mut observation = Qg6ResidualLeafObservation {
             leaf_id: scheduled.leaf_id,
             meta_block_id: scheduled.meta_block_id,
             sweep: scheduled.sweep,
@@ -4850,6 +4862,7 @@ mod tests {
             result_envelope_sha256: result_envelope_sha256.clone(),
             ranked_cache_key_sha256: ranked_cache_key_sha256.clone(),
             ranked_cache_nonce_sha256: ranked_cache_nonce_sha256.clone(),
+            raw_query_sha256: residual_digest(500 + u64::from(execution_ordinal)),
             raw_query_length_bytes: 32,
             ranked_miss_semantics_sha256: residual_ranked_miss_semantics_sha256(
                 &query_id,
@@ -4872,8 +4885,12 @@ mod tests {
             fuel_consumed: 1,
             cancelled: false,
             outcome_code: QG6_R1_RESIDUAL_COMPLETED_OUTCOME_CODE.to_owned(),
+            ranked_cache_lookup_receipt_sha256: residual_digest(600 + u64::from(execution_ordinal)),
             host_receipt_sha256: residual_digest(90),
+            boot_receipt_sha256: residual_digest(92),
             clock_receipt_sha256: residual_digest(91),
+            invocation_receipt_sha256: residual_digest(0),
+            generation_rebind_evidence: None,
             boundary_predecessor_leaf_id: None,
             boundary_predecessor_instance_receipt_sha256: None,
             boundary_effect_ns: 0,
@@ -4891,7 +4908,10 @@ mod tests {
                 + 100
                 + u64::try_from(scheduled.role.index()).expect("role fits u64"),
             latency_ns: 100 + u64::try_from(scheduled.role.index()).expect("role fits u64"),
-        }
+        };
+        observation.invocation_receipt_sha256 =
+            residual_invocation_receipt_sha256(&observation).expect("valid invocation receipt");
+        observation
     }
 
     fn finalize_residual_execution_order(observations: &mut [Qg6ResidualLeafObservation]) {
@@ -4918,52 +4938,26 @@ mod tests {
                 leaf.boundary_effect_limit_ns,
             )
             .expect("valid boundary receipt");
+            leaf.invocation_receipt_sha256 =
+                residual_invocation_receipt_sha256(leaf).expect("valid invocation receipt");
             predecessor = Some((leaf.leaf_id, leaf.instance_receipt_sha256.clone()));
             next_started_ns = leaf.ended_ns + 1;
         }
     }
 
-    fn residual_admission_authority() -> (
-        [String; QG6_R1_RESIDUAL_ROLE_COUNT],
-        String,
-        String,
-        [String; QG6_R1_RESIDUAL_ROLE_COUNT],
-    ) {
-        (
-            [
-                residual_digest(10),
-                residual_digest(10),
-                residual_digest(11),
-                residual_digest(11),
-                residual_digest(12),
-                residual_digest(12),
-            ],
-            residual_digest(20),
-            residual_digest(30),
-            [
-                residual_digest(80),
-                residual_digest(81),
-                residual_digest(82),
-                residual_digest(83),
-                residual_digest(84),
-                residual_digest(85),
-            ],
-        )
+    fn admit_residual_with_authority(
+        observations: Vec<Qg6ResidualLeafObservation>,
+        trusted_observations: &[Qg6ResidualLeafObservation],
+    ) -> Result<Qg6ResidualScheduleAdmission, Qg6ResidualValidationError> {
+        let authority = Qg6ResidualProducerAuthority::test_fixture(trusted_observations)?;
+        admit_qg6_residual_schedule_meta_block_with_authority(observations, &authority)
     }
 
     fn admit_residual(
         observations: Vec<Qg6ResidualLeafObservation>,
     ) -> Result<Qg6ResidualScheduleAdmission, Qg6ResidualValidationError> {
-        let (sources, cargo_lock, timing_elf, source_build_receipts) =
-            residual_admission_authority();
-        admit_qg6_residual_schedule_meta_block(
-            observations,
-            &sources,
-            &cargo_lock,
-            &timing_elf,
-            &source_build_receipts,
-            10,
-        )
+        let trusted_observations = observations.clone();
+        admit_residual_with_authority(observations, &trusted_observations)
     }
 
     fn valid_residual_meta_block() -> Vec<Qg6ResidualLeafObservation> {
@@ -5327,7 +5321,8 @@ mod tests {
 
     #[test]
     fn residual_admission_rejects_coordinated_source_lock_elf_substitution() {
-        let mut observations = valid_residual_meta_block();
+        let trusted_observations = valid_residual_meta_block();
+        let mut observations = trusted_observations.clone();
         for leaf in &mut observations {
             let family = u64::try_from(leaf.role.index() / 2).expect("family fits u64");
             leaf.source_sha256 = residual_digest(110 + family);
@@ -5343,7 +5338,7 @@ mod tests {
             .expect("coordinated leaf consistency");
         }
         assert!(matches!(
-            admit_residual(observations),
+            admit_residual_with_authority(observations, &trusted_observations),
             Err(Qg6ResidualValidationError::ProvenanceMismatch { .. })
         ));
     }

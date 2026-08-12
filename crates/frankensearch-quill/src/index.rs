@@ -2033,6 +2033,7 @@ struct ParallelIngestReceipt {
     /// plus the exact peak overlap. Binding these to the receipt keeps the
     /// planner's *requested* width separable from what was *observed*, and
     /// keeps worker diversity separable from actual concurrency.
+    #[cfg(test)]
     worker_witness: ParallelWorkerWitness,
 }
 
@@ -5886,6 +5887,7 @@ impl QuillWriterState {
             })
             .collect::<Result<Vec<_>, QuillIndexError>>()?;
         checkpoint.check(cx)?;
+        #[cfg(test)]
         let worker_witness = observation.snapshot();
 
         let created_unix_s = self.created_unix_s()?;
@@ -6013,6 +6015,7 @@ impl QuillWriterState {
             arena_chunk_bytes,
             arena_bytes_used_high_water,
             arena_bytes_reserved_high_water,
+            #[cfg(test)]
             worker_witness,
         }))
     }
@@ -6156,6 +6159,7 @@ impl QuillWriterState {
             })
             .collect::<Result<Vec<_>, QuillIndexError>>()?;
         checkpoint.check(cx)?;
+        #[cfg(test)]
         let worker_witness = observation.snapshot();
 
         let mut replacements = Vec::new();
@@ -6253,6 +6257,7 @@ impl QuillWriterState {
             arena_chunk_bytes: budget_admission.arena_chunk_bytes,
             arena_bytes_used_high_water,
             arena_bytes_reserved_high_water,
+            #[cfg(test)]
             worker_witness,
         }))
     }
@@ -11589,7 +11594,7 @@ fn query_work_upper_bound(
         // included, so the ceiling has to be drawn from the same population.
         // Bounding it by the live count let a tombstone-heavy generation
         // exhaust a budget that was sized for a fraction of the work.
-        let docs = u64::try_from(delta.physical_document_count()).unwrap_or(u64::MAX);
+        let docs = u64::try_from(delta.segment().physical_document_count()).unwrap_or(u64::MAX);
         physical_docs = physical_docs.saturating_add(docs);
         posting_blocks_per_stream = posting_blocks_per_stream.saturating_add(docs.div_ceil(128));
         let terms = u64::try_from(delta.segment().term_count()).unwrap_or(u64::MAX);

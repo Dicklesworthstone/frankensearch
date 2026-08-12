@@ -8,18 +8,18 @@ use crate::GauntletError;
 
 const ORACLE_VERSION_CONTRACT_JSON: &str = include_str!("../oracle-version-contract.json");
 const Q1_FIXTURE_CATALOG_JSON: &str = include_str!("../fixtures/q1-obligations.json");
-const ORACLE_V2_TANTIVY_VERSION: &str = "0.26.1";
-const ORACLE_V2_TANTIVY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
-const ORACLE_V2_TANTIVY_CHECKSUM_SHA256: &str =
-    "edde6a10743fff00a4e1a8c9ef020bf5f3cbad301b7d2d39f2b07f123c4eac07";
-const ORACLE_V2_LEXICAL_PACKAGE: &str = "frankensearch-lexical";
-const ORACLE_V2_LEXICAL_PACKAGE_VERSION: &str = "0.2.1";
-const ORACLE_V2_LEXICAL_CONTRACT_AUDIT_REVISION: &str = "062a5e5b2d41653b1c8b07888eda1a765e421f49";
+const ORACLE_V3_TANTIVY_VERSION: &str = "0.27.0";
+const ORACLE_V3_TANTIVY_SOURCE: &str = "git+https://github.com/quickwit-oss/tantivy?rev=1f32c1a8af0eb9d68bd3f5576caf20941364b657#1f32c1a8af0eb9d68bd3f5576caf20941364b657";
+const ORACLE_V3_TANTIVY_CHECKSUM_SHA256: &str =
+    "db62510712cc8d0a776d35af8e5bd18565b0d3bc466299202d775ae75aa11aa1";
+const ORACLE_V3_LEXICAL_PACKAGE: &str = "frankensearch-lexical";
+const ORACLE_V3_LEXICAL_PACKAGE_VERSION: &str = "0.2.1";
+const ORACLE_V3_LEXICAL_CONTRACT_AUDIT_REVISION: &str = "062a5e5b2d41653b1c8b07888eda1a765e421f49";
 const LOCKED_TANTIVY_VERSION: &str = env!("QUILL_ORACLE_TANTIVY_VERSION");
 const LOCKED_TANTIVY_SOURCE: &str = env!("QUILL_ORACLE_TANTIVY_SOURCE");
 const LOCKED_TANTIVY_CHECKSUM_SHA256: &str = env!("QUILL_ORACLE_TANTIVY_CHECKSUM_SHA256");
 const ORACLE_DEPENDENCY_CONTRACT_HASH_DOMAIN: &[u8] =
-    b"frankensearch/quill/oracle-dependency-contract/v2\0";
+    b"frankensearch/quill/oracle-dependency-contract/v3\0";
 /// Exact `frankensearch-lexical` crate version resolved by this build.
 pub const FRANKENSEARCH_LEXICAL_CRATE_VERSION: &str = env!("FRANKENSEARCH_LEXICAL_CRATE_VERSION");
 const QUIVER_DIFFERENTIAL_FIXTURE_ID: &str = "quiver-postings-bitpack-scalar-wide-v1";
@@ -44,21 +44,21 @@ pub struct OracleVersionContract {
 }
 
 impl OracleVersionContract {
-    /// Validate the self-contained v2 dependency record without consulting the
+    /// Validate the self-contained v3 dependency record without consulting the
     /// current checkout, executable, manifest, or lockfile.
     ///
     /// # Errors
     ///
-    /// Returns an error when any v2 package, registry, checksum, or historical
+    /// Returns an error when any v3 package, source, checksum, or historical
     /// audit pin is malformed or changed.
     pub fn validate_stored_structure(&self) -> Result<(), GauntletError> {
-        if self.schema_version != 2
-            || self.tantivy_version != ORACLE_V2_TANTIVY_VERSION
-            || self.tantivy_source != ORACLE_V2_TANTIVY_SOURCE
-            || self.tantivy_checksum_sha256 != ORACLE_V2_TANTIVY_CHECKSUM_SHA256
-            || self.lexical_package != ORACLE_V2_LEXICAL_PACKAGE
-            || self.lexical_package_version != ORACLE_V2_LEXICAL_PACKAGE_VERSION
-            || self.lexical_contract_audit_revision != ORACLE_V2_LEXICAL_CONTRACT_AUDIT_REVISION
+        if self.schema_version != 3
+            || self.tantivy_version != ORACLE_V3_TANTIVY_VERSION
+            || self.tantivy_source != ORACLE_V3_TANTIVY_SOURCE
+            || self.tantivy_checksum_sha256 != ORACLE_V3_TANTIVY_CHECKSUM_SHA256
+            || self.lexical_package != ORACLE_V3_LEXICAL_PACKAGE
+            || self.lexical_package_version != ORACLE_V3_LEXICAL_PACKAGE_VERSION
+            || self.lexical_contract_audit_revision != ORACLE_V3_LEXICAL_CONTRACT_AUDIT_REVISION
             || !is_lower_hex(&self.tantivy_checksum_sha256, 64)
             || !is_lower_hex(&self.lexical_contract_audit_revision, 40)
         {
@@ -70,7 +70,7 @@ impl OracleVersionContract {
         Ok(())
     }
 
-    /// Validate that this v2 record describes the exact dependency resolved by
+    /// Validate that this v3 record describes the exact dependency resolved by
     /// the current producer build.
     pub(crate) fn validate_current_dependency(&self) -> Result<(), GauntletError> {
         self.validate_stored_structure()?;
@@ -732,7 +732,7 @@ mod tests {
         assert_eq!(contract.lexical_contract_audit_revision.len(), 40);
         contract
             .validate_stored_structure()
-            .expect("stored v2 contract is self-contained");
+            .expect("stored v3 contract is self-contained");
         contract
             .validate_current_dependency()
             .expect("stored contract matches current lock resolution");
@@ -744,10 +744,10 @@ mod tests {
         let mut mutations = Vec::new();
 
         let mut mutated = contract.clone();
-        mutated.schema_version = 1;
+        mutated.schema_version = 2;
         mutations.push(mutated);
         let mut mutated = contract.clone();
-        mutated.tantivy_version = "0.26.0".to_owned();
+        mutated.tantivy_version = "0.26.1".to_owned();
         mutations.push(mutated);
         let mut mutated = contract.clone();
         mutated.tantivy_source = "git+https://example.invalid/tantivy".to_owned();

@@ -2,9 +2,10 @@
 # rch-ensure-deps.sh — Bootstrap sibling path dependencies for rch workers.
 #
 # When rch syncs frankensearch to a remote worker via rsync, it only syncs
-# the project directory itself. The workspace Cargo.toml references sibling
-# path dependencies (asupersync, frankensqlite, fast_cmaes, frankentui)
-# that don't exist on workers by default.
+# the project directory itself. The workspace Cargo.toml references the sibling
+# `fast_cmaes` checkout, which does not exist on workers by default. Asupersync,
+# FrankenSQLite, and FrankenTUI are package dependencies and must be resolved
+# by Cargo rather than shadowed by unrelated sibling clones.
 #
 # In worker mode this also warms cargo's SHARED caches (crates.io index + the
 # frankentorch git dependency). Those are not part of the synced project, so a
@@ -37,17 +38,8 @@ set -euo pipefail
 # Pin sibling deps to explicit commits for reproducibility.
 # These MUST match the refs in .github/workflows/ci.yml.
 
-ASUPERSYNC_REPO="https://github.com/Dicklesworthstone/asupersync.git"
-ASUPERSYNC_REF="3b34c9b0a14c55eb814cf4aaeceeba3be0c0a72e"
-
-FRANKENSQLITE_REPO="https://github.com/Dicklesworthstone/frankensqlite.git"
-FRANKENSQLITE_REF="68ebc5c4cbbedc6d5be8ea35e42e8eb0c926d690"
-
 FAST_CMAES_REPO="https://github.com/Dicklesworthstone/fast_cmaes.git"
-FAST_CMAES_REF="9406d5ec9512767106c9639628e30902ef7eae32"
-
-FRANKENTUI_REPO="https://github.com/Dicklesworthstone/frankentui.git"
-FRANKENTUI_REF="4f2803a7c99d4fc439f3503e93c69e9ca68f354c"
+FAST_CMAES_REF="3bf11b7601b54a08ffabb55821289ecb235a504d"
 
 # Match RCH's configured remote_base (`/data/tmp/rch`). Some workers install
 # the `rch` executable at `/tmp/rch`, so that legacy path cannot be a directory.
@@ -336,7 +328,7 @@ check_dep() {
 needs_path_rewrite() {
     # Check if any Cargo.toml still references /data/projects/ (dev machine paths)
     # that don't resolve on this host.
-    if [[ -d "/data/projects/frankensqlite" ]]; then
+    if [[ -d "/data/projects/fast_cmaes" ]]; then
         return 1  # Paths resolve fine (probably on dev machine)
     fi
     grep -rq '/data/projects/' "${PROJECT_ROOT}"/Cargo.toml \
@@ -369,10 +361,7 @@ run_local_bootstrap() {
     if [[ "${mode}" == "--check" ]]; then
         log_info "Checking sibling dependency availability..."
         local missing=0
-        check_dep "${DEPS_DIR}/asupersync"    || missing=$((missing + 1))
-        check_dep "${DEPS_DIR}/frankensqlite" || missing=$((missing + 1))
-        check_dep "${DEPS_DIR}/fast_cmaes"    || missing=$((missing + 1))
-        check_dep "${DEPS_DIR}/frankentui"    || missing=$((missing + 1))
+        check_dep "${DEPS_DIR}/fast_cmaes" || missing=$((missing + 1))
 
         if needs_path_rewrite; then
             echo "  NOTE: Cargo.toml files contain /data/projects/ paths that need rewriting"
@@ -392,10 +381,7 @@ run_local_bootstrap() {
 
     if [[ "${mode}" == "auto" ]]; then
         local all_present=true
-        [[ -d "${DEPS_DIR}/asupersync" ]]    || all_present=false
-        [[ -d "${DEPS_DIR}/frankensqlite" ]] || all_present=false
-        [[ -d "${DEPS_DIR}/fast_cmaes" ]]    || all_present=false
-        [[ -d "${DEPS_DIR}/frankentui" ]]    || all_present=false
+        [[ -d "${DEPS_DIR}/fast_cmaes" ]] || all_present=false
 
         if ${all_present} && ! needs_path_rewrite; then
             if [[ "${PROVISION_MODELS}" == true ]]; then
@@ -407,10 +393,7 @@ run_local_bootstrap() {
     fi
 
     log_info "Ensuring sibling dependencies in ${DEPS_DIR}/..."
-    clone_or_update "${ASUPERSYNC_REPO}"    "${DEPS_DIR}/asupersync"    "${ASUPERSYNC_REF}" "${mode}"
-    clone_or_update "${FRANKENSQLITE_REPO}" "${DEPS_DIR}/frankensqlite" "${FRANKENSQLITE_REF}" "${mode}"
-    clone_or_update "${FAST_CMAES_REPO}"    "${DEPS_DIR}/fast_cmaes"    "${FAST_CMAES_REF}" "${mode}"
-    clone_or_update "${FRANKENTUI_REPO}"    "${DEPS_DIR}/frankentui"    "${FRANKENTUI_REF}" "${mode}"
+    clone_or_update "${FAST_CMAES_REPO}" "${DEPS_DIR}/fast_cmaes" "${FAST_CMAES_REF}" "${mode}"
 
     if needs_path_rewrite; then
         rewrite_absolute_paths
@@ -537,29 +520,20 @@ bootstrap_remote_worker() {
 
     ssh "${ssh_options[@]}" "${worker}" \
         bash -s -- "${MODE}" "${RCH_REMOTE_DEPS_DIR}" \
-        "${ASUPERSYNC_REPO}" "${ASUPERSYNC_REF}" \
-        "${FRANKENSQLITE_REPO}" "${FRANKENSQLITE_REF}" \
         "${FAST_CMAES_REPO}" "${FAST_CMAES_REF}" \
-        "${FRANKENTUI_REPO}" "${FRANKENTUI_REF}" \
         "${remote_project_dir_arg}" "${FRANKENTORCH_REF}" \
         "${PROVISION_MODELS}" "${MODELS_ONLY}" "${encoded_model_specs[@]}" <<'EOF'
 set -euo pipefail
 
 mode="$1"
 deps_dir="$2"
-asupersync_repo="$3"
-asupersync_ref="$4"
-frankensqlite_repo="$5"
-frankensqlite_ref="$6"
-fast_cmaes_repo="$7"
-fast_cmaes_ref="$8"
-frankentui_repo="${9:-}"
-frankentui_ref="${10:-}"
-project_dir="${11:-}"
-frankentorch_ref="${12:-}"
-provision_models="${13:-false}"
-models_only="${14:-false}"
-shift 14
+fast_cmaes_repo="$3"
+fast_cmaes_ref="$4"
+project_dir="${5:-}"
+frankentorch_ref="${6:-}"
+provision_models="${7:-false}"
+models_only="${8:-false}"
+shift 8
 encoded_model_specs=("$@")
 if [[ "${project_dir}" == "__RCH_DISCOVER_PROJECT__" ]]; then
     project_dir=""
@@ -759,14 +733,14 @@ resolve_remote_project_manifest() {
     # RCH's remote path is `${remote_base}/${project_id}/${project_hash}`.
     # The sibling-dependency bootstrap lives at the project-id level, so the
     # content-addressed project roots are its immediate children. Exclude the
-    # fixed sibling clones and require a frankensearch-specific workspace
+    # fixed sibling clone and require a frankensearch-specific workspace
     # member before accepting a candidate.
     for candidate in "${deps_dir}"/*/Cargo.toml; do
         [[ -f "${candidate}" ]] || continue
         candidate_dir="$(dirname "${candidate}")"
         candidate_name="$(basename "${candidate_dir}")"
         case "${candidate_name}" in
-            asupersync|fast_cmaes|frankensqlite|frankentui)
+            fast_cmaes)
                 continue
                 ;;
         esac
@@ -808,10 +782,7 @@ mkdir -p "${deps_dir}"
 if [[ "${mode}" == "--check" ]]; then
     log "Checking remote dependency availability in ${deps_dir}..."
     missing=0
-    check_dep_remote "${deps_dir}/asupersync" "${asupersync_ref}" || missing=$((missing + 1))
-    check_dep_remote "${deps_dir}/frankensqlite" "${frankensqlite_ref}" || missing=$((missing + 1))
     check_dep_remote "${deps_dir}/fast_cmaes" "${fast_cmaes_ref}" || missing=$((missing + 1))
-    check_dep_remote "${deps_dir}/frankentui" "${frankentui_ref}" || missing=$((missing + 1))
     if cargo_git_cache_warm; then
         echo "  OK: cargo git cache (frankentorch ${frankentorch_ref:0:12})"
     else
@@ -830,12 +801,7 @@ if [[ "${mode}" == "--check" ]]; then
 fi
 
 log "Ensuring remote sibling dependencies in ${deps_dir}..."
-clone_or_update_remote "${asupersync_repo}" "${deps_dir}/asupersync" "${asupersync_ref}"
-clone_or_update_remote "${frankensqlite_repo}" "${deps_dir}/frankensqlite" "${frankensqlite_ref}"
 clone_or_update_remote "${fast_cmaes_repo}" "${deps_dir}/fast_cmaes" "${fast_cmaes_ref}"
-if [[ -n "${frankentui_repo}" && -n "${frankentui_ref}" ]]; then
-    clone_or_update_remote "${frankentui_repo}" "${deps_dir}/frankentui" "${frankentui_ref}"
-fi
 warm_cargo_caches_remote
 if [[ "${provision_models}" == true ]]; then
     provision_bundled_models_remote

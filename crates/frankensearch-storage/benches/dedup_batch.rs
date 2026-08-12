@@ -20,7 +20,7 @@ use std::hint::black_box;
 
 use frankensearch_core::{SearchError, SearchResult, bench_support::paired_median_ratio};
 use frankensearch_storage::{DeduplicationDecision, DocumentRecord, EmbeddingStatus, Storage};
-use fsqlite::{Connection, Row};
+use fsqlite::{AsyncConnection, Row};
 use fsqlite_types::value::SqliteValue;
 
 const EMBEDDER_ID: &str = "fast-tier";
@@ -145,7 +145,7 @@ fn legacy_check_dedup_batch(
 }
 
 fn legacy_fetch_existing_dedup_rows(
-    conn: &Connection,
+    conn: &AsyncConnection,
     items: &[(String, [u8; 32])],
     embedder_id: &str,
 ) -> SearchResult<HashMap<String, LegacyDedupRow>> {
@@ -172,7 +172,7 @@ fn legacy_fetch_existing_dedup_rows(
     }
 
     let rows = conn
-        .query_with_params(&sql, &params)
+        .query_with_params_sync(&sql, &params)
         .map_err(fsqlite_error)?;
     let mut existing = HashMap::with_capacity(rows.len());
 
@@ -222,7 +222,7 @@ fn slot_join_check_dedup_batch(
 }
 
 fn slot_join_fetch_existing_dedup_slots(
-    conn: &Connection,
+    conn: &AsyncConnection,
     items: &[(String, [u8; 32])],
     embedder_id: &str,
 ) -> SearchResult<Vec<Option<LegacyDedupRow>>> {
@@ -251,7 +251,7 @@ fn slot_join_fetch_existing_dedup_slots(
     }
 
     let rows = conn
-        .query_with_params(&sql, &params)
+        .query_with_params_sync(&sql, &params)
         .map_err(fsqlite_error)?;
     let mut existing = vec![None; items.len()];
 

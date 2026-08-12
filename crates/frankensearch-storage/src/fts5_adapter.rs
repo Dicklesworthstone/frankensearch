@@ -19,6 +19,7 @@
 //! configuration.
 
 use std::collections::HashMap;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -33,9 +34,7 @@ use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument, warn};
 
-use crate::connection::{
-    Storage, fsqlite_cx, map_storage_error_at, require_async_transaction_cleanup_capability,
-};
+use crate::connection::{Storage, fsqlite_cx, map_storage_error_at};
 use crate::schema::PORTER_FTS5_REBUILD_TABLE;
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -483,17 +482,16 @@ impl frankensearch_core::LexicalRead for PersistedFts5LexicalSearch {
     }
 }
 
-/// Rebuild a persisted Porter FTS5 table for FrankenSQLite 0.2.1.
+/// Rebuild a persisted Porter FTS5 table for FrankenSQLite 0.3.
 ///
 /// The table's own DDL decides its content mode. Ordinary stored and external
 /// tables use FTS5's `rebuild` command; contentless tables are rejected because
 /// authoritative text and original rowids must be re-ingested instead.
 ///
-/// The rebuild is intentionally gated before `BEGIN`: 0.2.1 cannot submit the
-/// required non-cancelled rollback on cancellation, error, commit failure, or
-/// panic. The 0.3 implementation must issue rebuild, marker upsert, and
-/// `COMMIT` in one transaction and roll that transaction back exactly once
-/// with the dedicated cleanup capability when any of those steps fails.
+/// Rebuild and marker promotion share one synchronous worker transaction. The
+/// 0.3 synchronous cleanup path is independent of request cancellation, so an
+/// ordinary error, failed commit, or panic always attempts exactly one rollback
+/// before the original error or panic is returned to the caller.
 pub async fn rebuild_porter_fts5_table(
     cx: &Cx,
     conn: &AsyncConnection,
@@ -518,7 +516,59 @@ pub async fn rebuild_porter_fts5_table(
         Some(_) | None => {}
     }
 
-    require_async_transaction_cleanup_capability()
+    conn.execute_sync("BEGIN IMMEDIATE;")
+        .map_err(|error| map_storage_error_at("begin Porter FTS5 rebuild", error))?;
+
+    let result = catch_unwind(AssertUnwindSafe(|| -> SearchResult<()> {
+        let rebuild_sql = format!("INSERT INTO {table_name}({table_name}) VALUES ('rebuild');");
+        conn.execute_sync(&rebuild_sql)
+            .map_err(|error| map_storage_error_at("rebuild Porter FTS5 table", error))?;
+
+        let params = [
+            SqliteValue::Text(table_name.clone().into()),
+            SqliteValue::Integer(PORTER_FTS5_REBUILD_VERSION),
+        ];
+        conn.execute_with_params_sync(
+            &format!(
+                "INSERT INTO {PORTER_FTS5_REBUILD_TABLE} (table_name, rebuild_version) \
+                 VALUES (?1, ?2) \
+                 ON CONFLICT(table_name) DO UPDATE SET rebuild_version = excluded.rebuild_version;"
+            ),
+            &params,
+        )
+        .map_err(|error| map_storage_error_at("write Porter FTS5 rebuild marker", error))?;
+        Ok(())
+    }));
+
+    match result {
+        Ok(Ok(())) => conn.commit_transaction_sync().map_err(|commit_error| {
+            if let Err(rollback_error) = conn.rollback_transaction_sync() {
+                warn!(
+                    error = %rollback_error,
+                    "rollback failed after Porter FTS5 rebuild commit error"
+                );
+            }
+            map_storage_error_at("commit Porter FTS5 rebuild", commit_error)
+        }),
+        Ok(Err(error)) => {
+            if let Err(rollback_error) = conn.rollback_transaction_sync() {
+                warn!(
+                    error = %rollback_error,
+                    "rollback failed after Porter FTS5 rebuild error"
+                );
+            }
+            Err(error)
+        }
+        Err(payload) => {
+            if let Err(rollback_error) = conn.rollback_transaction_sync() {
+                warn!(
+                    error = %rollback_error,
+                    "rollback failed during Porter FTS5 rebuild panic recovery"
+                );
+            }
+            resume_unwind(payload);
+        }
+    }
 }
 
 fn validated_fts5_identifier(table_name: &str) -> SearchResult<String> {

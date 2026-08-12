@@ -10,7 +10,7 @@ use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use frankensearch_core::{SearchError, SearchResult};
-use fsqlite::{Connection, Row};
+use fsqlite::{AsyncConnection, Row};
 use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 
@@ -197,13 +197,13 @@ impl Storage {
         let params = [SqliteValue::Text(index_name.to_owned().into())];
         let rows = self
             .connection()
-            .query_with_params(
+            .query_with_params_sync(
                 "SELECT index_name, index_type, embedder_id, embedder_revision, \
-                    dimension, record_count, file_path, file_size_bytes, file_hash, \
-                    schema_version, built_at, build_duration_ms, source_doc_count, \
-                    config_json, fec_path, fec_size_bytes, last_verified_at, \
-                    last_repair_at, repair_count, mean_norm, variance \
-                 FROM index_metadata WHERE index_name = ?1 LIMIT 1;",
+            dimension, record_count, file_path, file_size_bytes, file_hash, \
+            schema_version, built_at, build_duration_ms, source_doc_count, \
+            config_json, fec_path, fec_size_bytes, last_verified_at, \
+            last_repair_at, repair_count, mean_norm, variance \
+         FROM index_metadata WHERE index_name = ?1 LIMIT 1;",
                 &params,
             )
             .map_err(map_storage_error)?;
@@ -219,13 +219,13 @@ impl Storage {
     pub fn list_index_metadata(&self) -> SearchResult<Vec<IndexMetadata>> {
         let rows = self
             .connection()
-            .query(
+            .query_sync(
                 "SELECT index_name, index_type, embedder_id, embedder_revision, \
-                    dimension, record_count, file_path, file_size_bytes, file_hash, \
-                    schema_version, built_at, build_duration_ms, source_doc_count, \
-                    config_json, fec_path, fec_size_bytes, last_verified_at, \
-                    last_repair_at, repair_count, mean_norm, variance \
-                 FROM index_metadata ORDER BY index_name;",
+            dimension, record_count, file_path, file_size_bytes, file_hash, \
+            schema_version, built_at, build_duration_ms, source_doc_count, \
+            config_json, fec_path, fec_size_bytes, last_verified_at, \
+            last_repair_at, repair_count, mean_norm, variance \
+         FROM index_metadata ORDER BY index_name;",
             )
             .map_err(map_storage_error)?;
 
@@ -316,7 +316,7 @@ impl Storage {
 
         let affected = self
             .connection()
-            .execute_with_params(
+            .execute_with_params_sync(
                 "UPDATE index_metadata SET last_verified_at = ?1 WHERE index_name = ?2;",
                 &params,
             )
@@ -345,10 +345,10 @@ impl Storage {
 
         let affected = self
             .connection()
-            .execute_with_params(
+            .execute_with_params_sync(
                 "UPDATE index_metadata SET last_repair_at = ?1, \
-                    repair_count = repair_count + 1 \
-                 WHERE index_name = ?2;",
+            repair_count = repair_count + 1 \
+         WHERE index_name = ?2;",
                 &params,
             )
             .map_err(map_storage_error)?;
@@ -387,7 +387,10 @@ impl Storage {
              WHERE index_name = '{escaped_index}' \
              ORDER BY built_at DESC, build_id DESC;"
         );
-        let rows = self.connection().query(&sql).map_err(map_storage_error)?;
+        let rows = self
+            .connection()
+            .query_sync(&sql)
+            .map_err(map_storage_error)?;
 
         let mut history = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -416,13 +419,16 @@ impl Storage {
         let (history_deleted, metadata_deleted) = self.transaction(|conn| {
             let params = [SqliteValue::Text(index_name.to_owned().into())];
             let history_deleted = conn
-                .execute_with_params(
+                .execute_with_params_sync(
                     "DELETE FROM index_build_history WHERE index_name = ?1;",
                     &params,
                 )
                 .map_err(map_storage_error)?;
             let metadata_deleted = conn
-                .execute_with_params("DELETE FROM index_metadata WHERE index_name = ?1;", &params)
+                .execute_with_params_sync(
+                    "DELETE FROM index_metadata WHERE index_name = ?1;",
+                    &params,
+                )
                 .map_err(map_storage_error)?;
             Ok((history_deleted, metadata_deleted))
         })?;
@@ -445,7 +451,7 @@ impl Storage {
 // ─── Internal helpers ───────────────────────────────────────────────────────
 
 fn upsert_index_metadata(
-    conn: &Connection,
+    conn: &AsyncConnection,
     params: &RecordBuildParams,
     built_at: i64,
 ) -> SearchResult<()> {
@@ -471,26 +477,26 @@ fn upsert_index_metadata(
     ];
 
     let updated = conn
-        .execute_with_params(
+        .execute_with_params_sync(
             "UPDATE index_metadata SET \
-                index_type = ?1, \
-                embedder_id = ?2, \
-                embedder_revision = ?3, \
-                dimension = ?4, \
-                record_count = ?5, \
-                file_path = ?6, \
-                file_size_bytes = ?7, \
-                file_hash = ?8, \
-                schema_version = ?9, \
-                built_at = ?10, \
-                build_duration_ms = ?11, \
-                source_doc_count = ?12, \
-                config_json = ?13, \
-                fec_path = ?14, \
-                fec_size_bytes = ?15, \
-                mean_norm = ?16, \
-                variance = ?17 \
-             WHERE index_name = ?18;",
+        index_type = ?1, \
+        embedder_id = ?2, \
+        embedder_revision = ?3, \
+        dimension = ?4, \
+        record_count = ?5, \
+        file_path = ?6, \
+        file_size_bytes = ?7, \
+        file_hash = ?8, \
+        schema_version = ?9, \
+        built_at = ?10, \
+        build_duration_ms = ?11, \
+        source_doc_count = ?12, \
+        config_json = ?13, \
+        fec_path = ?14, \
+        fec_size_bytes = ?15, \
+        mean_norm = ?16, \
+        variance = ?17 \
+     WHERE index_name = ?18;",
             &update_params,
         )
         .map_err(map_storage_error)?;
@@ -522,17 +528,17 @@ fn upsert_index_metadata(
         sqlite_f64_opt(params.variance),
     ];
 
-    conn.execute_with_params(
+    conn.execute_with_params_sync(
         "INSERT INTO index_metadata (\
-            index_name, index_type, embedder_id, embedder_revision, \
-            dimension, record_count, file_path, file_size_bytes, file_hash, \
-            schema_version, built_at, build_duration_ms, source_doc_count, \
-            config_json, fec_path, fec_size_bytes, last_verified_at, \
-            last_repair_at, repair_count, mean_norm, variance\
-         ) VALUES (\
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
-            ?15, ?16, ?17, ?18, ?19, ?20, ?21\
-         );",
+        index_name, index_type, embedder_id, embedder_revision, \
+        dimension, record_count, file_path, file_size_bytes, file_hash, \
+        schema_version, built_at, build_duration_ms, source_doc_count, \
+        config_json, fec_path, fec_size_bytes, last_verified_at, \
+        last_repair_at, repair_count, mean_norm, variance\
+     ) VALUES (\
+        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+        ?15, ?16, ?17, ?18, ?19, ?20, ?21\
+     );",
         &insert_params,
     )
     .map_err(map_storage_error)?;
@@ -541,7 +547,7 @@ fn upsert_index_metadata(
 }
 
 fn insert_build_history(
-    conn: &Connection,
+    conn: &AsyncConnection,
     params: &RecordBuildParams,
     built_at: i64,
 ) -> SearchResult<()> {
@@ -558,11 +564,11 @@ fn insert_build_history(
         sqlite_f64_opt(params.variance),
     ];
 
-    conn.execute_with_params(
+    conn.execute_with_params_sync(
         "INSERT INTO index_build_history (\
-            index_name, built_at, build_duration_ms, record_count, \
-            source_doc_count, \"trigger\", config_json, notes, mean_norm, variance\
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10);",
+        index_name, built_at, build_duration_ms, record_count, \
+        source_doc_count, \"trigger\", config_json, notes, mean_norm, variance\
+     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10);",
         &sql_params,
     )
     .map_err(map_storage_error)?;
@@ -570,11 +576,11 @@ fn insert_build_history(
     Ok(())
 }
 
-fn prune_build_history(conn: &Connection, index_name: &str, keep: i64) -> SearchResult<()> {
+fn prune_build_history(conn: &AsyncConnection, index_name: &str, keep: i64) -> SearchResult<()> {
     let escaped_index = sql_escape_single_quoted(index_name);
 
     if keep <= 0 {
-        conn.execute(&format!(
+        conn.execute_sync(&format!(
             "DELETE FROM index_build_history WHERE index_name = '{escaped_index}';"
         ))
         .map_err(map_storage_error)?;
@@ -590,10 +596,10 @@ fn prune_build_history(conn: &Connection, index_name: &str, keep: i64) -> Search
     // NOTE: Uses format!() because query_with_params returns at most one
     // row for multi-row result sets (FrankenSQLite limitation).
     let rows = conn
-        .query(&format!(
+        .query_sync(&format!(
             "SELECT build_id FROM index_build_history \
-             WHERE index_name = '{escaped_index}' \
-             ORDER BY build_id DESC;"
+         WHERE index_name = '{escaped_index}' \
+         ORDER BY build_id DESC;"
         ))
         .map_err(map_storage_error)?;
     if rows.len() <= keep {
@@ -603,7 +609,7 @@ fn prune_build_history(conn: &Connection, index_name: &str, keep: i64) -> Search
     let cutoff_row = &rows[keep - 1];
     let cutoff = row_i64(cutoff_row, 0, "index_build_history.build_id")?;
 
-    conn.execute(&format!(
+    conn.execute_sync(&format!(
         "DELETE FROM index_build_history \
          WHERE index_name = '{escaped_index}' \
            AND build_id < {cutoff};"
@@ -612,10 +618,10 @@ fn prune_build_history(conn: &Connection, index_name: &str, keep: i64) -> Search
     Ok(())
 }
 
-fn count_modified_since(conn: &Connection, since: i64) -> SearchResult<i64> {
+fn count_modified_since(conn: &AsyncConnection, since: i64) -> SearchResult<i64> {
     let params = [SqliteValue::Integer(since), SqliteValue::Integer(since)];
     let rows = conn
-        .query_with_params(
+        .query_with_params_sync(
             "SELECT COUNT(*) FROM documents WHERE updated_at > ?1 AND created_at <= ?2;",
             &params,
         )
@@ -626,10 +632,10 @@ fn count_modified_since(conn: &Connection, since: i64) -> SearchResult<i64> {
     row_i64(row, 0, "count_modified")
 }
 
-fn count_added_since(conn: &Connection, since: i64) -> SearchResult<i64> {
+fn count_added_since(conn: &AsyncConnection, since: i64) -> SearchResult<i64> {
     let params = [SqliteValue::Integer(since)];
     let rows = conn
-        .query_with_params(
+        .query_with_params_sync(
             "SELECT COUNT(*) FROM documents WHERE created_at > ?1;",
             &params,
         )
@@ -640,11 +646,17 @@ fn count_added_since(conn: &Connection, since: i64) -> SearchResult<i64> {
     row_i64(row, 0, "count_added")
 }
 
-fn count_total_documents(conn: &Connection) -> SearchResult<i64> {
-    let row = conn
-        .query_row("SELECT COUNT(*) FROM documents;")
+fn count_total_documents(conn: &AsyncConnection) -> SearchResult<i64> {
+    let rows = conn
+        .query_sync("SELECT COUNT(*) FROM documents;")
         .map_err(map_storage_error)?;
-    row_i64(&row, 0, "documents.count")
+    let row = rows.first().ok_or_else(|| SearchError::SubsystemError {
+        subsystem: "storage",
+        source: Box::new(std::io::Error::other(
+            "documents count query returned no row",
+        )),
+    })?;
+    row_i64(row, 0, "documents.count")
 }
 
 fn parse_index_metadata(row: &Row) -> SearchResult<IndexMetadata> {

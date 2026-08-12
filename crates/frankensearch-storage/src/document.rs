@@ -4,7 +4,7 @@ use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use frankensearch_core::{SearchError, SearchResult};
-use fsqlite::{Connection, Row};
+use fsqlite::{AsyncConnection, Row};
 use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 
@@ -151,10 +151,10 @@ impl Storage {
         let params = [SqliteValue::Text(doc_id.to_owned().into())];
         let rows = self
             .connection()
-            .query_with_params(
+            .query_with_params_sync(
                 "SELECT doc_id, source_path, content_preview, content_hash, content_length, \
-                    created_at, updated_at, metadata_json \
-                 FROM documents WHERE doc_id = ?1 LIMIT 1;",
+            created_at, updated_at, metadata_json \
+         FROM documents WHERE doc_id = ?1 LIMIT 1;",
                 &params,
             )
             .map_err(storage_error)?;
@@ -228,7 +228,7 @@ impl Storage {
         ];
         let rows = self
             .connection()
-            .query_with_params(sql, &params)
+            .query_with_params_sync(sql, &params)
             .map_err(storage_error)?;
         let mut doc_ids = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -263,16 +263,14 @@ impl Storage {
                 SqliteValue::Text(EmbeddingStatus::Embedded.as_str().to_owned().into()),
                 SqliteValue::Integer(finished_at),
             ];
-            conn.execute_with_params(
-                "INSERT INTO embedding_status \
-                 (doc_id, embedder_id, embedder_revision, status, embedded_at, error_message, retry_count) \
-                 VALUES (?1, ?2, NULL, ?3, ?4, NULL, 0) \
-                 ON CONFLICT(doc_id, embedder_id) DO UPDATE SET \
-                 status = excluded.status, \
-                 embedded_at = excluded.embedded_at, \
-                 error_message = NULL;",
-                &params,
-            )
+            conn.execute_with_params_sync("INSERT INTO embedding_status \
+             (doc_id, embedder_id, embedder_revision, status, embedded_at, error_message, retry_count) \
+             VALUES (?1, ?2, NULL, ?3, ?4, NULL, 0) \
+             ON CONFLICT(doc_id, embedder_id) DO UPDATE SET \
+             status = excluded.status, \
+             embedded_at = excluded.embedded_at, \
+             error_message = NULL;",
+            &params,)
             .map_err(storage_error)?;
             Ok(())
         })?;
@@ -309,17 +307,15 @@ impl Storage {
                 SqliteValue::Text(EmbeddingStatus::Failed.as_str().to_owned().into()),
                 SqliteValue::Text(error_message.to_owned().into()),
             ];
-            conn.execute_with_params(
-                "INSERT INTO embedding_status \
-                 (doc_id, embedder_id, embedder_revision, status, embedded_at, error_message, retry_count) \
-                 VALUES (?1, ?2, NULL, ?3, NULL, ?4, 1) \
-                 ON CONFLICT(doc_id, embedder_id) DO UPDATE SET \
-                 status = excluded.status, \
-                 embedded_at = NULL, \
-                 error_message = excluded.error_message, \
-                 retry_count = embedding_status.retry_count + 1;",
-                &params,
-            )
+            conn.execute_with_params_sync("INSERT INTO embedding_status \
+             (doc_id, embedder_id, embedder_revision, status, embedded_at, error_message, retry_count) \
+             VALUES (?1, ?2, NULL, ?3, NULL, ?4, 1) \
+             ON CONFLICT(doc_id, embedder_id) DO UPDATE SET \
+             status = excluded.status, \
+             embedded_at = NULL, \
+             error_message = excluded.error_message, \
+             retry_count = embedding_status.retry_count + 1;",
+            &params,)
             .map_err(storage_error)?;
             Ok(())
         })?;
@@ -350,16 +346,14 @@ impl Storage {
                 SqliteValue::Text(EmbeddingStatus::Skipped.as_str().to_owned().into()),
                 SqliteValue::Text(reason.to_owned().into()),
             ];
-            conn.execute_with_params(
-                "INSERT INTO embedding_status \
-                 (doc_id, embedder_id, embedder_revision, status, embedded_at, error_message, retry_count) \
-                 VALUES (?1, ?2, NULL, ?3, NULL, ?4, 0) \
-                 ON CONFLICT(doc_id, embedder_id) DO UPDATE SET \
-                 status = excluded.status, \
-                 embedded_at = NULL, \
-                 error_message = excluded.error_message;",
-                &params,
-            )
+            conn.execute_with_params_sync("INSERT INTO embedding_status \
+             (doc_id, embedder_id, embedder_revision, status, embedded_at, error_message, retry_count) \
+             VALUES (?1, ?2, NULL, ?3, NULL, ?4, 0) \
+             ON CONFLICT(doc_id, embedder_id) DO UPDATE SET \
+             status = excluded.status, \
+             embedded_at = NULL, \
+             error_message = excluded.error_message;",
+            &params,)
             .map_err(storage_error)?;
             Ok(())
         })?;
@@ -381,12 +375,12 @@ impl Storage {
         let params = [SqliteValue::Text(embedder_id.to_owned().into())];
         let rows = self
             .connection()
-            .query_with_params(
+            .query_with_params_sync(
                 "SELECT e.status, COUNT(*) \
-                 FROM embedding_status e \
-                 INNER JOIN documents d ON d.doc_id = e.doc_id \
-                 WHERE e.embedder_id = ?1 \
-                 GROUP BY status;",
+         FROM embedding_status e \
+         INNER JOIN documents d ON d.doc_id = e.doc_id \
+         WHERE e.embedder_id = ?1 \
+         GROUP BY status;",
                 &params,
             )
             .map_err(storage_error)?;
@@ -442,7 +436,7 @@ impl Storage {
         let params = [SqliteValue::Text(doc_id.to_owned().into())];
         let deleted = self
             .connection()
-            .execute_with_params("DELETE FROM documents WHERE doc_id = ?1;", &params)
+            .execute_with_params_sync("DELETE FROM documents WHERE doc_id = ?1;", &params)
             .map_err(storage_error)?;
 
         tracing::debug!(
@@ -504,7 +498,7 @@ impl Storage {
     }
 }
 
-pub fn upsert_document(conn: &Connection, doc: &DocumentRecord) -> SearchResult<usize> {
+pub fn upsert_document(conn: &AsyncConnection, doc: &DocumentRecord) -> SearchResult<usize> {
     validate_document(doc)?;
     let content_length = usize_to_i64(doc.content_length, "content_length")?;
     let metadata_json = metadata_to_json(doc.metadata.as_ref())?;
@@ -519,15 +513,15 @@ pub fn upsert_document(conn: &Connection, doc: &DocumentRecord) -> SearchResult<
             SqliteValue::Integer(doc.updated_at),
             sqlite_text_opt(metadata_json.as_deref()),
         ];
-        conn.execute_with_params(
+        conn.execute_with_params_sync(
             "UPDATE documents SET \
-             source_path = ?2, \
-             content_preview = ?3, \
-             content_hash = ?4, \
-             content_length = ?5, \
-             updated_at = ?6, \
-             metadata_json = ?7 \
-             WHERE doc_id = ?1;",
+         source_path = ?2, \
+         content_preview = ?3, \
+         content_hash = ?4, \
+         content_length = ?5, \
+         updated_at = ?6, \
+         metadata_json = ?7 \
+         WHERE doc_id = ?1;",
             &params,
         )
         .map_err(storage_error)
@@ -543,17 +537,15 @@ pub fn upsert_document(conn: &Connection, doc: &DocumentRecord) -> SearchResult<
             sqlite_text_opt(metadata_json.as_deref()),
         ];
 
-        conn.execute_with_params(
-            "INSERT INTO documents \
-             (doc_id, source_path, content_preview, content_hash, content_length, created_at, updated_at, metadata_json) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);",
-            &params,
-        )
+        conn.execute_with_params_sync("INSERT INTO documents \
+         (doc_id, source_path, content_preview, content_hash, content_length, created_at, updated_at, metadata_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);",
+        &params,)
         .map_err(storage_error)
     }
 }
 
-pub fn list_document_ids(conn: &Connection, limit: usize) -> SearchResult<Vec<String>> {
+pub fn list_document_ids(conn: &AsyncConnection, limit: usize) -> SearchResult<Vec<String>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -565,7 +557,7 @@ pub fn list_document_ids(conn: &Connection, limit: usize) -> SearchResult<Vec<St
     })?;
     let params = [SqliteValue::Integer(limit_i64)];
     let rows = conn
-        .query_with_params(
+        .query_with_params_sync(
             "SELECT doc_id FROM documents ORDER BY updated_at DESC LIMIT ?1;",
             &params,
         )
@@ -579,15 +571,21 @@ pub fn list_document_ids(conn: &Connection, limit: usize) -> SearchResult<Vec<St
     Ok(ids)
 }
 
-pub fn count_documents(conn: &Connection) -> SearchResult<i64> {
-    let row = conn
-        .query_row("SELECT COUNT(*) FROM documents;")
+pub fn count_documents(conn: &AsyncConnection) -> SearchResult<i64> {
+    let rows = conn
+        .query_sync("SELECT COUNT(*) FROM documents;")
         .map_err(storage_error)?;
-    row_i64(&row, 0, "documents.count")
+    let row = rows.first().ok_or_else(|| SearchError::SubsystemError {
+        subsystem: "storage",
+        source: Box::new(std::io::Error::other(
+            "documents count query returned no row",
+        )),
+    })?;
+    row_i64(row, 0, "documents.count")
 }
 
 fn upsert_document_with_outcome(
-    conn: &Connection,
+    conn: &AsyncConnection,
     doc: &DocumentRecord,
 ) -> SearchResult<UpsertOutcome> {
     validate_document(doc)?;
@@ -650,10 +648,10 @@ fn sqlite_text_opt(value: Option<&str>) -> SqliteValue {
     })
 }
 
-fn document_exists(conn: &Connection, doc_id: &str) -> SearchResult<bool> {
+fn document_exists(conn: &AsyncConnection, doc_id: &str) -> SearchResult<bool> {
     let params = [SqliteValue::Text(doc_id.to_owned().into())];
     let rows = conn
-        .query_with_params(
+        .query_with_params_sync(
             "SELECT doc_id FROM documents WHERE doc_id = ?1 LIMIT 1;",
             &params,
         )
@@ -661,10 +659,10 @@ fn document_exists(conn: &Connection, doc_id: &str) -> SearchResult<bool> {
     Ok(!rows.is_empty())
 }
 
-fn fetch_content_hash(conn: &Connection, doc_id: &str) -> SearchResult<Option<[u8; 32]>> {
+fn fetch_content_hash(conn: &AsyncConnection, doc_id: &str) -> SearchResult<Option<[u8; 32]>> {
     let params = [SqliteValue::Text(doc_id.to_owned().into())];
     let rows = conn
-        .query_with_params(
+        .query_with_params_sync(
             "SELECT content_hash FROM documents WHERE doc_id = ?1 LIMIT 1;",
             &params,
         )
@@ -675,9 +673,9 @@ fn fetch_content_hash(conn: &Connection, doc_id: &str) -> SearchResult<Option<[u
     row_blob_32(row, 0, "documents.content_hash").map(Some)
 }
 
-fn reset_embedding_status(conn: &Connection, doc_id: &str) -> SearchResult<()> {
+fn reset_embedding_status(conn: &AsyncConnection, doc_id: &str) -> SearchResult<()> {
     let params = [SqliteValue::Text(doc_id.to_owned().into())];
-    conn.execute_with_params("DELETE FROM embedding_status WHERE doc_id = ?1;", &params)
+    conn.execute_with_params_sync("DELETE FROM embedding_status WHERE doc_id = ?1;", &params)
         .map_err(storage_error)?;
     Ok(())
 }
