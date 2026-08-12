@@ -127,6 +127,18 @@ pub enum QuillIndexError {
     /// Keeper admission, recovery, or publication failed.
     #[error(transparent)]
     Keeper(#[from] KeeperError),
+    /// The process-local published view no longer agrees with durable Keeper
+    /// authority and must be reconciled before it can be returned to callers.
+    #[error(
+        "published Quill view requires reconciliation: published generation \
+         {published_generation}, durable generation {durable_generation}"
+    )]
+    PublicationReconciliationRequired {
+        /// Generation currently installed in the process-local reader view.
+        published_generation: u64,
+        /// Generation proven by the retained Keeper authority view.
+        durable_generation: u64,
+    },
     /// A lexical-root CURRENT pointer or layout could not be validated.
     #[error(transparent)]
     CurrentPointer(#[from] CurrentPointerError),
@@ -1321,42 +1333,57 @@ impl SnapshotPublisher {
         })
     }
 
-    fn install_prepared_sealed(
+    /// Check that Keeper's reopened successor is exactly compatible with the
+    /// retained process-local publication plan. This is deliberately fallible:
+    /// callers retain their retry state until it passes.
+    fn validate_prepared_sealed(
         &self,
-        keeper: Arc<KeeperSnapshot>,
-        prepared: PreparedSealedPublication,
-    ) -> Arc<QuillSearchSnapshot> {
+        keeper: &KeeperSnapshot,
+        prepared: &PreparedSealedPublication,
+    ) -> Result<(), SnapshotError> {
         let manifest = &keeper.loaded_manifest().manifest;
-        assert_eq!(
-            manifest.generation, prepared.expected_keeper_generation,
-            "Keeper installed an unexpected MANIFEST generation after publication"
-        );
-        assert_eq!(
-            manifest.schema_id, prepared.expected_schema_id,
-            "Keeper installed an unexpected schema after publication"
-        );
-        assert_eq!(
-            manifest.docid_high_watermark, prepared.expected_docid_high_watermark,
-            "Keeper installed an unexpected Q1 watermark after publication"
-        );
-        assert!(
-            keeper.schema() == prepared.schema,
-            "Keeper installed a schema descriptor that differs from the prepared publication"
-        );
-        assert_eq!(
-            keeper
-                .at_seal_doc_count()
-                .checked_add(prepared.delta_live_doc_count),
-            Some(prepared.bm25_doc_count),
-            "Keeper plus Delta BM25 count differs from the prepared publication"
-        );
-        assert_eq!(
-            keeper
-                .doc_count()
-                .checked_add(prepared.delta_live_doc_count),
-            Some(prepared.live_doc_count),
-            "Keeper plus Delta live count differs from the prepared publication"
-        );
+        if manifest.generation != prepared.expected_keeper_generation {
+            return Err(SnapshotError::KeeperTransition {
+                detail: format!(
+                    "Keeper installed generation {} but the retained publication requires {}",
+                    manifest.generation, prepared.expected_keeper_generation
+                ),
+            });
+        }
+        if manifest.schema_id != prepared.expected_schema_id || keeper.schema() != prepared.schema {
+            return Err(SnapshotError::KeeperTransition {
+                detail: "Keeper installed a schema that differs from the retained publication"
+                    .to_owned(),
+            });
+        }
+        if manifest.docid_high_watermark != prepared.expected_docid_high_watermark {
+            return Err(SnapshotError::KeeperTransition {
+                detail: format!(
+                    "Keeper installed watermark {} but the retained publication requires {}",
+                    manifest.docid_high_watermark, prepared.expected_docid_high_watermark
+                ),
+            });
+        }
+        if keeper
+            .at_seal_doc_count()
+            .checked_add(prepared.delta_live_doc_count)
+            != Some(prepared.bm25_doc_count)
+        {
+            return Err(SnapshotError::KeeperTransition {
+                detail: "Keeper plus retained Delta BM25 count differs from the publication"
+                    .to_owned(),
+            });
+        }
+        if keeper
+            .doc_count()
+            .checked_add(prepared.delta_live_doc_count)
+            != Some(prepared.live_doc_count)
+        {
+            return Err(SnapshotError::KeeperTransition {
+                detail: "Keeper plus retained Delta live count differs from the publication"
+                    .to_owned(),
+            });
+        }
         for expected in &prepared.field_stats {
             let keeper_stats = manifest
                 .field_stats
@@ -1368,27 +1395,51 @@ impl SnapshotPublisher {
             let keeper_doc_count = keeper_stats
                 .map(|row| u64::from(row.doc_count))
                 .or_else(|| manifest.segments.is_empty().then_some(0));
-            let delta_total_tokens = prepared.deltas.iter().fold(0_u64, |total, delta| {
-                total
-                    .checked_add(
-                        delta
-                            .live_total_tokens(expected.field_ord)
-                            .expect("prepared Delta field statistics must remain complete"),
-                    )
-                    .expect("prepared composite field statistics must remain in range")
-            });
-            assert_eq!(
-                keeper_total_tokens.and_then(|total| total.checked_add(delta_total_tokens)),
-                Some(expected.total_tokens),
-                "Keeper plus Delta token statistics differ from the prepared publication"
-            );
-            assert_eq!(
-                keeper_doc_count.and_then(|count| count.checked_add(prepared.delta_live_doc_count)),
-                Some(expected.doc_count),
-                "Keeper plus Delta field document count differs from the prepared publication"
-            );
+            let mut delta_total_tokens = 0_u64;
+            for delta in &prepared.deltas {
+                let delta_tokens = delta
+                    .live_total_tokens(expected.field_ord)
+                    .ok_or(SnapshotError::MissingDeltaFieldStats {
+                        field_ord: expected.field_ord,
+                    })?;
+                delta_total_tokens = delta_total_tokens.checked_add(delta_tokens).ok_or(
+                    SnapshotError::CounterOverflow {
+                        counter: "retained Delta field token count",
+                    },
+                )?;
+            }
+            if keeper_total_tokens.and_then(|total| total.checked_add(delta_total_tokens))
+                != Some(expected.total_tokens)
+            {
+                return Err(SnapshotError::KeeperTransition {
+                    detail: format!(
+                        "Keeper plus retained Delta token count differs for field {}",
+                        expected.field_ord
+                    ),
+                });
+            }
+            if keeper_doc_count.and_then(|count| count.checked_add(prepared.delta_live_doc_count))
+                != Some(expected.doc_count)
+            {
+                return Err(SnapshotError::KeeperTransition {
+                    detail: format!(
+                        "Keeper plus retained Delta document count differs for field {}",
+                        expected.field_ord
+                    ),
+                });
+            }
         }
 
+        Ok(())
+    }
+
+    /// Install a successor only after [`Self::validate_prepared_sealed`] has
+    /// accepted it while the caller still owns every retained retry artifact.
+    fn install_validated_prepared_sealed(
+        &self,
+        keeper: Arc<KeeperSnapshot>,
+        prepared: PreparedSealedPublication,
+    ) -> Arc<QuillSearchSnapshot> {
         let next = Arc::new(QuillSearchSnapshot {
             snapshot_epoch: prepared.snapshot_epoch,
             keeper,
@@ -4274,7 +4325,7 @@ struct QuillReader {
 /// index.commit(cx).await?;
 ///
 /// assert!(index.path().is_none());
-/// assert_eq!(index.doc_count(), 1);
+/// assert_eq!(index.doc_count()?, 1);
 /// let page = index.search_paginated(cx, "lexical", 10, 0, true)?;
 /// let full = index.search_results(cx, "lexical", 10)?;
 /// let ids = index.search_doc_ids(cx, "lexical", 10)?;
@@ -4439,10 +4490,34 @@ enum IndexBackend {
 }
 
 impl IndexBackend {
-    const fn snapshot(&self) -> &KeeperSnapshot {
+    /// Retained state for local bookkeeping only.
+    ///
+    /// This must never be used to answer an authority-sensitive facade call:
+    /// an abandoned durable publication can leave it behind disk.
+    const fn retained_snapshot_for_bookkeeping(&self) -> &KeeperSnapshot {
         match self {
             Self::Durable(writer) => writer.retained_snapshot_for_bookkeeping(),
             Self::Memory(snapshot) => snapshot,
+        }
+    }
+
+    /// Return the proven Keeper authority view, failing closed after a dropped
+    /// durable publication future until its writer has reconciled.
+    ///
+    /// This deliberately says nothing about the process-local published
+    /// snapshot. The narrow post-publication installation path needs the
+    /// durable successor while the local `ArcSwap` still names its predecessor.
+    fn proven_authority_snapshot(&self) -> Result<&KeeperSnapshot, KeeperError> {
+        match self {
+            Self::Durable(writer) => writer.snapshot(),
+            Self::Memory(snapshot) => Ok(snapshot),
+        }
+    }
+
+    const fn publication_awaits_reconciliation(&self) -> bool {
+        match self {
+            Self::Durable(writer) => writer.publication_awaits_reconciliation(),
+            Self::Memory(_) => false,
         }
     }
 }
@@ -4488,7 +4563,7 @@ impl QuillWriterState {
         async move {
             let writer = KeeperWriter::open(cx, directory, DEFAULT_SCHEMA).await?;
             let index = Self::from_backend(IndexBackend::Durable(writer), DEFAULT_SCHEMA, config)?;
-            record_snapshot_fields(&open_span, index.snapshot());
+            record_snapshot_fields(&open_span, index.authority_snapshot()?);
             Ok(index)
         }
         .instrument(instrumented)
@@ -4536,7 +4611,7 @@ impl QuillWriterState {
             )
             .await?;
             let index = Self::from_backend(IndexBackend::Durable(writer), DEFAULT_SCHEMA, config)?;
-            record_snapshot_fields(&open_span, index.snapshot());
+            record_snapshot_fields(&open_span, index.authority_snapshot()?);
             Ok(index)
         }
         .instrument(instrumented)
@@ -4584,7 +4659,7 @@ impl QuillWriterState {
             )
             .await?;
             let index = Self::from_backend(IndexBackend::Durable(writer), DEFAULT_SCHEMA, config)?;
-            record_snapshot_fields(&open_span, index.snapshot());
+            record_snapshot_fields(&open_span, index.authority_snapshot()?);
             Ok(index)
         }
         .instrument(instrumented)
@@ -4614,7 +4689,7 @@ impl QuillWriterState {
         async move {
             let writer = KeeperWriter::create(cx, directory, schema).await?;
             let index = Self::from_backend(IndexBackend::Durable(writer), schema, config)?;
-            record_snapshot_fields(&open_span, index.snapshot());
+            record_snapshot_fields(&open_span, index.authority_snapshot()?);
             Ok(index)
         }
         .instrument(instrumented)
@@ -4643,7 +4718,7 @@ impl QuillWriterState {
         let _open_entered = open_span.enter();
         let snapshot = KeeperSnapshot::in_memory(DEFAULT_SCHEMA)?;
         let index = Self::from_backend(IndexBackend::Memory(snapshot), DEFAULT_SCHEMA, config)?;
-        record_snapshot_fields(&open_span, index.snapshot());
+        record_snapshot_fields(&open_span, index.authority_snapshot()?);
         Ok(index)
     }
 
@@ -4690,7 +4765,10 @@ impl QuillWriterState {
         config: QuillConfig,
     ) -> Result<Self, QuillIndexError> {
         let parser = Some(DefaultQueryParser::new(schema)?);
-        let manifest = &backend.snapshot().loaded_manifest().manifest;
+        let manifest = &backend
+            .retained_snapshot_for_bookkeeping()
+            .loaded_manifest()
+            .manifest;
         let next_lease_base = next_lease_boundary(manifest.docid_high_watermark)?;
         let detected_parallelism = std::thread::available_parallelism().map_or(1, usize::from);
         let shard_router = ShardRouter::from_config(&config, detected_parallelism);
@@ -4717,7 +4795,7 @@ impl QuillWriterState {
             .checked_add(1)
             .ok_or_else(|| invalid_state("seal sequence exhausted"))?;
         let published_snapshot = Arc::new(SnapshotPublisher::new(
-            Arc::new(backend.snapshot().clone()),
+            Arc::new(backend.retained_snapshot_for_bookkeeping().clone()),
             Vec::new(),
         )?);
         Ok(Self {
@@ -4750,10 +4828,193 @@ impl QuillWriterState {
         })
     }
 
-    /// Current committed immutable snapshot.
-    #[must_use]
-    pub const fn snapshot(&self) -> &KeeperSnapshot {
-        self.backend.snapshot()
+    /// Return Keeper's proven durable authority without admitting the retained
+    /// process-local view as public authority.
+    ///
+    /// This is reserved for the synchronous post-publication successor
+    /// installation window. Keeper still rejects a pending or unreconciled
+    /// publication; only the intentional local predecessor/successor mismatch
+    /// is permitted here.
+    fn proven_authority_snapshot(&self) -> Result<&KeeperSnapshot, QuillIndexError> {
+        Ok(self.backend.proven_authority_snapshot()?)
+    }
+
+    /// Return authority only when Keeper and the published process-local view
+    /// name the same generation.
+    ///
+    /// Planning and all public facade reads use this strict path. It fails
+    /// closed when either the durable writer or the process-local published
+    /// view needs reconciliation after a publication future drop.
+    fn authority_snapshot(&self) -> Result<&KeeperSnapshot, QuillIndexError> {
+        let snapshot = self.proven_authority_snapshot()?;
+        let published_generation = self.published_snapshot.load().keeper_generation();
+        let durable_generation = snapshot.loaded_manifest().manifest.generation;
+        if published_generation != durable_generation {
+            return Err(QuillIndexError::PublicationReconciliationRequired {
+                published_generation,
+                durable_generation,
+            });
+        }
+        Ok(snapshot)
+    }
+
+    /// Return the already-installed process-local view only after proving it
+    /// matches durable Keeper authority.
+    fn checked_published_snapshot(&self) -> Result<Arc<QuillSearchSnapshot>, QuillIndexError> {
+        self.authority_snapshot()?;
+        Ok(self.published_snapshot.load())
+    }
+
+    /// Whether an abandoned or incompletely surfaced publication must be
+    /// reconciled before another mutation may plan against this writer.
+    fn publication_awaits_reconciliation(&self) -> bool {
+        self.backend.publication_awaits_reconciliation()
+            || self.published_snapshot.load().keeper_generation()
+                != self
+                    .backend
+                    .retained_snapshot_for_bookkeeping()
+                    .loaded_manifest()
+                    .manifest
+                    .generation
+    }
+
+    /// Clear only the scalar transaction state whose MANIFEST has already
+    /// been proven and installed into the local publication. Keeping this
+    /// separate from durable I/O lets recovery retain every artifact until the
+    /// exact successor has passed `validate_prepared_sealed`.
+    fn finish_published_pending_segments(&mut self) {
+        self.pending_segments.clear();
+        self.pending_owned_segments.clear();
+        self.pending_field_stats.clear();
+        self.pending_manifest = None;
+        self.pending_replacement_manifest = None;
+        self.uncommitted_ids.clear();
+        for shard in &self.shards {
+            self.uncommitted_ids.extend(
+                shard
+                    .identities
+                    .iter()
+                    .map(|identity| identity.document_id.clone()),
+            );
+        }
+        if self
+            .shards
+            .iter()
+            .all(|shard| shard.accumulator.document_count() == 0)
+        {
+            self.unpublished_since = None;
+        }
+    }
+
+    /// Reconcile an abandoned durable publication and install the exact
+    /// matching process-local successor before allowing strict reads again.
+    ///
+    /// The writer lock held by the public wrapper excludes new mutation while
+    /// Keeper opens the durable MANIFEST. Retained Delta and scalar retry
+    /// state is not taken or cleared until the reopened successor validates.
+    async fn reconcile_publication(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Arc<QuillSearchSnapshot>, QuillIndexError> {
+        let authority = match &mut self.backend {
+            IndexBackend::Durable(writer) => {
+                Arc::new(writer.reconcile_publication(cx).await?.clone())
+            }
+            IndexBackend::Memory(snapshot) => Arc::new(snapshot.clone()),
+        };
+        let local = self.published_snapshot.load();
+        let local_generation = local.keeper_generation();
+        let durable_generation = authority.loaded_manifest().manifest.generation;
+        if durable_generation < local_generation {
+            return Err(invalid_state(format!(
+                "reconciliation observed durable generation {durable_generation} behind local generation {local_generation}"
+            )));
+        }
+        if durable_generation == local_generation {
+            return Ok(local);
+        }
+
+        if self.pending_delta_seal.is_some() {
+            self.published_snapshot.validate_prepared_sealed(
+                authority.as_ref(),
+                &self
+                    .pending_delta_seal
+                    .as_ref()
+                    .expect("checked pending Delta seal remains present")
+                    .prepared,
+            )?;
+            let pending = self
+                .pending_delta_seal
+                .take()
+                .expect("validated pending Delta seal remains present");
+            let installed = self
+                .published_snapshot
+                .install_validated_prepared_sealed(authority, pending.prepared);
+            self.next_seal_seq = pending.next_seal_seq;
+            self.next_lease_base = self.next_lease_base.max(pending.successor_watermark);
+            self.docid_allocator =
+                DocIdAllocator::open(self.next_lease_base, self.shard_router.shard_count())
+                    .map_err(|error| invalid_state(error.to_string()))?;
+            return Ok(installed);
+        }
+
+        if let Some(manifest) = self.pending_manifest.as_ref() {
+            let prepared = self
+                .published_snapshot
+                .prepare_sealed_manifest(self.schema, manifest)?;
+            self.published_snapshot
+                .validate_prepared_sealed(authority.as_ref(), &prepared)?;
+            let installed = self
+                .published_snapshot
+                .install_validated_prepared_sealed(authority, prepared);
+            self.finish_published_pending_segments();
+            return Ok(installed);
+        }
+
+        if self.staged_flush.is_some()
+            || !self.pending_segments.is_empty()
+            || !self.pending_owned_segments.is_empty()
+            || !self.pending_field_stats.is_empty()
+            || self.pending_replacement_manifest.is_some()
+        {
+            return Err(invalid_state(
+                "durable authority advanced while a scalar transaction lacks its retained MANIFEST proposal",
+            ));
+        }
+        if !local.delta_snapshots().is_empty() {
+            return Err(invalid_state(
+                "durable authority advanced without a retained Delta-seal proposal",
+            ));
+        }
+
+        // Delete, compact, concat, and bulk-completion transitions do not
+        // retain a custom process-local plan. Their durable successor is
+        // complete by construction, so rebuild a no-Delta composite directly
+        // from the reopened Keeper snapshot.
+        let installed = self
+            .published_snapshot
+            .publish_complete(authority, Vec::new())?;
+        let recovered_next_seal = installed
+            .keeper_snapshot()
+            .segments()
+            .iter()
+            .map(|segment| segment.manifest().seal_seq)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| invalid_state("seal sequence exhausted during reconciliation"))?;
+        self.next_seal_seq = self.next_seal_seq.max(recovered_next_seal);
+        self.next_lease_base = self.next_lease_base.max(
+            installed
+                .keeper_snapshot()
+                .loaded_manifest()
+                .manifest
+                .docid_high_watermark,
+        );
+        self.docid_allocator =
+            DocIdAllocator::open(self.next_lease_base, self.shard_router.shard_count())
+                .map_err(|error| invalid_state(error.to_string()))?;
+        Ok(installed)
     }
 
     /// Atomically publish the complete process-local Delta table for the
@@ -4783,7 +5044,7 @@ impl QuillWriterState {
         }
         Ok(self
             .published_snapshot
-            .publish_complete(Arc::new(self.backend.snapshot().clone()), deltas)?)
+            .publish_complete(Arc::new(self.authority_snapshot()?.clone()), deltas)?)
     }
 
     /// Seal one already-published Delta epoch into Keeper and atomically
@@ -4848,7 +5109,7 @@ impl QuillWriterState {
             .map(Arc::new);
         check_cancel(cx, "Delta segment install")?;
 
-        let mut manifest = self.backend.snapshot().next_manifest()?;
+        let mut manifest = self.authority_snapshot()?.next_manifest()?;
         // Keeper owns the one authoritative publish timestamp. Retaining a
         // zero here also lets an ambiguous retry compare the exact logical
         // proposal after Keeper normalizes its installed timestamp.
@@ -4975,15 +5236,29 @@ impl QuillWriterState {
         }
 
         // No await or cancellation checkpoint is permitted after MANIFEST
-        // authority changes. Taking the retained state and swapping the local
-        // epoch therefore complete in the same poll that observes publication.
+        // authority changes. Proving the installed state and swapping the
+        // local epoch therefore complete in the same poll that observes
+        // publication.
+        // Keep the retained retry proposal intact until Keeper's proven
+        // successor has been obtained. If that proof fails, a caller can
+        // resume the exact proposal rather than silently losing it after the
+        // durable side may have advanced.
+        let authority = Arc::new(self.proven_authority_snapshot()?.clone());
+        self.published_snapshot.validate_prepared_sealed(
+            authority.as_ref(),
+            &self
+                .pending_delta_seal
+                .as_ref()
+                .expect("published Delta seal retains its prepared local swap")
+                .prepared,
+        )?;
         let pending = self
             .pending_delta_seal
             .take()
             .expect("published Delta seal retains its prepared local swap");
         let installed = self
             .published_snapshot
-            .install_prepared_sealed(Arc::new(self.backend.snapshot().clone()), pending.prepared);
+            .install_validated_prepared_sealed(authority, pending.prepared);
         self.next_seal_seq = pending.next_seal_seq;
         self.next_lease_base = self.next_lease_base.max(pending.successor_watermark);
         self.docid_allocator =
@@ -4995,7 +5270,7 @@ impl QuillWriterState {
     /// Durable index directory, or `None` for an owned-buffer index.
     #[must_use]
     pub fn directory(&self) -> Option<&Path> {
-        self.backend.snapshot().directory()
+        self.backend.retained_snapshot_for_bookkeeping().directory()
     }
 
     /// Whether the writer holds documents or installed segments not yet visible.
@@ -5009,12 +5284,14 @@ impl QuillWriterState {
             || self.pending_manifest.is_some()
             || self.pending_replacement_manifest.is_some()
             || self.pending_delta_seal.is_some()
+            || self.publication_awaits_reconciliation()
     }
 
     #[cfg(feature = "conformance-internals")]
     fn conformance_pending_writer_state(
         &self,
     ) -> Result<ConformancePendingWriterState, QuillIndexError> {
+        let authority = self.authority_snapshot()?;
         let shard_count = conformance_usize_to_u64(self.shards.len(), "writer shard count")?;
         let dirty_shard_count = conformance_usize_to_u64(
             self.shards
@@ -5093,7 +5370,7 @@ impl QuillWriterState {
         conformance_hash_bytes(
             &mut hasher,
             &conformance_manifest_bytes(
-                &self.backend.snapshot().loaded_manifest().manifest,
+                &authority.loaded_manifest().manifest,
                 "writer backend MANIFEST",
             )?,
         );
@@ -5417,6 +5694,7 @@ impl QuillWriterState {
         // this helper is also called directly by tests, so it owns its own
         // precondition rather than inheriting one. Removing it would leave
         // those callers unvalidated (bd-quill-rejected-ingest-publishes-partial-batch-aihri).
+        let authority = self.authority_snapshot()?;
         let mut batch_ids = BTreeSet::new();
         for document in documents {
             check_cancel(cx, "internal parallel index validation")?;
@@ -5425,11 +5703,7 @@ impl QuillWriterState {
             }
             if !batch_ids.insert(document.id.as_str())
                 || self.uncommitted_ids.contains(&document.id)
-                || self
-                    .backend
-                    .snapshot()
-                    .resolve_document_id(&document.id)?
-                    .is_some()
+                || authority.resolve_document_id(&document.id)?.is_some()
             {
                 return Err(invalid_state(format!(
                     "duplicate live document id {:?}",
@@ -5666,6 +5940,7 @@ impl QuillWriterState {
         // Same as the internal-parallel route: redundant under
         // `index_documents_with_replacements`, retained because direct callers
         // exist and this helper owns its own precondition.
+        let authority = self.authority_snapshot()?;
         let mut batch_ids = BTreeSet::new();
         for document in documents {
             check_cancel(cx, "parallel index validation")?;
@@ -5674,11 +5949,7 @@ impl QuillWriterState {
             }
             if !batch_ids.insert(document.id.as_str())
                 || self.uncommitted_ids.contains(&document.id)
-                || self
-                    .backend
-                    .snapshot()
-                    .resolve_document_id(&document.id)?
-                    .is_some()
+                || authority.resolve_document_id(&document.id)?.is_some()
             {
                 return Err(invalid_state(format!(
                     "duplicate live document id {:?}",
@@ -6242,6 +6513,7 @@ impl QuillWriterState {
         documents: &[IndexableDocument],
         replacement_ids: &BTreeSet<&str>,
     ) -> Result<(), QuillIndexError> {
+        let authority = self.authority_snapshot()?;
         let mut batch_ids = BTreeSet::new();
         for document in documents {
             check_cancel(cx, "index admission")?;
@@ -6250,11 +6522,7 @@ impl QuillWriterState {
             }
             if !batch_ids.insert(document.id.as_str())
                 || self.uncommitted_ids.contains(&document.id)
-                || self
-                    .backend
-                    .snapshot()
-                    .resolve_document_id(&document.id)?
-                    .is_some()
+                || authority.resolve_document_id(&document.id)?.is_some()
                     && !replacement_ids.contains(document.id.as_str())
             {
                 return Err(invalid_state(format!(
@@ -6618,7 +6886,7 @@ impl QuillWriterState {
             self.apply_tier_policy(cx).await?;
         }
         self.ingest_retry_required = false;
-        Ok(self.backend.snapshot())
+        self.authority_snapshot()
     }
 
     async fn publish_bulk_cadence_if_due(&mut self, cx: &Cx) -> Result<(), QuillIndexError> {
@@ -6698,11 +6966,16 @@ impl QuillWriterState {
                         *snapshot = published;
                     }
                 }
-                self.published_snapshot.install_prepared_sealed(
-                    Arc::new(self.backend.snapshot().clone()),
-                    prepared_publication,
-                );
-                record_snapshot_fields(&open_span, self.backend.snapshot());
+                // `writer.publish` may have advanced Keeper before the local
+                // ArcSwap installs the matching successor. Use only the
+                // proven Keeper view for this synchronous bridge; strict
+                // authority resumes immediately after installation below.
+                let authority = Arc::new(self.proven_authority_snapshot()?.clone());
+                self.published_snapshot
+                    .validate_prepared_sealed(authority.as_ref(), &prepared_publication)?;
+                self.published_snapshot
+                    .install_validated_prepared_sealed(authority, prepared_publication);
+                record_snapshot_fields(&open_span, self.authority_snapshot()?);
                 Ok::<(), QuillIndexError>(())
             }
             .instrument(instrumented)
@@ -6711,27 +6984,7 @@ impl QuillWriterState {
         }
         .instrument(instrumented)
         .await?;
-        self.pending_segments.clear();
-        self.pending_owned_segments.clear();
-        self.pending_field_stats.clear();
-        self.pending_manifest = None;
-        self.pending_replacement_manifest = None;
-        self.uncommitted_ids.clear();
-        for shard in &self.shards {
-            self.uncommitted_ids.extend(
-                shard
-                    .identities
-                    .iter()
-                    .map(|identity| identity.document_id.clone()),
-            );
-        }
-        if self
-            .shards
-            .iter()
-            .all(|shard| shard.accumulator.document_count() == 0)
-        {
-            self.unpublished_since = None;
-        }
+        self.finish_published_pending_segments();
         Ok(())
     }
 
@@ -6739,7 +6992,11 @@ impl QuillWriterState {
         loop {
             let policy = TierMergePolicy::from_config(&self.config);
             let plan = plan_tier_merge(
-                &self.backend.snapshot().loaded_manifest().manifest.segments,
+                &self
+                    .authority_snapshot()?
+                    .loaded_manifest()
+                    .manifest
+                    .segments,
                 policy,
             )?;
             let Some(plan) = plan else {
@@ -6783,8 +7040,7 @@ impl QuillWriterState {
         self.commit_with_trigger(cx, LifecycleTrigger::BulkFinish)
             .await?;
         let source_segment_ids = self
-            .backend
-            .snapshot()
+            .authority_snapshot()?
             .loaded_manifest()
             .manifest
             .segments
@@ -6812,15 +7068,15 @@ impl QuillWriterState {
         }
         self.publish_bulk_completion(cx).await?;
         self.reader.config.bulk_load_mode = false;
-        Ok(self.backend.snapshot())
+        self.authority_snapshot()
     }
 
     async fn publish_bulk_completion(&mut self, cx: &Cx) -> Result<(), QuillIndexError> {
-        let current = &self.backend.snapshot().loaded_manifest().manifest;
+        let current = &self.authority_snapshot()?.loaded_manifest().manifest;
         if current.flags & MANIFEST_FLAG_BULK_MODE_IN_PROGRESS == 0 {
             return Ok(());
         }
-        let mut manifest = self.backend.snapshot().next_manifest()?;
+        let mut manifest = self.authority_snapshot()?.next_manifest()?;
         manifest.flags &= !MANIFEST_FLAG_BULK_MODE_IN_PROGRESS;
         manifest.last_publish_unix_s = 0;
         if matches!(&self.backend, IndexBackend::Durable(_)) {
@@ -6838,8 +7094,11 @@ impl QuillWriterState {
                 *snapshot = snapshot.publish_owned_segments(&manifest, Vec::new())?;
             }
         }
+        let authority = Arc::new(self.proven_authority_snapshot()?.clone());
         self.published_snapshot
-            .install_prepared_sealed(Arc::new(self.backend.snapshot().clone()), prepared);
+            .validate_prepared_sealed(authority.as_ref(), &prepared)?;
+        self.published_snapshot
+            .install_validated_prepared_sealed(authority, prepared);
         Ok(())
     }
 
@@ -6902,12 +7161,13 @@ impl QuillWriterState {
                 *snapshot = successor;
             }
         }
-        self.published_snapshot.install_prepared_sealed(
-            Arc::new(self.backend.snapshot().clone()),
-            prepared_publication,
-        );
+        let authority = Arc::new(self.proven_authority_snapshot()?.clone());
+        self.published_snapshot
+            .validate_prepared_sealed(authority.as_ref(), &prepared_publication)?;
+        self.published_snapshot
+            .install_validated_prepared_sealed(authority, prepared_publication);
         self.next_seal_seq = next_seal_seq;
-        Ok(self.backend.snapshot())
+        self.authority_snapshot()
     }
 
     fn retire_ingest_leases(&mut self) -> Result<(), QuillIndexError> {
@@ -6953,14 +7213,17 @@ impl QuillWriterState {
                 "compaction requires a fully committed scalar index",
             ));
         }
+        let authority = self.authority_snapshot()?;
+        let authority_generation = authority.loaded_manifest().manifest.generation;
+        let authority_segment_count = authority.segments().len();
         let created_unix_s = self.created_unix_s()?;
         let compact_span = tracing::info_span!(
             target: crate::tracing_conventions::TARGET,
             crate::tracing_conventions::KEEPER_COMPACT,
             phase = "compact",
             durability = matches!(&self.backend, IndexBackend::Durable(_)),
-            generation = self.snapshot().loaded_manifest().manifest.generation,
-            segment_count = self.snapshot().segments().len(),
+            generation = authority_generation,
+            segment_count = authority_segment_count,
             result_count = tracing::field::Empty,
             output_bytes = tracing::field::Empty,
             duration_us = tracing::field::Empty,
@@ -6988,16 +7251,18 @@ impl QuillWriterState {
         compact_span.record("result_count", report.compacted_segments);
         compact_span.record("output_bytes", report.output_bytes);
         if report.changed() {
-            let prepared_publication = self.published_snapshot.prepare_sealed_manifest(
-                self.schema,
-                &self.backend.snapshot().loaded_manifest().manifest,
-            )?;
-            self.published_snapshot.install_prepared_sealed(
-                Arc::new(self.backend.snapshot().clone()),
+            let authority = self.proven_authority_snapshot()?;
+            let prepared_publication = self
+                .published_snapshot
+                .prepare_sealed_manifest(self.schema, &authority.loaded_manifest().manifest)?;
+            self.published_snapshot
+                .validate_prepared_sealed(authority, &prepared_publication)?;
+            self.published_snapshot.install_validated_prepared_sealed(
+                Arc::new(authority.clone()),
                 prepared_publication,
             );
             self.next_seal_seq = self
-                .snapshot()
+                .authority_snapshot()?
                 .segments()
                 .iter()
                 .map(|segment| segment.manifest().seal_seq)
@@ -7013,15 +7278,12 @@ impl QuillWriterState {
         documents: &[IndexableDocument],
     ) -> Result<(), QuillIndexError> {
         check_cancel(cx, "upsert documents")?;
-        let mut manifest = self.backend.snapshot().next_manifest()?;
+        let snapshot = self.authority_snapshot()?;
+        let mut manifest = snapshot.next_manifest()?;
         let mut replacement_ids = BTreeSet::new();
         for document in documents {
             check_cancel(cx, "upsert document batch")?;
-            if self
-                .backend
-                .snapshot()
-                .delete_document(&mut manifest, &document.id)?
-            {
+            if snapshot.delete_document(&mut manifest, &document.id)? {
                 replacement_ids.insert(document.id.as_str());
             }
         }
@@ -7086,16 +7348,13 @@ impl QuillWriterState {
                 "delete_document cannot mutate a frozen process-local Delta epoch",
             ));
         }
-        let mut manifest = self.backend.snapshot().next_manifest()?;
+        let snapshot = self.authority_snapshot()?;
+        let mut manifest = snapshot.next_manifest()?;
         manifest.last_publish_unix_s = 0;
         let mut deleted = 0_usize;
         for &document_id in document_ids {
             check_cancel(cx, "delete document batch")?;
-            if self
-                .backend
-                .snapshot()
-                .delete_document(&mut manifest, document_id)?
-            {
+            if snapshot.delete_document(&mut manifest, document_id)? {
                 deleted = deleted.saturating_add(1);
             }
         }
@@ -7114,8 +7373,11 @@ impl QuillWriterState {
                 *snapshot = snapshot.publish_owned_segments(&manifest, Vec::new())?;
             }
         }
+        let authority = Arc::new(self.proven_authority_snapshot()?.clone());
         self.published_snapshot
-            .install_prepared_sealed(Arc::new(self.backend.snapshot().clone()), prepared);
+            .validate_prepared_sealed(authority.as_ref(), &prepared)?;
+        self.published_snapshot
+            .install_validated_prepared_sealed(authority, prepared);
         Ok(deleted)
     }
 
@@ -7131,9 +7393,10 @@ impl QuillWriterState {
                 "delete_all cannot mutate frozen process-local Delta epochs",
             ));
         }
-        let mut manifest = self.backend.snapshot().next_manifest()?;
+        let snapshot = self.authority_snapshot()?;
+        let mut manifest = snapshot.next_manifest()?;
         manifest.last_publish_unix_s = 0;
-        self.backend.snapshot().delete_all(&mut manifest)?;
+        snapshot.delete_all(&mut manifest)?;
         let prepared = self
             .published_snapshot
             .prepare_sealed_manifest(self.schema, &manifest)?;
@@ -7146,8 +7409,11 @@ impl QuillWriterState {
                 *snapshot = snapshot.publish_owned_segments(&manifest, Vec::new())?;
             }
         }
+        let authority = Arc::new(self.proven_authority_snapshot()?.clone());
         self.published_snapshot
-            .install_prepared_sealed(Arc::new(self.backend.snapshot().clone()), prepared);
+            .validate_prepared_sealed(authority.as_ref(), &prepared)?;
+        self.published_snapshot
+            .install_validated_prepared_sealed(authority, prepared);
         Ok(())
     }
 
@@ -7158,7 +7424,7 @@ impl QuillWriterState {
         let manifest = if let Some(manifest) = &self.pending_replacement_manifest {
             manifest.clone()
         } else {
-            self.backend.snapshot().next_manifest()?
+            self.authority_snapshot()?.next_manifest()?
         };
         self.prepare_pending_manifest_from(manifest)?;
         self.pending_replacement_manifest = None;
@@ -7528,7 +7794,7 @@ impl QuillWriterState {
         };
         if let IndexBackend::Durable(writer) = &mut self.backend {
             let directory = writer
-                .snapshot()
+                .retained_snapshot_for_bookkeeping()
                 .directory()
                 .expect("KeeperWriter always owns a durable directory");
             let pending = staged.encoded.write_temp_retryable(directory)?;
@@ -7587,9 +7853,8 @@ impl QuillWriterState {
         created_unix_s: i64,
         reserved_segment_ids: &BTreeSet<u64>,
     ) -> Result<u64, QuillIndexError> {
-        let generation = self
-            .backend
-            .snapshot()
+        let authority = self.authority_snapshot()?;
+        let generation = authority
             .loaded_manifest()
             .manifest
             .generation
@@ -7612,9 +7877,7 @@ impl QuillWriterState {
             preimage[44..].copy_from_slice(&salt.to_le_bytes());
             let candidate = xxh3_64(&preimage);
             let collision = reserved_segment_ids.contains(&candidate)
-                || self
-                    .backend
-                    .snapshot()
+                || authority
                     .loaded_manifest()
                     .manifest
                     .segments
@@ -7635,9 +7898,8 @@ impl QuillWriterState {
         source_segment_ids: &[u64],
         domain: &[u8],
     ) -> Result<u64, QuillIndexError> {
-        let generation = self
-            .backend
-            .snapshot()
+        let authority = self.authority_snapshot()?;
+        let generation = authority
             .loaded_manifest()
             .manifest
             .generation
@@ -7658,9 +7920,7 @@ impl QuillWriterState {
             preimage[24..32].copy_from_slice(&self.next_seal_seq.to_le_bytes());
             preimage[32..].copy_from_slice(&salt.to_le_bytes());
             let candidate = xxh3_64(&preimage);
-            if self
-                .backend
-                .snapshot()
+            if authority
                 .loaded_manifest()
                 .manifest
                 .segments
@@ -7856,7 +8116,27 @@ impl QuillReader {
         exact_count: bool,
     ) -> Result<(QuillSearchResult, ConformancePruningTraceReceipt), QuillIndexError> {
         let published = self.published_snapshot.load();
-        let expected_segments = published.keeper_snapshot().segments().len();
+        self.search_paginated_with_conformance_pruning_trace_on(
+            cx,
+            query,
+            limit,
+            offset,
+            exact_count,
+            published.as_ref(),
+        )
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    fn search_paginated_with_conformance_pruning_trace_on(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+        snapshot: &QuillSearchSnapshot,
+    ) -> Result<(QuillSearchResult, ConformancePruningTraceReceipt), QuillIndexError> {
+        let expected_segments = snapshot.keeper_snapshot().segments().len();
         let guard = ConformancePruningTraceGuard::new(
             expected_segments,
             Arc::clone(&self.conformance_controller),
@@ -7872,7 +8152,7 @@ impl QuillReader {
             Some(guard.session()),
             #[cfg(feature = "profile-internals")]
             None,
-            published.as_ref(),
+            snapshot,
         )?;
         let receipt = guard.complete()?;
         Ok((result, receipt))
@@ -8094,8 +8374,8 @@ impl QuillReader {
         limit: usize,
         hydrate_metadata: bool,
     ) -> Result<Vec<ScoredResult>, QuillIndexError> {
-        self.scored_results_pinned(cx, query, limit, hydrate_metadata)
-            .map(|(results, _snapshot)| results)
+        let snapshot = self.published_snapshot.load();
+        self.scored_results_on(cx, query, limit, hydrate_metadata, snapshot.as_ref())
     }
 
     /// Score on the currently published snapshot and return that exact
@@ -8109,14 +8389,27 @@ impl QuillReader {
         hydrate_metadata: bool,
     ) -> Result<(Vec<ScoredResult>, Arc<QuillSearchSnapshot>), QuillIndexError> {
         let published = self.published_snapshot.load();
-        let search = self.search_paginated_on(cx, query, limit, 0, false, published.as_ref())?;
+        let results = self.scored_results_on(cx, query, limit, hydrate_metadata, published.as_ref())?;
+        Ok((results, published))
+    }
+
+    /// Score against the exact caller-pinned composite snapshot.
+    fn scored_results_on(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        hydrate_metadata: bool,
+        snapshot: &QuillSearchSnapshot,
+    ) -> Result<Vec<ScoredResult>, QuillIndexError> {
+        let search = self.search_paginated_on(cx, query, limit, 0, false, snapshot)?;
         let mut results = Vec::new();
         results
             .try_reserve_exact(search.hits.len())
             .map_err(|_| invalid_state("could not allocate lexical results"))?;
         for hit in search.hits {
             let metadata = hydrate_metadata
-                .then(|| published.materialize_metadata(hit.global_docid))
+                .then(|| snapshot.materialize_metadata(hit.global_docid))
                 .transpose()?
                 .flatten();
             results.push(ScoredResult {
@@ -8132,7 +8425,7 @@ impl QuillReader {
                 metadata,
             });
         }
-        Ok((results, published))
+        Ok(results)
     }
 
     /// Collect the complete deterministic set of matching global document IDs.
@@ -8149,7 +8442,16 @@ impl QuillReader {
     /// failures.
     pub fn collect_docids(&self, cx: &Cx, query: &str) -> Result<Vec<u32>, QuillIndexError> {
         let published = self.published_snapshot.load();
-        let snapshot = published.as_ref();
+        self.collect_docids_on(cx, query, published.as_ref())
+    }
+
+    /// Collect against the exact caller-pinned composite snapshot.
+    fn collect_docids_on(
+        &self,
+        cx: &Cx,
+        query: &str,
+        snapshot: &QuillSearchSnapshot,
+    ) -> Result<Vec<u32>, QuillIndexError> {
         let keeper = snapshot.keeper_snapshot();
         let segment_count = keeper
             .segments()
@@ -8227,11 +8529,24 @@ impl QuillReader {
         exact_count: bool,
     ) -> Result<QuillSearchResult, QuillIndexError> {
         let published = self.published_snapshot.load();
-        let keeper = published.keeper_snapshot();
+        self.search_preparsed_paginated_on(cx, query, limit, offset, exact_count, published.as_ref())
+    }
+
+    #[cfg(feature = "bench-internals")]
+    fn search_preparsed_paginated_on(
+        &self,
+        cx: &Cx,
+        query: &Query,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+        snapshot: &QuillSearchSnapshot,
+    ) -> Result<QuillSearchResult, QuillIndexError> {
+        let keeper = snapshot.keeper_snapshot();
         let segment_count = keeper
             .segments()
             .len()
-            .saturating_add(published.delta_count());
+            .saturating_add(snapshot.delta_count());
         let query_span = tracing::info_span!(
             target: crate::tracing_conventions::TARGET,
             crate::tracing_conventions::ARGUS_QUERY,
@@ -8239,7 +8554,7 @@ impl QuillReader {
             query_form = "preparsed",
             cache_lookup = tracing::field::Empty,
             segment_count,
-            doc_count = published.live_doc_count(),
+            doc_count = snapshot.live_doc_count(),
             limit,
             offset,
             exact_count,
@@ -8256,7 +8571,7 @@ impl QuillReader {
         let cache_enabled = self.ranked_query_cache_enabled();
         if cache_enabled {
             if let Some(result) = self.published_snapshot.ranked_query_cache.get_preparsed(
-                published.snapshot_epoch(),
+                snapshot.snapshot_epoch(),
                 query,
                 limit,
                 offset,
@@ -8281,7 +8596,7 @@ impl QuillReader {
         let result = self.execute_ranked_query(
             cx,
             &canonical,
-            published.as_ref(),
+            snapshot,
             limit,
             offset,
             exact_count,
@@ -8296,7 +8611,7 @@ impl QuillReader {
         }
         if cache_enabled {
             self.published_snapshot.ranked_query_cache.insert_preparsed(
-                published.snapshot_epoch(),
+                snapshot.snapshot_epoch(),
                 query,
                 limit,
                 offset,
@@ -8319,11 +8634,21 @@ impl QuillReader {
         cx: &Cx,
         query: &Query,
     ) -> Result<Vec<u32>, QuillIndexError> {
+        let published = self.published_snapshot.load();
+        self.collect_preparsed_docids_on(cx, query, published.as_ref())
+    }
+
+    #[cfg(feature = "bench-internals")]
+    fn collect_preparsed_docids_on(
+        &self,
+        cx: &Cx,
+        query: &Query,
+        snapshot: &QuillSearchSnapshot,
+    ) -> Result<Vec<u32>, QuillIndexError> {
         check_cancel(cx, "collect_preparsed_docids")?;
         let mut canonical = query.clone();
         let _canonicalization = canonicalize_query(&mut canonical);
-        let published = self.published_snapshot.load();
-        self.execute_docid_query(cx, &canonical, published.as_ref())
+        self.execute_docid_query(cx, &canonical, snapshot)
     }
 
     /// Bench-only: run one ranked sealed-segment collection with the fan-out
@@ -8354,11 +8679,30 @@ impl QuillReader {
         fan_out: bool,
         rank_pruning: Option<bool>,
     ) -> Result<Vec<(u32, u32)>, QuillIndexError> {
+        let published = self.published_snapshot.load();
+        self.bench_search_sealed_forced_on(
+            cx,
+            query,
+            limit,
+            fan_out,
+            rank_pruning,
+            published.as_ref(),
+        )
+    }
+
+    #[cfg(feature = "bench-internals")]
+    fn bench_search_sealed_forced_on(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        fan_out: bool,
+        rank_pruning: Option<bool>,
+        snapshot: &QuillSearchSnapshot,
+    ) -> Result<Vec<(u32, u32)>, QuillIndexError> {
         let mut parsed = self.default_parser()?.parse_lenient(query);
         let _canonicalization = canonicalize_query(&mut parsed.query);
         validate_query_lowering(&parsed.query, 1.0, self.schema)?;
-        let published = self.published_snapshot.load();
-        let snapshot = published.as_ref();
         let topdocs_root = limit != 0;
         let rank_pruning = topdocs_root
             && rank_pruning.unwrap_or_else(|| query_has_prunable_root_union(&parsed.query, 1.0));
@@ -8890,11 +9234,21 @@ impl QuillReader {
         query: &str,
         fan_out: bool,
     ) -> Result<Vec<u32>, QuillIndexError> {
+        let published = self.published_snapshot.load();
+        self.bench_collect_docids_forced_on(cx, query, fan_out, published.as_ref())
+    }
+
+    #[cfg(feature = "bench-internals")]
+    fn bench_collect_docids_forced_on(
+        &self,
+        cx: &Cx,
+        query: &str,
+        fan_out: bool,
+        snapshot: &QuillSearchSnapshot,
+    ) -> Result<Vec<u32>, QuillIndexError> {
         let mut parsed = self.default_parser()?.parse_lenient(query);
         let _canonicalization = canonicalize_query(&mut parsed.query);
         validate_query_lowering(&parsed.query, 1.0, self.schema)?;
-        let published = self.published_snapshot.load();
-        let snapshot = published.as_ref();
         let mut collector = DocSetCollector::new();
         let work_upper_bound = query_work_upper_bound(
             &parsed.query,
@@ -9023,23 +9377,35 @@ impl QuillReader {
         limit: usize,
         snippet_config: &SnippetConfig,
     ) -> Result<Vec<QuillSnippetHit>, QuillIndexError> {
+        let snapshot = self.published_snapshot.load();
+        self.search_with_snippets_on(cx, query, limit, snippet_config, snapshot.as_ref())
+    }
+
+    /// Generate snippets against the exact caller-pinned composite snapshot.
+    fn search_with_snippets_on(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        snippet_config: &SnippetConfig,
+        snapshot: &QuillSearchSnapshot,
+    ) -> Result<Vec<QuillSnippetHit>, QuillIndexError> {
         let query_type = classify_query(query);
         if query_type == QueryExplanation::Empty {
             return Ok(Vec::new());
         }
         check_cancel(cx, "search")?;
-        let snapshot = self.published_snapshot.load();
         let mut parsed = self.default_parser()?.parse_lenient(query);
         let _canonicalization = canonicalize_query(&mut parsed.query);
         let rank_work_upper_bound = query_work_upper_bound(
             &parsed.query,
-            snapshot.as_ref(),
+            snapshot,
             self.schema,
             self.config.glob_expansion_limit,
         )?;
         let tail_work_upper_bound = snippet_tail_work_upper_bound(
             &parsed.query,
-            snapshot.as_ref(),
+            snapshot,
             limit,
             self.config.glob_expansion_limit,
         )?;
@@ -9058,7 +9424,7 @@ impl QuillReader {
             limit,
             0,
             false,
-            snapshot.as_ref(),
+            snapshot,
             &checkpoint,
             checkpoint_metering,
         )?;
@@ -9069,7 +9435,7 @@ impl QuillReader {
         let terms = compiled_snippet_terms(
             &checkpoint,
             &parsed.query,
-            snapshot.as_ref(),
+            snapshot,
             self.schema,
             self.config.glob_expansion_limit,
         )?;
@@ -9590,16 +9956,44 @@ impl QuillIndex {
         ))
     }
 
-    /// Current committed immutable snapshot.
-    #[must_use]
-    pub fn snapshot(&self) -> Arc<KeeperSnapshot> {
-        self.reader.published_snapshot.load().keeper_snapshot_arc()
+    /// Return one exact process-local snapshot for a facade read.
+    ///
+    /// If the writer is unlocked, the same locked critical section proves the
+    /// Keeper marker and compares this exact `Arc` to durable generation. If a
+    /// live writer owns the lock, this read linearizes immediately before that
+    /// not-yet-returned mutation and may safely retain the currently published
+    /// `Arc`. A dropped future releases the lock, so the next read observes the
+    /// Keeper marker or generation mismatch and fails closed.
+    fn checked_published_snapshot(&self) -> Result<Arc<QuillSearchSnapshot>, QuillIndexError> {
+        match self.writer.try_lock() {
+            Ok(writer) => writer.checked_published_snapshot(),
+            Err(TryLockError::Locked) => Ok(self.reader.published_snapshot.load()),
+            Err(TryLockError::Poisoned) => {
+                Err(invalid_state("Quill writer is poisoned; refusing authority read"))
+            }
+        }
     }
 
-    /// Current process-local Keeper plus Delta snapshot.
+    /// Current authoritative immutable Keeper snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed reconciliation-required failure when publication may
+    /// have advanced durable authority beyond this process-local view.
     #[must_use]
-    pub fn search_snapshot(&self) -> Arc<QuillSearchSnapshot> {
-        self.reader.published_snapshot.load()
+    pub fn snapshot(&self) -> Result<Arc<KeeperSnapshot>, QuillIndexError> {
+        Ok(self.checked_published_snapshot()?.keeper_snapshot_arc())
+    }
+
+    /// Current authoritative process-local Keeper plus Delta snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed reconciliation-required failure when publication may
+    /// have advanced durable authority beyond this process-local view.
+    #[must_use]
+    pub fn search_snapshot(&self) -> Result<Arc<QuillSearchSnapshot>, QuillIndexError> {
+        self.checked_published_snapshot()
     }
 
     /// Clone the deterministic real-`Cx` cancellation requester used by the
@@ -9629,12 +10023,14 @@ impl QuillIndex {
         offset: usize,
         exact_count: bool,
     ) -> Result<(QuillSearchResult, ConformancePruningTraceReceipt), QuillIndexError> {
-        self.reader.search_paginated_with_conformance_pruning_trace(
+        let snapshot = self.checked_published_snapshot()?;
+        self.reader.search_paginated_with_conformance_pruning_trace_on(
             cx,
             query,
             limit,
             offset,
             exact_count,
+            snapshot.as_ref(),
         )
     }
 
@@ -9668,7 +10064,8 @@ impl QuillIndex {
         &self,
         document_id: &str,
     ) -> Result<Option<QuillDocumentWitness>, QuillIndexError> {
-        self.search_snapshot().resolve_document_witness(document_id)
+        self.search_snapshot()?
+            .resolve_document_witness(document_id)
     }
 
     /// Probe the published ID map for one exact identifier in a benchmark-only
@@ -9710,8 +10107,8 @@ impl QuillIndex {
 
     /// Number of live documents in the published Keeper-plus-Delta view.
     #[must_use]
-    pub fn doc_count(&self) -> u64 {
-        self.reader.published_snapshot.load().live_doc_count()
+    pub fn doc_count(&self) -> Result<u64, QuillIndexError> {
+        Ok(self.checked_published_snapshot()?.live_doc_count())
     }
 
     /// Whether the writer holds documents or installed segments not yet visible.
@@ -9770,6 +10167,21 @@ impl QuillIndex {
             .lock_writer(cx, "Delta seal resume writer lock")
             .await?;
         writer.resume_pending_delta_seal(cx).await
+    }
+
+    /// Reconcile a possibly dropped durable publication under the writer lock.
+    ///
+    /// This reopens Keeper authority, installs the matching process-local
+    /// composite, and only then releases strict public reads. A failed proof
+    /// deliberately retains its operation-specific retry state.
+    pub async fn reconcile_publication(
+        &self,
+        cx: &Cx,
+    ) -> Result<Arc<QuillSearchSnapshot>, QuillIndexError> {
+        let mut writer = self
+            .lock_writer(cx, "publication reconciliation writer lock")
+            .await?;
+        writer.reconcile_publication(cx).await
     }
 
     /// Accumulate one document into the scalar writer.
@@ -9843,7 +10255,7 @@ impl QuillIndex {
         let mut writer = self.lock_writer(cx, "commit writer lock").await?;
         writer.commit(cx).await?;
         drop(writer);
-        Ok(self.snapshot())
+        self.snapshot()
     }
 
     /// Finish an explicitly configured bulk build with one final
@@ -9862,7 +10274,7 @@ impl QuillIndex {
         let mut writer = self.lock_writer(cx, "bulk finish writer lock").await?;
         writer.finish_bulk_load(cx).await?;
         drop(writer);
-        Ok(self.snapshot())
+        self.snapshot()
     }
 
     /// Replace one exact committed manifest run with a Q1 concat merge.
@@ -9883,7 +10295,7 @@ impl QuillIndex {
             .concat_merge(cx, source_segment_ids, output_segment_id, created_unix_s)
             .await?;
         drop(writer);
-        Ok(self.snapshot())
+        self.snapshot()
     }
 
     /// Fold tombstones into immutable positional holes for eligible segments.
@@ -9981,8 +10393,9 @@ impl QuillIndex {
         offset: usize,
         exact_count: bool,
     ) -> Result<QuillSearchResult, QuillIndexError> {
+        let snapshot = self.checked_published_snapshot()?;
         self.reader
-            .search_paginated(cx, query, limit, offset, exact_count)
+            .search_paginated_on(cx, query, limit, offset, exact_count, snapshot.as_ref())
     }
 
     /// Search for full lexical results with canonical stored metadata.
@@ -9997,7 +10410,9 @@ impl QuillIndex {
         query: &str,
         limit: usize,
     ) -> Result<Vec<ScoredResult>, QuillIndexError> {
-        self.reader.scored_results(cx, query, limit, true)
+        let snapshot = self.checked_published_snapshot()?;
+        self.reader
+            .scored_results_on(cx, query, limit, true, snapshot.as_ref())
     }
 
     /// Search the identifier-only lane used by hot lexical consumers.
@@ -10012,7 +10427,11 @@ impl QuillIndex {
         query: &str,
         limit: usize,
     ) -> Result<Vec<QuillHit>, QuillIndexError> {
-        self.reader.search_doc_ids(cx, query, limit)
+        let snapshot = self.checked_published_snapshot()?;
+        Ok(self
+            .reader
+            .search_paginated_on(cx, query, limit, 0, false, snapshot.as_ref())?
+            .hits)
     }
 
     /// Search with the incumbent enriched result shape.
@@ -10032,8 +10451,9 @@ impl QuillIndex {
         limit: usize,
         snippet_config: &SnippetConfig,
     ) -> Result<Vec<QuillSnippetHit>, QuillIndexError> {
+        let snapshot = self.checked_published_snapshot()?;
         self.reader
-            .search_with_snippets(cx, query, limit, snippet_config)
+            .search_with_snippets_on(cx, query, limit, snippet_config, snapshot.as_ref())
     }
 
     /// Collect the complete deterministic set of matching global document IDs.
@@ -10043,7 +10463,8 @@ impl QuillIndex {
     /// Returns typed cancellation, parse/lowering, cursor, or allocation
     /// failures.
     pub fn collect_docids(&self, cx: &Cx, query: &str) -> Result<Vec<u32>, QuillIndexError> {
-        self.reader.collect_docids(cx, query)
+        let snapshot = self.checked_published_snapshot()?;
+        self.reader.collect_docids_on(cx, query, snapshot.as_ref())
     }
 
     /// Execute one already-built query tree through the ranked mixed-state path.
@@ -10060,8 +10481,15 @@ impl QuillIndex {
         offset: usize,
         exact_count: bool,
     ) -> Result<QuillSearchResult, QuillIndexError> {
-        self.reader
-            .search_preparsed_paginated(cx, query, limit, offset, exact_count)
+        let snapshot = self.checked_published_snapshot()?;
+        self.reader.search_preparsed_paginated_on(
+            cx,
+            query,
+            limit,
+            offset,
+            exact_count,
+            snapshot.as_ref(),
+        )
     }
 
     /// Execute one already-built query tree through the scoreless id-set path.
@@ -10075,7 +10503,9 @@ impl QuillIndex {
         cx: &Cx,
         query: &Query,
     ) -> Result<Vec<u32>, QuillIndexError> {
-        self.reader.collect_preparsed_docids(cx, query)
+        let snapshot = self.checked_published_snapshot()?;
+        self.reader
+            .collect_preparsed_docids_on(cx, query, snapshot.as_ref())
     }
 
     /// Bench-only forced sealed fan-out path for scoreless id-set collection.
@@ -10091,7 +10521,9 @@ impl QuillIndex {
         query: &str,
         fan_out: bool,
     ) -> Result<Vec<u32>, QuillIndexError> {
-        self.reader.bench_collect_docids_forced(cx, query, fan_out)
+        let snapshot = self.checked_published_snapshot()?;
+        self.reader
+            .bench_collect_docids_forced_on(cx, query, fan_out, snapshot.as_ref())
     }
 
     /// Bench-only forced sealed fan-out path.
@@ -10109,8 +10541,15 @@ impl QuillIndex {
         fan_out: bool,
         rank_pruning: Option<bool>,
     ) -> Result<Vec<(u32, u32)>, QuillIndexError> {
-        self.reader
-            .bench_search_sealed_forced(cx, query, limit, fan_out, rank_pruning)
+        let snapshot = self.checked_published_snapshot()?;
+        self.reader.bench_search_sealed_forced_on(
+            cx,
+            query,
+            limit,
+            fan_out,
+            rank_pruning,
+            snapshot.as_ref(),
+        )
     }
 }
 
@@ -10314,6 +10753,8 @@ impl RootBoundQuillSearchIndex {
 }
 
 impl SegmentStatsProvider for QuillIndex {
+    /// Return non-authoritative process-local telemetry. Callers that need a
+    /// durable authority read must use [`QuillIndex::snapshot`] instead.
     fn segment_stats(&self) -> SegmentStats {
         self.reader.segment_stats()
     }
@@ -10443,8 +10884,9 @@ impl LexicalRead for QuillIndex {
         limit: usize,
     ) -> SearchFuture<'a, Vec<ScoredResult>> {
         Box::pin(async move {
+            let snapshot = self.checked_published_snapshot().map_err(SearchError::from)?;
             self.reader
-                .scored_results(cx, query, limit, true)
+                .scored_results_on(cx, query, limit, true, snapshot.as_ref())
                 .map_err(SearchError::from)
         })
     }
@@ -10455,7 +10897,25 @@ impl LexicalRead for QuillIndex {
         query: &'a str,
         limit: usize,
     ) -> SearchFuture<'a, LexicalCandidateBatch> {
-        quill_search_candidates(&self.reader, cx, query, limit)
+        Box::pin(async move {
+            let snapshot = self.checked_published_snapshot().map_err(SearchError::from)?;
+            let results = self
+                .reader
+                .scored_results_on(cx, query, limit, false, snapshot.as_ref())
+                .map_err(SearchError::from)?;
+            #[cfg(not(feature = "conformance-internals"))]
+            let context =
+                LexicalHydrationContext::new(QUILL_LEXICAL_BACKEND, Box::new(snapshot));
+            #[cfg(feature = "conformance-internals")]
+            let context = LexicalHydrationContext::new(
+                QUILL_LEXICAL_BACKEND,
+                Box::new(ConformanceHydrationPin {
+                    snapshot,
+                    controller: Arc::clone(&self.reader.conformance_controller),
+                }),
+            );
+            Ok(LexicalCandidateBatch::deferred(results, context))
+        })
     }
 
     fn hydrate_candidates<'a>(
@@ -10468,7 +10928,12 @@ impl LexicalRead for QuillIndex {
     }
 
     fn doc_count(&self) -> usize {
-        usize::try_from(Self::doc_count(self)).unwrap_or(usize::MAX)
+        // `LexicalRead::doc_count` is an infallible capacity/telemetry hint,
+        // not a durable authority read. Its trait contract cannot represent a
+        // reconciliation-required failure; authority-sensitive callers use
+        // `QuillIndex::doc_count` instead.
+        let snapshot = self.reader.published_snapshot.load();
+        usize::try_from(snapshot.live_doc_count()).unwrap_or(usize::MAX)
     }
 }
 
@@ -15163,9 +15628,15 @@ mod tests {
         run_with_cx(|cx| async move {
             let mut index = QuillIndex::in_memory(deterministic_config())
                 .expect("create Delta-only snippet tail index");
-            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let generation = index
+                .snapshot()
+                .expect("fresh durable snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
             let lease_base = index
                 .snapshot()
+                .expect("fresh durable snapshot is authoritative")
                 .loaded_manifest()
                 .manifest
                 .docid_high_watermark;
@@ -15191,7 +15662,9 @@ mod tests {
                 ])
                 .expect("publish the two live Delta generations");
 
-            let snapshot = index.search_snapshot();
+            let snapshot = index
+                .search_snapshot()
+                .expect("Delta-only snapshot is authoritative");
             assert_eq!(
                 snapshot.keeper_snapshot().segments().len(),
                 0,
@@ -15316,7 +15789,12 @@ mod tests {
         })
         .expect("create exact-budget public index");
         assert_eq!(
-            index.snapshot().loaded_manifest().manifest.generation,
+            index
+                .snapshot()
+                .expect("exact-budget snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation,
             generation,
             "the independently composed and public genesis snapshots share one generation"
         );
@@ -15937,7 +16415,9 @@ mod tests {
         cx: &Cx,
         query: &Query,
     ) -> (QuillSearchResult, Vec<u32>) {
-        let snapshot = index.search_snapshot();
+        let snapshot = index
+            .search_snapshot()
+            .expect("typed-query snapshot is authoritative");
         let ranked = index
             .execute_ranked_query(cx, query, &snapshot, 10, 0, true, Vec::new())
             .expect("execute typed ranked query");
@@ -15972,7 +16452,11 @@ mod tests {
                 .expect("accumulate concat-merge leaf");
             index.commit(cx).await.expect("commit concat-merge leaf");
             assert_eq!(
-                index.snapshot().segments().len(),
+                index
+                    .snapshot()
+                    .expect("concat-merge fixture snapshot is authoritative")
+                    .segments()
+                    .len(),
                 batch_index + 1,
                 "each committed fixture batch must seal one leaf segment",
             );
@@ -16122,7 +16606,11 @@ mod tests {
 
     fn q1_ob2a_decoded_terms(index: &QuillIndex) -> Vec<(u16, Vec<u8>, u32, Vec<Posting>)> {
         let mut decoded = BTreeMap::<(u16, Vec<u8>), (u32, Vec<Posting>)>::new();
-        for segment in index.snapshot().segments() {
+        for segment in index
+            .snapshot()
+            .expect("Q1-OB2a fixture snapshot is authoritative")
+            .segments()
+        {
             let dictionary = open_dictionary(segment, DEFAULT_SCHEMA).expect("Q1-OB2a TERMDICT");
             let limit = usize::try_from(dictionary.term_count()).expect("term count fits usize");
             let terms = dictionary
@@ -16369,7 +16857,9 @@ mod tests {
             .expect("fan-out fixture has a default parser")
             .parse_lenient(query_text);
         let _ = canonicalize_query(&mut parsed.query);
-        let snapshot = index.search_snapshot();
+        let snapshot = index
+            .search_snapshot()
+            .expect("fan-out fixture snapshot is authoritative");
         let rank_pruning =
             !exact_count && limit != 0 && query_has_prunable_root_union(&parsed.query, 1.0);
         let topdocs_root = !exact_count && limit != 0;
@@ -16459,7 +16949,14 @@ mod tests {
                 .await
                 .expect("seal fan-out fixture segment");
         }
-        assert_eq!(index.snapshot().segments().len(), segments);
+        assert_eq!(
+            index
+                .snapshot()
+                .expect("fan-out fixture snapshot is authoritative")
+                .segments()
+                .len(),
+            segments
+        );
         index
     }
 
@@ -16471,7 +16968,9 @@ mod tests {
             .expect("fan-out fixture has a default parser")
             .parse_lenient(query_text);
         let _ = canonicalize_query(&mut parsed.query);
-        let snapshot = index.search_snapshot();
+        let snapshot = index
+            .search_snapshot()
+            .expect("fan-out fixture snapshot is authoritative");
         let mut collector = DocSetCollector::new();
         let work_upper_bound = query_work_upper_bound(
             &parsed.query,
@@ -16572,10 +17071,13 @@ mod tests {
 
             for (segment_count, seed, expected_mode) in fixtures {
                 let index = segment_fanout_fixture_index(&cx, segment_count, 64, seed).await;
-                let snapshot = index.search_snapshot();
+                let snapshot = index
+                    .search_snapshot()
+                    .expect("pruning fixture snapshot is authoritative");
                 let snapshot_epoch = snapshot.snapshot_epoch();
                 let expected_doc_counts = index
                     .snapshot()
+                    .expect("pruning fixture snapshot is authoritative")
                     .segments()
                     .iter()
                     .map(|segment| u64::from(segment.doc_count()))
@@ -16906,7 +17408,9 @@ mod tests {
                 .expect("index cache fixture");
             index.commit(&cx).await.expect("seal cache fixture");
 
-            let snapshot = index.snapshot();
+            let snapshot = index
+                .snapshot()
+                .expect("cache fixture snapshot is authoritative");
             assert_eq!(snapshot.segments().len(), 1);
             let segment = &snapshot.segments()[0];
             let (full_validations_before, borrowed_views_before) =
@@ -16970,7 +17474,9 @@ mod tests {
                 .expect("index rebind fixture");
             index.commit(&cx).await.expect("seal rebind fixture");
 
-            let before_snapshot = index.snapshot();
+            let before_snapshot = index
+                .snapshot()
+                .expect("rebind fixture snapshot is authoritative");
             assert_eq!(before_snapshot.segments().len(), 1);
             let segment = &before_snapshot.segments()[0];
             assert_eq!(segment.term_dictionary_cache_counts().0, 1);
@@ -16996,7 +17502,9 @@ mod tests {
                     .expect("tombstone delete")
             );
 
-            let after_snapshot = index.snapshot();
+            let after_snapshot = index
+                .snapshot()
+                .expect("tombstone successor snapshot is authoritative");
             assert_eq!(after_snapshot.segments().len(), 1);
             let rebound = &after_snapshot.segments()[0];
             assert_eq!(
@@ -17231,7 +17739,12 @@ mod tests {
                     .await
                     .expect("repeat delete")
             );
-            assert_eq!(index.doc_count(), 0);
+            assert_eq!(
+                index
+                    .doc_count()
+                    .expect("deleted document count is authoritative"),
+                0
+            );
 
             LexicalWrite::index_documents(
                 &index,
@@ -17254,7 +17767,12 @@ mod tests {
                     .expect("delete bounded document batch"),
                 2
             );
-            assert_eq!(index.doc_count(), 1);
+            assert_eq!(
+                index
+                    .doc_count()
+                    .expect("batch-delete count is authoritative"),
+                1
+            );
             assert_eq!(
                 LexicalRead::search(&index, &cx, "gamma", 10)
                     .await
@@ -17263,7 +17781,12 @@ mod tests {
                 1
             );
             index.delete_all(&cx).await.expect("delete all documents");
-            assert_eq!(index.doc_count(), 0);
+            assert_eq!(
+                index
+                    .doc_count()
+                    .expect("delete-all count is authoritative"),
+                0
+            );
 
             let cancelled = cx.clone();
             cancelled.set_cancel_requested(true);
@@ -17280,7 +17803,12 @@ mod tests {
                 .await,
                 Err(SearchError::Cancelled { .. })
             ));
-            assert_eq!(index.doc_count(), 0);
+            assert_eq!(
+                index
+                    .doc_count()
+                    .expect("cancelled mutation count is authoritative"),
+                0
+            );
         });
     }
 
@@ -17330,7 +17858,12 @@ mod tests {
                 index.segment_stats().published_generation,
                 seed_generation.saturating_add(1)
             );
-            assert_eq!(index.doc_count(), 3);
+            assert_eq!(
+                index
+                    .doc_count()
+                    .expect("atomic upsert count is authoritative"),
+                3
+            );
         });
     }
 
@@ -17362,7 +17895,12 @@ mod tests {
             LexicalWrite::commit(&index, &cx)
                 .await
                 .expect("publish both disjoint batches");
-            assert_eq!(index.doc_count(), 4);
+            assert_eq!(
+                index
+                    .doc_count()
+                    .expect("disjoint batch count is authoritative"),
+                4
+            );
         });
     }
 
@@ -17866,7 +18404,10 @@ mod tests {
                 .expect("accumulate sealed fixtures");
             index.commit(&cx).await.expect("commit sealed fixtures");
 
-            let committed = index.snapshot().clone();
+            let committed = index
+                .snapshot()
+                .expect("sealed upsert snapshot is authoritative")
+                .clone();
             let mut tombstoned_manifest = committed.next_manifest().expect("next manifest");
             assert!(
                 committed
@@ -17982,7 +18523,9 @@ mod tests {
                 .commit(&cx)
                 .await
                 .expect("seal final logical upsert row");
-            let keeper = sealed.snapshot();
+            let keeper = sealed
+                .snapshot()
+                .expect("sealed upsert snapshot is authoritative");
             let post_stats = snapshot_field(&keeper, CONTENT_FIELD).expect("post-seal stats");
             let post_df = snapshot_doc_freq(&keeper, DEFAULT_SCHEMA, CONTENT_FIELD, b"alpha")
                 .expect("post-seal alpha df");
@@ -18285,7 +18828,9 @@ mod tests {
                 .expect("accumulate sealed row");
             index.commit(&cx).await.expect("commit sealed row");
 
-            let keeper = index.snapshot();
+            let keeper = index
+                .snapshot()
+                .expect("overlap fixture snapshot is authoritative");
             let generation = keeper.loaded_manifest().manifest.generation;
             let segment = &keeper.loaded_manifest().manifest.segments[0];
             assert_eq!((segment.docid_lo, segment.docid_hi), (0, 1));
@@ -18339,7 +18884,9 @@ mod tests {
                 .await
                 .expect("accumulate first successor");
             first.commit(&cx).await.expect("publish first successor");
-            let successor = first.snapshot();
+            let successor = first
+                .snapshot()
+                .expect("first successor snapshot is authoritative");
 
             let before = snapshot_source.load();
             let stale_delta = Arc::new(
@@ -18380,7 +18927,9 @@ mod tests {
                 .commit(&cx)
                 .await
                 .expect("publish colliding successor fixture");
-            let collision = second.snapshot();
+            let collision = second
+                .snapshot()
+                .expect("colliding successor snapshot is authoritative");
             let Err(collision) = snapshot_source.publish_complete(collision, Vec::new()) else {
                 panic!("same-generation divergent MANIFEST was accepted");
             };
@@ -18402,7 +18951,12 @@ mod tests {
                 .index_documents(&cx, &[IndexableDocument::new("scalar", "sealed first")])
                 .await
                 .expect("accumulate scalar row");
-            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let generation = index
+                .snapshot()
+                .expect("scalar fixture snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
             let empty_delta = Arc::new(
                 DeltaSegment::new(DEFAULT_SCHEMA, u64::from(DOC_ORDS_PER_LEASE), usize::MAX)
                     .expect("empty Delta")
@@ -18416,18 +18970,26 @@ mod tests {
 
             let lease_base = index
                 .snapshot()
+                .expect("sealed scalar snapshot is authoritative")
                 .loaded_manifest()
                 .manifest
                 .docid_high_watermark;
             let global_docid = u32::try_from(lease_base).expect("Delta docid");
-            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let generation = index
+                .snapshot()
+                .expect("sealed scalar snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
             let mut delta =
                 DeltaSegment::new(DEFAULT_SCHEMA, lease_base, usize::MAX).expect("live Delta");
             apply_alpha_delta(&mut delta, global_docid, "delta", 1);
             index
                 .publish_delta_table(vec![Arc::new(delta.freeze(generation))])
                 .expect("publish live Delta");
-            let before = index.search_snapshot();
+            let before = index
+                .search_snapshot()
+                .expect("published Delta snapshot is authoritative");
 
             let error = index
                 .index_documents(
@@ -18442,7 +19004,9 @@ mod tests {
             };
             assert!(error.to_string().contains("Delta epochs are active"));
 
-            let after = index.search_snapshot();
+            let after = index
+                .search_snapshot()
+                .expect("post-rejection Delta snapshot is authoritative");
             assert!(Arc::ptr_eq(&before, &after));
             assert_eq!(
                 after.materialize_document_id(global_docid).as_deref(),
@@ -18813,7 +19377,12 @@ mod tests {
     fn delta_seal_transaction_has_no_gap_and_never_crosses_a_lease() {
         run_with_cx(|cx| async move {
             let index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
-            let first_generation = index.snapshot().loaded_manifest().manifest.generation;
+            let first_generation = index
+                .snapshot()
+                .expect("first lease snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
             let first_docid = DOC_ORDS_PER_LEASE - 1;
             let mut first_delta =
                 DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("first Delta lease");
@@ -18825,7 +19394,9 @@ mod tests {
             index
                 .publish_delta_table(vec![Arc::clone(&first_sealed)])
                 .expect("publish first Delta epoch");
-            let held_first = index.search_snapshot();
+            let held_first = index
+                .search_snapshot()
+                .expect("first Delta snapshot is authoritative");
             let first_pre_search = index
                 .search_paginated(&cx, "alpha", 10, 0, true)
                 .expect("search first Delta epoch");
@@ -18906,7 +19477,12 @@ mod tests {
                 Some("lease-zero")
             );
 
-            let second_generation = index.snapshot().loaded_manifest().manifest.generation;
+            let second_generation = index
+                .snapshot()
+                .expect("sealed first lease snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
             let second_docid = DOC_ORDS_PER_LEASE;
             let mut second_delta = DeltaSegment::new(DEFAULT_SCHEMA, second_lease, usize::MAX)
                 .expect("second Delta lease");
@@ -18915,7 +19491,9 @@ mod tests {
             index
                 .publish_delta_table(vec![Arc::clone(&second_sealed)])
                 .expect("publish second Delta epoch");
-            let held_second = index.search_snapshot();
+            let held_second = index
+                .search_snapshot()
+                .expect("second Delta snapshot is authoritative");
             let second_pre_search = index
                 .search_paginated(&cx, "alpha", 10, 0, true)
                 .expect("search second Delta epoch");
@@ -19000,7 +19578,13 @@ mod tests {
                 "the durable watermark must cover every allocated replacement lease"
             );
             let mut reopened = QuillIndex::from_backend(
-                IndexBackend::Memory(index.snapshot().as_ref().clone()),
+                IndexBackend::Memory(
+                    index
+                        .snapshot()
+                        .expect("sealed second lease snapshot is authoritative")
+                        .as_ref()
+                        .clone(),
+                ),
                 DEFAULT_SCHEMA,
                 deterministic_config(),
             )
@@ -19020,6 +19604,7 @@ mod tests {
             assert_eq!(
                 reopened
                     .snapshot()
+                    .expect("reopened lease snapshot is authoritative")
                     .loaded_manifest()
                     .manifest
                     .segments
@@ -19036,7 +19621,12 @@ mod tests {
     fn delta_seal_rejects_an_omitted_surviving_shard_epoch() {
         run_with_cx(|cx| async move {
             let mut index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
-            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let generation = index
+                .snapshot()
+                .expect("omitted-survivor snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
             let mut source =
                 DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("source Delta shard");
             apply_sealable_delta_document(&mut source, 0, "source", "alpha", 1);
@@ -19079,7 +19669,12 @@ mod tests {
             ));
             assert!(index.writer_mut().pending_delta_seal.is_none());
             assert_eq!(
-                index.snapshot().loaded_manifest().manifest.generation,
+                index
+                    .snapshot()
+                    .expect("failed seal snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
                 generation
             );
             assert_eq!(
@@ -19116,7 +19711,12 @@ mod tests {
     fn delta_seal_rejects_a_stale_earlier_freeze_of_a_surviving_shard() {
         run_with_cx(|cx| async move {
             let mut index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
-            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let generation = index
+                .snapshot()
+                .expect("stale-survivor snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
             let mut source =
                 DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("source Delta shard");
             apply_sealable_delta_document(&mut source, 0, "source", "alpha", 1);
@@ -19181,7 +19781,12 @@ mod tests {
             ));
             assert!(index.writer_mut().pending_delta_seal.is_none());
             assert_eq!(
-                index.snapshot().loaded_manifest().manifest.generation,
+                index
+                    .snapshot()
+                    .expect("failed stale seal snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
                 generation
             );
             assert_eq!(
@@ -19334,7 +19939,10 @@ mod tests {
                 while !writer_started.load(Ordering::SeqCst) {
                     yield_now().await;
                 }
-                writer_publisher.install_prepared_sealed(successor, prepared);
+                writer_publisher
+                    .validate_prepared_sealed(successor.as_ref(), &prepared)
+                    .expect("prepared seal successor remains valid");
+                writer_publisher.install_validated_prepared_sealed(successor, prepared);
                 writer_finished.store(true, Ordering::SeqCst);
             })
             .expect("create seal writer");
@@ -19443,7 +20051,9 @@ mod tests {
                     outcome, 0,
                     "seed={seed:#018x}: delete task did not complete"
                 );
-                let snapshot = index.snapshot();
+                let snapshot = index
+                    .snapshot()
+                    .expect("commit/delete snapshot is authoritative");
                 assert!(
                     snapshot
                         .resolve_document_id("beta")
@@ -19478,7 +20088,9 @@ mod tests {
             for seed in e3_9_seed_corpus() {
                 let ingest =
                     Arc::new(QuillIndex::in_memory(deterministic_config()).expect("memory index"));
-                let before = ingest.search_snapshot();
+                let before = ingest
+                    .search_snapshot()
+                    .expect("ingest cancellation snapshot is authoritative");
                 let writer = Arc::clone(&ingest.writer);
                 let operation_cx = Arc::new(Cx::for_testing());
                 let holder_release = Arc::new(AtomicBool::new(false));
@@ -19548,12 +20160,24 @@ mod tests {
                     operation_cancelled.load(Ordering::SeqCst),
                     "seed={seed:#018x}: ingest waiter did not observe cancellation"
                 );
-                assert!(Arc::ptr_eq(&before, &ingest.search_snapshot()));
+                assert!(Arc::ptr_eq(
+                    &before,
+                    &ingest
+                        .search_snapshot()
+                        .expect("ingest cancellation snapshot is authoritative"),
+                ));
                 assert!(!ingest.has_uncommitted_changes());
-                assert_eq!(ingest.doc_count(), 0);
+                assert_eq!(
+                    ingest
+                        .doc_count()
+                        .expect("cancelled ingest count is authoritative"),
+                    0
+                );
 
                 let merge = Arc::new(concat_merge_fixture_index(&cx).await);
-                let before = merge.search_snapshot();
+                let before = merge
+                    .search_snapshot()
+                    .expect("merge cancellation snapshot is authoritative");
                 let before_evidence = q1_ob2a_query_evidence(&merge, &cx);
                 let source_ids = committed_segment_ids(&merge);
                 let output_segment_id = fresh_merge_segment_id(&merge, seed);
@@ -19630,7 +20254,12 @@ mod tests {
                     operation_cancelled.load(Ordering::SeqCst),
                     "seed={seed:#018x}: merge waiter did not observe cancellation"
                 );
-                assert!(Arc::ptr_eq(&before, &merge.search_snapshot()));
+                assert!(Arc::ptr_eq(
+                    &before,
+                    &merge
+                        .search_snapshot()
+                        .expect("merge cancellation snapshot is authoritative"),
+                ));
                 assert_eq!(q1_ob2a_query_evidence(&merge, &cx), before_evidence);
             }
         });
@@ -19642,7 +20271,9 @@ mod tests {
             let index = Arc::new(q1_ob4_tombstoned_index(20, &[0, 1, 2, 3, 4]));
             let query_cx = Cx::for_testing();
             let expected = q1_ob4_query_evidence(&index, &query_cx);
-            let held = index.snapshot();
+            let held = index
+                .snapshot()
+                .expect("compaction held snapshot is authoritative");
             let held_generation = held.loaded_manifest().manifest.generation;
             let weak = Arc::downgrade(&held);
             let reader_started = Arc::new(AtomicBool::new(false));
@@ -19712,7 +20343,12 @@ mod tests {
             );
             assert_eq!(q1_ob4_query_evidence(&index, &query_cx), expected);
             assert_eq!(
-                index.snapshot().loaded_manifest().manifest.generation,
+                index
+                    .snapshot()
+                    .expect("compaction successor snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
                 held_generation + 1
             );
             assert_eq!(held.loaded_manifest().manifest.generation, held_generation);
@@ -19747,7 +20383,9 @@ mod tests {
                     .await
                     .expect("seed E6.5 index");
                 index.commit(&cx).await.expect("publish E6.5 seed");
-                let held_old_snapshot = index.search_snapshot();
+                let held_old_snapshot = index
+                    .search_snapshot()
+                    .expect("concurrent ingest snapshot is authoritative");
                 let old_artifact = e6_5_query_artifact(&index, &cx);
 
                 let oracle =
@@ -19860,7 +20498,13 @@ mod tests {
                     1,
                     "{replay}: held reader snapshot changed after publication"
                 );
-                assert_eq!(index.doc_count(), 3, "{replay}: successor document count");
+                assert_eq!(
+                    index
+                        .doc_count()
+                        .expect("concurrent ingest count is authoritative"),
+                    3,
+                    "{replay}: successor document count"
+                );
             }
         });
     }
@@ -19878,7 +20522,9 @@ mod tests {
                     )
                     .await
                     .expect("stage cancellable commit");
-                let commit_before = commit_index.search_snapshot();
+                let commit_before = commit_index
+                    .search_snapshot()
+                    .expect("cancelled commit snapshot is authoritative");
                 let commit_writer = Arc::clone(&commit_index.writer);
                 let commit_cx = Arc::new(Cx::for_testing());
                 let commit_release = Arc::new(AtomicBool::new(false));
@@ -19953,7 +20599,12 @@ mod tests {
                     "{replay}: commit waiter missed cancellation"
                 );
                 assert!(
-                    Arc::ptr_eq(&commit_before, &commit_index.search_snapshot()),
+                    Arc::ptr_eq(
+                        &commit_before,
+                        &commit_index
+                            .search_snapshot()
+                            .expect("cancelled commit snapshot is authoritative"),
+                    ),
                     "{replay}: cancelled commit changed the published snapshot"
                 );
                 assert!(
@@ -19964,11 +20615,22 @@ mod tests {
                     .commit(&cx)
                     .await
                     .expect("retry cancelled E6.5 commit");
-                assert_eq!(commit_index.doc_count(), 1, "{replay}: commit retry");
+                assert_eq!(
+                    commit_index
+                        .doc_count()
+                        .expect("retried commit count is authoritative"),
+                    1,
+                    "{replay}: commit retry"
+                );
 
                 let seal_index =
                     Arc::new(QuillIndex::in_memory(deterministic_config()).expect("seal index"));
-                let generation = seal_index.snapshot().loaded_manifest().manifest.generation;
+                let generation = seal_index
+                    .snapshot()
+                    .expect("seal fixture snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest
+                    .generation;
                 let mut delta =
                     DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("E6.5 seal Delta");
                 apply_alpha_delta(&mut delta, 0, "seal-cancelled", 1);
@@ -19976,7 +20638,9 @@ mod tests {
                 seal_index
                     .publish_delta_table(vec![Arc::clone(&sealed)])
                     .expect("publish E6.5 seal Delta");
-                let seal_before = seal_index.search_snapshot();
+                let seal_before = seal_index
+                    .search_snapshot()
+                    .expect("cancelled seal snapshot is authoritative");
                 let seal_artifact_before = e6_5_query_artifact(&seal_index, &cx);
                 let seal_writer = Arc::clone(&seal_index.writer);
                 let seal_cx = Arc::new(Cx::for_testing());
@@ -20066,7 +20730,12 @@ mod tests {
                     "{replay}: seal waiter missed cancellation"
                 );
                 assert!(
-                    Arc::ptr_eq(&seal_before, &seal_index.search_snapshot()),
+                    Arc::ptr_eq(
+                        &seal_before,
+                        &seal_index
+                            .search_snapshot()
+                            .expect("cancelled seal snapshot is authoritative"),
+                    ),
                     "{replay}: cancelled seal changed the published snapshot"
                 );
                 assert_eq!(
@@ -20074,7 +20743,13 @@ mod tests {
                     seal_artifact_before,
                     "{replay}: cancelled seal created a visibility gap"
                 );
-                assert_eq!(seal_index.search_snapshot().delta_count(), 1);
+                assert_eq!(
+                    seal_index
+                        .search_snapshot()
+                        .expect("cancelled seal snapshot is authoritative")
+                        .delta_count(),
+                    1
+                );
                 seal_index
                     .seal_delta_snapshot(
                         &cx,
@@ -20088,7 +20763,13 @@ mod tests {
                     )
                     .await
                     .expect("retry cancelled E6.5 seal");
-                assert_eq!(seal_index.search_snapshot().delta_count(), 0);
+                assert_eq!(
+                    seal_index
+                        .search_snapshot()
+                        .expect("retried seal snapshot is authoritative")
+                        .delta_count(),
+                    0
+                );
                 assert_eq!(
                     e6_5_query_artifact(&seal_index, &cx),
                     seal_artifact_before,
@@ -20257,7 +20938,9 @@ mod tests {
                         "{replay}: recovery round {recovery_round} changed query artifacts"
                     );
                     assert_eq!(
-                        reopened.doc_count(),
+                        reopened
+                            .doc_count()
+                            .expect("recovered watch count is authoritative"),
                         2,
                         "{replay}: recovery round {recovery_round} live count"
                     );
@@ -20335,8 +21018,12 @@ mod tests {
                 report.trace_fingerprint
             );
 
-            let first_snapshot = first.snapshot();
-            let second_snapshot = second.snapshot();
+            let first_snapshot = first
+                .snapshot()
+                .expect("first replay snapshot is authoritative");
+            let second_snapshot = second
+                .snapshot()
+                .expect("second replay snapshot is authoritative");
             assert_eq!(
                 first_snapshot.loaded_manifest().manifest,
                 second_snapshot.loaded_manifest().manifest,
@@ -20375,7 +21062,12 @@ mod tests {
             let mut index = QuillIndex::create(&cx, directory.path(), deterministic_config())
                 .await
                 .expect("create durable index");
-            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let generation = index
+                .snapshot()
+                .expect("installed-segment snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
             let mut delta =
                 DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("uncommitted Delta");
             apply_alpha_delta(&mut delta, 0, "visible-not-durable", 1);
@@ -20408,6 +21100,7 @@ mod tests {
             assert_eq!(
                 index
                     .search_snapshot()
+                    .expect("process-local Delta snapshot is authoritative")
                     .bm25_doc_freq(CONTENT_FIELD, b"alpha")
                     .expect("process-local alpha frequency"),
                 1,
@@ -20428,7 +21121,12 @@ mod tests {
             let mut index = QuillIndex::create(&cx, directory.path(), deterministic_config())
                 .await
                 .expect("create durable index");
-            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let generation = index
+                .snapshot()
+                .expect("retained-seal snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
             let mut delta =
                 DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("retained Delta source");
             apply_alpha_delta(&mut delta, 0, "retained", 1);
@@ -20454,6 +21152,7 @@ mod tests {
             );
             let mut manifest = index
                 .snapshot()
+                .expect("retained-seal snapshot is authoritative")
                 .next_manifest()
                 .expect("successor MANIFEST");
             manifest.last_publish_unix_s = 0;
@@ -20500,7 +21199,12 @@ mod tests {
                 .await
                 .expect("simulate install whose caller future lost completion");
             assert_eq!(
-                index.snapshot().loaded_manifest().manifest.generation,
+                index
+                    .snapshot()
+                    .expect("pre-reconciliation snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
                 generation,
                 "segment installation alone must not advance durable authority"
             );
@@ -20525,6 +21229,7 @@ mod tests {
             assert!(
                 index
                     .snapshot()
+                    .expect("reconciled retained-seal snapshot is authoritative")
                     .loaded_manifest()
                     .manifest
                     .last_publish_unix_s
@@ -20556,7 +21261,12 @@ mod tests {
         run_with_cx(|cx| async move {
             let mut index =
                 QuillIndex::in_memory(deterministic_config()).expect("create in-memory index");
-            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let generation = index
+                .snapshot()
+                .expect("prepublication fixture snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
             let base_seal_seq = index.writer_mut().next_seal_seq;
             let mut delta = DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX)
                 .expect("in-memory retry-test Delta source");
@@ -20583,6 +21293,7 @@ mod tests {
             );
             let mut manifest = index
                 .snapshot()
+                .expect("prepublication fixture snapshot is authoritative")
                 .next_manifest()
                 .expect("successor MANIFEST");
             manifest.last_publish_unix_s = 0;
@@ -20697,7 +21408,12 @@ mod tests {
             let mut index = QuillIndex::create(&cx, directory.path(), deterministic_config())
                 .await
                 .expect("create durable index");
-            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let generation = index
+                .snapshot()
+                .expect("manifest-failure fixture snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
             let base_seal_seq = index.writer_mut().next_seal_seq;
             let mut delta = DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX)
                 .expect("manifest-failure Delta source");
@@ -20724,6 +21440,7 @@ mod tests {
             );
             let mut manifest = index
                 .snapshot()
+                .expect("manifest-failure fixture snapshot is authoritative")
                 .next_manifest()
                 .expect("successor MANIFEST");
             manifest.last_publish_unix_s = 0;
@@ -20808,7 +21525,12 @@ mod tests {
                 assert_eq!(path, &collision_path);
             }
             assert_eq!(
-                index.snapshot().loaded_manifest().manifest.generation,
+                index
+                    .snapshot()
+                    .expect("failed manifest publication snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
                 generation,
                 "failed MANIFEST publication must not advance durable authority"
             );
@@ -20869,7 +21591,12 @@ mod tests {
                 "publication must consume the retained reference"
             );
             assert_eq!(
-                index.snapshot().loaded_manifest().manifest.generation,
+                index
+                    .snapshot()
+                    .expect("retried publication snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
                 generation + 1,
                 "retried publication must advance exactly one generation"
             );
@@ -20895,7 +21622,9 @@ mod tests {
                 .await
                 .expect("index first document");
             index.commit(&cx).await.expect("first commit publishes");
-            let old = index.snapshot();
+            let old = index
+                .snapshot()
+                .expect("first published snapshot is authoritative");
             for segment in old.segments() {
                 segment.verify().expect("fresh snapshot verifies");
             }
@@ -20918,7 +21647,9 @@ mod tests {
                 .expect("index second document");
             index.commit(&cx).await.expect("second commit publishes");
 
-            let new = index.snapshot();
+            let new = index
+                .snapshot()
+                .expect("successor published snapshot is authoritative");
             assert!(
                 !Arc::ptr_eq(&old, &new),
                 "a successor publication must install a new snapshot"
@@ -20985,7 +21716,12 @@ mod tests {
                 )
                 .await
                 .expect("stage the commit-retry document");
-            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let generation = index
+                .snapshot()
+                .expect("pending-payload fixture snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
 
             // Inject the failure at the exact publication boundary: the shard
             // flush has already sealed the encoded segment into the writer's
@@ -21026,7 +21762,12 @@ mod tests {
                 )
             };
             assert_eq!(
-                index.snapshot().loaded_manifest().manifest.generation,
+                index
+                    .snapshot()
+                    .expect("aborted pending-payload snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
                 generation,
                 "an aborted publication must not advance the published generation"
             );
@@ -21096,7 +21837,12 @@ mod tests {
                 )
                 .await
                 .expect("stage the publisher-failure document");
-            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let generation = index
+                .snapshot()
+                .expect("publisher-retry fixture snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
 
             // Seal without publishing. The encoded segment now sits in the
             // writer's pending inventory exactly as an interrupted commit
@@ -21161,7 +21907,12 @@ mod tests {
                 writer.pending_owned_segments.truncate(1);
             }
             assert_eq!(
-                index.snapshot().loaded_manifest().manifest.generation,
+                index
+                    .snapshot()
+                    .expect("rejected publisher snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
                 generation,
                 "a rejected publication must not advance the published generation"
             );
@@ -21217,7 +21968,12 @@ mod tests {
             let mut index = QuillIndex::create(&cx, directory.path(), deterministic_config())
                 .await
                 .expect("create durable index");
-            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let generation = index
+                .snapshot()
+                .expect("fresh durable snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
             let next_seal_seq = index.writer_mut().next_seal_seq;
             let mut delta =
                 DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("drop-test Delta source");
@@ -21232,7 +21988,7 @@ mod tests {
 
             let pause = crate::keeper::pause_manifest_publish_at_checkpoint_for_test(
                 directory.path(),
-                crate::keeper::PublishCheckpoint::TempMovedToCurrent,
+                crate::keeper::PublishCheckpoint::DirectorySynced,
             );
             let mut seal = Box::pin(index.seal_delta_snapshot(
                 &cx,
@@ -21244,37 +22000,53 @@ mod tests {
                     engine_version: CURRENT_ENGINE_VERSION,
                 },
             ));
-            std::future::poll_fn(|task_cx| {
-                if pause.is_reached() {
-                    return Poll::Ready(());
-                }
-                match seal.as_mut().poll(task_cx) {
-                    Poll::Pending => {
-                        task_cx.waker().wake_by_ref();
-                        Poll::Pending
-                    }
-                    Poll::Ready(_) => {
-                        panic!("Delta seal completed before the armed checkpoint")
-                    }
-                }
+            let pending = std::future::poll_fn(|task_cx| {
+                Poll::Ready(matches!(seal.as_mut().poll(task_cx), Poll::Pending))
             })
             .await;
+            assert!(
+                pending,
+                "Delta seal completed before the armed DirectorySynced checkpoint"
+            );
+            pause
+                .wait_until_reached(Duration::from_secs(2))
+                .expect("reach the bounded durable Delta-seal rendezvous");
             drop(seal);
 
             assert!(
                 index.writer_mut().pending_delta_seal.is_some(),
                 "the actual dropped future must leave its complete proposal retained"
             );
-            assert_eq!(
-                index.snapshot().loaded_manifest().manifest.generation,
-                generation,
-                "KeeperWriter must still hold the pre-publish reader snapshot"
-            );
-            assert_eq!(
-                index
-                    .search_paginated(&cx, "alpha", 10, 0, true)
-                    .expect("old Delta remains visible after the dropped future"),
-                before
+            assert!(matches!(
+                index.snapshot(),
+                Err(QuillIndexError::Keeper(
+                    KeeperError::PublicationReconciliationRequired {
+                        retained_generation,
+                        proposed_generation,
+                    }
+                )) if retained_generation == generation && proposed_generation == generation + 1
+            ));
+            assert!(matches!(
+                index.search_snapshot(),
+                Err(QuillIndexError::Keeper(
+                    KeeperError::PublicationReconciliationRequired { .. }
+                ))
+            ));
+            assert!(matches!(
+                index.search_paginated(&cx, "alpha", 10, 0, true),
+                Err(QuillIndexError::Keeper(
+                    KeeperError::PublicationReconciliationRequired { .. }
+                ))
+            ));
+            assert!(matches!(
+                index.doc_count(),
+                Err(QuillIndexError::Keeper(
+                    KeeperError::PublicationReconciliationRequired { .. }
+                ))
+            ));
+            assert!(
+                index.has_uncommitted_changes(),
+                "an abandoned durable publication is pending writer work, never a clean epoch"
             );
             let installed = Manifest::from_bytes(
                 &std::fs::read(directory.path().join("MANIFEST"))
@@ -21298,7 +22070,12 @@ mod tests {
             assert_eq!(index.writer_mut().next_seal_seq, next_seal_seq + 1);
             assert_eq!(index.writer_mut().next_lease_base, sealed.lease_end());
             assert_eq!(
-                index.snapshot().loaded_manifest().manifest.generation,
+                index
+                    .snapshot()
+                    .expect("resumed snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
                 generation + 1,
                 "resume must reconcile N+1 rather than publishing N+2"
             );
@@ -21323,7 +22100,12 @@ mod tests {
     fn tombstone_fold_keeps_multi_must_score_bits_across_delta_seal() {
         run_with_cx(|cx| async move {
             let index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
-            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let generation = index
+                .snapshot()
+                .expect("tombstone-fold snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
             let mut delta =
                 DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("score-order Delta");
 
@@ -21418,7 +22200,9 @@ mod tests {
                 .await
                 .expect("accumulate equivalent sealed document");
             sealed.commit(&cx).await.expect("seal equivalent document");
-            let keeper = sealed.snapshot();
+            let keeper = sealed
+                .snapshot()
+                .expect("sealed parity snapshot is authoritative");
             let post_stats = snapshot_field(&keeper, CONTENT_FIELD).expect("post-seal stats");
             let post_df = snapshot_doc_freq(&keeper, DEFAULT_SCHEMA, CONTENT_FIELD, b"alpha")
                 .expect("post-seal alpha df");
@@ -21531,7 +22315,9 @@ mod tests {
                 .await
                 .expect("accumulate equivalent corpus");
             sealed.commit(&cx).await.expect("seal equivalent corpus");
-            let sealed_snapshot = sealed.snapshot();
+            let sealed_snapshot = sealed
+                .snapshot()
+                .expect("sealed cursor snapshot is authoritative");
             let mut post = lower_term(
                 &sealed_snapshot.segments()[0],
                 &sealed_snapshot,
@@ -21579,7 +22365,9 @@ mod tests {
                 .await
                 .expect("accumulate sealed row");
             mixed.commit(&cx).await.expect("commit sealed row");
-            let keeper = mixed.snapshot();
+            let keeper = mixed
+                .snapshot()
+                .expect("mixed fixture snapshot is authoritative");
             let generation = keeper.loaded_manifest().manifest.generation;
             let delta_base = u64::from(DOC_ORDS_PER_LEASE);
             let delta_docid = u32::try_from(delta_base).expect("second lease fits u32");
@@ -21639,7 +22427,9 @@ mod tests {
                 .commit(&cx)
                 .await
                 .expect("commit equivalent all-sealed rows");
-            let all_sealed_snapshot = all_sealed.snapshot();
+            let all_sealed_snapshot = all_sealed
+                .snapshot()
+                .expect("all-sealed fixture snapshot is authoritative");
             let mut oracle = lower_term(
                 &all_sealed_snapshot.segments()[0],
                 &all_sealed_snapshot,
@@ -21818,7 +22608,9 @@ mod tests {
                     .expect("accumulate monolithic sealed fixture");
             }
             mixed.commit(&cx).await.expect("seal large fixture");
-            let keeper = mixed.snapshot();
+            let keeper = mixed
+                .snapshot()
+                .expect("mixed pruning snapshot is authoritative");
             assert_eq!(
                 keeper.segments().len(),
                 1,
@@ -21862,7 +22654,9 @@ mod tests {
             mixed
                 .publish_delta_table(vec![delta])
                 .expect("publish large mixed snapshot");
-            let live_snapshot = mixed.search_snapshot();
+            let live_snapshot = mixed
+                .search_snapshot()
+                .expect("mixed pruning search snapshot is authoritative");
             let live_stats = live_snapshot
                 .bm25_field_stats(CONTENT_FIELD)
                 .expect("mixed content statistics");
@@ -22309,7 +23103,11 @@ mod tests {
                     .commit(&cx)
                     .await
                     .unwrap_or_else(|error| panic!("{label}: seed commit: {error}"));
-                assert_eq!(index.doc_count(), 1, "{label}: seed");
+                assert_eq!(
+                    index.doc_count().expect("seed count is authoritative"),
+                    1,
+                    "{label}: seed"
+                );
 
                 // A batch whose LAST document duplicates a committed id. Every
                 // document before it is unique and would be accepted one at a
@@ -22343,7 +23141,9 @@ mod tests {
 
                 // 1. nothing from the rejected batch was published.
                 assert_eq!(
-                    index.doc_count(),
+                    index
+                        .doc_count()
+                        .expect("rejected-batch count is authoritative"),
                     1,
                     "{label}: the rejected batch published fragments",
                 );
@@ -22371,7 +23171,13 @@ mod tests {
                     .commit(&cx)
                     .await
                     .unwrap_or_else(|error| panic!("{label}: reingest commit: {error}"));
-                assert_eq!(index.doc_count(), 2, "{label}: reingest");
+                assert_eq!(
+                    index
+                        .doc_count()
+                        .expect("reingested count is authoritative"),
+                    2,
+                    "{label}: reingest"
+                );
             }
         });
     }
@@ -22447,7 +23253,9 @@ mod tests {
                     .await
                     .unwrap_or_else(|error| panic!("{label}: commit: {error}"));
                 assert_eq!(
-                    index.doc_count(),
+                    index
+                        .doc_count()
+                        .expect("retry-guard count is authoritative"),
                     2,
                     "{label}: seed plus the accepted batch"
                 );
@@ -22497,7 +23305,9 @@ mod tests {
             assert_eq!(original.hits.len(), 1);
             assert_eq!(original.hits[0].document_id, "dup-doc");
             assert_eq!(
-                index.doc_count(),
+                index
+                    .doc_count()
+                    .expect("duplicate-rejection count is authoritative"),
                 1,
                 "rejected ingests must not change doc_count",
             );
@@ -22607,10 +23417,24 @@ mod tests {
                 &[],
                 deterministic_config(),
             );
-            assert_eq!(all_delta.doc_count(), 2);
-            assert_eq!(empty.doc_count(), 0);
-            assert_eq!(mixed.doc_count(), 2, "public count includes the Delta leaf");
-            assert_eq!(all_sealed.doc_count(), 2);
+            assert_eq!(
+                all_delta
+                    .doc_count()
+                    .expect("all-Delta count is authoritative"),
+                2
+            );
+            assert_eq!(empty.doc_count().expect("empty count is authoritative"), 0);
+            assert_eq!(
+                mixed.doc_count().expect("mixed count is authoritative"),
+                2,
+                "public count includes the Delta leaf"
+            );
+            assert_eq!(
+                all_sealed
+                    .doc_count()
+                    .expect("all-sealed count is authoritative"),
+                2
+            );
 
             let queries = [
                 (
@@ -22750,7 +23574,9 @@ mod tests {
             ];
             for query in &invalid_queries {
                 let errors = [&empty, &all_delta, &mixed, &all_sealed].map(|index| {
-                    let snapshot = index.search_snapshot();
+                    let snapshot = index
+                        .search_snapshot()
+                        .expect("typed validation snapshot is authoritative");
                     let ranked = index
                         .execute_ranked_query(&cx, query, &snapshot, 10, 0, true, Vec::new())
                         .expect_err("invalid ranked query must fail before leaf iteration")
@@ -22771,7 +23597,9 @@ mod tests {
             let mut bounded = deterministic_config();
             bounded.glob_expansion_limit = 1;
             let bounded = typed_residency_index(&[], &[first, second], bounded);
-            let snapshot = bounded.search_snapshot();
+            let snapshot = bounded
+                .search_snapshot()
+                .expect("bounded typed snapshot is authoritative");
             let glob = Query::Glob {
                 field_ids: vec![1],
                 pattern: "alp*".to_owned(),
@@ -23023,7 +23851,11 @@ mod tests {
                 .await
                 .expect("publish second Basic segment");
             assert_eq!(
-                index.snapshot().segments().len(),
+                index
+                    .snapshot()
+                    .expect("Basic fixture snapshot is authoritative")
+                    .segments()
+                    .len(),
                 2,
                 "fixture must exercise composite scoring across two sealed segments"
             );
@@ -23084,7 +23916,9 @@ mod tests {
 
             let cancelled = Cx::for_testing();
             cancelled.set_cancel_requested(true);
-            let snapshot = index.search_snapshot();
+            let snapshot = index
+                .search_snapshot()
+                .expect("fast-only fixture snapshot is authoritative");
             let segment = snapshot
                 .keeper_snapshot()
                 .segments()
@@ -23154,7 +23988,10 @@ mod tests {
         run_with_blocking_cx(|cx| async move {
             let deleted = [1_u32, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23];
             let index = q1_ob4_tombstoned_index(40, &deleted);
-            let source = index.snapshot().clone();
+            let source = index
+                .snapshot()
+                .expect("compaction source snapshot is authoritative")
+                .clone();
             let source_manifest = source.loaded_manifest().manifest.clone();
             let source_segment = &source.segments()[0];
             let source_segment_id = source_segment.manifest().segment_id;
@@ -23178,7 +24015,9 @@ mod tests {
             assert_eq!(report.input_bytes, source_segment.manifest().file_len);
             assert!(report.output_bytes > 0);
 
-            let replacement_snapshot = index.snapshot();
+            let replacement_snapshot = index
+                .snapshot()
+                .expect("compaction replacement snapshot is authoritative");
             let replacement = &replacement_snapshot.segments()[0];
             assert_ne!(replacement.manifest().segment_id, source_segment_id);
             assert_eq!(replacement.manifest().docid_lo, 0);
@@ -23200,10 +24039,17 @@ mod tests {
             );
             for global_docid in 0_u32..40 {
                 let should_live = !deleted.contains(&global_docid);
-                assert_eq!(index.snapshot().is_live(global_docid), should_live);
                 assert_eq!(
                     index
                         .snapshot()
+                        .expect("compaction liveness snapshot is authoritative")
+                        .is_live(global_docid),
+                    should_live
+                );
+                assert_eq!(
+                    index
+                        .snapshot()
+                        .expect("compaction materialization snapshot is authoritative")
                         .materialize_document_id(global_docid)
                         .is_some(),
                     should_live,
@@ -23227,6 +24073,7 @@ mod tests {
             assert!(
                 index
                     .snapshot()
+                    .expect("compaction statistics snapshot is authoritative")
                     .loaded_manifest()
                     .manifest
                     .field_stats
@@ -23256,16 +24103,19 @@ mod tests {
             let committed = q1_ob2a_owned_index(vec![sealed.encoded], field_stats);
             let mut tombstoned = committed
                 .snapshot()
+                .expect("long compaction source snapshot is authoritative")
                 .next_manifest()
                 .expect("long tombstone MANIFEST");
             assert!(
                 committed
                     .snapshot()
+                    .expect("long compaction source snapshot is authoritative")
                     .delete_document(&mut tombstoned, "long-deleted")
                     .expect("delete long document")
             );
             let tombstoned = committed
                 .snapshot()
+                .expect("long compaction source snapshot is authoritative")
                 .publish_owned_segments(&tombstoned, Vec::new())
                 .expect("publish long tombstones");
             let compacted = QuillIndex::from_backend(
@@ -23285,6 +24135,7 @@ mod tests {
             assert_eq!(
                 compacted
                     .snapshot()
+                    .expect("long compaction result snapshot is authoritative")
                     .loaded_manifest()
                     .manifest
                     .field_stats
@@ -23302,8 +24153,18 @@ mod tests {
         run_with_blocking_cx(|cx| async move {
             let boundary_deleted = [0_u32, 1, 2, 3];
             let boundary = q1_ob4_tombstoned_index(20, &boundary_deleted);
-            let boundary_generation = boundary.snapshot().loaded_manifest().manifest.generation;
-            let boundary_segment_id = boundary.snapshot().segments()[0].manifest().segment_id;
+            let boundary_generation = boundary
+                .snapshot()
+                .expect("boundary snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
+            let boundary_segment_id = boundary
+                .snapshot()
+                .expect("boundary snapshot is authoritative")
+                .segments()[0]
+                .manifest()
+                .segment_id;
             let report = boundary
                 .compact(&cx, CompactionPolicy::default())
                 .await
@@ -23311,7 +24172,12 @@ mod tests {
             assert!(!report.changed(), "density equality must not compact");
             assert_eq!(report.generation_after, boundary_generation);
             assert_eq!(
-                boundary.snapshot().segments()[0].manifest().segment_id,
+                boundary
+                    .snapshot()
+                    .expect("boundary successor snapshot is authoritative")
+                    .segments()[0]
+                    .manifest()
+                    .segment_id,
                 boundary_segment_id,
             );
 
@@ -23323,7 +24189,12 @@ mod tests {
                 .expect("25-percent compaction");
             assert!(first.changed());
             let compacted_generation = first.generation_after;
-            let compacted_segment_id = eligible.snapshot().segments()[0].manifest().segment_id;
+            let compacted_segment_id = eligible
+                .snapshot()
+                .expect("eligible successor snapshot is authoritative")
+                .segments()[0]
+                .manifest()
+                .segment_id;
             let second = eligible
                 .compact(&cx, CompactionPolicy::default())
                 .await
@@ -23332,7 +24203,12 @@ mod tests {
             assert_eq!(second.generation_before, compacted_generation);
             assert_eq!(second.generation_after, compacted_generation);
             assert_eq!(
-                eligible.snapshot().segments()[0].manifest().segment_id,
+                eligible
+                    .snapshot()
+                    .expect("idempotent successor snapshot is authoritative")
+                    .segments()[0]
+                    .manifest()
+                    .segment_id,
                 compacted_segment_id,
                 "a tombstone-free replacement must not thrash",
             );
@@ -23344,7 +24220,12 @@ mod tests {
         run_with_blocking_cx(|cx| async move {
             let deleted = (0_u32..20).collect::<Vec<_>>();
             let index = q1_ob4_tombstoned_index(20, &deleted);
-            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let generation = index
+                .snapshot()
+                .expect("fully-deleted snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
             let report = index
                 .compact(&cx, CompactionPolicy::default())
                 .await
@@ -23354,11 +24235,24 @@ mod tests {
             assert_eq!(report.removed_segments, 1);
             assert_eq!(report.dropped_documents, 20);
             assert_eq!(report.output_bytes, 0);
-            assert!(index.snapshot().segments().is_empty());
-            assert_eq!(index.snapshot().doc_count(), 0);
             assert!(
                 index
                     .snapshot()
+                    .expect("fully-deleted successor snapshot is authoritative")
+                    .segments()
+                    .is_empty()
+            );
+            assert_eq!(
+                index
+                    .snapshot()
+                    .expect("fully-deleted successor snapshot is authoritative")
+                    .doc_count(),
+                0
+            );
+            assert!(
+                index
+                    .snapshot()
+                    .expect("fully-deleted statistics snapshot is authoritative")
                     .loaded_manifest()
                     .manifest
                     .field_stats
@@ -23369,6 +24263,7 @@ mod tests {
             for density in [0.0, -0.1, 1.1, f64::INFINITY, f64::NAN] {
                 let Err(error) = index
                     .snapshot()
+                    .expect("invalid-policy snapshot is authoritative")
                     .compact_owned(CompactionPolicy::new(density), 0)
                 else {
                     panic!("invalid density {density:?} unexpectedly compacted");
@@ -23399,18 +24294,25 @@ mod tests {
                 .commit(&cx)
                 .await
                 .expect("commit durable Q1-OB4 segment");
-            let source_segment_id = index.snapshot().segments()[0].manifest().segment_id;
+            let source_segment_id = index
+                .snapshot()
+                .expect("durable compaction source snapshot is authoritative")
+                .segments()[0]
+                .manifest()
+                .segment_id;
             let source_path = directory
                 .path()
                 .join(format!("seg-{source_segment_id:016x}.fslx"));
             let mut tombstoned = index
                 .snapshot()
+                .expect("durable compaction source snapshot is authoritative")
                 .next_manifest()
                 .expect("durable Q1-OB4 tombstone MANIFEST");
             for global_docid in 0_u32..5 {
                 assert!(
                     index
                         .snapshot()
+                        .expect("durable compaction source snapshot is authoritative")
                         .delete_document(&mut tombstoned, &format!("q1-ob2a-{global_docid:03}"),)
                         .expect("stage durable Q1-OB4 tombstone"),
                 );
@@ -23428,7 +24330,12 @@ mod tests {
             let index = QuillIndex::open(&cx, directory.path(), deterministic_config())
                 .await
                 .expect("reopen durable tombstone generation");
-            let old_manifest = index.snapshot().loaded_manifest().manifest.clone();
+            let old_manifest = index
+                .snapshot()
+                .expect("durable tombstone snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .clone();
             let query_before = q1_ob4_query_evidence(&index, &cx);
             let pause = crate::keeper::pause_manifest_publish_at_checkpoint_for_test(
                 directory.path(),
@@ -23702,7 +24609,9 @@ mod tests {
                 .expect("index remaining phrase-seam corpus");
             index.commit(&cx).await.expect("commit phrase-seam corpus");
 
-            let snapshot = index.snapshot();
+            let snapshot = index
+                .snapshot()
+                .expect("phrase-seam snapshot is authoritative");
             assert_eq!(snapshot.segments().len(), 1);
             let segment = &snapshot.segments()[0];
             let dictionary =
@@ -23878,7 +24787,9 @@ mod tests {
                     .expect("route one production batch");
             }
             index.commit(&cx).await.expect("publish routed batches");
-            let snapshot = index.snapshot();
+            let snapshot = index
+                .snapshot()
+                .expect("routed-shard snapshot is authoritative");
             assert_pairwise_disjoint_manifest(
                 snapshot.loaded_manifest().manifest.segments.as_slice(),
             );
@@ -24227,7 +25138,13 @@ mod tests {
                     .commit_with_trigger(&cx, LifecycleTrigger::ExplicitFlush)
                     .await
                     .expect("publish budget-fit shared-nothing batch");
-                assert_eq!(writer.snapshot().doc_count(), 250);
+                assert_eq!(
+                    writer
+                        .authority_snapshot()
+                        .expect("budget-fit writer snapshot is authoritative")
+                        .doc_count(),
+                    250
+                );
             });
         });
     }
@@ -24969,7 +25886,13 @@ mod tests {
                     .commit_with_trigger(&cx, LifecycleTrigger::ExplicitFlush)
                     .await
                     .expect("publish second default-budget generation");
-                assert_eq!(writer.snapshot().doc_count(), 512);
+                assert_eq!(
+                    writer
+                        .authority_snapshot()
+                        .expect("fan-out writer snapshot is authoritative")
+                        .doc_count(),
+                    512
+                );
             });
         });
     }
@@ -25100,8 +26023,18 @@ mod tests {
                     .expect("publish adaptive boundary");
                 scalar.commit(&cx).await.expect("publish scalar boundary");
                 assert_eq!(
-                    adaptive.snapshot().loaded_manifest().manifest.field_stats,
-                    scalar.snapshot().loaded_manifest().manifest.field_stats,
+                    adaptive
+                        .snapshot()
+                        .expect("adaptive equality snapshot is authoritative")
+                        .loaded_manifest()
+                        .manifest
+                        .field_stats,
+                    scalar
+                        .snapshot()
+                        .expect("scalar equality snapshot is authoritative")
+                        .loaded_manifest()
+                        .manifest
+                        .field_stats,
                 );
                 for document in &documents {
                     assert_eq!(
@@ -25198,8 +26131,18 @@ mod tests {
                     .await
                     .expect("publish equality scalar control");
                 assert_eq!(
-                    adaptive.snapshot().loaded_manifest().manifest.field_stats,
-                    scalar.snapshot().loaded_manifest().manifest.field_stats,
+                    adaptive
+                        .snapshot()
+                        .expect("adaptive equality snapshot is authoritative")
+                        .loaded_manifest()
+                        .manifest
+                        .field_stats,
+                    scalar
+                        .snapshot()
+                        .expect("scalar equality snapshot is authoritative")
+                        .loaded_manifest()
+                        .manifest
+                        .field_stats,
                 );
                 for document in [
                     documents.first().expect("first equality document"),
@@ -25254,14 +26197,25 @@ mod tests {
                     .active_shards;
             let expected_segments = active_shards.max(1);
             index.commit(&cx).await.expect("publish parallel batch");
-            assert_eq!(index.snapshot().segments().len(), expected_segments);
             assert_eq!(
-                index.snapshot().doc_count(),
+                index
+                    .snapshot()
+                    .expect("large-batch snapshot is authoritative")
+                    .segments()
+                    .len(),
+                expected_segments
+            );
+            assert_eq!(
+                index
+                    .snapshot()
+                    .expect("large-batch snapshot is authoritative")
+                    .doc_count(),
                 u64::try_from(documents.len()).expect("fixture document count fits u64"),
             );
             assert_pairwise_disjoint_manifest(
                 index
                     .snapshot()
+                    .expect("large-batch snapshot is authoritative")
                     .loaded_manifest()
                     .manifest
                     .segments
@@ -25303,11 +26257,16 @@ mod tests {
                 .await
                 .expect("publish deterministic internal segments");
 
-            let snapshot = index.snapshot();
+            let snapshot = index
+                .snapshot()
+                .expect("deterministic batch snapshot is authoritative");
             let manifest = &snapshot.loaded_manifest().manifest;
             assert_eq!(manifest.segments.len(), INTERNAL_PARALLEL_INGEST_SHARDS);
             assert_eq!(
-                index.snapshot().doc_count(),
+                index
+                    .snapshot()
+                    .expect("deterministic batch snapshot is authoritative")
+                    .doc_count(),
                 u64::try_from(document_count).expect("fixture document count fits u64"),
             );
             assert_eq!(
@@ -25386,17 +26345,42 @@ mod tests {
                 .await
                 .expect("publish scalar topology leaf");
             assert_eq!(
-                adaptive.snapshot().segments().len(),
+                adaptive
+                    .snapshot()
+                    .expect("adaptive topology snapshot is authoritative")
+                    .segments()
+                    .len(),
                 INTERNAL_PARALLEL_INGEST_SHARDS,
             );
-            assert_eq!(scalar.snapshot().segments().len(), 1);
             assert_eq!(
-                scalar.snapshot().segments()[0].doc_count(),
+                scalar
+                    .snapshot()
+                    .expect("scalar topology snapshot is authoritative")
+                    .segments()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                scalar
+                    .snapshot()
+                    .expect("scalar topology snapshot is authoritative")
+                    .segments()[0]
+                    .doc_count(),
                 u32::try_from(document_count).expect("fixture count fits u32"),
             );
             assert_eq!(
-                adaptive.snapshot().loaded_manifest().manifest.field_stats,
-                scalar.snapshot().loaded_manifest().manifest.field_stats,
+                adaptive
+                    .snapshot()
+                    .expect("adaptive topology snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest
+                    .field_stats,
+                scalar
+                    .snapshot()
+                    .expect("scalar topology snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest
+                    .field_stats,
             );
             assert_eq!(
                 adaptive
@@ -25522,11 +26506,25 @@ mod tests {
                     .expect("plan adaptive parallel fixture")
                     .active_shards;
             index.commit(&cx).await.expect("publish adaptive batch");
-            assert_eq!(index.snapshot().segments().len(), active_shards.max(1));
-            assert_eq!(index.snapshot().doc_count(), 250);
+            assert_eq!(
+                index
+                    .snapshot()
+                    .expect("adaptive batch snapshot is authoritative")
+                    .segments()
+                    .len(),
+                active_shards.max(1)
+            );
+            assert_eq!(
+                index
+                    .snapshot()
+                    .expect("adaptive batch snapshot is authoritative")
+                    .doc_count(),
+                250
+            );
             assert_pairwise_disjoint_manifest(
                 index
                     .snapshot()
+                    .expect("adaptive batch snapshot is authoritative")
                     .loaded_manifest()
                     .manifest
                     .segments
@@ -25687,8 +26685,20 @@ mod tests {
 
             index.commit(&cx).await.expect("publish retried batch");
             control.commit(&cx).await.expect("publish control batch");
-            assert_eq!(index.snapshot().doc_count(), 256);
-            assert_eq!(control.snapshot().doc_count(), 256);
+            assert_eq!(
+                index
+                    .snapshot()
+                    .expect("retried parallel snapshot is authoritative")
+                    .doc_count(),
+                256
+            );
+            assert_eq!(
+                control
+                    .snapshot()
+                    .expect("parallel control snapshot is authoritative")
+                    .doc_count(),
+                256
+            );
             for document in &documents {
                 assert_eq!(
                     index
@@ -25744,8 +26754,21 @@ mod tests {
                 .expect("publish deterministic batch");
             let expected_segments = INTERNAL_PARALLEL_INGEST_SHARDS
                 .min(documents.len() / PARALLEL_INGEST_MIN_DOCS_PER_SHARD);
-            assert_eq!(index.snapshot().segments().len(), expected_segments);
-            assert_eq!(index.snapshot().doc_count(), 250);
+            assert_eq!(
+                index
+                    .snapshot()
+                    .expect("fixed-plan snapshot is authoritative")
+                    .segments()
+                    .len(),
+                expected_segments
+            );
+            assert_eq!(
+                index
+                    .snapshot()
+                    .expect("fixed-plan snapshot is authoritative")
+                    .doc_count(),
+                250
+            );
         });
     }
 
@@ -25827,6 +26850,7 @@ mod tests {
             assert_pairwise_disjoint_manifest(
                 fanout
                     .snapshot()
+                    .expect("fan-out snapshot is authoritative")
                     .loaded_manifest()
                     .manifest
                     .segments
@@ -25834,7 +26858,12 @@ mod tests {
             );
             if fanout_shards > 1 {
                 assert!(
-                    fanout.snapshot().segments().len() > 1,
+                    fanout
+                        .snapshot()
+                        .expect("fan-out snapshot is authoritative")
+                        .segments()
+                        .len()
+                        > 1,
                     "a fanned-out batch must seal a segment per participating shard",
                 );
             }
@@ -25893,7 +26922,9 @@ mod tests {
                 .await
                 .expect("accumulate bulk fixture");
 
-            let intermediate = index.snapshot();
+            let intermediate = index
+                .snapshot()
+                .expect("bulk intermediate snapshot is authoritative");
             assert_eq!(intermediate.segments().len(), 6);
             assert_eq!(intermediate.doc_count(), 6);
             assert_ne!(
@@ -25957,7 +26988,13 @@ mod tests {
                     .await
                     .expect("successful seal-producing batch");
             }
-            assert_eq!(index.doc_count(), 0, "segments remain unpublished");
+            assert_eq!(
+                index
+                    .doc_count()
+                    .expect("unpublished bounded-batch count is authoritative"),
+                0,
+                "segments remain unpublished"
+            );
             assert!(index.has_uncommitted_changes());
 
             let duplicate_batch = [
@@ -25989,7 +27026,12 @@ mod tests {
             // bounded-0, bounded-1, bounded-3. bounded-2 was rejected and
             // contributed nothing: this is the count that was 3-with-bounded-2
             // before the fix, and it is the whole point of the bead.
-            assert_eq!(index.doc_count(), 3);
+            assert_eq!(
+                index
+                    .doc_count()
+                    .expect("bounded-batch count is authoritative"),
+                3
+            );
             assert!(!index.writer_mut().ingest_retry_required);
             assert!(
                 index
@@ -26042,7 +27084,9 @@ mod tests {
                 .expect("route second tier batch");
             index.commit(&cx).await.expect("publish and tier merge");
 
-            let snapshot = index.snapshot();
+            let snapshot = index
+                .snapshot()
+                .expect("tier-policy snapshot is authoritative");
             assert_eq!(snapshot.segments().len(), 1);
             assert_eq!(snapshot.doc_count(), 2);
             let merged_hi = snapshot.segments()[0].manifest().docid_hi;
@@ -26059,7 +27103,9 @@ mod tests {
                 .await
                 .expect("append after tier merge");
             index.commit(&cx).await.expect("publish post-merge append");
-            let post_merge = index.snapshot();
+            let post_merge = index
+                .snapshot()
+                .expect("post-merge snapshot is authoritative");
             assert_pairwise_disjoint_manifest(
                 post_merge.loaded_manifest().manifest.segments.as_slice(),
             );
@@ -26086,14 +27132,23 @@ mod tests {
                 .index_documents(&cx, &[IndexableDocument::new("lag-a", "visibility alpha")])
                 .await
                 .expect("accumulate first visibility batch");
-            assert_eq!(index.doc_count(), 0, "sub-bound changes stay unpublished");
+            assert_eq!(
+                index.doc_count().expect("pre-lag count is authoritative"),
+                0,
+                "sub-bound changes stay unpublished"
+            );
 
             std::thread::sleep(Duration::from_millis(2));
             index
                 .index_documents(&cx, &[IndexableDocument::new("lag-b", "visibility beta")])
                 .await
                 .expect("lag-bound batch forces publication");
-            assert_eq!(index.doc_count(), 2);
+            assert_eq!(
+                index
+                    .doc_count()
+                    .expect("lag-forced count is authoritative"),
+                2
+            );
             assert!(!index.has_uncommitted_changes());
         });
     }
@@ -26148,13 +27203,20 @@ mod tests {
             let source_ids = committed_segment_ids(&index);
             assert_eq!(source_ids.len(), 3);
 
-            let generation_before = index.snapshot().loaded_manifest().manifest.generation;
+            let generation_before = index
+                .snapshot()
+                .expect("concat source snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
             let results_before = concat_merge_query_results(&index, &cx);
             let docids_before = index
                 .collect_docids(&cx, "rust OR python")
                 .expect("collect pre-merge docids");
             let output_segment_id = fresh_merge_segment_id(&index, 0xc011_ca7e_0000_0001);
-            let source_snapshot = index.snapshot();
+            let source_snapshot = index
+                .snapshot()
+                .expect("concat source snapshot is authoritative");
             let source_dictionary_counts = source_snapshot
                 .segments()
                 .iter()
@@ -26183,9 +27245,21 @@ mod tests {
                     "concat must open one cached dictionary view per source segment"
                 );
             }
-            assert_eq!(index.snapshot().segments().len(), 1);
             assert_eq!(
-                index.snapshot().loaded_manifest().manifest.generation,
+                index
+                    .snapshot()
+                    .expect("concat successor snapshot is authoritative")
+                    .segments()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                index
+                    .snapshot()
+                    .expect("concat successor snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
                 generation_before + 1,
             );
             assert_eq!(
@@ -26199,7 +27273,12 @@ mod tests {
                     .expect("collect post-merge docids"),
                 docids_before,
             );
-            let merge_seal_seq = index.snapshot().segments()[0].manifest().seal_seq;
+            let merge_seal_seq = index
+                .snapshot()
+                .expect("concat successor snapshot is authoritative")
+                .segments()[0]
+                .manifest()
+                .seal_seq;
 
             index
                 .index_documents(
@@ -26242,8 +27321,24 @@ mod tests {
                 [(0, 100), (100, 400)],
                 "Q1-OB2a leaves must be adjacent inside one lease",
             );
-            assert_eq!(monolithic.snapshot().segments()[0].manifest().docid_lo, 0);
-            assert_eq!(monolithic.snapshot().segments()[0].manifest().docid_hi, 400);
+            assert_eq!(
+                monolithic
+                    .snapshot()
+                    .expect("monolithic source snapshot is authoritative")
+                    .segments()[0]
+                    .manifest()
+                    .docid_lo,
+                0
+            );
+            assert_eq!(
+                monolithic
+                    .snapshot()
+                    .expect("monolithic source snapshot is authoritative")
+                    .segments()[0]
+                    .manifest()
+                    .docid_hi,
+                400
+            );
 
             let source_shared_dfs = leaves
                 .snapshot()
@@ -26262,7 +27357,9 @@ mod tests {
             assert_eq!(source_shared_dfs, [100, 300]);
             assert_eq!(
                 snapshot_doc_freq(
-                    &monolithic.snapshot(),
+                    &monolithic
+                        .snapshot()
+                        .expect("monolithic source snapshot is authoritative"),
                     DEFAULT_SCHEMA,
                     CONTENT_FIELD,
                     b"shared",
@@ -26279,7 +27376,12 @@ mod tests {
                 .collect::<Vec<_>>();
             let source_aggregate =
                 aggregate_field_stats(source_stats.iter()).expect("aggregate source STATS");
-            let monolithic_stats = q1_ob2a_decoded_stats(&monolithic.snapshot().segments()[0]);
+            let monolithic_stats = q1_ob2a_decoded_stats(
+                &monolithic
+                    .snapshot()
+                    .expect("monolithic source snapshot is authoritative")
+                    .segments()[0],
+            );
             let monolithic_aggregate = monolithic_stats
                 .rows()
                 .iter()
@@ -26291,8 +27393,18 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(source_aggregate, monolithic_aggregate);
             assert_eq!(
-                leaves.snapshot().loaded_manifest().manifest.field_stats,
-                monolithic.snapshot().loaded_manifest().manifest.field_stats,
+                leaves
+                    .snapshot()
+                    .expect("leaf source snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest
+                    .field_stats,
+                monolithic
+                    .snapshot()
+                    .expect("monolithic source snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest
+                    .field_stats,
             );
 
             let monolithic_terms = q1_ob2a_decoded_terms(&monolithic);
@@ -26319,10 +27431,24 @@ mod tests {
                 .concat_merge(&cx, &source_ids, 0x0b2a_0004, 0)
                 .await
                 .expect("Q1-OB2a concat merge");
-            assert_eq!(leaves.snapshot().segments().len(), 1);
             assert_eq!(
-                snapshot_doc_freq(&leaves.snapshot(), DEFAULT_SCHEMA, CONTENT_FIELD, b"shared")
-                    .expect("merged shared df"),
+                leaves
+                    .snapshot()
+                    .expect("merged leaf snapshot is authoritative")
+                    .segments()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                snapshot_doc_freq(
+                    &leaves
+                        .snapshot()
+                        .expect("merged leaf snapshot is authoritative"),
+                    DEFAULT_SCHEMA,
+                    CONTENT_FIELD,
+                    b"shared",
+                )
+                .expect("merged shared df"),
                 400,
             );
             assert_eq!(
@@ -26331,13 +27457,28 @@ mod tests {
                 "every merged term and decoded posting must match fresh monolithic indexing",
             );
             assert_eq!(
-                q1_ob2a_decoded_stats(&leaves.snapshot().segments()[0]),
+                q1_ob2a_decoded_stats(
+                    &leaves
+                        .snapshot()
+                        .expect("merged leaf snapshot is authoritative")
+                        .segments()[0],
+                ),
                 monolithic_stats,
                 "merged decoded STATS must match fresh monolithic indexing",
             );
             assert_eq!(
-                leaves.snapshot().loaded_manifest().manifest.field_stats,
-                monolithic.snapshot().loaded_manifest().manifest.field_stats,
+                leaves
+                    .snapshot()
+                    .expect("merged leaf snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest
+                    .field_stats,
+                monolithic
+                    .snapshot()
+                    .expect("monolithic source snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest
+                    .field_stats,
             );
             assert_eq!(
                 q1_ob2a_query_evidence(&leaves, &cx),
@@ -26353,7 +27494,12 @@ mod tests {
             let index = concat_merge_fixture_index(&cx).await;
             let source_ids = committed_segment_ids(&index);
             assert_eq!(source_ids.len(), 3);
-            let manifest_before = index.snapshot().loaded_manifest().manifest.clone();
+            let manifest_before = index
+                .snapshot()
+                .expect("concat rejection snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .clone();
             let output_segment_id = fresh_merge_segment_id(&index, 0xc011_ca7e_0000_0010);
 
             let reversed = [source_ids[1], source_ids[0]];
@@ -26370,7 +27516,11 @@ mod tests {
                 })
             ));
             assert_eq!(
-                &index.snapshot().loaded_manifest().manifest,
+                &index
+                    .snapshot()
+                    .expect("reversed rejection snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest,
                 &manifest_before,
                 "reversed rejection must not advance the snapshot generation",
             );
@@ -26389,7 +27539,11 @@ mod tests {
                 })
             ));
             assert_eq!(
-                &index.snapshot().loaded_manifest().manifest,
+                &index
+                    .snapshot()
+                    .expect("skipped rejection snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest,
                 &manifest_before,
                 "skipped-run rejection must leave the exact snapshot unchanged",
             );
@@ -26411,7 +27565,11 @@ mod tests {
                 }) if actual == source_ids[0]
             ));
             assert_eq!(
-                &index.snapshot().loaded_manifest().manifest,
+                &index
+                    .snapshot()
+                    .expect("wrapped rejection snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest,
                 &manifest_before,
                 "wrapped-run rejection must leave the exact snapshot unchanged",
             );
@@ -26467,12 +27625,39 @@ mod tests {
                 .await
                 .expect("right-associated final concat merge");
 
-            assert_eq!(direct.snapshot().segments().len(), 1);
-            assert_eq!(left_associated.snapshot().segments().len(), 1);
-            assert_eq!(right_associated.snapshot().segments().len(), 1);
-            let direct_snapshot = direct.snapshot();
-            let left_snapshot = left_associated.snapshot();
-            let right_snapshot = right_associated.snapshot();
+            assert_eq!(
+                direct
+                    .snapshot()
+                    .expect("direct merge snapshot is authoritative")
+                    .segments()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                left_associated
+                    .snapshot()
+                    .expect("left-associated merge snapshot is authoritative")
+                    .segments()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                right_associated
+                    .snapshot()
+                    .expect("right-associated merge snapshot is authoritative")
+                    .segments()
+                    .len(),
+                1
+            );
+            let direct_snapshot = direct
+                .snapshot()
+                .expect("direct merge snapshot is authoritative");
+            let left_snapshot = left_associated
+                .snapshot()
+                .expect("left-associated merge snapshot is authoritative");
+            let right_snapshot = right_associated
+                .snapshot()
+                .expect("right-associated merge snapshot is authoritative");
             let direct_segment = &direct_snapshot.segments()[0];
             let left_segment = &left_snapshot.segments()[0];
             let right_segment = &right_snapshot.segments()[0];
@@ -26532,11 +27717,23 @@ mod tests {
             second.commit(&cx).await.expect("second commit");
 
             assert_eq!(
-                first.snapshot().loaded_manifest().manifest,
-                second.snapshot().loaded_manifest().manifest
+                first
+                    .snapshot()
+                    .expect("first deterministic snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest,
+                second
+                    .snapshot()
+                    .expect("second deterministic snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest
             );
-            let first_snapshot = first.snapshot();
-            let second_snapshot = second.snapshot();
+            let first_snapshot = first
+                .snapshot()
+                .expect("first deterministic snapshot is authoritative");
+            let second_snapshot = second
+                .snapshot()
+                .expect("second deterministic snapshot is authoritative");
             let first_segment = &first_snapshot.segments()[0];
             let second_segment = &second_snapshot.segments()[0];
             assert_eq!(first_segment.header(), second_segment.header());
@@ -26653,7 +27850,14 @@ mod tests {
                 .await
                 .expect("reuse exact prior-attempt bytes");
 
-            assert_eq!(index.snapshot().loaded_manifest().manifest, proposal);
+            assert_eq!(
+                index
+                    .snapshot()
+                    .expect("reused-manifest snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest,
+                proposal
+            );
             assert!(index.writer_mut().pending_manifest.is_none());
         });
     }
@@ -26679,7 +27883,13 @@ mod tests {
                     .flush_shard(&cx, 0, LifecycleTrigger::ExplicitFlush)
                     .await
                     .expect("install segment without MANIFEST");
-                assert_eq!(first.snapshot().doc_count(), 0);
+                assert_eq!(
+                    first
+                        .snapshot()
+                        .expect("unpublished first snapshot is authoritative")
+                        .doc_count(),
+                    0
+                );
                 first.writer_mut().pending_segments[0].segment_id
             };
             let abandoned_path = directory.join(format!("seg-{abandoned_segment_id:016x}.fslx"));
@@ -26706,7 +27916,9 @@ mod tests {
                 .await
                 .expect("publish replacement batch");
 
-            let restarted_snapshot = restarted.snapshot();
+            let restarted_snapshot = restarted
+                .snapshot()
+                .expect("restarted snapshot is authoritative");
             let committed = &restarted_snapshot.loaded_manifest().manifest;
             assert_eq!(committed.segments.len(), 1);
             assert_ne!(committed.segments[0].segment_id, abandoned_segment_id);
@@ -26745,7 +27957,12 @@ mod tests {
                 .await
                 .expect("durable ingest");
             index.commit(&cx).await.expect("durable commit");
-            let segment_path = index.snapshot().segments()[0].path().to_path_buf();
+            let segment_path = index
+                .snapshot()
+                .expect("durable facade snapshot is authoritative")
+                .segments()[0]
+                .path()
+                .to_path_buf();
             drop(index);
 
             let manifest_path = directory.join("MANIFEST");

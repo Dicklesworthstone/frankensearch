@@ -11626,6 +11626,7 @@ pub(crate) enum PublishCheckpoint {
 struct ManifestPublishPause {
     checkpoint: PublishCheckpoint,
     reached: Arc<std::sync::atomic::AtomicBool>,
+    arrived: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     released: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 }
 
@@ -11634,7 +11635,9 @@ struct ManifestPublishPause {
 #[cfg(test)]
 pub(crate) struct ManifestPublishPauseControl {
     directory: PathBuf,
+    checkpoint: PublishCheckpoint,
     reached: Arc<std::sync::atomic::AtomicBool>,
+    arrived: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     released: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 }
 
@@ -11656,10 +11659,12 @@ pub(crate) fn pause_manifest_publish_at_checkpoint_for_test(
 ) -> ManifestPublishPauseControl {
     let directory = normalize_publish_directory(directory.to_path_buf());
     let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let arrived = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let released = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let pause = ManifestPublishPause {
         checkpoint,
         reached: Arc::clone(&reached),
+        arrived: Arc::clone(&arrived),
         released: Arc::clone(&released),
     };
     let previous = manifest_publish_pauses()
@@ -11672,7 +11677,9 @@ pub(crate) fn pause_manifest_publish_at_checkpoint_for_test(
     );
     ManifestPublishPauseControl {
         directory,
+        checkpoint,
         reached,
+        arrived,
         released,
     }
 }
@@ -11682,6 +11689,40 @@ impl ManifestPublishPauseControl {
     /// Whether the blocking publisher has completed the armed checkpoint.
     pub(crate) fn is_reached(&self) -> bool {
         self.reached.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Wait for the blocked filesystem choreography to signal its real
+    /// checkpoint, with a wall-clock diagnostic bound rather than scheduler
+    /// polling. This remains test-only and never participates in production
+    /// publication.
+    pub(crate) fn wait_until_reached(&self, timeout: Duration) -> Result<(), String> {
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| "MANIFEST checkpoint wait timeout overflowed".to_owned())?;
+        let (arrived, wake) = self.arrived.as_ref();
+        let mut arrived = arrived
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*arrived {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "publication did not reach {:?} within {timeout:?}",
+                    self.checkpoint
+                ));
+            }
+            let (next, result) = wake
+                .wait_timeout(arrived, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            arrived = next;
+            if result.timed_out() && !*arrived {
+                return Err(format!(
+                    "publication did not reach {:?} within {timeout:?}",
+                    self.checkpoint
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Release the blocked choreography. Calling this more than once is safe.
@@ -11719,6 +11760,11 @@ fn observe_manifest_publish_checkpoint_for_test(directory: &Path, checkpoint: Pu
     pause
         .reached
         .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (arrived, arrived_wake) = pause.arrived.as_ref();
+    *arrived
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+    arrived_wake.notify_all();
     let (released, wake) = pause.released.as_ref();
     let mut released = released
         .lock()
@@ -20867,50 +20913,37 @@ mod tests {
         Ok(())
     }
 
-    /// A deterministic upper bound for reaching the real durable-publish seam.
+    /// A wall-clock bound for the test-only durable-publish rendezvous.
     ///
-    /// The bound prevents a regression from turning this hostile-drop probe
-    /// into an indefinitely self-waking test. The production path reaches the
-    /// existing `DirectorySynced` checkpoint after its blocking publisher has
-    /// durably installed the new MANIFEST.
-    const MAX_DURABLE_PUBLISH_CHECKPOINT_POLLS: usize = 256;
+    /// The production publisher reaches `DirectorySynced` in its dedicated
+    /// blocking lane. The test waits for that lane's checkpoint event rather
+    /// than assuming a fixed number of async scheduler yields is enough for
+    /// an OS directory fsync.
+    const DURABLE_PUBLISH_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(2);
 
     /// Drive the public publisher to its existing durable checkpoint.
     ///
-    /// The bounded poll loop is intentionally a test-only diagnostic
-    /// rendezvous: a completion before the checkpoint or exhaustion of the
-    /// bound is a deterministic test failure, never a hang.
+    /// One poll starts the real publisher. Its dedicated blocking lane then
+    /// signals the armed checkpoint through a condition-variable event. A
+    /// completion before that checkpoint or the wall-clock bound is a
+    /// diagnostic failure, never a self-waking hang.
     async fn drive_publish_to_durable_checkpoint<F: std::future::Future>(
         publish: &mut std::pin::Pin<Box<F>>,
         pause: &ManifestPublishPauseControl,
     ) -> Result<(), String> {
-        for _ in 1..=MAX_DURABLE_PUBLISH_CHECKPOINT_POLLS {
-            if pause.is_reached() {
-                return Ok(());
-            }
-            let pending = std::future::poll_fn(|task_cx| {
-                std::task::Poll::Ready(matches!(
-                    std::future::Future::poll(publish.as_mut(), task_cx),
-                    std::task::Poll::Pending
-                ))
-            })
-            .await;
-            if !pending {
-                return Err(
-                    "publication completed before the armed DirectorySynced checkpoint".to_owned(),
-                );
-            }
-            // Let the dedicated blocking lane make observable progress before
-            // consuming another virtual poll from the fixed diagnostic budget.
-            yield_now().await;
-            if pause.is_reached() {
-                return Ok(());
-            }
+        let pending = std::future::poll_fn(|task_cx| {
+            std::task::Poll::Ready(matches!(
+                std::future::Future::poll(publish.as_mut(), task_cx),
+                std::task::Poll::Pending
+            ))
+        })
+        .await;
+        if !pending {
+            return Err(
+                "publication completed before the armed DirectorySynced checkpoint".to_owned(),
+            );
         }
-        Err(format!(
-            "publication did not reach DirectorySynced within \
-             {MAX_DURABLE_PUBLISH_CHECKPOINT_POLLS} bounded polls"
-        ))
+        pause.wait_until_reached(DURABLE_PUBLISH_CHECKPOINT_TIMEOUT)
     }
 
     #[test]
@@ -20968,10 +21001,9 @@ mod tests {
                 "marker observation alone is not authority; the checked reader must fail closed"
             );
 
-            // This is parent-red through an existing public path, not a missing
-            // test symbol: before this correction the same generation-3
-            // `KeeperWriter::publish` call validates against retained generation
-            // 1 and rejects the valid successor as a gap.
+            // The checked generation-1 snapshot assertion immediately above
+            // is parent-red. This generation-3 call verifies the corrected
+            // reconciliation behavior after that fail-closed observation.
             let advanced = writer
                 .publish(&cx, &Manifest::empty(3, schema_id, 0))
                 .await

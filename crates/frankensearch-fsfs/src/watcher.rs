@@ -693,6 +693,17 @@ struct PassPlan {
     expected_epoch: u64,
 }
 
+/// Lineage observed before a filesystem walk begins.
+///
+/// A scan is evidence about the tree at one instant. It must not be planned
+/// against an authority generation installed while that scan was in flight:
+/// doing so would let an older listing settle a newer authority conclusion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReconciliationToken {
+    epoch: u64,
+    generation: Option<u64>,
+}
+
 impl PassPlan {
     /// Whether this pass may derive deletions, including for the paths its own
     /// unapplied events named.
@@ -749,7 +760,11 @@ impl CatchupEvents {
                 commitment.identities,
             )
         {
-            state.require_full_scan();
+            // The sink may already have applied some or all returned events.
+            // Retain those exact paths, rather than a bare full-scan bit, so
+            // a later authority pass can fold their absence into its delete
+            // candidate set.
+            state.require_for_events(&self.events);
             return Err(SearchError::SubsystemError {
                 subsystem: WATCHER_SUBSYSTEM,
                 source: Box::new(io::Error::other(
@@ -779,9 +794,11 @@ impl Drop for CatchupEvents {
     fn drop(&mut self) {
         if let Some(commitment) = self.commitment.take() {
             // The caller either discarded the operations or its apply failed.
-            // The plan has not committed authority or cleared retained legacy,
-            // so explicitly owing a fresh pass is sufficient to rederive it.
-            lock_or_recover(&commitment.reconciliation).require_full_scan();
+            // The plan has not committed authority or cleared retained legacy.
+            // Preserve the actual batch too: a newly indexed path may vanish
+            // before the retry, in which case its delete is owed even when it
+            // was not part of the last established authority snapshot.
+            lock_or_recover(&commitment.reconciliation).require_for_events(&self.events);
         }
     }
 }
@@ -900,6 +917,14 @@ impl ReconciliationState {
             .map(|held| &held.root_identities)
     }
 
+    /// Capture the complete authority lineage before beginning a scan.
+    fn planning_token(&self) -> ReconciliationToken {
+        ReconciliationToken {
+            epoch: self.epoch,
+            generation: self.established_generation(),
+        }
+    }
+
     /// Take in names the watcher never observed itself.
     ///
     /// They are retained rather than merged into any baseline, because they
@@ -968,17 +993,28 @@ impl ReconciliationState {
     /// verifiable: the plan records the authority lineage it reasoned about,
     /// and the commit refuses to install anything if that lineage moved while
     /// the operations were being applied.
-    fn plan_complete_pass(&self, roots: &[PathBuf], completeness: &ScanCompleteness) -> PassPlan {
-        let expected_generation = self.established_generation();
-        let expected_epoch = self.epoch;
+    fn plan_complete_pass(
+        &self,
+        roots: &[PathBuf],
+        completeness: &ScanCompleteness,
+        token: ReconciliationToken,
+    ) -> Option<PassPlan> {
+        // A mutation that landed during collection is represented by either
+        // the authority generation or the reconciliation epoch. Refuse to
+        // reason from a scan that predates either change.
+        if self.planning_token() != token {
+            return None;
+        }
+        let expected_generation = token.generation;
+        let expected_epoch = token.epoch;
         if !completeness.identity_is_trustworthy() {
-            return PassPlan {
+            return Some(PassPlan {
                 outcome: PassOutcome::Degraded,
                 deletion_baseline: None,
                 adjudicates_legacy: false,
                 expected_generation,
                 expected_epoch,
-            };
+            });
         }
         let identities = completeness.root_identities();
         let adjudicate = |baseline: &FileSnapshot, legacy: Option<&FileSnapshot>| {
@@ -995,7 +1031,7 @@ impl ReconciliationState {
                 expected_epoch,
             }
         };
-        match &self.authority {
+        Some(match &self.authority {
             // Established, and still covering the configured roots.
             DeletionAuthorityState::Established { authority, legacy }
                 if authority.covers(roots) =>
@@ -1025,7 +1061,7 @@ impl ReconciliationState {
                 expected_generation,
                 expected_epoch,
             },
-        }
+        })
     }
 
     /// Install a planned pass, or refuse it because the lineage moved.
@@ -1853,10 +1889,33 @@ impl FsWatcher {
     ///
     /// Returns errors from current snapshot collection.
     pub fn build_catchup_events(&self, previous: &FileSnapshot) -> SearchResult<CatchupEvents> {
+        // Importing inherited names is itself a state change. Capture the
+        // token only after that import, but before the filesystem walk: a
+        // successful live mutation while the walk is in flight must make this
+        // older observation ineligible to plan or acknowledge authority.
+        let token = {
+            let mut state = lock_or_recover(&self.reconciliation);
+            state.inherit_legacy(previous);
+            state.planning_token()
+        };
         let (current, mut completeness) = self.collect_snapshot()?;
         let (baseline, commitment) = {
             let mut state = lock_or_recover(&self.reconciliation);
-            state.inherit_legacy(previous);
+            if state.planning_token() != token {
+                // Do not bind the post-scan state to a listing that predates
+                // it. The writer that moved the lineage owns its exact event
+                // debt; this catch-up request adds the conservative rescan.
+                state.require_full_scan();
+                return Ok(CatchupEvents {
+                    events: Self::diff_snapshots(
+                        &FileSnapshot::new(),
+                        &current,
+                        now_millis(),
+                        &completeness,
+                    ),
+                    commitment: None,
+                });
+            }
             if let Some(authority) = state.established_authority(&self.roots) {
                 // A swapped root reads as a complete scan of an empty tree;
                 // only the identities bound to the authority tell them apart,
@@ -1864,8 +1923,30 @@ impl FsWatcher {
                 completeness.reject_swapped_roots(&authority.root_identities);
             }
             if completeness.is_complete() && completeness.identity_is_trustworthy() {
-                let plan = state.plan_complete_pass(&self.roots, &completeness);
-                let baseline = plan.deletion_baseline.clone().unwrap_or_default();
+                let Some(plan) = state.plan_complete_pass(&self.roots, &completeness, token) else {
+                    state.require_full_scan();
+                    return Ok(CatchupEvents {
+                        events: Self::diff_snapshots(
+                            &FileSnapshot::new(),
+                            &current,
+                            now_millis(),
+                            &completeness,
+                        ),
+                        commitment: None,
+                    });
+                };
+                let mut baseline = plan.deletion_baseline.clone().unwrap_or_default();
+                if plan.adjudicates() {
+                    // A returned catch-up operation can have reached a sink
+                    // before that sink reported failure. Its path is not in
+                    // the last established snapshot, but if it has vanished
+                    // since then, the next authorized pass still owes its
+                    // delete. Preserve baseline timestamps where available:
+                    // they carry the normal modify detection for old names.
+                    for path in &state.affected_paths {
+                        baseline.entry(path.clone()).or_insert(0);
+                    }
+                }
                 // The returned events are not yet applied. Deferring this
                 // commit is what keeps a stale delete owed if a caller drops
                 // the batch or its sink fails partway through it.
@@ -2755,10 +2836,10 @@ async fn run_authoritative_reconciliation(
     snapshot_collector: &SnapshotCollector,
     abort: &dyn Fn() -> bool,
 ) -> SearchResult<()> {
-    let (epoch, affected_paths, authority_identities) = {
+    let (token, affected_paths, authority_identities) = {
         let state = lock_or_recover(reconciliation);
         (
-            state.epoch,
+            state.planning_token(),
             state.affected_paths.clone(),
             state
                 .established_authority(roots)
@@ -2831,8 +2912,15 @@ async fn run_authoritative_reconciliation(
     // operation is applied.
     let scan_identities = completeness.root_identities().clone();
     let plan = {
-        let state = lock_or_recover(reconciliation);
-        state.plan_complete_pass(roots, &completeness)
+        let mut state = lock_or_recover(reconciliation);
+        let Some(plan) = state.plan_complete_pass(roots, &completeness, token) else {
+            // A mutation succeeded while this walk was in flight. Its owner
+            // retained exact debt; do not attach this older snapshot to the
+            // newer lineage or apply another stale conclusion.
+            state.require_full_scan();
+            return Ok(());
+        };
+        plan
     };
     match plan.outcome {
         PassOutcome::Adjudicated => {}
@@ -2875,7 +2963,11 @@ async fn run_authoritative_reconciliation(
         // The epoch must hold through the apply, not merely at the commit: a
         // concurrent mutation that advanced it means these events describe a
         // filesystem state that is no longer the one being reconciled.
-        if lock_or_recover(reconciliation).epoch != epoch {
+        let lineage_matches = {
+            let state = lock_or_recover(reconciliation);
+            state.planning_token() == token
+        };
+        if !lineage_matches {
             return Err(SearchError::SubsystemError {
                 subsystem: "fsfs-watcher",
                 source: Box::new(io::Error::other(
@@ -2909,7 +3001,7 @@ async fn run_authoritative_reconciliation(
                 state.require_for_events(event_batch);
                 return Err(reconciliation_abort_error(cx));
             }
-            if state.epoch != epoch {
+            if state.planning_token() != token {
                 state.require_for_events(event_batch);
                 return Err(SearchError::SubsystemError {
                     subsystem: "fsfs-watcher",
@@ -2934,16 +3026,17 @@ async fn run_authoritative_reconciliation(
         state.require_for_events(&events);
         return Err(reconciliation_abort_error(cx));
     }
-    if state.epoch != epoch {
+    if state.planning_token() != token {
         // The tree moved under this pass. Its operations landed, but its
         // conclusion describes a state that no longer exists, so nothing is
         // installed and nothing is counted — the next pass does both.
+        state.require_for_events(&events);
         return Ok(());
     }
     if !state.commit_complete_pass(&plan, current, scan_identities) {
         // Authority was rebound while this pass was applying. Fail closed: the
         // conclusion is dropped and a fresh pass is owed.
-        state.require_full_scan();
+        state.require_for_events(&events);
         return Ok(());
     }
     drop(state);
@@ -3033,12 +3126,6 @@ fn record_successful_events(
         state.indexed_snapshot = current.clone();
         state.baseline_initialized = true;
     }
-    if !completeness.is_complete() {
-        // The per-event updates below stay correct — they are keyed on paths
-        // this batch actually touched — but the snapshot behind them is short,
-        // so the baseline must still be re-established authoritatively.
-        state.required = true;
-    }
     for event in events {
         if let Some(modified_at_ms) = current.get(&event.path) {
             state
@@ -3050,6 +3137,11 @@ fn record_successful_events(
     }
 
     if !completeness.is_complete() || !completeness.identity_is_trustworthy() {
+        // A successful sink mutation without a trustworthy complete scan
+        // cannot advance deletion authority. It still changes the exact set
+        // a later pass owes, so it must advance the epoch and retain the
+        // batch's paths rather than merely setting a boolean requirement.
+        state.require_for_events(events);
         return Ok(RecordSuccessfulEventsOutcome::Recorded);
     }
     let observed_identities = completeness.root_identities();
@@ -3060,7 +3152,7 @@ fn record_successful_events(
         // swapped root become authority without any pass ever adjudicating it,
         // after which every file of the old root reads as deleted. Fail closed
         // and hand it to a pass that can prove what happened.
-        state.require_full_scan();
+        state.require_for_events(events);
         return Ok(RecordSuccessfulEventsOutcome::Recorded);
     }
     if expected_generation.is_none()
@@ -3075,11 +3167,9 @@ fn record_successful_events(
         // A probationary candidate stops automatically re-arming after the
         // configured number of changing observations. A real successful
         // event is new evidence, though: it must re-arm the confirming pass
-        // without promoting that candidate to deletion authority.
-        if !state.required && matches!(state.authority, DeletionAuthorityState::Probationary { .. })
-        {
-            state.require_for_events(events);
-        }
+        // without promoting that candidate to deletion authority. The same
+        // exact-debt rule applies to every other non-authoritative lineage.
+        state.require_for_events(events);
         return Ok(RecordSuccessfulEventsOutcome::Recorded);
     }
     // A successful batch over a complete, trustworthy scan advances the
@@ -3089,7 +3179,7 @@ fn record_successful_events(
     // derive deletes from it.
     let updated = state.indexed_snapshot.clone();
     if !state.advance_established(updated, observed_identities) {
-        state.require_full_scan();
+        state.require_for_events(events);
     }
     Ok(RecordSuccessfulEventsOutcome::Recorded)
 }
@@ -3852,10 +3942,10 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_BATCH_SIZE, DEFAULT_DEBOUNCE_MS, FileSnapshot, FsWatcher, NoopWatchIngestPipeline,
-        PendingBatchLease, PendingEvents, ReadyBatchQueue, ReconciliationState,
-        ReconciliationTracker, ScanCompleteness, ScanProbe, WatchBatchOutcome, WatchEvent,
-        WatchEventKind, WatchIngestFuture, WatchIngestOp, WatchIngestPipeline,
+        CatchupEvents, DEFAULT_BATCH_SIZE, DEFAULT_DEBOUNCE_MS, FileSnapshot, FsWatcher,
+        NoopWatchIngestPipeline, PendingBatchLease, PendingEvents, ReadyBatchQueue,
+        ReconciliationState, ReconciliationTracker, ScanCompleteness, ScanProbe, WatchBatchOutcome,
+        WatchEvent, WatchEventKind, WatchIngestFuture, WatchIngestOp, WatchIngestPipeline,
         WatcherExecutionPolicy, WatcherLifecycle, WatcherStatsInner, WatcherStop,
         collect_snapshot_from_roots, drain_notify_channel, flush_pending_batches,
         install_scan_observer, is_retryable_error, normalize_file_key, now_millis,
@@ -3887,6 +3977,22 @@ mod tests {
             root_identities: authentic_root_identities(roots),
             generation: 1,
         }
+    }
+
+    /// Exercise the public catch-up handoff against a real sink. The caller
+    /// still owns acknowledgement, which deliberately makes a dropped or
+    /// rejected capability fail closed through `CatchupEvents::Drop`.
+    async fn apply_catchup_events(
+        cx: &Cx,
+        discovery: &DiscoveryConfig,
+        pipeline: &dyn WatchIngestPipeline,
+        catchup: &CatchupEvents,
+    ) -> SearchResult<()> {
+        let prepared = super::prepare_event_batch(discovery, catchup.events());
+        if !prepared.ops.is_empty() {
+            pipeline.apply_batch(cx, &prepared.ops).await?;
+        }
+        Ok(())
     }
 
     /// `WatcherStop::request` must publish the flag and the notify inside
@@ -4073,7 +4179,7 @@ mod tests {
     use asupersync::Cx;
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::test_utils::run_test_with_cx;
-    use asupersync::types::CancelKind;
+    use asupersync::types::{CancelKind, CancelReason};
     use frankensearch_core::{SearchError, SearchResult};
     use notify::event::{CreateKind, ModifyKind, RenameMode};
     use notify::{Event, EventKind};
@@ -4096,7 +4202,8 @@ mod tests {
         attempts: Mutex<Vec<Vec<WatchIngestOp>>>,
         fail_next: AtomicBool,
         stop_after_success: Mutex<Option<(Arc<WatcherStop>, usize)>>,
-        stop_on_flush_barrier: Mutex<Option<Arc<WatcherStop>>>,
+        flush_barriers_seen: AtomicUsize,
+        stop_after_flush_barrier: Mutex<Option<(Arc<WatcherStop>, usize)>>,
         /// Cancellation state of the `Cx` the sink was actually handed.
         observed_cancelled: AtomicBool,
     }
@@ -4147,7 +4254,11 @@ mod tests {
 
         fn poll_flush_barrier<'a>(&'a self, _cx: &'a Cx) -> WatchIngestFuture<'a, bool> {
             Box::pin(async move {
-                if let Some(stop) = lock_or_recover(&self.stop_on_flush_barrier).as_ref() {
+                let seen = self.flush_barriers_seen.fetch_add(1, Ordering::AcqRel) + 1;
+                if let Some((stop, threshold)) =
+                    lock_or_recover(&self.stop_after_flush_barrier).as_ref()
+                    && seen >= *threshold
+                {
                     stop.request();
                 }
                 Ok(false)
@@ -4171,11 +4282,33 @@ mod tests {
             Box::pin(async move {
                 self.entered.store(true, Ordering::Release);
                 while !self.released.load(Ordering::Acquire) {
+                    if cx.is_cancel_requested() {
+                        return Err(SearchError::Cancelled {
+                            phase: "watcher.test.parked-apply".to_owned(),
+                            reason: cx.cancel_reason().map_or_else(
+                                || "parked apply cancelled".to_owned(),
+                                |reason| reason.to_string(),
+                            ),
+                        });
+                    }
                     asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
                 }
                 lock_or_recover(&self.applied).push(batch.to_vec());
                 Ok(batch.len())
             })
+        }
+    }
+
+    /// Releases a parked test sink during unwinding as well as the ordinary
+    /// success path. A parked task must never outlive a failed assertion just
+    /// because a test forgot to flip its manual release flag.
+    struct ParkedApplyReleaseGuard {
+        pipeline: Arc<ParkedApplyPipeline>,
+    }
+
+    impl Drop for ParkedApplyReleaseGuard {
+        fn drop(&mut self) {
+            self.pipeline.released.store(true, Ordering::Release);
         }
     }
 
@@ -5259,119 +5392,132 @@ mod tests {
     /// This drives the public API rather than the collect/diff helpers.
     #[test]
     fn catchup_retains_inherited_names_and_deletes_only_under_rebuild_authority() {
-        let temp = tempdir().expect("tempdir");
-        let root = temp.path().join("g3r-catchup");
-        let blocked = temp.path().join("g3r-catchup-blocked");
-        fs::create_dir_all(&root).expect("create root");
-        fs::create_dir_all(&blocked).expect("create second root");
-        fs::write(root.join("kept.rs"), "fn kept() {}\n").expect("write kept fixture");
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("g3r-catchup");
+            let blocked = temp.path().join("g3r-catchup-blocked");
+            fs::create_dir_all(&root).expect("create root");
+            fs::create_dir_all(&blocked).expect("create second root");
+            fs::write(root.join("kept.rs"), "fn kept() {}\n").expect("write kept fixture");
 
-        let watcher = FsWatcher::new(
-            vec![root.clone(), blocked.clone()],
-            DiscoveryConfig::default(),
-            Arc::new(NoopWatchIngestPipeline),
-        );
-
-        // There is no legacy record yet, so this call must not arm a grant
-        // that a later unrelated crash-recovery snapshot can inherit.
-        watcher.authorize_deletion_authority_rebuild();
-        assert!(
-            !lock_or_recover(&watcher.reconciliation).rebuild_authorized,
-            "a rebuild request with no held legacy baseline must be rejected immediately"
-        );
-
-        // The caller's record names a file that no longer exists, while a root
-        // is unavailable.
-        let indexed_elsewhere = root.join("already-gone.rs");
-        let previous = FileSnapshot::from([(indexed_elsewhere.clone(), 5)]);
-        let moved = temp.path().join("g3r-catchup-blocked-moved");
-        fs::rename(&blocked, &moved).expect("move the second root aside");
-
-        let events = watcher
-            .build_catchup_events(&previous)
-            .expect("catch-up still reports what it can see");
-        assert!(
-            !events
-                .iter()
-                .any(|event| event.kind == WatchEventKind::Deleted),
-            "an incomplete catch-up must derive no deletes, got {events:?}"
-        );
-
-        {
-            let state = lock_or_recover(&watcher.reconciliation);
-            assert!(state.required, "an incomplete catch-up stays required");
-            assert!(
-                matches!(
-                    &state.authority,
-                    super::DeletionAuthorityState::UnverifiedLegacy { .. }
-                ),
-                "names with no identity evidence behind them must be held in the \
-                 unverified state, not in the one that authorizes deletion"
+            let discovery = DiscoveryConfig::default();
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let watcher = FsWatcher::new(
+                vec![root.clone(), blocked.clone()],
+                discovery.clone(),
+                Arc::clone(&pipeline) as Arc<dyn WatchIngestPipeline>,
             );
-            assert_eq!(
-                state.authority.legacy(),
-                Some(&previous),
-                "the caller's record must be retained so it stays settleable"
-            );
-        }
 
-        // Completeness returns, twice. Both passes see every root, and both
-        // still refuse: two identical observations prove the roots were stable
-        // across them, not that they are the roots this record came from.
-        fs::rename(&moved, &blocked).expect("restore the second root");
-        for pass in 0..2 {
-            let observed = watcher
-                .build_catchup_events(&FileSnapshot::new())
-                .expect("complete catch-up");
+            // There is no legacy record yet, so this call must not arm a grant
+            // that a later unrelated crash-recovery snapshot can inherit.
+            watcher.authorize_deletion_authority_rebuild();
             assert!(
-                !observed
+                !lock_or_recover(&watcher.reconciliation).rebuild_authorized,
+                "a rebuild request with no held legacy baseline must be rejected immediately"
+            );
+
+            // The caller's record names a file that no longer exists, while a root
+            // is unavailable.
+            let indexed_elsewhere = root.join("already-gone.rs");
+            let previous = FileSnapshot::from([(indexed_elsewhere.clone(), 5)]);
+            let moved = temp.path().join("g3r-catchup-blocked-moved");
+            fs::rename(&blocked, &moved).expect("move the second root aside");
+
+            let events = watcher
+                .build_catchup_events(&previous)
+                .expect("catch-up still reports what it can see");
+            assert!(
+                !events
                     .iter()
                     .any(|event| event.kind == WatchEventKind::Deleted),
-                "complete observation {pass} must not adjudicate an inherited name, got {observed:?}"
+                "an incomplete catch-up must derive no deletes, got {events:?}"
             );
+            apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &events)
+                .await
+                .expect("the incomplete receipt's visible operations apply");
+
+            {
+                let state = lock_or_recover(&watcher.reconciliation);
+                assert!(state.required, "an incomplete catch-up stays required");
+                assert!(
+                    matches!(
+                        &state.authority,
+                        super::DeletionAuthorityState::UnverifiedLegacy { .. }
+                    ),
+                    "names with no identity evidence behind them must be held in the \
+                     unverified state, not in the one that authorizes deletion"
+                );
+                assert_eq!(
+                    state.authority.legacy(),
+                    Some(&previous),
+                    "the caller's record must be retained so it stays settleable"
+                );
+            }
+
+            // Completeness returns, twice. Both passes see every root, and both
+            // still refuse: two identical observations prove the roots were stable
+            // across them, not that they are the roots this record came from.
+            fs::rename(&moved, &blocked).expect("restore the second root");
+            for pass in 0..2 {
+                let observed = watcher
+                    .build_catchup_events(&FileSnapshot::new())
+                    .expect("complete catch-up");
+                assert!(
+                    !observed
+                        .iter()
+                        .any(|event| event.kind == WatchEventKind::Deleted),
+                    "complete observation {pass} must not adjudicate an inherited name, got {observed:?}"
+                );
+                assert!(
+                    watcher.holds_unverified_legacy_baseline(),
+                    "the inherited name must still be retained after pass {pass}"
+                );
+                apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &observed)
+                    .await
+                    .expect("the complete catch-up observation applies before acknowledgement");
+                observed
+                    .acknowledge_applied()
+                    .expect("the applied catch-up observation commits its non-deleting state");
+            }
+
+            // The operator states that the configured roots really are the roots
+            // that corpus was built from. Only now is the absence adjudicable.
+            watcher.authorize_deletion_authority_rebuild();
+            let recovered = watcher
+                .build_catchup_events(&FileSnapshot::new())
+                .expect("catch-up under rebuild authority");
             assert!(
-                watcher.holds_unverified_legacy_baseline(),
-                "the inherited name must still be retained after pass {pass}"
+                recovered
+                    .iter()
+                    .any(|event| event.kind == WatchEventKind::Deleted
+                        && event.path == indexed_elsewhere),
+                "the retained name must be settled by the explicit grant, and it can only \
+                 have come from retention because the argument was empty, got {recovered:?}"
             );
-            observed
-                .acknowledge_applied()
-                .expect("the applied catch-up observation commits its non-deleting state");
-        }
-
-        // The operator states that the configured roots really are the roots
-        // that corpus was built from. Only now is the absence adjudicable.
-        watcher.authorize_deletion_authority_rebuild();
-        let recovered = watcher
-            .build_catchup_events(&FileSnapshot::new())
-            .expect("catch-up under rebuild authority");
-        assert!(
+            apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &recovered)
+                .await
+                .expect("the stale delete applies before acknowledgement");
             recovered
-                .iter()
-                .any(|event| event.kind == WatchEventKind::Deleted
-                    && event.path == indexed_elsewhere),
-            "the retained name must be settled by the explicit grant, and it can only \
-             have come from retention because the argument was empty, got {recovered:?}"
-        );
-        recovered
-            .acknowledge_applied()
-            .expect("the applied stale delete settles the explicitly granted record");
-        assert!(
-            !watcher.holds_unverified_legacy_baseline(),
-            "a settled record is no longer held, so the one-shot grant cannot be replayed"
-        );
+                .acknowledge_applied()
+                .expect("the applied stale delete settles the explicitly granted record");
+            assert!(
+                !watcher.holds_unverified_legacy_baseline(),
+                "a settled record is no longer held, so the one-shot grant cannot be replayed"
+            );
 
-        // And the grant really is one-shot: a fresh inherited name after it is
-        // spent is refused again.
-        let later = root.join("indexed-after-the-grant.rs");
-        let refused = watcher
-            .build_catchup_events(&FileSnapshot::from([(later.clone(), 7)]))
-            .expect("catch-up after the grant is spent");
-        assert!(
-            !refused
-                .iter()
-                .any(|event| event.kind == WatchEventKind::Deleted && event.path == later),
-            "the spent grant must not authorize the next inherited name, got {refused:?}"
-        );
+            // And the grant really is one-shot: a fresh inherited name after it is
+            // spent is refused again.
+            let later = root.join("indexed-after-the-grant.rs");
+            let refused = watcher
+                .build_catchup_events(&FileSnapshot::from([(later.clone(), 7)]))
+                .expect("catch-up after the grant is spent");
+            assert!(
+                !refused
+                    .iter()
+                    .any(|event| event.kind == WatchEventKind::Deleted && event.path == later),
+                "the spent grant must not authorize the next inherited name, got {refused:?}"
+            );
+        });
     }
 
     /// A catch-up delete is only a proposal until its returned operations have
@@ -5379,76 +5525,324 @@ mod tests {
     /// the next public catch-up derive it again.
     #[test]
     fn discarded_catchup_delete_remains_owed_and_is_rederived() {
-        let temp = tempdir().expect("tempdir");
-        let root = temp.path().join("g4-catchup-transactional");
-        fs::create_dir_all(&root).expect("create root");
-        fs::write(root.join("kept.rs"), "fn kept() {}\n").expect("write kept fixture");
-        let stale = root.join("stale.rs");
-        let previous = FileSnapshot::from([(stale.clone(), 7)]);
-        let watcher = FsWatcher::new(
-            vec![root.clone()],
-            DiscoveryConfig::default(),
-            Arc::new(NoopWatchIngestPipeline),
-        );
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("g4-catchup-transactional");
+            fs::create_dir_all(&root).expect("create root");
+            fs::write(root.join("kept.rs"), "fn kept() {}\n").expect("write kept fixture");
+            let stale = root.join("stale.rs");
+            let previous = FileSnapshot::from([(stale.clone(), 7)]);
+            let discovery = DiscoveryConfig::default();
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let watcher = FsWatcher::new(
+                vec![root.clone()],
+                discovery.clone(),
+                Arc::clone(&pipeline) as Arc<dyn WatchIngestPipeline>,
+            );
 
-        // Settle the two observations that establish current-root authority,
-        // while retaining the inherited record as deletion-ineligible legacy.
-        let first = watcher
-            .build_catchup_events(&previous)
-            .expect("first public catch-up");
-        assert!(
-            !first
-                .iter()
-                .any(|event| event.kind == WatchEventKind::Deleted),
-            "the first inherited observation cannot delete stale state"
-        );
-        first
-            .acknowledge_applied()
-            .expect("first applied catch-up commits its probationary observation");
-        let confirmation = watcher
-            .build_catchup_events(&FileSnapshot::new())
-            .expect("confirming public catch-up");
-        confirmation
-            .acknowledge_applied()
-            .expect("confirming applied catch-up establishes current-root authority");
-        assert!(watcher.holds_unverified_legacy_baseline());
+            // Settle the two observations that establish current-root authority,
+            // while retaining the inherited record as deletion-ineligible legacy.
+            let first = watcher
+                .build_catchup_events(&previous)
+                .expect("first public catch-up");
+            assert!(
+                !first
+                    .iter()
+                    .any(|event| event.kind == WatchEventKind::Deleted),
+                "the first inherited observation cannot delete stale state"
+            );
+            apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &first)
+                .await
+                .expect("first catch-up operations apply");
+            first
+                .acknowledge_applied()
+                .expect("first applied catch-up commits its probationary observation");
+            let confirmation = watcher
+                .build_catchup_events(&FileSnapshot::new())
+                .expect("confirming public catch-up");
+            apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &confirmation)
+                .await
+                .expect("confirming catch-up operations apply");
+            confirmation
+                .acknowledge_applied()
+                .expect("confirming applied catch-up establishes current-root authority");
+            assert!(watcher.holds_unverified_legacy_baseline());
 
-        watcher.authorize_deletion_authority_rebuild();
-        let discarded = watcher
-            .build_catchup_events(&FileSnapshot::new())
-            .expect("stale delete proposal");
-        assert!(
-            discarded
-                .iter()
-                .any(|event| { event.kind == WatchEventKind::Deleted && event.path == stale }),
-            "the explicit grant must propose the retained stale delete"
-        );
-        drop(discarded);
+            watcher.authorize_deletion_authority_rebuild();
+            let discarded = watcher
+                .build_catchup_events(&FileSnapshot::new())
+                .expect("stale delete proposal");
+            assert!(
+                discarded
+                    .iter()
+                    .any(|event| { event.kind == WatchEventKind::Deleted && event.path == stale }),
+                "the explicit grant must propose the retained stale delete"
+            );
+            drop(discarded);
 
-        assert!(
-            watcher.holds_unverified_legacy_baseline(),
-            "discarding an unapplied delete must not clear its legacy record"
-        );
-        assert!(
-            lock_or_recover(&watcher.reconciliation).required,
-            "discarding an unapplied delete must leave reconciliation owed"
-        );
-        let rederived = watcher
-            .build_catchup_events(&FileSnapshot::new())
-            .expect("rederive the discarded stale delete");
-        assert!(
+            assert!(
+                watcher.holds_unverified_legacy_baseline(),
+                "discarding an unapplied delete must not clear its legacy record"
+            );
+            assert!(
+                lock_or_recover(&watcher.reconciliation).required,
+                "discarding an unapplied delete must leave reconciliation owed"
+            );
+            let rederived = watcher
+                .build_catchup_events(&FileSnapshot::new())
+                .expect("rederive the discarded stale delete");
+            assert!(
+                rederived
+                    .iter()
+                    .any(|event| { event.kind == WatchEventKind::Deleted && event.path == stale }),
+                "the dropped delete must be rederived from retained legacy"
+            );
+            apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &rederived)
+                .await
+                .expect("the retried delete applies before acknowledgement");
             rederived
-                .iter()
-                .any(|event| { event.kind == WatchEventKind::Deleted && event.path == stale }),
-            "the dropped delete must be rederived from retained legacy"
-        );
-        rederived
-            .acknowledge_applied()
-            .expect("the retried delete now acknowledges its successful apply");
-        assert!(
-            !watcher.holds_unverified_legacy_baseline(),
-            "only the acknowledged retry may settle the retained stale delete"
-        );
+                .acknowledge_applied()
+                .expect("the retried delete now acknowledges its successful apply");
+            assert!(
+                !watcher.holds_unverified_legacy_baseline(),
+                "only the acknowledged retry may settle the retained stale delete"
+            );
+        });
+    }
+
+    /// A failed catch-up create may already be visible to its sink. If that
+    /// new path vanishes before the retry, it is not in the old authority
+    /// snapshot; the retained affected-path debt is the only evidence that
+    /// makes its delete rederivable.
+    #[test]
+    fn partial_catchup_apply_keeps_vanished_new_path_as_delete_debt() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("g4-catchup-partial-apply");
+            fs::create_dir_all(&root).expect("create root");
+            let baseline = root.join("baseline.rs");
+            fs::write(&baseline, "fn baseline() {}\n").expect("write baseline fixture");
+            let discovery = DiscoveryConfig::default();
+            let pipeline = Arc::new(PartialMutationPipeline::default());
+            let watcher = FsWatcher::new(
+                vec![root.clone()],
+                discovery.clone(),
+                Arc::clone(&pipeline) as Arc<dyn WatchIngestPipeline>,
+            );
+
+            let initial = watcher
+                .build_catchup_events(&FileSnapshot::new())
+                .expect("initial catch-up");
+            apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &initial)
+                .await
+                .expect("initial sink apply");
+            initial
+                .acknowledge_applied()
+                .expect("initial catch-up establishes authority");
+
+            let newly_indexed = root.join("newly-indexed.rs");
+            fs::write(&newly_indexed, "fn new_file() {}\n").expect("write new fixture");
+            let partial = watcher
+                .build_catchup_events(&FileSnapshot::new())
+                .expect("catch-up proposing the new file");
+            assert!(
+                partial.iter().any(|event| {
+                    event.kind == WatchEventKind::Created && event.path == newly_indexed
+                }),
+                "the first proposal must contain the new path, got {partial:?}"
+            );
+            pipeline.fail_after_first.store(true, Ordering::Release);
+            apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &partial)
+                .await
+                .expect_err("the sink must report its partial post-mutation failure");
+            assert!(
+                lock_or_recover(&pipeline.applied)
+                    .iter()
+                    .any(|op| match op {
+                        WatchIngestOp::Upsert { file_key, .. } => {
+                            file_key == &normalize_file_key(&newly_indexed)
+                        }
+                        WatchIngestOp::Delete { .. } => false,
+                    }),
+                "the failing sink must actually have applied the new path before it errored"
+            );
+            drop(partial);
+            fs::remove_file(&newly_indexed).expect("remove partially indexed file");
+
+            {
+                let state = lock_or_recover(&watcher.reconciliation);
+                assert!(
+                    state.required,
+                    "partial application must leave reconciliation owed"
+                );
+                assert!(
+                    state.affected_paths.contains(&newly_indexed),
+                    "the partially applied path must be retained exactly"
+                );
+            }
+
+            let retry = watcher
+                .build_catchup_events(&FileSnapshot::new())
+                .expect("catch-up after the vanished partial apply");
+            assert!(
+                retry.iter().any(|event| {
+                    event.kind == WatchEventKind::Deleted && event.path == newly_indexed
+                }),
+                "the authorized retry must derive the delete from affected-path debt, got {retry:?}"
+            );
+            apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &retry)
+                .await
+                .expect("retry sink apply");
+            retry
+                .acknowledge_applied()
+                .expect("retry acknowledgement commits the recovered authority");
+            let state = lock_or_recover(&watcher.reconciliation);
+            assert!(!state.required, "acknowledged retry settles the exact debt");
+            assert!(state.affected_paths.is_empty());
+        });
+    }
+
+    /// A catch-up scan must keep the authority lineage that existed before it
+    /// started. Advancing an established generation during the directory walk
+    /// is enough to make the returned listing stale, even though no epoch was
+    /// required to change for that live authority advance.
+    #[test]
+    fn catchup_rejects_generation_advanced_during_public_scan() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("g4-catchup-prescan-generation");
+            fs::create_dir_all(&root).expect("create root");
+            let kept = root.join("kept.rs");
+            let stale = root.join("stale.rs");
+            fs::write(&kept, "fn kept() {}\n").expect("write kept fixture");
+            fs::write(&stale, "fn stale() {}\n").expect("write stale fixture");
+            let discovery = DiscoveryConfig::default();
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let watcher = FsWatcher::new(
+                vec![root.clone()],
+                discovery.clone(),
+                Arc::clone(&pipeline) as Arc<dyn WatchIngestPipeline>,
+            );
+
+            let initial = watcher
+                .build_catchup_events(&FileSnapshot::new())
+                .expect("initial authority catch-up");
+            apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &initial)
+                .await
+                .expect("initial sink apply");
+            initial
+                .acknowledge_applied()
+                .expect("initial authority acknowledgement");
+            fs::remove_file(&stale).expect("remove stale fixture");
+
+            let (reconciliation, replacement_snapshot, replacement_identities) = {
+                let state = lock_or_recover(&watcher.reconciliation);
+                let authority = state.authority.established().expect("initial authority");
+                (
+                    Arc::clone(&watcher.reconciliation),
+                    authority.snapshot.clone(),
+                    authority.root_identities.clone(),
+                )
+            };
+            let observed_root = root.clone();
+            let advanced = Arc::new(AtomicBool::new(false));
+            let observer_advanced = Arc::clone(&advanced);
+            let _observer = install_scan_observer(Arc::new(move |probe, path| {
+                if probe == ScanProbe::DirectoryEntered
+                    && path.starts_with(&observed_root)
+                    && !observer_advanced.swap(true, Ordering::AcqRel)
+                {
+                    assert!(
+                        lock_or_recover(&reconciliation).advance_established(
+                            replacement_snapshot.clone(),
+                            &replacement_identities
+                        ),
+                        "the interleaving must be a real successful authority advance"
+                    );
+                }
+            }));
+
+            let stale_plan = watcher
+                .build_catchup_events(&FileSnapshot::new())
+                .expect("public catch-up after interleaved authority advance");
+            assert!(
+                advanced.load(Ordering::Acquire),
+                "the scan observer must interleave"
+            );
+            assert!(
+                !stale_plan
+                    .iter()
+                    .any(|event| event.kind == WatchEventKind::Deleted && event.path == stale),
+                "a scan captured before the new generation must not derive its stale delete, got {stale_plan:?}"
+            );
+            apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &stale_plan)
+                .await
+                .expect("the rejected-plan receipt still applies only safe upserts");
+            let state = lock_or_recover(&watcher.reconciliation);
+            assert!(
+                state.required,
+                "the token mismatch leaves a fresh pass owed"
+            );
+        });
+    }
+
+    /// A caller can finish applying an older catch-up batch just as another
+    /// successful mutation advances the epoch. Acknowledgement must reject
+    /// that older conclusion and retain its actual operations as exact debt.
+    #[test]
+    fn catchup_ack_epoch_race_retains_already_applied_operations() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("g4-catchup-ack-epoch");
+            fs::create_dir_all(&root).expect("create root");
+            let stale = root.join("stale.rs");
+            fs::write(&stale, "fn stale() {}\n").expect("write stale fixture");
+            let discovery = DiscoveryConfig::default();
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let watcher = FsWatcher::new(
+                vec![root.clone()],
+                discovery.clone(),
+                Arc::clone(&pipeline) as Arc<dyn WatchIngestPipeline>,
+            );
+
+            let initial = watcher
+                .build_catchup_events(&FileSnapshot::new())
+                .expect("initial authority catch-up");
+            apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &initial)
+                .await
+                .expect("initial sink apply");
+            initial
+                .acknowledge_applied()
+                .expect("initial authority acknowledgement");
+            fs::remove_file(&stale).expect("remove stale fixture");
+
+            let pending = watcher
+                .build_catchup_events(&FileSnapshot::new())
+                .expect("delete proposal");
+            assert!(
+                pending
+                    .iter()
+                    .any(|event| event.kind == WatchEventKind::Deleted && event.path == stale),
+                "the pre-race proposal must contain the stale delete"
+            );
+            apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &pending)
+                .await
+                .expect("the recording sink applies the pre-race proposal");
+            let late = root.join("late-during-ack.rs");
+            lock_or_recover(&watcher.reconciliation).require_for_events(&[WatchEvent::modified(
+                &late,
+                100,
+                Some(12),
+            )]);
+            pending
+                .acknowledge_applied()
+                .expect_err("an epoch change after apply must reject the old authority commit");
+
+            let state = lock_or_recover(&watcher.reconciliation);
+            assert!(state.required, "the acknowledgement race remains owed");
+            assert!(state.affected_paths.contains(&stale));
+            assert!(state.affected_paths.contains(&late));
+        });
     }
 
     /// A rebuild grant is approval for the inherited record it observed, not
@@ -5682,7 +6076,7 @@ mod tests {
                     .all_ops()
                     .into_iter()
                     .filter_map(|op| match op {
-                        WatchIngestOp::Delete { path, .. } => Some(path),
+                        WatchIngestOp::Delete { file_key, .. } => Some(file_key),
                         WatchIngestOp::Upsert { .. } => None,
                     })
                     .collect::<Vec<_>>()
@@ -5729,7 +6123,7 @@ mod tests {
             .await
             .expect("a covering authority adjudicates");
             assert!(
-                deletes_for(&adjudicating).contains(&vanished),
+                deletes_for(&adjudicating).contains(&normalize_file_key(&vanished)),
                 "control: a covering authority does derive the affected-path delete, got {:?}",
                 deletes_for(&adjudicating)
             );
@@ -5884,16 +6278,16 @@ mod tests {
                 .all_ops()
                 .into_iter()
                 .filter_map(|op| match op {
-                    WatchIngestOp::Delete { path, .. } => Some(path),
+                    WatchIngestOp::Delete { file_key, .. } => Some(file_key),
                     WatchIngestOp::Upsert { .. } => None,
                 })
                 .collect::<Vec<_>>();
             assert!(
-                deletes.contains(&doomed),
+                deletes.contains(&normalize_file_key(&doomed)),
                 "the suppressed delete must be recovered, got {deletes:?}"
             );
             assert!(
-                !deletes.contains(&kept),
+                !deletes.contains(&normalize_file_key(&kept)),
                 "a surviving file must never be deleted"
             );
         });
@@ -6032,22 +6426,50 @@ mod tests {
                 })
                 .expect("spawn parked reconciliation");
 
+            let release_guard = ParkedApplyReleaseGuard {
+                pipeline: Arc::clone(&pipeline),
+            };
+            let mut reached_apply = false;
             for _ in 0..1_000 {
                 if pipeline.entered.load(Ordering::Acquire) {
+                    reached_apply = true;
                     break;
                 }
                 asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
             }
+            stop.request();
+            // Releasing before every assertion makes a failed handshake
+            // harmless. The join itself is bounded so a regression reports a
+            // test failure instead of wedging the test runtime forever.
+            drop(release_guard);
+            let joined =
+                match asupersync::time::timeout(cx.now(), Duration::from_secs(1), task.join(&cx))
+                    .await
+                {
+                    Ok(joined) => joined,
+                    Err(_) => {
+                        task.abort_with_reason(CancelReason::user(
+                            "parked reconciliation test cleanup timed out",
+                        ));
+                        let _ = asupersync::time::timeout(
+                            cx.now(),
+                            Duration::from_secs(1),
+                            task.join(&cx),
+                        )
+                        .await;
+                        let join_timed_out = true;
+                        assert!(
+                            !join_timed_out,
+                            "parked reconciliation did not finish within the bounded cleanup window"
+                        );
+                        return;
+                    }
+                };
             assert!(
-                pipeline.entered.load(Ordering::Acquire),
+                reached_apply,
                 "the reconciliation never reached the parked apply boundary"
             );
-            stop.request();
-            pipeline.released.store(true, Ordering::Release);
-
-            let error = task
-                .join(&cx)
-                .await
+            let error = joined
                 .expect("parked reconciliation task terminal result")
                 .expect_err("a stop after apply must reject the reconciliation commit");
             assert!(
@@ -6315,13 +6737,13 @@ mod tests {
                 .all_ops()
                 .into_iter()
                 .filter_map(|op| match op {
-                    WatchIngestOp::Delete { path, .. } => Some(path),
+                    WatchIngestOp::Delete { file_key, .. } => Some(file_key),
                     WatchIngestOp::Upsert { .. } => None,
                 })
                 .collect::<Vec<_>>();
             assert_eq!(
                 deletes,
-                vec![doomed],
+                vec![normalize_file_key(&doomed)],
                 "the removed file must be derived exactly once, not once per duplicate"
             );
         });
@@ -7334,11 +7756,11 @@ mod tests {
 
             let pipeline = Arc::new(RecordingPipeline::default());
             let stop = Arc::new(WatcherStop::default());
-            // The first successful mutation must still enter bookkeeping and
-            // observe the injected retryable collector error. Request stop
-            // from the next flush barrier, after the authoritative retry has
-            // recorded and published its one reconciled success.
-            *lock_or_recover(&pipeline.stop_on_flush_barrier) = Some(Arc::clone(&stop));
+            // The first barrier runs before the ready batch is dequeued, so
+            // stopping there would make the original collector failure
+            // impossible. Stop at the *second* barrier instead: it runs after
+            // the reconciled retry has recorded and published its success.
+            *lock_or_recover(&pipeline.stop_after_flush_barrier) = Some((Arc::clone(&stop), 2));
             let queue: ReadyBatchQueue =
                 Arc::new(Mutex::new(VecDeque::from([vec![WatchEvent::modified(
                     &path,
