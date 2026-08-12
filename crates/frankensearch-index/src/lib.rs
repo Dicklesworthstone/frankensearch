@@ -173,6 +173,29 @@ const VECTOR_ALIGN_BYTES: u64 = 64;
 const RECORD_FLAG_TOMBSTONE: u16 = 0x0001;
 const TOMBSTONE_VACUUM_THRESHOLD: f64 = 0.20;
 
+#[cfg(test)]
+std::thread_local! {
+    /// Forces the next f16 decode-destination reservation to fail without
+    /// exhausting the process allocator.
+    static FAIL_NEXT_F16_DESTINATION_RESERVATION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_next_f16_destination_reservation() {
+    FAIL_NEXT_F16_DESTINATION_RESERVATION.with(|failure| failure.set(true));
+}
+
+#[cfg(test)]
+fn take_f16_destination_reservation_failure() -> bool {
+    FAIL_NEXT_F16_DESTINATION_RESERVATION.with(|failure| failure.replace(false))
+}
+
+#[cfg(test)]
+fn f16_destination_reservation_failure_is_pending() -> bool {
+    FAIL_NEXT_F16_DESTINATION_RESERVATION.with(std::cell::Cell::get)
+}
+
 /// Vector element quantization stored in the FSVI slab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -3220,14 +3243,37 @@ impl VectorIndex {
     /// # Errors
     ///
     /// Returns `SearchError::InvalidConfig` for out-of-range indices and
-    /// `SearchError::IndexCorrupted` for malformed vector slab data.
+    /// `SearchError::IndexCorrupted` for malformed vector slab data, or
+    /// `SearchError::InvalidConfig` when the output allocation fails.
     pub fn vector_at_f16(&self, index: usize) -> SearchResult<Vec<f16>> {
+        let mut output = Vec::new();
+        self.extend_vector_at_f16(index, &mut output)?;
+        Ok(output)
+    }
+
+    /// Decode one vector directly into a caller-owned f16 slab.
+    ///
+    /// This is the allocation-bounded counterpart to [`Self::vector_at_f16`]:
+    /// callers that already reserved a destination for many rows avoid one
+    /// transient `Vec` allocation per source row. The destination's required
+    /// growth is checked before any values are appended.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same indexing and corruption errors as
+    /// [`Self::vector_at_f16`], or [`SearchError::InvalidConfig`] if the
+    /// destination cannot reserve this row.
+    pub fn extend_vector_at_f16(
+        &self,
+        index: usize,
+        destination: &mut Vec<f16>,
+    ) -> SearchResult<()> {
         self.ensure_index(index)?;
         let start = self.vector_start(index)?;
-        let dim = self.dimension();
+        let dimension = self.dimension();
         match self.quantization() {
             Quantization::F16 => {
-                let byte_len = dim.checked_mul(2).ok_or_else(|| {
+                let byte_len = dimension.checked_mul(2).ok_or_else(|| {
                     index_corrupted(&self.path, "f16 vector byte length overflow")
                 })?;
                 let end = start
@@ -3239,14 +3285,13 @@ impl VectorIndex {
                         "f16 vector extends past file end",
                     ));
                 }
-                let mut out = Vec::with_capacity(dim);
+                reserve_f16_destination(destination, dimension)?;
                 for chunk in self.data[start..end].as_chunks::<2>().0 {
-                    out.push(f16::from_le_bytes(*chunk));
+                    destination.push(f16::from_le_bytes(*chunk));
                 }
-                Ok(out)
             }
             Quantization::F32 => {
-                let byte_len = dim.checked_mul(4).ok_or_else(|| {
+                let byte_len = dimension.checked_mul(4).ok_or_else(|| {
                     index_corrupted(&self.path, "f32 vector byte length overflow")
                 })?;
                 let end = start
@@ -3258,13 +3303,13 @@ impl VectorIndex {
                         "f32 vector extends past file end",
                     ));
                 }
-                let mut out = Vec::with_capacity(dim);
+                reserve_f16_destination(destination, dimension)?;
                 for chunk in self.data[start..end].as_chunks::<4>().0 {
-                    out.push(f16::from_f32(f32::from_le_bytes(*chunk)));
+                    destination.push(f16::from_f32(f32::from_le_bytes(*chunk)));
                 }
-                Ok(out)
             }
         }
+        Ok(())
     }
 
     /// Binary-search the sorted record table by document hash.
@@ -6039,6 +6084,24 @@ fn map_lock_error(
             "cannot acquire {requested_access} lock before mapping this FSVI: {error}; drop live readers/writers before retrying"
         ),
     }
+}
+
+fn f16_destination_allocation_error(dimension: usize) -> SearchError {
+    SearchError::InvalidConfig {
+        field: "vectors.f16_destination".to_owned(),
+        value: dimension.to_string(),
+        reason: "destination allocation failed".to_owned(),
+    }
+}
+
+fn reserve_f16_destination(destination: &mut Vec<f16>, dimension: usize) -> SearchResult<()> {
+    #[cfg(test)]
+    if take_f16_destination_reservation_failure() {
+        return Err(f16_destination_allocation_error(dimension));
+    }
+    destination
+        .try_reserve_exact(dimension)
+        .map_err(|_| f16_destination_allocation_error(dimension))
 }
 
 fn index_corrupted(path: &Path, detail: impl Into<String>) -> SearchError {
@@ -10390,6 +10453,32 @@ mod tests {
 
     // ─── vector_at_f16 on f16 index ─────────────────────────────────────
 
+    fn assert_f16_destination_allocation_error(error: SearchError, dimension: usize) {
+        assert!(matches!(
+            error,
+            SearchError::InvalidConfig {
+                field,
+                value,
+                reason,
+            } if field == "vectors.f16_destination"
+                && value == dimension.to_string()
+                && reason == "destination allocation failed"
+        ));
+    }
+
+    #[test]
+    fn f16_destination_reservation_rejects_maximum_shape_without_oom() {
+        let mut destination = Vec::new();
+        let error = reserve_f16_destination(&mut destination, usize::MAX)
+            .expect_err("a maximum f16 vector shape must fail before allocation");
+
+        assert_f16_destination_allocation_error(error, usize::MAX);
+        assert!(
+            destination.is_empty(),
+            "a failed reservation must not append"
+        );
+    }
+
     #[test]
     fn vector_at_f16_roundtrip() {
         let path = temp_index_path("f16-at-roundtrip");
@@ -10399,11 +10488,24 @@ mod tests {
         writer.finish().unwrap();
 
         let index = VectorIndex::open(&path).unwrap();
+        fail_next_f16_destination_reservation();
+        let allocation_error = index
+            .vector_at_f16(0)
+            .expect_err("f16 decode allocation failure must be typed");
+        assert_f16_destination_allocation_error(allocation_error, 3);
+        assert!(
+            !f16_destination_reservation_failure_is_pending(),
+            "the f16 decode branch must consume the reservation failure"
+        );
         let f16_vec = index.vector_at_f16(0).unwrap();
         assert_eq!(f16_vec.len(), 3);
         assert!((f16_vec[0].to_f32() - 0.5).abs() < 0.01);
         assert!((f16_vec[1].to_f32() - (-0.5)).abs() < 0.01);
         assert!((f16_vec[2].to_f32() - 1.0).abs() < 0.01);
+
+        let mut direct = Vec::new();
+        index.extend_vector_at_f16(0, &mut direct).unwrap();
+        assert_eq!(direct, f16_vec);
 
         std::fs::remove_file(&path).ok();
     }
@@ -10419,9 +10521,22 @@ mod tests {
         writer.finish().unwrap();
 
         let index = VectorIndex::open(&path).unwrap();
+        fail_next_f16_destination_reservation();
+        let allocation_error = index
+            .vector_at_f16(0)
+            .expect_err("f32 decode allocation failure must be typed");
+        assert_f16_destination_allocation_error(allocation_error, 3);
+        assert!(
+            !f16_destination_reservation_failure_is_pending(),
+            "the f32 decode branch must consume the reservation failure"
+        );
         let f16_vec = index.vector_at_f16(0).unwrap();
         assert_eq!(f16_vec.len(), 3);
         assert!((f16_vec[0].to_f32() - 0.25).abs() < 0.01);
+
+        let mut direct = Vec::new();
+        index.extend_vector_at_f16(0, &mut direct).unwrap();
+        assert_eq!(direct, f16_vec);
 
         std::fs::remove_file(&path).ok();
     }

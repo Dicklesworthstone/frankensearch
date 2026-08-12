@@ -4180,11 +4180,17 @@ fn canonical_json_matches<T: Serialize>(value: &T, expected: &[u8]) -> Result<bo
     Ok(matcher.matches && matcher.offset == expected.len())
 }
 
+/// This capability needs Rustix `openat`/`statat(AT_SYMLINK_NOFOLLOW)`,
+/// `flock`, and `renameat_with(RENAME_NOREPLACE)`. Rustix 1.1.4 exposes that
+/// full set on Apple and Linux-kernel targets only. Other targets receive a
+/// typed `Unsupported` I/O error instead of a path-based fallback.
 #[cfg(any(
+    target_os = "android",
+    target_os = "ios",
     target_os = "linux",
     target_os = "macos",
-    target_os = "ios",
     target_os = "tvos",
+    target_os = "visionos",
     target_os = "watchos"
 ))]
 pub struct PinnedDirectory {
@@ -4192,24 +4198,452 @@ pub struct PinnedDirectory {
     display_path: PathBuf,
 }
 
-#[cfg(not(any(
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
     target_os = "linux",
     target_os = "macos",
-    target_os = "ios",
     target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos"
+))]
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct PinnedRegularFileIdentity {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos"
+))]
+pub(crate) struct PinnedRegularFile {
+    file: File,
+    post_io_identity: PinnedRegularFileIdentity,
+    post_io_sha256: [u8; 32],
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos"
+))]
+static PINNED_REGULAR_FILE_STAGING_NONCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+static PINNED_REGULAR_FILE_BEFORE_PUBLISH_HOOK: std::sync::Mutex<
+    Option<std::sync::Arc<dyn Fn(&Path) + Send + Sync>>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+static PINNED_REGULAR_FILE_BEFORE_DIGEST_HOOK: std::sync::Mutex<
+    Option<std::sync::Arc<dyn Fn(&Path) + Send + Sync>>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+static PINNED_DIRECTORY_BEFORE_SYNC_HOOK: std::sync::Mutex<
+    Option<std::sync::Arc<dyn Fn(&Path) + Send + Sync>>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+pub(crate) struct PinnedRegularFileBeforePublishHookGuard;
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+pub(crate) struct PinnedRegularFileBeforeDigestHookGuard;
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+pub(crate) struct PinnedDirectoryBeforeSyncHookGuard;
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+pub(crate) fn install_pinned_regular_file_before_publish_hook(
+    hook: impl Fn(&Path) + Send + Sync + 'static,
+) -> PinnedRegularFileBeforePublishHookGuard {
+    let mut slot = PINNED_REGULAR_FILE_BEFORE_PUBLISH_HOOK
+        .lock()
+        .expect("pinned regular-file publish hook mutex must not be poisoned");
+    assert!(
+        slot.is_none(),
+        "pinned regular-file publish hook must be cleared before replacement"
+    );
+    *slot = Some(std::sync::Arc::new(hook));
+    PinnedRegularFileBeforePublishHookGuard
+}
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+pub(crate) fn install_pinned_regular_file_before_digest_hook(
+    hook: impl Fn(&Path) + Send + Sync + 'static,
+) -> PinnedRegularFileBeforeDigestHookGuard {
+    let mut slot = PINNED_REGULAR_FILE_BEFORE_DIGEST_HOOK
+        .lock()
+        .expect("pinned regular-file digest hook mutex must not be poisoned");
+    assert!(
+        slot.is_none(),
+        "pinned regular-file digest hook must be cleared before replacement"
+    );
+    *slot = Some(std::sync::Arc::new(hook));
+    PinnedRegularFileBeforeDigestHookGuard
+}
+
+/// Install a fuzz-harness-only rendezvous in the post-rename,
+/// pre-directory-sync window.
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+pub(crate) fn install_pinned_directory_before_sync_hook(
+    hook: impl Fn(&Path) + Send + Sync + 'static,
+) -> PinnedDirectoryBeforeSyncHookGuard {
+    let mut slot = PINNED_DIRECTORY_BEFORE_SYNC_HOOK
+        .lock()
+        .expect("pinned directory sync hook mutex must not be poisoned");
+    assert!(
+        slot.is_none(),
+        "pinned directory sync hook must be cleared before replacement"
+    );
+    *slot = Some(std::sync::Arc::new(hook));
+    PinnedDirectoryBeforeSyncHookGuard
+}
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+fn clear_pinned_regular_file_before_publish_hook() {
+    let mut slot = PINNED_REGULAR_FILE_BEFORE_PUBLISH_HOOK
+        .lock()
+        .expect("pinned regular-file publish hook mutex must not be poisoned");
+    *slot = None;
+}
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+fn clear_pinned_regular_file_before_digest_hook() {
+    let mut slot = PINNED_REGULAR_FILE_BEFORE_DIGEST_HOOK
+        .lock()
+        .expect("pinned regular-file digest hook mutex must not be poisoned");
+    *slot = None;
+}
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+fn clear_pinned_directory_before_sync_hook() {
+    let mut slot = PINNED_DIRECTORY_BEFORE_SYNC_HOOK
+        .lock()
+        .expect("pinned directory sync hook mutex must not be poisoned");
+    *slot = None;
+}
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+impl Drop for PinnedRegularFileBeforePublishHookGuard {
+    fn drop(&mut self) {
+        clear_pinned_regular_file_before_publish_hook();
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+impl Drop for PinnedRegularFileBeforeDigestHookGuard {
+    fn drop(&mut self) {
+        clear_pinned_regular_file_before_digest_hook();
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+impl Drop for PinnedDirectoryBeforeSyncHookGuard {
+    fn drop(&mut self) {
+        clear_pinned_directory_before_sync_hook();
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+fn pinned_regular_file_before_publish(path: &Path) {
+    let hook = PINNED_REGULAR_FILE_BEFORE_PUBLISH_HOOK
+        .lock()
+        .expect("pinned regular-file publish hook mutex must not be poisoned")
+        .clone();
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+fn pinned_regular_file_before_digest(path: &Path) {
+    let hook = PINNED_REGULAR_FILE_BEFORE_DIGEST_HOOK
+        .lock()
+        .expect("pinned regular-file digest hook mutex must not be poisoned")
+        .clone();
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+fn pinned_directory_before_sync(path: &Path) {
+    let hook = PINNED_DIRECTORY_BEFORE_SYNC_HOOK
+        .lock()
+        .expect("pinned directory sync hook mutex must not be poisoned")
+        .clone();
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
     target_os = "watchos"
 )))]
 pub struct PinnedDirectory;
 
-#[cfg(any(
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
     target_os = "linux",
     target_os = "macos",
-    target_os = "ios",
     target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos"
+)))]
+pub(crate) struct PinnedRegularFile;
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
     target_os = "watchos"
 ))]
 impl PinnedDirectory {
-    fn open_path(path: &Path) -> Result<Self, GauntletError> {
+    pub(crate) fn open_path(path: &Path) -> Result<Self, GauntletError> {
         Self::walk_path(path, false)
     }
 
@@ -4305,6 +4739,12 @@ impl PinnedDirectory {
         self.open_child(name)
     }
 
+    /// Open or create one direct child directory through this pinned
+    /// descriptor.  The resulting capability never follows a child symlink.
+    pub(crate) fn ensure_child_directory(&self, name: &OsStr) -> Result<Self, GauntletError> {
+        self.ensure_child(name)
+    }
+
     fn create_child_exclusive(&self, name: &OsStr) -> Result<Option<Self>, GauntletError> {
         use rustix::fs::{Mode, mkdirat};
         use rustix::io::Errno;
@@ -4345,24 +4785,45 @@ impl PinnedDirectory {
         name: &OsStr,
         max_bytes: u64,
     ) -> Result<Vec<u8>, GauntletError> {
+        let (bytes, _) = self.read_regular_bounded_open(name, max_bytes)?;
+        Ok(bytes)
+    }
+
+    /// Read one regular child without closing the authenticated descriptor.
+    /// Callers that expose a successful public operation must bind the final
+    /// directory entry with [`Self::authenticate_regular_child`] before they
+    /// release the returned handle.
+    pub(crate) fn read_regular_bounded_open(
+        &self,
+        name: &OsStr,
+        max_bytes: u64,
+    ) -> Result<(Vec<u8>, PinnedRegularFile), GauntletError> {
         use rustix::fs::{FileType, Mode, OFlags, fstat, openat};
+        use rustix::io::Errno;
 
         validate_child_name(&self.display_path, name)?;
-        let descriptor = openat(
+        let descriptor = match openat(
             &self.file,
             name,
             OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
             Mode::empty(),
-        )
-        .map_err(std::io::Error::from)?;
-        let stat = fstat(&descriptor).map_err(std::io::Error::from)?;
-        let size = u64::try_from(stat.st_size).unwrap_or(u64::MAX);
-        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile || size > max_bytes {
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(Errno::LOOP | Errno::NOTDIR) => {
+                return Err(GauntletError::UnsafeStorePath {
+                    path: self.display_path.join(name),
+                });
+            }
+            Err(error) => return Err(std::io::Error::from(error).into()),
+        };
+        let before = fstat(&descriptor).map_err(std::io::Error::from)?;
+        let size = u64::try_from(before.st_size).unwrap_or(u64::MAX);
+        if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile || size > max_bytes {
             return Err(GauntletError::UnsafeStorePath {
                 path: self.display_path.join(name),
             });
         }
-        let file = File::from(descriptor);
+        let mut file = File::from(descriptor);
         let capacity = usize::try_from(size).map_err(|_| GauntletError::UnsafeStorePath {
             path: self.display_path.join(name),
         })?;
@@ -4373,14 +4834,303 @@ impl PinnedDirectory {
                 format!("unable to reserve bounded artifact read: {error}"),
             )
         })?;
-        file.take(max_bytes.saturating_add(1))
+        (&mut file)
+            .take(max_bytes.saturating_add(1))
             .read_to_end(&mut bytes)?;
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        let after = fstat(&file).map_err(std::io::Error::from)?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes
+            || before.st_dev != after.st_dev
+            || before.st_ino != after.st_ino
+            || before.st_mode != after.st_mode
+            || before.st_size != after.st_size
+            || before.st_mtime != after.st_mtime
+            || before.st_mtime_nsec != after.st_mtime_nsec
+            || before.st_ctime != after.st_ctime
+            || before.st_ctime_nsec != after.st_ctime_nsec
+            || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != size
+        {
             return Err(GauntletError::UnsafeStorePath {
                 path: self.display_path.join(name),
             });
         }
-        Ok(bytes)
+        let post_io_sha256: [u8; 32] = Sha256::digest(&bytes).into();
+        Ok((
+            bytes,
+            PinnedRegularFile {
+                file,
+                post_io_identity: self.regular_file_identity(name, &after)?,
+                post_io_sha256,
+            },
+        ))
+    }
+
+    /// Bind a regular child name to a still-open descriptor after I/O.  Both
+    /// descriptor stats and the final `statat(..., SYMLINK_NOFOLLOW)` dirent
+    /// stat must match the post-I/O device, inode, type, size, and timestamps.
+    /// The descriptor is then re-read and compared to its post-I/O SHA-256 so
+    /// an equal-length rewrite of the same inode cannot pass as authentic.
+    pub(crate) fn authenticate_regular_child(
+        &self,
+        name: &OsStr,
+        file: &PinnedRegularFile,
+    ) -> Result<(), GauntletError> {
+        use rustix::fs::{AtFlags, fstat, statat};
+
+        validate_child_name(&self.display_path, name)?;
+        let before_dirent = fstat(&file.file).map_err(std::io::Error::from)?;
+        if self.regular_file_identity(name, &before_dirent)? != file.post_io_identity {
+            return Err(GauntletError::UnsafeStorePath {
+                path: self.display_path.join(name),
+            });
+        }
+        let directory_entry =
+            statat(&self.file, name, AtFlags::SYMLINK_NOFOLLOW).map_err(std::io::Error::from)?;
+        if self.regular_file_identity(name, &directory_entry)? != file.post_io_identity {
+            return Err(GauntletError::UnsafeStorePath {
+                path: self.display_path.join(name),
+            });
+        }
+        let after_dirent = fstat(&file.file).map_err(std::io::Error::from)?;
+        if self.regular_file_identity(name, &after_dirent)? != file.post_io_identity {
+            return Err(GauntletError::UnsafeStorePath {
+                path: self.display_path.join(name),
+            });
+        }
+        if self.regular_file_sha256(name, file)? != file.post_io_sha256 {
+            return Err(GauntletError::UnsafeStorePath {
+                path: self.display_path.join(name),
+            });
+        }
+        Ok(())
+    }
+
+    /// Sync the held directory after a final child entry is authenticated and
+    /// before its public operation returns success.
+    pub(crate) fn sync_directory(&self) -> Result<(), GauntletError> {
+        #[cfg(all(test, feature = "fuzz-harness"))]
+        pinned_directory_before_sync(&self.display_path);
+        self.file.sync_all().map_err(Into::into)
+    }
+
+    /// Reject a display path whose current directory object is no longer the
+    /// one held by this capability.  Re-opening uses the same no-follow walk,
+    /// so an inserted symlink is rejected as well.
+    pub(crate) fn verify_display_path_identity(&self) -> Result<(), GauntletError> {
+        use rustix::fs::fstat;
+
+        let reopened = Self::open_path(&self.display_path)?;
+        let pinned = fstat(&self.file).map_err(std::io::Error::from)?;
+        let current = fstat(&reopened.file).map_err(std::io::Error::from)?;
+        if pinned.st_dev != current.st_dev || pinned.st_ino != current.st_ino {
+            return Err(GauntletError::UnsafeStorePath {
+                path: self.display_path.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Stage a new regular child, sync and read it back through its descriptor,
+    /// then publish its final name exactly once with no replacement. The final
+    /// name is not visible until the staged bytes are complete. A caller must
+    /// authenticate the final entry and sync this directory before reporting
+    /// either publish outcome as successful. A race that loses the no-replace
+    /// publish leaves its completed staging entry intact and returns `Ok(None)`
+    /// so callers can authenticate the winner.
+    pub(crate) fn write_regular_create_new_and_read_back(
+        &self,
+        name: &OsStr,
+        expected_bytes: &[u8],
+    ) -> Result<Option<(Vec<u8>, PinnedRegularFile)>, GauntletError> {
+        use rustix::fs::{FileType, Mode, OFlags, RenameFlags, fstat, openat, renameat_with};
+        use rustix::io::Errno;
+
+        validate_child_name(&self.display_path, name)?;
+        if self.entry_exists(name)? {
+            return Ok(None);
+        }
+        let (staging_name, descriptor) = loop {
+            let nonce = PINNED_REGULAR_FILE_STAGING_NONCE
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let staging_name = OsString::from(format!(
+                ".typed-query-replay-stage-{}-{nonce}",
+                std::process::id()
+            ));
+            match openat(
+                &self.file,
+                &staging_name,
+                OFlags::RDWR
+                    | OFlags::CREATE
+                    | OFlags::EXCL
+                    | OFlags::CLOEXEC
+                    | OFlags::NOFOLLOW
+                    | OFlags::NONBLOCK,
+                Mode::RUSR | Mode::WUSR,
+            ) {
+                Ok(descriptor) => break (staging_name, descriptor),
+                Err(Errno::EXIST) => continue,
+                Err(Errno::LOOP | Errno::NOTDIR) => {
+                    return Err(GauntletError::UnsafeStorePath {
+                        path: self.display_path.join(name),
+                    });
+                }
+                Err(error) => return Err(std::io::Error::from(error).into()),
+            }
+        };
+        let initial = fstat(&descriptor).map_err(std::io::Error::from)?;
+        if FileType::from_raw_mode(initial.st_mode) != FileType::RegularFile || initial.st_size != 0
+        {
+            return Err(GauntletError::UnsafeStorePath {
+                path: self.display_path.join(&staging_name),
+            });
+        }
+        let mut file = File::from(descriptor);
+        file.write_all(expected_bytes)?;
+        file.sync_all()?;
+        let after_write = fstat(&file).map_err(std::io::Error::from)?;
+        let expected_size = u64::try_from(expected_bytes.len()).unwrap_or(u64::MAX);
+        if self
+            .regular_file_identity(&staging_name, &after_write)?
+            .size
+            != expected_size
+        {
+            return Err(GauntletError::UnsafeStorePath {
+                path: self.display_path.join(&staging_name),
+            });
+        }
+        file.seek(SeekFrom::Start(0))?;
+        let mut read_back = Vec::new();
+        read_back
+            .try_reserve_exact(expected_bytes.len())
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
+                    format!("unable to reserve create-new replay readback: {error}"),
+                )
+            })?;
+        (&mut file)
+            .take(expected_size.saturating_add(1))
+            .read_to_end(&mut read_back)?;
+        let after_read = fstat(&file).map_err(std::io::Error::from)?;
+        if read_back != expected_bytes
+            || after_write.st_dev != after_read.st_dev
+            || after_write.st_ino != after_read.st_ino
+            || after_write.st_mode != after_read.st_mode
+            || after_write.st_size != after_read.st_size
+            || after_write.st_mtime != after_read.st_mtime
+            || after_write.st_mtime_nsec != after_read.st_mtime_nsec
+            || after_write.st_ctime != after_read.st_ctime
+            || after_write.st_ctime_nsec != after_read.st_ctime_nsec
+            || self.regular_file_identity(&staging_name, &after_read)?.size != expected_size
+        {
+            return Err(GauntletError::UnsafeStorePath {
+                path: self.display_path.join(&staging_name),
+            });
+        }
+        let post_io_sha256: [u8; 32] = Sha256::digest(&read_back).into();
+        let staged_file = PinnedRegularFile {
+            file,
+            post_io_identity: self.regular_file_identity(&staging_name, &after_read)?,
+            post_io_sha256,
+        };
+        #[cfg(all(test, feature = "fuzz-harness"))]
+        pinned_regular_file_before_publish(&self.display_path);
+        match renameat_with(
+            &self.file,
+            &staging_name,
+            &self.file,
+            name,
+            RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => Ok(Some((read_back, staged_file))),
+            Err(Errno::EXIST) => Ok(None),
+            Err(Errno::LOOP | Errno::NOTDIR) => Err(GauntletError::UnsafeStorePath {
+                path: self.display_path.join(name),
+            }),
+            Err(error) => Err(std::io::Error::from(error).into()),
+        }
+    }
+
+    fn regular_file_sha256(
+        &self,
+        name: &OsStr,
+        file: &PinnedRegularFile,
+    ) -> Result<[u8; 32], GauntletError> {
+        use rustix::fs::fstat;
+        use std::os::unix::fs::FileExt as _;
+
+        let before = fstat(&file.file).map_err(std::io::Error::from)?;
+        if self.regular_file_identity(name, &before)? != file.post_io_identity {
+            return Err(GauntletError::UnsafeStorePath {
+                path: self.display_path.join(name),
+            });
+        }
+        #[cfg(all(test, feature = "fuzz-harness"))]
+        pinned_regular_file_before_digest(&self.display_path.join(name));
+        let mut remaining = file.post_io_identity.size;
+        let mut offset = 0_u64;
+        let mut buffer = [0_u8; 8 * 1024];
+        let mut hasher = Sha256::new();
+        while remaining > 0 {
+            let limit = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+            let read = file.file.read_at(&mut buffer[..limit], offset)?;
+            if read == 0 {
+                return Err(GauntletError::UnsafeStorePath {
+                    path: self.display_path.join(name),
+                });
+            }
+            hasher.update(&buffer[..read]);
+            let read = u64::try_from(read).unwrap_or(u64::MAX);
+            remaining = remaining.saturating_sub(read);
+            offset = offset
+                .checked_add(read)
+                .ok_or_else(|| GauntletError::UnsafeStorePath {
+                    path: self.display_path.join(name),
+                })?;
+        }
+        let mut extra = [0_u8; 1];
+        if file.file.read_at(&mut extra, offset)? != 0 {
+            return Err(GauntletError::UnsafeStorePath {
+                path: self.display_path.join(name),
+            });
+        }
+        let after = fstat(&file.file).map_err(std::io::Error::from)?;
+        if self.regular_file_identity(name, &after)? != file.post_io_identity {
+            return Err(GauntletError::UnsafeStorePath {
+                path: self.display_path.join(name),
+            });
+        }
+        Ok(hasher.finalize().into())
+    }
+
+    fn regular_file_identity(
+        &self,
+        name: &OsStr,
+        stat: &rustix::fs::Stat,
+    ) -> Result<PinnedRegularFileIdentity, GauntletError> {
+        use rustix::fs::FileType;
+
+        let path = self.display_path.join(name);
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+            return Err(GauntletError::UnsafeStorePath { path });
+        }
+        Ok(PinnedRegularFileIdentity {
+            device: u64::try_from(stat.st_dev)
+                .map_err(|_| GauntletError::UnsafeStorePath { path: path.clone() })?,
+            inode: u64::try_from(stat.st_ino)
+                .map_err(|_| GauntletError::UnsafeStorePath { path: path.clone() })?,
+            mode: u32::try_from(stat.st_mode)
+                .map_err(|_| GauntletError::UnsafeStorePath { path: path.clone() })?,
+            size: u64::try_from(stat.st_size)
+                .map_err(|_| GauntletError::UnsafeStorePath { path: path.clone() })?,
+            modified_seconds: i64::try_from(stat.st_mtime)
+                .map_err(|_| GauntletError::UnsafeStorePath { path: path.clone() })?,
+            modified_nanoseconds: i64::try_from(stat.st_mtime_nsec)
+                .map_err(|_| GauntletError::UnsafeStorePath { path: path.clone() })?,
+            changed_seconds: i64::try_from(stat.st_ctime)
+                .map_err(|_| GauntletError::UnsafeStorePath { path: path.clone() })?,
+            changed_nanoseconds: i64::try_from(stat.st_ctime_nsec)
+                .map_err(|_| GauntletError::UnsafeStorePath { path })?,
+        })
     }
 
     pub(crate) fn entry_names(
@@ -4751,10 +5501,12 @@ impl PinnedDirectory {
 }
 
 #[cfg(any(
+    target_os = "android",
+    target_os = "ios",
     target_os = "linux",
     target_os = "macos",
-    target_os = "ios",
     target_os = "tvos",
+    target_os = "visionos",
     target_os = "watchos"
 ))]
 fn directory_open_flags() -> rustix::fs::OFlags {
@@ -4790,22 +5542,24 @@ fn gauntlet_to_io(error: &GauntletError) -> std::io::Error {
 }
 
 #[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
     target_os = "linux",
     target_os = "macos",
-    target_os = "ios",
     target_os = "tvos",
+    target_os = "visionos",
     target_os = "watchos"
 )))]
 impl PinnedDirectory {
     fn unsupported<T>() -> Result<T, GauntletError> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "descriptor-relative artifact storage is unsupported on this platform",
+            "descriptor-relative artifact storage requires Rustix openat/statat, flock, and renameat_with no-replace support and is unsupported on this target",
         )
         .into())
     }
 
-    fn open_path(_path: &Path) -> Result<Self, GauntletError> {
+    pub(crate) fn open_path(_path: &Path) -> Result<Self, GauntletError> {
         Self::unsupported()
     }
 
@@ -4834,6 +5588,10 @@ impl PinnedDirectory {
         Self::unsupported()
     }
 
+    pub(crate) fn ensure_child_directory(&self, _name: &OsStr) -> Result<Self, GauntletError> {
+        Self::unsupported()
+    }
+
     fn create_child_exclusive(&self, _name: &OsStr) -> Result<Option<Self>, GauntletError> {
         Self::unsupported()
     }
@@ -4851,6 +5609,38 @@ impl PinnedDirectory {
         _name: &OsStr,
         _max_bytes: u64,
     ) -> Result<Vec<u8>, GauntletError> {
+        Self::unsupported()
+    }
+
+    pub(crate) fn read_regular_bounded_open(
+        &self,
+        _name: &OsStr,
+        _max_bytes: u64,
+    ) -> Result<(Vec<u8>, PinnedRegularFile), GauntletError> {
+        Self::unsupported()
+    }
+
+    pub(crate) fn verify_display_path_identity(&self) -> Result<(), GauntletError> {
+        Self::unsupported()
+    }
+
+    pub(crate) fn authenticate_regular_child(
+        &self,
+        _name: &OsStr,
+        _file: &PinnedRegularFile,
+    ) -> Result<(), GauntletError> {
+        Self::unsupported()
+    }
+
+    pub(crate) fn sync_directory(&self) -> Result<(), GauntletError> {
+        Self::unsupported()
+    }
+
+    pub(crate) fn write_regular_create_new_and_read_back(
+        &self,
+        _name: &OsStr,
+        _bytes: &[u8],
+    ) -> Result<Option<(Vec<u8>, PinnedRegularFile)>, GauntletError> {
         Self::unsupported()
     }
 

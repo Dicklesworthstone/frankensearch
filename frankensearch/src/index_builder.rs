@@ -910,8 +910,18 @@ pub fn open_admitted_v2_sync_with_residual_sidecar_cache(
     residual_cache_dir: impl AsRef<Path>,
     config: TwoTierConfig,
 ) -> SearchResult<SyncTwoTierSearcher> {
+    // This opener consumes only retained admitted FSVI owners to construct the
+    // in-memory exact product. Strip optional ANN paths before `TwoTierIndex`
+    // assembly: otherwise its `ann` path can build and persist HNSW sidecars
+    // that are immediately discarded with this temporary owner container.
+    // Fast/quality index paths remain intact, so exact tier admission,
+    // cross-tier publication validation, and identity checks are unchanged.
+    let mut owner_paths = TwoTierIndexPaths::new(paths.fast_index().to_path_buf());
+    if let Some(quality_path) = paths.quality_index() {
+        owner_paths = owner_paths.with_quality_index(quality_path.to_path_buf());
+    }
     let admitted = TwoTierIndex::open_admitted_v2_with_paths(
-        paths,
+        &owner_paths,
         config.clone(),
         fast_binding,
         quality_binding,
@@ -2715,6 +2725,10 @@ mod tests {
         writer.finish().expect("seal fixture");
 
         let paths = TwoTierIndexPaths::new(&source_path);
+        #[cfg(feature = "ann")]
+        let discarded_ann_path = dir.join("discarded-by-sync-product.hnsw");
+        #[cfg(feature = "ann")]
+        let paths = paths.with_fast_ann(&discarded_ann_path);
         let searcher = open_admitted_v2_sync_with_residual_sidecar_cache(
             &paths,
             &binding,
@@ -2722,6 +2736,10 @@ mod tests {
             &cache_dir,
             TwoTierConfig {
                 fast_only: true,
+                // Force the ordinary two-tier opener's ANN threshold. The
+                // synchronous residual facade must still not build or persist
+                // this configured sidecar because it discards that container.
+                hnsw_threshold: 0,
                 ..TwoTierConfig::default()
             },
         )
@@ -2744,6 +2762,12 @@ mod tests {
                 .count(),
             1,
             "the default facade opener must route through residual-cache publication"
+        );
+        #[cfg(feature = "ann")]
+        assert!(
+            !discarded_ann_path.exists(),
+            "the owner-only synchronous facade must strip ANN paths instead of persisting an \
+             artifact its in-memory product discards"
         );
     }
 }

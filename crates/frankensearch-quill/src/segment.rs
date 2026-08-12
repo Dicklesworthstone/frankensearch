@@ -1047,6 +1047,36 @@ impl<B: AsRef<[u8]>> SegmentReader<B> {
         self.file_xxh3
     }
 
+    /// Recompute and verify the whole-file FSLX integrity witness.
+    ///
+    /// This hashes the exact file prefix before the fixed trailer, which is
+    /// the same domain used by [`Self::verify`]. It deliberately leaves every
+    /// lazy per-section checksum untouched. XXH3 detects corruption here; it
+    /// does not authenticate untrusted content.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed corruption error when the actual backing bytes do not
+    /// match the trailer witness parsed at open time.
+    pub(crate) fn verify_file_witness(&self) -> Result<u64, QuillError> {
+        let bytes = self.source.as_ref();
+        let trailer_start = bytes
+            .len()
+            .checked_sub(TRAILER_LEN)
+            .ok_or_else(|| corrupted(&self.path, "file is shorter than its trailer"))?;
+        let actual = xxh3_64(&bytes[..trailer_start]);
+        if actual != self.file_xxh3 {
+            return Err(corrupted(
+                &self.path,
+                format!(
+                    "file checksum mismatch: expected {:#018x}, got {actual:#018x}",
+                    self.file_xxh3
+                ),
+            ));
+        }
+        Ok(actual)
+    }
+
     /// Verify one section once and borrow its exact payload bytes.
     ///
     /// Unknown optional kinds remain visible in [`Self::section_entries`] and
@@ -1091,12 +1121,15 @@ impl<B: AsRef<[u8]>> SegmentReader<B> {
     /// Eagerly revalidate the structure, every section, and file-prefix witness.
     ///
     /// Unlike [`Self::section`], this always recomputes hashes so doctor flows
-    /// do not trust an earlier lazy result.
+    /// do not trust an earlier lazy result. The returned prefix witness is the
+    /// value freshly recomputed from the exact bytes that passed this complete
+    /// validation; crate-internal manifest binding carries it forward instead
+    /// of hashing the same prefix again.
     ///
     /// # Errors
     ///
     /// Returns a typed corruption error for any checksum mismatch.
-    pub fn verify(&self) -> Result<(), QuillError> {
+    pub(crate) fn verify_with_file_witness(&self) -> Result<u64, QuillError> {
         let bytes = self.source.as_ref();
         let parsed = parse_container(bytes, &self.path, self.schema, self.limits)?;
         for entry in &parsed.sections {
@@ -1114,24 +1147,25 @@ impl<B: AsRef<[u8]>> SegmentReader<B> {
                 ));
             }
         }
-        let actual = xxh3_64(&bytes[..parsed.trailer_start]);
-        if actual != parsed.file_xxh3 {
-            return Err(corrupted(
-                &self.path,
-                format!(
-                    "file checksum mismatch: expected {:#018x}, got {actual:#018x}",
-                    parsed.file_xxh3
-                ),
-            ));
-        }
-        Ok(())
+        self.verify_file_witness()
+    }
+
+    /// Eagerly revalidate the structure, every section, and file-prefix witness.
+    ///
+    /// Unlike [`Self::section`], this always recomputes hashes so doctor flows
+    /// do not trust an earlier lazy result.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed corruption error for any checksum mismatch.
+    pub fn verify(&self) -> Result<(), QuillError> {
+        self.verify_with_file_witness().map(|_| ())
     }
 }
 
 struct ParsedContainer {
     header: SegmentHeader,
     sections: Vec<SectionEntry>,
-    trailer_start: usize,
     file_xxh3: u64,
 }
 
@@ -1355,7 +1389,6 @@ fn parse_container(
             section_count,
         },
         sections,
-        trailer_start,
         file_xxh3,
     })
 }
@@ -2607,8 +2640,14 @@ mod tests {
         bytes[hash_offset..hash_offset + 8].copy_from_slice(&replacement_hash.to_le_bytes());
         rewrite_header_crc(&mut bytes);
 
+        let actual_prefix_xxh3 = xxh3_64(&bytes[..bytes.len() - TRAILER_LEN]);
         let reader = SegmentReader::from_owned(bytes, MINIMAL_SCHEMA)?;
+        assert_ne!(actual_prefix_xxh3, reader.file_xxh3());
         assert!(reader.section(SectionKind::POSTINGS)?.is_some());
+        assert!(matches!(
+            reader.verify_file_witness(),
+            Err(QuillError::IndexCorrupted { .. })
+        ));
         assert!(matches!(
             reader.verify(),
             Err(QuillError::IndexCorrupted { .. })

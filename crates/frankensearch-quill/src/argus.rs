@@ -377,6 +377,449 @@ pub trait QueryWorkCheckpoint: Send + Sync {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ValidatedPostMoveContract(());
 
+/// The concrete, non-virtual path a doc-major union reads arrival predecessors
+/// through.
+///
+/// Every previous attempt to seal this capability sealed the wrong thing. A
+/// capability token could be forwarded by a wrapper that did not implement the
+/// operation; a sealed *result* could be replayed; binding a result to the
+/// document it answered still left a wrapper free to probe one cursor while the
+/// engine drove another, producing receipts that were genuine, correctly minted
+/// and correctly targeted, and described the wrong posting list.
+///
+/// The common flaw is that all of them asked a `dyn PostingCursor` — an
+/// overridable surface — for evidence about itself. There is no arrival method
+/// on that trait any more. The read exists only as an inherent method on this
+/// concrete type, and a term scorer either holds one of these or does not: a
+/// wrapper cannot become one, cannot interpose on one, and cannot hand the
+/// engine a second cursor to probe, because the value the engine probes is the
+/// same value it advances and scores.
+pub(crate) struct ValidatedArrivalCursor<'a> {
+    sealed: SealedPostingCursor<'a>,
+    checkpoint: PostingCheckpoint<'a>,
+    refused: Option<RefusedAdmission>,
+    /// Work this cursor really performed, when a test asked to observe it.
+    ///
+    /// The counter lives here rather than in a wrapper because a wrapper is an
+    /// opaque cursor by construction: instrumenting from outside would move the
+    /// clause off the validated arm and measure the walk instead of the seek.
+    #[cfg(test)]
+    work: Option<std::rc::Rc<CursorWork>>,
+}
+
+/// Movement a scoring cursor performed, counted at the cursor itself.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct CursorWork {
+    pub(crate) steps: std::cell::Cell<u64>,
+    pub(crate) seeks: std::cell::Cell<u64>,
+    pub(crate) probes: std::cell::Cell<u64>,
+}
+
+impl<'a> ValidatedArrivalCursor<'a> {
+    /// Bind a validated sealed cursor to the checkpoint that meters it.
+    pub(crate) fn new(
+        sealed: SealedPostingCursor<'a>,
+        checkpoint: Arc<dyn QueryWorkCheckpoint + 'a>,
+    ) -> Self {
+        Self {
+            sealed,
+            checkpoint: PostingCheckpoint::Shared(checkpoint),
+            refused: None,
+            #[cfg(test)]
+            work: None,
+        }
+    }
+
+    /// The same cursor, reporting what it does to `work`.
+    #[cfg(test)]
+    pub(crate) fn new_counted(
+        sealed: SealedPostingCursor<'a>,
+        checkpoint: Arc<dyn QueryWorkCheckpoint + 'a>,
+        work: std::rc::Rc<CursorWork>,
+    ) -> Self {
+        Self {
+            sealed,
+            checkpoint: PostingCheckpoint::Shared(checkpoint),
+            refused: None,
+            work: Some(work),
+        }
+    }
+
+    /// Blocks the underlying sealed cursor has physically decoded.
+    #[cfg(test)]
+    pub(crate) fn decoded_blocks(&self) -> usize {
+        self.sealed.sealed_decoded_blocks()
+    }
+
+    #[cfg(test)]
+    fn record(&self, select: fn(&CursorWork) -> &std::cell::Cell<u64>) {
+        if let Some(work) = &self.work {
+            let counter = select(work);
+            counter.set(counter.get() + 1);
+        }
+    }
+
+    fn guard_refused(&self) -> Result<(), ArgusError> {
+        match self.refused {
+            Some(refusal) => Err(refusal.error()),
+            None => Ok(()),
+        }
+    }
+
+    fn admit_or_refuse(&mut self, units: u64) -> Result<(), ArgusError> {
+        match self.checkpoint.admit(QueryWorkKind::PostingBlock, units) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.refused = RefusedAdmission::capture(&error);
+                Err(error)
+            }
+        }
+    }
+
+    /// Inclusive last document this term can still reach.
+    pub(crate) fn arrival_final_doc(&self) -> Option<u32> {
+        self.sealed.sealed_final_doc()
+    }
+
+    /// Greatest document this term holds strictly below `target`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the checkpoint's refusal, which is latched here exactly as a
+    /// move latches it, and any typed storage failure.
+    pub(crate) fn arrival_doc_before(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+        self.guard_refused()?;
+        #[cfg(test)]
+        self.record(|work| &work.probes);
+        let permit = self.sealed.sealed_arrival_permit(target);
+        if permit > 0 {
+            self.admit_or_refuse(permit)?;
+        }
+        match self.sealed.sealed_doc_before(target) {
+            Ok(predecessor) => Ok(predecessor),
+            Err(error) => {
+                self.refused = RefusedAdmission::capture(&error);
+                Err(error)
+            }
+        }
+    }
+}
+
+impl PostingCursor for ValidatedArrivalCursor<'_> {
+    fn doc(&self) -> Option<u32> {
+        self.sealed.doc()
+    }
+
+    fn freq(&self) -> Option<u32> {
+        self.sealed.freq()
+    }
+
+    fn positions_handle(&self) -> Option<PositionsHandle<'_>> {
+        self.sealed.positions_handle()
+    }
+
+    fn size_hint(&self) -> u32 {
+        self.sealed.size_hint()
+    }
+
+    fn cost(&self) -> u64 {
+        self.sealed.cost()
+    }
+
+    fn segment_num_docs(&self) -> u32 {
+        self.sealed.segment_num_docs()
+    }
+
+    fn next(&mut self) -> Result<Option<u32>, ArgusError> {
+        self.guard_refused()?;
+        #[cfg(test)]
+        self.record(|work| &work.steps);
+        self.admit_or_refuse(0)?;
+        let permit = self.sealed.block_permit_for_next();
+        if permit > 0 {
+            self.admit_or_refuse(permit)?;
+        }
+        match self.sealed.next() {
+            Ok(moved) => Ok(moved),
+            Err(error) => {
+                self.refused = RefusedAdmission::capture(&error);
+                Err(error)
+            }
+        }
+    }
+
+    fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+        self.guard_refused()?;
+        #[cfg(test)]
+        self.record(|work| &work.seeks);
+        self.admit_or_refuse(0)?;
+        let permit = self.sealed.block_permit_for_advance(target);
+        if permit > 0 {
+            self.admit_or_refuse(permit)?;
+        }
+        match self.sealed.advance(target) {
+            Ok(moved) => Ok(moved),
+            Err(error) => {
+                self.refused = RefusedAdmission::capture(&error);
+                Err(error)
+            }
+        }
+    }
+
+    fn validated_post_move_contract(&self) -> Option<ValidatedPostMoveContract> {
+        self.sealed.validated_post_move_contract()
+    }
+
+    fn fork_for_pruning(&self) -> Option<Box<dyn PostingCursor + '_>> {
+        let inner = self.sealed.fork_for_pruning()?;
+        Some(Box::new(CheckpointPostingCursor {
+            inner,
+            checkpoint: PostingCheckpoint::Borrowed(self.checkpoint.as_borrowed()),
+            refused: None,
+        }))
+    }
+
+    fn term_score_upper_bound(
+        &self,
+        live_avgdl: f32,
+        weight: f32,
+        record_option: TermRecordOption,
+    ) -> Option<f32> {
+        self.sealed
+            .term_score_upper_bound(live_avgdl, weight, record_option)
+    }
+
+    fn supports_block_max(&self) -> bool {
+        self.sealed.supports_block_max()
+    }
+
+    fn current_block_score_upper_bound(
+        &self,
+        live_avgdl: f32,
+        weight: f32,
+        record_option: TermRecordOption,
+    ) -> Option<f32> {
+        self.sealed
+            .current_block_score_upper_bound(live_avgdl, weight, record_option)
+    }
+
+    fn current_block_last_doc(&self) -> Option<u32> {
+        self.sealed.current_block_last_doc()
+    }
+
+    fn current_work_block(&self) -> Option<u64> {
+        self.sealed.current_work_block()
+    }
+
+    fn block_permit_for_next(&self) -> u64 {
+        self.sealed.block_permit_for_next()
+    }
+
+    fn block_permit_for_advance(&self, target: u32) -> u64 {
+        self.sealed.block_permit_for_advance(target)
+    }
+}
+
+/// The cursor one term scorer drives.
+///
+/// This enum is the whole of the exact-cursor guarantee. `Validated` holds the
+/// crate's own cursor by value, so movement, scoring and arrival reads are all
+/// served by one instance with no virtual call in between; `Opaque` is every
+/// other implementation, including every wrapper, and has no arrival read at
+/// all. A wrapper cannot move itself into `Validated` because the constructor
+/// that builds that arm takes the concrete type.
+enum TermCursor<'a> {
+    Validated(ValidatedArrivalCursor<'a>),
+    Opaque(Box<dyn PostingCursor + 'a>),
+}
+
+impl TermCursor<'_> {
+    /// Inclusive last document, on the validated arm only.
+    fn arrival_final_doc(&self) -> Option<u32> {
+        match self {
+            Self::Validated(cursor) => cursor.arrival_final_doc(),
+            Self::Opaque(_) => None,
+        }
+    }
+
+    /// Greatest document strictly below `target`, on the validated arm only.
+    ///
+    /// # Errors
+    ///
+    /// Refuses for an opaque cursor — there is no way for one to answer, and
+    /// answering `None` would be indistinguishable from the legitimate "this
+    /// term holds nothing below the probe".
+    fn arrival_doc_before(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+        match self {
+            Self::Validated(cursor) => cursor.arrival_doc_before(target),
+            Self::Opaque(_) => Err(ArgusError::CursorInvariant(
+                "arrival predecessor read from a cursor outside the validated path",
+            )),
+        }
+    }
+}
+
+impl PostingCursor for TermCursor<'_> {
+    fn doc(&self) -> Option<u32> {
+        match self {
+            Self::Validated(cursor) => cursor.doc(),
+            Self::Opaque(cursor) => cursor.doc(),
+        }
+    }
+
+    fn freq(&self) -> Option<u32> {
+        match self {
+            Self::Validated(cursor) => cursor.freq(),
+            Self::Opaque(cursor) => cursor.freq(),
+        }
+    }
+
+    fn positions_handle(&self) -> Option<PositionsHandle<'_>> {
+        match self {
+            Self::Validated(cursor) => cursor.positions_handle(),
+            Self::Opaque(cursor) => cursor.positions_handle(),
+        }
+    }
+
+    fn size_hint(&self) -> u32 {
+        match self {
+            Self::Validated(cursor) => cursor.size_hint(),
+            Self::Opaque(cursor) => cursor.size_hint(),
+        }
+    }
+
+    fn cost(&self) -> u64 {
+        match self {
+            Self::Validated(cursor) => cursor.cost(),
+            Self::Opaque(cursor) => cursor.cost(),
+        }
+    }
+
+    fn segment_num_docs(&self) -> u32 {
+        match self {
+            Self::Validated(cursor) => cursor.segment_num_docs(),
+            Self::Opaque(cursor) => cursor.segment_num_docs(),
+        }
+    }
+
+    fn next(&mut self) -> Result<Option<u32>, ArgusError> {
+        match self {
+            Self::Validated(cursor) => cursor.next(),
+            Self::Opaque(cursor) => cursor.next(),
+        }
+    }
+
+    fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+        match self {
+            Self::Validated(cursor) => cursor.advance(target),
+            Self::Opaque(cursor) => cursor.advance(target),
+        }
+    }
+
+    fn validated_post_move_contract(&self) -> Option<ValidatedPostMoveContract> {
+        match self {
+            Self::Validated(cursor) => cursor.validated_post_move_contract(),
+            Self::Opaque(cursor) => cursor.validated_post_move_contract(),
+        }
+    }
+
+    fn fork_for_pruning(&self) -> Option<Box<dyn PostingCursor + '_>> {
+        match self {
+            Self::Validated(cursor) => cursor.fork_for_pruning(),
+            Self::Opaque(cursor) => cursor.fork_for_pruning(),
+        }
+    }
+
+    fn term_score_upper_bound(
+        &self,
+        live_avgdl: f32,
+        weight: f32,
+        record_option: TermRecordOption,
+    ) -> Option<f32> {
+        match self {
+            Self::Validated(cursor) => {
+                cursor.term_score_upper_bound(live_avgdl, weight, record_option)
+            }
+            Self::Opaque(cursor) => {
+                cursor.term_score_upper_bound(live_avgdl, weight, record_option)
+            }
+        }
+    }
+
+    fn supports_block_max(&self) -> bool {
+        match self {
+            Self::Validated(cursor) => cursor.supports_block_max(),
+            Self::Opaque(cursor) => cursor.supports_block_max(),
+        }
+    }
+
+    fn current_block_score_upper_bound(
+        &self,
+        live_avgdl: f32,
+        weight: f32,
+        record_option: TermRecordOption,
+    ) -> Option<f32> {
+        match self {
+            Self::Validated(cursor) => {
+                cursor.current_block_score_upper_bound(live_avgdl, weight, record_option)
+            }
+            Self::Opaque(cursor) => {
+                cursor.current_block_score_upper_bound(live_avgdl, weight, record_option)
+            }
+        }
+    }
+
+    fn current_block_last_doc(&self) -> Option<u32> {
+        match self {
+            Self::Validated(cursor) => cursor.current_block_last_doc(),
+            Self::Opaque(cursor) => cursor.current_block_last_doc(),
+        }
+    }
+
+    fn current_work_block(&self) -> Option<u64> {
+        match self {
+            Self::Validated(cursor) => cursor.current_work_block(),
+            Self::Opaque(cursor) => cursor.current_work_block(),
+        }
+    }
+
+    fn block_permit_for_next(&self) -> u64 {
+        match self {
+            Self::Validated(cursor) => cursor.block_permit_for_next(),
+            Self::Opaque(cursor) => cursor.block_permit_for_next(),
+        }
+    }
+
+    fn block_permit_for_advance(&self, target: u32) -> u64 {
+        match self {
+            Self::Validated(cursor) => cursor.block_permit_for_advance(target),
+            Self::Opaque(cursor) => cursor.block_permit_for_advance(target),
+        }
+    }
+
+    fn next_admitted(
+        &mut self,
+        checkpoint: &dyn QueryWorkCheckpoint,
+    ) -> Result<Option<u32>, ArgusError> {
+        match self {
+            Self::Validated(cursor) => cursor.next_admitted(checkpoint),
+            Self::Opaque(cursor) => cursor.next_admitted(checkpoint),
+        }
+    }
+
+    fn advance_admitted(
+        &mut self,
+        checkpoint: &dyn QueryWorkCheckpoint,
+        target: u32,
+    ) -> Result<Option<u32>, ArgusError> {
+        match self {
+            Self::Validated(cursor) => cursor.advance_admitted(checkpoint, target),
+            Self::Opaque(cursor) => cursor.advance_admitted(checkpoint, target),
+        }
+    }
+}
+
 /// Forward-only posting access shared by sealed and future delta segments.
 ///
 /// A cursor starts on its first posting. `advance` is an inclusive lower-bound
@@ -1076,6 +1519,58 @@ impl<'a> SealedPostingCursor<'a> {
             segment_num_docs,
         })
     }
+
+    /// Inclusive last document this term can still reach, read from validated
+    /// block metadata without moving or decoding.
+    ///
+    /// Inherent rather than a trait method, and that is the point: there is no
+    /// arrival surface on [`PostingCursor`] for a wrapper to override, forward,
+    /// or answer on behalf of a different cursor. Only code holding this
+    /// concrete type can ask, and the only thing that holds one is the term
+    /// scorer that also advances and scores it.
+    #[must_use]
+    pub(crate) fn sealed_final_doc(&self) -> Option<u32> {
+        let SealedCursorInner::Docs(cursor) = &self.inner else {
+            return None;
+        };
+        cursor.final_doc()
+    }
+
+    /// Greatest document this term holds strictly below `target`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error if a selected validated block cannot be decoded,
+    /// and refuses for a POSITIONS-backed cursor, which has no block table.
+    pub(crate) fn sealed_doc_before(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+        let SealedCursorInner::Docs(cursor) = &mut self.inner else {
+            return Err(ArgusError::CursorInvariant(
+                "a POSITIONS-backed sealed cursor has no validated arrival metadata",
+            ));
+        };
+        Ok(cursor.doc_before(target)?)
+    }
+
+    /// Blocks this cursor has physically decoded, forward loads and backward
+    /// reads alike. Test builds only.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn sealed_decoded_blocks(&self) -> usize {
+        let SealedCursorInner::Docs(cursor) = &self.inner else {
+            return 0;
+        };
+        cursor.decoded_blocks()
+    }
+
+    /// Blocks [`Self::sealed_doc_before`] would decode, determined without
+    /// decoding, so the caller admits them first.
+    #[must_use]
+    pub(crate) fn sealed_arrival_permit(&self, target: u32) -> u64 {
+        let SealedCursorInner::Docs(cursor) = &self.inner else {
+            return 0;
+        };
+        u64::from(cursor.doc_before_decodes_block(target))
+    }
 }
 
 impl PostingCursor for SealedPostingCursor<'_> {
@@ -1333,19 +1828,13 @@ impl<'a> DeltaPostingCursor<'a> {
         checkpoint: Option<&dyn QueryWorkCheckpoint>,
     ) -> Result<Self, ArgusError> {
         let term = delta.find_term(field_ord, term_bytes);
-        // Delta term metadata is not a lookup. `live_doc_freq` walks the whole
-        // physical chain to count survivors, so opening a cursor reads every
-        // row of the term before a single posting is served. That walk is
-        // admitted here, before it runs, at the same physical-block rate the
-        // scan itself pays. A term that is missing entirely still admits —
-        // with zero units — so a cancelled query cannot open cursors forever.
+        // Term metadata is answered from the count taken at freeze, so
+        // opening a cursor reads no rows and buys no permit for the lookup.
+        // It still polls: a term missing from this generation does no work at
+        // all, and that is exactly the path on which a cancelled query would
+        // otherwise open cursors forever without ever being told to stop.
         if let Some(checkpoint) = checkpoint {
-            let physical = term.map_or(0, DeltaTerm::physical_doc_freq);
-            let blocks = physical.div_ceil(DELTA_LOGICAL_BLOCK_POSTINGS as usize);
-            checkpoint.admit(
-                QueryWorkKind::PostingBlock,
-                u64::try_from(blocks).unwrap_or(u64::MAX),
-            )?;
+            checkpoint.admit(QueryWorkKind::PostingBlock, 0)?;
         }
         let (live_doc_freq, block_max) =
             term.map_or((0, None), DeltaTerm::live_doc_freq_and_block_max);
@@ -1763,7 +2252,7 @@ impl TermRecordOption {
 
 /// One BM25 term leaf bound to a segment cursor and fieldnorm view.
 pub struct TermScorer<'a> {
-    cursor: Box<dyn PostingCursor + 'a>,
+    cursor: TermCursor<'a>,
     fieldnorms: Box<dyn FieldNormReader + 'a>,
     snapshot: Bm25FieldSnapshot,
     record_option: TermRecordOption,
@@ -1800,6 +2289,60 @@ impl<'a> TermScorer<'a> {
     ) -> Result<Self, ArgusError>
     where
         C: PostingCursor + 'a,
+        F: FieldNormReader + 'a,
+    {
+        Self::with_term_cursor(
+            TermCursor::Opaque(Box::new(cursor)),
+            fieldnorms,
+            snapshot,
+            snapshot_doc_freq,
+            record_option,
+            field_boost,
+        )
+    }
+
+    /// Build a term scorer over the crate's own validated cursor.
+    ///
+    /// This is the only way into [`TermCursor::Validated`], and it takes the
+    /// concrete type by value. A wrapper cannot reach this arm: it has nothing
+    /// to pass, and handing over an embedded cursor would mean surrendering the
+    /// instance it would otherwise drive — which is exactly the substitution the
+    /// arm exists to prevent, since the scorer then advances, scores and probes
+    /// that one value.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as [`Self::new`].
+    pub(crate) fn new_validated<F>(
+        cursor: ValidatedArrivalCursor<'a>,
+        fieldnorms: F,
+        snapshot: Bm25FieldSnapshot,
+        snapshot_doc_freq: u64,
+        record_option: TermRecordOption,
+        field_boost: f32,
+    ) -> Result<Self, ArgusError>
+    where
+        F: FieldNormReader + 'a,
+    {
+        Self::with_term_cursor(
+            TermCursor::Validated(cursor),
+            fieldnorms,
+            snapshot,
+            snapshot_doc_freq,
+            record_option,
+            field_boost,
+        )
+    }
+
+    fn with_term_cursor<F>(
+        cursor: TermCursor<'a>,
+        fieldnorms: F,
+        snapshot: Bm25FieldSnapshot,
+        snapshot_doc_freq: u64,
+        record_option: TermRecordOption,
+        field_boost: f32,
+    ) -> Result<Self, ArgusError>
+    where
         F: FieldNormReader + 'a,
     {
         if fieldnorms.field_ord() != snapshot.field_ord() {
@@ -1884,7 +2427,7 @@ impl<'a> TermScorer<'a> {
             .and_then(|average| cursor.term_score_upper_bound(average, weight, record_option))
             .filter(|bound| bound.is_finite() && !bound.is_sign_negative());
         Ok(Self {
-            cursor: Box::new(cursor),
+            cursor,
             fieldnorms: Box::new(fieldnorms),
             snapshot,
             record_option,
@@ -1907,7 +2450,7 @@ impl<'a> TermScorer<'a> {
         let moved = if self.validated_post_move_contract {
             moved
         } else {
-            validate_cursor_after_move(self.cursor.as_ref(), self.fieldnorms.as_ref(), moved)?
+            validate_cursor_after_move(&self.cursor, self.fieldnorms.as_ref(), moved)?
         };
         match (previous, moved) {
             (None, Some(_)) => Err(ArgusError::CursorInvariant(
@@ -1926,7 +2469,7 @@ impl<'a> TermScorer<'a> {
         let moved = if self.validated_post_move_contract {
             moved
         } else {
-            validate_cursor_after_move(self.cursor.as_ref(), self.fieldnorms.as_ref(), moved)?
+            validate_cursor_after_move(&self.cursor, self.fieldnorms.as_ref(), moved)?
         };
         match (previous, moved) {
             (None, Some(_)) => Err(ArgusError::CursorInvariant(
@@ -3066,6 +3609,40 @@ impl<'a> ReferenceScorer<'a> {
         }
     }
 
+    /// Inclusive last document this scorer can still reach, when its storage
+    /// can answer from validated metadata alone.
+    ///
+    /// Only a direct term answers: the doc-major arrival order this feeds is
+    /// defined over a term union, and every other node would have to derive a
+    /// reachable bound from children it does not own.
+    fn arrival_final_doc(&self) -> Option<u32> {
+        match &self.node {
+            ScorerNode::Term(term) => term.cursor.arrival_final_doc(),
+            _ => None,
+        }
+    }
+
+    /// Greatest document this scorer holds strictly below `target`.
+    ///
+    /// The receipt is redeemed against the document that was actually probed,
+    /// so a cursor replaying an older answer is refused here rather than
+    /// believed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed invariant error if the clause is not a direct term or
+    /// answers a document other than `target`, the cursor's refusal when it
+    /// does not implement validated arrival reads, and propagates its typed
+    /// storage or admission failure.
+    fn arrival_doc_before(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+        match &mut self.node {
+            ScorerNode::Term(term) => term.cursor.arrival_doc_before(target),
+            _ => Err(ArgusError::CursorInvariant(
+                "arrival predecessor read from a clause that is not a direct term",
+            )),
+        }
+    }
+
     /// A pure-term group eligible for grouped `MaxScore`: a union whose active
     /// children are all bounded direct terms, so it exposes a conservative
     /// whole-group ceiling. Deferred grouped-`MaxScore` foundation
@@ -3145,6 +3722,20 @@ impl<'a> ReferenceScorer<'a> {
             return None;
         };
         Some(union.pruning_stats)
+    }
+
+    /// Whether this clause reads arrival history from the crate's own cursor.
+    ///
+    /// Test-only, and deliberately structural rather than behavioural: it is
+    /// how a lowering test proves the *shipping* path reaches
+    /// [`TermCursor::Validated`], which is the half of the property a fixture
+    /// built inside `argus` cannot establish for itself.
+    #[cfg(test)]
+    pub(crate) fn arrival_path_is_validated(&self) -> bool {
+        match &self.node {
+            ScorerNode::Term(term) => matches!(term.cursor, TermCursor::Validated(_)),
+            _ => false,
+        }
     }
 
     /// Return privacy-safe aggregate evidence for the pruning path that
@@ -4338,8 +4929,20 @@ pub(crate) struct ConformanceUnionRefill {
 struct UnionPruningStats {
     max_score_windows: u64,
     block_max_wand_windows: u64,
+    /// Posting blocks the *shadow* discovery cursors skipped.
+    ///
+    /// This has never been a count of scoring work avoided, and reading it as
+    /// one is what made the doc-major candidate fill's traversal invisible:
+    /// discovery can skip a block that the real scoring cursors then walk. The
+    /// doc-major fill now seeks over the same region, so the two agree — except
+    /// in the windows counted by [`Self::arrival_walk_windows`], which are the
+    /// windows where the scoring cursors did walk it.
     blocks_skipped: u64,
     candidate_docs: u64,
+    /// Pruned doc-major windows whose scoring cursors walked every posting
+    /// instead of seeking: a clause exhausts inside them, or a clause cannot
+    /// report arrival metadata at all.
+    arrival_walk_windows: u64,
 }
 
 /// Aggregate scorer evidence suitable for stable tracing fields.
@@ -5174,9 +5777,19 @@ impl<'a> BufferedUnionScorer<'a> {
         horizon_end: u64,
         candidates: &[u32],
     ) -> Result<(), ArgusError> {
+        if self.tantivy_topdocs_term_union {
+            return self.fill_tantivy_topdocs_candidate_window(
+                window_start,
+                horizon_end,
+                candidates,
+            );
+        }
+
         // Candidate discovery advances only shadow cursors. Real cursors still
         // visit selected documents in their current scorer-vector order, so
-        // pruning cannot regroup ordinary exhaustive contributions.
+        // pruning cannot regroup ordinary exhaustive contributions. That holds
+        // for the ordinary buffered union only; a ranked direct-term root pins
+        // Tantivy's doc-major order and takes the branch above.
         let mut index = 0;
         while index < self.active.len() {
             loop {
@@ -5231,6 +5844,370 @@ impl<'a> BufferedUnionScorer<'a> {
                     break;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Fill one candidate-restricted window in exactly the doc-major order
+    /// [`Self::fill_tantivy_topdocs_term_window`] would have produced, scoring
+    /// only the documents competitive discovery selected.
+    ///
+    /// Shipping rank pruning is precisely the ranked direct-term root that sets
+    /// `tantivy_topdocs_term_union`, so summing a pruned window in
+    /// scorer-vector order made a single query mix two f32 addition orders:
+    /// Tantivy's in its first, always-exhaustive window and scorer-major in
+    /// every later pruned one. The drift also outlived the window, because the
+    /// pinned sort is stable and the next refill inherits whatever permutation
+    /// this one leaves (`bd-quill-pruned-topdocs-term-order-9wu3p`).
+    ///
+    /// What has to be reproduced is the traversal order, not just the
+    /// per-document sum — but it does not have to be reproduced by stepping.
+    /// Under that stable sort the equal-document order is "decreasing previous
+    /// posting": a scorer stepping onto a document sorts ahead of everyone
+    /// already parked there. With `X = {5, 8, 10}`, `Y = {7, 10}`, `Z = {10}`
+    /// and `10` the only candidate, stepping yields `X + Y + Z` because `X`'s
+    /// stop at 8 lets `Y` overtake it, and seeking straight to 10 rebuilds that
+    /// same order from the previous postings 8, 7 and none. So the arrival
+    /// predecessor is the whole of what a seek loses, and a cursor that
+    /// validates a block table already knows it
+    /// ([`SealedPostingCursor::sealed_doc_before`], reached only through
+    /// [`ValidatedArrivalCursor::arrival_doc_before`]).
+    ///
+    /// Two cases resist that reconstruction and take the walking fill, which
+    /// simulates the traversal exactly.
+    ///
+    /// The first is the exhaustion of a clause: a term that runs out mid-window
+    /// is dropped by a positional `swap_remove`, which moves the vector's last
+    /// scorer into the hole and can invert an equal-document pair whose
+    /// postings say nothing about it. For sealed clauses that is at most one
+    /// window per clause for the whole query, since a clause exhausts once.
+    ///
+    /// The second is a clause whose storage cannot report arrival metadata at
+    /// all, which today means every non-sealed cursor — Delta above all. That
+    /// is not bounded per clause: one live Delta clause routes *every* pruned
+    /// window here. It is still not a lost skip, because
+    /// [`DeltaPostingCursor::advance`] is itself a per-posting walk with no
+    /// block-skip structure and no per-block last document, so the walking fill
+    /// costs a Delta clause what its own seek to the horizon would have cost.
+    /// The seek repair is scoped to sealed block-max clauses, which is where
+    /// discovery can skip blocks that scoring cursors would otherwise re-walk.
+    /// A Delta predecessor is not derivable from its live-filtered forward walk
+    /// without a second walk, so this deliberately does not fake one.
+    fn fill_tantivy_topdocs_candidate_window(
+        &mut self,
+        window_start: u32,
+        horizon_end: u64,
+        candidates: &[u32],
+    ) -> Result<(), ArgusError> {
+        if self.arrival_order_is_reconstructible(horizon_end) {
+            return self.fill_tantivy_topdocs_seeking_window(window_start, horizon_end, candidates);
+        }
+        self.pruning_stats.arrival_walk_windows =
+            self.pruning_stats.arrival_walk_windows.saturating_add(1);
+        self.fill_tantivy_topdocs_walking_window(window_start, horizon_end, candidates)
+    }
+
+    /// Whether every active clause can rebuild this window's arrival order from
+    /// validated metadata rather than from steps.
+    ///
+    /// Two conditions, neither of them a claim taken on trust. The clause must
+    /// hold the crate's own validated cursor — [`TermCursor::Validated`], which
+    /// no wrapper can enter — and that cursor's reachable last document must lie
+    /// at or beyond this horizon, because a clause exhausting mid-window is
+    /// `swap_remove`d and that permutes the vector by position.
+    ///
+    /// A reachable last document is a `u32`, so a horizon past `u32::MAX` fails
+    /// the second condition, which is what keeps the seeking fill's horizon seek
+    /// in range.
+    fn arrival_order_is_reconstructible(&self, horizon_end: u64) -> bool {
+        self.active.iter().all(|scorer| {
+            scorer
+                .arrival_final_doc()
+                .is_some_and(|last| u64::from(last) >= horizon_end)
+        })
+    }
+
+    /// Fill a candidate-restricted doc-major window with seeks, reconstructing
+    /// each pivot's equal-document order from arrival predecessors.
+    ///
+    /// Real scoring cursors move only to selected candidates and then to the
+    /// horizon, so their *moves* are seeks rather than one step per posting.
+    ///
+    /// That is a statement about moves only. The order reconstruction this fill
+    /// depends on also issues predecessor probes; those probes decode at most
+    /// one block per block they descend into, and are charged for exactly that
+    /// ([`Self::refine_arrival_group`]). Whether the total is *cheaper* than the
+    /// walk it replaces is still unmeasured, and no such claim is made here. The
+    /// property this fill exists to hold is the *order*: pruned windows
+    /// accumulate in the same doc-major sequence as exhaustive ones.
+    ///
+    /// The order is rebuilt at each pivot by [`Self::sort_active_by_arrival`]
+    /// against a `floor` — the most recent document at which the vector order
+    /// was known correct. It starts at `window_start`, where the previous fill
+    /// left a correct order, and advances to each scored candidate. Two clauses
+    /// whose predecessor chains agree all the way down to the floor were parked
+    /// on the same document there, so the order the floor left them in is the
+    /// order stepping would have kept, and the walk stops instead of descending
+    /// into history the window cannot observe.
+    fn fill_tantivy_topdocs_seeking_window(
+        &mut self,
+        window_start: u32,
+        horizon_end: u64,
+        candidates: &[u32],
+    ) -> Result<(), ArgusError> {
+        let mut floor = window_start;
+        let mut arrival_keys = Vec::new();
+        for &candidate in candidates {
+            if u64::from(candidate) >= horizon_end {
+                break;
+            }
+            #[cfg(feature = "pruning-conformance")]
+            self.set_conformance_query_work_context(
+                ConformanceQueryWorkPhase::Seek,
+                Some(candidate),
+                false,
+            );
+            for scorer in &mut self.active {
+                if scorer.doc().is_some_and(|doc| doc < candidate) {
+                    scorer.advance(candidate)?;
+                }
+            }
+            // Every clause now sits at or beyond the candidate, so the pivot
+            // group — if the candidate is held at all — is the sorted prefix.
+            self.sort_active_by_arrival(floor, &mut arrival_keys)?;
+            floor = candidate;
+            let pivot_len = self
+                .active
+                .iter()
+                .take_while(|scorer| scorer.doc() == Some(candidate))
+                .count();
+            if pivot_len == 0 {
+                continue;
+            }
+            let offset = usize::try_from(u64::from(candidate) - u64::from(window_start))
+                .map_err(|_| ArgusError::CursorInvariant("union offset does not fit usize"))?;
+            let mut score = 0.0_f32;
+            for scorer in &mut self.active[..pivot_len] {
+                score += scorer.score()?;
+            }
+            self.score_window[offset] = Some(finite_score(score, candidate)?);
+            #[cfg(feature = "pruning-conformance")]
+            self.set_conformance_query_work_context(
+                ConformanceQueryWorkPhase::Drain,
+                Some(candidate),
+                true,
+            );
+        }
+        #[cfg(feature = "pruning-conformance")]
+        self.set_conformance_query_work_context(ConformanceQueryWorkPhase::Seek, None, false);
+        // The exhaustive fill leaves every clause on its first posting at or
+        // beyond the horizon; nothing exhausts here, so this reaches the same
+        // positions with one seek each.
+        for scorer in &mut self.active {
+            Self::advance_scorer_to_horizon(scorer, horizon_end)?;
+        }
+        self.sort_active_by_arrival(floor, &mut arrival_keys)
+    }
+
+    /// Restore the scorer order the stepping traversal would have left, without
+    /// stepping: stable-sort by current document, then order each
+    /// equal-document group by descending arrival predecessor.
+    ///
+    /// The stable sort is what carries the base case. A group the predecessor
+    /// refinement cannot separate keeps the order the vector already held,
+    /// which is the order the `floor` established.
+    ///
+    /// `arrival_keys` is the refinement's scratch, borrowed from the caller so
+    /// a window that never ties two clauses on one document allocates nothing.
+    fn sort_active_by_arrival(
+        &mut self,
+        floor: u32,
+        arrival_keys: &mut Vec<Option<u32>>,
+    ) -> Result<(), ArgusError> {
+        self.active.sort_by_key(ReferenceScorer::doc);
+        let mut start = 0;
+        while start < self.active.len() {
+            let doc = self.active[start].doc();
+            let mut end = start + 1;
+            while end < self.active.len() && self.active[end].doc() == doc {
+                end += 1;
+            }
+            if end - start > 1 && doc.is_some() {
+                self.refine_arrival_group(start, end, floor, arrival_keys)?;
+            }
+            start = end;
+        }
+        Ok(())
+    }
+
+    /// Order one equal-document group by descending arrival predecessor,
+    /// refining a round at a time rather than comparing pairs.
+    ///
+    /// The pinned traversal moves an equal-document prefix to the vector's
+    /// front and stably re-sorts, so a clause that just stepped onto a document
+    /// precedes one already parked there, and two that stepped on together keep
+    /// the order they held where they parted. Separating them is therefore a
+    /// lexicographic comparison of descending posting histories — previous
+    /// postings first, then the postings before those.
+    ///
+    /// Doing that pairwise would let one shared run be re-descended once per
+    /// comparison, so the histories are walked as *cached keys* instead: every
+    /// round probes each still-tied clause exactly once, from the value that
+    /// clause last answered. Each probe therefore steps that clause past one of
+    /// its own postings inside `(floor, group document]`, and the floor
+    /// advances to each scored candidate, so those intervals are disjoint
+    /// across the window. That bounds the *number of probes* by the postings the
+    /// exhaustive fill would have stepped through, and it is one probe per
+    /// clause whenever the tied clauses hold different documents in the gap.
+    ///
+    /// A probe count is still not a cost bound, but the cost it used to hide is
+    /// now bounded and measured. A probe is free in the block its cursor is
+    /// parked in; a descent below that block used to re-decode the block it read
+    /// on *every* probe, so a tie walking a shared run through one 128-posting
+    /// block cost up to one decode per posting where a forward walk costs one
+    /// for the block. The cursor now retains the block a backward read lands in,
+    /// and because the descent is monotone the rest of that block is served from
+    /// it: `deep_backward_descent_is_charged_once` pins 32+ probes to one
+    /// physical decode and one admitted posting block.
+    ///
+    /// What is still unproven is the comparison that matters operationally —
+    /// whether this path is *cheaper* than the walk it replaces. That needs a
+    /// live measurement, not a decode count, so neither this function nor its
+    /// callers may claim a skip-cost advantage.
+    ///
+    /// A key of `None` settles a clause: either its history ended, or it
+    /// reached the floor, where the order the vector already holds is
+    /// authoritative. `None` sorting below `Some` is exactly right — a clause
+    /// with no posting above the floor arrived earlier than one that has one.
+    fn refine_arrival_group(
+        &mut self,
+        start: usize,
+        end: usize,
+        floor: u32,
+        arrival_keys: &mut Vec<Option<u32>>,
+    ) -> Result<(), ArgusError> {
+        let doc = self.active[start].doc();
+        arrival_keys.clear();
+        let width = end - start;
+        arrival_keys
+            .try_reserve(width)
+            .map_err(|_| ArgusError::Allocation {
+                resource: "union arrival keys",
+                count: width,
+            })?;
+        arrival_keys.resize(width, doc);
+
+        let mut run_start = start;
+        while run_start < end {
+            let key = arrival_keys[run_start - start];
+            let mut run_end = run_start + 1;
+            while run_end < end && arrival_keys[run_end - start] == key {
+                run_end += 1;
+            }
+            let Some(probe) = key else {
+                // Settled: every clause in this run is ordered by the vector.
+                run_start = run_end;
+                continue;
+            };
+            if run_end - run_start == 1 {
+                run_start = run_end;
+                continue;
+            }
+            for index in run_start..run_end {
+                let earlier = self.active[index].arrival_doc_before(probe)?;
+                // Termination rests on this: the refinement only ends because
+                // every round moves a probe strictly downward toward the floor.
+                // A cursor that answered with its own probe would spin here
+                // forever, so the contract is enforced rather than trusted.
+                if earlier.is_some_and(|value| value >= probe) {
+                    return Err(ArgusError::CursorInvariant(
+                        "arrival predecessor did not move strictly below its probe",
+                    ));
+                }
+                arrival_keys[index - start] = earlier.filter(|value| *value > floor);
+            }
+            // Stable insertion sort on the refreshed keys: descending, so the
+            // later arrival leads. No probe happens here — the keys are cached
+            // — and the run is re-scanned so its new sub-runs refine next.
+            let mut index = run_start + 1;
+            while index < run_end {
+                let mut position = index;
+                while position > run_start
+                    && arrival_keys[position - 1 - start] < arrival_keys[position - start]
+                {
+                    self.active.swap(position - 1, position);
+                    arrival_keys.swap(position - 1 - start, position - start);
+                    position -= 1;
+                }
+                index += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Fill a candidate-restricted doc-major window by simulating the stepping
+    /// traversal, eliding only `score` for documents discovery did not select.
+    ///
+    /// This is the exact fallback for the windows
+    /// [`Self::arrival_order_is_reconstructible`] refuses. It costs one step
+    /// per posting in the window. For a sealed union that is bounded at one
+    /// window per clause per query — the window where that clause exhausts and
+    /// a positional `swap_remove` permutes the vector — but for a union holding
+    /// any cursor without arrival metadata it is every pruned window, which the
+    /// dispatch documents rather than hides.
+    fn fill_tantivy_topdocs_walking_window(
+        &mut self,
+        window_start: u32,
+        horizon_end: u64,
+        candidates: &[u32],
+    ) -> Result<(), ArgusError> {
+        self.active.sort_by_key(ReferenceScorer::doc);
+        while let Some(doc) = self.active.first().and_then(ReferenceScorer::doc) {
+            if u64::from(doc) >= horizon_end {
+                break;
+            }
+            let pivot_len = self
+                .active
+                .iter()
+                .take_while(|scorer| scorer.doc() == Some(doc))
+                .count();
+            // Discovery emits its documents sorted and deduplicated, which is
+            // the same ordering the ordinary candidate fill partitions over.
+            let selected = candidates.binary_search(&doc).is_ok();
+            if selected {
+                let offset = usize::try_from(u64::from(doc) - u64::from(window_start))
+                    .map_err(|_| ArgusError::CursorInvariant("union offset does not fit usize"))?;
+                let mut score = 0.0_f32;
+                for scorer in &mut self.active[..pivot_len] {
+                    score += scorer.score()?;
+                }
+                self.score_window[offset] = Some(finite_score(score, doc)?);
+            }
+            // Same phase vocabulary the ordinary candidate fill installs: a
+            // scored pivot drains, an unselected one is passed over.
+            #[cfg(feature = "pruning-conformance")]
+            self.set_conformance_query_work_context(
+                if selected {
+                    ConformanceQueryWorkPhase::Drain
+                } else {
+                    ConformanceQueryWorkPhase::Seek
+                },
+                selected.then_some(doc),
+                selected,
+            );
+
+            for scorer in &mut self.active[..pivot_len] {
+                scorer.next()?;
+            }
+            let mut index = 0;
+            while index < self.active.len() {
+                if self.active[index].doc().is_none() {
+                    self.active.swap_remove(index);
+                } else {
+                    index += 1;
+                }
+            }
+            self.active.sort_by_key(ReferenceScorer::doc);
         }
         Ok(())
     }
@@ -6762,6 +7739,109 @@ mod tests {
         Ok(delta.freeze(1))
     }
 
+    /// One exact logical block of live Delta rows.
+    ///
+    /// This shape distinguishes the final real row at ordinal 127 from a
+    /// nonexistent row at ordinal 128: both are where a block-only accounting
+    /// implementation is tempted to charge a phantom next block.
+    fn delta_exact_block_snapshot() -> Result<DeltaSnapshot, Box<dyn std::error::Error>> {
+        let mut delta = crate::delta::DeltaSegment::new(DELTA_TOMBSTONE_SCHEMA, 0, usize::MAX)?;
+        let norms = [crate::delta::DeltaFieldNorm {
+            field_ord: 0,
+            raw_length: 1,
+            fieldnorm_id: fieldnorm_to_id(1),
+        }];
+        for global_docid in 0..DELTA_LOGICAL_BLOCK_POSTINGS {
+            let document_id = format!("exact-block-{global_docid}");
+            let position = [global_docid];
+            delta.apply_document(
+                global_docid,
+                DocId::from(document_id.as_str()),
+                &norms,
+                &[crate::delta::DeltaTermPosting {
+                    field_ord: 0,
+                    term: b"alpha",
+                    frequency: 1,
+                    positions: Some(&position),
+                }],
+            )?;
+        }
+        Ok(delta.freeze(1))
+    }
+
+    #[test]
+    fn delta_missing_term_open_polls_without_charging_a_row()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = delta_tombstone_snapshot()?;
+        let checkpoint = Arc::new(CancelOnNthAdmission::new(1));
+
+        let error =
+            match DeltaPostingCursor::new_admitted(&snapshot, 0, b"missing", checkpoint.as_ref()) {
+                Ok(_) => panic!("a missing-term open must observe its cancellation poll"),
+                Err(error) => error,
+            };
+        assert!(
+            matches!(
+                error,
+                ArgusError::QueryCancelled {
+                    phase: "checkpoint_cursor_unit_test"
+                }
+            ),
+            "expected the checkpoint's typed refusal, got {error:?}"
+        );
+        assert_eq!(
+            checkpoint
+                .units_at_fire
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a missing term has no physical row to charge"
+        );
+        assert_eq!(
+            checkpoint
+                .admissions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the missing-term open must issue exactly its zero-unit poll"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn delta_exact_logical_block_has_no_phantom_admission() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let snapshot = delta_exact_block_snapshot()?;
+        let checkpoint = Arc::new(UnitSequenceCheckpoint::default());
+        let mut cursor =
+            DeltaPostingCursor::new_admitted(&snapshot, 0, b"alpha", checkpoint.as_ref())?;
+        let mut rows = if cursor.doc().is_some() { 1 } else { 0 };
+        while cursor.next_admitted(checkpoint.as_ref())?.is_some() {
+            rows += 1;
+        }
+
+        assert_eq!(rows, usize::try_from(DELTA_LOGICAL_BLOCK_POSTINGS)?);
+        let units = checkpoint
+            .units
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            units.len(),
+            usize::try_from(DELTA_LOGICAL_BLOCK_POSTINGS)? + 2,
+            "one open poll, the first real block, then one poll for every remaining row and the final empty step"
+        );
+        assert_eq!(units.get(0..2), Some([0, 1].as_slice()));
+        assert!(
+            units[2..].iter().all(|&units| units == 0),
+            "ordinal 128 is past the physical end and must not buy a second block"
+        );
+        assert_eq!(
+            units.iter().sum::<u64>(),
+            1,
+            "exactly one 128-row Delta block was opened"
+        );
+        Ok(())
+    }
+
     /// A Delta walk over a tombstone run admits every physical step, so it
     /// can be refused in the middle of the run and stops there.
     ///
@@ -6787,10 +7867,10 @@ mod tests {
                 .units
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // The metadata scan is admitted first, at one unit per physical
-            // block it walks (301 rows => 3), then construction's own step at
-            // ordinal 0 opens the first block.
-            assert_eq!(units.as_slice(), [3, 1].as_slice());
+            // Opening polls before the lookup, then construction's first
+            // real step opens ordinal 0's block. Metadata uses the frozen
+            // O(1) live count, so it neither scans nor charges three blocks.
+            assert_eq!(units.as_slice(), [0, 1].as_slice());
         }
 
         assert!(cursor.next()?.is_some(), "the run ends at a live posting");
@@ -6799,18 +7879,18 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        // One construction step, one pre-move poll, then one admission per
-        // physical step of the run.
+        // One zero-unit open poll, one construction step, one wrapper poll,
+        // then one admission per remaining physical step of the run.
         assert_eq!(
             units.len(),
             usize::try_from(DELTA_TOMBSTONE_RUN)? + 3,
-            "the metadata scan, construction's step, the pre-move poll, and \
-             one admission per physical step of the run"
+            "the open poll, construction's step, the pre-move poll, and one \
+             admission per remaining physical step of the run"
         );
         assert_eq!(
             units.iter().sum::<u64>(),
-            6,
-            "three units for the metadata scan, then ordinals 0, 128 and 256"
+            3,
+            "one unit for each real physical block at ordinals 0, 128 and 256"
         );
         Ok(())
     }
@@ -6819,10 +7899,10 @@ mod tests {
     fn delta_tombstone_walk_refused_mid_run_makes_no_further_progress()
     -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = delta_tombstone_snapshot()?;
-        // Admission 1 is the metadata scan, 2 is construction's step at
-        // ordinal 0, 3 is the wrapper's pre-move poll, and the walk's step at
-        // physical ordinal N is admission N + 3. Refuse at ordinal 128 — a
-        // block boundary in the middle of the tombstone run.
+        // Admission 1 is the zero-unit open poll, 2 is construction's step
+        // at ordinal 0, 3 is the wrapper's pre-move poll, and the walk's step
+        // at physical ordinal N is admission N + 3. Refuse at ordinal 128 —
+        // a block boundary in the middle of the tombstone run.
         let checkpoint = Arc::new(CancelOnNthAdmission::new(131));
         let handle: Arc<dyn QueryWorkCheckpoint> = checkpoint.clone();
         let inner = DeltaPostingCursor::new_admitted(&snapshot, 0, b"alpha", handle.as_ref())?;
@@ -6875,6 +7955,157 @@ mod tests {
             "a refused Delta cursor must not resume walking"
         );
         assert_eq!(PostingCursor::doc(&cursor), doc_before);
+        Ok(())
+    }
+
+    /// A refusal inside the walk must leave the raw cursor's physical state
+    /// exactly as the refused step found it.
+    ///
+    /// The wrapper's terminal refusal hides this: it stops calling the inner
+    /// cursor at all. Here the Delta cursor is driven directly, so the only
+    /// thing standing between a refusal and a corrupted walk is that the
+    /// admission precedes the physical step. The resumed walk is the proof
+    /// that nothing was consumed or skipped — it must land on the next live
+    /// posting having read every remaining row exactly once.
+    #[test]
+    fn raw_delta_cursor_refused_mid_walk_keeps_its_physical_position()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = delta_tombstone_snapshot()?;
+        // Construction spends admission 1 on the zero-unit open poll and
+        // admission 2 on the step at ordinal 0, so the walk's step at physical
+        // ordinal N is admission N + 2. Refuse at ordinal 128, a block
+        // boundary deep inside the tombstone run.
+        let checkpoint = Arc::new(CancelOnNthAdmission::new(130));
+        let mut cursor =
+            DeltaPostingCursor::new_admitted(&snapshot, 0, b"alpha", checkpoint.as_ref())?;
+        assert_eq!(cursor.current_ordinal, Some(0));
+        assert_eq!(cursor.next_ordinal, 1);
+        assert_eq!(cursor.physical_len, DELTA_TOMBSTONE_RUN + 1);
+
+        let error = cursor
+            .next_admitted(checkpoint.as_ref())
+            .expect_err("the walk must observe the refusal mid-run");
+        assert!(
+            matches!(
+                error,
+                ArgusError::QueryCancelled {
+                    phase: "checkpoint_cursor_unit_test"
+                }
+            ),
+            "expected the checkpoint's typed refusal, got {error:?}"
+        );
+
+        // The refused step never ran: its ordinal was not consumed, the last
+        // physical docid is still the row before it, and the published
+        // posting is untouched.
+        assert_eq!(
+            cursor.next_ordinal, 128,
+            "the refused step must not consume its ordinal"
+        );
+        assert_eq!(
+            cursor.last_physical_doc,
+            Some(127),
+            "the last physical row read must still be the one before the refusal"
+        );
+        assert_eq!(cursor.current_ordinal, Some(0));
+        assert_eq!(cursor.doc(), Some(0));
+        assert!(
+            cursor.remaining.is_some(),
+            "a refused walk must keep its physical iterator"
+        );
+
+        // Resuming unadmitted proves the iterator sat exactly at ordinal 128:
+        // the walk reaches the trailing live posting and ends having consumed
+        // every physical row once.
+        assert_eq!(cursor.pull_next_live(None)?, Some(DELTA_TOMBSTONE_RUN));
+        assert_eq!(cursor.next_ordinal, DELTA_TOMBSTONE_RUN + 1);
+        assert_eq!(cursor.current_ordinal, Some(DELTA_TOMBSTONE_RUN));
+        Ok(())
+    }
+
+    /// Live postings scattered between tombstones, across two block seams.
+    ///
+    /// Every ordinal carries the same churn identity except the chosen ones,
+    /// so each unique identity stays live while the churn rows are superseded
+    /// down to their last.
+    fn delta_interleaved_snapshot() -> Result<DeltaSnapshot, Box<dyn std::error::Error>> {
+        let mut delta = crate::delta::DeltaSegment::new(DELTA_TOMBSTONE_SCHEMA, 0, usize::MAX)?;
+        let norms = [crate::delta::DeltaFieldNorm {
+            field_ord: 0,
+            raw_length: 1,
+            fieldnorm_id: fieldnorm_to_id(1),
+        }];
+        for ordinal in 0..DELTA_TOMBSTONE_RUN {
+            let identity = if DELTA_INTERLEAVED_LIVE.contains(&ordinal) {
+                format!("live-{ordinal}")
+            } else {
+                "churn".to_owned()
+            };
+            let position = [ordinal];
+            delta.apply_document(
+                ordinal,
+                DocId::from(identity.as_str()),
+                &norms,
+                &[crate::delta::DeltaTermPosting {
+                    field_ord: 0,
+                    term: b"alpha",
+                    frequency: 1,
+                    positions: Some(&position),
+                }],
+            )?;
+        }
+        Ok(delta.freeze(1))
+    }
+
+    /// Ordinals kept live: one inside the first logical block, then one just
+    /// past each of the 128 and 256 boundaries.
+    ///
+    /// 258 rather than 250 on purpose — 250 still sits in the second block,
+    /// so it would not have exercised the third at all.
+    const DELTA_INTERLEAVED_LIVE: [u32; 3] = [10, 130, 258];
+
+    #[test]
+    fn delta_walk_skips_tombstones_across_block_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = delta_interleaved_snapshot()?;
+        // The final churn row survives as its identity's newest posting.
+        let last_churn = DELTA_TOMBSTONE_RUN - 1;
+
+        let mut cursor = DeltaPostingCursor::new(&snapshot, 0, b"alpha")?;
+        assert_eq!(
+            cursor.doc(),
+            Some(DELTA_INTERLEAVED_LIVE[0]),
+            "construction must skip the tombstones before the first live row"
+        );
+        let mut walked = vec![cursor.doc().ok_or("first live posting")?];
+        while let Some(doc) = cursor.next()? {
+            walked.push(doc);
+        }
+        assert_eq!(
+            walked,
+            vec![
+                DELTA_INTERLEAVED_LIVE[0],
+                DELTA_INTERLEAVED_LIVE[1],
+                DELTA_INTERLEAVED_LIVE[2],
+                last_churn,
+            ],
+            "the walk must yield exactly the live postings, in order"
+        );
+
+        // A seek crossing both seams in one call lands on the first live
+        // posting at or past the target, not on a tombstone.
+        let mut seeking = DeltaPostingCursor::new(&snapshot, 0, b"alpha")?;
+        assert_eq!(
+            seeking.advance(DELTA_INTERLEAVED_LIVE[1] - 1)?,
+            Some(DELTA_INTERLEAVED_LIVE[1])
+        );
+        assert_eq!(
+            seeking.advance(DELTA_INTERLEAVED_LIVE[2])?,
+            Some(DELTA_INTERLEAVED_LIVE[2]),
+            "a seek landing exactly on a live posting must not move past it"
+        );
+        assert_eq!(seeking.advance(last_churn)?, Some(last_churn));
+        assert_eq!(seeking.advance(u32::MAX)?, None);
         Ok(())
     }
 
@@ -7230,6 +8461,69 @@ mod tests {
             clauses.push(ScorerClause::should(ReferenceScorer::term(scorer)));
         }
         ReferenceScorer::boolean(clauses)
+    }
+
+    /// Ranked-root (`boolean_topdocs`) analogue of [`sealed_union`], with one
+    /// explicit snapshot document frequency shared by every clause.
+    ///
+    /// `boolean_topdocs` is the only constructor that sets
+    /// `tantivy_topdocs_term_union`, and it is what shipping lowers a ranked
+    /// direct-term root to, so it is the shape rank pruning actually runs in.
+    ///
+    /// The explicit document frequency is what a real multi-segment snapshot
+    /// supplies: the cursor is segment-local while `doc_freq` is global. Fixing
+    /// one value across every clause makes `idf` identical between them, so a
+    /// planted contribution ratio is exactly the boost ratio no matter how many
+    /// postings each term carries.
+    fn sealed_topdocs_union<'a>(
+        posting_lists: &'a [crate::quiver::PostingList<'_>],
+        block_max: Option<&'a [Arc<[BlockMaxEntry]>]>,
+        fieldnorms: DocLenField<'a>,
+        snapshot: &Bm25FieldSnapshot,
+        snapshot_doc_freq: u64,
+        boosts: &[f32],
+        segment_num_docs: u32,
+    ) -> Result<ReferenceScorer<'a>, ArgusError> {
+        if posting_lists.len() != boosts.len() {
+            return Err(ArgusError::CursorInvariant(
+                "ranked-root union fixture cardinalities disagree",
+            ));
+        }
+        if block_max.is_some_and(|bounds| bounds.len() != posting_lists.len()) {
+            return Err(ArgusError::CursorInvariant(
+                "ranked-root union BLOCKMAX cardinality disagrees",
+            ));
+        }
+        let mut clauses = Vec::new();
+        clauses
+            .try_reserve_exact(posting_lists.len())
+            .map_err(|_| ArgusError::Allocation {
+                resource: "ranked-root union fixture clauses",
+                count: posting_lists.len(),
+            })?;
+        for (index, postings) in posting_lists.iter().enumerate() {
+            let cursor = if let Some(bounds) = block_max {
+                SealedPostingCursor::with_block_max(
+                    postings.cursor()?,
+                    Arc::clone(&bounds[index]),
+                    postings.doc_freq(),
+                    segment_num_docs,
+                )
+            } else {
+                SealedPostingCursor::new(postings, segment_num_docs)?
+            };
+            clauses.push(ScorerClause::should(ReferenceScorer::term(
+                TermScorer::new(
+                    cursor,
+                    fieldnorms,
+                    snapshot.clone(),
+                    snapshot_doc_freq,
+                    TermRecordOption::WithFreqs,
+                    boosts[index],
+                )?,
+            )));
+        }
+        ReferenceScorer::boolean_topdocs(clauses)
     }
 
     /// Build a nested pure-term union: `group_sizes` slices the flat term
@@ -11151,6 +12445,1644 @@ mod tests {
         }
         assert_ne!(union_order.to_bits(), parse_order.to_bits());
         assert_eq!(candidate_hits[0].score.to_bits(), union_order.to_bits());
+        Ok(())
+    }
+
+    /// A pruned ranked-root window must accumulate in Tantivy's doc-major term
+    /// order rather than in scorer-vector order
+    /// (`bd-quill-pruned-topdocs-term-order-9wu3p`).
+    ///
+    /// The fixture is the shipping shape: `boolean_topdocs` over seven direct
+    /// frequency terms carrying real validated BLOCKMAX, a `TopDocs` cutoff
+    /// filled by an entirely exhaustive first window, and survivors in later,
+    /// pruned windows. The BLOCKMAX-free arm is the oracle — without ceilings
+    /// every one of its windows falls back to the exhaustive fill — so the two
+    /// arms differ only in whether pruning ran.
+    ///
+    /// Every clause shares one snapshot document frequency, so `idf` cancels
+    /// and each small clause contributes exactly `2.0 / 1.0e8` of the huge one.
+    /// That ratio sits below half an ulp of the huge contribution while six of
+    /// them together sit above it, so the huge term absorbs all six smalls when
+    /// it is summed first and cannot absorb them when it is summed last. The
+    /// postings are laid out so the pinned stable sort puts the huge clause
+    /// last at both survivors while the scorer vector holds it first.
+    ///
+    /// Doc `10_000` is the drift probe: it is reached in the refill *after* the
+    /// first pruned one, with every clause arriving simultaneously, so its
+    /// equal-document order is exactly the permutation the pruned window left
+    /// behind. Doc `15_000` is reached with one active clause, which routes its
+    /// refill back through the exhaustive fill.
+    #[test]
+    fn pruned_topdocs_windows_keep_tantivy_doc_major_term_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const NUM_DOCS: u32 = 16_384;
+        const DENSE_END: u32 = 4_096;
+        const HUGE_ENTRY: u32 = 4_096;
+        const PRUNED_SURVIVOR: u32 = 6_000;
+        const INHERITED_SURVIVOR: u32 = 10_000;
+        const EXHAUSTIVE_TAIL: u32 = 15_000;
+        const SMALL_TERMS: u32 = 6;
+        const SNAPSHOT_DOC_FREQ: u64 = 4_099;
+        const MATCHED_DOCS: u64 = 4_106;
+
+        let lengths = vec![Some(1); usize::try_from(NUM_DOCS).expect("fixture count fits usize")];
+        let encoded_doclens = EncodedDocLenSection::encode(
+            0,
+            u64::from(NUM_DOCS),
+            &[1],
+            &[DocLenFieldInput::new(1, &lengths)],
+        )?;
+        let doclens = encoded_doclens.section(&[1])?;
+        let field = doclens.field(1).expect("field exists");
+        let snapshot = snapshot(1, u64::from(NUM_DOCS), u64::from(NUM_DOCS))?;
+
+        let mut rows_by_term = vec![vec![
+            Posting::new(HUGE_ENTRY, 1),
+            Posting::new(PRUNED_SURVIVOR, 1),
+            Posting::new(INHERITED_SURVIVOR, 1),
+            Posting::new(EXHAUSTIVE_TAIL, 1),
+        ]];
+        for index in 0..SMALL_TERMS {
+            let mut rows = (0..DENSE_END)
+                .map(|doc| Posting::new(doc, 1))
+                .collect::<Vec<_>>();
+            // One private posting per small clause, all of them above the huge
+            // clause's window entry. That makes the huge clause hold the lowest
+            // previous posting beneath each survivor, so the stable sort parks
+            // it last there while the scorer vector still holds it first.
+            rows.push(Posting::new(DENSE_END + 1 + index, 1));
+            rows.push(Posting::new(PRUNED_SURVIVOR, 1));
+            rows.push(Posting::new(INHERITED_SURVIVOR, 1));
+            rows_by_term.push(rows);
+        }
+        for rows in &rows_by_term {
+            assert!(
+                rows.windows(2).all(|pair| pair[0].doc_id < pair[1].doc_id),
+                "fixture postings must be strictly ascending"
+            );
+        }
+        assert_eq!(
+            u64::try_from(rows_by_term[1].len())?,
+            SNAPSHOT_DOC_FREQ,
+            "the shared snapshot document frequency mirrors one small clause"
+        );
+        let boosts = [1.0e8_f32, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0];
+        assert_eq!(rows_by_term.len(), boosts.len());
+        assert!(
+            (2..=MAX_SCORE_MAX_CLAUSES).contains(&boosts.len()),
+            "the fixture must land inside the MaxScore clause range"
+        );
+
+        let fieldnorm_id = fieldnorm_to_id(1);
+        let encoded_terms = rows_by_term
+            .iter()
+            .map(|rows| EncodedPostingList::encode_with_block_max(rows, |_| Some(fieldnorm_id)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let posting_lists = encoded_terms
+            .iter()
+            .map(|(postings, _)| postings.posting_list())
+            .collect::<Result<Vec<_>, _>>()?;
+        let block_max = validated_block_max_entries(&encoded_terms, &posting_lists, field)?;
+
+        let small = expected_term_score(&snapshot, SNAPSHOT_DOC_FREQ, fieldnorm_id, 1, 2.0);
+        let huge = expected_term_score(&snapshot, SNAPSHOT_DOC_FREQ, fieldnorm_id, 1, 1.0e8);
+        // The union accumulator starts at 0.0, and 0.0 + x is exactly x.
+        let mut dense = 0.0_f32;
+        for _ in 0..SMALL_TERMS {
+            dense += small;
+        }
+        let doc_major = dense + huge;
+        let mut scorer_major = huge;
+        for _ in 0..SMALL_TERMS {
+            scorer_major += small;
+        }
+        assert_ne!(
+            doc_major.to_bits(),
+            scorer_major.to_bits(),
+            "the fixture must plant a non-associative f32 sum or it proves nothing"
+        );
+        assert_eq!(
+            scorer_major.to_bits(),
+            huge.to_bits(),
+            "each small contribution alone must vanish into the huge one"
+        );
+
+        for limit in [1_usize, 2, 4, 8, 64] {
+            let mut oracle = sealed_topdocs_union(
+                &posting_lists,
+                None,
+                field,
+                &snapshot,
+                SNAPSHOT_DOC_FREQ,
+                &boosts,
+                NUM_DOCS,
+            )?;
+            let mut oracle_collector = TopDocsCollector::new(limit, 0)?;
+            oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
+            let oracle_stats = oracle
+                .union_pruning_stats()
+                .expect("the ranked root is a buffered union");
+            let oracle_hits = oracle_collector.finish()?.hits;
+            assert_eq!(
+                oracle_stats,
+                UnionPruningStats::default(),
+                "the BLOCKMAX-free oracle must stay exhaustive at limit {limit}"
+            );
+
+            let (mut candidate, _work) = validated_topdocs_union(
+                &posting_lists,
+                Some(&block_max),
+                field,
+                &snapshot,
+                SNAPSHOT_DOC_FREQ,
+                &boosts,
+                NUM_DOCS,
+            )?;
+            let mut candidate_collector = TopDocsCollector::new(limit, 0)?;
+            candidate_collector.collect(&mut candidate, &AllLiveDocs)?;
+            let stats = candidate
+                .union_pruning_stats()
+                .expect("the ranked root is a buffered union");
+            let candidate_hits = candidate_collector.finish()?.hits;
+
+            assert_hits_bit_exact(&candidate_hits, &oracle_hits);
+            assert_eq!(candidate_hits.len(), limit);
+            assert!(
+                stats.max_score_windows >= 1,
+                "rank pruning must actually engage at limit {limit}"
+            );
+            assert_eq!(
+                stats.block_max_wand_windows, 0,
+                "seven direct-term clauses take MaxScore, not block-max WAND"
+            );
+            assert_eq!(stats.blocks_skipped, 0, "MaxScore never skips blocks");
+            assert!(stats.candidate_docs >= 1);
+
+            let score_of = |docid: u32| -> u32 {
+                candidate_hits
+                    .iter()
+                    .find(|hit| hit.global_docid == docid)
+                    .unwrap_or_else(|| panic!("doc {docid} is missing from the limit-{limit} page"))
+                    .score
+                    .to_bits()
+            };
+            assert_eq!(candidate_hits[0].global_docid, PRUNED_SURVIVOR);
+            assert_eq!(
+                score_of(PRUNED_SURVIVOR),
+                doc_major.to_bits(),
+                "the pruned window's survivor must keep Tantivy's doc-major order at limit {limit}"
+            );
+            if limit >= 2 {
+                assert_eq!(
+                    score_of(INHERITED_SURVIVOR),
+                    doc_major.to_bits(),
+                    "a refill after a pruned one must not inherit scorer-major drift"
+                );
+            }
+            if limit >= 4 {
+                assert_eq!(score_of(HUGE_ENTRY), huge.to_bits());
+                assert_eq!(
+                    score_of(EXHAUSTIVE_TAIL),
+                    huge.to_bits(),
+                    "the single-clause tail refill routes back through the exhaustive fill"
+                );
+            }
+            if limit >= 8 {
+                assert_eq!(
+                    score_of(0),
+                    dense.to_bits(),
+                    "the exhaustive first window is unchanged"
+                );
+                assert_eq!(
+                    candidate_hits
+                        .iter()
+                        .map(|hit| hit.global_docid)
+                        .take(8)
+                        .collect::<Vec<_>>(),
+                    vec![
+                        PRUNED_SURVIVOR,
+                        INHERITED_SURVIVOR,
+                        HUGE_ENTRY,
+                        EXHAUSTIVE_TAIL,
+                        0,
+                        1,
+                        2,
+                        3
+                    ],
+                    "ranked order must stay score-descending then docid-ascending"
+                );
+            }
+        }
+
+        let mut counted_scorer = sealed_topdocs_union(
+            &posting_lists,
+            Some(&block_max),
+            field,
+            &snapshot,
+            SNAPSHOT_DOC_FREQ,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut counted_collector = TopDocsCollector::with_exact_count(4, 0)?;
+        counted_collector.collect(&mut counted_scorer, &AllLiveDocs)?;
+        let counted_stats = counted_scorer
+            .union_pruning_stats()
+            .expect("the ranked root is a buffered union");
+        let counted_page = counted_collector.finish()?;
+        assert_eq!(
+            counted_stats,
+            UnionPruningStats::default(),
+            "exact-count collection must keep pruning disabled"
+        );
+        assert_eq!(counted_page.total_count, Some(MATCHED_DOCS));
+        assert_eq!(
+            counted_page.hits[0].score.to_bits(),
+            doc_major.to_bits(),
+            "the counted exhaustive path already used the doc-major order"
+        );
+        Ok(())
+    }
+
+    /// [`sealed_topdocs_union`] built on the *validated* arm, with each cursor
+    /// reporting the work it really performs.
+    ///
+    /// This is the only builder that exercises the seeking fill. A wrapper
+    /// cannot be used to instrument it: wrapping moves the clause onto the
+    /// opaque arm, so an outside counter would measure the walk it was meant to
+    /// disprove. The counter therefore lives on the validated cursor itself.
+    fn validated_topdocs_union<'a>(
+        posting_lists: &'a [crate::quiver::PostingList<'_>],
+        block_max: Option<&'a [Arc<[BlockMaxEntry]>]>,
+        fieldnorms: DocLenField<'a>,
+        snapshot: &Bm25FieldSnapshot,
+        snapshot_doc_freq: u64,
+        boosts: &[f32],
+        segment_num_docs: u32,
+    ) -> Result<(ReferenceScorer<'a>, Vec<std::rc::Rc<CursorWork>>), ArgusError> {
+        if posting_lists.len() != boosts.len() {
+            return Err(ArgusError::CursorInvariant(
+                "validated ranked-root fixture cardinalities disagree",
+            ));
+        }
+        let checkpoint: Arc<dyn QueryWorkCheckpoint> = Arc::new(CountingCheckpoint::default());
+        let mut clauses = Vec::new();
+        let mut work = Vec::new();
+        for (index, postings) in posting_lists.iter().enumerate() {
+            let sealed = if let Some(bounds) = block_max {
+                SealedPostingCursor::with_block_max(
+                    postings.cursor()?,
+                    Arc::clone(&bounds[index]),
+                    postings.doc_freq(),
+                    segment_num_docs,
+                )
+            } else {
+                SealedPostingCursor::new(postings, segment_num_docs)?
+            };
+            let counter = std::rc::Rc::new(CursorWork::default());
+            work.push(std::rc::Rc::clone(&counter));
+            clauses.push(ScorerClause::should(ReferenceScorer::term(
+                TermScorer::new_validated(
+                    ValidatedArrivalCursor::new_counted(sealed, Arc::clone(&checkpoint), counter),
+                    fieldnorms,
+                    snapshot.clone(),
+                    snapshot_doc_freq,
+                    TermRecordOption::WithFreqs,
+                    boosts[index],
+                )?,
+            )));
+        }
+        Ok((ReferenceScorer::boolean_topdocs(clauses)?, work))
+    }
+
+    fn total_steps(work: &[std::rc::Rc<CursorWork>]) -> u64 {
+        work.iter().map(|counter| counter.steps.get()).sum()
+    }
+
+    /// A wrapper embedding a real sealed cursor and forwarding every
+    /// [`PostingCursor`] method to it.
+    ///
+    /// It is as close to the genuine article as a wrapper can be, and that is
+    /// the point of the fixture. Two earlier designs handed the seeking fill to
+    /// something like this: one admitted on a forwardable capability token, the
+    /// other on a per-result receipt that a wrapper could mint honestly and then
+    /// replay. Both let a wrapper stand between the union and the cursor whose
+    /// history it was reading.
+    ///
+    /// There is nothing left for this type to forward or withhold. Arrival reads
+    /// are not on [`PostingCursor`] at all — they are inherent methods on
+    /// [`ValidatedArrivalCursor`], reachable only by the term scorer that owns
+    /// one — so wrapping is itself the whole of what this can do, and a wrapped
+    /// clause lands on [`TermCursor::Opaque`] and walks.
+    struct PartialArrivalCursor<'a> {
+        inner: SealedPostingCursor<'a>,
+    }
+
+    impl PostingCursor for PartialArrivalCursor<'_> {
+        fn doc(&self) -> Option<u32> {
+            self.inner.doc()
+        }
+
+        fn freq(&self) -> Option<u32> {
+            self.inner.freq()
+        }
+
+        fn positions_handle(&self) -> Option<PositionsHandle<'_>> {
+            self.inner.positions_handle()
+        }
+
+        fn size_hint(&self) -> u32 {
+            self.inner.size_hint()
+        }
+
+        fn cost(&self) -> u64 {
+            self.inner.cost()
+        }
+
+        fn segment_num_docs(&self) -> u32 {
+            self.inner.segment_num_docs()
+        }
+
+        fn next(&mut self) -> Result<Option<u32>, ArgusError> {
+            self.inner.next()
+        }
+
+        fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+            self.inner.advance(target)
+        }
+
+        fn validated_post_move_contract(&self) -> Option<ValidatedPostMoveContract> {
+            self.inner.validated_post_move_contract()
+        }
+
+        fn fork_for_pruning(&self) -> Option<Box<dyn PostingCursor + '_>> {
+            self.inner.fork_for_pruning()
+        }
+
+        fn term_score_upper_bound(
+            &self,
+            live_avgdl: f32,
+            weight: f32,
+            record_option: TermRecordOption,
+        ) -> Option<f32> {
+            self.inner
+                .term_score_upper_bound(live_avgdl, weight, record_option)
+        }
+
+        fn supports_block_max(&self) -> bool {
+            self.inner.supports_block_max()
+        }
+
+        fn current_block_score_upper_bound(
+            &self,
+            live_avgdl: f32,
+            weight: f32,
+            record_option: TermRecordOption,
+        ) -> Option<f32> {
+            self.inner
+                .current_block_score_upper_bound(live_avgdl, weight, record_option)
+        }
+
+        fn current_block_last_doc(&self) -> Option<u32> {
+            self.inner.current_block_last_doc()
+        }
+
+        fn current_work_block(&self) -> Option<u64> {
+            self.inner.current_work_block()
+        }
+
+        fn block_permit_for_next(&self) -> u64 {
+            self.inner.block_permit_for_next()
+        }
+
+        fn block_permit_for_advance(&self, target: u32) -> u64 {
+            self.inner.block_permit_for_advance(target)
+        }
+    }
+
+    /// [`sealed_topdocs_union`] whose sealed cursors are each handed to `wrap`,
+    /// so one fixture can be driven through every hostile wrapper.
+    fn wrapped_topdocs_union<'a, C, F>(
+        posting_lists: &'a [crate::quiver::PostingList<'_>],
+        block_max: &'a [Arc<[BlockMaxEntry]>],
+        fieldnorms: DocLenField<'a>,
+        snapshot: &Bm25FieldSnapshot,
+        snapshot_doc_freq: u64,
+        boosts: &[f32],
+        segment_num_docs: u32,
+        wrap: F,
+    ) -> Result<ReferenceScorer<'a>, ArgusError>
+    where
+        C: PostingCursor + 'a,
+        F: Fn(SealedPostingCursor<'a>) -> C,
+    {
+        let mut clauses = Vec::new();
+        for (index, postings) in posting_lists.iter().enumerate() {
+            let inner = SealedPostingCursor::with_block_max(
+                postings.cursor()?,
+                Arc::clone(&block_max[index]),
+                postings.doc_freq(),
+                segment_num_docs,
+            );
+            clauses.push(ScorerClause::should(ReferenceScorer::term(
+                TermScorer::new(
+                    wrap(inner),
+                    fieldnorms,
+                    snapshot.clone(),
+                    snapshot_doc_freq,
+                    TermRecordOption::WithFreqs,
+                    boosts[index],
+                )?,
+            )));
+        }
+        ReferenceScorer::boolean_topdocs(clauses)
+    }
+
+    /// A pruned doc-major window must rebuild Tantivy's equal-document order
+    /// from arrival predecessors instead of walking to it
+    /// (`bd-quill-pruned-topdocs-term-order-9wu3p`, forward correction of the
+    /// rejected `20b0a7b5`).
+    ///
+    /// This is the reviewer's hostile shape generalized. With
+    /// `X = {5, 8, 10}`, `Y = {7, 10}`, `Z = {10}`, stepping reaches 10 as
+    /// `X + Y + Z`: `X`'s stop at 8 and `Y`'s at 7 order them by decreasing
+    /// previous posting, and `Z`, which skipped nothing, parks last. Here each
+    /// small clause owns one private posting below the meeting document — the
+    /// role of 8 and 7 — while the huge clause owns none, so the pinned order
+    /// puts the huge clause last and its `1.0e8` boost cannot absorb the six
+    /// smalls that precede it. Summed in scorer-vector order, where the huge
+    /// clause is first, every small vanishes; the two orders differ in raw f32
+    /// bits, and the fixture asserts that before relying on it.
+    ///
+    /// The candidate arm and the BLOCKMAX-free oracle differ only in whether
+    /// pruning ran, so bit-exact agreement is the parity proof, and
+    /// `arrival_walk_windows` proves the pruned window reached it by seeking
+    /// rather than by falling back to the exact walk.
+    #[test]
+    fn pruned_topdocs_window_rebuilds_arrival_order_without_walking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const NUM_DOCS: u32 = 24_097;
+        const CUTOFF_DOC: u32 = 0;
+        const MEETING_DOC: u32 = 5_400;
+        const TAIL_DOC: u32 = 20_000;
+        const PRIVATE_BASE: u32 = 5_001;
+        const PRIVATE_STRIDE: u32 = 32;
+        const PRIVATE_RUN: u32 = 20;
+        const SMALL_TERMS: u32 = 6;
+        const CUTOFF_DOCS: u32 = 4;
+        const SNAPSHOT_DOC_FREQ: u64 = 8;
+        /// One step per clause at each document of the two exhaustive windows,
+        /// plus slack. Walking the pruned window instead would add all
+        /// `SMALL_TERMS * PRIVATE_RUN` private postings.
+        const STEP_BUDGET: u64 = 60;
+
+        let lengths = vec![Some(1); usize::try_from(NUM_DOCS)?];
+        let encoded_doclens = EncodedDocLenSection::encode(
+            0,
+            u64::from(NUM_DOCS),
+            &[1],
+            &[DocLenFieldInput::new(1, &lengths)],
+        )?;
+        let doclens = encoded_doclens.section(&[1])?;
+        let field = doclens.field(1).expect("field exists");
+        let snapshot = snapshot(1, u64::from(NUM_DOCS), u64::from(NUM_DOCS))?;
+
+        // The cutoff documents fill the `TopDocs` heap inside the first,
+        // always-exhaustive window, so every later window sees a finite cutoff
+        // and can prune. Clause 0 skips nothing between them and the meeting
+        // document, so its arrival predecessor there is the oldest of all.
+        let cutoff_docs = || (CUTOFF_DOC..CUTOFF_DOC + CUTOFF_DOCS).map(|doc| Posting::new(doc, 1));
+        let mut rows_by_term = vec![
+            cutoff_docs()
+                .chain([Posting::new(MEETING_DOC, 1), Posting::new(TAIL_DOC, 1)])
+                .collect::<Vec<_>>(),
+        ];
+        for index in 0..SMALL_TERMS {
+            // A private run per small clause, none of them competitive and none
+            // of them a candidate: they exist only so each clause reaches the
+            // meeting document from a different, strictly later posting.
+            let privates = (0..PRIVATE_RUN)
+                .map(|step| Posting::new(PRIVATE_BASE + index * PRIVATE_STRIDE + step, 1));
+            rows_by_term.push(
+                cutoff_docs()
+                    .chain(privates)
+                    .chain([Posting::new(MEETING_DOC, 1), Posting::new(TAIL_DOC, 1)])
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let boosts = [1.0e8_f32, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0];
+        assert_eq!(rows_by_term.len(), boosts.len());
+        for rows in &rows_by_term {
+            assert!(
+                rows.windows(2).all(|pair| pair[0].doc_id < pair[1].doc_id),
+                "fixture postings must be strictly ascending"
+            );
+            assert!(
+                rows.iter().all(|row| row.doc_id < NUM_DOCS),
+                "fixture postings must stay inside the segment"
+            );
+        }
+        assert!(
+            PRIVATE_BASE + (SMALL_TERMS - 1) * PRIVATE_STRIDE + PRIVATE_RUN < MEETING_DOC,
+            "every private run must close before the meeting document"
+        );
+
+        let fieldnorm_id = fieldnorm_to_id(1);
+        let encoded_terms = rows_by_term
+            .iter()
+            .map(|rows| EncodedPostingList::encode_with_block_max(rows, |_| Some(fieldnorm_id)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let posting_lists = encoded_terms
+            .iter()
+            .map(|(postings, _)| postings.posting_list())
+            .collect::<Result<Vec<_>, _>>()?;
+        let block_max = validated_block_max_entries(&encoded_terms, &posting_lists, field)?;
+
+        let small = expected_term_score(&snapshot, SNAPSHOT_DOC_FREQ, fieldnorm_id, 1, 2.0);
+        let huge = expected_term_score(&snapshot, SNAPSHOT_DOC_FREQ, fieldnorm_id, 1, 1.0e8);
+        let mut dense = 0.0_f32;
+        for _ in 0..SMALL_TERMS {
+            dense += small;
+        }
+        let doc_major = dense + huge;
+        let mut scorer_major = huge;
+        for _ in 0..SMALL_TERMS {
+            scorer_major += small;
+        }
+        assert_ne!(
+            doc_major.to_bits(),
+            scorer_major.to_bits(),
+            "the fixture must plant a non-associative f32 sum or it proves nothing"
+        );
+        assert_eq!(
+            scorer_major.to_bits(),
+            huge.to_bits(),
+            "each small contribution alone must vanish into the huge one"
+        );
+
+        for limit in [1_usize, 2, 4] {
+            let mut oracle = sealed_topdocs_union(
+                &posting_lists,
+                None,
+                field,
+                &snapshot,
+                SNAPSHOT_DOC_FREQ,
+                &boosts,
+                NUM_DOCS,
+            )?;
+            let mut oracle_collector = TopDocsCollector::new(limit, 0)?;
+            oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
+            let oracle_hits = oracle_collector.finish()?.hits;
+
+            let (mut candidate, work) = validated_topdocs_union(
+                &posting_lists,
+                Some(&block_max),
+                field,
+                &snapshot,
+                SNAPSHOT_DOC_FREQ,
+                &boosts,
+                NUM_DOCS,
+            )?;
+            let mut candidate_collector = TopDocsCollector::new(limit, 0)?;
+            candidate_collector.collect(&mut candidate, &AllLiveDocs)?;
+            let stats = candidate
+                .union_pruning_stats()
+                .expect("the ranked root is a buffered union");
+            let candidate_hits = candidate_collector.finish()?.hits;
+
+            assert_hits_bit_exact(&candidate_hits, &oracle_hits);
+            assert_eq!(candidate_hits[0].global_docid, MEETING_DOC);
+            assert_eq!(
+                candidate_hits[0].score.to_bits(),
+                doc_major.to_bits(),
+                "the pruned window must rebuild the doc-major order at limit {limit}"
+            );
+            assert!(
+                stats.max_score_windows >= 1,
+                "rank pruning must actually engage at limit {limit}"
+            );
+            assert!(
+                stats.arrival_walk_windows <= 1,
+                "only the terminal window, where every clause exhausts, may walk"
+            );
+            assert!(
+                total_steps(&work) <= STEP_BUDGET,
+                "the pruned window's scoring cursors must move past the private \
+                 runs by seeking, not step through them: {} steps at limit \
+                 {limit} (steps only; decodes are unmeasured)",
+                total_steps(&work)
+            );
+        }
+        Ok(())
+    }
+
+    /// A block-max WAND window whose competitive set is empty must cost the
+    /// real scoring cursors one seek per clause, not one step per posting
+    /// (`bd-quill-pruned-topdocs-term-order-9wu3p`, forward correction of the
+    /// rejected `20b0a7b5`).
+    ///
+    /// Nine direct frequency terms with real validated BLOCKMAX and enough
+    /// aggregate cost to select BMW rather than `MaxScore`. Document 0 fills
+    /// the `TopDocs` cutoff, the middle horizon is dense and entirely
+    /// skippable, and document 9,000 is the only competitive survivor. The
+    /// dense horizon is the measurement: discovery skips its blocks in shadow,
+    /// and `blocks_skipped` says so, but only the counter on the scoring
+    /// cursors can show whether the real scan skipped them too. Walking that
+    /// horizon costs thousands of steps, which is what the rejected parent did
+    /// after paying for discovery.
+    ///
+    /// The huge clause holds nothing between the cutoff and the survivor, so
+    /// its arrival predecessor there is older than the window and it sorts
+    /// last; the eight smalls each omit a different residue class, so they
+    /// separate after a bounded number of refinement rounds. Their mutual order
+    /// cannot change the sum — they contribute equally — while the huge clause
+    /// landing last is exactly what stops it absorbing them.
+    #[test]
+    fn empty_block_max_wand_window_costs_seeks_not_steps() -> Result<(), Box<dyn std::error::Error>>
+    {
+        const NUM_DOCS: u32 = 12_301;
+        const FIELD_LENGTH: u32 = 64;
+        const CUTOFF_DOC: u32 = 0;
+        /// Enough cutoff documents that the `TopDocs` heap is full before the
+        /// first window ends: with no cutoff there is nothing to prune against,
+        /// and the dense horizon would be scored exhaustively by both arms,
+        /// which would make the step budget below prove nothing.
+        const CUTOFF_DOCS: u32 = 4;
+        const DENSE_START: u32 = 4_096;
+        const DENSE_END: u32 = 12_300;
+        const TARGET_DOC: u32 = 9_000;
+        const SMALL_TERMS: u32 = 8;
+        const SNAPSHOT_DOC_FREQ: u64 = 4_096;
+        /// The exhaustive first and terminal windows step a clause at a time;
+        /// walking the skipped horizon instead would add tens of thousands.
+        ///
+        /// This bounds *steps* — `next` calls on the scoring cursors — and
+        /// nothing else. It is not a cost bound: predecessor probes below a
+        /// parked block re-decode that block per probe, and neither this fixture
+        /// nor any other in this file counts physical decodes or fuel.
+        const STEP_BUDGET: u64 = 2_000;
+        assert_eq!(BMW_MIN_CLAUSES, 9, "fixture requires nine direct terms");
+
+        let lengths = vec![Some(FIELD_LENGTH); usize::try_from(NUM_DOCS)?];
+        let encoded_doclens = EncodedDocLenSection::encode(
+            0,
+            u64::from(NUM_DOCS),
+            &[1],
+            &[DocLenFieldInput::new(1, &lengths)],
+        )?;
+        let doclens = encoded_doclens.section(&[1])?;
+        let field = doclens.field(1).expect("field exists");
+        let snapshot = snapshot(
+            1,
+            u64::from(NUM_DOCS) * u64::from(FIELD_LENGTH),
+            u64::from(NUM_DOCS),
+        )?;
+
+        let cutoff_docs = || (CUTOFF_DOC..CUTOFF_DOC + CUTOFF_DOCS).map(|doc| Posting::new(doc, 4));
+        let mut rows_by_term = vec![
+            cutoff_docs()
+                .chain([Posting::new(TARGET_DOC, 8), Posting::new(DENSE_END, 1)])
+                .collect::<Vec<_>>(),
+        ];
+        for residue in 0..SMALL_TERMS {
+            let mut rows = cutoff_docs().collect::<Vec<_>>();
+            rows.extend((DENSE_START..=DENSE_END).filter_map(|doc| {
+                if doc == TARGET_DOC {
+                    return Some(Posting::new(doc, 8));
+                }
+                (doc % SMALL_TERMS != residue).then_some(Posting::new(doc, 1))
+            }));
+            rows_by_term.push(rows);
+        }
+        let mut boosts = vec![2.0_f32; BMW_MIN_CLAUSES];
+        boosts[0] = 1.0e8;
+        assert_eq!(rows_by_term.len(), boosts.len());
+        assert_eq!(rows_by_term.len(), BMW_MIN_CLAUSES);
+        let total_cost: u64 = rows_by_term
+            .iter()
+            .map(|rows| u64::try_from(rows.len()).unwrap_or(u64::MAX))
+            .sum();
+        assert!(
+            total_cost >= 16_384,
+            "aggregate cost must select block-max WAND, not MaxScore: {total_cost}"
+        );
+
+        let fieldnorm_id = fieldnorm_to_id(FIELD_LENGTH);
+        let encoded_terms = rows_by_term
+            .iter()
+            .map(|rows| EncodedPostingList::encode_with_block_max(rows, |_| Some(fieldnorm_id)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let posting_lists = encoded_terms
+            .iter()
+            .map(|(postings, _)| postings.posting_list())
+            .collect::<Result<Vec<_>, _>>()?;
+        let block_max = validated_block_max_entries(&encoded_terms, &posting_lists, field)?;
+
+        let small = expected_term_score(&snapshot, SNAPSHOT_DOC_FREQ, fieldnorm_id, 8, 2.0);
+        let huge = expected_term_score(&snapshot, SNAPSHOT_DOC_FREQ, fieldnorm_id, 8, 1.0e8);
+        let mut dense = 0.0_f32;
+        for _ in 0..SMALL_TERMS {
+            dense += small;
+        }
+        let doc_major = dense + huge;
+        let mut scorer_major = huge;
+        for _ in 0..SMALL_TERMS {
+            scorer_major += small;
+        }
+        assert_ne!(
+            doc_major.to_bits(),
+            scorer_major.to_bits(),
+            "the fixture must plant a non-associative f32 sum or it proves nothing"
+        );
+
+        for limit in [1_usize, 4] {
+            let mut oracle = sealed_topdocs_union(
+                &posting_lists,
+                None,
+                field,
+                &snapshot,
+                SNAPSHOT_DOC_FREQ,
+                &boosts,
+                NUM_DOCS,
+            )?;
+            let mut oracle_collector = TopDocsCollector::new(limit, 0)?;
+            oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
+            let oracle_stats = oracle
+                .union_pruning_stats()
+                .expect("the ranked root is a buffered union");
+            let oracle_hits = oracle_collector.finish()?.hits;
+            assert_eq!(
+                oracle_stats,
+                UnionPruningStats::default(),
+                "the BLOCKMAX-free oracle must stay exhaustive at limit {limit}"
+            );
+
+            let (mut candidate, work) = validated_topdocs_union(
+                &posting_lists,
+                Some(&block_max),
+                field,
+                &snapshot,
+                SNAPSHOT_DOC_FREQ,
+                &boosts,
+                NUM_DOCS,
+            )?;
+            let mut candidate_collector = TopDocsCollector::new(limit, 0)?;
+            candidate_collector.collect(&mut candidate, &AllLiveDocs)?;
+            let stats = candidate
+                .union_pruning_stats()
+                .expect("the ranked root is a buffered union");
+            let candidate_hits = candidate_collector.finish()?.hits;
+
+            assert_hits_bit_exact(&candidate_hits, &oracle_hits);
+            assert_eq!(candidate_hits[0].global_docid, TARGET_DOC);
+            assert_eq!(
+                candidate_hits[0].score.to_bits(),
+                doc_major.to_bits(),
+                "the survivor must keep the doc-major order at limit {limit}"
+            );
+            assert!(
+                stats.block_max_wand_windows >= 2,
+                "block-max WAND must run in the skipped and the surviving window"
+            );
+            assert!(
+                stats.blocks_skipped > 0,
+                "discovery must actually skip blocks at limit {limit}"
+            );
+            assert!(
+                stats.arrival_walk_windows <= 1,
+                "only the terminal window, where every clause exhausts, may walk: {} walked",
+                stats.arrival_walk_windows
+            );
+            assert!(
+                total_steps(&work) <= STEP_BUDGET,
+                "scoring cursors must move by seeking over the skipped horizon: \
+                 {} steps at limit {limit} (steps only; decodes are unmeasured)",
+                total_steps(&work)
+            );
+        }
+        Ok(())
+    }
+
+    /// Deterministic pseudo-random source: a step-versus-seek oracle needs many
+    /// posting shapes, not a curated one.
+    struct ArrivalRng(u64);
+
+    impl ArrivalRng {
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            u32::try_from(self.0 >> 33).expect("a 31-bit shift fits u32")
+        }
+
+        fn below(&mut self, bound: u32) -> u32 {
+            self.next_u32() % bound
+        }
+    }
+
+    /// Randomized step-versus-seek oracle for the doc-major arrival order.
+    ///
+    /// Every seed builds one ranked direct-term union twice over identical
+    /// postings: the BLOCKMAX-free arm scores every window by stepping, the
+    /// BLOCKMAX arm prunes and, wherever no clause exhausts inside a window,
+    /// reaches its candidates by seeking and rebuilds the equal-document order
+    /// from arrival predecessors. Bit-exact agreement across both arms is the
+    /// property; a curated fixture cannot cover the shapes that matter here —
+    /// clauses sharing a predecessor, then sharing the one before that, and
+    /// separating only deeper in — but random dense postings produce them
+    /// constantly.
+    #[test]
+    fn randomized_pruned_topdocs_matches_stepped_arrival_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const NUM_DOCS: u32 = 9_000;
+        const FIELD_LENGTH: u32 = 8;
+        const CLAUSES: usize = 9;
+        const SNAPSHOT_DOC_FREQ: u64 = 3_000;
+
+        let lengths = vec![Some(FIELD_LENGTH); usize::try_from(NUM_DOCS)?];
+        let encoded_doclens = EncodedDocLenSection::encode(
+            0,
+            u64::from(NUM_DOCS),
+            &[1],
+            &[DocLenFieldInput::new(1, &lengths)],
+        )?;
+        let doclens = encoded_doclens.section(&[1])?;
+        let field = doclens.field(1).expect("field exists");
+        let snapshot = snapshot(
+            1,
+            u64::from(NUM_DOCS) * u64::from(FIELD_LENGTH),
+            u64::from(NUM_DOCS),
+        )?;
+        let fieldnorm_id = fieldnorm_to_id(FIELD_LENGTH);
+
+        let mut pruned_windows = 0_u64;
+        let mut sought_windows = 0_u64;
+        for seed in 0..6_u64 {
+            const SMALL_BOOSTS: [f32; 4] = [1.0, 2.0, 3.0, 5.0];
+            let mut rng = ArrivalRng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let mut rows_by_term = Vec::new();
+            let mut boosts = Vec::new();
+            for clause in 0..CLAUSES {
+                // Dense enough that clauses routinely share runs of consecutive
+                // documents, which is what forces the arrival refinement past
+                // its first round.
+                let keep = 40 + rng.below(50);
+                let mut rows = Vec::new();
+                for doc in 0..NUM_DOCS {
+                    if rng.below(100) < keep {
+                        rows.push(Posting::new(doc, 1 + rng.below(8)));
+                    }
+                }
+                if rows.is_empty() {
+                    rows.push(Posting::new(rng.below(NUM_DOCS), 1));
+                }
+                rows_by_term.push(rows);
+                // One dominating clause per seed keeps a real cutoff in play,
+                // which is what makes the other clauses prunable at all.
+                boosts.push(if clause == 0 {
+                    1.0e8
+                } else {
+                    SMALL_BOOSTS[usize::try_from(rng.below(4))?]
+                });
+            }
+
+            let encoded_terms = rows_by_term
+                .iter()
+                .map(|rows| EncodedPostingList::encode_with_block_max(rows, |_| Some(fieldnorm_id)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let posting_lists = encoded_terms
+                .iter()
+                .map(|(postings, _)| postings.posting_list())
+                .collect::<Result<Vec<_>, _>>()?;
+            let block_max = validated_block_max_entries(&encoded_terms, &posting_lists, field)?;
+
+            for limit in [1_usize, 5] {
+                let mut oracle = sealed_topdocs_union(
+                    &posting_lists,
+                    None,
+                    field,
+                    &snapshot,
+                    SNAPSHOT_DOC_FREQ,
+                    &boosts,
+                    NUM_DOCS,
+                )?;
+                let mut oracle_collector = TopDocsCollector::new(limit, 0)?;
+                oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
+                let oracle_hits = oracle_collector.finish()?.hits;
+
+                let (mut candidate, _work) = validated_topdocs_union(
+                    &posting_lists,
+                    Some(&block_max),
+                    field,
+                    &snapshot,
+                    SNAPSHOT_DOC_FREQ,
+                    &boosts,
+                    NUM_DOCS,
+                )?;
+                let mut candidate_collector = TopDocsCollector::new(limit, 0)?;
+                candidate_collector.collect(&mut candidate, &AllLiveDocs)?;
+                let stats = candidate
+                    .union_pruning_stats()
+                    .expect("the ranked root is a buffered union");
+                let candidate_hits = candidate_collector.finish()?.hits;
+
+                assert_eq!(
+                    candidate_hits.len(),
+                    oracle_hits.len(),
+                    "seed {seed} limit {limit} returned a different page size"
+                );
+                for (rank, (actual, expected)) in
+                    candidate_hits.iter().zip(&oracle_hits).enumerate()
+                {
+                    assert_eq!(
+                        actual.global_docid, expected.global_docid,
+                        "seed {seed} limit {limit} rank {rank} docid differs"
+                    );
+                    assert_eq!(
+                        actual.score.to_bits(),
+                        expected.score.to_bits(),
+                        "seed {seed} limit {limit} rank {rank} score bits differ for doc {}",
+                        actual.global_docid
+                    );
+                }
+                let windows = stats
+                    .max_score_windows
+                    .saturating_add(stats.block_max_wand_windows);
+                pruned_windows = pruned_windows.saturating_add(windows);
+                sought_windows = sought_windows
+                    .saturating_add(windows.saturating_sub(stats.arrival_walk_windows));
+            }
+        }
+        assert!(
+            pruned_windows > 0,
+            "the randomized corpus must actually prune, or it proves nothing"
+        );
+        assert!(
+            sought_windows > 0,
+            "the randomized corpus must actually reach a pruned window by seeking"
+        );
+        Ok(())
+    }
+
+    /// A wrapper that launders a capability it does not implement must fail
+    /// closed (`bd-quill-pruned-topdocs-term-order-9wu3p`).
+    ///
+    /// Two designs have failed this fixture, in the same way. First the gate was
+    /// a `final_doc()`-shaped one, spread across two independently defaulted
+    /// trait methods. Then it was a `validated_arrival_metadata()` token — which
+    /// a wrapper can simply *forward* from an embedded sealed cursor while
+    /// inheriting the defaulted read, so the engine saw genuine evidence and
+    /// then probed the wrapper. Both times the defaulted read answered
+    /// `Ok(None)`: a legal answer meaning "no earlier posting". Every key
+    /// settled on the first refinement round, every equal-document group
+    /// collapsed to its incoming order, and the union summed in scorer-vector
+    /// order with nothing raised. Neither of those trait methods exists now.
+    ///
+    /// Binding proof to each result was not enough either: a wrapper holding two
+    /// sealed cursors could probe one while the engine drove the other, and
+    /// every receipt it returned was genuine, correctly minted and correctly
+    /// targeted, about the wrong posting list. All three designs asked an
+    /// overridable trait for evidence about itself. There is no arrival method
+    /// on `PostingCursor` any more, so this wrapper — which forwards every
+    /// accessor it honestly can — is simply an opaque cursor, and opaque cursors
+    /// walk.
+    ///
+    /// The fixture is the arrival shape, where scorer-vector order lets the
+    /// huge clause absorb the smalls, so a silent gate failure shows up as a
+    /// wrong f32 score rather than a slow query. Every pruned window must take
+    /// the exact walk and the scores must stay bit-exact against the exhaustive
+    /// oracle.
+    #[test]
+    fn laundered_arrival_capability_cannot_enable_seeking() -> Result<(), Box<dyn std::error::Error>>
+    {
+        const NUM_DOCS: u32 = 24_097;
+        const CUTOFF_DOCS: u32 = 4;
+        const MEETING_DOC: u32 = 5_400;
+        const TAIL_DOC: u32 = 20_000;
+        const PRIVATE_BASE: u32 = 5_001;
+        const PRIVATE_STRIDE: u32 = 32;
+        const PRIVATE_RUN: u32 = 20;
+        const SMALL_TERMS: u32 = 6;
+        const SNAPSHOT_DOC_FREQ: u64 = 8;
+
+        let lengths = vec![Some(1); usize::try_from(NUM_DOCS)?];
+        let encoded_doclens = EncodedDocLenSection::encode(
+            0,
+            u64::from(NUM_DOCS),
+            &[1],
+            &[DocLenFieldInput::new(1, &lengths)],
+        )?;
+        let doclens = encoded_doclens.section(&[1])?;
+        let field = doclens.field(1).expect("field exists");
+        let snapshot = snapshot(1, u64::from(NUM_DOCS), u64::from(NUM_DOCS))?;
+
+        let cutoff_docs = || (0..CUTOFF_DOCS).map(|doc| Posting::new(doc, 1));
+        let mut rows_by_term = vec![
+            cutoff_docs()
+                .chain([Posting::new(MEETING_DOC, 1), Posting::new(TAIL_DOC, 1)])
+                .collect::<Vec<_>>(),
+        ];
+        for index in 0..SMALL_TERMS {
+            let privates = (0..PRIVATE_RUN)
+                .map(|step| Posting::new(PRIVATE_BASE + index * PRIVATE_STRIDE + step, 1));
+            rows_by_term.push(
+                cutoff_docs()
+                    .chain(privates)
+                    .chain([Posting::new(MEETING_DOC, 1), Posting::new(TAIL_DOC, 1)])
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let boosts = [1.0e8_f32, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0];
+        assert_eq!(rows_by_term.len(), boosts.len());
+
+        let fieldnorm_id = fieldnorm_to_id(1);
+        let encoded_terms = rows_by_term
+            .iter()
+            .map(|rows| EncodedPostingList::encode_with_block_max(rows, |_| Some(fieldnorm_id)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let posting_lists = encoded_terms
+            .iter()
+            .map(|(postings, _)| postings.posting_list())
+            .collect::<Result<Vec<_>, _>>()?;
+        let block_max = validated_block_max_entries(&encoded_terms, &posting_lists, field)?;
+
+        let small = expected_term_score(&snapshot, SNAPSHOT_DOC_FREQ, fieldnorm_id, 1, 2.0);
+        let huge = expected_term_score(&snapshot, SNAPSHOT_DOC_FREQ, fieldnorm_id, 1, 1.0e8);
+        let mut dense = 0.0_f32;
+        for _ in 0..SMALL_TERMS {
+            dense += small;
+        }
+        let doc_major = dense + huge;
+        assert_ne!(
+            doc_major.to_bits(),
+            huge.to_bits(),
+            "the fixture must be able to show a collapsed order or it proves nothing"
+        );
+
+        // The wrapper embeds a genuine sealed cursor and forwards everything a
+        // wrapper can honestly forward. There is nothing left for it to launder:
+        // the arrival read is not on the trait, so wrapping is itself the whole
+        // of what it can do, and that lands it on the opaque arm.
+        for limit in [1_usize, 4] {
+            let mut oracle = sealed_topdocs_union(
+                &posting_lists,
+                None,
+                field,
+                &snapshot,
+                SNAPSHOT_DOC_FREQ,
+                &boosts,
+                NUM_DOCS,
+            )?;
+            let mut oracle_collector = TopDocsCollector::new(limit, 0)?;
+            oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
+            let oracle_hits = oracle_collector.finish()?.hits;
+
+            let mut partial = wrapped_topdocs_union(
+                &posting_lists,
+                &block_max,
+                field,
+                &snapshot,
+                SNAPSHOT_DOC_FREQ,
+                &boosts,
+                NUM_DOCS,
+                |inner| PartialArrivalCursor { inner },
+            )?;
+            let mut partial_collector = TopDocsCollector::new(limit, 0)?;
+            partial_collector.collect(&mut partial, &AllLiveDocs)?;
+            let stats = partial
+                .union_pruning_stats()
+                .expect("the ranked root is a buffered union");
+            let partial_hits = partial_collector.finish()?.hits;
+
+            assert_hits_bit_exact(&partial_hits, &oracle_hits);
+            assert_eq!(
+                partial_hits[0].score.to_bits(),
+                doc_major.to_bits(),
+                "a half-capable clause must not collapse the arrival order at limit {limit}"
+            );
+            let pruned = stats
+                .max_score_windows
+                .saturating_add(stats.block_max_wand_windows);
+            assert!(
+                pruned >= 1,
+                "the fixture must still prune at limit {limit}, or the gate is untested"
+            );
+            assert_eq!(
+                stats.arrival_walk_windows, pruned,
+                "every pruned window must take the exact walk when the capability is absent"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A wrapper holding two sealed cursors, driving one and answering history
+    /// from the other.
+    ///
+    /// This is the substitution attack that survived receipt sealing and target
+    /// binding: every answer `shadow` produced was genuine, correctly minted and
+    /// correctly targeted, and described a posting list the engine never moved.
+    /// Both lists carry the meeting document, so `doc()` agrees wherever the
+    /// union looks; only the history beneath it differs, which is exactly what
+    /// decides an equal-document order.
+    struct SubstitutingArrivalCursor<'a> {
+        driven: SealedPostingCursor<'a>,
+        shadow: SealedPostingCursor<'a>,
+    }
+
+    impl SubstitutingArrivalCursor<'_> {
+        /// What this wrapper *would* answer if anything asked it for history.
+        ///
+        /// Nothing can: there is no arrival method on [`PostingCursor`]. The
+        /// method exists so the fixture can prove the two lists really disagree,
+        /// which is what makes the negative non-vacuous.
+        fn shadow_doc_before(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+            self.shadow.sealed_doc_before(target)
+        }
+    }
+
+    impl PostingCursor for SubstitutingArrivalCursor<'_> {
+        fn doc(&self) -> Option<u32> {
+            self.driven.doc()
+        }
+
+        fn freq(&self) -> Option<u32> {
+            self.driven.freq()
+        }
+
+        fn positions_handle(&self) -> Option<PositionsHandle<'_>> {
+            self.driven.positions_handle()
+        }
+
+        fn size_hint(&self) -> u32 {
+            self.driven.size_hint()
+        }
+
+        fn cost(&self) -> u64 {
+            self.driven.cost()
+        }
+
+        fn segment_num_docs(&self) -> u32 {
+            self.driven.segment_num_docs()
+        }
+
+        fn next(&mut self) -> Result<Option<u32>, ArgusError> {
+            self.driven.next()
+        }
+
+        fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+            self.driven.advance(target)
+        }
+
+        fn validated_post_move_contract(&self) -> Option<ValidatedPostMoveContract> {
+            self.driven.validated_post_move_contract()
+        }
+
+        fn fork_for_pruning(&self) -> Option<Box<dyn PostingCursor + '_>> {
+            self.driven.fork_for_pruning()
+        }
+
+        fn term_score_upper_bound(
+            &self,
+            live_avgdl: f32,
+            weight: f32,
+            record_option: TermRecordOption,
+        ) -> Option<f32> {
+            self.driven
+                .term_score_upper_bound(live_avgdl, weight, record_option)
+        }
+
+        fn supports_block_max(&self) -> bool {
+            self.driven.supports_block_max()
+        }
+
+        fn current_block_score_upper_bound(
+            &self,
+            live_avgdl: f32,
+            weight: f32,
+            record_option: TermRecordOption,
+        ) -> Option<f32> {
+            self.driven
+                .current_block_score_upper_bound(live_avgdl, weight, record_option)
+        }
+
+        fn current_block_last_doc(&self) -> Option<u32> {
+            self.driven.current_block_last_doc()
+        }
+
+        fn current_work_block(&self) -> Option<u64> {
+            self.driven.current_work_block()
+        }
+
+        fn block_permit_for_next(&self) -> u64 {
+            self.driven.block_permit_for_next()
+        }
+
+        fn block_permit_for_advance(&self, target: u32) -> u64 {
+            self.driven.block_permit_for_advance(target)
+        }
+    }
+
+    /// A wrapper cannot substitute the cursor whose history the union reads
+    /// (`bd-quill-pruned-topdocs-term-order-9wu3p`).
+    ///
+    /// Sealing the mint, then sealing the result, then binding the result to
+    /// its probed document each closed one route and left this one: a wrapper
+    /// holding two sealed cursors, driving one and probing the other. Every
+    /// receipt it returned passed every check and described the wrong list.
+    ///
+    /// The route is gone rather than guarded. There is no arrival method on
+    /// `PostingCursor`, so a wrapper has nothing to override and nothing to
+    /// forward: it is an opaque cursor, it reports no reachable last document,
+    /// and every pruned window takes the exact walk. The union reads a history
+    /// only from a value it also advances and scores.
+    #[test]
+    fn two_sealed_cursor_wrapper_cannot_substitute_arrival_history()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const NUM_DOCS: u32 = 24_097;
+        const CUTOFF_DOCS: u32 = 4;
+        const MEETING_DOC: u32 = 5_400;
+        const TAIL_DOC: u32 = 20_000;
+        const DRIVEN_BASE: u32 = 5_001;
+        const SHADOW_BASE: u32 = 5_200;
+        const PRIVATE_RUN: u32 = 20;
+        const SMALL_TERMS: u32 = 6;
+        const SNAPSHOT_DOC_FREQ: u64 = 8;
+
+        let lengths = vec![Some(1); usize::try_from(NUM_DOCS)?];
+        let encoded_doclens = EncodedDocLenSection::encode(
+            0,
+            u64::from(NUM_DOCS),
+            &[1],
+            &[DocLenFieldInput::new(1, &lengths)],
+        )?;
+        let doclens = encoded_doclens.section(&[1])?;
+        let field = doclens.field(1).expect("field exists");
+        let snapshot = snapshot(1, u64::from(NUM_DOCS), u64::from(NUM_DOCS))?;
+
+        // The two lists agree on every document the union visits and disagree
+        // only in the private run beneath the meeting document — the history an
+        // arrival order is built from. The shadow run is placed above the driven
+        // one so a substituted answer would reorder the clauses, not merely
+        // perturb them.
+        let cutoff_docs = || (0..CUTOFF_DOCS).map(|doc| Posting::new(doc, 1));
+        let head = || [Posting::new(MEETING_DOC, 1), Posting::new(TAIL_DOC, 1)];
+        let mut driven_rows = vec![cutoff_docs().chain(head()).collect::<Vec<_>>()];
+        let mut shadow_rows = driven_rows.clone();
+        for index in 0..SMALL_TERMS {
+            driven_rows.push(
+                cutoff_docs()
+                    .chain(
+                        (0..PRIVATE_RUN)
+                            .map(|step| Posting::new(DRIVEN_BASE + index * PRIVATE_RUN + step, 1)),
+                    )
+                    .chain(head())
+                    .collect::<Vec<_>>(),
+            );
+            shadow_rows.push(
+                cutoff_docs()
+                    .chain((0..PRIVATE_RUN).map(|step| {
+                        Posting::new(
+                            SHADOW_BASE + (SMALL_TERMS - 1 - index) * PRIVATE_RUN + step,
+                            1,
+                        )
+                    }))
+                    .chain(head())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let boosts = [1.0e8_f32, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0];
+
+        let fieldnorm_id = fieldnorm_to_id(1);
+        let driven_terms = driven_rows
+            .iter()
+            .map(|rows| EncodedPostingList::encode_with_block_max(rows, |_| Some(fieldnorm_id)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let shadow_terms = shadow_rows
+            .iter()
+            .map(|rows| EncodedPostingList::encode_with_block_max(rows, |_| Some(fieldnorm_id)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let driven_lists = driven_terms
+            .iter()
+            .map(|(postings, _)| postings.posting_list())
+            .collect::<Result<Vec<_>, _>>()?;
+        let shadow_lists = shadow_terms
+            .iter()
+            .map(|(postings, _)| postings.posting_list())
+            .collect::<Result<Vec<_>, _>>()?;
+        let driven_block_max = validated_block_max_entries(&driven_terms, &driven_lists, field)?;
+
+        // Non-vacuity: the substitution must actually change the answer, or a
+        // green test would prove nothing about substitution.
+        let mut probe = SubstitutingArrivalCursor {
+            driven: SealedPostingCursor::new(&driven_lists[1], NUM_DOCS)?,
+            shadow: SealedPostingCursor::new(&shadow_lists[1], NUM_DOCS)?,
+        };
+        probe.advance(MEETING_DOC)?;
+        assert_eq!(
+            probe.doc(),
+            Some(MEETING_DOC),
+            "both lists must carry the meeting document, or the wrapper is detectable by position"
+        );
+        let honest = probe.driven.sealed_doc_before(MEETING_DOC)?;
+        let substituted = probe.shadow_doc_before(MEETING_DOC)?;
+        assert_ne!(
+            honest, substituted,
+            "the shadow list must answer differently, or this negative is vacuous"
+        );
+
+        let mut oracle = sealed_topdocs_union(
+            &driven_lists,
+            None,
+            field,
+            &snapshot,
+            SNAPSHOT_DOC_FREQ,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut oracle_collector = TopDocsCollector::new(4, 0)?;
+        oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
+        let oracle_hits = oracle_collector.finish()?.hits;
+
+        let mut substituting = wrapped_topdocs_union(
+            &driven_lists,
+            &driven_block_max,
+            field,
+            &snapshot,
+            SNAPSHOT_DOC_FREQ,
+            &boosts,
+            NUM_DOCS,
+            |driven| SubstitutingArrivalCursor {
+                driven,
+                shadow: SealedPostingCursor::new(&shadow_lists[0], NUM_DOCS)
+                    .expect("shadow fixture opens"),
+            },
+        )?;
+        let mut collector = TopDocsCollector::new(4, 0)?;
+        collector.collect(&mut substituting, &AllLiveDocs)?;
+        let stats = substituting
+            .union_pruning_stats()
+            .expect("the ranked root is a buffered union");
+        let hits = collector.finish()?.hits;
+
+        assert_hits_bit_exact(&hits, &oracle_hits);
+        let pruned = stats
+            .max_score_windows
+            .saturating_add(stats.block_max_wand_windows);
+        assert!(
+            pruned >= 1,
+            "the fixture must still prune, or the route is untested"
+        );
+        assert_eq!(
+            stats.arrival_walk_windows, pruned,
+            "a wrapper must never reach the seeking fill, whatever it embeds"
+        );
+        Ok(())
+    }
+
+    /// Admits freely until armed, then refuses every admission the way an
+    /// exhausted real checkpoint does, counting every call it saw.
+    #[derive(Default)]
+    struct ArmedRefusalCheckpoint {
+        armed: std::sync::atomic::AtomicBool,
+        admissions: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ArmedRefusalCheckpoint {
+        fn arm(&self) {
+            self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn admissions(&self) -> usize {
+            self.admissions.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl QueryWorkCheckpoint for ArmedRefusalCheckpoint {
+        fn admit(&self, _kind: QueryWorkKind, _units: u64) -> Result<(), ArgusError> {
+            self.admissions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ArgusError::QueryFuelExhausted {
+                    budget: 11,
+                    consumed: 13,
+                    segments_touched: 17,
+                    dictionary_blocks: 19,
+                    posting_blocks: 23,
+                    position_docs: 29,
+                });
+            }
+            Ok(())
+        }
+    }
+
+    /// A deep backward descent is charged for the block it decodes and for
+    /// nothing else (`bd-quill-pruned-topdocs-term-order-9wu3p`).
+    ///
+    /// The retained block is only worth having if the *charge* follows the
+    /// decode: a permit predicate that still reported "decodes" for every probe
+    /// would bill a query for work the cache elided, and one that reported
+    /// "free" for the first probe would let a decode run unadmitted. Both are
+    /// impossible by construction now — the read and its permit are written
+    /// against the same `ArrivalPlan` — and this pins the observable behaviour
+    /// of that: a parked-block control that costs nothing at all, then many
+    /// probes descending through one block for one physical decode and one
+    /// admitted posting block.
+    ///
+    /// This is a cost unit and proves nothing about ordering. The semantic
+    /// control lives in the full `TopDocs` fixtures, which compare a pruned arm
+    /// bit-for-bit against an exhaustive oracle:
+    /// `pruned_topdocs_window_rebuilds_arrival_order_without_walking`,
+    /// `empty_block_max_wand_window_costs_seeks_not_steps` and
+    /// `randomized_pruned_topdocs_matches_stepped_arrival_order`.
+    #[test]
+    fn deep_backward_descent_is_charged_once() -> Result<(), Box<dyn std::error::Error>> {
+        let postings = (0..=300)
+            .map(|docid| Posting::new(docid, 1))
+            .collect::<Vec<_>>();
+        let encoded = EncodedPostingList::encode(&postings)?;
+        let list = encoded.posting_list()?;
+        let checkpoint = Arc::new(CountingCheckpoint::default());
+        let checkpoint_for_cursor: Arc<dyn QueryWorkCheckpoint> = checkpoint.clone();
+        let segment_num_docs = u32::try_from(postings.len())?;
+        let sealed = SealedPostingCursor::new(&list, segment_num_docs)?;
+        let mut cursor = ValidatedArrivalCursor::new(sealed, checkpoint_for_cursor);
+
+        cursor.advance(300)?;
+        let decoded_after_seek = cursor.decoded_blocks();
+        let admitted_after_seek = checkpoint
+            .admitted_units
+            .load(std::sync::atomic::Ordering::SeqCst);
+
+        // Negative control: probes answered inside the parked block cost
+        // nothing at all. Without this the descent's "one decode, one unit"
+        // would be equally satisfied by a cursor that charged for every probe
+        // and happened to decode once.
+        for probe in [299_u32, 298, 280, 257] {
+            assert_eq!(
+                cursor.arrival_doc_before(probe)?,
+                Some(probe - 1),
+                "parked probe={probe}"
+            );
+        }
+        assert_eq!(
+            cursor.decoded_blocks(),
+            decoded_after_seek,
+            "a probe inside the parked block must not decode"
+        );
+        assert_eq!(
+            checkpoint
+                .admitted_units
+                .load(std::sync::atomic::Ordering::SeqCst),
+            admitted_after_seek,
+            "a probe inside the parked block must not be charged"
+        );
+
+        // Descend out of the parked block, one posting at a time.
+        let mut probes = 0_usize;
+        let mut probe = 256_u32;
+        while probe > 128 {
+            let answer = cursor
+                .arrival_doc_before(probe)?
+                .expect("a dense fixture always has an earlier posting");
+            assert_eq!(answer, probe - 1, "probe={probe}");
+            probes += 1;
+            probe = answer;
+        }
+
+        assert!(
+            probes >= 32,
+            "the descent must probe deeply enough to expose re-decoding: {probes} probes"
+        );
+        assert_eq!(
+            cursor.decoded_blocks() - decoded_after_seek,
+            1,
+            "a descent through one retained block must decode it exactly once"
+        );
+        assert_eq!(
+            checkpoint
+                .admitted_units
+                .load(std::sync::atomic::Ordering::SeqCst)
+                - admitted_after_seek,
+            1,
+            "exactly the decoded block may be charged"
+        );
+        Ok(())
+    }
+
+    /// A refused arrival probe is terminal for the cursor that saw it
+    /// (`bd-quill-pruned-topdocs-term-order-9wu3p`).
+    ///
+    /// The probe once admitted through the checkpoint directly from `&self`, on
+    /// the reasoning that a probe never moves and so leaves the cursor nowhere a
+    /// refusal has to freeze. That defends the wrong invariant. The doctrine is
+    /// about admission: a refused cursor "decodes nothing, mutates nothing, and
+    /// admits nothing again". Without a latch the next move polled and charged a
+    /// query already told to stop.
+    ///
+    /// The admission count is what proves the latch. A second refusal with
+    /// identical fields could be a fresh refusal from a deterministic
+    /// checkpoint; a second refusal with *no additional admission* can only be
+    /// the retained one.
+    #[test]
+    fn refused_arrival_probe_is_terminal_without_readmitting()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PARKED_DOC: u32 = 200;
+        const PROBE_TARGET: u32 = 50;
+
+        let postings = (0..257)
+            .map(|docid| Posting::new(docid, 1))
+            .collect::<Vec<_>>();
+        let encoded = EncodedPostingList::encode(&postings)?;
+        let list = encoded.posting_list()?;
+        assert!(
+            list.block_count() > 1,
+            "fixture must cross a posting-block boundary"
+        );
+        let checkpoint = Arc::new(ArmedRefusalCheckpoint::default());
+        let checkpoint_for_cursor: Arc<dyn QueryWorkCheckpoint> = checkpoint.clone();
+        let segment_num_docs = u32::try_from(postings.len())?;
+        let sealed = SealedPostingCursor::new(&list, segment_num_docs)?;
+        // The probe has to be one that actually decodes, or the refusal it is
+        // supposed to trigger never happens and the test proves nothing. This
+        // is read from the sealed cursor before it is moved into the validated
+        // cursor that will own it.
+        let mut cursor = ValidatedArrivalCursor::new(sealed, checkpoint_for_cursor);
+
+        cursor.advance(PARKED_DOC)?;
+        assert_eq!(cursor.doc(), Some(PARKED_DOC));
+
+        let before_refusal = checkpoint.admissions();
+        checkpoint.arm();
+
+        /// The planted refusal's fields, or `None` for any other error, so a
+        /// wrong variant fails as a mismatch rather than as a panic.
+        const PLANTED_REFUSAL: (u64, u64, u64, u64, u64, u64) = (11, 13, 17, 19, 23, 29);
+        let refusal_fields = |error: &ArgusError| match error {
+            ArgusError::QueryFuelExhausted {
+                budget,
+                consumed,
+                segments_touched,
+                dictionary_blocks,
+                posting_blocks,
+                position_docs,
+            } => Some((
+                *budget,
+                *consumed,
+                *segments_touched,
+                *dictionary_blocks,
+                *posting_blocks,
+                *position_docs,
+            )),
+            _ => None,
+        };
+
+        let first = cursor
+            .arrival_doc_before(PROBE_TARGET)
+            .expect_err("an armed checkpoint refuses the decoding probe");
+        assert_eq!(
+            refusal_fields(&first),
+            Some(PLANTED_REFUSAL),
+            "the refused probe must carry the planted refusal verbatim"
+        );
+        assert_eq!(
+            checkpoint.admissions(),
+            before_refusal + 1,
+            "the probe admits exactly once before it decodes"
+        );
+
+        let repeated = cursor
+            .arrival_doc_before(PROBE_TARGET)
+            .expect_err("a refused cursor stays refused");
+        assert_eq!(
+            refusal_fields(&repeated),
+            Some(PLANTED_REFUSAL),
+            "the repeated probe must replay the retained refusal, not a fresh one"
+        );
+        assert_eq!(
+            checkpoint.admissions(),
+            before_refusal + 1,
+            "a refused cursor must not admit again for a second probe"
+        );
+
+        let moved = cursor
+            .next()
+            .expect_err("a move after a refused probe repeats the refusal");
+        assert_eq!(
+            refusal_fields(&moved),
+            Some(PLANTED_REFUSAL),
+            "the move after a refused probe must replay the retained refusal"
+        );
+        assert_eq!(
+            checkpoint.admissions(),
+            before_refusal + 1,
+            "a refused cursor must not admit again for a move"
+        );
+        assert_eq!(
+            cursor.doc(),
+            Some(PARKED_DOC),
+            "a refused cursor stays exactly where the refusal found it"
+        );
         Ok(())
     }
 

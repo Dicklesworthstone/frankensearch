@@ -224,6 +224,27 @@ impl Storage {
         Self::open(StorageConfig::in_memory())
     }
 
+    /// Open a real in-memory connection without running schema bootstrap.
+    ///
+    /// Tests which exercise the fail-closed bootstrap gate itself need to
+    /// install only the exact schema surface under test. Keeping this seam
+    /// test-only prevents production callers from bypassing bootstrap.
+    #[cfg(all(test, feature = "fts5"))]
+    pub(crate) async fn open_unbootstrapped_in_memory_for_test(cx: &Cx) -> SearchResult<Self> {
+        let config = StorageConfig::in_memory();
+        let path = config.db_path.to_string_lossy().to_string();
+        let conn = open_connection_with_retry(cx, &path)
+            .await
+            .map_err(|error| map_storage_error_at("test connection open", error))?;
+        let storage = Self {
+            conn,
+            config,
+            metrics: StorageMetrics::default(),
+        };
+        storage.apply_pragmas(cx).await?;
+        Ok(storage)
+    }
+
     #[must_use]
     pub fn connection(&self) -> &AsyncConnection {
         &self.conn

@@ -14,7 +14,6 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
@@ -27,7 +26,7 @@ use frankensearch_core::generation::{
     CanonicalDocsetV1, ExactComponentReceiptV1, GenerationComponentReceiptV1,
     GenerationComponentRole, SourceCheckpointV1,
 };
-use frankensearch_core::{DocId, SearchError};
+use frankensearch_core::{DocId, SearchError, SearchResult};
 #[cfg(feature = "durability")]
 use frankensearch_durability::{FileProtector, FileRecoveryOutcome, FileSourceWitness};
 use frankensearch_index::mapped_file::ReadOnlyMappedFile;
@@ -546,6 +545,17 @@ pub enum KeeperError {
     GenerationExhausted {
         /// Last representable generation.
         current: u64,
+    },
+    /// The retained writer view may lag a durable publication whose future was abandoned.
+    #[error(
+        "Keeper snapshot requires reconciliation: retained generation {retained_generation}, \
+         abandoned proposed generation {proposed_generation}"
+    )]
+    PublicationReconciliationRequired {
+        /// Generation in the retained, non-authoritative view.
+        retained_generation: u64,
+        /// Generation that the abandoned future may have made durable.
+        proposed_generation: u64,
     },
     /// A proposed generation would roll back durable index identity or state.
     #[error("invalid manifest transition: {detail}")]
@@ -1947,12 +1957,10 @@ impl RecoveredSegmentBacking {
         }
     }
 
-    /// Trailer-verified xxh3-64 over the file prefix, recorded at parse time.
+    /// Trailer-declared xxh3-64 over the file prefix.
     ///
-    /// This is the content-identity witness for the whole immutable backing:
-    /// it was checked against the actual bytes when the reader was
-    /// constructed, and [`validate_segment_witnesses`] re-checks it against
-    /// every manifest generation that binds this backing.
+    /// Callers must authenticate this value against the backing bytes before
+    /// using it as a content-identity witness for a manifest binding.
     fn file_xxh3(&self) -> u64 {
         match self {
             Self::Mapped(reader) => reader.file_xxh3(),
@@ -1977,8 +1985,18 @@ impl RecoveredSegmentBacking {
         manifest: &ManifestSegment,
     ) -> Result<(), KeeperError> {
         match self {
-            Self::Mapped(reader) => validate_segment_witnesses(path, manifest, reader),
-            Self::Owned(reader) => validate_segment_witnesses(path, manifest, reader),
+            Self::Mapped(reader) => validate_segment_witnesses(
+                path,
+                manifest,
+                reader,
+                verified_file_witness(path, reader)?,
+            ),
+            Self::Owned(reader) => validate_segment_witnesses(
+                path,
+                manifest,
+                reader,
+                verified_file_witness(path, reader)?,
+            ),
         }
     }
 }
@@ -2313,7 +2331,8 @@ impl RecoveredSegment {
                 source,
             }
         })?;
-        validate_segment_witnesses(&path, &manifest, &reader)?;
+        let file_xxh3 = verified_file_witness(&path, &reader)?;
+        validate_segment_witnesses(&path, &manifest, &reader, file_xxh3)?;
         Self::bind_backing(
             path,
             manifest,
@@ -2459,10 +2478,10 @@ impl RecoveredSegment {
                 metadata
             }
         };
-        // The reader's trailer hash was verified against the actual bytes at
-        // parse time; on reuse it was just proven equal to the predecessor's
-        // recorded witness, so recording it preserves the anchor to the
-        // originally validated content across rebind chains.
+        // Manifest admission just recomputed this trailer witness from the
+        // actual backing bytes. On reuse it was also proven equal to the
+        // predecessor's recorded witness, so recording it preserves the
+        // anchor to the originally validated content across rebind chains.
         let term_dictionary_file_xxh3 = reader.file_xxh3();
         Ok(Self {
             path,
@@ -3029,7 +3048,8 @@ impl KeeperSnapshot {
                     source,
                 }
             })?;
-            validate_segment_witnesses(&path, manifest_segment, &reader)?;
+            let file_xxh3 = verified_file_witness(&path, &reader)?;
+            validate_segment_witnesses(&path, manifest_segment, &reader, file_xxh3)?;
             segments.push(RecoveredSegment::bind(
                 path,
                 manifest_segment.clone(),
@@ -3109,6 +3129,28 @@ impl KeeperSnapshot {
             schema,
             LoadedManifest {
                 manifest: Manifest::empty(1, schema_id, 0),
+                source: ManifestSource::InMemory,
+            },
+            Vec::new(),
+        )
+    }
+
+    /// Construct an owned-buffer snapshot at one exact generation for a
+    /// facade-boundary test. Shipping callers always start at genesis and use
+    /// [`Self::next_manifest`] for successors.
+    #[cfg(test)]
+    pub(crate) fn in_memory_with_generation_for_test(
+        schema: SchemaDescriptor,
+        generation: u64,
+    ) -> Result<Self, KeeperError> {
+        let schema_id = schema
+            .schema_id()
+            .map_err(|source| KeeperError::InvalidSchema { source })?;
+        Self::from_parts(
+            None,
+            schema,
+            LoadedManifest {
+                manifest: Manifest::empty(generation, schema_id, 0),
                 source: ManifestSource::InMemory,
             },
             Vec::new(),
@@ -3683,11 +3725,342 @@ enum WriterProtection {
     },
 }
 
+/// Retained evidence that one MANIFEST publication may have become durable
+/// without its owning future surviving to install the successor snapshot.
+///
+/// A durable publication finishes inside a blocking closure that outlives a
+/// dropped future, so `rename`+`fsync` can install generation N+1 while the
+/// caller's future never resumes to assign the refreshed snapshot. The marker
+/// is written synchronously in the same poll that reaches the publication, so
+/// a drop, panic, or cancellation anywhere below it cannot erase the fact that
+/// disk may now be ahead of the retained view.
+#[derive(Debug, Clone, Copy)]
+struct PendingPublication {
+    /// Generation the retained snapshot held when the attempt began.
+    from_generation: u64,
+    /// Generation the attempt proposed to install.
+    proposed_generation: u64,
+}
+
+/// The publication phase carried alongside the last fully published
+/// generation in [`PublicationReadState`].
+///
+/// The phase is deliberately part of the same atomic word as the generation:
+/// an authority reader must never combine a fresh phase with a stale
+/// generation (or vice versa).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum PublicationAuthorityPhase {
+    /// The local published `Arc` and durable MANIFEST name this generation.
+    Stable = 0,
+    /// A blocking publisher is preparing a successor; no slot has moved yet.
+    Preparing = 1,
+    /// The durable MANIFEST may be ahead of the local published `Arc`.
+    DurableAhead = 2,
+    /// A blocking publication unwound around a slot transition; reopen first.
+    Indeterminate = 3,
+}
+
+impl PublicationAuthorityPhase {
+    const fn from_bits(bits: u64) -> Self {
+        match bits {
+            0 => Self::Stable,
+            1 => Self::Preparing,
+            2 => Self::DurableAhead,
+            3 => Self::Indeterminate,
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// One atomically-readable authority generation and phase.
+///
+/// `generation` is the generation of the currently published process-local
+/// snapshot. In `DurableAhead` the next generation is externally visible; in
+/// `Indeterminate` its extent must be established by reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PublicationAuthorityState {
+    packed: u64,
+}
+
+impl PublicationAuthorityState {
+    /// Generation currently represented by this word.
+    #[must_use]
+    pub(crate) const fn generation(self) -> u64 {
+        self.packed >> 2
+    }
+
+    /// Publication phase carried with [`Self::generation`].
+    #[must_use]
+    pub(crate) const fn phase(self) -> PublicationAuthorityPhase {
+        PublicationAuthorityPhase::from_bits(self.packed & 0b11)
+    }
+
+    /// Whether a process-local snapshot at this generation remains readable.
+    #[must_use]
+    pub(crate) const fn is_readable(self) -> bool {
+        matches!(
+            self.phase(),
+            PublicationAuthorityPhase::Stable | PublicationAuthorityPhase::Preparing
+        )
+    }
+}
+
+/// Shared publication authority for one `KeeperWriter` and its lock-free
+/// `QuillReader` facade.
+///
+/// This owns exactly one atomic word: `(generation << 2) | phase`. The word is
+/// installed by the blocking MANIFEST publisher before observer callbacks can
+/// expose a rename, and readers load it with `Acquire` around one pinned
+/// process-local snapshot `Arc`.
+#[derive(Debug, Clone)]
+pub(crate) struct PublicationReadState {
+    authority: Arc<AtomicU64>,
+}
+
+impl PublicationReadState {
+    const PHASE_BITS: u32 = 2;
+    pub(crate) const MAX_GENERATION: u64 = u64::MAX >> Self::PHASE_BITS;
+
+    /// Construct the stable initial authority word for an opened snapshot.
+    pub(crate) fn new(generation: u64) -> Result<Self, KeeperError> {
+        Ok(Self {
+            authority: Arc::new(AtomicU64::new(Self::pack(
+                generation,
+                PublicationAuthorityPhase::Stable,
+            )?)),
+        })
+    }
+
+    fn pack(generation: u64, phase: PublicationAuthorityPhase) -> Result<u64, KeeperError> {
+        if generation > Self::MAX_GENERATION {
+            return Err(KeeperError::InvalidTransition {
+                detail: format!(
+                    "generation {generation} cannot be represented in the packed publication authority word"
+                ),
+            });
+        }
+        Ok((generation << Self::PHASE_BITS) | u64::from(phase as u8))
+    }
+
+    /// Reject a MANIFEST generation that cannot fit in the reader-visible
+    /// packed authority word before a process-local or owned-buffer mutation.
+    pub(crate) fn validate_generation(generation: u64) -> Result<(), KeeperError> {
+        let _ = Self::pack(generation, PublicationAuthorityPhase::Stable)?;
+        Ok(())
+    }
+
+    /// Load one indivisible generation/phase observation for a lock-free read.
+    #[must_use]
+    pub(crate) fn load(&self) -> PublicationAuthorityState {
+        PublicationAuthorityState {
+            packed: self.authority.load(AtomicOrdering::Acquire),
+        }
+    }
+
+    /// Mark the exact process-local successor readable only after its `Arc` is
+    /// installed. This is also the only normal path out of `DurableAhead`.
+    pub(crate) fn stabilize(&self, generation: u64) -> Result<(), KeeperError> {
+        let stable = Self::pack(generation, PublicationAuthorityPhase::Stable)?;
+        loop {
+            let observed = self.load();
+            if generation < observed.generation() {
+                return Ok(());
+            }
+            if generation == observed.generation() {
+                if observed.phase() == PublicationAuthorityPhase::Stable {
+                    return Ok(());
+                }
+                return Err(KeeperError::InvalidTransition {
+                    detail: format!(
+                        "generic stabilization cannot clear same-generation {:?} publication authority at generation {generation}",
+                        observed.phase()
+                    ),
+                });
+            }
+            if observed.phase() == PublicationAuthorityPhase::Preparing {
+                return Err(KeeperError::InvalidTransition {
+                    detail: format!(
+                        "cannot stabilize generation {generation} while generation {} has an active publication",
+                        observed.generation()
+                    ),
+                });
+            }
+            if self
+                .authority
+                .compare_exchange(
+                    observed.packed,
+                    stable,
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Acquire,
+                )
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Clear same-generation indeterminacy only after Keeper reopened the
+    /// durable MANIFEST and proved that the retained process-local generation
+    /// is still authoritative.
+    pub(crate) fn stabilize_reconciled_same_generation(
+        &self,
+        generation: u64,
+    ) -> Result<(), KeeperError> {
+        let stable = Self::pack(generation, PublicationAuthorityPhase::Stable)?;
+        let indeterminate = Self::pack(generation, PublicationAuthorityPhase::Indeterminate)?;
+        match self.authority.compare_exchange(
+            indeterminate,
+            stable,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(observed) if observed == stable => Ok(()),
+            Err(observed) => {
+                let observed = PublicationAuthorityState { packed: observed };
+                Err(KeeperError::InvalidTransition {
+                    detail: format!(
+                        "same-generation reconciliation for {generation} cannot clear {:?} authority at generation {}",
+                        observed.phase(),
+                        observed.generation()
+                    ),
+                })
+            }
+        }
+    }
+}
+
+/// Blocking-closure ownership of one MANIFEST publication transition.
+///
+/// Its `Drop` implementation is intentionally the only unwind classifier: a
+/// still-preparing closure becomes indeterminate. Once a slot has moved the
+/// word has already left `Preparing`, so the compare-exchange cannot downgrade
+/// a post-rename state back to a readable one.
+struct PublicationAuthorityTransition {
+    state: PublicationReadState,
+    stable: u64,
+    preparing: u64,
+    indeterminate: u64,
+    durable_ahead: u64,
+}
+
+impl PublicationAuthorityTransition {
+    fn begin(state: PublicationReadState, proposed_generation: u64) -> Result<Self, KeeperError> {
+        let before = state.load();
+        if before.phase() != PublicationAuthorityPhase::Stable {
+            return Err(KeeperError::InvalidTransition {
+                detail: format!(
+                    "cannot begin MANIFEST publication from {:?} generation {}",
+                    before.phase(),
+                    before.generation()
+                ),
+            });
+        }
+        let expected_proposed =
+            before
+                .generation()
+                .checked_add(1)
+                .ok_or_else(|| KeeperError::GenerationExhausted {
+                    current: before.generation(),
+                })?;
+        if proposed_generation != expected_proposed {
+            return Err(KeeperError::InvalidTransition {
+                detail: format!(
+                    "packed publication authority at generation {} cannot publish generation {proposed_generation}",
+                    before.generation()
+                ),
+            });
+        }
+        let _ = PublicationReadState::pack(proposed_generation, PublicationAuthorityPhase::Stable)?;
+        let stable =
+            PublicationReadState::pack(before.generation(), PublicationAuthorityPhase::Stable)?;
+        let preparing =
+            PublicationReadState::pack(before.generation(), PublicationAuthorityPhase::Preparing)?;
+        let indeterminate = PublicationReadState::pack(
+            before.generation(),
+            PublicationAuthorityPhase::Indeterminate,
+        )?;
+        let durable_ahead = PublicationReadState::pack(
+            before.generation(),
+            PublicationAuthorityPhase::DurableAhead,
+        )?;
+        state
+            .authority
+            .compare_exchange(
+                stable,
+                preparing,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .map_err(|observed| KeeperError::InvalidTransition {
+                detail: format!(
+                    "publication authority changed while beginning generation {proposed_generation}: observed packed word {observed:#018x}"
+                ),
+            })?;
+        Ok(Self {
+            state,
+            stable,
+            preparing,
+            indeterminate,
+            durable_ahead,
+        })
+    }
+
+    /// A known failure before either MANIFEST slot has moved is retry-safe.
+    fn restore_known_pre_rename_failure(&self) {
+        let _ = self.state.authority.compare_exchange(
+            self.preparing,
+            self.stable,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        );
+    }
+
+    /// A successful claim is the conservative boundary after which the
+    /// blocking closure may reach either slot rename. Readers fail closed
+    /// before the first slot move until reconciliation settles the attempt.
+    fn mark_indeterminate(&self) {
+        let _ = self.state.authority.compare_exchange(
+            self.preparing,
+            self.indeterminate,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        );
+    }
+
+    /// `MANIFEST` now names the successor. Store before any checkpoint
+    /// observer runs so a parked callback is already inside the fail-closed
+    /// window.
+    fn mark_durable_ahead(&self) {
+        self.state
+            .authority
+            .store(self.durable_ahead, AtomicOrdering::Release);
+    }
+}
+
+impl Drop for PublicationAuthorityTransition {
+    fn drop(&mut self) {
+        let _ = self.state.authority.compare_exchange(
+            self.preparing,
+            self.indeterminate,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        );
+    }
+}
+
 /// Sole cross-process mutation capability for one Quill index directory.
 ///
 /// This type is intentionally not `Clone`. Its internal admission token may be
 /// retained by an in-flight blocking publication so cancellation cannot release
 /// the OS lock while filesystem mutation is still running.
+///
+/// For the same reason a successful publication can outlive the future that
+/// awaited it. This writer therefore retains a pending-publication marker
+/// across such a drop, and every later authority read reconciles the durable
+/// MANIFEST before [`Self::snapshot`] is used as publication authority.
 ///
 /// Every process that mutates the index directory must honor Quill's `LOCK`.
 /// Crash consistency does not cover an out-of-band process replacing admitted
@@ -3697,6 +4070,14 @@ pub struct KeeperWriter {
     snapshot: KeeperSnapshot,
     garbage_options: GarbageCollectionOptions,
     protection: WriterProtection,
+    /// Bound only by the process-local Quill facade. Standalone Keeper users
+    /// have no `ArcSwap` reader to coordinate, so they do not install this
+    /// state word.
+    publication_read_state: Option<PublicationReadState>,
+    /// Set synchronously before a publication is awaited; cleared only once the
+    /// retained snapshot has been proven against the durable generation that
+    /// attempt may have installed.
+    pending_publication: Option<PendingPublication>,
 }
 
 impl KeeperWriter {
@@ -3941,13 +4322,115 @@ impl KeeperWriter {
             snapshot,
             garbage_options,
             protection,
+            publication_read_state: None,
+            pending_publication: None,
         })
     }
 
-    /// Current immutable reader view held by this writer.
+    /// Return this writer's current authoritative immutable reader view.
+    ///
+    /// A dropped [`Self::publish`] future can leave a durable successor on disk
+    /// before this writer refreshes its retained view. In that state this method
+    /// fails closed; call [`Self::reconcile_publication`] and retry instead of
+    /// treating the retained generation as authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeeperError::PublicationReconciliationRequired`] when a prior
+    /// publication must be reconciled before this view can be used as authority.
+    pub fn snapshot(&self) -> Result<&KeeperSnapshot, KeeperError> {
+        let Some(pending) = self.pending_publication else {
+            return Ok(&self.snapshot);
+        };
+        Err(KeeperError::PublicationReconciliationRequired {
+            retained_generation: self.snapshot.loaded_manifest().manifest.generation,
+            proposed_generation: pending.proposed_generation,
+        })
+    }
+
+    /// Retained writer view for crate-internal bookkeeping only.
+    ///
+    /// This is deliberately not a public authority reader. In particular, it
+    /// can lag disk while [`Self::publication_awaits_reconciliation`] is true.
     #[must_use]
-    pub const fn snapshot(&self) -> &KeeperSnapshot {
+    pub(crate) const fn retained_snapshot_for_bookkeeping(&self) -> &KeeperSnapshot {
         &self.snapshot
+    }
+
+    /// Bind the process-local reader's packed publication authority word.
+    ///
+    /// This is crate-private because only `QuillWriterState::from_backend`
+    /// constructs the matching immutable reader `Arc`.
+    pub(crate) fn bind_publication_read_state(&mut self, state: PublicationReadState) {
+        self.publication_read_state = Some(state);
+    }
+
+    fn publication_read_state_is_stable_at(&self, generation: u64) -> bool {
+        self.publication_read_state.as_ref().is_some_and(|state| {
+            let observed = state.load();
+            observed.phase() == PublicationAuthorityPhase::Stable
+                && observed.generation() == generation
+        })
+    }
+
+    /// Whether a publication may have become durable without this writer
+    /// installing its successor snapshot.
+    ///
+    /// True only between an abandoned [`Self::publish`] future and the next
+    /// authority read that proves the retained snapshot against disk.
+    #[must_use]
+    pub const fn publication_awaits_reconciliation(&self) -> bool {
+        self.pending_publication.is_some()
+    }
+
+    /// Prove the retained snapshot against the durable MANIFEST.
+    ///
+    /// This is a no-op when no publication was abandoned. Otherwise durable
+    /// authority is re-read under the publication guard — so an abandoned
+    /// attempt whose blocking choreography is still running cannot be observed
+    /// mid-rename — and adopted. Authority never moves backwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, admission-identity, snapshot-open, or
+    /// rollback failures. The marker survives every one of them, so a failed
+    /// reconciliation cannot be mistaken for an installed successor.
+    pub async fn reconcile_publication(&mut self, cx: &Cx) -> Result<&KeeperSnapshot, KeeperError> {
+        self.reconcile_pending_publication(cx).await?;
+        Ok(self.retained_snapshot_for_bookkeeping())
+    }
+
+    /// Adopt the durable generation an abandoned publication may have
+    /// installed, and report whether a marker was reconciled.
+    ///
+    /// The publication guard is taken first: a dropped future leaves its
+    /// blocking closure holding that guard until the choreography ends, so
+    /// acquiring it is what makes the following read an authority read rather
+    /// than a sighting of a half-renamed directory.
+    async fn reconcile_pending_publication(&mut self, cx: &Cx) -> Result<bool, KeeperError> {
+        let Some(pending) = self.pending_publication else {
+            return Ok(false);
+        };
+        let guard = writer_mutation_guard(cx).await?;
+        self.admission.ensure_directory_identity()?;
+        let directory = self.admission.directory.clone();
+        let installed = open_snapshot_blocking(directory, self.snapshot.schema()).await?;
+        drop(guard);
+        let retained_generation = self.snapshot.loaded_manifest().manifest.generation;
+        let installed_generation = installed.loaded_manifest().manifest.generation;
+        if installed_generation < retained_generation {
+            return Err(KeeperError::InvalidTransition {
+                detail: format!(
+                    "durable generation {installed_generation} is behind the retained writer \
+                     snapshot at {retained_generation} after an abandoned publication of \
+                     generation {} from generation {}",
+                    pending.proposed_generation, pending.from_generation
+                ),
+            });
+        }
+        self.snapshot = installed;
+        self.pending_publication = None;
+        Ok(true)
     }
 
     /// Publish exactly the next MANIFEST generation through an `O_EXCL` claim.
@@ -3974,6 +4457,17 @@ impl KeeperWriter {
         manifest
             .validate()
             .map_err(|source| KeeperError::InvalidManifest { source })?;
+        // An earlier attempt may have become durable after its future was
+        // dropped. Prove the retained snapshot against disk before this
+        // proposal is validated against it, otherwise a stale successor check
+        // would admit a proposal for a generation that already exists. When the
+        // abandoned attempt is exactly what won, adopt it instead of
+        // republishing the same generation.
+        if self.reconcile_pending_publication(cx).await?
+            && manifest_matches_proposal(&self.snapshot.loaded_manifest().manifest, manifest)
+        {
+            return Ok(self.retained_snapshot_for_bookkeeping());
+        }
         validate_manifest_successor(&self.snapshot.loaded_manifest().manifest, manifest)?;
         let directory = self.admission.directory.clone();
         let preflight_directory = directory.clone();
@@ -3995,7 +4489,19 @@ impl KeeperWriter {
             });
         }
         let claim_admission = Arc::clone(&self.admission);
-        let publisher = ManifestPublisher::new(&directory);
+        let publisher = ManifestPublisher::with_publication_read_state(
+            &directory,
+            self.publication_read_state.clone(),
+        );
+        // Written in the same poll that reaches the publication and never
+        // behind an await: dropping, unwinding, or cancelling out of anything
+        // below cannot erase it, so the durable generation this attempt may
+        // install stays reconcilable through the next authority read.
+        let from_generation = self.snapshot.loaded_manifest().manifest.generation;
+        self.pending_publication = Some(PendingPublication {
+            from_generation,
+            proposed_generation: manifest.generation,
+        });
         let publish_result = match &self.protection {
             WriterProtection::Disabled => {
                 publisher
@@ -4019,14 +4525,29 @@ impl KeeperWriter {
             }
         };
         if let Err(error) = publish_result {
-            if self.reconcile_manifest_proposal(cx, manifest).await? {
-                return Ok(&self.snapshot);
+            // A closure-owned pre-slot failure restored the packed word to the
+            // exact predecessor. No MANIFEST entry moved, so preserving the
+            // pessimistic marker would needlessly turn valid readers into a
+            // false reconciliation requirement. Retry state remains owned by
+            // the caller because this returns the original publication error.
+            if self.publication_read_state_is_stable_at(from_generation) {
+                self.pending_publication = None;
+                return Err(error);
             }
+            if self.reconcile_manifest_proposal(cx, manifest).await? {
+                self.pending_publication = None;
+                return Ok(self.retained_snapshot_for_bookkeeping());
+            }
+            // The proposal did not win, but recovery may still have advanced
+            // durable authority past the retained snapshot. Keep the marker so
+            // the next authority read reconciles rather than assuming this
+            // failure left disk where the retained view says it is.
             return Err(error);
         }
         self.admission.ensure_directory_identity()?;
         self.snapshot = open_snapshot_blocking(directory, self.snapshot.schema()).await?;
-        Ok(&self.snapshot)
+        self.pending_publication = None;
+        Ok(self.retained_snapshot_for_bookkeeping())
     }
 
     async fn reconcile_manifest_proposal(
@@ -4178,6 +4699,9 @@ impl KeeperWriter {
         if cx.is_cancel_requested() {
             return Err(ConcatMergeError::Cancelled.into());
         }
+        // Plan against proven authority: an abandoned publication may have
+        // advanced disk past the retained snapshot these source ids name.
+        self.reconcile_pending_publication(cx).await?;
         let mut source_ids = Vec::new();
         source_ids
             .try_reserve_exact(source_segment_ids.len())
@@ -4230,6 +4754,10 @@ impl KeeperWriter {
         if cx.is_cancel_requested() {
             return Err(CompactionError::Cancelled.into());
         }
+        // Rewrite against proven authority: a compaction planned from a
+        // snapshot that an abandoned publication already superseded would
+        // propose a generation that exists.
+        self.reconcile_pending_publication(cx).await?;
         let snapshot = self.snapshot.clone();
         let artifact =
             spawn_blocking(move || build_compaction(&snapshot, policy, created_unix_s)).await?;
@@ -7679,15 +8207,13 @@ fn recover_durable_segment(
             });
         }
     };
-    if let Err(source) = reader.verify() {
-        return Ok(DurableSegmentRecovery::Unrepairable {
-            error: KeeperError::SegmentOpen {
-                path: path.clone(),
-                source,
-            },
-        });
-    }
-    if let Err(error) = validate_segment_witnesses(&path, manifest_segment, &reader) {
+    let file_xxh3 = match fully_verified_file_witness(&path, &reader) {
+        Ok(file_xxh3) => file_xxh3,
+        Err(error) => {
+            return Ok(DurableSegmentRecovery::Unrepairable { error });
+        }
+    };
+    if let Err(error) = validate_segment_witnesses(&path, manifest_segment, &reader, file_xxh3) {
         return Ok(DurableSegmentRecovery::Unrepairable { error });
     }
     let label = format!("segment-{:016x}", manifest_segment.segment_id);
@@ -7834,11 +8360,8 @@ fn recompute_manifest_field_stats(
                 source,
             }
         })?;
-        reader.verify().map_err(|source| KeeperError::SegmentOpen {
-            path: path.clone(),
-            source,
-        })?;
-        validate_segment_witnesses(&path, segment, &reader)?;
+        let file_xxh3 = fully_verified_file_witness(&path, &reader)?;
+        validate_segment_witnesses(&path, segment, &reader, file_xxh3)?;
         let stats = reader
             .section(SectionKind::STATS)
             .map_err(|source| KeeperError::SegmentOpen {
@@ -7894,11 +8417,8 @@ fn open_verified_segment(
             path: path.to_path_buf(),
             source,
         })?;
-    reader.verify().map_err(|source| KeeperError::SegmentOpen {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    validate_segment_witnesses(path, manifest, &reader)
+    let file_xxh3 = fully_verified_file_witness(path, &reader)?;
+    validate_segment_witnesses(path, manifest, &reader, file_xxh3)
 }
 
 #[cfg(feature = "durability")]
@@ -9308,11 +9828,8 @@ fn validate_proposed_manifest_segments(
                 source,
             }
         })?;
-        reader.verify().map_err(|source| KeeperError::SegmentOpen {
-            path: path.clone(),
-            source,
-        })?;
-        validate_segment_witnesses(&path, manifest_segment, &reader)?;
+        let file_xxh3 = fully_verified_file_witness(&path, &reader)?;
+        validate_segment_witnesses(&path, manifest_segment, &reader, file_xxh3)?;
         #[cfg(feature = "durability")]
         if let WriterProtection::Enabled { protector, .. } = protection {
             let sidecar = FileProtector::sidecar_path(&path);
@@ -9339,27 +9856,65 @@ fn validate_proposed_manifest_segments(
     Ok(())
 }
 
+/// Recompute and authenticate the trailer witness without eagerly validating
+/// every section. Ordinary read-only Keeper open uses this once before binding
+/// a segment; lazy section checks retain their normal behavior.
+fn verified_file_witness(
+    path: &Path,
+    reader: &SegmentReader<impl AsRef<[u8]>>,
+) -> Result<u64, KeeperError> {
+    reader
+        .verify_file_witness()
+        .map_err(|source| KeeperError::SegmentOpen {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+/// Fully validate a segment and retain the one freshly recomputed prefix
+/// witness for manifest binding. Eager recovery, stats, and proposed-manifest
+/// preflight use this instead of rehashing the same full prefix afterward.
+fn fully_verified_file_witness(
+    path: &Path,
+    reader: &SegmentReader<impl AsRef<[u8]>>,
+) -> Result<u64, KeeperError> {
+    reader
+        .verify_with_file_witness()
+        .map_err(|source| KeeperError::SegmentOpen {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
 fn validate_segment_witnesses(
     path: &Path,
     manifest: &ManifestSegment,
     reader: &SegmentReader<impl AsRef<[u8]>>,
+    actual_file_xxh3: u64,
 ) -> Result<(), KeeperError> {
     let header = reader.header();
-    let mismatch = if header.segment_id != manifest.segment_id {
+    if header.segment_id != manifest.segment_id {
+        return Err(KeeperError::SegmentMetadataMismatch {
+            path: path.to_path_buf(),
+            detail: format!(
+                "header segment_id {:#018x} != manifest {:#018x}",
+                header.segment_id, manifest.segment_id
+            ),
+        });
+    }
+    if reader.file_len() != manifest.file_len {
+        return Err(KeeperError::SegmentMetadataMismatch {
+            path: path.to_path_buf(),
+            detail: format!(
+                "file length {} != manifest {}",
+                reader.file_len(),
+                manifest.file_len
+            ),
+        });
+    }
+    let mismatch = if actual_file_xxh3 != manifest.file_xxh3 {
         Some(format!(
-            "header segment_id {:#018x} != manifest {:#018x}",
-            header.segment_id, manifest.segment_id
-        ))
-    } else if reader.file_len() != manifest.file_len {
-        Some(format!(
-            "file length {} != manifest {}",
-            reader.file_len(),
-            manifest.file_len
-        ))
-    } else if reader.file_xxh3() != manifest.file_xxh3 {
-        Some(format!(
-            "trailer file_xxh3 {:#018x} != manifest {:#018x}",
-            reader.file_xxh3(),
+            "actual file_xxh3 {actual_file_xxh3:#018x} != manifest {:#018x}",
             manifest.file_xxh3
         ))
     } else if header.docid_lo != manifest.docid_lo || header.docid_hi != manifest.docid_hi {
@@ -11092,6 +11647,7 @@ fn release_generation_claim(_: &GenerationClaimGuard) {}
 struct ManifestPublisher {
     directory: PathBuf,
     publish_lock: Arc<Mutex<()>>,
+    publication_read_state: Option<PublicationReadState>,
 }
 
 #[derive(Debug, Clone)]
@@ -11108,6 +11664,22 @@ impl ManifestPublisher {
         Self {
             directory: directory.into(),
             publish_lock: global_publish_lock(),
+            publication_read_state: None,
+        }
+    }
+
+    /// Bind this publisher to the reader-visible authority word for a public
+    /// Quill writer. Private Keeper substrate tests intentionally leave this
+    /// absent because they have no process-local reader `Arc` to coordinate.
+    #[must_use]
+    fn with_publication_read_state(
+        directory: impl Into<PathBuf>,
+        publication_read_state: Option<PublicationReadState>,
+    ) -> Self {
+        Self {
+            directory: directory.into(),
+            publish_lock: global_publish_lock(),
+            publication_read_state,
         }
     }
 
@@ -11119,6 +11691,7 @@ impl ManifestPublisher {
         Self {
             directory: directory.into(),
             publish_lock,
+            publication_read_state: None,
         }
     }
 
@@ -11248,6 +11821,7 @@ impl ManifestPublisher {
         }
         let directory = self.directory.clone();
         let publish_lock = Arc::clone(&self.publish_lock);
+        let publication_read_state = self.publication_read_state.clone();
         let guard = OwnedMutexGuard::lock(publish_lock, cx)
             .await
             .map_err(|source| KeeperError::PublishLock { source })?;
@@ -11290,12 +11864,17 @@ impl ManifestPublisher {
             let directory = normalize_publish_directory(directory);
             match protection {
                 ManifestProtection::Disabled => {
-                    publish_manifest_locked(directory, &bytes, guard, claim)
+                    publish_manifest_locked(directory, &bytes, guard, claim, publication_read_state)
                 }
                 #[cfg(feature = "durability")]
-                ManifestProtection::Enabled(protector) => {
-                    publish_manifest_durable_locked(directory, &bytes, guard, claim, &protector)
-                }
+                ManifestProtection::Enabled(protector) => publish_manifest_durable_locked(
+                    directory,
+                    &bytes,
+                    guard,
+                    claim,
+                    &protector,
+                    publication_read_state,
+                ),
             }
         })
         .await
@@ -11370,21 +11949,56 @@ fn publish_manifest_locked<C, F>(
     bytes: &[u8],
     _guard: OwnedMutexGuard<()>,
     claim: F,
+    publication_read_state: Option<PublicationReadState>,
 ) -> Result<LoadedManifest, KeeperError>
 where
     F: FnOnce(&Path, u64) -> Result<C, KeeperError>,
 {
+    let transition = publication_read_state
+        .map(|state| {
+            let proposed = Manifest::from_bytes(bytes)
+                .map_err(|source| KeeperError::InvalidManifest { source })?;
+            PublicationAuthorityTransition::begin(state, proposed.generation)
+        })
+        .transpose()?;
     #[cfg(test)]
     {
         let observed_directory = directory.clone();
-        publish_manifest_choreography(directory, bytes, claim, move |checkpoint, _| {
-            observe_manifest_publish_checkpoint_for_test(&observed_directory, checkpoint);
-            Ok(())
-        })
+        let result = publish_manifest_choreography(directory, bytes, claim, |checkpoint, _| {
+            if let Some(transition) = transition.as_ref() {
+                match checkpoint {
+                    PublishCheckpoint::GenerationClaimed => transition.mark_indeterminate(),
+                    PublishCheckpoint::TempMovedToCurrent => transition.mark_durable_ahead(),
+                    _ => {}
+                }
+            }
+            observe_manifest_publish_checkpoint_for_test(&observed_directory, checkpoint)
+        });
+        if result.is_err() {
+            if let Some(transition) = transition.as_ref() {
+                transition.restore_known_pre_rename_failure();
+            }
+        }
+        result
     }
     #[cfg(not(test))]
     {
-        publish_manifest_choreography(directory, bytes, claim, |_, _| Ok(()))
+        let result = publish_manifest_choreography(directory, bytes, claim, |checkpoint, _| {
+            if let Some(transition) = transition.as_ref() {
+                match checkpoint {
+                    PublishCheckpoint::GenerationClaimed => transition.mark_indeterminate(),
+                    PublishCheckpoint::TempMovedToCurrent => transition.mark_durable_ahead(),
+                    _ => {}
+                }
+            }
+            Ok(())
+        });
+        if result.is_err() {
+            if let Some(transition) = transition.as_ref() {
+                transition.restore_known_pre_rename_failure();
+            }
+        }
+        result
     }
 }
 
@@ -11395,27 +12009,68 @@ fn publish_manifest_durable_locked<C, F>(
     _guard: OwnedMutexGuard<()>,
     claim: F,
     protector: &FileProtector,
+    publication_read_state: Option<PublicationReadState>,
 ) -> Result<LoadedManifest, KeeperError>
 where
     F: FnOnce(&Path, u64) -> Result<C, KeeperError>,
 {
+    let transition = publication_read_state
+        .map(|state| {
+            let proposed = Manifest::from_bytes(bytes)
+                .map_err(|source| KeeperError::InvalidManifest { source })?;
+            PublicationAuthorityTransition::begin(state, proposed.generation)
+        })
+        .transpose()?;
     #[cfg(test)]
     {
         let observed_directory = directory.clone();
-        publish_manifest_durable_choreography(
+        let result = publish_manifest_durable_choreography(
             directory,
             bytes,
             claim,
             protector,
-            move |checkpoint, _| {
-                observe_manifest_publish_checkpoint_for_test(&observed_directory, checkpoint);
-                Ok(())
+            |checkpoint, _| {
+                if let Some(transition) = transition.as_ref() {
+                    match checkpoint {
+                        PublishCheckpoint::GenerationClaimed => transition.mark_indeterminate(),
+                        PublishCheckpoint::TempMovedToCurrent => transition.mark_durable_ahead(),
+                        _ => {}
+                    }
+                }
+                observe_manifest_publish_checkpoint_for_test(&observed_directory, checkpoint)
             },
-        )
+        );
+        if result.is_err() {
+            if let Some(transition) = transition.as_ref() {
+                transition.restore_known_pre_rename_failure();
+            }
+        }
+        result
     }
     #[cfg(not(test))]
     {
-        publish_manifest_durable_choreography(directory, bytes, claim, protector, |_, _| Ok(()))
+        let result = publish_manifest_durable_choreography(
+            directory,
+            bytes,
+            claim,
+            protector,
+            |checkpoint, _| {
+                if let Some(transition) = transition.as_ref() {
+                    match checkpoint {
+                        PublishCheckpoint::GenerationClaimed => transition.mark_indeterminate(),
+                        PublishCheckpoint::TempMovedToCurrent => transition.mark_durable_ahead(),
+                        _ => {}
+                    }
+                }
+                Ok(())
+            },
+        );
+        if result.is_err() {
+            if let Some(transition) = transition.as_ref() {
+                transition.restore_known_pre_rename_failure();
+            }
+        }
+        result
     }
 }
 
@@ -11433,8 +12088,27 @@ pub(crate) enum PublishCheckpoint {
 #[derive(Clone)]
 struct ManifestPublishPause {
     checkpoint: PublishCheckpoint,
-    reached: Arc<std::sync::atomic::AtomicBool>,
+    event: Arc<std::sync::Mutex<ManifestPublishCheckpointEvent>>,
     released: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+/// One injected, typed pre-rename publisher failure for a real public-path
+/// test. This is deliberately separate from the pause map: failure returns to
+/// the blocking closure instead of parking it.
+#[cfg(test)]
+#[derive(Clone)]
+struct ManifestPublishFailure {
+    checkpoint: PublishCheckpoint,
+}
+
+/// Test-only checkpoint state shared by the blocking publisher and its async
+/// observer. The observer retains a task waker so a blocking filesystem phase
+/// can resume the test executor without a scheduler-yield assumption.
+#[cfg(test)]
+#[derive(Default)]
+struct ManifestPublishCheckpointEvent {
+    reached: bool,
+    waker: Option<std::task::Waker>,
 }
 
 /// One-shot control for pausing real MANIFEST choreography in cancellation
@@ -11442,8 +12116,15 @@ struct ManifestPublishPause {
 #[cfg(test)]
 pub(crate) struct ManifestPublishPauseControl {
     directory: PathBuf,
-    reached: Arc<std::sync::atomic::AtomicBool>,
+    checkpoint: PublishCheckpoint,
+    event: Arc<std::sync::Mutex<ManifestPublishCheckpointEvent>>,
     released: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+/// Removes one test-only fault injection when dropped.
+#[cfg(test)]
+pub(crate) struct ManifestPublishFailureControl {
+    directory: PathBuf,
 }
 
 #[cfg(test)]
@@ -11452,8 +12133,39 @@ static MANIFEST_PUBLISH_PAUSES: OnceLock<
 > = OnceLock::new();
 
 #[cfg(test)]
+static MANIFEST_PUBLISH_FAILURES: OnceLock<
+    std::sync::Mutex<BTreeMap<PathBuf, ManifestPublishFailure>>,
+> = OnceLock::new();
+
+/// Serializes tests that arm the global MANIFEST publisher pause. The
+/// production publisher itself is process-serialized; this test-only guard
+/// prevents independently scheduled test runtimes from waiting behind a
+/// different paused publisher before they can reach their own checkpoint.
+#[cfg(test)]
+static MANIFEST_PUBLISH_PAUSE_TEST_SERIAL: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+
+#[cfg(test)]
 fn manifest_publish_pauses() -> &'static std::sync::Mutex<BTreeMap<PathBuf, ManifestPublishPause>> {
     MANIFEST_PUBLISH_PAUSES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn manifest_publish_failures()
+-> &'static std::sync::Mutex<BTreeMap<PathBuf, ManifestPublishFailure>> {
+    MANIFEST_PUBLISH_FAILURES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// Hold the shared test-only MANIFEST pause serialization guard.
+///
+/// Callers must acquire this before arming a pause and keep it until after the
+/// publisher is released, so every paused public-operation test shares one
+/// deterministic rendezvous lane.
+#[cfg(test)]
+pub(crate) fn manifest_publish_pause_test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
+    MANIFEST_PUBLISH_PAUSE_TEST_SERIAL
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Arm one real MANIFEST publisher checkpoint for a single directory.
@@ -11463,33 +12175,79 @@ pub(crate) fn pause_manifest_publish_at_checkpoint_for_test(
     checkpoint: PublishCheckpoint,
 ) -> ManifestPublishPauseControl {
     let directory = normalize_publish_directory(directory.to_path_buf());
-    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let event = Arc::new(std::sync::Mutex::new(
+        ManifestPublishCheckpointEvent::default(),
+    ));
     let released = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let pause = ManifestPublishPause {
         checkpoint,
-        reached: Arc::clone(&reached),
+        event: Arc::clone(&event),
         released: Arc::clone(&released),
     };
-    let previous = manifest_publish_pauses()
+    let mut pauses = manifest_publish_pauses()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(directory.clone(), pause);
-    assert!(
-        previous.is_none(),
-        "only one MANIFEST checkpoint pause may be armed per directory"
-    );
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match pauses.entry(directory.clone()) {
+        std::collections::btree_map::Entry::Vacant(slot) => {
+            slot.insert(pause);
+        }
+        std::collections::btree_map::Entry::Occupied(_) => {
+            panic!("only one MANIFEST checkpoint pause may be armed per directory");
+        }
+    }
+    drop(pauses);
     ManifestPublishPauseControl {
         directory,
-        reached,
+        checkpoint,
+        event,
         released,
     }
 }
 
+/// Inject one typed publisher failure after the named real choreography
+/// checkpoint. Tests use `TempWritten` to prove the known-pre-rename path
+/// restores `Stable` without manufacturing a filesystem error.
+#[cfg(test)]
+pub(crate) fn fail_manifest_publish_at_checkpoint_for_test(
+    directory: &Path,
+    checkpoint: PublishCheckpoint,
+) -> ManifestPublishFailureControl {
+    let directory = normalize_publish_directory(directory.to_path_buf());
+    let mut failures = manifest_publish_failures()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match failures.entry(directory.clone()) {
+        std::collections::btree_map::Entry::Vacant(slot) => {
+            slot.insert(ManifestPublishFailure { checkpoint });
+        }
+        std::collections::btree_map::Entry::Occupied(_) => {
+            panic!("only one MANIFEST checkpoint failure may be armed per directory");
+        }
+    }
+    drop(failures);
+    ManifestPublishFailureControl { directory }
+}
+
 #[cfg(test)]
 impl ManifestPublishPauseControl {
-    /// Whether the blocking publisher has completed the armed checkpoint.
-    pub(crate) fn is_reached(&self) -> bool {
-        self.reached.load(std::sync::atomic::Ordering::SeqCst)
+    /// Poll the checkpoint event, retaining this task's waker until the real
+    /// blocking choreography completes the checkpoint.
+    fn poll_reached(&self, task_cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        let mut event = self
+            .event
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if event.reached {
+            return std::task::Poll::Ready(());
+        }
+        if !event
+            .waker
+            .as_ref()
+            .is_some_and(|waker| waker.will_wake(task_cx.waker()))
+        {
+            event.waker = Some(task_cx.waker().clone());
+        }
+        std::task::Poll::Pending
     }
 
     /// Release the blocked choreography. Calling this more than once is safe.
@@ -11514,7 +12272,73 @@ impl Drop for ManifestPublishPauseControl {
 }
 
 #[cfg(test)]
-fn observe_manifest_publish_checkpoint_for_test(directory: &Path, checkpoint: PublishCheckpoint) {
+impl Drop for ManifestPublishFailureControl {
+    fn drop(&mut self) {
+        manifest_publish_failures()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.directory);
+    }
+}
+
+/// Co-poll a real public publication with its armed filesystem checkpoint.
+///
+/// Publication can await earlier blocking preflight work before the pauseable
+/// choreography. This helper therefore keeps polling the whole future while
+/// also waiting on the checkpoint's registered waker. The timeout is an
+/// asupersync timer diagnostic rather than a synchronous wait that would park
+/// the current-thread executor and suppress the preflight wake-up.
+#[cfg(test)]
+pub(crate) async fn drive_manifest_publish_to_checkpoint_for_test<F: std::future::Future>(
+    publish: &mut std::pin::Pin<Box<F>>,
+    pause: &ManifestPublishPauseControl,
+    timeout: Duration,
+) -> Result<(), String> {
+    let rendezvous = std::future::poll_fn(|task_cx| {
+        if pause.poll_reached(task_cx).is_ready() {
+            return std::task::Poll::Ready(Ok(()));
+        }
+
+        match publish.as_mut().poll(task_cx) {
+            std::task::Poll::Ready(_) => std::task::Poll::Ready(Err(format!(
+                "publication completed before the armed {:?} checkpoint",
+                pause.checkpoint
+            ))),
+            std::task::Poll::Pending => {
+                if pause.poll_reached(task_cx).is_ready() {
+                    std::task::Poll::Ready(Ok(()))
+                } else {
+                    std::task::Poll::Pending
+                }
+            }
+        }
+    });
+
+    match asupersync::time::timeout(asupersync::time::wall_now(), timeout, rendezvous).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "publication did not reach {:?} within {timeout:?}",
+            pause.checkpoint
+        )),
+    }
+}
+
+#[cfg(test)]
+fn observe_manifest_publish_checkpoint_for_test(
+    directory: &Path,
+    checkpoint: PublishCheckpoint,
+) -> Result<(), KeeperError> {
+    let failure = manifest_publish_failures()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(directory)
+        .filter(|failure| failure.checkpoint == checkpoint)
+        .cloned();
+    if failure.is_some() {
+        return Err(KeeperError::InvalidTransition {
+            detail: format!("test-only MANIFEST publisher failure at {:?}", checkpoint),
+        });
+    }
     let pause = manifest_publish_pauses()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -11522,11 +12346,19 @@ fn observe_manifest_publish_checkpoint_for_test(directory: &Path, checkpoint: Pu
         .filter(|pause| pause.checkpoint == checkpoint)
         .cloned();
     let Some(pause) = pause else {
-        return;
+        return Ok(());
     };
-    pause
-        .reached
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let task_waker = {
+        let mut event = pause
+            .event
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        event.reached = true;
+        event.waker.take()
+    };
+    if let Some(task_waker) = task_waker {
+        task_waker.wake();
+    }
     let (released, wake) = pause.released.as_ref();
     let mut released = released
         .lock()
@@ -11537,6 +12369,7 @@ fn observe_manifest_publish_checkpoint_for_test(directory: &Path, checkpoint: Pu
             .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
     drop(released);
+    Ok(())
 }
 
 fn publish_manifest_choreography<C, F, O>(
@@ -14145,20 +14978,30 @@ fn detect_live_writer(directory: &Path) -> bool {
 }
 
 impl SegmentStatsProvider for KeeperSnapshot {
-    fn segment_stats(&self) -> SegmentStats {
+    fn segment_stats(&self) -> SearchResult<SegmentStats> {
         let manifest = &self.loaded.manifest;
         let (managed_disk_bytes, live_writer) =
             self.directory.as_ref().map_or((0, false), |directory| {
                 (managed_disk_bytes(directory), detect_live_writer(directory))
             });
-        SegmentStats {
+        let live_docs =
+            usize::try_from(self.live_doc_count).map_err(|_| SearchError::SubsystemError {
+                subsystem: "quill",
+                source: "Keeper live-document count does not fit usize".into(),
+            })?;
+        let tombstones =
+            usize::try_from(self.tombstone_count).map_err(|_| SearchError::SubsystemError {
+                subsystem: "quill",
+                source: "Keeper tombstone count does not fit usize".into(),
+            })?;
+        Ok(SegmentStats {
             schema_id: manifest.schema_id,
             published_generation: manifest.generation,
             sealed_segments: self.segments.len(),
             // The searchable delta segment is E5; nothing pre-delta exists yet.
             delta_segments: 0,
-            live_docs: usize::try_from(self.live_doc_count).unwrap_or(usize::MAX),
-            tombstones: usize::try_from(self.tombstone_count).unwrap_or(usize::MAX),
+            live_docs,
+            tombstones,
             managed_disk_bytes,
             delta_memory_bytes: 0,
             last_publish_unix: (manifest.last_publish_unix_s != 0)
@@ -14172,16 +15015,19 @@ impl SegmentStatsProvider for KeeperSnapshot {
                 .iter()
                 .filter(|segment| segment.estimated_missing_docs.is_none())
                 .count(),
-        }
+        })
     }
 }
 
 impl SegmentStatsProvider for KeeperWriter {
-    fn segment_stats(&self) -> SegmentStats {
-        let mut stats = self.snapshot.segment_stats();
+    fn segment_stats(&self) -> SearchResult<SegmentStats> {
+        let mut stats = self
+            .snapshot()
+            .map_err(SearchError::from)?
+            .segment_stats()?;
         // The writer holds LOCK by construction; no probe is needed.
         stats.live_writer = true;
-        stats
+        Ok(stats)
     }
 }
 
@@ -14252,16 +15098,164 @@ mod tests {
     use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FileHealth};
     use tempfile::tempdir;
 
-    use crate::quiver::{EncodedIdHashSection, EncodedIdMapSection, IdMapEntryInput};
+    use crate::grimoire::{
+        ByteSpan, EncodedTermDictionary, TermInput, TermMetadata, TermSectionLengths,
+    };
+    use crate::quiver::{
+        BlockMaxConcatList, EncodedBlockMax, EncodedIdHashSection, EncodedIdMapSection,
+        EncodedPostingList, IdMapEntryInput, Posting, PostingList,
+    };
     use crate::schema::{DEFAULT_SCHEMA, FSFS_CHUNK_SCHEMA};
     #[cfg(feature = "durability")]
     use crate::segment::SegmentWriteCheckpoint;
-    use crate::segment::{EncodedSegment, SectionInput, SegmentHeaderInput};
+    use crate::segment::{EncodedSegment, SectionInput, SegmentHeaderInput, SegmentReader};
 
     use super::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
     const EMPTY_TERM_DICTIONARY: [u8; 4] = 0_u32.to_le_bytes();
+
+    #[test]
+    fn publication_authority_phase_decodes_in_const_context() {
+        const PHASES: [PublicationAuthorityPhase; 4] = [
+            PublicationAuthorityPhase::from_bits(0),
+            PublicationAuthorityPhase::from_bits(1),
+            PublicationAuthorityPhase::from_bits(2),
+            PublicationAuthorityPhase::from_bits(3),
+        ];
+
+        assert_eq!(
+            PHASES,
+            [
+                PublicationAuthorityPhase::Stable,
+                PublicationAuthorityPhase::Preparing,
+                PublicationAuthorityPhase::DurableAhead,
+                PublicationAuthorityPhase::Indeterminate,
+            ]
+        );
+    }
+
+    #[test]
+    fn publication_transition_unwind_marks_preparing_authority_indeterminate() {
+        let state = PublicationReadState::new(7).expect("pack initial authority generation");
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let state = state.clone();
+            move || {
+                let _transition = PublicationAuthorityTransition::begin(state, 8)
+                    .expect("begin publication transition");
+                panic!("inject pre-rename publisher unwind");
+            }
+        }));
+        assert!(unwind.is_err(), "the injected closure must unwind");
+        let observed = state.load();
+        assert_eq!(observed.generation(), 7);
+        assert_eq!(observed.phase(), PublicationAuthorityPhase::Indeterminate);
+        assert!(
+            !observed.is_readable(),
+            "an unwound pre-rename closure must never leave its predecessor authoritative"
+        );
+    }
+
+    #[test]
+    fn publication_transition_rejects_an_unrepresentable_successor_before_cas() {
+        let generation = PublicationReadState::MAX_GENERATION;
+        let state =
+            PublicationReadState::new(generation).expect("pack maximum authority generation");
+        let Err(error) = PublicationAuthorityTransition::begin(state.clone(), generation + 1)
+        else {
+            panic!("the packed successor generation must be rejected before CAS");
+        };
+        assert!(matches!(error, KeeperError::InvalidTransition { .. }));
+        let observed = state.load();
+        assert_eq!(observed.generation(), generation);
+        assert_eq!(observed.phase(), PublicationAuthorityPhase::Stable);
+    }
+
+    #[test]
+    fn publication_stabilize_never_regresses_a_newer_generation() {
+        let state = PublicationReadState::new(7).expect("pack initial authority generation");
+        state
+            .stabilize(9)
+            .expect("install the newer process-local successor");
+
+        state
+            .stabilize(8)
+            .expect("a stale stabilizer is superseded without lowering authority");
+        let observed = state.load();
+        assert_eq!(observed.generation(), 9);
+        assert_eq!(observed.phase(), PublicationAuthorityPhase::Stable);
+
+        let transition = PublicationAuthorityTransition::begin(state.clone(), 10)
+            .expect("begin the next publication");
+        state
+            .stabilize(8)
+            .expect("a stale stabilizer must also preserve a newer active publication");
+        let observed = state.load();
+        assert_eq!(observed.generation(), 9);
+        assert_eq!(observed.phase(), PublicationAuthorityPhase::Preparing);
+        transition.restore_known_pre_rename_failure();
+    }
+
+    #[test]
+    fn generic_stabilize_never_clears_same_generation_preparing() {
+        let state = PublicationReadState::new(7).expect("pack initial authority generation");
+        let transition = PublicationAuthorityTransition::begin(state.clone(), 8)
+            .expect("begin publication transition");
+
+        assert!(matches!(
+            state.stabilize(7),
+            Err(KeeperError::InvalidTransition { .. })
+        ));
+        assert!(matches!(
+            state.stabilize(8),
+            Err(KeeperError::InvalidTransition { .. })
+        ));
+        let observed = state.load();
+        assert_eq!(observed.generation(), 7);
+        assert_eq!(observed.phase(), PublicationAuthorityPhase::Preparing);
+        transition.restore_known_pre_rename_failure();
+    }
+
+    #[test]
+    fn only_reconciliation_clears_same_generation_indeterminate() {
+        let state = PublicationReadState::new(7).expect("pack initial authority generation");
+        let transition = PublicationAuthorityTransition::begin(state.clone(), 8)
+            .expect("begin publication transition");
+        transition.mark_indeterminate();
+        drop(transition);
+
+        assert!(matches!(
+            state.stabilize(7),
+            Err(KeeperError::InvalidTransition { .. })
+        ));
+        state
+            .stabilize_reconciled_same_generation(7)
+            .expect("proven reconciliation restores the same generation");
+        let observed = state.load();
+        assert_eq!(observed.generation(), 7);
+        assert_eq!(observed.phase(), PublicationAuthorityPhase::Stable);
+    }
+
+    #[test]
+    fn reconciliation_never_clears_same_generation_durable_ahead() {
+        let state = PublicationReadState::new(7).expect("pack initial authority generation");
+        let transition = PublicationAuthorityTransition::begin(state.clone(), 8)
+            .expect("begin publication transition");
+        transition.mark_durable_ahead();
+        drop(transition);
+
+        assert!(matches!(
+            state.stabilize(7),
+            Err(KeeperError::InvalidTransition { .. })
+        ));
+        assert!(matches!(
+            state.stabilize_reconciled_same_generation(7),
+            Err(KeeperError::InvalidTransition { .. })
+        ));
+        let observed = state.load();
+        assert_eq!(observed.generation(), 7);
+        assert_eq!(observed.phase(), PublicationAuthorityPhase::DurableAhead);
+    }
 
     fn tier_test_segment(segment_id: u64, docid_lo: u64, docid_hi: u64) -> ManifestSegment {
         ManifestSegment {
@@ -14674,7 +15668,7 @@ mod tests {
                 .await
                 .map_err(|error| error.to_string())?;
             let next = writer
-                .snapshot()
+                .retained_snapshot_for_bookkeeping()
                 .next_manifest()
                 .map_err(|error| error.to_string())?;
             writer
@@ -14731,6 +15725,26 @@ mod tests {
         document_ids: &[Option<&str>],
         term_dictionary: &[u8],
     ) -> Result<EncodedSegment, Box<dyn std::error::Error>> {
+        encoded_identity_test_segment_with_term_sections(
+            segment_id,
+            docid_lo,
+            document_ids,
+            term_dictionary,
+            &[],
+            &[],
+            &[],
+        )
+    }
+
+    fn encoded_identity_test_segment_with_term_sections(
+        segment_id: u64,
+        docid_lo: u64,
+        document_ids: &[Option<&str>],
+        term_dictionary: &[u8],
+        postings: &[u8],
+        positions: &[u8],
+        blockmax: &[u8],
+    ) -> Result<EncodedSegment, Box<dyn std::error::Error>> {
         let docid_hi = docid_lo
             .checked_add(u64::try_from(document_ids.len())?)
             .ok_or_else(|| QuillError::Invariant {
@@ -14781,9 +15795,9 @@ mod tests {
             },
             &[
                 SectionInput::new(SectionKind::TERMDICT, term_dictionary),
-                SectionInput::new(SectionKind::POSTINGS, &[]),
-                SectionInput::new(SectionKind::POSITIONS, &[]),
-                SectionInput::new(SectionKind::BLOCKMAX, &[]),
+                SectionInput::new(SectionKind::POSTINGS, postings),
+                SectionInput::new(SectionKind::POSITIONS, positions),
+                SectionInput::new(SectionKind::BLOCKMAX, blockmax),
                 SectionInput::new(SectionKind::DOCLEN, b"doclen"),
                 SectionInput::new(SectionKind::IDMAP, id_map.as_bytes()),
                 SectionInput::new(SectionKind::IDHASH, id_hash.as_bytes()),
@@ -15896,7 +16910,14 @@ mod tests {
                 .publish(&cx, &durable_test_manifest(3, Vec::new()))
                 .await
                 .expect("retry durable generation three");
-            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 3);
+            assert_eq!(
+                writer
+                    .retained_snapshot_for_bookkeeping()
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                3
+            );
             assert_eq!(
                 std::fs::read(&retired).expect("retain first retirement artifact"),
                 retired_bytes
@@ -17640,6 +18661,148 @@ mod tests {
     }
 
     #[test]
+    fn keeper_open_recomputes_actual_prefix_witness_before_lazy_postings_bind() -> TestResult {
+        const FILE_PREFIX_LEN: usize = 16;
+        const FIXED_HEADER_LEN: usize = 56;
+        const SECTION_ENTRY_LEN: usize = 28;
+        const SECTION_ENTRY_XXH3_OFFSET: usize = 20;
+        const TRAILER_LEN: usize = 12;
+
+        let directory = tempdir()?;
+        let encoded_postings =
+            EncodedPostingList::encode(&[Posting::new(0, 1), Posting::new(1, 1)])?;
+        let replacement_postings =
+            EncodedPostingList::encode(&[Posting::new(0, 1), Posting::new(2, 1)])?;
+        assert_eq!(
+            replacement_postings.as_bytes().len(),
+            encoded_postings.as_bytes().len(),
+            "the replacement must preserve the exact POSTINGS section length"
+        );
+        assert_ne!(
+            replacement_postings.as_bytes(),
+            encoded_postings.as_bytes(),
+            "the replacement must change POSTINGS content while retaining its layout"
+        );
+        let posting_list = PostingList::parse(encoded_postings.as_bytes(), 2)?;
+        let encoded_blockmax = EncodedBlockMax::encode(&posting_list, |_| Some(1))?;
+        let term_dictionary = EncodedTermDictionary::encode_sorted(
+            DEFAULT_SCHEMA,
+            TermSectionLengths {
+                postings: u64::try_from(encoded_postings.as_bytes().len())?,
+                positions: Some(0),
+                blockmax: u64::try_from(encoded_blockmax.as_bytes().len())?,
+            },
+            &[TermInput::new(
+                0,
+                b"witness",
+                TermMetadata::without_positions(
+                    2,
+                    ByteSpan::new(0, u64::try_from(encoded_postings.as_bytes().len())?),
+                    ByteSpan::new(0, u64::try_from(encoded_blockmax.as_bytes().len())?),
+                ),
+            )],
+        )?;
+        let encoded = encoded_identity_test_segment_with_term_sections(
+            0x6e11,
+            0,
+            &[
+                Some("witness-doc-0"),
+                Some("witness-doc-1"),
+                Some("witness-doc-2"),
+            ],
+            term_dictionary.as_bytes(),
+            encoded_postings.as_bytes(),
+            &[],
+            encoded_blockmax.as_bytes(),
+        )?;
+        let pending = encoded.write_temp(directory.path())?;
+        let path = publish_pending_segment(pending)?;
+        let manifest = durable_test_manifest(1, vec![manifest_segment(&encoded, 1)]);
+        let manifest_path = directory.path().join("MANIFEST");
+        write_manifest(&manifest_path, &manifest)?;
+        let original_manifest = std::fs::read(&manifest_path)?;
+
+        let baseline = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+        assert_eq!(
+            baseline.segments().len(),
+            1,
+            "fixture publishes cleanly first"
+        );
+        drop(baseline);
+
+        let postings_entry = encoded
+            .section_entries()
+            .iter()
+            .position(|entry| entry.kind == SectionKind::POSTINGS)
+            .expect("encoded fixture has POSTINGS");
+        let postings_offset = usize::try_from(encoded.section_entries()[postings_entry].offset)?;
+        let postings_len = usize::try_from(encoded.section_entries()[postings_entry].len)?;
+        assert_eq!(
+            postings_len,
+            replacement_postings.as_bytes().len(),
+            "fixture POSTINGS range matches the same-length replacement"
+        );
+
+        let mut bytes = std::fs::read(&path)?;
+        let trailer_start = bytes.len() - TRAILER_LEN;
+        let original_trailer = bytes[trailer_start..].to_vec();
+        bytes[postings_offset..postings_offset + postings_len]
+            .copy_from_slice(replacement_postings.as_bytes());
+        let section_xxh3_offset = FILE_PREFIX_LEN
+            + FIXED_HEADER_LEN
+            + postings_entry * SECTION_ENTRY_LEN
+            + SECTION_ENTRY_XXH3_OFFSET;
+        let postings_xxh3 =
+            xxhash_rust::xxh3::xxh3_64(&bytes[postings_offset..postings_offset + postings_len]);
+        bytes[section_xxh3_offset..section_xxh3_offset + std::mem::size_of::<u64>()]
+            .copy_from_slice(&postings_xxh3.to_le_bytes());
+        let header_len = usize::try_from(u32::from_le_bytes(bytes[12..16].try_into()?))?;
+        let header_crc_offset = FILE_PREFIX_LEN + header_len;
+        let header_crc = crc32fast::hash(&bytes[FILE_PREFIX_LEN..header_crc_offset]);
+        bytes[header_crc_offset..header_crc_offset + std::mem::size_of::<u32>()]
+            .copy_from_slice(&header_crc.to_le_bytes());
+
+        let lazy_reader = SegmentReader::from_owned(bytes.clone(), DEFAULT_SCHEMA)?;
+        let replacement_postings = lazy_reader
+            .section(SectionKind::POSTINGS)?
+            .expect("fixture retains POSTINGS after valid replacement");
+        assert_eq!(
+            replacement_postings,
+            &bytes[postings_offset..postings_offset + postings_len],
+            "the recomputed section witness preserves lazy POSTINGS parsing"
+        );
+        let parsed_replacement = PostingList::parse(replacement_postings, 2)?;
+        let blockmax = lazy_reader
+            .section(SectionKind::BLOCKMAX)?
+            .expect("fixture retains BLOCKMAX");
+        let blockmax_relation = BlockMaxConcatList::parse(blockmax, &parsed_replacement)?;
+        assert_eq!(
+            blockmax_relation.entry_count(),
+            parsed_replacement.block_count(),
+            "the unchanged BLOCKMAX stream remains related to replacement POSTINGS"
+        );
+        let actual_prefix_xxh3 = xxhash_rust::xxh3::xxh3_64(&bytes[..trailer_start]);
+        assert_ne!(actual_prefix_xxh3, encoded.file_xxh3());
+        assert_eq!(lazy_reader.file_xxh3(), encoded.file_xxh3());
+        assert_eq!(&bytes[trailer_start..], original_trailer.as_slice());
+        assert!(matches!(
+            lazy_reader.verify_file_witness(),
+            Err(QuillError::IndexCorrupted { .. })
+        ));
+
+        std::fs::write(&path, &bytes)?;
+        assert_eq!(std::fs::read(&manifest_path)?, original_manifest);
+        assert!(matches!(
+            KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA),
+            Err(KeeperError::SegmentOpen {
+                source: QuillError::IndexCorrupted { detail, .. },
+                ..
+            }) if detail.contains("file checksum mismatch")
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn term_dictionary_checksum_failure_is_rejected_during_read_only_open() -> TestResult {
         let directory = tempdir()?;
         let encoded = encoded_test_segment(0xacd, 10, 20, 1)?;
@@ -17776,19 +18939,22 @@ mod tests {
             assert!(original.is_live(0), "older mmap snapshot stays visible");
 
             let high_watermark = writer
-                .snapshot()
+                .retained_snapshot_for_bookkeeping()
                 .loaded_manifest()
                 .manifest
                 .docid_high_watermark;
             let segment_paths = writer
-                .snapshot()
+                .retained_snapshot_for_bookkeeping()
                 .segments()
                 .iter()
                 .map(|segment| segment.path().to_path_buf())
                 .collect::<Vec<_>>();
-            let mut empty = writer.snapshot().next_manifest().expect("empty successor");
+            let mut empty = writer
+                .retained_snapshot_for_bookkeeping()
+                .next_manifest()
+                .expect("empty successor");
             writer
-                .snapshot()
+                .retained_snapshot_for_bookkeeping()
                 .delete_all(&mut empty)
                 .expect("stage delete_all");
             assert!(empty.segments.is_empty());
@@ -17963,7 +19129,10 @@ mod tests {
                 .await
                 .expect("open writer");
             let before = std::fs::read(&manifest_path).expect("read initial manifest");
-            let mut proposed = writer.snapshot().next_manifest().expect("next generation");
+            let mut proposed = writer
+                .retained_snapshot_for_bookkeeping()
+                .next_manifest()
+                .expect("next generation");
             assert!(
                 proposed.segments[0]
                     .tombstones
@@ -17984,7 +19153,14 @@ mod tests {
                 before,
                 "preflight rejection must leave the current MANIFEST untouched"
             );
-            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 1);
+            assert_eq!(
+                writer
+                    .retained_snapshot_for_bookkeeping()
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                1
+            );
             assert_eq!(
                 KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)
                     .expect("reopen prior snapshot")
@@ -18624,7 +19800,7 @@ mod tests {
                 .await
                 .map_err(|error| error.to_string())?;
             if !writer
-                .snapshot()
+                .retained_snapshot_for_bookkeeping()
                 .loaded_manifest()
                 .manifest
                 .segments
@@ -18635,11 +19811,11 @@ mod tests {
             }
 
             let mut publish_two = writer
-                .snapshot()
+                .retained_snapshot_for_bookkeeping()
                 .next_manifest()
                 .map_err(|error| error.to_string())?;
             writer
-                .snapshot()
+                .retained_snapshot_for_bookkeeping()
                 .delete_all(&mut publish_two)
                 .map_err(|error| error.to_string())?;
             publish_two.last_publish_unix_s = 0;
@@ -18685,7 +19861,7 @@ mod tests {
             }
 
             let mut publish_three = writer
-                .snapshot()
+                .retained_snapshot_for_bookkeeping()
                 .next_manifest()
                 .map_err(|error| error.to_string())?;
             publish_three.last_publish_unix_s = 0;
@@ -18711,7 +19887,7 @@ mod tests {
             let third_publish_floor = segment_unreachability_floor_at(
                 &directory_file,
                 &directory,
-                writer.snapshot(),
+                writer.retained_snapshot_for_bookkeeping(),
                 SystemTime::now(),
             )
             .map_err(|error| error.to_string())?
@@ -18729,7 +19905,7 @@ mod tests {
 
             std::thread::sleep(Duration::from_millis(10));
             let mut publish_four = writer
-                .snapshot()
+                .retained_snapshot_for_bookkeeping()
                 .next_manifest()
                 .map_err(|error| error.to_string())?;
             publish_four.last_publish_unix_s = 0;
@@ -18742,7 +19918,7 @@ mod tests {
             let fourth_publish_floor = segment_unreachability_floor_at(
                 &directory_file,
                 &directory,
-                writer.snapshot(),
+                writer.retained_snapshot_for_bookkeeping(),
                 SystemTime::now(),
             )
             .map_err(|error| error.to_string())?
@@ -19879,6 +21055,19 @@ mod tests {
             .expect("test runtime produced a result")
     }
 
+    fn run_with_blocking_cx<F, Fut>(operation: F)
+    where
+        F: FnOnce(Cx) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let cx = Cx::for_testing();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 4)
+            .build()
+            .expect("build test runtime with a blocking pool");
+        runtime.block_on(operation(cx));
+    }
+
     #[cfg(unix)]
     struct WriterChild {
         child: Option<std::process::Child>,
@@ -20417,7 +21606,14 @@ mod tests {
                 .await
                 .map_err(|error| error.to_string())?;
             assert!(!directory.join("gen-2.claim").exists());
-            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 2);
+            assert_eq!(
+                writer
+                    .retained_snapshot_for_bookkeeping()
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                2
+            );
             drop(writer);
             Ok(())
         });
@@ -20433,14 +21629,28 @@ mod tests {
             let mut writer = KeeperWriter::open(&cx, &directory, DEFAULT_SCHEMA)
                 .await
                 .map_err(|error| error.to_string())?;
-            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 2);
+            assert_eq!(
+                writer
+                    .retained_snapshot_for_bookkeeping()
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                2
+            );
             assert!(!directory.join(".tmp-manifest-3").exists());
             assert!(!directory.join("gen-3.claim").exists());
             writer
                 .publish(&cx, &Manifest::empty(3, schema_id, 0))
                 .await
                 .map_err(|error| error.to_string())?;
-            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 3);
+            assert_eq!(
+                writer
+                    .retained_snapshot_for_bookkeeping()
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                3
+            );
             Ok(())
         });
         recovered.map_err(io::Error::other)?;
@@ -20450,6 +21660,242 @@ mod tests {
                 .and_then(|entry| entry.file_name().into_string().ok())
                 .is_some_and(|name| name.starts_with(".tmp-abandoned-manifest-3-"))
         }));
+        Ok(())
+    }
+
+    /// A wall-clock bound for the test-only durable-publish rendezvous.
+    ///
+    /// The production publisher reaches `DirectorySynced` in its dedicated
+    /// blocking lane. The test waits for that lane's checkpoint event rather
+    /// than assuming a fixed number of async scheduler yields is enough for
+    /// an OS directory fsync.
+    const DURABLE_PUBLISH_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(2);
+
+    #[test]
+    fn dropped_publish_future_after_durable_install_advances_the_next_publication() -> TestResult {
+        let _pause_serial = manifest_publish_pause_test_serial_guard();
+        let index = tempdir()?;
+        let directory = index.path().to_path_buf();
+        run_with_blocking_cx(move |cx| async move {
+            let mut writer = KeeperWriter::create(&cx, &directory, DEFAULT_SCHEMA)
+                .await
+                .expect("create genesis index");
+            let schema_id = DEFAULT_SCHEMA.schema_id().expect("default schema identity");
+            assert_eq!(
+                writer
+                    .snapshot()
+                    .expect("fresh writer snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                1
+            );
+            assert!(!writer.publication_awaits_reconciliation());
+
+            // Use the pre-existing production choreography checkpoint: after
+            // its directory fsync generation 2 is durable, but the future has
+            // not yet resumed to install its refreshed retained snapshot.
+            let successor = Manifest::empty(2, schema_id, 0);
+            let pause = pause_manifest_publish_at_checkpoint_for_test(
+                &directory,
+                PublishCheckpoint::DirectorySynced,
+            );
+            let mut publish = Box::pin(writer.publish(&cx, &successor));
+            drive_manifest_publish_to_checkpoint_for_test(
+                &mut publish,
+                &pause,
+                DURABLE_PUBLISH_CHECKPOINT_TIMEOUT,
+            )
+            .await
+            .expect("reach the bounded durable-publish rendezvous");
+            drop(publish);
+            pause.release();
+
+            let installed = Manifest::from_bytes(
+                &std::fs::read(directory.join("MANIFEST")).expect("read installed MANIFEST"),
+            )
+            .expect("decode installed MANIFEST");
+            assert_eq!(
+                installed.generation, 2,
+                "the real publisher must have made generation N+1 durable before the drop"
+            );
+            assert!(matches!(
+                writer.snapshot(),
+                Err(KeeperError::PublicationReconciliationRequired {
+                    retained_generation: 1,
+                    proposed_generation: 2,
+                })
+            ));
+            let stats_error = SegmentStatsProvider::segment_stats(&writer)
+                .expect_err("writer stats must fail closed with its authority snapshot");
+            assert!(
+                matches!(
+                    &stats_error,
+                    SearchError::SubsystemError { subsystem, source }
+                        if *subsystem == "quill"
+                            && matches!(
+                                source.downcast_ref::<KeeperError>(),
+                                Some(KeeperError::PublicationReconciliationRequired {
+                                    retained_generation: 1,
+                                    proposed_generation: 2,
+                                })
+                            )
+                ),
+                "writer stats must retain the typed reconciliation failure: {stats_error:?}"
+            );
+            assert!(
+                writer.publication_awaits_reconciliation(),
+                "marker observation alone is not authority; the checked reader must fail closed"
+            );
+
+            // The checked generation-1 snapshot assertion immediately above
+            // is parent-red. This generation-3 call verifies the corrected
+            // reconciliation behavior after that fail-closed observation.
+            let advanced = writer
+                .publish(&cx, &Manifest::empty(3, schema_id, 0))
+                .await
+                .expect("the next publication reconciles the abandoned generation")
+                .loaded_manifest()
+                .manifest
+                .generation;
+            assert_eq!(advanced, 3);
+            assert!(!writer.publication_awaits_reconciliation());
+            assert_eq!(
+                SegmentStatsProvider::segment_stats(&writer)
+                    .expect("reconciled writer stats are authoritative")
+                    .published_generation,
+                3
+            );
+
+            let reopened =
+                KeeperSnapshot::open(&directory, DEFAULT_SCHEMA).expect("reopen published index");
+            assert_eq!(
+                writer
+                    .snapshot()
+                    .expect("reconciled writer snapshot is authoritative")
+                    .loaded_manifest()
+                    .manifest,
+                reopened.loaded_manifest().manifest,
+                "the retained handle and a fresh reopen must agree exactly"
+            );
+            let previous = Manifest::from_bytes(
+                &std::fs::read(directory.join("MANIFEST.prev")).expect("read previous MANIFEST"),
+            )
+            .expect("decode previous MANIFEST");
+            assert_eq!(
+                previous.generation, 2,
+                "the abandoned generation is retained as the previous slot, never rolled back"
+            );
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn abandoned_publication_is_adopted_by_its_identical_retry_and_by_reconciliation() -> TestResult
+    {
+        let _pause_serial = manifest_publish_pause_test_serial_guard();
+        let index = tempdir()?;
+        let directory = index.path().to_path_buf();
+        run_with_blocking_cx(move |cx| async move {
+            let mut writer = KeeperWriter::create(&cx, &directory, DEFAULT_SCHEMA)
+                .await
+                .expect("create genesis index");
+            let schema_id = DEFAULT_SCHEMA.schema_id().expect("default schema identity");
+
+            // An owner that retries the exact abandoned proposal adopts the
+            // durable generation instead of publishing a second successor.
+            let second = Manifest::empty(2, schema_id, 0);
+            let pause = pause_manifest_publish_at_checkpoint_for_test(
+                &directory,
+                PublishCheckpoint::DirectorySynced,
+            );
+            let mut publish = Box::pin(writer.publish(&cx, &second));
+            drive_manifest_publish_to_checkpoint_for_test(
+                &mut publish,
+                &pause,
+                DURABLE_PUBLISH_CHECKPOINT_TIMEOUT,
+            )
+            .await
+            .expect("reach the bounded durable-publish rendezvous");
+            drop(publish);
+            pause.release();
+
+            let adopted = writer
+                .publish(&cx, &second)
+                .await
+                .expect("the identical retry adopts the durable generation")
+                .loaded_manifest()
+                .manifest
+                .generation;
+            assert_eq!(
+                adopted, 2,
+                "an identical retry must reconcile generation N+1, not publish N+2"
+            );
+            assert!(!writer.publication_awaits_reconciliation());
+            let previous = Manifest::from_bytes(
+                &std::fs::read(directory.join("MANIFEST.prev")).expect("read previous MANIFEST"),
+            )
+            .expect("decode previous MANIFEST");
+            assert_eq!(
+                previous.generation, 1,
+                "adoption must not publish a second successor over the abandoned one"
+            );
+
+            // An owner that never retries still gets an honest view: explicit
+            // reconciliation proves the retained snapshot against disk.
+            let third = Manifest::empty(3, schema_id, 0);
+            let pause = pause_manifest_publish_at_checkpoint_for_test(
+                &directory,
+                PublishCheckpoint::DirectorySynced,
+            );
+            let mut publish = Box::pin(writer.publish(&cx, &third));
+            drive_manifest_publish_to_checkpoint_for_test(
+                &mut publish,
+                &pause,
+                DURABLE_PUBLISH_CHECKPOINT_TIMEOUT,
+            )
+            .await
+            .expect("reach the bounded durable-publish rendezvous");
+            drop(publish);
+            pause.release();
+
+            assert!(matches!(
+                writer.snapshot(),
+                Err(KeeperError::PublicationReconciliationRequired {
+                    retained_generation: 2,
+                    proposed_generation: 3,
+                })
+            ));
+            let reconciled = writer
+                .reconcile_publication(&cx)
+                .await
+                .expect("reconcile the abandoned publication")
+                .loaded_manifest()
+                .manifest
+                .clone();
+            assert_eq!(reconciled.generation, 3);
+            assert!(!writer.publication_awaits_reconciliation());
+            let reopened =
+                KeeperSnapshot::open(&directory, DEFAULT_SCHEMA).expect("reopen published index");
+            assert_eq!(
+                reconciled,
+                reopened.loaded_manifest().manifest,
+                "reconciliation must install exactly what durable authority holds"
+            );
+            // Reconciling again is inert, and publication continues monotonically.
+            writer
+                .reconcile_publication(&cx)
+                .await
+                .expect("reconciliation without an abandoned publication is a no-op");
+            let advanced = writer
+                .publish(&cx, &Manifest::empty(4, schema_id, 0))
+                .await
+                .expect("publish the reconciled successor")
+                .loaded_manifest()
+                .manifest
+                .generation;
+            assert_eq!(advanced, 4);
+        });
         Ok(())
     }
 
@@ -20555,7 +22001,13 @@ mod tests {
                 .publish(&cx, &proposed)
                 .await
                 .map_err(|error| error.to_string())?;
-            if writer.snapshot().loaded_manifest().manifest.generation != 1 {
+            if writer
+                .retained_snapshot_for_bookkeeping()
+                .loaded_manifest()
+                .manifest
+                .generation
+                != 1
+            {
                 return Err("writer snapshot unexpectedly advanced before retry".to_owned());
             }
 
@@ -20564,7 +22016,10 @@ mod tests {
                 .await
                 .map_err(|error| error.to_string())?;
 
-            let installed = &writer.snapshot().loaded_manifest().manifest;
+            let installed = &writer
+                .retained_snapshot_for_bookkeeping()
+                .loaded_manifest()
+                .manifest;
             if installed.generation != 2 {
                 return Err("exact installed proposal was not reconciled".to_owned());
             }
@@ -20607,7 +22062,13 @@ mod tests {
                 }
                 Ok(_) => return Err("differing installed MANIFEST was reconciled".to_owned()),
             }
-            if writer.snapshot().loaded_manifest().manifest.generation != 1 {
+            if writer
+                .retained_snapshot_for_bookkeeping()
+                .loaded_manifest()
+                .manifest
+                .generation
+                != 1
+            {
                 return Err("writer snapshot advanced after differing proposal".to_owned());
             }
             let on_disk = load_manifest_pair(&directory)
@@ -20644,7 +22105,13 @@ mod tests {
             if after != before {
                 return Err("MANIFEST changed before segment preflight failed".to_owned());
             }
-            if writer.snapshot().loaded_manifest().manifest.generation != 1 {
+            if writer
+                .retained_snapshot_for_bookkeeping()
+                .loaded_manifest()
+                .manifest
+                .generation
+                != 1
+            {
                 return Err("writer snapshot advanced after rejected publication".to_owned());
             }
             Ok(())
@@ -20716,7 +22183,13 @@ mod tests {
             if after != before {
                 return Err("MANIFEST changed before segment preflight failed".to_owned());
             }
-            if writer.snapshot().loaded_manifest().manifest.generation != 1 {
+            if writer
+                .retained_snapshot_for_bookkeeping()
+                .loaded_manifest()
+                .manifest
+                .generation
+                != 1
+            {
                 return Err("writer snapshot advanced after rejected publication".to_owned());
             }
             Ok(())
@@ -20798,7 +22271,7 @@ mod tests {
                 .await
                 .map_err(|error| error.to_string())?;
             let mut next = writer
-                .snapshot()
+                .retained_snapshot_for_bookkeeping()
                 .next_manifest()
                 .map_err(|error| error.to_string())?;
             next.docid_high_watermark = manifest_segment.docid_hi;
@@ -20837,7 +22310,7 @@ mod tests {
             )
             .await
             .map_err(|error| error.to_string())?;
-            let snapshot = writer.snapshot();
+            let snapshot = writer.retained_snapshot_for_bookkeeping();
             if snapshot.loaded_manifest().manifest.generation != 3
                 || !snapshot.loaded_manifest().manifest.segments.is_empty()
                 || !snapshot.is_degraded()
@@ -20874,7 +22347,12 @@ mod tests {
                         .map_err(|error| error.to_string())?
                         .len(),
                 );
-            if snapshot.segment_stats().managed_disk_bytes < retained_bytes {
+            if snapshot
+                .segment_stats()
+                .map_err(|error| error.to_string())?
+                .managed_disk_bytes
+                < retained_bytes
+            {
                 return Err("managed disk accounting omitted quarantine artifacts".to_owned());
             }
             drop(writer);
@@ -21187,7 +22665,14 @@ mod tests {
             let mut writer = KeeperWriter::open(&cx, &directory, DEFAULT_SCHEMA)
                 .await
                 .map_err(|error| error.to_string())?;
-            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 1);
+            assert_eq!(
+                writer
+                    .retained_snapshot_for_bookkeeping()
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                1
+            );
             let schema_id = DEFAULT_SCHEMA
                 .schema_id()
                 .map_err(|error| error.to_string())?;
@@ -21252,7 +22737,14 @@ mod tests {
                 KeeperWriter::open_durable(&cx, directory, DEFAULT_SCHEMA, corrupt_protector)
                     .await
                     .map_err(|error| error.to_string())?;
-            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 2);
+            assert_eq!(
+                writer
+                    .retained_snapshot_for_bookkeeping()
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                2
+            );
             Ok(())
         });
         recovered_corrupt.map_err(io::Error::other)?;
@@ -21270,7 +22762,14 @@ mod tests {
                 KeeperWriter::create_durable(&cx, directory, DEFAULT_SCHEMA, missing_protector)
                     .await
                     .map_err(|error| error.to_string())?;
-            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 2);
+            assert_eq!(
+                writer
+                    .retained_snapshot_for_bookkeeping()
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                2
+            );
             Ok(())
         });
         recovered_missing.map_err(io::Error::other)?;
@@ -21465,7 +22964,13 @@ mod tests {
                 KeeperWriter::open_durable(&cx, &directory, DEFAULT_SCHEMA, repair_protector)
                     .await
                     .map_err(|error| error.to_string())?;
-            if writer.snapshot().loaded_manifest().manifest.generation != 1 {
+            if writer
+                .retained_snapshot_for_bookkeeping()
+                .loaded_manifest()
+                .manifest
+                .generation
+                != 1
+            {
                 return Err("unrecoverable reconstructed current displaced previous".to_owned());
             }
             Ok(())
@@ -21555,7 +23060,13 @@ mod tests {
                 KeeperWriter::open_durable(&cx, &directory, DEFAULT_SCHEMA, repair_protector)
                     .await
                     .map_err(|error| error.to_string())?;
-            if writer.snapshot().loaded_manifest().manifest.generation != 3 {
+            if writer
+                .retained_snapshot_for_bookkeeping()
+                .loaded_manifest()
+                .manifest
+                .generation
+                != 3
+            {
                 return Err("unusable optional fallback displaced healthy current".to_owned());
             }
             Ok(())
@@ -21610,7 +23121,13 @@ mod tests {
                 KeeperWriter::open_durable(&cx, &directory, DEFAULT_SCHEMA, repair_protector)
                     .await
                     .map_err(|error| error.to_string())?;
-            if writer.snapshot().loaded_manifest().manifest.generation != 2 {
+            if writer
+                .retained_snapshot_for_bookkeeping()
+                .loaded_manifest()
+                .manifest
+                .generation
+                != 2
+            {
                 return Err("stale optional fallback displaced healthy current".to_owned());
             }
             Ok(())
@@ -21728,7 +23245,13 @@ mod tests {
                 KeeperWriter::open_durable(&cx, &directory, DEFAULT_SCHEMA, repair_protector)
                     .await
                     .map_err(|error| error.to_string())?;
-            if writer.snapshot().loaded_manifest().manifest.generation != 1 {
+            if writer
+                .retained_snapshot_for_bookkeeping()
+                .loaded_manifest()
+                .manifest
+                .generation
+                != 1
+            {
                 return Err("malformed current sidecar blocked previous fallback".to_owned());
             }
             Ok(())
@@ -21780,7 +23303,13 @@ mod tests {
                 KeeperWriter::open_durable(&cx, &directory, DEFAULT_SCHEMA, repair_protector)
                     .await
                     .map_err(|error| error.to_string())?;
-            if writer.snapshot().loaded_manifest().manifest.generation != 2 {
+            if writer
+                .retained_snapshot_for_bookkeeping()
+                .loaded_manifest()
+                .manifest
+                .generation
+                != 2
+            {
                 return Err("malformed optional fallback blocked healthy current".to_owned());
             }
             Ok(())
@@ -21848,7 +23377,14 @@ mod tests {
                 KeeperWriter::open_durable(&cx, &directory, DEFAULT_SCHEMA, repair_protector)
                     .await
                     .map_err(|error| error.to_string())?;
-            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 2);
+            assert_eq!(
+                writer
+                    .retained_snapshot_for_bookkeeping()
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                2
+            );
             Ok(())
         });
         repaired.map_err(io::Error::other)?;
@@ -22541,7 +24077,8 @@ mod tests {
             let writer = KeeperWriter::create(&cx, directory.path(), DEFAULT_SCHEMA)
                 .await
                 .expect("create index");
-            let writer_stats = SegmentStatsProvider::segment_stats(&writer);
+            let writer_stats = SegmentStatsProvider::segment_stats(&writer)
+                .expect("read live-writer segment stats");
             assert_eq!(writer_stats.published_generation, 1);
             assert_eq!(writer_stats.sealed_segments, 0);
             assert_eq!(writer_stats.live_docs, 0);
@@ -22563,7 +24100,8 @@ mod tests {
             // D1 LOCK record (same pid, demonstrably alive).
             let snapshot =
                 KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA).expect("open snapshot");
-            let snapshot_stats = SegmentStatsProvider::segment_stats(&snapshot);
+            let snapshot_stats = SegmentStatsProvider::segment_stats(&snapshot)
+                .expect("read concurrent snapshot segment stats");
             assert_eq!(snapshot_stats.published_generation, 1);
             assert!(snapshot_stats.last_publish_unix.is_some());
             assert!(snapshot_stats.live_writer, "LOCK record names a live pid");
@@ -22573,7 +24111,8 @@ mod tests {
             drop(writer);
             let snapshot =
                 KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA).expect("reopen snapshot");
-            let released = SegmentStatsProvider::segment_stats(&snapshot);
+            let released = SegmentStatsProvider::segment_stats(&snapshot)
+                .expect("read released snapshot segment stats");
             assert!(
                 !released.live_writer,
                 "released LOCK reports no live writer"

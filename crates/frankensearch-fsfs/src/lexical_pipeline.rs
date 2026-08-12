@@ -1032,7 +1032,13 @@ mod tests {
                 .await
                 .expect("flush Quill batch");
             index.commit(&cx).await.expect("commit Quill batch");
-            assert_eq!(index.segment_stats().live_docs, 2);
+            assert_eq!(
+                index
+                    .segment_stats()
+                    .expect("read committed Quill segment stats")
+                    .live_docs,
+                2
+            );
             assert_eq!(
                 index
                     .search_doc_ids(&cx, "alpha", 10)
@@ -1328,7 +1334,9 @@ mod tests {
                     .await
                     .expect("flush partial prefix");
                 assert_eq!(
-                    partial.doc_count(),
+                    partial
+                        .doc_count()
+                        .expect("partial bulk count is authoritative"),
                     u64::try_from(published_prefix).expect("prefix fits u64"),
                     "prefix={published_prefix}: cadence publication must be durable"
                 );
@@ -1478,7 +1486,13 @@ mod tests {
                     .await
                     .expect("finish bulk contract index");
                 let initial_elapsed = initial_start.elapsed();
-                assert_eq!(bulk_index.segment_stats().live_docs, INITIAL_DOCS);
+                assert_eq!(
+                    bulk_index
+                        .segment_stats()
+                        .expect("read completed bulk Quill segment stats")
+                        .live_docs,
+                    INITIAL_DOCS
+                );
 
                 let watch_index = QuillIndex::create(
                     &cx,

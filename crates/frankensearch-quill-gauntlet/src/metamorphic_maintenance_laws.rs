@@ -1313,6 +1313,7 @@ pub mod maintenance_execution {
     ) -> Option<(usize, usize)> {
         let source_segment_ids = index
             .snapshot()
+            .expect("maintenance snapshot is authoritative")
             .segments()
             .iter()
             .map(|segment| segment.manifest().segment_id)
@@ -1522,7 +1523,11 @@ pub mod maintenance_execution {
                         .expect("reopen the maintenance index from durable state");
                     // Read the count from the FRESH instance: a non-zero value
                     // proves recovery happened rather than a new empty index.
-                    reopen_witnesses.push(reopened.doc_count());
+                    reopen_witnesses.push(
+                        reopened
+                            .doc_count()
+                            .expect("reopened maintenance count is authoritative"),
+                    );
                     subject.restore_index(reopened);
                 }
                 MaintenanceStep::Tombstone { corpus_index } => {
@@ -1718,6 +1723,7 @@ pub mod maintenance_execution {
         let index = subject.index_mut().expect("open explicit merge campaign");
         let source_segment_ids = index
             .snapshot()
+            .expect("maintenance snapshot is authoritative")
             .segments()
             .iter()
             .map(|segment| segment.manifest().segment_id)

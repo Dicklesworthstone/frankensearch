@@ -199,8 +199,8 @@ impl LexicalRead for StaticLexical {
         Box::pin(async move { Ok(self.hits.iter().take(limit).cloned().collect()) })
     }
 
-    fn doc_count(&self) -> usize {
-        self.hits.len()
+    fn doc_count(&self) -> frankensearch_core::SearchResult<usize> {
+        Ok(self.hits.len())
     }
 }
 

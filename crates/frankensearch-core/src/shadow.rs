@@ -1349,7 +1349,7 @@ impl crate::traits::LexicalRead for ShadowLexical {
         self.serving.read.hydrate_candidates(cx, context, results)
     }
 
-    fn doc_count(&self) -> usize {
+    fn doc_count(&self) -> SearchResult<usize> {
         self.serving.read.doc_count()
     }
 }
@@ -1541,6 +1541,7 @@ mod tests {
     struct StaticLexical {
         results: Vec<ScoredResult>,
         fail_index: AtomicBool,
+        fail_doc_count: AtomicBool,
         search_count: AtomicUsize,
     }
 
@@ -1549,6 +1550,7 @@ mod tests {
             Self {
                 results,
                 fail_index: AtomicBool::new(false),
+                fail_doc_count: AtomicBool::new(false),
                 search_count: AtomicUsize::new(0),
             }
         }
@@ -1567,8 +1569,15 @@ mod tests {
             })
         }
 
-        fn doc_count(&self) -> usize {
-            self.results.len()
+        fn doc_count(&self) -> SearchResult<usize> {
+            if self.fail_doc_count.load(Ordering::Acquire) {
+                return Err(SearchError::InvalidConfig {
+                    field: "shadow.test.doc_count".to_owned(),
+                    value: "unavailable".to_owned(),
+                    reason: "injected serving document-count failure".to_owned(),
+                });
+            }
+            Ok(self.results.len())
         }
     }
 
@@ -1613,8 +1622,8 @@ mod tests {
             })
         }
 
-        fn doc_count(&self) -> usize {
-            0
+        fn doc_count(&self) -> SearchResult<usize> {
+            Ok(0)
         }
     }
 
@@ -1772,6 +1781,26 @@ mod tests {
         wrapper.submit_shadow(&cx, "io", 1, &serving_results, ShadowSearchPath::Search, 1);
         assert_eq!(shadow.search_count.load(Ordering::Acquire), 0);
         assert_eq!(wrapper.status().shed, 2_502);
+    }
+
+    #[test]
+    fn document_count_propagates_serving_authority_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let serving = Arc::new(StaticLexical::new(vec![result("a", 1.0)]));
+        let shadow = Arc::new(StaticLexical::new(vec![result("a", 1.0)]));
+        let wrapper = ShadowLexical::new(serving.clone(), shadow, enabled_config(temp.path()))
+            .expect("wrapper");
+
+        assert_eq!(wrapper.doc_count().expect("serving count"), 1);
+        serving.fail_doc_count.store(true, Ordering::Release);
+        let error = wrapper
+            .doc_count()
+            .expect_err("shadow wrapper must not fabricate a serving count");
+        assert!(matches!(
+            error,
+            SearchError::InvalidConfig { field, .. }
+                if field == "shadow.test.doc_count"
+        ));
     }
 
     #[test]

@@ -834,8 +834,14 @@ mod lexical {
             // No backend-specific fixture transform can drift between arms.
             let quill = build_quill_index(&cx, &quill_dir, &docs).await;
             let tantivy = build_tantivy_index(&cx, &tantivy_dir, &docs).await;
-            assert_eq!(LexicalRead::doc_count(&quill), docs.len());
-            assert_eq!(LexicalRead::doc_count(&tantivy), docs.len());
+            assert_eq!(
+                LexicalRead::doc_count(&quill).expect("Quill document count"),
+                docs.len()
+            );
+            assert_eq!(
+                LexicalRead::doc_count(&tantivy).expect("Tantivy document count"),
+                docs.len()
+            );
 
             assert_qrels("Quill before reopen", &passages, &spec, |query, limit| {
                 quill_sync_observation(&quill, &cx, query, limit)
@@ -868,8 +874,14 @@ mod lexical {
                 .await
                 .expect("reopen Quill index");
             let tantivy = TantivyIndex::open(&tantivy_dir).expect("reopen Tantivy index");
-            assert_eq!(LexicalRead::doc_count(&quill), docs.len());
-            assert_eq!(LexicalRead::doc_count(&tantivy), docs.len());
+            assert_eq!(
+                LexicalRead::doc_count(&quill).expect("reopened Quill document count"),
+                docs.len()
+            );
+            assert_eq!(
+                LexicalRead::doc_count(&tantivy).expect("reopened Tantivy document count"),
+                docs.len()
+            );
 
             assert_qrels("Quill after reopen", &passages, &spec, |query, limit| {
                 quill_sync_observation(&quill, &cx, query, limit)

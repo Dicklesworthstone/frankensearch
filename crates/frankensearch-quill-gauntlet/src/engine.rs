@@ -27,6 +27,8 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::GauntletError;
 use crate::artifact::GauntletProducerBuildIdentity;
+#[cfg(feature = "fuzz-harness")]
+use crate::artifact::{PinnedDirectory, PinnedRegularFile};
 use crate::comparator::{
     ComparatorConfig, ComparisonReport, CountState, EngineObservation, NativeTieKey,
     OracleBugControlObservation, RankedHit, compare_observations,
@@ -3067,8 +3069,95 @@ pub struct TypedQueryFuzzReplay {
     pub divergence_class: DivergenceClass,
 }
 
+/// An owned, descriptor-bound typed-query replay.
+///
+/// This capability deliberately exposes replay reconstruction rather than an
+/// authenticated filesystem path. Its held sidecar-directory and regular-file
+/// descriptors remain the authority when a consumer asks to reconstruct the
+/// minimized workload.
+#[cfg(feature = "fuzz-harness")]
+pub struct TypedQueryFuzzReplayArtifact {
+    replay: TypedQueryFuzzReplay,
+    replay_directory: PinnedDirectory,
+    filename: std::ffi::OsString,
+    file: PinnedRegularFile,
+}
+
 #[cfg(feature = "fuzz-harness")]
 const TYPED_QUERY_FUZZ_REPLAY_EXTENSION: &str = "json";
+#[cfg(feature = "fuzz-harness")]
+const TYPED_QUERY_FUZZ_REPLAY_DIRECTORY: &str = "typed_query_tree";
+/// A replay contains a 64-byte fuzz input, a fixed sixteen-document manifest,
+/// and one typed AST.  This bounded reader fails closed before allocating for
+/// an untrusted sidecar file.
+#[cfg(feature = "fuzz-harness")]
+const MAX_TYPED_QUERY_FUZZ_REPLAY_BYTES: u64 = 1024 * 1024;
+
+#[cfg(all(test, feature = "fuzz-harness"))]
+thread_local! {
+    static TYPED_QUERY_FUZZ_REPLAY_FINAL_BINDING_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce(&std::path::Path)>>> =
+            std::cell::RefCell::new(None);
+    static TYPED_QUERY_FUZZ_REPLAY_POST_DISPLAY_VERIFICATION_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce(&std::path::Path)>>> =
+            std::cell::RefCell::new(None);
+}
+
+/// Test-only interlock for a deterministic mutation after replay I/O and
+/// before the final descriptor-to-dirent binding.  Production performs no
+/// callback at this point.
+#[cfg(feature = "fuzz-harness")]
+fn typed_query_fuzz_replay_before_final_binding(path: &std::path::Path) {
+    #[cfg(all(test, feature = "fuzz-harness"))]
+    TYPED_QUERY_FUZZ_REPLAY_FINAL_BINDING_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(path);
+        }
+    });
+    #[cfg(not(test))]
+    let _ = path;
+}
+
+/// Test-only interlock after the ambient display-path check and before the
+/// final descriptor-relative entry authentication. Production performs no
+/// callback at this point.
+#[cfg(feature = "fuzz-harness")]
+fn typed_query_fuzz_replay_after_display_verification(path: &std::path::Path) {
+    #[cfg(all(test, feature = "fuzz-harness"))]
+    TYPED_QUERY_FUZZ_REPLAY_POST_DISPLAY_VERIFICATION_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(path);
+        }
+    });
+    #[cfg(not(test))]
+    let _ = path;
+}
+
+#[cfg(all(test, feature = "fuzz-harness"))]
+fn install_typed_query_fuzz_replay_final_binding_hook(
+    hook: impl FnOnce(&std::path::Path) + 'static,
+) {
+    TYPED_QUERY_FUZZ_REPLAY_FINAL_BINDING_HOOK.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "typed-query replay binding hook must be consumed before replacement"
+        );
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(all(test, feature = "fuzz-harness"))]
+fn install_typed_query_fuzz_replay_post_display_verification_hook(
+    hook: impl FnOnce(&std::path::Path) + 'static,
+) {
+    TYPED_QUERY_FUZZ_REPLAY_POST_DISPLAY_VERIFICATION_HOOK.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "typed-query replay post-display hook must be consumed before replacement"
+        );
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
 
 #[cfg(feature = "fuzz-harness")]
 impl TypedQueryFuzzReplay {
@@ -3202,45 +3291,126 @@ impl TypedQueryFuzzReplay {
     }
 }
 
+#[cfg(feature = "fuzz-harness")]
+impl TypedQueryFuzzReplayArtifact {
+    /// Reconstruct the minimized workload through the still-owned descriptor
+    /// binding, rejecting a later replacement of the original sidecar entry.
+    pub fn replay_workload(&self) -> Result<TypedQueryFuzzWorkload, GauntletError> {
+        self.replay_directory
+            .authenticate_regular_child(&self.filename, &self.file)?;
+        self.replay.replay_workload()
+    }
+
+    /// Return the content-addressed key for diagnostics without exposing an
+    /// ambient path as an authenticated replay handle.
+    pub fn artifact_key(&self) -> Result<String, GauntletError> {
+        self.replay.artifact_key()
+    }
+}
+
 /// Persist a replay under a key that includes corpus and failure identity.
+///
+/// The returned capability owns the canonical no-follow directory and regular
+/// file descriptors. Consumers must use its replay method rather than treating
+/// an ambient path as authenticated after this call returns.
 #[cfg(feature = "fuzz-harness")]
 pub fn persist_typed_query_fuzz_replay(
     root: &std::path::Path,
     replay: &TypedQueryFuzzReplay,
-) -> Result<std::path::PathBuf, GauntletError> {
+) -> Result<TypedQueryFuzzReplayArtifact, GauntletError> {
     let bytes = replay.canonical_bytes()?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_TYPED_QUERY_FUZZ_REPLAY_BYTES {
+        return Err(GauntletError::InvalidCase {
+            reason: "typed-query replay canonical payload exceeds its bounded sidecar budget"
+                .to_owned(),
+        });
+    }
     let key = replay.artifact_key_from_canonical_bytes(&bytes)?;
-    let directory = root.join("typed_query_tree");
-    std::fs::create_dir_all(&directory)?;
-    let path = directory.join(typed_query_fuzz_replay_filename(&key));
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
+    let filename = typed_query_fuzz_replay_filename(&key);
+    let root_directory = PinnedDirectory::ensure_path(root)?;
+    let replay_directory = root_directory
+        .ensure_child_directory(std::ffi::OsStr::new(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY))?;
+    let path = root.join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY).join(&filename);
+    let file = match replay_directory
+        .write_regular_create_new_and_read_back(std::ffi::OsStr::new(&filename), &bytes)?
     {
-        Ok(mut file) => {
-            use std::io::Write as _;
-
-            file.write_all(&bytes)?;
-            file.sync_all()?;
+        Some((read_back, file)) => {
+            if read_back != bytes {
+                return Err(GauntletError::UnsafeStorePath { path: path.clone() });
+            }
+            file
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let existing = std::fs::read(&path)?;
+        None => {
+            let (existing, file) = replay_directory.read_regular_bounded_open(
+                std::ffi::OsStr::new(&filename),
+                MAX_TYPED_QUERY_FUZZ_REPLAY_BYTES,
+            )?;
             if existing != bytes {
                 return Err(GauntletError::ArtifactCollision { path });
             }
+            file
         }
-        Err(error) => return Err(error.into()),
-    }
-    Ok(path)
+    };
+    bind_typed_query_fuzz_replay_final_entry(
+        &replay_directory,
+        std::ffi::OsStr::new(&filename),
+        &file,
+        &path,
+    )?;
+    // A no-replace loser has authenticated the winner's complete bytes, but
+    // its final directory entry remains crash-vulnerable until this held
+    // descriptor is synced.  Keep the sync after the final binding for both
+    // outcomes so neither caller can report a durable replay prematurely.
+    replay_directory.sync_directory()?;
+    Ok(TypedQueryFuzzReplayArtifact {
+        replay: replay.clone(),
+        replay_directory,
+        filename: filename.into(),
+        file,
+    })
 }
 
-/// Load and validate a minimized replay before returning it to a runner.
+/// Load and validate a minimized replay into an owned descriptor-bound
+/// capability before returning it to a runner.
 #[cfg(feature = "fuzz-harness")]
 pub fn load_typed_query_fuzz_replay(
     path: &std::path::Path,
-) -> Result<TypedQueryFuzzReplay, GauntletError> {
-    let stored_bytes = std::fs::read(path)?;
+) -> Result<TypedQueryFuzzReplayArtifact, GauntletError> {
+    let filename = path
+        .file_name()
+        .ok_or_else(|| GauntletError::ManifestMismatch {
+            reason: "typed-query replay path has no final filename component".to_owned(),
+        })?;
+    if path.extension() != Some(std::ffi::OsStr::new(TYPED_QUERY_FUZZ_REPLAY_EXTENSION)) {
+        return Err(GauntletError::ManifestMismatch {
+            reason: "typed-query replay path uses an unknown extension".to_owned(),
+        });
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| GauntletError::ManifestMismatch {
+            reason: "typed-query replay path has no parent directory".to_owned(),
+        })?;
+    if parent.file_name() != Some(std::ffi::OsStr::new(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY)) {
+        return Err(GauntletError::ManifestMismatch {
+            reason: "typed-query replay must reside directly in typed_query_tree".to_owned(),
+        });
+    }
+    let replay_directory = PinnedDirectory::open_path(parent)?;
+    load_typed_query_fuzz_replay_from_directory(replay_directory, filename, path)
+}
+
+/// Authenticate a replay through an already-owned sidecar-directory capability.
+/// The public path entrypoint opens that capability with a no-follow component
+/// walk before reaching this shared validation path.
+#[cfg(feature = "fuzz-harness")]
+fn load_typed_query_fuzz_replay_from_directory(
+    replay_directory: PinnedDirectory,
+    filename: &std::ffi::OsStr,
+    path: &std::path::Path,
+) -> Result<TypedQueryFuzzReplayArtifact, GauntletError> {
+    let (stored_bytes, file) =
+        replay_directory.read_regular_bounded_open(filename, MAX_TYPED_QUERY_FUZZ_REPLAY_BYTES)?;
     let replay = serde_json::from_slice::<TypedQueryFuzzReplay>(&stored_bytes)?;
     let canonical_bytes = replay.canonical_bytes()?;
     if stored_bytes != canonical_bytes {
@@ -3250,9 +3420,8 @@ pub fn load_typed_query_fuzz_replay(
     }
     let key = replay.artifact_key_from_canonical_bytes(&canonical_bytes)?;
     let expected_filename = typed_query_fuzz_replay_filename(&key);
-    let actual_filename = path
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
+    let actual_filename = filename
+        .to_str()
         .ok_or_else(|| GauntletError::ManifestMismatch {
             reason: "typed-query replay path has no UTF-8 final filename component".to_owned(),
         })?;
@@ -3263,7 +3432,31 @@ pub fn load_typed_query_fuzz_replay(
             ),
         });
     }
-    Ok(replay)
+    bind_typed_query_fuzz_replay_final_entry(&replay_directory, filename, &file, path)?;
+    Ok(TypedQueryFuzzReplayArtifact {
+        replay,
+        replay_directory,
+        filename: filename.to_owned(),
+        file,
+    })
+}
+
+/// Bind the just-read or just-created replay FD to the exact final sidecar
+/// name.  The final repeated authentication follows the display-path identity
+/// check so this routine reports either a parent-directory substitution or a
+/// final-entry replacement before the public operation succeeds.
+#[cfg(feature = "fuzz-harness")]
+fn bind_typed_query_fuzz_replay_final_entry(
+    replay_directory: &PinnedDirectory,
+    filename: &std::ffi::OsStr,
+    file: &PinnedRegularFile,
+    path: &std::path::Path,
+) -> Result<(), GauntletError> {
+    typed_query_fuzz_replay_before_final_binding(path);
+    replay_directory.authenticate_regular_child(filename, file)?;
+    replay_directory.verify_display_path_identity()?;
+    typed_query_fuzz_replay_after_display_verification(path);
+    replay_directory.authenticate_regular_child(filename, file)
 }
 
 #[cfg(feature = "fuzz-harness")]
@@ -4918,7 +5111,9 @@ mod tests {
         seed: u64,
         corpus_hash: u64,
     ) -> E55CaseEvidence {
-        let snapshot = index.search_snapshot();
+        let snapshot = index
+            .search_snapshot()
+            .expect("E5.5 published snapshot is authoritative");
         let query_text = match &query.input {
             E55QueryInput::Source(source) => (*source).to_owned(),
             E55QueryInput::Preparsed(_) => format!("<preparsed:{}>", query.id),
@@ -5027,7 +5222,9 @@ mod tests {
             docids.windows(2).all(|window| window[0] < window[1]),
             "E5.5 docset is sorted and unique"
         );
-        let snapshot = index.search_snapshot();
+        let snapshot = index
+            .search_snapshot()
+            .expect("E5.5 published snapshot is authoritative");
         let hits = docids
             .into_iter()
             .map(|global_docid| RankedHit {
@@ -5079,7 +5276,10 @@ mod tests {
         let config = e55_config();
         let index = QuillIndex::in_memory_with_schema(E55_SCHEMA, config)
             .expect("construct historical E5.5 index");
-        let generation = index.search_snapshot().keeper_generation();
+        let generation = index
+            .search_snapshot()
+            .expect("historical E5.5 snapshot is authoritative")
+            .keeper_generation();
         let mut historical = E55DeltaBuilder::new(0);
         let (historical_docid, replaced) = historical.add(E55Document::new(
             E55_HISTORICAL_ID,
@@ -5107,17 +5307,25 @@ mod tests {
         assert_eq!(
             index
                 .search_snapshot()
+                .expect("historical E5.5 snapshot is authoritative")
                 .materialize_document_id(historical_docid)
                 .as_deref(),
             Some(E55_HISTORICAL_ID),
             "the sealed upsert source remains live until its replacement is staged"
         );
-        let baseline_history_segments = index.snapshot().segments().len();
+        let baseline_history_segments = index
+            .snapshot()
+            .expect("historical E5.5 snapshot is authoritative")
+            .segments()
+            .len();
         (index, baseline_history_segments, historical_docid)
     }
 
     fn e55_tombstone_sealed_upsert_source(index: &QuillIndex, historical_docid: u32) -> QuillIndex {
-        let committed = index.snapshot().clone();
+        let committed = index
+            .snapshot()
+            .expect("sealed upsert source snapshot is authoritative")
+            .clone();
         assert_eq!(
             committed
                 .materialize_document_id(historical_docid)
@@ -5228,6 +5436,7 @@ mod tests {
     ) -> E55LiveCorpus {
         let lease_base = index
             .snapshot()
+            .expect("E5.5 live corpus snapshot is authoritative")
             .loaded_manifest()
             .manifest
             .docid_high_watermark;
@@ -5243,7 +5452,10 @@ mod tests {
             extras_per_delta + 16 < DOC_ORDS_PER_LEASE as usize,
             "seeded E5.5 fixture stays within each Q1 lease"
         );
-        let generation = index.search_snapshot().keeper_generation();
+        let generation = index
+            .search_snapshot()
+            .expect("E5.5 published snapshot is authoritative")
+            .keeper_generation();
         let mut random = seed;
 
         let mut first = E55DeltaBuilder::new(lease_base);
@@ -5258,6 +5470,7 @@ mod tests {
         assert_eq!(
             index
                 .search_snapshot()
+                .expect("E5.5 published snapshot is authoritative")
                 .materialize_document_id(historical_docid)
                 .as_deref(),
             Some(E55_HISTORICAL_ID),
@@ -5278,6 +5491,7 @@ mod tests {
         assert_eq!(
             index
                 .search_snapshot()
+                .expect("E5.5 published snapshot is authoritative")
                 .materialize_document_id(historical_docid)
                 .as_deref(),
             Some(E55_HISTORICAL_ID),
@@ -5410,7 +5624,9 @@ mod tests {
     }
 
     fn e55_stats_witness(index: &QuillIndex) -> E55StatsWitness {
-        let snapshot = index.search_snapshot();
+        let snapshot = index
+            .search_snapshot()
+            .expect("E5.5 published snapshot is authoritative");
         let fields = [
             E55_ID_FIELD,
             E55_CONTENT_FIELD,
@@ -5457,7 +5673,9 @@ mod tests {
     }
 
     fn e55_live_leaf_ranges(index: &QuillIndex, baseline_dead_segments: usize) -> Vec<(u64, u64)> {
-        let snapshot = index.search_snapshot();
+        let snapshot = index
+            .search_snapshot()
+            .expect("E5.5 published snapshot is authoritative");
         let mut ranges = snapshot
             .keeper_snapshot()
             .segments()
@@ -5492,7 +5710,9 @@ mod tests {
         retired_docids: &[u32],
         replacement_docid: u32,
     ) {
-        let snapshot = index.search_snapshot();
+        let snapshot = index
+            .search_snapshot()
+            .expect("E5.5 published snapshot is authoritative");
         for (document_id, &global_docid) in expected_live {
             assert_eq!(
                 snapshot
@@ -5541,7 +5761,9 @@ mod tests {
         expected_delta_leaves: usize,
         context: &E55CaptureContext<'_>,
     ) -> E55ResidencyEvidence {
-        let snapshot = index.search_snapshot();
+        let snapshot = index
+            .search_snapshot()
+            .expect("E5.5 published snapshot is authoritative");
         let raw_keeper_segments = snapshot.keeper_snapshot().segments().len();
         let new_keeper_segments = raw_keeper_segments
             .checked_sub(context.baseline_dead_segments)
@@ -5614,7 +5836,9 @@ mod tests {
         state: &'static str,
         expected: E410EdgeStateShape,
     ) -> BTreeMap<String, E55CaseEvidence> {
-        let snapshot = index.search_snapshot();
+        let snapshot = index
+            .search_snapshot()
+            .expect("E4.10 published snapshot is authoritative");
         let keeper = snapshot.keeper_snapshot();
         assert_eq!(
             keeper.segments().len(),
@@ -5769,7 +5993,10 @@ mod tests {
     fn e410_delta_only_index() -> QuillIndex {
         let index = QuillIndex::in_memory_with_schema(E55_SCHEMA, e55_config())
             .expect("construct strict E4.10 Delta-only index");
-        let generation = index.search_snapshot().keeper_generation();
+        let generation = index
+            .search_snapshot()
+            .expect("strict E4.10 snapshot is authoritative")
+            .keeper_generation();
         let mut delta = E55DeltaBuilder::new(0);
         let (_, replaced) = delta.add(E55Document::new(
             E55_HISTORICAL_ID,
@@ -5931,7 +6158,10 @@ mod tests {
             e55_index_with_live_history(cx).await;
         let mut corpus = e55_build_live_corpus(&index, seed, extras_per_delta, historical_docid);
         let index = e55_tombstone_sealed_upsert_source(&index, historical_docid);
-        let successor_generation = index.search_snapshot().keeper_generation();
+        let successor_generation = index
+            .search_snapshot()
+            .expect("sealed-upsert successor snapshot is authoritative")
+            .keeper_generation();
         corpus.first = Arc::new(corpus.first.rebind_keeper_generation(successor_generation));
         corpus.second = Arc::new(corpus.second.rebind_keeper_generation(successor_generation));
         let mut retired_docids = corpus.retired_docids.clone();
@@ -5964,6 +6194,7 @@ mod tests {
 
         let mixed_generation = index
             .search_snapshot()
+            .expect("mixed-residency snapshot is authoritative")
             .keeper_generation()
             .checked_add(1)
             .expect("mixed E5.5 Keeper generation fits u64");
@@ -9548,7 +9779,8 @@ mod tests {
                     rejected
                         .index()
                         .expect("E6.3 read rejected duplicate lifecycle campaign")
-                        .doc_count(),
+                        .doc_count()
+                        .expect("E6.3 rejected campaign count is authoritative"),
                     0,
                     "E6.3 seed {seed:#x} a rejected ingest must not publish part of its batch"
                 );
@@ -10637,7 +10869,18 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "fuzz-harness")]
+    #[cfg(all(
+        feature = "fuzz-harness",
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
+    ))]
     fn typed_query_replay_test_root(label: &str) -> std::path::PathBuf {
         static DIRECTORY_NONCE: AtomicUsize = AtomicUsize::new(0);
 
@@ -10648,6 +10891,89 @@ mod tests {
         ));
         std::fs::create_dir(&root).expect("create unique owned replay test directory");
         root
+    }
+
+    #[cfg(all(
+        feature = "fuzz-harness",
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
+    ))]
+    fn typed_query_write_new_owned_file(path: &std::path::Path, bytes: &[u8]) {
+        use std::io::Write as _;
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("create one new owned hostile replay artifact");
+        file.write_all(bytes)
+            .expect("write one new owned hostile replay artifact");
+        file.sync_all()
+            .expect("sync one new owned hostile replay artifact");
+    }
+
+    #[cfg(all(
+        feature = "fuzz-harness",
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
+    ))]
+    fn typed_query_replay_path(
+        root: &std::path::Path,
+        replay: &TypedQueryFuzzReplay,
+    ) -> std::path::PathBuf {
+        root.join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY)
+            .join(typed_query_fuzz_replay_filename(
+                &replay
+                    .artifact_key()
+                    .expect("canonical typed-query replay key"),
+            ))
+    }
+
+    #[cfg(all(
+        feature = "fuzz-harness",
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
+    ))]
+    fn typed_query_rewrite_owned_file_same_length(path: &std::path::Path, bytes: &[u8]) {
+        use std::io::Write as _;
+
+        let original_len = std::fs::metadata(path)
+            .expect("owned replay artifact exists before hostile rewrite")
+            .len();
+        assert_eq!(
+            u64::try_from(bytes.len()).expect("hostile bytes fit u64"),
+            original_len,
+            "hostile rewrite must retain the original file length"
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open one owned replay artifact for hostile same-inode rewrite");
+        file.write_all(bytes)
+            .expect("rewrite one owned replay artifact at the same length");
+        file.sync_all()
+            .expect("sync hostile same-inode replay rewrite");
     }
 
     #[cfg(feature = "fuzz-harness")]
@@ -10713,37 +11039,80 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "fuzz-harness")]
+    #[cfg(all(
+        feature = "fuzz-harness",
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
+    ))]
     #[test]
     fn typed_query_public_replay_persistence_authenticates_canonical_filename() {
         let replay = typed_query_test_replay(&[22, 1, 7, 99], TypedQueryTree::MixedHitMiss(1, 7));
         let root = typed_query_replay_test_root("public-persistence");
-        let path = persist_typed_query_fuzz_replay(&root, &replay)
+        let artifact = persist_typed_query_fuzz_replay(&root, &replay)
             .expect("persist with create-new in an owned directory");
         let canonical_bytes = replay.canonical_bytes().expect("canonical replay bytes");
         let artifact_key = replay.artifact_key().expect("canonical artifact key");
         let expected_filename = typed_query_fuzz_replay_filename(&artifact_key);
+        let path = typed_query_replay_path(&root, &replay);
         assert_eq!(
             path.file_name().and_then(std::ffi::OsStr::to_str),
             Some(expected_filename.as_str()),
-            "the persisted final path component must be the canonical content-addressed name"
+            "the caller-supplied load locator must use the canonical content-addressed name"
         );
         assert_eq!(
-            load_typed_query_fuzz_replay(&path).expect("load canonical persisted replay"),
-            replay,
-            "the public load entrypoint must reconstruct the persisted replay"
+            artifact
+                .replay_workload()
+                .expect("persisted descriptor capability reconstructs the replay")
+                .case
+                .query,
+            replay.minimized_query,
+            "the public persist entrypoint must return a consumable descriptor capability"
+        );
+        assert_eq!(
+            load_typed_query_fuzz_replay(&path)
+                .expect("load canonical persisted replay")
+                .replay_workload()
+                .expect("loaded descriptor capability reconstructs the replay")
+                .case
+                .query,
+            replay.minimized_query,
+            "the public load entrypoint must return a consumable descriptor capability"
+        );
+        assert_eq!(
+            persist_typed_query_fuzz_replay(&root, &replay)
+                .expect("authenticate an already-created canonical replay without overwrite")
+                .artifact_key()
+                .expect("duplicate descriptor capability has the canonical key"),
+            artifact_key,
+            "a duplicate persist may only reuse the same authenticated create-new artifact"
         );
 
         let reject_under_original_key = |label: &str, bytes: Vec<u8>| {
-            std::fs::write(&path, bytes).expect("plant hostile replay bytes under original key");
+            let hostile_root = typed_query_replay_test_root(label);
+            let hostile_directory = hostile_root.join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY);
+            std::fs::create_dir(&hostile_directory)
+                .expect("create unique hostile typed-query directory");
+            let hostile_path = hostile_directory.join(&expected_filename);
+            typed_query_write_new_owned_file(&hostile_path, &bytes);
             assert!(
                 matches!(
-                    load_typed_query_fuzz_replay(&path),
+                    load_typed_query_fuzz_replay(&hostile_path),
                     Err(GauntletError::ManifestMismatch { .. })
                 ),
                 "{label} must not load under the original content-addressed key"
             );
-            std::fs::write(&path, &canonical_bytes).expect("restore owned canonical replay bytes");
+            assert_eq!(
+                std::fs::read(&hostile_path).expect("hostile artifact remains intact"),
+                bytes,
+                "{label} must not be overwritten during rejection"
+            );
         };
 
         let replacement =
@@ -10806,17 +11175,25 @@ mod tests {
             serde_json::to_vec(&query_tamper).expect("query mutation bytes"),
         );
 
-        let wrong_filename = path.with_file_name("not-the-content-key.json");
-        std::fs::write(&wrong_filename, &canonical_bytes)
-            .expect("plant valid replay under wrong filename");
+        let wrong_filename_root = typed_query_replay_test_root("wrong-filename");
+        let wrong_filename_directory = wrong_filename_root.join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY);
+        std::fs::create_dir(&wrong_filename_directory)
+            .expect("create wrong-filename typed-query directory");
+        let wrong_filename = wrong_filename_directory.join("not-the-content-key.json");
+        typed_query_write_new_owned_file(&wrong_filename, &canonical_bytes);
         assert!(matches!(
             load_typed_query_fuzz_replay(&wrong_filename),
             Err(GauntletError::ManifestMismatch { .. })
         ));
 
-        let unknown_extension = path.with_extension("replay");
-        std::fs::write(&unknown_extension, &canonical_bytes)
-            .expect("plant valid replay with unknown extension");
+        let unknown_extension_root = typed_query_replay_test_root("unknown-extension");
+        let unknown_extension_directory =
+            unknown_extension_root.join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY);
+        std::fs::create_dir(&unknown_extension_directory)
+            .expect("create unknown-extension typed-query directory");
+        let unknown_extension =
+            unknown_extension_directory.join("replay-with-unknown-extension.replay");
+        typed_query_write_new_owned_file(&unknown_extension, &canonical_bytes);
         assert!(matches!(
             load_typed_query_fuzz_replay(&unknown_extension),
             Err(GauntletError::ManifestMismatch { .. })
@@ -10832,12 +11209,683 @@ mod tests {
                 .expect("collision path has a typed-query directory"),
         )
         .expect("create owned collision directory");
-        std::fs::write(&collision_path, b"unrelated existing replay")
-            .expect("plant pre-existing collision");
+        typed_query_write_new_owned_file(&collision_path, b"unrelated existing replay");
         assert!(matches!(
             persist_typed_query_fuzz_replay(&collision_root, &replay),
             Err(GauntletError::ArtifactCollision { path: reported }) if reported == collision_path
         ));
+        assert_eq!(
+            std::fs::read(&collision_path).expect("collision artifact remains intact"),
+            b"unrelated existing replay"
+        );
+        assert_eq!(
+            load_typed_query_fuzz_replay(&path)
+                .expect("original replay remains loadable")
+                .replay_workload()
+                .expect("original descriptor capability remains consumable")
+                .case
+                .query,
+            replay.minimized_query,
+            "hostile cases must not overwrite the original persisted artifact"
+        );
+    }
+
+    #[cfg(all(
+        feature = "fuzz-harness",
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
+    ))]
+    #[test]
+    fn typed_query_replay_sidecar_rejects_symlinks_and_nonregular_entries() {
+        use std::os::unix::fs::symlink;
+
+        let replay = typed_query_test_replay(&[22, 1, 7, 99], TypedQueryTree::MixedHitMiss(1, 7));
+        let canonical_bytes = replay.canonical_bytes().expect("canonical replay bytes");
+        let filename = typed_query_fuzz_replay_filename(
+            &replay.artifact_key().expect("canonical artifact key"),
+        );
+
+        let final_target_root = typed_query_replay_test_root("final-symlink-target");
+        let final_target_artifact = persist_typed_query_fuzz_replay(&final_target_root, &replay)
+            .expect("persist final-symlink target");
+        assert_eq!(
+            final_target_artifact
+                .replay_workload()
+                .expect("final-symlink target capability remains consumable")
+                .case
+                .query,
+            replay.minimized_query
+        );
+        let final_target = typed_query_replay_path(&final_target_root, &replay);
+        let final_symlink_root = typed_query_replay_test_root("final-symlink");
+        let final_symlink_directory = final_symlink_root.join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY);
+        std::fs::create_dir(&final_symlink_directory).expect("create final-symlink directory");
+        let final_symlink = final_symlink_directory.join(&filename);
+        symlink(&final_target, &final_symlink).expect("plant final-component symlink");
+        assert!(matches!(
+            persist_typed_query_fuzz_replay(&final_symlink_root, &replay),
+            Err(GauntletError::UnsafeStorePath { .. })
+        ));
+        assert!(matches!(
+            load_typed_query_fuzz_replay(&final_symlink),
+            Err(GauntletError::UnsafeStorePath { .. })
+        ));
+        assert!(
+            std::fs::symlink_metadata(&final_symlink)
+                .expect("final symlink remains intact")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(&final_target).expect("final target remains intact"),
+            canonical_bytes
+        );
+
+        let directory_target_root = typed_query_replay_test_root("directory-symlink-target");
+        let directory_target_artifact =
+            persist_typed_query_fuzz_replay(&directory_target_root, &replay)
+                .expect("persist directory-symlink target");
+        assert_eq!(
+            directory_target_artifact
+                .replay_workload()
+                .expect("directory-symlink target capability remains consumable")
+                .case
+                .query,
+            replay.minimized_query
+        );
+        let directory_target = typed_query_replay_path(&directory_target_root, &replay);
+        let directory_symlink_root = typed_query_replay_test_root("directory-symlink");
+        let directory_symlink = directory_symlink_root.join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY);
+        symlink(
+            directory_target
+                .parent()
+                .expect("directory target has sidecar parent"),
+            &directory_symlink,
+        )
+        .expect("plant typed-query-tree directory symlink");
+        let directory_symlink_path = directory_symlink.join(&filename);
+        assert!(matches!(
+            persist_typed_query_fuzz_replay(&directory_symlink_root, &replay),
+            Err(GauntletError::UnsafeStorePath { .. })
+        ));
+        assert!(matches!(
+            load_typed_query_fuzz_replay(&directory_symlink_path),
+            Err(GauntletError::UnsafeStorePath { .. })
+        ));
+        assert!(
+            std::fs::symlink_metadata(&directory_symlink)
+                .expect("directory symlink remains intact")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            load_typed_query_fuzz_replay(&directory_target)
+                .expect("directory symlink target remains loadable")
+                .replay_workload()
+                .expect("directory symlink target descriptor remains consumable")
+                .case
+                .query,
+            replay.minimized_query
+        );
+
+        let nonregular_root = typed_query_replay_test_root("nonregular-collision");
+        let nonregular_directory = nonregular_root.join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY);
+        std::fs::create_dir(&nonregular_directory).expect("create nonregular sidecar directory");
+        let nonregular_collision = nonregular_directory.join(&filename);
+        std::fs::create_dir(&nonregular_collision).expect("plant nonregular collision directory");
+        assert!(matches!(
+            persist_typed_query_fuzz_replay(&nonregular_root, &replay),
+            Err(GauntletError::UnsafeStorePath { .. })
+        ));
+        assert!(
+            std::fs::metadata(&nonregular_collision)
+                .expect("nonregular collision remains intact")
+                .is_dir()
+        );
+    }
+
+    #[cfg(all(
+        feature = "fuzz-harness",
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
+    ))]
+    #[test]
+    fn typed_query_public_replay_rejects_post_io_final_and_parent_substitution() {
+        let replay = typed_query_test_replay(&[22, 1, 7, 99], TypedQueryTree::MixedHitMiss(1, 7));
+        let canonical_bytes = replay.canonical_bytes().expect("canonical replay bytes");
+        let filename = typed_query_fuzz_replay_filename(
+            &replay.artifact_key().expect("canonical artifact key"),
+        );
+
+        let create_root = typed_query_replay_test_root("create-final-substitution");
+        let create_displaced = create_root
+            .join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY)
+            .join(format!("{filename}.displaced-create"));
+        let create_bytes = canonical_bytes.clone();
+        let create_displaced_for_hook = create_displaced.clone();
+        install_typed_query_fuzz_replay_final_binding_hook(move |path| {
+            std::fs::rename(path, &create_displaced_for_hook)
+                .expect("move post-write owned canonical artifact aside without deletion");
+            typed_query_write_new_owned_file(path, &create_bytes);
+        });
+        let create_path = create_root
+            .join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY)
+            .join(&filename);
+        assert!(matches!(
+            persist_typed_query_fuzz_replay(&create_root, &replay),
+            Err(GauntletError::UnsafeStorePath { path }) if path == create_path
+        ));
+        assert_eq!(
+            std::fs::read(&create_displaced).expect("displaced post-write artifact remains intact"),
+            canonical_bytes
+        );
+        assert_eq!(
+            std::fs::read(&create_path).expect("substituted canonical artifact remains intact"),
+            canonical_bytes
+        );
+
+        let load_root = typed_query_replay_test_root("load-final-substitution");
+        let load_artifact =
+            persist_typed_query_fuzz_replay(&load_root, &replay).expect("persist load source");
+        assert_eq!(
+            load_artifact
+                .replay_workload()
+                .expect("load source descriptor capability remains consumable")
+                .case
+                .query,
+            replay.minimized_query
+        );
+        let load_path = typed_query_replay_path(&load_root, &replay);
+        let load_displaced = load_path.with_file_name(format!("{filename}.displaced-load"));
+        let load_bytes = canonical_bytes.clone();
+        let load_displaced_for_hook = load_displaced.clone();
+        install_typed_query_fuzz_replay_final_binding_hook(move |path| {
+            std::fs::rename(path, &load_displaced_for_hook)
+                .expect("move post-read owned canonical artifact aside without deletion");
+            typed_query_write_new_owned_file(path, &load_bytes);
+        });
+        assert!(matches!(
+            load_typed_query_fuzz_replay(&load_path),
+            Err(GauntletError::UnsafeStorePath { path }) if path == load_path
+        ));
+        assert_eq!(
+            std::fs::read(&load_displaced).expect("displaced post-read artifact remains intact"),
+            canonical_bytes
+        );
+        assert_eq!(
+            std::fs::read(&load_path).expect("substituted load artifact remains intact"),
+            canonical_bytes
+        );
+
+        let parent_root = typed_query_replay_test_root("load-parent-substitution");
+        let parent_artifact = persist_typed_query_fuzz_replay(&parent_root, &replay)
+            .expect("persist parent-substitution source");
+        assert_eq!(
+            parent_artifact
+                .replay_workload()
+                .expect("parent-substitution source descriptor remains consumable")
+                .case
+                .query,
+            replay.minimized_query
+        );
+        let parent_path = typed_query_replay_path(&parent_root, &replay);
+        let parent_directory = parent_path
+            .parent()
+            .expect("parent-substitution source has sidecar directory")
+            .to_path_buf();
+        let displaced_parent = parent_root.join("typed_query_tree-displaced-parent");
+        let parent_bytes = canonical_bytes.clone();
+        let parent_directory_for_hook = parent_directory.clone();
+        let displaced_parent_for_hook = displaced_parent.clone();
+        install_typed_query_fuzz_replay_final_binding_hook(move |path| {
+            std::fs::rename(&parent_directory_for_hook, &displaced_parent_for_hook)
+                .expect("move owned sidecar directory aside without deletion");
+            std::fs::create_dir(&parent_directory_for_hook)
+                .expect("create substituted owned sidecar directory");
+            typed_query_write_new_owned_file(path, &parent_bytes);
+        });
+        assert!(matches!(
+            load_typed_query_fuzz_replay(&parent_path),
+            Err(GauntletError::UnsafeStorePath { path }) if path == parent_directory
+        ));
+        assert_eq!(
+            std::fs::read(displaced_parent.join(&filename))
+                .expect("displaced parent artifact remains intact"),
+            canonical_bytes
+        );
+        assert_eq!(
+            std::fs::read(&parent_path).expect("substituted parent artifact remains intact"),
+            canonical_bytes
+        );
+    }
+
+    #[cfg(all(
+        feature = "fuzz-harness",
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
+    ))]
+    #[test]
+    fn typed_query_public_replay_capability_handles_late_substitution_and_rejects_same_inode_rewrite()
+     {
+        let replay = typed_query_test_replay(&[22, 1, 7, 99], TypedQueryTree::MixedHitMiss(1, 7));
+        let canonical_bytes = replay.canonical_bytes().expect("canonical replay bytes");
+        let filename = typed_query_fuzz_replay_filename(
+            &replay.artifact_key().expect("canonical artifact key"),
+        );
+
+        let persist_root = typed_query_replay_test_root("late-persist-path-substitution");
+        let persist_path = typed_query_replay_path(&persist_root, &replay);
+        let persist_directory = persist_path
+            .parent()
+            .expect("persist path has a sidecar directory")
+            .to_path_buf();
+        let persist_displaced = persist_root.join("typed_query_tree-displaced-late-persist");
+        let persist_decoy = vec![b'~'; canonical_bytes.len()];
+        let persist_directory_for_hook = persist_directory.clone();
+        let persist_displaced_for_hook = persist_displaced.clone();
+        install_typed_query_fuzz_replay_post_display_verification_hook(move |path| {
+            std::fs::rename(&persist_directory_for_hook, &persist_displaced_for_hook)
+                .expect("move owned sidecar after display verification without deletion");
+            std::fs::create_dir(&persist_directory_for_hook)
+                .expect("create substituted owned sidecar directory");
+            typed_query_write_new_owned_file(path, &persist_decoy);
+        });
+        let persisted = persist_typed_query_fuzz_replay(&persist_root, &replay)
+            .expect("late display-path substitution must not replace the returned capability");
+        assert_eq!(
+            persisted
+                .replay_workload()
+                .expect("persisted capability must consume its original descriptor binding")
+                .case
+                .query,
+            replay.minimized_query
+        );
+        assert_eq!(
+            std::fs::read(persist_displaced.join(&filename))
+                .expect("original late-persist artifact remains intact"),
+            canonical_bytes
+        );
+        assert_eq!(
+            std::fs::read(&persist_path).expect("ambient late-persist path resolves to the decoy"),
+            vec![b'~'; canonical_bytes.len()],
+            "the old PathBuf-returning API would have exposed this substituted entry"
+        );
+
+        let load_root = typed_query_replay_test_root("late-load-path-substitution");
+        persist_typed_query_fuzz_replay(&load_root, &replay)
+            .expect("persist late-load source descriptor capability");
+        let load_path = typed_query_replay_path(&load_root, &replay);
+        let load_directory = load_path
+            .parent()
+            .expect("load path has a sidecar directory")
+            .to_path_buf();
+        let load_displaced = load_root.join("typed_query_tree-displaced-late-load");
+        let load_decoy = vec![b'!'; canonical_bytes.len()];
+        let load_directory_for_hook = load_directory.clone();
+        let load_displaced_for_hook = load_displaced.clone();
+        install_typed_query_fuzz_replay_post_display_verification_hook(move |path| {
+            std::fs::rename(&load_directory_for_hook, &load_displaced_for_hook)
+                .expect("move owned load sidecar after display verification without deletion");
+            std::fs::create_dir(&load_directory_for_hook)
+                .expect("create substituted owned load sidecar directory");
+            typed_query_write_new_owned_file(path, &load_decoy);
+        });
+        let loaded = load_typed_query_fuzz_replay(&load_path)
+            .expect("late display-path substitution must not replace the loaded capability");
+        assert_eq!(
+            loaded
+                .replay_workload()
+                .expect("loaded capability must consume its original descriptor binding")
+                .case
+                .query,
+            replay.minimized_query
+        );
+        assert_eq!(
+            std::fs::read(load_displaced.join(&filename))
+                .expect("original late-load artifact remains intact"),
+            canonical_bytes
+        );
+        assert_eq!(
+            std::fs::read(&load_path).expect("ambient late-load path resolves to the decoy"),
+            vec![b'!'; canonical_bytes.len()]
+        );
+
+        let mutation_root = typed_query_replay_test_root("same-inode-equal-length-mutation");
+        persist_typed_query_fuzz_replay(&mutation_root, &replay)
+            .expect("persist same-inode mutation source descriptor capability");
+        let mutation_path = typed_query_replay_path(&mutation_root, &replay);
+        let mutation_bytes = vec![b'x'; canonical_bytes.len()];
+        install_typed_query_fuzz_replay_post_display_verification_hook(move |path| {
+            typed_query_rewrite_owned_file_same_length(path, &mutation_bytes);
+        });
+        assert!(matches!(
+            load_typed_query_fuzz_replay(&mutation_path),
+            Err(GauntletError::UnsafeStorePath { path }) if path == mutation_path
+        ));
+        assert_eq!(
+            std::fs::read(&mutation_path).expect("same-inode hostile rewrite remains intact"),
+            vec![b'x'; canonical_bytes.len()]
+        );
+    }
+
+    #[cfg(all(
+        feature = "fuzz-harness",
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
+    ))]
+    #[test]
+    fn typed_query_public_replay_capability_rejects_post_return_mutation_and_supports_concurrency()
+    {
+        use std::sync::{Arc, Barrier};
+
+        let replay = typed_query_test_replay(&[22, 1, 7, 99], TypedQueryTree::MixedHitMiss(1, 7));
+        let canonical_bytes = replay.canonical_bytes().expect("canonical replay bytes");
+
+        let concurrent_root = typed_query_replay_test_root("concurrent-capability-consumption");
+        let concurrent_artifact = Arc::new(
+            persist_typed_query_fuzz_replay(&concurrent_root, &replay)
+                .expect("persist one descriptor-bound artifact for concurrent consumption"),
+        );
+        let concurrent_path = typed_query_replay_path(&concurrent_root, &replay);
+        let digest_barrier = Arc::new(Barrier::new(4));
+        let path_for_digest_hook = concurrent_path.clone();
+        let barrier_for_digest_hook = Arc::clone(&digest_barrier);
+        let _digest_hook =
+            crate::artifact::install_pinned_regular_file_before_digest_hook(move |path| {
+                if path == path_for_digest_hook.as_path() {
+                    barrier_for_digest_hook.wait();
+                }
+            });
+        let expected_query = replay.minimized_query.clone();
+        std::thread::scope(|scope| {
+            let mut consumers = Vec::new();
+            for _ in 0..4 {
+                let artifact = Arc::clone(&concurrent_artifact);
+                let expected_query = expected_query.clone();
+                consumers.push(scope.spawn(move || {
+                    assert_eq!(
+                        artifact
+                            .replay_workload()
+                            .expect("concurrent positional replay consumption must succeed")
+                            .case
+                            .query,
+                        expected_query
+                    );
+                }));
+            }
+            for consumer in consumers {
+                consumer
+                    .join()
+                    .expect("concurrent replay consumer must not panic");
+            }
+        });
+
+        let replacement_root = typed_query_replay_test_root("post-return-final-replacement");
+        let replacement_artifact = persist_typed_query_fuzz_replay(&replacement_root, &replay)
+            .expect("persist post-return replacement source");
+        let replacement_path = typed_query_replay_path(&replacement_root, &replay);
+        let displaced_replacement = replacement_path.with_file_name("displaced-replacement.json");
+        std::fs::rename(&replacement_path, &displaced_replacement)
+            .expect("move owned original entry aside after persist returned");
+        typed_query_write_new_owned_file(&replacement_path, &canonical_bytes);
+        assert!(matches!(
+            replacement_artifact.replay_workload(),
+            Err(GauntletError::UnsafeStorePath { path }) if path == replacement_path
+        ));
+        assert_eq!(
+            std::fs::read(&displaced_replacement)
+                .expect("displaced original post-return artifact remains intact"),
+            canonical_bytes
+        );
+
+        let rewrite_root = typed_query_replay_test_root("post-return-same-inode-rewrite");
+        let rewrite_artifact = persist_typed_query_fuzz_replay(&rewrite_root, &replay)
+            .expect("persist post-return same-inode rewrite source");
+        let rewrite_path = typed_query_replay_path(&rewrite_root, &replay);
+        let rewritten_bytes = vec![b'x'; canonical_bytes.len()];
+        typed_query_rewrite_owned_file_same_length(&rewrite_path, &rewritten_bytes);
+        assert!(matches!(
+            rewrite_artifact.replay_workload(),
+            Err(GauntletError::UnsafeStorePath { path }) if path == rewrite_path
+        ));
+        assert_eq!(
+            std::fs::read(&rewrite_path).expect("post-return same-inode rewrite remains intact"),
+            rewritten_bytes
+        );
+    }
+
+    #[cfg(all(
+        feature = "fuzz-harness",
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
+    ))]
+    #[test]
+    fn typed_query_public_persist_concurrently_publishes_only_complete_same_key_bytes() {
+        use std::sync::{Arc, Barrier};
+
+        let replay = Arc::new(typed_query_test_replay(
+            &[22, 1, 7, 99],
+            TypedQueryTree::MixedHitMiss(1, 7),
+        ));
+        let root = typed_query_replay_test_root("concurrent-same-key-publication");
+        let sidecar_directory = root.join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY);
+        let publish_barrier = Arc::new(Barrier::new(2));
+        let sidecar_for_hook = sidecar_directory.clone();
+        let publish_barrier_for_hook = Arc::clone(&publish_barrier);
+        let _publish_hook =
+            crate::artifact::install_pinned_regular_file_before_publish_hook(move |directory| {
+                if directory == sidecar_for_hook.as_path() {
+                    publish_barrier_for_hook.wait();
+                }
+            });
+        let (first, second) = std::thread::scope(|scope| {
+            let first_root = &root;
+            let first_replay = Arc::clone(&replay);
+            let first = scope
+                .spawn(move || persist_typed_query_fuzz_replay(first_root, first_replay.as_ref()));
+            let second_root = &root;
+            let second_replay = Arc::clone(&replay);
+            let second = scope.spawn(move || {
+                persist_typed_query_fuzz_replay(second_root, second_replay.as_ref())
+            });
+            (
+                first.join().expect("first same-key writer must not panic"),
+                second
+                    .join()
+                    .expect("second same-key writer must not panic"),
+            )
+        });
+        let first = first.expect("first same-key writer must receive a complete artifact");
+        let second = second.expect("second same-key writer must receive a complete artifact");
+        assert_eq!(
+            first
+                .replay_workload()
+                .expect("first same-key artifact must be consumable")
+                .case
+                .query,
+            replay.as_ref().minimized_query
+        );
+        assert_eq!(
+            second
+                .replay_workload()
+                .expect("second same-key artifact must be consumable")
+                .case
+                .query,
+            replay.as_ref().minimized_query
+        );
+        assert_eq!(
+            std::fs::read(typed_query_replay_path(&root, replay.as_ref()))
+                .expect("same-key final artifact must be complete"),
+            replay
+                .as_ref()
+                .canonical_bytes()
+                .expect("canonical same-key replay bytes")
+        );
+    }
+
+    #[cfg(all(
+        feature = "fuzz-harness",
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
+    ))]
+    #[test]
+    fn typed_query_existing_success_syncs_before_returning_while_winner_is_parked() {
+        use std::{
+            sync::{
+                Arc, Mutex,
+                atomic::{AtomicUsize, Ordering},
+                mpsc::{self, RecvTimeoutError},
+            },
+            time::Duration,
+        };
+
+        const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(2);
+
+        let replay = typed_query_test_replay(&[22, 1, 7, 99], TypedQueryTree::MixedHitMiss(1, 7));
+        let root = typed_query_replay_test_root("existing-success-directory-sync");
+        let sidecar_directory = root.join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY);
+        let (sync_event_sender, sync_event_receiver) = mpsc::sync_channel(2);
+        let (release_winner_sender, release_winner_receiver) = mpsc::sync_channel(1);
+        let (release_loser_sender, release_loser_receiver) = mpsc::sync_channel(1);
+        let release_winner_receiver = Arc::new(Mutex::new(release_winner_receiver));
+        let release_loser_receiver = Arc::new(Mutex::new(release_loser_receiver));
+        let sync_calls = Arc::new(AtomicUsize::new(0));
+        let sidecar_directory_for_hook = sidecar_directory.clone();
+        let sync_event_sender_for_hook = sync_event_sender.clone();
+        let release_winner_receiver_for_hook = Arc::clone(&release_winner_receiver);
+        let release_loser_receiver_for_hook = Arc::clone(&release_loser_receiver);
+        let sync_calls_for_hook = Arc::clone(&sync_calls);
+        let _sync_hook = crate::artifact::install_pinned_directory_before_sync_hook(move |path| {
+            if path != sidecar_directory_for_hook.as_path() {
+                return;
+            }
+            let (label, release_receiver) = match sync_calls_for_hook.fetch_add(1, Ordering::SeqCst)
+            {
+                0 => ("winner", Some(&release_winner_receiver_for_hook)),
+                1 => ("loser", Some(&release_loser_receiver_for_hook)),
+                _ => ("unexpected", None),
+            };
+            sync_event_sender_for_hook
+                .send(label)
+                .expect("bounded directory-sync rendezvous receiver must remain live");
+            if let Some(release_receiver) = release_receiver {
+                release_receiver
+                    .lock()
+                    .expect("bounded directory-sync release mutex must not be poisoned")
+                    .recv_timeout(RENDEZVOUS_TIMEOUT)
+                    .expect("bounded directory-sync rendezvous release must arrive");
+            }
+        });
+
+        let winner_root = root.clone();
+        let winner_replay = replay.clone();
+        let winner = std::thread::spawn(move || {
+            persist_typed_query_fuzz_replay(&winner_root, &winner_replay)
+        });
+        assert_eq!(
+            sync_event_receiver
+                .recv_timeout(RENDEZVOUS_TIMEOUT)
+                .expect("winner must reach the post-rename, pre-directory-sync rendezvous"),
+            "winner"
+        );
+
+        let loser_root = root.clone();
+        let loser_replay = replay.clone();
+        let loser =
+            std::thread::spawn(move || persist_typed_query_fuzz_replay(&loser_root, &loser_replay));
+        assert_eq!(
+            sync_event_receiver
+                .recv_timeout(RENDEZVOUS_TIMEOUT)
+                .expect("loser must authenticate the existing entry and reach its directory sync"),
+            "loser"
+        );
+        assert!(
+            !loser.is_finished(),
+            "loser must not return before its own held-directory sync completes"
+        );
+        assert!(matches!(
+            sync_event_receiver.recv_timeout(Duration::from_millis(100)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+
+        release_loser_sender
+            .send(())
+            .expect("release the loser after its bounded sync rendezvous");
+        let loser = loser
+            .join()
+            .expect("loser must not panic during existing-entry synchronization")
+            .expect("loser must return a synchronized descriptor capability");
+        assert_eq!(
+            loser
+                .replay_workload()
+                .expect("synchronized loser capability must remain consumable")
+                .case
+                .query,
+            replay.minimized_query
+        );
+
+        release_winner_sender
+            .send(())
+            .expect("release the winner after the loser has synchronized the directory");
+        let winner = winner
+            .join()
+            .expect("winner must not panic after the bounded rendezvous")
+            .expect("winner must return a synchronized descriptor capability");
+        assert_eq!(
+            winner
+                .replay_workload()
+                .expect("synchronized winner capability must remain consumable")
+                .case
+                .query,
+            replay.minimized_query
+        );
+        assert_eq!(
+            sync_calls.load(Ordering::SeqCst),
+            2,
+            "winner and loser must each issue the held-directory sync before success"
+        );
     }
 
     #[cfg(feature = "fuzz-harness")]

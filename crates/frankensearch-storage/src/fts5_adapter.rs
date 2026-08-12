@@ -22,7 +22,6 @@ use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use asupersync::Cx;
 use frankensearch_core::error::{SearchError, SearchResult};
@@ -173,7 +172,6 @@ pub struct Fts5LexicalSearch {
     table: Mutex<Fts5Table>,
     rowid_map: Mutex<RowIdMap>,
     config: Fts5AdapterConfig,
-    doc_count: AtomicUsize,
 }
 
 #[allow(clippy::missing_fields_in_debug)]
@@ -181,7 +179,6 @@ impl std::fmt::Debug for Fts5LexicalSearch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Fts5LexicalSearch")
             .field("config", &self.config)
-            .field("doc_count", &self.doc_count.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -203,7 +200,6 @@ impl Fts5LexicalSearch {
             table: Mutex::new(table),
             rowid_map: Mutex::new(RowIdMap::new()),
             config,
-            doc_count: AtomicUsize::new(0),
         }
     }
 
@@ -328,9 +324,6 @@ impl Fts5LexicalSearch {
             return Ok(false);
         };
         table.delete_document(rowid);
-        drop(rowid_map);
-        drop(table);
-        self.doc_count.fetch_sub(1, Ordering::Relaxed);
         Ok(true)
     }
 
@@ -346,9 +339,6 @@ impl Fts5LexicalSearch {
         }
         rowid_map.doc_to_row.clear();
         rowid_map.row_to_doc.clear();
-        drop(rowid_map);
-        drop(table);
-        self.doc_count.store(0, Ordering::Relaxed);
 
         debug!("fts5: cleared all documents");
         Ok(())
@@ -373,7 +363,6 @@ pub struct PersistedFts5LexicalSearch {
     storage: Arc<Storage>,
     table_name: String,
     config: Fts5AdapterConfig,
-    doc_count: usize,
 }
 
 impl std::fmt::Debug for PersistedFts5LexicalSearch {
@@ -382,7 +371,6 @@ impl std::fmt::Debug for PersistedFts5LexicalSearch {
             .debug_struct("PersistedFts5LexicalSearch")
             .field("table_name", &self.table_name)
             .field("config", &self.config)
-            .field("doc_count", &self.doc_count)
             .finish_non_exhaustive()
     }
 }
@@ -398,9 +386,6 @@ impl PersistedFts5LexicalSearch {
         let fsqlite_cx = fsqlite_cx(cx);
         let metadata =
             ensure_porter_fts5_ready(&fsqlite_cx, storage.connection(), &table_name).await?;
-        let doc_count =
-            persisted_fts5_doc_count(&fsqlite_cx, storage.connection(), &table_name).await?;
-
         Ok(Self {
             storage,
             table_name,
@@ -409,7 +394,6 @@ impl PersistedFts5LexicalSearch {
                 tokenizer: Fts5TokenizerChoice::Porter,
                 title_boost: TITLE_BOOST,
             },
-            doc_count,
         })
     }
 
@@ -417,6 +401,23 @@ impl PersistedFts5LexicalSearch {
     #[must_use]
     pub fn config(&self) -> &Fts5AdapterConfig {
         &self.config
+    }
+
+    /// Query the current persisted table count within a caller-owned runtime
+    /// context.
+    ///
+    /// This is the authoritative alternative to the synchronous
+    /// [`frankensearch_core::LexicalRead::doc_count`] capability, which cannot
+    /// pin or await this adapter's live FrankenSQLite generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or result-shape error when the current table count
+    /// cannot be established.
+    pub async fn current_doc_count(&self, cx: &Cx) -> SearchResult<usize> {
+        let fsqlite_cx = fsqlite_cx(cx);
+        persisted_fts5_verified_doc_count(&fsqlite_cx, self.storage.connection(), &self.table_name)
+            .await
     }
 }
 
@@ -471,8 +472,13 @@ impl frankensearch_core::LexicalRead for PersistedFts5LexicalSearch {
         })
     }
 
-    fn doc_count(&self) -> usize {
-        self.doc_count
+    fn doc_count(&self) -> SearchResult<usize> {
+        Err(SearchError::SubsystemError {
+            subsystem: "fts5",
+            source: "the persisted FTS5 adapter has no synchronous pinned-generation count; \
+                     call PersistedFts5LexicalSearch::current_doc_count with the caller's Cx"
+                .into(),
+        })
     }
 }
 
@@ -589,9 +595,19 @@ async fn ensure_porter_fts5_ready(
 ) -> SearchResult<PersistedFts5Metadata> {
     let metadata = read_persisted_fts5_metadata(fsqlite_cx, conn, table_name).await?;
     ensure_rebuildable_porter_fts5(table_name, &metadata)?;
+    ensure_porter_fts5_rebuild_version(
+        table_name,
+        read_porter_fts5_rebuild_marker(fsqlite_cx, conn, table_name).await?,
+    )?;
+    Ok(metadata)
+}
 
-    match read_porter_fts5_rebuild_marker(fsqlite_cx, conn, table_name).await? {
-        Some(PORTER_FTS5_REBUILD_VERSION) => Ok(metadata),
+fn ensure_porter_fts5_rebuild_version(
+    table_name: &str,
+    rebuild_version: Option<i64>,
+) -> SearchResult<()> {
+    match rebuild_version {
+        Some(PORTER_FTS5_REBUILD_VERSION) => Ok(()),
         Some(version) if version > PORTER_FTS5_REBUILD_VERSION => Err(SearchError::InvalidConfig {
             field: "fts5.rebuild_version".to_owned(),
             value: version.to_string(),
@@ -717,22 +733,90 @@ fn ensure_rebuildable_porter_fts5(
     Ok(())
 }
 
-async fn persisted_fts5_doc_count(
+async fn persisted_fts5_verified_doc_count(
     fsqlite_cx: &FsqliteCx,
     conn: &AsyncConnection,
     table_name: &str,
 ) -> SearchResult<usize> {
+    let params = [SqliteValue::Text(table_name.to_owned().into())];
     let rows = conn
-        .query(fsqlite_cx, &format!("SELECT COUNT(*) FROM {table_name};"))
+        .query_with_params(
+            fsqlite_cx,
+            &format!(
+                "SELECT schema_entry.sql, \
+                        (SELECT COUNT(*) FROM {PORTER_FTS5_REBUILD_TABLE} \
+                         WHERE table_name = ?1), \
+                        (SELECT MIN(rebuild_version) FROM {PORTER_FTS5_REBUILD_TABLE} \
+                         WHERE table_name = ?1), \
+                        (SELECT COUNT(*) FROM {table_name}) \
+                 FROM sqlite_master AS schema_entry \
+                 WHERE schema_entry.type = 'table' AND schema_entry.name = ?1;"
+            ),
+            &params,
+        )
         .await
-        .map_err(|error| map_storage_error_at("count persisted Porter FTS5 documents", error))?;
+        .map_err(|error| {
+            map_storage_error_at("verify and count persisted Porter FTS5 documents", error)
+        })?;
     let [row] = rows.as_slice() else {
         return Err(persisted_fts5_metadata_error(
             table_name,
-            "COUNT(*) did not return exactly one row",
+            if rows.is_empty() {
+                "table is absent from sqlite_master"
+            } else {
+                "verification and COUNT(*) returned more than one row"
+            },
         ));
     };
-    let Some(SqliteValue::Integer(count)) = row.get(0) else {
+    let Some(SqliteValue::Text(sql)) = row.get(0) else {
+        return Err(persisted_fts5_metadata_error(
+            table_name,
+            "sqlite_master.sql is not text",
+        ));
+    };
+    let metadata = parse_persisted_fts5_metadata(table_name, sql.as_ref())?;
+    ensure_rebuildable_porter_fts5(table_name, &metadata)?;
+
+    let Some(SqliteValue::Integer(marker_count)) = row.get(1) else {
+        return Err(SearchError::InvalidConfig {
+            field: "fts5.rebuild_version".to_owned(),
+            value: table_name.to_owned(),
+            reason: "governed Porter FTS5 marker cardinality is not an integer".to_owned(),
+        });
+    };
+    match *marker_count {
+        0 => ensure_porter_fts5_rebuild_version(table_name, None)?,
+        1 => {}
+        count => {
+            return Err(SearchError::InvalidConfig {
+                field: "fts5.rebuild_version".to_owned(),
+                value: format!("{table_name}: {count} rows"),
+                reason: "governed Porter FTS5 marker table contains duplicate rows for one table"
+                    .to_owned(),
+            });
+        }
+    }
+
+    let rebuild_version = match row.get(2) {
+        Some(SqliteValue::Integer(version)) => Some(*version),
+        Some(SqliteValue::Null) => None,
+        Some(value) => {
+            return Err(SearchError::InvalidConfig {
+                field: "fts5.rebuild_version".to_owned(),
+                value: format!("{table_name}: {value:?}"),
+                reason: "refusing to count a Porter FTS5 table whose governed rebuild marker is not an integer".to_owned(),
+            });
+        }
+        None => {
+            return Err(persisted_fts5_metadata_error(
+                table_name,
+                "verification result is missing the rebuild marker column",
+            ));
+        }
+    };
+    ensure_porter_fts5_rebuild_version(table_name, rebuild_version)?;
+
+    let Some(SqliteValue::Integer(count)) = row.get(3) else {
         return Err(persisted_fts5_metadata_error(
             table_name,
             "COUNT(*) did not return an integer",
@@ -1268,8 +1352,8 @@ impl frankensearch_core::LexicalRead for Fts5LexicalSearch {
     /// FTS5 attaches full metadata during `search`, so the inherited eager
     /// `search_candidates` and its no-op hydration are exact for this backend:
     /// there is no deferred path to lose and no snapshot to pin.
-    fn doc_count(&self) -> usize {
-        self.doc_count.load(Ordering::Relaxed)
+    fn doc_count(&self) -> SearchResult<usize> {
+        Ok(self.rowid_map.lock().map_err(lock_error)?.doc_to_row.len())
     }
 }
 
@@ -1286,10 +1370,6 @@ impl frankensearch_core::LexicalWrite for Fts5LexicalSearch {
             // Upsert: delete existing document with same ID first.
             if let Some(old_rowid) = rowid_map.get_rowid(&doc.id) {
                 table.delete_document(old_rowid);
-                // Don't decrement doc_count here — it nets out with the add below.
-            } else {
-                // Only increment if this is truly new.
-                self.doc_count.fetch_add(1, Ordering::Relaxed);
             }
 
             let rowid = rowid_map.get_or_assign(&doc.id);
@@ -1312,8 +1392,6 @@ impl frankensearch_core::LexicalWrite for Fts5LexicalSearch {
             for doc in docs {
                 if let Some(old_rowid) = rowid_map.get_rowid(&doc.id) {
                     table.delete_document(old_rowid);
-                } else {
-                    self.doc_count.fetch_add(1, Ordering::Relaxed);
                 }
 
                 let rowid = rowid_map.get_or_assign(&doc.id);
@@ -1400,7 +1478,27 @@ mod tests {
     #[test]
     fn new_instance_is_empty() {
         let search = Fts5LexicalSearch::with_defaults();
-        assert_eq!(search.doc_count(), 0);
+        assert_eq!(search.doc_count().expect("document count"), 0);
+    }
+
+    #[test]
+    fn document_count_fails_closed_when_row_authority_is_poisoned() {
+        let search = Arc::new(Fts5LexicalSearch::with_defaults());
+        let poisoner = Arc::clone(&search);
+        std::thread::spawn(move || {
+            let _guard = poisoner.rowid_map.lock().expect("lock row authority");
+            panic!("poison row authority for document-count regression");
+        })
+        .join()
+        .expect_err("poisoning worker must panic");
+
+        assert!(matches!(
+            search.doc_count(),
+            Err(SearchError::SubsystemError {
+                subsystem: "fts5",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1450,6 +1548,124 @@ mod tests {
         assert!(ensure_rebuildable_porter_fts5("docs", &unicode).is_err());
     }
 
+    #[test]
+    fn persisted_count_requires_async_authority_and_revalidates_the_marker() {
+        run_with_cx(|cx| async move {
+            let storage = Arc::new(
+                Storage::open_unbootstrapped_in_memory_for_test(&cx)
+                    .await
+                    .expect("in-memory storage should open"),
+            );
+            let fsqlite_cx = fsqlite_cx(&cx);
+            storage
+                .connection()
+                .execute(
+                    &fsqlite_cx,
+                    &format!(
+                        "CREATE TABLE {PORTER_FTS5_REBUILD_TABLE}(\
+                         table_name TEXT, rebuild_version INTEGER NOT NULL);"
+                    ),
+                )
+                .await
+                .expect("governed rebuild marker table should be created");
+            storage
+                .connection()
+                .execute(
+                    &fsqlite_cx,
+                    "CREATE VIRTUAL TABLE persisted_docs USING fts5(\
+                     doc_id UNINDEXED, metadata_json UNINDEXED, content, tokenize='porter');",
+                )
+                .await
+                .expect("persisted Porter table should be created");
+            storage
+                .connection()
+                .execute(
+                    &fsqlite_cx,
+                    "INSERT INTO persisted_docs(doc_id, metadata_json, content) VALUES \
+                     ('doc-1', '{}', 'first document'), \
+                     ('doc-2', '{}', 'second document');",
+                )
+                .await
+                .expect("persisted documents should be inserted");
+            storage
+                .connection()
+                .execute(
+                    &fsqlite_cx,
+                    &format!(
+                        "INSERT INTO {PORTER_FTS5_REBUILD_TABLE}(table_name, rebuild_version) \
+                         VALUES ('persisted_docs', {PORTER_FTS5_REBUILD_VERSION});"
+                    ),
+                )
+                .await
+                .expect("governed rebuild marker should be installed");
+
+            let reader =
+                PersistedFts5LexicalSearch::open(&cx, Arc::clone(&storage), "persisted_docs")
+                    .await
+                    .expect("governed persisted reader should open");
+            assert!(matches!(
+                reader.doc_count(),
+                Err(SearchError::SubsystemError {
+                    subsystem: "fts5",
+                    ..
+                })
+            ));
+            assert_eq!(
+                reader
+                    .current_doc_count(&cx)
+                    .await
+                    .expect("async count should pin live persisted authority"),
+                2
+            );
+
+            storage
+                .connection()
+                .execute(
+                    &fsqlite_cx,
+                    &format!(
+                        "UPDATE {PORTER_FTS5_REBUILD_TABLE} SET rebuild_version = 0 \
+                         WHERE table_name = 'persisted_docs';"
+                    ),
+                )
+                .await
+                .expect("marker invalidation should succeed");
+            assert!(matches!(
+                reader.current_doc_count(&cx).await,
+                Err(SearchError::InvalidConfig { field, .. })
+                    if field == "fts5.rebuild_version"
+            ));
+
+            storage
+                .connection()
+                .execute(
+                    &fsqlite_cx,
+                    &format!(
+                        "UPDATE {PORTER_FTS5_REBUILD_TABLE} \
+                         SET rebuild_version = {PORTER_FTS5_REBUILD_VERSION} \
+                         WHERE table_name = 'persisted_docs';"
+                    ),
+                )
+                .await
+                .expect("governed marker should be restored");
+            storage
+                .connection()
+                .execute(
+                    &fsqlite_cx,
+                    &format!(
+                        "INSERT INTO {PORTER_FTS5_REBUILD_TABLE}(table_name, rebuild_version) \
+                         VALUES ('persisted_docs', {PORTER_FTS5_REBUILD_VERSION});"
+                    ),
+                )
+                .await
+                .expect("duplicate hostile markers should be inserted");
+            assert!(matches!(
+                reader.current_doc_count(&cx).await,
+                Err(SearchError::InvalidConfig { field, reason, .. })
+                    if field == "fts5.rebuild_version" && reason.contains("duplicate")
+            ));
+        });
+    }
+
     // -- Indexing --
 
     #[test]
@@ -1458,7 +1674,7 @@ mod tests {
         run_with_cx(|cx| async move {
             let doc = make_doc("doc1", "hello world of search");
             search.index_document(&cx, &doc).await.unwrap();
-            assert_eq!(search.doc_count(), 1);
+            assert_eq!(search.doc_count().expect("document count"), 1);
         });
     }
 
@@ -1472,7 +1688,7 @@ mod tests {
                 make_doc("c", "third document"),
             ];
             search.index_documents(&cx, &docs).await.unwrap();
-            assert_eq!(search.doc_count(), 3);
+            assert_eq!(search.doc_count().expect("document count"), 3);
         });
     }
 
@@ -1482,11 +1698,11 @@ mod tests {
         run_with_cx(|cx| async move {
             let doc_v1 = make_doc("doc1", "original content");
             search.index_document(&cx, &doc_v1).await.unwrap();
-            assert_eq!(search.doc_count(), 1);
+            assert_eq!(search.doc_count().expect("document count"), 1);
 
             let doc_v2 = make_doc("doc1", "updated content completely different");
             search.index_document(&cx, &doc_v2).await.unwrap();
-            assert_eq!(search.doc_count(), 1);
+            assert_eq!(search.doc_count().expect("document count"), 1);
 
             // Search should find updated content.
             let results = search.search(&cx, "updated", 10).await.unwrap();
@@ -1644,7 +1860,6 @@ mod tests {
             let rowid = rowid_map.get_or_assign(&doc.id);
             let columns = Fts5LexicalSearch::doc_to_columns(&doc);
             table.insert_document(rowid, &columns);
-            search.doc_count.fetch_add(1, Ordering::Relaxed);
         }
 
         let hits = search.search_with_snippets("fox", 10).unwrap();
@@ -1668,11 +1883,11 @@ mod tests {
                 .index_document(&cx, &make_doc("doc1", "findable content"))
                 .await
                 .unwrap();
-            assert_eq!(search.doc_count(), 1);
+            assert_eq!(search.doc_count().expect("document count"), 1);
 
             let removed = search.delete_document("doc1").unwrap();
             assert!(removed);
-            assert_eq!(search.doc_count(), 0);
+            assert_eq!(search.doc_count().expect("document count"), 0);
 
             let results = search.search(&cx, "findable", 10).await.unwrap();
             assert!(results.is_empty());
@@ -1700,10 +1915,10 @@ mod tests {
                 .index_document(&cx, &make_doc("doc2", "world"))
                 .await
                 .unwrap();
-            assert_eq!(search.doc_count(), 2);
+            assert_eq!(search.doc_count().expect("document count"), 2);
 
             search.clear().unwrap();
-            assert_eq!(search.doc_count(), 0);
+            assert_eq!(search.doc_count().expect("document count"), 0);
 
             let results = search.search(&cx, "hello", 10).await.unwrap();
             assert!(results.is_empty());
@@ -1728,7 +1943,7 @@ mod tests {
         run_with_cx(|cx| async move {
             let doc = make_doc("doc1", "");
             search.index_document(&cx, &doc).await.unwrap();
-            assert_eq!(search.doc_count(), 1);
+            assert_eq!(search.doc_count().expect("document count"), 1);
 
             let results = search.search(&cx, "anything", 10).await.unwrap();
             assert!(results.is_empty());
@@ -1758,14 +1973,14 @@ mod tests {
                 .index_document(&cx, &make_doc("doc1", "original"))
                 .await
                 .unwrap();
-            assert_eq!(search.doc_count(), 1);
+            assert_eq!(search.doc_count().expect("document count"), 1);
 
             let batch = vec![
                 make_doc("doc1", "updated"),   // existing
                 make_doc("doc2", "brand new"), // new
             ];
             search.index_documents(&cx, &batch).await.unwrap();
-            assert_eq!(search.doc_count(), 2);
+            assert_eq!(search.doc_count().expect("document count"), 2);
         });
     }
 
@@ -1841,11 +2056,12 @@ mod tests {
     // -- Debug impl --
 
     #[test]
-    fn debug_format_includes_doc_count() {
+    fn debug_format_never_waits_for_row_authority() {
         let search = Fts5LexicalSearch::with_defaults();
         let debug = format!("{search:?}");
         assert!(debug.contains("Fts5LexicalSearch"));
-        assert!(debug.contains("doc_count"));
+        assert!(debug.contains("config"));
+        assert!(!debug.contains("doc_count"));
     }
 
     // -- Fts5Hit serde --
@@ -1987,9 +2203,9 @@ mod tests {
                      build_ms_per_mb={:.2} search_ms={search_ms:.3} hits={} doc_count={}",
                     build_ms / mb as f64,
                     hits.len(),
-                    search.doc_count(),
+                    search.doc_count().expect("document count"),
                 );
-                assert_eq!(search.doc_count(), doc_count);
+                assert_eq!(search.doc_count().expect("document count"), doc_count);
             }
         });
     }

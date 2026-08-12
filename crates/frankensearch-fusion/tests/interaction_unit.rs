@@ -137,8 +137,8 @@ impl LexicalRead for StubLexical {
         })
     }
 
-    fn doc_count(&self) -> usize {
-        self.doc_count
+    fn doc_count(&self) -> frankensearch_core::SearchResult<usize> {
+        Ok(self.doc_count)
     }
 }
 

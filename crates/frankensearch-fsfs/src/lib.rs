@@ -347,7 +347,7 @@ pub use tracing_setup::{
     resolve_log_filter,
 };
 pub use watcher::{
-    DEFAULT_BATCH_SIZE, DEFAULT_DEBOUNCE_MS, FileSnapshot, FsWatcher, NoopWatchIngestPipeline,
-    WatchBatchOutcome, WatchEvent, WatchEventKind, WatchIngestFuture, WatchIngestOp,
-    WatchIngestPipeline, WatcherExecutionPolicy, WatcherStats,
+    CatchupEvents, DEFAULT_BATCH_SIZE, DEFAULT_DEBOUNCE_MS, FileSnapshot, FsWatcher,
+    NoopWatchIngestPipeline, WatchBatchOutcome, WatchEvent, WatchEventKind, WatchIngestFuture,
+    WatchIngestOp, WatchIngestPipeline, WatcherExecutionPolicy, WatcherStats,
 };

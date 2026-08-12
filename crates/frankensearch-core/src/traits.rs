@@ -1015,7 +1015,12 @@ pub trait LexicalRead: Send + Sync {
     }
 
     /// Number of documents currently searchable.
-    fn doc_count(&self) -> usize;
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` when the backend cannot establish an authoritative
+    /// count for its current readable generation.
+    fn doc_count(&self) -> SearchResult<usize>;
 }
 
 /// Mutation/indexing surface of a lexical backend (bd-8nqz.1).
@@ -1590,8 +1595,8 @@ mod tests {
             })
         }
 
-        fn doc_count(&self) -> usize {
-            1
+        fn doc_count(&self) -> SearchResult<usize> {
+            Ok(1)
         }
     }
 

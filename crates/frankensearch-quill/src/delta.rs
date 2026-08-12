@@ -765,6 +765,16 @@ struct TermChain {
     last_docid: Option<u32>,
     max_frequency_code: u8,
     min_fieldnorm_id: u8,
+    /// Postings in this chain that are not tombstoned.
+    ///
+    /// Counting survivors by walking the chain made every metadata read — a
+    /// document frequency, a range or glob expansion, a snippet term choice —
+    /// a full scan of the term, unbounded by anything the query admitted.
+    /// The count is maintained where liveness actually changes instead: one
+    /// increment per appended posting, one decrement per newly tombstoned
+    /// document, and nothing at publication, because freezing clones the
+    /// chain and a generation bump clears it.
+    live_len: u32,
 }
 
 impl Default for TermChain {
@@ -775,6 +785,7 @@ impl Default for TermChain {
             last_docid: None,
             max_frequency_code: 0,
             min_fieldnorm_id: u8::MAX,
+            live_len: 0,
         }
     }
 }
@@ -827,6 +838,16 @@ impl DeltaSnapshot {
     #[must_use]
     pub const fn segment(&self) -> &DeltaSegment {
         &self.segment
+    }
+
+    /// Number of physical rows retained by this immutable delta generation.
+    ///
+    /// Tombstoned rows remain physical work for posting scans and therefore
+    /// remain part of admission and fuel accounting even though they are not
+    /// included in [`Self::live_document_count`].
+    #[must_use]
+    pub fn physical_document_count(&self) -> usize {
+        self.segment.physical_document_count()
     }
 
     /// Keeper MANIFEST generation this delta epoch was derived from.
@@ -1156,33 +1177,36 @@ impl DeltaSegment {
     #[must_use]
     pub fn freeze(&self, keeper_generation: u64) -> DeltaSnapshot {
         let snapshot_owner_id = NEXT_DELTA_OWNER_ID.fetch_add(1, Ordering::Relaxed);
+        let segment = Self {
+            schema: self.schema,
+            lease_base: self.lease_base,
+            lease_end: self.lease_end,
+            next_docid_floor: self.next_docid_floor,
+            budget_bytes: self.budget_bytes,
+            owner_id: snapshot_owner_id,
+            generation: self.generation,
+            fields: self.fields.clone(),
+            terms: self.terms.clone(),
+            chains: self.chains.clone(),
+            posting_arena: self.posting_arena.snapshot_copy(),
+            position_arena: self.position_arena.snapshot_copy(),
+            document_docids: self.document_docids.clone(),
+            document_ids: self.document_ids.clone(),
+            document_content_hashes: self.document_content_hashes.clone(),
+            document_term_offsets: self.document_term_offsets.clone(),
+            document_term_ids: self.document_term_ids.clone(),
+            fieldnorms: self.fieldnorms.clone(),
+            numeric_fields: self.numeric_fields.clone(),
+            stored_fields: self.stored_fields.clone(),
+            live_ids: self.live_ids.clone(),
+            tombstone_words: self.tombstone_words.clone(),
+            tombstone_count: self.tombstone_count,
+            logical_bytes_used: self.logical_bytes_used,
+        };
+        // No publication pass: the live counts ride along inside the cloned
+        // chains, already exact.
         DeltaSnapshot {
-            segment: Self {
-                schema: self.schema,
-                lease_base: self.lease_base,
-                lease_end: self.lease_end,
-                next_docid_floor: self.next_docid_floor,
-                budget_bytes: self.budget_bytes,
-                owner_id: snapshot_owner_id,
-                generation: self.generation,
-                fields: self.fields.clone(),
-                terms: self.terms.clone(),
-                chains: self.chains.clone(),
-                posting_arena: self.posting_arena.snapshot_copy(),
-                position_arena: self.position_arena.snapshot_copy(),
-                document_docids: self.document_docids.clone(),
-                document_ids: self.document_ids.clone(),
-                document_content_hashes: self.document_content_hashes.clone(),
-                document_term_offsets: self.document_term_offsets.clone(),
-                document_term_ids: self.document_term_ids.clone(),
-                fieldnorms: self.fieldnorms.clone(),
-                numeric_fields: self.numeric_fields.clone(),
-                stored_fields: self.stored_fields.clone(),
-                live_ids: self.live_ids.clone(),
-                tombstone_words: self.tombstone_words.clone(),
-                tombstone_count: self.tombstone_count,
-                logical_bytes_used: self.logical_bytes_used,
-            },
+            segment,
             keeper_generation,
             // Each frozen epoch is a distinct publication candidate, even
             // when two freezes observe the same mutable Delta generation.
@@ -1418,6 +1442,14 @@ impl DeltaSegment {
                 },
             ));
             chain.last_docid = Some(global_docid);
+            // The row just appended is live until something tombstones it.
+            // Saturating here would silently under-count a term rather than
+            // fail, and the arena's own preflight already bounds the chain
+            // length, so an overflow at this point is a broken invariant.
+            chain.live_len = chain
+                .live_len
+                .checked_add(1)
+                .expect("preflighted chain length fits u32");
             chain.max_frequency_code = chain
                 .max_frequency_code
                 .max(crate::contract::block_max_frequency_to_code(frequency));
@@ -1901,6 +1933,16 @@ impl DeltaSegment {
             .collect()
     }
 
+    /// Number of distinct `(field, term)` keys retained by this generation.
+    ///
+    /// Unlike [`Self::sorted_terms`], this is O(1) and does not allocate a
+    /// temporary ordered view. Callers that need only a dictionary-work
+    /// ceiling must use this count rather than materializing every term.
+    #[must_use]
+    pub fn term_count(&self) -> usize {
+        self.terms.len()
+    }
+
     /// Physical fieldnorm, including a tombstoned row.
     #[must_use]
     pub fn fieldnorm_id(&self, field_ord: u16, global_docid: u32) -> Option<u8> {
@@ -2297,6 +2339,53 @@ impl DeltaSegment {
         (ordinal < DOC_ORDS_PER_LEASE as usize).then_some(ordinal)
     }
 
+    /// Drop one newly tombstoned document out of its terms' live counts.
+    ///
+    /// The document's term list is recorded at apply time, so this touches
+    /// exactly the chains that hold a row for it. A document that never
+    /// landed — or whose generation was already cleared — contributes no
+    /// terms and therefore no decrements.
+    fn retire_document_postings(&mut self, global_docid: u32) {
+        let Ok(document_index) = self.document_docids.binary_search(&global_docid) else {
+            return;
+        };
+        let Some(&start) = self.document_term_offsets.get(document_index) else {
+            return;
+        };
+        let Some(&end) = self.document_term_offsets.get(document_index + 1) else {
+            return;
+        };
+        let (Ok(start), Ok(end)) = (usize::try_from(start), usize::try_from(end)) else {
+            return;
+        };
+        let Some(term_count) = end.checked_sub(start) else {
+            return;
+        };
+        for offset in 0..term_count {
+            // Copy one ID out before taking the disjoint mutable chain
+            // borrow. Cloning the whole slice here used transient storage
+            // proportional to document term count on every replacement and
+            // deletion.
+            let Some(term_slot) = start.checked_add(offset) else {
+                return;
+            };
+            let Some(term_index) = self.document_term_ids.get(term_slot).copied() else {
+                return;
+            };
+            let Ok(term_offset) = usize::try_from(term_index) else {
+                continue;
+            };
+            if let Some(chain) = self.chains.get_mut(term_offset) {
+                // A count that would go negative means a posting was retired
+                // twice, which the exactly-once caller forbids.
+                chain.live_len = chain
+                    .live_len
+                    .checked_sub(1)
+                    .expect("a live posting is retired at most once");
+            }
+        }
+    }
+
     fn mark_tombstone(&mut self, global_docid: u32) -> usize {
         let ordinal = self
             .lease_ordinal(global_docid)
@@ -2311,6 +2400,12 @@ impl DeltaSegment {
         if self.tombstone_words[word] & mask == 0 {
             self.tombstone_words[word] |= mask;
             self.tombstone_count += 1;
+            // Exactly-once by construction: this branch is the transition
+            // from live to tombstoned, so a document superseded and later
+            // deleted cannot be counted off twice. Only the terms this
+            // document actually contributed are touched, which is a walk of
+            // its own term list rather than of any chain.
+            self.retire_document_postings(global_docid);
         }
         self.tombstone_words
             .len()
@@ -2348,9 +2443,9 @@ impl<'a> DeltaTerm<'a> {
     /// Live posting count after applying delta tombstones.
     #[must_use]
     pub fn live_doc_freq(self) -> usize {
-        self.postings()
-            .filter(|posting| self.is_live(*posting))
-            .count()
+        // Maintained where liveness changes, so this is a field read rather
+        // than a walk of the chain. See `TermChain::live_len`.
+        self.delta.chains[self.term_index as usize].live_len as usize
     }
 
     /// Compute the live cardinality and whole-term pruning envelope in one
@@ -3317,6 +3412,173 @@ mod tests {
         Ok(())
     }
 
+    /// The maintained live count must equal a walk of each chain, on every
+    /// axis that can change liveness.
+    ///
+    /// The walks are the definitions; the counters are the optimisation. This
+    /// covers independent chains, a replacement whose term set changes, an
+    /// already-set tombstone bit, and a reset generation, rather than merely
+    /// comparing one counter to a hand-picked number.
+    #[test]
+    fn maintained_live_count_matches_a_walk_on_every_liveness_axis() -> Result<(), DeltaError> {
+        fn walk_live(delta: &DeltaSegment, term_bytes: &[u8]) -> usize {
+            let term = delta
+                .find_term(1, term_bytes)
+                .expect("fixture term is present");
+            term.postings().filter(|row| term.is_live(*row)).count()
+        }
+        fn assert_agrees(delta: &DeltaSegment, expected: &[(&[u8], usize)], label: &str) {
+            for &(term_bytes, expected) in expected {
+                let term = delta
+                    .find_term(1, term_bytes)
+                    .expect("fixture term is present");
+                assert_eq!(
+                    term.live_doc_freq(),
+                    walk_live(delta, term_bytes),
+                    "counter disagreed with a walk for {term_bytes:?} after {label}"
+                );
+                assert_eq!(
+                    term.live_doc_freq(),
+                    expected,
+                    "unexpected live count for {term_bytes:?} after {label}"
+                );
+            }
+        }
+
+        let mut delta = DeltaSegment::new(TEST_SCHEMA, 0, usize::MAX)?;
+        let apply = |delta: &mut DeltaSegment,
+                     docid: u32,
+                     id: &str,
+                     terms: &[&[u8]]|
+         -> Result<(), DeltaError> {
+            let position = [docid];
+            let postings = terms
+                .iter()
+                .map(|term| DeltaTermPosting {
+                    field_ord: 1,
+                    term: *term,
+                    frequency: 1,
+                    positions: Some(&position),
+                })
+                .collect::<Vec<_>>();
+            delta.apply_document(
+                docid,
+                DocId::from(id),
+                &norms(
+                    0,
+                    u32::try_from(terms.len()).expect("test term count fits u32"),
+                    0,
+                ),
+                &postings,
+            )?;
+            Ok(())
+        };
+
+        apply(&mut delta, 0, "a", &[b"alpha", b"beta"])?;
+        apply(&mut delta, 1, "b", &[b"alpha", b"beta"])?;
+        apply(&mut delta, 2, "c", &[b"beta", b"gamma"])?;
+        assert_agrees(
+            &delta,
+            &[(b"alpha", 2), (b"beta", 3), (b"gamma", 1)],
+            "independent fresh chains",
+        );
+
+        // Replacing b changes its term set. The old alpha and beta postings
+        // retire before the new beta and delta postings become live.
+        apply(&mut delta, 3, "b", &[b"beta", b"delta"])?;
+        assert_agrees(
+            &delta,
+            &[(b"alpha", 1), (b"beta", 3), (b"gamma", 1), (b"delta", 1)],
+            "replacement with changed terms",
+        );
+
+        // Deletion retires the surviving row of a without touching the other
+        // independent chains.
+        assert_eq!(delta.delete_delta_id("a"), Some(0));
+        assert_agrees(
+            &delta,
+            &[(b"alpha", 0), (b"beta", 2), (b"gamma", 1), (b"delta", 1)],
+            "one deletion",
+        );
+
+        // Superseded then deleted: only b's later physical row may retire.
+        assert_eq!(delta.delete_delta_id("b"), Some(3));
+        assert_agrees(
+            &delta,
+            &[(b"alpha", 0), (b"beta", 1), (b"gamma", 1), (b"delta", 0)],
+            "supersede-then-delete",
+        );
+
+        // Deleting c sets its bit once. Re-marking that exact bit must leave
+        // every counter intact; this is the duplicate-tombstone branch the
+        // public identity path reaches after an already retired row.
+        assert_eq!(delta.delete_delta_id("c"), Some(2));
+        let before_duplicate_mark = delta
+            .sorted_terms()
+            .into_iter()
+            .map(|term| (term.term().to_vec(), term.live_doc_freq()))
+            .collect::<Vec<_>>();
+        assert_eq!(delta.mark_tombstone(2), 0);
+        assert_eq!(
+            delta
+                .sorted_terms()
+                .into_iter()
+                .map(|term| (term.term().to_vec(), term.live_doc_freq()))
+                .collect::<Vec<_>>(),
+            before_duplicate_mark,
+            "an already-set tombstone bit must not decrement again"
+        );
+        assert_agrees(
+            &delta,
+            &[(b"alpha", 0), (b"beta", 0), (b"gamma", 0), (b"delta", 0)],
+            "same-bit duplicate tombstone",
+        );
+
+        let canonical_terms = delta
+            .sorted_terms()
+            .into_iter()
+            .map(|term| term.term().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            canonical_terms,
+            [
+                b"alpha".to_vec(),
+                b"beta".to_vec(),
+                b"delta".to_vec(),
+                b"gamma".to_vec(),
+            ],
+            "dictionary enumeration remains canonical even when all rows are tombstoned"
+        );
+        assert_eq!(delta.term_count(), 4);
+
+        // A frozen epoch carries the counters with its chains, needing no
+        // publication-time walk.
+        let snapshot = delta.freeze(7);
+        let frozen = snapshot.segment();
+        assert_agrees(
+            frozen,
+            &[(b"alpha", 0), (b"beta", 0), (b"gamma", 0), (b"delta", 0)],
+            "freeze",
+        );
+
+        let generation_before_reset = delta.generation;
+        delta.reset_after_seal(0)?;
+        assert_eq!(delta.generation, generation_before_reset.wrapping_add(1));
+        assert_eq!(delta.term_count(), 0);
+        apply(&mut delta, 4, "next-generation", &[b"zeta", b"alpha"])?;
+        assert_agrees(&delta, &[(b"alpha", 1), (b"zeta", 1)], "reset generation");
+        assert_eq!(
+            delta
+                .sorted_terms()
+                .into_iter()
+                .map(|term| term.term().to_vec())
+                .collect::<Vec<_>>(),
+            [b"alpha".to_vec(), b"zeta".to_vec()],
+            "a reset generation rebuilds dictionary order independently"
+        );
+        Ok(())
+    }
+
     #[test]
     fn interleaved_terms_keep_independent_chain_links_across_growth_boundaries()
     -> Result<(), DeltaError> {
@@ -3646,6 +3908,10 @@ mod tests {
         assert_eq!(delta.physical_document_count(), 3);
         assert_eq!(delta.live_document_count(), 1);
         assert_eq!(delta.live_total_tokens(1), Some(1));
+
+        let frozen = delta.freeze(7);
+        assert_eq!(frozen.physical_document_count(), 3);
+        assert_eq!(frozen.live_document_count(), 1);
 
         let term = delta.find_term(1, b"term").expect("term view");
         assert_eq!(term.physical_doc_freq(), 3);

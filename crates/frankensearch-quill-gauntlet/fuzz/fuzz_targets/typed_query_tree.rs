@@ -290,13 +290,23 @@ fuzz_target!(|input: &[u8]| {
                     minimized_replay.minimized_query, minimized_case.query,
                     "persisted minimized query must be the shrunk differential case query"
                 );
-                let replay_path = persist_typed_query_fuzz_replay(
+                let replay_artifact = persist_typed_query_fuzz_replay(
                     std::path::Path::new("artifacts"),
                     &minimized_replay,
                 )
                 .expect("persist minimized replay under its corpus and fingerprint identity");
+                let replayed_workload = replay_artifact
+                    .replay_workload()
+                    .expect("consume the descriptor-bound minimized replay");
+                assert_eq!(
+                    replayed_workload.case.query, minimized_case.query,
+                    "descriptor-bound replay must reconstruct the shrunk query"
+                );
+                let replay_key = replay_artifact
+                    .artifact_key()
+                    .expect("describe the descriptor-bound minimized replay");
                 panic!(
-                    "unclassified Quill/Tantivy divergence: provenance={} original_fingerprint={original_fingerprint:?} original_divergence_class={original_divergence_class:?} minimized_replay_path={replay_path:?} minimized_replay={minimized_replay:?} shrink_steps={reduction_steps}",
+                    "unclassified Quill/Tantivy divergence: provenance={} original_fingerprint={original_fingerprint:?} original_divergence_class={original_divergence_class:?} minimized_replay_key={replay_key} minimized_replay={minimized_replay:?} shrink_steps={reduction_steps}",
                     workload.provenance_for_ast(minimized_tree),
                 );
             }

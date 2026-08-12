@@ -34,9 +34,9 @@ use crate::perf::{
     PairedEstimatorConfig, PairedEstimatorError, PairedEvidenceStatus, PairedExperimentResult,
     PerfApplicabilityPlan, PerfApplicabilityPlanBinding, PerfCellApplicability,
     PerfExecutionProvenance, PerfGate, PerfGateArtifact, PerfInputIdentity, PerfMatrixSpec,
-    PerfRawSample, PerfSampleArm, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, median_sorted,
-    parse_cpu_list_ids, percentile, perf_metric_unit, perf_operation_scope, splitmix64,
-    validate_paired_blocks,
+    PerfRawSample, PerfSampleArm, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg1ExpectedAuthority,
+    median_sorted, parse_cpu_list_ids, percentile, perf_metric_unit, perf_operation_scope,
+    resolve_qg1_expected_authority_for_replay, splitmix64, validate_paired_blocks,
 };
 use crate::qg6_prepared::{
     Qg6ArmRole, Qg6QueryIdentityReceipt, Qg6QuerySpec, Qg6SemanticContract,
@@ -1478,8 +1478,30 @@ impl EvidenceCell {
         treatment_arm_null: PairedExperimentResult,
         policy: &EvidencePolicy,
     ) -> Result<(), EvidenceArtifactError> {
+        self.attach_treatment_arm_null_against_qg1_authority(treatment_arm_null, policy, None)
+    }
+
+    /// Attach a treatment-arm A/A null measured under a QG-1 producer, using
+    /// the expectation that producer retained.
+    ///
+    /// A QG-1 null carries a sealed lifecycle authority in its configuration,
+    /// and authority-free verification refuses to authenticate such evidence
+    /// from its own artifact. The live matrix therefore hands the producer's
+    /// retained expectation to this entry; replay hands the one its consumer
+    /// kept. Passing `None` keeps the exact generic contract, including that
+    /// refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::attach_treatment_arm_null`].
+    pub fn attach_treatment_arm_null_against_qg1_authority(
+        &mut self,
+        treatment_arm_null: PairedExperimentResult,
+        policy: &EvidencePolicy,
+        external_qg1_authority: Option<&Qg1ExpectedAuthority>,
+    ) -> Result<(), EvidenceArtifactError> {
         policy.validate()?;
-        treatment_arm_null.verify_recomputed()?;
+        treatment_arm_null.verify_recomputed_against_qg1_authority(external_qg1_authority)?;
         let EvidenceCellBody::Paired {
             paired,
             treatment_arm_null: slot,
@@ -1622,22 +1644,55 @@ impl EvidenceCell {
     /// Returns [`EvidenceArtifactError::InconsistentArtifact`] on any
     /// mismatch between stored summaries and their raw sources.
     pub fn verify_recomputed(&self, policy: &EvidencePolicy) -> Result<(), EvidenceArtifactError> {
+        self.verify_recomputed_against_qg1_authorities(policy, &[])
+    }
+
+    /// Recompute this cell, selecting the retained QG-1 expectation it was
+    /// measured under from the consumer's independently held set.
+    ///
+    /// A reloaded QG-1 cell can never carry its own expectation: the producer
+    /// capability preimages are not serialized and cannot be reconstructed
+    /// from the artifact. The consumer therefore supplies the expectations it
+    /// retained, and exactly the one that issued this cell's sealed authority
+    /// is used. An empty set reproduces the generic contract, under which a
+    /// QG-1 cell still fails closed rather than authenticating itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::verify_recomputed`].
+    pub fn verify_recomputed_against_qg1_authorities(
+        &self,
+        policy: &EvidencePolicy,
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+    ) -> Result<(), EvidenceArtifactError> {
         match &self.body {
             EvidenceCellBody::Paired {
                 paired,
                 treatment_arm_null,
                 ..
             } => {
+                // Replay context: only an externally retained expectation that
+                // names this cell's producer can authenticate it. An empty set
+                // is not permission to fall back to the expectation a live
+                // configuration still carries — that would let a QG-1 cell
+                // authenticate itself, which is the whole defect this guards.
+                let expected = resolve_qg1_expected_authority_for_replay(
+                    external_qg1_authorities,
+                    &paired.config,
+                );
                 let mut rebuilt =
                     Self::evaluate(self.spec.clone(), paired.as_ref().clone(), policy)?;
                 // QG-6 semantic bindings are cell-level evidence. Validate
                 // them before the generic paired estimator so hostile row
                 // mutations receive the semantic fail-closed classification
                 // instead of being obscured by a lower-level pair mismatch.
-                paired.verify_recomputed()?;
+                paired.verify_recomputed_against_qg1_authority(expected)?;
                 if let Some(treatment_arm_null) = treatment_arm_null {
-                    rebuilt
-                        .attach_treatment_arm_null(treatment_arm_null.as_ref().clone(), policy)?;
+                    rebuilt.attach_treatment_arm_null_against_qg1_authority(
+                        treatment_arm_null.as_ref().clone(),
+                        policy,
+                        expected,
+                    )?;
                 }
                 if rebuilt == *self {
                     Ok(())
@@ -1915,8 +1970,18 @@ impl PerfEvidenceArtifact {
                 ),
             });
         }
-        if paired.config != crate::PairedEstimatorConfig::predeclared(paired.config.bootstrap_seed)
-        {
+        // A QG-1 cell's configuration carries the sealed lifecycle authority
+        // its producer issued, which no predeclared template can equal. Its
+        // estimator policy must still be exactly predeclared; the authority
+        // itself is authenticated separately, against the expectation the
+        // consumer retained. Every other gate keeps full equality.
+        let predeclared = crate::PairedEstimatorConfig::predeclared(paired.config.bootstrap_seed);
+        let policy_matches = if cell.spec.gate == PerfGate::Qg1 {
+            paired.config.matches_estimator_policy(&predeclared)
+        } else {
+            paired.config == predeclared
+        };
+        if !policy_matches {
             return Err(EvidenceArtifactError::InvalidProvenance {
                 reason: format!(
                     "cell {} does not use the exact predeclared estimator configuration",
@@ -2591,6 +2656,25 @@ impl PerfEvidenceArtifact {
     /// broken content seal, invalid policy or provenance, malformed cell set,
     /// non-recomputable cell or gate fold, or inadmissible recorded decision.
     pub fn verify_integrity(&self) -> Result<(), EvidenceArtifactError> {
+        self.verify_integrity_against_qg1_authorities(&[])
+    }
+
+    /// Verify this artifact against the QG-1 expectations its consumer
+    /// retained outside it.
+    ///
+    /// This is the replay entry for artifacts containing headline QG-1 cells.
+    /// Each paired cell selects the single retained expectation that issued
+    /// its sealed authority; cells that name no QG-1 authority are unaffected,
+    /// and an empty set is exactly [`Self::verify_integrity`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::verify_integrity`], including the
+    /// fail-closed refusal of a QG-1 cell whose retained expectation is absent.
+    pub fn verify_integrity_against_qg1_authorities(
+        &self,
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+    ) -> Result<(), EvidenceArtifactError> {
         if self.schema_version != PERF_EVIDENCE_SCHEMA_VERSION {
             return Err(EvidenceArtifactError::SchemaMismatch {
                 found: self.schema_version.clone(),
@@ -2666,7 +2750,7 @@ impl PerfEvidenceArtifact {
         }
         for cell in &self.cells {
             self.verify_cell_provenance(cell)?;
-            cell.verify_recomputed(&self.policy)?;
+            cell.verify_recomputed_against_qg1_authorities(&self.policy, external_qg1_authorities)?;
         }
         let (expected_status, expected_reasons) =
             Self::fold(&self.cells, self.admission_no_claim.as_ref());
@@ -2811,6 +2895,25 @@ impl PerfEvidenceArtifact {
     ///
     /// Returns the specific [`EvidenceArtifactError`] for each defect class.
     pub fn from_verified_slice(contents: &[u8]) -> Result<Self, EvidenceArtifactError> {
+        Self::from_verified_slice_against_qg1_authorities(contents, &[])
+    }
+
+    /// Parse exact artifact bytes and verify them against the QG-1
+    /// expectations their consumer retained outside the artifact.
+    ///
+    /// Strict canonical parsing is identical; only the integrity pass differs,
+    /// so a persisted QG-1 artifact is verifiable exactly once its retained
+    /// authority set is supplied. An empty set is [`Self::from_verified_slice`],
+    /// under which a QG-1 cell still fails closed and non-QG-1 evidence is
+    /// unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns the specific [`EvidenceArtifactError`] for each defect class.
+    pub fn from_verified_slice_against_qg1_authorities(
+        contents: &[u8],
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+    ) -> Result<Self, EvidenceArtifactError> {
         let probe =
             crate::machine_class_registry::parse_strict_json(contents).map_err(|error| {
                 EvidenceArtifactError::Malformed {
@@ -2842,7 +2945,7 @@ impl PerfEvidenceArtifact {
                 reason: "artifact bytes are not exact canonical pretty JSON".to_owned(),
             });
         }
-        artifact.verify_integrity()?;
+        artifact.verify_integrity_against_qg1_authorities(external_qg1_authorities)?;
         Ok(artifact)
     }
 
@@ -2856,8 +2959,21 @@ impl PerfEvidenceArtifact {
     ///
     /// Returns the specific [`EvidenceArtifactError`] for each defect class.
     pub fn load_verified(path: &Path) -> Result<Self, EvidenceArtifactError> {
+        Self::load_verified_against_qg1_authorities(path, &[])
+    }
+
+    /// Load one artifact and verify it against the QG-1 expectations its
+    /// consumer retained outside the artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns the specific [`EvidenceArtifactError`] for each defect class.
+    pub fn load_verified_against_qg1_authorities(
+        path: &Path,
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+    ) -> Result<Self, EvidenceArtifactError> {
         let contents = fs::read(path)?;
-        Self::from_verified_slice(&contents)
+        Self::from_verified_slice_against_qg1_authorities(&contents, external_qg1_authorities)
     }
 
     /// Load one artifact as ADMISSIBLE EVIDENCE: verified exactly as
@@ -2881,7 +2997,21 @@ impl PerfEvidenceArtifact {
         path: &Path,
         register: &PerfQuarantineRegister,
     ) -> Result<Self, EvidenceArtifactError> {
-        let artifact = Self::load_verified(path)?;
+        Self::load_admissible_evidence_against_qg1_authorities(path, register, &[])
+    }
+
+    /// Load admissible evidence whose QG-1 cells are authenticated against the
+    /// expectations their consumer retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns every error [`Self::load_admissible_evidence`] can.
+    pub fn load_admissible_evidence_against_qg1_authorities(
+        path: &Path,
+        register: &PerfQuarantineRegister,
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+    ) -> Result<Self, EvidenceArtifactError> {
+        let artifact = Self::load_verified_against_qg1_authorities(path, external_qg1_authorities)?;
         register.screen(&artifact)?;
         Ok(artifact)
     }
