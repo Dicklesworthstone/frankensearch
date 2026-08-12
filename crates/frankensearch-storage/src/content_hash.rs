@@ -2,15 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::io;
 
-use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
 use fsqlite::{AsyncConnection, Row};
-use fsqlite_types::cx::Cx as FsqliteCx;
 use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::connection::{Storage, fsqlite_cx};
+use crate::connection::Storage;
 use crate::document::EmbeddingStatus;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -88,14 +86,12 @@ pub fn sha256_hex(content: &str) -> String {
     ContentHasher::hash_hex(content)
 }
 
-pub async fn record_content_hash(
-    cx: &Cx,
+pub fn record_content_hash(
     conn: &AsyncConnection,
     content_hash: &str,
     doc_id: &str,
     seen_at: i64,
 ) -> SearchResult<usize> {
-    let fsqlite_cx = fsqlite_cx(cx);
     let sql = "INSERT INTO content_hashes \
         (content_hash, first_doc_id, seen_count, first_seen_at, last_seen_at) \
         VALUES (?1, ?2, 1, ?3, ?4) \
@@ -110,26 +106,21 @@ pub async fn record_content_hash(
         SqliteValue::Integer(seen_at),
     ];
 
-    conn.execute_with_params(&fsqlite_cx, sql, &params)
-        .await
+    conn.execute_with_params_sync(sql, &params)
         .map_err(storage_error)
 }
 
-pub async fn lookup_content_hash(
-    cx: &Cx,
+pub fn lookup_content_hash(
     conn: &AsyncConnection,
     content_hash: &str,
 ) -> SearchResult<Option<ContentHashRecord>> {
-    let fsqlite_cx = fsqlite_cx(cx);
     let params = [SqliteValue::Text(content_hash.to_owned().into())];
     let rows = conn
-        .query_with_params(
-            &fsqlite_cx,
+        .query_with_params_sync(
             "SELECT content_hash, first_doc_id, seen_count, first_seen_at, last_seen_at \
              FROM content_hashes WHERE content_hash = ?1;",
             &params,
         )
-        .await
         .map_err(storage_error)?;
 
     let Some(row) = rows.first() else {
@@ -146,9 +137,8 @@ pub async fn lookup_content_hash(
 }
 
 impl Storage {
-    pub async fn check_dedup(
+    pub fn check_dedup(
         &self,
-        cx: &Cx,
         doc_id: &str,
         new_hash: &[u8; 32],
         embedder_id: &str,
@@ -157,8 +147,7 @@ impl Storage {
         ensure_non_empty(embedder_id, "embedder_id")?;
 
         let items = [(doc_id.to_owned(), *new_hash)];
-        self.check_dedup_batch(cx, &items, embedder_id)
-            .await?
+        self.check_dedup_batch(&items, embedder_id)?
             .into_iter()
             .next()
             .ok_or_else(|| SearchError::SubsystemError {
@@ -167,9 +156,8 @@ impl Storage {
             })
     }
 
-    pub async fn check_dedup_batch(
+    pub fn check_dedup_batch(
         &self,
-        cx: &Cx,
         items: &[(String, [u8; 32])],
         embedder_id: &str,
     ) -> SearchResult<Vec<DeduplicationDecision>> {
@@ -189,8 +177,8 @@ impl Storage {
             }
         }
 
-        self.transaction(cx, |conn, fsqlite_cx| Box::pin(async move {
-            let existing = fetch_existing_dedup_rows(fsqlite_cx, conn, items, embedder_id).await?;
+        self.transaction(|conn| {
+            let existing = fetch_existing_dedup_rows(conn, items, embedder_id)?;
             let mut decisions = Vec::with_capacity(items.len());
             let mut skipped_docs = 0_u64;
             let mut new_docs = 0_u64;
@@ -224,13 +212,11 @@ impl Storage {
             );
 
             Ok(decisions)
-        }))
-        .await
+        })
     }
 }
 
-async fn fetch_existing_dedup_rows(
-    fsqlite_cx: &FsqliteCx,
+fn fetch_existing_dedup_rows(
     conn: &AsyncConnection,
     items: &[(String, [u8; 32])],
     embedder_id: &str,
@@ -259,8 +245,7 @@ async fn fetch_existing_dedup_rows(
     }
 
     let rows = conn
-        .query_with_params(fsqlite_cx, &sql, &params)
-        .await
+        .query_with_params_sync(&sql, &params)
         .map_err(storage_error)?;
     let mut existing = HashMap::with_capacity(rows.len());
 
@@ -478,7 +463,7 @@ mod tests {
         ];
         storage
             .connection()
-            .execute_with_params(
+            .execute_with_params_sync(
                 "INSERT INTO embedding_status \
                  (doc_id, embedder_id, embedder_revision, status, embedded_at, error_message, retry_count) \
                  VALUES (?1, ?2, NULL, ?3, NULL, NULL, 0) \

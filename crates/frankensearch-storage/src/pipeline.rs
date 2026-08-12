@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
 use frankensearch_core::{Canonicalizer, Embedder, SearchError, SearchResult};
-use fsqlite::Connection;
+use fsqlite::AsyncConnection;
 use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -391,11 +391,8 @@ impl StorageBackedJobRunner {
             }
 
             let ready_params = [SqliteValue::Integer(now_ms)];
-            let ready_rows = conn
-                .query_with_params(
-                    "SELECT COUNT(*) FROM embedding_jobs WHERE status = 'pending' AND submitted_at <= ?1;",
-                    &ready_params,
-                )
+            let ready_rows = conn.query_with_params_sync("SELECT COUNT(*) FROM embedding_jobs WHERE status = 'pending' AND submitted_at <= ?1;",
+            &ready_params,)
                 .map_err(map_storage_error)?;
             let ready_pending = if let Some(row) = ready_rows.first() {
                 usize::try_from(row_i64(row, 0, "embedding_jobs.ready_pending")?)
@@ -1025,7 +1022,7 @@ struct IngestTxResult {
 }
 
 fn dedup_state_for_doc(
-    conn: &Connection,
+    conn: &AsyncConnection,
     doc_id: &str,
     new_hash: &[u8; 32],
     embedder_id: &str,
@@ -1035,17 +1032,17 @@ fn dedup_state_for_doc(
         SqliteValue::Text(embedder_id.to_owned().into()),
     ];
     let rows = conn
-        .query_with_params(
+        .query_with_params_sync(
             "SELECT d.content_hash, e.status, j.job_id \
-             FROM documents d \
-             LEFT JOIN embedding_status e \
-               ON d.doc_id = e.doc_id AND e.embedder_id = ?2 \
-             LEFT JOIN embedding_jobs j \
-               ON d.doc_id = j.doc_id \
-              AND j.embedder_id = ?2 \
-              AND j.status IN ('pending', 'processing') \
-             WHERE d.doc_id = ?1 \
-             LIMIT 1;",
+     FROM documents d \
+     LEFT JOIN embedding_status e \
+       ON d.doc_id = e.doc_id AND e.embedder_id = ?2 \
+     LEFT JOIN embedding_jobs j \
+       ON d.doc_id = j.doc_id \
+      AND j.embedder_id = ?2 \
+      AND j.status IN ('pending', 'processing') \
+     WHERE d.doc_id = ?1 \
+     LIMIT 1;",
             &params,
         )
         .map_err(map_storage_error)?;
@@ -1090,9 +1087,9 @@ fn dedup_state_for_doc(
     })
 }
 
-fn reset_embedding_status(conn: &Connection, doc_id: &str) -> SearchResult<()> {
+fn reset_embedding_status(conn: &AsyncConnection, doc_id: &str) -> SearchResult<()> {
     let params = [SqliteValue::Text(doc_id.to_owned().into())];
-    conn.execute_with_params("DELETE FROM embedding_status WHERE doc_id = ?1;", &params)
+    conn.execute_with_params_sync("DELETE FROM embedding_status WHERE doc_id = ?1;", &params)
         .map_err(map_storage_error)?;
     Ok(())
 }
@@ -1782,7 +1779,7 @@ mod tests {
             runner
                 .storage
                 .connection()
-                .execute_with_params(
+                .execute_with_params_sync(
                     "UPDATE embedding_jobs SET started_at = ?1 WHERE job_id = ?2;",
                     &params,
                 )
@@ -1873,7 +1870,7 @@ mod tests {
             runner
                 .storage
                 .connection()
-                .execute("DELETE FROM embedding_jobs;")
+                .execute_sync("DELETE FROM embedding_jobs;")
                 .expect("manual delete should succeed");
 
             let zombie_depth = runner.queue.queue_depth().expect("depth");
@@ -2153,7 +2150,7 @@ mod tests {
                 runner
                     .storage
                     .connection()
-                    .execute_with_params(
+                    .execute_with_params_sync(
                         "UPDATE embedding_jobs SET started_at = ?1 WHERE job_id = ?2;",
                         &params,
                     )
@@ -2319,13 +2316,10 @@ mod tests {
             ];
             runner
                 .storage
-                .connection()
-                .execute_with_params(
-                    "INSERT INTO embedding_jobs (\
-                        doc_id, embedder_id, priority, submitted_at, status, retry_count, max_retries, content_hash\
-                     ) VALUES (?1, ?2, ?3, ?4, 'pending', 0, 1, ?5);",
-                    &params,
-                )
+                .connection().execute_with_params_sync("INSERT INTO embedding_jobs (\
+                doc_id, embedder_id, priority, submitted_at, status, retry_count, max_retries, content_hash\
+             ) VALUES (?1, ?2, ?3, ?4, 'pending', 0, 1, ?5);",
+            &params,)
                 .expect("manual queue insert should succeed");
 
             let processed = runner
@@ -3533,7 +3527,7 @@ mod integration_tests {
                 ];
                 storage
                     .connection()
-                    .execute_with_params(
+                    .execute_with_params_sync(
                         "UPDATE embedding_jobs SET started_at = ?1 WHERE job_id = ?2;",
                         &params,
                     )

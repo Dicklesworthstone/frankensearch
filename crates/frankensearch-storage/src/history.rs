@@ -7,7 +7,7 @@
 use std::io;
 
 use frankensearch_core::{SearchError, SearchResult};
-use fsqlite::Connection;
+use fsqlite::AsyncConnection;
 use fsqlite_types::value::SqliteValue;
 
 use crate::connection::map_storage_error;
@@ -41,7 +41,7 @@ pub struct SearchHistoryEntry {
 /// seconds, the existing entry is updated instead of creating a duplicate.
 #[allow(clippy::too_many_arguments)]
 pub fn record_search(
-    conn: &Connection,
+    conn: &AsyncConnection,
     query: &str,
     query_class: Option<&str>,
     result_count: Option<i64>,
@@ -58,11 +58,11 @@ pub fn record_search(
         SqliteValue::Integer(window_start),
     ];
     let existing = conn
-        .query_with_params(
+        .query_with_params_sync(
             "SELECT id FROM search_history \
-             WHERE query = ?1 \
-             AND searched_at >= ?2 \
-             ORDER BY searched_at DESC LIMIT 1;",
+     WHERE query = ?1 \
+     AND searched_at >= ?2 \
+     ORDER BY searched_at DESC LIMIT 1;",
             &dedup_params,
         )
         .map_err(map_storage_error)?;
@@ -86,11 +86,11 @@ pub fn record_search(
             SqliteValue::Integer(searched_at),
             SqliteValue::Integer(existing_id),
         ];
-        conn.execute_with_params(
+        conn.execute_with_params_sync(
             "UPDATE search_history SET \
-             result_count = ?1, phase1_latency_ms = ?2, phase2_latency_ms = ?3, \
-             top_results_json = ?4, searched_at = ?5 \
-             WHERE id = ?6;",
+         result_count = ?1, phase1_latency_ms = ?2, phase2_latency_ms = ?3, \
+         top_results_json = ?4, searched_at = ?5 \
+         WHERE id = ?6;",
             &update_params,
         )
         .map_err(map_storage_error)?;
@@ -105,11 +105,11 @@ pub fn record_search(
             opt_text(top_results_json),
             SqliteValue::Integer(searched_at),
         ];
-        conn.execute_with_params(
+        conn.execute_with_params_sync(
             "INSERT INTO search_history \
-             (query, query_class, result_count, phase1_latency_ms, \
-              phase2_latency_ms, top_results_json, searched_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
+         (query, query_class, result_count, phase1_latency_ms, \
+          phase2_latency_ms, top_results_json, searched_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
             &insert_params,
         )
         .map_err(map_storage_error)?;
@@ -142,7 +142,7 @@ fn limit_to_i64(limit: usize, field: &'static str) -> SearchResult<i64> {
 
 /// Retrieve search history in most-recent-first order.
 pub fn list_search_history(
-    conn: &Connection,
+    conn: &AsyncConnection,
     limit: usize,
 ) -> SearchResult<Vec<SearchHistoryEntry>> {
     if limit == 0 {
@@ -152,10 +152,10 @@ pub fn list_search_history(
     let limit_i64 = limit_to_i64(limit, "history.limit")?;
     let params = [SqliteValue::Integer(limit_i64)];
     let rows = conn
-        .query_with_params(
+        .query_with_params_sync(
             "SELECT id, query, query_class, result_count, phase1_latency_ms, \
-             phase2_latency_ms, top_results_json, searched_at \
-             FROM search_history ORDER BY searched_at DESC LIMIT ?1;",
+     phase2_latency_ms, top_results_json, searched_at \
+     FROM search_history ORDER BY searched_at DESC LIMIT ?1;",
             &params,
         )
         .map_err(map_storage_error)?;
@@ -169,7 +169,7 @@ pub fn list_search_history(
 
 /// Find history entries matching a prefix (for auto-suggest).
 pub fn search_history_prefix(
-    conn: &Connection,
+    conn: &AsyncConnection,
     prefix: &str,
     limit: usize,
 ) -> SearchResult<Vec<SearchHistoryEntry>> {
@@ -184,11 +184,11 @@ pub fn search_history_prefix(
         SqliteValue::Integer(limit_i64),
     ];
     let rows = conn
-        .query_with_params(
+        .query_with_params_sync(
             "SELECT id, query, query_class, result_count, phase1_latency_ms, \
-             phase2_latency_ms, top_results_json, searched_at \
-             FROM search_history WHERE query LIKE ?1 ESCAPE '\\' \
-             ORDER BY searched_at DESC LIMIT ?2;",
+     phase2_latency_ms, top_results_json, searched_at \
+     FROM search_history WHERE query LIKE ?1 ESCAPE '\\' \
+     ORDER BY searched_at DESC LIMIT ?2;",
             &params,
         )
         .map_err(map_storage_error)?;
@@ -201,9 +201,9 @@ pub fn search_history_prefix(
 }
 
 /// Count total search history entries.
-pub fn count_search_history(conn: &Connection) -> SearchResult<i64> {
+pub fn count_search_history(conn: &AsyncConnection) -> SearchResult<i64> {
     let rows = conn
-        .query("SELECT COUNT(*) FROM search_history;")
+        .query_sync("SELECT COUNT(*) FROM search_history;")
         .map_err(map_storage_error)?;
     match rows.first().and_then(|r| r.get(0)) {
         Some(SqliteValue::Integer(count)) => Ok(*count),
@@ -212,7 +212,7 @@ pub fn count_search_history(conn: &Connection) -> SearchResult<i64> {
 }
 
 /// Truncate search history to keep only the most recent `max_entries`.
-pub fn truncate_search_history(conn: &Connection, max_entries: usize) -> SearchResult<i64> {
+pub fn truncate_search_history(conn: &AsyncConnection, max_entries: usize) -> SearchResult<i64> {
     let count = count_search_history(conn)?;
     let max_entries_i64 = limit_to_i64(max_entries, "history.max_entries")?;
     if count <= max_entries_i64 {
@@ -221,9 +221,9 @@ pub fn truncate_search_history(conn: &Connection, max_entries: usize) -> SearchR
 
     let to_delete = count - max_entries_i64;
     let params = [SqliteValue::Integer(to_delete)];
-    conn.execute_with_params(
+    conn.execute_with_params_sync(
         "DELETE FROM search_history WHERE id IN (\
-         SELECT id FROM search_history ORDER BY searched_at ASC LIMIT ?1);",
+     SELECT id FROM search_history ORDER BY searched_at ASC LIMIT ?1);",
         &params,
     )
     .map_err(map_storage_error)?;
@@ -291,7 +291,7 @@ pub struct Bookmark {
 
 /// Add a bookmark. If the same (`doc_id`, query) pair exists, updates the note.
 pub fn add_bookmark(
-    conn: &Connection,
+    conn: &AsyncConnection,
     doc_id: &str,
     query: Option<&str>,
     note: Option<&str>,
@@ -304,17 +304,17 @@ pub fn add_bookmark(
             SqliteValue::Text(doc_id.to_owned().into()),
             SqliteValue::Text(q.to_owned().into()),
         ];
-        conn.query_with_params(
+        conn.query_with_params_sync(
             "SELECT id FROM bookmarks \
-             WHERE doc_id = ?1 AND query = ?2 LIMIT 1;",
+         WHERE doc_id = ?1 AND query = ?2 LIMIT 1;",
             &check_params,
         )
         .map_err(map_storage_error)?
     } else {
         let check_params = [SqliteValue::Text(doc_id.to_owned().into())];
-        conn.query_with_params(
+        conn.query_with_params_sync(
             "SELECT id FROM bookmarks \
-             WHERE doc_id = ?1 AND query IS NULL LIMIT 1;",
+         WHERE doc_id = ?1 AND query IS NULL LIMIT 1;",
             &check_params,
         )
         .map_err(map_storage_error)?
@@ -335,7 +335,7 @@ pub fn add_bookmark(
             SqliteValue::Integer(created_at),
             SqliteValue::Integer(existing_id),
         ];
-        conn.execute_with_params(
+        conn.execute_with_params_sync(
             "UPDATE bookmarks SET note = ?1, created_at = ?2 WHERE id = ?3;",
             &update_params,
         )
@@ -347,9 +347,9 @@ pub fn add_bookmark(
             opt_text(note),
             SqliteValue::Integer(created_at),
         ];
-        conn.execute_with_params(
+        conn.execute_with_params_sync(
             "INSERT INTO bookmarks (doc_id, query, note, created_at) \
-             VALUES (?1, ?2, ?3, ?4);",
+         VALUES (?1, ?2, ?3, ?4);",
             &insert_params,
         )
         .map_err(map_storage_error)?;
@@ -358,10 +358,10 @@ pub fn add_bookmark(
 }
 
 /// Remove a bookmark by its row ID.
-pub fn remove_bookmark(conn: &Connection, bookmark_id: i64) -> SearchResult<bool> {
+pub fn remove_bookmark(conn: &AsyncConnection, bookmark_id: i64) -> SearchResult<bool> {
     let params = [SqliteValue::Integer(bookmark_id)];
     let existed = !conn
-        .query_with_params("SELECT 1 FROM bookmarks WHERE id = ?1 LIMIT 1;", &params)
+        .query_with_params_sync("SELECT 1 FROM bookmarks WHERE id = ?1 LIMIT 1;", &params)
         .map_err(map_storage_error)?
         .is_empty();
 
@@ -369,26 +369,26 @@ pub fn remove_bookmark(conn: &Connection, bookmark_id: i64) -> SearchResult<bool
         return Ok(false);
     }
 
-    conn.execute_with_params("DELETE FROM bookmarks WHERE id = ?1;", &params)
+    conn.execute_with_params_sync("DELETE FROM bookmarks WHERE id = ?1;", &params)
         .map_err(map_storage_error)?;
 
     // Verify deletion completed.
     let check = conn
-        .query_with_params("SELECT id FROM bookmarks WHERE id = ?1;", &params)
+        .query_with_params_sync("SELECT id FROM bookmarks WHERE id = ?1;", &params)
         .map_err(map_storage_error)?;
     Ok(check.is_empty())
 }
 
 /// Remove a bookmark by document ID (removes all bookmarks for that doc).
-pub fn remove_bookmark_by_doc(conn: &Connection, doc_id: &str) -> SearchResult<()> {
+pub fn remove_bookmark_by_doc(conn: &AsyncConnection, doc_id: &str) -> SearchResult<()> {
     let params = [SqliteValue::Text(doc_id.to_owned().into())];
-    conn.execute_with_params("DELETE FROM bookmarks WHERE doc_id = ?1;", &params)
+    conn.execute_with_params_sync("DELETE FROM bookmarks WHERE doc_id = ?1;", &params)
         .map_err(map_storage_error)?;
     Ok(())
 }
 
 /// List all bookmarks in most-recent-first order.
-pub fn list_bookmarks(conn: &Connection, limit: usize) -> SearchResult<Vec<Bookmark>> {
+pub fn list_bookmarks(conn: &AsyncConnection, limit: usize) -> SearchResult<Vec<Bookmark>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -396,9 +396,9 @@ pub fn list_bookmarks(conn: &Connection, limit: usize) -> SearchResult<Vec<Bookm
     let limit_i64 = limit_to_i64(limit, "bookmarks.limit")?;
     let params = [SqliteValue::Integer(limit_i64)];
     let rows = conn
-        .query_with_params(
+        .query_with_params_sync(
             "SELECT id, doc_id, query, note, created_at \
-             FROM bookmarks ORDER BY created_at DESC LIMIT ?1;",
+     FROM bookmarks ORDER BY created_at DESC LIMIT ?1;",
             &params,
         )
         .map_err(map_storage_error)?;
@@ -411,9 +411,9 @@ pub fn list_bookmarks(conn: &Connection, limit: usize) -> SearchResult<Vec<Bookm
 }
 
 /// Count total bookmarks.
-pub fn count_bookmarks(conn: &Connection) -> SearchResult<i64> {
+pub fn count_bookmarks(conn: &AsyncConnection) -> SearchResult<i64> {
     let rows = conn
-        .query("SELECT COUNT(*) FROM bookmarks;")
+        .query_sync("SELECT COUNT(*) FROM bookmarks;")
         .map_err(map_storage_error)?;
     match rows.first().and_then(|r| r.get(0)) {
         Some(SqliteValue::Integer(count)) => Ok(*count),
@@ -422,10 +422,10 @@ pub fn count_bookmarks(conn: &Connection) -> SearchResult<i64> {
 }
 
 /// Check if a document is bookmarked.
-pub fn is_bookmarked(conn: &Connection, doc_id: &str) -> SearchResult<bool> {
+pub fn is_bookmarked(conn: &AsyncConnection, doc_id: &str) -> SearchResult<bool> {
     let params = [SqliteValue::Text(doc_id.to_owned().into())];
     let rows = conn
-        .query_with_params(
+        .query_with_params_sync(
             "SELECT 1 FROM bookmarks WHERE doc_id = ?1 LIMIT 1;",
             &params,
         )
@@ -502,10 +502,10 @@ mod tests {
     use super::*;
     use crate::schema;
 
-    fn test_conn() -> Connection {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+    fn test_conn() -> AsyncConnection {
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
         // Apply pragmas for foreign keys.
-        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute_sync("PRAGMA foreign_keys=ON;")
             .expect("pragma should succeed");
         schema::bootstrap(&conn).expect("schema bootstrap should succeed");
         conn

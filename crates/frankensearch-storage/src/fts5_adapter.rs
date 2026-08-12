@@ -19,9 +19,10 @@
 //! configuration.
 
 use std::collections::HashMap;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 
 use asupersync::Cx;
 use frankensearch_core::error::{SearchError, SearchResult};
@@ -34,9 +35,7 @@ use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument, warn};
 
-use crate::connection::{
-    Storage, fsqlite_cx, map_storage_error_at, require_async_transaction_cleanup_capability,
-};
+use crate::connection::{Storage, fsqlite_cx, map_storage_error_at};
 use crate::schema::PORTER_FTS5_REBUILD_TABLE;
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -394,17 +393,13 @@ impl PersistedFts5LexicalSearch {
     /// This checks the table's actual `sqlite_master` DDL rather than trusting
     /// an application-supplied content mode or tokenizer. It also requires the
     /// committed rebuild marker before returning a searchable reader.
-    pub async fn open(
-        cx: &Cx,
-        storage: Arc<Storage>,
-        table_name: &str,
-    ) -> SearchResult<Self> {
+    pub async fn open(cx: &Cx, storage: Arc<Storage>, table_name: &str) -> SearchResult<Self> {
         let table_name = validated_fts5_identifier(table_name)?;
         let fsqlite_cx = fsqlite_cx(cx);
-        let metadata = ensure_porter_fts5_ready(&fsqlite_cx, storage.connection(), &table_name)
-            .await?;
-        let doc_count = persisted_fts5_doc_count(&fsqlite_cx, storage.connection(), &table_name)
-            .await?;
+        let metadata =
+            ensure_porter_fts5_ready(&fsqlite_cx, storage.connection(), &table_name).await?;
+        let doc_count =
+            persisted_fts5_doc_count(&fsqlite_cx, storage.connection(), &table_name).await?;
 
         Ok(Self {
             storage,
@@ -443,12 +438,8 @@ impl frankensearch_core::LexicalRead for PersistedFts5LexicalSearch {
             // This is intentionally in the live data path, not only in the
             // rebuild helper: external DDL or marker changes fail the search
             // closed before MATCH can return a stale Porter result.
-            ensure_porter_fts5_ready(
-                &fsqlite_cx,
-                self.storage.connection(),
-                &self.table_name,
-            )
-            .await?;
+            ensure_porter_fts5_ready(&fsqlite_cx, self.storage.connection(), &self.table_name)
+                .await?;
 
             let limit = i64::try_from(limit).map_err(|_| SearchError::InvalidConfig {
                 field: "fts5.limit".to_owned(),
@@ -485,17 +476,16 @@ impl frankensearch_core::LexicalRead for PersistedFts5LexicalSearch {
     }
 }
 
-/// Rebuild a persisted Porter FTS5 table for FrankenSQLite 0.2.1.
+/// Rebuild a persisted Porter FTS5 table for FrankenSQLite 0.3.
 ///
 /// The table's own DDL decides its content mode. Ordinary stored and external
 /// tables use FTS5's `rebuild` command; contentless tables are rejected because
 /// authoritative text and original rowids must be re-ingested instead.
 ///
-/// The rebuild is intentionally gated before `BEGIN`: 0.2.1 cannot submit the
-/// required non-cancelled rollback on cancellation, error, commit failure, or
-/// panic. The 0.3 implementation must issue rebuild, marker upsert, and
-/// `COMMIT` in one transaction and roll that transaction back exactly once
-/// with the dedicated cleanup capability when any of those steps fails.
+/// Rebuild and marker promotion share one synchronous worker transaction. The
+/// 0.3 synchronous cleanup path is independent of request cancellation, so an
+/// ordinary error, failed commit, or panic always attempts exactly one rollback
+/// before the original error or panic is returned to the caller.
 pub async fn rebuild_porter_fts5_table(
     cx: &Cx,
     conn: &AsyncConnection,
@@ -512,18 +502,74 @@ pub async fn rebuild_porter_fts5_table(
             return Err(SearchError::InvalidConfig {
                 field: "fts5.rebuild_version".to_owned(),
                 value: version.to_string(),
-                reason: "database was rebuilt by a newer Porter FTS5 migration; refusing a downgrade".to_owned(),
+                reason:
+                    "database was rebuilt by a newer Porter FTS5 migration; refusing a downgrade"
+                        .to_owned(),
             });
         }
         Some(_) | None => {}
     }
 
-    require_async_transaction_cleanup_capability()
+    conn.execute_sync("BEGIN IMMEDIATE;")
+        .map_err(|error| map_storage_error_at("begin Porter FTS5 rebuild", error))?;
+
+    let result = catch_unwind(AssertUnwindSafe(|| -> SearchResult<()> {
+        let rebuild_sql = format!("INSERT INTO {table_name}({table_name}) VALUES ('rebuild');");
+        conn.execute_sync(&rebuild_sql)
+            .map_err(|error| map_storage_error_at("rebuild Porter FTS5 table", error))?;
+
+        let params = [
+            SqliteValue::Text(table_name.clone().into()),
+            SqliteValue::Integer(PORTER_FTS5_REBUILD_VERSION),
+        ];
+        conn.execute_with_params_sync(
+            &format!(
+                "INSERT INTO {PORTER_FTS5_REBUILD_TABLE} (table_name, rebuild_version) \
+                 VALUES (?1, ?2) \
+                 ON CONFLICT(table_name) DO UPDATE SET rebuild_version = excluded.rebuild_version;"
+            ),
+            &params,
+        )
+        .map_err(|error| map_storage_error_at("write Porter FTS5 rebuild marker", error))?;
+        Ok(())
+    }));
+
+    match result {
+        Ok(Ok(())) => conn.commit_transaction_sync().map_err(|commit_error| {
+            if let Err(rollback_error) = conn.rollback_transaction_sync() {
+                warn!(
+                    error = %rollback_error,
+                    "rollback failed after Porter FTS5 rebuild commit error"
+                );
+            }
+            map_storage_error_at("commit Porter FTS5 rebuild", commit_error)
+        }),
+        Ok(Err(error)) => {
+            if let Err(rollback_error) = conn.rollback_transaction_sync() {
+                warn!(
+                    error = %rollback_error,
+                    "rollback failed after Porter FTS5 rebuild error"
+                );
+            }
+            Err(error)
+        }
+        Err(payload) => {
+            if let Err(rollback_error) = conn.rollback_transaction_sync() {
+                warn!(
+                    error = %rollback_error,
+                    "rollback failed during Porter FTS5 rebuild panic recovery"
+                );
+            }
+            resume_unwind(payload);
+        }
+    }
 }
 
 fn validated_fts5_identifier(table_name: &str) -> SearchResult<String> {
     let mut chars = table_name.chars();
-    let valid_start = chars.next().is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic());
+    let valid_start = chars
+        .next()
+        .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic());
     let valid_rest = chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric());
     if valid_start && valid_rest {
         Ok(table_name.to_owned())
@@ -623,7 +669,8 @@ async fn read_porter_fts5_rebuild_marker(
             return Err(SearchError::InvalidConfig {
                 field: "fts5.rebuild_version".to_owned(),
                 value: table_name.to_owned(),
-                reason: "governed Porter FTS5 marker table contains duplicate rows for one table".to_owned(),
+                reason: "governed Porter FTS5 marker table contains duplicate rows for one table"
+                    .to_owned(),
             });
         }
     };
@@ -705,16 +752,22 @@ fn decode_persisted_fts5_row(row: &Row) -> SearchResult<ScoredResult> {
     }
 
     let metadata = match row.get(1) {
-        None => return Err(persisted_fts5_result_error("metadata_json column is missing")),
+        None => {
+            return Err(persisted_fts5_result_error(
+                "metadata_json column is missing",
+            ));
+        }
         Some(SqliteValue::Null) => None,
         Some(SqliteValue::Text(text)) if text.is_empty() => None,
-        Some(SqliteValue::Text(text)) => Some(serde_json::from_str(text).map_err(|error| {
-            SearchError::InvalidConfig {
-                field: "fts5.metadata_json".to_owned(),
-                value: error.to_string(),
-                reason: "persisted FTS5 metadata_json is not valid JSON".to_owned(),
-            }
-        })?),
+        Some(SqliteValue::Text(text)) => {
+            Some(
+                serde_json::from_str(text).map_err(|error| SearchError::InvalidConfig {
+                    field: "fts5.metadata_json".to_owned(),
+                    value: error.to_string(),
+                    reason: "persisted FTS5 metadata_json is not valid JSON".to_owned(),
+                })?,
+            )
+        }
         Some(value) => {
             return Err(persisted_fts5_result_error(&format!(
                 "metadata_json must be TEXT or NULL, got {value:?}"
@@ -937,9 +990,12 @@ fn split_fts5_option<'a>(
 
 fn parse_fts5_option_value(value: &str, table_name: &str) -> SearchResult<String> {
     let value = value.trim();
-    let Some(quote) = value.as_bytes().first().copied().filter(|quote| {
-        matches!(quote, b'\'' | b'\"' | b'`')
-    }) else {
+    let Some(quote) = value
+        .as_bytes()
+        .first()
+        .copied()
+        .filter(|quote| matches!(quote, b'\'' | b'\"' | b'`'))
+    else {
         return Ok(value.to_ascii_lowercase());
     };
     if value.len() < 2 {

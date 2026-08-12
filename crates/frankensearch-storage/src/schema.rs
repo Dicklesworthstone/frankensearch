@@ -1,13 +1,11 @@
 use std::io;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
-use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
 use fsqlite::{AsyncConnection, FrankenError, Row};
 use fsqlite_types::value::SqliteValue;
 
-use crate::connection::{
-    fsqlite_cx, map_storage_error_at, require_async_transaction_cleanup_capability,
-};
+use crate::connection::map_storage_error_at;
 
 pub const SCHEMA_VERSION: i64 = 7;
 
@@ -15,6 +13,7 @@ pub const SCHEMA_VERSION: i64 = 7;
 ///
 /// This belongs to the storage schema rather than to the rebuild operation so
 /// that a failed or cancelled rebuild cannot leave behind ad-hoc schema.
+#[cfg(feature = "fts5")]
 pub(crate) const PORTER_FTS5_REBUILD_TABLE: &str = "frankensearch_fts5_rebuild_version";
 
 struct Migration {
@@ -345,8 +344,8 @@ const MIGRATIONS: &[Migration] = &[
     },
 ];
 
-pub async fn bootstrap(cx: &Cx, conn: &AsyncConnection) -> SearchResult<()> {
-    match schema_version_state(cx, conn, "schema preflight").await? {
+pub fn bootstrap(conn: &AsyncConnection) -> SearchResult<()> {
+    match schema_version_state(conn, "schema preflight")? {
         SchemaVersionState::Present(version) => {
             reject_future_version(version, "schema preflight")?;
             if version == SCHEMA_VERSION {
@@ -361,26 +360,51 @@ pub async fn bootstrap(cx: &Cx, conn: &AsyncConnection) -> SearchResult<()> {
         SchemaVersionState::MissingTable | SchemaVersionState::Empty => {}
     }
 
-    // Schema migration writes must share the transaction cleanup contract with
-    // every other storage write. Failing before BEGIN is deliberate: 0.2.1
-    // cannot roll this transaction back after request cancellation.
-    // This 0.3 cleanup capability gate intentionally prevents post-BEGIN
-    // code until it can preserve the original cancellation/error and rethrow a
-    // panic after exactly-once rollback. Leaving this as the tail expression
-    // is safer than a best-effort rollback that could strand `schema_version`
-    // half-migrated.
-    require_async_transaction_cleanup_capability()
+    conn.execute_sync("BEGIN IMMEDIATE;")
+        .map_err(|error| map_storage_error_at("schema transaction begin", error))?;
+    let result = catch_unwind(AssertUnwindSafe(|| bootstrap_inner(conn)));
+    match result {
+        Ok(Ok(())) => conn.commit_transaction_sync().map_err(|commit_err| {
+            if let Err(rollback_err) = conn.rollback_transaction_sync() {
+                tracing::warn!(
+                    target: "frankensearch.storage",
+                    stage = "schema transaction rollback after commit",
+                    error = %rollback_err,
+                    "rollback failed after schema bootstrap commit error"
+                );
+            }
+            map_storage_error_at("schema transaction commit", commit_err)
+        }),
+        Ok(Err(error)) => {
+            if let Err(rollback_err) = conn.rollback_transaction_sync() {
+                tracing::warn!(
+                    target: "frankensearch.storage",
+                    stage = "schema transaction rollback after bootstrap",
+                    error = %rollback_err,
+                    "rollback failed after schema bootstrap error"
+                );
+            }
+            Err(error)
+        }
+        Err(payload) => {
+            if let Err(rollback_err) = conn.rollback_transaction_sync() {
+                tracing::error!(
+                    target: "frankensearch.storage",
+                    stage = "schema transaction rollback after panic",
+                    error = %rollback_err,
+                    "critical: rollback failed during schema bootstrap panic recovery"
+                );
+            }
+            resume_unwind(payload);
+        }
+    }
 }
 
-#[allow(dead_code)] // Re-enabled with the required 0.3 cleanup transaction wrapper.
-async fn bootstrap_inner(fsqlite_cx: &FsqliteCx, conn: &AsyncConnection) -> SearchResult<()> {
-    conn.execute(fsqlite_cx, "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);")
-        .await
+fn bootstrap_inner(conn: &AsyncConnection) -> SearchResult<()> {
+    conn.execute_sync("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);")
         .map_err(|error| map_storage_error_at("schema transaction marker table", error))?;
 
-    let mut version = current_version_optional_with_cx(fsqlite_cx, conn, "schema transaction recheck")
-        .await?
-        .unwrap_or(0);
+    let mut version = current_version_optional_at(conn, "schema transaction recheck")?.unwrap_or(0);
     reject_future_version(version, "schema transaction recheck")?;
 
     if version == 0 {
@@ -391,18 +415,15 @@ async fn bootstrap_inner(fsqlite_cx: &FsqliteCx, conn: &AsyncConnection) -> Sear
         );
 
         for statement in LATEST_SCHEMA {
-            conn.execute(fsqlite_cx, statement)
-                .await
+            conn.execute_sync(statement)
                 .map_err(|error| map_storage_error_at("fresh schema application", error))?;
         }
 
         let params = [SqliteValue::Integer(SCHEMA_VERSION)];
-        conn.execute_with_params(
-            fsqlite_cx,
+        conn.execute_with_params_sync(
             "INSERT OR REPLACE INTO schema_version(version) VALUES (?1);",
             &params,
         )
-        .await
         .map_err(|error| map_storage_error_at("fresh schema marker write", error))?;
         version = SCHEMA_VERSION;
     }
@@ -427,18 +448,15 @@ async fn bootstrap_inner(fsqlite_cx: &FsqliteCx, conn: &AsyncConnection) -> Sear
         );
 
         for statement in migration.statements {
-            conn.execute(fsqlite_cx, statement)
-                .await
+            conn.execute_sync(statement)
                 .map_err(|error| map_storage_error_at("schema migration application", error))?;
         }
 
         let params = [SqliteValue::Integer(migration.version)];
-        conn.execute_with_params(
-            fsqlite_cx,
+        conn.execute_with_params_sync(
             "INSERT OR REPLACE INTO schema_version(version) VALUES (?1);",
             &params,
         )
-        .await
         .map_err(|error| map_storage_error_at("schema migration marker write", error))?;
         version = migration.version;
     }
@@ -452,40 +470,25 @@ async fn bootstrap_inner(fsqlite_cx: &FsqliteCx, conn: &AsyncConnection) -> Sear
     Ok(())
 }
 
-pub async fn current_version(cx: &Cx, conn: &AsyncConnection) -> SearchResult<i64> {
-    current_version_at(cx, conn, "schema version read").await
+pub fn current_version(conn: &AsyncConnection) -> SearchResult<i64> {
+    current_version_at(conn, "schema version read")
 }
 
-pub(crate) async fn current_version_at(
-    cx: &Cx,
-    conn: &AsyncConnection,
-    stage: &'static str,
-) -> SearchResult<i64> {
-    current_version_optional_at(cx, conn, stage)
-        .await?
+pub(crate) fn current_version_at(conn: &AsyncConnection, stage: &'static str) -> SearchResult<i64> {
+    current_version_optional_at(conn, stage)?
         .ok_or_else(|| schema_contract_error(stage, "schema_version table has no rows"))
 }
 
 #[cfg(test)]
-async fn current_version_optional(cx: &Cx, conn: &AsyncConnection) -> SearchResult<Option<i64>> {
-    current_version_optional_at(cx, conn, "schema version read").await
+fn current_version_optional(conn: &AsyncConnection) -> SearchResult<Option<i64>> {
+    current_version_optional_at(conn, "schema version read")
 }
 
-async fn current_version_optional_at(
-    cx: &Cx,
+fn current_version_optional_at(
     conn: &AsyncConnection,
     stage: &'static str,
 ) -> SearchResult<Option<i64>> {
-    let fsqlite_cx = fsqlite_cx(cx);
-    current_version_optional_with_cx(&fsqlite_cx, conn, stage).await
-}
-
-async fn current_version_optional_with_cx(
-    fsqlite_cx: &FsqliteCx,
-    conn: &AsyncConnection,
-    stage: &'static str,
-) -> SearchResult<Option<i64>> {
-    match schema_version_state_with_cx(fsqlite_cx, conn, stage).await? {
+    match schema_version_state(conn, stage)? {
         SchemaVersionState::MissingTable => Err(map_storage_error_at(
             stage,
             FrankenError::NoSuchTable {
@@ -497,34 +500,19 @@ async fn current_version_optional_with_cx(
     }
 }
 
-async fn schema_version_state(
-    cx: &Cx,
-    conn: &AsyncConnection,
-    stage: &'static str,
-) -> SearchResult<SchemaVersionState> {
-    let fsqlite_cx = fsqlite_cx(cx);
-    schema_version_state_with_cx(&fsqlite_cx, conn, stage).await
-}
-
-async fn schema_version_state_with_cx(
-    fsqlite_cx: &FsqliteCx,
+fn schema_version_state(
     conn: &AsyncConnection,
     stage: &'static str,
 ) -> SearchResult<SchemaVersionState> {
     let table_columns = conn
-        .query(fsqlite_cx, "PRAGMA table_info(schema_version);")
-        .await
+        .query_sync("PRAGMA table_info(schema_version);")
         .map_err(|error| map_storage_error_at(stage, error))?;
     if table_columns.is_empty() {
         return Ok(SchemaVersionState::MissingTable);
     }
 
     let rows = match conn
-        .query(
-            fsqlite_cx,
-            "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1;",
-        )
-        .await
+        .query_sync("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1;")
     {
         Ok(rows) => rows,
         Err(FrankenError::NoSuchTable { name }) if name == "schema_version" => {
@@ -589,30 +577,30 @@ mod tests {
     use super::{
         SCHEMA_VERSION, bootstrap, current_version, current_version_optional, storage_error,
     };
-    use fsqlite::Connection;
+    use fsqlite::AsyncConnection;
     use fsqlite_types::value::SqliteValue;
 
-    fn table_exists(conn: &Connection, table_name: &str) -> bool {
+    fn table_exists(conn: &AsyncConnection, table_name: &str) -> bool {
         // Probe table existence with a zero-row SELECT instead of
         // querying sqlite_master: FrankenSQLite's VDBE cannot open a
         // storage cursor on sqlite_master's btree root page.
-        conn.query(&format!("SELECT 1 FROM \"{table_name}\" LIMIT 0"))
+        conn.query_sync(&format!("SELECT 1 FROM \"{table_name}\" LIMIT 0"))
             .is_ok()
     }
 
-    fn index_exists(conn: &Connection, table_name: &str, index_name: &str) -> bool {
+    fn index_exists(conn: &AsyncConnection, table_name: &str, index_name: &str) -> bool {
         // Probe index existence via INDEXED BY hint instead of querying
         // sqlite_master: FrankenSQLite's VDBE cannot open a storage
         // cursor on sqlite_master's btree root page. If the index
         // doesn't exist, the query errors with "no such index".
-        conn.query(&format!(
+        conn.query_sync(&format!(
             "SELECT 1 FROM \"{table_name}\" INDEXED BY \"{index_name}\" LIMIT 0"
         ))
         .is_ok()
     }
 
-    fn seed_historical_schema(conn: &Connection, version: i64) {
-        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY);")
+    fn seed_historical_schema(conn: &AsyncConnection, version: i64) {
+        conn.execute_sync("CREATE TABLE schema_version (version INTEGER PRIMARY KEY);")
             .expect("schema_version table should be creatable");
 
         for migration in super::MIGRATIONS
@@ -620,12 +608,12 @@ mod tests {
             .filter(|migration| migration.version <= version)
         {
             for statement in migration.statements {
-                conn.execute(statement).unwrap_or_else(|error| {
+                conn.execute_sync(statement).unwrap_or_else(|error| {
                     panic!("seed migration {}: {error}", migration.version)
                 });
             }
             let params = [SqliteValue::Integer(migration.version)];
-            conn.execute_with_params(
+            conn.execute_with_params_sync(
                 "INSERT OR REPLACE INTO schema_version(version) VALUES (?1);",
                 &params,
             )
@@ -635,7 +623,7 @@ mod tests {
 
     #[test]
     fn bootstrap_sets_latest_version_for_fresh_database() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
 
         bootstrap(&conn).expect("bootstrap should succeed");
         assert_eq!(
@@ -658,7 +646,7 @@ mod tests {
 
     #[test]
     fn bootstrap_accepts_read_only_confirmation_that_marker_table_is_absent() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
         assert_eq!(
             super::schema_version_state(&conn, "test absence probe")
                 .expect("absence probe should be readable"),
@@ -674,10 +662,10 @@ mod tests {
 
     #[test]
     fn bootstrap_does_not_swallow_malformed_marker_state_as_absence() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
-        conn.execute("CREATE TABLE schema_version (version TEXT PRIMARY KEY);")
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
+        conn.execute_sync("CREATE TABLE schema_version (version TEXT PRIMARY KEY);")
             .expect("malformed marker table should be creatable");
-        conn.execute("INSERT INTO schema_version(version) VALUES ('not-an-integer');")
+        conn.execute_sync("INSERT INTO schema_version(version) VALUES ('not-an-integer');")
             .expect("malformed marker should insert");
 
         let error = bootstrap(&conn).expect_err("malformed marker state must fail closed");
@@ -698,12 +686,14 @@ mod tests {
 
     #[test]
     fn bootstrap_migrates_legacy_schema_versions() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
 
-        conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);")
-            .expect("schema_version table should be creatable");
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);",
+        )
+        .expect("schema_version table should be creatable");
         let params = [SqliteValue::Integer(SCHEMA_VERSION - 1)];
-        conn.execute_with_params("INSERT INTO schema_version(version) VALUES (?1);", &params)
+        conn.execute_with_params_sync("INSERT INTO schema_version(version) VALUES (?1);", &params)
             .expect("legacy marker row should insert");
 
         assert_eq!(
@@ -724,7 +714,8 @@ mod tests {
     #[test]
     fn bootstrap_migrates_every_historical_schema_edge() {
         for starting_version in 1..SCHEMA_VERSION {
-            let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+            let conn =
+                AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
             seed_historical_schema(&conn, starting_version);
 
             assert_eq!(
@@ -745,13 +736,15 @@ mod tests {
 
     #[test]
     fn bootstrap_rejects_future_schema_versions() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
 
-        conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);")
-            .expect("schema_version should be creatable");
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);",
+        )
+        .expect("schema_version should be creatable");
         let future_version = SCHEMA_VERSION + 100;
         let params = [SqliteValue::Integer(future_version)];
-        conn.execute_with_params("INSERT INTO schema_version(version) VALUES (?1);", &params)
+        conn.execute_with_params_sync("INSERT INTO schema_version(version) VALUES (?1);", &params)
             .expect("future version marker should insert");
 
         let error = bootstrap(&conn).expect_err("future schemas should be rejected");
@@ -764,7 +757,7 @@ mod tests {
 
     #[test]
     fn bootstrap_is_idempotent_at_latest_version() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
 
         bootstrap(&conn).expect("first bootstrap should succeed");
         bootstrap(&conn).expect("second bootstrap should succeed");
@@ -799,7 +792,7 @@ mod tests {
             let path = db_path.clone();
             handles.push(thread::spawn(move || {
                 gate.wait();
-                let conn = Connection::open(path.to_string_lossy().to_string())
+                let conn = AsyncConnection::open_sync(path.to_string_lossy().to_string())
                     .expect("connection should open");
                 // Retry bootstrap to handle SQLITE_BUSY under contention.
                 let mut last_err = None;
@@ -933,7 +926,7 @@ mod tests {
 
     #[test]
     fn bootstrap_creates_all_expected_tables() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
         bootstrap(&conn).expect("bootstrap should succeed");
 
         let expected_tables = [
@@ -960,7 +953,7 @@ mod tests {
 
     #[test]
     fn bootstrap_creates_all_expected_indices() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
         bootstrap(&conn).expect("bootstrap should succeed");
 
         let expected_indices: &[(&str, &str)] = &[
@@ -987,15 +980,15 @@ mod tests {
 
     #[test]
     fn row_i64_wrong_type_returns_error() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
-        conn.execute("CREATE TABLE test_row (val TEXT);")
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
+        conn.execute_sync("CREATE TABLE test_row (val TEXT);")
             .expect("create");
         let params = [SqliteValue::Text("hello".to_owned().into())];
-        conn.execute_with_params("INSERT INTO test_row(val) VALUES (?1);", &params)
+        conn.execute_with_params_sync("INSERT INTO test_row(val) VALUES (?1);", &params)
             .expect("insert");
 
         let rows = conn
-            .query("SELECT val FROM test_row LIMIT 1;")
+            .query_sync("SELECT val FROM test_row LIMIT 1;")
             .expect("query");
         let row = rows.first().expect("should have a row");
         let err = super::row_i64(row, 0, "test_field").expect_err("text should not parse as i64");
@@ -1008,15 +1001,15 @@ mod tests {
 
     #[test]
     fn row_i64_missing_column_returns_error() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
-        conn.execute("CREATE TABLE test_row2 (val INTEGER);")
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
+        conn.execute_sync("CREATE TABLE test_row2 (val INTEGER);")
             .expect("create");
         let params = [SqliteValue::Integer(42)];
-        conn.execute_with_params("INSERT INTO test_row2(val) VALUES (?1);", &params)
+        conn.execute_with_params_sync("INSERT INTO test_row2(val) VALUES (?1);", &params)
             .expect("insert");
 
         let rows = conn
-            .query("SELECT val FROM test_row2 LIMIT 1;")
+            .query_sync("SELECT val FROM test_row2 LIMIT 1;")
             .expect("query");
         let row = rows.first().expect("should have a row");
         let err = super::row_i64(row, 99, "missing_col").expect_err("out-of-bounds index");
@@ -1029,15 +1022,15 @@ mod tests {
 
     #[test]
     fn row_i64_valid_integer_returns_value() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
-        conn.execute("CREATE TABLE test_row3 (val INTEGER);")
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
+        conn.execute_sync("CREATE TABLE test_row3 (val INTEGER);")
             .expect("create");
         let params = [SqliteValue::Integer(42)];
-        conn.execute_with_params("INSERT INTO test_row3(val) VALUES (?1);", &params)
+        conn.execute_with_params_sync("INSERT INTO test_row3(val) VALUES (?1);", &params)
             .expect("insert");
 
         let rows = conn
-            .query("SELECT val FROM test_row3 LIMIT 1;")
+            .query_sync("SELECT val FROM test_row3 LIMIT 1;")
             .expect("query");
         let row = rows.first().expect("should have a row");
         let value = super::row_i64(row, 0, "val").expect("should extract integer");
@@ -1048,18 +1041,22 @@ mod tests {
 
     #[test]
     fn current_version_optional_empty_table_returns_none() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
-        conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);")
-            .expect("create table");
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);",
+        )
+        .expect("create table");
         let result = current_version_optional(&conn).expect("should not error");
         assert_eq!(result, None);
     }
 
     #[test]
     fn current_version_empty_table_returns_error() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
-        conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);")
-            .expect("create table");
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);",
+        )
+        .expect("create table");
         let err = current_version(&conn).expect_err("should fail on empty table");
         let msg = err.to_string();
         assert!(
@@ -1070,7 +1067,7 @@ mod tests {
 
     #[test]
     fn current_version_missing_table_preserves_typed_cause_and_stage() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
         let error = current_version(&conn).expect_err("missing marker table should fail");
         assert!(
             error.to_string().contains("schema version read"),
@@ -1109,7 +1106,7 @@ mod tests {
 
     #[test]
     fn tables_accept_basic_queries_after_bootstrap() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
         bootstrap(&conn).expect("bootstrap should succeed");
 
         // Verify each table is queryable
@@ -1123,7 +1120,7 @@ mod tests {
             "SELECT COUNT(*) FROM search_history;",
             "SELECT COUNT(*) FROM bookmarks;",
         ] {
-            conn.query(query)
+            conn.query_sync(query)
                 .unwrap_or_else(|_| panic!("query should succeed: {query}"));
         }
     }
@@ -1132,11 +1129,11 @@ mod tests {
 
     #[test]
     fn schema_version_row_contains_latest_after_fresh_bootstrap() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
         bootstrap(&conn).expect("bootstrap should succeed");
 
         let rows = conn
-            .query("SELECT version FROM schema_version ORDER BY version DESC;")
+            .query_sync("SELECT version FROM schema_version ORDER BY version DESC;")
             .expect("query schema_version");
         assert!(!rows.is_empty(), "schema_version table should have rows");
 
@@ -1148,7 +1145,7 @@ mod tests {
 
     #[test]
     fn index_exists_returns_false_for_nonexistent_index() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
         bootstrap(&conn).expect("bootstrap should succeed");
         // Use a nonexistent table name: FrankenSQLite's VDBE does not
         // validate INDEXED BY hints at query-planning time, so probing
@@ -1165,7 +1162,7 @@ mod tests {
 
     #[test]
     fn documents_table_accepts_insert_and_select() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
         bootstrap(&conn).expect("bootstrap should succeed");
 
         let params = [
@@ -1177,14 +1174,12 @@ mod tests {
             SqliteValue::Integer(1000),
             SqliteValue::Integer(1000),
         ];
-        conn.execute_with_params(
-            "INSERT INTO documents(doc_id, source_path, content_preview, content_hash, content_length, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
-            &params,
-        )
+        conn.execute_with_params_sync("INSERT INTO documents(doc_id, source_path, content_preview, content_hash, content_length, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
+        &params,)
         .expect("insert should succeed");
 
         let rows = conn
-            .query("SELECT doc_id FROM documents WHERE doc_id = 'doc-001';")
+            .query_sync("SELECT doc_id FROM documents WHERE doc_id = 'doc-001';")
             .expect("select should succeed");
         assert_eq!(rows.len(), 1);
     }
