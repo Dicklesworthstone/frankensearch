@@ -14,7 +14,6 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
@@ -3721,6 +3720,272 @@ struct PendingPublication {
     proposed_generation: u64,
 }
 
+/// The publication phase carried alongside the last fully published
+/// generation in [`PublicationReadState`].
+///
+/// The phase is deliberately part of the same atomic word as the generation:
+/// an authority reader must never combine a fresh phase with a stale
+/// generation (or vice versa).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum PublicationAuthorityPhase {
+    /// The local published `Arc` and durable MANIFEST name this generation.
+    Stable = 0,
+    /// A blocking publisher is preparing a successor; no slot has moved yet.
+    Preparing = 1,
+    /// The durable MANIFEST may be ahead of the local published `Arc`.
+    DurableAhead = 2,
+    /// A blocking publication unwound around a slot transition; reopen first.
+    Indeterminate = 3,
+}
+
+impl PublicationAuthorityPhase {
+    const fn from_bits(bits: u64) -> Self {
+        match bits {
+            0 => Self::Stable,
+            1 => Self::Preparing,
+            2 => Self::DurableAhead,
+            3 => Self::Indeterminate,
+            _ => unreachable!("two publication phase bits have four states"),
+        }
+    }
+}
+
+/// One atomically-readable authority generation and phase.
+///
+/// `generation` is the generation of the currently published process-local
+/// snapshot. In `DurableAhead` the next generation is externally visible; in
+/// `Indeterminate` its extent must be established by reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PublicationAuthorityState {
+    packed: u64,
+}
+
+impl PublicationAuthorityState {
+    /// Generation currently represented by this word.
+    #[must_use]
+    pub(crate) const fn generation(self) -> u64 {
+        self.packed >> 2
+    }
+
+    /// Publication phase carried with [`Self::generation`].
+    #[must_use]
+    pub(crate) const fn phase(self) -> PublicationAuthorityPhase {
+        PublicationAuthorityPhase::from_bits(self.packed & 0b11)
+    }
+
+    /// Whether a process-local snapshot at this generation remains readable.
+    #[must_use]
+    pub(crate) const fn is_readable(self) -> bool {
+        matches!(
+            self.phase(),
+            PublicationAuthorityPhase::Stable | PublicationAuthorityPhase::Preparing
+        )
+    }
+}
+
+/// Shared publication authority for one `KeeperWriter` and its lock-free
+/// `QuillReader` facade.
+///
+/// This owns exactly one atomic word: `(generation << 2) | phase`. The word is
+/// installed by the blocking MANIFEST publisher before observer callbacks can
+/// expose a rename, and readers load it with `Acquire` around one pinned
+/// process-local snapshot `Arc`.
+#[derive(Debug, Clone)]
+pub(crate) struct PublicationReadState {
+    authority: Arc<AtomicU64>,
+}
+
+impl PublicationReadState {
+    const PHASE_BITS: u32 = 2;
+    const MAX_GENERATION: u64 = u64::MAX >> Self::PHASE_BITS;
+
+    /// Construct the stable initial authority word for an opened snapshot.
+    pub(crate) fn new(generation: u64) -> Result<Self, KeeperError> {
+        Ok(Self {
+            authority: Arc::new(AtomicU64::new(Self::pack(
+                generation,
+                PublicationAuthorityPhase::Stable,
+            )?)),
+        })
+    }
+
+    fn pack(generation: u64, phase: PublicationAuthorityPhase) -> Result<u64, KeeperError> {
+        if generation > Self::MAX_GENERATION {
+            return Err(KeeperError::InvalidTransition {
+                detail: format!(
+                    "generation {generation} cannot be represented in the packed publication authority word"
+                ),
+            });
+        }
+        Ok((generation << Self::PHASE_BITS) | u64::from(phase as u8))
+    }
+
+    /// Load one indivisible generation/phase observation for a lock-free read.
+    #[must_use]
+    pub(crate) fn load(&self) -> PublicationAuthorityState {
+        PublicationAuthorityState {
+            packed: self.authority.load(AtomicOrdering::Acquire),
+        }
+    }
+
+    /// Mark the exact process-local successor readable only after its `Arc` is
+    /// installed. This is also the only normal path out of `DurableAhead`.
+    pub(crate) fn stabilize(&self, generation: u64) -> Result<(), KeeperError> {
+        let stable = Self::pack(generation, PublicationAuthorityPhase::Stable)?;
+        loop {
+            let observed = self.load();
+            if generation < observed.generation() {
+                return Err(KeeperError::InvalidTransition {
+                    detail: format!(
+                        "cannot stabilize generation {generation} behind observed publication authority generation {}",
+                        observed.generation()
+                    ),
+                });
+            }
+            if generation == observed.generation()
+                && observed.phase() == PublicationAuthorityPhase::Stable
+            {
+                return Ok(());
+            }
+            if self
+                .authority
+                .compare_exchange(
+                    observed.packed,
+                    stable,
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Acquire,
+                )
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Blocking-closure ownership of one MANIFEST publication transition.
+///
+/// Its `Drop` implementation is intentionally the only unwind classifier: a
+/// still-preparing closure becomes indeterminate. Once a slot has moved the
+/// word has already left `Preparing`, so the compare-exchange cannot downgrade
+/// a post-rename state back to a readable one.
+struct PublicationAuthorityTransition {
+    state: PublicationReadState,
+    stable: u64,
+    preparing: u64,
+    indeterminate: u64,
+    durable_ahead: u64,
+}
+
+impl PublicationAuthorityTransition {
+    fn begin(state: PublicationReadState, proposed_generation: u64) -> Result<Self, KeeperError> {
+        let before = state.load();
+        if before.phase() != PublicationAuthorityPhase::Stable {
+            return Err(KeeperError::InvalidTransition {
+                detail: format!(
+                    "cannot begin MANIFEST publication from {:?} generation {}",
+                    before.phase(),
+                    before.generation()
+                ),
+            });
+        }
+        let expected_proposed =
+            before
+                .generation()
+                .checked_add(1)
+                .ok_or(KeeperError::GenerationExhausted {
+                    current: before.generation(),
+                })?;
+        if proposed_generation != expected_proposed {
+            return Err(KeeperError::InvalidTransition {
+                detail: format!(
+                    "packed publication authority at generation {} cannot publish generation {proposed_generation}",
+                    before.generation()
+                ),
+            });
+        }
+        let _ = PublicationReadState::pack(
+            proposed_generation,
+            PublicationAuthorityPhase::Stable,
+        )?;
+        let stable =
+            PublicationReadState::pack(before.generation(), PublicationAuthorityPhase::Stable)?;
+        let preparing =
+            PublicationReadState::pack(before.generation(), PublicationAuthorityPhase::Preparing)?;
+        let indeterminate = PublicationReadState::pack(
+            before.generation(),
+            PublicationAuthorityPhase::Indeterminate,
+        )?;
+        let durable_ahead = PublicationReadState::pack(
+            before.generation(),
+            PublicationAuthorityPhase::DurableAhead,
+        )?;
+        state
+            .authority
+            .compare_exchange(
+                stable,
+                preparing,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .map_err(|observed| KeeperError::InvalidTransition {
+                detail: format!(
+                    "publication authority changed while beginning generation {proposed_generation}: observed packed word {observed:#018x}"
+                ),
+            })?;
+        Ok(Self {
+            state,
+            stable,
+            preparing,
+            indeterminate,
+            durable_ahead,
+        })
+    }
+
+    /// A known failure before either MANIFEST slot has moved is retry-safe.
+    fn restore_known_pre_rename_failure(&self) {
+        let _ = self.state.authority.compare_exchange(
+            self.preparing,
+            self.stable,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        );
+    }
+
+    /// A successful claim is the conservative boundary after which the
+    /// blocking closure may reach either slot rename. Readers fail closed
+    /// before the first slot move until reconciliation settles the attempt.
+    fn mark_indeterminate(&self) {
+        let _ = self.state.authority.compare_exchange(
+            self.preparing,
+            self.indeterminate,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        );
+    }
+
+    /// `MANIFEST` now names the successor. Store before any checkpoint
+    /// observer runs so a parked callback is already inside the fail-closed
+    /// window.
+    fn mark_durable_ahead(&self) {
+        self.state
+            .authority
+            .store(self.durable_ahead, AtomicOrdering::Release);
+    }
+}
+
+impl Drop for PublicationAuthorityTransition {
+    fn drop(&mut self) {
+        let _ = self.state.authority.compare_exchange(
+            self.preparing,
+            self.indeterminate,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        );
+    }
+}
+
 /// Sole cross-process mutation capability for one Quill index directory.
 ///
 /// This type is intentionally not `Clone`. Its internal admission token may be
@@ -3740,6 +4005,10 @@ pub struct KeeperWriter {
     snapshot: KeeperSnapshot,
     garbage_options: GarbageCollectionOptions,
     protection: WriterProtection,
+    /// Bound only by the process-local Quill facade. Standalone Keeper users
+    /// have no `ArcSwap` reader to coordinate, so they do not install this
+    /// state word.
+    publication_read_state: Option<PublicationReadState>,
     /// Set synchronously before a publication is awaited; cleared only once the
     /// retained snapshot has been proven against the durable generation that
     /// attempt may have installed.
@@ -3988,6 +4257,7 @@ impl KeeperWriter {
             snapshot,
             garbage_options,
             protection,
+            publication_read_state: None,
             pending_publication: None,
         })
     }
@@ -4020,6 +4290,22 @@ impl KeeperWriter {
     #[must_use]
     pub(crate) const fn retained_snapshot_for_bookkeeping(&self) -> &KeeperSnapshot {
         &self.snapshot
+    }
+
+    /// Bind the process-local reader's packed publication authority word.
+    ///
+    /// This is crate-private because only `QuillWriterState::from_backend`
+    /// constructs the matching immutable reader `Arc`.
+    pub(crate) fn bind_publication_read_state(&mut self, state: PublicationReadState) {
+        self.publication_read_state = Some(state);
+    }
+
+    fn publication_read_state_is_stable_at(&self, generation: u64) -> bool {
+        self.publication_read_state.as_ref().is_some_and(|state| {
+            let observed = state.load();
+            observed.phase() == PublicationAuthorityPhase::Stable
+                && observed.generation() == generation
+        })
     }
 
     /// Whether a publication may have become durable without this writer
@@ -4138,7 +4424,10 @@ impl KeeperWriter {
             });
         }
         let claim_admission = Arc::clone(&self.admission);
-        let publisher = ManifestPublisher::new(&directory);
+        let publisher = ManifestPublisher::with_publication_read_state(
+            &directory,
+            self.publication_read_state.clone(),
+        );
         // Written in the same poll that reaches the publication and never
         // behind an await: dropping, unwinding, or cancelling out of anything
         // below cannot erase it, so the durable generation this attempt may
@@ -4171,6 +4460,15 @@ impl KeeperWriter {
             }
         };
         if let Err(error) = publish_result {
+            // A closure-owned pre-slot failure restored the packed word to the
+            // exact predecessor. No MANIFEST entry moved, so preserving the
+            // pessimistic marker would needlessly turn valid readers into a
+            // false reconciliation requirement. Retry state remains owned by
+            // the caller because this returns the original publication error.
+            if self.publication_read_state_is_stable_at(from_generation) {
+                self.pending_publication = None;
+                return Err(error);
+            }
             if self.reconcile_manifest_proposal(cx, manifest).await? {
                 self.pending_publication = None;
                 return Ok(self.retained_snapshot_for_bookkeeping());
@@ -11284,6 +11582,7 @@ fn release_generation_claim(_: &GenerationClaimGuard) {}
 struct ManifestPublisher {
     directory: PathBuf,
     publish_lock: Arc<Mutex<()>>,
+    publication_read_state: Option<PublicationReadState>,
 }
 
 #[derive(Debug, Clone)]
@@ -11300,6 +11599,22 @@ impl ManifestPublisher {
         Self {
             directory: directory.into(),
             publish_lock: global_publish_lock(),
+            publication_read_state: None,
+        }
+    }
+
+    /// Bind this publisher to the reader-visible authority word for a public
+    /// Quill writer. Private Keeper substrate tests intentionally leave this
+    /// absent because they have no process-local reader `Arc` to coordinate.
+    #[must_use]
+    fn with_publication_read_state(
+        directory: impl Into<PathBuf>,
+        publication_read_state: Option<PublicationReadState>,
+    ) -> Self {
+        Self {
+            directory: directory.into(),
+            publish_lock: global_publish_lock(),
+            publication_read_state,
         }
     }
 
@@ -11311,6 +11626,7 @@ impl ManifestPublisher {
         Self {
             directory: directory.into(),
             publish_lock,
+            publication_read_state: None,
         }
     }
 
@@ -11440,6 +11756,7 @@ impl ManifestPublisher {
         }
         let directory = self.directory.clone();
         let publish_lock = Arc::clone(&self.publish_lock);
+        let publication_read_state = self.publication_read_state.clone();
         let guard = OwnedMutexGuard::lock(publish_lock, cx)
             .await
             .map_err(|source| KeeperError::PublishLock { source })?;
@@ -11482,12 +11799,17 @@ impl ManifestPublisher {
             let directory = normalize_publish_directory(directory);
             match protection {
                 ManifestProtection::Disabled => {
-                    publish_manifest_locked(directory, &bytes, guard, claim)
+                    publish_manifest_locked(directory, &bytes, guard, claim, publication_read_state)
                 }
                 #[cfg(feature = "durability")]
-                ManifestProtection::Enabled(protector) => {
-                    publish_manifest_durable_locked(directory, &bytes, guard, claim, &protector)
-                }
+                ManifestProtection::Enabled(protector) => publish_manifest_durable_locked(
+                    directory,
+                    &bytes,
+                    guard,
+                    claim,
+                    &protector,
+                    publication_read_state,
+                ),
             }
         })
         .await
@@ -11562,21 +11884,56 @@ fn publish_manifest_locked<C, F>(
     bytes: &[u8],
     _guard: OwnedMutexGuard<()>,
     claim: F,
+    publication_read_state: Option<PublicationReadState>,
 ) -> Result<LoadedManifest, KeeperError>
 where
     F: FnOnce(&Path, u64) -> Result<C, KeeperError>,
 {
+    let transition = publication_read_state
+        .map(|state| {
+            let proposed = Manifest::from_bytes(bytes)
+                .map_err(|source| KeeperError::InvalidManifest { source })?;
+            PublicationAuthorityTransition::begin(state, proposed.generation)
+        })
+        .transpose()?;
     #[cfg(test)]
     {
         let observed_directory = directory.clone();
-        publish_manifest_choreography(directory, bytes, claim, move |checkpoint, _| {
-            observe_manifest_publish_checkpoint_for_test(&observed_directory, checkpoint);
-            Ok(())
-        })
+        let result = publish_manifest_choreography(directory, bytes, claim, |checkpoint, _| {
+            if let Some(transition) = transition.as_ref() {
+                match checkpoint {
+                    PublishCheckpoint::GenerationClaimed => transition.mark_indeterminate(),
+                    PublishCheckpoint::TempMovedToCurrent => transition.mark_durable_ahead(),
+                    _ => {}
+                }
+            }
+            observe_manifest_publish_checkpoint_for_test(&observed_directory, checkpoint)
+        });
+        if result.is_err() {
+            if let Some(transition) = transition.as_ref() {
+                transition.restore_known_pre_rename_failure();
+            }
+        }
+        result
     }
     #[cfg(not(test))]
     {
-        publish_manifest_choreography(directory, bytes, claim, |_, _| Ok(()))
+        let result = publish_manifest_choreography(directory, bytes, claim, |checkpoint, _| {
+            if let Some(transition) = transition.as_ref() {
+                match checkpoint {
+                    PublishCheckpoint::GenerationClaimed => transition.mark_indeterminate(),
+                    PublishCheckpoint::TempMovedToCurrent => transition.mark_durable_ahead(),
+                    _ => {}
+                }
+            }
+            Ok(())
+        });
+        if result.is_err() {
+            if let Some(transition) = transition.as_ref() {
+                transition.restore_known_pre_rename_failure();
+            }
+        }
+        result
     }
 }
 
@@ -11587,27 +11944,68 @@ fn publish_manifest_durable_locked<C, F>(
     _guard: OwnedMutexGuard<()>,
     claim: F,
     protector: &FileProtector,
+    publication_read_state: Option<PublicationReadState>,
 ) -> Result<LoadedManifest, KeeperError>
 where
     F: FnOnce(&Path, u64) -> Result<C, KeeperError>,
 {
+    let transition = publication_read_state
+        .map(|state| {
+            let proposed = Manifest::from_bytes(bytes)
+                .map_err(|source| KeeperError::InvalidManifest { source })?;
+            PublicationAuthorityTransition::begin(state, proposed.generation)
+        })
+        .transpose()?;
     #[cfg(test)]
     {
         let observed_directory = directory.clone();
-        publish_manifest_durable_choreography(
+        let result = publish_manifest_durable_choreography(
             directory,
             bytes,
             claim,
             protector,
-            move |checkpoint, _| {
-                observe_manifest_publish_checkpoint_for_test(&observed_directory, checkpoint);
-                Ok(())
+            |checkpoint, _| {
+                if let Some(transition) = transition.as_ref() {
+                    match checkpoint {
+                        PublishCheckpoint::GenerationClaimed => transition.mark_indeterminate(),
+                        PublishCheckpoint::TempMovedToCurrent => transition.mark_durable_ahead(),
+                        _ => {}
+                    }
+                }
+                observe_manifest_publish_checkpoint_for_test(&observed_directory, checkpoint)
             },
-        )
+        );
+        if result.is_err() {
+            if let Some(transition) = transition.as_ref() {
+                transition.restore_known_pre_rename_failure();
+            }
+        }
+        result
     }
     #[cfg(not(test))]
     {
-        publish_manifest_durable_choreography(directory, bytes, claim, protector, |_, _| Ok(()))
+        let result = publish_manifest_durable_choreography(
+            directory,
+            bytes,
+            claim,
+            protector,
+            |checkpoint, _| {
+                if let Some(transition) = transition.as_ref() {
+                    match checkpoint {
+                        PublishCheckpoint::GenerationClaimed => transition.mark_indeterminate(),
+                        PublishCheckpoint::TempMovedToCurrent => transition.mark_durable_ahead(),
+                        _ => {}
+                    }
+                }
+                Ok(())
+            },
+        );
+        if result.is_err() {
+            if let Some(transition) = transition.as_ref() {
+                transition.restore_known_pre_rename_failure();
+            }
+        }
+        result
     }
 }
 
@@ -11627,6 +12025,15 @@ struct ManifestPublishPause {
     checkpoint: PublishCheckpoint,
     event: Arc<std::sync::Mutex<ManifestPublishCheckpointEvent>>,
     released: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+/// One injected, typed pre-rename publisher failure for a real public-path
+/// test. This is deliberately separate from the pause map: failure returns to
+/// the blocking closure instead of parking it.
+#[cfg(test)]
+#[derive(Clone)]
+struct ManifestPublishFailure {
+    checkpoint: PublishCheckpoint,
 }
 
 /// Test-only checkpoint state shared by the blocking publisher and its async
@@ -11649,9 +12056,20 @@ pub(crate) struct ManifestPublishPauseControl {
     released: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 }
 
+/// Removes one test-only fault injection when dropped.
+#[cfg(test)]
+pub(crate) struct ManifestPublishFailureControl {
+    directory: PathBuf,
+}
+
 #[cfg(test)]
 static MANIFEST_PUBLISH_PAUSES: OnceLock<
     std::sync::Mutex<BTreeMap<PathBuf, ManifestPublishPause>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static MANIFEST_PUBLISH_FAILURES: OnceLock<
+    std::sync::Mutex<BTreeMap<PathBuf, ManifestPublishFailure>>,
 > = OnceLock::new();
 
 /// Serializes tests that arm the global MANIFEST publisher pause. The
@@ -11664,6 +12082,11 @@ static MANIFEST_PUBLISH_PAUSE_TEST_SERIAL: OnceLock<std::sync::Mutex<()>> = Once
 #[cfg(test)]
 fn manifest_publish_pauses() -> &'static std::sync::Mutex<BTreeMap<PathBuf, ManifestPublishPause>> {
     MANIFEST_PUBLISH_PAUSES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn manifest_publish_failures() -> &'static std::sync::Mutex<BTreeMap<PathBuf, ManifestPublishFailure>> {
+    MANIFEST_PUBLISH_FAILURES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
 /// Hold the shared test-only MANIFEST pause serialization guard.
@@ -11711,6 +12134,26 @@ pub(crate) fn pause_manifest_publish_at_checkpoint_for_test(
     }
 }
 
+/// Inject one typed publisher failure after the named real choreography
+/// checkpoint. Tests use `TempWritten` to prove the known-pre-rename path
+/// restores `Stable` without manufacturing a filesystem error.
+#[cfg(test)]
+pub(crate) fn fail_manifest_publish_at_checkpoint_for_test(
+    directory: &Path,
+    checkpoint: PublishCheckpoint,
+) -> ManifestPublishFailureControl {
+    let directory = normalize_publish_directory(directory.to_path_buf());
+    let previous = manifest_publish_failures()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(directory.clone(), ManifestPublishFailure { checkpoint });
+    assert!(
+        previous.is_none(),
+        "only one MANIFEST checkpoint failure may be armed per directory"
+    );
+    ManifestPublishFailureControl { directory }
+}
+
 #[cfg(test)]
 impl ManifestPublishPauseControl {
     /// Poll the checkpoint event, retaining this task's waker until the real
@@ -11751,6 +12194,16 @@ impl ManifestPublishPauseControl {
 impl Drop for ManifestPublishPauseControl {
     fn drop(&mut self) {
         self.release();
+    }
+}
+
+#[cfg(test)]
+impl Drop for ManifestPublishFailureControl {
+    fn drop(&mut self) {
+        manifest_publish_failures()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.directory);
     }
 }
 
@@ -11797,7 +12250,21 @@ pub(crate) async fn drive_manifest_publish_to_checkpoint_for_test<F: std::future
 }
 
 #[cfg(test)]
-fn observe_manifest_publish_checkpoint_for_test(directory: &Path, checkpoint: PublishCheckpoint) {
+fn observe_manifest_publish_checkpoint_for_test(
+    directory: &Path,
+    checkpoint: PublishCheckpoint,
+) -> Result<(), KeeperError> {
+    let failure = manifest_publish_failures()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(directory)
+        .filter(|failure| failure.checkpoint == checkpoint)
+        .cloned();
+    if failure.is_some() {
+        return Err(KeeperError::InvalidTransition {
+            detail: format!("test-only MANIFEST publisher failure at {:?}", checkpoint),
+        });
+    }
     let pause = manifest_publish_pauses()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -11805,7 +12272,7 @@ fn observe_manifest_publish_checkpoint_for_test(directory: &Path, checkpoint: Pu
         .filter(|pause| pause.checkpoint == checkpoint)
         .cloned();
     let Some(pause) = pause else {
-        return;
+        return Ok(());
     };
     let task_waker = {
         let mut event = pause
@@ -11828,6 +12295,7 @@ fn observe_manifest_publish_checkpoint_for_test(directory: &Path, checkpoint: Pu
             .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
     drop(released);
+    Ok(())
 }
 
 fn publish_manifest_choreography<C, F, O>(
@@ -14559,6 +15027,74 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
     const EMPTY_TERM_DICTIONARY: [u8; 4] = 0_u32.to_le_bytes();
+
+    #[test]
+    fn publication_transition_unwind_marks_preparing_authority_indeterminate() {
+        let state = PublicationReadState::new(7).expect("pack initial authority generation");
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let state = state.clone();
+            move || {
+                let _transition = PublicationAuthorityTransition::begin(state, 8)
+                    .expect("begin publication transition");
+                panic!("inject pre-rename publisher unwind");
+            }
+        }));
+        assert!(unwind.is_err(), "the injected closure must unwind");
+        let observed = state.load();
+        assert_eq!(observed.generation(), 7);
+        assert_eq!(observed.phase(), PublicationAuthorityPhase::Indeterminate);
+        assert!(
+            !observed.is_readable(),
+            "an unwound pre-rename closure must never leave its predecessor authoritative"
+        );
+    }
+
+    #[test]
+    fn publication_transition_rejects_an_unrepresentable_successor_before_cas() {
+        let generation = PublicationReadState::MAX_GENERATION;
+        let state =
+            PublicationReadState::new(generation).expect("pack maximum authority generation");
+        let Err(error) = PublicationAuthorityTransition::begin(state.clone(), generation + 1)
+        else {
+            panic!("the packed successor generation must be rejected before CAS");
+        };
+        assert!(matches!(error, KeeperError::InvalidTransition { .. }));
+        let observed = state.load();
+        assert_eq!(observed.generation(), generation);
+        assert_eq!(observed.phase(), PublicationAuthorityPhase::Stable);
+    }
+
+    #[test]
+    fn publication_stabilize_never_regresses_a_newer_generation() {
+        let state = PublicationReadState::new(7).expect("pack initial authority generation");
+        state
+            .stabilize(9)
+            .expect("install the newer process-local successor");
+
+        let Err(error) = state.stabilize(8) else {
+            panic!("a stale process-local successor must not lower publication authority");
+        };
+        assert!(matches!(error, KeeperError::InvalidTransition { .. }));
+        let observed = state.load();
+        assert_eq!(observed.generation(), 9);
+        assert_eq!(observed.phase(), PublicationAuthorityPhase::Stable);
+    }
+
+    #[test]
+    fn publication_stabilize_recovers_same_generation_indeterminate() {
+        let state = PublicationReadState::new(7).expect("pack initial authority generation");
+        let transition = PublicationAuthorityTransition::begin(state.clone(), 8)
+            .expect("begin publication transition");
+        transition.mark_indeterminate();
+        drop(transition);
+
+        state
+            .stabilize(7)
+            .expect("restore the already-installed generation to stable");
+        let observed = state.load();
+        assert_eq!(observed.generation(), 7);
+        assert_eq!(observed.phase(), PublicationAuthorityPhase::Stable);
+    }
 
     fn tier_test_segment(segment_id: u64, docid_lo: u64, docid_hi: u64) -> ManifestSegment {
         ManifestSegment {
