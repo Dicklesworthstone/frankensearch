@@ -621,14 +621,19 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
         )?,
         None => (Vec::new(), Vec::new()),
     };
+    // The sets borrow these vectors, so they must outlive the call rather than
+    // being built inline as temporaries.
+    let baseline_authority_refs: Vec<&Qg1ExpectedAuthority> = baseline_authorities.iter().collect();
+    let candidate_authority_refs: Vec<&Qg1ExpectedAuthority> =
+        candidate_authorities.iter().collect();
+    let rerun_authority_refs: Vec<&Qg1ExpectedAuthority> = rerun_authorities.iter().collect();
     let qg1_authorities = PerfRatchetQg1AuthoritySets {
-        baseline: baseline_authorities.iter().collect(),
-        candidate: candidate_authorities.iter().collect(),
-        rerun: rerun_authorities.iter().collect(),
+        baseline: &baseline_authority_refs,
+        candidate: &candidate_authority_refs,
+        rerun: &rerun_authority_refs,
     };
 
     let mut evaluation = evaluate_perf_ratchet_against_qg1_authorities(
-        &qg1_authorities,
         PerfRatchetRequest {
             baseline: Some(&baseline),
             baseline_evidence: baseline_evidence.as_ref().map(|(artifact, _)| artifact),
@@ -646,6 +651,7 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
             expected_manifest_sha256: &manifest_sha256,
             evidence: evidence_files,
         },
+        qg1_authorities,
     );
 
     // Archive the trust inputs alongside the artifacts they admitted, in
