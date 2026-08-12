@@ -50,6 +50,7 @@ const CACHE_LINE_F32: usize = 16;
 const MODEL2VEC_NATIVE_DIMENSIONS: usize = 256;
 
 /// Maximum number of valid rows whose ordered additions share one live sum row.
+#[cfg(target_arch = "x86_64")]
 const MODEL2VEC_FUSED_ROWS: usize = 4;
 
 /// Mean-pool Model2Vec rows into `sum`, returning the number of in-vocabulary rows.
@@ -257,7 +258,7 @@ fn accumulate_model2vec_rows_prefetched(
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn prefetch_f32_row(embeddings: &[f32], start: usize, dimensions: usize) {
-    use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+    use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
 
     debug_assert!(start.saturating_add(dimensions) <= embeddings.len());
     let mut offset = 0_usize;
@@ -303,7 +304,9 @@ fn accumulate_f32_into_avx2(sum: &mut [f32], row: &[f32]) {
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Model2VecAccumulationRoute {
+    #[cfg(target_arch = "x86_64")]
     Native256ShortAvx2,
+    #[cfg(target_arch = "x86_64")]
     Prefetched,
     Base,
 }
@@ -332,8 +335,8 @@ pub(crate) fn last_model2vec_accumulation_route_for_test() -> Model2VecAccumulat
 #[cfg(test)]
 mod tests {
     use super::{
-        Model2VecAccumulationRoute, accumulate_f32_into, accumulate_model2vec_rows,
-        last_model2vec_accumulation_route_for_test,
+        accumulate_f32_into, accumulate_model2vec_rows, last_model2vec_accumulation_route_for_test,
+        Model2VecAccumulationRoute,
     };
 
     fn former_model2vec_gather(
