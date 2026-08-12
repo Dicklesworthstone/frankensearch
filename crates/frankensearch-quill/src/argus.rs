@@ -5168,9 +5168,19 @@ impl<'a> BufferedUnionScorer<'a> {
         horizon_end: u64,
         candidates: &[u32],
     ) -> Result<(), ArgusError> {
+        if self.tantivy_topdocs_term_union {
+            return self.fill_tantivy_topdocs_candidate_window(
+                window_start,
+                horizon_end,
+                candidates,
+            );
+        }
+
         // Candidate discovery advances only shadow cursors. Real cursors still
         // visit selected documents in their current scorer-vector order, so
-        // pruning cannot regroup ordinary exhaustive contributions.
+        // pruning cannot regroup ordinary exhaustive contributions. That holds
+        // for the ordinary buffered union only; a ranked direct-term root pins
+        // Tantivy's doc-major order and takes the branch above.
         let mut index = 0;
         while index < self.active.len() {
             loop {
@@ -5225,6 +5235,88 @@ impl<'a> BufferedUnionScorer<'a> {
                     break;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Fill one candidate-restricted window in exactly the traversal
+    /// [`Self::fill_tantivy_topdocs_term_window`] would have used, scoring only
+    /// the documents competitive discovery selected.
+    ///
+    /// Shipping rank pruning is precisely the ranked direct-term root that sets
+    /// `tantivy_topdocs_term_union`, so summing a pruned window in
+    /// scorer-vector order made a single query mix two f32 addition orders:
+    /// Tantivy's in its first, always-exhaustive window and scorer-major in
+    /// every later pruned one. The drift also outlived the window, because the
+    /// pinned sort is stable and the next refill inherits whatever permutation
+    /// this one leaves (`bd-quill-pruned-topdocs-term-order-9wu3p`).
+    ///
+    /// What has to be reproduced is the traversal, not just the per-document
+    /// sum. Under that stable sort the equal-document order is "decreasing
+    /// previous posting": a scorer stepping onto a document sorts ahead of
+    /// everyone already parked there. The order at a candidate is therefore a
+    /// function of the *complete* posting interleaving beneath it, and no seek
+    /// that jumps over intervening postings can reconstruct it. With
+    /// `X = {5, 8, 10}`, `Y = {7, 10}`, `Z = {10}` and `10` the only candidate,
+    /// stepping yields `X + Y + Z` because `X`'s stop at 8 lets `Y` overtake
+    /// it, while seeking both straight to 10 yields `Y + X + Z`. Candidate
+    /// restriction consequently elides `score`, never a move, and the block
+    /// skip that the ordinary path gets from `advance` is not available here.
+    /// Recovering it needs a codec-level "previous posting" accessor, which is
+    /// a separate change.
+    fn fill_tantivy_topdocs_candidate_window(
+        &mut self,
+        window_start: u32,
+        horizon_end: u64,
+        candidates: &[u32],
+    ) -> Result<(), ArgusError> {
+        self.active.sort_by_key(ReferenceScorer::doc);
+        while let Some(doc) = self.active.first().and_then(ReferenceScorer::doc) {
+            if u64::from(doc) >= horizon_end {
+                break;
+            }
+            let pivot_len = self
+                .active
+                .iter()
+                .take_while(|scorer| scorer.doc() == Some(doc))
+                .count();
+            // Discovery emits its documents sorted and deduplicated, which is
+            // the same ordering the ordinary candidate fill partitions over.
+            let selected = candidates.binary_search(&doc).is_ok();
+            if selected {
+                let offset = usize::try_from(u64::from(doc) - u64::from(window_start))
+                    .map_err(|_| ArgusError::CursorInvariant("union offset does not fit usize"))?;
+                let mut score = 0.0_f32;
+                for scorer in &mut self.active[..pivot_len] {
+                    score += scorer.score()?;
+                }
+                self.score_window[offset] = Some(finite_score(score, doc)?);
+            }
+            // Same phase vocabulary the ordinary candidate fill installs: a
+            // scored pivot drains, an unselected one is passed over.
+            #[cfg(feature = "pruning-conformance")]
+            self.set_conformance_query_work_context(
+                if selected {
+                    ConformanceQueryWorkPhase::Drain
+                } else {
+                    ConformanceQueryWorkPhase::Seek
+                },
+                selected.then_some(doc),
+                selected,
+            );
+
+            for scorer in &mut self.active[..pivot_len] {
+                scorer.next()?;
+            }
+            let mut index = 0;
+            while index < self.active.len() {
+                if self.active[index].doc().is_none() {
+                    self.active.swap_remove(index);
+                } else {
+                    index += 1;
+                }
+            }
+            self.active.sort_by_key(ReferenceScorer::doc);
         }
         Ok(())
     }
@@ -7478,6 +7570,69 @@ mod tests {
             clauses.push(ScorerClause::should(ReferenceScorer::term(scorer)));
         }
         ReferenceScorer::boolean(clauses)
+    }
+
+    /// Ranked-root (`boolean_topdocs`) analogue of [`sealed_union`], with one
+    /// explicit snapshot document frequency shared by every clause.
+    ///
+    /// `boolean_topdocs` is the only constructor that sets
+    /// `tantivy_topdocs_term_union`, and it is what shipping lowers a ranked
+    /// direct-term root to, so it is the shape rank pruning actually runs in.
+    ///
+    /// The explicit document frequency is what a real multi-segment snapshot
+    /// supplies: the cursor is segment-local while `doc_freq` is global. Fixing
+    /// one value across every clause makes `idf` identical between them, so a
+    /// planted contribution ratio is exactly the boost ratio no matter how many
+    /// postings each term carries.
+    fn sealed_topdocs_union<'a>(
+        posting_lists: &'a [crate::quiver::PostingList<'_>],
+        block_max: Option<&'a [Arc<[BlockMaxEntry]>]>,
+        fieldnorms: DocLenField<'a>,
+        snapshot: &Bm25FieldSnapshot,
+        snapshot_doc_freq: u64,
+        boosts: &[f32],
+        segment_num_docs: u32,
+    ) -> Result<ReferenceScorer<'a>, ArgusError> {
+        if posting_lists.len() != boosts.len() {
+            return Err(ArgusError::CursorInvariant(
+                "ranked-root union fixture cardinalities disagree",
+            ));
+        }
+        if block_max.is_some_and(|bounds| bounds.len() != posting_lists.len()) {
+            return Err(ArgusError::CursorInvariant(
+                "ranked-root union BLOCKMAX cardinality disagrees",
+            ));
+        }
+        let mut clauses = Vec::new();
+        clauses
+            .try_reserve_exact(posting_lists.len())
+            .map_err(|_| ArgusError::Allocation {
+                resource: "ranked-root union fixture clauses",
+                count: posting_lists.len(),
+            })?;
+        for (index, postings) in posting_lists.iter().enumerate() {
+            let cursor = if let Some(bounds) = block_max {
+                SealedPostingCursor::with_block_max(
+                    postings.cursor()?,
+                    Arc::clone(&bounds[index]),
+                    postings.doc_freq(),
+                    segment_num_docs,
+                )
+            } else {
+                SealedPostingCursor::new(postings, segment_num_docs)?
+            };
+            clauses.push(ScorerClause::should(ReferenceScorer::term(
+                TermScorer::new(
+                    cursor,
+                    fieldnorms,
+                    snapshot.clone(),
+                    snapshot_doc_freq,
+                    TermRecordOption::WithFreqs,
+                    boosts[index],
+                )?,
+            )));
+        }
+        ReferenceScorer::boolean_topdocs(clauses)
     }
 
     /// Build a nested pure-term union: `group_sizes` slices the flat term
@@ -11399,6 +11554,261 @@ mod tests {
         }
         assert_ne!(union_order.to_bits(), parse_order.to_bits());
         assert_eq!(candidate_hits[0].score.to_bits(), union_order.to_bits());
+        Ok(())
+    }
+
+    /// A pruned ranked-root window must accumulate in Tantivy's doc-major term
+    /// order rather than in scorer-vector order
+    /// (`bd-quill-pruned-topdocs-term-order-9wu3p`).
+    ///
+    /// The fixture is the shipping shape: `boolean_topdocs` over seven direct
+    /// frequency terms carrying real validated BLOCKMAX, a `TopDocs` cutoff
+    /// filled by an entirely exhaustive first window, and survivors in later,
+    /// pruned windows. The BLOCKMAX-free arm is the oracle — without ceilings
+    /// every one of its windows falls back to the exhaustive fill — so the two
+    /// arms differ only in whether pruning ran.
+    ///
+    /// Every clause shares one snapshot document frequency, so `idf` cancels
+    /// and each small clause contributes exactly `2.0 / 1.0e8` of the huge one.
+    /// That ratio sits below half an ulp of the huge contribution while six of
+    /// them together sit above it, so the huge term absorbs all six smalls when
+    /// it is summed first and cannot absorb them when it is summed last. The
+    /// postings are laid out so the pinned stable sort puts the huge clause
+    /// last at both survivors while the scorer vector holds it first.
+    ///
+    /// Doc `10_000` is the drift probe: it is reached in the refill *after* the
+    /// first pruned one, with every clause arriving simultaneously, so its
+    /// equal-document order is exactly the permutation the pruned window left
+    /// behind. Doc `15_000` is reached with one active clause, which routes its
+    /// refill back through the exhaustive fill.
+    #[test]
+    fn pruned_topdocs_windows_keep_tantivy_doc_major_term_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const NUM_DOCS: u32 = 16_384;
+        const DENSE_END: u32 = 4_096;
+        const HUGE_ENTRY: u32 = 4_096;
+        const PRUNED_SURVIVOR: u32 = 6_000;
+        const INHERITED_SURVIVOR: u32 = 10_000;
+        const EXHAUSTIVE_TAIL: u32 = 15_000;
+        const SMALL_TERMS: u32 = 6;
+        const SNAPSHOT_DOC_FREQ: u64 = 4_099;
+        const MATCHED_DOCS: u64 = 4_106;
+
+        let lengths = vec![Some(1); usize::try_from(NUM_DOCS).expect("fixture count fits usize")];
+        let encoded_doclens = EncodedDocLenSection::encode(
+            0,
+            u64::from(NUM_DOCS),
+            &[1],
+            &[DocLenFieldInput::new(1, &lengths)],
+        )?;
+        let doclens = encoded_doclens.section(&[1])?;
+        let field = doclens.field(1).expect("field exists");
+        let snapshot = snapshot(1, u64::from(NUM_DOCS), u64::from(NUM_DOCS))?;
+
+        let mut rows_by_term = vec![vec![
+            Posting::new(HUGE_ENTRY, 1),
+            Posting::new(PRUNED_SURVIVOR, 1),
+            Posting::new(INHERITED_SURVIVOR, 1),
+            Posting::new(EXHAUSTIVE_TAIL, 1),
+        ]];
+        for index in 0..SMALL_TERMS {
+            let mut rows = (0..DENSE_END)
+                .map(|doc| Posting::new(doc, 1))
+                .collect::<Vec<_>>();
+            // One private posting per small clause, all of them above the huge
+            // clause's window entry. That makes the huge clause hold the lowest
+            // previous posting beneath each survivor, so the stable sort parks
+            // it last there while the scorer vector still holds it first.
+            rows.push(Posting::new(DENSE_END + 1 + index, 1));
+            rows.push(Posting::new(PRUNED_SURVIVOR, 1));
+            rows.push(Posting::new(INHERITED_SURVIVOR, 1));
+            rows_by_term.push(rows);
+        }
+        for rows in &rows_by_term {
+            assert!(
+                rows.windows(2).all(|pair| pair[0].doc_id < pair[1].doc_id),
+                "fixture postings must be strictly ascending"
+            );
+        }
+        assert_eq!(
+            u64::try_from(rows_by_term[1].len())?,
+            SNAPSHOT_DOC_FREQ,
+            "the shared snapshot document frequency mirrors one small clause"
+        );
+        let boosts = [1.0e8_f32, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0];
+        assert_eq!(rows_by_term.len(), boosts.len());
+        assert!(
+            (2..=MAX_SCORE_MAX_CLAUSES).contains(&boosts.len()),
+            "the fixture must land inside the MaxScore clause range"
+        );
+
+        let fieldnorm_id = fieldnorm_to_id(1);
+        let encoded_terms = rows_by_term
+            .iter()
+            .map(|rows| EncodedPostingList::encode_with_block_max(rows, |_| Some(fieldnorm_id)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let posting_lists = encoded_terms
+            .iter()
+            .map(|(postings, _)| postings.posting_list())
+            .collect::<Result<Vec<_>, _>>()?;
+        let block_max = validated_block_max_entries(&encoded_terms, &posting_lists, field)?;
+
+        let small = expected_term_score(&snapshot, SNAPSHOT_DOC_FREQ, fieldnorm_id, 1, 2.0);
+        let huge = expected_term_score(&snapshot, SNAPSHOT_DOC_FREQ, fieldnorm_id, 1, 1.0e8);
+        // The union accumulator starts at 0.0, and 0.0 + x is exactly x.
+        let mut dense = 0.0_f32;
+        for _ in 0..SMALL_TERMS {
+            dense += small;
+        }
+        let doc_major = dense + huge;
+        let mut scorer_major = huge;
+        for _ in 0..SMALL_TERMS {
+            scorer_major += small;
+        }
+        assert_ne!(
+            doc_major.to_bits(),
+            scorer_major.to_bits(),
+            "the fixture must plant a non-associative f32 sum or it proves nothing"
+        );
+        assert_eq!(
+            scorer_major.to_bits(),
+            huge.to_bits(),
+            "each small contribution alone must vanish into the huge one"
+        );
+
+        for limit in [1_usize, 2, 4, 8, 64] {
+            let mut oracle = sealed_topdocs_union(
+                &posting_lists,
+                None,
+                field,
+                &snapshot,
+                SNAPSHOT_DOC_FREQ,
+                &boosts,
+                NUM_DOCS,
+            )?;
+            let mut oracle_collector = TopDocsCollector::new(limit, 0)?;
+            oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
+            let oracle_stats = oracle
+                .union_pruning_stats()
+                .expect("the ranked root is a buffered union");
+            let oracle_hits = oracle_collector.finish()?.hits;
+            assert_eq!(
+                oracle_stats,
+                UnionPruningStats::default(),
+                "the BLOCKMAX-free oracle must stay exhaustive at limit {limit}"
+            );
+
+            let mut candidate = sealed_topdocs_union(
+                &posting_lists,
+                Some(&block_max),
+                field,
+                &snapshot,
+                SNAPSHOT_DOC_FREQ,
+                &boosts,
+                NUM_DOCS,
+            )?;
+            let mut candidate_collector = TopDocsCollector::new(limit, 0)?;
+            candidate_collector.collect(&mut candidate, &AllLiveDocs)?;
+            let stats = candidate
+                .union_pruning_stats()
+                .expect("the ranked root is a buffered union");
+            let candidate_hits = candidate_collector.finish()?.hits;
+
+            assert_hits_bit_exact(&candidate_hits, &oracle_hits);
+            assert_eq!(candidate_hits.len(), limit);
+            assert!(
+                stats.max_score_windows >= 1,
+                "rank pruning must actually engage at limit {limit}"
+            );
+            assert_eq!(
+                stats.block_max_wand_windows, 0,
+                "seven direct-term clauses take MaxScore, not block-max WAND"
+            );
+            assert_eq!(stats.blocks_skipped, 0, "MaxScore never skips blocks");
+            assert!(stats.candidate_docs >= 1);
+
+            let score_of = |docid: u32| -> u32 {
+                candidate_hits
+                    .iter()
+                    .find(|hit| hit.global_docid == docid)
+                    .unwrap_or_else(|| panic!("doc {docid} is missing from the limit-{limit} page"))
+                    .score
+                    .to_bits()
+            };
+            assert_eq!(candidate_hits[0].global_docid, PRUNED_SURVIVOR);
+            assert_eq!(
+                score_of(PRUNED_SURVIVOR),
+                doc_major.to_bits(),
+                "the pruned window's survivor must keep Tantivy's doc-major order at limit {limit}"
+            );
+            if limit >= 2 {
+                assert_eq!(
+                    score_of(INHERITED_SURVIVOR),
+                    doc_major.to_bits(),
+                    "a refill after a pruned one must not inherit scorer-major drift"
+                );
+            }
+            if limit >= 4 {
+                assert_eq!(score_of(HUGE_ENTRY), huge.to_bits());
+                assert_eq!(
+                    score_of(EXHAUSTIVE_TAIL),
+                    huge.to_bits(),
+                    "the single-clause tail refill routes back through the exhaustive fill"
+                );
+            }
+            if limit >= 8 {
+                assert_eq!(
+                    score_of(0),
+                    dense.to_bits(),
+                    "the exhaustive first window is unchanged"
+                );
+                assert_eq!(
+                    candidate_hits
+                        .iter()
+                        .map(|hit| hit.global_docid)
+                        .take(8)
+                        .collect::<Vec<_>>(),
+                    vec![
+                        PRUNED_SURVIVOR,
+                        INHERITED_SURVIVOR,
+                        HUGE_ENTRY,
+                        EXHAUSTIVE_TAIL,
+                        0,
+                        1,
+                        2,
+                        3
+                    ],
+                    "ranked order must stay score-descending then docid-ascending"
+                );
+            }
+        }
+
+        let mut counted_scorer = sealed_topdocs_union(
+            &posting_lists,
+            Some(&block_max),
+            field,
+            &snapshot,
+            SNAPSHOT_DOC_FREQ,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut counted_collector = TopDocsCollector::with_exact_count(4, 0)?;
+        counted_collector.collect(&mut counted_scorer, &AllLiveDocs)?;
+        let counted_stats = counted_scorer
+            .union_pruning_stats()
+            .expect("the ranked root is a buffered union");
+        let counted_page = counted_collector.finish()?;
+        assert_eq!(
+            counted_stats,
+            UnionPruningStats::default(),
+            "exact-count collection must keep pruning disabled"
+        );
+        assert_eq!(counted_page.total_count, Some(MATCHED_DOCS));
+        assert_eq!(
+            counted_page.hits[0].score.to_bits(),
+            doc_major.to_bits(),
+            "the counted exhaustive path already used the doc-major order"
+        );
         Ok(())
     }
 
