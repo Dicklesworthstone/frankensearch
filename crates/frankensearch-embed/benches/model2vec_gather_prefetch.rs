@@ -390,10 +390,7 @@ fn paired_full_embed_sync_gate(
 ) {
     let former_fingerprints = full_embed_sync_fingerprints(embedder, texts, former);
     let shipping_fingerprints = full_embed_sync_fingerprints(embedder, texts, shipping);
-    assert_eq!(
-        shipping_fingerprints, former_fingerprints,
-        "full embed_sync output fingerprint drift in {comparison} {label}"
-    );
+    let fingerprints_match = shipping_fingerprints == former_fingerprints;
 
     let aa = paired_median_ratio(
         31,
@@ -405,10 +402,7 @@ fn paired_full_embed_sync_gate(
             black_box(run_full_embed_sync_corpus(embedder, texts, former));
         },
     );
-    assert!(
-        aa.is_admissible_null(),
-        "full embed_sync A/A null is inadmissible for {label}: {aa:?}"
-    );
+    let aa_admissible = aa.is_admissible_null();
 
     let bb = paired_median_ratio(
         31,
@@ -420,10 +414,7 @@ fn paired_full_embed_sync_gate(
             black_box(run_full_embed_sync_corpus(embedder, texts, shipping));
         },
     );
-    assert!(
-        bb.is_admissible_null(),
-        "full embed_sync B/B null is inadmissible for {label}: {bb:?}"
-    );
+    let bb_admissible = bb.is_admissible_null();
 
     let ab = paired_median_ratio(
         31,
@@ -439,7 +430,20 @@ fn paired_full_embed_sync_gate(
     let no_claim = !fail_on_decidable_regression;
     eprintln!(
         "[full-embed-sync] comparison={comparison} distribution={label} AA={aa:?} BB={bb:?} AB={ab:?} \
-         decidable={decidable} no_claim={no_claim}"
+         fingerprints_match={fingerprints_match} aa_admissible={aa_admissible} \
+         bb_admissible={bb_admissible} decidable={decidable} no_claim={no_claim}"
+    );
+    assert_eq!(
+        shipping_fingerprints, former_fingerprints,
+        "full embed_sync output fingerprint drift in {comparison} {label}"
+    );
+    assert!(
+        aa.is_admissible_null(),
+        "full embed_sync A/A null is inadmissible for {label}: {aa:?}"
+    );
+    assert!(
+        bb.is_admissible_null(),
+        "full embed_sync B/B null is inadmissible for {label}: {bb:?}"
     );
     if fail_on_decidable_regression {
         assert!(
