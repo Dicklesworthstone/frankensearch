@@ -26752,14 +26752,21 @@ mod tests {
             run_with_cx(|cx| async move {
                 let index =
                     QuillIndex::in_memory(QuillConfig::default()).expect("cancellation index");
+                let mut writer = index
+                    .lock_writer(&cx, "index writer lock")
+                    .await
+                    .expect("a live Cx must acquire the writer before cancellation");
                 let cancelled = cx.clone();
                 cancelled.set_cancel_requested(true);
                 let documents = vec![IndexableDocument::new("cancelled-doc", "alpha beta")];
-                let error = index
+                let error = writer
                     .index_documents(&cancelled, &documents)
                     .await
                     .expect_err("a cancelled Cx must be refused");
-                assert!(matches!(error, QuillIndexError::Cancelled { .. }));
+                assert!(matches!(
+                    error,
+                    QuillIndexError::Cancelled { phase: "index" }
+                ));
             });
         });
         assert_ingest_span_reports(&captured, "cancelled", false);
