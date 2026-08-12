@@ -61,6 +61,14 @@ const MODEL2VEC_FUSED_ROWS: usize = 4;
 /// most four valid rows in token order. Portable builds, non-AVX2 x86-64 CPUs,
 /// all other dimensions, and sequences at or above that threshold retain their
 /// original accumulation paths exactly.
+///
+/// # Panics
+///
+/// Panics when `sum` has zero dimensions, when `vocab_size * sum.len()`
+/// overflows, or when `embeddings` is not exactly that many values. The exact
+/// table-length requirement is the established contract: trailing rows are not
+/// permitted. Every in-vocabulary token's row bounds are checked before any
+/// architecture-specific path can form a pointer.
 #[doc(hidden)]
 #[inline]
 pub fn accumulate_model2vec_rows(
@@ -69,11 +77,7 @@ pub fn accumulate_model2vec_rows(
     token_ids: &[u32],
     vocab_size: usize,
 ) -> usize {
-    debug_assert_eq!(
-        embeddings.len(),
-        vocab_size.saturating_mul(sum.len()),
-        "embedding table shape must match vocab_size × dimensions"
-    );
+    validate_model2vec_accumulation_shape(sum, embeddings, token_ids, vocab_size);
 
     if sum.len() == MODEL2VEC_NATIVE_DIMENSIONS && token_ids.len() < MODEL2VEC_PREFETCH_MIN_TOKENS {
         #[cfg(target_arch = "x86_64")]
@@ -108,13 +112,71 @@ pub fn accumulate_model2vec_rows(
     accumulate_model2vec_rows_base(sum, embeddings, token_ids, vocab_size)
 }
 
+/// Validate the safe public Model2Vec accumulation inputs before architecture-
+/// specific code can form raw pointers.
+#[inline]
+fn validate_model2vec_accumulation_shape(
+    sum: &[f32],
+    embeddings: &[f32],
+    token_ids: &[u32],
+    vocab_size: usize,
+) {
+    let dimensions = sum.len();
+    assert_ne!(
+        dimensions, 0,
+        "Model2Vec accumulation dimensions must be non-zero"
+    );
+
+    let table_len = vocab_size
+        .checked_mul(dimensions)
+        .expect("Model2Vec embedding table size overflows usize");
+    assert_eq!(
+        embeddings.len(),
+        table_len,
+        "Model2Vec embedding table length must equal vocab_size * dimensions"
+    );
+
+    for &token_id in token_ids {
+        let index = token_id as usize;
+        if index < vocab_size {
+            let (_, end) = model2vec_row_bounds(index, dimensions);
+            assert!(
+                end <= embeddings.len(),
+                "Model2Vec token row must lie within the embedding table"
+            );
+        }
+    }
+}
+
+/// Return the checked half-open bounds of one in-vocabulary embedding row.
+#[inline]
+fn model2vec_row_bounds(index: usize, dimensions: usize) -> (usize, usize) {
+    let start = index
+        .checked_mul(dimensions)
+        .expect("Model2Vec embedding row offset overflows usize");
+    let end = start
+        .checked_add(dimensions)
+        .expect("Model2Vec embedding row end overflows usize");
+    (start, end)
+}
+
+/// Form one embedding row only after calculating its bounds with checked arithmetic.
+#[inline]
+fn model2vec_embedding_row(embeddings: &[f32], index: usize, dimensions: usize) -> &[f32] {
+    let (start, end) = model2vec_row_bounds(index, dimensions);
+    &embeddings[start..end]
+}
+
 /// Accumulate short native-256 sequences with AVX2 vectors that remain live
 /// across one to four gathered rows. Each lane adds its rows in original token
 /// order; invalid token IDs do not consume a fused-row slot.
 ///
 /// # Safety
 ///
-/// The caller must prove AVX2 is available with a runtime feature check.
+/// The caller must prove AVX2 is available with a runtime feature check. The
+/// public boundary has also proved that `sum` is 256-wide, the table has an
+/// exact checked shape, and every selected in-vocabulary row has a checked
+/// 256-wide range in `embeddings`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_code)]
@@ -136,17 +198,17 @@ unsafe fn accumulate_model2vec_rows_native_256_short_avx2(
             let index = token_ids[position] as usize;
             position += 1;
             if index < vocab_size {
-                let start = index * MODEL2VEC_NATIVE_DIMENSIONS;
-                rows[row_count] = &embeddings[start..start + MODEL2VEC_NATIVE_DIMENSIONS];
+                rows[row_count] =
+                    model2vec_embedding_row(embeddings, index, MODEL2VEC_NATIVE_DIMENSIONS);
                 row_count += 1;
                 count += 1;
             }
         }
 
         if row_count != 0 {
-            // SAFETY: `sum` and every selected row have exactly 256 f32 values.
-            // The loop loads and stores eight values at offsets below 256, and
-            // `row_count` is constrained to the 1..=4 range above.
+            // SAFETY: boundary validation proved `sum` and every selected row
+            // are exactly 256 f32 values. The loop loads and stores eight values
+            // at offsets below 256, and `row_count` is constrained to 1..=4.
             unsafe {
                 accumulate_model2vec_rows_fused_avx2(sum, &rows, row_count);
             }
@@ -219,8 +281,7 @@ fn accumulate_model2vec_rows_base(
     for &token_id in token_ids {
         let idx = token_id as usize;
         if idx < vocab_size {
-            let start = idx * dimensions;
-            accumulate_f32_into(sum, &embeddings[start..start + dimensions]);
+            accumulate_f32_into(sum, model2vec_embedding_row(embeddings, idx, dimensions));
             count += 1;
         }
     }
@@ -241,14 +302,13 @@ fn accumulate_model2vec_rows_prefetched(
         if let Some(&future_id) = token_ids.get(position + MODEL2VEC_PREFETCH_DISTANCE) {
             let future_idx = future_id as usize;
             if future_idx < vocab_size {
-                prefetch_f32_row(embeddings, future_idx * dimensions, dimensions);
+                prefetch_f32_row(model2vec_embedding_row(embeddings, future_idx, dimensions));
             }
         }
 
         let idx = token_id as usize;
         if idx < vocab_size {
-            let start = idx * dimensions;
-            accumulate_f32_into(sum, &embeddings[start..start + dimensions]);
+            accumulate_f32_into(sum, model2vec_embedding_row(embeddings, idx, dimensions));
             count += 1;
         }
     }
@@ -257,22 +317,17 @@ fn accumulate_model2vec_rows_prefetched(
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-fn prefetch_f32_row(embeddings: &[f32], start: usize, dimensions: usize) {
+fn prefetch_f32_row(row: &[f32]) {
     use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
 
-    debug_assert!(start.saturating_add(dimensions) <= embeddings.len());
-    let mut offset = 0_usize;
-    while offset < dimensions {
-        // SAFETY: `start + offset` is within the embedding row by the loop bound
-        // and caller's validated table shape. `_mm_prefetch` is only a cache hint.
+    for offset in (0..row.len()).step_by(CACHE_LINE_F32) {
+        // SAFETY: `row` was formed from checked bounds before this call, so it
+        // is an in-allocation slice. `offset < row.len()` by the range and the
+        // pointer stays in that slice. `_mm_prefetch` is only a cache hint.
         #[allow(unsafe_code)]
         unsafe {
-            _mm_prefetch(
-                embeddings.as_ptr().add(start + offset).cast::<i8>(),
-                _MM_HINT_T0,
-            );
+            _mm_prefetch(row.as_ptr().add(offset).cast::<i8>(), _MM_HINT_T0);
         }
-        offset += CACHE_LINE_F32;
     }
 }
 
@@ -553,12 +608,18 @@ mod tests {
             (257, 512),
         ] {
             let embeddings = vec![0.25_f32; VOCAB * dimensions];
-            let ids = vec![0_u32; token_count];
+            let ids: Vec<u32> = (0..token_count)
+                .map(|position| if position % 5 == 0 { u32::MAX } else { 0 })
+                .collect();
             let mut sum = vec![0.0_f32; dimensions];
             let count = accumulate_model2vec_rows(&mut sum, &embeddings, &ids, VOCAB);
+            let expected_count = ids
+                .iter()
+                .filter(|&&token_id| (token_id as usize) < VOCAB)
+                .count();
 
             assert_eq!(
-                count, token_count,
+                count, expected_count,
                 "dimensions={dimensions}, tokens={token_count}"
             );
             assert_eq!(
@@ -567,5 +628,47 @@ mod tests {
                 "dimensions={dimensions}, tokens={token_count}"
             );
         }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "Model2Vec embedding table length must equal vocab_size * dimensions"
+    )]
+    fn model2vec_accumulator_rejects_short_table_before_512_token_prefetch() {
+        const DIMENSIONS: usize = 256;
+        let mut sum = [0.0_f32; DIMENSIONS];
+        let embeddings = [0.0_f32; DIMENSIONS - 1];
+        let token_ids = vec![0_u32; MODEL2VEC_PREFETCH_MIN_TOKENS];
+
+        let _ = accumulate_model2vec_rows(&mut sum, &embeddings, &token_ids, 1);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "Model2Vec embedding table length must equal vocab_size * dimensions"
+    )]
+    fn model2vec_accumulator_rejects_mismatched_sum_and_extra_table_values() {
+        let mut sum = [0.0_f32; 2];
+        let embeddings = [0.0_f32; 3];
+
+        let _ = accumulate_model2vec_rows(&mut sum, &embeddings, &[0], 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Model2Vec accumulation dimensions must be non-zero")]
+    fn model2vec_accumulator_rejects_zero_dimensions() {
+        let mut sum: [f32; 0] = [];
+        let embeddings: [f32; 0] = [];
+
+        let _ = accumulate_model2vec_rows(&mut sum, &embeddings, &[0], 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Model2Vec embedding table size overflows usize")]
+    fn model2vec_accumulator_rejects_table_size_overflow_without_allocation() {
+        let mut sum = [0.0_f32; 2];
+        let embeddings: [f32; 0] = [];
+
+        let _ = accumulate_model2vec_rows(&mut sum, &embeddings, &[], usize::MAX);
     }
 }
