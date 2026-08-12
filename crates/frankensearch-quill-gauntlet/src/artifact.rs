@@ -4248,6 +4248,7 @@ static PINNED_REGULAR_FILE_STAGING_NONCE: std::sync::atomic::AtomicU64 =
 
 #[cfg(all(
     test,
+    feature = "fuzz-harness",
     any(
         target_os = "android",
         target_os = "ios",
@@ -4264,6 +4265,7 @@ static PINNED_REGULAR_FILE_BEFORE_PUBLISH_HOOK: std::sync::Mutex<
 
 #[cfg(all(
     test,
+    feature = "fuzz-harness",
     any(
         target_os = "android",
         target_os = "ios",
@@ -4280,6 +4282,24 @@ static PINNED_REGULAR_FILE_BEFORE_DIGEST_HOOK: std::sync::Mutex<
 
 #[cfg(all(
     test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+static PINNED_DIRECTORY_BEFORE_SYNC_HOOK: std::sync::Mutex<
+    Option<std::sync::Arc<dyn Fn(&Path) + Send + Sync>>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
     any(
         target_os = "android",
         target_os = "ios",
@@ -4294,6 +4314,7 @@ pub(crate) struct PinnedRegularFileBeforePublishHookGuard;
 
 #[cfg(all(
     test,
+    feature = "fuzz-harness",
     any(
         target_os = "android",
         target_os = "ios",
@@ -4308,6 +4329,22 @@ pub(crate) struct PinnedRegularFileBeforeDigestHookGuard;
 
 #[cfg(all(
     test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+pub(crate) struct PinnedDirectoryBeforeSyncHookGuard;
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
     any(
         target_os = "android",
         target_os = "ios",
@@ -4334,6 +4371,7 @@ pub(crate) fn install_pinned_regular_file_before_publish_hook(
 
 #[cfg(all(
     test,
+    feature = "fuzz-harness",
     any(
         target_os = "android",
         target_os = "ios",
@@ -4358,8 +4396,38 @@ pub(crate) fn install_pinned_regular_file_before_digest_hook(
     PinnedRegularFileBeforeDigestHookGuard
 }
 
+/// Install a fuzz-harness-only rendezvous in the post-rename,
+/// pre-directory-sync window.
 #[cfg(all(
     test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+pub(crate) fn install_pinned_directory_before_sync_hook(
+    hook: impl Fn(&Path) + Send + Sync + 'static,
+) -> PinnedDirectoryBeforeSyncHookGuard {
+    let mut slot = PINNED_DIRECTORY_BEFORE_SYNC_HOOK
+        .lock()
+        .expect("pinned directory sync hook mutex must not be poisoned");
+    assert!(
+        slot.is_none(),
+        "pinned directory sync hook must be cleared before replacement"
+    );
+    *slot = Some(std::sync::Arc::new(hook));
+    PinnedDirectoryBeforeSyncHookGuard
+}
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
     any(
         target_os = "android",
         target_os = "ios",
@@ -4379,6 +4447,7 @@ fn clear_pinned_regular_file_before_publish_hook() {
 
 #[cfg(all(
     test,
+    feature = "fuzz-harness",
     any(
         target_os = "android",
         target_os = "ios",
@@ -4398,6 +4467,27 @@ fn clear_pinned_regular_file_before_digest_hook() {
 
 #[cfg(all(
     test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+fn clear_pinned_directory_before_sync_hook() {
+    let mut slot = PINNED_DIRECTORY_BEFORE_SYNC_HOOK
+        .lock()
+        .expect("pinned directory sync hook mutex must not be poisoned");
+    *slot = None;
+}
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
     any(
         target_os = "android",
         target_os = "ios",
@@ -4416,6 +4506,7 @@ impl Drop for PinnedRegularFileBeforePublishHookGuard {
 
 #[cfg(all(
     test,
+    feature = "fuzz-harness",
     any(
         target_os = "android",
         target_os = "ios",
@@ -4434,6 +4525,26 @@ impl Drop for PinnedRegularFileBeforeDigestHookGuard {
 
 #[cfg(all(
     test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+impl Drop for PinnedDirectoryBeforeSyncHookGuard {
+    fn drop(&mut self) {
+        clear_pinned_directory_before_sync_hook();
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
     any(
         target_os = "android",
         target_os = "ios",
@@ -4456,6 +4567,7 @@ fn pinned_regular_file_before_publish(path: &Path) {
 
 #[cfg(all(
     test,
+    feature = "fuzz-harness",
     any(
         target_os = "android",
         target_os = "ios",
@@ -4470,6 +4582,29 @@ fn pinned_regular_file_before_digest(path: &Path) {
     let hook = PINNED_REGULAR_FILE_BEFORE_DIGEST_HOOK
         .lock()
         .expect("pinned regular-file digest hook mutex must not be poisoned")
+        .clone();
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+fn pinned_directory_before_sync(path: &Path) {
+    let hook = PINNED_DIRECTORY_BEFORE_SYNC_HOOK
+        .lock()
+        .expect("pinned directory sync hook mutex must not be poisoned")
         .clone();
     if let Some(hook) = hook {
         hook(path);
@@ -4769,9 +4904,11 @@ impl PinnedDirectory {
         Ok(())
     }
 
-    /// Sync the held directory after a create-new child is durable and before
-    /// its final name-to-descriptor binding is accepted.
+    /// Sync the held directory after a final child entry is authenticated and
+    /// before its public operation returns success.
     pub(crate) fn sync_directory(&self) -> Result<(), GauntletError> {
+        #[cfg(all(test, feature = "fuzz-harness"))]
+        pinned_directory_before_sync(&self.display_path);
         self.file.sync_all().map_err(Into::into)
     }
 
@@ -4794,9 +4931,11 @@ impl PinnedDirectory {
 
     /// Stage a new regular child, sync and read it back through its descriptor,
     /// then publish its final name exactly once with no replacement. The final
-    /// name is not visible until the staged bytes are complete. A race that
-    /// loses the no-replace publish leaves its completed staging entry intact
-    /// and returns `Ok(None)` so callers can authenticate the winner.
+    /// name is not visible until the staged bytes are complete. A caller must
+    /// authenticate the final entry and sync this directory before reporting
+    /// either publish outcome as successful. A race that loses the no-replace
+    /// publish leaves its completed staging entry intact and returns `Ok(None)`
+    /// so callers can authenticate the winner.
     pub(crate) fn write_regular_create_new_and_read_back(
         &self,
         name: &OsStr,
@@ -4893,7 +5032,7 @@ impl PinnedDirectory {
             post_io_identity: self.regular_file_identity(&staging_name, &after_read)?,
             post_io_sha256,
         };
-        #[cfg(test)]
+        #[cfg(all(test, feature = "fuzz-harness"))]
         pinned_regular_file_before_publish(&self.display_path);
         match renameat_with(
             &self.file,
@@ -4902,10 +5041,7 @@ impl PinnedDirectory {
             name,
             RenameFlags::NOREPLACE,
         ) {
-            Ok(()) => {
-                self.file.sync_all()?;
-                Ok(Some((read_back, staged_file)))
-            }
+            Ok(()) => Ok(Some((read_back, staged_file))),
             Err(Errno::EXIST) => Ok(None),
             Err(Errno::LOOP | Errno::NOTDIR) => Err(GauntletError::UnsafeStorePath {
                 path: self.display_path.join(name),
@@ -4928,7 +5064,7 @@ impl PinnedDirectory {
                 path: self.display_path.join(name),
             });
         }
-        #[cfg(test)]
+        #[cfg(all(test, feature = "fuzz-harness"))]
         pinned_regular_file_before_digest(&self.display_path.join(name));
         let mut remaining = file.post_io_identity.size;
         let mut offset = 0_u64;

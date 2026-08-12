@@ -3338,7 +3338,6 @@ pub fn persist_typed_query_fuzz_replay(
             if read_back != bytes {
                 return Err(GauntletError::UnsafeStorePath { path: path.clone() });
             }
-            replay_directory.sync_directory()?;
             file
         }
         None => {
@@ -3358,6 +3357,11 @@ pub fn persist_typed_query_fuzz_replay(
         &file,
         &path,
     )?;
+    // A no-replace loser has authenticated the winner's complete bytes, but
+    // its final directory entry remains crash-vulnerable until this held
+    // descriptor is synced.  Keep the sync after the final binding for both
+    // outcomes so neither caller can report a durable replay prematurely.
+    replay_directory.sync_directory()?;
     Ok(TypedQueryFuzzReplayArtifact {
         replay: replay.clone(),
         replay_directory,
@@ -11712,6 +11716,136 @@ mod tests {
                 .as_ref()
                 .canonical_bytes()
                 .expect("canonical same-key replay bytes")
+        );
+    }
+
+    #[cfg(all(
+        feature = "fuzz-harness",
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
+    ))]
+    #[test]
+    fn typed_query_existing_success_syncs_before_returning_while_winner_is_parked() {
+        use std::{
+            sync::{
+                Arc, Mutex,
+                atomic::{AtomicUsize, Ordering},
+                mpsc::{self, RecvTimeoutError},
+            },
+            time::Duration,
+        };
+
+        const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(2);
+
+        let replay = typed_query_test_replay(&[22, 1, 7, 99], TypedQueryTree::MixedHitMiss(1, 7));
+        let root = typed_query_replay_test_root("existing-success-directory-sync");
+        let sidecar_directory = root.join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY);
+        let (sync_event_sender, sync_event_receiver) = mpsc::sync_channel(2);
+        let (release_winner_sender, release_winner_receiver) = mpsc::sync_channel(1);
+        let (release_loser_sender, release_loser_receiver) = mpsc::sync_channel(1);
+        let release_winner_receiver = Arc::new(Mutex::new(release_winner_receiver));
+        let release_loser_receiver = Arc::new(Mutex::new(release_loser_receiver));
+        let sync_calls = Arc::new(AtomicUsize::new(0));
+        let sidecar_directory_for_hook = sidecar_directory.clone();
+        let sync_event_sender_for_hook = sync_event_sender.clone();
+        let release_winner_receiver_for_hook = Arc::clone(&release_winner_receiver);
+        let release_loser_receiver_for_hook = Arc::clone(&release_loser_receiver);
+        let sync_calls_for_hook = Arc::clone(&sync_calls);
+        let _sync_hook = crate::artifact::install_pinned_directory_before_sync_hook(move |path| {
+            if path != sidecar_directory_for_hook.as_path() {
+                return;
+            }
+            let (label, release_receiver) = match sync_calls_for_hook.fetch_add(1, Ordering::SeqCst)
+            {
+                0 => ("winner", Some(&release_winner_receiver_for_hook)),
+                1 => ("loser", Some(&release_loser_receiver_for_hook)),
+                _ => ("unexpected", None),
+            };
+            sync_event_sender_for_hook
+                .send(label)
+                .expect("bounded directory-sync rendezvous receiver must remain live");
+            if let Some(release_receiver) = release_receiver {
+                release_receiver
+                    .lock()
+                    .expect("bounded directory-sync release mutex must not be poisoned")
+                    .recv_timeout(RENDEZVOUS_TIMEOUT)
+                    .expect("bounded directory-sync rendezvous release must arrive");
+            }
+        });
+
+        let winner_root = root.clone();
+        let winner_replay = replay.clone();
+        let winner = std::thread::spawn(move || {
+            persist_typed_query_fuzz_replay(&winner_root, &winner_replay)
+        });
+        assert_eq!(
+            sync_event_receiver
+                .recv_timeout(RENDEZVOUS_TIMEOUT)
+                .expect("winner must reach the post-rename, pre-directory-sync rendezvous"),
+            "winner"
+        );
+
+        let loser_root = root.clone();
+        let loser_replay = replay.clone();
+        let loser =
+            std::thread::spawn(move || persist_typed_query_fuzz_replay(&loser_root, &loser_replay));
+        assert_eq!(
+            sync_event_receiver
+                .recv_timeout(RENDEZVOUS_TIMEOUT)
+                .expect("loser must authenticate the existing entry and reach its directory sync"),
+            "loser"
+        );
+        assert!(
+            !loser.is_finished(),
+            "loser must not return before its own held-directory sync completes"
+        );
+        assert!(matches!(
+            sync_event_receiver.recv_timeout(Duration::from_millis(100)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+
+        release_loser_sender
+            .send(())
+            .expect("release the loser after its bounded sync rendezvous");
+        let loser = loser
+            .join()
+            .expect("loser must not panic during existing-entry synchronization")
+            .expect("loser must return a synchronized descriptor capability");
+        assert_eq!(
+            loser
+                .replay_workload()
+                .expect("synchronized loser capability must remain consumable")
+                .case
+                .query,
+            replay.minimized_query
+        );
+
+        release_winner_sender
+            .send(())
+            .expect("release the winner after the loser has synchronized the directory");
+        let winner = winner
+            .join()
+            .expect("winner must not panic after the bounded rendezvous")
+            .expect("winner must return a synchronized descriptor capability");
+        assert_eq!(
+            winner
+                .replay_workload()
+                .expect("synchronized winner capability must remain consumable")
+                .case
+                .query,
+            replay.minimized_query
+        );
+        assert_eq!(
+            sync_calls.load(Ordering::SeqCst),
+            2,
+            "winner and loser must each issue the held-directory sync before success"
         );
     }
 
