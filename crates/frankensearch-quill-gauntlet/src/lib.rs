@@ -174,15 +174,16 @@ pub use perf::{
     PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
     PerfTopology, PositionMode, QG1_TANTIVY_INCUMBENT_SCREEN_SCHEMA_VERSION,
     QG1_TANTIVY_INCUMBENT_TANTIVY_VERSION, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS,
-    Qg1AuthorityRegisterEntryV1, Qg1BatchCoverage, Qg1LifecycleProducer, Qg1LifecycleWitness,
-    Qg1SampleBinding, Qg1TantivyBoundStream, Qg1TantivyDecisionStreamKind,
-    Qg1TantivyIncumbentCandidate, Qg1TantivyIncumbentDecision, Qg1TantivyIncumbentError,
-    Qg1TantivyIncumbentPilot, Qg1TantivyIncumbentScreen, Qg1TantivyIncumbentScreenPlan,
-    Qg1TantivySemanticContract, Qg1TantivyWriterMode, Qg6SampleBinding, estimate_paired_experiment,
-    estimate_paired_experiment_against_qg1_authority, machine_fingerprint,
-    parse_macos_time_max_rss_bytes, peak_rss_bytes, perf_manifest_contract_sha256,
-    perf_writer_heap_bytes, preregister_qg1_tantivy_incumbents, seeded_balanced_pair_order,
-    validate_matrix,
+    Qg1AuthorityRegisterEntryV1, Qg1AuthorityRoleV1, Qg1BatchCoverage, Qg1ExpectedAuthority,
+    Qg1LifecycleProducer, Qg1LifecycleWitness, Qg1PinnedAuthorityTargetV1, Qg1SampleBinding,
+    Qg1TantivyBoundStream, Qg1TantivyDecisionStreamKind, Qg1TantivyIncumbentCandidate,
+    Qg1TantivyIncumbentDecision, Qg1TantivyIncumbentError, Qg1TantivyIncumbentPilot,
+    Qg1TantivyIncumbentScreen, Qg1TantivyIncumbentScreenPlan, Qg1TantivySemanticContract,
+    Qg1TantivyWriterMode, Qg1TargetPinV1, Qg1VerifiedAuthorityRegistrationV1, Qg6SampleBinding,
+    estimate_paired_experiment, estimate_paired_experiment_against_qg1_authority,
+    machine_fingerprint, parse_macos_time_max_rss_bytes, peak_rss_bytes,
+    perf_manifest_contract_sha256, perf_writer_heap_bytes, preregister_qg1_tantivy_incumbents,
+    seeded_balanced_pair_order, validate_matrix,
 };
 pub use perf::{PERF_RUN_PLAN_DOC_PATH, render_perf_run_plan_markdown};
 pub use perf_assembly::{
@@ -213,8 +214,10 @@ pub use perf_evidence::{
 pub use perf_ratchet::{
     PERF_HISTORY_POINTER_SCHEMA_VERSION, PERF_MAX_REGRESSION_PCT, PERF_MAX_REPRODUCTION_DELTA_PCT,
     PERF_RATCHET_SCHEMA_VERSION, PERF_REGRESSION_ROBUST_Z, PerfCellComparison, PerfEvidenceFile,
-    PerfGateDecision, PerfRatchetEvaluation, PerfRatchetMode, PerfRatchetReason,
-    PerfRatchetRequest, evaluate_perf_ratchet, is_explicit_bootstrap, is_explicit_bootstrap_for,
+    PerfGateDecision, PerfRatchetEvaluation, PerfRatchetMode, PerfRatchetQg1AuthoritySets,
+    PerfRatchetReason, PerfRatchetRequest, evaluate_perf_ratchet,
+    evaluate_perf_ratchet_against_qg1_authorities, is_explicit_bootstrap,
+    is_explicit_bootstrap_for,
 };
 pub use privacy::{
     ARTIFACT_PRIVACY_POLICY_SCHEMA_VERSION, ArtifactClassification, ArtifactContentKind,
