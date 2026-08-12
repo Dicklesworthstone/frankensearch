@@ -10828,7 +10828,15 @@ mod tests {
 
     #[cfg(all(
         feature = "fuzz-harness",
-        any(target_vendor = "apple", target_os = "android", target_os = "linux")
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
     ))]
     fn typed_query_replay_test_root(label: &str) -> std::path::PathBuf {
         static DIRECTORY_NONCE: AtomicUsize = AtomicUsize::new(0);
@@ -10844,7 +10852,15 @@ mod tests {
 
     #[cfg(all(
         feature = "fuzz-harness",
-        any(target_vendor = "apple", target_os = "android", target_os = "linux")
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
     ))]
     fn typed_query_write_new_owned_file(path: &std::path::Path, bytes: &[u8]) {
         use std::io::Write as _;
@@ -10862,7 +10878,15 @@ mod tests {
 
     #[cfg(all(
         feature = "fuzz-harness",
-        any(target_vendor = "apple", target_os = "android", target_os = "linux")
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
     ))]
     fn typed_query_replay_path(
         root: &std::path::Path,
@@ -10878,7 +10902,15 @@ mod tests {
 
     #[cfg(all(
         feature = "fuzz-harness",
-        any(target_vendor = "apple", target_os = "android", target_os = "linux")
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
     ))]
     fn typed_query_rewrite_owned_file_same_length(path: &std::path::Path, bytes: &[u8]) {
         use std::io::Write as _;
@@ -10966,7 +10998,15 @@ mod tests {
 
     #[cfg(all(
         feature = "fuzz-harness",
-        any(target_vendor = "apple", target_os = "android", target_os = "linux")
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
     ))]
     #[test]
     fn typed_query_public_replay_persistence_authenticates_canonical_filename() {
@@ -11149,7 +11189,15 @@ mod tests {
 
     #[cfg(all(
         feature = "fuzz-harness",
-        any(target_vendor = "apple", target_os = "android", target_os = "linux")
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
     ))]
     #[test]
     fn typed_query_replay_sidecar_rejects_symlinks_and_nonregular_entries() {
@@ -11262,7 +11310,15 @@ mod tests {
 
     #[cfg(all(
         feature = "fuzz-harness",
-        any(target_vendor = "apple", target_os = "android", target_os = "linux")
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
     ))]
     #[test]
     fn typed_query_public_replay_rejects_post_io_final_and_parent_substitution() {
@@ -11376,7 +11432,15 @@ mod tests {
 
     #[cfg(all(
         feature = "fuzz-harness",
-        any(target_vendor = "apple", target_os = "android", target_os = "linux")
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
     ))]
     #[test]
     fn typed_query_public_replay_capability_handles_late_substitution_and_rejects_same_inode_rewrite()
@@ -11479,6 +11543,175 @@ mod tests {
         assert_eq!(
             std::fs::read(&mutation_path).expect("same-inode hostile rewrite remains intact"),
             vec![b'x'; canonical_bytes.len()]
+        );
+    }
+
+    #[cfg(all(
+        feature = "fuzz-harness",
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
+    ))]
+    #[test]
+    fn typed_query_public_replay_capability_rejects_post_return_mutation_and_supports_concurrency()
+    {
+        use std::sync::{Arc, Barrier};
+
+        let replay = typed_query_test_replay(&[22, 1, 7, 99], TypedQueryTree::MixedHitMiss(1, 7));
+        let canonical_bytes = replay.canonical_bytes().expect("canonical replay bytes");
+
+        let concurrent_root = typed_query_replay_test_root("concurrent-capability-consumption");
+        let concurrent_artifact = Arc::new(
+            persist_typed_query_fuzz_replay(&concurrent_root, &replay)
+                .expect("persist one descriptor-bound artifact for concurrent consumption"),
+        );
+        let concurrent_path = typed_query_replay_path(&concurrent_root, &replay);
+        let digest_barrier = Arc::new(Barrier::new(4));
+        let path_for_digest_hook = concurrent_path.clone();
+        let barrier_for_digest_hook = Arc::clone(&digest_barrier);
+        let _digest_hook =
+            crate::artifact::install_pinned_regular_file_before_digest_hook(move |path| {
+                if path == path_for_digest_hook.as_path() {
+                    barrier_for_digest_hook.wait();
+                }
+            });
+        let expected_query = replay.minimized_query.clone();
+        std::thread::scope(|scope| {
+            let mut consumers = Vec::new();
+            for _ in 0..4 {
+                let artifact = Arc::clone(&concurrent_artifact);
+                let expected_query = expected_query.clone();
+                consumers.push(scope.spawn(move || {
+                    assert_eq!(
+                        artifact
+                            .replay_workload()
+                            .expect("concurrent positional replay consumption must succeed")
+                            .case
+                            .query,
+                        expected_query
+                    );
+                }));
+            }
+            for consumer in consumers {
+                consumer
+                    .join()
+                    .expect("concurrent replay consumer must not panic");
+            }
+        });
+
+        let replacement_root = typed_query_replay_test_root("post-return-final-replacement");
+        let replacement_artifact = persist_typed_query_fuzz_replay(&replacement_root, &replay)
+            .expect("persist post-return replacement source");
+        let replacement_path = typed_query_replay_path(&replacement_root, &replay);
+        let displaced_replacement = replacement_path.with_file_name("displaced-replacement.json");
+        std::fs::rename(&replacement_path, &displaced_replacement)
+            .expect("move owned original entry aside after persist returned");
+        typed_query_write_new_owned_file(&replacement_path, &canonical_bytes);
+        assert!(matches!(
+            replacement_artifact.replay_workload(),
+            Err(GauntletError::UnsafeStorePath { path }) if path == replacement_path
+        ));
+        assert_eq!(
+            std::fs::read(&displaced_replacement)
+                .expect("displaced original post-return artifact remains intact"),
+            canonical_bytes
+        );
+
+        let rewrite_root = typed_query_replay_test_root("post-return-same-inode-rewrite");
+        let rewrite_artifact = persist_typed_query_fuzz_replay(&rewrite_root, &replay)
+            .expect("persist post-return same-inode rewrite source");
+        let rewrite_path = typed_query_replay_path(&rewrite_root, &replay);
+        let rewritten_bytes = vec![b'x'; canonical_bytes.len()];
+        typed_query_rewrite_owned_file_same_length(&rewrite_path, &rewritten_bytes);
+        assert!(matches!(
+            rewrite_artifact.replay_workload(),
+            Err(GauntletError::UnsafeStorePath { path }) if path == rewrite_path
+        ));
+        assert_eq!(
+            std::fs::read(&rewrite_path).expect("post-return same-inode rewrite remains intact"),
+            rewritten_bytes
+        );
+    }
+
+    #[cfg(all(
+        feature = "fuzz-harness",
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
+    ))]
+    #[test]
+    fn typed_query_public_persist_concurrently_publishes_only_complete_same_key_bytes() {
+        use std::sync::{Arc, Barrier};
+
+        let replay = Arc::new(typed_query_test_replay(
+            &[22, 1, 7, 99],
+            TypedQueryTree::MixedHitMiss(1, 7),
+        ));
+        let root = typed_query_replay_test_root("concurrent-same-key-publication");
+        let sidecar_directory = root.join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY);
+        let publish_barrier = Arc::new(Barrier::new(2));
+        let sidecar_for_hook = sidecar_directory.clone();
+        let publish_barrier_for_hook = Arc::clone(&publish_barrier);
+        let _publish_hook =
+            crate::artifact::install_pinned_regular_file_before_publish_hook(move |directory| {
+                if directory == sidecar_for_hook.as_path() {
+                    publish_barrier_for_hook.wait();
+                }
+            });
+        let (first, second) = std::thread::scope(|scope| {
+            let first_root = &root;
+            let first_replay = Arc::clone(&replay);
+            let first = scope
+                .spawn(move || persist_typed_query_fuzz_replay(first_root, first_replay.as_ref()));
+            let second_root = &root;
+            let second_replay = Arc::clone(&replay);
+            let second = scope.spawn(move || {
+                persist_typed_query_fuzz_replay(second_root, second_replay.as_ref())
+            });
+            (
+                first.join().expect("first same-key writer must not panic"),
+                second
+                    .join()
+                    .expect("second same-key writer must not panic"),
+            )
+        });
+        let first = first.expect("first same-key writer must receive a complete artifact");
+        let second = second.expect("second same-key writer must receive a complete artifact");
+        assert_eq!(
+            first
+                .replay_workload()
+                .expect("first same-key artifact must be consumable")
+                .case
+                .query,
+            replay.as_ref().minimized_query
+        );
+        assert_eq!(
+            second
+                .replay_workload()
+                .expect("second same-key artifact must be consumable")
+                .case
+                .query,
+            replay.as_ref().minimized_query
+        );
+        assert_eq!(
+            std::fs::read(typed_query_replay_path(&root, replay.as_ref()))
+                .expect("same-key final artifact must be complete"),
+            replay
+                .as_ref()
+                .canonical_bytes()
+                .expect("canonical same-key replay bytes")
         );
     }
 

@@ -4184,13 +4184,29 @@ fn canonical_json_matches<T: Serialize>(value: &T, expected: &[u8]) -> Result<bo
 /// `flock`, and `renameat_with(RENAME_NOREPLACE)`. Rustix 1.1.4 exposes that
 /// full set on Apple and Linux-kernel targets only. Other targets receive a
 /// typed `Unsupported` I/O error instead of a path-based fallback.
-#[cfg(any(target_vendor = "apple", target_os = "android", target_os = "linux"))]
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos"
+))]
 pub struct PinnedDirectory {
     file: File,
     display_path: PathBuf,
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "android", target_os = "linux"))]
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos"
+))]
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct PinnedRegularFileIdentity {
     device: u64,
@@ -4203,20 +4219,294 @@ struct PinnedRegularFileIdentity {
     changed_nanoseconds: i64,
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "android", target_os = "linux"))]
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos"
+))]
 pub(crate) struct PinnedRegularFile {
     file: File,
     post_io_identity: PinnedRegularFileIdentity,
     post_io_sha256: [u8; 32],
 }
 
-#[cfg(not(any(target_vendor = "apple", target_os = "android", target_os = "linux")))]
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos"
+))]
+static PINNED_REGULAR_FILE_STAGING_NONCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+static PINNED_REGULAR_FILE_BEFORE_PUBLISH_HOOK: std::sync::Mutex<
+    Option<std::sync::Arc<dyn Fn(&Path) + Send + Sync>>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+static PINNED_REGULAR_FILE_BEFORE_DIGEST_HOOK: std::sync::Mutex<
+    Option<std::sync::Arc<dyn Fn(&Path) + Send + Sync>>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+pub(crate) struct PinnedRegularFileBeforePublishHookGuard;
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+pub(crate) struct PinnedRegularFileBeforeDigestHookGuard;
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+pub(crate) fn install_pinned_regular_file_before_publish_hook(
+    hook: impl Fn(&Path) + Send + Sync + 'static,
+) -> PinnedRegularFileBeforePublishHookGuard {
+    let mut slot = PINNED_REGULAR_FILE_BEFORE_PUBLISH_HOOK
+        .lock()
+        .expect("pinned regular-file publish hook mutex must not be poisoned");
+    assert!(
+        slot.is_none(),
+        "pinned regular-file publish hook must be cleared before replacement"
+    );
+    *slot = Some(std::sync::Arc::new(hook));
+    PinnedRegularFileBeforePublishHookGuard
+}
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+pub(crate) fn install_pinned_regular_file_before_digest_hook(
+    hook: impl Fn(&Path) + Send + Sync + 'static,
+) -> PinnedRegularFileBeforeDigestHookGuard {
+    let mut slot = PINNED_REGULAR_FILE_BEFORE_DIGEST_HOOK
+        .lock()
+        .expect("pinned regular-file digest hook mutex must not be poisoned");
+    assert!(
+        slot.is_none(),
+        "pinned regular-file digest hook must be cleared before replacement"
+    );
+    *slot = Some(std::sync::Arc::new(hook));
+    PinnedRegularFileBeforeDigestHookGuard
+}
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+fn clear_pinned_regular_file_before_publish_hook() {
+    let mut slot = PINNED_REGULAR_FILE_BEFORE_PUBLISH_HOOK
+        .lock()
+        .expect("pinned regular-file publish hook mutex must not be poisoned");
+    *slot = None;
+}
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+fn clear_pinned_regular_file_before_digest_hook() {
+    let mut slot = PINNED_REGULAR_FILE_BEFORE_DIGEST_HOOK
+        .lock()
+        .expect("pinned regular-file digest hook mutex must not be poisoned");
+    *slot = None;
+}
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+impl Drop for PinnedRegularFileBeforePublishHookGuard {
+    fn drop(&mut self) {
+        clear_pinned_regular_file_before_publish_hook();
+    }
+}
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+impl Drop for PinnedRegularFileBeforeDigestHookGuard {
+    fn drop(&mut self) {
+        clear_pinned_regular_file_before_digest_hook();
+    }
+}
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+fn pinned_regular_file_before_publish(path: &Path) {
+    let hook = PINNED_REGULAR_FILE_BEFORE_PUBLISH_HOOK
+        .lock()
+        .expect("pinned regular-file publish hook mutex must not be poisoned")
+        .clone();
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+fn pinned_regular_file_before_digest(path: &Path) {
+    let hook = PINNED_REGULAR_FILE_BEFORE_DIGEST_HOOK
+        .lock()
+        .expect("pinned regular-file digest hook mutex must not be poisoned")
+        .clone();
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos"
+)))]
 pub struct PinnedDirectory;
 
-#[cfg(not(any(target_vendor = "apple", target_os = "android", target_os = "linux")))]
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos"
+)))]
 pub(crate) struct PinnedRegularFile;
 
-#[cfg(any(target_vendor = "apple", target_os = "android", target_os = "linux"))]
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos"
+))]
 impl PinnedDirectory {
     pub(crate) fn open_path(path: &Path) -> Result<Self, GauntletError> {
         Self::walk_path(path, false)
@@ -4502,44 +4792,56 @@ impl PinnedDirectory {
         Ok(())
     }
 
-    /// Create a new readable regular child exactly once, sync it, and read it
-    /// back through the same descriptor.  Existing entries are never opened
-    /// for writing; callers receive `Ok(None)` and can authenticate the
-    /// existing regular file through a separate no-follow read.
+    /// Stage a new regular child, sync and read it back through its descriptor,
+    /// then publish its final name exactly once with no replacement. The final
+    /// name is not visible until the staged bytes are complete. A race that
+    /// loses the no-replace publish leaves its completed staging entry intact
+    /// and returns `Ok(None)` so callers can authenticate the winner.
     pub(crate) fn write_regular_create_new_and_read_back(
         &self,
         name: &OsStr,
         expected_bytes: &[u8],
     ) -> Result<Option<(Vec<u8>, PinnedRegularFile)>, GauntletError> {
-        use rustix::fs::{FileType, Mode, OFlags, fstat, openat};
+        use rustix::fs::{FileType, Mode, OFlags, RenameFlags, fstat, openat, renameat_with};
         use rustix::io::Errno;
 
         validate_child_name(&self.display_path, name)?;
-        let descriptor = match openat(
-            &self.file,
-            name,
-            OFlags::RDWR
-                | OFlags::CREATE
-                | OFlags::EXCL
-                | OFlags::CLOEXEC
-                | OFlags::NOFOLLOW
-                | OFlags::NONBLOCK,
-            Mode::RUSR | Mode::WUSR,
-        ) {
-            Ok(descriptor) => descriptor,
-            Err(Errno::EXIST) => return Ok(None),
-            Err(Errno::LOOP | Errno::NOTDIR) => {
-                return Err(GauntletError::UnsafeStorePath {
-                    path: self.display_path.join(name),
-                });
+        if self.entry_exists(name)? {
+            return Ok(None);
+        }
+        let (staging_name, descriptor) = loop {
+            let nonce = PINNED_REGULAR_FILE_STAGING_NONCE
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let staging_name = OsString::from(format!(
+                ".typed-query-replay-stage-{}-{nonce}",
+                std::process::id()
+            ));
+            match openat(
+                &self.file,
+                &staging_name,
+                OFlags::RDWR
+                    | OFlags::CREATE
+                    | OFlags::EXCL
+                    | OFlags::CLOEXEC
+                    | OFlags::NOFOLLOW
+                    | OFlags::NONBLOCK,
+                Mode::RUSR | Mode::WUSR,
+            ) {
+                Ok(descriptor) => break (staging_name, descriptor),
+                Err(Errno::EXIST) => continue,
+                Err(Errno::LOOP | Errno::NOTDIR) => {
+                    return Err(GauntletError::UnsafeStorePath {
+                        path: self.display_path.join(name),
+                    });
+                }
+                Err(error) => return Err(std::io::Error::from(error).into()),
             }
-            Err(error) => return Err(std::io::Error::from(error).into()),
         };
         let initial = fstat(&descriptor).map_err(std::io::Error::from)?;
         if FileType::from_raw_mode(initial.st_mode) != FileType::RegularFile || initial.st_size != 0
         {
             return Err(GauntletError::UnsafeStorePath {
-                path: self.display_path.join(name),
+                path: self.display_path.join(&staging_name),
             });
         }
         let mut file = File::from(descriptor);
@@ -4547,9 +4849,13 @@ impl PinnedDirectory {
         file.sync_all()?;
         let after_write = fstat(&file).map_err(std::io::Error::from)?;
         let expected_size = u64::try_from(expected_bytes.len()).unwrap_or(u64::MAX);
-        if self.regular_file_identity(name, &after_write)?.size != expected_size {
+        if self
+            .regular_file_identity(&staging_name, &after_write)?
+            .size
+            != expected_size
+        {
             return Err(GauntletError::UnsafeStorePath {
-                path: self.display_path.join(name),
+                path: self.display_path.join(&staging_name),
             });
         }
         file.seek(SeekFrom::Start(0))?;
@@ -4575,21 +4881,37 @@ impl PinnedDirectory {
             || after_write.st_mtime_nsec != after_read.st_mtime_nsec
             || after_write.st_ctime != after_read.st_ctime
             || after_write.st_ctime_nsec != after_read.st_ctime_nsec
-            || self.regular_file_identity(name, &after_read)?.size != expected_size
+            || self.regular_file_identity(&staging_name, &after_read)?.size != expected_size
         {
             return Err(GauntletError::UnsafeStorePath {
-                path: self.display_path.join(name),
+                path: self.display_path.join(&staging_name),
             });
         }
         let post_io_sha256: [u8; 32] = Sha256::digest(&read_back).into();
-        Ok(Some((
-            read_back,
-            PinnedRegularFile {
-                file,
-                post_io_identity: self.regular_file_identity(name, &after_read)?,
-                post_io_sha256,
-            },
-        )))
+        let staged_file = PinnedRegularFile {
+            file,
+            post_io_identity: self.regular_file_identity(&staging_name, &after_read)?,
+            post_io_sha256,
+        };
+        #[cfg(test)]
+        pinned_regular_file_before_publish(&self.display_path);
+        match renameat_with(
+            &self.file,
+            &staging_name,
+            &self.file,
+            name,
+            RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => {
+                self.file.sync_all()?;
+                Ok(Some((read_back, staged_file)))
+            }
+            Err(Errno::EXIST) => Ok(None),
+            Err(Errno::LOOP | Errno::NOTDIR) => Err(GauntletError::UnsafeStorePath {
+                path: self.display_path.join(name),
+            }),
+            Err(error) => Err(std::io::Error::from(error).into()),
+        }
     }
 
     fn regular_file_sha256(
@@ -4598,6 +4920,7 @@ impl PinnedDirectory {
         file: &PinnedRegularFile,
     ) -> Result<[u8; 32], GauntletError> {
         use rustix::fs::fstat;
+        use std::os::unix::fs::FileExt as _;
 
         let before = fstat(&file.file).map_err(std::io::Error::from)?;
         if self.regular_file_identity(name, &before)? != file.post_io_identity {
@@ -4605,24 +4928,31 @@ impl PinnedDirectory {
                 path: self.display_path.join(name),
             });
         }
-        let mut reader = file.file.try_clone()?;
-        reader.seek(SeekFrom::Start(0))?;
+        #[cfg(test)]
+        pinned_regular_file_before_digest(&self.display_path.join(name));
         let mut remaining = file.post_io_identity.size;
+        let mut offset = 0_u64;
         let mut buffer = [0_u8; 8 * 1024];
         let mut hasher = Sha256::new();
         while remaining > 0 {
             let limit = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
-            let read = reader.read(&mut buffer[..limit])?;
+            let read = file.file.read_at(&mut buffer[..limit], offset)?;
             if read == 0 {
                 return Err(GauntletError::UnsafeStorePath {
                     path: self.display_path.join(name),
                 });
             }
             hasher.update(&buffer[..read]);
-            remaining = remaining.saturating_sub(u64::try_from(read).unwrap_or(u64::MAX));
+            let read = u64::try_from(read).unwrap_or(u64::MAX);
+            remaining = remaining.saturating_sub(read);
+            offset = offset
+                .checked_add(read)
+                .ok_or_else(|| GauntletError::UnsafeStorePath {
+                    path: self.display_path.join(name),
+                })?;
         }
         let mut extra = [0_u8; 1];
-        if reader.read(&mut extra)? != 0 {
+        if file.file.read_at(&mut extra, offset)? != 0 {
             return Err(GauntletError::UnsafeStorePath {
                 path: self.display_path.join(name),
             });
@@ -5034,7 +5364,15 @@ impl PinnedDirectory {
     }
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "android", target_os = "linux"))]
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos"
+))]
 fn directory_open_flags() -> rustix::fs::OFlags {
     rustix::fs::OFlags::RDONLY
         | rustix::fs::OFlags::CLOEXEC
@@ -5067,7 +5405,15 @@ fn gauntlet_to_io(error: &GauntletError) -> std::io::Error {
     std::io::Error::other(error.to_string())
 }
 
-#[cfg(not(any(target_vendor = "apple", target_os = "android", target_os = "linux")))]
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos"
+)))]
 impl PinnedDirectory {
     fn unsupported<T>() -> Result<T, GauntletError> {
         Err(std::io::Error::new(
