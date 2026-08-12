@@ -3351,6 +3351,8 @@ pub enum ConformanceCancellationStage {
     ParallelBudgetAdmission = 5,
     /// One sealed-segment pruning receipt has been recorded successfully.
     PruningTraceSegmentRecorded = 6,
+    /// Ranked hits are complete and the snippet tail is about to begin.
+    SnippetTailAdmission = 7,
 }
 
 /// Fixed-size conformance receipt for the complete retained scalar writer
@@ -3476,6 +3478,7 @@ impl ConformanceCancellationStage {
             Self::ParallelIngest => 4,
             Self::ParallelBudgetAdmission => 5,
             Self::PruningTraceSegmentRecorded => 6,
+            Self::SnippetTailAdmission => 7,
         }
     }
 }
@@ -7823,6 +7826,8 @@ impl QuillReader {
             limit,
             offset,
             exact_count,
+            None,
+            None,
             #[cfg(feature = "pruning-conformance")]
             None,
             Some(&session),
@@ -7862,6 +7867,8 @@ impl QuillReader {
             limit,
             offset,
             exact_count,
+            None,
+            None,
             Some(guard.session()),
             #[cfg(feature = "profile-internals")]
             None,
@@ -7886,6 +7893,8 @@ impl QuillReader {
             limit,
             offset,
             exact_count,
+            None,
+            None,
             #[cfg(feature = "pruning-conformance")]
             None,
             #[cfg(feature = "profile-internals")]
@@ -7894,13 +7903,42 @@ impl QuillReader {
         )
     }
 
-    fn search_paginated_on_inner(
+    fn search_paginated_on_with_checkpoint<'a>(
         &self,
-        cx: &Cx,
+        cx: &'a Cx,
         query: &str,
         limit: usize,
         offset: usize,
         exact_count: bool,
+        snapshot: &QuillSearchSnapshot,
+        checkpoint: &QueryCheckpointHandle<'a>,
+        checkpoint_metering: bool,
+    ) -> Result<QuillSearchResult, QuillIndexError> {
+        self.search_paginated_on_inner(
+            cx,
+            query,
+            limit,
+            offset,
+            exact_count,
+            Some(checkpoint),
+            Some(checkpoint_metering),
+            #[cfg(feature = "pruning-conformance")]
+            None,
+            #[cfg(feature = "profile-internals")]
+            None,
+            snapshot,
+        )
+    }
+
+    fn search_paginated_on_inner<'a>(
+        &self,
+        cx: &'a Cx,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+        checkpoint: Option<&QueryCheckpointHandle<'a>>,
+        checkpoint_metering: Option<bool>,
         #[cfg(feature = "pruning-conformance")] pruning_trace: Option<
             &ConformancePruningTraceSession,
         >,
@@ -8024,6 +8062,8 @@ impl QuillReader {
             offset,
             exact_count,
             parsed.diagnostics,
+            checkpoint,
+            checkpoint_metering,
             #[cfg(feature = "pruning-conformance")]
             pruning_trace,
             #[cfg(feature = "profile-internals")]
@@ -8378,6 +8418,8 @@ impl QuillReader {
             offset,
             exact_count,
             diagnostics,
+            None,
+            None,
             #[cfg(feature = "pruning-conformance")]
             None,
             #[cfg(feature = "profile-internals")]
@@ -8385,15 +8427,17 @@ impl QuillReader {
         )
     }
 
-    fn execute_ranked_query_inner(
+    fn execute_ranked_query_inner<'a>(
         &self,
-        cx: &Cx,
+        cx: &'a Cx,
         query: &Query,
         snapshot: &QuillSearchSnapshot,
         limit: usize,
         offset: usize,
         exact_count: bool,
         diagnostics: Vec<QueryDiagnostic>,
+        supplied_checkpoint: Option<&QueryCheckpointHandle<'a>>,
+        supplied_checkpoint_metering: Option<bool>,
         #[cfg(feature = "pruning-conformance")] pruning_trace: Option<
             &ConformancePruningTraceSession,
         >,
@@ -8406,39 +8450,47 @@ impl QuillReader {
             self.schema,
             self.config.glob_expansion_limit,
         )?;
-        #[cfg(feature = "profile-internals")]
-        let concrete_checkpoint = profile.map_or_else(
-            || {
-                self.query_checkpoint(
-                    cx,
-                    "search",
-                    self.config.query_fuel_budget,
-                    work_upper_bound,
-                )
-            },
-            |profile| {
-                self.profile_query_checkpoint(
-                    cx,
-                    "search",
-                    self.config.query_fuel_budget,
-                    work_upper_bound,
-                    profile,
-                )
-            },
-        );
-        #[cfg(not(feature = "profile-internals"))]
-        let concrete_checkpoint = self.query_checkpoint(
-            cx,
-            "search",
-            self.config.query_fuel_budget,
-            work_upper_bound,
-        );
-        let metering = concrete_checkpoint.metering();
+        let (checkpoint, metering) = if let Some(checkpoint) = supplied_checkpoint {
+            let metering = supplied_checkpoint_metering.ok_or_else(|| {
+                invalid_state("supplied ranked-query checkpoint has no metering disposition")
+            })?;
+            (Arc::clone(checkpoint), metering)
+        } else {
+            #[cfg(feature = "profile-internals")]
+            let concrete_checkpoint = profile.map_or_else(
+                || {
+                    self.query_checkpoint(
+                        cx,
+                        "search",
+                        self.config.query_fuel_budget,
+                        work_upper_bound,
+                    )
+                },
+                |profile| {
+                    self.profile_query_checkpoint(
+                        cx,
+                        "search",
+                        self.config.query_fuel_budget,
+                        work_upper_bound,
+                        profile,
+                    )
+                },
+            );
+            #[cfg(not(feature = "profile-internals"))]
+            let concrete_checkpoint = self.query_checkpoint(
+                cx,
+                "search",
+                self.config.query_fuel_budget,
+                work_upper_bound,
+            );
+            let metering = concrete_checkpoint.metering();
+            let checkpoint: QueryCheckpointHandle<'_> = concrete_checkpoint;
+            (checkpoint, metering)
+        };
         #[cfg(feature = "profile-internals")]
         if let Some(profile) = profile {
             profile.bind_work_plan(work_upper_bound, metering)?;
         }
-        let checkpoint: QueryCheckpointHandle<'_> = concrete_checkpoint;
         let keeper = snapshot.keeper_snapshot();
         let segment_count = keeper
             .segments()
@@ -8975,11 +9027,46 @@ impl QuillReader {
         if query_type == QueryExplanation::Empty {
             return Ok(Vec::new());
         }
+        check_cancel(cx, "search")?;
         let snapshot = self.published_snapshot.load();
-        let search = self.search_paginated_on(cx, query, limit, 0, false, snapshot.as_ref())?;
         let mut parsed = self.default_parser()?.parse_lenient(query);
         let _canonicalization = canonicalize_query(&mut parsed.query);
+        let rank_work_upper_bound = query_work_upper_bound(
+            &parsed.query,
+            snapshot.as_ref(),
+            self.schema,
+            self.config.glob_expansion_limit,
+        )?;
+        let tail_work_upper_bound = snippet_tail_work_upper_bound(
+            &parsed.query,
+            snapshot.as_ref(),
+            self.config.glob_expansion_limit,
+        )?;
+        let work_upper_bound = rank_work_upper_bound.saturating_add(tail_work_upper_bound);
+        let concrete_checkpoint = self.query_checkpoint(
+            cx,
+            "search",
+            self.config.query_fuel_budget,
+            work_upper_bound,
+        );
+        let checkpoint_metering = concrete_checkpoint.metering();
+        let checkpoint: QueryCheckpointHandle<'_> = concrete_checkpoint;
+        let search = self.search_paginated_on_with_checkpoint(
+            cx,
+            query,
+            limit,
+            0,
+            false,
+            snapshot.as_ref(),
+            &checkpoint,
+            checkpoint_metering,
+        )?;
+        #[cfg(feature = "conformance-internals")]
+        self.conformance_controller
+            .checkpoint(ConformanceCancellationStage::SnippetTailAdmission, cx);
+        checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
         let terms = compiled_snippet_terms(
+            &checkpoint,
             &parsed.query,
             snapshot.as_ref(),
             self.schema,
@@ -10565,6 +10652,139 @@ const fn sealed_segment_fanout(segment_count: usize, total_sealed_docs: u64) -> 
     segment_count >= 2
         && (total_sealed_docs >= SEGMENT_FANOUT_THRESHOLD
             || segment_count >= SEGMENT_COUNT_FANOUT_THRESHOLD)
+}
+
+#[derive(Default)]
+struct SnippetTailWorkShape {
+    wildcard_glob_scans: u64,
+    exact_glob_scans: u64,
+    term_count_ceiling: u64,
+}
+
+impl SnippetTailWorkShape {
+    fn add_term_count(&mut self, count: usize) {
+        self.term_count_ceiling = self
+            .term_count_ceiling
+            .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+    }
+
+    fn add_glob(&mut self, pattern: &[u8], expansion_limit: usize) {
+        if pattern.contains(&b'*') {
+            self.add_wildcard_glob(expansion_limit);
+        } else {
+            self.exact_glob_scans = self.exact_glob_scans.saturating_add(1);
+            self.add_term_count(expansion_limit);
+        }
+    }
+
+    fn add_wildcard_glob(&mut self, expansion_limit: usize) {
+        self.wildcard_glob_scans = self.wildcard_glob_scans.saturating_add(1);
+        self.add_term_count(expansion_limit);
+    }
+
+    fn visit(&mut self, query: &Query, expansion_limit: usize) {
+        match query {
+            Query::Term { fields, .. }
+                if fields.iter().any(|field| field.field_id == CONTENT_FIELD) =>
+            {
+                self.add_term_count(1);
+            }
+            Query::Phrase {
+                fields,
+                terms,
+                prefix,
+                ..
+            } if fields.iter().any(|field| field.field_id == CONTENT_FIELD) => {
+                if *prefix && !terms.is_empty() {
+                    self.add_term_count(terms.len().saturating_sub(1));
+                    self.add_wildcard_glob(expansion_limit);
+                } else {
+                    self.add_term_count(terms.len());
+                }
+            }
+            Query::Boolean { clauses, .. } => {
+                for clause in clauses
+                    .iter()
+                    .filter(|clause| clause.occur != Occur::MustNot)
+                {
+                    self.visit(&clause.query, expansion_limit);
+                }
+            }
+            Query::Set { field_id, values } if *field_id == CONTENT_FIELD => {
+                self.add_term_count(
+                    values
+                        .iter()
+                        .filter(|value| matches!(value, QueryValue::Str(_)))
+                        .count(),
+                );
+            }
+            Query::Glob { field_ids, pattern } if field_ids.contains(&CONTENT_FIELD) => {
+                self.add_glob(pattern.as_bytes(), expansion_limit);
+            }
+            Query::Boost { query, .. } => self.visit(query, expansion_limit),
+            Query::Empty
+            | Query::All
+            | Query::Term { .. }
+            | Query::Phrase { .. }
+            | Query::Range { .. }
+            | Query::Set { .. }
+            | Query::Glob { .. } => {}
+        }
+    }
+}
+
+fn snippet_tail_work_upper_bound(
+    query: &Query,
+    snapshot: &QuillSearchSnapshot,
+    expansion_limit: usize,
+) -> Result<u64, QuillIndexError> {
+    let mut shape = SnippetTailWorkShape::default();
+    shape.visit(query, expansion_limit);
+
+    let keeper = snapshot.keeper_snapshot();
+    let keeper_segment_count = u64::try_from(keeper.segments().len()).unwrap_or(u64::MAX);
+    let mut wildcard_dictionary_blocks = 0_u64;
+    let mut delta_dictionary_blocks = 0_u64;
+    for segment in keeper.segments() {
+        let bytes = required_section(segment, SectionKind::TERMDICT)?;
+        let count_bytes = bytes
+            .get(..4)
+            .ok_or_else(|| invalid_state("TERMDICT is shorter than its block-count header"))?;
+        let block_count = u32::from_le_bytes([
+            count_bytes[0],
+            count_bytes[1],
+            count_bytes[2],
+            count_bytes[3],
+        ]);
+        wildcard_dictionary_blocks =
+            wildcard_dictionary_blocks.saturating_add(u64::from(block_count));
+    }
+    for delta in snapshot.delta_snapshots() {
+        let term_count = u64::try_from(delta.segment().term_count()).unwrap_or(u64::MAX);
+        delta_dictionary_blocks = delta_dictionary_blocks.saturating_add(term_count.div_ceil(16));
+    }
+
+    // `snapshot_glob_terms` visits one indexed block per wildcard cursor
+    // block. Exact globs use one indexed lookup per Keeper segment, while
+    // both forms walk Delta's sorted terms in 16-term blocks. This derives the
+    // bound from immutable dictionary headers instead of scanning the tail
+    // before its checkpoint can admit the real work.
+    let wildcard_glob_work = shape
+        .wildcard_glob_scans
+        .saturating_mul(wildcard_dictionary_blocks.saturating_add(delta_dictionary_blocks));
+    let exact_glob_work = shape
+        .exact_glob_scans
+        .saturating_mul(keeper_segment_count.saturating_add(delta_dictionary_blocks));
+    // `checkpointed_snapshot_doc_freq` does exactly one admitted Keeper
+    // dictionary lookup for every compiled term; Delta frequencies are frozen
+    // O(1) lookups and therefore have no separate fuel unit.
+    let document_frequency_work = shape
+        .term_count_ceiling
+        .saturating_mul(keeper_segment_count);
+
+    Ok(wildcard_glob_work
+        .saturating_add(exact_glob_work)
+        .saturating_add(document_frequency_work))
 }
 
 fn query_work_upper_bound(
@@ -12722,17 +12942,26 @@ fn snapshot_glob_terms(
 }
 
 fn compiled_snippet_terms(
+    checkpoint: &QueryCheckpointHandle<'_>,
     query: &Query,
     snapshot: &QuillSearchSnapshot,
     schema: SchemaDescriptor,
     expansion_limit: usize,
 ) -> Result<Vec<SnippetTerm>, QuillIndexError> {
     let mut terms = BTreeSet::<Vec<u8>>::new();
-    collect_snippet_term_bytes(query, snapshot, schema, expansion_limit, &mut terms)?;
+    collect_snippet_term_bytes(
+        checkpoint,
+        query,
+        snapshot,
+        schema,
+        expansion_limit,
+        &mut terms,
+    )?;
     terms
         .into_iter()
         .map(|term| {
-            let document_frequency = snapshot.bm25_doc_freq(CONTENT_FIELD, &term)?;
+            let document_frequency =
+                checkpointed_snapshot_doc_freq(checkpoint, snapshot, CONTENT_FIELD, &term)?;
             let text = String::from_utf8(term)
                 .map_err(|_| invalid_state("content term dictionary contains non-UTF-8 bytes"))?;
             Ok(SnippetTerm::new(text, document_frequency))
@@ -12741,6 +12970,7 @@ fn compiled_snippet_terms(
 }
 
 fn collect_snippet_term_bytes(
+    checkpoint: &QueryCheckpointHandle<'_>,
     query: &Query,
     snapshot: &QuillSearchSnapshot,
     schema: SchemaDescriptor,
@@ -12764,7 +12994,7 @@ fn collect_snippet_term_bytes(
                 if prefix_index == Some(index) {
                     let pattern = format!("{}*", term.text);
                     terms.extend(snapshot_glob_terms(
-                        None,
+                        Some(checkpoint),
                         snapshot,
                         schema,
                         CONTENT_FIELD,
@@ -12782,6 +13012,7 @@ fn collect_snippet_term_bytes(
                 .filter(|clause| clause.occur != Occur::MustNot)
             {
                 collect_snippet_term_bytes(
+                    checkpoint,
                     &clause.query,
                     snapshot,
                     schema,
@@ -12798,7 +13029,7 @@ fn collect_snippet_term_bytes(
         }
         Query::Glob { field_ids, pattern } if field_ids.contains(&CONTENT_FIELD) => {
             terms.extend(snapshot_glob_terms(
-                None,
+                Some(checkpoint),
                 snapshot,
                 schema,
                 CONTENT_FIELD,
@@ -12807,7 +13038,14 @@ fn collect_snippet_term_bytes(
             )?);
         }
         Query::Boost { query, .. } => {
-            collect_snippet_term_bytes(query, snapshot, schema, expansion_limit, terms)?;
+            collect_snippet_term_bytes(
+                checkpoint,
+                query,
+                snapshot,
+                schema,
+                expansion_limit,
+                terms,
+            )?;
         }
         Query::Empty
         | Query::All
@@ -14747,6 +14985,106 @@ mod tests {
             *posting_blocks,
             *position_docs,
         )
+    }
+
+    #[cfg(feature = "conformance-internals")]
+    #[test]
+    fn public_snippet_search_cancels_at_the_post_ranking_tail_boundary() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config())
+                .expect("create public snippet cancellation index");
+            index
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("snippet-cancel", "alpha alphabet alpine"),
+                )
+                .await
+                .expect("index public snippet cancellation fixture");
+            index
+                .commit(&cx)
+                .await
+                .expect("publish public snippet cancellation fixture");
+
+            let baseline = index
+                .search_with_snippets(&cx, "alpha*", 10, &crate::SnippetConfig::default())
+                .expect("uninterrupted public snippet search");
+            assert_eq!(baseline.len(), 1);
+            assert!(
+                baseline[0]
+                    .snippet
+                    .as_deref()
+                    .is_some_and(|snippet| snippet.contains("<b>alpha</b>")),
+                "the fixture must require the real snippet tail"
+            );
+
+            let controller = index.conformance_cancellation_controller();
+            controller
+                .arm(ConformanceCancellationStage::SnippetTailAdmission, 1)
+                .expect("arm the exact post-ranking snippet-tail checkpoint");
+            let cancelled =
+                index.search_with_snippets(&cx, "alpha*", 10, &crate::SnippetConfig::default());
+            assert!(
+                matches!(cancelled, Err(QuillIndexError::Cancelled { phase }) if phase == "search"),
+                "cancellation at the post-ranking checkpoint must prevent a normal enriched response: {cancelled:?}"
+            );
+            assert_eq!(
+                controller.observed_checkpoints(),
+                1,
+                "the armed checkpoint must be the single post-ranking tail admission"
+            );
+            assert!(
+                controller.fired(),
+                "the real invocation Cx must be cancelled there"
+            );
+            controller.disarm();
+        });
+    }
+
+    #[test]
+    fn public_snippet_search_low_fuel_glob_refuses_before_tail_dictionary_work() {
+        run_with_cx(|cx| async move {
+            let mut index = QuillIndex::in_memory(deterministic_config())
+                .expect("create public low-fuel snippet index");
+            let content = (0..64)
+                .map(|ordinal| format!("tailx{ordinal:03}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            index
+                .index_document(&cx, &IndexableDocument::new("snippet-fuel", content))
+                .await
+                .expect("index adversarial snippet glob fixture");
+            index
+                .commit(&cx)
+                .await
+                .expect("publish adversarial snippet glob fixture");
+
+            let ranked = index
+                .search_paginated(&cx, "content:tailx*", 10, 0, false)
+                .expect("prime the public ranked-search cache");
+            assert_eq!(
+                ranked.hits.len(),
+                1,
+                "the public ranked search must complete first"
+            );
+
+            // The cache hit makes this invocation start exactly at the snippet
+            // tail. A zero budget must therefore refuse the first admitted
+            // dictionary unit rather than returning an unmetered snippet.
+            index.reader.config.query_fuel_budget = 0;
+            let first = index
+                .search_with_snippets(&cx, "content:tailx*", 10, &crate::SnippetConfig::default())
+                .expect_err("public low-fuel glob must not bypass the snippet-tail checkpoint");
+            let second = index
+                .search_with_snippets(&cx, "content:tailx*", 10, &crate::SnippetConfig::default())
+                .expect_err("repeated public low-fuel glob must fail at the same boundary");
+
+            assert_eq!(fuel_diagnostics(&first), fuel_diagnostics(&second));
+            assert_eq!(
+                fuel_diagnostics(&first),
+                (0, 0, 0, 0, 0, 0),
+                "the first tail dictionary admission must refuse before any work is recorded"
+            );
+        });
     }
 
     /// A tombstone-heavy published Delta gets enough query work for every
