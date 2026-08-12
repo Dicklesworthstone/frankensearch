@@ -8117,16 +8117,41 @@ mod tests {
             live_config.qg1_expected_authority.as_ref(),
         )
         .expect("the intact QG-1 lifecycle binding reaches the screen and decision guard");
+        // The guard consumes an already-resolved expectation, so this resolves
+        // exactly as the live screen does: an empty caller set against a live
+        // configuration yields the expectation that configuration's own
+        // producer installed.
+        let live_decision_authority =
+            resolve_qg1_expected_authority_for_live_decision(&[], &live_config);
+        assert_eq!(
+            live_decision_authority,
+            Some(&expected_authority),
+            "a live screen with no caller set resolves to its own producer's expectation"
+        );
         assert!(
             qg1_valid_throughput_experiment(
                 &live_intact_experiment,
-                None,
+                live_decision_authority,
                 &scope,
                 Some(&provenance),
                 500,
                 64_000,
             ),
             "the shared QG-1 screen and decision guard admits live producer-authenticated evidence"
+        );
+        // Caller-level replay negative: the same live object, resolved in the
+        // replay context instead, has no authority at all and must not pass
+        // the guard. The live fallback is scoped to live decisions only.
+        assert!(
+            !qg1_valid_throughput_experiment(
+                &live_intact_experiment,
+                resolve_qg1_expected_authority_for_replay(&[], &live_config),
+                &scope,
+                Some(&provenance),
+                500,
+                64_000,
+            ),
+            "replay resolution must never admit a QG-1 experiment from its own configuration"
         );
         assert!(
             qg1_valid_throughput_experiment(
@@ -8278,10 +8303,13 @@ mod tests {
         let forged_live_experiment =
             estimate_paired_experiment_inner(&cloned_fast_pair, &null, &live_config)
                 .expect("the public receipt fields remain self-consistent after full resealing");
+        // Resolved exactly as the live screen resolves, so the rejection is
+        // the capability mismatch rather than a trivially absent expectation:
+        // the forged rows carry a tag no retained preimage can reproduce.
         assert!(
             !qg1_valid_throughput_experiment(
                 &forged_live_experiment,
-                None,
+                live_decision_authority,
                 &scope,
                 Some(&provenance),
                 500,
