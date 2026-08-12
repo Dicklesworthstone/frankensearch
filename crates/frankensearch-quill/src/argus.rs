@@ -197,7 +197,7 @@ pub enum ArgusError {
         dictionary_blocks: u64,
         /// Posting blocks admitted before exhaustion.
         posting_blocks: u64,
-        /// Candidate documents admitted for position verification.
+        /// Per-document phrase-position verification or snippet enrichment admitted before exhaustion.
         position_docs: u64,
     },
     /// A phrase plan cannot describe an exact positional query.
@@ -295,7 +295,7 @@ pub enum QueryWorkKind {
     DictionaryBlock,
     /// Decoding or entering one posting block.
     PostingBlock,
-    /// Verifying positions for one phrase candidate document.
+    /// Per-document phrase-position verification or snippet enrichment.
     PositionDocument,
 }
 

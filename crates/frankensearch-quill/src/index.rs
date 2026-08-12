@@ -215,7 +215,7 @@ pub enum QuillIndexError {
         dictionary_blocks: u64,
         /// Posting blocks admitted before exhaustion.
         posting_blocks: u64,
-        /// Phrase candidate documents admitted before exhaustion.
+        /// Per-document phrase-position verification or snippet enrichment admitted before exhaustion.
         position_docs: u64,
     },
 }
@@ -12846,6 +12846,7 @@ fn lower_query_with_mode<'a>(
                         snapshot,
                         field.field_id,
                         term.text.as_bytes(),
+                        SnapshotDocFreqDeltaAdmission::Ranking,
                     )?;
                     phrase_terms.push(match leaf {
                         QueryLeaf::Sealed(segment) => {
@@ -13756,22 +13757,16 @@ fn compiled_snippet_terms(
         expansion_limit,
         &mut terms,
     )?;
-    let delta_count = u64::try_from(snapshot.delta_count()).unwrap_or(u64::MAX);
     terms
         .into_iter()
         .map(|term| {
-            // `checkpointed_snapshot_doc_freq` admits one unit per KEEPER
-            // segment and nothing per Delta generation, so this loop could run
-            // `terms x generations` probes with no unit ever charged. The
-            // shared helper is deliberately NOT changed: it is also on the
-            // ranking path (`lower_leaf_term`), whose bound this bead may not
-            // move, so the missing Delta units are admitted here, in the tail
-            // that `snippet_tail_work_upper_bound` actually bounds.
-            if delta_count != 0 {
-                checkpoint.admit(QueryWorkKind::DictionaryBlock, delta_count)?;
-            }
-            let document_frequency =
-                checkpointed_snapshot_doc_freq(checkpoint, snapshot, CONTENT_FIELD, &term)?;
+            let document_frequency = checkpointed_snapshot_doc_freq(
+                checkpoint,
+                snapshot,
+                CONTENT_FIELD,
+                &term,
+                SnapshotDocFreqDeltaAdmission::TailPerGeneration,
+            )?;
             let text = String::from_utf8(term)
                 .map_err(|_| invalid_state("content term dictionary contains non-UTF-8 bytes"))?;
             Ok(SnippetTerm::new(text, document_frequency))
@@ -13896,7 +13891,13 @@ fn lower_leaf_term<'a>(
     checkpoint: &QueryCheckpointHandle<'a>,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     let stats = composite_snapshot_field(snapshot, field_ord)?;
-    let doc_freq = checkpointed_snapshot_doc_freq(checkpoint, snapshot, field_ord, term)?;
+    let doc_freq = checkpointed_snapshot_doc_freq(
+        checkpoint,
+        snapshot,
+        field_ord,
+        term,
+        SnapshotDocFreqDeltaAdmission::Ranking,
+    )?;
     let record_option = term_record_option(schema, field_ord)?;
     match leaf {
         QueryLeaf::Sealed(segment) => {
@@ -13939,11 +13940,20 @@ fn lower_leaf_term<'a>(
     }
 }
 
+#[derive(Clone, Copy)]
+enum SnapshotDocFreqDeltaAdmission {
+    /// Ranking keeps its existing no-Delta-admission behavior.
+    Ranking,
+    /// Snippet-tail doc-frequency probes pay one unit per Delta generation.
+    TailPerGeneration,
+}
+
 fn checkpointed_snapshot_doc_freq(
     checkpoint: &QueryCheckpointHandle<'_>,
     snapshot: &QuillSearchSnapshot,
     field_ord: u16,
     term: &[u8],
+    delta_admission: SnapshotDocFreqDeltaAdmission,
 ) -> Result<u64, QuillIndexError> {
     #[cfg(feature = "profile-internals")]
     checkpoint.record_snapshot_doc_freq();
@@ -13968,9 +13978,15 @@ fn checkpointed_snapshot_doc_freq(
         }
     }
     for delta in snapshot.delta_snapshots() {
-        // `live_doc_freq` is answered from the count taken at freeze, so this
-        // is a lookup rather than a traversal and needs no admission of its
-        // own.
+        if matches!(
+            delta_admission,
+            SnapshotDocFreqDeltaAdmission::TailPerGeneration
+        ) {
+            // The frozen count is O(1), but the tail still crosses one
+            // generation-specific lookup boundary. Admit immediately before
+            // that lookup so cancellation or fuel exhaustion cannot cross it.
+            checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
+        }
         let delta_doc_freq = delta
             .find_term(field_ord, term)
             .map_or(0, |found| found.live_doc_freq());
@@ -16056,6 +16072,97 @@ mod tests {
                 fuel_diagnostics(&enrichment),
                 (2, 2, 0, 2, 0, 0),
                 "both Delta probes must be paid for and the refusal must land on enrichment"
+            );
+        });
+    }
+
+    /// The supported typed glob path must retain a per-generation boundary in
+    /// the snippet tail after ranking has completed.
+    ///
+    /// The two Delta ordered views each consume one unit to expand `alpha*`.
+    /// With one unit remaining, the first document-frequency lookup is
+    /// admitted and the second is refused before its lookup. The parent
+    /// batched both probes, so it refused at two units instead; this exact
+    /// counter distinction is the planted parent-red.
+    #[test]
+    fn delta_only_glob_snippet_tail_admits_each_generation_before_its_lookup() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config())
+                .expect("create Delta-only glob-tail index");
+            let generation = index
+                .snapshot()
+                .expect("fresh durable snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
+            let lease_base = index
+                .snapshot()
+                .expect("fresh durable snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .docid_high_watermark;
+            let first_base = u32::try_from(lease_base).expect("first Delta docid base fits u32");
+            let mut first =
+                DeltaSegment::new(DEFAULT_SCHEMA, lease_base, usize::MAX).expect("first Delta");
+            apply_sealable_delta_document(&mut first, first_base, "glob-tail-first", "alpha", 1);
+            let second_lease_base = first.lease_end();
+            let second_base =
+                u32::try_from(second_lease_base).expect("second Delta docid base fits u32");
+            let mut second = DeltaSegment::new(DEFAULT_SCHEMA, second_lease_base, usize::MAX)
+                .expect("second Delta");
+            apply_sealable_delta_document(&mut second, second_base, "glob-tail-second", "alpha", 1);
+            index
+                .publish_delta_table(vec![
+                    Arc::new(first.freeze(generation)),
+                    Arc::new(second.freeze(generation)),
+                ])
+                .expect("publish two live Delta generations");
+
+            let snapshot = index
+                .search_snapshot()
+                .expect("Delta-only glob-tail snapshot is authoritative");
+            assert_eq!(snapshot.keeper_snapshot().segments().len(), 0);
+            assert_eq!(snapshot.delta_count(), 2);
+            let query = Query::Glob {
+                field_ids: vec![CONTENT_FIELD],
+                pattern: "alpha*".to_owned(),
+            };
+            let ranked = index
+                .execute_ranked_query(&cx, &query, &snapshot, 10, 0, false, Vec::new())
+                .expect("supported typed glob must rank both Delta documents before the tail");
+            assert_eq!(ranked.hits.len(), 2);
+
+            let tail_upper_bound = snippet_tail_work_upper_bound(
+                &query,
+                &snapshot,
+                10,
+                index.reader.config.glob_expansion_limit,
+            )
+            .expect("bound Delta-only glob tail");
+            assert!(tail_upper_bound > 3, "the tail checkpoint must meter");
+            let exhaust_once = || {
+                let checkpoint: QueryCheckpointHandle<'_> =
+                    QueryCheckpoint::new(&cx, "search", 3, tail_upper_bound);
+                checkpoint
+                    .admit(QueryWorkKind::DictionaryBlock, 0)
+                    .expect("enter the exact post-ranking snippet tail");
+                compiled_snippet_terms(
+                    &checkpoint,
+                    &query,
+                    &snapshot,
+                    DEFAULT_SCHEMA,
+                    index.reader.config.glob_expansion_limit,
+                )
+                .expect_err("the second Delta lookup must exhaust the remaining tail fuel")
+            };
+
+            let first = exhaust_once();
+            let second = exhaust_once();
+            assert_eq!(fuel_diagnostics(&second), fuel_diagnostics(&first));
+            assert_eq!(
+                fuel_diagnostics(&first),
+                (3, 3, 0, 3, 0, 0),
+                "two ordered-view admissions plus the first Delta lookup are paid before the next lookup is refused"
             );
         });
     }
