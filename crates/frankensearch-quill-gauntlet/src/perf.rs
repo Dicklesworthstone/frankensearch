@@ -1316,7 +1316,10 @@ impl Qg1TantivyIncumbentScreen {
             }
             if !qg1_valid_throughput_experiment(
                 &pilot.experiment,
-                resolve_qg1_expected_authority(external_qg1_authorities, &pilot.experiment.config),
+                resolve_qg1_expected_authority_for_live_decision(
+                    external_qg1_authorities,
+                    &pilot.experiment.config,
+                ),
                 &expected_scope,
                 None,
                 screen_plan.work_units,
@@ -1585,8 +1588,10 @@ impl Qg1TantivyIncumbentDecision {
         // The decision resolves its own producer from the retained set: the
         // pilots' expectations never authenticate it, and a supplied set that
         // cannot name it must not fall back to its embedded copy.
-        let expected_qg1_authority =
-            resolve_qg1_expected_authority(external_qg1_authorities, &self.estimator_config);
+        let expected_qg1_authority = resolve_qg1_expected_authority_for_live_decision(
+            external_qg1_authorities,
+            &self.estimator_config,
+        );
         let selected_config = selected_candidate.config_sha256.as_str();
         let streams = [
             (
@@ -3841,13 +3846,14 @@ pub(crate) fn select_qg1_expected_authority<'a>(
     }
 }
 
-/// Resolve the expectation one authority-bearing seam must use.
+/// Resolve the expectation a live screen or decision seam must use.
 ///
-/// The embedded live expectation stands in only when the caller supplied no
-/// external set. A supplied set that cannot name this producer resolves to
-/// `None`, which every seam treats as fail-closed: a wrong or duplicated set
-/// must never be rescued by the configuration the artifact carries.
-pub(crate) fn resolve_qg1_expected_authority<'a>(
+/// These seams operate on an in-process object whose configuration still holds
+/// the expectation its own producer installed, so a caller that supplies no
+/// external set is asking to be bound by exactly that. A supplied set that
+/// cannot name this producer resolves to `None`: a wrong or duplicated set is
+/// never rescued by the embedded copy.
+pub(crate) fn resolve_qg1_expected_authority_for_live_decision<'a>(
     authorities: &[&'a Qg1ExpectedAuthority],
     config: &'a PairedEstimatorConfig,
 ) -> Option<&'a Qg1ExpectedAuthority> {
@@ -3855,6 +3861,24 @@ pub(crate) fn resolve_qg1_expected_authority<'a>(
         Qg1AuthoritySelection::Selected(selected) => Some(selected),
         Qg1AuthoritySelection::NoExternalSet => config.qg1_expected_authority.as_ref(),
         Qg1AuthoritySelection::Unresolved => None,
+    }
+}
+
+/// Resolve the expectation an evidence replay or integrity seam must use.
+///
+/// Replay authenticates an artifact against something retained outside it, so
+/// the embedded expectation never stands in — not even when the caller
+/// supplies no set at all. Only an externally supplied expectation that names
+/// this producer exactly once can authenticate QG-1 evidence here; every other
+/// outcome is `None`, which those seams treat as fail-closed. This is what
+/// keeps a live cell from authenticating itself through its own configuration.
+pub(crate) fn resolve_qg1_expected_authority_for_replay<'a>(
+    authorities: &[&'a Qg1ExpectedAuthority],
+    config: &PairedEstimatorConfig,
+) -> Option<&'a Qg1ExpectedAuthority> {
+    match select_qg1_expected_authority(authorities, config) {
+        Qg1AuthoritySelection::Selected(selected) => Some(selected),
+        Qg1AuthoritySelection::NoExternalSet | Qg1AuthoritySelection::Unresolved => None,
     }
 }
 
@@ -4990,7 +5014,8 @@ impl PairedExperimentResult {
     ///
     /// The caller resolves which expectation applies — including whether the
     /// configuration's embedded one may stand in — through
-    /// [`resolve_qg1_expected_authority`], so this uses exactly what it was
+    /// [`resolve_qg1_expected_authority_for_replay`] or its live-decision
+    /// sibling, so this uses exactly what it was
     /// given. Canonical QG-1 evidence with `None` is refused by the
     /// authority-bearing estimator, never silently admitted.
     fn recomputes_against_qg1_authority(
@@ -8755,24 +8780,47 @@ mod tests {
             "a duplicated expectation cannot name a single producer"
         );
 
+        // Live screen and decision context: an absent set means "bind me to my
+        // own producer", so the embedded expectation stands in.
         assert_eq!(
-            resolve_qg1_expected_authority(&[], &config),
+            resolve_qg1_expected_authority_for_live_decision(&[], &config),
             Some(&expected),
             "an absent set falls back to the expectation the live producer installed"
         );
         assert_eq!(
-            resolve_qg1_expected_authority(&[&expected], &config),
+            resolve_qg1_expected_authority_for_live_decision(&[&expected], &config),
             Some(&expected)
         );
         assert_eq!(
-            resolve_qg1_expected_authority(&[&foreign_expected], &config),
+            resolve_qg1_expected_authority_for_live_decision(&[&foreign_expected], &config),
             None,
             "a supplied wrong set must never be rescued by the embedded expectation"
         );
         assert_eq!(
-            resolve_qg1_expected_authority(&[&expected, &expected], &config),
+            resolve_qg1_expected_authority_for_live_decision(&[&expected, &expected], &config),
             None,
             "a supplied duplicate set must never be rescued by the embedded expectation"
+        );
+
+        // Replay and integrity context: the embedded expectation never
+        // authenticates, so an absent set is no authority at all.
+        assert_eq!(
+            resolve_qg1_expected_authority_for_replay(&[], &config),
+            None,
+            "replay must not let a QG-1 cell authenticate itself from its own configuration"
+        );
+        assert_eq!(
+            resolve_qg1_expected_authority_for_replay(&[&expected], &config),
+            Some(&expected),
+            "only an externally retained expectation authenticates replayed QG-1 evidence"
+        );
+        assert_eq!(
+            resolve_qg1_expected_authority_for_replay(&[&foreign_expected], &config),
+            None
+        );
+        assert_eq!(
+            resolve_qg1_expected_authority_for_replay(&[&expected, &expected], &config),
+            None
         );
     }
 

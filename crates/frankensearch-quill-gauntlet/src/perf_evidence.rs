@@ -36,7 +36,7 @@ use crate::perf::{
     PerfExecutionProvenance, PerfGate, PerfGateArtifact, PerfInputIdentity, PerfMatrixSpec,
     PerfRawSample, PerfSampleArm, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg1ExpectedAuthority,
     median_sorted, parse_cpu_list_ids, percentile, perf_metric_unit, perf_operation_scope,
-    resolve_qg1_expected_authority, splitmix64, validate_paired_blocks,
+    resolve_qg1_expected_authority_for_replay, splitmix64, validate_paired_blocks,
 };
 use crate::qg6_prepared::{
     Qg6ArmRole, Qg6QueryIdentityReceipt, Qg6QuerySpec, Qg6SemanticContract,
@@ -1671,11 +1671,15 @@ impl EvidenceCell {
                 treatment_arm_null,
                 ..
             } => {
-                // A supplied set that cannot name this cell's producer resolves
-                // to nothing: only a caller that supplied no set at all may be
-                // bound by the expectation the configuration still carries.
-                let expected =
-                    resolve_qg1_expected_authority(external_qg1_authorities, &paired.config);
+                // Replay context: only an externally retained expectation that
+                // names this cell's producer can authenticate it. An empty set
+                // is not permission to fall back to the expectation a live
+                // configuration still carries — that would let a QG-1 cell
+                // authenticate itself, which is the whole defect this guards.
+                let expected = resolve_qg1_expected_authority_for_replay(
+                    external_qg1_authorities,
+                    &paired.config,
+                );
                 let mut rebuilt =
                     Self::evaluate(self.spec.clone(), paired.as_ref().clone(), policy)?;
                 // QG-6 semantic bindings are cell-level evidence. Validate
