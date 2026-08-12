@@ -59,7 +59,7 @@ use crate::argus::{
     DeltaPostingCursor, DocSetCollector, FieldNormReader, MAX_SCORE_MAX_CLAUSES, PhraseScorer,
     PhraseTerm, PositionsHandle, PositionsReader, PostingCursor, PruningTelemetry,
     QueryWorkCheckpoint, QueryWorkKind, ReferenceScorer, ScorerClause, SealedPostingCursor,
-    TermRecordOption, TermScorer, TopDocsCollector,
+    TermRecordOption, TermScorer, TopDocsCollector, ValidatedArrivalCursor,
 };
 #[cfg(feature = "pruning-conformance")]
 use crate::argus::{
@@ -13627,9 +13627,14 @@ fn lower_leaf_term<'a>(
             )?;
             #[cfg(feature = "profile-internals")]
             checkpoint.record_term_dictionary_view();
+            // The sealed leaf is the one path whose cursor type the crate knows
+            // concretely, so it is the one that can carry arrival reads: the
+            // scorer advances, scores and probes a single value it owns. Delta
+            // and every custom cursor stay opaque below, which keeps their
+            // pruned windows on the exact walk.
             let cursor =
-                CheckpointPostingCursor::new(cursor, clone_query_checkpoint_for_argus(checkpoint))?;
-            build_term_scorer(cursor, fieldnorms, stats, doc_freq, record_option, boost)
+                ValidatedArrivalCursor::new(cursor, clone_query_checkpoint_for_argus(checkpoint));
+            build_validated_term_scorer(cursor, fieldnorms, stats, doc_freq, record_option, boost)
         }
         QueryLeaf::Delta(delta) => {
             // The construction pull can walk a tombstoned prefix, so it is
@@ -13826,6 +13831,32 @@ where
     F: FieldNormReader + 'a,
 {
     Ok(ReferenceScorer::term(TermScorer::new(
+        cursor,
+        fieldnorms,
+        Bm25FieldSnapshot::new(stats)?,
+        snapshot_doc_freq,
+        record_option,
+        boost,
+    )?))
+}
+
+/// [`build_term_scorer`] for the one cursor the crate builds concretely.
+///
+/// This is not generic, and that is the point: the validated arm is reachable
+/// only by handing over a [`ValidatedArrivalCursor`] by value, so no wrapper can
+/// route itself here.
+fn build_validated_term_scorer<'a, F>(
+    cursor: ValidatedArrivalCursor<'a>,
+    fieldnorms: F,
+    stats: SnapshotFieldStats,
+    snapshot_doc_freq: u64,
+    record_option: TermRecordOption,
+    boost: f32,
+) -> Result<ReferenceScorer<'a>, QuillIndexError>
+where
+    F: FieldNormReader + 'a,
+{
+    Ok(ReferenceScorer::term(TermScorer::new_validated(
         cursor,
         fieldnorms,
         Bm25FieldSnapshot::new(stats)?,
@@ -22792,6 +22823,88 @@ mod tests {
             "Delta Basic postings score document presence, not retained raw frequency"
         );
         assert_eq!(scorer.next().expect("exhaust Basic Delta scorer"), None);
+    }
+
+    /// The shipping sealed lowering must put a ranked term on the validated
+    /// arrival path, and the Delta lowering must not
+    /// (`bd-quill-pruned-topdocs-term-order-9wu3p`).
+    ///
+    /// This is the link a fixture inside `argus` cannot supply for itself. The
+    /// seeking fill is only reachable from [`TermCursor::Validated`], and that
+    /// arm is only reachable by handing `TermScorer::new_validated` a concrete
+    /// `ValidatedArrivalCursor`. Whether *shipping* does that is a property of
+    /// `lower_leaf_term`, so this drives that function directly rather than a
+    /// scorer assembled by a test helper: without it the whole capability could
+    /// be green in unit tests and dead in production.
+    ///
+    /// The Delta half is what keeps the claim honest. Delta has no block-skip
+    /// structure and cannot answer arrival reads, so it must stay opaque; an
+    /// assertion that only checked the sealed side would pass just as well if
+    /// every leaf had been wired to the validated arm.
+    #[test]
+    fn shipping_sealed_lowering_reaches_the_validated_arrival_path() {
+        run_with_cx(|cx| async move {
+            let sealed = QuillIndex::in_memory(deterministic_config()).expect("sealed index");
+            sealed
+                .index_documents(
+                    &cx,
+                    &[
+                        IndexableDocument::new("one", "alpha"),
+                        IndexableDocument::new("three", "alpha alpha alpha"),
+                        IndexableDocument::new("two", "alpha alpha"),
+                    ],
+                )
+                .await
+                .expect("accumulate sealed corpus");
+            sealed.commit(&cx).await.expect("seal corpus");
+            let snapshot = sealed.snapshot().expect("sealed snapshot is authoritative");
+            let checkpoint =
+                sealed.query_checkpoint(&cx, "arrival_path_lowering", u64::MAX, u64::MAX);
+
+            let sealed_scorer = lower_leaf_term(
+                QueryLeaf::Sealed(&snapshot.segments()[0]),
+                &snapshot,
+                DEFAULT_SCHEMA,
+                CONTENT_FIELD,
+                b"alpha",
+                1.0,
+                true,
+                &checkpoint,
+            )
+            .expect("shipping sealed lowering");
+            assert!(
+                sealed_scorer.arrival_path_is_validated(),
+                "the shipping sealed lowering must reach the validated arrival path, \
+                 or the seeking fill is unreachable in production"
+            );
+
+            let keeper = Arc::new(
+                KeeperSnapshot::in_memory(DEFAULT_SCHEMA).expect("genesis Keeper snapshot"),
+            );
+            let generation = keeper.loaded_manifest().manifest.generation;
+            let mut delta = DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("Delta shard");
+            apply_alpha_delta(&mut delta, 0, "one", 1);
+            let frozen = Arc::new(delta.freeze(generation));
+            let composite = QuillSearchSnapshot::compose(0, keeper, vec![Arc::clone(&frozen)])
+                .expect("composite snapshot");
+            let delta_checkpoint =
+                sealed.query_checkpoint(&cx, "arrival_path_lowering_delta", u64::MAX, u64::MAX);
+            let delta_scorer = lower_leaf_term(
+                QueryLeaf::Delta(&frozen),
+                &composite,
+                DEFAULT_SCHEMA,
+                CONTENT_FIELD,
+                b"alpha",
+                1.0,
+                true,
+                &delta_checkpoint,
+            )
+            .expect("shipping Delta lowering");
+            assert!(
+                !delta_scorer.arrival_path_is_validated(),
+                "Delta cannot answer arrival reads and must stay on the opaque path"
+            );
+        });
     }
 
     #[test]
