@@ -377,18 +377,62 @@ pub trait QueryWorkCheckpoint: Send + Sync {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ValidatedPostMoveContract(());
 
-/// Unforgeable evidence that a cursor answers both arrival accessors —
-/// [`PostingCursor::final_doc`] and [`PostingCursor::doc_before`] — from
-/// validated metadata rather than from a default.
+/// A validated answer to one arrival-predecessor probe.
 ///
-/// The private field prevents custom [`PostingCursor`] implementations from
-/// claiming the capability. It exists as a token rather than a `bool` for the
-/// same reason [`ValidatedPostMoveContract`] does: the consequence of a wrong
-/// claim is silent, not loud. A cursor that answered `final_doc` but defaulted
-/// `doc_before` would let a doc-major union sum in the wrong f32 order without
-/// any error to notice.
+/// This is deliberately *not* a reusable capability token. A detached token
+/// proves nothing about the operation that follows it: a wrapper can delegate
+/// `validated_arrival_metadata()` to an embedded sealed cursor, inherit the
+/// default predecessor read, and hand back a legal-looking "no earlier
+/// posting" for every probe — silently recreating the very reordering this
+/// bead exists to prevent. Proof therefore travels with each *result*.
+///
+/// The private field is the seal. Only this module mints one, so a wrapper
+/// that forwards the operation returns the inner cursor's authenticated answer
+/// and stays correct, while a wrapper that forwards nothing can only return
+/// the default, which is a typed refusal rather than an answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ValidatedArrivalMetadata(());
+pub struct ArrivalPredecessor(ArrivalPredecessorKind);
+
+/// Authenticated outcomes of a predecessor probe.
+///
+/// `BeforeStart` is an *answer*, not an absence: the term genuinely holds no
+/// posting below the probe. Collapsing it into the same `None` a cursor
+/// returns when it cannot answer is what made the defaulted read invisible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArrivalPredecessorKind {
+    BeforeStart,
+    Found(u32),
+}
+
+impl ArrivalPredecessor {
+    /// The greatest document strictly below the probe, or `None` for an
+    /// authenticated "this term starts at or above it".
+    #[must_use]
+    pub const fn doc(self) -> Option<u32> {
+        match self.0 {
+            ArrivalPredecessorKind::BeforeStart => None,
+            ArrivalPredecessorKind::Found(doc) => Some(doc),
+        }
+    }
+}
+
+/// A validated inclusive last document one cursor can still reach.
+///
+/// Sealed for the same reason as [`ArrivalPredecessor`]: a wrapper that could
+/// fabricate this would claim a clause survives a window it actually exhausts
+/// inside, and the seeking fill would then leave an exhausted clause in the
+/// scorer vector — a silently emptied window, not an error. Forwarding the
+/// inner cursor's value is the only thing a wrapper can do with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArrivalReach(u32);
+
+impl ArrivalReach {
+    /// The inclusive last document.
+    #[must_use]
+    pub const fn doc(self) -> u32 {
+        self.0
+    }
+}
 
 /// Forward-only posting access shared by sealed and future delta segments.
 ///
@@ -492,29 +536,12 @@ pub trait PostingCursor {
         None
     }
 
-    /// Unforgeable evidence that this cursor answers *both* arrival accessors
-    /// from validated metadata.
-    ///
-    /// A capability spread across two independently defaulted methods is not a
-    /// capability: a cursor that implements [`Self::final_doc`] and inherits
-    /// the default [`Self::doc_before`] would pass a `final_doc`-shaped gate,
-    /// then report every predecessor as "no earlier posting". A doc-major
-    /// union would read that as every clause having arrived at the beginning
-    /// of time, collapse every equal-document group to its incoming order, and
-    /// sum in the wrong order while raising nothing. The token cannot be minted
-    /// outside this module, so the fail-closed default is the only answer a
-    /// custom implementation can give.
-    fn validated_arrival_metadata(&self) -> Option<ValidatedArrivalMetadata> {
-        None
-    }
-
     /// Inclusive last document this cursor can still reach, read from
     /// validated metadata without moving or decoding.
     ///
-    /// This answers a separate question from
-    /// [`Self::validated_arrival_metadata`] — whether a clause survives a whole
-    /// window — and a caller reconstructing arrival order needs both.
-    fn final_doc(&self) -> Option<u32> {
+    /// The sealed [`ArrivalReach`] is what makes a forwarding wrapper safe and
+    /// a fabricating one impossible; the default is `None`, which fails closed.
+    fn final_doc(&self) -> Option<ArrivalReach> {
         None
     }
 
@@ -522,9 +549,15 @@ pub trait PostingCursor {
     ///
     /// This is the arrival predecessor of a stable doc-major term union: with
     /// equal-document order being decreasing previous posting, it is the only
-    /// thing a seek loses that stepping would have known. Callers gate on
-    /// [`Self::validated_arrival_metadata`], so `Ok(None)` here means the term
-    /// holds no such document — never that the cursor declined to answer.
+    /// thing a seek loses that stepping would have known.
+    ///
+    /// **The default refuses.** It must: a cursor that cannot perform this read
+    /// has no way to say so that is distinguishable from the legitimate answer
+    /// "this term holds nothing below the probe", and a union that mistakes one
+    /// for the other sums in the wrong order in silence. Refusing is also what
+    /// makes the capability unlaunderable — the caller proves a clause can
+    /// answer by *making it answer*, so forwarding a token while defaulting the
+    /// operation fails closed instead of passing.
     ///
     /// This takes `&mut self` although no cursor moves to answer it. A probe
     /// can admit work, an admission can be refused, and a refusal is terminal
@@ -533,10 +566,13 @@ pub trait PostingCursor {
     ///
     /// # Errors
     ///
-    /// Returns a typed error if the cursor cannot preserve its validated
-    /// storage invariants, or the checkpoint's refusal.
-    fn doc_before(&mut self, _target: u32) -> Result<Option<u32>, ArgusError> {
-        Ok(None)
+    /// Returns a typed refusal when the cursor does not implement validated
+    /// arrival reads, a typed error if it cannot preserve its storage
+    /// invariants, or the checkpoint's refusal.
+    fn doc_before(&mut self, _target: u32) -> Result<ArrivalPredecessor, ArgusError> {
+        Err(ArgusError::CursorInvariant(
+            "cursor does not implement validated arrival predecessor reads",
+        ))
     }
 
     /// Blocks [`Self::doc_before`] would decode, determined without decoding.
@@ -675,15 +711,11 @@ where
         (**self).current_block_last_doc()
     }
 
-    fn validated_arrival_metadata(&self) -> Option<ValidatedArrivalMetadata> {
-        (**self).validated_arrival_metadata()
-    }
-
-    fn final_doc(&self) -> Option<u32> {
+    fn final_doc(&self) -> Option<ArrivalReach> {
         (**self).final_doc()
     }
 
-    fn doc_before(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+    fn doc_before(&mut self, target: u32) -> Result<ArrivalPredecessor, ArgusError> {
         (**self).doc_before(target)
     }
 
@@ -1017,11 +1049,7 @@ impl PostingCursor for CheckpointPostingCursor<'_> {
         self.inner.current_block_last_doc()
     }
 
-    fn validated_arrival_metadata(&self) -> Option<ValidatedArrivalMetadata> {
-        self.inner.validated_arrival_metadata()
-    }
-
-    fn final_doc(&self) -> Option<u32> {
+    fn final_doc(&self) -> Option<ArrivalReach> {
         self.inner.final_doc()
     }
 
@@ -1040,7 +1068,7 @@ impl PostingCursor for CheckpointPostingCursor<'_> {
     /// and every move around it still admits at least zero units, so the
     /// cancellation poll keeps its per-move cadence without paying for one
     /// per predecessor read.
-    fn doc_before(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+    fn doc_before(&mut self, target: u32) -> Result<ArrivalPredecessor, ArgusError> {
         self.guard_refused()?;
         let permit = self.inner.block_permit_for_doc_before(target);
         if permit > 0 {
@@ -1322,27 +1350,28 @@ impl PostingCursor for SealedPostingCursor<'_> {
         cursor.block_last_doc()
     }
 
-    /// Only the POSTINGS variant answers both accessors; the POSITIONS variant
-    /// answers neither, so it must not claim the capability.
-    fn validated_arrival_metadata(&self) -> Option<ValidatedArrivalMetadata> {
-        let SealedCursorInner::Docs(_) = &self.inner else {
-            return None;
-        };
-        Some(ValidatedArrivalMetadata(()))
-    }
-
-    fn final_doc(&self) -> Option<u32> {
+    /// Only the POSTINGS variant carries a validated block table; the POSITIONS
+    /// variant cannot answer, and says so by leaving the default in place.
+    fn final_doc(&self) -> Option<ArrivalReach> {
         let SealedCursorInner::Docs(cursor) = &self.inner else {
             return None;
         };
-        cursor.final_doc()
+        cursor.final_doc().map(ArrivalReach)
     }
 
-    fn doc_before(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+    /// This is the one site that mints [`ArrivalPredecessor`], which is what
+    /// makes the capability inseparable from the read: every other
+    /// implementation either forwards this result or refuses.
+    fn doc_before(&mut self, target: u32) -> Result<ArrivalPredecessor, ArgusError> {
         let SealedCursorInner::Docs(cursor) = &self.inner else {
-            return Ok(None);
+            return Err(ArgusError::CursorInvariant(
+                "a POSITIONS-backed sealed cursor has no validated arrival metadata",
+            ));
         };
-        Ok(cursor.doc_before(target)?)
+        Ok(match cursor.doc_before(target)? {
+            Some(doc) => ArrivalPredecessor(ArrivalPredecessorKind::Found(doc)),
+            None => ArrivalPredecessor(ArrivalPredecessorKind::BeforeStart),
+        })
     }
 
     fn block_permit_for_doc_before(&self, target: u32) -> u64 {
@@ -3212,46 +3241,41 @@ impl<'a> ReferenceScorer<'a> {
     }
 
     /// Inclusive last document this scorer can still reach, when its storage
-    /// holds the arrival capability and can answer from validated metadata
-    /// alone.
+    /// can answer from validated metadata alone.
     ///
     /// Only a direct term answers: the doc-major arrival order this feeds is
     /// defined over a term union, and every other node would have to derive a
-    /// reachable bound from children it does not own. The capability token is
-    /// checked *here*, so a cursor that answers only half of the pair reports
-    /// no reachable last document and the caller keeps the exhaustive walk.
+    /// reachable bound from children it does not own.
     fn arrival_final_doc(&self) -> Option<u32> {
         match &self.node {
-            ScorerNode::Term(term) => {
-                term.cursor.validated_arrival_metadata()?;
-                term.cursor.final_doc()
-            }
+            ScorerNode::Term(term) => term.cursor.final_doc().map(ArrivalReach::doc),
             _ => None,
         }
     }
 
-    /// Greatest document this scorer holds strictly below `target`.
+    /// Prove this clause can perform arrival reads by performing one.
     ///
-    /// The capability is re-checked rather than assumed from the caller's
-    /// admission gate. A missing token here cannot be answered with `Ok(None)`:
-    /// that is indistinguishable from "no earlier posting", which is a legal
-    /// answer that silently reorders an equal-document sum. It is a refusal.
+    /// Nothing here is taken on a cursor's word. A probe below every possible
+    /// document is answered `BeforeStart` by any real term, decodes nothing and
+    /// admits nothing, so it is a free way to make a clause demonstrate the
+    /// operation the seeking fill is about to depend on. A cursor that only
+    /// *claims* the capability — by forwarding a metadata accessor while
+    /// inheriting the defaulted read — refuses here, and the caller keeps the
+    /// exhaustive walk.
+    fn arrival_reads_are_validated(&mut self) -> bool {
+        self.arrival_doc_before(0).is_ok()
+    }
+
+    /// Greatest document this scorer holds strictly below `target`.
     ///
     /// # Errors
     ///
-    /// Returns a typed invariant error if the clause cannot supply validated
-    /// arrival metadata, and propagates the cursor's typed storage or
-    /// admission failure.
-    fn arrival_doc_before(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+    /// Returns a typed invariant error if the clause is not a direct term, the
+    /// cursor's refusal when it does not implement validated arrival reads, and
+    /// propagates its typed storage or admission failure.
+    fn arrival_doc_before(&mut self, target: u32) -> Result<ArrivalPredecessor, ArgusError> {
         match &mut self.node {
-            ScorerNode::Term(term) => {
-                if term.cursor.validated_arrival_metadata().is_none() {
-                    return Err(ArgusError::CursorInvariant(
-                        "arrival predecessor read from a clause without validated arrival metadata",
-                    ));
-                }
-                term.cursor.doc_before(target)
-            }
+            ScorerNode::Term(term) => term.cursor.doc_before(target),
             _ => Err(ArgusError::CursorInvariant(
                 "arrival predecessor read from a clause that is not a direct term",
             )),
@@ -5510,18 +5534,26 @@ impl<'a> BufferedUnionScorer<'a> {
     /// Whether every active clause can rebuild this window's arrival order from
     /// validated metadata rather than from steps.
     ///
-    /// Both halves are required and neither is a heuristic. A clause that
-    /// cannot report [`ReferenceScorer::arrival_final_doc`] cannot report a
-    /// predecessor either, and a clause whose last document falls inside this
-    /// horizon will be `swap_remove`d during the fill. `final_doc` is a `u32`,
-    /// so a horizon past `u32::MAX` also fails here, which is what keeps the
-    /// seeking fill's horizon seek in range.
-    fn arrival_order_is_reconstructible(&self, horizon_end: u64) -> bool {
-        self.active.iter().all(|scorer| {
-            scorer
+    /// Three conditions, none of them a claim taken on trust. The clause must
+    /// report a validated reachable last document; that document must lie at or
+    /// beyond this horizon, because a clause exhausting mid-window is
+    /// `swap_remove`d and that permutes the vector by position; and the clause
+    /// must *demonstrate* the predecessor read rather than assert it, which
+    /// [`ReferenceScorer::arrival_reads_are_validated`] does with a free probe.
+    ///
+    /// `ArrivalReach` carries a `u32`, so a horizon past `u32::MAX` fails the
+    /// second condition, which is what keeps the seeking fill's horizon seek in
+    /// range.
+    fn arrival_order_is_reconstructible(&mut self, horizon_end: u64) -> bool {
+        for index in 0..self.active.len() {
+            let reachable = self.active[index]
                 .arrival_final_doc()
-                .is_some_and(|last| u64::from(last) >= horizon_end)
-        })
+                .is_some_and(|last| u64::from(last) >= horizon_end);
+            if !reachable || !self.active[index].arrival_reads_are_validated() {
+                return false;
+            }
+        }
+        true
     }
 
     /// Fill a candidate-restricted doc-major window with seeks, reconstructing
@@ -5692,7 +5724,7 @@ impl<'a> BufferedUnionScorer<'a> {
                 continue;
             }
             for index in run_start..run_end {
-                let earlier = self.active[index].arrival_doc_before(probe)?;
+                let earlier = self.active[index].arrival_doc_before(probe)?.doc();
                 // Termination rests on this: the refinement only ends because
                 // every round moves a probe strictly downward toward the floor.
                 // A cursor that answered with its own probe would spin here
@@ -12371,15 +12403,11 @@ mod tests {
             self.inner.current_block_last_doc()
         }
 
-        fn validated_arrival_metadata(&self) -> Option<ValidatedArrivalMetadata> {
-            self.inner.validated_arrival_metadata()
-        }
-
-        fn final_doc(&self) -> Option<u32> {
+        fn final_doc(&self) -> Option<ArrivalReach> {
             self.inner.final_doc()
         }
 
-        fn doc_before(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+        fn doc_before(&mut self, target: u32) -> Result<ArrivalPredecessor, ArgusError> {
             self.work.probes.set(self.work.probes.get() + 1);
             self.inner.doc_before(target)
         }
@@ -12452,16 +12480,21 @@ mod tests {
         work.iter().map(|counter| counter.steps.get()).sum()
     }
 
-    /// A cursor that claims half the arrival capability: it answers
-    /// [`PostingCursor::final_doc`] from real validated metadata but inherits
-    /// the default [`PostingCursor::doc_before`], and — like any cursor written
-    /// outside this module — cannot mint
-    /// [`ValidatedArrivalMetadata`].
+    /// The capability-laundering wrapper: it embeds a real sealed cursor and
+    /// *delegates every cheap metadata accessor to it*, including
+    /// [`PostingCursor::final_doc`], while inheriting the defaulted
+    /// [`PostingCursor::doc_before`].
     ///
-    /// This is the shape a custom storage adapter naturally grows into: the
-    /// cheap accessor gets implemented, the subtle one does not. Its default
-    /// `doc_before` answers `Ok(None)`, which is a *legal* answer meaning "no
-    /// earlier posting", so nothing about it looks wrong.
+    /// This is the shape that defeats a detached capability token. An earlier
+    /// design admitted the seeking fill on a `validated_arrival_metadata()`
+    /// token; a wrapper like this one forwarded that token from its embedded
+    /// sealed cursor, so the engine saw genuine evidence — and then probed the
+    /// *wrapper*, whose defaulted read answered "no earlier posting" for every
+    /// clause. Every equal-document group collapsed to its incoming order and
+    /// the union summed in scorer-vector order, silently. Proof that travels
+    /// with the result instead of ahead of it is what closes this: the default
+    /// read refuses, so the operation cannot be skipped while the claim
+    /// survives.
     struct PartialArrivalCursor<'a> {
         inner: SealedPostingCursor<'a>,
     }
@@ -12535,9 +12568,11 @@ mod tests {
             self.inner.current_block_last_doc()
         }
 
-        // Deliberately implemented, and deliberately alone: the whole point of
-        // the fixture is that half a capability must not read as a capability.
-        fn final_doc(&self) -> Option<u32> {
+        // Delegated, and deliberately alone. Everything a wrapper can honestly
+        // forward is forwarded; only the operation the union actually depends
+        // on is left to its default. `doc_before` is NOT implemented here, and
+        // that omission is the fixture.
+        fn final_doc(&self) -> Option<ArrivalReach> {
             self.inner.final_doc()
         }
 
@@ -13106,24 +13141,35 @@ mod tests {
         Ok(())
     }
 
-    /// Half an arrival capability must not read as a capability
-    /// (`bd-quill-pruned-topdocs-term-order-9wu3p`, correction slice 1).
+    /// A wrapper that launders a capability it does not implement must fail
+    /// closed (`bd-quill-pruned-topdocs-term-order-9wu3p`).
     ///
-    /// The gate used to be `final_doc().is_some()`, spread across two
-    /// independently defaulted trait methods. A cursor answering only that one
-    /// — the natural half for a custom adapter to implement — passed it, and
-    /// then every predecessor read as the default `Ok(None)`. That is a legal
-    /// answer meaning "no earlier posting", so the refinement settled every key
-    /// on its first round, collapsed every equal-document group to its incoming
-    /// order, and summed in scorer-vector order. Nothing raised.
+    /// Two designs have failed this fixture, in the same way. First the gate
+    /// was `final_doc().is_some()`, spread across two independently defaulted
+    /// methods. Then it was a `validated_arrival_metadata()` token — which a
+    /// wrapper can simply *forward* from an embedded sealed cursor while
+    /// inheriting the defaulted read, so the engine saw genuine evidence and
+    /// then probed the wrapper. Both times the defaulted read answered
+    /// `Ok(None)`: a legal answer meaning "no earlier posting". Every key
+    /// settled on the first refinement round, every equal-document group
+    /// collapsed to its incoming order, and the union summed in scorer-vector
+    /// order with nothing raised.
+    ///
+    /// The lesson both times is that a detached, reusable claim proves nothing
+    /// about the operation that follows it. Proof now travels with each result:
+    /// [`ArrivalPredecessor`] is minted only where the read really happens, its
+    /// `BeforeStart` is an authenticated answer rather than an absence, and the
+    /// default read is a typed refusal. So this wrapper — which forwards every
+    /// accessor it honestly can, including `final_doc` — still cannot make the
+    /// engine seek.
     ///
     /// The fixture is the arrival shape, where scorer-vector order lets the
-    /// huge clause absorb the smalls: a silent gate failure is a wrong f32
-    /// score, not a slow one. With the capability token required, these clauses
-    /// cannot claim it, so every pruned window takes the exact walk and the
-    /// scores stay bit-exact against the exhaustive oracle.
+    /// huge clause absorb the smalls, so a silent gate failure shows up as a
+    /// wrong f32 score rather than a slow query. Every pruned window must take
+    /// the exact walk and the scores must stay bit-exact against the exhaustive
+    /// oracle.
     #[test]
-    fn partial_arrival_capability_cannot_enable_seeking() -> Result<(), Box<dyn std::error::Error>>
+    fn laundered_arrival_capability_cannot_enable_seeking() -> Result<(), Box<dyn std::error::Error>>
     {
         const NUM_DOCS: u32 = 24_097;
         const CUTOFF_DOCS: u32 = 4;
@@ -13187,6 +13233,30 @@ mod tests {
             doc_major.to_bits(),
             huge.to_bits(),
             "the fixture must be able to show a collapsed order or it proves nothing"
+        );
+
+        // Pin the counterexample directly, not just its consequences. The
+        // wrapper must really be laundering — forwarding validated metadata it
+        // did not compute — and must really be defaulting the read. If the
+        // first assertion failed, the gate below would close for a reason
+        // having nothing to do with this attack, and the test would pass
+        // vacuously.
+        let mut launderer = PartialArrivalCursor {
+            inner: SealedPostingCursor::with_block_max(
+                posting_lists[0].cursor()?,
+                Arc::clone(&block_max[0]),
+                posting_lists[0].doc_freq(),
+                NUM_DOCS,
+            ),
+        };
+        assert_eq!(
+            launderer.final_doc().map(ArrivalReach::doc),
+            Some(TAIL_DOC),
+            "the wrapper must forward genuine validated metadata, or it is not laundering"
+        );
+        assert!(
+            launderer.doc_before(MEETING_DOC).is_err(),
+            "a defaulted predecessor read must refuse, never answer 'no earlier posting'"
         );
 
         for limit in [1_usize, 4] {
