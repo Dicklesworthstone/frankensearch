@@ -386,12 +386,24 @@ pub struct ValidatedPostMoveContract(());
 /// posting" for every probe — silently recreating the very reordering this
 /// bead exists to prevent. Proof therefore travels with each *result*.
 ///
-/// The private field is the seal. Only this module mints one, so a wrapper
+/// The private fields are the seal. Only this module mints one, so a wrapper
 /// that forwards the operation returns the inner cursor's authenticated answer
 /// and stays correct, while a wrapper that forwards nothing can only return
 /// the default, which is a typed refusal rather than an answer.
+///
+/// A receipt also names the document it answers. Sealing the *mint* alone left
+/// the result replayable: a wrapper could keep one genuine receipt — a
+/// `BeforeStart` from a probe below every document is the convenient one — and
+/// hand the same `Copy` value back for every later probe, passing every check
+/// while telling the union that no clause ever skipped anything. Binding the
+/// target makes a receipt answer exactly one question, so a replayed one is
+/// refused by [`Self::doc_for`] instead of silently collapsing an
+/// equal-document order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ArrivalPredecessor(ArrivalPredecessorKind);
+pub struct ArrivalPredecessor {
+    target: u32,
+    kind: ArrivalPredecessorKind,
+}
 
 /// Authenticated outcomes of a predecessor probe.
 ///
@@ -405,14 +417,27 @@ enum ArrivalPredecessorKind {
 }
 
 impl ArrivalPredecessor {
-    /// The greatest document strictly below the probe, or `None` for an
+    /// The greatest document strictly below `target`, or `None` for an
     /// authenticated "this term starts at or above it".
-    #[must_use]
-    pub const fn doc(self) -> Option<u32> {
-        match self.0 {
+    ///
+    /// The caller states the document it probed and the receipt must agree.
+    /// This is the check that makes a receipt un-replayable, so it is the only
+    /// way to read one.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed invariant error when the receipt answers a different
+    /// document than the one requested.
+    pub fn doc_for(self, target: u32) -> Result<Option<u32>, ArgusError> {
+        if self.target != target {
+            return Err(ArgusError::CursorInvariant(
+                "arrival predecessor answers a different document than the one probed",
+            ));
+        }
+        Ok(match self.kind {
             ArrivalPredecessorKind::BeforeStart => None,
             ArrivalPredecessorKind::Found(doc) => Some(doc),
-        }
+        })
     }
 }
 
@@ -1074,7 +1099,18 @@ impl PostingCursor for CheckpointPostingCursor<'_> {
         if permit > 0 {
             self.admit_or_refuse(permit)?;
         }
-        self.inner.doc_before(target)
+        // A refusal the inner cursor raises is latched exactly as `next` and
+        // `advance` latch theirs. Refusals do not only come from this wrapper's
+        // own admission: an inner checkpointed cursor can raise one, and
+        // returning it unlatched would let the next move poll and charge a
+        // query that has already been told to stop.
+        match self.inner.doc_before(target) {
+            Ok(predecessor) => Ok(predecessor),
+            Err(error) => {
+                self.refused = RefusedAdmission::capture(&error);
+                Err(error)
+            }
+        }
     }
 
     fn block_permit_for_doc_before(&self, target: u32) -> u64 {
@@ -1368,9 +1404,12 @@ impl PostingCursor for SealedPostingCursor<'_> {
                 "a POSITIONS-backed sealed cursor has no validated arrival metadata",
             ));
         };
-        Ok(match cursor.doc_before(target)? {
-            Some(doc) => ArrivalPredecessor(ArrivalPredecessorKind::Found(doc)),
-            None => ArrivalPredecessor(ArrivalPredecessorKind::BeforeStart),
+        Ok(ArrivalPredecessor {
+            target,
+            kind: match cursor.doc_before(target)? {
+                Some(doc) => ArrivalPredecessorKind::Found(doc),
+                None => ArrivalPredecessorKind::BeforeStart,
+            },
         })
     }
 
@@ -3262,24 +3301,47 @@ impl<'a> ReferenceScorer<'a> {
     /// *claims* the capability — by forwarding a metadata accessor while
     /// inheriting the defaulted read — refuses here, and the caller keeps the
     /// exhaustive walk.
-    fn arrival_reads_are_validated(&mut self) -> bool {
-        self.arrival_doc_before(0).is_ok()
+    ///
+    /// This one answer is never reused as a standing capability: each later
+    /// probe re-proves itself, because its receipt is bound to the document it
+    /// answers. What this decides is only whether to seek or to walk.
+    ///
+    /// # Errors
+    ///
+    /// A cancellation or fuel refusal is *propagated*, never converted into a
+    /// fallback. Those two mean the query must stop; treating them as "this
+    /// cursor cannot answer" would let a cancelled query keep walking its plan
+    /// to completion.
+    fn arrival_reads_are_validated(&mut self) -> Result<bool, ArgusError> {
+        match self.arrival_doc_before(0) {
+            Ok(_) => Ok(true),
+            Err(error) if RefusedAdmission::capture(&error).is_some() => Err(error),
+            Err(_) => Ok(false),
+        }
     }
 
     /// Greatest document this scorer holds strictly below `target`.
     ///
+    /// The receipt is redeemed against the document that was actually probed,
+    /// so a cursor replaying an older answer is refused here rather than
+    /// believed.
+    ///
     /// # Errors
     ///
-    /// Returns a typed invariant error if the clause is not a direct term, the
-    /// cursor's refusal when it does not implement validated arrival reads, and
-    /// propagates its typed storage or admission failure.
-    fn arrival_doc_before(&mut self, target: u32) -> Result<ArrivalPredecessor, ArgusError> {
-        match &mut self.node {
-            ScorerNode::Term(term) => term.cursor.doc_before(target),
-            _ => Err(ArgusError::CursorInvariant(
-                "arrival predecessor read from a clause that is not a direct term",
-            )),
-        }
+    /// Returns a typed invariant error if the clause is not a direct term or
+    /// answers a document other than `target`, the cursor's refusal when it
+    /// does not implement validated arrival reads, and propagates its typed
+    /// storage or admission failure.
+    fn arrival_doc_before(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+        let receipt = match &mut self.node {
+            ScorerNode::Term(term) => term.cursor.doc_before(target)?,
+            _ => {
+                return Err(ArgusError::CursorInvariant(
+                    "arrival predecessor read from a clause that is not a direct term",
+                ));
+            }
+        };
+        receipt.doc_for(target)
     }
 
     /// A pure-term group eligible for grouped `MaxScore`: a union whose active
@@ -5523,7 +5585,7 @@ impl<'a> BufferedUnionScorer<'a> {
         horizon_end: u64,
         candidates: &[u32],
     ) -> Result<(), ArgusError> {
-        if self.arrival_order_is_reconstructible(horizon_end) {
+        if self.arrival_order_is_reconstructible(horizon_end)? {
             return self.fill_tantivy_topdocs_seeking_window(window_start, horizon_end, candidates);
         }
         self.pruning_stats.arrival_walk_windows =
@@ -5544,16 +5606,19 @@ impl<'a> BufferedUnionScorer<'a> {
     /// `ArrivalReach` carries a `u32`, so a horizon past `u32::MAX` fails the
     /// second condition, which is what keeps the seeking fill's horizon seek in
     /// range.
-    fn arrival_order_is_reconstructible(&mut self, horizon_end: u64) -> bool {
+    fn arrival_order_is_reconstructible(&mut self, horizon_end: u64) -> Result<bool, ArgusError> {
         for index in 0..self.active.len() {
             let reachable = self.active[index]
                 .arrival_final_doc()
                 .is_some_and(|last| u64::from(last) >= horizon_end);
-            if !reachable || !self.active[index].arrival_reads_are_validated() {
-                return false;
+            if !reachable {
+                return Ok(false);
+            }
+            if !self.active[index].arrival_reads_are_validated()? {
+                return Ok(false);
             }
         }
-        true
+        Ok(true)
     }
 
     /// Fill a candidate-restricted doc-major window with seeks, reconstructing
@@ -5724,7 +5789,7 @@ impl<'a> BufferedUnionScorer<'a> {
                 continue;
             }
             for index in run_start..run_end {
-                let earlier = self.active[index].arrival_doc_before(probe)?.doc();
+                let earlier = self.active[index].arrival_doc_before(probe)?;
                 // Termination rests on this: the refinement only ends because
                 // every round moves a probe strictly downward toward the floor.
                 // A cursor that answered with its own probe would spin here
@@ -12589,8 +12654,216 @@ mod tests {
         }
     }
 
-    /// [`sealed_topdocs_union`] over cursors that answer only `final_doc`.
-    fn partial_arrival_topdocs_union<'a>(
+    /// The receipt-replaying wrapper: it performs one genuine probe and then
+    /// hands the same answer back for every later one.
+    ///
+    /// Sealing who may *mint* a receipt does not stop this. The wrapper's first
+    /// probe is real, so the value it caches is authentic; `Copy` then lets it
+    /// answer every question with it. A probe below every document is the
+    /// convenient one to cache, because `BeforeStart` tells the union that no
+    /// clause ever skipped anything, which collapses every equal-document group
+    /// to its incoming order. Binding a receipt to the document it answers is
+    /// what turns this from a silent wrong score into a refusal.
+    struct ReplayingArrivalCursor<'a> {
+        inner: SealedPostingCursor<'a>,
+        cached: Option<ArrivalPredecessor>,
+    }
+
+    impl PostingCursor for ReplayingArrivalCursor<'_> {
+        fn doc(&self) -> Option<u32> {
+            self.inner.doc()
+        }
+
+        fn freq(&self) -> Option<u32> {
+            self.inner.freq()
+        }
+
+        fn positions_handle(&self) -> Option<PositionsHandle<'_>> {
+            self.inner.positions_handle()
+        }
+
+        fn size_hint(&self) -> u32 {
+            self.inner.size_hint()
+        }
+
+        fn cost(&self) -> u64 {
+            self.inner.cost()
+        }
+
+        fn segment_num_docs(&self) -> u32 {
+            self.inner.segment_num_docs()
+        }
+
+        fn next(&mut self) -> Result<Option<u32>, ArgusError> {
+            self.inner.next()
+        }
+
+        fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+            self.inner.advance(target)
+        }
+
+        fn validated_post_move_contract(&self) -> Option<ValidatedPostMoveContract> {
+            self.inner.validated_post_move_contract()
+        }
+
+        fn fork_for_pruning(&self) -> Option<Box<dyn PostingCursor + '_>> {
+            self.inner.fork_for_pruning()
+        }
+
+        fn term_score_upper_bound(
+            &self,
+            live_avgdl: f32,
+            weight: f32,
+            record_option: TermRecordOption,
+        ) -> Option<f32> {
+            self.inner
+                .term_score_upper_bound(live_avgdl, weight, record_option)
+        }
+
+        fn supports_block_max(&self) -> bool {
+            self.inner.supports_block_max()
+        }
+
+        fn current_block_score_upper_bound(
+            &self,
+            live_avgdl: f32,
+            weight: f32,
+            record_option: TermRecordOption,
+        ) -> Option<f32> {
+            self.inner
+                .current_block_score_upper_bound(live_avgdl, weight, record_option)
+        }
+
+        fn current_block_last_doc(&self) -> Option<u32> {
+            self.inner.current_block_last_doc()
+        }
+
+        fn final_doc(&self) -> Option<ArrivalReach> {
+            self.inner.final_doc()
+        }
+
+        fn doc_before(&mut self, target: u32) -> Result<ArrivalPredecessor, ArgusError> {
+            if let Some(cached) = self.cached {
+                return Ok(cached);
+            }
+            let genuine = self.inner.doc_before(target)?;
+            self.cached = Some(genuine);
+            Ok(genuine)
+        }
+
+        fn current_work_block(&self) -> Option<u64> {
+            self.inner.current_work_block()
+        }
+
+        fn block_permit_for_next(&self) -> u64 {
+            self.inner.block_permit_for_next()
+        }
+
+        fn block_permit_for_advance(&self, target: u32) -> u64 {
+            self.inner.block_permit_for_advance(target)
+        }
+    }
+
+    /// A cursor whose arrival probe refuses the way a cancelled query does.
+    struct RefusingProbeCursor<'a> {
+        inner: SealedPostingCursor<'a>,
+    }
+
+    impl PostingCursor for RefusingProbeCursor<'_> {
+        fn doc(&self) -> Option<u32> {
+            self.inner.doc()
+        }
+
+        fn freq(&self) -> Option<u32> {
+            self.inner.freq()
+        }
+
+        fn positions_handle(&self) -> Option<PositionsHandle<'_>> {
+            self.inner.positions_handle()
+        }
+
+        fn size_hint(&self) -> u32 {
+            self.inner.size_hint()
+        }
+
+        fn cost(&self) -> u64 {
+            self.inner.cost()
+        }
+
+        fn segment_num_docs(&self) -> u32 {
+            self.inner.segment_num_docs()
+        }
+
+        fn next(&mut self) -> Result<Option<u32>, ArgusError> {
+            self.inner.next()
+        }
+
+        fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+            self.inner.advance(target)
+        }
+
+        fn validated_post_move_contract(&self) -> Option<ValidatedPostMoveContract> {
+            self.inner.validated_post_move_contract()
+        }
+
+        fn fork_for_pruning(&self) -> Option<Box<dyn PostingCursor + '_>> {
+            self.inner.fork_for_pruning()
+        }
+
+        fn term_score_upper_bound(
+            &self,
+            live_avgdl: f32,
+            weight: f32,
+            record_option: TermRecordOption,
+        ) -> Option<f32> {
+            self.inner
+                .term_score_upper_bound(live_avgdl, weight, record_option)
+        }
+
+        fn supports_block_max(&self) -> bool {
+            self.inner.supports_block_max()
+        }
+
+        fn current_block_score_upper_bound(
+            &self,
+            live_avgdl: f32,
+            weight: f32,
+            record_option: TermRecordOption,
+        ) -> Option<f32> {
+            self.inner
+                .current_block_score_upper_bound(live_avgdl, weight, record_option)
+        }
+
+        fn current_block_last_doc(&self) -> Option<u32> {
+            self.inner.current_block_last_doc()
+        }
+
+        fn final_doc(&self) -> Option<ArrivalReach> {
+            self.inner.final_doc()
+        }
+
+        fn doc_before(&mut self, _target: u32) -> Result<ArrivalPredecessor, ArgusError> {
+            Err(ArgusError::QueryCancelled {
+                phase: "arrival_probe_unit_test",
+            })
+        }
+
+        fn current_work_block(&self) -> Option<u64> {
+            self.inner.current_work_block()
+        }
+
+        fn block_permit_for_next(&self) -> u64 {
+            self.inner.block_permit_for_next()
+        }
+
+        fn block_permit_for_advance(&self, target: u32) -> u64 {
+            self.inner.block_permit_for_advance(target)
+        }
+    }
+
+    /// [`sealed_topdocs_union`] whose sealed cursors are each handed to `wrap`,
+    /// so one fixture can be driven through every hostile wrapper.
+    fn wrapped_topdocs_union<'a, C, F>(
         posting_lists: &'a [crate::quiver::PostingList<'_>],
         block_max: &'a [Arc<[BlockMaxEntry]>],
         fieldnorms: DocLenField<'a>,
@@ -12598,7 +12871,12 @@ mod tests {
         snapshot_doc_freq: u64,
         boosts: &[f32],
         segment_num_docs: u32,
-    ) -> Result<ReferenceScorer<'a>, ArgusError> {
+        wrap: F,
+    ) -> Result<ReferenceScorer<'a>, ArgusError>
+    where
+        C: PostingCursor + 'a,
+        F: Fn(SealedPostingCursor<'a>) -> C,
+    {
         let mut clauses = Vec::new();
         for (index, postings) in posting_lists.iter().enumerate() {
             let inner = SealedPostingCursor::with_block_max(
@@ -12609,7 +12887,7 @@ mod tests {
             );
             clauses.push(ScorerClause::should(ReferenceScorer::term(
                 TermScorer::new(
-                    PartialArrivalCursor { inner },
+                    wrap(inner),
                     fieldnorms,
                     snapshot.clone(),
                     snapshot_doc_freq,
@@ -13273,7 +13551,7 @@ mod tests {
             oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
             let oracle_hits = oracle_collector.finish()?.hits;
 
-            let mut partial = partial_arrival_topdocs_union(
+            let mut partial = wrapped_topdocs_union(
                 &posting_lists,
                 &block_max,
                 field,
@@ -13281,6 +13559,7 @@ mod tests {
                 SNAPSHOT_DOC_FREQ,
                 &boosts,
                 NUM_DOCS,
+                |inner| PartialArrivalCursor { inner },
             )?;
             let mut partial_collector = TopDocsCollector::new(limit, 0)?;
             partial_collector.collect(&mut partial, &AllLiveDocs)?;
@@ -13307,6 +13586,135 @@ mod tests {
                 "every pruned window must take the exact walk when the capability is absent"
             );
         }
+
+        // A replayed receipt must be refused, not believed. This wrapper's
+        // first probe is genuine — the engine's own free capability probe,
+        // below every document — so what it caches is authentic; `Copy` then
+        // lets it answer every later question with the same `BeforeStart`.
+        // Sealing the mint does not stop that. Binding the receipt to the
+        // document it answers does, and the refusal is loud: before that
+        // binding this fixture returned a page whose top score was the
+        // collapsed `huge`.
+        let mut replaying = wrapped_topdocs_union(
+            &posting_lists,
+            &block_max,
+            field,
+            &snapshot,
+            SNAPSHOT_DOC_FREQ,
+            &boosts,
+            NUM_DOCS,
+            |inner| ReplayingArrivalCursor {
+                inner,
+                cached: None,
+            },
+        )?;
+        let mut replaying_collector = TopDocsCollector::new(4, 0)?;
+        let replayed = replaying_collector
+            .collect(&mut replaying, &AllLiveDocs)
+            .expect_err("a replayed arrival receipt must be refused");
+        assert!(
+            matches!(
+                replayed,
+                ArgusError::CursorInvariant(
+                    "arrival predecessor answers a different document than the one probed"
+                )
+            ),
+            "expected a target-mismatch refusal, got {replayed:?}"
+        );
+
+        // A cancellation raised by the probe must reach the caller. Treating it
+        // as "this cursor cannot answer" would silently downgrade a cancelled
+        // query to the exhaustive walk and run it to completion.
+        let mut refusing = wrapped_topdocs_union(
+            &posting_lists,
+            &block_max,
+            field,
+            &snapshot,
+            SNAPSHOT_DOC_FREQ,
+            &boosts,
+            NUM_DOCS,
+            |inner| RefusingProbeCursor { inner },
+        )?;
+        let mut refusing_collector = TopDocsCollector::new(4, 0)?;
+        let refused = refusing_collector
+            .collect(&mut refusing, &AllLiveDocs)
+            .expect_err("a refusal from the arrival probe must not become a fallback");
+        assert!(
+            matches!(
+                refused,
+                ArgusError::QueryCancelled {
+                    phase: "arrival_probe_unit_test"
+                }
+            ),
+            "expected the probe's cancellation verbatim, got {refused:?}"
+        );
+        Ok(())
+    }
+
+    /// A refusal the *inner* cursor raises during an arrival probe is latched
+    /// exactly like one raised by a move
+    /// (`bd-quill-pruned-topdocs-term-order-9wu3p`).
+    ///
+    /// The wrapper used to latch only refusals from its own admission, and
+    /// returned an inner cursor's refusal unlatched. The cursor then looked
+    /// healthy: the next move polled the checkpoint and charged fuel against a
+    /// query that had already been told to stop.
+    #[test]
+    fn inner_probe_refusal_is_latched_like_a_move() -> Result<(), Box<dyn std::error::Error>> {
+        let postings = (0..257)
+            .map(|docid| Posting::new(docid, 1))
+            .collect::<Vec<_>>();
+        let encoded = EncodedPostingList::encode(&postings)?;
+        let list = encoded.posting_list()?;
+        let checkpoint = Arc::new(CountingCheckpoint::default());
+        let checkpoint_for_cursor: Arc<dyn QueryWorkCheckpoint> = checkpoint.clone();
+        let segment_num_docs = u32::try_from(postings.len())?;
+        let refusing = RefusingProbeCursor {
+            inner: SealedPostingCursor::new(&list, segment_num_docs)?,
+        };
+        let mut cursor = CheckpointPostingCursor::new(refusing, checkpoint_for_cursor)?;
+
+        let parked = cursor.doc();
+        let refused = cursor
+            .doc_before(64)
+            .expect_err("the inner cursor refuses this probe");
+        assert!(
+            matches!(
+                refused,
+                ArgusError::QueryCancelled {
+                    phase: "arrival_probe_unit_test"
+                }
+            ),
+            "expected the inner refusal verbatim, got {refused:?}"
+        );
+        let admissions_after_refusal = checkpoint
+            .admissions
+            .load(std::sync::atomic::Ordering::SeqCst);
+
+        let moved = cursor
+            .advance(200)
+            .expect_err("a move after a refused probe must repeat the refusal");
+        assert!(
+            matches!(
+                moved,
+                ArgusError::QueryCancelled {
+                    phase: "arrival_probe_unit_test"
+                }
+            ),
+            "expected the latched refusal, got {moved:?}"
+        );
+        assert_eq!(
+            checkpoint
+                .admissions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            admissions_after_refusal,
+            "a cursor refused during a probe must not admit again for a move"
+        );
+        assert_eq!(
+            cursor.doc(),
+            parked,
+            "a refused cursor stays exactly where the refusal found it"
+        );
         Ok(())
     }
 
