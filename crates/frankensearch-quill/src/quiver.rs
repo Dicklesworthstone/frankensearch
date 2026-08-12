@@ -1380,7 +1380,6 @@ impl PostingCursorBlocks<'_> {
 }
 
 /// Lazy posting cursor with block-level `advance` skipping.
-#[derive(Clone)]
 pub struct PostingCursor<'a> {
     bytes: &'a [u8],
     blocks: PostingCursorBlocks<'a>,
@@ -1420,9 +1419,11 @@ pub struct PostingCursor<'a> {
 
 /// The one block retained behind a cursor for backward predecessor reads.
 ///
-/// `Clone` because [`PostingCursor`] is: a pruning fork copies the cursor, and a
-/// fork inheriting the retained block simply starts warm.
-#[derive(Clone)]
+/// Deliberately not `Clone`. Retaining a block is optional and fallible by
+/// policy — the read falls back to decoding when a reservation fails — and a
+/// derived clone would smuggle an infallible `Vec` allocation into every
+/// pruning fork, which is both a cost the policy refuses and a failure the
+/// caller could not handle. [`PostingCursor`] clones cold instead.
 struct BackwardBlock {
     index: usize,
     docs: Vec<u32>,
@@ -1445,6 +1446,32 @@ enum ArrivalPlan {
     Retained { earlier: Option<u32> },
     /// Requires decoding `index`, and is the only plan that costs a block.
     Decode { index: usize, earlier: Option<u32> },
+}
+
+impl Clone for PostingCursor<'_> {
+    /// Clone the cursor cold: position and validated metadata carry over, the
+    /// retained backward block does not.
+    ///
+    /// Every other field is a copy or a shared-handle bump, so this allocates
+    /// nothing. Carrying the retained block would make each clone perform an
+    /// infallible `Vec` clone — the exact allocation the cache's fallible
+    /// `try_reserve_exact` policy exists to avoid, and one a fork could not
+    /// refuse. Dropping it is free of semantic consequence: the cache is
+    /// disposable, so a cold clone answers every backward read identically and
+    /// simply pays one decode to warm itself again if it ever descends.
+    fn clone(&self) -> Self {
+        Self {
+            bytes: self.bytes,
+            blocks: self.blocks.clone(),
+            state: self.state,
+            decoded_docs: self.decoded_docs,
+            decoded_freqs: self.decoded_freqs,
+            decoded_count: self.decoded_count,
+            back: None,
+            #[cfg(test)]
+            decoded_blocks: self.decoded_blocks,
+        }
+    }
 }
 
 impl<'a> PostingCursor<'a> {
@@ -13771,6 +13798,58 @@ mod tests {
             1,
             "a descent through one retained block must decode it exactly once"
         );
+        Ok(())
+    }
+
+    /// Cloning a warm cursor is cold, and answers the same documents.
+    ///
+    /// A pruning fork clones the cursor. If the retained block came with it,
+    /// every fork would perform an infallible `Vec` clone — the allocation the
+    /// cache's fallible reservation policy exists to avoid, and one a fork has
+    /// no way to refuse. Dropping it costs the clone one decode if it ever
+    /// descends, and costs correctness nothing, which is what this pins: the
+    /// clone re-decodes where the original would not, and both answer
+    /// identically.
+    #[test]
+    fn cloning_a_warm_cursor_is_cold_and_answers_identically() -> TestResult {
+        let expected = (0..=300)
+            .map(|doc| Posting::new(doc, 1))
+            .collect::<Vec<_>>();
+        let encoded = EncodedPostingList::encode(&expected)?;
+        let list = encoded.posting_list()?;
+        let mut warm = list.cursor()?;
+        warm.advance(300)?;
+        // Warm the retained block by descending out of the parked one.
+        assert_eq!(warm.doc_before(255)?, Some(254));
+        let warm_decodes = warm.decoded_blocks();
+        // A second probe in the same block is served from the retained copy.
+        assert_eq!(warm.doc_before(254)?, Some(253));
+        assert_eq!(
+            warm.decoded_blocks(),
+            warm_decodes,
+            "the original is warm and must not decode again"
+        );
+
+        let mut cold = warm.clone();
+        assert_eq!(
+            cold.doc(),
+            warm.doc(),
+            "a clone keeps the position it was taken at"
+        );
+        assert_eq!(
+            cold.doc_before(254)?,
+            Some(253),
+            "a cold clone must answer exactly what the warm cursor answered"
+        );
+        assert_eq!(
+            cold.decoded_blocks() - warm_decodes,
+            1,
+            "a cold clone re-decodes the block it did not inherit"
+        );
+        // And having paid once, it is warm in its own right.
+        let rewarmed = cold.decoded_blocks();
+        assert_eq!(cold.doc_before(253)?, Some(252));
+        assert_eq!(cold.decoded_blocks(), rewarmed);
         Ok(())
     }
 
