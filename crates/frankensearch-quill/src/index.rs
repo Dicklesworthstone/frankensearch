@@ -4919,6 +4919,23 @@ impl QuillWriterState {
         Ok(self.backend.proven_authority_snapshot()?)
     }
 
+    /// Reject a successor that cannot be represented by the shared
+    /// reader-visible publication word before mutating an owned Keeper.
+    fn preflight_successor_generation(&self, generation: u64) -> Result<(), QuillIndexError> {
+        PublicationReadState::validate_generation(generation)?;
+        Ok(())
+    }
+
+    /// Apply the packed-generation preflight at the common prepared
+    /// publication boundary shared by seal, scalar, bulk, concat, and delete
+    /// mutation paths.
+    fn preflight_prepared_publication(
+        &self,
+        prepared: &PreparedSealedPublication,
+    ) -> Result<(), QuillIndexError> {
+        self.preflight_successor_generation(prepared.expected_keeper_generation)
+    }
+
     /// Return authority only when Keeper and the published process-local view
     /// name the same generation.
     ///
@@ -5294,6 +5311,13 @@ impl QuillWriterState {
                 memory_owned,
             )
         };
+        self.preflight_prepared_publication(
+            &self
+                .pending_delta_seal
+                .as_ref()
+                .expect("Delta seal completion retains its prepared publication")
+                .prepared,
+        )?;
 
         if let (Some(encoded), IndexBackend::Durable(writer)) = (encoded, &mut self.backend)
             && !segment_installed
@@ -7007,6 +7031,7 @@ impl QuillWriterState {
         let prepared_publication = self
             .published_snapshot
             .prepare_sealed_manifest(self.schema, &manifest)?;
+        self.preflight_prepared_publication(&prepared_publication)?;
         let commit_span = tracing::info_span!(
             target: crate::tracing_conventions::TARGET,
             crate::tracing_conventions::KEEPER_LIFECYCLE,
@@ -7171,6 +7196,7 @@ impl QuillWriterState {
         let prepared = self
             .published_snapshot
             .prepare_sealed_manifest(self.schema, &manifest)?;
+        self.preflight_prepared_publication(&prepared)?;
         check_cancel(cx, "bulk completion publish")?;
         match &mut self.backend {
             IndexBackend::Durable(writer) => {
@@ -7221,6 +7247,7 @@ impl QuillWriterState {
         let prepared_publication = self
             .published_snapshot
             .prepare_equivalent_sealed_successor()?;
+        self.preflight_prepared_publication(&prepared_publication)?;
         match &mut self.backend {
             IndexBackend::Durable(writer) => {
                 writer
@@ -7450,6 +7477,7 @@ impl QuillWriterState {
         let prepared = self
             .published_snapshot
             .prepare_sealed_manifest(self.schema, &manifest)?;
+        self.preflight_prepared_publication(&prepared)?;
         check_cancel(cx, "delete document publish")?;
         match &mut self.backend {
             IndexBackend::Durable(writer) => {
@@ -7486,6 +7514,7 @@ impl QuillWriterState {
         let prepared = self
             .published_snapshot
             .prepare_sealed_manifest(self.schema, &manifest)?;
+        self.preflight_prepared_publication(&prepared)?;
         check_cancel(cx, "delete all publish")?;
         match &mut self.backend {
             IndexBackend::Durable(writer) => {
@@ -8108,6 +8137,9 @@ impl QuillReader {
         keeper: Arc<KeeperSnapshot>,
         prepared: PreparedSealedPublication,
     ) -> Result<Arc<QuillSearchSnapshot>, QuillIndexError> {
+        PublicationReadState::validate_generation(
+            keeper.loaded_manifest().manifest.generation,
+        )?;
         let installed = self
             .published_snapshot
             .install_validated_prepared_sealed(keeper, prepared);
@@ -8123,6 +8155,9 @@ impl QuillReader {
         keeper: Arc<KeeperSnapshot>,
         deltas: Vec<Arc<DeltaSnapshot>>,
     ) -> Result<Arc<QuillSearchSnapshot>, QuillIndexError> {
+        PublicationReadState::validate_generation(
+            keeper.loaded_manifest().manifest.generation,
+        )?;
         let installed = self.published_snapshot.publish_complete(keeper, deltas)?;
         self.publication_read_state
             .stabilize(installed.keeper_generation())?;

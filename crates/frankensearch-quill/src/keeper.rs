@@ -3135,6 +3135,28 @@ impl KeeperSnapshot {
         )
     }
 
+    /// Construct an owned-buffer snapshot at one exact generation for a
+    /// facade-boundary test. Shipping callers always start at genesis and use
+    /// [`Self::next_manifest`] for successors.
+    #[cfg(test)]
+    pub(crate) fn in_memory_with_generation_for_test(
+        schema: SchemaDescriptor,
+        generation: u64,
+    ) -> Result<Self, KeeperError> {
+        let schema_id = schema
+            .schema_id()
+            .map_err(|source| KeeperError::InvalidSchema { source })?;
+        Self::from_parts(
+            None,
+            schema,
+            LoadedManifest {
+                manifest: Manifest::empty(generation, schema_id, 0),
+                source: ManifestSource::InMemory,
+            },
+            Vec::new(),
+        )
+    }
+
     /// Publish owned FSLX segments into one immutable in-memory successor.
     ///
     /// `proposed` must be the exact next MANIFEST generation. Retained
@@ -3798,7 +3820,7 @@ pub(crate) struct PublicationReadState {
 
 impl PublicationReadState {
     const PHASE_BITS: u32 = 2;
-    const MAX_GENERATION: u64 = u64::MAX >> Self::PHASE_BITS;
+    pub(crate) const MAX_GENERATION: u64 = u64::MAX >> Self::PHASE_BITS;
 
     /// Construct the stable initial authority word for an opened snapshot.
     pub(crate) fn new(generation: u64) -> Result<Self, KeeperError> {
@@ -3819,6 +3841,13 @@ impl PublicationReadState {
             });
         }
         Ok((generation << Self::PHASE_BITS) | u64::from(phase as u8))
+    }
+
+    /// Reject a MANIFEST generation that cannot fit in the reader-visible
+    /// packed authority word before a process-local or owned-buffer mutation.
+    pub(crate) fn validate_generation(generation: u64) -> Result<(), KeeperError> {
+        let _ = Self::pack(generation, PublicationAuthorityPhase::Stable)?;
+        Ok(())
     }
 
     /// Load one indivisible generation/phase observation for a lock-free read.
