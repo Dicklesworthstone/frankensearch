@@ -580,6 +580,11 @@ struct ReconciliationState {
     required: bool,
     affected_paths: BTreeSet<PathBuf>,
     epoch: u64,
+    /// Once either lineage counter reaches its representable limit, no older
+    /// token may be treated as current. The watcher cannot safely roll a
+    /// version number over, so it remains fail-closed and reports a typed
+    /// retryable error instead.
+    lineage_exhausted: bool,
     /// What is known about the tree the index describes.
     authority: DeletionAuthorityState,
     /// Operator opt-in permitting the next adjudicating pass to also settle
@@ -753,26 +758,32 @@ impl CatchupEvents {
             return Ok(());
         };
         let mut state = lock_or_recover(&commitment.reconciliation);
-        if state.epoch != commitment.plan.expected_epoch
-            || !state.commit_complete_pass(
-                &commitment.plan,
-                commitment.snapshot,
-                commitment.identities,
-            )
-        {
-            // The sink may already have applied some or all returned events.
-            // Retain those exact paths, rather than a bare full-scan bit, so
-            // a later authority pass can fold their absence into its delete
-            // candidate set.
-            state.require_for_events(&self.events);
-            return Err(SearchError::SubsystemError {
-                subsystem: WATCHER_SUBSYSTEM,
-                source: Box::new(io::Error::other(
-                    "catch-up authority changed while operations were applying",
-                )),
-            });
+        match state.commit_complete_pass(
+            &commitment.plan,
+            commitment.snapshot,
+            commitment.identities,
+        ) {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                // The sink may already have applied some or all returned events.
+                // Retain those exact paths, rather than a bare full-scan bit, so
+                // a later authority pass can fold their absence into its delete
+                // candidate set.
+                state.require_for_events(&self.events)?;
+                Err(SearchError::SubsystemError {
+                    subsystem: WATCHER_SUBSYSTEM,
+                    source: Box::new(io::Error::other(
+                        "catch-up authority changed while operations were applying",
+                    )),
+                })
+            }
+            Err(error) => {
+                // The exhaustion marker itself is already fail-closed, but the
+                // catch-up events still name possible sink mutations.
+                let _ = state.require_for_events(&self.events);
+                Err(error)
+            }
         }
-        Ok(())
     }
 }
 
@@ -798,7 +809,7 @@ impl Drop for CatchupEvents {
             // Preserve the actual batch too: a newly indexed path may vanish
             // before the retry, in which case its delete is owed even when it
             // was not part of the last established authority snapshot.
-            lock_or_recover(&commitment.reconciliation).require_for_events(&self.events);
+            let _ = lock_or_recover(&commitment.reconciliation).require_for_events(&self.events);
         }
     }
 }
@@ -879,21 +890,65 @@ impl RootIdentity {
 type ReconciliationTracker = Arc<Mutex<ReconciliationState>>;
 
 impl ReconciliationState {
-    fn require_for_events(&mut self, events: &[WatchEvent]) {
+    fn lineage_counter_exhausted(&mut self, counter: &'static str) -> SearchError {
+        self.lineage_exhausted = true;
         self.required = true;
-        self.epoch = self.epoch.saturating_add(1);
+        self.unsettled_passes = 0;
+        SearchError::SubsystemError {
+            subsystem: WATCHER_SUBSYSTEM,
+            source: Box::new(io::Error::other(format!(
+                "watcher reconciliation {counter} counter exhausted"
+            ))),
+        }
+    }
+
+    fn ensure_lineage_available(&self) -> SearchResult<()> {
+        if self.lineage_exhausted {
+            return Err(SearchError::SubsystemError {
+                subsystem: WATCHER_SUBSYSTEM,
+                source: Box::new(io::Error::other(
+                    "watcher reconciliation lineage counter exhausted",
+                )),
+            });
+        }
+        Ok(())
+    }
+
+    fn advance_epoch(&mut self) -> SearchResult<()> {
+        self.ensure_lineage_available()?;
+        let Some(next_epoch) = self.epoch.checked_add(1) else {
+            return Err(self.lineage_counter_exhausted("epoch"));
+        };
+        self.epoch = next_epoch;
+        Ok(())
+    }
+
+    fn next_authority_generation(&mut self, previous: Option<u64>) -> SearchResult<u64> {
+        self.ensure_lineage_available()?;
+        let Some(previous) = previous else {
+            return Ok(1);
+        };
+        let Some(next_generation) = previous.checked_add(1) else {
+            return Err(self.lineage_counter_exhausted("authority generation"));
+        };
+        Ok(next_generation)
+    }
+
+    fn require_for_events(&mut self, events: &[WatchEvent]) -> SearchResult<()> {
+        self.required = true;
         // Real work is owed again, so the fail-closed hold below is released:
         // the bound exists to stop a self-perpetuating rescan, not to stop the
         // watcher from reacting to the filesystem.
         self.unsettled_passes = 0;
         self.affected_paths
             .extend(events.iter().map(|event| event.path.clone()));
+        self.advance_epoch()
     }
 
-    fn require_full_scan(&mut self) {
+    fn require_full_scan(&mut self) -> SearchResult<()> {
         self.required = true;
-        self.epoch = self.epoch.saturating_add(1);
         self.unsettled_passes = 0;
+        self.advance_epoch()
     }
 
     /// The authority deletions may be derived against, or `None`.
@@ -918,11 +973,12 @@ impl ReconciliationState {
     }
 
     /// Capture the complete authority lineage before beginning a scan.
-    fn planning_token(&self) -> ReconciliationToken {
-        ReconciliationToken {
+    fn planning_token(&self) -> SearchResult<ReconciliationToken> {
+        self.ensure_lineage_available()?;
+        Ok(ReconciliationToken {
             epoch: self.epoch,
             generation: self.established_generation(),
-        }
+        })
     }
 
     /// Take in names the watcher never observed itself.
@@ -931,9 +987,9 @@ impl ReconciliationState {
     /// are exactly the names no observation can adjudicate: nothing records
     /// which roots they were read through, so their absence today cannot be
     /// distinguished from the roots having been replaced since.
-    fn inherit_legacy(&mut self, snapshot: &FileSnapshot) {
+    fn inherit_legacy(&mut self, snapshot: &FileSnapshot) -> SearchResult<()> {
         if snapshot.is_empty() {
-            return;
+            return Ok(());
         }
         // An operator grant is for the legacy record they could inspect. A
         // later crash-recovery import changes that record, so retaining the
@@ -965,7 +1021,7 @@ impl ReconciliationState {
         // legacy record through an earlier grant. Advancing the epoch makes
         // every plan made before this import fail closed at its acknowledgement
         // point, and leaves a fresh complete pass owed for the merged record.
-        self.require_full_scan();
+        self.require_full_scan()
     }
 
     /// Grant one-shot permission to adjudicate the currently held inherited
@@ -998,23 +1054,23 @@ impl ReconciliationState {
         roots: &[PathBuf],
         completeness: &ScanCompleteness,
         token: ReconciliationToken,
-    ) -> Option<PassPlan> {
+    ) -> SearchResult<Option<PassPlan>> {
         // A mutation that landed during collection is represented by either
         // the authority generation or the reconciliation epoch. Refuse to
         // reason from a scan that predates either change.
-        if self.planning_token() != token {
-            return None;
+        if self.planning_token()? != token {
+            return Ok(None);
         }
         let expected_generation = token.generation;
         let expected_epoch = token.epoch;
         if !completeness.identity_is_trustworthy() {
-            return Some(PassPlan {
+            return Ok(Some(PassPlan {
                 outcome: PassOutcome::Degraded,
                 deletion_baseline: None,
                 adjudicates_legacy: false,
                 expected_generation,
                 expected_epoch,
-            });
+            }));
         }
         let identities = completeness.root_identities();
         let adjudicate = |baseline: &FileSnapshot, legacy: Option<&FileSnapshot>| {
@@ -1031,7 +1087,7 @@ impl ReconciliationState {
                 expected_epoch,
             }
         };
-        Some(match &self.authority {
+        Ok(Some(match &self.authority {
             // Established, and still covering the configured roots.
             DeletionAuthorityState::Established { authority, legacy }
                 if authority.covers(roots) =>
@@ -1061,7 +1117,7 @@ impl ReconciliationState {
                 expected_generation,
                 expected_epoch,
             },
-        })
+        }))
     }
 
     /// Install a planned pass, or refuse it because the lineage moved.
@@ -1075,17 +1131,16 @@ impl ReconciliationState {
         plan: &PassPlan,
         snapshot: FileSnapshot,
         identities: BTreeMap<PathBuf, RootIdentity>,
-    ) -> bool {
+    ) -> SearchResult<bool> {
+        self.ensure_lineage_available()?;
         if self.epoch != plan.expected_epoch
             || self.established_generation() != plan.expected_generation
         {
-            return false;
+            return Ok(false);
         }
-        let generation = plan
-            .expected_generation
-            .map_or(1, |previous| previous.saturating_add(1));
         match plan.outcome {
             PassOutcome::Adjudicated => {
+                let generation = self.next_authority_generation(plan.expected_generation)?;
                 let retained = self.authority.take_legacy();
                 let legacy = if plan.adjudicates_legacy {
                     // Spent: the names were folded into this pass's baseline
@@ -1110,6 +1165,7 @@ impl ReconciliationState {
                 self.unsettled_passes = 0;
             }
             PassOutcome::Probationary => {
+                let generation = self.next_authority_generation(plan.expected_generation)?;
                 // The inherited names, and any authority that just lost
                 // coverage of the configured roots, survive as legacy: this
                 // pass adjudicated neither. The working set is left exactly as
@@ -1138,7 +1194,7 @@ impl ReconciliationState {
                 self.unsettled_passes = 0;
             }
         }
-        true
+        Ok(true)
     }
 
     /// Seed the very first authority from a scan that applies nothing.
@@ -1153,9 +1209,10 @@ impl ReconciliationState {
         &mut self,
         snapshot: FileSnapshot,
         identities: BTreeMap<PathBuf, RootIdentity>,
-    ) -> bool {
+    ) -> SearchResult<bool> {
+        self.ensure_lineage_available()?;
         if !matches!(self.authority, DeletionAuthorityState::Absent) {
-            return false;
+            return Ok(false);
         }
         self.indexed_snapshot = snapshot.clone();
         self.baseline_initialized = true;
@@ -1167,7 +1224,7 @@ impl ReconciliationState {
             },
             legacy: None,
         };
-        true
+        Ok(true)
     }
 
     /// Advance an established authority in place, preserving root continuity.
@@ -1181,16 +1238,26 @@ impl ReconciliationState {
         &mut self,
         snapshot: FileSnapshot,
         identities: &BTreeMap<PathBuf, RootIdentity>,
-    ) -> bool {
-        let DeletionAuthorityState::Established { authority, .. } = &mut self.authority else {
-            return false;
+    ) -> SearchResult<bool> {
+        self.ensure_lineage_available()?;
+        let (previous_generation, roots_match) = match &self.authority {
+            DeletionAuthorityState::Established { authority, .. } => {
+                (authority.generation, authority.observed_through(identities))
+            }
+            DeletionAuthorityState::Absent
+            | DeletionAuthorityState::UnverifiedLegacy { .. }
+            | DeletionAuthorityState::Probationary { .. } => return Ok(false),
         };
-        if !authority.observed_through(identities) {
-            return false;
+        if !roots_match {
+            return Ok(false);
         }
+        let next_generation = self.next_authority_generation(Some(previous_generation))?;
+        let DeletionAuthorityState::Established { authority, .. } = &mut self.authority else {
+            return Ok(false);
+        };
         authority.snapshot = snapshot;
-        authority.generation = authority.generation.saturating_add(1);
-        true
+        authority.generation = next_generation;
+        Ok(true)
     }
 
     /// Detach the inherited names, absorbing an authority that just lost
@@ -1895,17 +1962,17 @@ impl FsWatcher {
         // older observation ineligible to plan or acknowledge authority.
         let token = {
             let mut state = lock_or_recover(&self.reconciliation);
-            state.inherit_legacy(previous);
-            state.planning_token()
+            state.inherit_legacy(previous)?;
+            state.planning_token()?
         };
         let (current, mut completeness) = self.collect_snapshot()?;
         let (baseline, commitment) = {
             let mut state = lock_or_recover(&self.reconciliation);
-            if state.planning_token() != token {
+            if state.planning_token()? != token {
                 // Do not bind the post-scan state to a listing that predates
                 // it. The writer that moved the lineage owns its exact event
                 // debt; this catch-up request adds the conservative rescan.
-                state.require_full_scan();
+                state.require_full_scan()?;
                 return Ok(CatchupEvents {
                     events: Self::diff_snapshots(
                         &FileSnapshot::new(),
@@ -1923,17 +1990,20 @@ impl FsWatcher {
                 completeness.reject_swapped_roots(&authority.root_identities);
             }
             if completeness.is_complete() && completeness.identity_is_trustworthy() {
-                let Some(plan) = state.plan_complete_pass(&self.roots, &completeness, token) else {
-                    state.require_full_scan();
-                    return Ok(CatchupEvents {
-                        events: Self::diff_snapshots(
-                            &FileSnapshot::new(),
-                            &current,
-                            now_millis(),
-                            &completeness,
-                        ),
-                        commitment: None,
-                    });
+                let plan = match state.plan_complete_pass(&self.roots, &completeness, token)? {
+                    Some(plan) => plan,
+                    None => {
+                        state.require_full_scan()?;
+                        return Ok(CatchupEvents {
+                            events: Self::diff_snapshots(
+                                &FileSnapshot::new(),
+                                &current,
+                                now_millis(),
+                                &completeness,
+                            ),
+                            commitment: None,
+                        });
+                    }
                 };
                 let mut baseline = plan.deletion_baseline.clone().unwrap_or_default();
                 if plan.adjudicates() {
@@ -1962,7 +2032,7 @@ impl FsWatcher {
             } else {
                 // Short or unidentifiable: report what was seen, adjudicate
                 // nothing, and leave a complete pass owed.
-                state.require_full_scan();
+                state.require_full_scan()?;
                 (FileSnapshot::new(), None)
             }
         };
@@ -2164,10 +2234,12 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
         // promoted only by a pass that can actually apply the deletes it
         // derives. A restart is not evidence that those files came back.
         if baseline_completeness.is_complete() && baseline_completeness.identity_is_trustworthy() {
-            let seeded = reconciliation
-                .seed_initial_authority(baseline, baseline_completeness.root_identities().clone());
+            let seeded = reconciliation.seed_initial_authority(
+                baseline,
+                baseline_completeness.root_identities().clone(),
+            )?;
             if !seeded {
-                reconciliation.require_full_scan();
+                reconciliation.require_full_scan()?;
             }
         } else {
             // A short startup scan is not deletion authority. Take it as a
@@ -2178,7 +2250,7 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
                 reconciliation.indexed_snapshot = baseline;
                 reconciliation.baseline_initialized = true;
             }
-            reconciliation.require_full_scan();
+            reconciliation.require_full_scan()?;
         }
     }
 
@@ -2231,7 +2303,7 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
             policy.watching_enabled,
             &mut pressure_was_disabled,
             &context.reconciliation,
-        );
+        )?;
         if !policy.watching_enabled {
             let dropped = pending.clear();
             if dropped > 0 {
@@ -2274,7 +2346,7 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
         Some(&mount_table),
     );
     if !final_policy.watching_enabled || pressure_was_disabled {
-        lock_or_recover(&context.reconciliation).require_full_scan();
+        lock_or_recover(&context.reconciliation).require_full_scan()?;
     }
     flush_pending_batches(
         &mut pending,
@@ -2306,13 +2378,14 @@ fn observe_pressure_transition(
     watching_enabled: bool,
     pressure_was_disabled: &mut bool,
     reconciliation: &ReconciliationTracker,
-) {
+) -> SearchResult<()> {
     if !watching_enabled {
         *pressure_was_disabled = true;
     } else if std::mem::take(pressure_was_disabled) {
-        lock_or_recover(reconciliation).require_full_scan();
+        lock_or_recover(reconciliation).require_full_scan()?;
         debug!("pressure relieved; requiring authoritative watcher rescan");
     }
+    Ok(())
 }
 
 struct IngestTaskStopGuard {
@@ -2360,7 +2433,7 @@ impl Drop for PendingBatchLease {
     fn drop(&mut self) {
         if let Some(batch) = self.batch.take() {
             if self.live_apply_started {
-                lock_or_recover(&self.reconciliation).require_for_events(&batch);
+                let _ = lock_or_recover(&self.reconciliation).require_for_events(&batch);
             } else {
                 lock_or_recover(&self.queue).push_front(batch);
             }
@@ -2391,7 +2464,7 @@ impl DirectApplyGuard {
 impl Drop for DirectApplyGuard {
     fn drop(&mut self) {
         if !self.committed {
-            lock_or_recover(&self.reconciliation).require_for_events(&self.events);
+            let _ = lock_or_recover(&self.reconciliation).require_for_events(&self.events);
         }
     }
 }
@@ -2676,7 +2749,7 @@ async fn drain_final_batches(
             return Err(cancelled_ingest_error(cx));
         }
         if lock_or_recover(reconciliation).required {
-            fold_queue_into_reconciliation(ready_batches, reconciliation);
+            fold_queue_into_reconciliation(ready_batches, reconciliation)?;
             return Ok(());
         }
         let Some(mut lease) = PendingBatchLease::acquire(ready_batches, reconciliation) else {
@@ -2699,7 +2772,7 @@ async fn drain_final_batches(
                 // strand those later observations in the ready queue.
                 if stop.is_requested() {
                     drop(lease);
-                    fold_queue_into_reconciliation(ready_batches, reconciliation);
+                    fold_queue_into_reconciliation(ready_batches, reconciliation)?;
                     return Ok(());
                 }
                 match record_successful_events(
@@ -2721,7 +2794,7 @@ async fn drain_final_batches(
                     }
                     Ok(RecordSuccessfulEventsOutcome::Aborted) => {
                         drop(lease);
-                        fold_queue_into_reconciliation(ready_batches, reconciliation);
+                        fold_queue_into_reconciliation(ready_batches, reconciliation)?;
                         if cx.is_cancel_requested() {
                             return Err(cancelled_ingest_error(cx));
                         }
@@ -2733,7 +2806,7 @@ async fn drain_final_batches(
                         // leaves a rescan owed, which is what settles it.
                         drop(lease);
                         if stop.is_requested() {
-                            fold_queue_into_reconciliation(ready_batches, reconciliation);
+                            fold_queue_into_reconciliation(ready_batches, reconciliation)?;
                             return Ok(());
                         }
                         if cx.is_cancel_requested() {
@@ -2758,7 +2831,7 @@ async fn drain_final_batches(
                     // Retrying is unbounded work during a shutdown, and the
                     // dropped lease plus every later ready batch must become
                     // one owed rescan.
-                    fold_queue_into_reconciliation(ready_batches, reconciliation);
+                    fold_queue_into_reconciliation(ready_batches, reconciliation)?;
                     return Ok(());
                 }
                 return Err(error);
@@ -2768,7 +2841,7 @@ async fn drain_final_batches(
 
     // Bound reached: what is still queued becomes the next pass's work rather
     // than work that silently disappeared.
-    fold_queue_into_reconciliation(ready_batches, reconciliation);
+    fold_queue_into_reconciliation(ready_batches, reconciliation)?;
     Ok(())
 }
 
@@ -2777,15 +2850,15 @@ async fn drain_final_batches(
 fn fold_queue_into_reconciliation(
     ready_batches: &ReadyBatchQueue,
     reconciliation: &ReconciliationTracker,
-) {
+) -> SearchResult<()> {
     let queued = {
         let mut queue = lock_or_recover(ready_batches);
         queue.drain(..).flatten().collect::<Vec<_>>()
     };
     if queued.is_empty() {
-        return;
+        return Ok(());
     }
-    lock_or_recover(reconciliation).require_for_events(&queued);
+    lock_or_recover(reconciliation).require_for_events(&queued)
 }
 
 async fn finish_watcher_tasks(
@@ -2839,7 +2912,7 @@ async fn run_authoritative_reconciliation(
     let (token, affected_paths, authority_identities) = {
         let state = lock_or_recover(reconciliation);
         (
-            state.planning_token(),
+            state.planning_token()?,
             state.affected_paths.clone(),
             state
                 .established_authority(roots)
@@ -2913,12 +2986,15 @@ async fn run_authoritative_reconciliation(
     let scan_identities = completeness.root_identities().clone();
     let plan = {
         let mut state = lock_or_recover(reconciliation);
-        let Some(plan) = state.plan_complete_pass(roots, &completeness, token) else {
-            // A mutation succeeded while this walk was in flight. Its owner
-            // retained exact debt; do not attach this older snapshot to the
-            // newer lineage or apply another stale conclusion.
-            state.require_full_scan();
-            return Ok(());
+        let plan = match state.plan_complete_pass(roots, &completeness, token)? {
+            Some(plan) => plan,
+            None => {
+                // A mutation succeeded while this walk was in flight. Its owner
+                // retained exact debt; do not attach this older snapshot to the
+                // newer lineage or apply another stale conclusion.
+                state.require_full_scan()?;
+                return Ok(());
+            }
         };
         plan
     };
@@ -2956,18 +3032,38 @@ async fn run_authoritative_reconciliation(
     // already published would then be counted a second time.
     let mut staged_reindexed = 0_usize;
     let mut staged_skipped = 0_usize;
+    // Once an apply has started, its sink may have accepted a prefix even if
+    // it later reports an error. Retaining the entire planned pass is
+    // conservative but exact enough to recover a path that disappeared after
+    // a successful prefix and before the retry.
+    let mut mutation_started = false;
     for event_batch in events.chunks(batch_size.max(1)) {
         if cx.is_cancel_requested() || abort() {
+            if mutation_started {
+                lock_or_recover(reconciliation).require_for_events(&events)?;
+            }
             return Err(reconciliation_abort_error(cx));
         }
         // The epoch must hold through the apply, not merely at the commit: a
         // concurrent mutation that advanced it means these events describe a
         // filesystem state that is no longer the one being reconciled.
-        let lineage_matches = {
+        let lineage = {
             let state = lock_or_recover(reconciliation);
-            state.planning_token() == token
+            state.planning_token()
+        };
+        let lineage_matches = match lineage {
+            Ok(current) => current == token,
+            Err(error) => {
+                if mutation_started {
+                    let _ = lock_or_recover(reconciliation).require_for_events(&events);
+                }
+                return Err(error);
+            }
         };
         if !lineage_matches {
+            if mutation_started {
+                lock_or_recover(reconciliation).require_for_events(&events)?;
+            }
             return Err(SearchError::SubsystemError {
                 subsystem: "fsfs-watcher",
                 source: Box::new(io::Error::other(
@@ -2980,13 +3076,15 @@ async fn run_authoritative_reconciliation(
             staged_skipped = staged_skipped.saturating_add(prepared.skipped);
             continue;
         }
+        mutation_started = true;
         let reindexed = match ingest.apply_batch(cx, &prepared.ops).await {
             Ok(reindexed) => reindexed,
             Err(error) => {
-                // A sink error can arrive after a partial mutation. Treat the
-                // whole chunk as debt instead of assuming the error means no
-                // operation landed.
-                lock_or_recover(reconciliation).require_for_events(event_batch);
+                // A sink error can arrive after a partial mutation. Once any
+                // apply boundary has been crossed, retain the full pass so a
+                // successful earlier upsert that vanishes before retry still
+                // derives its delete.
+                lock_or_recover(reconciliation).require_for_events(&events)?;
                 return Err(error);
             }
         };
@@ -2998,11 +3096,18 @@ async fn run_authoritative_reconciliation(
             // to the staged publication below.
             let mut state = lock_or_recover(reconciliation);
             if cx.is_cancel_requested() || abort() {
-                state.require_for_events(event_batch);
+                state.require_for_events(&events)?;
                 return Err(reconciliation_abort_error(cx));
             }
-            if state.planning_token() != token {
-                state.require_for_events(event_batch);
+            let lineage_matches = match state.planning_token() {
+                Ok(current) => current == token,
+                Err(error) => {
+                    let _ = state.require_for_events(&events);
+                    return Err(error);
+                }
+            };
+            if !lineage_matches {
+                state.require_for_events(&events)?;
                 return Err(SearchError::SubsystemError {
                     subsystem: "fsfs-watcher",
                     source: Box::new(io::Error::other(
@@ -3023,21 +3128,37 @@ async fn run_authoritative_reconciliation(
         // The last apply may have returned just before this lock. Retain every
         // operation from this pass as debt so no authority or telemetry is
         // published after cancellation.
-        state.require_for_events(&events);
+        state.require_for_events(&events)?;
         return Err(reconciliation_abort_error(cx));
     }
-    if state.planning_token() != token {
+    let lineage_matches = match state.planning_token() {
+        Ok(current) => current == token,
+        Err(error) => {
+            let _ = state.require_for_events(&events);
+            return Err(error);
+        }
+    };
+    if !lineage_matches {
         // The tree moved under this pass. Its operations landed, but its
         // conclusion describes a state that no longer exists, so nothing is
         // installed and nothing is counted — the next pass does both.
-        state.require_for_events(&events);
+        state.require_for_events(&events)?;
         return Ok(());
     }
-    if !state.commit_complete_pass(&plan, current, scan_identities) {
-        // Authority was rebound while this pass was applying. Fail closed: the
-        // conclusion is dropped and a fresh pass is owed.
-        state.require_for_events(&events);
-        return Ok(());
+    match state.commit_complete_pass(&plan, current, scan_identities) {
+        Ok(true) => {}
+        Ok(false) => {
+            // Authority was rebound while this pass was applying. Fail closed: the
+            // conclusion is dropped and a fresh pass is owed.
+            state.require_for_events(&events)?;
+            return Ok(());
+        }
+        Err(error) => {
+            // The typed counter failure leaves the lineage poisoned, but the
+            // operations that already crossed the sink boundary remain debt.
+            let _ = state.require_for_events(&events);
+            return Err(error);
+        }
     }
     drop(state);
     stats.add_reindexed(staged_reindexed);
@@ -3101,9 +3222,10 @@ fn record_successful_events(
     // batch was applied against the one still in force now.
     let (expected_epoch, expected_generation, expected_identities) = {
         let state = lock_or_recover(reconciliation);
+        let token = state.planning_token()?;
         (
-            state.epoch,
-            state.established_generation(),
+            token.epoch,
+            token.generation,
             state.established_identities().cloned(),
         )
     };
@@ -3121,6 +3243,10 @@ fn record_successful_events(
     let mut state = lock_or_recover(reconciliation);
     if commit_abort() {
         return Ok(RecordSuccessfulEventsOutcome::Aborted);
+    }
+    if let Err(error) = state.ensure_lineage_available() {
+        let _ = state.require_for_events(events);
+        return Err(error);
     }
     if !state.baseline_initialized {
         state.indexed_snapshot = current.clone();
@@ -3141,7 +3267,7 @@ fn record_successful_events(
         // cannot advance deletion authority. It still changes the exact set
         // a later pass owes, so it must advance the epoch and retain the
         // batch's paths rather than merely setting a boolean requirement.
-        state.require_for_events(events);
+        state.require_for_events(events)?;
         return Ok(RecordSuccessfulEventsOutcome::Recorded);
     }
     let observed_identities = completeness.root_identities();
@@ -3152,7 +3278,7 @@ fn record_successful_events(
         // swapped root become authority without any pass ever adjudicating it,
         // after which every file of the old root reads as deleted. Fail closed
         // and hand it to a pass that can prove what happened.
-        state.require_for_events(events);
+        state.require_for_events(events)?;
         return Ok(RecordSuccessfulEventsOutcome::Recorded);
     }
     if expected_generation.is_none()
@@ -3169,7 +3295,7 @@ fn record_successful_events(
         // event is new evidence, though: it must re-arm the confirming pass
         // without promoting that candidate to deletion authority. The same
         // exact-debt rule applies to every other non-authoritative lineage.
-        state.require_for_events(events);
+        state.require_for_events(events)?;
         return Ok(RecordSuccessfulEventsOutcome::Recorded);
     }
     // A successful batch over a complete, trustworthy scan advances the
@@ -3178,8 +3304,13 @@ fn record_successful_events(
     // authority describing a tree that no longer exists, and a later pass would
     // derive deletes from it.
     let updated = state.indexed_snapshot.clone();
-    if !state.advance_established(updated, observed_identities) {
-        state.require_for_events(events);
+    match state.advance_established(updated, observed_identities) {
+        Ok(true) => {}
+        Ok(false) => state.require_for_events(events)?,
+        Err(error) => {
+            let _ = state.require_for_events(events);
+            return Err(error);
+        }
     }
     Ok(RecordSuccessfulEventsOutcome::Recorded)
 }
@@ -4201,6 +4332,7 @@ mod tests {
         batches: Mutex<Vec<Vec<WatchIngestOp>>>,
         attempts: Mutex<Vec<Vec<WatchIngestOp>>>,
         fail_next: AtomicBool,
+        fail_on_attempt: Mutex<Option<usize>>,
         stop_after_success: Mutex<Option<(Arc<WatcherStop>, usize)>>,
         flush_barriers_seen: AtomicUsize,
         stop_after_flush_barrier: Mutex<Option<(Arc<WatcherStop>, usize)>>,
@@ -4224,13 +4356,26 @@ mod tests {
             batch: &'a [WatchIngestOp],
         ) -> WatchIngestFuture<'a, usize> {
             Box::pin(async move {
-                lock_or_recover(&self.attempts).push(batch.to_vec());
+                let attempt = {
+                    let mut attempts = lock_or_recover(&self.attempts);
+                    attempts.push(batch.to_vec());
+                    attempts.len()
+                };
                 // Recording the observed cancellation state is what lets the
                 // lineage test below prove the caller's `Cx` actually arrives
                 // here rather than a freshly minted one.
                 self.observed_cancelled
                     .store(cx.is_cancel_requested(), Ordering::Release);
-                if self.fail_next.swap(false, Ordering::AcqRel) {
+                let fail_this_attempt = {
+                    let mut fail_on_attempt = lock_or_recover(&self.fail_on_attempt);
+                    if fail_on_attempt.is_some_and(|target| target == attempt) {
+                        fail_on_attempt.take();
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if self.fail_next.swap(false, Ordering::AcqRel) || fail_this_attempt {
                     return Err(frankensearch_core::SearchError::SubsystemError {
                         subsystem: "test",
                         source: Box::new(io::Error::other("forced failure")),
@@ -4385,7 +4530,7 @@ mod tests {
                 self.attempts.fetch_add(1, Ordering::AcqRel);
                 if self.advance_once.swap(false, Ordering::AcqRel) {
                     lock_or_recover(&self.reconciliation)
-                        .require_for_events(std::slice::from_ref(&self.late_event));
+                        .require_for_events(std::slice::from_ref(&self.late_event))?;
                 }
                 Ok(batch.len())
             })
@@ -5291,7 +5436,9 @@ mod tests {
             let pipeline = Arc::new(RecordingPipeline::default());
             let reconciliation: ReconciliationTracker =
                 Arc::new(Mutex::new(ReconciliationState::default()));
-            lock_or_recover(&reconciliation).require_full_scan();
+            lock_or_recover(&reconciliation)
+                .require_full_scan()
+                .expect("fixture epoch is available");
             let queue: ReadyBatchQueue = Arc::new(Mutex::new(VecDeque::new()));
             let stats = Arc::new(WatcherStatsInner::default());
             let stop = Arc::new(WatcherStop::default());
@@ -5753,10 +5900,12 @@ mod tests {
                     && !observer_advanced.swap(true, Ordering::AcqRel)
                 {
                     assert!(
-                        lock_or_recover(&reconciliation).advance_established(
-                            replacement_snapshot.clone(),
-                            &replacement_identities
-                        ),
+                        lock_or_recover(&reconciliation)
+                            .advance_established(
+                                replacement_snapshot.clone(),
+                                &replacement_identities
+                            )
+                            .expect("the interleaving generation is available"),
                         "the interleaving must be a real successful authority advance"
                     );
                 }
@@ -5829,11 +5978,9 @@ mod tests {
                 .await
                 .expect("the recording sink applies the pre-race proposal");
             let late = root.join("late-during-ack.rs");
-            lock_or_recover(&watcher.reconciliation).require_for_events(&[WatchEvent::modified(
-                &late,
-                100,
-                Some(12),
-            )]);
+            lock_or_recover(&watcher.reconciliation)
+                .require_for_events(&[WatchEvent::modified(&late, 100, Some(12))])
+                .expect("the acknowledgement race has an available epoch");
             pending
                 .acknowledge_applied()
                 .expect_err("an epoch change after apply must reject the old authority commit");
@@ -5853,13 +6000,17 @@ mod tests {
         let later = FileSnapshot::from([(PathBuf::from("later-crash.rs"), 2)]);
         let mut state = ReconciliationState::default();
 
-        state.inherit_legacy(&first);
+        state
+            .inherit_legacy(&first)
+            .expect("first legacy import has an available epoch");
         state.authorize_rebuild();
         assert!(
             state.rebuild_authorized,
             "a held legacy record may receive an explicit rebuild grant"
         );
-        state.inherit_legacy(&later);
+        state
+            .inherit_legacy(&later)
+            .expect("later legacy import has an available epoch");
         assert!(
             !state.rebuild_authorized,
             "a later legacy import must revoke a grant scoped to the earlier record"
@@ -5892,6 +6043,7 @@ mod tests {
                 required: true,
                 affected_paths: BTreeSet::from([stale.clone()]),
                 epoch: 0,
+                lineage_exhausted: false,
                 authority: super::DeletionAuthorityState::UnverifiedLegacy {
                     legacy: legacy.clone(),
                 },
@@ -5979,6 +6131,7 @@ mod tests {
                 required: true,
                 affected_paths: BTreeSet::new(),
                 epoch: 0,
+                lineage_exhausted: false,
                 // The negative case: an authority that names files while
                 // carrying no identity able to detect a swap of the root they
                 // were read through.
@@ -6058,6 +6211,7 @@ mod tests {
                         required: true,
                         affected_paths: BTreeSet::from([vanished.clone()]),
                         epoch: 0,
+                        lineage_exhausted: false,
                         authority: super::DeletionAuthorityState::Established {
                             authority: super::DeletionAuthority {
                                 snapshot: FileSnapshot::new(),
@@ -6384,11 +6538,17 @@ mod tests {
                 Arc::new(Mutex::new(ReconciliationState::default()));
             {
                 let mut state = lock_or_recover(&reconciliation);
-                assert!(state.seed_initial_authority(
-                    baseline.clone(),
-                    completeness.root_identities().clone(),
-                ));
-                state.require_full_scan();
+                assert!(
+                    state
+                        .seed_initial_authority(
+                            baseline.clone(),
+                            completeness.root_identities().clone(),
+                        )
+                        .expect("fixture lineage is available")
+                );
+                state
+                    .require_full_scan()
+                    .expect("fixture epoch is available");
             }
             let (before_snapshot, before_generation) = {
                 let state = lock_or_recover(&reconciliation);
@@ -6602,7 +6762,9 @@ mod tests {
             let pipeline = Arc::new(RecordingPipeline::default());
             let reconciliation: ReconciliationTracker =
                 Arc::new(Mutex::new(ReconciliationState::default()));
-            lock_or_recover(&reconciliation).require_full_scan();
+            lock_or_recover(&reconciliation)
+                .require_full_scan()
+                .expect("fixture epoch is available");
             let queue: ReadyBatchQueue = Arc::new(Mutex::new(VecDeque::new()));
             let stats = WatcherStatsInner::default();
             let scans = Arc::new(AtomicUsize::new(0));
@@ -6769,8 +6931,12 @@ mod tests {
             let legacy = root.join("legacy-from-crash.rs");
             {
                 let mut state = lock_or_recover(&watcher.reconciliation);
-                state.inherit_legacy(&FileSnapshot::from([(legacy, 1)]));
-                state.require_full_scan();
+                state
+                    .inherit_legacy(&FileSnapshot::from([(legacy, 1)]))
+                    .expect("fixture legacy import has an available epoch");
+                state
+                    .require_full_scan()
+                    .expect("fixture epoch is available");
             }
 
             // First unverified observation becomes a candidate. Replacing the
@@ -6888,7 +7054,9 @@ mod tests {
         {
             let mut state = lock_or_recover(&reconciliation);
             assert!(
-                state.seed_initial_authority(snapshot, completeness.root_identities().clone()),
+                state
+                    .seed_initial_authority(snapshot, completeness.root_identities().clone())
+                    .expect("fixture lineage is available"),
                 "the fixture must start from real, covering authority"
             );
         }
@@ -6965,7 +7133,9 @@ mod tests {
             {
                 let mut state = lock_or_recover(&watcher.reconciliation);
                 assert!(
-                    state.seed_initial_authority(baseline, completeness.root_identities().clone(),),
+                    state
+                        .seed_initial_authority(baseline, completeness.root_identities().clone(),)
+                        .expect("fixture lineage is available"),
                     "control fixture must start from established authority"
                 );
             }
@@ -7573,7 +7743,9 @@ mod tests {
                 )]])));
             let reconciliation: ReconciliationTracker =
                 Arc::new(Mutex::new(ReconciliationState::default()));
-            lock_or_recover(&reconciliation).require_full_scan();
+            lock_or_recover(&reconciliation)
+                .require_full_scan()
+                .expect("fixture epoch is available");
             let stats = Arc::new(WatcherStatsInner::default());
             let stop = Arc::new(WatcherStop::default());
             let producer_done = Arc::new(AtomicBool::new(true));
@@ -7843,6 +8015,7 @@ mod tests {
                 required: true,
                 affected_paths: BTreeSet::from([prior_path.clone()]),
                 epoch: 1,
+                lineage_exhausted: false,
                 // Established authority, with the real identities a live scan
                 // of these roots would have recorded. This is deliberately the
                 // opposite state from the no-authority fixture above: this one
@@ -7917,6 +8090,160 @@ mod tests {
             assert!(!state.required);
             assert!(state.affected_paths.is_empty());
         });
+    }
+
+    /// A later chunk failure must not discard a successful earlier upsert from
+    /// the deletion baseline. The retry observes that first path as absent and
+    /// therefore has to derive its delete, while staged statistics count only
+    /// the completed retry.
+    #[test]
+    fn multi_chunk_failure_retains_applied_prefix_as_delete_debt() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("g4-prefix-debt");
+            fs::create_dir_all(&root).expect("create root");
+            let first = root.join("first.rs");
+            let second = root.join("second.rs");
+
+            let roots = vec![root.clone()];
+            let discovery = DiscoveryConfig::default();
+            let reconciliation: ReconciliationTracker =
+                Arc::new(Mutex::new(ReconciliationState::default()));
+            let (empty_baseline, completeness) =
+                collect_snapshot_from_roots(&roots, &discovery, &|| false)
+                    .expect("collect initial snapshot");
+            {
+                let mut state = lock_or_recover(&reconciliation);
+                assert!(
+                    state
+                        .seed_initial_authority(
+                            empty_baseline,
+                            completeness.root_identities().clone(),
+                        )
+                        .expect("initial authority lineage is available")
+                );
+                state
+                    .require_full_scan()
+                    .expect("initial reconciliation epoch is available");
+            }
+            fs::write(&first, "fn first() {}\n").expect("write first fixture");
+            fs::write(&second, "fn second() {}\n").expect("write second fixture");
+
+            let pipeline = Arc::new(RecordingPipeline::default());
+            *lock_or_recover(&pipeline.fail_on_attempt) = Some(2);
+            let queue: ReadyBatchQueue = Arc::new(Mutex::new(VecDeque::new()));
+            let stats = WatcherStatsInner::default();
+
+            let failure = run_authoritative_reconciliation(
+                &cx,
+                &roots,
+                &discovery,
+                pipeline.as_ref(),
+                &reconciliation,
+                &queue,
+                &stats,
+                1,
+                &collect_snapshot_from_roots,
+                &|| false,
+            )
+            .await
+            .expect_err("the second chunk must fail after the first upsert applies");
+            assert!(failure.to_string().contains("forced failure"));
+            assert_eq!(pipeline.all_ops().len(), 1, "only the prefix applied");
+            assert_eq!(stats.snapshot().files_reindexed, 0);
+            {
+                let state = lock_or_recover(&reconciliation);
+                assert!(state.required, "the failed pass remains owed");
+                assert_eq!(
+                    state.affected_paths,
+                    BTreeSet::from([first.clone(), second.clone()]),
+                    "the entire pass, not just the failed second chunk, is exact debt"
+                );
+            }
+
+            fs::remove_file(&first).expect("remove the already-upserted path before retry");
+            run_authoritative_reconciliation(
+                &cx,
+                &roots,
+                &discovery,
+                pipeline.as_ref(),
+                &reconciliation,
+                &queue,
+                &stats,
+                1,
+                &collect_snapshot_from_roots,
+                &|| false,
+            )
+            .await
+            .expect("the retry must reconcile the vanished prefix");
+
+            let first_key = normalize_file_key(&first);
+            assert!(
+                pipeline.all_ops().iter().any(|operation| {
+                    matches!(operation, WatchIngestOp::Delete { file_key, .. } if file_key == &first_key)
+                }),
+                "the retry must derive a delete for the vanished applied prefix, got {:?}",
+                pipeline.all_ops()
+            );
+            assert_eq!(lock_or_recover(&pipeline.attempts).len(), 4);
+            let snapshot = stats.snapshot();
+            assert_eq!(snapshot.files_reindexed, 2);
+            assert_eq!(snapshot.files_skipped, 0);
+            assert_eq!(snapshot.errors, 0);
+            let state = lock_or_recover(&reconciliation);
+            assert!(!state.required);
+            assert!(state.affected_paths.is_empty());
+        });
+    }
+
+    #[test]
+    fn lineage_counter_exhaustion_rejects_old_tokens_without_rollover() {
+        let event = WatchEvent::modified("epoch-exhausted.rs", 1, Some(1));
+        let mut epoch_state = ReconciliationState {
+            epoch: u64::MAX,
+            ..ReconciliationState::default()
+        };
+        let old_epoch_token = epoch_state
+            .planning_token()
+            .expect("the pre-exhaustion token is observable");
+        let epoch_error = epoch_state
+            .require_for_events(std::slice::from_ref(&event))
+            .expect_err("epoch exhaustion must be a typed failure");
+        assert!(epoch_error.to_string().contains("epoch counter exhausted"));
+        assert!(epoch_state.lineage_exhausted);
+        assert!(epoch_state.affected_paths.contains(&event.path));
+        assert!(
+            epoch_state.planning_token().is_err(),
+            "an old maximum epoch token must never compare equal to a new plan"
+        );
+        assert_eq!(old_epoch_token.epoch, u64::MAX);
+
+        let mut generation_state = ReconciliationState::default();
+        generation_state.authority = super::DeletionAuthorityState::Established {
+            authority: super::DeletionAuthority {
+                snapshot: FileSnapshot::new(),
+                root_identities: BTreeMap::new(),
+                generation: u64::MAX,
+            },
+            legacy: None,
+        };
+        let old_generation_token = generation_state
+            .planning_token()
+            .expect("the pre-exhaustion generation token is observable");
+        let generation_error = generation_state
+            .advance_established(FileSnapshot::new(), &BTreeMap::new())
+            .expect_err("generation exhaustion must be a typed failure");
+        assert!(
+            generation_error
+                .to_string()
+                .contains("authority generation counter exhausted")
+        );
+        assert!(generation_state.lineage_exhausted);
+        assert!(
+            generation_state.planning_token().is_err(),
+            "an old maximum generation token must never compare equal to a new plan"
+        );
+        assert_eq!(old_generation_token.generation, Some(u64::MAX));
     }
 
     #[test]
@@ -8116,10 +8443,12 @@ mod tests {
             Arc::new(Mutex::new(ReconciliationState::default()));
         let mut pressure_was_disabled = false;
 
-        observe_pressure_transition(false, &mut pressure_was_disabled, &reconciliation);
+        observe_pressure_transition(false, &mut pressure_was_disabled, &reconciliation)
+            .expect("disabling pressure does not advance reconciliation");
         assert!(pressure_was_disabled);
         assert!(!lock_or_recover(&reconciliation).required);
-        observe_pressure_transition(true, &mut pressure_was_disabled, &reconciliation);
+        observe_pressure_transition(true, &mut pressure_was_disabled, &reconciliation)
+            .expect("re-enabling pressure has an available epoch");
 
         assert!(!pressure_was_disabled);
         assert!(lock_or_recover(&reconciliation).required);
