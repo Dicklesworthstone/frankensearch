@@ -9040,6 +9040,7 @@ impl QuillReader {
         let tail_work_upper_bound = snippet_tail_work_upper_bound(
             &parsed.query,
             snapshot.as_ref(),
+            limit,
             self.config.glob_expansion_limit,
         )?;
         let work_upper_bound = rank_work_upper_bound.saturating_add(tail_work_upper_bound);
@@ -9085,6 +9086,13 @@ impl QuillReader {
             .try_reserve_exact(search.hits.len())
             .map_err(|_| invalid_state("could not allocate enriched lexical results"))?;
         for (rank, hit) in search.hits.into_iter().enumerate() {
+            // Stored-content materialisation plus snippet analysis is per hit
+            // and is the last span of the tail that admitted nothing at all: a
+            // query cancelled after ranking still enriched every hit. Admitted
+            // BEFORE the stored value is materialised, and covered by the
+            // `limit` term of `snippet_tail_work_upper_bound`, so a budget
+            // sized for this query cannot be refused here.
+            checkpoint.admit(QueryWorkKind::PositionDocument, 1)?;
             let snippet = snapshot
                 .materialize_stored_value(CONTENT_FIELD, hit.global_docid)?
                 .map(|content| {
@@ -10733,9 +10741,22 @@ impl SnippetTailWorkShape {
     }
 }
 
+/// Dictionary-block ceiling for one Delta generation's ordered term view.
+///
+/// `DeltaSegment::sorted_terms` materialises AND radix-sorts every term id in
+/// the generation before the first term can be examined, so this ceiling is
+/// what the tail must admit BEFORE that view is built. The bound and the
+/// admission both derive from this one function on purpose: metering is armed
+/// by `upper_bound > budget`, so a unit the bound does not cover could refuse
+/// a query whose real work fits its budget.
+fn delta_ordered_view_blocks(term_count: usize) -> u64 {
+    u64::try_from(term_count).unwrap_or(u64::MAX).div_ceil(16)
+}
+
 fn snippet_tail_work_upper_bound(
     query: &Query,
     snapshot: &QuillSearchSnapshot,
+    limit: usize,
     expansion_limit: usize,
 ) -> Result<u64, QuillIndexError> {
     let mut shape = SnippetTailWorkShape::default();
@@ -10743,6 +10764,7 @@ fn snippet_tail_work_upper_bound(
 
     let keeper = snapshot.keeper_snapshot();
     let keeper_segment_count = u64::try_from(keeper.segments().len()).unwrap_or(u64::MAX);
+    let delta_count = u64::try_from(snapshot.delta_count()).unwrap_or(u64::MAX);
     let mut wildcard_dictionary_blocks = 0_u64;
     let mut delta_dictionary_blocks = 0_u64;
     for segment in keeper.segments() {
@@ -10760,8 +10782,8 @@ fn snippet_tail_work_upper_bound(
             wildcard_dictionary_blocks.saturating_add(u64::from(block_count));
     }
     for delta in snapshot.delta_snapshots() {
-        let term_count = u64::try_from(delta.segment().term_count()).unwrap_or(u64::MAX);
-        delta_dictionary_blocks = delta_dictionary_blocks.saturating_add(term_count.div_ceil(16));
+        delta_dictionary_blocks = delta_dictionary_blocks
+            .saturating_add(delta_ordered_view_blocks(delta.segment().term_count()));
     }
 
     // `snapshot_glob_terms` visits one indexed block per wildcard cursor
@@ -10775,16 +10797,26 @@ fn snippet_tail_work_upper_bound(
     let exact_glob_work = shape
         .exact_glob_scans
         .saturating_mul(keeper_segment_count.saturating_add(delta_dictionary_blocks));
-    // `checkpointed_snapshot_doc_freq` does exactly one admitted Keeper
-    // dictionary lookup for every compiled term; Delta frequencies are frozen
-    // O(1) lookups and therefore have no separate fuel unit.
+    // Per compiled term the tail does one admitted Keeper dictionary lookup
+    // per sealed segment AND one admitted probe per live Delta generation.
+    // Charging the Keeper side alone left `term_count_ceiling x delta_count`
+    // probes outside every budget, and made this whole bound ZERO for a
+    // Delta-only snapshot -- which disarms metering (`upper_bound > budget`)
+    // and let the entire tail run unmetered at any budget, including zero.
+    // A frozen `live_doc_freq` read is O(1), but the PRODUCT is not, and an
+    // unadmitted product is exactly what a fuel budget exists to refuse.
     let document_frequency_work = shape
         .term_count_ceiling
-        .saturating_mul(keeper_segment_count);
+        .saturating_mul(keeper_segment_count.saturating_add(delta_count));
+    // Per-hit stored-content materialisation plus snippet analysis is the
+    // last unadmitted span of the same tail. Ranking returns at most `limit`
+    // hits, so the ceiling is exact.
+    let enrichment_work = u64::try_from(limit).unwrap_or(u64::MAX);
 
     Ok(wildcard_glob_work
         .saturating_add(exact_glob_work)
-        .saturating_add(document_frequency_work))
+        .saturating_add(document_frequency_work)
+        .saturating_add(enrichment_work))
 }
 
 fn query_work_upper_bound(
@@ -12918,14 +12950,30 @@ fn snapshot_glob_terms(
         }
     }
     for delta in snapshot.delta_snapshots() {
-        let mut admitted_block = None;
+        // `sorted_terms` is not a cursor: it allocates one id per term and
+        // MSD-radix-sorts the whole set (`TermInterner::sorted_ids`) before
+        // the first term is examined. Admitting per 16-term block DURING the
+        // walk therefore charged nothing for the one allocation that scales
+        // with the generation, and a cancelled or zero-fuel query still paid
+        // for it in full. The ceiling comes from the O(1) `term_count` and is
+        // admitted BEFORE the ordered view exists.
+        //
+        // A chunked ordered traversal would be better still, but the ordering
+        // is produced wholesale by `TermInterner::sorted_ids` in `scribe.rs`
+        // and there is no lazy ordered cursor to drive; conservative
+        // pre-admission is the bounded option available here.
+        if let Some(checkpoint) = checkpoint {
+            checkpoint.admit(
+                QueryWorkKind::DictionaryBlock,
+                delta_ordered_view_blocks(delta.segment().term_count()),
+            )?;
+        }
         for (term_index, term) in delta.segment().sorted_terms().iter().enumerate() {
-            let block = term_index / 16;
-            if Some(block) != admitted_block {
-                if let Some(checkpoint) = checkpoint {
-                    checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
-                }
-                admitted_block = Some(block);
+            // The blocks are paid for above, so this admits ZERO units: it
+            // charges no fuel and moves no counter, and exists only so that a
+            // cancellation during a long walk is still surfaced promptly.
+            if let Some(checkpoint) = checkpoint.filter(|_| term_index % 16 == 0) {
+                checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
             }
             // The live count is taken at freeze, so this stays O(1) per term
             // even on the `checkpoint == None` path, which has nothing to
@@ -12957,9 +13005,20 @@ fn compiled_snippet_terms(
         expansion_limit,
         &mut terms,
     )?;
+    let delta_count = u64::try_from(snapshot.delta_count()).unwrap_or(u64::MAX);
     terms
         .into_iter()
         .map(|term| {
+            // `checkpointed_snapshot_doc_freq` admits one unit per KEEPER
+            // segment and nothing per Delta generation, so this loop could run
+            // `terms x generations` probes with no unit ever charged. The
+            // shared helper is deliberately NOT changed: it is also on the
+            // ranking path (`lower_leaf_term`), whose bound this bead may not
+            // move, so the missing Delta units are admitted here, in the tail
+            // that `snippet_tail_work_upper_bound` actually bounds.
+            if delta_count != 0 {
+                checkpoint.admit(QueryWorkKind::DictionaryBlock, delta_count)?;
+            }
             let document_frequency =
                 checkpointed_snapshot_doc_freq(checkpoint, snapshot, CONTENT_FIELD, &term)?;
             let text = String::from_utf8(term)
@@ -15083,6 +15142,117 @@ mod tests {
                 fuel_diagnostics(&first),
                 (0, 0, 0, 0, 0, 0),
                 "the first tail dictionary admission must refuse before any work is recorded"
+            );
+        });
+    }
+
+    /// The post-ranking tail must meter DELTA work, not only Keeper work.
+    ///
+    /// Planted negative for `d656de7d`. On a Delta-only snapshot that parent
+    /// computed `document_frequency_work = term_count_ceiling *
+    /// keeper_segment_count = 0`, and its per-term probe loop admitted one
+    /// unit per Keeper segment and none per Delta generation, so the whole
+    /// tail ran with no unit ever charged at ANY budget -- including zero.
+    /// Both refusals below return a full enriched response against it.
+    ///
+    /// The ranked cache is primed first so this invocation starts exactly at
+    /// the tail: ranking then admits nothing, and every unit in the
+    /// diagnostics below belongs to the tail alone.
+    #[test]
+    fn public_snippet_tail_meters_delta_probes_and_per_hit_enrichment() {
+        run_with_cx(|cx| async move {
+            let mut index = QuillIndex::in_memory(deterministic_config())
+                .expect("create Delta-only snippet tail index");
+            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let lease_base = index
+                .snapshot()
+                .loaded_manifest()
+                .manifest
+                .docid_high_watermark;
+            let base = u32::try_from(lease_base).expect("Delta docid base fits u32");
+
+            // Two generations whose content terms INTERLEAVE (alpha < beta <
+            // gamma) and each of which is MISSING a term the other holds. A
+            // probe that stopped at the first generation, or that answered
+            // from one generation's ordered view, would report a different
+            // document frequency for `alpha` than the two live rows below.
+            let mut first =
+                DeltaSegment::new(DEFAULT_SCHEMA, lease_base, usize::MAX).expect("first Delta");
+            apply_sealable_delta_document(&mut first, base, "delta-alpha-one", "alpha", 1);
+            apply_sealable_delta_document(&mut first, base + 1, "delta-gamma", "gamma", 1);
+            let mut second = DeltaSegment::new(DEFAULT_SCHEMA, lease_base + 2, usize::MAX)
+                .expect("second Delta");
+            apply_sealable_delta_document(&mut second, base + 2, "delta-beta", "beta", 1);
+            apply_sealable_delta_document(&mut second, base + 3, "delta-alpha-two", "alpha", 1);
+            index
+                .publish_delta_table(vec![
+                    Arc::new(first.freeze(generation)),
+                    Arc::new(second.freeze(generation)),
+                ])
+                .expect("publish the two live Delta generations");
+
+            let snapshot = index.search_snapshot();
+            assert_eq!(
+                snapshot.keeper_snapshot().segments().len(),
+                0,
+                "the fixture must be Delta-only, or the Keeper probe would refuse first"
+            );
+            assert_eq!(snapshot.delta_count(), 2, "both generations must be live");
+            assert_eq!(
+                snapshot.bm25_doc_freq(CONTENT_FIELD, b"alpha").unwrap(),
+                2,
+                "`alpha` must span BOTH generations"
+            );
+            assert_eq!(snapshot.bm25_doc_freq(CONTENT_FIELD, b"gamma").unwrap(), 1);
+            assert_eq!(snapshot.bm25_doc_freq(CONTENT_FIELD, b"beta").unwrap(), 1);
+
+            let ranked = index
+                .search_paginated(&cx, "content:alpha", 10, 0, false)
+                .expect("prime the public ranked-search cache");
+            assert_eq!(
+                ranked.hits.len(),
+                2,
+                "both interleaved generations must rank before the tail runs"
+            );
+
+            // Unchanged semantics first: a sufficient budget still enriches
+            // every hit, so neither refusal below is a fixture that simply
+            // cannot produce a result.
+            let baseline = index
+                .search_with_snippets(&cx, "content:alpha", 10, &crate::SnippetConfig::default())
+                .expect("uninterrupted Delta-only snippet search");
+            assert_eq!(baseline.len(), 2);
+            assert!(
+                baseline
+                    .iter()
+                    .all(|hit| hit.snippet.as_deref().is_some_and(|s| s.contains("alpha"))),
+                "the fixture must require the real per-hit enrichment"
+            );
+
+            // One compiled term x two generations = two probe units, so a zero
+            // budget must refuse the FIRST of them, before any work is
+            // recorded.
+            index.reader.config.query_fuel_budget = 0;
+            let refused = index
+                .search_with_snippets(&cx, "content:alpha", 10, &crate::SnippetConfig::default())
+                .expect_err("a zero budget must not buy an unmetered Delta probe");
+            assert_eq!(
+                fuel_diagnostics(&refused),
+                (0, 0, 0, 0, 0, 0),
+                "the first Delta probe must refuse before any unit is recorded"
+            );
+
+            // Exactly the two probe units and nothing more: the per-hit
+            // enrichment admission is then the first thing that cannot be
+            // paid for, which pins it as metered work rather than a free tail.
+            index.reader.config.query_fuel_budget = 2;
+            let enrichment = index
+                .search_with_snippets(&cx, "content:alpha", 10, &crate::SnippetConfig::default())
+                .expect_err("per-hit enrichment must be admitted, not free");
+            assert_eq!(
+                fuel_diagnostics(&enrichment),
+                (2, 2, 0, 2, 0, 0),
+                "both Delta probes must be paid for and the refusal must land on enrichment"
             );
         });
     }
