@@ -1663,7 +1663,7 @@ impl FsWatcher {
 
         let mut guard = DirectApplyGuard::new(&self.reconciliation, events);
         let reindexed = self.ingest.apply_batch(cx, &prepared.ops).await?;
-        if let Err(error) = record_successful_events(
+        match record_successful_events(
             &self.roots,
             &self.discovery,
             &self.reconciliation,
@@ -1672,11 +1672,18 @@ impl FsWatcher {
             // This caller owns the `Cx`; it has no watcher generation whose
             // stop signal it can observe.
             &|| cx.is_cancel_requested(),
+            &|| cx.is_cancel_requested(),
         ) {
-            if cx.is_cancel_requested() {
+            Ok(RecordSuccessfulEventsOutcome::Recorded) => {}
+            Ok(RecordSuccessfulEventsOutcome::Aborted) => {
                 return Err(cancelled_ingest_error(cx));
             }
-            return Err(error);
+            Err(error) => {
+                if cx.is_cancel_requested() {
+                    return Err(cancelled_ingest_error(cx));
+                }
+                return Err(error);
+            }
         }
         guard.commit();
         let outcome = prepared.outcome(reindexed);
@@ -2359,36 +2366,107 @@ async fn run_ingest_loop(
             Ok(reindexed) => {
                 let events = lease.events().to_vec();
                 let outcome = prepared.outcome(reindexed);
-                if let Err(error) = record_successful_events(
+                // A stop already visible here belongs to the completed apply,
+                // not to an in-flight bookkeeping walk. The collector still
+                // runs so a genuine post-apply failure can take the existing
+                // authoritative reconciliation path; a stop that arrives
+                // after the walk begins interrupts it promptly.
+                let stop_before_record = stop.is_requested();
+                match record_successful_events(
                     roots,
                     discovery,
                     reconciliation,
                     &events,
                     snapshot_collector,
-                    // A live ingest batch must stop its post-apply walk for
-                    // either public watcher shutdown or caller cancellation.
+                    &|| cx.is_cancel_requested() || (!stop_before_record && stop.is_requested()),
+                    // Never commit a successful bookkeeping result after a
+                    // stop or cancellation, even if it was already visible
+                    // before the walk entered.
                     &|| stop.is_requested() || cx.is_cancel_requested(),
                 ) {
-                    if stop.is_requested() {
-                        // The batch already crossed its mutation boundary.
-                        // Its lease records reconciliation debt, then the loop
-                        // head drains the stopped generation without treating
-                        // ordinary shutdown as a failed watcher task.
+                    Ok(RecordSuccessfulEventsOutcome::Recorded) => {
+                        lease.commit();
+                        stats.add_reindexed(outcome.reindexed);
+                        stats.add_skipped(outcome.skipped);
+                    }
+                    Ok(RecordSuccessfulEventsOutcome::Aborted) => {
+                        // `apply_batch` succeeded, but the bookkeeping walk
+                        // did not. Dropping the live lease records the exact
+                        // affected paths; the stop drain will fold every later
+                        // batch into that same debt.
+                        drop(lease);
+                        if cx.is_cancel_requested() {
+                            return Err(cancelled_ingest_error(cx));
+                        }
                         continue;
                     }
-                    if cx.is_cancel_requested() {
-                        return Err(cancelled_ingest_error(cx));
+                    Err(error) => {
+                        // A real collector failure is different from an
+                        // interrupted walk. It leaves the apply debt behind,
+                        // then a clean stop performs the established
+                        // authoritative reconciliation rather than silently
+                        // skipping this fixture's retry path.
+                        drop(lease);
+                        if cx.is_cancel_requested() {
+                            return Err(cancelled_ingest_error(cx));
+                        }
+                        stats.add_error();
+                        if stop.is_requested() && is_retryable_error(&error) {
+                            match run_authoritative_reconciliation(
+                                cx,
+                                roots,
+                                discovery,
+                                ingest,
+                                reconciliation,
+                                ready_batches,
+                                stats,
+                                batch_size,
+                                snapshot_collector,
+                                // This recovery follows a real bookkeeping
+                                // failure. The stop is graceful here; caller
+                                // cancellation remains abortive.
+                                &|| cx.is_cancel_requested(),
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    return drain_final_batches(
+                                        cx,
+                                        roots,
+                                        discovery,
+                                        ingest,
+                                        ready_batches,
+                                        stop,
+                                        stats,
+                                        reconciliation,
+                                        producer_done,
+                                        snapshot_collector,
+                                    )
+                                    .await;
+                                }
+                                Err(reconciliation_error) => {
+                                    if cx.is_cancel_requested() {
+                                        return Err(cancelled_ingest_error(cx));
+                                    }
+                                    stats.add_error();
+                                    if is_retryable_error(&reconciliation_error) {
+                                        fold_queue_into_reconciliation(
+                                            ready_batches,
+                                            reconciliation,
+                                        );
+                                        return Ok(());
+                                    }
+                                    return Err(reconciliation_error);
+                                }
+                            }
+                        }
+                        if !is_retryable_error(&error) {
+                            return Err(error);
+                        }
+                        asupersync::time::sleep(cx.now(), IDLE_POLL).await;
+                        continue;
                     }
-                    stats.add_error();
-                    if !is_retryable_error(&error) {
-                        return Err(error);
-                    }
-                    asupersync::time::sleep(cx.now(), IDLE_POLL).await;
-                    continue;
                 }
-                lease.commit();
-                stats.add_reindexed(outcome.reindexed);
-                stats.add_skipped(outcome.skipped);
             }
             Err(error) => {
                 stats.add_error();
@@ -2483,22 +2561,40 @@ async fn drain_final_batches(
         lease.begin_live_apply();
         match ingest.apply_batch(cx, &prepared.ops).await {
             Ok(reindexed) => {
+                // This function is entered only after a public stop has been
+                // published. The first live batch remains applied, but its
+                // bookkeeping must become reconciliation debt together with
+                // every later queued batch; otherwise returning here would
+                // strand those later observations in the ready queue.
+                if stop.is_requested() {
+                    drop(lease);
+                    fold_queue_into_reconciliation(ready_batches, reconciliation);
+                    return Ok(());
+                }
                 match record_successful_events(
                     roots,
                     discovery,
                     reconciliation,
                     &events,
                     snapshot_collector,
-                    // Final draining may still apply a flushed event, but a
-                    // stop or caller cancellation must leave its authority
-                    // and success counters uncommitted for reconciliation.
+                    // A stop that lands after this check interrupts the walk
+                    // and turns all remaining work into reconciliation debt.
+                    &|| stop.is_requested() || cx.is_cancel_requested(),
                     &|| stop.is_requested() || cx.is_cancel_requested(),
                 ) {
-                    Ok(()) => {
+                    Ok(RecordSuccessfulEventsOutcome::Recorded) => {
                         lease.commit();
                         let outcome = prepared.outcome(reindexed);
                         stats.add_reindexed(outcome.reindexed);
                         stats.add_skipped(outcome.skipped);
+                    }
+                    Ok(RecordSuccessfulEventsOutcome::Aborted) => {
+                        drop(lease);
+                        fold_queue_into_reconciliation(ready_batches, reconciliation);
+                        if cx.is_cancel_requested() {
+                            return Err(cancelled_ingest_error(cx));
+                        }
+                        return Ok(());
                     }
                     Err(error) => {
                         // The batch landed; only the bookkeeping scan behind it
@@ -2506,6 +2602,7 @@ async fn drain_final_batches(
                         // leaves a rescan owed, which is what settles it.
                         drop(lease);
                         if stop.is_requested() {
+                            fold_queue_into_reconciliation(ready_batches, reconciliation);
                             return Ok(());
                         }
                         if cx.is_cancel_requested() {
@@ -2528,7 +2625,9 @@ async fn drain_final_batches(
                 );
                 if is_retryable_error(&error) && !cx.is_cancel_requested() {
                     // Retrying is unbounded work during a shutdown, and the
-                    // dropped lease has already made the rescan owed.
+                    // dropped lease plus every later ready batch must become
+                    // one owed rescan.
+                    fold_queue_into_reconciliation(ready_batches, reconciliation);
                     return Ok(());
                 }
                 return Err(error);
@@ -2772,20 +2871,29 @@ async fn run_authoritative_reconciliation(
     Ok(())
 }
 
+/// Whether successful post-apply bookkeeping reached a commit point.
+///
+/// `Aborted` is deliberately distinct from a collector error. The former
+/// means stop/cancellation won the scan and the live lease must become debt;
+/// the latter still follows the ordinary retry/reconciliation contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordSuccessfulEventsOutcome {
+    Recorded,
+    Aborted,
+}
+
 fn record_successful_events(
     roots: &[PathBuf],
     discovery: &DiscoveryConfig,
     reconciliation: &ReconciliationTracker,
     events: &[WatchEvent],
     snapshot_collector: &SnapshotCollector,
-    abort: &dyn Fn() -> bool,
-) -> SearchResult<()> {
+    scan_abort: &dyn Fn() -> bool,
+    commit_abort: &dyn Fn() -> bool,
+) -> SearchResult<RecordSuccessfulEventsOutcome> {
     // `apply_batch` has already crossed its mutation boundary. From here a
     // stop or cancellation must leave reconciliation owed, not install a
     // freshly scanned authority or publish success statistics.
-    if abort() {
-        return Err(scan_interrupted_error());
-    }
     // Read the lineage this batch is being recorded against *before* the scan,
     // so the checks below compare the authority that was in force when the
     // batch was applied against the one still in force now.
@@ -2797,13 +2905,20 @@ fn record_successful_events(
             state.established_identities().cloned(),
         )
     };
-    let (current, completeness) = snapshot_collector(roots, discovery, abort)?;
-    if abort() {
-        return Err(scan_interrupted_error());
+    let (current, completeness) = match snapshot_collector(roots, discovery, scan_abort) {
+        Ok(snapshot) => snapshot,
+        // A collector that observes the predicate has abandoned a partial
+        // walk. That is an expected stop/cancel outcome, not a retryable I/O
+        // failure whose clean-shutdown path should force another scan.
+        Err(_error) if scan_abort() => return Ok(RecordSuccessfulEventsOutcome::Aborted),
+        Err(error) => return Err(error),
+    };
+    if commit_abort() {
+        return Ok(RecordSuccessfulEventsOutcome::Aborted);
     }
     let mut state = lock_or_recover(reconciliation);
-    if abort() {
-        return Err(scan_interrupted_error());
+    if commit_abort() {
+        return Ok(RecordSuccessfulEventsOutcome::Aborted);
     }
     if !state.baseline_initialized {
         state.indexed_snapshot = current.clone();
@@ -2826,7 +2941,7 @@ fn record_successful_events(
     }
 
     if !completeness.is_complete() || !completeness.identity_is_trustworthy() {
-        return Ok(());
+        return Ok(RecordSuccessfulEventsOutcome::Recorded);
     }
     let observed_identities = completeness.root_identities();
     let roots_unchanged = expected_identities.as_ref() == Some(observed_identities);
@@ -2837,7 +2952,7 @@ fn record_successful_events(
         // after which every file of the old root reads as deleted. Fail closed
         // and hand it to a pass that can prove what happened.
         state.require_full_scan();
-        return Ok(());
+        return Ok(RecordSuccessfulEventsOutcome::Recorded);
     }
     if expected_generation.is_none()
         || state.epoch != expected_epoch
@@ -2847,7 +2962,7 @@ fn record_successful_events(
         // Establishing authority is a pass's job, not a batch's: this path
         // applies no deletes and cannot adjudicate anything, so it may only
         // advance an authority that already exists and is still the same one.
-        return Ok(());
+        return Ok(RecordSuccessfulEventsOutcome::Recorded);
     }
     // A successful batch over a complete, trustworthy scan advances the
     // deletion authority as one value — the snapshot and the identities it was
@@ -2858,7 +2973,7 @@ fn record_successful_events(
     if !state.advance_established(updated, observed_identities) {
         state.require_full_scan();
     }
-    Ok(())
+    Ok(RecordSuccessfulEventsOutcome::Recorded)
 }
 
 fn flush_pending_batches(
@@ -3111,11 +3226,12 @@ fn watcher_error(error: &notify::Error) -> SearchError {
 
 /// Walk every root, abandoning the scan promptly when `should_abort` says so.
 ///
-/// The predicate is consulted once per directory rather than once per root:
-/// a single root can hold an unbounded tree, so checking only between roots
-/// would let one scan block a stop for as long as the walk takes. Abandoning
-/// returns a typed interruption instead of a short snapshot, so a stop can
-/// never be mistaken for a complete scan of a smaller tree.
+/// The predicate is consulted before every directory entry as well as every
+/// directory: a single flat directory can hold an unbounded number of files,
+/// so a directory-only poll would still let one listing delay a stop for the
+/// entire directory. Abandoning returns a typed interruption instead of a
+/// short snapshot, so a stop can never be mistaken for a complete scan of a
+/// smaller tree.
 fn collect_snapshot_from_roots(
     roots: &[PathBuf],
     discovery: &DiscoveryConfig,
@@ -3307,8 +3423,8 @@ fn collect_snapshot_for_root(
     let mut stack = vec![root.to_path_buf()];
     let mut visited_dirs = HashSet::new();
     while let Some(dir_path) = stack.pop() {
-        // Bounded interval: one check per directory entered, so a stop is
-        // observed within a single directory listing however large the tree.
+        // One check per directory bounds traversal between directory changes;
+        // the entry checks below bound a single flat directory too.
         #[cfg(test)]
         scan_probe(ScanProbe::DirectoryEntered, &dir_path);
         if should_abort() {
@@ -3332,6 +3448,12 @@ fn collect_snapshot_for_root(
         };
 
         for entry in dir_entries {
+            // `ReadDir` yields lazily. Check before advancing it and again
+            // after the test observer below, so a stop does not wait for the
+            // rest of a huge flat directory to be stat'd and classified.
+            if should_abort() {
+                return Err(scan_interrupted_error());
+            }
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) if is_ignorable_walk_error(&error) => {
@@ -3356,6 +3478,9 @@ fn collect_snapshot_for_root(
             // Between listing and stat: the window a file may vanish in.
             #[cfg(test)]
             scan_probe(ScanProbe::EntryListed, &path);
+            if should_abort() {
+                return Err(scan_interrupted_error());
+            }
             let metadata = match fs::metadata(&path) {
                 Ok(metadata) => metadata,
                 // A `NotFound` here is the one skip that is a complete
@@ -5901,6 +6026,7 @@ mod tests {
             &[WatchEvent::modified(&replacement, 100, Some(12))],
             &collect_snapshot_from_roots,
             &|| false,
+            &|| false,
         )
         .expect("recording succeeds; it simply refuses to rebind");
 
@@ -5986,11 +6112,13 @@ mod tests {
     /// A public stop after an actual sink apply must interrupt the bookkeeping
     /// walk before it advances authority or publishes successful batch stats.
     ///
-    /// The observer is RAII-scoped to this fixture. Its plain helper thread
+    /// The observer is RAII-scoped to this fixture. Its bounded helper thread
     /// publishes the same stop token `stop_checked` owns, then releases the
     /// synchronous walk so the single test runtime can join the public stop
-    /// path. With 40a1e0c8's hardcoded `false`, the released walk commits and
-    /// this test's generation/stat assertions fail.
+    /// path. A missed probe handshake is released and reported as a test
+    /// failure instead of leaving either the helper or the test waiting
+    /// forever. With 40a1e0c8's hardcoded `false`, the released walk commits
+    /// and this test's generation/stat assertions fail.
     #[test]
     fn public_stop_checked_aborts_post_apply_bookkeeping_without_commit() {
         run_on_runtime_task(|cx| async move {
@@ -6035,7 +6163,10 @@ mod tests {
                 Arc::clone(stop)
             };
 
-            let parked = Arc::new((Mutex::new((false, false)), Condvar::new()));
+            // `(parked, released, test_timed_out)`. The third bit lets the
+            // async test release a helper that never saw its probe before it
+            // decides the handshake failed.
+            let parked = Arc::new((Mutex::new((false, false, false)), Condvar::new()));
             let _probe = {
                 let parked = Arc::clone(&parked);
                 let owned_root = root.clone();
@@ -6054,20 +6185,28 @@ mod tests {
                     }
                 }))
             };
+            let (released_tx, released_rx) = std::sync::mpsc::sync_channel(1);
             let releaser = {
                 let parked = Arc::clone(&parked);
                 let stop_for_releaser = Arc::clone(&stop);
+                let released_tx = released_tx;
                 thread::spawn(move || {
                     let (state, changed) = &*parked;
                     let mut state = lock_or_recover(state);
-                    while !state.0 {
-                        state = changed
-                            .wait(state)
+                    while !state.0 && !state.2 {
+                        let (next, _timed_out) = changed
+                            .wait_timeout(state, Duration::from_millis(10))
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        state = next;
+                    }
+                    if !state.0 {
+                        let _ = released_tx.send(false);
+                        return;
                     }
                     stop_for_releaser.request();
                     state.1 = true;
                     changed.notify_all();
+                    let _ = released_tx.send(true);
                 })
             };
 
@@ -6077,13 +6216,37 @@ mod tests {
                 Some(12),
             )]);
 
+            let mut released = None;
             for _ in 0..1_000 {
-                if watcher.has_terminal_task_outcome() || stop.is_requested() {
+                if let Ok(value) = released_rx.try_recv() {
+                    released = Some(value);
                     break;
                 }
                 asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
             }
-            releaser.join().expect("release post-apply scan");
+            if released.is_none() {
+                let (state, changed) = &*parked;
+                let mut state = lock_or_recover(state);
+                state.2 = true;
+                state.1 = true;
+                changed.notify_all();
+                drop(state);
+                for _ in 0..1_000 {
+                    if let Ok(value) = released_rx.try_recv() {
+                        released = Some(value);
+                        break;
+                    }
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+            }
+            if released.is_some() {
+                releaser.join().expect("bounded releaser thread");
+            }
+            assert_eq!(
+                released,
+                Some(true),
+                "post-apply scan never reached the bounded probe handshake"
+            );
             watcher
                 .stop_checked(&cx)
                 .await
@@ -6105,6 +6268,116 @@ mod tests {
                 watcher.stats().files_skipped,
                 before_stats.files_skipped,
                 "a stopped bookkeeping walk must not publish skipped counts"
+            );
+        });
+    }
+
+    /// A flat directory needs an abort poll for each yielded entry, not just
+    /// when the directory is first entered. This drives the public watcher
+    /// lifecycle and marks the first entry after stop instead of relying on a
+    /// wall-clock claim about how quickly a large directory happens to scan.
+    #[test]
+    fn public_stop_checked_aborts_a_flat_post_apply_walk_before_the_next_entry() {
+        run_on_runtime_task(|cx| async move {
+            const FLAT_FILES: usize = 128;
+
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("g4-stop-flat-post-apply");
+            fs::create_dir_all(&root).expect("create root");
+            let mut files = Vec::with_capacity(FLAT_FILES);
+            for entry in 0..FLAT_FILES {
+                let path = root.join(format!("entry-{entry:03}.rs"));
+                fs::write(&path, "fn fixture() {}\n").expect("write flat fixture");
+                files.push(path);
+            }
+
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let watcher = Arc::new(FsWatcher::new(
+                vec![root.clone()],
+                DiscoveryConfig::default(),
+                Arc::clone(&pipeline) as Arc<dyn WatchIngestPipeline>,
+            ));
+            watcher.start(&cx).await.expect("start watcher");
+            for _ in 0..1_000 {
+                if lock_or_recover(&watcher.reconciliation)
+                    .authority
+                    .established()
+                    .is_some()
+                {
+                    break;
+                }
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            let (before_snapshot, before_generation) = {
+                let state = lock_or_recover(&watcher.reconciliation);
+                let authority = state.authority.established().expect("startup authority");
+                (authority.snapshot.clone(), authority.generation)
+            };
+            let before_stats = watcher.stats();
+            let stop = {
+                let control = lock_or_recover(&watcher.control);
+                assert!(
+                    matches!(&control.lifecycle, WatcherLifecycle::Running { .. }),
+                    "watcher should be running"
+                );
+                let WatcherLifecycle::Running { stop, .. } = &control.lifecycle else {
+                    return;
+                };
+                Arc::clone(stop)
+            };
+            let first_entry = Arc::new(AtomicBool::new(false));
+            let entry_after_stop = Arc::new(AtomicBool::new(false));
+            let _probe = {
+                let owned_root = root.clone();
+                let stop = Arc::clone(&stop);
+                let first_entry = Arc::clone(&first_entry);
+                let entry_after_stop = Arc::clone(&entry_after_stop);
+                install_scan_observer(Arc::new(move |probe: ScanProbe, path: &Path| {
+                    if probe != ScanProbe::EntryListed || !path.starts_with(&owned_root) {
+                        return;
+                    }
+                    if !first_entry.swap(true, Ordering::AcqRel) {
+                        stop.request();
+                    } else if stop.is_requested() {
+                        entry_after_stop.store(true, Ordering::Release);
+                    }
+                }))
+            };
+
+            lock_or_recover(&watcher.ready_batches).push_back(vec![WatchEvent::modified(
+                &files[0],
+                100,
+                Some(12),
+            )]);
+            for _ in 0..1_000 {
+                if stop.is_requested() || watcher.has_terminal_task_outcome() {
+                    break;
+                }
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            assert!(
+                first_entry.load(Ordering::Acquire),
+                "post-apply bookkeeping never reached a flat-directory entry"
+            );
+            watcher
+                .stop_checked(&cx)
+                .await
+                .expect("flat-directory stop is an ordinary typed shutdown");
+
+            assert!(
+                !entry_after_stop.load(Ordering::Acquire),
+                "the walk reached another flat-directory entry after stop"
+            );
+            let state = lock_or_recover(&watcher.reconciliation);
+            let authority = state.authority.established().expect("retained authority");
+            assert_eq!(authority.snapshot, before_snapshot);
+            assert_eq!(authority.generation, before_generation);
+            assert!(state.required, "interrupted flat walk must remain owed");
+            drop(state);
+            assert_eq!(
+                watcher.stats().files_reindexed,
+                before_stats.files_reindexed,
+                "interrupted flat walk must not publish a successful batch"
             );
         });
     }
@@ -6198,6 +6471,83 @@ mod tests {
             assert!(
                 lock_or_recover(&reconciliation).required,
                 "an interrupted post-stop bookkeeping walk must remain owed"
+            );
+        });
+    }
+
+    /// Once a stopped drain has applied one batch and cannot complete its
+    /// bookkeeping, every later ready batch must become the same
+    /// reconciliation debt. Returning after only the live lease was dropped
+    /// stranded those later events in the queue until a process restart.
+    #[test]
+    fn stop_drain_folds_every_later_batch_into_reconciliation_debt() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("g4-final-drain-all-debt");
+            fs::create_dir_all(&root).expect("create root");
+            let first = root.join("first-flushed.rs");
+            let later = root.join("later-flushed.rs");
+            fs::write(&first, "fn first() {}\n").expect("write first fixture");
+            fs::write(&later, "fn later() {}\n").expect("write later fixture");
+
+            let first_event = WatchEvent::modified(&first, 900, Some(14));
+            let later_event = WatchEvent::modified(&later, 901, Some(14));
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let queue: ReadyBatchQueue = Arc::new(Mutex::new(VecDeque::from([
+                vec![first_event.clone()],
+                vec![later_event.clone()],
+            ])));
+            let reconciliation: ReconciliationTracker =
+                Arc::new(Mutex::new(ReconciliationState::default()));
+            let stats = Arc::new(WatcherStatsInner::default());
+            let stop = Arc::new(WatcherStop::default());
+            let producer_done = Arc::new(AtomicBool::new(true));
+            stop.request();
+
+            let pipeline_for_task = Arc::clone(&pipeline);
+            let queue_for_task = Arc::clone(&queue);
+            let stop_for_task = Arc::clone(&stop);
+            let stats_for_task = Arc::clone(&stats);
+            let reconciliation_for_task = Arc::clone(&reconciliation);
+            let producer_done_for_task = Arc::clone(&producer_done);
+            let roots = vec![root.clone()];
+            let mut task = cx
+                .spawn_local(move |child_cx| async move {
+                    run_ingest_loop(
+                        &child_cx,
+                        &roots,
+                        &DiscoveryConfig::default(),
+                        pipeline_for_task.as_ref(),
+                        &queue_for_task,
+                        &stop_for_task,
+                        &stats_for_task,
+                        &reconciliation_for_task,
+                        100,
+                        &producer_done_for_task,
+                        &collect_snapshot_from_roots,
+                    )
+                    .await
+                })
+                .expect("spawn two-batch final-drain task");
+
+            task.join(&cx)
+                .await
+                .expect("two-batch final-drain task terminal result")
+                .expect("a stopped drain is an ordinary shutdown");
+
+            assert!(
+                lock_or_recover(&queue).is_empty(),
+                "no later batch may remain stranded after the first bookkeeping abort"
+            );
+            let state = lock_or_recover(&reconciliation);
+            assert!(state.required, "the stopped drain must leave a rescan owed");
+            assert!(
+                state.affected_paths.contains(&first_event.path),
+                "the applied lease must become reconciliation debt"
+            );
+            assert!(
+                state.affected_paths.contains(&later_event.path),
+                "every later ready batch must be folded into the same debt"
             );
         });
     }
