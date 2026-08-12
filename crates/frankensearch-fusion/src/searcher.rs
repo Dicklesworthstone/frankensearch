@@ -1079,12 +1079,27 @@ impl TwoTierSearcher {
         // cancel the invocation after accepting the fast result. Observe that
         // authority before starting quality embedding or its synchronous
         // vector work.
-        cx.checkpoint().map_err(|error| SearchError::Cancelled {
-            phase: "initial_to_quality".to_owned(),
-            reason: cx
+        if let Err(error) = cx.checkpoint() {
+            let phase = "initial_to_quality".to_owned();
+            let reason = cx
                 .cancel_reason()
-                .map_or_else(|| error.to_string(), |reason| reason.to_string()),
-        })?;
+                .map_or_else(|| error.to_string(), |reason| reason.to_string());
+            let cancellation = SearchError::Cancelled {
+                phase: phase.clone(),
+                reason: reason.clone(),
+            };
+            if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
+                self.emit_session_stop_telemetry(
+                    root_request_id,
+                    telemetry_last_event_id.clone(),
+                    LifecycleState::Degraded,
+                    LifecycleSeverity::Warn,
+                    Some(format!("cancelled:{phase}:{reason}")),
+                    search_started_at.elapsed(),
+                );
+            }
+            return Err(cancellation);
+        }
         self.export_search_metrics(query_class, &metrics, display_hits.len(), false);
 
         // Phase 2: Quality refinement (optional).
@@ -5173,8 +5188,10 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let adapter = Arc::new(RecordingHostAdapter::new("post_initial_cancellation"));
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
-                .with_quality_embedder(quality);
+                .with_quality_embedder(quality)
+                .with_host_adapter(adapter.clone());
 
             let mut phases = Vec::new();
             let error = searcher
@@ -5208,6 +5225,37 @@ mod tests {
                 quality_calls.load(std::sync::atomic::Ordering::Relaxed),
                 0,
                 "the quality embedder must not run after Initial cancels the real Cx"
+            );
+
+            let lifecycle_hooks = adapter.lifecycle_events();
+            assert!(matches!(
+                lifecycle_hooks.as_slice(),
+                [
+                    AdapterLifecycleEvent::SessionStart { .. },
+                    AdapterLifecycleEvent::HealthTick { .. },
+                    AdapterLifecycleEvent::SessionStop { .. },
+                ]
+            ));
+
+            let terminal_lifecycle_events: Vec<_> = adapter
+                .telemetry_events()
+                .into_iter()
+                .filter(|envelope| {
+                    matches!(
+                        &envelope.event,
+                        TelemetryEvent::Lifecycle {
+                            state: LifecycleState::Degraded,
+                            severity: LifecycleSeverity::Warn,
+                            reason: Some(reason),
+                            ..
+                        } if reason.starts_with("cancelled:initial_to_quality:")
+                    )
+                })
+                .collect();
+            assert_eq!(
+                terminal_lifecycle_events.len(),
+                1,
+                "post-Initial cancellation must emit one terminal lifecycle telemetry event"
             );
         });
     }
