@@ -1074,6 +1074,17 @@ impl TwoTierSearcher {
                 fused_count: display_hits.len(),
             },
         });
+
+        // The Initial callback is a public phase boundary: a consumer may
+        // cancel the invocation after accepting the fast result. Observe that
+        // authority before starting quality embedding or its synchronous
+        // vector work.
+        cx.checkpoint().map_err(|error| SearchError::Cancelled {
+            phase: "initial_to_quality".to_owned(),
+            reason: cx
+                .cancel_reason()
+                .map_or_else(|| error.to_string(), |reason| reason.to_string()),
+        })?;
         self.export_search_metrics(query_class, &metrics, display_hits.len(), false);
 
         // Phase 2: Quality refinement (optional).
@@ -5111,6 +5122,8 @@ mod tests {
             let mut phase_count = 0;
             let mut got_initial = false;
             let mut got_refined = false;
+            let mut initial_rank_bytes = Vec::new();
+            let mut refined_rank_bytes = Vec::new();
             let metrics = searcher
                 .search(
                     &cx,
@@ -5120,8 +5133,20 @@ mod tests {
                     |phase| {
                         phase_count += 1;
                         match phase {
-                            SearchPhase::Initial { .. } => got_initial = true,
-                            SearchPhase::Refined { .. } => got_refined = true,
+                            SearchPhase::Initial { results, .. } => {
+                                got_initial = true;
+                                initial_rank_bytes = results
+                                    .iter()
+                                    .map(|result| (result.doc_id.clone(), result.score.to_bits()))
+                                    .collect();
+                            }
+                            SearchPhase::Refined { results, .. } => {
+                                got_refined = true;
+                                refined_rank_bytes = results
+                                    .iter()
+                                    .map(|result| (result.doc_id.clone(), result.score.to_bits()))
+                                    .collect();
+                            }
                             SearchPhase::Reranked { .. } => got_refined = true,
                             SearchPhase::RefinementFailed { .. } => {}
                         }
@@ -5133,7 +5158,57 @@ mod tests {
             assert_eq!(phase_count, 2);
             assert!(got_initial);
             assert!(got_refined);
+            // Identical fast/quality tiers are a non-cancelled control: the
+            // Initial-to-Refined boundary must not change ordering or score bits.
+            assert_eq!(initial_rank_bytes, refined_rank_bytes);
             assert!(metrics.quality_embed_ms > 0.0);
+        });
+    }
+
+    #[test]
+    fn public_search_cancellation_after_initial_stops_before_quality_phase() {
+        let quality_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let quality = Arc::new(CountingEmbedder::new("quality", 4, quality_calls.clone()));
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index_with_quality(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                .with_quality_embedder(quality);
+
+            let mut phases = Vec::new();
+            let error = searcher
+                .search(
+                    &cx,
+                    "test query",
+                    5,
+                    |_| None,
+                    |phase| match phase {
+                        SearchPhase::Initial { .. } => {
+                            phases.push("initial");
+                            cx.cancel_with(
+                                asupersync::CancelKind::User,
+                                Some("cancel after initial callback"),
+                            );
+                        }
+                        SearchPhase::Refined { .. } => phases.push("refined"),
+                        SearchPhase::Reranked { .. } => phases.push("reranked"),
+                        SearchPhase::RefinementFailed { .. } => phases.push("refinement_failed"),
+                    },
+                )
+                .await
+                .expect_err("post-Initial Cx cancellation must stop refinement");
+
+            assert!(matches!(
+                error,
+                SearchError::Cancelled { phase, .. } if phase == "initial_to_quality"
+            ));
+            assert_eq!(phases, vec!["initial"]);
+            assert_eq!(
+                quality_calls.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "the quality embedder must not run after Initial cancels the real Cx"
+            );
         });
     }
 
