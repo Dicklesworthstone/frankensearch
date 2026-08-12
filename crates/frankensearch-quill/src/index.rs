@@ -4076,13 +4076,32 @@ impl QueryWorkCheckpoint for QueryCheckpoint<'_> {
     fn admit(&self, kind: QueryWorkKind, units: u64) -> Result<(), ArgusError> {
         #[cfg(feature = "pruning-conformance")]
         {
+            // `consumed_before` is an atomic load and stays here: it has to be
+            // sampled before the checkpoint, and under Rayon a later read would
+            // resample a value another segment worker has already moved.
+            //
+            // The context read must NOT. It takes a global `StdMutex` and hashes
+            // a `ThreadId`, on every admission — that is once per posting move,
+            // and twice on a move that enters a block — and the value is
+            // discarded unless the checkpoint fires, which happens at most once
+            // per query. Reading it inside the fire branch is value-identical:
+            // the map is keyed by the current thread and
+            // `set_conformance_query_work_context` is the only writer, reached
+            // only from the union scorer on this same thread, never from
+            // `checkpoint_query_collection` (which touches controller atomics
+            // and `cx` cancellation alone). The fuel-exhaustion arm below
+            // already reads it exactly this way.
             let consumed_before = self.state.consumed.load(Ordering::Acquire);
-            let context = self.conformance_query_work_context();
             if self
                 .conformance_controller
                 .checkpoint_query_collection(self.cx)
             {
-                self.record_query_interruption(context, kind, units, consumed_before);
+                self.record_query_interruption(
+                    self.conformance_query_work_context(),
+                    kind,
+                    units,
+                    consumed_before,
+                );
             }
         }
         #[cfg(all(
@@ -16383,6 +16402,73 @@ mod tests {
         ));
         assert!(controller.fired());
         assert_eq!(controller.query_interruption_location(), None);
+        controller.disarm();
+        cx.set_cancel_requested(false);
+    }
+
+    /// The recorded location must carry the query-work context in effect at the
+    /// *firing* admission, not one sampled at any earlier admission.
+    ///
+    /// `admit` now reads that context only inside the branch that fires, so this
+    /// pins the read point rather than the value: a context captured once and
+    /// reused — the failure mode moving the read introduces — records refill 1's
+    /// unscored `Seek` at window 0 instead of refill 2's scored `Drain` at 4096,
+    /// and every assertion below separates the two.
+    #[cfg(feature = "pruning-conformance")]
+    #[test]
+    fn query_interruption_location_binds_the_firing_admissions_context() {
+        let cx = Cx::for_testing();
+        let controller = Arc::new(ConformanceCancellationController::default());
+        controller
+            .arm(ConformanceCancellationStage::QueryCollection, 2)
+            .expect("arm the second collection checkpoint");
+        // `upper_bound` below `budget` keeps metering off, so both admissions
+        // reach the checkpoint on the zero-unit path and charge nothing.
+        let checkpoint = QueryCheckpoint::new_with_controller(
+            &cx,
+            "location_context_binding",
+            u64::MAX,
+            0,
+            Arc::clone(&controller),
+        );
+
+        checkpoint.set_conformance_query_work_context(Some(ConformanceQueryWorkContext {
+            refill_ordinal: 1,
+            window_start: 0,
+            phase: ConformanceQueryWorkPhase::Seek,
+            candidate_doc: Some(7),
+            candidate_scored: false,
+        }));
+        checkpoint
+            .admit(QueryWorkKind::PostingBlock, 0)
+            .expect("the first collection checkpoint must not fire");
+        assert_eq!(controller.query_interruption_location(), None);
+
+        checkpoint.set_conformance_query_work_context(Some(ConformanceQueryWorkContext {
+            refill_ordinal: 2,
+            window_start: 4_096,
+            phase: ConformanceQueryWorkPhase::Drain,
+            candidate_doc: Some(9_000),
+            candidate_scored: true,
+        }));
+        assert!(matches!(
+            checkpoint.admit(QueryWorkKind::PostingBlock, 0),
+            Err(ArgusError::QueryCancelled {
+                phase: "location_context_binding"
+            })
+        ));
+        assert!(controller.fired());
+
+        let location = controller
+            .query_interruption_location()
+            .expect("the firing admission records its exact location");
+        assert_eq!(location.refill_ordinal(), 2);
+        assert_eq!(location.window_start(), 4_096);
+        assert_eq!(location.phase(), ConformanceQueryWorkPhase::Drain);
+        assert_eq!(location.candidate_doc(), Some(9_000));
+        assert!(location.candidate_scored());
+
+        checkpoint.set_conformance_query_work_context(None);
         controller.disarm();
         cx.set_cancel_requested(false);
     }
