@@ -1208,8 +1208,17 @@ fn qg1_live_sample_binding(
     let continuous = continuous?;
     let receipt = &continuous.lifecycle_receipt;
     receipt.validate().ok()?;
-    let (lifecycle_authority_sha256, stream_role_identity_sha256) =
-        estimator_config.qg1_lifecycle_receipt_coordinates(scope, provenance, stream_role)?;
+    let (lifecycle_authority_sha256, stream_role_identity_sha256, issued_slot_sha256) =
+        estimator_config.qg1_lifecycle_receipt_coordinates(
+            scope,
+            provenance,
+            stream_role,
+            stream_sequence,
+            sample_id,
+            block_id,
+            arm,
+            order,
+        )?;
     if receipt.interval_ended_ns != elapsed_ns || continuous.elapsed_ns != elapsed_ns {
         return None;
     }
@@ -1284,6 +1293,7 @@ fn qg1_live_sample_binding(
         raw_order: order,
         lifecycle_authority_sha256,
         stream_role_identity_sha256,
+        issued_slot_sha256,
         lifecycle_receipt_id_sha256: String::new(),
         lifecycle_receipt_sha256: String::new(),
         prepared_corpus_sha256: provenance.corpus_sha256.clone(),
@@ -3617,6 +3627,22 @@ fn raw_sample_work(context: &BenchContext, spec: &PerfCellSpec) -> (Option<u64>,
 /// Freeze the exact QG-1 cell plan before warmup or measurement. The returned
 /// authority is retained by the live estimator rather than synthesized from
 /// any raw row.
+fn qg1_issued_streams(runs: usize, cell_seed: u64) -> Vec<(String, u64, u64, Vec<PerfSampleArm>)> {
+    let issue = |stream_role: &str, seed: u64, block_id_base: u64, sample_id_base: u64| {
+        (
+            stream_role.to_owned(),
+            block_id_base,
+            sample_id_base,
+            seeded_balanced_pair_order(runs, seed).expect("QG-1 issued randomized arm order"),
+        )
+    };
+    vec![
+        issue("qg1.effect.tantivy_vs_quill.v1", cell_seed, 0, 0),
+        issue("qg1.null.tantivy.v1", cell_seed ^ 0xaa, 0, 1_000_000),
+        issue("qg1.null.quill.v1", cell_seed ^ 0x55, 2_000_000, 2_000_000),
+    ]
+}
+
 fn install_qg1_lifecycle_authority(
     estimator_config: &mut PairedEstimatorConfig,
     context: &BenchContext,
@@ -3624,7 +3650,7 @@ fn install_qg1_lifecycle_authority(
     scope: &PerfOperationScope,
     provenance: &PerfSampleProvenance,
     expected_pair_count: u64,
-    stream_roles: &[&str],
+    issued_streams: Vec<(String, u64, u64, Vec<PerfSampleArm>)>,
 ) {
     if qg1_producer_coverage(spec) != Some(Qg1ProducerCoverage::EngineIndexingLifecycle) {
         return;
@@ -3666,7 +3692,7 @@ fn install_qg1_lifecycle_authority(
             batch_coverage,
             prepared.binding.tail_document_id.clone(),
             expected_pair_count,
-            stream_roles.iter().map(|role| (*role).to_owned()).collect(),
+            issued_streams,
         )
         .expect("freeze one complete pre-timing QG-1 lifecycle authority");
 }
@@ -3842,6 +3868,7 @@ struct PairedStreamRunner<'a> {
     work_units: Option<u64>,
     byte_count: Option<u64>,
     estimator_config: &'a PairedEstimatorConfig,
+    consumed_qg1_sequences: BTreeSet<u64>,
     samples: Vec<PerfRawSample>,
 }
 
@@ -3884,6 +3911,7 @@ impl<'a> PairedStreamRunner<'a> {
             work_units,
             byte_count,
             estimator_config,
+            consumed_qg1_sequences: BTreeSet::new(),
             samples,
         }
     }
@@ -3931,7 +3959,7 @@ impl<'a> PairedStreamRunner<'a> {
     }
 
     fn execute(
-        &self,
+        &mut self,
         engine: EngineArm,
         sample_arm: PerfSampleArm,
         sample_order: PerfSampleOrder,
@@ -3982,6 +4010,10 @@ impl<'a> PairedStreamRunner<'a> {
                     })
                 })
                 .expect("QG-1 raw-order stream sequence fits u64");
+            assert!(
+                self.consumed_qg1_sequences.insert(stream_sequence),
+                "QG-1 runner attempted to consume one issued transcript slot twice"
+            );
             qg1_live_sample_binding(
                 measurement.continuous.as_ref(),
                 window.ended_ns - window.started_ns,
@@ -4036,6 +4068,26 @@ impl<'a> PairedStreamRunner<'a> {
     }
 
     fn into_samples(self) -> Vec<PerfRawSample> {
+        if qg1_producer_coverage(self.spec) == Some(Qg1ProducerCoverage::EngineIndexingLifecycle) {
+            let stream_role = self
+                .plan
+                .qg1_stream_role
+                .expect("QG-1 paired stream has one canonical role");
+            assert_eq!(
+                self.consumed_qg1_sequences.len(),
+                self.samples.len(),
+                "QG-1 runner must consume every emitted raw row exactly once"
+            );
+            assert_eq!(
+                self.estimator_config.qg1_issued_stream_row_count(
+                    self.scope,
+                    &self.evidence.sample_provenance,
+                    stream_role,
+                ),
+                Some(self.samples.len()),
+                "QG-1 runner must consume every pre-issued transcript row exactly once"
+            );
+        }
         self.samples
     }
 }
@@ -4888,6 +4940,7 @@ fn collect_cell(
     let origin = Instant::now();
     let cell_seed = evidence.config.bootstrap_seed ^ fixture_seed(&spec.fixture);
     let mut estimator_config = evidence.config.clone();
+    let qg1_issued_streams = qg1_issued_streams(runs, cell_seed);
     install_qg1_lifecycle_authority(
         &mut estimator_config,
         context,
@@ -4895,11 +4948,7 @@ fn collect_cell(
         &scope,
         &evidence.sample_provenance,
         u64::try_from(runs).expect("QG-1 authority pair count fits u64"),
-        &[
-            "qg1.effect.tantivy_vs_quill.v1",
-            "qg1.null.tantivy.v1",
-            "qg1.null.quill.v1",
-        ],
+        qg1_issued_streams,
     );
 
     // Every non-query gate establishes its A/A floor through the exact paired
@@ -6530,9 +6579,18 @@ mod tests {
                 authority_receipt.prepared_input.tail_document_id.clone(),
                 10,
                 vec![
-                    "qg1.effect.tantivy_vs_quill.v1".to_owned(),
-                    "qg1.null.tantivy.v1".to_owned(),
-                    "qg1.null.quill.v1".to_owned(),
+                    (
+                        "qg1.effect.tantivy_vs_quill.v1".to_owned(),
+                        0,
+                        0,
+                        vec![PerfSampleArm::Control; 10],
+                    ),
+                    (
+                        "qg1.null.tantivy.v1".to_owned(),
+                        0,
+                        10_000,
+                        vec![PerfSampleArm::Control; 10],
+                    ),
                 ],
             )
             .expect("freeze hostile test lifecycle authority");

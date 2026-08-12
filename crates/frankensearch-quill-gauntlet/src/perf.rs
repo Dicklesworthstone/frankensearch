@@ -59,8 +59,8 @@ pub const PAIRED_ESTIMATOR_SCHEMA_VERSION: &str = "quill-paired-estimator-v1";
 /// of the outer artifact schema: raw rows are replayable evidence and must fail
 /// closed when an older binding cannot name its receipt fields.
 const QG1_LIFECYCLE_AUTHORITY_SCHEMA_VERSION: &str =
-    "frankensearch.quill.qg1-lifecycle-authority.v1";
-const QG1_LIFECYCLE_BINDING_SCHEMA_VERSION: &str = "frankensearch.quill.qg1-lifecycle-binding.v4";
+    "frankensearch.quill.qg1-lifecycle-authority.v2";
+const QG1_LIFECYCLE_BINDING_SCHEMA_VERSION: &str = "frankensearch.quill.qg1-lifecycle-binding.v5";
 const QG1_STREAM_ROLE_EFFECT: &str = "qg1.effect.tantivy_vs_quill.v1";
 const QG1_STREAM_ROLE_TANTIVY_NULL: &str = "qg1.null.tantivy.v1";
 const QG1_STREAM_ROLE_QUILL_NULL: &str = "qg1.null.quill.v1";
@@ -1180,7 +1180,7 @@ fn qg1_valid_throughput_experiment(
     expected_work_units: u64,
     expected_content_bytes: u64,
 ) -> bool {
-    experiment.verify_recomputed().is_ok()
+    experiment.recomputes_from_live_authority_config()
         && experiment.status == PairedEvidenceStatus::Valid
         && experiment.claim_state == PairedClaimState::EligibleForDecision
         && experiment.scope == *expected_scope
@@ -3204,6 +3204,19 @@ impl Qg1LifecycleWitness {
     }
 }
 
+/// One exact raw-row slot issued before timing begins. The authority owns this
+/// transcript; raw evidence can only consume a listed slot, never mint one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Qg1IssuedRow {
+    stream_role: String,
+    stream_sequence: u64,
+    block_id: u64,
+    sample_id: u64,
+    arm: PerfSampleArm,
+    order: PerfSampleOrder,
+}
+
 /// Pre-timing authority for every headline-eligible raw row in one QG-1
 /// cell. It is retained by the paired-estimator configuration, outside the raw
 /// rows it governs, so resealing mutable row fields cannot replace the planned
@@ -3241,6 +3254,9 @@ struct Qg1LifecycleAuthority {
     pub expected_pair_count: u64,
     /// Canonically ordered roles issued for this one cell invocation.
     pub stream_roles: Vec<String>,
+    /// Exact role-specific raw rows issued before timing, canonically ordered
+    /// by role then stream sequence.
+    pub issued_rows: Vec<Qg1IssuedRow>,
 }
 
 impl Qg1LifecycleAuthority {
@@ -3260,11 +3276,22 @@ impl Qg1LifecycleAuthority {
         prepared_batch_count: usize,
         batch_coverage: Vec<Qg1BatchCoverage>,
         tail_document_id: String,
-        expected_stream_row_count: u64,
         expected_pair_count: u64,
-        mut stream_roles: Vec<String>,
+        mut issued_rows: Vec<Qg1IssuedRow>,
     ) -> Result<Self, &'static str> {
-        stream_roles.sort();
+        issued_rows.sort_by(|left, right| {
+            (left.stream_role.as_str(), left.stream_sequence)
+                .cmp(&(right.stream_role.as_str(), right.stream_sequence))
+        });
+        let stream_roles = issued_rows
+            .iter()
+            .map(|row| row.stream_role.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let expected_stream_row_count = expected_pair_count
+            .checked_mul(2)
+            .ok_or("QG-1 authority stream row count overflowed")?;
         let mut authority = Self {
             schema_version: QG1_LIFECYCLE_AUTHORITY_SCHEMA_VERSION.to_owned(),
             authority_sha256: String::new(),
@@ -3281,6 +3308,7 @@ impl Qg1LifecycleAuthority {
             expected_stream_row_count,
             expected_pair_count,
             stream_roles,
+            issued_rows,
         };
         authority.prepared_input_sha256 = authority.recomputed_prepared_input_sha256();
         authority.authority_sha256 = authority.recomputed_authority_sha256();
@@ -3356,6 +3384,18 @@ impl Qg1LifecycleAuthority {
         for role in &self.stream_roles {
             update_length_framed(&mut hasher, role.as_bytes());
         }
+        for row in &self.issued_rows {
+            for value in [
+                row.stream_role.as_bytes(),
+                qg1_arm_id(row.arm).as_bytes(),
+                qg1_order_id(row.order).as_bytes(),
+            ] {
+                update_length_framed(&mut hasher, value);
+            }
+            update_length_framed(&mut hasher, &row.stream_sequence.to_le_bytes());
+            update_length_framed(&mut hasher, &row.block_id.to_le_bytes());
+            update_length_framed(&mut hasher, &row.sample_id.to_le_bytes());
+        }
         finish_sha256_hex(hasher)
     }
 
@@ -3408,7 +3448,127 @@ impl Qg1LifecycleAuthority {
         if next_document != self.document_count {
             return Err("QG-1 lifecycle authority batch schedule does not cover its input");
         }
+        let mut issued_by_role = BTreeMap::<&str, Vec<&Qg1IssuedRow>>::new();
+        for row in &self.issued_rows {
+            issued_by_role
+                .entry(row.stream_role.as_str())
+                .or_default()
+                .push(row);
+        }
+        if issued_by_role.len() != self.stream_roles.len()
+            || issued_by_role
+                .keys()
+                .copied()
+                .ne(self.stream_roles.iter().map(String::as_str))
+        {
+            return Err("QG-1 lifecycle authority transcript roles do not match its role plan");
+        }
+        for (role, rows) in issued_by_role {
+            if !qg1_stream_role_is_known(role)
+                || u64::try_from(rows.len()).ok() != Some(self.expected_stream_row_count)
+            {
+                return Err("QG-1 lifecycle authority transcript row count is not exact");
+            }
+            let mut seen_coordinates = BTreeSet::<(u64, u64)>::new();
+            let mut blocks = BTreeMap::<u64, Vec<&Qg1IssuedRow>>::new();
+            for (expected_sequence, row) in rows.into_iter().enumerate() {
+                if row.stream_sequence
+                    != u64::try_from(expected_sequence)
+                        .map_err(|_| "QG-1 transcript sequence does not fit u64")?
+                    || !seen_coordinates.insert((row.block_id, row.sample_id))
+                {
+                    return Err("QG-1 lifecycle authority transcript has duplicate or gapped rows");
+                }
+                blocks.entry(row.block_id).or_default().push(row);
+            }
+            if u64::try_from(blocks.len()).ok() != Some(self.expected_pair_count) {
+                return Err("QG-1 lifecycle authority transcript pair count is not exact");
+            }
+            for rows in blocks.into_values() {
+                if rows.len() != 2
+                    || !rows.iter().any(|row| row.arm == PerfSampleArm::Control)
+                    || !rows.iter().any(|row| row.arm == PerfSampleArm::Treatment)
+                    || !rows.iter().any(|row| row.order == PerfSampleOrder::First)
+                    || !rows.iter().any(|row| row.order == PerfSampleOrder::Second)
+                {
+                    return Err(
+                        "QG-1 lifecycle authority transcript does not issue one randomized pair",
+                    );
+                }
+            }
+        }
         Ok(())
+    }
+
+    fn issued_row_matches(
+        &self,
+        stream_role: &str,
+        stream_sequence: u64,
+        block_id: u64,
+        sample_id: u64,
+        arm: PerfSampleArm,
+        order: PerfSampleOrder,
+    ) -> bool {
+        self.issued_rows
+            .binary_search_by(|row| {
+                (row.stream_role.as_str(), row.stream_sequence).cmp(&(stream_role, stream_sequence))
+            })
+            .ok()
+            .is_some_and(|index| {
+                let row = &self.issued_rows[index];
+                row.block_id == block_id
+                    && row.sample_id == sample_id
+                    && row.arm == arm
+                    && row.order == order
+            })
+    }
+
+    fn issued_slot_sha256(&self, row: &Qg1IssuedRow) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"frankensearch.quill.qg1-issued-slot.v1\0");
+        for value in [
+            self.authority_sha256.as_bytes(),
+            row.stream_role.as_bytes(),
+            qg1_arm_id(row.arm).as_bytes(),
+            qg1_order_id(row.order).as_bytes(),
+        ] {
+            update_length_framed(&mut hasher, value);
+        }
+        update_length_framed(&mut hasher, &row.stream_sequence.to_le_bytes());
+        update_length_framed(&mut hasher, &row.block_id.to_le_bytes());
+        update_length_framed(&mut hasher, &row.sample_id.to_le_bytes());
+        finish_sha256_hex(hasher)
+    }
+
+    fn issued_slot_for(
+        &self,
+        stream_role: &str,
+        stream_sequence: u64,
+        block_id: u64,
+        sample_id: u64,
+        arm: PerfSampleArm,
+        order: PerfSampleOrder,
+    ) -> Option<String> {
+        self.issued_rows
+            .binary_search_by(|row| {
+                (row.stream_role.as_str(), row.stream_sequence).cmp(&(stream_role, stream_sequence))
+            })
+            .ok()
+            .and_then(|index| {
+                let row = &self.issued_rows[index];
+                (row.block_id == block_id
+                    && row.sample_id == sample_id
+                    && row.arm == arm
+                    && row.order == order)
+                    .then(|| self.issued_slot_sha256(row))
+            })
+    }
+
+    fn issued_row_count(&self, stream_role: &str) -> usize {
+        self.issued_rows
+            .iter()
+            .filter(|row| row.stream_role == stream_role)
+            .count()
     }
 }
 
@@ -3449,6 +3609,9 @@ pub struct Qg1SampleBinding {
     pub lifecycle_authority_sha256: String,
     /// Authority-issued identity for this exact stream role.
     pub stream_role_identity_sha256: String,
+    /// Immutable pre-issued capability for this exact raw transcript slot.
+    /// Sealing a receipt never regenerates it after a coordinate mutation.
+    pub issued_slot_sha256: String,
     /// Deterministic identity of this unique lifecycle receipt.
     pub lifecycle_receipt_id_sha256: String,
     /// Digest over the receipt identity, frozen prepared input, terminal
@@ -3576,6 +3739,7 @@ impl Qg1SampleBinding {
             qg1_order_id(self.raw_order).as_bytes(),
             self.lifecycle_authority_sha256.as_bytes(),
             self.stream_role_identity_sha256.as_bytes(),
+            self.issued_slot_sha256.as_bytes(),
         ] {
             update_length_framed(&mut hasher, value);
         }
@@ -3598,6 +3762,7 @@ impl Qg1SampleBinding {
             self.prepared_input_sha256.as_bytes(),
             self.lifecycle_authority_sha256.as_bytes(),
             self.stream_role_identity_sha256.as_bytes(),
+            self.issued_slot_sha256.as_bytes(),
         ] {
             update_length_framed(&mut hasher, value);
         }
@@ -3631,6 +3796,7 @@ impl Qg1SampleBinding {
             || !is_lower_hex_digest(&self.prepared_input_sha256)
             || !is_lower_hex_digest(&self.lifecycle_authority_sha256)
             || !is_lower_hex_digest(&self.stream_role_identity_sha256)
+            || !is_lower_hex_digest(&self.issued_slot_sha256)
             || self.raw_sample_id != raw.sample_id
             || self.raw_block_id != raw.block_id
             || self.raw_arm != raw.arm
@@ -3718,6 +3884,22 @@ impl Qg1SampleBinding {
             && self.lifecycle_authority_sha256 == authority.authority_sha256
             && authority.stream_role_identity_sha256(&self.stream_role)
                 == Some(self.stream_role_identity_sha256.clone())
+            && authority.issued_slot_for(
+                &self.stream_role,
+                self.stream_sequence,
+                self.raw_block_id,
+                self.raw_sample_id,
+                self.raw_arm,
+                self.raw_order,
+            ) == Some(self.issued_slot_sha256.clone())
+            && authority.issued_row_matches(
+                &self.stream_role,
+                self.stream_sequence,
+                self.raw_block_id,
+                self.raw_sample_id,
+                self.raw_arm,
+                self.raw_order,
+            )
             && self.prepared_corpus_sha256 == authority.provenance_corpus_sha256
             && self.prepared_input_sha256 == authority.prepared_input_sha256
             && self.prepared_manifest_sha256 == authority.prepared_manifest_sha256
@@ -3943,6 +4125,20 @@ impl PairedEstimatorConfig {
         }
     }
 
+    fn has_predeclared_thresholds(&self) -> bool {
+        let expected = Self::predeclared(self.bootstrap_seed);
+        self.bootstrap_resamples == expected.bootstrap_resamples
+            && self.min_pairs == expected.min_pairs
+            && self.max_order_imbalance == expected.max_order_imbalance
+            && self.max_null_center_log == expected.max_null_center_log
+            && self.max_null_ci_half_width_log == expected.max_null_ci_half_width_log
+            && self.max_null_log_mad == expected.max_null_log_mad
+            && self.max_null_order_effect_log == expected.max_null_order_effect_log
+            && self.max_null_drift_log == expected.max_null_drift_log
+            && self.summary_direction_dead_band_log == expected.summary_direction_dead_band_log
+            && self.max_reproduction_delta_log == expected.max_reproduction_delta_log
+    }
+
     /// Freeze the complete QG-1 prepared-cell authority before any warmup or
     /// timing sample is produced.
     ///
@@ -3951,8 +4147,14 @@ impl PairedEstimatorConfig {
     ///
     /// # Errors
     ///
+    /// `issued_streams` supplies `(role, block_id_base, sample_id_base,
+    /// first_arms)`. Each `first_arms` entry expands to the exact control and
+    /// treatment rows for one randomized pair, then becomes immutable inside
+    /// the authority before the runner starts.
+    ///
     /// Returns an invalid-configuration error when the proposed QG-1 plan is
-    /// not one complete canonical authority.
+    /// not one complete canonical authority, or when an authority was already
+    /// frozen into this configuration.
     pub fn install_qg1_lifecycle_authority(
         &mut self,
         scope: PerfOperationScope,
@@ -3965,13 +4167,93 @@ impl PairedEstimatorConfig {
         batch_coverage: Vec<Qg1BatchCoverage>,
         tail_document_id: String,
         expected_pair_count: u64,
-        stream_roles: Vec<String>,
+        issued_streams: Vec<(String, u64, u64, Vec<PerfSampleArm>)>,
     ) -> Result<(), PairedEstimatorError> {
-        let expected_stream_row_count = expected_pair_count.checked_mul(2).ok_or_else(|| {
-            PairedEstimatorError::InvalidConfig {
-                reason: "QG-1 lifecycle authority stream row count overflowed".to_owned(),
+        if self.qg1_lifecycle_authority.is_some() {
+            return Err(PairedEstimatorError::InvalidConfig {
+                reason: "QG-1 lifecycle authority is single-assignment once timing is planned"
+                    .to_owned(),
+            });
+        }
+        let mut issued_rows = Vec::new();
+        for (stream_role, block_id_base, sample_id_base, first_arms) in issued_streams {
+            if u64::try_from(first_arms.len()).ok() != Some(expected_pair_count) {
+                return Err(PairedEstimatorError::InvalidConfig {
+                    reason: "QG-1 issued transcript does not contain the exact planned pair count"
+                        .to_owned(),
+                });
             }
-        })?;
+            for (round, first_arm) in first_arms.into_iter().enumerate() {
+                let round =
+                    u64::try_from(round).map_err(|_| PairedEstimatorError::InvalidConfig {
+                        reason: "QG-1 issued transcript round does not fit u64".to_owned(),
+                    })?;
+                let block_id = block_id_base.checked_add(round).ok_or_else(|| {
+                    PairedEstimatorError::InvalidConfig {
+                        reason: "QG-1 issued transcript block ID overflowed".to_owned(),
+                    }
+                })?;
+                let control_sample_id = sample_id_base
+                    .checked_add(round.checked_mul(2).ok_or_else(|| {
+                        PairedEstimatorError::InvalidConfig {
+                            reason: "QG-1 issued transcript sample ID overflowed".to_owned(),
+                        }
+                    })?)
+                    .ok_or_else(|| PairedEstimatorError::InvalidConfig {
+                        reason: "QG-1 issued transcript sample ID overflowed".to_owned(),
+                    })?;
+                let treatment_sample_id = control_sample_id.checked_add(1).ok_or_else(|| {
+                    PairedEstimatorError::InvalidConfig {
+                        reason: "QG-1 issued transcript sample ID overflowed".to_owned(),
+                    }
+                })?;
+                let stream_sequence =
+                    round
+                        .checked_mul(2)
+                        .ok_or_else(|| PairedEstimatorError::InvalidConfig {
+                            reason: "QG-1 issued transcript sequence overflowed".to_owned(),
+                        })?;
+                let second_arm = match first_arm {
+                    PerfSampleArm::Control => PerfSampleArm::Treatment,
+                    PerfSampleArm::Treatment => PerfSampleArm::Control,
+                };
+                for (offset, arm, order, sample_id) in [
+                    (
+                        0_u64,
+                        first_arm,
+                        PerfSampleOrder::First,
+                        if first_arm == PerfSampleArm::Control {
+                            control_sample_id
+                        } else {
+                            treatment_sample_id
+                        },
+                    ),
+                    (
+                        1_u64,
+                        second_arm,
+                        PerfSampleOrder::Second,
+                        if second_arm == PerfSampleArm::Control {
+                            control_sample_id
+                        } else {
+                            treatment_sample_id
+                        },
+                    ),
+                ] {
+                    issued_rows.push(Qg1IssuedRow {
+                        stream_role: stream_role.clone(),
+                        stream_sequence: stream_sequence.checked_add(offset).ok_or_else(|| {
+                            PairedEstimatorError::InvalidConfig {
+                                reason: "QG-1 issued transcript sequence overflowed".to_owned(),
+                            }
+                        })?,
+                        block_id,
+                        sample_id,
+                        arm,
+                        order,
+                    });
+                }
+            }
+        }
         self.qg1_lifecycle_authority = Some(
             Qg1LifecycleAuthority::new(
                 scope,
@@ -3983,15 +4265,28 @@ impl PairedEstimatorConfig {
                 prepared_batch_count,
                 batch_coverage,
                 tail_document_id,
-                expected_stream_row_count,
                 expected_pair_count,
-                stream_roles,
+                issued_rows,
             )
             .map_err(|reason| PairedEstimatorError::InvalidConfig {
                 reason: reason.to_owned(),
             })?,
         );
         Ok(())
+    }
+
+    /// Return the pre-timing QG-1 authority digest for an external verifier to
+    /// retain separately from the serialised experiment artifact.
+    ///
+    /// This is intentionally a commitment to the frozen issuance transcript,
+    /// not a substitute for retaining that plan in the caller's evidence
+    /// store. Persisted verification must receive this value from that
+    /// independent store rather than reading it back from an artifact.
+    #[must_use]
+    pub fn qg1_lifecycle_authority_digest(&self) -> Option<&str> {
+        self.qg1_lifecycle_authority
+            .as_ref()
+            .map(|authority| authority.authority_sha256.as_str())
     }
 
     /// Issue the immutable authority coordinates a live QG-1 row must retain.
@@ -4001,17 +4296,38 @@ impl PairedEstimatorConfig {
         scope: &PerfOperationScope,
         provenance: &PerfSampleProvenance,
         stream_role: &str,
-    ) -> Option<(String, String)> {
+        stream_sequence: u64,
+        sample_id: u64,
+        block_id: u64,
+        arm: PerfSampleArm,
+        order: PerfSampleOrder,
+    ) -> Option<(String, String, String)> {
         let authority = self.qg1_lifecycle_authority.as_ref()?;
         if authority.validate().is_err()
             || authority.scope != *scope
             || authority.provenance_corpus_sha256 != provenance.corpus_sha256
+            || !authority.issued_row_matches(
+                stream_role,
+                stream_sequence,
+                block_id,
+                sample_id,
+                arm,
+                order,
+            )
         {
             return None;
         }
         Some((
             authority.authority_sha256.clone(),
             authority.stream_role_identity_sha256(stream_role)?,
+            authority.issued_slot_for(
+                stream_role,
+                stream_sequence,
+                block_id,
+                sample_id,
+                arm,
+                order,
+            )?,
         ))
     }
 
@@ -4026,6 +4342,24 @@ impl PairedEstimatorConfig {
         self.qg1_lifecycle_authority
             .as_ref()
             .is_some_and(|authority| binding.matches_authority(authority, scope, provenance))
+    }
+
+    /// Return the exact number of pre-issued rows for one QG-1 stream role.
+    #[must_use]
+    pub fn qg1_issued_stream_row_count(
+        &self,
+        scope: &PerfOperationScope,
+        provenance: &PerfSampleProvenance,
+        stream_role: &str,
+    ) -> Option<usize> {
+        let authority = self.qg1_lifecycle_authority.as_ref()?;
+        if authority.validate().is_err()
+            || authority.scope != *scope
+            || authority.provenance_corpus_sha256 != provenance.corpus_sha256
+        {
+            return None;
+        }
+        Some(authority.issued_row_count(stream_role))
     }
 
     /// Validate that every threshold was fixed to a finite, usable value.
@@ -4231,18 +4565,54 @@ pub struct PairedExperimentResult {
 }
 
 impl PairedExperimentResult {
-    /// Recompute every estimate and decision from the retained raw records.
+    /// Recompute a non-QG-1 persisted estimate from retained raw records.
+    ///
+    /// Persisted QG-1 evidence must instead call
+    /// [`Self::verify_recomputed_against_qg1_authority_digest`] with the
+    /// authority digest frozen before measurement. The artifact's serialized
+    /// configuration is evidence to compare, never its own replay authority.
     ///
     /// # Errors
     ///
     /// Returns [`PairedEstimatorError::InconsistentSummary`] on any mismatch.
     pub fn verify_recomputed(&self) -> Result<(), PairedEstimatorError> {
-        let mut expected_config = PairedEstimatorConfig::predeclared(self.config.bootstrap_seed);
-        expected_config.qg1_lifecycle_authority = self.config.qg1_lifecycle_authority.clone();
-        if self.config != expected_config || self.config.validate().is_err() {
+        self.verify_recomputed_against_qg1_authority_digest(None)
+    }
+
+    /// Recompute retained evidence against an authority digest supplied outside
+    /// the serialized result.
+    ///
+    /// The caller must retain this digest from the pre-timing cell plan. A
+    /// QG-1 artifact cannot satisfy this requirement by cloning or presenting
+    /// the authority embedded in its own configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-configuration error unless the optional expectation
+    /// exactly matches the artifact's QG-1 authority presence and digest.
+    pub fn verify_recomputed_against_qg1_authority_digest(
+        &self,
+        expected_qg1_authority_digest: Option<&str>,
+    ) -> Result<(), PairedEstimatorError> {
+        if !self.config.has_predeclared_thresholds() || self.config.validate().is_err() {
             return Err(PairedEstimatorError::InvalidConfig {
-                reason: "persisted evidence must use the exact predeclared estimator thresholds; \
-                         only the bootstrap seed and a valid QG-1 lifecycle authority may vary"
+                reason: "persisted evidence must use the exact predeclared estimator thresholds"
+                    .to_owned(),
+            });
+        }
+        let embedded_qg1_digest = self
+            .config
+            .qg1_lifecycle_authority
+            .as_ref()
+            .map(|authority| authority.authority_sha256.as_str());
+        let authority_matches = match (embedded_qg1_digest, expected_qg1_authority_digest) {
+            (None, None) => true,
+            (Some(actual), Some(expected)) => actual == expected,
+            _ => false,
+        };
+        if !authority_matches {
+            return Err(PairedEstimatorError::InvalidConfig {
+                reason: "persisted QG-1 evidence requires an independently supplied expected authority digest"
                     .to_owned(),
             });
         }
@@ -4253,6 +4623,13 @@ impl PairedExperimentResult {
         } else {
             Err(PairedEstimatorError::InconsistentSummary)
         }
+    }
+
+    fn recomputes_from_live_authority_config(&self) -> bool {
+        self.config.has_predeclared_thresholds()
+            && self.config.validate().is_ok()
+            && estimate_paired_experiment(&self.effect_samples, &self.null_samples, &self.config)
+                .is_ok_and(|recomputed| recomputed == *self)
     }
 
     /// Absolute log-effect delta against an independent process invocation.
@@ -6636,8 +7013,56 @@ mod tests {
         work_units: u64,
         content_bytes: u64,
         expected_pair_count: u64,
-        stream_roles: &[&str],
+        issued_streams: &[(&str, u64)],
     ) -> Qg1LifecycleAuthority {
+        let first_arms = seeded_balanced_pair_order(
+            usize::try_from(expected_pair_count).expect("QG-1 test pair count fits usize"),
+            0x00dd_5eed,
+        )
+        .expect("QG-1 test issued order");
+        let mut issued_rows = Vec::new();
+        for (stream_role, sample_id_base) in issued_streams {
+            for (round, first_arm) in first_arms.iter().copied().enumerate() {
+                let round = u64::try_from(round).expect("QG-1 test round fits u64");
+                let control_sample_id = sample_id_base + round * 2;
+                let treatment_sample_id = control_sample_id + 1;
+                let second_arm = match first_arm {
+                    PerfSampleArm::Control => PerfSampleArm::Treatment,
+                    PerfSampleArm::Treatment => PerfSampleArm::Control,
+                };
+                for (offset, arm, order, sample_id) in [
+                    (
+                        0_u64,
+                        first_arm,
+                        PerfSampleOrder::First,
+                        if first_arm == PerfSampleArm::Control {
+                            control_sample_id
+                        } else {
+                            treatment_sample_id
+                        },
+                    ),
+                    (
+                        1_u64,
+                        second_arm,
+                        PerfSampleOrder::Second,
+                        if second_arm == PerfSampleArm::Control {
+                            control_sample_id
+                        } else {
+                            treatment_sample_id
+                        },
+                    ),
+                ] {
+                    issued_rows.push(Qg1IssuedRow {
+                        stream_role: (*stream_role).to_owned(),
+                        stream_sequence: round * 2 + offset,
+                        block_id: round,
+                        sample_id,
+                        arm,
+                        order,
+                    });
+                }
+            }
+        }
         Qg1LifecycleAuthority::new(
             scope.clone(),
             provenance.corpus_sha256.clone(),
@@ -6651,11 +7076,8 @@ mod tests {
                 document_count: work_units,
             }],
             format!("synthetic-{:08}", work_units.saturating_sub(1)),
-            expected_pair_count
-                .checked_mul(2)
-                .expect("QG-1 test authority row count fits u64"),
             expected_pair_count,
-            stream_roles.iter().map(|role| (*role).to_owned()).collect(),
+            issued_rows,
         )
         .expect("freeze QG-1 test lifecycle authority")
     }
@@ -6700,6 +7122,16 @@ mod tests {
             stream_role_identity_sha256: authority
                 .stream_role_identity_sha256(stream_role)
                 .expect("QG-1 test authority permits its stream role"),
+            issued_slot_sha256: authority
+                .issued_slot_for(
+                    stream_role,
+                    stream_sequence,
+                    block_id,
+                    sample_id,
+                    arm,
+                    order,
+                )
+                .expect("QG-1 test authority issues its raw row"),
             lifecycle_receipt_id_sha256: String::new(),
             lifecycle_receipt_sha256: String::new(),
             prepared_corpus_sha256: provenance.corpus_sha256.clone(),
@@ -6823,8 +7255,8 @@ mod tests {
             content_bytes,
             u64::try_from(PERF_MIN_RUNS).expect("QG-1 pilot pair count fits u64"),
             &[
-                QG1_STREAM_ROLE_TANTIVY_PILOT_EFFECT,
-                QG1_STREAM_ROLE_TANTIVY_PILOT_NULL,
+                (QG1_STREAM_ROLE_TANTIVY_PILOT_EFFECT, 0),
+                (QG1_STREAM_ROLE_TANTIVY_PILOT_NULL, 10_000),
             ],
         );
         let effect = qg1_duration_stream(
@@ -6974,9 +7406,9 @@ mod tests {
             screen_plan.content_bytes,
             u64::try_from(PERF_MIN_RUNS).expect("QG-1 decision pair count fits u64"),
             &[
-                QG1_STREAM_ROLE_EFFECT,
-                QG1_STREAM_ROLE_TANTIVY_NULL,
-                QG1_STREAM_ROLE_QUILL_NULL,
+                (QG1_STREAM_ROLE_EFFECT, 100_000),
+                (QG1_STREAM_ROLE_TANTIVY_NULL, 200_000),
+                (QG1_STREAM_ROLE_QUILL_NULL, 300_000),
             ],
         );
         let mut estimator_config = estimator_config();
@@ -7054,13 +7486,18 @@ mod tests {
         let scope = qg1_throughput_scope(&cell);
         let provenance = provenance("qg1-binding-hostile");
         let durations = [1_000_000; PERF_MIN_RUNS];
+        let mut treatment_durations = [900_000; PERF_MIN_RUNS];
+        treatment_durations[PERF_MIN_RUNS - 1] = 1_200_000;
         let authority = qg1_test_authority(
             &scope,
             &provenance,
             500,
             64_000,
             u64::try_from(PERF_MIN_RUNS).expect("QG-1 hostile pair count fits u64"),
-            &[QG1_STREAM_ROLE_EFFECT, QG1_STREAM_ROLE_TANTIVY_NULL],
+            &[
+                (QG1_STREAM_ROLE_EFFECT, 0),
+                (QG1_STREAM_ROLE_TANTIVY_NULL, 10_000),
+            ],
         );
         let mut config = estimator_config();
         config.qg1_lifecycle_authority = Some(authority.clone());
@@ -7068,7 +7505,7 @@ mod tests {
             &scope,
             &provenance,
             &durations,
-            &[900_000; PERF_MIN_RUNS],
+            &treatment_durations,
             0,
             500,
             64_000,
@@ -7090,10 +7527,19 @@ mod tests {
             QG1_TANTIVY_ENGINE_ID,
             QG1_STREAM_ROLE_TANTIVY_NULL,
         );
+        let intact_experiment = estimate_paired_experiment(&effect, &null, &config)
+            .expect("the intact QG-1 lifecycle binding must reach the live estimator");
         assert!(
-            estimate_paired_experiment(&effect, &null, &config).is_ok(),
-            "the intact QG-1 lifecycle binding must reach the live estimator"
+            intact_experiment.verify_recomputed().is_err(),
+            "a persisted QG-1 artifact must not authenticate itself from its embedded authority"
         );
+        let expected_authority_digest = config
+            .qg1_lifecycle_authority_digest()
+            .expect("fixed pre-timing authority")
+            .to_owned();
+        intact_experiment
+            .verify_recomputed_against_qg1_authority_digest(Some(&expected_authority_digest))
+            .expect("persisted QG-1 evidence recomputes against the independently retained digest");
 
         let assert_rejected = |effect: Vec<PerfRawSample>, label: &str| {
             assert!(
@@ -7134,13 +7580,60 @@ mod tests {
             .lifecycle_receipt_id_sha256 = original_receipt_id;
         assert_rejected(duplicated_receipt, "duplicate lifecycle receipt identity");
 
+        let mut cloned_fast_pair = effect.clone();
+        let fast_pair = cloned_fast_pair
+            .iter()
+            .filter(|sample| sample.block_id == 0)
+            .cloned()
+            .collect::<Vec<_>>();
+        let suffix_block =
+            u64::try_from(PERF_MIN_RUNS - 1).expect("QG-1 hostile suffix block fits u64");
+        for sample in cloned_fast_pair
+            .iter_mut()
+            .filter(|sample| sample.block_id == suffix_block)
+        {
+            let replacement = fast_pair
+                .iter()
+                .find(|candidate| candidate.arm == sample.arm)
+                .expect("fast source pair has the matching arm");
+            sample.started_ns = replacement.started_ns;
+            sample.ended_ns = replacement.ended_ns;
+            sample.work_units = replacement.work_units;
+            sample.byte_count = replacement.byte_count;
+            sample.observed_value = replacement.observed_value;
+            let target_sequence = sample
+                .qg1_sample_binding
+                .as_ref()
+                .expect("suffix binding")
+                .stream_sequence;
+            let mut forged_binding = replacement
+                .qg1_sample_binding
+                .as_ref()
+                .expect("fast source binding")
+                .clone();
+            forged_binding.stream_sequence = target_sequence;
+            forged_binding.raw_sample_id = sample.sample_id;
+            forged_binding.raw_block_id = sample.block_id;
+            forged_binding.raw_arm = sample.arm;
+            forged_binding.raw_order = sample.order;
+            forged_binding.seal_lifecycle_receipt(&scope, &provenance);
+            sample.qg1_sample_binding = Some(forged_binding);
+        }
+        assert_rejected(
+            cloned_fast_pair,
+            "slow suffix pair replaced by a cloned and resealed fast pair at exact cardinality",
+        );
+
         let lowered_authority = qg1_test_authority(
             &scope,
             &provenance,
             500,
             64_000,
             9,
-            &[QG1_STREAM_ROLE_EFFECT, QG1_STREAM_ROLE_TANTIVY_NULL],
+            &[
+                (QG1_STREAM_ROLE_EFFECT, 0),
+                (QG1_STREAM_ROLE_TANTIVY_NULL, 10_000),
+            ],
         );
         let mut coordinated_suffix_effect = effect.clone();
         let mut coordinated_suffix_null = null.clone();
@@ -7386,6 +7879,63 @@ mod tests {
             "coordinated whole-stream prepared manifest/content/tail/schedule substitution",
         );
 
+        let mut substituted_authority = authority.clone();
+        for issued_row in &mut substituted_authority.issued_rows {
+            issued_row.block_id = issued_row
+                .block_id
+                .checked_add(1_000_000)
+                .expect("hostile transcript block shift fits u64");
+        }
+        substituted_authority.authority_sha256 =
+            substituted_authority.recomputed_authority_sha256();
+        substituted_authority
+            .validate()
+            .expect("coordinated hostile authority is internally consistent");
+        let mut substituted_effect = effect.clone();
+        let mut substituted_null = null.clone();
+        for sample in substituted_effect
+            .iter_mut()
+            .chain(substituted_null.iter_mut())
+        {
+            sample.block_id = sample
+                .block_id
+                .checked_add(1_000_000)
+                .expect("hostile raw block shift fits u64");
+            let binding = sample.qg1_sample_binding.as_mut().expect("binding");
+            binding.raw_block_id = sample.block_id;
+            binding.lifecycle_authority_sha256 = substituted_authority.authority_sha256.clone();
+            binding.stream_role_identity_sha256 = substituted_authority
+                .stream_role_identity_sha256(&binding.stream_role)
+                .expect("substituted authority preserves the known role");
+            binding.issued_slot_sha256 = substituted_authority
+                .issued_slot_for(
+                    &binding.stream_role,
+                    binding.stream_sequence,
+                    binding.raw_block_id,
+                    binding.raw_sample_id,
+                    binding.raw_arm,
+                    binding.raw_order,
+                )
+                .expect("substituted authority issues the relabelled raw row");
+            binding.seal_lifecycle_receipt(&scope, &provenance);
+        }
+        assert_streams_rejected(
+            substituted_effect.clone(),
+            substituted_null.clone(),
+            "fixed live authority rejects coordinated embedded authority and row transcript substitution",
+        );
+        let mut substituted_config = config.clone();
+        substituted_config.qg1_lifecycle_authority = Some(substituted_authority);
+        let substituted_experiment =
+            estimate_paired_experiment(&substituted_effect, &substituted_null, &substituted_config)
+                .expect("coordinated artifact substitution remains self-consistent");
+        assert!(
+            substituted_experiment
+                .verify_recomputed_against_qg1_authority_digest(Some(&expected_authority_digest))
+                .is_err(),
+            "persisted QG-1 verification must compare artifact evidence to its independently retained authority digest"
+        );
+
         let mut noncanonical_effect = effect.clone();
         let mut noncanonical_null = null.clone();
         let noncanonical_scope = PerfOperationScope {
@@ -7471,6 +8021,73 @@ mod tests {
         assert_rejected(
             unsearchable_tantivy,
             "unsearchable Tantivy terminal witness",
+        );
+    }
+
+    #[test]
+    fn qg1_lifecycle_authority_installation_is_single_assignment() {
+        let cell = qg1_bulk_cell(4);
+        let scope = qg1_throughput_scope(&cell);
+        let provenance = provenance("qg1-single-assignment");
+        let schedule =
+            seeded_balanced_pair_order(PERF_MIN_RUNS, 0x00dd_5eed).expect("QG-1 frozen schedule");
+        let issued_streams = || {
+            vec![
+                (QG1_STREAM_ROLE_EFFECT.to_owned(), 0, 0, schedule.clone()),
+                (
+                    QG1_STREAM_ROLE_TANTIVY_NULL.to_owned(),
+                    0,
+                    10_000,
+                    schedule.clone(),
+                ),
+            ]
+        };
+        let mut config = estimator_config();
+        config
+            .install_qg1_lifecycle_authority(
+                scope.clone(),
+                provenance.corpus_sha256.clone(),
+                "a".repeat(64),
+                "b".repeat(64),
+                500,
+                64_000,
+                1,
+                vec![Qg1BatchCoverage {
+                    document_start: 0,
+                    document_count: 500,
+                }],
+                "synthetic-00000499".to_owned(),
+                u64::try_from(PERF_MIN_RUNS).expect("QG-1 pair count fits u64"),
+                issued_streams(),
+            )
+            .expect("first pre-timing lifecycle authority install");
+        let frozen_digest = config
+            .qg1_lifecycle_authority_digest()
+            .expect("installed authority digest")
+            .to_owned();
+        assert!(matches!(
+            config.install_qg1_lifecycle_authority(
+                scope,
+                provenance.corpus_sha256.clone(),
+                "a".repeat(64),
+                "b".repeat(64),
+                500,
+                64_000,
+                1,
+                vec![Qg1BatchCoverage {
+                    document_start: 0,
+                    document_count: 500,
+                }],
+                "synthetic-00000499".to_owned(),
+                u64::try_from(PERF_MIN_RUNS).expect("QG-1 pair count fits u64"),
+                issued_streams(),
+            ),
+            Err(PairedEstimatorError::InvalidConfig { .. })
+        ));
+        assert_eq!(
+            config.qg1_lifecycle_authority_digest(),
+            Some(frozen_digest.as_str()),
+            "a rejected overwrite must leave the original pre-timing authority frozen"
         );
     }
 
