@@ -999,10 +999,23 @@ mod tests {
             let input = std::iter::repeat_n("hello", tokens)
                 .collect::<Vec<_>>()
                 .join(" ");
+            let expected_len = tokens.min(512);
+            let former_ids = former_token_ids(&embedder, &input);
+            let fast_ids = embedder
+                .tokenizer
+                .encode_fast(&input, false)
+                .unwrap()
+                .get_ids()
+                .to_vec();
             assert_eq!(
-                former_token_ids(&embedder, &input).len(),
-                512,
+                former_ids.len(),
+                expected_len,
                 "former tokenizer truncation at {tokens} input tokens"
+            );
+            assert_eq!(
+                fast_ids.len(),
+                expected_len,
+                "fast tokenizer truncation at {tokens} input tokens"
             );
         }
 
@@ -1281,6 +1294,72 @@ mod tests {
         )
         .expect("load verified potion embedder");
         assert_eq!(embedder.identity().unwrap(), &expected_identity);
+
+        let added_vocabulary = embedder.tokenizer.get_added_vocabulary().get_vocab();
+        let pad_id = *added_vocabulary
+            .get("[PAD]")
+            .expect("verified Potion tokenizer must retain [PAD] as an added special token");
+        let unk_id = *added_vocabulary
+            .get("[UNK]")
+            .expect("verified Potion tokenizer must retain [UNK] as an added special token");
+        let added_special_text = "hello [PAD] [UNK] world";
+        let long_over_512_text = std::iter::repeat_n("hello", 1024)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut parity_texts = crate::model_manifest::MODEL_CONFORMANCE_TEXTS_V1
+            .iter()
+            .map(|text| (*text).to_owned())
+            .collect::<Vec<_>>();
+        parity_texts.extend([
+            "Caf\u{e9} na\u{ef}ve \u{2014} \u{6771}\u{4eac} \u{1f980}".to_owned(),
+            added_special_text.to_owned(),
+            "\tmetaspace  boundaries\tand unseen-oov-\u{10ffff}".to_owned(),
+            long_over_512_text.clone(),
+        ]);
+        for text in &parity_texts {
+            assert_fast_ids_and_former_vector_bits(
+                &embedder,
+                text,
+                "verified Potion tokenizer parity input",
+            );
+        }
+
+        let added_special_ids = former_token_ids(&embedder, added_special_text);
+        assert!(
+            added_special_ids.contains(&pad_id) && added_special_ids.contains(&unk_id),
+            "verified Potion tokenizer must emit both literal added special-token IDs"
+        );
+        let former_long = embedder
+            .tokenizer
+            .encode(&long_over_512_text, false)
+            .expect("encode long verified Potion input");
+        let fast_long = embedder
+            .tokenizer
+            .encode_fast(&long_over_512_text, false)
+            .expect("encode_fast long verified Potion input");
+        assert!(
+            embedder.tokenizer.get_truncation().is_none(),
+            "registered Potion tokenizer must preserve its configured no-truncation policy"
+        );
+        assert!(
+            former_long.len() > 512,
+            "long verified Potion input must exceed the former 512-token synthetic boundary"
+        );
+        assert_eq!(
+            fast_long.len(),
+            former_long.len(),
+            "verified Potion long-input token count diverged"
+        );
+        assert_eq!(
+            fast_long.get_ids(),
+            former_long.get_ids(),
+            "verified Potion long-input token IDs diverged"
+        );
+        assert!(
+            former_long.get_overflowing().is_empty() && fast_long.get_overflowing().is_empty(),
+            "configured no-truncation policy must not emit overflow encodings"
+        );
+
         let texts = &crate::model_manifest::MODEL_CONFORMANCE_TEXTS_V1;
         let former_vectors = texts
             .iter()
