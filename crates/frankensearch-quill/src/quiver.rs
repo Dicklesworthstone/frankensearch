@@ -16425,6 +16425,15 @@ mod tests {
             !holes.contains_global_docid(hole_map.as_bytes(), 21),
             "the unchanged byte-backed path rejects an IDMAP hole"
         );
+        let mut malformed_hole_bytes = hole_map.as_bytes().to_vec();
+        let first_present_end_offset = ID_MAP_HEADER_LEN + ID_MAP_OFFSET_LEN;
+        malformed_hole_bytes
+            [first_present_end_offset..first_present_end_offset + ID_MAP_OFFSET_LEN]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(
+            !holes.contains_global_docid(&malformed_hole_bytes, 20),
+            "the hole fallback fails closed on a same-length poisoned offset"
+        );
 
         let empty_map = EncodedIdMapSection::encode(0, 0, &[])?;
         let empty_hash = EncodedIdHashSection::encode(empty_map.section()?)?;
