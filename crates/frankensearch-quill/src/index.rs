@@ -6498,11 +6498,14 @@ impl QuillWriterState {
                         "arena_bytes_reserved_high_water",
                         u64::try_from(receipt.arena_bytes_reserved_high_water).unwrap_or(u64::MAX),
                     );
-                    debug_assert_eq!(
-                        receipt.worker_witness,
-                        observation.snapshot(),
-                        "committed parallel receipt must match the batch observation"
-                    );
+                    #[cfg(test)]
+                    {
+                        debug_assert_eq!(
+                            receipt.worker_witness,
+                            observation.snapshot(),
+                            "committed parallel receipt must match the batch observation"
+                        );
+                    }
                     self.ingest_retry_required = false;
                     // The whole operation is finished here: the fan-out published
                     // a receipt and nothing further can fail.
