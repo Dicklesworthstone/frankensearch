@@ -583,8 +583,9 @@ struct ReconciliationState {
     /// What is known about the tree the index describes.
     authority: DeletionAuthorityState,
     /// Operator opt-in permitting the next adjudicating pass to also settle
-    /// the inherited legacy names. One-shot, and consumed only by a pass that
-    /// actually adjudicated them.
+    /// the inherited legacy names that were held when it was granted. One-shot
+    /// and consumed only by a pass that actually adjudicated them; a later
+    /// legacy import revokes it rather than broadening its scope.
     rebuild_authorized: bool,
     /// Consecutive complete passes that concluded without adjudicating.
     unsettled_passes: u32,
@@ -820,6 +821,10 @@ impl ReconciliationState {
         if snapshot.is_empty() {
             return;
         }
+        // An operator grant is for the legacy record they could inspect. A
+        // later crash-recovery import changes that record, so retaining the
+        // grant would let it authorize names the operator never approved.
+        self.rebuild_authorized = false;
         // Union, never replace: each inherited record names files some earlier
         // regime indexed, and dropping one to make room for the next would lose
         // exactly the names that have no other evidence behind them.
@@ -844,8 +849,22 @@ impl ReconciliationState {
         };
     }
 
-    /// Grant one-shot permission to adjudicate the inherited legacy names.
+    /// Grant one-shot permission to adjudicate the currently held inherited
+    /// legacy names.
+    ///
+    /// A grant without a held legacy baseline is rejected instead of waiting
+    /// for a later, unrelated `inherit_legacy` call. Otherwise an operator
+    /// action taken for one state could silently authorize a different
+    /// crash-recovery record that did not exist when the action was taken.
     fn authorize_rebuild(&mut self) {
+        if self.rebuild_authorized
+            || !self
+                .authority
+                .legacy()
+                .is_some_and(|legacy| !legacy.is_empty())
+        {
+            return;
+        }
         self.rebuild_authorized = true;
     }
 
@@ -1650,7 +1669,13 @@ impl FsWatcher {
             &self.reconciliation,
             events,
             &collect_snapshot_from_roots,
+            // This caller owns the `Cx`; it has no watcher generation whose
+            // stop signal it can observe.
+            &|| cx.is_cancel_requested(),
         ) {
+            if cx.is_cancel_requested() {
+                return Err(cancelled_ingest_error(cx));
+            }
             return Err(error);
         }
         guard.commit();
@@ -1680,6 +1705,10 @@ impl FsWatcher {
     /// those names on its own. This is the operator saying that the roots in
     /// the configuration really are the roots that corpus was built from, and
     /// it is spent by the next pass that holds authority and adjudicates them.
+    ///
+    /// With no currently held inherited baseline (or an already pending grant)
+    /// this is rejected immediately, so an early request cannot authorize a
+    /// later unrelated legacy snapshot.
     pub fn authorize_deletion_authority_rebuild(&self) {
         lock_or_recover(&self.reconciliation).authorize_rebuild();
     }
@@ -2231,6 +2260,7 @@ async fn run_ingest_loop(
                 discovery,
                 ingest,
                 ready_batches,
+                stop,
                 stats,
                 reconciliation,
                 producer_done,
@@ -2335,9 +2365,22 @@ async fn run_ingest_loop(
                     reconciliation,
                     &events,
                     snapshot_collector,
+                    // A live ingest batch must stop its post-apply walk for
+                    // either public watcher shutdown or caller cancellation.
+                    &|| stop.is_requested() || cx.is_cancel_requested(),
                 ) {
+                    if stop.is_requested() {
+                        // The batch already crossed its mutation boundary.
+                        // Its lease records reconciliation debt, then the loop
+                        // head drains the stopped generation without treating
+                        // ordinary shutdown as a failed watcher task.
+                        continue;
+                    }
+                    if cx.is_cancel_requested() {
+                        return Err(cancelled_ingest_error(cx));
+                    }
                     stats.add_error();
-                    if !is_retryable_error(&error) || cx.is_cancel_requested() {
+                    if !is_retryable_error(&error) {
                         return Err(error);
                     }
                     asupersync::time::sleep(cx.now(), IDLE_POLL).await;
@@ -2393,6 +2436,7 @@ async fn drain_final_batches(
     discovery: &DiscoveryConfig,
     ingest: &dyn WatchIngestPipeline,
     ready_batches: &ReadyBatchQueue,
+    stop: &WatcherStop,
     stats: &WatcherStatsInner,
     reconciliation: &ReconciliationTracker,
     producer_done: &AtomicBool,
@@ -2445,6 +2489,10 @@ async fn drain_final_batches(
                     reconciliation,
                     &events,
                     snapshot_collector,
+                    // Final draining may still apply a flushed event, but a
+                    // stop or caller cancellation must leave its authority
+                    // and success counters uncommitted for reconciliation.
+                    &|| stop.is_requested() || cx.is_cancel_requested(),
                 ) {
                     Ok(()) => {
                         lease.commit();
@@ -2457,6 +2505,12 @@ async fn drain_final_batches(
                         // failed. Dropping the lease past the mutation boundary
                         // leaves a rescan owed, which is what settles it.
                         drop(lease);
+                        if stop.is_requested() {
+                            return Ok(());
+                        }
+                        if cx.is_cancel_requested() {
+                            return Err(cancelled_ingest_error(cx));
+                        }
                         stats.add_error();
                         if is_retryable_error(&error) && !cx.is_cancel_requested() {
                             return Ok(());
@@ -2724,7 +2778,14 @@ fn record_successful_events(
     reconciliation: &ReconciliationTracker,
     events: &[WatchEvent],
     snapshot_collector: &SnapshotCollector,
+    abort: &dyn Fn() -> bool,
 ) -> SearchResult<()> {
+    // `apply_batch` has already crossed its mutation boundary. From here a
+    // stop or cancellation must leave reconciliation owed, not install a
+    // freshly scanned authority or publish success statistics.
+    if abort() {
+        return Err(scan_interrupted_error());
+    }
     // Read the lineage this batch is being recorded against *before* the scan,
     // so the checks below compare the authority that was in force when the
     // batch was applied against the one still in force now.
@@ -2736,8 +2797,14 @@ fn record_successful_events(
             state.established_identities().cloned(),
         )
     };
-    let (current, completeness) = snapshot_collector(roots, discovery, &|| false)?;
+    let (current, completeness) = snapshot_collector(roots, discovery, abort)?;
+    if abort() {
+        return Err(scan_interrupted_error());
+    }
     let mut state = lock_or_recover(reconciliation);
+    if abort() {
+        return Err(scan_interrupted_error());
+    }
     if !state.baseline_initialized {
         state.indexed_snapshot = current.clone();
         state.baseline_initialized = true;
@@ -4921,6 +4988,14 @@ mod tests {
             Arc::new(NoopWatchIngestPipeline),
         );
 
+        // There is no legacy record yet, so this call must not arm a grant
+        // that a later unrelated crash-recovery snapshot can inherit.
+        watcher.authorize_deletion_authority_rebuild();
+        assert!(
+            !lock_or_recover(&watcher.reconciliation).rebuild_authorized,
+            "a rebuild request with no held legacy baseline must be rejected immediately"
+        );
+
         // The caller's record names a file that no longer exists, while a root
         // is unavailable.
         let indexed_elsewhere = root.join("already-gone.rs");
@@ -5006,6 +5081,27 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == WatchEventKind::Deleted && event.path == later),
             "the spent grant must not authorize the next inherited name, got {refused:?}"
+        );
+    }
+
+    /// A rebuild grant is approval for the inherited record it observed, not
+    /// a reusable capability for a later crash-recovery import.
+    #[test]
+    fn later_legacy_import_revokes_a_pending_rebuild_grant() {
+        let first = FileSnapshot::from([(PathBuf::from("first-crash.rs"), 1)]);
+        let later = FileSnapshot::from([(PathBuf::from("later-crash.rs"), 2)]);
+        let mut state = ReconciliationState::default();
+
+        state.inherit_legacy(&first);
+        state.authorize_rebuild();
+        assert!(
+            state.rebuild_authorized,
+            "a held legacy record may receive an explicit rebuild grant"
+        );
+        state.inherit_legacy(&later);
+        assert!(
+            !state.rebuild_authorized,
+            "a later legacy import must revoke a grant scoped to the earlier record"
         );
     }
 
@@ -5804,6 +5900,7 @@ mod tests {
             &reconciliation,
             &[WatchEvent::modified(&replacement, 100, Some(12))],
             &collect_snapshot_from_roots,
+            &|| false,
         )
         .expect("recording succeeds; it simply refuses to rebind");
 
@@ -5830,14 +5927,197 @@ mod tests {
         );
     }
 
-    /// A stop must apply what the producer already flushed.
+    /// A completed bookkeeping walk remains the only path that advances an
+    /// established authority and publishes the batch's success counters.
+    #[test]
+    fn noncancelled_post_apply_bookkeeping_records_exact_authority_and_stats() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("g4-record-control");
+            fs::create_dir_all(&root).expect("create root");
+            let indexed = root.join("indexed.rs");
+            fs::write(&indexed, "fn indexed() {}\n").expect("write fixture");
+            let roots = vec![root.clone()];
+            let discovery = DiscoveryConfig::default();
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let watcher = FsWatcher::new(
+                roots.clone(),
+                discovery.clone(),
+                Arc::clone(&pipeline) as Arc<dyn WatchIngestPipeline>,
+            );
+            let (baseline, completeness) =
+                collect_snapshot_from_roots(&roots, &discovery, &|| false)
+                    .expect("collect authoritative baseline");
+            assert!(completeness.is_complete());
+            {
+                let mut state = lock_or_recover(&watcher.reconciliation);
+                assert!(
+                    state.seed_initial_authority(baseline, completeness.root_identities().clone(),),
+                    "control fixture must start from established authority"
+                );
+            }
+            let before_generation = lock_or_recover(&watcher.reconciliation)
+                .authority
+                .established()
+                .expect("control authority")
+                .generation;
+
+            let outcome = watcher
+                .process_events_now(&cx, &[WatchEvent::modified(&indexed, 100, Some(12))])
+                .await
+                .expect("noncancelled post-apply bookkeeping");
+            let (expected_snapshot, expected_completeness) =
+                collect_snapshot_from_roots(&roots, &discovery, &|| false)
+                    .expect("collect exact post-apply snapshot");
+            assert!(expected_completeness.is_complete());
+            assert_eq!(outcome.reindexed, 1);
+            assert_eq!(pipeline.all_ops().len(), 1, "the control applied one event");
+
+            let state = lock_or_recover(&watcher.reconciliation);
+            let authority = state.authority.established().expect("advanced authority");
+            assert_eq!(state.indexed_snapshot, expected_snapshot);
+            assert_eq!(authority.snapshot, expected_snapshot);
+            assert_eq!(authority.generation, before_generation + 1);
+            drop(state);
+            assert_eq!(watcher.stats().files_reindexed, 1);
+        });
+    }
+
+    /// A public stop after an actual sink apply must interrupt the bookkeeping
+    /// walk before it advances authority or publishes successful batch stats.
+    ///
+    /// The observer is RAII-scoped to this fixture. Its plain helper thread
+    /// publishes the same stop token `stop_checked` owns, then releases the
+    /// synchronous walk so the single test runtime can join the public stop
+    /// path. With 40a1e0c8's hardcoded `false`, the released walk commits and
+    /// this test's generation/stat assertions fail.
+    #[test]
+    fn public_stop_checked_aborts_post_apply_bookkeeping_without_commit() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("g4-stop-post-apply");
+            fs::create_dir_all(&root).expect("create root");
+            let indexed = root.join("indexed.rs");
+            fs::write(&indexed, "fn indexed() {}\n").expect("write fixture");
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let watcher = Arc::new(FsWatcher::new(
+                vec![root.clone()],
+                DiscoveryConfig::default(),
+                Arc::clone(&pipeline) as Arc<dyn WatchIngestPipeline>,
+            ));
+            watcher.start(&cx).await.expect("start watcher");
+
+            for _ in 0..1_000 {
+                if lock_or_recover(&watcher.reconciliation)
+                    .authority
+                    .established()
+                    .is_some()
+                {
+                    break;
+                }
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            let (before_snapshot, before_generation) = {
+                let state = lock_or_recover(&watcher.reconciliation);
+                let authority = state.authority.established().expect("startup authority");
+                (authority.snapshot.clone(), authority.generation)
+            };
+            let before_stats = watcher.stats();
+            let stop = {
+                let control = lock_or_recover(&watcher.control);
+                assert!(
+                    matches!(&control.lifecycle, WatcherLifecycle::Running { .. }),
+                    "watcher should be running"
+                );
+                let WatcherLifecycle::Running { stop, .. } = &control.lifecycle else {
+                    return;
+                };
+                Arc::clone(stop)
+            };
+
+            let parked = Arc::new((Mutex::new((false, false)), Condvar::new()));
+            let _probe = {
+                let parked = Arc::clone(&parked);
+                let owned_root = root.clone();
+                install_scan_observer(Arc::new(move |probe: ScanProbe, path: &Path| {
+                    if probe != ScanProbe::DirectoryEntered || !path.starts_with(&owned_root) {
+                        return;
+                    }
+                    let (state, changed) = &*parked;
+                    let mut state = lock_or_recover(state);
+                    state.0 = true;
+                    changed.notify_all();
+                    while !state.1 {
+                        state = changed
+                            .wait(state)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                }))
+            };
+            let releaser = {
+                let parked = Arc::clone(&parked);
+                let stop_for_releaser = Arc::clone(&stop);
+                thread::spawn(move || {
+                    let (state, changed) = &*parked;
+                    let mut state = lock_or_recover(state);
+                    while !state.0 {
+                        state = changed
+                            .wait(state)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                    stop_for_releaser.request();
+                    state.1 = true;
+                    changed.notify_all();
+                })
+            };
+
+            lock_or_recover(&watcher.ready_batches).push_back(vec![WatchEvent::modified(
+                &indexed,
+                100,
+                Some(12),
+            )]);
+
+            for _ in 0..1_000 {
+                if watcher.has_terminal_task_outcome() || stop.is_requested() {
+                    break;
+                }
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            releaser.join().expect("release post-apply scan");
+            watcher
+                .stop_checked(&cx)
+                .await
+                .expect("post-apply stop is an ordinary typed shutdown");
+
+            assert_eq!(pipeline.all_ops().len(), 1, "the event crossed apply once");
+            let state = lock_or_recover(&watcher.reconciliation);
+            let authority = state.authority.established().expect("retained authority");
+            assert_eq!(authority.snapshot, before_snapshot);
+            assert_eq!(authority.generation, before_generation);
+            assert!(state.required, "interrupted bookkeeping must remain owed");
+            drop(state);
+            assert_eq!(
+                watcher.stats().files_reindexed,
+                before_stats.files_reindexed,
+                "a stopped bookkeeping walk must not publish an applied batch as committed"
+            );
+            assert_eq!(
+                watcher.stats().files_skipped,
+                before_stats.files_skipped,
+                "a stopped bookkeeping walk must not publish skipped counts"
+            );
+        });
+    }
+
+    /// A stop applies what the producer already flushed, but defers authority
+    /// and success-stat commit to the next reconciliation.
     ///
     /// The producer's shutdown path drains its debounce buffer into the ready
     /// queue precisely because those events are real observations that nothing
     /// re-derives. Returning the instant a stop was seen discarded every one of
     /// them, so a file modified just before shutdown stayed stale in the index.
     #[test]
-    fn stop_applies_the_batches_the_producer_already_flushed() {
+    fn stop_applies_flushed_batches_without_committing_bookkeeping() {
         run_on_runtime_task(|cx| async move {
             let temp = tempdir().expect("tempdir");
             let root = temp.path().join("g4-final-drain");
@@ -5909,7 +6189,16 @@ mod tests {
                 lock_or_recover(&queue).is_empty(),
                 "the drained queue must be empty"
             );
-            assert_eq!(stats.snapshot().files_reindexed, 1);
+            assert_eq!(
+                stats.snapshot().files_reindexed,
+                0,
+                "a batch applied after stop cannot publish success before its authoritative \
+                 bookkeeping walk completes"
+            );
+            assert!(
+                lock_or_recover(&reconciliation).required,
+                "an interrupted post-stop bookkeeping walk must remain owed"
+            );
         });
     }
 
