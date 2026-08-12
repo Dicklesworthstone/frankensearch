@@ -1958,12 +1958,10 @@ impl RecoveredSegmentBacking {
         }
     }
 
-    /// Actual-byte-verified xxh3-64 over the file prefix.
+    /// Trailer-declared xxh3-64 over the file prefix.
     ///
-    /// This is the content-identity witness for the whole immutable backing:
-    /// [`validate_segment_witnesses`] recomputes it from the backing bytes
-    /// before each manifest binding, then compares it with both the trailer
-    /// witness and that manifest generation.
+    /// Callers must authenticate this value against the backing bytes before
+    /// using it as a content-identity witness for a manifest binding.
     fn file_xxh3(&self) -> u64 {
         match self {
             Self::Mapped(reader) => reader.file_xxh3(),
@@ -1988,8 +1986,18 @@ impl RecoveredSegmentBacking {
         manifest: &ManifestSegment,
     ) -> Result<(), KeeperError> {
         match self {
-            Self::Mapped(reader) => validate_segment_witnesses(path, manifest, reader),
-            Self::Owned(reader) => validate_segment_witnesses(path, manifest, reader),
+            Self::Mapped(reader) => validate_segment_witnesses(
+                path,
+                manifest,
+                reader,
+                verified_file_witness(path, reader)?,
+            ),
+            Self::Owned(reader) => validate_segment_witnesses(
+                path,
+                manifest,
+                reader,
+                verified_file_witness(path, reader)?,
+            ),
         }
     }
 }
@@ -2324,7 +2332,8 @@ impl RecoveredSegment {
                 source,
             }
         })?;
-        validate_segment_witnesses(&path, &manifest, &reader)?;
+        let file_xxh3 = verified_file_witness(&path, &reader)?;
+        validate_segment_witnesses(&path, &manifest, &reader, file_xxh3)?;
         Self::bind_backing(
             path,
             manifest,
@@ -3040,7 +3049,8 @@ impl KeeperSnapshot {
                     source,
                 }
             })?;
-            validate_segment_witnesses(&path, manifest_segment, &reader)?;
+            let file_xxh3 = verified_file_witness(&path, &reader)?;
+            validate_segment_witnesses(&path, manifest_segment, &reader, file_xxh3)?;
             segments.push(RecoveredSegment::bind(
                 path,
                 manifest_segment.clone(),
@@ -7834,15 +7844,13 @@ fn recover_durable_segment(
             });
         }
     };
-    if let Err(source) = reader.verify() {
-        return Ok(DurableSegmentRecovery::Unrepairable {
-            error: KeeperError::SegmentOpen {
-                path: path.clone(),
-                source,
-            },
-        });
-    }
-    if let Err(error) = validate_segment_witnesses(&path, manifest_segment, &reader) {
+    let file_xxh3 = match fully_verified_file_witness(&path, &reader) {
+        Ok(file_xxh3) => file_xxh3,
+        Err(error) => {
+            return Ok(DurableSegmentRecovery::Unrepairable { error });
+        }
+    };
+    if let Err(error) = validate_segment_witnesses(&path, manifest_segment, &reader, file_xxh3) {
         return Ok(DurableSegmentRecovery::Unrepairable { error });
     }
     let label = format!("segment-{:016x}", manifest_segment.segment_id);
@@ -7989,11 +7997,8 @@ fn recompute_manifest_field_stats(
                 source,
             }
         })?;
-        reader.verify().map_err(|source| KeeperError::SegmentOpen {
-            path: path.clone(),
-            source,
-        })?;
-        validate_segment_witnesses(&path, segment, &reader)?;
+        let file_xxh3 = fully_verified_file_witness(&path, &reader)?;
+        validate_segment_witnesses(&path, segment, &reader, file_xxh3)?;
         let stats = reader
             .section(SectionKind::STATS)
             .map_err(|source| KeeperError::SegmentOpen {
@@ -8049,11 +8054,8 @@ fn open_verified_segment(
             path: path.to_path_buf(),
             source,
         })?;
-    reader.verify().map_err(|source| KeeperError::SegmentOpen {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    validate_segment_witnesses(path, manifest, &reader)
+    let file_xxh3 = fully_verified_file_witness(path, &reader)?;
+    validate_segment_witnesses(path, manifest, &reader, file_xxh3)
 }
 
 #[cfg(feature = "durability")]
@@ -9463,11 +9465,8 @@ fn validate_proposed_manifest_segments(
                 source,
             }
         })?;
-        reader.verify().map_err(|source| KeeperError::SegmentOpen {
-            path: path.clone(),
-            source,
-        })?;
-        validate_segment_witnesses(&path, manifest_segment, &reader)?;
+        let file_xxh3 = fully_verified_file_witness(&path, &reader)?;
+        validate_segment_witnesses(&path, manifest_segment, &reader, file_xxh3)?;
         #[cfg(feature = "durability")]
         if let WriterProtection::Enabled { protector, .. } = protection {
             let sidecar = FileProtector::sidecar_path(&path);
@@ -9494,10 +9493,41 @@ fn validate_proposed_manifest_segments(
     Ok(())
 }
 
+/// Recompute and authenticate the trailer witness without eagerly validating
+/// every section. Ordinary read-only Keeper open uses this once before binding
+/// a segment; lazy section checks retain their normal behavior.
+fn verified_file_witness(
+    path: &Path,
+    reader: &SegmentReader<impl AsRef<[u8]>>,
+) -> Result<u64, KeeperError> {
+    reader
+        .verify_file_witness()
+        .map_err(|source| KeeperError::SegmentOpen {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+/// Fully validate a segment and retain the one freshly recomputed prefix
+/// witness for manifest binding. Eager recovery, stats, and proposed-manifest
+/// preflight use this instead of rehashing the same full prefix afterward.
+fn fully_verified_file_witness(
+    path: &Path,
+    reader: &SegmentReader<impl AsRef<[u8]>>,
+) -> Result<u64, KeeperError> {
+    reader
+        .verify_with_file_witness()
+        .map_err(|source| KeeperError::SegmentOpen {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
 fn validate_segment_witnesses(
     path: &Path,
     manifest: &ManifestSegment,
     reader: &SegmentReader<impl AsRef<[u8]>>,
+    actual_file_xxh3: u64,
 ) -> Result<(), KeeperError> {
     let header = reader.header();
     if header.segment_id != manifest.segment_id {
@@ -9519,13 +9549,6 @@ fn validate_segment_witnesses(
             ),
         });
     }
-    let actual_file_xxh3 =
-        reader
-            .verify_file_witness()
-            .map_err(|source| KeeperError::SegmentOpen {
-                path: path.to_path_buf(),
-                source,
-            })?;
     let mismatch = if actual_file_xxh3 != manifest.file_xxh3 {
         Some(format!(
             "actual file_xxh3 {actual_file_xxh3:#018x} != manifest {:#018x}",
@@ -14425,8 +14448,8 @@ mod tests {
         ByteSpan, EncodedTermDictionary, TermInput, TermMetadata, TermSectionLengths,
     };
     use crate::quiver::{
-        EncodedBlockMax, EncodedIdHashSection, EncodedIdMapSection, EncodedPostingList,
-        IdMapEntryInput, Posting,
+        BlockMaxConcatList, EncodedBlockMax, EncodedIdHashSection, EncodedIdMapSection,
+        EncodedPostingList, IdMapEntryInput, Posting, PostingList,
     };
     use crate::schema::{DEFAULT_SCHEMA, FSFS_CHUNK_SCHEMA};
     #[cfg(feature = "durability")]
@@ -17850,8 +17873,21 @@ mod tests {
         const TRAILER_LEN: usize = 12;
 
         let directory = tempdir()?;
-        let encoded_postings = EncodedPostingList::encode(&[Posting::new(0, 1)])?;
-        let posting_list = encoded_postings.posting_list()?;
+        let encoded_postings =
+            EncodedPostingList::encode(&[Posting::new(0, 1), Posting::new(1, 1)])?;
+        let replacement_postings =
+            EncodedPostingList::encode(&[Posting::new(0, 1), Posting::new(2, 1)])?;
+        assert_eq!(
+            replacement_postings.as_bytes().len(),
+            encoded_postings.as_bytes().len(),
+            "the replacement must preserve the exact POSTINGS section length"
+        );
+        assert_ne!(
+            replacement_postings.as_bytes(),
+            encoded_postings.as_bytes(),
+            "the replacement must change POSTINGS content while retaining its layout"
+        );
+        let posting_list = PostingList::parse(encoded_postings.as_bytes(), 2)?;
         let encoded_blockmax = EncodedBlockMax::encode(&posting_list, |_| Some(1))?;
         let term_dictionary = EncodedTermDictionary::encode_sorted(
             DEFAULT_SCHEMA,
@@ -17864,7 +17900,7 @@ mod tests {
                 0,
                 b"witness",
                 TermMetadata::without_positions(
-                    1,
+                    2,
                     ByteSpan::new(0, u64::try_from(encoded_postings.as_bytes().len())?),
                     ByteSpan::new(0, u64::try_from(encoded_blockmax.as_bytes().len())?),
                 ),
@@ -17873,7 +17909,11 @@ mod tests {
         let encoded = encoded_identity_test_segment_with_term_sections(
             0x6e11,
             0,
-            &[Some("witness-doc")],
+            &[
+                Some("witness-doc-0"),
+                Some("witness-doc-1"),
+                Some("witness-doc-2"),
+            ],
             term_dictionary.as_bytes(),
             encoded_postings.as_bytes(),
             &[],
@@ -17901,12 +17941,17 @@ mod tests {
             .expect("encoded fixture has POSTINGS");
         let postings_offset = usize::try_from(encoded.section_entries()[postings_entry].offset)?;
         let postings_len = usize::try_from(encoded.section_entries()[postings_entry].len)?;
-        assert!(postings_len > 0, "fixture has a concrete POSTINGS stream");
+        assert_eq!(
+            postings_len,
+            replacement_postings.as_bytes().len(),
+            "fixture POSTINGS range matches the same-length replacement"
+        );
 
         let mut bytes = std::fs::read(&path)?;
         let trailer_start = bytes.len() - TRAILER_LEN;
         let original_trailer = bytes[trailer_start..].to_vec();
-        bytes[postings_offset] ^= 0x80;
+        bytes[postings_offset..postings_offset + postings_len]
+            .copy_from_slice(replacement_postings.as_bytes());
         let section_xxh3_offset = FILE_PREFIX_LEN
             + FIXED_HEADER_LEN
             + postings_entry * SECTION_ENTRY_LEN
@@ -17922,10 +17967,23 @@ mod tests {
             .copy_from_slice(&header_crc.to_le_bytes());
 
         let lazy_reader = SegmentReader::from_owned(bytes.clone(), DEFAULT_SCHEMA)?;
+        let replacement_postings = lazy_reader
+            .section(SectionKind::POSTINGS)?
+            .expect("fixture retains POSTINGS after valid replacement");
         assert_eq!(
-            lazy_reader.section(SectionKind::POSTINGS)?,
-            Some(&bytes[postings_offset..postings_offset + postings_len]),
+            replacement_postings,
+            &bytes[postings_offset..postings_offset + postings_len],
             "the recomputed section witness preserves lazy POSTINGS parsing"
+        );
+        let parsed_replacement = PostingList::parse(replacement_postings, 2)?;
+        let blockmax = lazy_reader
+            .section(SectionKind::BLOCKMAX)?
+            .expect("fixture retains BLOCKMAX");
+        let blockmax_relation = BlockMaxConcatList::parse(blockmax, &parsed_replacement)?;
+        assert_eq!(
+            blockmax_relation.entry_count(),
+            parsed_replacement.block_count(),
+            "the unchanged BLOCKMAX stream remains related to replacement POSTINGS"
         );
         let actual_prefix_xxh3 = xxhash_rust::xxh3::xxh3_64(&bytes[..trailer_start]);
         assert_ne!(actual_prefix_xxh3, encoded.file_xxh3());

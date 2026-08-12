@@ -1121,12 +1121,15 @@ impl<B: AsRef<[u8]>> SegmentReader<B> {
     /// Eagerly revalidate the structure, every section, and file-prefix witness.
     ///
     /// Unlike [`Self::section`], this always recomputes hashes so doctor flows
-    /// do not trust an earlier lazy result.
+    /// do not trust an earlier lazy result. The returned prefix witness is the
+    /// value freshly recomputed from the exact bytes that passed this complete
+    /// validation; crate-internal manifest binding carries it forward instead
+    /// of hashing the same prefix again.
     ///
     /// # Errors
     ///
     /// Returns a typed corruption error for any checksum mismatch.
-    pub fn verify(&self) -> Result<(), QuillError> {
+    pub(crate) fn verify_with_file_witness(&self) -> Result<u64, QuillError> {
         let bytes = self.source.as_ref();
         let parsed = parse_container(bytes, &self.path, self.schema, self.limits)?;
         for entry in &parsed.sections {
@@ -1144,8 +1147,19 @@ impl<B: AsRef<[u8]>> SegmentReader<B> {
                 ));
             }
         }
-        self.verify_file_witness()?;
-        Ok(())
+        self.verify_file_witness()
+    }
+
+    /// Eagerly revalidate the structure, every section, and file-prefix witness.
+    ///
+    /// Unlike [`Self::section`], this always recomputes hashes so doctor flows
+    /// do not trust an earlier lazy result.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed corruption error for any checksum mismatch.
+    pub fn verify(&self) -> Result<(), QuillError> {
+        self.verify_with_file_witness().map(|_| ())
     }
 }
 
