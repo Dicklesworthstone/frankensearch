@@ -3032,15 +3032,15 @@ async fn run_authoritative_reconciliation(
     // already published would then be counted a second time.
     let mut staged_reindexed = 0_usize;
     let mut staged_skipped = 0_usize;
-    // Once an apply has started, its sink may have accepted a prefix even if
-    // it later reports an error. Retaining the entire planned pass is
-    // conservative but exact enough to recover a path that disappeared after
-    // a successful prefix and before the retry.
-    let mut mutation_started = false;
+    // A sink can accept a current batch before it reports an error. Retain
+    // only the batches that reached an apply boundary: prior successful
+    // batches plus the current, possibly partial one. Untouched later chunks
+    // have no mutation evidence and must not acquire deletion authority.
+    let mut attempted_prefix = Vec::new();
     for event_batch in events.chunks(batch_size.max(1)) {
         if cx.is_cancel_requested() || abort() {
-            if mutation_started {
-                lock_or_recover(reconciliation).require_for_events(&events)?;
+            if !attempted_prefix.is_empty() {
+                lock_or_recover(reconciliation).require_for_events(&attempted_prefix)?;
             }
             return Err(reconciliation_abort_error(cx));
         }
@@ -3054,15 +3054,15 @@ async fn run_authoritative_reconciliation(
         let lineage_matches = match lineage {
             Ok(current) => current == token,
             Err(error) => {
-                if mutation_started {
-                    let _ = lock_or_recover(reconciliation).require_for_events(&events);
+                if !attempted_prefix.is_empty() {
+                    let _ = lock_or_recover(reconciliation).require_for_events(&attempted_prefix);
                 }
                 return Err(error);
             }
         };
         if !lineage_matches {
-            if mutation_started {
-                lock_or_recover(reconciliation).require_for_events(&events)?;
+            if !attempted_prefix.is_empty() {
+                lock_or_recover(reconciliation).require_for_events(&attempted_prefix)?;
             }
             return Err(SearchError::SubsystemError {
                 subsystem: "fsfs-watcher",
@@ -3076,15 +3076,13 @@ async fn run_authoritative_reconciliation(
             staged_skipped = staged_skipped.saturating_add(prepared.skipped);
             continue;
         }
-        mutation_started = true;
+        attempted_prefix.extend_from_slice(event_batch);
         let reindexed = match ingest.apply_batch(cx, &prepared.ops).await {
             Ok(reindexed) => reindexed,
             Err(error) => {
-                // A sink error can arrive after a partial mutation. Once any
-                // apply boundary has been crossed, retain the full pass so a
-                // successful earlier upsert that vanishes before retry still
-                // derives its delete.
-                lock_or_recover(reconciliation).require_for_events(&events)?;
+                // The current batch may have partially landed, so the exact
+                // attempted prefix becomes the next reconciliation debt.
+                lock_or_recover(reconciliation).require_for_events(&attempted_prefix)?;
                 return Err(error);
             }
         };
@@ -3096,18 +3094,18 @@ async fn run_authoritative_reconciliation(
             // to the staged publication below.
             let mut state = lock_or_recover(reconciliation);
             if cx.is_cancel_requested() || abort() {
-                state.require_for_events(&events)?;
+                state.require_for_events(&attempted_prefix)?;
                 return Err(reconciliation_abort_error(cx));
             }
             let lineage_matches = match state.planning_token() {
                 Ok(current) => current == token,
                 Err(error) => {
-                    let _ = state.require_for_events(&events);
+                    let _ = state.require_for_events(&attempted_prefix);
                     return Err(error);
                 }
             };
             if !lineage_matches {
-                state.require_for_events(&events)?;
+                state.require_for_events(&attempted_prefix)?;
                 return Err(SearchError::SubsystemError {
                     subsystem: "fsfs-watcher",
                     source: Box::new(io::Error::other(
@@ -3125,16 +3123,20 @@ async fn run_authoritative_reconciliation(
     // before applying anything.
     let mut state = lock_or_recover(reconciliation);
     if cx.is_cancel_requested() || abort() {
-        // The last apply may have returned just before this lock. Retain every
-        // operation from this pass as debt so no authority or telemetry is
-        // published after cancellation.
-        state.require_for_events(&events)?;
+        // The last apply may have returned just before this lock. Retain only
+        // the attempted prefix so no authority or telemetry is published
+        // after cancellation, without inventing debt for an untouched tail.
+        if !attempted_prefix.is_empty() {
+            state.require_for_events(&attempted_prefix)?;
+        }
         return Err(reconciliation_abort_error(cx));
     }
     let lineage_matches = match state.planning_token() {
         Ok(current) => current == token,
         Err(error) => {
-            let _ = state.require_for_events(&events);
+            if !attempted_prefix.is_empty() {
+                let _ = state.require_for_events(&attempted_prefix);
+            }
             return Err(error);
         }
     };
@@ -3142,7 +3144,9 @@ async fn run_authoritative_reconciliation(
         // The tree moved under this pass. Its operations landed, but its
         // conclusion describes a state that no longer exists, so nothing is
         // installed and nothing is counted — the next pass does both.
-        state.require_for_events(&events)?;
+        if !attempted_prefix.is_empty() {
+            state.require_for_events(&attempted_prefix)?;
+        }
         return Ok(());
     }
     match state.commit_complete_pass(&plan, current, scan_identities) {
@@ -3150,13 +3154,17 @@ async fn run_authoritative_reconciliation(
         Ok(false) => {
             // Authority was rebound while this pass was applying. Fail closed: the
             // conclusion is dropped and a fresh pass is owed.
-            state.require_for_events(&events)?;
+            if !attempted_prefix.is_empty() {
+                state.require_for_events(&attempted_prefix)?;
+            }
             return Ok(());
         }
         Err(error) => {
             // The typed counter failure leaves the lineage poisoned, but the
             // operations that already crossed the sink boundary remain debt.
-            let _ = state.require_for_events(&events);
+            if !attempted_prefix.is_empty() {
+                let _ = state.require_for_events(&attempted_prefix);
+            }
             return Err(error);
         }
     }
@@ -8104,6 +8112,7 @@ mod tests {
             fs::create_dir_all(&root).expect("create root");
             let first = root.join("first.rs");
             let second = root.join("second.rs");
+            let third = root.join("third.rs");
 
             let roots = vec![root.clone()];
             let discovery = DiscoveryConfig::default();
@@ -8128,6 +8137,7 @@ mod tests {
             }
             fs::write(&first, "fn first() {}\n").expect("write first fixture");
             fs::write(&second, "fn second() {}\n").expect("write second fixture");
+            fs::write(&third, "fn third() {}\n").expect("write third fixture");
 
             let pipeline = Arc::new(RecordingPipeline::default());
             *lock_or_recover(&pipeline.fail_on_attempt) = Some(2);
@@ -8150,6 +8160,11 @@ mod tests {
             .expect_err("the second chunk must fail after the first upsert applies");
             assert!(failure.to_string().contains("forced failure"));
             assert_eq!(pipeline.all_ops().len(), 1, "only the prefix applied");
+            assert_eq!(
+                lock_or_recover(&pipeline.attempts).len(),
+                2,
+                "the untouched third chunk must not reach the sink before the failure"
+            );
             assert_eq!(stats.snapshot().files_reindexed, 0);
             {
                 let state = lock_or_recover(&reconciliation);
@@ -8157,11 +8172,12 @@ mod tests {
                 assert_eq!(
                     state.affected_paths,
                     BTreeSet::from([first.clone(), second.clone()]),
-                    "the entire pass, not just the failed second chunk, is exact debt"
+                    "only the successful and currently attempted chunks are exact debt"
                 );
             }
 
             fs::remove_file(&first).expect("remove the already-upserted path before retry");
+            fs::remove_file(&third).expect("remove the untouched tail before retry");
             run_authoritative_reconciliation(
                 &cx,
                 &roots,
@@ -8178,11 +8194,19 @@ mod tests {
             .expect("the retry must reconcile the vanished prefix");
 
             let first_key = normalize_file_key(&first);
+            let third_key = normalize_file_key(&third);
             assert!(
                 pipeline.all_ops().iter().any(|operation| {
                     matches!(operation, WatchIngestOp::Delete { file_key, .. } if file_key == &first_key)
                 }),
                 "the retry must derive a delete for the vanished applied prefix, got {:?}",
+                pipeline.all_ops()
+            );
+            assert!(
+                !pipeline.all_ops().iter().any(|operation| {
+                    matches!(operation, WatchIngestOp::Delete { file_key, .. } if file_key == &third_key)
+                }),
+                "the untouched third chunk must not acquire delete authority, got {:?}",
                 pipeline.all_ops()
             );
             assert_eq!(lock_or_recover(&pipeline.attempts).len(), 4);
