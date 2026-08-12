@@ -5533,6 +5533,151 @@ mod tests {
         });
     }
 
+    #[test]
+    fn owner_backed_quality_identity_checkpoint_preserves_uncancelled_refinement_bits_and_order() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = owner_backed_dir("quality-identity-control");
+            let fast_binding = artifact_binding("quality-identity-fast", 4, 41);
+            let quality_binding = artifact_binding("quality-identity-quality", 4, 41);
+            let index = owner_backed_two_tier_index(&dir, &fast_binding, &quality_binding);
+            let fast = Arc::new(IdentityCountingEmbedder::new(
+                "fast",
+                in_memory_identity("quality-identity-fast", 4),
+                vec![1.0, 0.0, 0.0, 0.0],
+            ));
+            let quality = Arc::new(IdentityCountingEmbedder::new(
+                "quality",
+                in_memory_identity("quality-identity-quality", 4),
+                vec![0.0, 1.0, 0.0, 0.0],
+            ));
+            let searcher = TwoTierSearcher::new(
+                index,
+                Arc::clone(&fast) as Arc<dyn Embedder>,
+                TwoTierConfig::default(),
+            )
+            .with_quality_embedder(Arc::clone(&quality) as Arc<dyn Embedder>);
+
+            let mut phases = Vec::new();
+            let mut refined = Vec::new();
+            searcher
+                .search(
+                    &cx,
+                    "query",
+                    3,
+                    |_| None,
+                    |phase| match phase {
+                        SearchPhase::Initial { .. } => phases.push("initial"),
+                        SearchPhase::Refined { results, .. } => {
+                            phases.push("refined");
+                            refined = results;
+                        }
+                        SearchPhase::Reranked { .. } => phases.push("reranked"),
+                        SearchPhase::RefinementFailed { error, .. } => {
+                            panic!("owner-backed refinement must not fail: {error}");
+                        }
+                    },
+                )
+                .await
+                .expect("uncancelled owner-backed refinement must succeed");
+
+            assert_eq!(phases, vec!["initial", "refined"]);
+            assert_eq!(
+                refined
+                    .iter()
+                    .map(|result| (result.doc_id.as_str(), result.score.to_bits()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("doc-quality-only", 1.0_f32.to_bits()),
+                    ("doc-near", 0.3_f32.to_bits()),
+                    ("doc-far", 0.0_f32.to_bits()),
+                ],
+                "the checkpoint must be an observation only: uncancelled owner-backed scores and order stay bit-identical"
+            );
+            assert_eq!(fast.embed_count(), 1);
+            assert_eq!(quality.embed_count(), 1);
+            assert_eq!(quality.identity_count(), 2);
+        });
+    }
+
+    #[test]
+    fn public_search_cancellation_after_quality_identity_stops_before_owner_activation() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = owner_backed_dir("quality-identity-cancellation");
+            let fast_binding = artifact_binding("quality-identity-cancel-fast", 4, 43);
+            let quality_binding = artifact_binding("quality-identity-cancel-quality", 4, 43);
+            let index = owner_backed_two_tier_index(&dir, &fast_binding, &quality_binding);
+            let fast = Arc::new(IdentityCountingEmbedder::new(
+                "fast",
+                in_memory_identity("quality-identity-cancel-fast", 4),
+                vec![1.0, 0.0, 0.0, 0.0],
+            ));
+            // The admission preflight calls `identity()` once before Initial.
+            // This real Embedder implementation cancels the supplied invocation
+            // context only on the post-embed binding call, while returning the
+            // same valid identity and vector a successful owner search receives.
+            let quality = Arc::new(
+                IdentityCountingEmbedder::new(
+                    "quality",
+                    in_memory_identity("quality-identity-cancel-quality", 4),
+                    vec![0.0, 1.0, 0.0, 0.0],
+                )
+                .cancel_on_identity_call(cx.clone(), 2),
+            );
+            let adapter = Arc::new(RecordingHostAdapter::new("quality_identity_cancellation"));
+            let searcher = TwoTierSearcher::new(
+                index,
+                Arc::clone(&fast) as Arc<dyn Embedder>,
+                TwoTierConfig::default(),
+            )
+            .with_quality_embedder(Arc::clone(&quality) as Arc<dyn Embedder>)
+            .with_host_adapter(adapter.clone());
+
+            let mut phases = Vec::new();
+            let error = searcher
+                .search(
+                    &cx,
+                    "query",
+                    3,
+                    |_| None,
+                    |phase| match phase {
+                        SearchPhase::Initial { .. } => phases.push("initial"),
+                        SearchPhase::Refined { .. } => phases.push("refined"),
+                        SearchPhase::Reranked { .. } => phases.push("reranked"),
+                        SearchPhase::RefinementFailed { .. } => phases.push("refinement_failed"),
+                    },
+                )
+                .await
+                .expect_err(
+                    "cancellation from the owner-backed quality identity must stop before activation",
+                );
+
+            assert!(matches!(
+                error,
+                SearchError::Cancelled { phase, reason }
+                    if phase == "quality_identity_to_activation"
+                        && reason == "user: cancel after quality identity"
+            ));
+            assert_eq!(phases, vec!["initial"]);
+            assert_eq!(fast.embed_count(), 1);
+            assert_eq!(quality.embed_count(), 1);
+            assert_eq!(
+                quality.identity_count(),
+                2,
+                "the cancellation must originate in the second, post-embed identity call"
+            );
+            assert!(
+                adapter.telemetry_events().iter().filter_map(|envelope| {
+                    match &envelope.event {
+                        TelemetryEvent::Search { query, .. } => Some(query.phase),
+                        _ => None,
+                    }
+                }).eq([SearchEventPhase::Initial]),
+                "cancellation before owner activation must not publish Refined or RefinementFailed"
+            );
+            assert_single_cancelled_session_stop(&adapter, "quality_identity_to_activation");
+        });
+    }
+
     #[cfg(feature = "rerank")]
     #[test]
     fn public_search_cancellation_after_refined_stops_before_rerank_hydration() {
