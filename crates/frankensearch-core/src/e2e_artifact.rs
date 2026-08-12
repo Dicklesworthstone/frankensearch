@@ -51,6 +51,12 @@ pub enum E2eArtifactValidationError {
     },
     #[error("invalid run_id '{run_id}': expected 26-char Crockford ULID")]
     InvalidRunId { run_id: String },
+    #[error("invalid ts '{ts}': expected canonical RFC3339 UTC YYYY-MM-DDTHH:MM:SSZ")]
+    InvalidTimestamp { ts: String },
+    #[error(
+        "invalid config_hash '{config_hash}': expected sha256: plus exactly 64 lowercase hexadecimal digits"
+    )]
+    InvalidConfigHash { config_hash: String },
     #[error("manifest missing required artifact entry '{required_file}'")]
     MissingRequiredArtifact { required_file: &'static str },
     #[error("manifest contains duplicate artifact entry '{file}'")]
@@ -118,6 +124,7 @@ pub fn validate_envelope<B>(
             run_id: envelope.run_id.clone(),
         });
     }
+    parse_canonical_rfc3339_utc(&envelope.ts)?;
     Ok(())
 }
 
@@ -151,6 +158,11 @@ pub fn validate_event_envelope(
 ///
 /// Returns an error if required artifacts are missing, duplicated, or have invalid line count.
 pub fn validate_manifest_body(body: &ManifestBody) -> Result<(), E2eArtifactValidationError> {
+    if !is_canonical_config_hash(&body.config_hash) {
+        return Err(E2eArtifactValidationError::InvalidConfigHash {
+            config_hash: body.config_hash.clone(),
+        });
+    }
     let mut seen_files = BTreeSet::new();
 
     for artifact in &body.artifacts {
@@ -476,6 +488,83 @@ fn has_non_empty_text(value: Option<&str>) -> bool {
 
 fn is_valid_ulid(value: &str) -> bool {
     value.len() == 26 && value.bytes().all(is_valid_ulid_byte)
+}
+
+/// Admit only `YYYY-MM-DDTHH:MM:SSZ`. Numeric offsets, lowercase `z`,
+/// fractions, whitespace, trailing data, and impossible calendar dates fail.
+fn parse_canonical_rfc3339_utc(ts: &str) -> Result<(), E2eArtifactValidationError> {
+    let reject = || Err(E2eArtifactValidationError::InvalidTimestamp { ts: ts.to_owned() });
+    let bytes = ts.as_bytes();
+    if bytes.len() != 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return reject();
+    }
+    let digit = |index: usize| -> Option<u32> {
+        let byte = *bytes.get(index)?;
+        byte.is_ascii_digit().then_some(u32::from(byte - b'0'))
+    };
+    let pair = |index: usize| -> Option<u32> { Some(digit(index)? * 10 + digit(index + 1)?) };
+    let mut year_digits = [0_u32; 4];
+    for (slot, index) in year_digits.iter_mut().zip(0_usize..4) {
+        let Some(value) = digit(index) else {
+            return reject();
+        };
+        *slot = value;
+    }
+    let year = year_digits[0] * 1000 + year_digits[1] * 100 + year_digits[2] * 10 + year_digits[3];
+    let Some(month) = pair(5) else {
+        return reject();
+    };
+    let Some(day) = pair(8) else {
+        return reject();
+    };
+    let Some(hour) = pair(11) else {
+        return reject();
+    };
+    let Some(minute) = pair(14) else {
+        return reject();
+    };
+    let Some(second) = pair(17) else {
+        return reject();
+    };
+    if !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 {
+        return reject();
+    }
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_gregorian_leap_year(year) => 29,
+        2 => 28,
+        _ => return reject(),
+    };
+    if day == 0 || day > days_in_month {
+        return reject();
+    }
+    let reconstructed = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z");
+    if reconstructed != ts {
+        return reject();
+    }
+    Ok(())
+}
+
+const fn is_gregorian_leap_year(year: u32) -> bool {
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+}
+
+fn is_canonical_config_hash(value: &str) -> bool {
+    let Some(digest) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 const fn is_valid_ulid_byte(byte: u8) -> bool {
@@ -1299,6 +1388,111 @@ mod tests {
     }
 
     #[test]
+    fn envelope_validator_accepts_canonical_rfc3339_utc_and_round_trips() {
+        let ts = "2026-02-14T12:00:00Z";
+        parse_canonical_rfc3339_utc(ts).expect("canonical UTC instant");
+        let envelope = E2eEnvelope::new(
+            E2E_SCHEMA_MANIFEST,
+            "01HQXG5M7P3KZFV9N2RSTW6YAB",
+            ts,
+            make_valid_manifest(),
+        );
+        validate_manifest_envelope(&envelope).expect("canonical ts must admit");
+        assert_eq!(envelope.ts, ts);
+        assert!(
+            parse_canonical_rfc3339_utc("2024-02-29T00:00:00Z").is_ok(),
+            "Gregorian leap day must admit"
+        );
+        assert!(
+            parse_canonical_rfc3339_utc("2000-02-29T23:59:59Z").is_ok(),
+            "century leap year must admit"
+        );
+    }
+
+    #[test]
+    fn envelope_validator_rejects_hostile_timestamps() {
+        let cases = [
+            "2026-02-14T12:00:00+00:00",
+            "2026-02-14T12:00:00-00:00",
+            "2026-02-14T12:00:00.000Z",
+            "2026-02-14T12:00:00.0Z",
+            "2026-02-14T12:00:00z",
+            "2026-02-14 12:00:00Z",
+            "2026-02-14T12:00:00Z ",
+            " 2026-02-14T12:00:00Z",
+            "2026-02-14T12:00:00Ztrail",
+            "2026-02-30T12:00:00Z",
+            "2026-13-01T12:00:00Z",
+            "2026-00-01T12:00:00Z",
+            "2026-02-14T24:00:00Z",
+            "2026-02-14T12:60:00Z",
+            "2026-02-14T12:00:60Z",
+            "2025-02-29T12:00:00Z",
+            "1900-02-29T12:00:00Z",
+            "2026-04-31T12:00:00Z",
+            "2026-02-14T12:00:00",
+            "",
+        ];
+        for ts in cases {
+            let envelope = E2eEnvelope::new(
+                E2E_SCHEMA_MANIFEST,
+                "01HQXG5M7P3KZFV9N2RSTW6YAB",
+                ts,
+                make_valid_manifest(),
+            );
+            let err = validate_manifest_envelope(&envelope).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    E2eArtifactValidationError::InvalidTimestamp { ts: ref rejected }
+                    if rejected == ts
+                ),
+                "ts {ts:?} must fail closed, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("ts"),
+                "error must name ts, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_validator_rejects_hostile_config_hashes() {
+        let cases = [
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "SHA256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "sha256:E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855",
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85",
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855ff",
+            "sha256:",
+            "",
+            "privacy-policy:1",
+            "tui.replay.sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "md5:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85g",
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n",
+        ];
+        for config_hash in cases {
+            let mut manifest = make_valid_manifest();
+            manifest.config_hash = config_hash.to_owned();
+            let err = validate_manifest_body(&manifest).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    E2eArtifactValidationError::InvalidConfigHash {
+                        config_hash: ref rejected
+                    } if rejected == config_hash
+                ),
+                "config_hash {config_hash:?} must fail closed, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("config_hash"),
+                "error must name config_hash, got {err}"
+            );
+        }
+    }
+
+    #[test]
     fn normalize_artifact_file_name_maps_legacy_aliases() {
         assert_eq!(
             normalize_artifact_file_name("legacy/run_manifest.json"),
@@ -1576,6 +1770,12 @@ mod tests {
             },
             E2eArtifactValidationError::InvalidRunId {
                 run_id: "bad".into(),
+            },
+            E2eArtifactValidationError::InvalidTimestamp {
+                ts: "not-a-timestamp".into(),
+            },
+            E2eArtifactValidationError::InvalidConfigHash {
+                config_hash: "bare-digest".into(),
             },
             E2eArtifactValidationError::MissingRequiredArtifact {
                 required_file: "test.json",

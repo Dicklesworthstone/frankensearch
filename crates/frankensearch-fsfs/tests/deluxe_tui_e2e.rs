@@ -524,9 +524,8 @@ fn build_deluxe_tui_unified_bundle(
             suite: Suite::Fsfs,
             determinism_tier: DeterminismTier::BitExact,
             seed: 73,
-            config_hash: format!(
-                "tui.replay.{}",
-                sha256_checksum(canonical_artifact_json.as_bytes())
+            config_hash: sha256_checksum(
+                format!("tui.replay\n{canonical_artifact_json}").as_bytes(),
             ),
             index_version: Some("fsfs-deluxe-tui-e2e-v1".to_owned()),
             model_versions: vec![

@@ -377,7 +377,7 @@ fn build_privacy_unified_bundle(
             suite: Suite::Fsfs,
             determinism_tier: DeterminismTier::Semantic,
             seed: 7,
-            config_hash: format!("privacy-policy:{}", policy.version),
+            config_hash: sha256_checksum(format!("privacy-policy:{}", policy.version).as_bytes()),
             index_version: None,
             model_versions: vec![ModelVersion {
                 name: "redaction-policy".to_owned(),
