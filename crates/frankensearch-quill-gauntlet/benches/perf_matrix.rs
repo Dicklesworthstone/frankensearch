@@ -18,16 +18,18 @@ use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::hint::black_box;
-use std::io::Write;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use asupersync::{Cx, runtime::Runtime};
 use criterion::Criterion;
-use frankensearch_core::bench_support::print_bench_elf_sha256;
+use frankensearch_core::bench_support::BenchExecutableIdentity;
 use frankensearch_core::{IndexableDocument, LexicalRead, LexicalWrite};
 use frankensearch_lexical::{
     BenchmarkRetainedTantivyReader, BenchmarkWriterJoinReceipt, SnippetConfig, TantivyIndex,
@@ -48,14 +50,15 @@ use frankensearch_quill_gauntlet::{
     PerfConcurrencyWitness, PerfCorpus, PerfEvidenceArtifact, PerfGate, PerfGateArtifact,
     PerfInputIdentity, PerfMatrixSpec, PerfMetricSemantics, PerfOperationScope, PerfQueryClass,
     PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
-    PerfTopology, PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg1BatchCoverage,
-    Qg1LifecycleProducer, Qg1LifecycleWitness, Qg1SampleBinding, Qg6ArmRole, Qg6Comparison,
-    Qg6Phase, Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleBinding, Qg6SampleOrder, Qg6SearchHit,
-    Qg6SearchResult, Qg6SemanticContract, RankClass, RankedHit, ScoreEpsilonReason,
-    SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent, command_sha256_from_argv,
-    compare_observations, estimate_paired_experiment,
-    estimate_paired_experiment_against_qg1_authority, machine_fingerprint, oracle_version_contract,
-    peak_rss_bytes, perf_manifest_contract_sha256, seeded_balanced_pair_order, validate_matrix,
+    PerfTopology, PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg1AuthorityRegisterEntryV1,
+    Qg1BatchCoverage, Qg1LifecycleProducer, Qg1LifecycleWitness, Qg1SampleBinding,
+    Qg1StartupHandshakeV1, Qg6ArmRole, Qg6Comparison, Qg6Phase, Qg6PreparedExperiment,
+    Qg6QuerySpec, Qg6SampleBinding, Qg6SampleOrder, Qg6SearchHit, Qg6SearchResult,
+    Qg6SemanticContract, RankClass, RankedHit, ScoreEpsilonReason, SyntheticCorpus,
+    SyntheticCorpusSpec, ZipfExponent, command_sha256_from_argv, compare_observations,
+    estimate_paired_experiment, estimate_paired_experiment_against_qg1_authority,
+    machine_fingerprint, oracle_version_contract, peak_rss_bytes, perf_manifest_contract_sha256,
+    seeded_balanced_pair_order, validate_matrix,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -76,6 +79,65 @@ const QG6_TIMED_SEARCHES_PER_SAMPLE: usize = 128;
 const QG1_CORPUS_GENERATOR_REVISION: &str = "frankensearch-quill-qg1-synthetic-corpus-v1";
 const QG1_TERMINAL_NO_CLAIM_CODE: &str = "qg1.terminal_fact_unproved";
 const QG1_TIMING_DIAGNOSTIC_NO_CLAIM_CODE: &str = "qg1.continuous_timing_unbound_diagnostic";
+const QG1_LIVE_STARTUP_DISCRIMINATOR_ENV: &str = "QUILL_PERF_QG1_LIVE_STARTUP_DISCRIMINATOR";
+const QG1_LIVE_STARTUP_ORDINARY_MARKER: &[u8] = b"qg1-live-startup-work-after-ack\n";
+#[cfg(test)]
+const QG1_AUTHORITY_SUBPROCESS_ENV: &str = "QUILL_PERF_QG1_AUTHORITY_SUBPROCESS";
+#[cfg(test)]
+const QG1_AUTHORITY_WORK_MARKER: &[u8] = b"\x1eQG1-WORK-AFTER-ACK\x1f";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Qg1LiveStartupDiscriminatorMode {
+    Parent,
+    Child,
+    Preamble,
+    NonQg,
+}
+
+fn qg1_live_startup_discriminator_mode() -> Option<Qg1LiveStartupDiscriminatorMode> {
+    match std::env::var(QG1_LIVE_STARTUP_DISCRIMINATOR_ENV).as_deref() {
+        Err(std::env::VarError::NotPresent) => None,
+        Ok("parent") => Some(Qg1LiveStartupDiscriminatorMode::Parent),
+        Ok("child") => Some(Qg1LiveStartupDiscriminatorMode::Child),
+        Ok("preamble") => Some(Qg1LiveStartupDiscriminatorMode::Preamble),
+        Ok("non-qg") => Some(Qg1LiveStartupDiscriminatorMode::NonQg),
+        Ok(other) => panic!(
+            "{QG1_LIVE_STARTUP_DISCRIMINATOR_ENV} must be parent, child, preamble, or non-qg; got {other:?}"
+        ),
+        Err(error) => panic!("{QG1_LIVE_STARTUP_DISCRIMINATOR_ENV} is not valid Unicode: {error}"),
+    }
+}
+
+/// The remote parent sets both values together. A stray handshake value on a
+/// non-QG invocation is ignored rather than causing a zero-register protocol.
+fn qg1_exact_startup_handshake_for_selected_gate() -> bool {
+    std::env::var(Qg1StartupHandshakeV1::ENV).as_deref() == Ok(Qg1StartupHandshakeV1::MODE)
+        && std::env::var("QUILL_PERF_GATE").as_deref() == Ok(PerfGate::Qg1.label())
+}
+
+/// Hash the executing image before benchmark construction without emitting to
+/// stdout. Exact QG-1 runs reserve stdout offset zero for the control protocol.
+fn hash_bench_elf_sha256_silently() -> io::Result<BenchExecutableIdentity> {
+    let path = std::env::current_exe()?;
+    let executable = fs::read(&path)?;
+    Ok(BenchExecutableIdentity {
+        sha256: lower_hex(&Sha256::digest(&executable)),
+        bytes: executable.len(),
+        path,
+    })
+}
+
+/// Emit the canonical benchmark identity only after QG-1 has received the one
+/// final parent ACK. Non-handshake invocations retain the historical line-one
+/// identity behavior from `main`.
+fn emit_bench_elf_sha256(identity: &BenchExecutableIdentity) {
+    println!(
+        "bench_elf_sha256={} ({} bytes) {}",
+        identity.sha256,
+        identity.bytes,
+        identity.path.display()
+    );
+}
 
 fn qg1_tail_document_id(document_count: u64) -> String {
     let tail_ordinal = document_count
@@ -3660,6 +3722,549 @@ fn qg1_issued_streams(runs: usize, cell_seed: u64) -> Vec<(String, u64, u64, Vec
     ]
 }
 
+/// The child freezes every engine-cell producer before it performs any
+/// preflight, warmup, or timed work.  Keeping the estimator configuration with
+/// the producer prevents `collect_cell` from minting a second authority after
+/// the parent has acknowledged this startup transcript.
+struct Qg1StartupProducer {
+    operation_id: String,
+    estimator_config: PairedEstimatorConfig,
+    producer: Qg1LifecycleProducer,
+}
+
+struct Qg1StartupProducers {
+    engine_cells: Vec<Qg1StartupProducer>,
+}
+
+impl Qg1StartupProducers {
+    fn for_spec(&self, spec: &PerfCellSpec) -> Option<&Qg1StartupProducer> {
+        if qg1_producer_coverage(spec) != Some(Qg1ProducerCoverage::EngineIndexingLifecycle) {
+            return None;
+        }
+        let operation_id = operation_scope(spec).operation_id;
+        self.engine_cells
+            .iter()
+            .find(|producer| producer.operation_id == operation_id)
+    }
+}
+
+fn construct_qg1_startup_producers(
+    context: &BenchContext,
+    selected: &[PerfCellSpec],
+    runs: usize,
+    evidence: &EvidenceContext,
+) -> Qg1StartupProducers {
+    let mut engine_cells = Vec::new();
+    for spec in selected {
+        if qg1_producer_coverage(spec) != Some(Qg1ProducerCoverage::EngineIndexingLifecycle) {
+            continue;
+        }
+        let scope = operation_scope(spec);
+        let cell_seed = evidence.config.bootstrap_seed ^ fixture_seed(&spec.fixture);
+        let mut estimator_config = evidence.config.clone();
+        let producer = install_qg1_lifecycle_authority(
+            &mut estimator_config,
+            context,
+            spec,
+            &scope,
+            &evidence.sample_provenance,
+            u64::try_from(runs).expect("QG-1 authority pair count fits u64"),
+            qg1_issued_streams(runs, cell_seed),
+        )
+        .expect("selected engine QG-1 cell must mint one startup authority producer");
+        engine_cells.push(Qg1StartupProducer {
+            operation_id: scope.operation_id,
+            estimator_config,
+            producer,
+        });
+    }
+    let expected_count = selected
+        .iter()
+        .filter(|spec| {
+            qg1_producer_coverage(spec) == Some(Qg1ProducerCoverage::EngineIndexingLifecycle)
+        })
+        .count();
+    assert_eq!(
+        engine_cells.len(),
+        expected_count,
+        "every selected engine QG-1 cell must contribute exactly one startup producer"
+    );
+    Qg1StartupProducers { engine_cells }
+}
+
+fn qg1_wait_for_authority_ack(
+    receiver: mpsc::Receiver<Result<Vec<u8>, String>>,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    receiver
+        .recv_timeout(timeout)
+        .map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => {
+                "QG-1 authority ACK was not received before the bounded deadline".to_owned()
+            }
+            mpsc::RecvTimeoutError::Disconnected => {
+                "QG-1 authority ACK stream closed before acknowledgement".to_owned()
+            }
+        })?
+}
+
+/// Publish every frozen engine-cell authority before preflight, warmup, or
+/// timing, then wait for the parent's single final acknowledgement. The child
+/// has no path through which it can self-publish or self-load this authority.
+fn require_qg1_pre_timing_authority_ack(selected_qg1: bool, producers: &[Qg1StartupProducer]) {
+    if !selected_qg1 {
+        return;
+    }
+    let mode = match std::env::var(Qg1StartupHandshakeV1::ENV) {
+        Ok(mode) => mode,
+        Err(std::env::VarError::NotPresent) => return,
+        Err(error) => panic!(
+            "{} is not valid Unicode: {error}",
+            Qg1StartupHandshakeV1::ENV
+        ),
+    };
+    assert_eq!(
+        mode,
+        Qg1StartupHandshakeV1::MODE,
+        "typed QG-1 producer requires the exact stdio authority handshake mode"
+    );
+
+    let mut stdout = std::io::stdout().lock();
+    for (offset, startup_producer) in producers.iter().enumerate() {
+        let entry = startup_producer.producer.register_entry();
+        entry
+            .verify()
+            .expect("producer must emit one complete verified QG-1 authority register entry");
+        let entry_bytes = entry
+            .to_json_bytes()
+            .expect("producer authority register entry must serialize");
+        let sequence = u64::try_from(offset)
+            .expect("QG-1 startup register ordinal fits u64")
+            .checked_add(1)
+            .expect("QG-1 startup register sequence cannot overflow");
+        let frame = Qg1StartupHandshakeV1::register_frame(sequence, &entry_bytes)
+            .expect("producer authority register entry fits the bounded stdio frame");
+        stdout
+            .write_all(&frame)
+            .expect("write QG-1 authority register frame to parent");
+    }
+    let register_count =
+        u64::try_from(producers.len()).expect("QG-1 startup register count fits u64");
+    stdout
+        .write_all(&Qg1StartupHandshakeV1::complete_frame(register_count))
+        .expect("write QG-1 authority COMPLETE frame to parent");
+    stdout
+        .flush()
+        .expect("flush QG-1 authority startup transcript to parent");
+    drop(stdout);
+
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut frame = vec![0_u8; Qg1StartupHandshakeV1::final_ack_len()];
+        let result = std::io::stdin()
+            .read_exact(&mut frame)
+            .map(|()| frame)
+            .map_err(|error| format!("QG-1 authority final ACK read failed: {error}"));
+        let _ = sender.send(result);
+    });
+    let acknowledgement =
+        qg1_wait_for_authority_ack(receiver, Qg1StartupHandshakeV1::STARTUP_TIMEOUT)
+            .unwrap_or_else(|error| panic!("{error}"));
+    Qg1StartupHandshakeV1::validate_final_ack(&acknowledgement)
+        .unwrap_or_else(|error| panic!("{error}"));
+}
+
+/// Recompute the exact QG-1 runner claims that the normal harness entry point
+/// will validate. The harness=false discriminator never hand-authors a plan.
+fn qg1_live_startup_discriminator_claims(gate: PerfGate) -> Result<RunnerPlanClaims, String> {
+    let matrix = PerfMatrixSpec::complete();
+    let registry = MachineClassRegistry::frozen().map_err(|error| error.to_string())?;
+    let profile = MachineProfileKey::new(
+        HardwareClassId::TrjZen35995wx,
+        ExecutionProfileId::Physical64,
+    )
+    .map_err(|error| error.to_string())?;
+    let plan = matrix
+        .applicability_plan(&registry, profile, gate)
+        .map_err(|error| error.to_string())?;
+    let execution_capacity = plan.execution_capacity.ok_or_else(|| {
+        "the live QG-1 discriminator profile has no execution capacity".to_owned()
+    })?;
+    let max_exercised_cell_width = plan.max_exercised_cell_width.ok_or_else(|| {
+        "the live QG-1 discriminator profile has no maximum cell width".to_owned()
+    })?;
+    let binding = plan.binding();
+    Ok(RunnerPlanClaims {
+        gate,
+        hardware_class: HardwareClassId::TrjZen35995wx,
+        execution_profile: ExecutionProfileId::Physical64,
+        execution_capacity,
+        max_exercised_cell_width,
+        rayon_num_threads: execution_capacity,
+        applicability_plan_schema_version: binding.schema_version.clone(),
+        applicability_plan_sha256: binding.applicability_plan_sha256.clone(),
+        gate_matrix_contract_sha256: binding.gate_matrix_contract_sha256.clone(),
+        profile_contract_sha256: binding.profile_contract_sha256.clone(),
+        registry_schema_version: binding.registry_schema_version.clone(),
+        registry_sha256: binding.registry_sha256.clone(),
+    })
+}
+
+/// Build the exact typed environment consumed by the normal benchmark entry
+/// path from independently recomputed claims.
+fn qg1_live_startup_discriminator_environment(
+    gate: PerfGate,
+) -> Result<Vec<(&'static str, String)>, String> {
+    let claims = qg1_live_startup_discriminator_claims(gate)?;
+    Ok(vec![
+        ("QUILL_PERF_GATE", gate.label().to_owned()),
+        ("QUILL_PERF_SCALE", "smoke".to_owned()),
+        ("QUILL_PERF_RUNS", PERF_MIN_RUNS.to_string()),
+        (
+            "QUILL_PERF_HARDWARE_CLASS",
+            claims.hardware_class.as_str().to_owned(),
+        ),
+        (
+            "QUILL_PERF_EXECUTION_PROFILE",
+            claims.execution_profile.as_str().to_owned(),
+        ),
+        (
+            "QUILL_PERF_EXECUTION_CAPACITY",
+            claims.execution_capacity.to_string(),
+        ),
+        (
+            "QUILL_PERF_MAX_EXERCISED_CELL_WIDTH",
+            claims.max_exercised_cell_width.to_string(),
+        ),
+        (
+            "QUILL_PERF_APPLICABILITY_PLAN_SCHEMA_VERSION",
+            claims.applicability_plan_schema_version,
+        ),
+        (
+            "QUILL_PERF_APPLICABILITY_PLAN_SHA256",
+            claims.applicability_plan_sha256,
+        ),
+        (
+            "QUILL_PERF_GATE_MATRIX_CONTRACT_SHA256",
+            claims.gate_matrix_contract_sha256,
+        ),
+        (
+            "QUILL_PERF_PROFILE_CONTRACT_SHA256",
+            claims.profile_contract_sha256,
+        ),
+        (
+            "QUILL_PERF_REGISTRY_SCHEMA_VERSION",
+            claims.registry_schema_version,
+        ),
+        ("QUILL_PERF_REGISTRY_SHA256", claims.registry_sha256),
+        ("RAYON_NUM_THREADS", claims.rayon_num_threads.to_string()),
+    ])
+}
+
+/// Independently recompute the engine-lifecycle operation map from the same
+/// frozen selection the normal child will receive. The parser below must match
+/// this exact map, not merely observe one nonempty register frame.
+fn qg1_live_startup_discriminator_selected_operation_ids() -> Result<BTreeSet<String>, String> {
+    let matrix = PerfMatrixSpec::complete();
+    let claims = qg1_live_startup_discriminator_claims(PerfGate::Qg1)?;
+    let runner = RunnerApplicabilityContext::reconstruct(&matrix, &claims)?;
+    let selected = selected_cells(&matrix, &runner, MatrixScale::Smoke, None)?;
+    let operation_ids = selected
+        .iter()
+        .filter(|cell| {
+            qg1_producer_coverage(&cell.spec) == Some(Qg1ProducerCoverage::EngineIndexingLifecycle)
+        })
+        .map(|cell| operation_scope(&cell.spec).operation_id)
+        .collect::<BTreeSet<_>>();
+    let expected = selected
+        .iter()
+        .filter(|cell| {
+            qg1_producer_coverage(&cell.spec) == Some(Qg1ProducerCoverage::EngineIndexingLifecycle)
+        })
+        .count();
+    if operation_ids.len() != expected {
+        return Err(
+            "the independently recomputed QG-1 selected engine operation map is not unique"
+                .to_owned(),
+        );
+    }
+    Ok(operation_ids)
+}
+
+fn qg1_live_startup_discriminator_child(
+    mode: Qg1LiveStartupDiscriminatorMode,
+) -> Result<std::process::Child, String> {
+    let child_mode = match mode {
+        Qg1LiveStartupDiscriminatorMode::Child => "child",
+        Qg1LiveStartupDiscriminatorMode::Preamble => "preamble",
+        Qg1LiveStartupDiscriminatorMode::NonQg => "non-qg",
+        Qg1LiveStartupDiscriminatorMode::Parent => {
+            return Err("the parent discriminator cannot spawn itself as a child".to_owned());
+        }
+    };
+    let mut command = Command::new(std::env::current_exe().map_err(|error| error.to_string())?);
+    command
+        .env(QG1_LIVE_STARTUP_DISCRIMINATOR_ENV, child_mode)
+        .env(Qg1StartupHandshakeV1::ENV, Qg1StartupHandshakeV1::MODE)
+        .env("QUILL_PERF_BUILD_PROFILE", "live-startup-discriminator")
+        .env_remove("QUILL_PERF_FIXTURE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let gate = if mode == Qg1LiveStartupDiscriminatorMode::NonQg {
+        PerfGate::Qg2
+    } else {
+        PerfGate::Qg1
+    };
+    for (name, value) in qg1_live_startup_discriminator_environment(gate)? {
+        command.env(name, value);
+    }
+    command
+        .spawn()
+        .map_err(|error| format!("spawn harness=false QG-1 startup child: {error}"))
+}
+
+fn qg1_live_startup_discriminator_abort(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn qg1_live_startup_operation_id(entry_bytes: &[u8]) -> Result<(String, String), String> {
+    let entry = Qg1AuthorityRegisterEntryV1::from_verified_slice(entry_bytes)
+        .map_err(|error| format!("live QG-1 register entry verification failed: {error}"))?;
+    let canonical = entry
+        .to_json_bytes()
+        .map_err(|error| format!("live QG-1 register entry did not re-encode: {error}"))?;
+    if canonical != entry_bytes {
+        return Err(
+            "live QG-1 register entry was not the exact canonical producer bytes".to_owned(),
+        );
+    }
+    let value = serde_json::from_slice::<serde_json::Value>(&canonical)
+        .map_err(|error| format!("live QG-1 verified entry cannot be inspected: {error}"))?;
+    let operation_id = value
+        .pointer("/authority/scope/operation_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|operation_id| !operation_id.is_empty())
+        .ok_or_else(|| "live QG-1 verified entry has no authority scope operation ID".to_owned())?
+        .to_owned();
+    Ok((operation_id, entry.digest().to_owned()))
+}
+
+fn qg1_live_startup_discriminator_positive_child() -> Result<(), String> {
+    let expected_operation_ids = qg1_live_startup_discriminator_selected_operation_ids()?;
+    let mut child = qg1_live_startup_discriminator_child(Qg1LiveStartupDiscriminatorMode::Child)?;
+    let mut stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            qg1_live_startup_discriminator_abort(&mut child);
+            return Err("live QG-1 startup child lacks stdout".to_owned());
+        }
+    };
+    let transcript = (|| -> Result<(), String> {
+        let mut next_sequence = 1_u64;
+        let mut received = BTreeMap::<String, String>::new();
+        loop {
+            match Qg1StartupHandshakeV1::read_control_frame(&mut stdout)? {
+                frankensearch_quill_gauntlet::Qg1StartupControlFrameV1::Register {
+                    sequence,
+                    entry_bytes,
+                } => {
+                    if sequence != next_sequence {
+                        return Err(format!(
+                            "live QG-1 startup REGISTER sequence {sequence} is not contiguous; expected {next_sequence}"
+                        ));
+                    }
+                    next_sequence = next_sequence.checked_add(1).ok_or_else(|| {
+                        "live QG-1 startup REGISTER sequence overflowed".to_owned()
+                    })?;
+                    let (operation_id, digest) = qg1_live_startup_operation_id(&entry_bytes)?;
+                    if received.insert(operation_id.clone(), digest).is_some() {
+                        return Err(format!(
+                            "live QG-1 startup transcript repeats selected operation {operation_id:?}"
+                        ));
+                    }
+                }
+                frankensearch_quill_gauntlet::Qg1StartupControlFrameV1::Complete {
+                    register_count,
+                } => {
+                    let received_count = u64::try_from(received.len()).map_err(|_| {
+                        "live QG-1 startup received map count does not fit u64".to_owned()
+                    })?;
+                    let expected_count =
+                        u64::try_from(expected_operation_ids.len()).map_err(|_| {
+                            "live QG-1 startup expected map count does not fit u64".to_owned()
+                        })?;
+                    if register_count != received_count || register_count != expected_count {
+                        return Err(format!(
+                            "live QG-1 COMPLETE({register_count}) does not match received map {received_count} or expected selected map {expected_count}"
+                        ));
+                    }
+                    let received_operation_ids = received.into_keys().collect::<BTreeSet<_>>();
+                    if received_operation_ids != expected_operation_ids {
+                        return Err(format!(
+                            "live QG-1 startup operation map differs from independently selected cells; expected {expected_operation_ids:?}, received {received_operation_ids:?}"
+                        ));
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    })();
+    if let Err(error) = transcript {
+        qg1_live_startup_discriminator_abort(&mut child);
+        return Err(error);
+    }
+
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut ordinary = [0_u8; 1];
+        let result = stdout
+            .read(&mut ordinary)
+            .map(|count| (ordinary[..count].to_vec(), stdout))
+            .map_err(|error| error.to_string());
+        let _ = sender.send(result);
+    });
+    if !matches!(
+        receiver.recv_timeout(Duration::from_millis(200)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ) {
+        qg1_live_startup_discriminator_abort(&mut child);
+        return Err(
+            "live QG-1 startup child emitted an ordinary stdout byte before final ACK".to_owned(),
+        );
+    }
+
+    let mut stdin = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            qg1_live_startup_discriminator_abort(&mut child);
+            return Err("live QG-1 startup child lacks stdin".to_owned());
+        }
+    };
+    stdin
+        .write_all(&Qg1StartupHandshakeV1::final_ack_frame())
+        .map_err(|error| format!("write live QG-1 final ACK: {error}"))?;
+    stdin
+        .flush()
+        .map_err(|error| format!("flush live QG-1 final ACK: {error}"))?;
+    drop(stdin);
+
+    let (mut ordinary, mut stdout) = match receiver.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            qg1_live_startup_discriminator_abort(&mut child);
+            return Err(error);
+        }
+        Err(error) => {
+            qg1_live_startup_discriminator_abort(&mut child);
+            return Err(format!(
+                "live QG-1 child did not emit after final ACK: {error}"
+            ));
+        }
+    };
+    if let Err(error) = stdout.read_to_end(&mut ordinary) {
+        qg1_live_startup_discriminator_abort(&mut child);
+        return Err(format!("read live QG-1 child ordinary stdout: {error}"));
+    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("reap live QG-1 startup child: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "live QG-1 startup child failed after final ACK: {status}"
+        ));
+    }
+    if !ordinary.starts_with(b"bench_elf_sha256=") {
+        return Err(format!(
+            "the first ordinary byte after final ACK is not the canonical benchmark identity: {ordinary:?}"
+        ));
+    }
+    if !ordinary
+        .windows(QG1_LIVE_STARTUP_ORDINARY_MARKER.len())
+        .any(|window| window == QG1_LIVE_STARTUP_ORDINARY_MARKER)
+    {
+        return Err(
+            "live QG-1 startup child did not reach its post-ACK ordinary marker".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn qg1_live_startup_discriminator_rejects_preamble() -> Result<(), String> {
+    let mut child =
+        qg1_live_startup_discriminator_child(Qg1LiveStartupDiscriminatorMode::Preamble)?;
+    let mut stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            qg1_live_startup_discriminator_abort(&mut child);
+            return Err("preamble QG-1 startup child lacks stdout".to_owned());
+        }
+    };
+    if Qg1StartupHandshakeV1::read_control_frame(&mut stdout).is_ok() {
+        qg1_live_startup_discriminator_abort(&mut child);
+        return Err("planted ordinary QG-1 preamble was accepted as a control frame".to_owned());
+    }
+    child
+        .kill()
+        .map_err(|error| format!("kill planted-preamble QG-1 startup child: {error}"))?;
+    let status = child
+        .wait()
+        .map_err(|error| format!("reap planted-preamble QG-1 startup child: {error}"))?;
+    if status.success() {
+        return Err(
+            "planted-preamble QG-1 startup child unexpectedly exited successfully".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn qg1_live_startup_discriminator_non_qg_child() -> Result<(), String> {
+    let mut child = qg1_live_startup_discriminator_child(Qg1LiveStartupDiscriminatorMode::NonQg)?;
+    let mut stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            qg1_live_startup_discriminator_abort(&mut child);
+            return Err("non-QG startup child lacks stdout".to_owned());
+        }
+    };
+    let mut ordinary = Vec::new();
+    stdout
+        .read_to_end(&mut ordinary)
+        .map_err(|error| format!("read non-QG startup child stdout: {error}"))?;
+    let status = child
+        .wait()
+        .map_err(|error| format!("reap non-QG startup child: {error}"))?;
+    if !status.success() {
+        return Err(format!("non-QG startup child failed: {status}"));
+    }
+    if !ordinary.starts_with(b"bench_elf_sha256=") {
+        return Err(format!(
+            "non-QG child did not preserve the ordinary identity as stdout line one: {ordinary:?}"
+        ));
+    }
+    if ordinary
+        .windows(Qg1StartupHandshakeV1::REGISTER_MAGIC.len())
+        .any(|window| window == Qg1StartupHandshakeV1::REGISTER_MAGIC)
+        || ordinary
+            .windows(Qg1StartupHandshakeV1::COMPLETE_MAGIC.len())
+            .any(|window| window == Qg1StartupHandshakeV1::COMPLETE_MAGIC)
+    {
+        return Err(
+            "non-QG child emitted QG-1 startup control bytes despite its non-QG selected gate"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn run_qg1_live_startup_discriminator_parent() -> Result<(), String> {
+    qg1_live_startup_discriminator_positive_child()?;
+    qg1_live_startup_discriminator_rejects_preamble()?;
+    qg1_live_startup_discriminator_non_qg_child()?;
+    Ok(())
+}
+
 fn install_qg1_lifecycle_authority(
     estimator_config: &mut PairedEstimatorConfig,
     context: &BenchContext,
@@ -4926,6 +5531,7 @@ fn collect_cell(
     role: EvidenceRole,
     runs: usize,
     evidence: &EvidenceContext,
+    qg1_startup_producer: Option<&Qg1StartupProducer>,
 ) -> CellCollection {
     if spec.gate == PerfGate::Qg10 {
         let samples = (0..runs)
@@ -4961,19 +5567,25 @@ fn collect_cell(
     }
 
     let scope = operation_scope(spec);
-    let origin = Instant::now();
+    // Preserve the legacy origin for every non-QG-1 gate. QG-1 deliberately
+    // defers clock creation until its authority has been parent-acknowledged.
+    let origin = (spec.gate != PerfGate::Qg1).then(Instant::now);
     let cell_seed = evidence.config.bootstrap_seed ^ fixture_seed(&spec.fixture);
-    let mut estimator_config = evidence.config.clone();
-    let qg1_issued_streams = qg1_issued_streams(runs, cell_seed);
-    let qg1_lifecycle_producer = install_qg1_lifecycle_authority(
-        &mut estimator_config,
-        context,
-        spec,
-        &scope,
-        &evidence.sample_provenance,
-        u64::try_from(runs).expect("QG-1 authority pair count fits u64"),
-        qg1_issued_streams,
-    );
+    let (estimator_config, qg1_lifecycle_producer) = match qg1_producer_coverage(spec) {
+        Some(Qg1ProducerCoverage::EngineIndexingLifecycle) => {
+            let startup = qg1_startup_producer
+                .expect("selected engine QG-1 cell must reuse its preflight startup producer");
+            (startup.estimator_config.clone(), Some(&startup.producer))
+        }
+        Some(Qg1ProducerCoverage::TokenizerOnlyDiagnosticNoEngineLifecycle) | None => {
+            assert!(
+                qg1_startup_producer.is_none(),
+                "tokenizer-only and non-QG-1 cells must not receive an engine authority producer"
+            );
+            (evidence.config.clone(), None)
+        }
+    };
+    let origin = origin.unwrap_or_else(Instant::now);
 
     // Every non-query gate establishes its A/A floor through the exact paired
     // routine. QG-6 uses the prepared four-arm runner so setup is impossible
@@ -5017,7 +5629,7 @@ fn collect_cell(
                 qg1_stream_role: (spec.gate == PerfGate::Qg1).then_some("qg1.null.tantivy.v1"),
             },
             &estimator_config,
-            qg1_lifecycle_producer.as_ref(),
+            qg1_lifecycle_producer,
         );
         let mut treatment_null = (spec.gate == PerfGate::Qg1).then(|| {
             PairedStreamRunner::new(
@@ -5038,7 +5650,7 @@ fn collect_cell(
                     qg1_stream_role: Some("qg1.null.quill.v1"),
                 },
                 &estimator_config,
-                qg1_lifecycle_producer.as_ref(),
+                qg1_lifecycle_producer,
             )
         });
         let mut effect = PairedStreamRunner::new(
@@ -5060,7 +5672,7 @@ fn collect_cell(
                     .then_some("qg1.effect.tantivy_vs_quill.v1"),
             },
             &estimator_config,
-            qg1_lifecycle_producer.as_ref(),
+            qg1_lifecycle_producer,
         );
         for round in 0..runs {
             for slot in interleaved_stream_order(cell_seed, round) {
@@ -5150,9 +5762,8 @@ fn collect_cell(
         .expect("QG-1 harness-produced streams must share one frozen prepared input");
     }
 
-    let qg1_expected_authority = qg1_lifecycle_producer
-        .as_ref()
-        .map(Qg1LifecycleProducer::expected_authority);
+    let qg1_expected_authority =
+        qg1_lifecycle_producer.map(Qg1LifecycleProducer::expected_authority);
     let experiment = estimate_paired_experiment_against_qg1_authority(
         &effect_samples,
         &oracle_null_samples,
@@ -5902,7 +6513,8 @@ fn evidence_policy_from_env() -> EvidencePolicy {
     policy
 }
 
-fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
+fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
+    let bench_elf_sha256 = &bench_identity.sha256;
     let scale = MatrixScale::from_env();
     let build_profile = build_profile_label(scale);
     let matrix = PerfMatrixSpec::complete();
@@ -5922,7 +6534,6 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
         .map(|cell| cell.spec.clone())
         .collect::<Vec<_>>();
     let context = BenchContext::for_selected(scale, &selected_specs);
-    preflight_indexing_fixtures(&context, &matrix, &selected_specs);
     let configured_runs = std::env::var("QUILL_PERF_RUNS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -5974,6 +6585,45 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
             build_profile: build_profile.clone(),
         },
     };
+    // The selected-cell order is the canonical startup transcript order.  All
+    // engine producers are frozen and parent-acknowledged before preflight can
+    // perform indexing work; tokenizer-only QG-1 diagnostics contribute none.
+    let qg1_startup_producers = construct_qg1_startup_producers(
+        &context,
+        &selected_specs,
+        configured_runs,
+        &evidence_context,
+    );
+    let selected_qg1 = runner.plan.binding().gate == PerfGate::Qg1;
+    require_qg1_pre_timing_authority_ack(selected_qg1, &qg1_startup_producers.engine_cells);
+    if qg1_exact_startup_handshake_for_selected_gate() {
+        assert!(
+            selected_qg1,
+            "the exact QG-1 startup handshake cannot be active for a non-QG selection"
+        );
+        emit_bench_elf_sha256(bench_identity);
+    }
+    if qg1_live_startup_discriminator_mode() == Some(Qg1LiveStartupDiscriminatorMode::NonQg) {
+        assert!(
+            !selected_qg1 && !qg1_exact_startup_handshake_for_selected_gate(),
+            "the non-QG discriminator must keep the QG-1 stdio handshake inactive"
+        );
+        return;
+    }
+    if qg1_live_startup_discriminator_mode() == Some(Qg1LiveStartupDiscriminatorMode::Child) {
+        assert!(
+            selected_qg1 && qg1_exact_startup_handshake_for_selected_gate(),
+            "the live QG-1 startup discriminator must reach the normal selected-gate barrier"
+        );
+        std::io::stdout()
+            .write_all(QG1_LIVE_STARTUP_ORDINARY_MARKER)
+            .expect("emit live QG-1 post-ACK ordinary marker");
+        std::io::stdout()
+            .flush()
+            .expect("flush live QG-1 post-ACK ordinary marker");
+        return;
+    }
+    preflight_indexing_fixtures(&context, &matrix, &selected_specs);
     let configured_widths = configured_engine_widths(&selected);
     let mut machine = MachineIdentity::capture(
         runner.execution_capacity,
@@ -5995,6 +6645,7 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
             planned.role,
             configured_runs,
             &evidence_context,
+            qg1_startup_producers.for_spec(spec),
         );
         by_gate
             .entry(spec.gate)
@@ -6314,6 +6965,20 @@ fn assert_incumbent_is_genuine_tantivy() -> String {
 fn main() {
     validate_manifest_gate_contract(MANIFEST)
         .expect("normative QG manifest has a complete, closed policy set");
+    if qg1_live_startup_discriminator_mode() == Some(Qg1LiveStartupDiscriminatorMode::Parent) {
+        run_qg1_live_startup_discriminator_parent().unwrap_or_else(|error| {
+            panic!("live harness=false QG-1 startup discriminator failed: {error}")
+        });
+        return;
+    }
+    #[cfg(test)]
+    if std::env::var_os(QG1_AUTHORITY_SUBPROCESS_ENV).is_some() {
+        // This marker remains a cfg(test) barrier unit seam only. It is not
+        // evidence for normal harness=false stdout ordering; that proof is the
+        // production parent/child discriminator above.
+        tests::qg1_authority_subprocess_helper();
+        return;
+    }
     #[cfg(test)]
     if std::env::var_os("QUILL_PERF_H1_PRODUCER_SELF_CHECK").is_some() {
         tests::assert_qg1_continuous_interval_contract();
@@ -6328,6 +6993,7 @@ fn main() {
         tests::assert_qg9_cache_eviction_file_discovery();
         tests::assert_qg9_cache_eviction_request();
         tests::assert_manifest_gate_contract();
+        tests::assert_qg1_authority_handshake_contract();
         eprintln!(
             "[quill-perf-self-check] H1 immutable producer and continuous-timing contracts passed"
         );
@@ -6336,16 +7002,353 @@ fn main() {
     if run_child_mode() {
         return;
     }
-    let identity = print_bench_elf_sha256().expect("hash executing QG benchmark");
+    let identity = hash_bench_elf_sha256_silently().expect("hash executing QG benchmark");
+    let qg1_exact_handshake = qg1_exact_startup_handshake_for_selected_gate();
+    if qg1_live_startup_discriminator_mode() == Some(Qg1LiveStartupDiscriminatorMode::Preamble) {
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(b"planted-ordinary-qg1-startup-preamble\n")
+            .expect("write planted ordinary QG-1 preamble");
+        stdout
+            .flush()
+            .expect("flush planted ordinary QG-1 preamble");
+    }
+    if !qg1_exact_handshake {
+        // Preserve the established line-one identity for non-QG and
+        // non-handshake runs. Exact QG-1 reserves stdout until final ACK.
+        emit_bench_elf_sha256(&identity);
+    }
     // Fail closed before a single cell is timed.
     let _oracle = assert_incumbent_is_genuine_tantivy();
     let mut criterion = Criterion::default().configure_from_args();
-    bench_matrix(&mut criterion, &identity.sha256);
+    bench_matrix(&mut criterion, &identity);
     criterion.final_summary();
 }
 
 #[cfg(test)]
 mod tests {
+    fn qg1_handshake_test_producer() -> frankensearch_quill_gauntlet::Qg1LifecycleProducer {
+        use frankensearch_quill_gauntlet::{
+            PairedEstimatorConfig, PerfMetricSemantics, PerfOperationScope, PerfSampleArm,
+            Qg1BatchCoverage,
+        };
+
+        let mut config = PairedEstimatorConfig::predeclared(0x5147_3148_534b_5445);
+        config
+            .install_qg1_lifecycle_authority(
+                PerfOperationScope {
+                    operation_id: "QG-1.bulk/tiny/1/positions_on.docs_per_second".to_owned(),
+                    version: 1,
+                    semantics: PerfMetricSemantics::Throughput,
+                    unit: "docs/s".to_owned(),
+                },
+                "a".repeat(64),
+                "b".repeat(64),
+                "c".repeat(64),
+                1,
+                1,
+                1,
+                vec![Qg1BatchCoverage {
+                    document_start: 0,
+                    document_count: 1,
+                }],
+                "synthetic-00000000".to_owned(),
+                1,
+                vec![
+                    (
+                        "qg1.effect.tantivy_vs_quill.v1".to_owned(),
+                        0,
+                        0,
+                        vec![PerfSampleArm::Control],
+                    ),
+                    (
+                        "qg1.null.tantivy.v1".to_owned(),
+                        0,
+                        1_000_000,
+                        vec![PerfSampleArm::Control],
+                    ),
+                    (
+                        "qg1.null.quill.v1".to_owned(),
+                        2_000_000,
+                        2_000_000,
+                        vec![PerfSampleArm::Control],
+                    ),
+                ],
+            )
+            .expect("construct one real pre-timing QG-1 producer")
+    }
+
+    #[test]
+    fn qg1_authority_subprocess_helper() {
+        if std::env::var_os(super::QG1_AUTHORITY_SUBPROCESS_ENV).is_none() {
+            return;
+        }
+        let producer = qg1_handshake_test_producer();
+        let startup = super::Qg1StartupProducer {
+            operation_id: "QG-1.bulk/tiny/1/positions_on.docs_per_second".to_owned(),
+            estimator_config: frankensearch_quill_gauntlet::PairedEstimatorConfig::predeclared(
+                0x5147_3148_534b_5445,
+            ),
+            producer,
+        };
+        super::require_qg1_pre_timing_authority_ack(true, &[startup]);
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(super::QG1_AUTHORITY_WORK_MARKER)
+            .expect("emit work marker only after the production authority barrier");
+        stdout.flush().expect("flush post-barrier work marker");
+    }
+
+    fn qg1_read_subprocess_startup_transcript(
+        mut stdout: std::process::ChildStdout,
+    ) -> Result<(u64, Vec<u8>, u64, std::process::ChildStdout), String> {
+        let register = Qg1StartupHandshakeV1::read_control_frame(&mut stdout)?;
+        let (sequence, entry_bytes) = match register {
+            frankensearch_quill_gauntlet::Qg1StartupControlFrameV1::Register {
+                sequence,
+                entry_bytes,
+            } => (sequence, entry_bytes),
+            frankensearch_quill_gauntlet::Qg1StartupControlFrameV1::Complete { .. } => {
+                return Err("subprocess emitted COMPLETE before its register".to_owned());
+            }
+        };
+        let complete = Qg1StartupHandshakeV1::read_control_frame(&mut stdout)?;
+        let register_count = match complete {
+            frankensearch_quill_gauntlet::Qg1StartupControlFrameV1::Complete { register_count } => {
+                register_count
+            }
+            frankensearch_quill_gauntlet::Qg1StartupControlFrameV1::Register { .. } => {
+                return Err("subprocess emitted a second register before COMPLETE".to_owned());
+            }
+        };
+        Ok((sequence, entry_bytes, register_count, stdout))
+    }
+
+    fn qg1_start_authority_subprocess() -> (
+        std::process::Child,
+        mpsc::Receiver<Result<(u64, Vec<u8>, u64, std::process::ChildStdout), String>>,
+    ) {
+        let current_test = std::env::current_exe().expect("current benchmark test executable");
+        let mut child = Command::new(current_test)
+            .env(super::QG1_AUTHORITY_SUBPROCESS_ENV, "1")
+            .env(Qg1StartupHandshakeV1::ENV, Qg1StartupHandshakeV1::MODE)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            // Do not retain an undrained diagnostic pipe while the parent is
+            // waiting on the bounded startup authority exchange.
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn the same binary with piped production handshake stdio");
+        let stdout = child.stdout.take().expect("subprocess stdout");
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let _ = sender.send(qg1_read_subprocess_startup_transcript(stdout));
+        });
+        (child, receiver)
+    }
+
+    fn qg1_receive_subprocess_register(
+        child: &mut std::process::Child,
+        receiver: mpsc::Receiver<Result<(u64, Vec<u8>, u64, std::process::ChildStdout), String>>,
+    ) -> (u64, Vec<u8>, u64, std::process::ChildStdout) {
+        match receiver.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(register)) => register,
+            Ok(Err(error)) => panic!("same-binary authority subprocess failed: {error}"),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("same-binary authority subprocess did not frame startup control: {error}");
+            }
+        }
+    }
+
+    fn qg1_assert_no_post_register_work_before_ack(
+        stdout: std::process::ChildStdout,
+    ) -> mpsc::Receiver<Result<(Vec<u8>, std::process::ChildStdout), String>> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let mut stdout = stdout;
+            let mut byte = [0_u8; 1];
+            let result = stdout
+                .read(&mut byte)
+                .map(|count| (byte[..count].to_vec(), stdout))
+                .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        });
+        assert!(
+            matches!(
+                receiver.recv_timeout(Duration::from_millis(200)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the same-binary helper emitted work before the parent final ACK"
+        );
+        receiver
+    }
+
+    fn qg1_finish_subprocess(
+        child: &mut std::process::Child,
+        receiver: mpsc::Receiver<Result<(Vec<u8>, std::process::ChildStdout), String>>,
+    ) -> (std::process::ExitStatus, Vec<u8>) {
+        let (mut output, mut stdout) = receiver
+            .recv_timeout(Duration::from_secs(15))
+            .expect("subprocess stdout closed or emitted after its authority outcome")
+            .expect("read subprocess post-register stdout");
+        let status = child.wait().expect("wait for authority subprocess");
+        stdout
+            .read_to_end(&mut output)
+            .expect("drain subprocess stdout after authority outcome");
+        (status, output)
+    }
+
+    #[test]
+    fn qg1_authority_ack_is_a_real_pre_sampling_barrier() {
+        let (mut child, register_receiver) = qg1_start_authority_subprocess();
+        let (sequence, entry_bytes, register_count, stdout) =
+            qg1_receive_subprocess_register(&mut child, register_receiver);
+        let expected = qg1_handshake_test_producer().register_entry();
+        assert_eq!(
+            entry_bytes,
+            expected
+                .to_json_bytes()
+                .expect("serialize real register entry"),
+            "the child emitted the complete real producer register before work"
+        );
+        assert_eq!(sequence, 1, "the startup register sequence begins at one");
+        assert_eq!(
+            register_count, 1,
+            "the child completes the exact register count"
+        );
+        let post_register = qg1_assert_no_post_register_work_before_ack(stdout);
+        let mut stdin = child.stdin.take().expect("subprocess stdin");
+        stdin
+            .write_all(&Qg1StartupHandshakeV1::final_ack_frame())
+            .expect("write exact final ACK");
+        stdin.flush().expect("flush exact final ACK");
+        drop(stdin);
+        let (status, output) = qg1_finish_subprocess(&mut child, post_register);
+        assert!(status.success(), "valid ACK subprocess failed: {status}");
+        assert!(
+            output
+                .windows(super::QG1_AUTHORITY_WORK_MARKER.len())
+                .any(|window| window == super::QG1_AUTHORITY_WORK_MARKER),
+            "the helper reached its post-barrier work marker only after the exact ACK"
+        );
+    }
+
+    #[test]
+    fn qg1_authority_ack_refuses_malformed_missing_and_timeout_before_work() {
+        enum AckCase {
+            Malformed,
+            Missing,
+            Timeout,
+        }
+        for case in [AckCase::Malformed, AckCase::Missing, AckCase::Timeout] {
+            let (mut child, register_receiver) = qg1_start_authority_subprocess();
+            let (_sequence, entry_bytes, register_count, stdout) =
+                qg1_receive_subprocess_register(&mut child, register_receiver);
+            let expected = qg1_handshake_test_producer().register_entry();
+            assert_eq!(
+                entry_bytes,
+                expected
+                    .to_json_bytes()
+                    .expect("serialize real register entry"),
+                "every negative reaches the actual production barrier before refusal"
+            );
+            assert_eq!(
+                register_count, 1,
+                "negative transcript has one complete register"
+            );
+            let post_register = qg1_assert_no_post_register_work_before_ack(stdout);
+            let mut stdin = child.stdin.take().expect("subprocess stdin");
+            match case {
+                AckCase::Malformed => {
+                    let mut acknowledgement = Qg1StartupHandshakeV1::final_ack_frame();
+                    acknowledgement[0] ^= 0x01;
+                    stdin
+                        .write_all(&acknowledgement)
+                        .expect("write malformed ACK");
+                    stdin.flush().expect("flush malformed ACK");
+                    drop(stdin);
+                }
+                AckCase::Missing => drop(stdin),
+                AckCase::Timeout => {
+                    let (status, output) = qg1_finish_subprocess(&mut child, post_register);
+                    assert!(
+                        !status.success(),
+                        "withheld ACK must make the same-binary helper refuse before work"
+                    );
+                    assert!(
+                        !output
+                            .windows(super::QG1_AUTHORITY_WORK_MARKER.len())
+                            .any(|window| window == super::QG1_AUTHORITY_WORK_MARKER),
+                        "a withheld ACK must never reach the post-barrier work marker"
+                    );
+                    drop(stdin);
+                    continue;
+                }
+            }
+            let (status, output) = qg1_finish_subprocess(&mut child, post_register);
+            assert!(
+                !status.success(),
+                "malformed and missing final ACKs must make the helper refuse"
+            );
+            assert!(
+                !output
+                    .windows(super::QG1_AUTHORITY_WORK_MARKER.len())
+                    .any(|window| window == super::QG1_AUTHORITY_WORK_MARKER),
+                "a rejected ACK must never reach the post-barrier work marker"
+            );
+        }
+    }
+
+    #[test]
+    fn qg1_authority_barrier_remains_before_its_timing_origin_and_runners() {
+        const TEST_MODULE_BOUNDARY: &str = "#[cfg(test)]\nmod tests {";
+        let source = include_str!("perf_matrix.rs");
+        assert_eq!(
+            source.matches(TEST_MODULE_BOUNDARY).count(),
+            1,
+            "the production/test boundary must remain unique"
+        );
+        let production = &source[..source
+            .find(TEST_MODULE_BOUNDARY)
+            .expect("production/test boundary")];
+        let bench_matrix = &production[production
+            .find("fn bench_matrix(")
+            .expect("unique production bench_matrix")..];
+        let unique_offset = |marker: &str| {
+            assert_eq!(
+                bench_matrix.matches(marker).count(),
+                1,
+                "bench_matrix must contain exactly one placement marker {marker:?}"
+            );
+            bench_matrix
+                .find(marker)
+                .expect("unique bench_matrix placement marker")
+        };
+        let install = unique_offset("let qg1_startup_producers =");
+        let acknowledgement = unique_offset(
+            "require_qg1_pre_timing_authority_ack(selected_qg1, &qg1_startup_producers.engine_cells);",
+        );
+        let identity = unique_offset("emit_bench_elf_sha256(bench_identity);");
+        let preflight =
+            unique_offset("preflight_indexing_fixtures(&context, &matrix, &selected_specs);");
+        let collection = unique_offset("let collection = collect_cell(");
+        assert!(
+            install < acknowledgement
+                && acknowledgement < identity
+                && identity < preflight
+                && preflight < collection,
+            "placement only: QG-1 must mint every producer, receive the parent final ACK, emit its ordinary identity, preflight, then collect"
+        );
+    }
+
+    pub fn assert_qg1_authority_handshake_contract() {
+        qg1_authority_ack_is_a_real_pre_sampling_barrier();
+        qg1_authority_ack_refuses_malformed_missing_and_timeout_before_work();
+        qg1_authority_barrier_remains_before_its_timing_origin_and_runners();
+    }
+
     pub fn assert_qg9_cache_evidence_contract() {
         let quill_only = super::ColdCacheAccumulator {
             quill_successes: 1,

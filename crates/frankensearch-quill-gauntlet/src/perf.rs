@@ -3887,6 +3887,138 @@ pub(crate) fn resolve_qg1_expected_authority_for_replay<'a>(
     }
 }
 
+/// Stable schema identity for one pinned all-required-target authority set.
+pub const QG1_TARGET_PIN_SCHEMA_VERSION: &str = "frankensearch.quill.qg1-target-pin.v1";
+
+/// The external pin that makes a register entry usable.
+///
+/// A register entry is SELF-CONSISTENT by construction: whoever wrote it wrote
+/// both the commitments and the preimages that open them, so verifying one
+/// proves internal coherence and nothing about provenance. That makes the
+/// register a transport substrate, never a trust root, and this type is the
+/// root it is missing.
+///
+/// The pin is separate evidence, pinned before timing, that names the complete
+/// required-target set, the campaign/run it belongs to, the clean canonical
+/// source revision it was cut from, and the authority digest expected for each
+/// target. An entry can only be reconstituted into a
+/// [`Qg1ExpectedAuthority`] when a pin names its digest, so a hand-minted
+/// entry authenticates nothing: the attacker would also have to be named by a
+/// pin they do not control.
+///
+/// # What it still does not do
+///
+/// Nothing here signs the pin. A holder of the pin file can rewrite it, so
+/// this establishes SEPARATION (the evidence cannot vouch for itself) and
+/// PRECEDENCE (the pin predates the run), not unforgeability. Consumers must
+/// obtain the pin from a channel independent of the evidence they are
+/// authenticating; no claim beyond that may be made from this type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg1TargetPinV1 {
+    /// Always [`QG1_TARGET_PIN_SCHEMA_VERSION`].
+    pub schema_version: String,
+    /// Campaign/run identity this pin was cut for.
+    campaign_run_id: String,
+    /// Clean canonical lowercase 40-hex source revision.
+    source_git_revision: String,
+    /// Canonical required-target id to expected authority digest, in canonical
+    /// order. A target missing here is a target this pin cannot authorize.
+    target_authority_digests: BTreeMap<String, String>,
+}
+
+impl Qg1TargetPinV1 {
+    /// Verify schema, run identity, source cleanliness, and digest shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-configuration error naming the first failure.
+    pub fn verify(&self) -> Result<(), PairedEstimatorError> {
+        let invalid = |reason: String| PairedEstimatorError::InvalidConfig { reason };
+        if self.schema_version != QG1_TARGET_PIN_SCHEMA_VERSION {
+            return Err(invalid(format!(
+                "QG-1 target pin has schema {:?}, expected {QG1_TARGET_PIN_SCHEMA_VERSION:?}",
+                self.schema_version
+            )));
+        }
+        if self.campaign_run_id.trim().is_empty() || self.campaign_run_id.len() > 256 {
+            return Err(invalid(
+                "QG-1 target pin requires one bounded campaign/run identity".to_owned(),
+            ));
+        }
+        if self.source_git_revision.len() != 40
+            || !self
+                .source_git_revision
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(invalid(format!(
+                "QG-1 target pin source revision {:?} is not a clean canonical lowercase 40-hex \
+                 revision",
+                self.source_git_revision
+            )));
+        }
+        if self.target_authority_digests.is_empty() {
+            return Err(invalid(
+                "QG-1 target pin names no required target; an empty pin can authorize nothing"
+                    .to_owned(),
+            ));
+        }
+        for (target, digest) in &self.target_authority_digests {
+            if target.trim().is_empty() || !is_lower_hex_digest(digest) {
+                return Err(invalid(format!(
+                    "QG-1 target pin entry for {target:?} is not a named target bound to a \
+                     lowercase SHA-256 authority digest"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Campaign/run identity this pin was cut for.
+    #[must_use]
+    pub fn campaign_run_id(&self) -> &str {
+        &self.campaign_run_id
+    }
+
+    /// The complete required-target set this pin names.
+    #[must_use]
+    pub fn required_targets(&self) -> impl Iterator<Item = &str> {
+        self.target_authority_digests.keys().map(String::as_str)
+    }
+
+    /// Refuse an entry whose authority digest this pin does not name.
+    ///
+    /// This is the trust boundary: without it, a caller who can write a
+    /// register file can mint an expectation, because the entry opens its own
+    /// commitments. With it, the entry must additionally be one the pin
+    /// already expected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-configuration error when no pinned target names this
+    /// entry's digest.
+    pub fn require_pinned_target(
+        &self,
+        entry: &Qg1AuthorityRegisterEntryV1,
+    ) -> Result<(), PairedEstimatorError> {
+        if self
+            .target_authority_digests
+            .values()
+            .any(|digest| digest == entry.digest())
+        {
+            return Ok(());
+        }
+        Err(PairedEstimatorError::InvalidConfig {
+            reason: format!(
+                "QG-1 register entry {} is not named by the pinned required-target set for run {}",
+                entry.digest(),
+                self.campaign_run_id
+            ),
+        })
+    }
+}
+
 /// Stable schema identity for one persisted QG-1 authority register entry.
 pub const QG1_AUTHORITY_REGISTER_SCHEMA_VERSION: &str =
     "frankensearch.quill.qg1-authority-register.v1";
@@ -4009,8 +4141,13 @@ impl Qg1AuthorityRegisterEntryV1 {
     /// # Errors
     ///
     /// Returns the first verification failure.
-    pub fn to_expected_authority(&self) -> Result<Qg1ExpectedAuthority, PairedEstimatorError> {
+    pub fn to_expected_authority(
+        &self,
+        pin: &Qg1TargetPinV1,
+    ) -> Result<Qg1ExpectedAuthority, PairedEstimatorError> {
         self.verify()?;
+        pin.verify()?;
+        pin.require_pinned_target(self)?;
         let mut capability_preimages = BTreeMap::new();
         for (key, hex) in &self.capability_preimages_hex {
             let preimage = decode_capability_preimage_hex(hex).ok_or_else(|| {
@@ -4090,7 +4227,7 @@ impl Qg1AuthorityRegisterEntryV1 {
         use rustix::fs::{Mode, OFlags};
 
         self.verify()?;
-        let io = |context: &str, error: std::io::Errno| PairedEstimatorError::InvalidConfig {
+        let io = |context: &str, error: rustix::io::Errno| PairedEstimatorError::InvalidConfig {
             reason: format!("QG-1 authority register {context} failed: {error}"),
         };
         let std_io = |context: &str, error: std::io::Error| PairedEstimatorError::InvalidConfig {
@@ -9481,9 +9618,34 @@ mod tests {
         let reloaded = Qg1AuthorityRegisterEntryV1::load_verified(&published)
             .expect("reload the published register entry");
         assert_eq!(reloaded, entry, "the entry survives serialization exactly");
+        // The entry alone is not enough: reconstitution requires an external
+        // pin that already named this authority digest for this run.
+        let pin = Qg1TargetPinV1 {
+            schema_version: QG1_TARGET_PIN_SCHEMA_VERSION.to_owned(),
+            campaign_run_id: "qg1-register-roundtrip".to_owned(),
+            source_git_revision: "c".repeat(40),
+            target_authority_digests: BTreeMap::from([(
+                "qg1.bulk/medium/1/positions_on.docs_per_second".to_owned(),
+                entry.digest().to_owned(),
+            )]),
+        };
+        let unpinned = Qg1TargetPinV1 {
+            target_authority_digests: BTreeMap::from([(
+                "qg1.bulk/medium/1/positions_on.docs_per_second".to_owned(),
+                "d".repeat(64),
+            )]),
+            ..pin.clone()
+        };
+        assert!(
+            matches!(
+                reloaded.to_expected_authority(&unpinned),
+                Err(PairedEstimatorError::InvalidConfig { .. })
+            ),
+            "a register entry no pin names must never reconstitute an expectation"
+        );
         let expected = reloaded
-            .to_expected_authority()
-            .expect("reconstitute the retained expectation");
+            .to_expected_authority(&pin)
+            .expect("reconstitute the retained expectation under its pin");
         assert_eq!(expected.digest(), producer.expected_authority().digest());
         assert!(
             expected.matches_config(&config),

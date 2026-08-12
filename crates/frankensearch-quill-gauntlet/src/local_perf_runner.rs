@@ -17,7 +17,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::time::Duration;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use rustix::fs::{
     FileType, FlockOperation, Mode, OFlags, RenameFlags, flock, fstat, mkdirat, open, openat,
@@ -45,6 +49,7 @@ use crate::machine_class_registry::{
     RunnerExecutionRequest, RunnerExecutionSnapshot, RunnerHardware, RunnerProducer, RunnerReceipt,
     VerifiedRunnerIdentity, seal_runner_receipt, sha256_hex,
 };
+use crate::perf::Qg1AuthorityRegisterEntryV1;
 use crate::{
     EvidenceArtifactError, PerfApplicabilityPlan, PerfApplicabilityPlanBinding,
     PerfEvidenceArtifact, PerfGate, PerfGateArtifact, PerfMatrixSpec, command_sha256_from_argv,
@@ -71,6 +76,123 @@ const MEASUREMENT_WARMUP_ROUNDS: &str = "1";
 const MEASUREMENT_BOOTSTRAP_SEED: &str = "5860671082138523204";
 const WAIT_RECOVERY_POLL_ATTEMPTS: usize = 100;
 const WAIT_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Fixed startup-only QG-1 authority wire protocol.
+///
+/// Control framing is valid only from child stdout offset zero until the child
+/// emits [`Self::complete_frame`]. Thereafter stdout is copied raw to `run.log`.
+/// This removes any interpretation of ordinary benchmark output as control.
+pub struct Qg1StartupHandshakeV1;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Qg1StartupControlFrameV1 {
+    Register { sequence: u64, entry_bytes: Vec<u8> },
+    Complete { register_count: u64 },
+}
+
+impl Qg1StartupHandshakeV1 {
+    pub const ENV: &'static str = "QUILL_PERF_QG1_AUTHORITY_HANDSHAKE";
+    pub const MODE: &'static str = "startup-stdio-v1";
+    pub const REGISTER_MAGIC: &'static [u8] = b"\x1eQG1-START-REGISTER-V1\x1f";
+    pub const COMPLETE_MAGIC: &'static [u8] = b"\x1eQG1-START-COMPLETE-V1\x1f";
+    pub const ACK_MAGIC: &'static [u8] = b"\x1eQG1-START-ACK-V1\x1f";
+    pub const MAX_REGISTER_BYTES: usize = 1_048_576;
+    pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+    pub fn register_frame(sequence: u64, entry: &[u8]) -> Result<Vec<u8>, String> {
+        if entry.is_empty() || entry.len() > Self::MAX_REGISTER_BYTES {
+            return Err("QG-1 startup register payload is outside the fixed bound".to_owned());
+        }
+        let length = u32::try_from(entry.len())
+            .map_err(|_| "QG-1 startup register length does not fit u32".to_owned())?;
+        let mut frame = Vec::with_capacity(Self::REGISTER_MAGIC.len() + 12 + entry.len());
+        frame.extend_from_slice(Self::REGISTER_MAGIC);
+        frame.extend_from_slice(&sequence.to_be_bytes());
+        frame.extend_from_slice(&length.to_be_bytes());
+        frame.extend_from_slice(entry);
+        Ok(frame)
+    }
+
+    pub fn read_control_frame(reader: &mut impl Read) -> Result<Qg1StartupControlFrameV1, String> {
+        let mut magic = Vec::with_capacity(Self::REGISTER_MAGIC.len());
+        loop {
+            let mut byte = [0_u8; 1];
+            reader
+                .read_exact(&mut byte)
+                .map_err(|error| format!("QG-1 startup control magic is truncated: {error}"))?;
+            magic.push(byte[0]);
+            let register_prefix = Self::REGISTER_MAGIC.starts_with(&magic);
+            let complete_prefix = Self::COMPLETE_MAGIC.starts_with(&magic);
+            if !register_prefix && !complete_prefix {
+                return Err("QG-1 startup control must begin at stdout offset zero".to_owned());
+            }
+            if magic == Self::REGISTER_MAGIC {
+                let mut header = [0_u8; std::mem::size_of::<u64>() + std::mem::size_of::<u32>()];
+                reader.read_exact(&mut header).map_err(|error| {
+                    format!("QG-1 startup register header is truncated: {error}")
+                })?;
+                let sequence = u64::from_be_bytes(
+                    header[..std::mem::size_of::<u64>()]
+                        .try_into()
+                        .map_err(|_| "QG-1 startup register sequence is malformed".to_owned())?,
+                );
+                let entry_len = usize::try_from(u32::from_be_bytes(
+                    header[std::mem::size_of::<u64>()..]
+                        .try_into()
+                        .map_err(|_| "QG-1 startup register length is malformed".to_owned())?,
+                ))
+                .map_err(|_| "QG-1 startup register length does not fit usize".to_owned())?;
+                if entry_len == 0 || entry_len > Self::MAX_REGISTER_BYTES {
+                    return Err(
+                        "QG-1 startup register payload is outside the fixed bound".to_owned()
+                    );
+                }
+                let mut entry_bytes = vec![0_u8; entry_len];
+                reader.read_exact(&mut entry_bytes).map_err(|error| {
+                    format!("QG-1 startup register payload is truncated: {error}")
+                })?;
+                return Ok(Qg1StartupControlFrameV1::Register {
+                    sequence,
+                    entry_bytes,
+                });
+            }
+            if magic == Self::COMPLETE_MAGIC {
+                let mut count = [0_u8; std::mem::size_of::<u64>()];
+                reader.read_exact(&mut count).map_err(|error| {
+                    format!("QG-1 startup complete frame is truncated: {error}")
+                })?;
+                return Ok(Qg1StartupControlFrameV1::Complete {
+                    register_count: u64::from_be_bytes(count),
+                });
+            }
+        }
+    }
+
+    pub fn complete_frame(register_count: u64) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(Self::COMPLETE_MAGIC.len() + 8);
+        frame.extend_from_slice(Self::COMPLETE_MAGIC);
+        frame.extend_from_slice(&register_count.to_be_bytes());
+        frame
+    }
+
+    pub fn final_ack_frame() -> Vec<u8> {
+        Self::ACK_MAGIC.to_vec()
+    }
+
+    pub fn final_ack_len() -> usize {
+        Self::ACK_MAGIC.len()
+    }
+
+    pub fn validate_final_ack(frame: &[u8]) -> Result<(), String> {
+        (frame == Self::ACK_MAGIC)
+            .then_some(())
+            .ok_or_else(|| "QG-1 startup final ACK is malformed, missing, or replayed".to_owned())
+    }
+}
+
+#[cfg(test)]
+static QG1_FORWARDER_TEST_ARTIFACT_NONCE: AtomicU64 = AtomicU64::new(1);
+#[cfg(test)]
+const QG1_FORWARDER_TEST_CREATE_ATTEMPTS: u64 = 64;
 const EMBEDDED_PRODUCER_CONTRACT_VERSION: &str = env!("QUILL_PERF_PRODUCER_CONTRACT_VERSION");
 const EMBEDDED_PRODUCER_GIT_REVISION: &str = env!("QUILL_PERF_PRODUCER_GIT_REVISION");
 const EMBEDDED_PRODUCER_GIT_DIRTY: &str = env!("QUILL_PERF_PRODUCER_GIT_DIRTY");
@@ -347,6 +469,47 @@ struct RunDirectories {
     artifacts: PinnedDirectory,
 }
 
+#[derive(Debug)]
+enum Qg1AuthorityForwarderEvent {
+    Register {
+        sequence: u64,
+        entry_bytes: Vec<u8>,
+    },
+    Complete {
+        register_count: u64,
+        response: mpsc::SyncSender<Qg1AuthorityForwarderResponse>,
+    },
+    Closed,
+    Failed(String),
+}
+
+#[derive(Debug)]
+enum Qg1AuthorityForwarderResponse {
+    FinalAcknowledge,
+    Refuse,
+}
+
+#[derive(Debug)]
+struct Qg1AuthorityForwarder {
+    events: mpsc::Receiver<Qg1AuthorityForwarderEvent>,
+    join: JoinHandle<Result<(), String>>,
+}
+
+#[derive(Debug)]
+struct AcceptedQg1Authorities {
+    directory: Option<PinnedDirectory>,
+    cell_digests: BTreeMap<String, String>,
+}
+
+impl AcceptedQg1Authorities {
+    const fn new() -> Self {
+        Self {
+            directory: None,
+            cell_digests: BTreeMap::new(),
+        }
+    }
+}
+
 /// Canonically ordered exclusive locks for every resource recorded by a
 /// pre-build booking receipt. The held descriptors intentionally survive exec
 /// with the benchmark child, just like the host-global lease.
@@ -438,6 +601,7 @@ pub enum LocalPerfIoErrorKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalPerfRejectionStage {
+    AuthorityHandshake,
     RunLogSync,
     RunLogRead,
     ExitStatusPersistence,
@@ -1743,15 +1907,30 @@ fn run_local_perf_command_inner(
     let run_log = create_new_file_at(&run_directories.run.handle, "run.log")?;
     let run_log_sync = run_log.try_clone()?;
     let run_log_stderr = run_log.try_clone()?;
+    let qg1_run_log = (config.gate == PerfGate::Qg1)
+        .then(|| run_log.try_clone())
+        .transpose()?;
     let mut descendant_scope = LocalPerfDescendantScope::enter()?;
     let mut child = Command::new(descriptor_path(&captured_build.executable)?);
     child
         .arg0(&captured_build.command[0])
-        .args(&captured_build.command[1..])
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(run_log))
-        .stderr(Stdio::from(run_log_stderr));
+        .args(&captured_build.command[1..]);
+    if config.gate == PerfGate::Qg1 {
+        child
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(run_log_stderr));
+    } else {
+        child
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(run_log))
+            .stderr(Stdio::from(run_log_stderr));
+    }
     configure_benchmark_child(&mut child, &captured_build.measurement_environment);
+    // Include the spawn call and every post-spawn setup step in QG-1's single
+    // startup budget. The deadline is deliberately not refreshed on success.
+    let qg1_startup_deadline = (config.gate == PerfGate::Qg1)
+        .then(|| Instant::now() + Qg1StartupHandshakeV1::STARTUP_TIMEOUT);
     let (mut child, root_process_identity) = match child.spawn() {
         Ok(child) => {
             let root_process_identity = capture_root_process_identity(&child);
@@ -1808,26 +1987,76 @@ fn run_local_perf_command_inner(
             )?);
         }
     };
-    let (status, recovered_wait_error, process_group_recovery) = match child.wait() {
-        Ok(status) => (status, None, LocalPerfProcessGroupRecovery::NotRequired),
-        Err(error) => {
-            let wait_error_kind = local_perf_io_error_kind(&error);
-            match force_kill_and_reap(&mut child, root_process_identity) {
-                Ok((status, process_group_recovery)) => {
-                    (status, Some(wait_error_kind), process_group_recovery)
-                }
-                Err(recovery_error_kind) => {
-                    return Err(LocalPerfRunError::UnreapedChild {
-                        wait_error_kind,
-                        recovery_error_kind,
-                    });
+    let (
+        status,
+        recovered_wait_error,
+        process_group_recovery,
+        qg1_accepted_authorities,
+        qg1_handshake_failure,
+        qg1_reconciliation,
+    ) = if config.gate == PerfGate::Qg1 {
+        let forwarder = start_qg1_authority_forwarder(
+            &mut child,
+            qg1_run_log.expect("QG-1 retains a run-log writer for authority forwarding"),
+        )?;
+        let mut handshake_log = run_log_sync.try_clone()?;
+        let (
+            status,
+            recovered_wait_error,
+            process_group_recovery,
+            accepted_authorities,
+            handshake_failure,
+            reconciliation,
+        ) = wait_for_qg1_authority_child(
+            &mut child,
+            root_process_identity,
+            &mut descendant_scope,
+            &run_directories,
+            &run_selection,
+            qg1_startup_deadline.expect("QG-1 startup deadline is armed before the child spawn"),
+            forwarder,
+            &mut handshake_log,
+        )?;
+        (
+            status,
+            recovered_wait_error,
+            process_group_recovery,
+            accepted_authorities,
+            handshake_failure,
+            Some(reconciliation),
+        )
+    } else {
+        let (status, recovered_wait_error, process_group_recovery) = match child.wait() {
+            Ok(status) => (status, None, LocalPerfProcessGroupRecovery::NotRequired),
+            Err(error) => {
+                let wait_error_kind = local_perf_io_error_kind(&error);
+                match force_kill_and_reap(&mut child, root_process_identity) {
+                    Ok((status, process_group_recovery)) => {
+                        (status, Some(wait_error_kind), process_group_recovery)
+                    }
+                    Err(recovery_error_kind) => {
+                        return Err(LocalPerfRunError::UnreapedChild {
+                            wait_error_kind,
+                            recovery_error_kind,
+                        });
+                    }
                 }
             }
-        }
+        };
+        (
+            status,
+            recovered_wait_error,
+            process_group_recovery,
+            AcceptedQg1Authorities::new(),
+            None,
+            None,
+        )
     };
-    let (process_tree_quiescence, descendant_processes_observed) =
-        LocalPerfDescendantScope::reconcile_after_root_exit()
-            .map_err(|error_kind| LocalPerfRunError::UnreapedProcessTree { error_kind })?;
+    let (process_tree_quiescence, descendant_processes_observed) = match qg1_reconciliation {
+        Some(reconciliation) => reconciliation,
+        None => LocalPerfDescendantScope::reconcile_after_root_exit()
+            .map_err(|error_kind| LocalPerfRunError::UnreapedProcessTree { error_kind })?,
+    };
     descendant_scope.restore()?;
     let run_log_synced = run_log_sync.sync_all().is_ok();
     let run_log_result = read_file_at(&run_directories.run.handle, "run.log");
@@ -1945,6 +2174,49 @@ fn run_local_perf_command_inner(
             outcome,
         )?);
     }
+    let post_exit_rejection = |stage| -> Result<LocalPerfRunError, LocalPerfRunError> {
+        let outcome = LocalPerfAttemptOutcome::PostExitRejected { stage };
+        let receipt_path = write_failed_attempt_receipt(
+            config,
+            &run_profile,
+            &run_selection,
+            &durability,
+            &run_directories,
+            &captured_build,
+            &producer_before,
+            &external_paths,
+            &start,
+            &lease_identity,
+            outcome,
+            process_lifecycle,
+            root_process_identity,
+            Some(&run_log_bytes),
+            &started_at_utc,
+        )?;
+        failed_attempt_error_after_release(
+            config,
+            &lease_file,
+            &booking_resource_leases,
+            &lease_identity,
+            &run_directories,
+            receipt_path,
+            outcome,
+        )
+    };
+    if let Some(LocalPerfAttemptOutcome::PostExitRejected { stage }) =
+        qg1_authority_handshake_outcome(
+            config.gate,
+            &run_selection,
+            &qg1_accepted_authorities,
+            qg1_handshake_failure.as_deref(),
+        )
+    {
+        // This map deliberately retains the canonical selected-cell ID and
+        // accepted digest for each pre-timing publication. It is not yet a
+        // manifest/replay authorization: later wiring must bind it to the
+        // persisted evidence and prove complete selected-cell coverage.
+        return Err(post_exit_rejection(stage)?);
+    }
     if let Some(error_kind) = recovered_wait_error {
         let outcome = LocalPerfAttemptOutcome::WaitRecoveredByKill { error_kind };
         let attempt_path = write_failed_attempt_receipt(
@@ -2014,36 +2286,6 @@ fn run_local_perf_command_inner(
             outcome,
         )?);
     }
-
-    let post_exit_rejection = |stage| -> Result<LocalPerfRunError, LocalPerfRunError> {
-        let outcome = LocalPerfAttemptOutcome::PostExitRejected { stage };
-        let receipt_path = write_failed_attempt_receipt(
-            config,
-            &run_profile,
-            &run_selection,
-            &durability,
-            &run_directories,
-            &captured_build,
-            &producer_before,
-            &external_paths,
-            &start,
-            &lease_identity,
-            outcome,
-            process_lifecycle,
-            root_process_identity,
-            Some(&run_log_bytes),
-            &started_at_utc,
-        )?;
-        failed_attempt_error_after_release(
-            config,
-            &lease_file,
-            &booking_resource_leases,
-            &lease_identity,
-            &run_directories,
-            receipt_path,
-            outcome,
-        )
-    };
     if !process_lifecycle.descendant_process_tree_quiescence_is_proven() {
         return Err(post_exit_rejection(
             LocalPerfRejectionStage::ProcessTreeQuiescence,
@@ -2921,6 +3163,671 @@ fn require_local_execution() -> Result<(), LocalPerfRunError> {
     Ok(())
 }
 
+fn create_qg1_authority_directory(
+    run: &PinnedDirectory,
+) -> Result<PinnedDirectory, LocalPerfRunError> {
+    verify_pinned_directory(run)?;
+    mkdirat(&run.handle, "qg1-authorities", Mode::from_raw_mode(0o700))
+        .map_err(std::io::Error::from)?;
+    run.handle.sync_all()?;
+    let handle = File::from(
+        openat(
+            &run.handle,
+            "qg1-authorities",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?,
+    );
+    let authority_directory = PinnedDirectory {
+        path: run.path.join("qg1-authorities"),
+        identity: checked_directory_identity(&handle)?,
+        handle,
+    };
+    verify_pinned_directory(&authority_directory)?;
+    Ok(authority_directory)
+}
+
+fn qg1_selected_cell_id_for_authority(
+    entry: &Qg1AuthorityRegisterEntryV1,
+    selection: &ResolvedRunSelection,
+) -> Result<String, LocalPerfRunError> {
+    let canonical = entry.to_json_bytes().map_err(|error| {
+        LocalPerfRunError::Invalid(format!("QG-1 authority did not re-encode: {error}"))
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&canonical)?;
+    let operation_id = value
+        .pointer("/authority/scope/operation_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            LocalPerfRunError::Invalid(
+                "verified QG-1 authority lacks its canonical operation scope identifier".to_owned(),
+            )
+        })?;
+    if operation_id.is_empty()
+        || operation_id.len() > MAX_IDENTITY_COMPONENT_BYTES * 4
+        || operation_id.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(LocalPerfRunError::Invalid(
+            "verified QG-1 authority carries an invalid operation scope identifier".to_owned(),
+        ));
+    }
+    let (gate, fixture_and_metric) = operation_id.split_once('.').ok_or_else(|| {
+        LocalPerfRunError::Invalid(
+            "verified QG-1 authority operation scope lacks its gate separator".to_owned(),
+        )
+    })?;
+    let (fixture, metric) = fixture_and_metric.rsplit_once('.').ok_or_else(|| {
+        LocalPerfRunError::Invalid(
+            "verified QG-1 authority operation scope lacks its metric separator".to_owned(),
+        )
+    })?;
+    if gate != PerfGate::Qg1.label() || fixture.is_empty() || metric.is_empty() {
+        return Err(LocalPerfRunError::Invalid(
+            "verified authority operation scope is not one QG-1 fixture/metric target".to_owned(),
+        ));
+    }
+    let selected_cell_id = format!("{gate}/{fixture}/{metric}");
+    if selection
+        .selected_cell_ids
+        .iter()
+        .filter(|cell_id| *cell_id == &selected_cell_id)
+        .count()
+        != 1
+    {
+        return Err(LocalPerfRunError::Invalid(format!(
+            "verified QG-1 authority operation scope {operation_id:?} is not exactly one frozen selected target"
+        )));
+    }
+    Ok(selected_cell_id)
+}
+
+fn qg1_expected_authority_cell_ids(
+    selection: &ResolvedRunSelection,
+) -> Result<BTreeSet<String>, LocalPerfRunError> {
+    if selection.selected_cell_ids.is_empty() {
+        return Err(LocalPerfRunError::Invalid(
+            "frozen QG-1 selection contains no canonical cells".to_owned(),
+        ));
+    }
+    let mut expected = BTreeSet::new();
+    for cell_id in &selection.selected_cell_ids {
+        if !cell_id.starts_with("QG-1/") {
+            return Err(LocalPerfRunError::Invalid(format!(
+                "frozen QG-1 selection contains a non-QG-1 cell {cell_id:?}"
+            )));
+        }
+        if cell_id.strip_suffix("/docs_per_second").is_some() {
+            if !expected.insert(cell_id.clone()) {
+                return Err(LocalPerfRunError::Invalid(format!(
+                    "frozen QG-1 selection repeats engine-lifecycle cell {cell_id:?}"
+                )));
+            }
+        } else if !cell_id.ends_with("/tokenize_docs_per_second") {
+            return Err(LocalPerfRunError::Invalid(format!(
+                "frozen QG-1 selection contains a non-lifecycle/non-diagnostic cell {cell_id:?}"
+            )));
+        }
+    }
+    Ok(expected)
+}
+
+fn qg1_authority_rejection_stage(
+    gate: PerfGate,
+    selection: &ResolvedRunSelection,
+    accepted: &AcceptedQg1Authorities,
+    handshake_failure: Option<&str>,
+) -> Option<LocalPerfRejectionStage> {
+    if gate != PerfGate::Qg1 {
+        return None;
+    }
+    let accepted_cell_ids = accepted
+        .cell_digests
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let set_complete = qg1_expected_authority_cell_ids(selection)
+        .is_ok_and(|expected| expected == accepted_cell_ids);
+    (handshake_failure.is_some() || !set_complete)
+        .then_some(LocalPerfRejectionStage::AuthorityHandshake)
+}
+
+fn qg1_authority_handshake_outcome(
+    gate: PerfGate,
+    selection: &ResolvedRunSelection,
+    accepted: &AcceptedQg1Authorities,
+    handshake_failure: Option<&str>,
+) -> Option<LocalPerfAttemptOutcome> {
+    qg1_authority_rejection_stage(gate, selection, accepted, handshake_failure)
+        .map(|stage| LocalPerfAttemptOutcome::PostExitRejected { stage })
+}
+
+fn qg1_accept_next_authority_sequence(
+    last_sequence: &mut Option<u64>,
+    sequence: u64,
+) -> Result<(), String> {
+    let expected = match last_sequence {
+        Some(previous) => previous.checked_add(1).ok_or_else(|| {
+            "QG-1 authority register sequence exhausted before the next cell".to_owned()
+        })?,
+        None => 1,
+    };
+    if sequence != expected {
+        return Err(format!(
+            "QG-1 authority register sequence {sequence} is stale, replayed, or out of order; expected {expected}"
+        ));
+    }
+    *last_sequence = Some(sequence);
+    Ok(())
+}
+
+fn publish_qg1_authority_entry(
+    run: &PinnedDirectory,
+    selection: &ResolvedRunSelection,
+    accepted: &mut AcceptedQg1Authorities,
+    entry_bytes: &[u8],
+) -> Result<String, LocalPerfRunError> {
+    if entry_bytes.is_empty() || entry_bytes.len() > Qg1StartupHandshakeV1::MAX_REGISTER_BYTES {
+        return Err(LocalPerfRunError::Invalid(
+            "QG-1 authority register payload is empty or exceeds its fixed maximum".to_owned(),
+        ));
+    }
+    let entry = Qg1AuthorityRegisterEntryV1::from_verified_slice(entry_bytes).map_err(|error| {
+        LocalPerfRunError::Invalid(format!(
+            "QG-1 authority register entry was rejected: {error}"
+        ))
+    })?;
+    let canonical = entry.to_json_bytes().map_err(|error| {
+        LocalPerfRunError::Invalid(format!(
+            "QG-1 authority register entry did not re-encode: {error}"
+        ))
+    })?;
+    if canonical != entry_bytes {
+        return Err(LocalPerfRunError::Invalid(
+            "QG-1 authority register entry is not the exact canonical producer frame".to_owned(),
+        ));
+    }
+    let cell_id = qg1_selected_cell_id_for_authority(&entry, selection)?;
+    let digest = entry.digest().to_owned();
+    if accepted.cell_digests.contains_key(&cell_id) {
+        return Err(LocalPerfRunError::Invalid(format!(
+            "QG-1 authority register repeated frozen cell {cell_id:?}"
+        )));
+    }
+    let directory = match accepted.directory.as_ref() {
+        Some(directory) => directory,
+        None => {
+            accepted.directory = Some(create_qg1_authority_directory(run)?);
+            accepted
+                .directory
+                .as_ref()
+                .expect("just-created QG-1 authority directory")
+        }
+    };
+    verify_pinned_directory(directory)?;
+    let file_name = format!("{digest}.json");
+    write_new_sync_at(&directory.handle, &file_name, &canonical)?;
+    directory.handle.sync_all()?;
+    let persisted = read_file_at(&directory.handle, &file_name)?;
+    if persisted != canonical {
+        return Err(LocalPerfRunError::Invalid(
+            "QG-1 authority publication changed before descriptor-relative reread".to_owned(),
+        ));
+    }
+    let reloaded =
+        Qg1AuthorityRegisterEntryV1::from_verified_slice(&persisted).map_err(|error| {
+            LocalPerfRunError::Invalid(format!(
+                "QG-1 authority publication failed descriptor-relative verification: {error}"
+            ))
+        })?;
+    if reloaded.digest() != digest {
+        return Err(LocalPerfRunError::Invalid(
+            "QG-1 authority publication digest changed during descriptor-relative reread"
+                .to_owned(),
+        ));
+    }
+    accepted.cell_digests.insert(cell_id, digest.clone());
+    Ok(digest)
+}
+
+fn qg1_validate_complete_authority_set(
+    selection: &ResolvedRunSelection,
+    accepted: &AcceptedQg1Authorities,
+    received_register_count: u64,
+    completed_register_count: u64,
+) -> Result<(), String> {
+    let accepted_cell_ids = accepted
+        .cell_digests
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let accepted_count = u64::try_from(accepted_cell_ids.len())
+        .map_err(|_| "QG-1 accepted authority count does not fit u64".to_owned())?;
+    if completed_register_count != received_register_count
+        || completed_register_count != accepted_count
+    {
+        return Err(format!(
+            "QG-1 startup COMPLETE count {completed_register_count} does not match received {received_register_count} or accepted {accepted_count}"
+        ));
+    }
+    let expected = qg1_expected_authority_cell_ids(selection).map_err(|error| error.to_string())?;
+    (accepted_cell_ids == expected).then_some(()).ok_or_else(|| {
+        format!(
+            "QG-1 startup authority cell map is incomplete or contains an unexpected entry; expected {expected:?}, accepted {accepted_cell_ids:?}"
+        )
+    })
+}
+
+fn qg1_forward_child_stdout(
+    mut stdin: std::process::ChildStdin,
+    mut stdout: std::process::ChildStdout,
+    mut run_log: File,
+    events: mpsc::SyncSender<Qg1AuthorityForwarderEvent>,
+) -> Result<(), String> {
+    loop {
+        match Qg1StartupHandshakeV1::read_control_frame(&mut stdout)? {
+            Qg1StartupControlFrameV1::Register {
+                sequence,
+                entry_bytes,
+            } => events
+                .send(Qg1AuthorityForwarderEvent::Register {
+                    sequence,
+                    entry_bytes,
+                })
+                .map_err(|_| {
+                    "QG-1 authority parent stopped before register validation".to_owned()
+                })?,
+            Qg1StartupControlFrameV1::Complete { register_count } => {
+                let (response_sender, response_receiver) = mpsc::sync_channel(1);
+                events
+                    .send(Qg1AuthorityForwarderEvent::Complete {
+                        register_count,
+                        response: response_sender,
+                    })
+                    .map_err(|_| {
+                        "QG-1 authority parent stopped before COMPLETE validation".to_owned()
+                    })?;
+                match response_receiver.recv() {
+                    Ok(Qg1AuthorityForwarderResponse::FinalAcknowledge) => {
+                        stdin
+                            .write_all(&Qg1StartupHandshakeV1::final_ack_frame())
+                            .map_err(|error| {
+                                format!("QG-1 authority final ACK write failed: {error}")
+                            })?;
+                        stdin.flush().map_err(|error| {
+                            format!("QG-1 authority final ACK flush failed: {error}")
+                        })?;
+                    }
+                    Ok(Qg1AuthorityForwarderResponse::Refuse) => {
+                        return Err(
+                            "QG-1 authority parent refused the child COMPLETE frame".to_owned()
+                        );
+                    }
+                    Err(_) => {
+                        return Err(
+                            "QG-1 authority parent response channel closed before final ACK"
+                                .to_owned(),
+                        );
+                    }
+                }
+                std::io::copy(&mut stdout, &mut run_log).map_err(|error| {
+                    format!("QG-1 authority raw stdout forwarding failed: {error}")
+                })?;
+                run_log.flush().map_err(|error| error.to_string())?;
+                let _ = events.send(Qg1AuthorityForwarderEvent::Closed);
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn start_qg1_authority_forwarder(
+    child: &mut Child,
+    run_log: File,
+) -> Result<Qg1AuthorityForwarder, LocalPerfRunError> {
+    let stdin = child.stdin.take().ok_or_else(|| {
+        LocalPerfRunError::Invalid("QG-1 child lacks its required stdio ACK input".to_owned())
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        LocalPerfRunError::Invalid("QG-1 child lacks its required stdio register output".to_owned())
+    })?;
+    let (sender, events) = mpsc::sync_channel(4);
+    let failure_sender = sender.clone();
+    let join = thread::spawn(move || {
+        let result = qg1_forward_child_stdout(stdin, stdout, run_log, sender);
+        if let Err(error) = &result {
+            let _ = failure_sender.send(Qg1AuthorityForwarderEvent::Failed(error.clone()));
+        }
+        result
+    });
+    Ok(Qg1AuthorityForwarder { events, join })
+}
+
+fn finish_qg1_authority_forwarder(forwarder: Qg1AuthorityForwarder) -> Result<(), String> {
+    forwarder
+        .join
+        .join()
+        .map_err(|_| "QG-1 authority stdout forwarder panicked".to_owned())?
+}
+
+fn finish_qg1_authority_after_root_exit(
+    child: &mut Child,
+    root_process_identity: LocalPerfRootProcessIdentity,
+    _descendant_scope: &mut LocalPerfDescendantScope,
+    forwarder: Qg1AuthorityForwarder,
+    run_log: &mut File,
+    mut terminal_status: Option<ExitStatus>,
+    recovered_wait_error: Option<LocalPerfIoErrorKind>,
+    mut process_group_recovery: LocalPerfProcessGroupRecovery,
+    accepted: AcceptedQg1Authorities,
+    mut handshake_failure: Option<String>,
+) -> Result<
+    (
+        ExitStatus,
+        Option<LocalPerfIoErrorKind>,
+        LocalPerfProcessGroupRecovery,
+        AcceptedQg1Authorities,
+        Option<String>,
+        (LocalPerfProcessTreeQuiescence, u32),
+    ),
+    LocalPerfRunError,
+> {
+    if let Some(error) = handshake_failure.as_deref() {
+        writeln!(run_log, "[qg1-authority-handshake] rejected: {error}")?;
+        run_log.sync_all()?;
+    }
+    if terminal_status.is_none() {
+        let (status, recovery) =
+            force_kill_and_reap(child, root_process_identity).map_err(|recovery_error_kind| {
+                LocalPerfRunError::UnreapedChild {
+                    wait_error_kind: LocalPerfIoErrorKind::Other,
+                    recovery_error_kind,
+                }
+            })?;
+        terminal_status = Some(status);
+        process_group_recovery = recovery;
+    }
+    // The root may have exited while an escaped descendant still owns stdout.
+    // Reconcile first so the forwarder cannot hold this recovery path open.
+    let reconciliation = LocalPerfDescendantScope::reconcile_after_root_exit()
+        .map_err(|error_kind| LocalPerfRunError::UnreapedProcessTree { error_kind })?;
+    if let Err(error) = finish_qg1_authority_forwarder(forwarder) {
+        handshake_failure.get_or_insert(error);
+    }
+    Ok((
+        terminal_status.expect("QG-1 root status is set before finalizing the forwarder"),
+        recovered_wait_error,
+        process_group_recovery,
+        accepted,
+        handshake_failure,
+        reconciliation,
+    ))
+}
+
+fn wait_for_qg1_authority_child(
+    child: &mut Child,
+    root_process_identity: LocalPerfRootProcessIdentity,
+    descendant_scope: &mut LocalPerfDescendantScope,
+    run_directories: &RunDirectories,
+    selection: &ResolvedRunSelection,
+    startup_deadline: Instant,
+    forwarder: Qg1AuthorityForwarder,
+    run_log: &mut File,
+) -> Result<
+    (
+        ExitStatus,
+        Option<LocalPerfIoErrorKind>,
+        LocalPerfProcessGroupRecovery,
+        AcceptedQg1Authorities,
+        Option<String>,
+        (LocalPerfProcessTreeQuiescence, u32),
+    ),
+    LocalPerfRunError,
+> {
+    let mut accepted = AcceptedQg1Authorities::new();
+    let mut last_sequence = None;
+    let mut received_register_count = 0_u64;
+    let mut startup_complete = false;
+    let mut recovered_wait_error = None;
+    let mut process_group_recovery = LocalPerfProcessGroupRecovery::NotRequired;
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let handshake_failure = (!startup_complete).then_some(
+                    "QG-1 child exited before the exact startup COMPLETE/final-ACK exchange"
+                        .to_owned(),
+                );
+                return finish_qg1_authority_after_root_exit(
+                    child,
+                    root_process_identity,
+                    descendant_scope,
+                    forwarder,
+                    run_log,
+                    Some(status),
+                    recovered_wait_error,
+                    process_group_recovery,
+                    accepted,
+                    handshake_failure,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let wait_error_kind = local_perf_io_error_kind(&error);
+                match force_kill_and_reap(child, root_process_identity) {
+                    Ok((status, recovery)) => {
+                        recovered_wait_error = Some(wait_error_kind);
+                        process_group_recovery = recovery;
+                        return finish_qg1_authority_after_root_exit(
+                            child,
+                            root_process_identity,
+                            descendant_scope,
+                            forwarder,
+                            run_log,
+                            Some(status),
+                            recovered_wait_error,
+                            process_group_recovery,
+                            accepted,
+                            Some(
+                                "QG-1 parent wait failed before the startup authority exchange"
+                                    .to_owned(),
+                            ),
+                        );
+                    }
+                    Err(recovery_error_kind) => {
+                        return Err(LocalPerfRunError::UnreapedChild {
+                            wait_error_kind,
+                            recovery_error_kind,
+                        });
+                    }
+                }
+            }
+        }
+        if !startup_complete && Instant::now() >= startup_deadline {
+            return finish_qg1_authority_after_root_exit(
+                child,
+                root_process_identity,
+                descendant_scope,
+                forwarder,
+                run_log,
+                None,
+                recovered_wait_error,
+                process_group_recovery,
+                accepted,
+                Some(
+                    "QG-1 startup authority did not complete before the total deadline".to_owned(),
+                ),
+            );
+        }
+
+        let wait = if startup_complete {
+            WAIT_RECOVERY_POLL_INTERVAL
+        } else {
+            startup_deadline.saturating_duration_since(Instant::now())
+        };
+        match forwarder.events.recv_timeout(wait) {
+            Ok(Qg1AuthorityForwarderEvent::Register {
+                sequence,
+                entry_bytes,
+            }) => {
+                if startup_complete {
+                    return finish_qg1_authority_after_root_exit(
+                        child,
+                        root_process_identity,
+                        descendant_scope,
+                        forwarder,
+                        run_log,
+                        None,
+                        recovered_wait_error,
+                        process_group_recovery,
+                        accepted,
+                        Some("QG-1 child emitted a register after COMPLETE".to_owned()),
+                    );
+                }
+                if let Err(error) = qg1_accept_next_authority_sequence(&mut last_sequence, sequence)
+                {
+                    return finish_qg1_authority_after_root_exit(
+                        child,
+                        root_process_identity,
+                        descendant_scope,
+                        forwarder,
+                        run_log,
+                        None,
+                        recovered_wait_error,
+                        process_group_recovery,
+                        accepted,
+                        Some(error),
+                    );
+                }
+                match publish_qg1_authority_entry(
+                    &run_directories.run,
+                    selection,
+                    &mut accepted,
+                    &entry_bytes,
+                ) {
+                    Ok(_) => {
+                        received_register_count =
+                            received_register_count.checked_add(1).ok_or_else(|| {
+                                LocalPerfRunError::Invalid(
+                                    "QG-1 startup register count overflow".to_owned(),
+                                )
+                            })?;
+                    }
+                    Err(error) => {
+                        return finish_qg1_authority_after_root_exit(
+                            child,
+                            root_process_identity,
+                            descendant_scope,
+                            forwarder,
+                            run_log,
+                            None,
+                            recovered_wait_error,
+                            process_group_recovery,
+                            accepted,
+                            Some(format!(
+                                "QG-1 authority register rejected before final ACK: {error}"
+                            )),
+                        );
+                    }
+                }
+            }
+            Ok(Qg1AuthorityForwarderEvent::Complete {
+                register_count,
+                response,
+            }) => match qg1_validate_complete_authority_set(
+                selection,
+                &accepted,
+                received_register_count,
+                register_count,
+            ) {
+                Ok(()) => {
+                    if response
+                        .send(Qg1AuthorityForwarderResponse::FinalAcknowledge)
+                        .is_err()
+                    {
+                        return finish_qg1_authority_after_root_exit(
+                            child,
+                            root_process_identity,
+                            descendant_scope,
+                            forwarder,
+                            run_log,
+                            None,
+                            recovered_wait_error,
+                            process_group_recovery,
+                            accepted,
+                            Some("QG-1 child closed the final-ACK response channel".to_owned()),
+                        );
+                    }
+                    startup_complete = true;
+                }
+                Err(error) => {
+                    let _ = response.send(Qg1AuthorityForwarderResponse::Refuse);
+                    return finish_qg1_authority_after_root_exit(
+                        child,
+                        root_process_identity,
+                        descendant_scope,
+                        forwarder,
+                        run_log,
+                        None,
+                        recovered_wait_error,
+                        process_group_recovery,
+                        accepted,
+                        Some(error),
+                    );
+                }
+            },
+            Ok(Qg1AuthorityForwarderEvent::Closed) if startup_complete => {}
+            Ok(Qg1AuthorityForwarderEvent::Closed) => {
+                return finish_qg1_authority_after_root_exit(
+                    child,
+                    root_process_identity,
+                    descendant_scope,
+                    forwarder,
+                    run_log,
+                    None,
+                    recovered_wait_error,
+                    process_group_recovery,
+                    accepted,
+                    Some("QG-1 child stdout closed before COMPLETE".to_owned()),
+                );
+            }
+            Ok(Qg1AuthorityForwarderEvent::Failed(error)) => {
+                return finish_qg1_authority_after_root_exit(
+                    child,
+                    root_process_identity,
+                    descendant_scope,
+                    forwarder,
+                    run_log,
+                    None,
+                    recovered_wait_error,
+                    process_group_recovery,
+                    accepted,
+                    Some(error),
+                );
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return finish_qg1_authority_after_root_exit(
+                    child,
+                    root_process_identity,
+                    descendant_scope,
+                    forwarder,
+                    run_log,
+                    None,
+                    recovered_wait_error,
+                    process_group_recovery,
+                    accepted,
+                    Some(
+                        "QG-1 authority stdout forwarder disconnected before child exit".to_owned(),
+                    ),
+                );
+            }
+        }
+    }
+}
+
 fn reject_ambient_git_environment() -> Result<(), LocalPerfRunError> {
     if std::env::vars_os().any(|(name, _)| name.as_encoded_bytes().starts_with(b"GIT_")) {
         return Err(LocalPerfRunError::Invalid(
@@ -3037,6 +3944,13 @@ fn controlled_environments(
         "QUILL_PERF_GATE",
         OsStr::new(config.gate.label()),
     );
+    if config.gate == PerfGate::Qg1 {
+        insert_environment(
+            &mut measurement,
+            Qg1StartupHandshakeV1::ENV,
+            OsStr::new(Qg1StartupHandshakeV1::MODE),
+        );
+    }
     apply_run_selection_environment(&mut measurement, selection);
     insert_environment(&mut measurement, "QUILL_PERF_SCALE", OsStr::new("full"));
     insert_environment(
@@ -5691,7 +6605,10 @@ fn validate_process_lifecycle(
         ));
     }
     let recovery_matches_outcome = match outcome {
-        LocalPerfAttemptOutcome::WaitRecoveredByKill { .. } => matches!(
+        LocalPerfAttemptOutcome::WaitRecoveredByKill { .. }
+        | LocalPerfAttemptOutcome::PostExitRejected {
+            stage: LocalPerfRejectionStage::AuthorityHandshake,
+        } => matches!(
             lifecycle.process_group_recovery,
             LocalPerfProcessGroupRecovery::SignaledOwnedGroup
                 | LocalPerfProcessGroupRecovery::DirectChildFallback
@@ -6201,7 +7118,7 @@ pub fn failed_attempt_receipt_for_test(
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufRead, BufReader, Read};
+    use std::io::{BufRead, BufReader, Read, SeekFrom, Write};
 
     use super::*;
 
@@ -6274,6 +7191,754 @@ mod tests {
         resolve_run_selection(plan, Some(&selection)).expect("resolved exact fixture selection")
     }
 
+    fn qg1_register_entry_for_target(operation_id: &str) -> Qg1AuthorityRegisterEntryV1 {
+        let mut config = crate::PairedEstimatorConfig::predeclared(0x5147_3148_534b_5445);
+        config
+            .install_qg1_lifecycle_authority(
+                crate::PerfOperationScope {
+                    operation_id: operation_id.to_owned(),
+                    version: 1,
+                    semantics: crate::PerfMetricSemantics::Throughput,
+                    unit: "docs/s".to_owned(),
+                },
+                "a".repeat(64),
+                "b".repeat(64),
+                "c".repeat(64),
+                1,
+                1,
+                1,
+                vec![crate::Qg1BatchCoverage {
+                    document_start: 0,
+                    document_count: 1,
+                }],
+                "synthetic-00000000".to_owned(),
+                1,
+                vec![
+                    (
+                        "qg1.effect.tantivy_vs_quill.v1".to_owned(),
+                        0,
+                        0,
+                        vec![crate::PerfSampleArm::Control],
+                    ),
+                    (
+                        "qg1.null.tantivy.v1".to_owned(),
+                        0,
+                        1_000_000,
+                        vec![crate::PerfSampleArm::Control],
+                    ),
+                    (
+                        "qg1.null.quill.v1".to_owned(),
+                        2_000_000,
+                        2_000_000,
+                        vec![crate::PerfSampleArm::Control],
+                    ),
+                ],
+            )
+            .expect("build a production-shaped QG-1 authority")
+            .register_entry()
+    }
+
+    #[test]
+    fn qg1_authority_scope_must_bind_one_frozen_slash_form_selected_cell() {
+        let selection = ResolvedRunSelection {
+            fixture: None,
+            selected_cell_ids: vec![
+                "QG-1/bulk/tiny/1/positions_on/docs_per_second".to_owned(),
+                "QG-1/tokenize_only/medium/tokenize_docs_per_second".to_owned(),
+            ],
+        };
+        let selected =
+            qg1_register_entry_for_target("QG-1.bulk/tiny/1/positions_on.docs_per_second");
+        assert_eq!(
+            qg1_selected_cell_id_for_authority(&selected, &selection)
+                .expect("exact selected authority target"),
+            "QG-1/bulk/tiny/1/positions_on/docs_per_second"
+        );
+        let unselected =
+            qg1_register_entry_for_target("QG-1.bulk/tiny/2/positions_on.docs_per_second");
+        assert!(
+            qg1_selected_cell_id_for_authority(&unselected, &selection).is_err(),
+            "an operation scope absent from the frozen selected target set must refuse before ACK"
+        );
+        assert_eq!(
+            qg1_expected_authority_cell_ids(&selection).expect("selected authority subset"),
+            BTreeSet::from(["QG-1/bulk/tiny/1/positions_on/docs_per_second".to_owned()]),
+            "the tokenizer diagnostic is deliberately outside the engine-lifecycle authority set"
+        );
+    }
+
+    #[test]
+    fn qg1_tokenizer_only_selection_requires_zero_lifecycle_authorities() {
+        let selection = ResolvedRunSelection {
+            fixture: Some("tokenize_only/medium".to_owned()),
+            selected_cell_ids: vec![
+                "QG-1/tokenize_only/medium/tokenize_docs_per_second".to_owned(),
+            ],
+        };
+        assert_eq!(
+            qg1_expected_authority_cell_ids(&selection)
+                .expect("canonical tokenizer-only selection is a diagnostic run"),
+            BTreeSet::new(),
+            "tokenizer-only diagnostics deliberately mint no engine lifecycle authority"
+        );
+        assert_eq!(
+            qg1_authority_rejection_stage(
+                PerfGate::Qg1,
+                &selection,
+                &AcceptedQg1Authorities::new(),
+                None,
+            ),
+            None,
+            "an all-tokenizer diagnostic can complete with exactly zero accepted engine authorities"
+        );
+        assert!(
+            qg1_authority_rejection_stage(
+                PerfGate::Qg1,
+                &selection,
+                &AcceptedQg1Authorities {
+                    directory: None,
+                    cell_digests: BTreeMap::from([(
+                        "QG-1/bulk/tiny/1/positions_on/docs_per_second".to_owned(),
+                        "a".repeat(64),
+                    )]),
+                },
+                None,
+            )
+            .is_some(),
+            "a tokenizer-only diagnostic must not admit any engine lifecycle authority"
+        );
+    }
+
+    #[test]
+    fn qg1_parent_rejects_distinct_cell_same_sequence_before_publication() {
+        let selection = ResolvedRunSelection {
+            fixture: None,
+            selected_cell_ids: vec![
+                "QG-1/bulk/tiny/1/positions_on/docs_per_second".to_owned(),
+                "QG-1/bulk/tiny/2/positions_on/docs_per_second".to_owned(),
+            ],
+        };
+        let first = qg1_register_entry_for_target("QG-1.bulk/tiny/1/positions_on.docs_per_second");
+        let second = qg1_register_entry_for_target("QG-1.bulk/tiny/2/positions_on.docs_per_second");
+        assert_ne!(
+            qg1_selected_cell_id_for_authority(&first, &selection).expect("first selected cell"),
+            qg1_selected_cell_id_for_authority(&second, &selection)
+                .expect("distinct selected cell"),
+            "the replay is not relying on the same cell or the same authority file name"
+        );
+        let mut last_sequence = None;
+        qg1_accept_next_authority_sequence(&mut last_sequence, 1)
+            .expect("parent accepts the first producer sequence");
+        assert!(
+            qg1_accept_next_authority_sequence(&mut last_sequence, 1).is_err(),
+            "parent rejects a replayed sequence for a distinct otherwise-valid authority before publication"
+        );
+        assert_eq!(last_sequence, Some(1));
+    }
+
+    #[test]
+    fn qg1_trailing_partial_magic_helper() {
+        let Some(mode) = std::env::var_os("QUILL_PERF_TEST_QG1_TRAILING_MAGIC") else {
+            return;
+        };
+        qg1_write_wait_test_register("QG-1.bulk/tiny/1/positions_on.docs_per_second", 1);
+        qg1_write_wait_test_complete(1);
+        qg1_read_wait_test_ack();
+        let bytes = match mode.to_string_lossy().as_ref() {
+            "full" => {
+                let mut bytes = Qg1StartupHandshakeV1::REGISTER_MAGIC.to_vec();
+                bytes.extend_from_slice(b"ordinary-post-complete-data");
+                bytes
+            }
+            "partial" => Qg1StartupHandshakeV1::REGISTER_MAGIC
+                [..Qg1StartupHandshakeV1::REGISTER_MAGIC.len() - 1]
+                .to_vec(),
+            unexpected => panic!("unexpected trailing-magic mode {unexpected:?}"),
+        };
+        std::io::stdout()
+            .write_all(&bytes)
+            .expect("write ordinary post-COMPLETE bytes");
+        std::io::stdout()
+            .flush()
+            .expect("flush ordinary post-COMPLETE bytes");
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn qg1_forwarder_preserves_full_and_partial_magic_after_complete_in_run_log() {
+        let mut created = None;
+        for _ in 0..QG1_FORWARDER_TEST_CREATE_ATTEMPTS {
+            let nonce = QG1_FORWARDER_TEST_ARTIFACT_NONCE.fetch_add(1, Ordering::Relaxed);
+            let run_log_path = std::env::temp_dir().join(format!(
+                "frankensearch-qg1-forwarder-{}-{nonce}.run.log",
+                std::process::id()
+            ));
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&run_log_path)
+            {
+                Ok(run_log) => {
+                    created = Some((run_log_path, run_log));
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    panic!("create-new forwarder run-log artifact {run_log_path:?} failed: {error}")
+                }
+            }
+        }
+        let (run_log_path, run_log) = created.unwrap_or_else(|| {
+            panic!(
+                "could not allocate a create-new forwarder artifact after {QG1_FORWARDER_TEST_CREATE_ATTEMPTS} PID/nonce attempts"
+            )
+        });
+        let mut retained_log_reader = run_log
+            .try_clone()
+            .expect("retain a descriptor for the create-new run-log artifact");
+        let current_test = std::env::current_exe().expect("current test executable");
+        let helper_name = "local_perf_runner::tests::qg1_trailing_partial_magic_helper";
+        for mode in ["full", "partial"] {
+            let child_log = run_log.try_clone().expect("clone retained run-log writer");
+            let mut child = Command::new(&current_test)
+                .args(["--exact", helper_name, "--nocapture", "--test-threads=1"])
+                .env("QUILL_PERF_TEST_QG1_TRAILING_MAGIC", mode)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn post-COMPLETE magic forwarder helper");
+            let forwarder = start_qg1_authority_forwarder(&mut child, child_log)
+                .expect("start the production QG-1 stdout forwarder");
+            match forwarder
+                .events
+                .recv_timeout(Duration::from_secs(5))
+                .expect("receive one startup register")
+            {
+                Qg1AuthorityForwarderEvent::Register { sequence, .. } => {
+                    assert_eq!(sequence, 1, "startup register precedes COMPLETE");
+                }
+                unexpected => panic!("expected startup register, got {unexpected:?}"),
+            }
+            match forwarder
+                .events
+                .recv_timeout(Duration::from_secs(5))
+                .expect("receive startup COMPLETE")
+            {
+                Qg1AuthorityForwarderEvent::Complete {
+                    register_count,
+                    response,
+                } => {
+                    assert_eq!(register_count, 1, "COMPLETE binds the one register");
+                    response
+                        .send(Qg1AuthorityForwarderResponse::FinalAcknowledge)
+                        .expect("send the sole final ACK");
+                }
+                unexpected => panic!("expected startup COMPLETE, got {unexpected:?}"),
+            }
+            let status = child.wait().expect("wait post-COMPLETE helper");
+            let mut helper_stderr = String::new();
+            child
+                .stderr
+                .take()
+                .expect("captured post-COMPLETE helper stderr")
+                .read_to_string(&mut helper_stderr)
+                .expect("read captured post-COMPLETE helper stderr");
+            assert!(
+                status.success(),
+                "post-COMPLETE helper must exit normally; stderr: {helper_stderr}"
+            );
+            finish_qg1_authority_forwarder(forwarder)
+                .expect("finish production QG-1 stdout forwarder");
+        }
+        retained_log_reader
+            .seek(SeekFrom::Start(0))
+            .expect("seek retained create-new run-log descriptor");
+        let mut run_log_bytes = Vec::new();
+        retained_log_reader
+            .read_to_end(&mut run_log_bytes)
+            .expect("read forwarded bytes through retained run-log descriptor");
+        assert!(
+            run_log_bytes
+                .windows(Qg1StartupHandshakeV1::REGISTER_MAGIC.len())
+                .any(|window| window == Qg1StartupHandshakeV1::REGISTER_MAGIC),
+            "a full ordinary post-COMPLETE magic sequence is raw run-log data; retained artifact: {run_log_path:?}"
+        );
+        assert!(
+            run_log_bytes.ends_with(
+                &Qg1StartupHandshakeV1::REGISTER_MAGIC
+                    [..Qg1StartupHandshakeV1::REGISTER_MAGIC.len() - 1]
+            ),
+            "EOF must preserve every raw post-COMPLETE byte, including a partial magic suffix; retained artifact: {run_log_path:?}"
+        );
+    }
+
+    #[test]
+    fn qg1_malformed_or_timeout_handshake_persists_authority_handshake_outcome() {
+        let selection = ResolvedRunSelection {
+            fixture: None,
+            selected_cell_ids: vec![
+                "QG-1/bulk/tiny/1/positions_on/docs_per_second".to_owned(),
+                "QG-1/tokenize_only/medium/tokenize_docs_per_second".to_owned(),
+            ],
+        };
+        for handshake_failure in [
+            "QG-1 authority register rejected before sampling: malformed frame",
+            "QG-1 authority frame did not complete before the bounded parent deadline",
+        ] {
+            let stage = qg1_authority_rejection_stage(
+                PerfGate::Qg1,
+                &selection,
+                &AcceptedQg1Authorities::new(),
+                Some(handshake_failure),
+            );
+            assert_eq!(stage, Some(LocalPerfRejectionStage::AuthorityHandshake));
+            let outcome = LocalPerfAttemptOutcome::PostExitRejected {
+                stage: stage.expect("QG-1 handshake failures are classified before status"),
+            };
+            let (receipt, bytes, _) = attempt_fixture(outcome, None);
+            let persisted = LocalPerfAttemptReceipt::from_verified_slice(&bytes)
+                .expect("persist exact failed-attempt outcome");
+            assert_eq!(
+                persisted.outcome,
+                LocalPerfAttemptOutcome::PostExitRejected {
+                    stage: LocalPerfRejectionStage::AuthorityHandshake,
+                },
+                "malformed and timeout child outcomes must not degrade into nonzero/signal status"
+            );
+            assert_eq!(receipt.outcome, persisted.outcome);
+        }
+    }
+
+    #[test]
+    fn qg1_authority_rejection_precedes_nonzero_status_classification() {
+        let source = production_source();
+        let authority_rejection = unique_marker_offset(
+            source,
+            "if let Some(LocalPerfAttemptOutcome::PostExitRejected { stage }) =",
+        );
+        let nonzero_status = unique_marker_offset(source, "if !status.success() {");
+        assert!(
+            authority_rejection < nonzero_status,
+            "the exact QG-1 AuthorityHandshake failed attempt must win over kill/signaled status"
+        );
+    }
+
+    fn qg1_write_wait_test_register(operation_id: &str, sequence: u64) {
+        let entry = qg1_register_entry_for_target(operation_id);
+        let entry_bytes = entry
+            .to_json_bytes()
+            .expect("serialize wait-test authority");
+        let frame = Qg1StartupHandshakeV1::register_frame(sequence, &entry_bytes)
+            .expect("frame bounded wait-test authority");
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(&frame)
+            .expect("write wait-test authority register");
+        stdout.flush().expect("flush wait-test authority entry");
+    }
+
+    fn qg1_write_wait_test_complete(register_count: u64) {
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(&Qg1StartupHandshakeV1::complete_frame(register_count))
+            .expect("write wait-test authority COMPLETE");
+        stdout.flush().expect("flush wait-test authority COMPLETE");
+    }
+
+    fn qg1_read_wait_test_ack() {
+        let mut acknowledgement = vec![0_u8; Qg1StartupHandshakeV1::final_ack_len()];
+        std::io::stdin()
+            .read_exact(&mut acknowledgement)
+            .expect("parent must emit the sole final ACK after COMPLETE");
+        Qg1StartupHandshakeV1::validate_final_ack(&acknowledgement)
+            .expect("wait-test child received the fixed final ACK frame");
+    }
+
+    #[test]
+    fn qg1_wait_boundary_child_helper() {
+        let Some(case) = std::env::var_os("QUILL_PERF_TEST_QG1_WAIT_CASE") else {
+            return;
+        };
+        match case.to_string_lossy().as_ref() {
+            "ack" => {
+                qg1_write_wait_test_register("QG-1.bulk/tiny/1/positions_on.docs_per_second", 1);
+                qg1_write_wait_test_complete(1);
+                qg1_read_wait_test_ack();
+                println!("qg1-wait-child-work-after-ack");
+            }
+            "malformed" => {
+                std::io::stdout()
+                    .write_all(b"not-a-qg1-startup-frame")
+                    .expect("write malformed wait-test frame");
+                std::io::stdout()
+                    .flush()
+                    .expect("flush malformed wait-test frame");
+                std::thread::sleep(Qg1StartupHandshakeV1::STARTUP_TIMEOUT + Duration::from_secs(1));
+            }
+            "partial" => {
+                std::io::stdout()
+                    .write_all(&Qg1StartupHandshakeV1::REGISTER_MAGIC[..4])
+                    .expect("write partial wait-test frame start");
+                std::io::stdout()
+                    .flush()
+                    .expect("flush partial wait-test frame start");
+                std::thread::sleep(Qg1StartupHandshakeV1::STARTUP_TIMEOUT + Duration::from_secs(1));
+            }
+            "timeout" => {
+                std::thread::sleep(Qg1StartupHandshakeV1::STARTUP_TIMEOUT + Duration::from_secs(1));
+            }
+            "missing" => {
+                qg1_write_wait_test_complete(0);
+                qg1_read_wait_test_ack();
+            }
+            "replay" => {
+                qg1_write_wait_test_register("QG-1.bulk/tiny/1/positions_on.docs_per_second", 1);
+                qg1_write_wait_test_register("QG-1.bulk/tiny/2/positions_on.docs_per_second", 1);
+                qg1_write_wait_test_complete(2);
+                qg1_read_wait_test_ack();
+                println!("qg1-wait-child-work-after-ack");
+            }
+            "extra" => {
+                qg1_write_wait_test_register("QG-1.bulk/tiny/1/positions_on.docs_per_second", 1);
+                qg1_write_wait_test_register("QG-1.bulk/tiny/2/positions_on.docs_per_second", 2);
+                qg1_write_wait_test_complete(2);
+                qg1_read_wait_test_ack();
+            }
+            "count_mismatch" => {
+                qg1_write_wait_test_register("QG-1.bulk/tiny/1/positions_on.docs_per_second", 1);
+                qg1_write_wait_test_complete(0);
+                qg1_read_wait_test_ack();
+            }
+            "tokenizer_zero" => {
+                qg1_write_wait_test_complete(0);
+                qg1_read_wait_test_ack();
+                println!("qg1-wait-tokenizer-work-after-ack");
+            }
+            unexpected => panic!("unexpected QG-1 wait-boundary child case {unexpected:?}"),
+        }
+    }
+
+    fn qg1_wait_result_for_test(
+        case: &str,
+        selection: &ResolvedRunSelection,
+    ) -> (
+        ExitStatus,
+        LocalPerfProcessGroupRecovery,
+        AcceptedQg1Authorities,
+        Option<String>,
+        Vec<u8>,
+    ) {
+        qg1_wait_result_for_test_with_startup_budget(
+            case,
+            selection,
+            Qg1StartupHandshakeV1::STARTUP_TIMEOUT,
+            Duration::ZERO,
+        )
+    }
+
+    fn qg1_wait_result_for_test_with_startup_budget(
+        case: &str,
+        selection: &ResolvedRunSelection,
+        startup_budget: Duration,
+        post_spawn_setup_delay: Duration,
+    ) -> (
+        ExitStatus,
+        LocalPerfProcessGroupRecovery,
+        AcceptedQg1Authorities,
+        Option<String>,
+        Vec<u8>,
+    ) {
+        let output_parent_path = std::env::temp_dir();
+        let output_parent = pin_directory(&output_parent_path, false)
+            .expect("pin test parent directory without creating or deleting it");
+        let mut run_directory = None;
+        for _ in 0..QG1_FORWARDER_TEST_CREATE_ATTEMPTS {
+            let nonce = QG1_FORWARDER_TEST_ARTIFACT_NONCE.fetch_add(1, Ordering::Relaxed);
+            let run_leaf = format!(
+                "frankensearch-qg1-wait-outcome-{}-{nonce}",
+                std::process::id()
+            );
+            match mkdirat(&output_parent.handle, &run_leaf, Mode::from_raw_mode(0o700)) {
+                Ok(()) => {
+                    run_directory = Some(run_leaf);
+                    break;
+                }
+                Err(error) if error == rustix::io::Errno::EXIST => continue,
+                Err(error) => panic!("create-new retained QG-1 wait directory failed: {error}"),
+            }
+        }
+        let run_leaf = run_directory.unwrap_or_else(|| {
+            panic!(
+                "could not create a retained QG-1 wait directory after {QG1_FORWARDER_TEST_CREATE_ATTEMPTS} attempts"
+            )
+        });
+        output_parent
+            .handle
+            .sync_all()
+            .expect("sync test parent directory");
+        let run_handle = File::from(
+            openat(
+                &output_parent.handle,
+                &run_leaf,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .expect("open retained test run directory without following paths"),
+        );
+        let run = PinnedDirectory {
+            path: output_parent_path.join(&run_leaf),
+            identity: checked_directory_identity(&run_handle).expect("pin test run directory"),
+            handle: run_handle,
+        };
+        let artifacts_handle = File::from(
+            openat(
+                &run.handle,
+                ".",
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .expect("open retained test artifact descriptor"),
+        );
+        let run_directories = RunDirectories {
+            run,
+            artifacts: PinnedDirectory {
+                path: output_parent_path.join(&run_leaf),
+                identity: checked_directory_identity(&artifacts_handle)
+                    .expect("pin retained test artifact directory"),
+                handle: artifacts_handle,
+            },
+        };
+        let run_log = create_new_file_at(&run_directories.run.handle, "run.log")
+            .expect("create-new retained QG-1 wait test run log");
+        let mut retained_log_reader = run_log
+            .try_clone()
+            .expect("retain QG-1 wait run-log descriptor");
+        let mut handshake_log = run_log.try_clone().expect("clone retained test run log");
+        let current_test = std::env::current_exe().expect("current test executable");
+        let helper_name = "local_perf_runner::tests::qg1_wait_boundary_child_helper";
+        let mut command = Command::new(current_test);
+        command
+            .args(["--exact", helper_name, "--nocapture", "--test-threads=1"])
+            .env("QUILL_PERF_TEST_QG1_WAIT_CASE", case)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .process_group(0);
+        // Mirror production: one budget starts immediately before spawn and
+        // setup can only spend, never refresh, that budget.
+        let startup_deadline = Instant::now() + startup_budget;
+        let mut child = command.spawn().expect("spawn QG-1 wait-boundary child");
+        let root_process_identity = capture_root_process_identity(&child);
+        let forwarder = start_qg1_authority_forwarder(&mut child, run_log)
+            .expect("start production QG-1 authority forwarder");
+        if !post_spawn_setup_delay.is_zero() {
+            std::thread::sleep(post_spawn_setup_delay);
+        }
+        let mut descendant_scope =
+            LocalPerfDescendantScope::enter().expect("establish QG-1 test descendant scope");
+        let (status, _, process_group_recovery, accepted, handshake_failure, _) =
+            wait_for_qg1_authority_child(
+                &mut child,
+                root_process_identity,
+                &mut descendant_scope,
+                &run_directories,
+                selection,
+                startup_deadline,
+                forwarder,
+                &mut handshake_log,
+            )
+            .expect("drive the real QG-1 parent wait/kill/reap boundary");
+        descendant_scope
+            .restore()
+            .expect("restore QG-1 test descendant scope");
+        retained_log_reader
+            .seek(SeekFrom::Start(0))
+            .expect("seek retained QG-1 wait run log");
+        let mut run_log_bytes = Vec::new();
+        retained_log_reader
+            .read_to_end(&mut run_log_bytes)
+            .expect("read retained QG-1 wait run log");
+        (
+            status,
+            process_group_recovery,
+            accepted,
+            handshake_failure,
+            run_log_bytes,
+        )
+    }
+
+    #[test]
+    fn qg1_actual_parent_wait_kill_reap_covers_final_ack_and_exact_startup_set() {
+        let one_engine_selection = ResolvedRunSelection {
+            fixture: None,
+            selected_cell_ids: vec!["QG-1/bulk/tiny/1/positions_on/docs_per_second".to_owned()],
+        };
+        let (status, _, accepted, failure, run_log) =
+            qg1_wait_result_for_test("ack", &one_engine_selection);
+        assert!(
+            status.success(),
+            "accepted authority child exits successfully"
+        );
+        assert!(
+            failure.is_none(),
+            "accepted authority has no parent handshake failure"
+        );
+        assert_eq!(
+            accepted
+                .cell_digests
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            qg1_expected_authority_cell_ids(&one_engine_selection)
+                .expect("one-engine expected authority set"),
+            "accepted ACK case carries the exact selected engine authority map"
+        );
+        assert!(
+            run_log
+                .windows(b"qg1-wait-child-work-after-ack".len())
+                .any(|window| window == b"qg1-wait-child-work-after-ack"),
+            "parent ACK path reaches child work only through the real wait boundary"
+        );
+        for case in [
+            "malformed",
+            "partial",
+            "timeout",
+            "missing",
+            "extra",
+            "count_mismatch",
+        ] {
+            let (status, recovery, accepted, failure, run_log) =
+                qg1_wait_result_for_test(case, &one_engine_selection);
+            let outcome = qg1_authority_handshake_outcome(
+                PerfGate::Qg1,
+                &one_engine_selection,
+                &accepted,
+                failure.as_deref(),
+            )
+            .expect("actual parent wait-boundary rejection outcome");
+            let (receipt, bytes, _) = attempt_fixture(outcome, None);
+            let persisted = LocalPerfAttemptReceipt::from_verified_slice(&bytes)
+                .expect("persist actual forwarder failed-attempt outcome");
+            assert_eq!(
+                persisted.outcome,
+                LocalPerfAttemptOutcome::PostExitRejected {
+                    stage: LocalPerfRejectionStage::AuthorityHandshake,
+                },
+                "actual {case} child must persist AuthorityHandshake rather than its signal/nonzero status; terminal status: {status}"
+            );
+            assert_eq!(receipt.outcome, persisted.outcome);
+            assert!(
+                matches!(
+                    recovery,
+                    LocalPerfProcessGroupRecovery::SignaledOwnedGroup
+                        | LocalPerfProcessGroupRecovery::DirectChildFallback
+                ),
+                "{case} must execute the real bounded kill/reap path before the failed receipt"
+            );
+            assert!(
+                !run_log
+                    .windows(b"qg1-wait-child-work-after-ack".len())
+                    .any(|window| window == b"qg1-wait-child-work-after-ack"),
+                "{case} must not permit timed-work marker before the sole final ACK; terminal status: {status}"
+            );
+        }
+        let two_engine_selection = ResolvedRunSelection {
+            fixture: None,
+            selected_cell_ids: vec![
+                "QG-1/bulk/tiny/1/positions_on/docs_per_second".to_owned(),
+                "QG-1/bulk/tiny/2/positions_on/docs_per_second".to_owned(),
+            ],
+        };
+        let (_, recovery, accepted, failure, _) =
+            qg1_wait_result_for_test("replay", &two_engine_selection);
+        assert!(
+            matches!(
+                recovery,
+                LocalPerfProcessGroupRecovery::SignaledOwnedGroup
+                    | LocalPerfProcessGroupRecovery::DirectChildFallback
+            ),
+            "replayed startup sequence must execute the real bounded kill/reap path before the failed receipt"
+        );
+        assert_eq!(
+            accepted.cell_digests.len(),
+            1,
+            "replayed sequence is refused before second publication"
+        );
+        assert!(
+            qg1_authority_handshake_outcome(
+                PerfGate::Qg1,
+                &two_engine_selection,
+                &accepted,
+                failure.as_deref(),
+            )
+            .is_some(),
+            "distinct-cell same-sequence replay is rejected by the real parent wait boundary"
+        );
+        let tokenizer_selection = ResolvedRunSelection {
+            fixture: Some("tokenize_only/medium".to_owned()),
+            selected_cell_ids: vec![
+                "QG-1/tokenize_only/medium/tokenize_docs_per_second".to_owned(),
+            ],
+        };
+        let (status, _, accepted, failure, run_log) =
+            qg1_wait_result_for_test("tokenizer_zero", &tokenizer_selection);
+        assert!(
+            status.success(),
+            "zero-producer tokenizer child succeeds after final ACK"
+        );
+        assert!(
+            failure.is_none(),
+            "zero-producer COMPLETE is exact and accepted"
+        );
+        assert!(
+            accepted.cell_digests.is_empty(),
+            "tokenizer-only selection publishes no producers"
+        );
+        assert!(
+            run_log
+                .windows(b"qg1-wait-tokenizer-work-after-ack".len())
+                .any(|window| window == b"qg1-wait-tokenizer-work-after-ack"),
+            "tokenizer-only work begins only after the final ACK"
+        );
+    }
+
+    #[test]
+    fn qg1_total_startup_deadline_is_not_refreshed_after_post_spawn_setup() {
+        let selection = ResolvedRunSelection {
+            fixture: None,
+            selected_cell_ids: vec!["QG-1/bulk/tiny/1/positions_on/docs_per_second".to_owned()],
+        };
+        let budget = Duration::from_secs(2);
+        let started = Instant::now();
+        let (_status, recovery, _accepted, failure, _run_log) =
+            qg1_wait_result_for_test_with_startup_budget(
+                "timeout",
+                &selection,
+                budget,
+                budget + Duration::from_millis(50),
+            );
+        assert!(
+            matches!(
+                recovery,
+                LocalPerfProcessGroupRecovery::SignaledOwnedGroup
+                    | LocalPerfProcessGroupRecovery::DirectChildFallback
+            ),
+            "an expired total deadline must kill and reap the live child"
+        );
+        assert!(
+            failure
+                .as_deref()
+                .is_some_and(|error| error.contains("total deadline")),
+            "post-spawn setup must leave the original deadline expired, not grant a fresh handshake timeout: {failure:?}"
+        );
+        assert!(
+            started.elapsed() < budget + Duration::from_secs(1),
+            "an expired pre-spawn deadline must be consumed immediately after setup rather than restarted"
+        );
+    }
+
     fn attempt_runner_identity() -> VerifiedRunnerIdentity {
         crate::machine_class_registry::admitted_test_identity_for_artifacts(
             "QG-1",
@@ -6317,6 +7982,19 @@ mod tests {
                 descendant_processes_observed: 0,
             },
             LocalPerfAttemptOutcome::WaitRecoveredByKill { .. } => LocalPerfProcessLifecycle {
+                spawn_attempted: true,
+                spawn_succeeded: true,
+                wait_completed: true,
+                child_reaped: true,
+                run_log_synced: true,
+                run_log_captured: true,
+                process_group_recovery: LocalPerfProcessGroupRecovery::SignaledOwnedGroup,
+                process_tree_quiescence: LocalPerfProcessTreeQuiescence::DirectChildOnly,
+                descendant_processes_observed: 0,
+            },
+            LocalPerfAttemptOutcome::PostExitRejected {
+                stage: LocalPerfRejectionStage::AuthorityHandshake,
+            } => LocalPerfProcessLifecycle {
                 spawn_attempted: true,
                 spawn_succeeded: true,
                 wait_completed: true,
