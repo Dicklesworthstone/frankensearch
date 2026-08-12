@@ -2195,10 +2195,9 @@ impl TwoTierSearcher {
                 // construction: it is a convex mix of this query and vectors
                 // read out of this very index, so binding it to the quality
                 // embedder's identity states exactly what is true of it.
-                let bound = BoundQueryEmbedding::new(
-                    quality_vec.clone(),
-                    quality_embedder.identity()?.clone(),
-                )?;
+                let quality_identity = quality_embedder.identity()?.clone();
+                cancellation_checkpoint(cx, "quality_identity_to_activation")?;
+                let bound = BoundQueryEmbedding::new(quality_vec.clone(), quality_identity)?;
                 let embeddings = TieredQueryEmbeddings::quality_only(bound);
                 let activated = self.index.activate_owner_backed_search(&embeddings)?;
                 cancellation_checkpoint(cx, "quality_activation_to_search")?;
@@ -4503,6 +4502,8 @@ mod tests {
         identity: EmbeddingIdentityBundleV1,
         vector: Vec<f32>,
         embeds: Arc<AtomicU64>,
+        identity_calls: Arc<AtomicU64>,
+        cancel_on_identity_call: Option<(Cx, u64)>,
     }
 
     impl IdentityCountingEmbedder {
@@ -4512,11 +4513,22 @@ mod tests {
                 identity,
                 vector,
                 embeds: Arc::new(AtomicU64::new(0)),
+                identity_calls: Arc::new(AtomicU64::new(0)),
+                cancel_on_identity_call: None,
             }
         }
 
         fn embed_count(&self) -> u64 {
             self.embeds.load(Ordering::Relaxed)
+        }
+
+        fn cancel_on_identity_call(mut self, cx: Cx, call: u64) -> Self {
+            self.cancel_on_identity_call = Some((cx, call));
+            self
+        }
+
+        fn identity_count(&self) -> u64 {
+            self.identity_calls.load(Ordering::Relaxed)
         }
     }
 
@@ -4528,6 +4540,15 @@ mod tests {
         }
 
         fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            let call = self.identity_calls.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some((cx, cancellation_call)) = &self.cancel_on_identity_call
+                && call == *cancellation_call
+            {
+                cx.cancel_with(
+                    asupersync::CancelKind::User,
+                    Some("cancel after quality identity"),
+                );
+            }
             Ok(&self.identity)
         }
 
