@@ -7354,6 +7354,9 @@ impl QuillWriterState {
                         spawn_blocking(move || source.compact_owned(policy, created_unix_s))
                             .await?;
                     check_cancel(cx, "compaction")?;
+                    PublicationReadState::validate_generation(
+                        successor.loaded_manifest().manifest.generation,
+                    )?;
                     *snapshot = successor;
                     Ok(report)
                 }
@@ -22661,6 +22664,62 @@ mod tests {
             commit
                 .await
                 .expect("finish publication after the pre-slot refusal proof");
+        });
+    }
+
+    #[test]
+    fn public_in_memory_commit_rejects_unrepresentable_successor_without_mutation() {
+        run_with_cx(|cx| async move {
+            let generation = PublicationReadState::MAX_GENERATION;
+            let snapshot = KeeperSnapshot::in_memory_with_generation_for_test(
+                DEFAULT_SCHEMA,
+                generation,
+            )
+            .expect("construct maximum-generation in-memory Keeper fixture");
+            let mut index = QuillIndex::from_backend(
+                IndexBackend::Memory(snapshot),
+                DEFAULT_SCHEMA,
+                deterministic_config(),
+            )
+            .expect("bind maximum-generation in-memory facade");
+            let before = index
+                .snapshot()
+                .expect("maximum-generation snapshot starts authoritative");
+            index
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("max-generation", "unrepresentable successor"),
+                )
+                .await
+                .expect("stage maximum-generation in-memory document");
+
+            let Err(error) = index.commit(&cx).await else {
+                panic!("public in-memory commit must reject an unrepresentable successor");
+            };
+            assert!(matches!(
+                error,
+                QuillIndexError::Keeper(KeeperError::InvalidTransition { detail })
+                    if detail.contains("cannot be represented in the packed publication authority word")
+            ));
+
+            let after = index
+                .snapshot()
+                .expect("failed successor leaves the published Arc authoritative");
+            assert!(
+                Arc::ptr_eq(&before, &after),
+                "failed maximum-generation commit must not replace the public snapshot Arc"
+            );
+            assert_eq!(
+                index
+                    .writer_mut()
+                    .backend
+                    .retained_snapshot_for_bookkeeping()
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                generation,
+                "failed maximum-generation commit must not mutate the in-memory Keeper"
+            );
         });
     }
 
