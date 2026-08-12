@@ -5,8 +5,17 @@
 //! `const fn` returning `false` with no serialized field to flip, and the
 //! cancellation receipt makes no authorization claim at all. Each of them
 //! defers to "the terminal release-gate aggregator". This module is that
-//! aggregator, and it is the only type in the repository whose
-//! `authorizes_replacement` can answer `true`.
+//! aggregator, and [`ReplacementAuthorizationV1`] is the only type in the
+//! repository whose `authorizes_replacement` can answer `true`.
+//!
+//! **No grant is currently harvestable.** [`authorize`] refuses every bundle,
+//! including a complete and clean one, because conformance alone may not
+//! authorize the flip and no validated all-required-target QG WIN release
+//! state can yet be consumed (bd-quill-e8-perf-doctrine-x4e4.15.1; see
+//! `require_consumable_qg_release_authority`). The value type still answers
+//! `true` if one is ever held — that is the contract a future real grant must
+//! satisfy — but nothing outside this module can construct one today. Read a
+//! passing conformance suite as "correct", never as "authorized".
 //!
 //! # What this module is NOT
 //!
@@ -281,6 +290,13 @@ pub struct ReplacementAuthorizationV1 {
 impl ReplacementAuthorizationV1 {
     /// This type, and only this type, may authorize the lexical replacement.
     ///
+    /// Holding one is currently impossible outside this module: [`authorize`]
+    /// refuses terminally until a validated all-required-target QG WIN release
+    /// state is consumable, so this method describes the contract a future
+    /// grant must satisfy rather than a grant anyone can obtain today. A
+    /// caller that reaches this method has either been handed a value from
+    /// inside this module or is reading a test's unreachable branch.
+    ///
     /// It does NOT mean every slot was tied to the candidate revision. Read
     /// [`Self::every_slot_is_candidate_bound`] for that; it answers `false`
     /// today, and the reason is in [`Self::slot_bindings`].
@@ -377,14 +393,28 @@ fn require_binding(
     Ok(())
 }
 
-/// Grant a terminal replacement authorization, or refuse naming the reason.
+/// Refuse a terminal replacement authorization, naming the reason.
+///
+/// **This function cannot currently return `Ok`.** Every conformance slot below
+/// is still checked in full and still refuses for its own reason first, so a
+/// dirty producer, a foreign candidate, or an incomplete campaign matrix is
+/// reported as such. A bundle that clears all of them then meets a terminal
+/// refusal from `require_consumable_qg_release_authority`, because
+/// conformance alone may not authorize the flip and no validated
+/// all-required-target QG WIN release state is consumable yet
+/// (bd-quill-e8-perf-doctrine-x4e4.15.1).
+///
+/// The `Ok` arm is retained rather than removed: it is the shape a future real
+/// grant must produce once that state exists, and every caller that matches on
+/// it keeps compiling.
 ///
 /// # Errors
 ///
 /// Refuses when any required slot is absent, when any slot carries a coverage
 /// class that cannot support a replacement, when the enriched receipt is not
-/// release-admissible, when the cancellation receipt does not validate, or when
-/// any slot binds a different candidate than the one under authorization.
+/// release-admissible, when the cancellation receipt does not validate, when
+/// any slot binds a different candidate than the one under authorization, and
+/// — after all of those pass — for the absent QG WIN release state.
 pub fn authorize(
     bundle: &ReplacementEvidenceBundleV1<'_>,
 ) -> Result<ReplacementAuthorizationV1, GauntletError> {
@@ -506,6 +536,13 @@ pub fn authorize(
     // the cleanliness of the checkout that produced the evidence.
     native_enriched.require_release_admissible()?;
 
+    // TERMINAL, and after every conformance slot above has already passed
+    // (bd-quill-e8-perf-doctrine-x4e4.15.1). Placing it here rather than first
+    // is load-bearing: a bundle that fails an existing slot must still refuse
+    // for THAT slot's reason, so this cannot mask a dirty producer, a foreign
+    // candidate, or an incomplete campaign matrix behind a performance answer.
+    require_consumable_qg_release_authority()?;
+
     Ok(ReplacementAuthorizationV1 {
         schema_version: REPLACEMENT_AUTHORIZATION_SCHEMA_VERSION.to_owned(),
         candidate_source_revision: candidate.to_owned(),
@@ -518,6 +555,42 @@ pub fn authorize(
         // present a bundle that claims stronger binding than the code performs.
         slot_bindings: slot_binding_record(),
         sealed: AuthorizationSeal,
+    })
+}
+
+/// Refuse the flip until a validated all-required-target QG WIN state can
+/// actually be consumed (bd-quill-e8-perf-doctrine-x4e4.15.1).
+///
+/// Conformance is not authorization. Every slot above proves the candidate is
+/// *correct*; none of them says anything about whether it is *fast enough*, and
+/// before this refusal existed a complete conformance bundle authorized the
+/// replacement while the QG matrix was absent, `NoDecision`, `Block`,
+/// `Quarantine`, or measured on a machine class the gate does not apply to.
+/// That is the hole this closes.
+///
+/// It takes no argument on purpose. A `Option<...>` slot on
+/// [`ReplacementEvidenceBundleV1`] would let the caller hand in the very
+/// verdict being gated on, which is the failure mode this module already
+/// refuses for the core and CASS slots by taking reports and matrices rather
+/// than pre-derived bindings.
+///
+/// It cannot be satisfied today, and the reason is upstream rather than here: a
+/// persisted `PerfEvidenceArtifact` carrying a QG-1 cell cannot be verified
+/// outside the process that produced it. `PerfEvidenceArtifact::load_verified`
+/// passes an empty external expectation set, and `Qg1ExpectedAuthority`
+/// has no serialization by deliberate design, so no consumer outside the bench
+/// can present a verified QG-1 WIN. Until an independently retained authority
+/// register exists, the honest terminal answer is refusal: this gate admits
+/// nothing rather than admitting everything, which is what it did before.
+///
+/// The replacement for this function is a real consumption of that register's
+/// verified artifact — not a relaxation of this refusal.
+fn require_consumable_qg_release_authority() -> Result<(), GauntletError> {
+    Err(GauntletError::InvalidContract {
+        reason: "replacement authorization requires a validated all-required-target QG WIN \
+                 release state, and no such state is consumable: verified QG release evidence \
+                 cannot be replayed outside its producing process"
+            .to_owned(),
     })
 }
 

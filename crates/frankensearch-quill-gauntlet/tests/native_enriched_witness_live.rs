@@ -751,17 +751,24 @@ fn an_inadmissible_enriched_receipt_can_never_authorize_a_replacement() {
     });
 }
 
-/// bd-8nqz.4 slice 2 (happy path): a complete, current, admissible bundle
-/// DOES authorize -- and the grant is emitted so a clean run is harvestable.
+/// bd-quill-e8-perf-doctrine-x4e4.15.1: a complete, current, admissible
+/// conformance bundle REFUSES until a validated all-required-target QG WIN
+/// release state is consumable. No grant is harvestable from a clean run.
 ///
-/// A validator proved only by its refusals is indistinguishable from one that
-/// refuses everything. This is the positive control, and it is deliberately
-/// the same shape as bd-8nqz.4.1's emitter: the outcome is asserted by REASON,
-/// so the honest answer in a dirty tree ("inadmissible because dirty") is
-/// recorded as such rather than being allowed to stand in for a clean grant.
+/// This was bd-8nqz.4's positive control, and it asserted that a clean bundle
+/// authorizes. It no longer can: conformance alone may not authorize the flip,
+/// so the terminal QG release gate refuses even a perfect bundle. What the
+/// test still proves is discrimination, which is the part that matters — the
+/// refusal REASON is DETERMINED by the receipt's own producer state, so a
+/// dirty tree still refuses for "dirty" and only a clean tree that clears
+/// every conformance slot reaches the QG release refusal. A gate that refused
+/// everything for one reason would be indistinguishable from a broken one.
+///
+/// The unreachable `Ok` arm is retained deliberately as a mutation-red
+/// control: if the terminal gate is ever removed, that arm runs and panics.
 #[cfg(feature = "tantivy-oracle")]
 #[test]
-fn a_complete_admissible_bundle_authorizes_and_emits_its_grant() {
+fn a_complete_conformance_bundle_refuses_until_qg_win_is_consumable() {
     use frankensearch_core::traits::LexicalWrite;
     use frankensearch_lexical::TantivyIndex;
     use frankensearch_quill_gauntlet::native_enriched_witness::{
@@ -902,6 +909,11 @@ fn a_complete_admissible_bundle_authorizes_and_emits_its_grant() {
         // Asserted by REASON, and DETERMINED by the receipt's own producer
         // state so exactly one outcome is pinned in any environment.
         match granted {
+            // Unreachable while the terminal QG release gate refuses
+            // (bd-quill-e8-perf-doctrine-x4e4.15.1). Retained rather than
+            // removed: reaching this arm means that gate is gone, and the
+            // bindings it asserts are exactly what a future real grant must
+            // still satisfy once a validated QG WIN state is consumable.
             Ok(authorization) => {
                 assert!(
                     !receipt.producer.source_git_dirty,
@@ -910,12 +922,30 @@ fn a_complete_admissible_bundle_authorizes_and_emits_its_grant() {
                 assert!(authorization.authorizes_replacement());
                 assert_eq!(authorization.candidate_source_revision, candidate);
                 assert_eq!(authorization.native_enriched_receipt_address, address);
+                panic!(
+                    "a complete both-engines bundle must refuse until a validated \
+                     all-required-target QG WIN release state is consumable"
+                );
             }
-            Err(error) => assert!(
-                error.to_string().contains("dirty"),
-                "the only expected refusal for a complete both-engines bundle is a dirty \
-                 producer, got: {error}"
-            ),
+            // DETERMINED by the receipt's own producer state, so exactly one
+            // reason is pinned in any environment: an existing slot still
+            // refuses for its own reason, and only a bundle that clears every
+            // one of them reaches the QG release refusal.
+            Err(error) => {
+                let reason = error.to_string();
+                if receipt.producer.source_git_dirty {
+                    assert!(
+                        reason.contains("dirty"),
+                        "a dirty producer must still refuse for its own reason, got: {reason}"
+                    );
+                } else {
+                    assert!(
+                        reason.contains("QG WIN"),
+                        "a clean complete both-engines bundle must refuse for the QG release \
+                         state, got: {reason}"
+                    );
+                }
+            }
         }
     });
 }
