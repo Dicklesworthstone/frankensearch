@@ -1285,7 +1285,7 @@ impl Qg1TantivyIncumbentScreen {
         let mut run_id = None;
         let mut scope = None;
         let mut provenance = None;
-        let mut estimator_config = None;
+        let mut estimator_config: Option<PairedEstimatorConfig> = None;
         for (expected, pilot) in candidates.iter().zip(&pilots) {
             pilot
                 .candidate
@@ -3417,10 +3417,8 @@ impl Qg1LifecycleAuthority {
         let mut capabilities = BTreeMap::new();
         for row in &mut issued_rows {
             let mut capability = [0_u8; 32];
-            getrandom::getrandom(&mut capability).map_err(|_| {
-                PairedEstimatorError::InvalidConfig {
-                    reason: "QG-1 producer capability entropy is unavailable".to_owned(),
-                }
+            getrandom::fill(&mut capability).map_err(|_| PairedEstimatorError::InvalidConfig {
+                reason: "QG-1 producer capability entropy is unavailable".to_owned(),
             })?;
             row.producer_capability_sha256 = lower_sha256_hex(&capability);
             if capabilities
@@ -3800,9 +3798,9 @@ impl Qg1ExpectedAuthority {
                 == qg1_producer_capability_tag_sha256(capability, binding, scope, provenance)
     }
 
-    fn samples_match_capabilities(
+    fn samples_match_capabilities<'sample>(
         &self,
-        samples: impl IntoIterator<Item = &PerfRawSample>,
+        samples: impl IntoIterator<Item = &'sample PerfRawSample>,
     ) -> bool {
         samples.into_iter().all(|sample| {
             sample.qg1_sample_binding.as_ref().is_some_and(|binding| {
@@ -3889,6 +3887,270 @@ pub(crate) fn resolve_qg1_expected_authority_for_replay<'a>(
     }
 }
 
+/// Stable schema identity for one persisted QG-1 authority register entry.
+pub const QG1_AUTHORITY_REGISTER_SCHEMA_VERSION: &str =
+    "frankensearch.quill.qg1-authority-register.v1";
+
+/// The persisted form of a producer-retained [`Qg1ExpectedAuthority`].
+///
+/// [`Qg1ExpectedAuthority`] deliberately has no `Serialize`, and that stays
+/// true: a persisted artifact must never be able to emit the expectation that
+/// authenticates it. This is a SEPARATE transport type, and the separation is
+/// the point — reconstituting an expectation is a fallible conversion that
+/// re-derives and re-checks the authority, so a register entry is a claim to be
+/// verified rather than an expectation to be trusted.
+///
+/// # What makes an entry honest
+///
+/// The entry is written at MINT time, before any sample exists, so its content
+/// cannot be tailored to a result. It is published content-addressed under its
+/// own `authority_sha256` with create-new semantics, so a later run cannot
+/// rewrite it and a different pre-timing plan lands at a different path. The
+/// capability preimages it carries were committed by the authority's issued
+/// rows before timing, so a row for a slot that was never pre-issued cannot be
+/// authenticated by it.
+///
+/// # What it does NOT defend against
+///
+/// An adversary that can write this directory at mint time controls the
+/// register, exactly as one that can write the evidence controls the evidence.
+/// This proves an expectation PRE-DATES and is IMMUTABLE relative to the
+/// evidence it authenticates; it is not an unforgeability claim, and no caller
+/// may describe it as one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg1AuthorityRegisterEntryV1 {
+    /// Always [`QG1_AUTHORITY_REGISTER_SCHEMA_VERSION`]; older entries never
+    /// silently gain admission.
+    pub schema_version: String,
+    /// The exact pre-timing authority, serialized as it was sealed.
+    authority: Qg1LifecycleAuthority,
+    /// Issued-row key to lowercase-hex capability preimage, in canonical order.
+    capability_preimages_hex: BTreeMap<String, String>,
+}
+
+impl Qg1AuthorityRegisterEntryV1 {
+    /// Content address of the authority this entry carries.
+    #[must_use]
+    pub fn digest(&self) -> &str {
+        &self.authority.authority_sha256
+    }
+
+    /// Canonical bytes used for durable publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-configuration error only if the typed schema stops
+    /// being encodable.
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, PairedEstimatorError> {
+        serde_json::to_vec(self).map_err(|error| PairedEstimatorError::InvalidConfig {
+            reason: format!("QG-1 authority register entry does not encode: {error}"),
+        })
+    }
+
+    /// Verify this entry's schema, sealed authority, and preimage commitments.
+    ///
+    /// Every preimage must be 32 lowercase-hex bytes whose digest equals the
+    /// `producer_capability_sha256` the authority already issued for that row,
+    /// and the issued rows and the preimage set must name exactly the same
+    /// slots. A register that omits, adds, or alters one slot is refused here
+    /// rather than producing an expectation that silently admits fewer rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-configuration error naming the first failure.
+    pub fn verify(&self) -> Result<(), PairedEstimatorError> {
+        let invalid = |reason: String| PairedEstimatorError::InvalidConfig { reason };
+        if self.schema_version != QG1_AUTHORITY_REGISTER_SCHEMA_VERSION {
+            return Err(invalid(format!(
+                "QG-1 authority register entry has schema {:?}, expected {QG1_AUTHORITY_REGISTER_SCHEMA_VERSION:?}",
+                self.schema_version
+            )));
+        }
+        self.authority.validate().map_err(|reason| {
+            invalid(format!(
+                "QG-1 authority register entry is not sealed: {reason}"
+            ))
+        })?;
+        if self.capability_preimages_hex.len() != self.authority.issued_rows.len() {
+            return Err(invalid(format!(
+                "QG-1 authority register entry carries {} preimages for {} issued rows",
+                self.capability_preimages_hex.len(),
+                self.authority.issued_rows.len()
+            )));
+        }
+        for row in &self.authority.issued_rows {
+            let key = qg1_issued_row_key(row);
+            let hex = self.capability_preimages_hex.get(&key).ok_or_else(|| {
+                invalid(format!(
+                    "QG-1 authority register entry has no preimage for issued row {key}"
+                ))
+            })?;
+            let preimage = decode_capability_preimage_hex(hex).ok_or_else(|| {
+                invalid(format!(
+                    "QG-1 authority register preimage for {key} is not 32 lowercase-hex bytes"
+                ))
+            })?;
+            if lower_sha256_hex(&preimage) != row.producer_capability_sha256 {
+                return Err(invalid(format!(
+                    "QG-1 authority register preimage for {key} does not open its issued commitment"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Reconstitute the retained expectation this entry stands for.
+    ///
+    /// Fallible on purpose, and it re-runs [`Self::verify`] rather than
+    /// trusting the bytes: the whole reason this is a distinct type is that a
+    /// deserialized claim is not yet an expectation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first verification failure.
+    pub fn to_expected_authority(&self) -> Result<Qg1ExpectedAuthority, PairedEstimatorError> {
+        self.verify()?;
+        let mut capability_preimages = BTreeMap::new();
+        for (key, hex) in &self.capability_preimages_hex {
+            let preimage = decode_capability_preimage_hex(hex).ok_or_else(|| {
+                PairedEstimatorError::InvalidConfig {
+                    reason: format!("QG-1 authority register preimage for {key} is malformed"),
+                }
+            })?;
+            capability_preimages.insert(key.clone(), preimage);
+        }
+        Ok(Qg1ExpectedAuthority {
+            authority: self.authority.clone(),
+            capability_preimages,
+        })
+    }
+
+    /// Parse and independently verify one persisted entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-configuration error for malformed bytes, an unknown
+    /// field, a stale schema, or any failed commitment. A truncated file fails
+    /// here, which is what makes a partially written register unusable rather
+    /// than silently short.
+    pub fn from_verified_slice(contents: &[u8]) -> Result<Self, PairedEstimatorError> {
+        let entry: Self = serde_json::from_slice(contents).map_err(|error| {
+            PairedEstimatorError::InvalidConfig {
+                reason: format!("QG-1 authority register entry does not parse: {error}"),
+            }
+        })?;
+        entry.verify()?;
+        Ok(entry)
+    }
+
+    /// Load and independently verify one persisted entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-configuration error on I/O failure or any
+    /// verification failure.
+    pub fn load_verified(path: &Path) -> Result<Self, PairedEstimatorError> {
+        let contents = fs::read(path).map_err(|error| PairedEstimatorError::InvalidConfig {
+            reason: format!(
+                "QG-1 authority register entry at {} is unreadable: {error}",
+                path.display()
+            ),
+        })?;
+        Self::from_verified_slice(&contents)
+    }
+
+    /// Publish this entry write-once under its own content address.
+    ///
+    /// No temporary file and no rename: the destination itself is opened with
+    /// `O_CREAT | O_EXCL | O_NOFOLLOW` relative to a directory descriptor, then
+    /// written, fsynced, and the directory fsynced. `O_EXCL` is what makes a
+    /// second mint of the same authority fail instead of replacing a register a
+    /// consumer may already have read; `O_NOFOLLOW` is what stops a planted
+    /// symlink from redirecting the write; opening relative to the directory
+    /// descriptor is what stops the path being swapped between checks.
+    ///
+    /// The temp-and-link scheme this replaces was wrong three ways: it deleted
+    /// a file (forbidden outright), it used a deterministic temp path that two
+    /// concurrent producers race on, and `File::create` truncates rather than
+    /// refusing. A temp scheme that does not delete leaks instead, so there is
+    /// no correct variant of it here.
+    ///
+    /// The one wart, stated rather than hidden: a crash between create and
+    /// fsync leaves a partial file that `O_EXCL` will never let this authority
+    /// replace. That fails CLOSED — the partial refuses on load, so it can
+    /// never be mistaken for a valid register — but it does require operator
+    /// action to clear, which is why it is documented here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-configuration error when the entry does not verify,
+    /// when the destination already exists, or on any I/O failure.
+    pub fn publish(&self, directory: &Path) -> Result<PathBuf, PairedEstimatorError> {
+        use rustix::fs::{Mode, OFlags};
+
+        self.verify()?;
+        let io = |context: &str, error: std::io::Errno| PairedEstimatorError::InvalidConfig {
+            reason: format!("QG-1 authority register {context} failed: {error}"),
+        };
+        let std_io = |context: &str, error: std::io::Error| PairedEstimatorError::InvalidConfig {
+            reason: format!("QG-1 authority register {context} failed: {error}"),
+        };
+        fs::create_dir_all(directory).map_err(|error| std_io("directory creation", error))?;
+        let file_name = format!("{}.json", self.digest());
+        let destination = directory.join(&file_name);
+        let bytes = self.to_json_bytes()?;
+
+        let directory_fd = rustix::fs::open(
+            directory,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| io("directory open", error))?;
+        let file = rustix::fs::openat(
+            &directory_fd,
+            file_name.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|error| io("create-new publication", error))?;
+        let mut written = 0;
+        while written < bytes.len() {
+            written += rustix::io::write(&file, &bytes[written..])
+                .map_err(|error| io("entry write", error))?;
+        }
+        rustix::fs::fsync(&file).map_err(|error| io("entry fsync", error))?;
+        rustix::fs::fsync(&directory_fd).map_err(|error| io("directory fsync", error))?;
+        Ok(destination)
+    }
+}
+
+/// Encode raw bytes as lowercase hex.
+///
+/// Distinct from [`lower_sha256_hex`], which HASHES its input: a capability
+/// preimage must be transported exactly, never digested, or the register could
+/// not open the commitment it exists to open.
+fn lower_hex_bytes(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
+/// Decode one 32-byte capability preimage from lowercase hex.
+fn decode_capability_preimage_hex(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 || !is_lower_hex_digest(hex) {
+        return None;
+    }
+    let mut preimage = [0_u8; 32];
+    for (index, slot) in preimage.iter_mut().enumerate() {
+        let start = index * 2;
+        *slot = u8::from_str_radix(hex.get(start..start + 2)?, 16).ok()?;
+    }
+    Some(preimage)
+}
+
 /// The only live producer able to attach a QG-1 lifecycle receipt. It owns
 /// opaque capability preimages and removes one before returning each binding.
 #[derive(Debug)]
@@ -3912,6 +4174,33 @@ impl Qg1LifecycleProducer {
     #[must_use]
     pub fn expected_authority(&self) -> &Qg1ExpectedAuthority {
         &self.expected_authority
+    }
+
+    /// The persistable form of this producer's retained expectation.
+    ///
+    /// Call it at MINT time and publish immediately, before any sample exists:
+    /// the register's honesty rests on the entry pre-dating the evidence it
+    /// will later authenticate, and a producer that persists after measuring
+    /// has already had the opportunity this ordering removes.
+    ///
+    /// It carries the FULL issued preimage set, not the unconsumed remainder.
+    /// A register that shrank as slots were consumed would authenticate only
+    /// the rows a run happened to emit, which is exactly backwards: the
+    /// consumer must be able to tell that an expected row is MISSING from the
+    /// evidence, and it can only do that against the complete issued
+    /// transcript.
+    #[must_use]
+    pub fn register_entry(&self) -> Qg1AuthorityRegisterEntryV1 {
+        Qg1AuthorityRegisterEntryV1 {
+            schema_version: QG1_AUTHORITY_REGISTER_SCHEMA_VERSION.to_owned(),
+            authority: self.expected_authority.authority.clone(),
+            capability_preimages_hex: self
+                .expected_authority
+                .capability_preimages
+                .iter()
+                .map(|(key, preimage)| (key.clone(), lower_hex_bytes(preimage)))
+                .collect(),
+        }
     }
 
     /// Consume one pre-issued capability and attach its receipt to a live row.
@@ -9127,6 +9416,155 @@ mod tests {
                 .map(|authority| authority.authority_sha256.as_str()),
             Some(frozen_digest.as_str()),
             "a rejected overwrite must leave the original pre-timing authority frozen"
+        );
+    }
+
+    /// Mint one REAL producer through the shipping install seam.
+    ///
+    /// No test-only producer exists and none is introduced here: this is the
+    /// same `install_qg1_lifecycle_authority` a live cell calls, so a register
+    /// entry built from it is the entry a live mint would publish.
+    fn minted_producer(label: &str) -> (PairedEstimatorConfig, Qg1LifecycleProducer) {
+        let cell = qg1_bulk_cell(4);
+        let scope = qg1_throughput_scope(&cell);
+        let provenance = provenance(label);
+        let schedule =
+            seeded_balanced_pair_order(PERF_MIN_RUNS, 0x00dd_5eed).expect("QG-1 frozen schedule");
+        let mut config = estimator_config();
+        let producer = config
+            .install_qg1_lifecycle_authority(
+                scope,
+                provenance.corpus_sha256.clone(),
+                "a".repeat(64),
+                "b".repeat(64),
+                500,
+                64_000,
+                1,
+                vec![Qg1BatchCoverage {
+                    document_start: 0,
+                    document_count: 500,
+                }],
+                "synthetic-00000499".to_owned(),
+                u64::try_from(PERF_MIN_RUNS).expect("QG-1 pair count fits u64"),
+                vec![
+                    (QG1_STREAM_ROLE_EFFECT.to_owned(), 0, 0, schedule.clone()),
+                    (QG1_STREAM_ROLE_TANTIVY_NULL.to_owned(), 0, 10_000, schedule),
+                ],
+            )
+            .expect("mint one pre-timing lifecycle authority");
+        (config, producer)
+    }
+
+    /// The property that did not exist before: a retained expectation survives
+    /// serialization and reload and still authenticates its own configuration.
+    ///
+    /// `Qg1ExpectedAuthority` has no `Serialize` and never gains one, so this
+    /// goes out through the register transport and comes back through a
+    /// fallible conversion that re-verifies every commitment. Before this
+    /// existed, no consumer outside the producing process could hold an
+    /// expectation at all, which is why QG-1 evidence could be written but
+    /// never replayed.
+    #[test]
+    fn qg1_authority_register_round_trips_through_publication_and_reload() {
+        let (config, producer) = minted_producer("qg1-register-roundtrip");
+        let directory = tempfile::tempdir().expect("register directory");
+        let entry = producer.register_entry();
+        let published = entry
+            .publish(directory.path())
+            .expect("publish the minted register entry");
+        assert_eq!(
+            published.file_name().and_then(|name| name.to_str()),
+            Some(format!("{}.json", entry.digest()).as_str()),
+            "publication is content-addressed by the authority digest"
+        );
+
+        let reloaded = Qg1AuthorityRegisterEntryV1::load_verified(&published)
+            .expect("reload the published register entry");
+        assert_eq!(reloaded, entry, "the entry survives serialization exactly");
+        let expected = reloaded
+            .to_expected_authority()
+            .expect("reconstitute the retained expectation");
+        assert_eq!(expected.digest(), producer.expected_authority().digest());
+        assert!(
+            expected.matches_config(&config),
+            "a reloaded expectation must select the very configuration its producer installed"
+        );
+    }
+
+    /// A minted register may never be replaced. A second publication of the
+    /// same authority fails rather than overwriting a register a consumer may
+    /// already have read.
+    #[test]
+    fn qg1_authority_register_publication_is_write_once() {
+        let (_config, producer) = minted_producer("qg1-register-write-once");
+        let directory = tempfile::tempdir().expect("register directory");
+        let entry = producer.register_entry();
+        let published = entry.publish(directory.path()).expect("first publication");
+        assert!(
+            matches!(
+                entry.publish(directory.path()),
+                Err(PairedEstimatorError::InvalidConfig { .. })
+            ),
+            "re-publishing a minted authority must fail create-new"
+        );
+        assert_eq!(
+            Qg1AuthorityRegisterEntryV1::load_verified(&published)
+                .expect("the original entry survives the refused overwrite"),
+            entry,
+        );
+    }
+
+    /// A preimage that no longer opens its issued commitment is refused, so a
+    /// register cannot be edited into authenticating rows it never issued.
+    #[test]
+    fn qg1_authority_register_rejects_a_tampered_preimage() {
+        let (_config, producer) = minted_producer("qg1-register-tamper");
+        let entry = producer.register_entry();
+        let bytes = entry.to_json_bytes().expect("encode the register entry");
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("the register entry is JSON");
+        let preimages = document
+            .get_mut("capability_preimages_hex")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("the entry carries its preimage map");
+        let key = preimages
+            .keys()
+            .next()
+            .expect("at least one issued row")
+            .clone();
+        let original = preimages[&key].as_str().expect("hex preimage").to_owned();
+        let flipped = format!(
+            "{}{}",
+            if original.starts_with('0') { "1" } else { "0" },
+            &original[1..]
+        );
+        preimages[&key] = serde_json::Value::String(flipped);
+        let tampered = serde_json::to_vec(&document).expect("re-encode the tampered entry");
+
+        assert!(
+            matches!(
+                Qg1AuthorityRegisterEntryV1::from_verified_slice(&tampered),
+                Err(PairedEstimatorError::InvalidConfig { .. })
+            ),
+            "a preimage that does not open its commitment must be refused"
+        );
+    }
+
+    /// A partially written register is unusable rather than silently short.
+    #[test]
+    fn qg1_authority_register_rejects_a_truncated_entry() {
+        let (_config, producer) = minted_producer("qg1-register-truncated");
+        let bytes = producer
+            .register_entry()
+            .to_json_bytes()
+            .expect("encode the register entry");
+        let truncated = &bytes[..bytes.len() / 2];
+        assert!(
+            matches!(
+                Qg1AuthorityRegisterEntryV1::from_verified_slice(truncated),
+                Err(PairedEstimatorError::InvalidConfig { .. })
+            ),
+            "a truncated register entry must be refused, never parsed short"
         );
     }
 
