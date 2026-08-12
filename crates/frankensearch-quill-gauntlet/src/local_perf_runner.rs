@@ -7718,9 +7718,6 @@ mod tests {
         };
         let run_log = create_new_file_at(&run_directories.run.handle, "run.log")
             .expect("create-new retained QG-1 wait test run log");
-        let mut retained_log_reader = run_log
-            .try_clone()
-            .expect("retain QG-1 wait run-log descriptor");
         let mut handshake_log = run_log.try_clone().expect("clone retained test run log");
         let current_test = std::env::current_exe().expect("current test executable");
         let helper_name = "local_perf_runner::tests::qg1_wait_boundary_child_helper";
@@ -7774,9 +7771,15 @@ mod tests {
         descendant_scope
             .restore()
             .expect("restore QG-1 test descendant scope");
-        retained_log_reader
-            .seek(SeekFrom::Start(0))
-            .expect("seek retained QG-1 wait run log");
+        let mut retained_log_reader = File::from(
+            openat(
+                &run_directories.run.handle,
+                "run.log",
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .expect("reopen retained QG-1 wait run log read-only without following paths"),
+        );
         let mut run_log_bytes = Vec::new();
         retained_log_reader
             .read_to_end(&mut run_log_bytes)
@@ -7966,10 +7969,17 @@ mod tests {
             fixture: None,
             selected_cell_ids: vec!["QG-1/bulk/tiny/1/positions_on/docs_per_second".to_owned()],
         };
-        let (status, recovery, accepted, failure, _) =
+        let (_status, recovery, accepted, failure, _) =
             qg1_wait_result_for_test("natural_exit", &selection);
-        assert!(status.success(), "the helper must exit naturally");
         assert_eq!(recovery, LocalPerfProcessGroupRecovery::NotRequired);
+        assert_eq!(
+            failure.as_deref(),
+            Some("QG-1 child exited before the exact startup COMPLETE/final-ACK exchange")
+        );
+        assert!(
+            accepted.cell_digests.is_empty(),
+            "the naturally exited child must not publish startup authority"
+        );
 
         let outcome = qg1_authority_handshake_outcome(
             PerfGate::Qg1,
