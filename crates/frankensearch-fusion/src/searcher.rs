@@ -278,11 +278,17 @@ pub struct TwoTierSearcher {
 #[cfg(test)]
 type CancellationTestHook = Arc<dyn Fn(&Cx, CancellationTestBoundary) + Send + Sync>;
 
-/// Test-only seam for cancelling the real invocation context at a publication boundary.
+/// Test-only seam for cancelling the real invocation context between synchronous stages.
 #[cfg(test)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CancellationTestBoundary {
+    PrfToFastPool,
+    QualitySearchToCalibration,
+    QualityBlendToRank,
+    QualityRankToResultConstruction,
     RefinedResultConstruction,
+    Phase2ToRefined,
+    SearchCompletionToSessionStop,
     #[cfg(feature = "rerank")]
     Phase3Explanation,
 }
@@ -1239,6 +1245,30 @@ impl TwoTierSearcher {
                 }
                 Ok(phase2_outcome) => match phase2_outcome {
                     Ok(refined_results) => {
+                        #[cfg(test)]
+                        self.run_cancellation_test_hook(
+                            cx,
+                            CancellationTestBoundary::Phase2ToRefined,
+                        );
+                        if let Err(cancellation) = cancellation_checkpoint(cx, "phase2_to_refined")
+                        {
+                            let (phase, reason) = match cancellation {
+                                SearchError::Cancelled { phase, reason } => (phase, reason),
+                                error => return Err(error),
+                            };
+                            if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
+                                self.emit_session_stop_telemetry(
+                                    root_request_id,
+                                    telemetry_last_event_id.clone(),
+                                    LifecycleState::Degraded,
+                                    LifecycleSeverity::Warn,
+                                    Some(format!("cancelled:{phase}:{reason}")),
+                                    search_started_at.elapsed(),
+                                );
+                            }
+                            return Err(SearchError::Cancelled { phase, reason });
+                        }
+
                         let phase2_latency = phase2_start.elapsed();
                         let refined_count = refined_results.len();
                         metrics.phase2_total_ms = phase2_latency.as_secs_f64() * 1000.0;
@@ -1460,6 +1490,30 @@ impl TwoTierSearcher {
             } else {
                 metrics.skip_reason = Some("quality_index_unavailable".to_owned());
             }
+        }
+
+        #[cfg(test)]
+        self.run_cancellation_test_hook(
+            cx,
+            CancellationTestBoundary::SearchCompletionToSessionStop,
+        );
+        if let Err(cancellation) = cancellation_checkpoint(cx, "search_completion_to_session_stop")
+        {
+            let (phase, reason) = match cancellation {
+                SearchError::Cancelled { phase, reason } => (phase, reason),
+                error => return Err(error),
+            };
+            if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
+                self.emit_session_stop_telemetry(
+                    root_request_id,
+                    telemetry_last_event_id.clone(),
+                    LifecycleState::Degraded,
+                    LifecycleSeverity::Warn,
+                    Some(format!("cancelled:{phase}:{reason}")),
+                    search_started_at.elapsed(),
+                );
+            }
+            return Err(SearchError::Cancelled { phase, reason });
         }
 
         if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
@@ -2141,6 +2195,8 @@ impl TwoTierSearcher {
             }
         }
 
+        #[cfg(test)]
+        self.run_cancellation_test_hook(cx, CancellationTestBoundary::PrfToFastPool);
         cancellation_checkpoint(cx, "prf_to_fast_pool")?;
 
         // Get quality scores for the full retained semantic pool (not just
@@ -2228,6 +2284,8 @@ impl TwoTierSearcher {
         };
         metrics.quality_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
+        #[cfg(test)]
+        self.run_cancellation_test_hook(cx, CancellationTestBoundary::QualitySearchToCalibration);
         cancellation_checkpoint(cx, "quality_search_to_calibration")?;
 
         // Calibration is a pure per-element score transform, so it is applied
@@ -2324,6 +2382,8 @@ impl TwoTierSearcher {
         };
         metrics.blend_ms = blend_start.elapsed().as_secs_f64() * 1000.0;
 
+        #[cfg(test)]
+        self.run_cancellation_test_hook(cx, CancellationTestBoundary::QualityBlendToRank);
         cancellation_checkpoint(cx, "quality_blend_to_rank")?;
 
         // Compute rank changes (initial vs refined).
@@ -2345,6 +2405,11 @@ impl TwoTierSearcher {
         }
         self.maybe_update_adaptive_conformal(tau);
 
+        #[cfg(test)]
+        self.run_cancellation_test_hook(
+            cx,
+            CancellationTestBoundary::QualityRankToResultConstruction,
+        );
         cancellation_checkpoint(cx, "quality_rank_to_result_construction")?;
 
         let initial_by_doc: AHashMap<&str, &ScoredResult> = initial_results
@@ -5872,6 +5937,319 @@ mod tests {
                 );
             });
         }
+    }
+
+    #[test]
+    fn public_search_phase2_sync_checkpoints_preserve_order_and_score_bits() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let baseline = TwoTierSearcher::new(
+                build_test_index_with_quality(4),
+                Arc::new(StubEmbedder::new("fast", 4)),
+                TwoTierConfig {
+                    explain: true,
+                    ..TwoTierConfig::default()
+                },
+            )
+            .with_quality_embedder(Arc::new(StubEmbedder::new("quality", 4)))
+            .with_prf_config(PrfConfig {
+                enabled: true,
+                min_feedback_docs: 1,
+                ..PrfConfig::default()
+            });
+            let mut baseline_score_bits = Vec::new();
+            baseline
+                .search(
+                    &cx,
+                    "find a natural language retrieval query",
+                    5,
+                    |_| None,
+                    |phase| {
+                        if let SearchPhase::Refined { results, .. } = phase {
+                            baseline_score_bits = results
+                                .iter()
+                                .map(|result| (result.doc_id.clone(), result.score.to_bits()))
+                                .collect();
+                        }
+                    },
+                )
+                .await
+                .expect("baseline Phase 2 must complete");
+
+            let observed_boundaries = Arc::new(Mutex::new(Vec::new()));
+            let boundaries_for_hook = Arc::clone(&observed_boundaries);
+            let hook: CancellationTestHook = Arc::new(move |_, boundary| {
+                boundaries_for_hook
+                    .lock()
+                    .expect("record phase-2 checkpoint")
+                    .push(boundary);
+            });
+            let searcher = TwoTierSearcher::new(
+                build_test_index_with_quality(4),
+                Arc::new(StubEmbedder::new("fast", 4)),
+                TwoTierConfig {
+                    explain: true,
+                    ..TwoTierConfig::default()
+                },
+            )
+            .with_quality_embedder(Arc::new(StubEmbedder::new("quality", 4)))
+            .with_prf_config(PrfConfig {
+                enabled: true,
+                min_feedback_docs: 1,
+                ..PrfConfig::default()
+            })
+            .with_cancellation_test_hook(hook);
+
+            let mut refined_score_bits = Vec::new();
+            let mut refinement_failure = None;
+            searcher
+                .search(
+                    &cx,
+                    "find a natural language retrieval query",
+                    5,
+                    |_| None,
+                    |phase| match phase {
+                        SearchPhase::Initial { .. } => {}
+                        SearchPhase::Refined { results, .. } => {
+                            refined_score_bits = results
+                                .iter()
+                                .map(|result| (result.doc_id.clone(), result.score.to_bits()))
+                                .collect();
+                        }
+                        SearchPhase::RefinementFailed { error, .. } => {
+                            refinement_failure = Some(error.to_string());
+                        }
+                        SearchPhase::Reranked { .. } => {}
+                    },
+                )
+                .await
+                .expect("uncancelled Phase 2 must complete");
+
+            assert_eq!(
+                refinement_failure, None,
+                "uncancelled Phase 2 must not fail"
+            );
+            assert_eq!(baseline_score_bits, refined_score_bits);
+            assert_eq!(
+                *observed_boundaries
+                    .lock()
+                    .expect("read phase-2 checkpoints"),
+                vec![
+                    CancellationTestBoundary::PrfToFastPool,
+                    CancellationTestBoundary::QualitySearchToCalibration,
+                    CancellationTestBoundary::QualityBlendToRank,
+                    CancellationTestBoundary::QualityRankToResultConstruction,
+                    CancellationTestBoundary::RefinedResultConstruction,
+                    CancellationTestBoundary::Phase2ToRefined,
+                    CancellationTestBoundary::SearchCompletionToSessionStop,
+                ],
+                "the uncancelled control must traverse every synchronous Phase-2 checkpoint"
+            );
+        });
+    }
+
+    #[test]
+    fn public_search_parent_cancellation_between_phase2_sync_stages_stops_before_refined() {
+        let cases = [
+            (CancellationTestBoundary::PrfToFastPool, "prf_to_fast_pool"),
+            (
+                CancellationTestBoundary::QualitySearchToCalibration,
+                "quality_search_to_calibration",
+            ),
+            (
+                CancellationTestBoundary::QualityBlendToRank,
+                "quality_blend_to_rank",
+            ),
+            (
+                CancellationTestBoundary::QualityRankToResultConstruction,
+                "quality_rank_to_result_construction",
+            ),
+            (
+                CancellationTestBoundary::RefinedResultConstruction,
+                "quality_result_construction_to_publish",
+            ),
+        ];
+
+        for (boundary, expected_phase) in cases {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let parent_cx = cx.clone();
+                let hook: CancellationTestHook = Arc::new(move |_, observed_boundary| {
+                    if observed_boundary == boundary {
+                        parent_cx.cancel_with(
+                            asupersync::CancelKind::User,
+                            Some("cancel parent Cx during synchronous Phase 2"),
+                        );
+                    }
+                });
+                let adapter = Arc::new(RecordingHostAdapter::new("phase2_parent_cancellation"));
+                let config = TwoTierConfig {
+                    explain: true,
+                    ..TwoTierConfig::default()
+                };
+                let searcher = TwoTierSearcher::new(
+                    build_test_index_with_quality(4),
+                    Arc::new(StubEmbedder::new("fast", 4)),
+                    config,
+                )
+                .with_quality_embedder(Arc::new(StubEmbedder::new("quality", 4)))
+                .with_prf_config(PrfConfig {
+                    enabled: true,
+                    min_feedback_docs: 1,
+                    ..PrfConfig::default()
+                })
+                .with_host_adapter(adapter.clone())
+                .with_cancellation_test_hook(hook);
+
+                let mut phases = Vec::new();
+                let error = searcher
+                    .search(
+                        &cx,
+                        "find a natural language retrieval query",
+                        5,
+                        |_| None,
+                        |phase| match phase {
+                            SearchPhase::Initial { .. } => phases.push("initial"),
+                            SearchPhase::Refined { .. } => phases.push("refined"),
+                            SearchPhase::Reranked { .. } => phases.push("reranked"),
+                            SearchPhase::RefinementFailed { .. } => {
+                                phases.push("refinement_failed");
+                            }
+                        },
+                    )
+                    .await
+                    .expect_err("a parent Cx cancellation must stop the next Phase-2 stage");
+
+                assert!(matches!(
+                    error,
+                    SearchError::Cancelled { phase, reason }
+                        if phase == expected_phase
+                            && reason == "user: cancel parent Cx during synchronous Phase 2"
+                ));
+                assert_eq!(phases, vec!["initial"], "boundary={boundary:?}");
+                assert!(
+                    adapter
+                        .telemetry_events()
+                        .iter()
+                        .filter_map(|envelope| match &envelope.event {
+                            TelemetryEvent::Search { query, .. } => Some(query.phase),
+                            _ => None,
+                        })
+                        .eq([SearchEventPhase::Initial]),
+                    "boundary={boundary:?} must not publish Refined"
+                );
+                assert_single_cancelled_session_stop(&adapter, expected_phase);
+            });
+        }
+    }
+
+    #[test]
+    fn public_search_parent_cancellation_after_phase2_stops_before_refined_publish() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent_cx = cx.clone();
+            let hook: CancellationTestHook = Arc::new(move |_, boundary| {
+                if boundary == CancellationTestBoundary::Phase2ToRefined {
+                    parent_cx.cancel_with(
+                        asupersync::CancelKind::User,
+                        Some("cancel parent Cx after Phase 2"),
+                    );
+                }
+            });
+            let adapter = Arc::new(RecordingHostAdapter::new("phase2_handoff_cancellation"));
+            let searcher = TwoTierSearcher::new(
+                build_test_index_with_quality(4),
+                Arc::new(StubEmbedder::new("fast", 4)),
+                TwoTierConfig::default(),
+            )
+            .with_quality_embedder(Arc::new(StubEmbedder::new("quality", 4)))
+            .with_host_adapter(adapter.clone())
+            .with_cancellation_test_hook(hook);
+
+            let mut phases = Vec::new();
+            let error = searcher
+                .search(
+                    &cx,
+                    "test query",
+                    5,
+                    |_| None,
+                    |phase| match phase {
+                        SearchPhase::Initial { .. } => phases.push("initial"),
+                        SearchPhase::Refined { .. } => phases.push("refined"),
+                        SearchPhase::Reranked { .. } => phases.push("reranked"),
+                        SearchPhase::RefinementFailed { .. } => phases.push("refinement_failed"),
+                    },
+                )
+                .await
+                .expect_err("post-Phase-2 cancellation must stop before Refined publication");
+
+            assert!(matches!(
+                error,
+                SearchError::Cancelled { phase, reason }
+                    if phase == "phase2_to_refined"
+                        && reason == "user: cancel parent Cx after Phase 2"
+            ));
+            assert_eq!(phases, vec!["initial"]);
+            assert!(
+                adapter
+                    .telemetry_events()
+                    .iter()
+                    .filter_map(|envelope| match &envelope.event {
+                        TelemetryEvent::Search { query, .. } => Some(query.phase),
+                        _ => None,
+                    })
+                    .eq([SearchEventPhase::Initial]),
+                "the public handoff must not publish Refined"
+            );
+            assert_single_cancelled_session_stop(&adapter, "phase2_to_refined");
+        });
+    }
+
+    #[test]
+    fn public_search_parent_cancellation_before_normal_session_stop_is_degraded_once() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent_cx = cx.clone();
+            let hook: CancellationTestHook = Arc::new(move |_, boundary| {
+                if boundary == CancellationTestBoundary::SearchCompletionToSessionStop {
+                    parent_cx.cancel_with(
+                        asupersync::CancelKind::User,
+                        Some("cancel parent Cx before normal session stop"),
+                    );
+                }
+            });
+            let adapter = Arc::new(RecordingHostAdapter::new("completion_cancellation"));
+            let searcher = TwoTierSearcher::new(
+                build_test_index_with_quality(4),
+                Arc::new(StubEmbedder::new("fast", 4)),
+                TwoTierConfig::default(),
+            )
+            .with_quality_embedder(Arc::new(StubEmbedder::new("quality", 4)))
+            .with_host_adapter(adapter.clone())
+            .with_cancellation_test_hook(hook);
+
+            let mut phases = Vec::new();
+            let error = searcher
+                .search(
+                    &cx,
+                    "test query",
+                    5,
+                    |_| None,
+                    |phase| match phase {
+                        SearchPhase::Initial { .. } => phases.push("initial"),
+                        SearchPhase::Refined { .. } => phases.push("refined"),
+                        SearchPhase::Reranked { .. } => phases.push("reranked"),
+                        SearchPhase::RefinementFailed { .. } => phases.push("refinement_failed"),
+                    },
+                )
+                .await
+                .expect_err("completion cancellation must prevent a normal SessionStop");
+
+            assert!(matches!(
+                error,
+                SearchError::Cancelled { phase, reason }
+                    if phase == "search_completion_to_session_stop"
+                        && reason == "user: cancel parent Cx before normal session stop"
+            ));
+            assert_eq!(phases, vec!["initial", "refined"]);
+            assert_single_cancelled_session_stop(&adapter, "search_completion_to_session_stop");
+        });
     }
 
     #[cfg(feature = "rerank")]
