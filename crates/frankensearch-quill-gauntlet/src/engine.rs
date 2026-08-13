@@ -71,6 +71,20 @@ const BUILT_IN_PROFILE_V1_CASS_SCHEMA_HASH: &str =
     "24e54284be158fe39dfa4bf0def76dba6dd9d50d8c59f7cb75f24e52b0cccae4";
 const BUILT_IN_PROFILE_V1_SCALAR_ORACLE_CONFIG_HASH: &str = "shipping-schema-and-parser-v1";
 const BUILT_IN_PROFILE_V1_CASS_ORACLE_CONFIG_HASH: &str = "cass-schema-and-parser-v1";
+const BUILT_IN_PROFILE_V2_QUILL_CRATE_VERSION: &str = "0.2.1";
+const BUILT_IN_PROFILE_V2_LEXICAL_CRATE_VERSION: &str = "0.2.1";
+const BUILT_IN_PROFILE_V2_DEFAULT_ANALYZER_HASH: &str =
+    "7425c0f2d0a909ca4103bd20f439b6282d3ce00ab3c9f6784ec7333398197041";
+const BUILT_IN_PROFILE_V2_DEFAULT_SCHEMA_HASH: &str =
+    "afe3ad4998181c98ee26de5c47905e3c9e0623e2e144643a02e19ce697b42c0a";
+const BUILT_IN_PROFILE_V2_SCALAR_G1A_SCHEMA_HASH: &str =
+    "ed82305678b4145b83bd48dc605bf3e9c65736ba3c74983f2268f0f8dbf11e59";
+const BUILT_IN_PROFILE_V2_CASS_ANALYZER_HASH: &str =
+    "8db8c441617927a16604df40ff17f57a5478996eaa2b0c7b4018dfac1340edcf";
+const BUILT_IN_PROFILE_V2_CASS_SCHEMA_HASH: &str =
+    "11057d81013ddadc6499674acb23a8b6842d589f4344fa88b3e70fa744fc4ee9";
+const BUILT_IN_PROFILE_V2_SCALAR_ORACLE_CONFIG_HASH: &str = "shipping-schema-and-parser-v1";
+const BUILT_IN_PROFILE_V2_CASS_ORACLE_CONFIG_HASH: &str = "cass-schema-and-parser-v1";
 
 /// Closed engine family used by the cross-engine false-green guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -382,6 +396,7 @@ pub struct BuiltInEngineProfileReceipt {
 
 impl BuiltInEngineProfileReceipt {
     const V1_SCHEMA_VERSION: u32 = 1;
+    const V2_SCHEMA_VERSION: u32 = 2;
     #[cfg_attr(
         not(any(test, feature = "tantivy-oracle")),
         expect(
@@ -389,7 +404,7 @@ impl BuiltInEngineProfileReceipt {
             reason = "typed built-in receipts are constructed only by oracle-backed or test lanes"
         )
     )]
-    const CURRENT_SCHEMA_VERSION: u32 = Self::V1_SCHEMA_VERSION;
+    const CURRENT_SCHEMA_VERSION: u32 = Self::V2_SCHEMA_VERSION;
 
     #[cfg_attr(
         not(any(test, feature = "tantivy-oracle")),
@@ -419,6 +434,7 @@ impl BuiltInEngineProfileReceipt {
     fn validate_stored(&self, engines: &EnginePairIdentity) -> Result<(), GauntletError> {
         match self.schema_version {
             1 => self.validate_stored_v1(engines),
+            2 => self.validate_stored_v2(engines),
             _ => Err(GauntletError::InvalidContract {
                 reason: "built-in engine profile receipt schema is unsupported".to_owned(),
             }),
@@ -482,6 +498,68 @@ impl BuiltInEngineProfileReceipt {
         {
             return Err(GauntletError::InvalidContract {
                 reason: "built-in engine profile receipt does not match its stored adapter identities and semantic contract"
+                    .to_owned(),
+            });
+        }
+        validate_recorded_producer_source(
+            &engines.subject.source_revision,
+            engines.subject.source_dirty,
+        )?;
+        Ok(())
+    }
+
+    fn stored_semantic_contract_v2(&self) -> crate::runner::SemanticContract {
+        let (analyzer_contract_hash, schema_contract_hash) = match self.profile {
+            BuiltInEngineProfile::ScalarShipping => (
+                BUILT_IN_PROFILE_V2_DEFAULT_ANALYZER_HASH,
+                BUILT_IN_PROFILE_V2_DEFAULT_SCHEMA_HASH,
+            ),
+            BuiltInEngineProfile::ScalarG1a => (
+                BUILT_IN_PROFILE_V2_DEFAULT_ANALYZER_HASH,
+                BUILT_IN_PROFILE_V2_SCALAR_G1A_SCHEMA_HASH,
+            ),
+            BuiltInEngineProfile::Cass => (
+                BUILT_IN_PROFILE_V2_CASS_ANALYZER_HASH,
+                BUILT_IN_PROFILE_V2_CASS_SCHEMA_HASH,
+            ),
+        };
+        crate::runner::SemanticContract {
+            analyzer_contract_hash: analyzer_contract_hash.to_owned(),
+            schema_contract_hash: schema_contract_hash.to_owned(),
+        }
+    }
+
+    fn validate_stored_v2(&self, engines: &EnginePairIdentity) -> Result<(), GauntletError> {
+        self.subject_config.validate_stored_v1()?;
+        let (subject_implementation, subject_hash, oracle_hash) = match self.profile {
+            BuiltInEngineProfile::ScalarShipping | BuiltInEngineProfile::ScalarG1a => (
+                "frankensearch-quill/scalar-index",
+                self.subject_config.descriptor_hash_v1(),
+                BUILT_IN_PROFILE_V2_SCALAR_ORACLE_CONFIG_HASH,
+            ),
+            BuiltInEngineProfile::Cass => (
+                "frankensearch-quill/cass-index",
+                format!(
+                    "cass-semantic-v1:{}",
+                    self.subject_config.descriptor_hash_v1()
+                ),
+                BUILT_IN_PROFILE_V2_CASS_ORACLE_CONFIG_HASH,
+            ),
+        };
+        if self.schema_version != Self::V2_SCHEMA_VERSION
+            || engines.comparison_mode != ComparisonMode::CrossEngine
+            || engines.subject.implementation != subject_implementation
+            || engines.subject.crate_version != BUILT_IN_PROFILE_V2_QUILL_CRATE_VERSION
+            || engines.subject.config_hash != subject_hash
+            || engines.oracle.implementation != "frankensearch-lexical/tantivy-index"
+            || engines.oracle.crate_version != BUILT_IN_PROFILE_V2_LEXICAL_CRATE_VERSION
+            || engines.oracle.config_hash != oracle_hash
+            || engines.semantic_contract.as_ref() != Some(&self.stored_semantic_contract_v2())
+            || engines.subject.source_revision != engines.oracle.source_revision
+            || engines.subject.source_dirty != engines.oracle.source_dirty
+        {
+            return Err(GauntletError::InvalidContract {
+                reason: "built-in engine profile receipt v2 does not match its stored adapter identities and semantic contract"
                     .to_owned(),
             });
         }
@@ -4156,9 +4234,24 @@ mod tests {
     fn stored_profile_pair(
         profile: BuiltInEngineProfile,
         config: &QuillConfig,
+        schema_version: u32,
     ) -> EnginePairIdentity {
-        let receipt = BuiltInEngineProfileReceipt::new(profile, config);
-        let semantic_contract = receipt.stored_semantic_contract_v1();
+        let receipt = match schema_version {
+            BuiltInEngineProfileReceipt::V1_SCHEMA_VERSION => BuiltInEngineProfileReceipt {
+                schema_version,
+                profile,
+                subject_config: QuillConfigReceipt::from_config(config),
+            },
+            BuiltInEngineProfileReceipt::V2_SCHEMA_VERSION => {
+                BuiltInEngineProfileReceipt::new(profile, config)
+            }
+            _ => panic!("unsupported test profile schema {schema_version}"),
+        };
+        let semantic_contract = match schema_version {
+            BuiltInEngineProfileReceipt::V1_SCHEMA_VERSION => receipt.stored_semantic_contract_v1(),
+            BuiltInEngineProfileReceipt::V2_SCHEMA_VERSION => receipt.stored_semantic_contract_v2(),
+            _ => unreachable!("validated above"),
+        };
         let (subject_implementation, subject_config_hash, oracle_config_hash) = match profile {
             BuiltInEngineProfile::ScalarShipping | BuiltInEngineProfile::ScalarG1a => (
                 "frankensearch-quill/scalar-index",
@@ -6467,17 +6560,36 @@ mod tests {
     }
 
     #[test]
-    fn built_in_profile_v1_accepts_every_frozen_lane_and_current_creation_policy() {
+    fn built_in_profile_v2_is_current_while_v1_remains_archive_only() {
         for profile in [
             BuiltInEngineProfile::ScalarShipping,
             BuiltInEngineProfile::ScalarG1a,
             BuiltInEngineProfile::Cass,
         ] {
-            let pair = stored_profile_pair(profile, &QuillConfig::default());
-            pair.validate_stored_contract()
-                .expect("frozen receipt must validate without mutable current policy");
-            pair.validate_builtin_contract()
-                .expect("current adapters must remain compatible with receipt v1");
+            let archived = stored_profile_pair(
+                profile,
+                &QuillConfig::default(),
+                BuiltInEngineProfileReceipt::V1_SCHEMA_VERSION,
+            );
+            archived
+                .validate_stored_contract()
+                .expect("frozen v1 receipt remains archive-valid");
+            assert!(
+                archived.validate_builtin_contract().is_err(),
+                "v1 cannot create a run under the Tantivy 0.27 semantic contract"
+            );
+
+            let current = stored_profile_pair(
+                profile,
+                &QuillConfig::default(),
+                BuiltInEngineProfileReceipt::V2_SCHEMA_VERSION,
+            );
+            current
+                .validate_stored_contract()
+                .expect("v2 receipt remains independently replay-valid");
+            current
+                .validate_builtin_contract()
+                .expect("v2 receipt must match the current adapters");
         }
     }
 
@@ -6569,8 +6681,11 @@ mod tests {
 
     #[test]
     fn built_in_profile_v1_rejects_every_bound_identity_mutation() {
-        let baseline =
-            stored_profile_pair(BuiltInEngineProfile::ScalarG1a, &QuillConfig::default());
+        let baseline = stored_profile_pair(
+            BuiltInEngineProfile::ScalarG1a,
+            &QuillConfig::default(),
+            BuiltInEngineProfileReceipt::V1_SCHEMA_VERSION,
+        );
         macro_rules! reject_pair_mutation {
             ($label:literal, $mutation:expr) => {{
                 let mut candidate = baseline.clone();
@@ -6704,8 +6819,10 @@ mod tests {
         );
         pair.validate_stored_contract()
             .expect("literal v1 bytes remain archive-valid");
-        pair.validate_builtin_contract()
-            .expect("current creation policy remains compatible with v1");
+        assert!(
+            pair.validate_builtin_contract().is_err(),
+            "literal v1 bytes cannot authorize a new Tantivy 0.27 execution"
+        );
         let profile = pair.built_in_profile.as_ref().expect("profile receipt");
         assert_eq!(
             serde_json::to_string(profile).expect("profile JSON"),

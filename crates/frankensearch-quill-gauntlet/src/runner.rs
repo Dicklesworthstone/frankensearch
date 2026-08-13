@@ -78,16 +78,16 @@ pub const DEFAULT_ANALYZER_CONTRACT_PREIMAGE: &str =
 pub const DEFAULT_ANALYZER_CONTRACT_HASH: &str =
     "7425c0f2d0a909ca4103bd20f439b6282d3ce00ab3c9f6784ec7333398197041";
 /// Canonical preimage for the default shipping schema, parser, and rank protocol.
-pub const DEFAULT_SCHEMA_CONTRACT_PREIMAGE: &str = "v2;id=text:string+stored;content=text:frankensearch_default+freqs_positions+stored;title=text:frankensearch_default+freqs_positions+stored;metadata_json=text:stored;ord=u64:fast+stored;query_parser=default_fields(content,title);title_boost_bits=1073741824;default_operator=or;max_query_chars=10000;bm25=tantivy-0.26.1-default;pagination=offset_then_limit;counts=exact;snippets=tantivy-html-configured";
+pub const DEFAULT_SCHEMA_CONTRACT_PREIMAGE: &str = "v2;id=text:string+stored;content=text:frankensearch_default+freqs_positions+stored;title=text:frankensearch_default+freqs_positions+stored;metadata_json=text:stored;ord=u64:fast+stored;query_parser=default_fields(content,title);title_boost_bits=1073741824;default_operator=or;max_query_chars=10000;bm25=tantivy-0.27.0-default;pagination=offset_then_limit;counts=exact;snippets=tantivy-html-configured";
 /// Scalar G1a subset: identical lexical semantics with snippet evidence disabled.
-pub const SCALAR_G1A_SCHEMA_CONTRACT_PREIMAGE: &str = "v1;profile=scalar-g1a;id=text:string+stored;content=text:frankensearch_default+freqs_positions+stored;title=text:frankensearch_default+freqs_positions+stored;metadata_json=text:stored;ord=u64:fast+stored;query_parser=default-fields-term-multiterm-exact-phrase-boolean;title_boost_bits=1073741824;default_operator=or;max_query_chars=10000;bm25=tantivy-0.26.1-default;pagination=offset_then_limit;counts=exact;snippets=disabled";
+pub const SCALAR_G1A_SCHEMA_CONTRACT_PREIMAGE: &str = "v1;profile=scalar-g1a;id=text:string+stored;content=text:frankensearch_default+freqs_positions+stored;title=text:frankensearch_default+freqs_positions+stored;metadata_json=text:stored;ord=u64:fast+stored;query_parser=default-fields-term-multiterm-exact-phrase-boolean;title_boost_bits=1073741824;default_operator=or;max_query_chars=10000;bm25=tantivy-0.27.0-default;pagination=offset_then_limit;counts=exact;snippets=disabled";
 /// Canonical preimage for the CASS hyphen/prefix analyzer protocol.
 pub const CASS_ANALYZER_CONTRACT_PREIMAGE: &str = "v2;tokenizer=cass_hyphen_normalize;token_runs=ascii_alphanumeric_with_interior_hyphens_or_pinned_cjk;hyphen_tokens=compound_and_parts_same_position;cjk_tokens=overlapping_bigrams_or_singleton;normalize=ascii_lowercase;max_token_bytes=inclusive-256;prefix_tokenizer=cass_prefix_normalize_without_hyphen_decomposition;prefix_source_split=unicode_alphanumeric;prefix_edge_ngrams=2..20-unicode-scalars;prefix_cjk=overlapping-bigrams";
 /// Canonical CASS field, parser, filtering, ranking, and pagination protocol.
-pub const CASS_SCHEMA_CONTRACT_PREIMAGE: &str = "v4;profile=cass;schema=frankensearch-cass-semantic-v1;fields=agent:keyword+stored,workspace:keyword+stored,workspace_original:stored,source_path:stored,msg_idx:u64+indexed+stored,created_at:i64+indexed+fast+stored,title:text+positions+stored,content:text+positions,title_prefix:text+basic,content_prefix:text+basic,preview:stored,source_id:keyword+stored,origin_kind:keyword+stored,origin_host:keyword+stored,conversation_id:i64+stored;derived_title_prefix=edge_ngrams(full_title);derived_content_prefix=edge_ngrams(utf8_boundary_prefix_bytes<=4096);derived_preview=first_400_unicode_scalars_plus_ellipsis_if_truncated;document_identity=source_id#msg_idx;query_parser=cass-or-binds-tighter-than-and;blank_query=match_all;bare_terms=exact_raw_or_bounded_edge-prefix;phrases=title_or_content_positions;cjk_phrases=compound-bigram-and;negation=all-plus-must-not;wildcards=exact-prefix-on-four-search-fields,suffix-substring-complex-regex-on-title-content;filters=agents-or,workspaces-or,created_at-inclusive,local=origin_kind:local,remote=origin_kind:ssh,source_id;bm25=tantivy-0.26.1-default-no-field-boosts;pagination=offset_then_limit;counts=exact;snippets=disabled";
+pub const CASS_SCHEMA_CONTRACT_PREIMAGE: &str = "v4;profile=cass;schema=frankensearch-cass-semantic-v1;fields=agent:keyword+stored,workspace:keyword+stored,workspace_original:stored,source_path:stored,msg_idx:u64+indexed+stored,created_at:i64+indexed+fast+stored,title:text+positions+stored,content:text+positions,title_prefix:text+basic,content_prefix:text+basic,preview:stored,source_id:keyword+stored,origin_kind:keyword+stored,origin_host:keyword+stored,conversation_id:i64+stored;derived_title_prefix=edge_ngrams(full_title);derived_content_prefix=edge_ngrams(utf8_boundary_prefix_bytes<=4096);derived_preview=first_400_unicode_scalars_plus_ellipsis_if_truncated;document_identity=source_id#msg_idx;query_parser=cass-or-binds-tighter-than-and;blank_query=match_all;bare_terms=exact_raw_or_bounded_edge-prefix;phrases=title_or_content_positions;cjk_phrases=compound-bigram-and;negation=all-plus-must-not;wildcards=exact-prefix-on-four-search-fields,suffix-substring-complex-regex-on-title-content;filters=agents-or,workspaces-or,created_at-inclusive,local=origin_kind:local,remote=origin_kind:ssh,source_id;bm25=tantivy-0.27.0-default-no-field-boosts;pagination=offset_then_limit;counts=exact;snippets=disabled";
 /// Default schema/query/ranking protocol implemented by the shipping Tantivy adapter.
 pub const DEFAULT_SCHEMA_CONTRACT_HASH: &str =
-    "9fed22a53e5060243e9528fbbf40605a0df8ea120b3d74ac41ecbb097c2df571";
+    "afe3ad4998181c98ee26de5c47905e3c9e0623e2e144643a02e19ce697b42c0a";
 const MISMATCH_SIGNATURE_DOMAIN: &[u8] = b"frankensearch/quill/mismatch-signature/v1\0";
 const LEXICAL_MISMATCH_SIGNATURE_DOMAIN: &[u8] =
     b"frankensearch/quill/lexical-mismatch-signature/v1\0";
@@ -10359,6 +10359,22 @@ mod tests {
         );
         assert_ne!(contract, SemanticContract::scalar_g1a());
         assert_ne!(contract, SemanticContract::shipping_default());
+    }
+
+    #[test]
+    fn current_semantic_contract_hashes_bind_tantivy_0_27() {
+        assert_eq!(
+            SemanticContract::shipping_default().schema_contract_hash,
+            DEFAULT_SCHEMA_CONTRACT_HASH
+        );
+        assert_eq!(
+            SemanticContract::scalar_g1a().schema_contract_hash,
+            "ed82305678b4145b83bd48dc605bf3e9c65736ba3c74983f2268f0f8dbf11e59"
+        );
+        assert_eq!(
+            SemanticContract::cass().schema_contract_hash,
+            "11057d81013ddadc6499674acb23a8b6842d589f4344fa88b3e70fa744fc4ee9"
+        );
     }
 
     #[test]
