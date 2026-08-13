@@ -2101,6 +2101,20 @@ impl ParallelIngestCheckpoint {
         #[cfg(feature = "conformance-internals")]
         self.controller
             .checkpoint(ConformanceCancellationStage::ParallelIngest, cx);
+        // A conformance-only worker FAILURE, which is not a cancellation and
+        // must not be reported as one. It returns the same typed class a
+        // caught worker panic produces (`catch_parallel_ingest_worker`), so
+        // the driver takes the identical non-cancel path to an `aborted`
+        // terminal without any panic being injected.
+        #[cfg(feature = "conformance-internals")]
+        if self
+            .controller
+            .checkpoint_worker_failure(ConformanceCancellationStage::ParallelIngestWorkerFailure)
+        {
+            return Err(invalid_state(
+                "parallel ingest worker failed before transactional commit",
+            ));
+        }
         check_cancel(cx, "parallel index worker")
     }
 }
@@ -3414,6 +3428,16 @@ pub enum ConformanceCancellationStage {
     PruningTraceSegmentRecorded = 6,
     /// Ranked hits are complete and the snippet tail is about to begin.
     SnippetTailAdmission = 7,
+    /// One document boundary inside a shared-nothing ingest worker, failed
+    /// rather than cancelled.
+    ///
+    /// Distinct from [`Self::ParallelIngest`] because the two prove different
+    /// terminals. That stage requests cancellation on the real `Cx` and the
+    /// operation ends `cancelled`; this one leaves `Cx` untouched and returns
+    /// a typed worker failure, so the operation ends `aborted`. Arming one
+    /// never advances the other's ordinal: the stage guard rejects a
+    /// non-matching stage before the counter moves.
+    ParallelIngestWorkerFailure = 8,
 }
 
 /// Fixed-size conformance receipt for the complete retained scalar writer
@@ -3540,6 +3564,7 @@ impl ConformanceCancellationStage {
             Self::ParallelBudgetAdmission => 5,
             Self::PruningTraceSegmentRecorded => 6,
             Self::SnippetTailAdmission => 7,
+            Self::ParallelIngestWorkerFailure => 8,
         }
     }
 }
@@ -3794,6 +3819,38 @@ impl ConformanceCancellationController {
 
     fn checkpoint(&self, stage: ConformanceCancellationStage, cx: &Cx) {
         let _ = self.checkpoint_with_pruning_receipts(stage, cx, None, None);
+    }
+
+    /// Fire the armed ordinal for a stage that must FAIL its caller rather
+    /// than cancel the operation.
+    ///
+    /// Takes no `Cx` on purpose. Requesting cancellation here would make the
+    /// driver classify the terminal from a `Cancelled` error and hide the
+    /// non-cancel path this stage exists to prove. Arm and ordinal accounting
+    /// is otherwise identical to
+    /// [`Self::checkpoint_with_pruning_receipts`], including the stage guard
+    /// that returns before the ordinal counter moves, so an unrelated armed
+    /// stage is never advanced by this call.
+    fn checkpoint_worker_failure(&self, stage: ConformanceCancellationStage) -> bool {
+        if self.stage.load(Ordering::Acquire) != stage.code() {
+            return false;
+        }
+        let ordinal = self
+            .observed_checkpoints
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        if ordinal != self.trigger_ordinal.load(Ordering::Acquire) {
+            return false;
+        }
+        self.fired.store(true, Ordering::Release);
+        tracing::info!(
+            target: crate::tracing_conventions::TARGET,
+            event = "quill.conformance.worker_failure_checkpoint",
+            ?stage,
+            ordinal,
+            "deterministic conformance checkpoint failed a parallel ingest worker"
+        );
+        true
     }
 
     #[cfg(feature = "pruning-conformance")]
@@ -27013,6 +27070,113 @@ mod tests {
         assert!(
             completed < started,
             "a cancelled shard must not be counted complete: {completed} of {started}, \
+             captured:\n{captured}",
+        );
+        assert!(
+            (1..=started).contains(&peak),
+            "peak {peak} must be a real in-flight count no greater than {started}, \
+             captured:\n{captured}",
+        );
+        assert_eq!(
+            ingest_span_field(&captured, "parallel_identity_degraded"),
+            "false",
+            "captured:\n{captured}",
+        );
+        assert_eq!(
+            ingest_span_field(&captured, "parallel_unidentified_shards"),
+            "0",
+            "captured:\n{captured}",
+        );
+    }
+
+    /// The non-cancel counterpart of the drain test above, and the only case
+    /// in this file where a shard that really started fails without being
+    /// cancelled. `parallel_worker_panic_is_a_typed_precommit_failure` proves
+    /// the same typed class but calls the catch helper directly, so it never
+    /// reaches the recorder, the span, or the driver's terminal
+    /// classification.
+    ///
+    /// The armed stage leaves `Cx` untouched, which is what separates this
+    /// from cancellation: an operation that ends on a typed non-cancel error
+    /// must classify `aborted`, not `cancelled`.
+    #[cfg(feature = "conformance-internals")]
+    #[test]
+    fn shipping_driver_worker_failure_mid_ingest_records_an_aborted_drain() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-thread mid-ingest worker-failure pool");
+        let captured = pool.install(|| {
+            capture_ingest_spans(|| {
+                run_with_cx(|cx| async move {
+                    let config = QuillConfig {
+                        max_ingest_shards: 4,
+                        max_visibility_lag_ms: 60_000,
+                        scribe_shard_budget_bytes: 512 * 1024 * 1024,
+                        ..QuillConfig::default()
+                    };
+                    let index =
+                        QuillIndex::in_memory(config).expect("mid-ingest worker-failure index");
+                    let documents = (0..250)
+                        .map(|ordinal| {
+                            IndexableDocument::new(
+                                format!("fail-mid-doc-{ordinal:05}"),
+                                "alpha beta gamma delta",
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let controller = index.conformance_cancellation_controller();
+                    controller
+                        .arm(
+                            ConformanceCancellationStage::ParallelIngestWorkerFailure,
+                            3,
+                        )
+                        .expect("arm mid-worker typed failure");
+                    let error = index
+                        .index_documents(&cx, &documents)
+                        .await
+                        .expect_err("an armed worker-failure checkpoint must fail the batch");
+                    assert!(
+                        matches!(
+                            &error,
+                            QuillIndexError::InvalidState { detail }
+                                if detail == "parallel ingest worker failed before transactional commit"
+                        ),
+                        "expected the typed worker failure, got: {error:?}",
+                    );
+                    assert!(controller.fired());
+                    // The whole point of the seam: a failure is not a
+                    // cancellation, so nothing may have requested one.
+                    assert!(
+                        !cx.is_cancel_requested(),
+                        "a worker failure must not request cancellation on the real Cx",
+                    );
+                    controller.disarm();
+                });
+            })
+        });
+
+        assert_ingest_span_reports(&captured, "aborted", false);
+        assert!(
+            !captured.contains("parallel_route="),
+            "a failed batch publishes no route receipt, captured:\n{captured}",
+        );
+        let started = ingest_span_field(&captured, "parallel_started_shards")
+            .parse::<u64>()
+            .expect("started shards is a count");
+        let completed = ingest_span_field(&captured, "parallel_completed_shards")
+            .parse::<u64>()
+            .expect("completed shards is a count");
+        let peak = ingest_span_field(&captured, "parallel_peak_shards_in_flight")
+            .parse::<u64>()
+            .expect("peak shards in flight is a count");
+        assert!(
+            started >= 1,
+            "the failure must land after a shard started, captured:\n{captured}",
+        );
+        assert!(
+            completed < started,
+            "a failed shard must not be counted complete: {completed} of {started}, \
              captured:\n{captured}",
         );
         assert!(
