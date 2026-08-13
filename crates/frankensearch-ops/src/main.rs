@@ -25,6 +25,13 @@ impl TerminalGuard {
     fn enter() -> Result<Self, Box<dyn Error>> {
         let options = TtySessionOptions {
             alternate_screen: true,
+            // Terminal restoration on SIGINT/SIGTERM/SIGHUP stays owned by the
+            // tty session, as it has been since this session was written: the
+            // hook used to be installed unconditionally by `TtyBackend::open`
+            // and is now opt-in under this flag. `TerminalGuard` has no `Drop`
+            // of its own, so declining it would leave a signalled process in
+            // raw mode on the alternate screen.
+            intercept_signals: true,
             features: BackendFeatures {
                 mouse_capture: true,
                 ..BackendFeatures::default()
@@ -40,6 +47,12 @@ const fn map_event(event: &Event) -> Option<InputEvent> {
         Event::Key(key) => Some(InputEvent::Key(key.code, key.modifiers)),
         Event::Mouse(mouse) => Some(InputEvent::Mouse(mouse.kind, mouse.x, mouse.y)),
         Event::Resize { width, height } => Some(InputEvent::Resize(*width, *height)),
+        // Composed text has no sink here: `InputEvent` carries keys, mouse,
+        // resize, and resolved actions, but no text payload. Preedit and commit
+        // phases are therefore dropped for the same reason `Paste` already is,
+        // rather than being mapped onto a key that was never pressed. Listed
+        // explicitly so a future `Event` variant still fails this match.
+        Event::Ime(_) => None,
         Event::Focus(_) | Event::Paste(_) | Event::Clipboard(_) | Event::Tick => None,
     }
 }
