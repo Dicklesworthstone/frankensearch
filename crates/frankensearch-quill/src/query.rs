@@ -3320,18 +3320,16 @@ fn merge_field_queries(queries: Vec<Query>) -> Option<Query> {
                 |query| matches!(query, Query::Term { text: candidate, .. } if candidate == &text),
             ) =>
         {
-            let mut fields = Vec::new();
-            for query in queries {
-                let Query::Term {
-                    fields: query_fields,
-                    ..
-                } = query
-                else {
-                    return None;
-                };
-                fields.extend(query_fields);
+            if queries.len() == 1 {
+                return queries.into_iter().next();
             }
-            Some(Query::Term { fields, text })
+            Some(Query::Boolean {
+                clauses: queries
+                    .into_iter()
+                    .map(|query| BooleanClause::new(Occur::Should, query))
+                    .collect(),
+                operator: None,
+            })
         }
         Query::Phrase {
             terms,
@@ -4404,6 +4402,47 @@ mod tests {
 
     fn parser() -> DefaultQueryParser {
         DefaultQueryParser::new(DEFAULT_SCHEMA).expect("default schema supports its parser")
+    }
+
+    fn is_single_field_term(query: &Query, text: &str, field: QueryField) -> bool {
+        matches!(
+            query,
+            Query::Term { fields, text: candidate }
+                if candidate == text && fields.as_slice() == [field]
+        )
+    }
+
+    fn is_default_term(query: &Query, text: &str) -> bool {
+        let Query::Boolean {
+            clauses,
+            operator: None,
+        } = query
+        else {
+            return false;
+        };
+        clauses.len() == 2
+            && clauses.iter().all(|clause| clause.occur == Occur::Should)
+            && is_single_field_term(&clauses[0].query, text, QueryField::new(1, 1.0))
+            && is_single_field_term(&clauses[1].query, text, QueryField::new(2, TITLE_BOOST))
+    }
+
+    fn term_leaf_count(query: &Query, text: &str) -> usize {
+        match query {
+            Query::Term {
+                text: candidate, ..
+            } => usize::from(candidate == text),
+            Query::Boolean { clauses, .. } => clauses
+                .iter()
+                .map(|clause| term_leaf_count(&clause.query, text))
+                .sum(),
+            Query::Boost { query, .. } => term_leaf_count(query, text),
+            Query::Empty
+            | Query::All
+            | Query::Phrase { .. }
+            | Query::Range { .. }
+            | Query::Set { .. }
+            | Query::Glob { .. } => 0,
+        }
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -5902,17 +5941,13 @@ mod tests {
         for (raw, normalized) in [("AND", "and"), ("OR", "or"), ("NOT", "not")] {
             let query = parser().parse(raw).query;
             assert!(
-                matches!(&query, Query::Term { .. }),
+                is_default_term(&query, normalized),
                 "standalone {raw} must be retained as a literal"
             );
-            let Query::Term { text, .. } = query else {
-                continue;
-            };
-            assert_eq!(text, normalized);
         }
         for raw in ["AND rust", "OR rust"] {
             let parsed = parser().parse(raw);
-            assert!(matches!(parsed.query, Query::Term { ref text, .. } if text == "rust"));
+            assert!(is_default_term(&parsed.query, "rust"));
             assert!(
                 parsed
                     .diagnostics
@@ -5995,17 +6030,27 @@ mod tests {
         };
         assert_eq!(
             clauses.len(),
-            3,
-            "flattened execution shape: alpha, the AND group, and the \
-             SURVIVING trailing duplicate: {clauses:?}"
+            5,
+            "flattened execution shape: two alpha field leaves, the AND group, and the \
+             two SURVIVING trailing alpha field leaves: {clauses:?}"
         );
         assert!(
-            matches!(&clauses[0].query, Query::Term { text, .. } if text == "alpha"),
-            "leading operand first: {clauses:?}"
+            is_single_field_term(&clauses[0].query, "alpha", QueryField::new(1, 1.0),)
+                && is_single_field_term(
+                    &clauses[1].query,
+                    "alpha",
+                    QueryField::new(2, TITLE_BOOST),
+                ),
+            "leading operand fields first: {clauses:?}"
         );
         assert!(
-            matches!(&clauses[2].query, Query::Term { text, .. } if text == "alpha"),
-            "the trailing duplicate survives after flattening: {clauses:?}"
+            is_single_field_term(&clauses[3].query, "alpha", QueryField::new(1, 1.0),)
+                && is_single_field_term(
+                    &clauses[4].query,
+                    "alpha",
+                    QueryField::new(2, TITLE_BOOST),
+                ),
+            "the trailing duplicate fields survive after flattening: {clauses:?}"
         );
 
         let pure = parser().parse("alpha alpha");
@@ -6021,8 +6066,9 @@ mod tests {
         };
         assert_eq!(
             pure_clauses.len(),
-            1,
-            "a pure implicit chain still retains only the first duplicate: {pure_clauses:?}"
+            2,
+            "a pure implicit chain retains one syntax term expanded over its two fields: \
+             {pure_clauses:?}"
         );
     }
 
@@ -6048,6 +6094,43 @@ mod tests {
     }
 
     #[test]
+    fn default_terms_expand_to_ordered_single_field_should_leaves() {
+        assert_eq!(
+            parser().parse("content:release").query,
+            Query::Term {
+                fields: vec![QueryField::new(1, 1.0)],
+                text: "release".to_owned(),
+            },
+            "an explicitly single-field term must remain one leaf"
+        );
+
+        let parsed = parser().parse("(release OR require) OR return");
+        let Query::Boolean { clauses, operator } = parsed.query else {
+            panic!("unfielded three-term OR must lower to an ordered boolean");
+        };
+        assert_eq!(operator, Some(BooleanOperator::Or));
+        let expected = [
+            ("release", QueryField::new(1, 1.0)),
+            ("release", QueryField::new(2, TITLE_BOOST)),
+            ("require", QueryField::new(1, 1.0)),
+            ("require", QueryField::new(2, TITLE_BOOST)),
+            ("return", QueryField::new(1, 1.0)),
+            ("return", QueryField::new(2, TITLE_BOOST)),
+        ];
+        assert_eq!(clauses.len(), expected.len());
+        for (clause, (text, field)) in clauses.iter().zip(expected) {
+            assert_eq!(clause.occur, Occur::Should);
+            assert_eq!(
+                clause.query,
+                Query::Term {
+                    fields: vec![field],
+                    text: text.to_owned(),
+                }
+            );
+        }
+    }
+
+    #[test]
     fn boosts_groups_and_scopes_canonicalize_before_dedup() {
         // The pinned Tantivy grammar removes identical syntactic children
         // before field expansion. Parentheses disappear at leaf parsing,
@@ -6060,20 +6143,23 @@ mod tests {
             "rust^2 rust^2.0",
             "rust OR rust",
         ] {
-            let Query::Boolean { clauses, .. } = parser().parse(raw).query else {
-                panic!("{raw:?} must retain the rewritten root clause");
-            };
-            assert_eq!(clauses.len(), 1, "{raw:?} must score one clause");
+            let query = parser().parse(raw).query;
+            assert_eq!(
+                term_leaf_count(&query, "rust"),
+                2,
+                "{raw:?} must retain one syntax term expanded over two fields: {query:?}"
+            );
         }
 
         // Syntax identity precedes analysis: case and quote delimiter remain
         // distinct even when the analyzer produces the same lowercase term.
         for raw in ["Rust rust", "\"rust\" rust", "'rust' \"rust\""] {
-            let Query::Boolean { clauses, .. } = &parser().parse(raw).query else {
-                panic!("{raw:?} must retain both scoring clauses");
-            };
-            assert_eq!(clauses.len(), 2, "{raw:?}");
-            assert_eq!(clauses[0].query, clauses[1].query, "{raw:?}");
+            let query = parser().parse(raw).query;
+            assert_eq!(
+                term_leaf_count(&query, "rust"),
+                4,
+                "{raw:?} must retain both syntax terms and both field expansions: {query:?}"
+            );
         }
         // Occurrence is part of the syntax key, and duplicate exclusions merge
         // exactly as duplicate positive clauses do.
@@ -6099,7 +6185,7 @@ mod tests {
             }));
         }
         let leading_decimal = parser().parse("rust^.5");
-        assert!(matches!(leading_decimal.query, Query::Term { .. }));
+        assert!(is_default_term(&leading_decimal.query, "rust"));
         assert!(
             leading_decimal
                 .diagnostics
@@ -6119,10 +6205,7 @@ mod tests {
         let invalid = parser().parse("rust rust^scientific1e2");
         // The invalid boost is rejected and erased from the syntax tree, so
         // the surviving atom deduplicates with its bare sibling.
-        assert!(matches!(
-            invalid.query,
-            Query::Boolean { ref clauses, .. } if clauses.len() == 1
-        ));
+        assert_eq!(term_leaf_count(&invalid.query, "rust"), 2);
         assert!(
             invalid
                 .diagnostics
@@ -6173,33 +6256,39 @@ mod tests {
 
     #[test]
     fn parser_syntax_rewrite_flattens_singletons_and_transfers_occurrence() {
-        assert!(matches!(parser().parse("+a").query, Query::Term { .. }));
-        assert!(matches!(parser().parse("(+a)").query, Query::Term { .. }));
+        assert!(is_default_term(&parser().parse("+a").query, "a"));
+        assert!(is_default_term(&parser().parse("(+a)").query, "a"));
         let Query::Boolean { clauses, .. } = parser().parse("(+a) a").query else {
             panic!("the rewritten duplicate keeps its root Boolean");
         };
-        assert_eq!(clauses.len(), 1, "singleton unary Must is erased first");
+        assert_eq!(
+            clauses.len(),
+            2,
+            "singleton unary Must is erased before the surviving term expands by field"
+        );
 
         let Query::Boolean { clauses, .. } = parser().parse("(+unknown:x^2) a").query else {
             panic!("the optional boosted-empty branch and term remain Boolean");
         };
-        assert_eq!(clauses.len(), 2);
+        assert_eq!(clauses.len(), 3);
         assert!(clauses.iter().all(|clause| clause.occur == Occur::Should));
         assert!(matches!(clauses[0].query, Query::Boost { .. }));
 
         let Query::Boolean { clauses, .. } = parser().parse("(-a) b").query else {
             panic!("negative group plus optional term must remain Boolean");
         };
-        assert_eq!(clauses.len(), 2);
+        assert_eq!(clauses.len(), 3);
         assert_eq!(clauses[0].occur, Occur::MustNot);
         assert_eq!(clauses[1].occur, Occur::Should);
+        assert_eq!(clauses[2].occur, Occur::Should);
 
         let Query::Boolean { clauses, .. } = parser().parse("(a AND a) b").query else {
             panic!("required group plus optional term must remain Boolean");
         };
-        assert_eq!(clauses.len(), 2);
+        assert_eq!(clauses.len(), 3);
         assert_eq!(clauses[0].occur, Occur::Must);
         assert_eq!(clauses[1].occur, Occur::Should);
+        assert_eq!(clauses[2].occur, Occur::Should);
 
         let Query::Boolean { clauses, .. } = parser().parse("((a AND a) b) (+a b)").query else {
             panic!("the rewritten root must remain Boolean");
@@ -6208,9 +6297,10 @@ mod tests {
         let Query::Boolean { clauses: inner, .. } = &clauses[0].query else {
             panic!("the two-clause child must retain its grouping");
         };
-        assert_eq!(inner.len(), 2);
+        assert_eq!(inner.len(), 3);
         assert_eq!(inner[0].occur, Occur::Must);
         assert_eq!(inner[1].occur, Occur::Should);
+        assert_eq!(inner[2].occur, Occur::Should);
 
         let Query::Boolean { clauses, .. } = parser().parse("(a AND a) +a").query else {
             panic!("dedup-before-flatten must leave the root Boolean");
@@ -6225,7 +6315,7 @@ mod tests {
         let Query::Boolean { clauses, .. } = parser().parse("(a /x/) (a /y/)").query else {
             panic!("raw-distinct groups must both survive");
         };
-        assert_eq!(clauses.len(), 2);
+        assert_eq!(clauses.len(), 4);
         // Raw-identity dedup ran on the NESTED syntax (distinct /x/ vs /y/
         // prevent it), then the post-trim singleton groups splice into the
         // parent for oracle-associated execution (bd-htcun flatten).
@@ -6238,13 +6328,17 @@ mod tests {
         let Query::Boolean { clauses, .. } = parser().parse("(a /x/) (a /x/)").query else {
             panic!("the rewritten duplicate keeps its root Boolean");
         };
-        assert_eq!(clauses.len(), 1, "raw-identical groups deduplicate");
+        assert_eq!(
+            clauses.len(),
+            2,
+            "raw-identical groups deduplicate before the two-field expansion"
+        );
 
         let Query::Boolean { clauses, .. } = parser().parse("(a unknown:x) (a unknown:y)").query
         else {
             panic!("distinct unknown-field syntax must prevent parent dedup");
         };
-        assert_eq!(clauses.len(), 2);
+        assert_eq!(clauses.len(), 4);
 
         let Query::Boost { query, .. } = parser().parse("(a AND unknown:x)^2").query else {
             panic!("a valid boost remains a lowering boundary");
@@ -6260,8 +6354,8 @@ mod tests {
         };
         assert_eq!(
             clauses.len(),
-            1,
-            "an f64-only boost boundary erases after its f32 identity cast"
+            2,
+            "an f64-only boost boundary erases before ordered field expansion"
         );
     }
 
@@ -6278,14 +6372,22 @@ mod tests {
             let Query::Boolean { clauses, .. } = parsed.query else {
                 panic!("the recovered duplicate keeps the rewritten root clause");
             };
-            assert_eq!(clauses.len(), 1, "the invalid boost is absent from its key");
+            assert_eq!(
+                clauses.len(),
+                2,
+                "the invalid boost is absent before the surviving term expands by field"
+            );
 
             let Query::Boolean { clauses, .. } =
                 parser().parse(&format!("(rust rust)^{overflowing}")).query
             else {
                 panic!("the recovered group keeps its rewritten root Boolean");
             };
-            assert_eq!(clauses.len(), 1, "invalid boost cannot block child rewrite");
+            assert_eq!(
+                clauses.len(),
+                2,
+                "invalid boost cannot block child rewrite or ordered field expansion"
+            );
         }
     }
 
@@ -6489,7 +6591,7 @@ mod tests {
     fn recovery_retains_valid_siblings_and_repairs_recursive_negatives() {
         for raw in ["(OR rust)", "(AND rust)"] {
             let parsed = parser().parse(raw);
-            assert!(matches!(parsed.query, Query::Term { ref text, .. } if text == "rust"));
+            assert!(is_default_term(&parsed.query, "rust"));
             assert!(parsed.diagnostics.iter().any(|diagnostic| {
                 diagnostic.kind == QueryDiagnosticKind::SyntaxRecovery
                     && diagnostic.byte_offset == Some(1)
@@ -6497,12 +6599,7 @@ mod tests {
         }
 
         let unmatched = parser().parse("rust ) ownership");
-        assert!(matches!(
-            unmatched.query,
-            Query::Boolean { ref clauses, .. }
-                if clauses.len() == 1
-                    && matches!(&clauses[0].query, Query::Term { text, .. } if text == "rust")
-        ));
+        assert!(is_default_term(&unmatched.query, "rust"));
         assert!(unmatched.diagnostics.iter().any(|diagnostic| {
             diagnostic.kind == QueryDiagnosticKind::SyntaxRecovery
                 && diagnostic.byte_offset == Some(5)
@@ -6571,9 +6668,18 @@ mod tests {
         assert!(matches!(
             malformed_slop.query,
             Query::Boolean { ref clauses, .. }
-                if clauses.len() == 2
+                if clauses.len() == 3
                     && matches!(&clauses[0].query, Query::Phrase { slop: 0, .. })
-                    && matches!(&clauses[1].query, Query::Term { text, .. } if text == "deprecated")
+                    && is_single_field_term(
+                        &clauses[1].query,
+                        "deprecated",
+                        QueryField::new(1, 1.0),
+                    )
+                    && is_single_field_term(
+                        &clauses[2].query,
+                        "deprecated",
+                        QueryField::new(2, TITLE_BOOST),
+                    )
         ));
         assert!(malformed_slop.diagnostics.iter().any(|diagnostic| {
             diagnostic.kind == QueryDiagnosticKind::SyntaxRecovery
@@ -6586,9 +6692,18 @@ mod tests {
         assert!(matches!(
             overflowing_slop.query,
             Query::Boolean { ref clauses, .. }
-                if clauses.len() == 2
+                if clauses.len() == 3
                     && matches!(&clauses[0].query, Query::Phrase { slop: 0, .. })
-                    && matches!(&clauses[1].query, Query::Term { text, .. } if text == "4294967296")
+                    && is_single_field_term(
+                        &clauses[1].query,
+                        "4294967296",
+                        QueryField::new(1, 1.0),
+                    )
+                    && is_single_field_term(
+                        &clauses[2].query,
+                        "4294967296",
+                        QueryField::new(2, TITLE_BOOST),
+                    )
         ));
     }
 
@@ -6625,8 +6740,17 @@ mod tests {
         assert!(matches!(
             parser().parse("-/rust/ rust").query,
             Query::Boolean { ref clauses, .. }
-                if clauses.len() == 1
-                    && matches!(&clauses[0].query, Query::Term { text, .. } if text == "rust")
+                if clauses.len() == 2
+                    && is_single_field_term(
+                        &clauses[0].query,
+                        "rust",
+                        QueryField::new(1, 1.0),
+                    )
+                    && is_single_field_term(
+                        &clauses[1].query,
+                        "rust",
+                        QueryField::new(2, TITLE_BOOST),
+                    )
         ));
     }
 
@@ -6634,17 +6758,13 @@ mod tests {
     fn parser_dedup_is_raw_and_preserves_distinct_normalized_fragments() {
         let distinct = parser().parse("Rust rust").query;
         assert!(matches!(&distinct, Query::Boolean { .. }));
-        let Query::Boolean { clauses, .. } = distinct else {
-            return;
-        };
-        assert_eq!(clauses.len(), 2);
-        assert_eq!(clauses[0].query, clauses[1].query);
+        assert_eq!(term_leaf_count(&distinct, "rust"), 4);
 
         // Idempotent MustNot clauses DO merge, even nested.
         let recursive = parser().parse("a OR -b OR (-b)").query;
         assert!(matches!(
             recursive,
-            Query::Boolean { ref clauses, .. } if clauses.len() == 2
+            Query::Boolean { ref clauses, .. } if clauses.len() == 3
         ));
     }
 
@@ -6655,10 +6775,10 @@ mod tests {
         let Query::Boolean { clauses, .. } = query else {
             return;
         };
-        assert!(matches!(&clauses[1].query, Query::Boolean { .. }));
+        assert!(matches!(&clauses[2].query, Query::Boolean { .. }));
         let Query::Boolean {
             clauses: negative, ..
-        } = &clauses[1].query
+        } = &clauses[2].query
         else {
             return;
         };

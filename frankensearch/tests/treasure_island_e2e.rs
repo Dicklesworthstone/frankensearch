@@ -468,6 +468,30 @@ mod lexical {
         serde_json::from_str(LEXICAL_QUERIES).expect("lexical_queries.json parses")
     }
 
+    #[cfg(feature = "lexical-tantivy")]
+    fn shared_core100_documents() -> Vec<IndexableDocument> {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/corpus.json"))
+                .expect("shared corpus fixture parses");
+        let documents = fixture["documents"]
+            .as_array()
+            .expect("shared corpus documents");
+        assert!(
+            documents.len() >= 100,
+            "shared corpus must retain its Core100 prefix"
+        );
+        documents[..100]
+            .iter()
+            .map(|document| {
+                IndexableDocument::new(
+                    document["doc_id"].as_str().expect("shared document id"),
+                    document["content"].as_str().expect("shared content"),
+                )
+                .with_title(document["title"].as_str().expect("shared title").to_owned())
+            })
+            .collect()
+    }
+
     async fn build_quill_index(
         cx: &frankensearch::Cx,
         dir: &std::path::Path,
@@ -730,6 +754,33 @@ mod lexical {
                 .map(|(id, _)| id)
                 .collect::<Vec<_>>();
             assert_eq!(quill_ids, tantivy_ids);
+        });
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    #[test]
+    fn public_unfielded_three_term_or_matches_tantivy_score_bits_and_order() {
+        super::quiet_logging();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            const QUERY: &str = "(release OR require) OR return";
+            const LIMIT: usize = 5;
+
+            let documents = shared_core100_documents();
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let quill = build_quill_index(&cx, &tmp.path().join("quill"), &documents).await;
+            let tantivy = build_tantivy_index(&cx, &tmp.path().join("tantivy"), &documents).await;
+
+            let tantivy_hits = public_observation(&tantivy, &cx, QUERY, LIMIT).await;
+            assert_eq!(
+                tantivy_hits.first(),
+                Some(&("test-rust-003".to_owned(), 0x4113_fe32)),
+                "the pinned mismatch witness must remain live"
+            );
+            let quill_hits = public_observation(&quill, &cx, QUERY, LIMIT).await;
+            assert_eq!(
+                quill_hits, tantivy_hits,
+                "public Quill must match pinned Tantivy in document order and exact f32 score bits"
+            );
         });
     }
 

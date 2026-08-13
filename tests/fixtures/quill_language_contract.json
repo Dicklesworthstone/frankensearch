@@ -235,9 +235,12 @@
       "expected_ast": {
         "type": "Boolean",
         "children": [
-          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "ownership", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "borrowing", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } }
+          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "title", "boost": 2.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "ownership", "fields": [{ "name": "content", "boost": 1.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "ownership", "fields": [{ "name": "title", "boost": 2.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "borrowing", "fields": [{ "name": "content", "boost": 1.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "borrowing", "fields": [{ "name": "title", "boost": 2.0 }] } }
         ]
       }
     },
@@ -249,13 +252,20 @@
       "expected_ast": {
         "type": "Boolean",
         "children": [
-          { "occur": "Should", "query": { "type": "Term", "text": "how", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "do", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "transformers", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "work", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "for", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "text", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } },
-          { "occur": "Should", "query": { "type": "Term", "text": "embeddings", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } }
+          { "occur": "Should", "query": { "type": "Term", "text": "how", "fields": [{ "name": "content", "boost": 1.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "how", "fields": [{ "name": "title", "boost": 2.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "do", "fields": [{ "name": "content", "boost": 1.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "do", "fields": [{ "name": "title", "boost": 2.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "transformers", "fields": [{ "name": "content", "boost": 1.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "transformers", "fields": [{ "name": "title", "boost": 2.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "work", "fields": [{ "name": "content", "boost": 1.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "work", "fields": [{ "name": "title", "boost": 2.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "for", "fields": [{ "name": "content", "boost": 1.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "for", "fields": [{ "name": "title", "boost": 2.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "text", "fields": [{ "name": "content", "boost": 1.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "text", "fields": [{ "name": "title", "boost": 2.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "embeddings", "fields": [{ "name": "content", "boost": 1.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "embeddings", "fields": [{ "name": "title", "boost": 2.0 }] } }
         ]
       }
     },
@@ -277,9 +287,11 @@
       "parser": "default_lenient",
       "input": "\"rust\"",
       "expected_ast": {
-        "type": "Term",
-        "text": "rust",
-        "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }]
+        "type": "Boolean",
+        "children": [
+          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "title", "boost": 2.0 }] } }
+        ]
       }
     },
     {
@@ -291,10 +303,17 @@
         "type": "Boolean",
         "operator": "OR",
         "children": [
-          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "title", "boost": 2.0 }] } },
           { "occur": "Should", "query": { "type": "Boolean", "operator": "AND", "children": [
-            { "occur": "Must", "query": { "type": "Term", "text": "ownership", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } },
-            { "occur": "Must", "query": { "type": "Term", "text": "borrowing", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } }
+            { "occur": "Must", "query": { "type": "Boolean", "children": [
+              { "occur": "Should", "query": { "type": "Term", "text": "ownership", "fields": [{ "name": "content", "boost": 1.0 }] } },
+              { "occur": "Should", "query": { "type": "Term", "text": "ownership", "fields": [{ "name": "title", "boost": 2.0 }] } }
+            ] } },
+            { "occur": "Must", "query": { "type": "Boolean", "children": [
+              { "occur": "Should", "query": { "type": "Term", "text": "borrowing", "fields": [{ "name": "content", "boost": 1.0 }] } },
+              { "occur": "Should", "query": { "type": "Term", "text": "borrowing", "fields": [{ "name": "title", "boost": 2.0 }] } }
+            ] } }
           ] } }
         ]
       }
@@ -322,7 +341,10 @@
       "expected_ast": {
         "type": "Boolean",
         "children": [
-          { "occur": "MustNot", "query": { "type": "Term", "text": "deprecated", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }], "score": 0.0 } },
+          { "occur": "MustNot", "query": { "type": "Boolean", "children": [
+            { "occur": "Should", "query": { "type": "Term", "text": "deprecated", "fields": [{ "name": "content", "boost": 1.0 }] } },
+            { "occur": "Should", "query": { "type": "Term", "text": "deprecated", "fields": [{ "name": "title", "boost": 2.0 }] } }
+          ] } },
           { "occur": "Should", "query": { "type": "All" } }
         ]
       },
@@ -337,7 +359,8 @@
       "expected_ast": {
         "type": "Boolean",
         "children": [
-          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } }
+          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "title", "boost": 2.0 }] } }
         ]
       }
     },
@@ -347,9 +370,11 @@
       "parser": "default_lenient",
       "input": "\"rust",
       "expected_ast": {
-        "type": "Term",
-        "text": "rust",
-        "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }]
+        "type": "Boolean",
+        "children": [
+          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "title", "boost": 2.0 }] } }
+        ]
       },
       "expected_diagnostic": "syntax recovery"
     },
@@ -361,7 +386,8 @@
       "expected_ast": {
         "type": "Boolean",
         "children": [
-          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } }
+          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "title", "boost": 2.0 }] } }
         ]
       },
       "expected_diagnostic": "unsupported field fragment dropped"
@@ -401,8 +427,14 @@
           "type": "Boolean",
           "operator": "OR",
           "children": [
-            { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } },
-            { "occur": "Should", "query": { "type": "Term", "text": "ownership", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } }
+            { "occur": "Should", "query": { "type": "Boolean", "children": [
+              { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }] } },
+              { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "title", "boost": 2.0 }] } }
+            ] } },
+            { "occur": "Should", "query": { "type": "Boolean", "children": [
+              { "occur": "Should", "query": { "type": "Term", "text": "ownership", "fields": [{ "name": "content", "boost": 1.0 }] } },
+              { "occur": "Should", "query": { "type": "Term", "text": "ownership", "fields": [{ "name": "title", "boost": 2.0 }] } }
+            ] } }
           ]
         }
       }
