@@ -10500,11 +10500,18 @@ mod tests {
             .validate_decision(&cell, &semantic_contract, &decision)
             .expect("same-invocation T/Quill, T/T, and Q/Q streams bind selected candidate");
 
+        let mut wrong_receipt = decision.clone();
+        wrong_receipt.tantivy_vs_quill.stream_receipt_sha256 = "0".repeat(64);
+        assert_eq!(
+            screen.validate_decision(&cell, &semantic_contract, &wrong_receipt),
+            Err(Qg1TantivyIncumbentError::StreamReceiptMismatch)
+        );
+
         let mut relabeled = decision.clone();
         relabeled.tantivy_vs_quill.control_engine_id = QG1_QUILL_ENGINE_ID.to_owned();
         assert_eq!(
             screen.validate_decision(&cell, &semantic_contract, &relabeled),
-            Err(Qg1TantivyIncumbentError::StreamReceiptMismatch)
+            Err(Qg1TantivyIncumbentError::DecisionCandidateMismatch)
         );
 
         relabeled.tantivy_vs_quill.stream_receipt_sha256 = relabeled
