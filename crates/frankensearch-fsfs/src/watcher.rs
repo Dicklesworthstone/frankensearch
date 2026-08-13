@@ -1052,10 +1052,7 @@ impl ReconciliationState {
     /// crash-recovery record that did not exist when the action was taken.
     fn authorize_rebuild(&mut self) {
         if self.rebuild_authorization.is_authorized()
-            || self
-                .authority
-                .legacy()
-                .is_none_or(FileSnapshot::is_empty)
+            || self.authority.legacy().is_none_or(FileSnapshot::is_empty)
         {
             return;
         }
@@ -1093,8 +1090,7 @@ impl ReconciliationState {
         }
         let identities = completeness.root_identities();
         let adjudicate = |baseline: &FileSnapshot, legacy: Option<&FileSnapshot>| {
-            let adjudicates_legacy =
-                self.rebuild_authorization.is_authorized() && legacy.is_some();
+            let adjudicates_legacy = self.rebuild_authorization.is_authorized() && legacy.is_some();
             let mut deletion_baseline = baseline.clone();
             if let Some(legacy) = legacy.filter(|_| adjudicates_legacy) {
                 deletion_baseline.extend(legacy.iter().map(|(path, at)| (path.clone(), *at)));
@@ -1844,75 +1840,75 @@ impl FsWatcher {
         events: &'a [WatchEvent],
     ) -> WatchIngestFuture<'a, WatchBatchOutcome> {
         Box::pin(async move {
-        for event in events {
-            self.stats.mark_event(event.observed_at_ms);
-        }
+            for event in events {
+                self.stats.mark_event(event.observed_at_ms);
+            }
 
-        let policy = self.execution_policy();
-        if !policy.watching_enabled {
-            self.stats.add_skipped(events.len());
-            return Ok(WatchBatchOutcome {
-                accepted: 0,
-                reindexed: 0,
-                skipped: events.len(),
-            });
-        }
+            let policy = self.execution_policy();
+            if !policy.watching_enabled {
+                self.stats.add_skipped(events.len());
+                return Ok(WatchBatchOutcome {
+                    accepted: 0,
+                    reindexed: 0,
+                    skipped: events.len(),
+                });
+            }
 
-        if lock_or_recover(&self.reconciliation).required {
-            run_authoritative_reconciliation(
-                cx,
+            if lock_or_recover(&self.reconciliation).required {
+                run_authoritative_reconciliation(
+                    cx,
+                    &self.roots,
+                    &self.discovery,
+                    self.ingest.as_ref(),
+                    &self.reconciliation,
+                    &self.ready_batches,
+                    &self.stats,
+                    self.base_batch_size,
+                    &collect_snapshot_from_roots,
+                    // Caller-driven path: its `Cx` is the cancellation channel.
+                    &|| cx.is_cancel_requested(),
+                )
+                .await?;
+            }
+
+            // Runs on the caller's executor under the caller's `Cx`: this path
+            // builds no runtime of its own and therefore cannot strand ingest work
+            // on a private one that the caller cannot cancel.
+            let prepared = prepare_event_batch(&self.discovery, events);
+            if prepared.ops.is_empty() {
+                let outcome = prepared.outcome(0);
+                self.stats.add_skipped(outcome.skipped);
+                return Ok(outcome);
+            }
+
+            let mut guard = DirectApplyGuard::new(&self.reconciliation, events);
+            let reindexed = self.ingest.apply_batch(cx, &prepared.ops).await?;
+            match record_successful_events(
                 &self.roots,
                 &self.discovery,
-                self.ingest.as_ref(),
                 &self.reconciliation,
-                &self.ready_batches,
-                &self.stats,
-                self.base_batch_size,
+                events,
                 &collect_snapshot_from_roots,
-                // Caller-driven path: its `Cx` is the cancellation channel.
+                // This caller owns the `Cx`; it has no watcher generation whose
+                // stop signal it can observe.
                 &|| cx.is_cancel_requested(),
-            )
-            .await?;
-        }
-
-        // Runs on the caller's executor under the caller's `Cx`: this path
-        // builds no runtime of its own and therefore cannot strand ingest work
-        // on a private one that the caller cannot cancel.
-        let prepared = prepare_event_batch(&self.discovery, events);
-        if prepared.ops.is_empty() {
-            let outcome = prepared.outcome(0);
-            self.stats.add_skipped(outcome.skipped);
-            return Ok(outcome);
-        }
-
-        let mut guard = DirectApplyGuard::new(&self.reconciliation, events);
-        let reindexed = self.ingest.apply_batch(cx, &prepared.ops).await?;
-        match record_successful_events(
-            &self.roots,
-            &self.discovery,
-            &self.reconciliation,
-            events,
-            &collect_snapshot_from_roots,
-            // This caller owns the `Cx`; it has no watcher generation whose
-            // stop signal it can observe.
-            &|| cx.is_cancel_requested(),
-            &|| cx.is_cancel_requested(),
-        ) {
-            Ok(RecordSuccessfulEventsOutcome::Recorded) => {}
-            Ok(RecordSuccessfulEventsOutcome::Aborted) => {
-                return Err(cancelled_ingest_error(cx));
-            }
-            Err(error) => {
-                if cx.is_cancel_requested() {
+                &|| cx.is_cancel_requested(),
+            ) {
+                Ok(RecordSuccessfulEventsOutcome::Recorded) => {}
+                Ok(RecordSuccessfulEventsOutcome::Aborted) => {
                     return Err(cancelled_ingest_error(cx));
                 }
-                return Err(error);
+                Err(error) => {
+                    if cx.is_cancel_requested() {
+                        return Err(cancelled_ingest_error(cx));
+                    }
+                    return Err(error);
+                }
             }
-        }
-        guard.commit();
-        let outcome = prepared.outcome(reindexed);
-        self.stats.add_reindexed(outcome.reindexed);
-        self.stats.add_skipped(outcome.skipped);
+            guard.commit();
+            let outcome = prepared.outcome(reindexed);
+            self.stats.add_reindexed(outcome.reindexed);
+            self.stats.add_skipped(outcome.skipped);
             Ok(outcome)
         })
     }
@@ -2012,7 +2008,8 @@ impl FsWatcher {
                 completeness.reject_swapped_roots(&authority.root_identities);
             }
             if completeness.is_complete() && completeness.identity_is_trustworthy() {
-                let Some(plan) = state.plan_complete_pass(&self.roots, &completeness, token)? else {
+                let Some(plan) = state.plan_complete_pass(&self.roots, &completeness, token)?
+                else {
                     state.require_full_scan()?;
                     return Ok(CatchupEvents {
                         events: Self::diff_snapshots(
@@ -2191,8 +2188,7 @@ impl ProducerOutageProbe {
 }
 
 #[cfg(test)]
-static PRODUCER_OUTAGE_PROBES: Mutex<Vec<(u64, Arc<ProducerOutageProbe>)>> =
-    Mutex::new(Vec::new());
+static PRODUCER_OUTAGE_PROBES: Mutex<Vec<(u64, Arc<ProducerOutageProbe>)>> = Mutex::new(Vec::new());
 
 #[cfg(test)]
 static NEXT_PRODUCER_OUTAGE_PROBE_ID: AtomicU64 = AtomicU64::new(0);
@@ -2309,9 +2305,7 @@ fn run_producer_supervisor(context: &ProducerContext) -> SearchResult<()> {
                 }
                 #[cfg(test)]
                 if let Some(probe) = outage_probe {
-                    probe
-                        .restart_debt_published
-                        .store(true, Ordering::Release);
+                    probe.restart_debt_published.store(true, Ordering::Release);
                     while !probe.allow_restart.load(Ordering::Acquire)
                         && !context.stop.is_requested()
                     {
@@ -2691,191 +2685,191 @@ fn run_ingest_loop<'a>(
     snapshot_collector: &'a SnapshotCollector,
 ) -> WatchIngestFuture<'a, ()> {
     Box::pin(async move {
-    const IDLE_POLL: Duration = Duration::from_millis(10);
-    const MAX_RECONCILIATION_ATTEMPTS: usize = 3;
-    let mut reconciliation_attempts = 0_usize;
+        const IDLE_POLL: Duration = Duration::from_millis(10);
+        const MAX_RECONCILIATION_ATTEMPTS: usize = 3;
+        let mut reconciliation_attempts = 0_usize;
 
-    loop {
-        if cx.is_cancel_requested() {
-            return Err(cancelled_ingest_error(cx));
-        }
-
-        // A full rescan can take arbitrarily long on a large tree, so a stop
-        // that arrived while the previous batch was applying must be honoured
-        // before starting one rather than after it finishes. It is not,
-        // however, a licence to discard work already produced: the producer
-        // flushes its debounce buffer into the ready queue precisely because
-        // those events are real, and returning here dropped every one of them.
-        // `return`, not `break`: this loop is the function's diverging tail
-        // expression, so breaking out of it would leave no value for a
-        // `SearchResult<()>`.
-        if stop.is_requested() {
-            return drain_final_batches(
-                cx,
-                roots,
-                discovery,
-                ingest,
-                ready_batches,
-                stop,
-                stats,
-                reconciliation,
-                producer_done,
-                snapshot_collector,
-            )
-            .await;
-        }
-        if lock_or_recover(reconciliation).required {
-            match run_authoritative_reconciliation(
-                cx,
-                roots,
-                discovery,
-                ingest,
-                reconciliation,
-                ready_batches,
-                stats,
-                batch_size,
-                snapshot_collector,
-                // The walk itself now admits the stop, so a rescan over a
-                // large tree cannot hold `stop_checked` for its duration.
-                &|| stop.is_requested(),
-            )
-            .await
-            {
-                Ok(()) => {
-                    reconciliation_attempts = 0;
-                    continue;
-                }
-                Err(error) if is_retryable_error(&error) && !cx.is_cancel_requested() => {
-                    if stop.is_requested() {
-                        // Abandoned for a stop rather than failed: an
-                        // unresolved pass applies nothing, and the requirement
-                        // it leaves behind is what the next start honours.
-                        // Reporting an ordinary shutdown as a terminal watcher
-                        // failure is what made every stop that landed mid-scan
-                        // surface an error. The loop head turns this into the
-                        // shutdown drain.
-                        continue;
-                    }
-                    stats.add_error();
-                    reconciliation_attempts = reconciliation_attempts.saturating_add(1);
-                    // A root that stays unavailable fails every attempt, so
-                    // the attempt bound is what stops a persistent
-                    // incompleteness from looping here forever, and the stop
-                    // flag is what keeps `stop_checked` prompt while it does.
-                    if reconciliation_attempts >= MAX_RECONCILIATION_ATTEMPTS {
-                        return Err(error);
-                    }
-                    warn!(error = %error, "watcher reconciliation failed; retrying full rescan");
-                    // Interruptible and stop-aware: a stop requested during the
-                    // backoff ends the wait instead of serving it out, and the
-                    // loop head then drains rather than serving out a retry.
-                    let _stopped = stop.wait_or_stopped(IDLE_POLL);
-                    continue;
-                }
-                Err(error) => {
-                    // Cancellation, or a failure no retry can clear.
-                    stats.add_error();
-                    return Err(error);
-                }
+        loop {
+            if cx.is_cancel_requested() {
+                return Err(cancelled_ingest_error(cx));
             }
-        }
 
-        match ingest.poll_flush_barrier(cx).await {
-            Ok(true) => debug!("watcher acknowledged a durable flush barrier"),
-            Ok(false) => {}
-            Err(error) => {
-                stats.add_error();
-                warn!(error = %error, "watcher failed to acknowledge a durable flush barrier");
-                if !is_retryable_error(&error) {
-                    return Err(error);
-                }
-            }
-        }
-
-        let Some(mut lease) = PendingBatchLease::acquire(ready_batches, reconciliation) else {
-            if stop.is_requested() && producer_done.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            asupersync::time::sleep(cx.now(), IDLE_POLL).await;
-            continue;
-        };
-
-        let prepared = prepare_event_batch(discovery, lease.events());
-        if prepared.ops.is_empty() {
-            stats.add_skipped(prepared.skipped);
-            lease.commit();
-            continue;
-        }
-
-        // This is the point of no replay. Once the sink future is created it
-        // may mutate lexical, vector, or storage state before returning. Any
-        // non-success from here requires a filesystem-authoritative rescan.
-        lease.begin_live_apply();
-        match ingest.apply_batch(cx, &prepared.ops).await {
-            Ok(reindexed) => {
-                let events = lease.events().to_vec();
-                let outcome = prepared.outcome(reindexed);
-                match record_successful_events(
+            // A full rescan can take arbitrarily long on a large tree, so a stop
+            // that arrived while the previous batch was applying must be honoured
+            // before starting one rather than after it finishes. It is not,
+            // however, a licence to discard work already produced: the producer
+            // flushes its debounce buffer into the ready queue precisely because
+            // those events are real, and returning here dropped every one of them.
+            // `return`, not `break`: this loop is the function's diverging tail
+            // expression, so breaking out of it would leave no value for a
+            // `SearchResult<()>`.
+            if stop.is_requested() {
+                return drain_final_batches(
+                    cx,
                     roots,
                     discovery,
+                    ingest,
+                    ready_batches,
+                    stop,
+                    stats,
                     reconciliation,
-                    &events,
+                    producer_done,
                     snapshot_collector,
-                    // A stop published at any point after the sink mutation,
-                    // including before bookkeeping enters the collector, is
-                    // reconciliation debt rather than permission to start an
-                    // unbounded tree walk.
-                    &|| stop.is_requested() || cx.is_cancel_requested(),
-                    // Never commit a successful bookkeeping result after a
-                    // stop or cancellation, even if it was already visible
-                    // before the walk entered.
-                    &|| stop.is_requested() || cx.is_cancel_requested(),
-                ) {
-                    Ok(RecordSuccessfulEventsOutcome::Recorded) => {
-                        lease.commit();
-                        stats.add_reindexed(outcome.reindexed);
-                        stats.add_skipped(outcome.skipped);
+                )
+                .await;
+            }
+            if lock_or_recover(reconciliation).required {
+                match run_authoritative_reconciliation(
+                    cx,
+                    roots,
+                    discovery,
+                    ingest,
+                    reconciliation,
+                    ready_batches,
+                    stats,
+                    batch_size,
+                    snapshot_collector,
+                    // The walk itself now admits the stop, so a rescan over a
+                    // large tree cannot hold `stop_checked` for its duration.
+                    &|| stop.is_requested(),
+                )
+                .await
+                {
+                    Ok(()) => {
+                        reconciliation_attempts = 0;
+                        continue;
                     }
-                    Ok(RecordSuccessfulEventsOutcome::Aborted) => {
-                        // `apply_batch` succeeded, but the bookkeeping walk
-                        // did not. Dropping the live lease records the exact
-                        // affected paths; the stop drain will fold every later
-                        // batch into that same debt.
-                        drop(lease);
-                        if cx.is_cancel_requested() {
-                            return Err(cancelled_ingest_error(cx));
-                        }
-                    }
-                    Err(error) => {
-                        // A real collector failure is different from an
-                        // interrupted walk. It leaves the apply debt behind;
-                        // the normal retry/reconciliation path below settles
-                        // it unless stop/cancel wins first.
-                        drop(lease);
-                        if cx.is_cancel_requested() {
-                            return Err(cancelled_ingest_error(cx));
+                    Err(error) if is_retryable_error(&error) && !cx.is_cancel_requested() => {
+                        if stop.is_requested() {
+                            // Abandoned for a stop rather than failed: an
+                            // unresolved pass applies nothing, and the requirement
+                            // it leaves behind is what the next start honours.
+                            // Reporting an ordinary shutdown as a terminal watcher
+                            // failure is what made every stop that landed mid-scan
+                            // surface an error. The loop head turns this into the
+                            // shutdown drain.
+                            continue;
                         }
                         stats.add_error();
-                        if !is_retryable_error(&error) {
+                        reconciliation_attempts = reconciliation_attempts.saturating_add(1);
+                        // A root that stays unavailable fails every attempt, so
+                        // the attempt bound is what stops a persistent
+                        // incompleteness from looping here forever, and the stop
+                        // flag is what keeps `stop_checked` prompt while it does.
+                        if reconciliation_attempts >= MAX_RECONCILIATION_ATTEMPTS {
                             return Err(error);
                         }
-                        asupersync::time::sleep(cx.now(), IDLE_POLL).await;
+                        warn!(error = %error, "watcher reconciliation failed; retrying full rescan");
+                        // Interruptible and stop-aware: a stop requested during the
+                        // backoff ends the wait instead of serving it out, and the
+                        // loop head then drains rather than serving out a retry.
+                        let _stopped = stop.wait_or_stopped(IDLE_POLL);
+                        continue;
+                    }
+                    Err(error) => {
+                        // Cancellation, or a failure no retry can clear.
+                        stats.add_error();
+                        return Err(error);
                     }
                 }
             }
-            Err(error) => {
-                stats.add_error();
-                warn!(
-                    error = %error,
-                    "watcher ingest failed after mutation boundary; requiring full rescan"
-                );
-                drop(lease);
-                if !is_retryable_error(&error) || cx.is_cancel_requested() {
-                    return Err(error);
+
+            match ingest.poll_flush_barrier(cx).await {
+                Ok(true) => debug!("watcher acknowledged a durable flush barrier"),
+                Ok(false) => {}
+                Err(error) => {
+                    stats.add_error();
+                    warn!(error = %error, "watcher failed to acknowledge a durable flush barrier");
+                    if !is_retryable_error(&error) {
+                        return Err(error);
+                    }
+                }
+            }
+
+            let Some(mut lease) = PendingBatchLease::acquire(ready_batches, reconciliation) else {
+                if stop.is_requested() && producer_done.load(Ordering::Acquire) {
+                    return Ok(());
                 }
                 asupersync::time::sleep(cx.now(), IDLE_POLL).await;
+                continue;
+            };
+
+            let prepared = prepare_event_batch(discovery, lease.events());
+            if prepared.ops.is_empty() {
+                stats.add_skipped(prepared.skipped);
+                lease.commit();
+                continue;
             }
-        }
+
+            // This is the point of no replay. Once the sink future is created it
+            // may mutate lexical, vector, or storage state before returning. Any
+            // non-success from here requires a filesystem-authoritative rescan.
+            lease.begin_live_apply();
+            match ingest.apply_batch(cx, &prepared.ops).await {
+                Ok(reindexed) => {
+                    let events = lease.events().to_vec();
+                    let outcome = prepared.outcome(reindexed);
+                    match record_successful_events(
+                        roots,
+                        discovery,
+                        reconciliation,
+                        &events,
+                        snapshot_collector,
+                        // A stop published at any point after the sink mutation,
+                        // including before bookkeeping enters the collector, is
+                        // reconciliation debt rather than permission to start an
+                        // unbounded tree walk.
+                        &|| stop.is_requested() || cx.is_cancel_requested(),
+                        // Never commit a successful bookkeeping result after a
+                        // stop or cancellation, even if it was already visible
+                        // before the walk entered.
+                        &|| stop.is_requested() || cx.is_cancel_requested(),
+                    ) {
+                        Ok(RecordSuccessfulEventsOutcome::Recorded) => {
+                            lease.commit();
+                            stats.add_reindexed(outcome.reindexed);
+                            stats.add_skipped(outcome.skipped);
+                        }
+                        Ok(RecordSuccessfulEventsOutcome::Aborted) => {
+                            // `apply_batch` succeeded, but the bookkeeping walk
+                            // did not. Dropping the live lease records the exact
+                            // affected paths; the stop drain will fold every later
+                            // batch into that same debt.
+                            drop(lease);
+                            if cx.is_cancel_requested() {
+                                return Err(cancelled_ingest_error(cx));
+                            }
+                        }
+                        Err(error) => {
+                            // A real collector failure is different from an
+                            // interrupted walk. It leaves the apply debt behind;
+                            // the normal retry/reconciliation path below settles
+                            // it unless stop/cancel wins first.
+                            drop(lease);
+                            if cx.is_cancel_requested() {
+                                return Err(cancelled_ingest_error(cx));
+                            }
+                            stats.add_error();
+                            if !is_retryable_error(&error) {
+                                return Err(error);
+                            }
+                            asupersync::time::sleep(cx.now(), IDLE_POLL).await;
+                        }
+                    }
+                }
+                Err(error) => {
+                    stats.add_error();
+                    warn!(
+                        error = %error,
+                        "watcher ingest failed after mutation boundary; requiring full rescan"
+                    );
+                    drop(lease);
+                    if !is_retryable_error(&error) || cx.is_cancel_requested() {
+                        return Err(error);
+                    }
+                    asupersync::time::sleep(cx.now(), IDLE_POLL).await;
+                }
+            }
         }
     })
 }
@@ -2917,124 +2911,124 @@ fn drain_final_batches<'a>(
     snapshot_collector: &'a SnapshotCollector,
 ) -> WatchIngestFuture<'a, ()> {
     Box::pin(async move {
-    const PRODUCER_FLUSH_POLLS: usize = 2_000;
-    const MAX_FINAL_BATCHES: usize = 4_096;
-    const DRAIN_POLL: Duration = Duration::from_millis(1);
+        const PRODUCER_FLUSH_POLLS: usize = 2_000;
+        const MAX_FINAL_BATCHES: usize = 4_096;
+        const DRAIN_POLL: Duration = Duration::from_millis(1);
 
-    // The final flush reaches the queue only once the producer has left its
-    // loop, so waiting for it is what makes this drain complete rather than
-    // racy — and the bound is what keeps a producer that never finishes from
-    // holding the stop open.
-    for _ in 0..PRODUCER_FLUSH_POLLS {
-        if producer_done.load(Ordering::Acquire) {
-            break;
+        // The final flush reaches the queue only once the producer has left its
+        // loop, so waiting for it is what makes this drain complete rather than
+        // racy — and the bound is what keeps a producer that never finishes from
+        // holding the stop open.
+        for _ in 0..PRODUCER_FLUSH_POLLS {
+            if producer_done.load(Ordering::Acquire) {
+                break;
+            }
+            if cx.is_cancel_requested() {
+                return Err(cancelled_ingest_error(cx));
+            }
+            asupersync::time::sleep(cx.now(), DRAIN_POLL).await;
         }
-        if cx.is_cancel_requested() {
-            return Err(cancelled_ingest_error(cx));
-        }
-        asupersync::time::sleep(cx.now(), DRAIN_POLL).await;
-    }
 
-    for _ in 0..MAX_FINAL_BATCHES {
-        // Cancellation is abortive where a stop is graceful: it must not be
-        // served out by finishing the queue first.
-        if cx.is_cancel_requested() {
-            return Err(cancelled_ingest_error(cx));
-        }
-        if lock_or_recover(reconciliation).required {
-            fold_queue_into_reconciliation(ready_batches, reconciliation)?;
-            return Ok(());
-        }
-        let Some(mut lease) = PendingBatchLease::acquire(ready_batches, reconciliation) else {
-            return Ok(());
-        };
-        let prepared = prepare_event_batch(discovery, lease.events());
-        if prepared.ops.is_empty() {
-            stats.add_skipped(prepared.skipped);
-            lease.commit();
-            continue;
-        }
-        let events = lease.events().to_vec();
-        lease.begin_live_apply();
-        match ingest.apply_batch(cx, &prepared.ops).await {
-            Ok(reindexed) => {
-                // This function is entered only after a public stop has been
-                // published. The first live batch remains applied, but its
-                // bookkeeping must become reconciliation debt together with
-                // every later queued batch; otherwise returning here would
-                // strand those later observations in the ready queue.
-                if stop.is_requested() {
-                    drop(lease);
-                    fold_queue_into_reconciliation(ready_batches, reconciliation)?;
-                    return Ok(());
-                }
-                match record_successful_events(
-                    roots,
-                    discovery,
-                    reconciliation,
-                    &events,
-                    snapshot_collector,
-                    // A stop that lands after this check interrupts the walk
-                    // and turns all remaining work into reconciliation debt.
-                    &|| stop.is_requested() || cx.is_cancel_requested(),
-                    &|| stop.is_requested() || cx.is_cancel_requested(),
-                ) {
-                    Ok(RecordSuccessfulEventsOutcome::Recorded) => {
-                        lease.commit();
-                        let outcome = prepared.outcome(reindexed);
-                        stats.add_reindexed(outcome.reindexed);
-                        stats.add_skipped(outcome.skipped);
-                    }
-                    Ok(RecordSuccessfulEventsOutcome::Aborted) => {
+        for _ in 0..MAX_FINAL_BATCHES {
+            // Cancellation is abortive where a stop is graceful: it must not be
+            // served out by finishing the queue first.
+            if cx.is_cancel_requested() {
+                return Err(cancelled_ingest_error(cx));
+            }
+            if lock_or_recover(reconciliation).required {
+                fold_queue_into_reconciliation(ready_batches, reconciliation)?;
+                return Ok(());
+            }
+            let Some(mut lease) = PendingBatchLease::acquire(ready_batches, reconciliation) else {
+                return Ok(());
+            };
+            let prepared = prepare_event_batch(discovery, lease.events());
+            if prepared.ops.is_empty() {
+                stats.add_skipped(prepared.skipped);
+                lease.commit();
+                continue;
+            }
+            let events = lease.events().to_vec();
+            lease.begin_live_apply();
+            match ingest.apply_batch(cx, &prepared.ops).await {
+                Ok(reindexed) => {
+                    // This function is entered only after a public stop has been
+                    // published. The first live batch remains applied, but its
+                    // bookkeeping must become reconciliation debt together with
+                    // every later queued batch; otherwise returning here would
+                    // strand those later observations in the ready queue.
+                    if stop.is_requested() {
                         drop(lease);
                         fold_queue_into_reconciliation(ready_batches, reconciliation)?;
-                        if cx.is_cancel_requested() {
-                            return Err(cancelled_ingest_error(cx));
-                        }
                         return Ok(());
                     }
-                    Err(error) => {
-                        // The batch landed; only the bookkeeping scan behind it
-                        // failed. Dropping the lease past the mutation boundary
-                        // leaves a rescan owed, which is what settles it.
-                        drop(lease);
-                        if stop.is_requested() {
+                    match record_successful_events(
+                        roots,
+                        discovery,
+                        reconciliation,
+                        &events,
+                        snapshot_collector,
+                        // A stop that lands after this check interrupts the walk
+                        // and turns all remaining work into reconciliation debt.
+                        &|| stop.is_requested() || cx.is_cancel_requested(),
+                        &|| stop.is_requested() || cx.is_cancel_requested(),
+                    ) {
+                        Ok(RecordSuccessfulEventsOutcome::Recorded) => {
+                            lease.commit();
+                            let outcome = prepared.outcome(reindexed);
+                            stats.add_reindexed(outcome.reindexed);
+                            stats.add_skipped(outcome.skipped);
+                        }
+                        Ok(RecordSuccessfulEventsOutcome::Aborted) => {
+                            drop(lease);
                             fold_queue_into_reconciliation(ready_batches, reconciliation)?;
+                            if cx.is_cancel_requested() {
+                                return Err(cancelled_ingest_error(cx));
+                            }
                             return Ok(());
                         }
-                        if cx.is_cancel_requested() {
-                            return Err(cancelled_ingest_error(cx));
+                        Err(error) => {
+                            // The batch landed; only the bookkeeping scan behind it
+                            // failed. Dropping the lease past the mutation boundary
+                            // leaves a rescan owed, which is what settles it.
+                            drop(lease);
+                            if stop.is_requested() {
+                                fold_queue_into_reconciliation(ready_batches, reconciliation)?;
+                                return Ok(());
+                            }
+                            if cx.is_cancel_requested() {
+                                return Err(cancelled_ingest_error(cx));
+                            }
+                            stats.add_error();
+                            if is_retryable_error(&error) && !cx.is_cancel_requested() {
+                                return Ok(());
+                            }
+                            return Err(error);
                         }
-                        stats.add_error();
-                        if is_retryable_error(&error) && !cx.is_cancel_requested() {
-                            return Ok(());
-                        }
-                        return Err(error);
                     }
                 }
-            }
-            Err(error) => {
-                stats.add_error();
-                drop(lease);
-                warn!(
-                    error = %error,
-                    "watcher ingest failed while draining a stopped generation"
-                );
-                if is_retryable_error(&error) && !cx.is_cancel_requested() {
-                    // Retrying is unbounded work during a shutdown, and the
-                    // dropped lease plus every later ready batch must become
-                    // one owed rescan.
-                    fold_queue_into_reconciliation(ready_batches, reconciliation)?;
-                    return Ok(());
+                Err(error) => {
+                    stats.add_error();
+                    drop(lease);
+                    warn!(
+                        error = %error,
+                        "watcher ingest failed while draining a stopped generation"
+                    );
+                    if is_retryable_error(&error) && !cx.is_cancel_requested() {
+                        // Retrying is unbounded work during a shutdown, and the
+                        // dropped lease plus every later ready batch must become
+                        // one owed rescan.
+                        fold_queue_into_reconciliation(ready_batches, reconciliation)?;
+                        return Ok(());
+                    }
+                    return Err(error);
                 }
-                return Err(error);
             }
         }
-    }
 
-    // Bound reached: what is still queued becomes the next pass's work rather
-    // than work that silently disappeared.
-    fold_queue_into_reconciliation(ready_batches, reconciliation)?;
+        // Bound reached: what is still queued becomes the next pass's work rather
+        // than work that silently disappeared.
+        fold_queue_into_reconciliation(ready_batches, reconciliation)?;
         Ok(())
     })
 }
@@ -3104,201 +3098,165 @@ fn run_authoritative_reconciliation<'a>(
     abort: &'a dyn Fn() -> bool,
 ) -> WatchIngestFuture<'a, ()> {
     Box::pin(async move {
-    let (token, affected_paths, authority_identities) = {
-        let reconciliation_state = lock_or_recover(reconciliation);
-        (
-            reconciliation_state.planning_token()?,
-            reconciliation_state.affected_paths.clone(),
-            reconciliation_state
-                .established_authority(roots)
-                .map(|authority| authority.root_identities.clone()),
-        )
-    };
-    // Every batch already visible here predates the authoritative snapshot
-    // below. Dropping it is safe: the rescan covers its final filesystem
-    // state, while batches produced after this clear remain queued and are
-    // applied after the rescan.
-    lock_or_recover(ready_batches).clear();
-    let (current, mut completeness) = snapshot_collector(roots, discovery, abort)?;
-    if let Some(identities) = authority_identities.as_ref() {
-        // A swapped root reads as a complete scan of an empty tree; only the
-        // identities bound to the authority distinguish it from a real one.
-        completeness.reject_swapped_roots(identities);
-    }
-    let observed_at_ms = now_millis();
-    let mount_table = build_mount_table(discovery);
-    let mut events = current
-        .keys()
-        .cloned()
-        .map(|path| {
-            build_watch_event(
-                path,
-                WatchEventKind::Modified,
-                observed_at_ms,
-                Some(&mount_table),
-            )
-        })
-        .collect::<Vec<_>>();
-
-    // An incomplete rescan is not authoritative about absence. It still
-    // reindexes everything it did observe above, but it derives no deletes:
-    // a path missing from a short snapshot may simply be one the scan could
-    // not read.
-    if !completeness.is_complete() {
-        // Applying the visible subset and returning `Ok` was the defect in the
-        // first correction: it reindexed a partial tree, cleared nothing, and
-        // reported success, so the caller had no reason to back off and the
-        // rescan ran again immediately on the next pass. An unresolved rescan
-        // is a retryable failure of the whole pass — no ops are applied here —
-        // and `SubsystemError` is the classification `is_retryable_error`
-        // already honours, so the ingest loop's bounded attempts, its
-        // interruptible sleep, and its stop/cancel checks all apply unchanged.
-        let mut reconciliation_state = lock_or_recover(reconciliation);
-        reconciliation_state.required = true;
-        drop(reconciliation_state);
-        let unresolved = completeness
-            .unresolved_paths()
-            .map(Path::display)
-            .map(|path| path.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        warn!(
-            unresolved_paths = completeness.unresolved_count(),
-            "watcher rescan could not resolve every path; applying nothing and retrying"
-        );
-        return Err(SearchError::SubsystemError {
-            subsystem: "fsfs-watcher",
-            source: Box::new(io::Error::other(format!(
-                "authoritative rescan is incomplete; {} unresolved path(s): {unresolved}",
-                completeness.unresolved_count()
-            ))),
-        });
-    }
-
-    // From here the scan is complete. What it may *conclude* is decided by the
-    // authority state, not by this call site, and it is decided before a single
-    // operation is applied.
-    let scan_identities = completeness.root_identities().clone();
-    let plan = {
-        let mut reconciliation_state = lock_or_recover(reconciliation);
-        let Some(plan) = reconciliation_state.plan_complete_pass(roots, &completeness, token)? else {
-            // A mutation succeeded while this walk was in flight. Its owner
-            // retained exact debt; do not attach this older snapshot to the
-            // newer lineage or apply another stale conclusion.
-            reconciliation_state.require_full_scan()?;
-            return Ok(());
-        };
-        drop(reconciliation_state);
-        plan
-    };
-    match plan.outcome {
-        PassOutcome::Adjudicated => {}
-        PassOutcome::Probationary => warn!(
-            "watcher recorded a probationary root observation; a confirming scan must match it \
-             before deletions are derived"
-        ),
-        PassOutcome::Degraded => {
-            warn!("watcher has no trustworthy root identity; upserting without deletion authority");
-        }
-    }
-
-    if let Some(deletion_baseline) = plan.deletion_baseline.as_ref() {
-        let mut deletion_candidates = deletion_baseline.keys().cloned().collect::<BTreeSet<_>>();
-        // The paths this watcher's own unapplied events named are absences of
-        // the same evidence class as the baseline's, and are adjudicated only
-        // by a pass that holds authority. Unioning them into a baseline that
-        // could not adjudicate anything is what let an authority naming nothing
-        // still delete.
-        if plan.adjudicates() {
-            deletion_candidates.extend(affected_paths);
-        }
-        events.extend(
-            deletion_candidates
-                .into_iter()
-                .filter(|path| !current.contains_key(path))
-                .map(|path| WatchEvent::deleted(path, observed_at_ms)),
-        );
-    }
-
-    // Telemetry is staged, not published per chunk: a pass that fails a later
-    // chunk, or whose epoch advances under it, is retried in full, and counts
-    // already published would then be counted a second time.
-    let mut staged_reindexed = 0_usize;
-    let mut staged_skipped = 0_usize;
-    // A sink can accept a current batch before it reports an error. Retain
-    // only the batches that reached an apply boundary: prior successful
-    // batches plus the current, possibly partial one. Untouched later chunks
-    // have no mutation evidence and must not acquire deletion authority.
-    let mut attempted_prefix = Vec::new();
-    for event_batch in events.chunks(batch_size.max(1)) {
-        if cx.is_cancel_requested() || abort() {
-            if !attempted_prefix.is_empty() {
-                lock_or_recover(reconciliation).require_for_events(&attempted_prefix)?;
-            }
-            return Err(reconciliation_abort_error(cx));
-        }
-        // The epoch must hold through the apply, not merely at the commit: a
-        // concurrent mutation that advanced it means these events describe a
-        // filesystem state that is no longer the one being reconciled.
-        let lineage = {
+        let (token, affected_paths, authority_identities) = {
             let reconciliation_state = lock_or_recover(reconciliation);
-            reconciliation_state.planning_token()
+            (
+                reconciliation_state.planning_token()?,
+                reconciliation_state.affected_paths.clone(),
+                reconciliation_state
+                    .established_authority(roots)
+                    .map(|authority| authority.root_identities.clone()),
+            )
         };
-        let lineage_matches = match lineage {
-            Ok(current) => current == token,
-            Err(error) => {
-                if !attempted_prefix.is_empty() {
-                    let _ = lock_or_recover(reconciliation).require_for_events(&attempted_prefix);
-                }
-                return Err(error);
-            }
-        };
-        if !lineage_matches {
-            if !attempted_prefix.is_empty() {
-                lock_or_recover(reconciliation).require_for_events(&attempted_prefix)?;
-            }
+        // Every batch already visible here predates the authoritative snapshot
+        // below. Dropping it is safe: the rescan covers its final filesystem
+        // state, while batches produced after this clear remain queued and are
+        // applied after the rescan.
+        lock_or_recover(ready_batches).clear();
+        let (current, mut completeness) = snapshot_collector(roots, discovery, abort)?;
+        if let Some(identities) = authority_identities.as_ref() {
+            // A swapped root reads as a complete scan of an empty tree; only the
+            // identities bound to the authority distinguish it from a real one.
+            completeness.reject_swapped_roots(identities);
+        }
+        let observed_at_ms = now_millis();
+        let mount_table = build_mount_table(discovery);
+        let mut events = current
+            .keys()
+            .cloned()
+            .map(|path| {
+                build_watch_event(
+                    path,
+                    WatchEventKind::Modified,
+                    observed_at_ms,
+                    Some(&mount_table),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        // An incomplete rescan is not authoritative about absence. It still
+        // reindexes everything it did observe above, but it derives no deletes:
+        // a path missing from a short snapshot may simply be one the scan could
+        // not read.
+        if !completeness.is_complete() {
+            // Applying the visible subset and returning `Ok` was the defect in the
+            // first correction: it reindexed a partial tree, cleared nothing, and
+            // reported success, so the caller had no reason to back off and the
+            // rescan ran again immediately on the next pass. An unresolved rescan
+            // is a retryable failure of the whole pass — no ops are applied here —
+            // and `SubsystemError` is the classification `is_retryable_error`
+            // already honours, so the ingest loop's bounded attempts, its
+            // interruptible sleep, and its stop/cancel checks all apply unchanged.
+            let mut reconciliation_state = lock_or_recover(reconciliation);
+            reconciliation_state.required = true;
+            drop(reconciliation_state);
+            let unresolved = completeness
+                .unresolved_paths()
+                .map(Path::display)
+                .map(|path| path.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            warn!(
+                unresolved_paths = completeness.unresolved_count(),
+                "watcher rescan could not resolve every path; applying nothing and retrying"
+            );
             return Err(SearchError::SubsystemError {
                 subsystem: "fsfs-watcher",
-                source: Box::new(io::Error::other(
-                    "reconciliation epoch advanced during apply; rescanning",
-                )),
+                source: Box::new(io::Error::other(format!(
+                    "authoritative rescan is incomplete; {} unresolved path(s): {unresolved}",
+                    completeness.unresolved_count()
+                ))),
             });
         }
-        let prepared = prepare_event_batch(discovery, event_batch);
-        if prepared.ops.is_empty() {
-            staged_skipped = staged_skipped.saturating_add(prepared.skipped);
-            continue;
-        }
-        attempted_prefix.extend_from_slice(event_batch);
-        let reindexed = match ingest.apply_batch(cx, &prepared.ops).await {
-            Ok(reindexed) => reindexed,
-            Err(error) => {
-                // The current batch may have partially landed, so the exact
-                // attempted prefix becomes the next reconciliation debt.
-                lock_or_recover(reconciliation).require_for_events(&attempted_prefix)?;
-                return Err(error);
-            }
-        };
-        {
-            // `apply_batch` is a mutation boundary. A stop or caller
-            // cancellation that lands while it is pending must be observed
-            // again while the reconciliation state is locked, before this
-            // applied chunk can advance authority, clear debt, or contribute
-            // to the staged publication below.
+
+        // From here the scan is complete. What it may *conclude* is decided by the
+        // authority state, not by this call site, and it is decided before a single
+        // operation is applied.
+        let scan_identities = completeness.root_identities().clone();
+        let plan = {
             let mut reconciliation_state = lock_or_recover(reconciliation);
+            let Some(plan) =
+                reconciliation_state.plan_complete_pass(roots, &completeness, token)?
+            else {
+                // A mutation succeeded while this walk was in flight. Its owner
+                // retained exact debt; do not attach this older snapshot to the
+                // newer lineage or apply another stale conclusion.
+                reconciliation_state.require_full_scan()?;
+                return Ok(());
+            };
+            drop(reconciliation_state);
+            plan
+        };
+        match plan.outcome {
+            PassOutcome::Adjudicated => {}
+            PassOutcome::Probationary => warn!(
+                "watcher recorded a probationary root observation; a confirming scan must match it \
+             before deletions are derived"
+            ),
+            PassOutcome::Degraded => {
+                warn!(
+                    "watcher has no trustworthy root identity; upserting without deletion authority"
+                );
+            }
+        }
+
+        if let Some(deletion_baseline) = plan.deletion_baseline.as_ref() {
+            let mut deletion_candidates =
+                deletion_baseline.keys().cloned().collect::<BTreeSet<_>>();
+            // The paths this watcher's own unapplied events named are absences of
+            // the same evidence class as the baseline's, and are adjudicated only
+            // by a pass that holds authority. Unioning them into a baseline that
+            // could not adjudicate anything is what let an authority naming nothing
+            // still delete.
+            if plan.adjudicates() {
+                deletion_candidates.extend(affected_paths);
+            }
+            events.extend(
+                deletion_candidates
+                    .into_iter()
+                    .filter(|path| !current.contains_key(path))
+                    .map(|path| WatchEvent::deleted(path, observed_at_ms)),
+            );
+        }
+
+        // Telemetry is staged, not published per chunk: a pass that fails a later
+        // chunk, or whose epoch advances under it, is retried in full, and counts
+        // already published would then be counted a second time.
+        let mut staged_reindexed = 0_usize;
+        let mut staged_skipped = 0_usize;
+        // A sink can accept a current batch before it reports an error. Retain
+        // only the batches that reached an apply boundary: prior successful
+        // batches plus the current, possibly partial one. Untouched later chunks
+        // have no mutation evidence and must not acquire deletion authority.
+        let mut attempted_prefix = Vec::new();
+        for event_batch in events.chunks(batch_size.max(1)) {
             if cx.is_cancel_requested() || abort() {
-                reconciliation_state.require_for_events(&attempted_prefix)?;
+                if !attempted_prefix.is_empty() {
+                    lock_or_recover(reconciliation).require_for_events(&attempted_prefix)?;
+                }
                 return Err(reconciliation_abort_error(cx));
             }
-            let lineage_matches = match reconciliation_state.planning_token() {
+            // The epoch must hold through the apply, not merely at the commit: a
+            // concurrent mutation that advanced it means these events describe a
+            // filesystem state that is no longer the one being reconciled.
+            let lineage = {
+                let reconciliation_state = lock_or_recover(reconciliation);
+                reconciliation_state.planning_token()
+            };
+            let lineage_matches = match lineage {
                 Ok(current) => current == token,
                 Err(error) => {
-                    let _ = reconciliation_state.require_for_events(&attempted_prefix);
+                    if !attempted_prefix.is_empty() {
+                        let _ =
+                            lock_or_recover(reconciliation).require_for_events(&attempted_prefix);
+                    }
                     return Err(error);
                 }
             };
             if !lineage_matches {
-                reconciliation_state.require_for_events(&attempted_prefix)?;
+                if !attempted_prefix.is_empty() {
+                    lock_or_recover(reconciliation).require_for_events(&attempted_prefix)?;
+                }
                 return Err(SearchError::SubsystemError {
                     subsystem: "fsfs-watcher",
                     source: Box::new(io::Error::other(
@@ -3306,65 +3264,107 @@ fn run_authoritative_reconciliation<'a>(
                     )),
                 });
             }
-            drop(reconciliation_state);
-        }
-        let outcome = prepared.outcome(reindexed);
-        staged_reindexed = staged_reindexed.saturating_add(outcome.reindexed);
-        staged_skipped = staged_skipped.saturating_add(outcome.skipped);
-    }
-
-    // Only a complete pass reaches here; the incomplete one returned above
-    // before applying anything.
-    let mut reconciliation_state = lock_or_recover(reconciliation);
-    if cx.is_cancel_requested() || abort() {
-        // The last apply may have returned just before this lock. Retain only
-        // the attempted prefix so no authority or telemetry is published
-        // after cancellation, without inventing debt for an untouched tail.
-        if !attempted_prefix.is_empty() {
-            reconciliation_state.require_for_events(&attempted_prefix)?;
-        }
-        return Err(reconciliation_abort_error(cx));
-    }
-    let lineage_matches = match reconciliation_state.planning_token() {
-        Ok(current) => current == token,
-        Err(error) => {
-            if !attempted_prefix.is_empty() {
-                let _ = reconciliation_state.require_for_events(&attempted_prefix);
+            let prepared = prepare_event_batch(discovery, event_batch);
+            if prepared.ops.is_empty() {
+                staged_skipped = staged_skipped.saturating_add(prepared.skipped);
+                continue;
             }
-            return Err(error);
+            attempted_prefix.extend_from_slice(event_batch);
+            let reindexed = match ingest.apply_batch(cx, &prepared.ops).await {
+                Ok(reindexed) => reindexed,
+                Err(error) => {
+                    // The current batch may have partially landed, so the exact
+                    // attempted prefix becomes the next reconciliation debt.
+                    lock_or_recover(reconciliation).require_for_events(&attempted_prefix)?;
+                    return Err(error);
+                }
+            };
+            {
+                // `apply_batch` is a mutation boundary. A stop or caller
+                // cancellation that lands while it is pending must be observed
+                // again while the reconciliation state is locked, before this
+                // applied chunk can advance authority, clear debt, or contribute
+                // to the staged publication below.
+                let mut reconciliation_state = lock_or_recover(reconciliation);
+                if cx.is_cancel_requested() || abort() {
+                    reconciliation_state.require_for_events(&attempted_prefix)?;
+                    return Err(reconciliation_abort_error(cx));
+                }
+                let lineage_matches = match reconciliation_state.planning_token() {
+                    Ok(current) => current == token,
+                    Err(error) => {
+                        let _ = reconciliation_state.require_for_events(&attempted_prefix);
+                        return Err(error);
+                    }
+                };
+                if !lineage_matches {
+                    reconciliation_state.require_for_events(&attempted_prefix)?;
+                    return Err(SearchError::SubsystemError {
+                        subsystem: "fsfs-watcher",
+                        source: Box::new(io::Error::other(
+                            "reconciliation epoch advanced during apply; rescanning",
+                        )),
+                    });
+                }
+                drop(reconciliation_state);
+            }
+            let outcome = prepared.outcome(reindexed);
+            staged_reindexed = staged_reindexed.saturating_add(outcome.reindexed);
+            staged_skipped = staged_skipped.saturating_add(outcome.skipped);
         }
-    };
-    if !lineage_matches {
-        // The tree moved under this pass. Its operations landed, but its
-        // conclusion describes a state that no longer exists, so nothing is
-        // installed and nothing is counted — the next pass does both.
-        if !attempted_prefix.is_empty() {
-            reconciliation_state.require_for_events(&attempted_prefix)?;
+
+        // Only a complete pass reaches here; the incomplete one returned above
+        // before applying anything.
+        let mut reconciliation_state = lock_or_recover(reconciliation);
+        if cx.is_cancel_requested() || abort() {
+            // The last apply may have returned just before this lock. Retain only
+            // the attempted prefix so no authority or telemetry is published
+            // after cancellation, without inventing debt for an untouched tail.
+            if !attempted_prefix.is_empty() {
+                reconciliation_state.require_for_events(&attempted_prefix)?;
+            }
+            return Err(reconciliation_abort_error(cx));
         }
-        return Ok(());
-    }
-    match reconciliation_state.commit_complete_pass(&plan, current, scan_identities) {
-        Ok(true) => {}
-        Ok(false) => {
-            // Authority was rebound while this pass was applying. Fail closed: the
-            // conclusion is dropped and a fresh pass is owed.
+        let lineage_matches = match reconciliation_state.planning_token() {
+            Ok(current) => current == token,
+            Err(error) => {
+                if !attempted_prefix.is_empty() {
+                    let _ = reconciliation_state.require_for_events(&attempted_prefix);
+                }
+                return Err(error);
+            }
+        };
+        if !lineage_matches {
+            // The tree moved under this pass. Its operations landed, but its
+            // conclusion describes a state that no longer exists, so nothing is
+            // installed and nothing is counted — the next pass does both.
             if !attempted_prefix.is_empty() {
                 reconciliation_state.require_for_events(&attempted_prefix)?;
             }
             return Ok(());
         }
-        Err(error) => {
-            // The typed counter failure leaves the lineage poisoned, but the
-            // operations that already crossed the sink boundary remain debt.
-            if !attempted_prefix.is_empty() {
-                let _ = reconciliation_state.require_for_events(&attempted_prefix);
+        match reconciliation_state.commit_complete_pass(&plan, current, scan_identities) {
+            Ok(true) => {}
+            Ok(false) => {
+                // Authority was rebound while this pass was applying. Fail closed: the
+                // conclusion is dropped and a fresh pass is owed.
+                if !attempted_prefix.is_empty() {
+                    reconciliation_state.require_for_events(&attempted_prefix)?;
+                }
+                return Ok(());
             }
-            return Err(error);
+            Err(error) => {
+                // The typed counter failure leaves the lineage poisoned, but the
+                // operations that already crossed the sink boundary remain debt.
+                if !attempted_prefix.is_empty() {
+                    let _ = reconciliation_state.require_for_events(&attempted_prefix);
+                }
+                return Err(error);
+            }
         }
-    }
-    drop(reconciliation_state);
-    stats.add_reindexed(staged_reindexed);
-    stats.add_skipped(staged_skipped);
+        drop(reconciliation_state);
+        stats.add_reindexed(staged_reindexed);
+        stats.add_skipped(staged_skipped);
         Ok(())
     })
 }
@@ -6866,12 +6866,8 @@ mod tests {
                 task.abort_with_reason(CancelReason::user(
                     "parked reconciliation test cleanup timed out",
                 ));
-                let _ = asupersync::time::timeout(
-                    cx.now(),
-                    Duration::from_secs(1),
-                    task.join(&cx),
-                )
-                .await;
+                let _ = asupersync::time::timeout(cx.now(), Duration::from_secs(1), task.join(&cx))
+                    .await;
                 panic!("parked reconciliation did not finish within the bounded cleanup window");
             };
             assert!(
@@ -9192,9 +9188,7 @@ mod tests {
             .expect("build watcher test runtime");
         let test_task = scheduler.handle().spawn(async move {
             let cx = Cx::current().expect("runtime task installs a spawn-capable Cx");
-            let mut local_task = cx
-                .spawn_local(test)
-                .expect("spawn local watcher test task");
+            let mut local_task = cx.spawn_local(test).expect("spawn local watcher test task");
             local_task
                 .join(&cx)
                 .await
