@@ -41,31 +41,109 @@ use frankensearch_quill::{
     QuillIndex, SchemaDescriptor,
 };
 use frankensearch_quill_gauntlet::{
-    BuildIdentity, ColdCacheEvidence, ComparatorConfig, ComparisonStatus, CorpusIdentity,
-    CorpusManifest, CountState, DistributionSummary, EngineConcurrencyObservation,
-    EngineObservation, EvidenceCell, EvidenceCellBody, EvidenceCellSpec, EvidencePolicy,
-    EvidenceProvenance, EvidenceRole, ExecutionProfileId, HardwareClassId, MachineClassRegistry,
-    MachineIdentity, MachineProfileKey, NativeTieKey, PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS,
-    PairedEstimatorConfig, PeakRssEvidence, PerfApplicabilityPlan, PerfCellApplicability,
-    PerfCellResult, PerfCellSpec, PerfConcurrencyEngine, PerfConcurrencyObserver,
-    PerfConcurrencyWitness, PerfCorpus, PerfEvidenceArtifact, PerfGate, PerfGateArtifact,
-    PerfInputIdentity, PerfMatrixSpec, PerfMetricSemantics, PerfOperationScope, PerfQueryClass,
-    PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
-    PerfTopology, PositionMode, QG1_QUILL_ENGINE_ID, QG1_STREAM_ROLE_EFFECT,
-    QG1_STREAM_ROLE_QUILL_NULL, QG1_STREAM_ROLE_TANTIVY_NULL, QG1_STREAM_ROLE_TANTIVY_PILOT_EFFECT,
-    QG1_STREAM_ROLE_TANTIVY_PILOT_NULL, QG1_TANTIVY_ENGINE_ID, QG6_QUERY_GROUP_IDS,
-    QG6_QUERY_GROUPS, Qg1AuthorityRegisterEntryV1, Qg1BatchCoverage, Qg1ExpectedAuthority,
-    Qg1IncumbentScreenEvidence, Qg1LifecycleProducer, Qg1LifecycleWitness, Qg1SampleBinding,
-    Qg1StartupHandshakeV1, Qg1TantivyBoundStream, Qg1TantivyDecisionStreamKind,
-    Qg1TantivyIncumbentDecision, Qg1TantivyIncumbentPilot, Qg1TantivyIncumbentScreen,
-    Qg1TantivyIncumbentScreenPlan, Qg1TantivySemanticContract, Qg1TantivyWriterMode, Qg6ArmRole,
-    Qg6Comparison, Qg6Phase, Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleBinding, Qg6SampleOrder,
-    Qg6SearchHit, Qg6SearchResult, Qg6SemanticContract, RankClass, RankedHit, ScoreEpsilonReason,
-    SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent, command_sha256_from_argv,
-    compare_observations, estimate_paired_experiment,
-    estimate_paired_experiment_against_qg1_authority, machine_fingerprint, oracle_version_contract,
-    peak_rss_bytes, perf_manifest_contract_sha256, preregister_qg1_tantivy_incumbents,
-    seeded_balanced_pair_order, validate_matrix,
+    BuildIdentity,
+    ColdCacheEvidence,
+    ComparatorConfig,
+    ComparisonStatus,
+    CorpusIdentity,
+    CorpusManifest,
+    CountState,
+    DistributionSummary,
+    EngineConcurrencyObservation,
+    EngineObservation,
+    EvidenceCell,
+    EvidenceCellBody,
+    EvidenceCellSpec,
+    EvidencePolicy,
+    EvidenceProvenance,
+    EvidenceRole,
+    ExecutionProfileId,
+    HardwareClassId,
+    MachineClassRegistry,
+    MachineIdentity,
+    MachineProfileKey,
+    NativeTieKey,
+    PERF_ARTIFACT_SCHEMA_VERSION,
+    PERF_MIN_RUNS,
+    PairedEstimatorConfig,
+    PeakRssEvidence,
+    PerfApplicabilityPlan,
+    PerfCellApplicability,
+    PerfCellResult,
+    PerfCellSpec,
+    PerfConcurrencyEngine,
+    PerfConcurrencyObserver,
+    PerfConcurrencyWitness,
+    PerfCorpus,
+    PerfEvidenceArtifact,
+    PerfGate,
+    PerfGateArtifact,
+    PerfInputIdentity,
+    PerfMatrixSpec,
+    PerfMetricSemantics,
+    PerfOperationScope,
+    PerfQueryClass,
+    PerfRawSample,
+    PerfSampleArm,
+    PerfSampleOrder,
+    PerfSamplePhase,
+    PerfSampleProvenance,
+    PerfTopology,
+    PositionMode,
+    QG1_QUILL_ENGINE_ID,
+    QG1_STREAM_ROLE_EFFECT,
+    QG1_STREAM_ROLE_QUILL_NULL,
+    QG1_STREAM_ROLE_TANTIVY_NULL,
+    QG1_STREAM_ROLE_TANTIVY_PILOT_EFFECT,
+    QG1_STREAM_ROLE_TANTIVY_PILOT_NULL,
+    QG1_TANTIVY_ENGINE_ID,
+    QG6_QUERY_GROUP_IDS,
+    QG6_QUERY_GROUPS,
+    Qg1AuthorityRegisterEntryV1,
+    Qg1BatchCoverage,
+    Qg1ExpectedAuthority,
+    Qg1IncumbentScreenEvidence,
+    Qg1LifecycleProducer,
+    Qg1LifecycleWitness,
+    Qg1SampleBinding,
+    Qg1StartupHandshakeV1,
+    Qg1TantivyBoundStream,
+    Qg1TantivyDecisionStreamKind,
+    Qg1TantivyIncumbentDecision,
+    Qg1TantivyIncumbentPilot,
+    Qg1TantivyIncumbentScreen,
+    Qg1TantivyIncumbentScreenPlan,
+    Qg1TantivySemanticContract,
+    Qg1TantivyWriterMode,
+    Qg6ArmRole,
+    Qg6Comparison,
+    Qg6Phase,
+    Qg6PreparedExperiment,
+    Qg6QuerySpec,
+    Qg6SampleBinding,
+    Qg6SampleOrder,
+    Qg6SearchHit,
+    Qg6SearchResult,
+    Qg6SemanticContract,
+    RankClass,
+    RankedHit,
+    ScoreEpsilonReason,
+    SyntheticCorpus,
+    SyntheticCorpusSpec,
+    ZipfExponent,
+    command_sha256_from_argv,
+    // `estimate_paired_experiment` is deliberately NOT imported here: its only
+    // callers are `cfg(test)` helpers, which already import it locally, and a
+    // root import would be unused in the harness-false production build.
+    compare_observations,
+    estimate_paired_experiment_against_qg1_authority,
+    machine_fingerprint,
+    oracle_version_contract,
+    peak_rss_bytes,
+    perf_manifest_contract_sha256,
+    preregister_qg1_tantivy_incumbents,
+    seeded_balanced_pair_order,
+    validate_matrix,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -8219,6 +8297,16 @@ fn main() {
         tests::qg1_authority_subprocess_helper();
         return;
     }
+    // QG-2's contract runs in the harness-false binary for the same reason
+    // H1's does: a `#[test]` item here is stripped and never executes, so it
+    // could never be evidence. This branch is what makes the QG-2 assertions
+    // actually run under the central command.
+    #[cfg(test)]
+    if std::env::var_os("QUILL_PERF_QG2_SELF_CHECK").is_some() {
+        qg2_continuous_tests::assert_qg2_continuous_interval_contract();
+        qg2_continuous_tests::assert_qg2_summed_shape_excludes_the_planted_tail();
+        return;
+    }
     #[cfg(test)]
     if std::env::var_os("QUILL_PERF_H1_PRODUCER_SELF_CHECK").is_some() {
         tests::assert_qg1_continuous_interval_contract();
@@ -8284,8 +8372,11 @@ mod qg2_continuous_tests {
     /// The endpoint assertions live inside `qg2_bulk_metric_continuous` itself,
     /// so a regression that stops at commit — before the update is searchable —
     /// fails there rather than being quietly reported as a faster number here.
-    #[test]
-    fn qg2_update_cells_measure_one_continuous_searchable_interval() {
+    /// Ordinary `cfg(test)` helper, reached from `main` under
+    /// `QUILL_PERF_QG2_SELF_CHECK`. A `#[test]` item here would be stripped by
+    /// `harness = false` and would therefore never execute, which is not
+    /// evidence of anything.
+    pub(super) fn assert_qg2_continuous_interval_contract() {
         let spec = qg2_spec();
         let context = super::BenchContext::for_selected(
             super::MatrixScale::Smoke,
@@ -8369,8 +8460,9 @@ mod qg2_continuous_tests {
     /// span by construction and outside the summed span by construction, so
     /// their difference is bounded below by the planted delay on a single
     /// monotonic clock.
-    #[test]
-    fn summed_feed_and_commit_excludes_the_planted_terminal_tail() {
+    /// Ordinary `cfg(test)` helper, reached from `main` under the same
+    /// environment switch as the contract above.
+    pub(super) fn assert_qg2_summed_shape_excludes_the_planted_tail() {
         let spec = qg2_spec();
         let context = super::BenchContext::for_selected(
             super::MatrixScale::Smoke,
@@ -8484,7 +8576,10 @@ mod tests {
     /// `cfg(test)` barrier. A child module's private items are not visible to
     /// its parent, and the honest fix is to widen exactly this one helper
     /// rather than to hide the call site that needs it.
-    #[test]
+    ///
+    /// Ordinary `cfg(test)` helper rather than a `#[test]` item: under
+    /// `harness = false` a test-attribute item is stripped, so `main` could not
+    /// call it at all.
     pub(super) fn qg1_authority_subprocess_helper() {
         if std::env::var_os(super::QG1_AUTHORITY_SUBPROCESS_ENV).is_none() {
             return;
@@ -8607,7 +8702,10 @@ mod tests {
         (status, output)
     }
 
-    #[test]
+    // Ordinary `cfg(test)` helper, not a `#[test]` item. This bench is
+    // `harness = false`, so test-attribute items are stripped and any ordinary
+    // caller of one fails to resolve. `assert_qg1_authority_handshake_contract`
+    // is that caller, and it runs from `main` in the harness-false binary.
     fn qg1_authority_ack_is_a_real_pre_sampling_barrier() {
         let (mut child, register_receiver) = qg1_start_authority_subprocess();
         let (sequence, entry_bytes, register_count, stdout) =
@@ -8642,7 +8740,7 @@ mod tests {
         );
     }
 
-    #[test]
+    // Ordinary `cfg(test)` helper; see the note above.
     fn qg1_authority_ack_refuses_malformed_missing_and_timeout_before_work() {
         enum AckCase {
             Malformed,
@@ -8708,7 +8806,7 @@ mod tests {
         }
     }
 
-    #[test]
+    // Ordinary `cfg(test)` helper; see the note above.
     fn qg1_authority_barrier_remains_before_its_timing_origin_and_runners() {
         const TEST_MODULE_BOUNDARY: &str = "#[cfg(test)]\nmod tests {";
         let source = include_str!("perf_matrix.rs");
