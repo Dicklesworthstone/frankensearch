@@ -6168,9 +6168,15 @@ fn qg1_live_semantic_contract(
     shipping_receipt: &BenchmarkWriterReceipt,
 ) -> Qg1TantivySemanticContract {
     let quill = quill_config(spec);
+    let oracle_contract = oracle_version_contract()
+        .expect("live QG-1 semantics require the exact current oracle dependency contract");
+    assert_eq!(
+        oracle_contract.tantivy_version,
+        frankensearch_quill_gauntlet::QG1_TANTIVY_INCUMBENT_TANTIVY_VERSION,
+        "QG-1 screen protocol must move in lockstep with the linked oracle dependency contract"
+    );
     Qg1TantivySemanticContract {
-        tantivy_version: frankensearch_quill_gauntlet::QG1_TANTIVY_INCUMBENT_TANTIVY_VERSION
-            .to_owned(),
+        tantivy_version: oracle_contract.tantivy_version,
         schema_sha256: qg1_incumbent_digest("tantivy.schema", &shipping_receipt.schema_fields),
         analyzer_sha256: qg1_incumbent_digest("tantivy.analyzer", &shipping_receipt.tokenizer_name),
         indexed_fields_sha256: qg1_incumbent_digest(
@@ -8283,7 +8289,7 @@ fn run_child_mode() -> bool {
 /// A manifest pin alone cannot catch that — it describes what Cargo resolved,
 /// not what the process linked. So this asserts both: the pinned contract
 /// (version, registry source, checksum, lexical package + audited contract
-/// revision, `tantivy = "=0.26.1"`)
+/// revision, and the exact current Tantivy source identity)
 /// *and* the version string the linked Tantivy reports about itself at run
 /// time. Printed so it lands in the evidence log beside the ratios.
 fn assert_incumbent_is_genuine_tantivy() -> String {

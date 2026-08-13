@@ -5,7 +5,7 @@ compiled `PerfMatrixSpec` by `render_perf_run_plan_markdown`; the gauntlet test
 `perf_run_plan_document_matches_the_manifest` fails closed on any drift. Regenerate
 deliberately with `QUILL_PERF_RUN_PLAN_UPDATE=1`.
 
-- manifest contract SHA-256: `6b23048474bf8812bfc3527c7eb6f28f70bbdc9b25618b2734ee709c9f7da048`
+- manifest contract SHA-256: `daf337373b63e41a86a09e7b8b6500c52323dde6ae1357e979451fbbd49b7561`
 - canonical matrix cells: 120
 
 ## Registered machines
@@ -351,4 +351,3 @@ scripts/perf-runner.sh --gate QG-10 --hardware-class m4-macos --execution-profil
 scripts/perf-runner.sh --gate QG-10 --hardware-class m5-macos --execution-profile scheduler-14 --run-id <unique-pass-id> --run-window <shared-window> [platform-required bounded options]
 scripts/perf-runner.sh --gate QG-10 --hardware-class x86-vps-ovh --execution-profile x86-diagnostic --run-id <unique-pass-id> --run-window <shared-window> [platform-required bounded options]
 ```
-

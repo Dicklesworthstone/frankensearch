@@ -15,7 +15,7 @@ const ORACLE_V2_TANTIVY_CHECKSUM_SHA256: &str =
 const ORACLE_V2_LEXICAL_PACKAGE: &str = "frankensearch-lexical";
 const ORACLE_V2_LEXICAL_PACKAGE_VERSION: &str = "0.2.1";
 const ORACLE_V2_LEXICAL_CONTRACT_AUDIT_REVISION: &str = "062a5e5b2d41653b1c8b07888eda1a765e421f49";
-const ORACLE_V3_TANTIVY_VERSION: &str = "0.27.0";
+pub const CURRENT_ORACLE_TANTIVY_VERSION: &str = "0.27.0";
 const ORACLE_V3_TANTIVY_SOURCE: &str = "git+https://github.com/quickwit-oss/tantivy?rev=1f32c1a8af0eb9d68bd3f5576caf20941364b657#1f32c1a8af0eb9d68bd3f5576caf20941364b657";
 const ORACLE_V3_TANTIVY_CHECKSUM_SHA256: &str =
     "db62510712cc8d0a776d35af8e5bd18565b0d3bc466299202d775ae75aa11aa1";
@@ -81,7 +81,7 @@ impl OracleVersionContract {
             && self.lexical_package_version == ORACLE_V2_LEXICAL_PACKAGE_VERSION
             && self.lexical_contract_audit_revision == ORACLE_V2_LEXICAL_CONTRACT_AUDIT_REVISION;
         let matches_v3 = self.schema_version == 3
-            && self.tantivy_version == ORACLE_V3_TANTIVY_VERSION
+            && self.tantivy_version == CURRENT_ORACLE_TANTIVY_VERSION
             && self.tantivy_source == ORACLE_V3_TANTIVY_SOURCE
             && self.tantivy_checksum_sha256 == ORACLE_V3_TANTIVY_CHECKSUM_SHA256
             && self.lexical_package == ORACLE_V3_LEXICAL_PACKAGE

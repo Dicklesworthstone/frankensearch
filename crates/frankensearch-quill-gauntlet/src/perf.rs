@@ -363,10 +363,11 @@ impl PerfCellSpec {
 /// This is intentionally a protocol pin rather than a Cargo-version guess:
 /// changing Tantivy can change shipping-auto worker selection and therefore
 /// requires a new incumbent screen.
-pub const QG1_TANTIVY_INCUMBENT_TANTIVY_VERSION: &str = "0.26.1";
+pub const QG1_TANTIVY_INCUMBENT_TANTIVY_VERSION: &str =
+    crate::version_contract::CURRENT_ORACLE_TANTIVY_VERSION;
 /// Wire schema for the provisional QG-1 Tantivy incumbent screen.
 pub const QG1_TANTIVY_INCUMBENT_SCREEN_SCHEMA_VERSION: &str =
-    "quill-qg1-tantivy-incumbent-screen-v3";
+    "quill-qg1-tantivy-incumbent-screen-v4-tantivy-0.27.0";
 
 /// Tantivy writer construction admitted to the QG-1 incumbent screen.
 ///
@@ -8200,6 +8201,8 @@ pub fn render_perf_run_plan_markdown() -> Result<String, GauntletError> {
         }
         out.push_str("```\n\n");
     }
+    let trailing_blank_line = out.pop();
+    debug_assert_eq!(trailing_blank_line, Some('\n'));
     Ok(out)
 }
 
@@ -8378,6 +8381,26 @@ mod tests {
             durability_sha256: "0".repeat(64),
             quill_config_sha256: "1".repeat(64),
         }
+    }
+
+    #[test]
+    fn qg1_incumbent_protocol_uses_the_current_oracle_and_rejects_retained_v2() {
+        let oracle = crate::oracle_version_contract().expect("current oracle contract");
+        assert_eq!(
+            QG1_TANTIVY_INCUMBENT_TANTIVY_VERSION,
+            oracle.tantivy_version
+        );
+        assert_eq!(
+            QG1_TANTIVY_INCUMBENT_SCREEN_SCHEMA_VERSION,
+            "quill-qg1-tantivy-incumbent-screen-v4-tantivy-0.27.0"
+        );
+
+        let mut retained_v2 = qg1_semantic_contract();
+        retained_v2.tantivy_version = "0.26.1".to_owned();
+        assert!(matches!(
+            retained_v2.contract_sha256(),
+            Err(Qg1TantivyIncumbentError::InvalidSemanticContract)
+        ));
     }
 
     fn qg1_screen_plan(cell: &PerfCellSpec, widths: Vec<usize>) -> Qg1TantivyIncumbentScreenPlan {
@@ -13049,19 +13072,14 @@ mod tests {
     fn manifest_contract_hash_ignores_only_activation_state() {
         let manifest = PERF_MANIFEST;
         assert_eq!(manifest.matches("activated = false").count(), 10);
-        // GOLDEN-CHANGE (QG-5 xlarge re-pin, 02b5ec25): the QG-5 fixture line
-        // moved from `50k docs (medium)` to `1M docs (xlarge)` once the e6.1
-        // xlarge generator landed, so the manifest a producer must bind is a
-        // different document and every measurement taken against the medium
-        // pin is correctly invalidated. That commit changed
-        // docs/contracts/quill-perf-gates.toml without re-freezing here, which
-        // is what left this gate red on the trunk (bd-916qm); the digest is
-        // re-frozen to the committed file, NOT the gate loosened -- the
-        // assertions below still bind every non-administrative byte.
+        // GOLDEN-CHANGE (Tantivy 0.27.0 dependency identity rebind): the
+        // executable oracle had already moved to the exact v3 dependency
+        // contract, so the stale 0.26.1 declaration is corrected without
+        // changing any threshold, estimator, fixture, or activation policy.
         // Activation is still the sole administrative normalization exception.
         assert_eq!(
             perf_manifest_contract_sha256(manifest),
-            "6b23048474bf8812bfc3527c7eb6f28f70bbdc9b25618b2734ee709c9f7da048",
+            "daf337373b63e41a86a09e7b8b6500c52323dde6ae1357e979451fbbd49b7561",
             "the normalized all-inactive manifest digest must remain frozen"
         );
         assert_eq!(
