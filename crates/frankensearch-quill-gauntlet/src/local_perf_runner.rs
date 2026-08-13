@@ -4107,19 +4107,39 @@ fn wait_for_qg1_authority_child(
                         ) {
                             Ok(pin) => pin,
                             Err(error) => {
-                                handshake_failure = Some(format!(
-                                    "QG-1 authority set could not be pinned before acknowledgement: {error}"
-                                ));
                                 let _ = response.send(Qg1AuthorityForwarderResponse::Refuse);
-                                continue;
+                                return finish_qg1_authority_after_root_exit(
+                                    child,
+                                    root_process_identity,
+                                    descendant_scope,
+                                    forwarder,
+                                    run_log,
+                                    None,
+                                    recovered_wait_error,
+                                    process_group_recovery,
+                                    accepted,
+                                    Some(format!(
+                                        "QG-1 authority set could not be pinned before acknowledgement: {error}"
+                                    )),
+                                );
                             }
                         };
                         if let Err(error) = accepted.bind_expected_authorities(&pin) {
-                            handshake_failure = Some(format!(
-                                "QG-1 retained authorities could not be bound by the persisted target pin before acknowledgement: {error}"
-                            ));
                             let _ = response.send(Qg1AuthorityForwarderResponse::Refuse);
-                            continue;
+                            return finish_qg1_authority_after_root_exit(
+                                child,
+                                root_process_identity,
+                                descendant_scope,
+                                forwarder,
+                                run_log,
+                                None,
+                                recovered_wait_error,
+                                process_group_recovery,
+                                accepted,
+                                Some(format!(
+                                    "QG-1 retained authorities could not be bound by the persisted target pin before acknowledgement: {error}"
+                                )),
+                            );
                         }
                     }
                     if response
