@@ -223,15 +223,8 @@ impl Qg1StartupHandshakeV1 {
 
 #[cfg(test)]
 static QG1_FORWARDER_TEST_ARTIFACT_NONCE: AtomicU64 = AtomicU64::new(1);
-/// Serializes ONLY the QG-1 tests that spawn a child into this test binary.
-///
-/// Descendant containment is per test binary, so a sibling QG-1 child still
-/// running in a parallel test is a genuine pre-existing descendant that
-/// production is right to refuse. This narrows the interference to the
-/// fixtures that cause it instead of serializing the suite or relaxing
-/// containment.
 #[cfg(test)]
-static QG1_CHILD_PROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+const QG1_PROCESS_TREE_TEST_ENV: &str = "QUILL_PERF_TEST_QG1_PROCESS_TREE";
 #[cfg(test)]
 const QG1_FORWARDER_TEST_CREATE_ATTEMPTS: u64 = 64;
 const EMBEDDED_PRODUCER_CONTRACT_VERSION: &str = env!("QUILL_PERF_PRODUCER_CONTRACT_VERSION");
@@ -8233,6 +8226,33 @@ mod tests {
         }
     }
 
+    /// Run one QG-1 process-tree fixture in a fresh test binary.
+    ///
+    /// Linux subreaper ownership is process-wide. A mutex in this binary can
+    /// serialize QG-1 fixtures with one another, but it cannot stop any of
+    /// libtest's other parallel tests from creating a child that would make
+    /// containment correctly refuse. The child runs the same test and still
+    /// exercises the real parent wait/kill/reap boundary; it merely owns a
+    /// process tree with no sibling test children.
+    fn qg1_process_tree_test_runs_in_isolated_child(test_name: &str) -> bool {
+        if std::env::var_os(QG1_PROCESS_TREE_TEST_ENV).as_deref() == Some(OsStr::new(test_name)) {
+            return false;
+        }
+
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .env(QG1_PROCESS_TREE_TEST_ENV, test_name)
+            .output()
+            .expect("run isolated QG-1 process-tree fixture");
+        assert!(
+            output.status.success(),
+            "isolated QG-1 process-tree fixture {test_name:?} failed; stdout {:?}; stderr {:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
     fn qg1_wait_result_for_test(
         case: &str,
         selection: &ResolvedRunSelection,
@@ -8263,18 +8283,6 @@ mod tests {
         Option<String>,
         Vec<u8>,
     ) {
-        // Held across the whole fixture, so it is acquired BEFORE the spawn and
-        // before `LocalPerfDescendantScope::enter()` below. Descendant
-        // containment is established per test binary, and every QG-1 child
-        // test spawns into that one binary: a sibling QG-1 child still running
-        // in another parallel test is a pre-existing descendant, which is a
-        // true observation the production scope is right to refuse. Serializing
-        // only these child-process fixtures removes the interference without
-        // touching production containment, and is narrower than a global test
-        // lock. Poison is tolerated so one failing case cannot cascade.
-        let _child_process_guard = QG1_CHILD_PROCESS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let output_parent_path = std::env::temp_dir();
         let output_parent = pin_directory(&output_parent_path, false)
             .expect("pin test parent directory without creating or deleting it");
@@ -8546,6 +8554,11 @@ mod tests {
 
     #[test]
     fn qg1_actual_parent_wait_kill_reap_covers_final_ack_and_exact_startup_set() {
+        if qg1_process_tree_test_runs_in_isolated_child(
+            "local_perf_runner::tests::qg1_actual_parent_wait_kill_reap_covers_final_ack_and_exact_startup_set",
+        ) {
+            return;
+        }
         let one_engine_selection = ResolvedRunSelection {
             fixture: None,
             selected_cell_ids: vec!["QG-1/bulk/tiny/1/positions_on/docs_per_second".to_owned()],
@@ -8800,6 +8813,11 @@ mod tests {
 
     #[test]
     fn qg1_total_startup_deadline_is_not_refreshed_after_post_spawn_setup() {
+        if qg1_process_tree_test_runs_in_isolated_child(
+            "local_perf_runner::tests::qg1_total_startup_deadline_is_not_refreshed_after_post_spawn_setup",
+        ) {
+            return;
+        }
         let selection = ResolvedRunSelection {
             fixture: None,
             selected_cell_ids: vec!["QG-1/bulk/tiny/1/positions_on/docs_per_second".to_owned()],
@@ -8835,6 +8853,11 @@ mod tests {
 
     #[test]
     fn qg1_natural_child_exit_before_handshake_seals_a_valid_failed_attempt_receipt() {
+        if qg1_process_tree_test_runs_in_isolated_child(
+            "local_perf_runner::tests::qg1_natural_child_exit_before_handshake_seals_a_valid_failed_attempt_receipt",
+        ) {
+            return;
+        }
         let selection = ResolvedRunSelection {
             fixture: None,
             selected_cell_ids: vec!["QG-1/bulk/tiny/1/positions_on/docs_per_second".to_owned()],
