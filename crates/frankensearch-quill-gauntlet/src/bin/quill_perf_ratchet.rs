@@ -602,14 +602,14 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
         args.baseline_target_pin.as_ref(),
         args.baseline_authority_dir.as_ref(),
         &baseline.run_id,
-        &baseline.source_git_revision,
+        &baseline.git_rev,
     )?;
     let (candidate_authorities, candidate_authority_evidence) = resolve_arm_authorities(
         "candidate",
         args.candidate_target_pin.as_ref(),
         args.candidate_authority_dir.as_ref(),
         &candidate.run_id,
-        &candidate.source_git_revision,
+        &candidate.git_rev,
     )?;
     let (rerun_authorities, rerun_authority_evidence) = match rerun.as_ref() {
         Some((artifact, _)) => resolve_arm_authorities(
@@ -617,7 +617,7 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
             args.rerun_target_pin.as_ref(),
             args.rerun_authority_dir.as_ref(),
             &artifact.run_id,
-            &artifact.source_git_revision,
+            &artifact.git_rev,
         )?,
         None => (Vec::new(), Vec::new()),
     };
@@ -1785,6 +1785,14 @@ mod tests {
             promote_dir: Some(history_dir.to_path_buf()),
             machine_profile: Some(test_profile()),
             date: Some("2026-07-29".to_owned()),
+            // Authority-free on purpose: these tests exercise history planning
+            // and output validation, never QG-1 authority loading.
+            baseline_target_pin: None,
+            baseline_authority_dir: None,
+            candidate_target_pin: None,
+            candidate_authority_dir: None,
+            rerun_target_pin: None,
+            rerun_authority_dir: None,
         }
     }
 
