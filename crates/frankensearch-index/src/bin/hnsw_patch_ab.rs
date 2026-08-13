@@ -617,11 +617,13 @@ fn print_help() {
          [--corpus-source-manifest PATH] [--output PATH] \
          [--child-deadline-ms N] [--child-term-grace-ms N] \
          [--child-log-byte-cap N] [--child-log-dir PATH]\n\
+         hnsw_patch_ab --pinned-run --elf PATH --remote-root DIR --local-dir DIR \
+         [--worker-id ID] [--workers-json PATH] -- [ELF-ARGS]\n\
          hnsw_patch_ab --pinned-retrieve --remote-root DIR --local-dir DIR \
          [--worker-id ID]\n\
-         Pinned retrieve always pulls report.json, child-journal.jsonl, \
-         child stdout/stderr, and artifacts.sha256 after the remote ELF \
-         exits. Retrieval success never converts quarantine/block into allow."
+         --pinned-run pins exactly one worker, runs the attested ELF there, \
+         then always retrieves report/journal/logs. Retrieval success never \
+         converts quarantine/block into allow."
     );
 }
 
@@ -4712,8 +4714,22 @@ const PINNED_RETRIEVE_RECEIPT: &str = "artifacts.sha256";
 const PINNED_RETRIEVE_REPORT: &str = "report.json";
 const PINNED_RETRIEVE_JOURNAL: &str = "child-journal.jsonl";
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct WorkerIdentity {
+    id: String,
+    host: String,
+    user: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RchWorkerRow {
+    id: String,
+    host: String,
+    user: String,
+}
+
 trait RemoteTransport {
-    fn worker_id(&self) -> &str;
+    fn worker(&self) -> WorkerIdentity;
     fn run_attested_elf(&self, spec: &RemoteRunSpec) -> Result<i32, DynError>;
     fn fetch_file(&self, remote_path: &str) -> Result<Vec<u8>, DynError>;
 }
@@ -4758,7 +4774,7 @@ struct RetrievedValidationHead {
 
 #[derive(Debug)]
 struct PinnedRetrieveOutcome {
-    worker_id: String,
+    worker: WorkerIdentity,
     remote_exit_code: i32,
     classification: PerformanceClaimStatus,
     retrieval_ok: bool,
@@ -4792,8 +4808,12 @@ impl MemoryTransport {
 
 #[cfg(test)]
 impl RemoteTransport for MemoryTransport {
-    fn worker_id(&self) -> &str {
-        &self.worker_id
+    fn worker(&self) -> WorkerIdentity {
+        WorkerIdentity {
+            id: self.worker_id.clone(),
+            host: "memory".to_owned(),
+            user: "test".to_owned(),
+        }
     }
 
     fn run_attested_elf(&self, _spec: &RemoteRunSpec) -> Result<i32, DynError> {
@@ -4816,8 +4836,12 @@ struct FilesystemTransport {
 }
 
 impl RemoteTransport for FilesystemTransport {
-    fn worker_id(&self) -> &str {
-        &self.worker_id
+    fn worker(&self) -> WorkerIdentity {
+        WorkerIdentity {
+            id: self.worker_id.clone(),
+            host: "filesystem".to_owned(),
+            user: "local".to_owned(),
+        }
     }
 
     fn run_attested_elf(&self, _spec: &RemoteRunSpec) -> Result<i32, DynError> {
@@ -4833,12 +4857,10 @@ impl RemoteTransport for FilesystemTransport {
     }
 }
 
-#[cfg(test)]
 fn artifact_receipt_line(path: &str, bytes: &[u8]) -> String {
     format!("{path} {}", sha256_bytes(bytes))
 }
 
-#[cfg(test)]
 fn write_artifact_receipt(files: &mut BTreeMap<String, Vec<u8>>, spec: &RemoteRunSpec) {
     let mut lines = Vec::new();
     for path in spec.required_paths() {
@@ -4966,7 +4988,9 @@ fn run_pinned_worker_measurement<T: RemoteTransport>(
                 serde_json::to_string_pretty(&serde_json::json!({
                     "schema": SCHEMA,
                     "event": "pinned_retrieve",
-                    "worker_id": transport.worker_id(),
+                    "worker_id": transport.worker().id,
+                    "worker_host": transport.worker().host,
+                    "worker_user": transport.worker().user,
                     "remote_exit_code": remote_exit_code,
                     "classification": classification.label(),
                     "retrieval_ok": true,
@@ -4976,7 +5000,7 @@ fn run_pinned_worker_measurement<T: RemoteTransport>(
                 .as_bytes(),
             )?;
             Ok(PinnedRetrieveOutcome {
-                worker_id: transport.worker_id().to_owned(),
+                worker: transport.worker(),
                 remote_exit_code,
                 classification,
                 retrieval_ok: true,
@@ -4986,7 +5010,7 @@ fn run_pinned_worker_measurement<T: RemoteTransport>(
         }
         Err(error) => Err(format!(
             "pinned retrieve failed after remote exit {remote_exit_code} on worker {}: {error}",
-            transport.worker_id()
+            transport.worker().id
         )
         .into()),
     }
@@ -5006,6 +5030,258 @@ fn wrapper_preserved_exit_code(outcome: &PinnedRetrieveOutcome) -> i32 {
             }
         }
     }
+}
+
+fn parse_rch_workers_json(bytes: &[u8]) -> Result<Vec<WorkerIdentity>, DynError> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    let workers = value
+        .pointer("/data/workers")
+        .or_else(|| value.get("workers"))
+        .ok_or("worker roster JSON has no workers array")?;
+    let rows: Vec<RchWorkerRow> = serde_json::from_value(workers.clone())?;
+    if rows.is_empty() {
+        return Err("worker roster is empty".into());
+    }
+    Ok(rows
+        .into_iter()
+        .map(|row| WorkerIdentity {
+            id: row.id,
+            host: row.host,
+            user: row.user,
+        })
+        .collect())
+}
+
+fn select_pinned_worker<'a>(
+    workers: &'a [WorkerIdentity],
+    requested: Option<&str>,
+) -> Result<&'a WorkerIdentity, DynError> {
+    match requested {
+        Some(id) => workers
+            .iter()
+            .find(|worker| worker.id == id)
+            .ok_or_else(|| format!("pinned worker {id:?} is not in the roster").into()),
+        None if workers.len() == 1 => Ok(&workers[0]),
+        None => Err("multiple workers available; pass --worker-id to pin exactly one".into()),
+    }
+}
+
+fn load_worker_roster(path: Option<&Path>) -> Result<Vec<WorkerIdentity>, DynError> {
+    let bytes = if let Some(path) = path {
+        fs::read(path)?
+    } else {
+        let output = Command::new("rch")
+            .args(["--json", "workers", "list"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "rch --json workers list failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
+        }
+        output.stdout
+    };
+    parse_rch_workers_json(&bytes)
+}
+
+fn seal_remote_artifacts(remote_root: &Path, spec: &RemoteRunSpec) -> Result<(), DynError> {
+    let receipt_path = remote_root.join(PINNED_RETRIEVE_RECEIPT);
+    if receipt_path.exists() {
+        return Ok(());
+    }
+    let mut files = BTreeMap::new();
+    for path in spec.required_paths() {
+        if path == PINNED_RETRIEVE_RECEIPT {
+            continue;
+        }
+        let full = remote_root.join(&path);
+        if full.is_file() {
+            files.insert(path, fs::read(full)?);
+        }
+    }
+    write_artifact_receipt(&mut files, spec);
+    let receipt = files
+        .get(PINNED_RETRIEVE_RECEIPT)
+        .ok_or("failed to seal remote artifact receipt")?;
+    persist_create_new(&receipt_path, receipt)
+}
+
+struct LocalPinnedTransport {
+    worker: WorkerIdentity,
+    remote_root: PathBuf,
+    elf: PathBuf,
+    elf_args: Vec<String>,
+    deadline: Duration,
+    term_grace: Duration,
+}
+
+impl RemoteTransport for LocalPinnedTransport {
+    fn worker(&self) -> WorkerIdentity {
+        self.worker.clone()
+    }
+
+    fn run_attested_elf(&self, spec: &RemoteRunSpec) -> Result<i32, DynError> {
+        if !self.elf.is_file() {
+            return Err(format!("attested ELF is not a file: {}", self.elf.display()).into());
+        }
+        fs::create_dir_all(&self.remote_root)?;
+        persist_create_new(
+            &self.remote_root.join("worker-identity.json"),
+            serde_json::to_string_pretty(&self.worker)?.as_bytes(),
+        )?;
+        let journal = Arc::new(ChildJournal::create_new(
+            &self.remote_root.join("wrapper-run-journal.jsonl"),
+        )?);
+        let mut command = Command::new(&self.elf);
+        command.args(&self.elf_args).current_dir(&self.remote_root);
+        let executed = run_bounded_child(
+            command,
+            ChildExecutionLimits {
+                deadline: self.deadline,
+                term_grace: self.term_grace,
+                stdout_byte_cap: DEFAULT_CHILD_LOG_BYTE_CAP,
+                stderr_byte_cap: DEFAULT_CHILD_LOG_BYTE_CAP,
+            },
+            &self.remote_root.join("wrapper-elf.stdout"),
+            &self.remote_root.join("wrapper-elf.stderr"),
+            &journal,
+            &ChildIdentity {
+                label: "pinned-elf".to_owned(),
+            },
+        )?;
+        seal_remote_artifacts(&self.remote_root, spec)?;
+        Ok(match executed.termination {
+            ChildTermination::Exited(code) => code,
+            ChildTermination::Signaled(_)
+            | ChildTermination::TimedOutTerminated
+            | ChildTermination::TimedOutKilled => 2,
+        })
+    }
+
+    fn fetch_file(&self, remote_path: &str) -> Result<Vec<u8>, DynError> {
+        if !safe_relative_source_path(remote_path) {
+            return Err(format!("unsafe remote artifact path: {remote_path:?}").into());
+        }
+        fs::read(self.remote_root.join(remote_path))
+            .map_err(|error| format!("fetch {remote_path}: {error}").into())
+    }
+}
+
+fn emit_wrapper_outcome(outcome: &PinnedRetrieveOutcome) -> Result<(), DynError> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": SCHEMA,
+            "event": "pinned_retrieve",
+            "worker_id": outcome.worker.id,
+            "worker_host": outcome.worker.host,
+            "worker_user": outcome.worker.user,
+            "remote_exit_code": outcome.remote_exit_code,
+            "classification": outcome.classification.label(),
+            "retrieval_ok": outcome.retrieval_ok,
+            "report_sha256": outcome.report_sha256,
+            "journal_sha256": outcome.journal_sha256,
+            "wrapper_exit_code": wrapper_preserved_exit_code(outcome),
+        }))?
+    );
+    let exit = wrapper_preserved_exit_code(outcome);
+    if exit == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "pinned retrieve preserved classification {} (exit {exit})",
+            outcome.classification.label()
+        )
+        .into())
+    }
+}
+
+fn pinned_run_main(args: &[String]) -> Result<(), DynError> {
+    let mut remote_root = None;
+    let mut local_dir = None;
+    let mut worker_id = None;
+    let mut workers_json = None;
+    let mut elf = None;
+    let mut deadline_ms = DEFAULT_CHILD_DEADLINE_SMOKE_MS;
+    let mut term_grace_ms = DEFAULT_CHILD_TERM_GRACE_MS;
+    let mut elf_args = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--pinned-run" => index += 1,
+            "--remote-root" => {
+                remote_root = Some(PathBuf::from(required_value(args, index)?));
+                index += 2;
+            }
+            "--local-dir" => {
+                local_dir = Some(PathBuf::from(required_value(args, index)?));
+                index += 2;
+            }
+            "--worker-id" => {
+                worker_id = Some(required_value(args, index)?.to_owned());
+                index += 2;
+            }
+            "--workers-json" => {
+                workers_json = Some(PathBuf::from(required_value(args, index)?));
+                index += 2;
+            }
+            "--elf" => {
+                elf = Some(PathBuf::from(required_value(args, index)?));
+                index += 2;
+            }
+            "--child-deadline-ms" => {
+                deadline_ms = parse_u64(required_value(args, index)?, "child-deadline-ms")?;
+                index += 2;
+            }
+            "--child-term-grace-ms" => {
+                term_grace_ms = parse_u64(required_value(args, index)?, "child-term-grace-ms")?;
+                index += 2;
+            }
+            "--" => {
+                elf_args.extend(args[index + 1..].iter().cloned());
+                break;
+            }
+            "--help" | "-h" => {
+                print_help();
+                return Ok(());
+            }
+            other => return Err(format!("unknown --pinned-run argument {other:?}").into()),
+        }
+    }
+    let remote_root = remote_root.ok_or("--pinned-run requires --remote-root")?;
+    let local_dir = local_dir.ok_or("--pinned-run requires --local-dir")?;
+    let elf = elf.ok_or("--pinned-run requires --elf")?;
+    if local_dir.exists() {
+        return Err(format!(
+            "refusing to overwrite existing retrieve directory: {}",
+            local_dir.display()
+        )
+        .into());
+    }
+    if remote_root.exists() && remote_root.read_dir()?.next().is_some() {
+        return Err(format!(
+            "refusing to reuse a non-empty remote root: {}",
+            remote_root.display()
+        )
+        .into());
+    }
+    let roster = load_worker_roster(workers_json.as_deref())?;
+    let worker = select_pinned_worker(&roster, worker_id.as_deref())?.clone();
+    let transport = LocalPinnedTransport {
+        worker,
+        remote_root,
+        elf,
+        elf_args,
+        deadline: Duration::from_millis(deadline_ms),
+        term_grace: Duration::from_millis(term_grace_ms),
+    };
+    let spec = RemoteRunSpec::decision_default();
+    let outcome = run_pinned_worker_measurement(&transport, &spec, &local_dir, true)?;
+    emit_wrapper_outcome(&outcome)
 }
 
 #[cfg(test)]
@@ -5072,34 +5348,14 @@ fn pinned_retrieve_main(args: &[String]) -> Result<(), DynError> {
     };
     let spec = RemoteRunSpec::decision_default();
     let outcome = run_pinned_worker_measurement(&transport, &spec, &local_dir, false)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "schema": SCHEMA,
-            "event": "pinned_retrieve",
-            "worker_id": outcome.worker_id,
-            "remote_exit_code": outcome.remote_exit_code,
-            "classification": outcome.classification.label(),
-            "retrieval_ok": outcome.retrieval_ok,
-            "report_sha256": outcome.report_sha256,
-            "journal_sha256": outcome.journal_sha256,
-            "wrapper_exit_code": wrapper_preserved_exit_code(&outcome),
-        }))?
-    );
-    let exit = wrapper_preserved_exit_code(&outcome);
-    if exit == 0 {
-        Ok(())
-    } else {
-        Err(format!(
-            "pinned retrieve preserved classification {} (exit {exit})",
-            outcome.classification.label()
-        )
-        .into())
-    }
+    emit_wrapper_outcome(&outcome)
 }
 
 fn run() -> Result<(), DynError> {
     let args: Vec<String> = env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--pinned-run") {
+        return pinned_run_main(&args);
+    }
     if args.iter().any(|arg| arg == "--pinned-retrieve") {
         return pinned_retrieve_main(&args);
     }
@@ -6006,7 +6262,7 @@ source = "git+https://github.com/Dicklesworthstone/hnswlib-rs?rev={CANDIDATE_REV
         let (outcome, directory) =
             run_memory_retrieve("fake-hz2", PerformanceClaimStatus::Quarantine, 2, |_| {}).unwrap();
         assert!(outcome.retrieval_ok);
-        assert_eq!(outcome.worker_id, "fake-hz2");
+        assert_eq!(outcome.worker.id, "fake-hz2");
         assert_eq!(outcome.remote_exit_code, 2);
         assert_eq!(outcome.classification, PerformanceClaimStatus::Quarantine);
         assert_eq!(wrapper_preserved_exit_code(&outcome), 2);
@@ -6111,6 +6367,167 @@ source = "git+https://github.com/Dicklesworthstone/hnswlib-rs?rev={CANDIDATE_REV
             .to_string();
         assert!(
             error.contains("exists") || error.contains("File exists") || error.contains("already"),
+            "{error}"
+        );
+    }
+
+    fn sample_roster_json() -> &'static str {
+        r#"{
+          "data": {
+            "workers": [
+              {"id":"hz1","host":"10.0.0.1","user":"root","total_slots":6,"priority":110,"tags":["rust"]},
+              {"id":"hz2","host":"10.0.0.2","user":"root","total_slots":8,"priority":110,"tags":["rust"]}
+            ],
+            "count": 2
+          }
+        }"#
+    }
+
+    #[test]
+    fn pinned_worker_select_requires_an_explicit_id_when_the_roster_is_ambiguous() {
+        let workers = parse_rch_workers_json(sample_roster_json().as_bytes()).unwrap();
+        assert_eq!(workers.len(), 2);
+        let error = select_pinned_worker(&workers, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--worker-id"), "{error}");
+        let hz2 = select_pinned_worker(&workers, Some("hz2")).unwrap();
+        assert_eq!(hz2.id, "hz2");
+        assert_eq!(hz2.host, "10.0.0.2");
+        assert!(select_pinned_worker(&workers, Some("nope")).is_err());
+    }
+
+    #[test]
+    fn pinned_worker_selects_the_only_roster_entry_without_a_pin() {
+        let json = r#"{"workers":[{"id":"solo","host":"127.0.0.1","user":"ubuntu","total_slots":1,"priority":1,"tags":[]}]}"#;
+        let workers = parse_rch_workers_json(json.as_bytes()).unwrap();
+        assert_eq!(select_pinned_worker(&workers, None).unwrap().id, "solo");
+    }
+
+    #[cfg(unix)]
+    fn write_fixture_elf(path: &Path, status: &str, exit: i32) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' '{{\"schema\":\"{SCHEMA}\",\"validation\":{{\"performance_claim_status\":\"{status}\"}}}}' > report.json\n\
+             printf '%s\\n' '{{\"schema\":\"{SCHEMA}\",\"event\":\"child_reaped\"}}' > child-journal.jsonl\n\
+             printf 'out\\n' > child.stdout\n\
+             printf 'err\\n' > child.stderr\n\
+             exit {exit}\n"
+        );
+        fs::write(path, script).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn run_local_pinned_elf(
+        status: &str,
+        exit: i32,
+    ) -> Result<(PinnedRetrieveOutcome, tempfile::TempDir), DynError> {
+        let tools = tempfile::tempdir().unwrap();
+        let elf = tools.path().join("fixture-elf");
+        write_fixture_elf(&elf, status, exit);
+        let remote = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let local_dir = local.path().join("retrieved");
+        let worker = WorkerIdentity {
+            id: "hz2".to_owned(),
+            host: "10.0.0.2".to_owned(),
+            user: "root".to_owned(),
+        };
+        let transport = LocalPinnedTransport {
+            worker: worker.clone(),
+            remote_root: remote.path().join("work"),
+            elf,
+            elf_args: Vec::new(),
+            deadline: Duration::from_secs(5),
+            term_grace: Duration::from_millis(200),
+        };
+        let outcome = run_pinned_worker_measurement(
+            &transport,
+            &RemoteRunSpec::decision_default(),
+            &local_dir,
+            true,
+        )?;
+        assert_eq!(outcome.worker, worker);
+        let _keep = (tools, remote);
+        Ok((outcome, local))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_run_executes_the_attested_elf_then_retrieves_quarantine() {
+        let (outcome, local) = run_local_pinned_elf("quarantine", 2).unwrap();
+        assert_eq!(outcome.remote_exit_code, 2);
+        assert_eq!(outcome.classification, PerformanceClaimStatus::Quarantine);
+        assert_eq!(wrapper_preserved_exit_code(&outcome), 2);
+        assert!(
+            local
+                .path()
+                .join("retrieved")
+                .join(PINNED_RETRIEVE_REPORT)
+                .is_file()
+        );
+        assert!(
+            local
+                .path()
+                .join("retrieved")
+                .join(PINNED_RETRIEVE_JOURNAL)
+                .is_file()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_run_does_not_launder_exit_zero_quarantine_from_a_real_elf() {
+        let (outcome, _) = run_local_pinned_elf("quarantine", 0).unwrap();
+        assert_eq!(outcome.remote_exit_code, 0);
+        assert_eq!(outcome.classification, PerformanceClaimStatus::Quarantine);
+        assert_eq!(wrapper_preserved_exit_code(&outcome), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_run_fails_closed_when_the_elf_omits_the_report() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tools = tempfile::tempdir().unwrap();
+        let elf = tools.path().join("broken-elf");
+        fs::write(
+            &elf,
+            "#!/bin/sh\nprintf 'journal\\n' > child-journal.jsonl\nprintf 'out\\n' > child.stdout\nprintf 'err\\n' > child.stderr\nexit 2\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&elf).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&elf, permissions).unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let transport = LocalPinnedTransport {
+            worker: WorkerIdentity {
+                id: "hz2".to_owned(),
+                host: "10.0.0.2".to_owned(),
+                user: "root".to_owned(),
+            },
+            remote_root: remote.path().join("work"),
+            elf,
+            elf_args: Vec::new(),
+            deadline: Duration::from_secs(5),
+            term_grace: Duration::from_millis(200),
+        };
+        let error = run_pinned_worker_measurement(
+            &transport,
+            &RemoteRunSpec::decision_default(),
+            &local.path().join("retrieved"),
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("missing") || error.contains("report.json"),
             "{error}"
         );
     }
