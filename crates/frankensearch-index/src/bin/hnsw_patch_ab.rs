@@ -75,7 +75,7 @@ enum EngineKind {
     Candidate,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum PerformanceClaimStatus {
     Allow,
@@ -616,7 +616,12 @@ fn print_help() {
          [--corpus-slab PATH] [--corpus-manifest PATH] \
          [--corpus-source-manifest PATH] [--output PATH] \
          [--child-deadline-ms N] [--child-term-grace-ms N] \
-         [--child-log-byte-cap N] [--child-log-dir PATH]"
+         [--child-log-byte-cap N] [--child-log-dir PATH]\n\
+         hnsw_patch_ab --pinned-retrieve --remote-root DIR --local-dir DIR \
+         [--worker-id ID]\n\
+         Pinned retrieve always pulls report.json, child-journal.jsonl, \
+         child stdout/stderr, and artifacts.sha256 after the remote ELF \
+         exits. Retrieval success never converts quarantine/block into allow."
     );
 }
 
@@ -4703,7 +4708,401 @@ fn structured_log(event: &str, fields: &str) {
     );
 }
 
+const PINNED_RETRIEVE_RECEIPT: &str = "artifacts.sha256";
+const PINNED_RETRIEVE_REPORT: &str = "report.json";
+const PINNED_RETRIEVE_JOURNAL: &str = "child-journal.jsonl";
+
+trait RemoteTransport {
+    fn worker_id(&self) -> &str;
+    fn run_attested_elf(&self, spec: &RemoteRunSpec) -> Result<i32, DynError>;
+    fn fetch_file(&self, remote_path: &str) -> Result<Vec<u8>, DynError>;
+}
+
+#[derive(Clone, Debug)]
+struct RemoteRunSpec {
+    report_name: String,
+    journal_name: String,
+    log_names: Vec<String>,
+}
+
+impl RemoteRunSpec {
+    fn decision_default() -> Self {
+        Self {
+            report_name: PINNED_RETRIEVE_REPORT.to_owned(),
+            journal_name: PINNED_RETRIEVE_JOURNAL.to_owned(),
+            log_names: vec!["child.stdout".to_owned(), "child.stderr".to_owned()],
+        }
+    }
+
+    fn required_paths(&self) -> Vec<String> {
+        let mut paths = vec![
+            PINNED_RETRIEVE_RECEIPT.to_owned(),
+            self.report_name.clone(),
+            self.journal_name.clone(),
+        ];
+        paths.extend(self.log_names.iter().cloned());
+        paths
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RetrievedReportHead {
+    schema: String,
+    validation: RetrievedValidationHead,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RetrievedValidationHead {
+    performance_claim_status: PerformanceClaimStatus,
+}
+
+#[derive(Debug)]
+struct PinnedRetrieveOutcome {
+    worker_id: String,
+    remote_exit_code: i32,
+    classification: PerformanceClaimStatus,
+    retrieval_ok: bool,
+    report_sha256: String,
+    journal_sha256: String,
+}
+
+#[cfg(test)]
+type MemoryRunFn = Box<dyn Fn(&Mutex<BTreeMap<String, Vec<u8>>>) -> i32 + Send + Sync>;
+
+#[cfg(test)]
+struct MemoryTransport {
+    worker_id: String,
+    files: Mutex<BTreeMap<String, Vec<u8>>>,
+    run: MemoryRunFn,
+}
+
+#[cfg(test)]
+impl MemoryTransport {
+    fn new(
+        worker_id: impl Into<String>,
+        run: impl Fn(&Mutex<BTreeMap<String, Vec<u8>>>) -> i32 + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            worker_id: worker_id.into(),
+            files: Mutex::new(BTreeMap::new()),
+            run: Box::new(run),
+        }
+    }
+}
+
+#[cfg(test)]
+impl RemoteTransport for MemoryTransport {
+    fn worker_id(&self) -> &str {
+        &self.worker_id
+    }
+
+    fn run_attested_elf(&self, _spec: &RemoteRunSpec) -> Result<i32, DynError> {
+        Ok((self.run)(&self.files))
+    }
+
+    fn fetch_file(&self, remote_path: &str) -> Result<Vec<u8>, DynError> {
+        self.files
+            .lock()
+            .map_err(|_| "memory transport lock poisoned")?
+            .get(remote_path)
+            .cloned()
+            .ok_or_else(|| format!("remote artifact missing: {remote_path}").into())
+    }
+}
+
+struct FilesystemTransport {
+    worker_id: String,
+    remote_root: PathBuf,
+}
+
+impl RemoteTransport for FilesystemTransport {
+    fn worker_id(&self) -> &str {
+        &self.worker_id
+    }
+
+    fn run_attested_elf(&self, _spec: &RemoteRunSpec) -> Result<i32, DynError> {
+        Err("filesystem transport is retrieve-only; the attested ELF must already have run".into())
+    }
+
+    fn fetch_file(&self, remote_path: &str) -> Result<Vec<u8>, DynError> {
+        if !safe_relative_source_path(remote_path) {
+            return Err(format!("unsafe remote artifact path: {remote_path:?}").into());
+        }
+        fs::read(self.remote_root.join(remote_path))
+            .map_err(|error| format!("fetch {remote_path}: {error}").into())
+    }
+}
+
+#[cfg(test)]
+fn artifact_receipt_line(path: &str, bytes: &[u8]) -> String {
+    format!("{path} {}", sha256_bytes(bytes))
+}
+
+#[cfg(test)]
+fn write_artifact_receipt(files: &mut BTreeMap<String, Vec<u8>>, spec: &RemoteRunSpec) {
+    let mut lines = Vec::new();
+    for path in spec.required_paths() {
+        if path == PINNED_RETRIEVE_RECEIPT {
+            continue;
+        }
+        if let Some(bytes) = files.get(&path) {
+            lines.push(artifact_receipt_line(&path, bytes));
+        }
+    }
+    lines.sort();
+    files.insert(
+        PINNED_RETRIEVE_RECEIPT.to_owned(),
+        format!("{}\n", lines.join("\n")).into_bytes(),
+    );
+}
+
+fn parse_artifact_receipt(bytes: &[u8]) -> Result<BTreeMap<String, String>, DynError> {
+    let text = std::str::from_utf8(bytes)?;
+    let mut hashes = BTreeMap::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let (path, hash) = line
+            .split_once(' ')
+            .ok_or_else(|| format!("artifact receipt line {} is not 'path sha256'", index + 1))?;
+        if !safe_relative_source_path(path) || !is_sha256_hex(hash) {
+            return Err(format!("artifact receipt line {} is malformed", index + 1).into());
+        }
+        if hashes.insert(path.to_owned(), hash.to_owned()).is_some() {
+            return Err(format!("artifact receipt duplicates {path}").into());
+        }
+    }
+    Ok(hashes)
+}
+
+fn classify_retrieved_report(bytes: &[u8]) -> Result<PerformanceClaimStatus, DynError> {
+    let head: RetrievedReportHead = serde_json::from_slice(bytes)?;
+    if head.schema != SCHEMA {
+        return Err(format!(
+            "retrieved report schema {} does not match {SCHEMA}",
+            head.schema
+        )
+        .into());
+    }
+    Ok(head.validation.performance_claim_status)
+}
+
+fn persist_create_new(path: &Path, bytes: &[u8]) -> Result<(), DynError> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn retrieve_required_artifacts<T: RemoteTransport>(
+    transport: &T,
+    spec: &RemoteRunSpec,
+    local_dir: &Path,
+) -> Result<BTreeMap<String, Vec<u8>>, DynError> {
+    let receipt = transport.fetch_file(PINNED_RETRIEVE_RECEIPT)?;
+    let declared = parse_artifact_receipt(&receipt)?;
+    persist_create_new(&local_dir.join(PINNED_RETRIEVE_RECEIPT), &receipt)?;
+    let mut fetched = BTreeMap::new();
+    for path in spec.required_paths() {
+        if path == PINNED_RETRIEVE_RECEIPT {
+            continue;
+        }
+        let bytes = transport.fetch_file(&path)?;
+        let observed = sha256_bytes(&bytes);
+        match declared.get(&path) {
+            Some(expected) if expected == &observed => {}
+            Some(expected) => {
+                return Err(format!(
+                    "remote artifact {path} hash {observed} != declared {expected}"
+                )
+                .into());
+            }
+            None => {
+                return Err(
+                    format!("remote artifact {path} is absent from the hash receipt").into(),
+                );
+            }
+        }
+        persist_create_new(&local_dir.join(&path), &bytes)?;
+        fetched.insert(path, bytes);
+    }
+    Ok(fetched)
+}
+
+fn run_pinned_worker_measurement<T: RemoteTransport>(
+    transport: &T,
+    spec: &RemoteRunSpec,
+    local_dir: &Path,
+    run_remote: bool,
+) -> Result<PinnedRetrieveOutcome, DynError> {
+    fs::create_dir_all(local_dir)?;
+    let remote_exit_code = if run_remote {
+        transport.run_attested_elf(spec)?
+    } else {
+        0
+    };
+    let retrieved = retrieve_required_artifacts(transport, spec, local_dir);
+    match retrieved {
+        Ok(files) => {
+            let report = files
+                .get(&spec.report_name)
+                .ok_or("retrieved artifacts omitted the report")?;
+            let journal = files
+                .get(&spec.journal_name)
+                .ok_or("retrieved artifacts omitted the journal")?;
+            if journal.is_empty() {
+                return Err("retrieved journal is empty".into());
+            }
+            let classification = classify_retrieved_report(report)?;
+            persist_create_new(
+                &local_dir.join("wrapper-outcome.json"),
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema": SCHEMA,
+                    "event": "pinned_retrieve",
+                    "worker_id": transport.worker_id(),
+                    "remote_exit_code": remote_exit_code,
+                    "classification": classification.label(),
+                    "retrieval_ok": true,
+                    "report_sha256": sha256_bytes(report),
+                    "journal_sha256": sha256_bytes(journal),
+                }))?
+                .as_bytes(),
+            )?;
+            Ok(PinnedRetrieveOutcome {
+                worker_id: transport.worker_id().to_owned(),
+                remote_exit_code,
+                classification,
+                retrieval_ok: true,
+                report_sha256: sha256_bytes(report),
+                journal_sha256: sha256_bytes(journal),
+            })
+        }
+        Err(error) => Err(format!(
+            "pinned retrieve failed after remote exit {remote_exit_code} on worker {}: {error}",
+            transport.worker_id()
+        )
+        .into()),
+    }
+}
+
+fn wrapper_preserved_exit_code(outcome: &PinnedRetrieveOutcome) -> i32 {
+    if !outcome.retrieval_ok {
+        return 3;
+    }
+    match outcome.classification {
+        PerformanceClaimStatus::Allow | PerformanceClaimStatus::NoClaim => outcome.remote_exit_code,
+        PerformanceClaimStatus::Quarantine | PerformanceClaimStatus::Block => {
+            if outcome.remote_exit_code == 0 {
+                2
+            } else {
+                outcome.remote_exit_code
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn plant_minimal_report(
+    files: &mut BTreeMap<String, Vec<u8>>,
+    spec: &RemoteRunSpec,
+    status: PerformanceClaimStatus,
+) {
+    let report = format!(
+        "{{\"schema\":{schema},\"validation\":{{\"performance_claim_status\":\"{}\"}}}}",
+        status.label(),
+        schema = serde_json::to_string(SCHEMA).unwrap_or_else(|_| "\"\"".to_owned()),
+    );
+    files.insert(spec.report_name.clone(), report.into_bytes());
+    files.insert(
+        spec.journal_name.clone(),
+        format!("{{\"schema\":\"{SCHEMA}\",\"event\":\"child_reaped\"}}\n").into_bytes(),
+    );
+    for name in &spec.log_names {
+        files.insert(name.clone(), format!("{name} log\n").into_bytes());
+    }
+    write_artifact_receipt(files, spec);
+}
+
+fn pinned_retrieve_main(args: &[String]) -> Result<(), DynError> {
+    let mut remote_root = None;
+    let mut local_dir = None;
+    let mut worker_id = "unspecified-worker".to_owned();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--pinned-retrieve" => index += 1,
+            "--remote-root" => {
+                remote_root = Some(PathBuf::from(required_value(args, index)?));
+                index += 2;
+            }
+            "--local-dir" => {
+                local_dir = Some(PathBuf::from(required_value(args, index)?));
+                index += 2;
+            }
+            "--worker-id" => {
+                required_value(args, index)?.clone_into(&mut worker_id);
+                index += 2;
+            }
+            "--help" | "-h" => {
+                print_help();
+                return Ok(());
+            }
+            other => return Err(format!("unknown --pinned-retrieve argument {other:?}").into()),
+        }
+    }
+    let remote_root = remote_root.ok_or("--pinned-retrieve requires --remote-root")?;
+    let local_dir = local_dir.ok_or("--pinned-retrieve requires --local-dir")?;
+    if local_dir.exists() {
+        return Err(format!(
+            "refusing to overwrite existing retrieve directory: {}",
+            local_dir.display()
+        )
+        .into());
+    }
+    let transport = FilesystemTransport {
+        worker_id,
+        remote_root,
+    };
+    let spec = RemoteRunSpec::decision_default();
+    let outcome = run_pinned_worker_measurement(&transport, &spec, &local_dir, false)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": SCHEMA,
+            "event": "pinned_retrieve",
+            "worker_id": outcome.worker_id,
+            "remote_exit_code": outcome.remote_exit_code,
+            "classification": outcome.classification.label(),
+            "retrieval_ok": outcome.retrieval_ok,
+            "report_sha256": outcome.report_sha256,
+            "journal_sha256": outcome.journal_sha256,
+            "wrapper_exit_code": wrapper_preserved_exit_code(&outcome),
+        }))?
+    );
+    let exit = wrapper_preserved_exit_code(&outcome);
+    if exit == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "pinned retrieve preserved classification {} (exit {exit})",
+            outcome.classification.label()
+        )
+        .into())
+    }
+}
+
 fn run() -> Result<(), DynError> {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--pinned-retrieve") {
+        return pinned_retrieve_main(&args);
+    }
     let config = Config::parse()?;
     if config.child_engine.is_some() {
         child_main(&config)
@@ -5579,5 +5978,140 @@ source = "git+https://github.com/Dicklesworthstone/hnswlib-rs?rev={CANDIDATE_REV
             result.pid
         );
         assert!(!process_exists(orphan), "orphan {orphan} still alive");
+    }
+
+    fn run_memory_retrieve(
+        worker_id: &str,
+        status: PerformanceClaimStatus,
+        remote_exit: i32,
+        after_run: impl Fn(&Mutex<BTreeMap<String, Vec<u8>>>) + Send + Sync + 'static,
+    ) -> Result<(PinnedRetrieveOutcome, tempfile::TempDir), DynError> {
+        let spec = RemoteRunSpec::decision_default();
+        let planted = spec.clone();
+        let transport = MemoryTransport::new(worker_id, move |files| {
+            {
+                let mut guard = files.lock().expect("test transport lock");
+                plant_minimal_report(&mut guard, &planted, status);
+            }
+            after_run(files);
+            remote_exit
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let outcome = run_pinned_worker_measurement(&transport, &spec, directory.path(), true)?;
+        Ok((outcome, directory))
+    }
+
+    #[test]
+    fn pinned_retrieve_keeps_quarantine_after_nonzero_exit() {
+        let (outcome, directory) =
+            run_memory_retrieve("fake-hz2", PerformanceClaimStatus::Quarantine, 2, |_| {}).unwrap();
+        assert!(outcome.retrieval_ok);
+        assert_eq!(outcome.worker_id, "fake-hz2");
+        assert_eq!(outcome.remote_exit_code, 2);
+        assert_eq!(outcome.classification, PerformanceClaimStatus::Quarantine);
+        assert_eq!(wrapper_preserved_exit_code(&outcome), 2);
+        assert!(directory.path().join(PINNED_RETRIEVE_REPORT).is_file());
+        assert!(directory.path().join(PINNED_RETRIEVE_JOURNAL).is_file());
+        assert!(directory.path().join("child.stdout").is_file());
+        assert!(directory.path().join("wrapper-outcome.json").is_file());
+    }
+
+    #[test]
+    fn pinned_retrieve_does_not_launder_exit_zero_quarantine() {
+        let (outcome, _) =
+            run_memory_retrieve("fake-hz2", PerformanceClaimStatus::Quarantine, 0, |_| {}).unwrap();
+        assert_eq!(outcome.classification, PerformanceClaimStatus::Quarantine);
+        assert_eq!(wrapper_preserved_exit_code(&outcome), 2);
+        assert_ne!(outcome.classification, PerformanceClaimStatus::Allow);
+    }
+
+    #[test]
+    fn pinned_retrieve_fails_closed_when_report_is_absent() {
+        let error =
+            run_memory_retrieve("fake-hz2", PerformanceClaimStatus::Quarantine, 2, |files| {
+                files
+                    .lock()
+                    .expect("test transport lock")
+                    .remove(PINNED_RETRIEVE_REPORT);
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("missing") || error.contains("report.json"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn pinned_retrieve_fails_closed_when_report_is_altered() {
+        let error =
+            run_memory_retrieve("fake-hz2", PerformanceClaimStatus::Quarantine, 2, |files| {
+                files.lock().expect("test transport lock").insert(
+                    PINNED_RETRIEVE_REPORT.to_owned(),
+                    b"{\"tampered\":true}".to_vec(),
+                );
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("hash") || error.contains("altered") || error.contains("!="),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn pinned_retrieve_allow_preserves_remote_success() {
+        let (outcome, _) =
+            run_memory_retrieve("fake-hz2", PerformanceClaimStatus::Allow, 0, |_| {}).unwrap();
+        assert_eq!(outcome.classification, PerformanceClaimStatus::Allow);
+        assert_eq!(wrapper_preserved_exit_code(&outcome), 0);
+    }
+
+    #[test]
+    fn pinned_retrieve_filesystem_transport_reads_a_prebuilt_remote_root() {
+        let spec = RemoteRunSpec::decision_default();
+        let remote = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let local_dir = local.path().join("retrieved");
+        {
+            let mut files = BTreeMap::new();
+            plant_minimal_report(&mut files, &spec, PerformanceClaimStatus::Block);
+            for (path, bytes) in files {
+                fs::write(remote.path().join(path), bytes).unwrap();
+            }
+        }
+        let transport = FilesystemTransport {
+            worker_id: "pinned-fs".to_owned(),
+            remote_root: remote.path().to_path_buf(),
+        };
+        let outcome = run_pinned_worker_measurement(&transport, &spec, &local_dir, false).unwrap();
+        assert_eq!(outcome.classification, PerformanceClaimStatus::Block);
+        assert_eq!(wrapper_preserved_exit_code(&outcome), 2);
+        assert_eq!(
+            fs::read(local_dir.join(PINNED_RETRIEVE_REPORT)).unwrap(),
+            fs::read(remote.path().join(PINNED_RETRIEVE_REPORT)).unwrap()
+        );
+    }
+
+    #[test]
+    fn pinned_retrieve_create_new_refuses_a_second_local_write() {
+        let spec = RemoteRunSpec::decision_default();
+        let transport = MemoryTransport::new("fake-hz2", {
+            let spec = spec.clone();
+            move |files| {
+                let mut guard = files.lock().expect("test transport lock");
+                plant_minimal_report(&mut guard, &spec, PerformanceClaimStatus::NoClaim);
+                0
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        run_pinned_worker_measurement(&transport, &spec, directory.path(), true).unwrap();
+        let error = run_pinned_worker_measurement(&transport, &spec, directory.path(), true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("exists") || error.contains("File exists") || error.contains("already"),
+            "{error}"
+        );
     }
 }
