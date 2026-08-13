@@ -12001,9 +12001,9 @@ impl SnippetTailWorkShape {
 
 /// Dictionary-block ceiling for one Delta generation's ordered term view.
 ///
-/// `DeltaSegment::sorted_terms` materialises AND radix-sorts every term id in
-/// the generation before the first term can be examined, so this ceiling is
-/// what the tail must admit BEFORE that view is built. The bound and the
+/// `DeltaSnapshot::ordered_terms` materialises AND radix-sorts every term id
+/// on its first view before the first term can be examined, so this ceiling is
+/// what the tail must admit BEFORE that cache can be built. The bound and the
 /// admission both derive from this one function on purpose: metering is armed
 /// by `upper_bound > budget`, so a unit the bound does not cover could refuse
 /// a query whose real work fits its budget.
@@ -13969,16 +13969,16 @@ fn snapshot_string_range_terms(
         }
     }
     for delta in snapshot.delta_snapshots() {
-        // `sorted_terms` materialises and radix-sorts the complete ordered
-        // view before yielding its first term. Admit that bounded work from
-        // the O(1) term count before the allocation/sort can begin; otherwise
-        // a cancelled or under-budget range still pays the whole cost before
-        // observing its first checkpoint.
+        // `ordered_terms` materialises and radix-sorts the complete ordered
+        // view on its first use before yielding its first term. Admit that
+        // bounded work from the O(1) term count before the cache can be built;
+        // otherwise a cancelled or under-budget range still pays the whole
+        // cost before observing its first checkpoint.
         checkpoint.admit(
             QueryWorkKind::DictionaryBlock,
             delta_ordered_view_blocks(delta.segment().term_count()),
         )?;
-        for (term_index, term) in delta.segment().sorted_terms().iter().enumerate() {
+        for (term_index, term) in delta.ordered_terms().enumerate() {
             // Ordered-view blocks are paid above. Keep a zero-unit boundary
             // so cancellation during a long range walk is still observed.
             if term_index % 16 == 0 {
@@ -14374,25 +14374,23 @@ fn snapshot_glob_terms(
         }
     }
     for delta in snapshot.delta_snapshots() {
-        // `sorted_terms` is not a cursor: it allocates one id per term and
-        // MSD-radix-sorts the whole set (`TermInterner::sorted_ids`) before
-        // the first term is examined. Admitting per 16-term block DURING the
-        // walk therefore charged nothing for the one allocation that scales
-        // with the generation, and a cancelled or zero-fuel query still paid
-        // for it in full. The ceiling comes from the O(1) `term_count` and is
-        // admitted BEFORE the ordered view exists.
+        // `ordered_terms` is not a cursor: its first use allocates one id per
+        // term and MSD-radix-sorts the whole set (`TermInterner::sorted_ids`)
+        // before the first term is examined. Admitting per 16-term block
+        // DURING that initial walk would charge nothing for the one allocation
+        // that scales with the generation, and a cancelled or zero-fuel query
+        // would still pay for it in full. The ceiling comes from the O(1)
+        // `term_count` and is admitted BEFORE the ordered view exists.
         //
-        // A chunked ordered traversal would be better still, but the ordering
-        // is produced wholesale by `TermInterner::sorted_ids` in `scribe.rs`
-        // and there is no lazy ordered cursor to drive; conservative
-        // pre-admission is the bounded option available here.
+        // The cache retains the wholesale order per frozen generation; the
+        // first lookup remains conservatively pre-admitted.
         if let Some(checkpoint) = checkpoint {
             checkpoint.admit(
                 QueryWorkKind::DictionaryBlock,
                 delta_ordered_view_blocks(delta.segment().term_count()),
             )?;
         }
-        for (term_index, term) in delta.segment().sorted_terms().iter().enumerate() {
+        for (term_index, term) in delta.ordered_terms().enumerate() {
             // The blocks are paid for above, so this admits ZERO units: it
             // charges no fuel and moves no counter, and exists only so that a
             // cancellation during a long walk is still surfaced promptly.

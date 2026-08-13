@@ -6,6 +6,7 @@
 
 use std::marker::PhantomData;
 use std::mem::size_of;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ahash::{AHashMap, AHashSet};
@@ -829,6 +830,7 @@ pub struct DeltaSegment {
 #[derive(Debug)]
 pub struct DeltaSnapshot {
     segment: DeltaSegment,
+    ordered_term_ids: OnceLock<Box<[u32]>>,
     keeper_generation: u64,
     lineage_id: u64,
 }
@@ -838,6 +840,22 @@ impl DeltaSnapshot {
     #[must_use]
     pub const fn segment(&self) -> &DeltaSegment {
         &self.segment
+    }
+
+    /// Canonically ordered term views for this immutable generation.
+    ///
+    /// Query lowering must pre-admit the first view before calling this; the
+    /// cache materializes the complete retained ID slice in one operation.
+    #[must_use]
+    pub(crate) fn ordered_terms(&self) -> DeltaOrderedTerms<'_> {
+        let term_ids = self
+            .ordered_term_ids
+            .get_or_init(|| self.segment.terms.sorted_ids().into_boxed_slice());
+        DeltaOrderedTerms {
+            delta: &self.segment,
+            term_ids,
+            next_term: 0,
+        }
     }
 
     /// Number of physical rows retained by this immutable delta generation.
@@ -1017,6 +1035,27 @@ impl DeltaSnapshot {
         let first = u64::from(*self.segment.document_docids.first()?);
         let last = u64::from(*self.segment.document_docids.last()?);
         Some((first, last + 1))
+    }
+}
+
+/// Allocation-free traversal of one frozen Delta generation's canonical order.
+#[derive(Debug, Clone)]
+pub(crate) struct DeltaOrderedTerms<'a> {
+    delta: &'a DeltaSegment,
+    term_ids: &'a [u32],
+    next_term: usize,
+}
+
+impl<'a> Iterator for DeltaOrderedTerms<'a> {
+    type Item = DeltaTerm<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let term_index = *self.term_ids.get(self.next_term)?;
+        self.next_term += 1;
+        Some(DeltaTerm {
+            delta: self.delta,
+            term_index,
+        })
     }
 }
 
@@ -1207,6 +1246,7 @@ impl DeltaSegment {
         // chains, already exact.
         DeltaSnapshot {
             segment,
+            ordered_term_ids: OnceLock::new(),
             keeper_generation,
             // Each frozen epoch is a distinct publication candidate, even
             // when two freezes observe the same mutable Delta generation.
@@ -3695,6 +3735,62 @@ mod tests {
             1
         );
         assert_eq!(frozen.live_total_tokens(1), Some(2));
+        Ok(())
+    }
+
+    #[test]
+    fn frozen_snapshot_ordered_terms_reuse_one_backing_and_isolate_successors()
+    -> Result<(), DeltaError> {
+        let mut delta = DeltaSegment::new(TEST_SCHEMA, 0, usize::MAX)?;
+        apply_positioned(&mut delta, 0, "zeta", b"zeta", &[0])?;
+        apply_positioned(&mut delta, 1, "alpha", b"alpha", &[0])?;
+        let frozen = delta.freeze(7);
+
+        let first_view = frozen.ordered_terms();
+        let first_backing = first_view.term_ids.as_ptr();
+        let first_terms = first_view
+            .map(|term| term.term().to_vec())
+            .collect::<Vec<_>>();
+        let second_view = frozen.ordered_terms();
+        let second_backing = second_view.term_ids.as_ptr();
+        let second_terms = second_view
+            .map(|term| term.term().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(first_terms, [b"alpha".to_vec(), b"zeta".to_vec()]);
+        assert_eq!(second_terms, first_terms);
+        assert_eq!(
+            first_backing, second_backing,
+            "later readers must reuse the first frozen snapshot's retained IDs"
+        );
+
+        apply_positioned(&mut delta, 2, "middle", b"middle", &[0])?;
+        let successor = delta.freeze(8);
+        let successor_view = successor.ordered_terms();
+        assert_eq!(
+            successor_view
+                .clone()
+                .map(|term| term.term().to_vec())
+                .collect::<Vec<_>>(),
+            [b"alpha".to_vec(), b"middle".to_vec(), b"zeta".to_vec()]
+        );
+        assert_ne!(
+            first_backing,
+            successor_view.term_ids.as_ptr(),
+            "a successor freeze must retain its own generation's IDs"
+        );
+        assert_eq!(
+            frozen
+                .ordered_terms()
+                .map(|term| term.term().to_vec())
+                .collect::<Vec<_>>(),
+            first_terms,
+            "a mutable successor must not change the frozen ordered view"
+        );
+        let rebound = frozen.rebind_keeper_generation(9);
+        assert!(
+            rebound.ordered_term_ids.get().is_none(),
+            "rebinding must not copy a predecessor cache into a new owner"
+        );
         Ok(())
     }
 
