@@ -897,10 +897,7 @@ impl std::fmt::Debug for HybridIndexParts {
 /// explicit Tantivy oracle/rollback reader.
 fn is_hash_generation_id(embedder_id: &str) -> bool {
     let id = embedder_id.to_ascii_lowercase();
-    id == "hash"
-        || id.starts_with("hash-")
-        || id.starts_with("fnv1a-")
-        || id.starts_with("jl-")
+    id == "hash" || id.starts_with("hash-") || id.starts_with("fnv1a-") || id.starts_with("jl-")
 }
 
 pub async fn open_hybrid(

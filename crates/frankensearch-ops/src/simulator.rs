@@ -812,7 +812,7 @@ fn synthesize_phases(
                 vectors_searched: 4_096,
                 lexical_candidates: 96,
                 fused_count: result_count.saturating_add(2),
-            skip_reason: None,
+                skip_reason: None,
             },
         };
         phases.push(reranked);
