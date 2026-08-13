@@ -893,13 +893,23 @@ impl std::fmt::Debug for HybridIndexParts {
 ///
 /// # Errors
 ///
-/// Returns an error when the vector index cannot be opened, or when a
-/// lexical directory exists but its index fails to open (a corrupt lexical
-/// arm is reported, never silently dropped). A missing lexical directory
+/// Returns an error when the vector index cannot be opened, when the fast
+/// tier carries a hash-embedder identity (that generation is not a hybrid
+/// semantic product), or when a lexical directory exists but its index
+/// fails to open (a corrupt lexical arm is reported, never silently
+/// dropped). A missing lexical directory
 /// yields `lexical: None` and `lexical_backend: None`, as does a build without
 /// a lexical backend compiled in. When the arm is present,
 /// `lexical_backend` records whether it is the default Quill reader or an
 /// explicit Tantivy oracle/rollback reader.
+fn is_hash_generation_id(embedder_id: &str) -> bool {
+    let id = embedder_id.to_ascii_lowercase();
+    id == "hash"
+        || id.starts_with("hash-")
+        || id.starts_with("fnv1a-")
+        || id.starts_with("jl-")
+}
+
 pub async fn open_hybrid(
     cx: &Cx,
     data_dir: impl AsRef<Path>,
@@ -907,6 +917,14 @@ pub async fn open_hybrid(
 ) -> SearchResult<HybridIndexParts> {
     let data_dir = data_dir.as_ref();
     let vectors = Arc::new(TwoTierIndex::open(data_dir, config)?);
+    if is_hash_generation_id(vectors.fast_embedder_id()) {
+        return Err(SearchError::EmbedderUnavailable {
+            model: vectors.fast_embedder_id().to_owned(),
+            reason: "open_hybrid refuses hash-identity generations; rebuild with a semantic \
+                     embedder, or open TwoTierIndex directly for explicit hash control"
+                .to_owned(),
+        });
+    }
 
     let lexical_dir = data_dir.join("lexical");
     let (lexical, lexical_backend) = if lexical_dir.is_dir() {
@@ -2766,6 +2784,32 @@ mod tests {
             assert_eq!(parts.vectors.doc_count(), 1);
             assert!(parts.lexical.is_none());
             assert!(parts.lexical_backend.is_none());
+        });
+    }
+
+    #[cfg(feature = "hash")]
+    #[test]
+    fn open_hybrid_refuses_a_hash_identity_generation() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let hash_stack = EmbedderStack::from_parts(
+                Arc::new(frankensearch_embed::HashEmbedder::default_256()) as Arc<dyn Embedder>,
+                None,
+            );
+            IndexBuilder::new(dir.path())
+                .with_embedder_stack(hash_stack)
+                .add_document("doc-1", "Hello world")
+                .build(&cx)
+                .await
+                .unwrap();
+
+            let error = open_hybrid(&cx, dir.path(), TwoTierConfig::default())
+                .await
+                .expect_err("hash generations must not open as hybrid search");
+            assert!(
+                matches!(error, SearchError::EmbedderUnavailable { .. }),
+                "expected EmbedderUnavailable, got: {error:?}"
+            );
         });
     }
 
