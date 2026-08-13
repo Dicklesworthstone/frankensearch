@@ -8909,6 +8909,7 @@ impl FsfsRuntime {
         checks.push(Self::collect_lexical_engine_doctor_check(&index_root)?);
         checks.push(self.collect_shadow_oracle_doctor_check(&index_root)?);
         checks.push(Self::collect_zero_signal_doctor_check(&index_root));
+        checks.push(Self::collect_vector_generation_doctor_check(&index_root));
 
         // 5. Index directory permissions, without mutating the live index.
         if index_root.exists() {
@@ -9187,6 +9188,59 @@ impl FsfsRuntime {
     /// (live records but zero usable vectors) fail, and a healthy populated
     /// index passes with its counts. An unreadable artifact fails; a missing
     /// artifact warns because the semantic lane is simply not built yet.
+    fn collect_vector_generation_doctor_check(index_root: &Path) -> DoctorCheck {
+        let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
+        if !vector_path.exists() {
+            return DoctorCheck {
+                name: "semantic.vector_generation".to_owned(),
+                verdict: DoctorVerdict::Warn,
+                detail: format!(
+                    "no published vector generation at {}",
+                    vector_path.display()
+                ),
+                suggestion: Some(
+                    "run `fsfs index <dir>` to build a semantic generation".to_owned(),
+                ),
+            };
+        }
+        let index = match VectorIndex::open_read_only(&vector_path) {
+            Ok(index) => index,
+            Err(error) => {
+                return DoctorCheck {
+                    name: "semantic.vector_generation".to_owned(),
+                    verdict: DoctorVerdict::Fail,
+                    detail: format!(
+                        "vector generation at {} could not be opened: {error}",
+                        vector_path.display()
+                    ),
+                    suggestion: Some(
+                        "rebuild index artifacts in place with `fsfs index --full`".to_owned(),
+                    ),
+                };
+            }
+        };
+        let embedder_id = index.embedder_id().to_owned();
+        if Self::is_legacy_hash_vector_generation(&embedder_id) {
+            return DoctorCheck {
+                name: "semantic.vector_generation".to_owned(),
+                verdict: DoctorVerdict::Fail,
+                detail: format!(
+                    "vector generation identity `{embedder_id}` is a hash control artifact, not a semantic search generation"
+                ),
+                suggestion: Some(
+                    "rebuild with a verified semantic embedder; installing a model alone cannot repair hash vectors"
+                        .to_owned(),
+                ),
+            };
+        }
+        DoctorCheck {
+            name: "semantic.vector_generation".to_owned(),
+            verdict: DoctorVerdict::Pass,
+            detail: format!("identity={embedder_id} dimension={}", index.dimension()),
+            suggestion: None,
+        }
+    }
+
     fn collect_zero_signal_doctor_check(index_root: &Path) -> DoctorCheck {
         use frankensearch_core::config::ZeroSignalReason;
 
@@ -27165,6 +27219,13 @@ mod tests {
                 .any(|c| c.name == "semantic.zero_signal"),
             "doctor should report the semantic zero-signal census"
         );
+        assert!(
+            payload
+                .checks
+                .iter()
+                .any(|c| c.name == "semantic.vector_generation"),
+            "doctor should classify the published vector generation identity"
+        );
         assert_eq!(
             payload.pass_count + payload.warn_count + payload.fail_count,
             payload.checks.len(),
@@ -27198,6 +27259,57 @@ mod tests {
             check.detail
         );
         drop(live_reader);
+    }
+
+    #[test]
+    fn doctor_vector_generation_fails_closed_on_hash_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+        fs::create_dir_all(vector_path.parent().expect("vector path parent"))
+            .expect("create vector directory");
+        VectorIndex::create(&vector_path, "fnv1a-256", 256)
+            .expect("create hash control generation")
+            .finish()
+            .expect("finish hash control generation");
+
+        let check = FsfsRuntime::collect_vector_generation_doctor_check(&index_root);
+        assert_eq!(check.verdict, super::DoctorVerdict::Fail);
+        assert_eq!(check.name, "semantic.vector_generation");
+        assert!(
+            check.detail.contains("fnv1a-256") && check.detail.contains("hash control"),
+            "doctor must name the hash identity: {}",
+            check.detail
+        );
+        assert!(
+            check
+                .suggestion
+                .as_deref()
+                .is_some_and(|value| value.contains("rebuild")),
+            "hash generation must tell the operator to rebuild"
+        );
+    }
+
+    #[test]
+    fn doctor_vector_generation_passes_a_semantic_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+        fs::create_dir_all(vector_path.parent().expect("vector path parent"))
+            .expect("create vector directory");
+        VectorIndex::create(&vector_path, "potion-multilingual-128m", 256)
+            .expect("create semantic generation")
+            .finish()
+            .expect("finish semantic generation");
+
+        let check = FsfsRuntime::collect_vector_generation_doctor_check(&index_root);
+        assert_eq!(check.verdict, super::DoctorVerdict::Pass);
+        assert!(
+            check.detail.contains("potion-multilingual-128m")
+                && check.detail.contains("dimension=256"),
+            "doctor should report the published identity: {}",
+            check.detail
+        );
     }
 
     #[test]
