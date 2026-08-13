@@ -8275,6 +8275,15 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .process_group(0);
+        // Mirror production ordering exactly: containment is established FIRST
+        // and retained across the spawn (`run_local_perf_command_inner` enters
+        // the scope before it spawns). Entering afterwards made the fixture's
+        // own intended child a pre-existing descendant, which the scope is
+        // right to refuse — the refusal was a true observation of the
+        // fixture's ordering, not a containment defect, and no lock can fix it
+        // because the offending process is the one this fixture just spawned.
+        let mut descendant_scope =
+            LocalPerfDescendantScope::enter().expect("establish QG-1 test descendant scope");
         // Mirror production: one budget starts immediately before spawn and
         // setup can only spend, never refresh, that budget.
         let startup_deadline = Instant::now() + startup_budget;
@@ -8300,9 +8309,7 @@ mod tests {
         if !post_spawn_setup_delay.is_zero() {
             std::thread::sleep(post_spawn_setup_delay);
         }
-        let mut descendant_scope =
-            LocalPerfDescendantScope::enter().expect("establish QG-1 test descendant scope");
-        let (status, _, process_group_recovery, accepted, handshake_failure, _) =
+        let (status, _, process_group_recovery, accepted, handshake_failure, reconciliation) =
             wait_for_qg1_authority_child(
                 &mut child,
                 root_process_identity,
@@ -8320,6 +8327,16 @@ mod tests {
         descendant_scope
             .restore()
             .expect("restore QG-1 test descendant scope");
+        // The ordering this fix establishes, asserted rather than assumed: a
+        // scope entered BEFORE the spawn contains the intended child, so
+        // reconciliation reports zero escaped descendants. Entering after the
+        // spawn made that same child pre-existing, which is what the central
+        // run refused.
+        let (_, escaped_descendants) = reconciliation;
+        assert_eq!(
+            escaped_descendants, 0,
+            "a scope entered before the spawn must contain the intended child, leaving no escaped descendant"
+        );
         let mut retained_log_reader = File::from(
             openat(
                 &run_directories.run.handle,
