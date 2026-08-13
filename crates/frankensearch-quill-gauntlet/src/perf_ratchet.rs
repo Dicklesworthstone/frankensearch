@@ -16,10 +16,11 @@ use serde_json::Value;
 use crate::perf::PERF_NULL_MARGIN_MULTIPLIER;
 use crate::{
     DistributionSummary, EvidenceCellBody, EvidenceDecisionStatus, EvidenceRole,
-    MachineClassRegistry, MachineProfileKey, PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS,
-    PerfApplicabilityPlan, PerfApplicabilityPlanBinding, PerfCellApplicability, PerfCellResult,
-    PerfEvidenceArtifact, PerfExecutionProvenance, PerfGate, PerfGateArtifact, PerfMatrixSpec,
-    Qg1ExpectedAuthority, VerifiedRunnerIdentity,
+    ExecutionProfileId, HardwareClassId, MachineClassRegistry, MachineProfileKey,
+    PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS, PerfApplicabilityPlan,
+    PerfApplicabilityPlanBinding, PerfCellApplicability, PerfCellResult, PerfEvidenceArtifact,
+    PerfExecutionProvenance, PerfGate, PerfGateArtifact, PerfMatrixSpec, Qg1ExpectedAuthority,
+    VerifiedRunnerIdentity,
 };
 
 /// Version of the machine-readable ratchet decision artifact.
@@ -3230,15 +3231,79 @@ fn evaluate_qg7(target: &mut GateTargetEvaluator<'_, '_>) {
     }
 }
 
-fn evaluate_qg8(target: &mut GateTargetEvaluator<'_, '_>) {
-    if let (Some(four), Some(sixteen)) = (
-        target.value("scaling/xlarge/4/positions_on", "docs_per_second", "quill"),
-        target.value("scaling/xlarge/16/positions_on", "docs_per_second", "quill"),
+/// Reviewed QG-8 own-arm scaling floor. x86 uses 16-vs-4; Apple scheduler
+/// profiles use the same 1.8x floor on their widest runnable cell (8-vs-4).
+const QG8_OWN_SCALING_THRESHOLD: f64 = 1.8;
+
+struct Qg8ScalingComparison {
+    wide_threads: u32,
+    baseline_threads: u32,
+    label: &'static str,
+}
+
+fn qg8_scaling_comparison(
+    plan: &PerfApplicabilityPlanBinding,
+) -> Result<Qg8ScalingComparison, String> {
+    match (
+        plan.profile.hardware_class_id(),
+        plan.profile.execution_profile_id(),
     ) {
-        let ratio = sixteen / four.max(f64::MIN_POSITIVE);
+        (
+            HardwareClassId::TrjZen35995wx,
+            ExecutionProfileId::Physical64 | ExecutionProfileId::Smt2_128,
+        ) => Ok(Qg8ScalingComparison {
+            wide_threads: 16,
+            baseline_threads: 4,
+            label: "16-thread/4-thread",
+        }),
+        (HardwareClassId::M4Macos, ExecutionProfileId::Scheduler10)
+        | (HardwareClassId::M5Macos, ExecutionProfileId::Scheduler14) => Ok(Qg8ScalingComparison {
+            wide_threads: 8,
+            baseline_threads: 4,
+            label: "8-thread/4-thread",
+        }),
+        (HardwareClassId::X86VpsOvh, ExecutionProfileId::X86Diagnostic) => {
+            Err("QG-8 rejects diagnostic x86-vps-ovh/x86-diagnostic evidence".to_owned())
+        }
+        (hardware, profile) => Err(format!(
+            "QG-8 has no scaling contract for {}/{}",
+            hardware.as_str(),
+            profile.as_str()
+        )),
+    }
+}
+
+fn evaluate_qg8(target: &mut GateTargetEvaluator<'_, '_>) {
+    let Some(plan) = target.artifact.applicability_plan.as_ref() else {
         target.target(
-            ratio >= 1.8,
-            format!("QG-8 16-thread/4-thread scaling {ratio:.6} is below 1.8"),
+            false,
+            "QG-8 requires an applicability-plan hardware/profile identity",
+        );
+        return;
+    };
+    let comparison = match qg8_scaling_comparison(plan) {
+        Ok(comparison) => comparison,
+        Err(message) => {
+            target.target(false, message);
+            return;
+        }
+    };
+    let wide_fixture = format!("scaling/xlarge/{}/positions_on", comparison.wide_threads);
+    let baseline_fixture = format!(
+        "scaling/xlarge/{}/positions_on",
+        comparison.baseline_threads
+    );
+    if let (Some(wide), Some(baseline)) = (
+        target.value(&wide_fixture, "docs_per_second", "quill"),
+        target.value(&baseline_fixture, "docs_per_second", "quill"),
+    ) {
+        let ratio = wide / baseline.max(f64::MIN_POSITIVE);
+        target.target(
+            ratio >= QG8_OWN_SCALING_THRESHOLD,
+            format!(
+                "QG-8 {} scaling {ratio:.6} is below {QG8_OWN_SCALING_THRESHOLD}",
+                comparison.label
+            ),
         );
     }
 }
@@ -3635,6 +3700,252 @@ mod tests {
         let state = qg5_target_decision(0.20);
 
         assert_eq!(state.decision(), PerfGateDecision::Allow);
+    }
+
+    fn profile_key(
+        hardware: crate::HardwareClassId,
+        profile: crate::ExecutionProfileId,
+    ) -> MachineProfileKey {
+        MachineProfileKey::new(hardware, profile).expect("registered hardware/profile pair")
+    }
+
+    fn applicability_plan_for(profile: MachineProfileKey, gate: PerfGate) -> PerfApplicabilityPlan {
+        PerfMatrixSpec::complete()
+            .applicability_plan(
+                &MachineClassRegistry::frozen().expect("frozen machine registry"),
+                profile,
+                gate,
+            )
+            .expect("canonical applicability plan")
+    }
+
+    fn qg8_cell(threads: u32, docs_per_second: f64) -> PerfCellResult {
+        PerfCellResult {
+            fixture: format!("scaling/xlarge/{threads}/positions_on"),
+            metric: "docs_per_second".to_owned(),
+            engine: "quill".to_owned(),
+            unit: "docs/s".to_owned(),
+            distribution: distribution(docs_per_second),
+        }
+    }
+
+    fn qg8_target_artifact(
+        profile: MachineProfileKey,
+        cells: Vec<PerfCellResult>,
+    ) -> PerfGateArtifact {
+        let plan = applicability_plan_for(profile, PerfGate::Qg8);
+        let mut artifact = qg2_artifact("new", 1.0, 1.0);
+        artifact.gate = PerfGate::Qg8;
+        artifact.applicability_plan = Some(plan.binding);
+        artifact.cells = cells;
+        artifact
+    }
+
+    fn qg8_target_decision(
+        profile: MachineProfileKey,
+        cells: Vec<PerfCellResult>,
+    ) -> DecisionState {
+        let artifact = qg8_target_artifact(profile, cells);
+        let cells = artifact
+            .cells
+            .iter()
+            .map(|cell| (CellKey::from(cell), cell))
+            .collect::<BTreeMap<_, _>>();
+        let mut state = DecisionState::default();
+        evaluate_gate_targets(&artifact, &cells, None, true, false, &mut state);
+        state
+    }
+
+    fn trj_physical() -> MachineProfileKey {
+        profile_key(
+            crate::HardwareClassId::TrjZen35995wx,
+            crate::ExecutionProfileId::Physical64,
+        )
+    }
+
+    fn m4_scheduler10() -> MachineProfileKey {
+        profile_key(
+            crate::HardwareClassId::M4Macos,
+            crate::ExecutionProfileId::Scheduler10,
+        )
+    }
+
+    #[test]
+    fn qg8_trj_accepts_reviewed_16_vs_4_at_threshold() {
+        let state = qg8_target_decision(
+            trj_physical(),
+            vec![qg8_cell(4, 1000.0), qg8_cell(16, 1800.0)],
+        );
+        assert!(
+            state
+                .reasons
+                .iter()
+                .all(|reason| reason.code != "perf.ratchet.gate_target_missed"),
+            "TRJ 16/4 at 1.8x must not miss the QG-8 target: {:?}",
+            state.reasons
+        );
+    }
+
+    #[test]
+    fn qg8_trj_rejects_16_vs_4_below_threshold() {
+        let state = qg8_target_decision(
+            trj_physical(),
+            vec![qg8_cell(4, 1000.0), qg8_cell(16, 1799.0)],
+        );
+        assert!(state.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.gate_target_missed"
+                && reason.message.contains("16-thread/4-thread")
+        }));
+    }
+
+    #[test]
+    fn qg8_trj_does_not_treat_8_as_the_wide_cell() {
+        let state = qg8_target_decision(
+            trj_physical(),
+            vec![qg8_cell(4, 1000.0), qg8_cell(8, 5000.0)],
+        );
+        assert!(
+            state.reasons.iter().any(|reason| {
+                reason.code == "perf.ratchet.target_cell_missing"
+                    && reason.message.contains("scaling/xlarge/16/positions_on")
+            }),
+            "TRJ must still require the 16-thread cell: {:?}",
+            state.reasons
+        );
+    }
+
+    #[test]
+    fn qg8_m4_accepts_reviewed_8_vs_4_at_threshold_without_width_16() {
+        let state = qg8_target_decision(
+            m4_scheduler10(),
+            vec![qg8_cell(4, 1000.0), qg8_cell(8, 1800.0)],
+        );
+        assert!(
+            state.reasons.iter().all(|reason| {
+                reason.code != "perf.ratchet.gate_target_missed"
+                    && reason.code != "perf.ratchet.target_cell_missing"
+            }),
+            "M4 8/4 at 1.8x must not require width 16 or 10: {:?}",
+            state.reasons
+        );
+    }
+
+    #[test]
+    fn qg8_m4_rejects_8_vs_4_below_threshold() {
+        let state = qg8_target_decision(
+            m4_scheduler10(),
+            vec![qg8_cell(4, 1000.0), qg8_cell(8, 1799.0)],
+        );
+        assert!(state.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.gate_target_missed"
+                && reason.message.contains("8-thread/4-thread")
+        }));
+    }
+
+    #[test]
+    fn qg8_m4_rejects_missing_width_8_even_if_16_is_present() {
+        let state = qg8_target_decision(
+            m4_scheduler10(),
+            vec![qg8_cell(4, 1000.0), qg8_cell(16, 5000.0)],
+        );
+        assert!(
+            state.reasons.iter().any(|reason| {
+                reason.code == "perf.ratchet.target_cell_missing"
+                    && reason.message.contains("scaling/xlarge/8/positions_on")
+            }),
+            "M4 must not treat a substituted 16-thread cell as the wide arm: {:?}",
+            state.reasons
+        );
+    }
+
+    #[test]
+    fn qg8_m4_rejects_missing_width_4() {
+        let state = qg8_target_decision(m4_scheduler10(), vec![qg8_cell(8, 1800.0)]);
+        assert!(state.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.target_cell_missing"
+                && reason.message.contains("scaling/xlarge/4/positions_on")
+        }));
+    }
+
+    #[test]
+    fn qg8_m4_does_not_invent_a_width_10_cell() {
+        let state = qg8_target_decision(
+            m4_scheduler10(),
+            vec![qg8_cell(4, 1000.0), qg8_cell(8, 1800.0)],
+        );
+        assert!(
+            state
+                .reasons
+                .iter()
+                .all(|reason| { !reason.message.contains("scaling/xlarge/10/positions_on") }),
+            "scheduler-10 must not invent a width-10 QG-8 cell: {:?}",
+            state.reasons
+        );
+    }
+
+    #[test]
+    fn qg8_rejects_diagnostic_x86_profile() {
+        let mut binding = plan_binding(PerfGate::Qg8);
+        binding.profile = profile_key(
+            crate::HardwareClassId::X86VpsOvh,
+            crate::ExecutionProfileId::X86Diagnostic,
+        );
+        let mut artifact = qg8_target_artifact(
+            trj_physical(),
+            vec![qg8_cell(4, 1000.0), qg8_cell(16, 1800.0)],
+        );
+        artifact.applicability_plan = Some(binding);
+        let cells = artifact
+            .cells
+            .iter()
+            .map(|cell| (CellKey::from(cell), cell))
+            .collect::<BTreeMap<_, _>>();
+        let mut state = DecisionState::default();
+        evaluate_gate_targets(&artifact, &cells, None, true, false, &mut state);
+        assert!(state.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.gate_target_missed"
+                && reason.message.contains("diagnostic x86")
+        }));
+    }
+
+    #[test]
+    fn qg8_rejects_m4_m5_profile_substitution() {
+        assert!(
+            MachineProfileKey::new(
+                crate::HardwareClassId::M4Macos,
+                crate::ExecutionProfileId::Scheduler14,
+            )
+            .is_err(),
+            "M5 scheduler-14 must not bind onto m4-macos"
+        );
+        assert!(
+            MachineProfileKey::new(
+                crate::HardwareClassId::M5Macos,
+                crate::ExecutionProfileId::Scheduler10,
+            )
+            .is_err(),
+            "M4 scheduler-10 must not bind onto m5-macos"
+        );
+    }
+
+    #[test]
+    fn qg8_without_applicability_plan_fails_closed() {
+        let mut artifact = qg8_target_artifact(
+            trj_physical(),
+            vec![qg8_cell(4, 1000.0), qg8_cell(16, 1800.0)],
+        );
+        artifact.applicability_plan = None;
+        let cells = artifact
+            .cells
+            .iter()
+            .map(|cell| (CellKey::from(cell), cell))
+            .collect::<BTreeMap<_, _>>();
+        let mut state = DecisionState::default();
+        evaluate_gate_targets(&artifact, &cells, None, true, false, &mut state);
+        assert!(state.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.gate_target_missed"
+                && reason.message.contains("applicability-plan")
+        }));
     }
 
     fn qg2_current_pair(
