@@ -175,31 +175,39 @@ fn locked_package(cargo_lock_bytes: &[u8], package_name: &str) -> LockedPackage 
     };
     let version = required("version");
     let source = required("source");
-    let checksum = if let Some(checksum) = package.get("checksum").and_then(toml::Value::as_str) {
-        assert_eq!(
-            source, CRATES_IO_REGISTRY_SOURCE,
-            "a checksummed Tantivy oracle must resolve from the canonical crates.io registry"
+    let checksum = package
+        .get("checksum")
+        .and_then(toml::Value::as_str)
+        .map_or_else(
+            || {
+                let (locator, resolved_revision) = source.rsplit_once('#').unwrap_or_else(|| {
+                    panic!(
+                        "locked Git {package_name} source must carry a resolved revision fragment"
+                    )
+                });
+                assert!(
+                    is_lower_git_revision(resolved_revision),
+                    "locked Git {package_name} source must resolve to a full lowercase Git SHA-1"
+                );
+                assert_eq!(
+                    locator,
+                    format!("{TANTIVY_GIT_SOURCE_PREFIX}{resolved_revision}"),
+                    "the Tantivy oracle Git source must be the canonical upstream URL with identical requested and resolved revisions"
+                );
+                // Cargo registry packages carry a content checksum. Exact Git packages
+                // do not, so v3 records the SHA-256 of Cargo.lock's canonical source
+                // identity instead. That identity includes both the requested and the
+                // resolved full commit and is accepted only for the upstream URL above.
+                sha256_hex(source.as_bytes())
+            },
+            |checksum| {
+                assert_eq!(
+                    source, CRATES_IO_REGISTRY_SOURCE,
+                    "a checksummed Tantivy oracle must resolve from the canonical crates.io registry"
+                );
+                checksum.to_owned()
+            },
         );
-        checksum.to_owned()
-    } else {
-        let (locator, resolved_revision) = source.rsplit_once('#').unwrap_or_else(|| {
-            panic!("locked Git {package_name} source must carry a resolved revision fragment")
-        });
-        assert!(
-            is_lower_git_revision(resolved_revision),
-            "locked Git {package_name} source must resolve to a full lowercase Git SHA-1"
-        );
-        assert_eq!(
-            locator,
-            format!("{TANTIVY_GIT_SOURCE_PREFIX}{resolved_revision}"),
-            "the Tantivy oracle Git source must be the canonical upstream URL with identical requested and resolved revisions"
-        );
-        // Cargo registry packages carry a content checksum. Exact Git packages
-        // do not, so v3 records the SHA-256 of Cargo.lock's canonical source
-        // identity instead. That identity includes both the requested and the
-        // resolved full commit and is accepted only for the upstream URL above.
-        sha256_hex(source.as_bytes())
-    };
     assert!(
         is_lower_hex(&checksum, 64),
         "locked {package_name} checksum must be canonical lowercase SHA-256"
