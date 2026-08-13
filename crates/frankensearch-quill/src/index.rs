@@ -25665,6 +25665,17 @@ mod tests {
                     1.0,
                 ),
                 (
+                    Query::Set {
+                        field_id: 5,
+                        values: vec![
+                            QueryValue::U64(11),
+                            QueryValue::U64(17),
+                            QueryValue::U64(11),
+                        ],
+                    },
+                    1.0,
+                ),
+                (
                     Query::Glob {
                         field_ids: vec![1],
                         pattern: "alp*".to_owned(),
@@ -25724,10 +25735,6 @@ mod tests {
                     field_id: 2,
                     lower: Bound::Included(QueryValue::Str("wrong".to_owned())),
                     upper: Bound::Unbounded,
-                },
-                Query::Set {
-                    field_id: 5,
-                    values: vec![QueryValue::U64(11)],
                 },
                 Query::Boost {
                     query: Box::new(Query::All),
