@@ -1220,7 +1220,11 @@ mod tests {
                 "token IDs at native-256 boundary tokens={tokens}"
             );
             if !text.is_empty() {
-                let token_count = embedder.tokenizer.encode(text.as_str(), false).unwrap().len();
+                let token_count = embedder
+                    .tokenizer
+                    .encode(text.as_str(), false)
+                    .unwrap()
+                    .len();
                 assert_eq!(
                     last_model2vec_accumulation_route_for_test(),
                     expected_native_256_route(token_count),
