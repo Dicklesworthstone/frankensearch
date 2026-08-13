@@ -10447,7 +10447,7 @@ mod tests {
             screen_plan.content_bytes,
             "one-live-invocation",
             1_000_000,
-            200_000,
+            800_000,
             200_000,
         );
         pilots[3] = qg1_pilot_with_control(
@@ -10469,6 +10469,11 @@ mod tests {
             pilots[3].experiment.effect.treatment_over_control
                 > pilots[2].experiment.effect.treatment_over_control,
             "the paired ShippingAuto-controlled estimand must recover the fixed_4 incumbent"
+        );
+        assert!(
+            pilots[3].experiment.effect.ci95_low_ratio
+                > pilots[2].experiment.effect.ci95_high_ratio,
+            "the fixture must keep fixed_4's paired ratio interval distinct from fixed_2"
         );
         let screen =
             Qg1TantivyIncumbentScreen::screen(&cell, screen_plan, &semantic_contract, pilots)
@@ -10634,8 +10639,18 @@ mod tests {
             &mut pilot.experiment.null_samples,
         );
         for sample in effect_samples.iter_mut().chain(null_samples.iter_mut()) {
+            sample.qg1_sample_binding = None;
             sample.scope = wrong_scope.clone();
         }
+        assert!(
+            pilot
+                .experiment
+                .effect_samples
+                .iter()
+                .chain(&pilot.experiment.null_samples)
+                .all(|sample| sample.qg1_sample_binding.is_none()),
+            "a relabelled non-QG-1 fixture must not retain QG-1 lifecycle evidence"
+        );
         pilot.experiment = estimate_paired_experiment(
             &pilot.experiment.effect_samples,
             &pilot.experiment.null_samples,
