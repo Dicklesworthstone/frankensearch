@@ -8871,22 +8871,6 @@ impl QuillReader {
         Ok(result)
     }
 
-    /// Execute one already-built query tree through the scoreless id-set path.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same typed lowering, collection, and cancellation failures
-    /// as [`Self::collect_docids`].
-    #[cfg(feature = "bench-internals")]
-    pub fn collect_preparsed_docids(
-        &self,
-        cx: &Cx,
-        query: &Query,
-    ) -> Result<Vec<u32>, QuillIndexError> {
-        let published = self.published_snapshot.load();
-        self.collect_preparsed_docids_on(cx, query, published.as_ref())
-    }
-
     #[cfg(feature = "bench-internals")]
     fn collect_preparsed_docids_on(
         &self,
@@ -8898,45 +8882,6 @@ impl QuillReader {
         let mut canonical = query.clone();
         let _canonicalization = canonicalize_query(&mut canonical);
         self.execute_docid_query(cx, &canonical, snapshot)
-    }
-
-    /// Bench-only: run one ranked sealed-segment collection with the fan-out
-    /// decision forced, bypassing [`sealed_segment_fanout`]
-    /// (bd-quill-e4-argus-3ycz.9 A/B). Returns `(global_docid, score_bits)`
-    /// pairs so arms can assert bit-exact parity before timing. Delta
-    /// snapshots are intentionally excluded: the lever under measurement is
-    /// sealed-segment scoring only.
-    ///
-    /// `rank_pruning` overrides the shipping gate when `Some`, which is what
-    /// lets a single binary time the pruned and exhaustive arms against each
-    /// other (`bd-quill-e8-perf-doctrine-x4e4.5.1`). `None` uses the shipping
-    /// decision. Overriding it to `true` never makes an ineligible shape prune:
-    /// the runtime strategy selection in `argus::competitive_candidates` fails
-    /// closed on its own, so this only controls whether pruning metadata is
-    /// opened at all.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same typed parsing, lowering, collection, and cancellation
-    /// failures as [`Self::search_paginated`].
-    #[cfg(feature = "bench-internals")]
-    pub fn bench_search_sealed_forced(
-        &self,
-        cx: &Cx,
-        query: &str,
-        limit: usize,
-        fan_out: bool,
-        rank_pruning: Option<bool>,
-    ) -> Result<Vec<(u32, u32)>, QuillIndexError> {
-        let published = self.published_snapshot.load();
-        self.bench_search_sealed_forced_on(
-            cx,
-            query,
-            limit,
-            fan_out,
-            rank_pruning,
-            published.as_ref(),
-        )
     }
 
     #[cfg(feature = "bench-internals")]
@@ -9466,25 +9411,6 @@ impl QuillReader {
             }
         }
         Ok(())
-    }
-
-    /// Bench-only: run one unscored id-set collection over the sealed
-    /// segments with the fan-out decision forced (bd-quill-e4-argus-3ycz.9
-    /// sibling A/B). Delta snapshots are intentionally excluded.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same typed parsing, lowering, collection, and cancellation
-    /// failures as [`Self::collect_docids`].
-    #[cfg(feature = "bench-internals")]
-    pub fn bench_collect_docids_forced(
-        &self,
-        cx: &Cx,
-        query: &str,
-        fan_out: bool,
-    ) -> Result<Vec<u32>, QuillIndexError> {
-        let published = self.published_snapshot.load();
-        self.bench_collect_docids_forced_on(cx, query, fan_out, published.as_ref())
     }
 
     #[cfg(feature = "bench-internals")]
