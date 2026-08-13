@@ -296,10 +296,15 @@ impl IndexBuilder {
         }
 
         // Resolve embedder stack.
-        let explicit_stack = self.embedder_stack.is_some();
         let stack = match self.embedder_stack.take() {
             Some(stack) => stack,
-            None => EmbedderStack::auto_detect_with(Some(&self.data_dir))?,
+            None => match EmbedderStack::auto_detect_semantic_with(Some(&self.data_dir)) {
+                Ok(stack) => stack,
+                Err(error) => {
+                    export_error(metrics_exporter.as_ref(), &error);
+                    return Err(error);
+                }
+            },
         };
         build_checkpoint(cx, "index builder initialization")?;
 
@@ -307,21 +312,9 @@ impl IndexBuilder {
         // vectors written below carry this embedder's identity, so the
         // generation is permanently degraded and a later model install cannot
         // repair it — only a compatible rebuild can. Auto-detect HashOnly is
-        // never a silent success: that is how semantic search "just works"
-        // as lexical-only forever (`bd-a6zt`). Hash remains reachable only
-        // through an explicit stack (tests / control policy).
+        // refused above via `auto_detect_semantic_with`. Hash remains
+        // reachable only through an explicit stack (tests / control policy).
         let embedder_availability = stack.availability();
-        if matches!(embedder_availability, TwoTierAvailability::HashOnly) && !explicit_stack {
-            let error = SearchError::EmbedderUnavailable {
-                model: "semantic".to_owned(),
-                reason: stack.degradation_message().unwrap_or_else(|| {
-                    "auto-detect found no semantic model; refusing to write a hash generation"
-                        .to_owned()
-                }),
-            };
-            export_error(metrics_exporter.as_ref(), &error);
-            return Err(error);
-        }
         if embedder_availability.is_degraded() {
             tracing::warn!(
                 availability = %embedder_availability,
