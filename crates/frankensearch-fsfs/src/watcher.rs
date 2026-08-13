@@ -2139,6 +2139,114 @@ struct ProducerContext {
     base_batch_size: usize,
 }
 
+/// One root-scoped producer outage injected by a public-path test.
+///
+/// The probe is registered by root so concurrently running watcher tests cannot
+/// perturb each other. Its two handshakes pin the mutation inside the real
+/// supervisor outage: after the old notify watcher has dropped, but before the
+/// replacement producer is allowed to start.
+#[cfg(test)]
+struct ProducerOutageProbe {
+    root: PathBuf,
+    fail_next_producer: AtomicBool,
+    awaiting_restart: AtomicBool,
+    outage_open: AtomicBool,
+    mutation_complete: AtomicBool,
+    restart_debt_published: AtomicBool,
+    allow_restart: AtomicBool,
+    replacement_started: AtomicBool,
+}
+
+#[cfg(test)]
+impl ProducerOutageProbe {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            fail_next_producer: AtomicBool::new(true),
+            awaiting_restart: AtomicBool::new(false),
+            outage_open: AtomicBool::new(false),
+            mutation_complete: AtomicBool::new(false),
+            restart_debt_published: AtomicBool::new(false),
+            allow_restart: AtomicBool::new(false),
+            replacement_started: AtomicBool::new(false),
+        }
+    }
+}
+
+#[cfg(test)]
+static PRODUCER_OUTAGE_PROBES: Mutex<Vec<(u64, Arc<ProducerOutageProbe>)>> =
+    Mutex::new(Vec::new());
+
+#[cfg(test)]
+static NEXT_PRODUCER_OUTAGE_PROBE_ID: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+struct ProducerOutageProbeGuard {
+    id: u64,
+    probe: Arc<ProducerOutageProbe>,
+}
+
+#[cfg(test)]
+impl Drop for ProducerOutageProbeGuard {
+    fn drop(&mut self) {
+        // A failed assertion must not strand the producer thread in either
+        // handshake while the watcher unwinds.
+        self.probe.mutation_complete.store(true, Ordering::Release);
+        self.probe.allow_restart.store(true, Ordering::Release);
+        lock_or_recover(&PRODUCER_OUTAGE_PROBES).retain(|(id, _)| *id != self.id);
+    }
+}
+
+#[cfg(test)]
+fn install_producer_outage_probe(
+    root: PathBuf,
+) -> (Arc<ProducerOutageProbe>, ProducerOutageProbeGuard) {
+    let probe = Arc::new(ProducerOutageProbe::new(root));
+    let id = NEXT_PRODUCER_OUTAGE_PROBE_ID.fetch_add(1, Ordering::AcqRel);
+    lock_or_recover(&PRODUCER_OUTAGE_PROBES).push((id, Arc::clone(&probe)));
+    let guard = ProducerOutageProbeGuard {
+        id,
+        probe: Arc::clone(&probe),
+    };
+    (probe, guard)
+}
+
+#[cfg(test)]
+fn producer_outage_probe(roots: &[PathBuf]) -> Option<Arc<ProducerOutageProbe>> {
+    lock_or_recover(&PRODUCER_OUTAGE_PROBES)
+        .iter()
+        .find(|(_, probe)| roots.iter().any(|root| root == &probe.root))
+        .map(|(_, probe)| Arc::clone(probe))
+}
+
+#[cfg(test)]
+fn take_forced_producer_failure(roots: &[PathBuf]) -> bool {
+    let Some(probe) = producer_outage_probe(roots) else {
+        return false;
+    };
+    if !probe.fail_next_producer.swap(false, Ordering::AcqRel) {
+        if probe.restart_debt_published.load(Ordering::Acquire) {
+            probe.replacement_started.store(true, Ordering::Release);
+        }
+        return false;
+    }
+    probe.awaiting_restart.store(true, Ordering::Release);
+    true
+}
+
+#[cfg(test)]
+fn await_forced_outage_mutation(context: &ProducerContext) -> Option<Arc<ProducerOutageProbe>> {
+    let probe = producer_outage_probe(&context.roots)?;
+    if !probe.awaiting_restart.swap(false, Ordering::AcqRel) {
+        return None;
+    }
+    probe.outage_open.store(true, Ordering::Release);
+    while !probe.mutation_complete.load(Ordering::Acquire) && !context.stop.is_requested() {
+        thread::sleep(Duration::from_millis(1));
+    }
+    Some(probe)
+}
+
 fn run_producer_supervisor(context: &ProducerContext) -> SearchResult<()> {
     const MAX_RESTARTS: usize = 10;
     const MIN_BACKOFF_MS: u64 = 500;
@@ -2162,6 +2270,34 @@ fn run_producer_supervisor(context: &ProducerContext) -> SearchResult<()> {
                         "watcher producer reached a terminal failure"
                     );
                     break Err(error);
+                }
+                #[cfg(test)]
+                let outage_probe = await_forced_outage_mutation(context);
+                // A failed producer means there was an interval with no
+                // trustworthy notify ingress. Publish the debt before serving
+                // the backoff or constructing a replacement watcher, so the
+                // ingest task cannot resume ordinary event processing without
+                // first reconciling the filesystem-authoritative snapshot.
+                if let Err(reconciliation_error) =
+                    lock_or_recover(&context.reconciliation).require_full_scan()
+                {
+                    warn!(
+                        producer_error = %error,
+                        error = %reconciliation_error,
+                        "watcher producer restart could not publish reconciliation debt"
+                    );
+                    break Err(reconciliation_error);
+                }
+                #[cfg(test)]
+                if let Some(probe) = outage_probe {
+                    probe
+                        .restart_debt_published
+                        .store(true, Ordering::Release);
+                    while !probe.allow_restart.load(Ordering::Acquire)
+                        && !context.stop.is_requested()
+                    {
+                        thread::sleep(Duration::from_millis(1));
+                    }
                 }
                 context
                     .stats
@@ -2258,9 +2394,17 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
         }
     }
 
+    #[cfg(test)]
+    if take_forced_producer_failure(&context.roots) {
+        return Err(watcher_task_error(
+            "forced producer failure after notify ingress became live",
+        ));
+    }
+
     let mut pending = PendingEvents::default();
     let mut pressure_was_disabled = false;
     let mut disconnected = false;
+    let mut producer_failure = None;
     while !context.stop.is_requested() {
         let policy = WatcherExecutionPolicy::for_pressure(
             pressure_state_from_code(context.pressure_state.load(Ordering::Acquire)),
@@ -2280,13 +2424,19 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
         );
 
         match event_rx.recv_timeout(timeout) {
-            Ok(event) => process_notify_result(
-                event,
-                policy,
-                &context.stats,
-                &mut pending,
-                Some(&mount_table),
-            ),
+            Ok(event) => {
+                if let Err(error) = process_notify_result(
+                    event,
+                    policy,
+                    &context.stats,
+                    &mut pending,
+                    Some(&mount_table),
+                    &context.reconciliation,
+                ) {
+                    producer_failure = Some(error);
+                    break;
+                }
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 disconnected = true;
@@ -2294,13 +2444,20 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
             }
         }
         while let Ok(event) = event_rx.try_recv() {
-            process_notify_result(
+            if let Err(error) = process_notify_result(
                 event,
                 policy,
                 &context.stats,
                 &mut pending,
                 Some(&mount_table),
-            );
+                &context.reconciliation,
+            ) {
+                producer_failure = Some(error);
+                break;
+            }
+        }
+        if producer_failure.is_some() {
+            break;
         }
 
         observe_pressure_transition(
@@ -2342,12 +2499,13 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
         context.base_debounce_ms,
         context.base_batch_size,
     );
-    drain_notify_channel(
+    let drain_result = drain_notify_channel(
         &event_rx,
         final_policy,
         &context.stats,
         &mut pending,
         Some(&mount_table),
+        &context.reconciliation,
     );
     if !final_policy.watching_enabled || pressure_was_disabled {
         lock_or_recover(&context.reconciliation).require_full_scan()?;
@@ -2358,6 +2516,10 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
         context.base_batch_size,
     );
 
+    if let Some(error) = producer_failure {
+        return Err(error);
+    }
+    drain_result?;
     if disconnected && !context.stop.is_requested() {
         return Err(watcher_task_error(
             "notify channel disconnected before watcher shutdown",
@@ -2372,10 +2534,17 @@ fn drain_notify_channel(
     stats: &WatcherStatsInner,
     pending: &mut PendingEvents,
     mount_table: Option<&MountTable>,
-) {
+    reconciliation: &ReconciliationTracker,
+) -> SearchResult<()> {
+    let mut failure = None;
     while let Ok(event) = event_rx.try_recv() {
-        process_notify_result(event, policy, stats, pending, mount_table);
+        match process_notify_result(event, policy, stats, pending, mount_table, reconciliation) {
+            Ok(()) => {}
+            Err(error) if failure.is_none() => failure = Some(error),
+            Err(_) => {}
+        }
     }
+    failure.map_or(Ok(()), Err)
 }
 
 fn observe_pressure_transition(
@@ -3354,12 +3523,13 @@ fn process_notify_result(
     stats: &WatcherStatsInner,
     pending: &mut PendingEvents,
     mount_table: Option<&MountTable>,
-) {
+    reconciliation: &ReconciliationTracker,
+) -> SearchResult<()> {
     match event {
         Ok(event) => {
             let mapped_events = map_notify_event_with_mount_table(event, mount_table);
             if mapped_events.is_empty() {
-                return;
+                return Ok(());
             }
 
             for watch_event in mapped_events {
@@ -3375,9 +3545,16 @@ fn process_notify_result(
         }
         Err(error) => {
             stats.add_error();
+            // A backend error is an admission that callback delivery may have
+            // skipped changes. Mark that outage before returning the failure
+            // that makes the supervisor replace this watcher; merely logging
+            // and continuing leaves no source from which to recover the gap.
+            lock_or_recover(reconciliation).require_full_scan()?;
             warn!(error = %error, "watch backend emitted error");
+            return Err(watcher_error(&error));
         }
     }
+    Ok(())
 }
 
 fn prepare_event_batch(discovery: &DiscoveryConfig, events: &[WatchEvent]) -> PreparedWatchBatch {
@@ -8445,13 +8622,17 @@ mod tests {
         .add_path(channel_path.clone())))
             .expect("queue channel event");
         let stats = super::WatcherStatsInner::default();
+        let reconciliation: ReconciliationTracker =
+            Arc::new(Mutex::new(ReconciliationState::default()));
         drain_notify_channel(
             &rx,
             WatcherExecutionPolicy::for_pressure(PressureState::Normal, 500, 10),
             &stats,
             &mut pending,
             None,
-        );
+            &reconciliation,
+        )
+        .expect("a successful notify event drains cleanly");
         let queue: ReadyBatchQueue = Arc::new(Mutex::new(VecDeque::new()));
 
         flush_pending_batches(&mut pending, &queue, 10);
@@ -8463,6 +8644,125 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(drained, BTreeSet::from([event.path, channel_path]));
         assert!(pending.by_path.is_empty());
+    }
+
+    #[test]
+    fn notify_ingress_error_requires_reconciliation_before_it_returns() {
+        let stats = WatcherStatsInner::default();
+        let mut pending = PendingEvents::default();
+        let reconciliation: ReconciliationTracker =
+            Arc::new(Mutex::new(ReconciliationState::default()));
+
+        let error = super::process_notify_result(
+            Err(notify::Error::generic("forced notify ingress failure")),
+            WatcherExecutionPolicy::for_pressure(PressureState::Normal, 500, 10),
+            &stats,
+            &mut pending,
+            None,
+            &reconciliation,
+        )
+        .expect_err("a notify ingress error must replace the producer");
+
+        assert!(error.to_string().contains("forced notify ingress failure"));
+        assert_eq!(stats.snapshot().errors, 1);
+        assert!(
+            lock_or_recover(&reconciliation).required,
+            "the callback failure must publish full-scan debt before the producer exits"
+        );
+    }
+
+    /// The replacement producer is held behind a test-only handshake, so the
+    /// only mechanism capable of observing `missed` is the supervisor's
+    /// reconciliation debt. This uses the public watcher lifecycle; no event is
+    /// inserted into the ready queue and no replacement notify callback exists
+    /// until after the recovery assertion.
+    #[test]
+    fn public_producer_outage_recovers_a_file_created_before_restart() {
+        run_on_runtime_task(|cx| async move {
+            const WAIT_POLLS: usize = 5_000;
+
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("producer-outage-recovery");
+            fs::create_dir_all(&root).expect("create watched root");
+            let (probe, _probe_guard) = super::install_producer_outage_probe(root.clone());
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let watcher = FsWatcher::new(
+                vec![root.clone()],
+                DiscoveryConfig::default(),
+                Arc::clone(&pipeline) as Arc<dyn WatchIngestPipeline>,
+            )
+            .with_debounce_ms(1);
+            watcher.start(&cx).await.expect("start public watcher");
+
+            for _ in 0..WAIT_POLLS {
+                if probe.outage_open.load(Ordering::Acquire) {
+                    break;
+                }
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            if !probe.outage_open.load(Ordering::Acquire) {
+                probe.mutation_complete.store(true, Ordering::Release);
+                probe.allow_restart.store(true, Ordering::Release);
+                let _ = watcher.stop_checked(&cx).await;
+                panic!("the forced producer outage did not open within the bounded wait");
+            }
+
+            // The first notify watcher has been dropped and the replacement is
+            // blocked. No callback can report this file.
+            let missed = root.join("created-during-outage.rs");
+            fs::write(&missed, "fn recovered_from_scan() {}\n")
+                .expect("write file while notify ingress is down");
+            probe.mutation_complete.store(true, Ordering::Release);
+
+            for _ in 0..WAIT_POLLS {
+                if probe.restart_debt_published.load(Ordering::Acquire) {
+                    break;
+                }
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            if !probe.restart_debt_published.load(Ordering::Acquire) {
+                probe.allow_restart.store(true, Ordering::Release);
+                let _ = watcher.stop_checked(&cx).await;
+                panic!("the supervisor did not publish restart debt within the bounded wait");
+            }
+
+            let missed_key = normalize_file_key(&missed);
+            let mut recovered_before_restart = false;
+            for _ in 0..WAIT_POLLS {
+                recovered_before_restart = pipeline.all_ops().iter().any(|op| {
+                    matches!(
+                        op,
+                        WatchIngestOp::Upsert { file_key, .. } if file_key == &missed_key
+                    )
+                });
+                if recovered_before_restart || watcher.has_terminal_task_outcome() {
+                    break;
+                }
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+
+            // Only now may the supervisor build the replacement notify watcher.
+            probe.allow_restart.store(true, Ordering::Release);
+            for _ in 0..WAIT_POLLS {
+                if probe.replacement_started.load(Ordering::Acquire) {
+                    break;
+                }
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            let replacement_started = probe.replacement_started.load(Ordering::Acquire);
+            let stop_result = watcher.stop_checked(&cx).await;
+
+            assert!(
+                recovered_before_restart,
+                "the file created with no live callback was not recovered by authoritative scan"
+            );
+            assert!(
+                replacement_started,
+                "the replacement producer did not start within the bounded wait"
+            );
+            stop_result.expect("stop recovered watcher generation");
+            assert_eq!(watcher.stats().worker_restarts, 1);
+        });
     }
 
     #[test]
