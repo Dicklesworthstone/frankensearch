@@ -4117,8 +4117,9 @@ mod tests {
     use super::*;
     use crate::perf::{
         PerfCellResult, PerfMetricSemantics, PerfOperationScope, PerfSampleArm, PerfSampleOrder,
-        PerfSamplePhase, PerfSampleProvenance, QG6_QUERY_GROUP_IDS, estimate_paired_experiment,
-        seeded_balanced_pair_order,
+        PerfSamplePhase, PerfSampleProvenance, QG6_QUERY_GROUP_IDS, Qg1BatchCoverage,
+        Qg1LifecycleProducer, Qg1LifecycleWitness, Qg1SampleBinding, estimate_paired_experiment,
+        estimate_paired_experiment_against_qg1_authority, seeded_balanced_pair_order,
     };
     use crate::qg6_prepared::Qg6ResultReceipt;
 
@@ -4290,6 +4291,260 @@ mod tests {
             .expect("valid treatment-arm null experiment")
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn authority_bound_qg1_throughput_stream(
+        scope: &PerfOperationScope,
+        provenance: &PerfSampleProvenance,
+        producer: &Qg1LifecycleProducer,
+        stream_role: &str,
+        first_arms: &[PerfSampleArm],
+        control_elapsed_ns: u64,
+        treatment_elapsed_ns: u64,
+        sample_id_base: u64,
+        work_units: u64,
+        content_bytes: u64,
+    ) -> Vec<PerfRawSample> {
+        let mut samples = Vec::with_capacity(first_arms.len() * 2);
+        for (index, first_arm) in first_arms.iter().copied().enumerate() {
+            let block_id = u64::try_from(index).expect("QG-1 test block ID");
+            let base = block_id * 1_000_000;
+            let control_first = first_arm == PerfSampleArm::Control;
+            let (control_start, treatment_start) = if control_first {
+                (base, base + control_elapsed_ns + 100)
+            } else {
+                (base + treatment_elapsed_ns + 100, base)
+            };
+            let sample_id = sample_id_base + block_id * 2;
+            samples.push(PerfRawSample {
+                block_id,
+                sample_id,
+                arm: PerfSampleArm::Control,
+                order: if control_first {
+                    PerfSampleOrder::First
+                } else {
+                    PerfSampleOrder::Second
+                },
+                phase: PerfSamplePhase::Measurement,
+                scope: scope.clone(),
+                provenance: provenance.clone(),
+                started_ns: control_start,
+                ended_ns: control_start + control_elapsed_ns,
+                work_units: Some(work_units),
+                byte_count: Some(content_bytes),
+                observed_value: None,
+                group_id: None,
+                qg6_sample_binding: None,
+                qg1_sample_binding: None,
+                tantivy_config_sha256: None,
+            });
+            samples.push(PerfRawSample {
+                block_id,
+                sample_id: sample_id + 1,
+                arm: PerfSampleArm::Treatment,
+                order: if control_first {
+                    PerfSampleOrder::Second
+                } else {
+                    PerfSampleOrder::First
+                },
+                phase: PerfSamplePhase::Measurement,
+                scope: scope.clone(),
+                provenance: provenance.clone(),
+                started_ns: treatment_start,
+                ended_ns: treatment_start + treatment_elapsed_ns,
+                work_units: Some(work_units),
+                byte_count: Some(content_bytes),
+                observed_value: None,
+                group_id: None,
+                qg6_sample_binding: None,
+                qg1_sample_binding: None,
+                tantivy_config_sha256: None,
+            });
+        }
+
+        for sample in &mut samples {
+            let stream_sequence = sample.block_id * 2
+                + if sample.order == PerfSampleOrder::Second {
+                    1
+                } else {
+                    0
+                };
+            let tantivy_witness = stream_role == crate::perf::QG1_STREAM_ROLE_TANTIVY_NULL
+                || (stream_role == crate::perf::QG1_STREAM_ROLE_EFFECT
+                    && sample.arm == PerfSampleArm::Control);
+            let lifecycle_witness = if tantivy_witness {
+                Qg1LifecycleWitness::Tantivy {
+                    searchable_segments_before: 1,
+                    searchable_segments_after: 1,
+                    join_elapsed_ns: 1,
+                    writer_rearmed: false,
+                }
+            } else {
+                Qg1LifecycleWitness::Quill {
+                    publication_generation_delta: 1,
+                }
+            };
+            let binding = Qg1SampleBinding {
+                schema_version: Qg1SampleBinding::SCHEMA_VERSION.to_owned(),
+                stream_role: stream_role.to_owned(),
+                stream_id_sha256: String::new(),
+                stream_sequence,
+                raw_sample_id: sample.sample_id,
+                raw_block_id: sample.block_id,
+                raw_arm: sample.arm,
+                raw_order: sample.order,
+                lifecycle_authority_sha256: String::new(),
+                stream_role_identity_sha256: String::new(),
+                producer_capability_sha256: String::new(),
+                producer_capability_tag_sha256: String::new(),
+                lifecycle_receipt_id_sha256: String::new(),
+                lifecycle_receipt_sha256: String::new(),
+                prepared_corpus_sha256: sample.provenance.corpus_sha256.clone(),
+                prepared_input_sha256: String::new(),
+                prepared_manifest_sha256: "a".repeat(64),
+                indexed_content_sha256: "b".repeat(64),
+                document_count: work_units,
+                content_bytes,
+                prepared_batch_count: 1,
+                recorded_batch_count: 1,
+                batch_coverage: vec![Qg1BatchCoverage {
+                    document_start: 0,
+                    document_count: work_units,
+                }],
+                tail_document_id: format!("synthetic-{:08}", work_units.saturating_sub(1)),
+                terminal_endpoint_ns: sample.ended_ns - sample.started_ns,
+                lifecycle_witness,
+            };
+            sample.qg1_sample_binding = Some(
+                producer
+                    .consume_lifecycle_receipt(&sample.scope, &sample.provenance, binding)
+                    .expect("producer consumes one QG-1 lifecycle receipt per raw row"),
+            );
+        }
+        samples
+    }
+
+    struct Qg1ExperimentFixture {
+        paired: PairedExperimentResult,
+        treatment_arm_null: PairedExperimentResult,
+        expected_authority: Qg1ExpectedAuthority,
+    }
+
+    fn valid_qg1_experiment_for_spec(spec: &EvidenceCellSpec, ratio: f64) -> Qg1ExperimentFixture {
+        const PAIRS: usize = 12;
+        const CONTENT_BYTES: u64 = 64_000;
+
+        let canonical = PerfMatrixSpec::complete()
+            .for_gate(PerfGate::Qg1)
+            .into_iter()
+            .find(|cell| cell.fixture == spec.fixture && cell.metric == spec.metric)
+            .expect("QG-1 fixture uses one canonical matrix cell");
+        let work_units = canonical
+            .document_count
+            .expect("canonical QG-1 throughput cell has work units");
+        let scope = perf_operation_scope(spec.gate, &spec.fixture, &spec.metric);
+        let mut provenance = sample_provenance("run-a");
+        provenance.input_identity = spec.input_identity.clone();
+        let schedule =
+            seeded_balanced_pair_order(PAIRS, 0x00c0_ffee).expect("QG-1 authority schedule");
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let control_elapsed_ns = (ratio * 100_000.0).round() as u64;
+        let treatment_elapsed_ns = 100_000;
+        let mut estimator = config();
+        let producer = estimator
+            .install_qg1_lifecycle_authority(
+                scope.clone(),
+                provenance.corpus_sha256.clone(),
+                "a".repeat(64),
+                "b".repeat(64),
+                work_units,
+                CONTENT_BYTES,
+                1,
+                vec![Qg1BatchCoverage {
+                    document_start: 0,
+                    document_count: work_units,
+                }],
+                format!("synthetic-{:08}", work_units.saturating_sub(1)),
+                u64::try_from(PAIRS).expect("QG-1 pair count fits u64"),
+                vec![
+                    (
+                        crate::perf::QG1_STREAM_ROLE_EFFECT.to_owned(),
+                        0,
+                        0,
+                        schedule.clone(),
+                    ),
+                    (
+                        crate::perf::QG1_STREAM_ROLE_TANTIVY_NULL.to_owned(),
+                        0,
+                        10_000,
+                        schedule.clone(),
+                    ),
+                    (
+                        crate::perf::QG1_STREAM_ROLE_QUILL_NULL.to_owned(),
+                        0,
+                        20_000,
+                        schedule.clone(),
+                    ),
+                ],
+            )
+            .expect("mint QG-1 authority before the first raw row");
+        let expected_authority = producer.expected_authority().clone();
+        let effect = authority_bound_qg1_throughput_stream(
+            &scope,
+            &provenance,
+            &producer,
+            crate::perf::QG1_STREAM_ROLE_EFFECT,
+            &schedule,
+            control_elapsed_ns,
+            treatment_elapsed_ns,
+            0,
+            work_units,
+            CONTENT_BYTES,
+        );
+        let tantivy_null = authority_bound_qg1_throughput_stream(
+            &scope,
+            &provenance,
+            &producer,
+            crate::perf::QG1_STREAM_ROLE_TANTIVY_NULL,
+            &schedule,
+            control_elapsed_ns,
+            control_elapsed_ns,
+            10_000,
+            work_units,
+            CONTENT_BYTES,
+        );
+        let quill_null = authority_bound_qg1_throughput_stream(
+            &scope,
+            &provenance,
+            &producer,
+            crate::perf::QG1_STREAM_ROLE_QUILL_NULL,
+            &schedule,
+            treatment_elapsed_ns,
+            treatment_elapsed_ns,
+            20_000,
+            work_units,
+            CONTENT_BYTES,
+        );
+        let paired = estimate_paired_experiment_against_qg1_authority(
+            &effect,
+            &tantivy_null,
+            &estimator,
+            Some(&expected_authority),
+        )
+        .expect("authority-bound QG-1 effect estimate");
+        let treatment_arm_null = estimate_paired_experiment_against_qg1_authority(
+            &effect,
+            &quill_null,
+            &estimator,
+            Some(&expected_authority),
+        )
+        .expect("authority-bound QG-1 treatment-arm null estimate");
+        Qg1ExperimentFixture {
+            paired,
+            treatment_arm_null,
+            expected_authority,
+        }
+    }
+
     fn bind_experiment_to_spec(
         mut experiment: PairedExperimentResult,
         spec: &EvidenceCellSpec,
@@ -4315,6 +4570,9 @@ mod tests {
     }
 
     fn valid_experiment_for_spec(spec: &EvidenceCellSpec, ratio: f64) -> PairedExperimentResult {
+        if spec.gate == PerfGate::Qg1 && spec.metric == "docs_per_second" {
+            return valid_qg1_experiment_for_spec(spec, ratio).paired;
+        }
         bind_experiment_to_spec(valid_experiment(ratio), spec)
     }
 
@@ -4599,17 +4857,22 @@ mod tests {
         }
     }
 
-    fn provisional_cell() -> EvidenceCell {
+    fn provisional_cell_with_authority() -> (EvidenceCell, Qg1ExpectedAuthority) {
         let spec = cell_spec(PerfGate::Qg1, EvidenceRole::Required);
-        let mut cell = EvidenceCell::evaluate(
-            spec.clone(),
-            valid_experiment_for_spec(&spec, 1.10),
+        let fixture = valid_qg1_experiment_for_spec(&spec, 1.10);
+        let mut cell = EvidenceCell::evaluate(spec.clone(), fixture.paired, &policy())
+            .expect("provisional cell");
+        cell.attach_treatment_arm_null_against_qg1_authority(
+            fixture.treatment_arm_null,
             &policy(),
+            Some(&fixture.expected_authority),
         )
-        .expect("provisional cell");
-        cell.attach_treatment_arm_null(valid_treatment_arm_null_for_spec(&spec, 1.10), &policy())
-            .expect("attach QG-1 treatment-arm null");
-        cell
+        .expect("attach authority-bound QG-1 treatment-arm null");
+        (cell, fixture.expected_authority)
+    }
+
+    fn provisional_cell() -> EvidenceCell {
+        provisional_cell_with_authority().0
     }
 
     fn provisional_qg2_cell() -> EvidenceCell {
@@ -7320,15 +7583,21 @@ mod tests {
             .collect()
     }
 
-    fn qg1_screen_artifact() -> PerfEvidenceArtifact {
-        PerfEvidenceArtifact::assemble(
+    fn qg1_screen_artifact_with_authority() -> (PerfEvidenceArtifact, Qg1ExpectedAuthority) {
+        let (cell, expected_authority) = provisional_cell_with_authority();
+        let artifact = PerfEvidenceArtifact::assemble(
             PerfGate::Qg1,
             plan_binding(PerfGate::Qg1),
             policy(),
             evidence_provenance(PerfGate::Qg1),
-            vec![provisional_cell()],
+            vec![cell],
         )
-        .expect("QG-1 screen-bearing artifact")
+        .expect("QG-1 screen-bearing artifact");
+        (artifact, expected_authority)
+    }
+
+    fn qg1_screen_artifact() -> PerfEvidenceArtifact {
+        qg1_screen_artifact_with_authority().0
     }
 
     /// Planted omission negative: QG-1 evidence that does not screen every
@@ -7337,7 +7606,7 @@ mod tests {
     /// admissibility.
     #[test]
     fn omitted_qg1_incumbent_screen_is_no_decision_and_never_ratchets() {
-        let mut omitted = qg1_screen_artifact();
+        let (mut omitted, expected_authority) = qg1_screen_artifact_with_authority();
         assert!(omitted.qg1_incumbent_screens.is_empty());
         assert_eq!(
             omitted.gate_status,
@@ -7360,10 +7629,13 @@ mod tests {
 
         let directory = tempfile::tempdir().expect("omitted-screen evidence directory");
         let paths = omitted
-            .write_atomic(directory.path())
+            .write_atomic_against_qg1_authorities(directory.path(), &[&expected_authority])
             .expect("evidence with no screen still persists durably");
-        let reloaded = PerfEvidenceArtifact::load_verified(&paths.json)
-            .expect("reload evidence with no screen");
+        let reloaded = PerfEvidenceArtifact::load_verified_against_qg1_authorities(
+            &paths.json,
+            &[&expected_authority],
+        )
+        .expect("reload evidence with no screen");
         assert_eq!(reloaded.gate_status, EvidenceDecisionStatus::NoDecision);
         assert!(!reloaded.ratchet_admissible());
 
@@ -7379,7 +7651,7 @@ mod tests {
     /// frozen its incumbent.
     #[test]
     fn attached_qg1_incumbent_screen_is_durable_and_forces_no_decision() {
-        let mut artifact = qg1_screen_artifact();
+        let (mut artifact, expected_authority) = qg1_screen_artifact_with_authority();
         let screens = qg1_screen_projection(&artifact);
         artifact
             .attach_qg1_incumbent_screens(screens.clone())
@@ -7413,11 +7685,13 @@ mod tests {
         );
 
         let paths = artifact
-            .write_atomic_against_qg1_authorities(directory.path(), &[])
+            .write_atomic_against_qg1_authorities(directory.path(), &[&expected_authority])
             .expect("persist the screen-bearing artifact");
-        let reloaded =
-            PerfEvidenceArtifact::load_verified_against_qg1_authorities(&paths.json, &[])
-                .expect("reload the screen-bearing artifact");
+        let reloaded = PerfEvidenceArtifact::load_verified_against_qg1_authorities(
+            &paths.json,
+            &[&expected_authority],
+        )
+        .expect("reload the screen-bearing artifact");
         assert_eq!(
             reloaded.qg1_incumbent_screens, screens,
             "the complete screen projection survives write and reload exactly"
@@ -7612,7 +7886,7 @@ mod tests {
     /// persisted artifact whose projection was edited fails verification.
     #[test]
     fn qg1_incumbent_screen_coverage_must_be_exact() {
-        let artifact = qg1_screen_artifact();
+        let (artifact, expected_authority) = qg1_screen_artifact_with_authority();
         let screens = qg1_screen_projection(&artifact);
 
         let mut duplicated = screens.clone();
@@ -7655,7 +7929,7 @@ mod tests {
             "an empty projection cannot cover a required engine cell"
         );
 
-        let mut attached = qg1_screen_artifact();
+        let mut attached = artifact;
         attached
             .attach_qg1_incumbent_screens(screens)
             .expect("attach the canonical projection");
@@ -7674,7 +7948,7 @@ mod tests {
         .expect("the resealed dropped projection re-parses");
         assert!(
             matches!(
-                dropped.verify_integrity_against_qg1_authorities(&[]),
+                dropped.verify_integrity_against_qg1_authorities(&[&expected_authority]),
                 Err(EvidenceArtifactError::InconsistentArtifact { .. })
             ),
             "an artifact whose projection was dropped after folding must not verify"
