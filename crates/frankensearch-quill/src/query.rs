@@ -2560,12 +2560,44 @@ impl Grammar {
 
     fn lower_atom(&mut self, atom: &AtomToken) -> Option<Query> {
         if !atom.delimiter.is_quoted() && atom.raw == "*" {
-            if atom.field.is_none() {
+            let Some(field_name) = atom.field.as_deref() else {
                 return Some(self.apply_boost(Query::All, atom));
+            };
+            let Some(descriptor) = self
+                .parser
+                .schema
+                .fields
+                .iter()
+                .find(|field| field.name == field_name)
+                .copied()
+            else {
+                self.drop_with_diagnostic(
+                    QueryDiagnosticKind::UnknownField,
+                    &format!("unknown field {field_name}; unsupported field fragment dropped"),
+                    atom.byte_offset,
+                    Some(atom.raw.clone()),
+                );
+                return None;
+            };
+            if matches!(
+                descriptor.kind,
+                FieldKind::I64 { fast: true, .. } | FieldKind::U64 { fast: true, .. }
+            ) {
+                return Some(self.apply_boost(
+                    Query::Range {
+                        field_id: descriptor.id,
+                        lower: Bound::Unbounded,
+                        upper: Bound::Unbounded,
+                    },
+                    atom,
+                ));
             }
             self.drop_with_diagnostic(
                 QueryDiagnosticKind::UnsupportedField,
-                "field-scoped match-all requires an unsupported existence query",
+                &format!(
+                    "field {} does not support fast-field existence queries",
+                    descriptor.name
+                ),
                 atom.byte_offset,
                 None,
             );
@@ -6389,6 +6421,31 @@ mod tests {
                 "invalid boost cannot block child rewrite or ordered field expansion"
             );
         }
+    }
+
+    #[test]
+    fn fast_numeric_field_exists_lowers_to_an_unbounded_range() {
+        let typed_parser =
+            DefaultQueryParser::new(TYPED_SCHEMA).expect("typed test schema is valid");
+        let exists = typed_parser.parse("unsigned:*");
+        assert_eq!(
+            exists.query,
+            Query::Range {
+                field_id: 4,
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            }
+        );
+        assert!(exists.diagnostics.is_empty());
+
+        let non_fast = typed_parser.parse("signed:*");
+        assert_eq!(non_fast.query, Query::Empty);
+        assert!(non_fast.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == QueryDiagnosticKind::UnsupportedField
+                && diagnostic
+                    .message
+                    .contains("does not support fast-field existence queries")
+        }));
     }
 
     #[test]

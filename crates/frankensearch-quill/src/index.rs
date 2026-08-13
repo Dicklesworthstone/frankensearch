@@ -27830,6 +27830,97 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn public_fast_field_exists_matches_tantivy_ids_and_score_bits() {
+        use frankensearch_lexical::tantivy_crate::{
+            Index, TantivyDocument,
+            collector::TopDocs,
+            doc,
+            query::QueryParser,
+            schema::{FAST, Schema},
+        };
+
+        run_with_cx(|cx| async move {
+            let corpus = [
+                ("exists-c", "gamma"),
+                ("exists-a", "alpha"),
+                ("exists-b", "beta"),
+            ];
+
+            let quill = QuillIndex::in_memory(deterministic_config()).expect("construct Quill");
+            let documents = corpus
+                .iter()
+                .map(|(id, content)| IndexableDocument::new(*id, *content))
+                .collect::<Vec<_>>();
+            quill
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index public Quill existence corpus");
+            quill
+                .commit(&cx)
+                .await
+                .expect("commit Quill existence corpus");
+
+            let mut schema_builder = Schema::builder();
+            let ord = schema_builder.add_u64_field("ord", FAST);
+            let tantivy = Index::create_in_ram(schema_builder.build());
+            let mut writer = tantivy
+                .writer_with_num_threads::<TantivyDocument>(1, 15_000_000)
+                .expect("construct Tantivy writer");
+            for (ordinal, _) in corpus.iter().enumerate() {
+                writer
+                    .add_document(doc!(
+                        ord => u64::try_from(ordinal).expect("fixture ordinal fits u64")
+                    ))
+                    .expect("index Tantivy existence document");
+            }
+            writer.commit().expect("commit Tantivy existence corpus");
+            drop(writer);
+            let reader = tantivy.reader().expect("open Tantivy existence reader");
+            let searcher = reader.searcher();
+            let parser = QueryParser::for_index(&tantivy, Vec::new());
+
+            let mut quill_hits = quill
+                .search_doc_ids(&cx, "ord:*", corpus.len())
+                .expect("execute public Quill fast-field existence query")
+                .into_iter()
+                .map(|hit| (hit.document_id, hit.score.to_bits()))
+                .collect::<Vec<_>>();
+            let parsed = parser
+                .parse_query("ord:*")
+                .expect("parse Tantivy fast-field existence query");
+            let mut tantivy_hits = searcher
+                .search(
+                    parsed.as_ref(),
+                    &TopDocs::with_limit(corpus.len()).order_by_score(),
+                )
+                .expect("execute Tantivy fast-field existence query")
+                .into_iter()
+                .map(|(score, address)| {
+                    assert_eq!(address.segment_ord, 0);
+                    (
+                        corpus[usize::try_from(address.doc_id).expect("doc id fits")]
+                            .0
+                            .to_owned(),
+                        score.to_bits(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            quill_hits.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            tantivy_hits.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+
+            assert_eq!(quill_hits, tantivy_hits);
+            assert_eq!(
+                quill_hits,
+                ["exists-a", "exists-b", "exists-c"]
+                    .into_iter()
+                    .map(|id| (id.to_owned(), 1.0_f32.to_bits()))
+                    .collect::<Vec<_>>()
+            );
+        });
+    }
+
     #[test]
     fn scalar_memory_commit_is_visibility_boundary_and_queries_end_to_end() {
         run_with_cx(|cx| async move {
