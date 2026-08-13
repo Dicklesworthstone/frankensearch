@@ -12,7 +12,7 @@
 //!     .add_document("doc-1", "Hello world")
 //!     .add_document("doc-2", "Distributed consensus algorithms")
 //!     .build(&cx)
-//!     .await?;
+//!     .await?; // errors if auto-detect finds no semantic model
 //!
 //! println!("Indexed {} docs in {:.1}ms", stats.doc_count, stats.total_ms);
 //! ```
@@ -296,6 +296,7 @@ impl IndexBuilder {
         }
 
         // Resolve embedder stack.
+        let explicit_stack = self.embedder_stack.is_some();
         let stack = match self.embedder_stack.take() {
             Some(stack) => stack,
             None => EmbedderStack::auto_detect_with(Some(&self.data_dir))?,
@@ -305,11 +306,22 @@ impl IndexBuilder {
         // A degraded stack here is not a transient runtime condition: the
         // vectors written below carry this embedder's identity, so the
         // generation is permanently degraded and a later model install cannot
-        // repair it — only a compatible rebuild can. Say so loudly at the
-        // moment of writing rather than letting it surface as mysteriously
-        // poor relevance much later (`bd-a6zt`). Checked for a caller-supplied
-        // stack too: passing a hash stack explicitly is just as consequential.
+        // repair it — only a compatible rebuild can. Auto-detect HashOnly is
+        // never a silent success: that is how semantic search "just works"
+        // as lexical-only forever (`bd-a6zt`). Hash remains reachable only
+        // through an explicit stack (tests / control policy).
         let embedder_availability = stack.availability();
+        if matches!(embedder_availability, TwoTierAvailability::HashOnly) && !explicit_stack {
+            let error = SearchError::EmbedderUnavailable {
+                model: "semantic".to_owned(),
+                reason: stack.degradation_message().unwrap_or_else(|| {
+                    "auto-detect found no semantic model; refusing to write a hash generation"
+                        .to_owned()
+                }),
+            };
+            export_error(metrics_exporter.as_ref(), &error);
+            return Err(error);
+        }
         if embedder_availability.is_degraded() {
             tracing::warn!(
                 availability = %embedder_availability,
@@ -1607,6 +1619,22 @@ mod tests {
             assert!(
                 stats.is_degraded_generation(),
                 "hash-only generations are permanently non-semantic and must say so",
+            );
+        });
+    }
+
+    #[test]
+    fn build_refuses_auto_detected_hash_only_generation() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let error = IndexBuilder::new(dir.path())
+                .add_document("doc-1", "Hello world")
+                .build(&cx)
+                .await
+                .expect_err("auto-detect hash must not write a generation");
+            assert!(
+                matches!(error, SearchError::EmbedderUnavailable { .. }),
+                "expected EmbedderUnavailable, got: {error:?}"
             );
         });
     }
