@@ -8403,7 +8403,7 @@ impl QuillWriterState {
                 engine_version: CURRENT_ENGINE_VERSION,
                 documents: &documents,
             },
-            FlushMode::Scalar,
+            FlushMode::Automatic,
         )?;
         let manifest_segment = manifest_segment(&encoded, plan.seal_seq);
         let next_seal_seq = plan

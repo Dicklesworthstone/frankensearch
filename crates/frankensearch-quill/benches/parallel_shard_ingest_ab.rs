@@ -1,26 +1,19 @@
-//! Shared-nothing parallel segment build vs today's serial shard fill.
+//! Shared-nothing parallel segment build and radix execution controls.
 //!
-//! Quill already partitions ingest into `W` shard accumulators
-//! ([`frankensearch_quill::scribe::ShardRouter`] routes whole batches
-//! round-robin), but the shards are a *memory* partition only: every
-//! accumulate and every seal runs inline on the single task that holds the
-//! exclusive writer lock. This bench measures the ceiling of turning that
-//! partition into a *compute* partition.
+//! Quill partitions ingest into `W` shard accumulators and builds independent
+//! budget-crossing shards through Rayon. This benchmark retains the former
+//! scalar paths as explicit controls so the two production levers remain
+//! measurable against byte-identical work.
 //!
 //! Three configurations are scored against one A/A null, all producing
 //! byte-identical sealed segments from byte-identical shard assignment:
 //!
-//! - **baseline** — serial shard walk, `FlushMode::Scalar`. This is what
-//!   `index.rs` does today. There is exactly *one* production seal site —
-//!   `prepare_shard_flush` (reached from the async `flush_shard`) — and it
-//!   forces the single-threaded radix. The three other `FlushMode::Scalar`
-//!   occurrences in `index.rs` are inside `#[cfg(test)] mod tests`.
-//! - **seal-automatic** (lever 1a) — serial shard walk, `FlushMode::Automatic`.
-//!   The parallel radix seal already exists, is the crate default, and is
-//!   parity-tested against Scalar in `scribe.rs`; production simply never asks
-//!   for it.
-//! - **shard-fanout** (lever 1b) — shared-nothing shard fan-out, seal mode
-//!   unchanged, so the win is attributable purely to parallel accumulation.
+//! - **baseline** — the former serial shard walk and scalar radix reference.
+//! - **seal-automatic** — the same serial shard walk with the automatic stable
+//!   radix used by production parallel shard builds. This isolates the radix
+//!   lever from shard fan-out.
+//! - **shard-fanout** — shared-nothing shard fan-out with scalar radix, which
+//!   isolates the outer fan-out from the radix lever.
 //!
 //! Parity is asserted per shard before any timing.
 //!
@@ -193,8 +186,7 @@ fn build_shard(corpus: &[FixtureDocument], shard: &ShardWork, mode: FlushMode) -
     .expect("shard seal must succeed")
 }
 
-/// Baseline — today's engine: every shard built inline on the caller's thread,
-/// sealed with the single-threaded radix that `index.rs` actually passes.
+/// Former shipping baseline: build every shard inline with scalar radix.
 fn build_serial(
     corpus: &[FixtureDocument],
     shards: &[ShardWork],
@@ -283,8 +275,8 @@ fn run_cell(
         .expect("fixed Rayon pool must build");
 
     // Parity gate: neither lever may change a single output byte. This also
-    // re-proves in-bench that the parallel radix seal is byte-identical to the
-    // single-threaded one production currently forces.
+    // re-proves in-bench that production's automatic radix seal is
+    // byte-identical to the former scalar reference.
     let baseline = build_serial(corpus, &shards, FlushMode::Scalar);
     let seal_parallel = build_serial(corpus, &shards, FlushMode::Automatic);
     let shard_parallel = build_parallel(corpus, &shards, &pool, FlushMode::Scalar);
@@ -313,8 +305,8 @@ fn run_cell(
         )));
     };
     let null = paired_median_ratio(rounds, 1, base, base);
-    // Lever 1a: keep the serial shard walk, but stop forcing the single-threaded
-    // seal that `index.rs` passes today.
+    // Lever 1a: keep the serial shard walk and isolate automatic radix from the
+    // production outer shard fan-out.
     let seal_lever = paired_median_ratio(rounds, 1, base, || {
         black_box(total_len(&build_serial(
             black_box(corpus),
