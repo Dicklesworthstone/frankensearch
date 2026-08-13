@@ -8265,12 +8265,61 @@ mod tests {
         let run_log = create_new_file_at(&run_directories.run.handle, "run.log")
             .expect("create-new retained QG-1 wait test run log");
         let mut handshake_log = run_log.try_clone().expect("clone retained test run log");
-        let current_test = std::env::current_exe().expect("current test executable");
-        let helper_name = "local_perf_runner::tests::qg1_wait_boundary_child_helper";
-        let mut command = Command::new(current_test);
+        let mut command = if case == "ack" {
+            // A libtest child writes its harness banner to fd 1 before the
+            // helper can emit, so byte zero would not be the register magic and
+            // the production offset-zero rule would refuse it. That rule is
+            // correct and stays strict; the CHILD changes instead. This is a
+            // real OS process with its own group, so actual parent
+            // wait/kill/reap containment and the startup deadline are still
+            // exercised end to end -- only the harness noise is gone.
+            //
+            // The frames are precomputed here and staged descriptor-relatively,
+            // so the child's first write is the register frame at byte zero. It
+            // then consumes exactly the final-ACK bytes from stdin and only
+            // afterwards does post-ACK work, which is the ordering this case
+            // exists to prove.
+            let entry =
+                qg1_register_entry_for_target("QG-1.bulk/tiny/1/positions_on.docs_per_second");
+            let entry_bytes = entry
+                .to_json_bytes()
+                .expect("serialize wait-boundary authority");
+            let mut frames = Qg1StartupHandshakeV1::register_frame(1, &entry_bytes)
+                .expect("frame bounded wait-boundary authority");
+            frames.extend_from_slice(&Qg1StartupHandshakeV1::complete_frame(1));
+            assert!(
+                frames.starts_with(Qg1StartupHandshakeV1::REGISTER_MAGIC),
+                "the staged child stream must begin at byte zero with the register magic"
+            );
+            write_new_sync_at(&run_directories.run.handle, "qg1-wait-frames.bin", &frames)
+                .expect("stage create-new QG-1 wait-boundary child frames");
+            run_directories
+                .run
+                .handle
+                .sync_all()
+                .expect("sync staged QG-1 wait-boundary child frames");
+            let frames_path = run_directories.run.path.join("qg1-wait-frames.bin");
+            let ack_len = Qg1StartupHandshakeV1::final_ack_len();
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg(format!(
+                    "cat \"$1\"; dd bs=1 count={ack_len} of=/dev/null 2>/dev/null; \
+                     echo qg1-wait-child-work-after-ack"
+                ))
+                .arg("qg1-wait-boundary-child")
+                .arg(&frames_path);
+            command
+        } else {
+            let current_test = std::env::current_exe().expect("current test executable");
+            let helper_name = "local_perf_runner::tests::qg1_wait_boundary_child_helper";
+            let mut command = Command::new(current_test);
+            command
+                .args(["--exact", helper_name, "--nocapture", "--test-threads=1"])
+                .env("QUILL_PERF_TEST_QG1_WAIT_CASE", case);
+            command
+        };
         command
-            .args(["--exact", helper_name, "--nocapture", "--test-threads=1"])
-            .env("QUILL_PERF_TEST_QG1_WAIT_CASE", case)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
