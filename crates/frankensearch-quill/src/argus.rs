@@ -461,10 +461,7 @@ impl<'a> ValidatedArrivalCursor<'a> {
     }
 
     fn guard_refused(&self) -> Result<(), ArgusError> {
-        match self.refused {
-            Some(refusal) => Err(refusal.error()),
-            None => Ok(()),
-        }
+        self.refused.map_or(Ok(()), |refusal| Err(refusal.error()))
     }
 
     fn admit_or_refuse(&mut self, units: u64) -> Result<(), ArgusError> {
@@ -623,14 +620,22 @@ impl PostingCursor for ValidatedArrivalCursor<'_> {
 
 /// The cursor one term scorer drives.
 ///
-/// This enum is the whole of the exact-cursor guarantee. `Validated` holds the
-/// crate's own cursor by value, so movement, scoring and arrival reads are all
-/// served by one instance with no virtual call in between; `Opaque` is every
-/// other implementation, including every wrapper, and has no arrival read at
-/// all. A wrapper cannot move itself into `Validated` because the constructor
-/// that builds that arm takes the concrete type.
+/// This enum is the whole of the exact-cursor guarantee. `Validated` owns the
+/// crate's own cursor as a concrete type, so movement, scoring and arrival
+/// reads are all served by one instance with no virtual call in between;
+/// `Opaque` is every other implementation, including every wrapper, and has no
+/// arrival read at all. A wrapper cannot move itself into `Validated` because
+/// the constructor that builds that arm takes the concrete type.
+///
+/// The validated arm is boxed. `ValidatedArrivalCursor` embeds a whole decoded
+/// posting block, so holding it inline made every move of a `TermCursor` — and
+/// therefore of the `TermScorer` and `ScorerNode` that carry it — copy better
+/// than a kilobyte to carry an arm that is otherwise one pointer wide. The box
+/// is an owning, statically dispatched pointer to the concrete type: dispatch
+/// stays direct, and the arm still cannot be reached with anything but the
+/// crate's own cursor.
 enum TermCursor<'a> {
-    Validated(ValidatedArrivalCursor<'a>),
+    Validated(Box<ValidatedArrivalCursor<'a>>),
     Opaque(Box<dyn PostingCursor + 'a>),
 }
 
@@ -1236,10 +1241,7 @@ impl<'a> CheckpointPostingCursor<'a> {
     /// found it and no further fuel can be charged against a query that has
     /// already been told to stop.
     fn guard_refused(&self) -> Result<(), ArgusError> {
-        match self.refused {
-            Some(refusal) => Err(refusal.error()),
-            None => Ok(()),
-        }
+        self.refused.map_or(Ok(()), |refusal| Err(refusal.error()))
     }
 
     /// Admit `units`, retaining any refusal so the cursor becomes terminal.
@@ -2325,7 +2327,7 @@ impl<'a> TermScorer<'a> {
         F: FieldNormReader + 'a,
     {
         Self::with_term_cursor(
-            TermCursor::Validated(cursor),
+            TermCursor::Validated(Box::new(cursor)),
             fieldnorms,
             snapshot,
             snapshot_doc_freq,
@@ -7775,11 +7777,11 @@ mod tests {
         let snapshot = delta_tombstone_snapshot()?;
         let checkpoint = Arc::new(CancelOnNthAdmission::new(1));
 
-        let error =
-            match DeltaPostingCursor::new_admitted(&snapshot, 0, b"missing", checkpoint.as_ref()) {
-                Ok(_) => panic!("a missing-term open must observe its cancellation poll"),
-                Err(error) => error,
-            };
+        let Err(error) =
+            DeltaPostingCursor::new_admitted(&snapshot, 0, b"missing", checkpoint.as_ref())
+        else {
+            panic!("a missing-term open must observe its cancellation poll")
+        };
         assert!(
             matches!(
                 error,
@@ -7813,7 +7815,7 @@ mod tests {
         let checkpoint = Arc::new(UnitSequenceCheckpoint::default());
         let mut cursor =
             DeltaPostingCursor::new_admitted(&snapshot, 0, b"alpha", checkpoint.as_ref())?;
-        let mut rows = if cursor.doc().is_some() { 1 } else { 0 };
+        let mut rows = usize::from(cursor.doc().is_some());
         while cursor.next_admitted(checkpoint.as_ref())?.is_some() {
             rows += 1;
         }
@@ -12981,7 +12983,11 @@ mod tests {
                 "fixture postings must stay inside the segment"
             );
         }
-        assert!(
+        // Every operand is a `const`, so this holds at compile time or not at
+        // all: as a `const` item it is checked whether or not this test is
+        // selected to run, and a fixture edit that broke it would fail the
+        // build rather than wait for the test that happens to exercise it.
+        const _: () = assert!(
             PRIVATE_BASE + (SMALL_TERMS - 1) * PRIVATE_STRIDE + PRIVATE_RUN < MEETING_DOC,
             "every private run must close before the meeting document"
         );
