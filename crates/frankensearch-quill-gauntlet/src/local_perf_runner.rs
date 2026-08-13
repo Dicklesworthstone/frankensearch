@@ -187,6 +187,8 @@ impl Qg1StartupHandshakeV1 {
         }
     }
 
+    /// Frame the child's COMPLETE marker binding its exact register count.
+    #[must_use]
     pub fn complete_frame(register_count: u64) -> Vec<u8> {
         let mut frame = Vec::with_capacity(Self::COMPLETE_MAGIC.len() + 8);
         frame.extend_from_slice(Self::COMPLETE_MAGIC);
@@ -3824,7 +3826,10 @@ fn qg1_forward_child_stdout<R: Read, W: Write>(
     mut stdin: W,
     mut stdout: R,
     mut run_log: File,
-    events: mpsc::SyncSender<Qg1AuthorityForwarderEvent>,
+    // Borrowed: every use is `send`, which takes `&self`. The owner stays the
+    // spawned forwarding thread, so the channel still closes exactly when that
+    // thread ends and the forwarding lifetime is unchanged.
+    events: &mpsc::SyncSender<Qg1AuthorityForwarderEvent>,
 ) -> Result<(), String> {
     loop {
         match Qg1StartupHandshakeV1::read_control_frame(&mut stdout)? {
@@ -3896,7 +3901,9 @@ fn start_qg1_authority_forwarder(
     let (sender, events) = mpsc::sync_channel(4);
     let failure_sender = sender.clone();
     let join = thread::spawn(move || {
-        let result = qg1_forward_child_stdout(stdin, stdout, run_log, sender);
+        // `sender` stays owned by this closure and is dropped when the thread
+        // ends, so borrowing it here does not shorten the channel's life.
+        let result = qg1_forward_child_stdout(stdin, stdout, run_log, &sender);
         if let Err(error) = &result {
             let _ = failure_sender.send(Qg1AuthorityForwarderEvent::Failed(error.clone()));
         }
@@ -8007,7 +8014,7 @@ mod tests {
                     ack_transport,
                     std::io::Cursor::new(stream),
                     child_log,
-                    sender,
+                    &sender,
                 )
             });
             let forwarder = Qg1AuthorityForwarder { events, join };
