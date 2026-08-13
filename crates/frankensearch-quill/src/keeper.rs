@@ -2337,6 +2337,9 @@ pub struct RecoveredSegment {
     authenticated_file_witness: AuthenticatedFileWitness,
     #[cfg(test)]
     term_dictionary_cache_counters: Arc<TermDictionaryCacheCounters>,
+    /// Test-only call/attempt counter; range and tombstone misses are included.
+    #[cfg(test)]
+    document_id_materialization_calls: Arc<AtomicU64>,
 }
 
 impl RecoveredSegment {
@@ -2546,6 +2549,11 @@ impl RecoveredSegment {
             }
             _ => Arc::new(TermDictionaryCacheCounters::new()),
         };
+        #[cfg(test)]
+        let document_id_materialization_calls = reuse_from.map_or_else(
+            || Arc::new(AtomicU64::new(0)),
+            |previous| Arc::clone(&previous.document_id_materialization_calls),
+        );
         let term_dictionary_metadata = match reused_metadata {
             Some(metadata) => metadata,
             None => {
@@ -2569,6 +2577,8 @@ impl RecoveredSegment {
             authenticated_file_witness,
             #[cfg(test)]
             term_dictionary_cache_counters,
+            #[cfg(test)]
+            document_id_materialization_calls,
         })
     }
 
@@ -2800,6 +2810,9 @@ impl RecoveredSegment {
     /// returns `None` for an out-of-range id, an IDMAP hole, or a tombstoned row.
     #[must_use]
     pub fn materialize_document_id(&self, global_docid: u32) -> Option<DocId> {
+        #[cfg(test)]
+        self.document_id_materialization_calls
+            .fetch_add(1, AtomicOrdering::Relaxed);
         if !(self.manifest.docid_lo..self.manifest.docid_hi).contains(&u64::from(global_docid))
             || self.is_tombstoned(global_docid)
         {
@@ -2808,6 +2821,12 @@ impl RecoveredSegment {
         let id_map = self.reader.section(SectionKind::IDMAP).ok().flatten()?;
         self.id_lookup
             .materialize_global_docid(id_map, global_docid)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn document_id_materialization_call_count(&self) -> u64 {
+        self.document_id_materialization_calls
+            .load(AtomicOrdering::Relaxed)
     }
 
     fn contains_identity_row(&self, global_docid: u32) -> bool {
@@ -3577,17 +3596,24 @@ impl KeeperSnapshot {
     /// Whether one global document id is visible in this snapshot.
     #[must_use]
     pub fn is_live(&self, global_docid: u32) -> bool {
+        self.live_segment_for_docid(global_docid).is_some()
+    }
+
+    /// Select the immutable live segment that owns one global document id.
+    ///
+    /// Manifest validation keeps segment ranges ordered and disjoint, so the
+    /// predecessor of the first range starting after `global_docid` is the
+    /// only possible owner. The live-doc check rejects range holes and
+    /// tombstones without materializing the external identifier.
+    pub(crate) fn live_segment_for_docid(&self, global_docid: u32) -> Option<&RecoveredSegment> {
         let global_docid_u64 = u64::from(global_docid);
         let insertion = self
             .segments
             .partition_point(|segment| segment.manifest.docid_lo <= global_docid_u64);
-        let Some(segment) = insertion
+        insertion
             .checked_sub(1)
             .and_then(|index| self.segments.get(index))
-        else {
-            return false;
-        };
-        crate::argus::LiveDocs::is_live(segment, global_docid)
+            .filter(|segment| crate::argus::LiveDocs::is_live(*segment, global_docid))
     }
 
     /// Materialize one live winner's external identifier via its IDMAP slice.

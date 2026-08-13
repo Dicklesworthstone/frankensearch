@@ -970,12 +970,7 @@ impl QuillSearchSnapshot {
             }
         }
 
-        let Some(segment) = self
-            .keeper
-            .segments()
-            .iter()
-            .find(|segment| segment.materialize_document_id(global_docid).is_some())
-        else {
+        let Some(segment) = self.keeper.live_segment_for_docid(global_docid) else {
             return Ok(None);
         };
         let manifest = segment.manifest();
@@ -18855,6 +18850,96 @@ mod tests {
             assert!(
                 ids("NOT alpha AND NOT beta").await.is_empty(),
                 "an exclusion-only conjunction must still match nothing"
+            );
+        });
+    }
+
+    #[test]
+    fn stored_value_hydration_does_not_rematerialize_candidate_identity() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(QuillConfig {
+                deterministic_ingest: true,
+                tier_fanout: usize::MAX,
+                ..QuillConfig::default()
+            })
+            .expect("create multi-segment stored-value index");
+            for document in [
+                IndexableDocument::new("segment-one", "alpha filler"),
+                IndexableDocument::new("segment-two", "beta filler"),
+                IndexableDocument::new("stored-target", "needle exact stored bytes")
+                    .with_metadata("path", "src/target.rs"),
+            ] {
+                LexicalWrite::index_document(&index, &cx, &document)
+                    .await
+                    .expect("index one segment fixture document");
+                LexicalWrite::commit(&index, &cx)
+                    .await
+                    .expect("seal one fixture segment");
+            }
+
+            let snapshot = index.search_snapshot().expect("pin fixture snapshot");
+            assert_eq!(snapshot.keeper.segments().len(), 3);
+            let materialization_call_count = || {
+                snapshot
+                    .keeper
+                    .segments()
+                    .iter()
+                    .map(RecoveredSegment::document_id_materialization_call_count)
+                    .sum::<u64>()
+            };
+            assert_eq!(materialization_call_count(), 0);
+
+            let batch = LexicalRead::search_candidates(&index, &cx, "needle", 10)
+                .await
+                .expect("search deferred candidate");
+            let (mut candidates, pin) = batch.into_parts();
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].doc_id, "stored-target");
+            assert_eq!(materialization_call_count(), 1);
+
+            LexicalRead::hydrate_candidates(&index, &cx, pin.as_ref(), &mut candidates)
+                .await
+                .expect("hydrate deferred candidate metadata");
+            assert_eq!(
+                candidates[0].metadata.as_deref(),
+                Some(&serde_json::json!({"path": "src/target.rs"}))
+            );
+
+            let global_docid = snapshot
+                .resolve_document_id("stored-target")
+                .expect("resolve stored target")
+                .expect("stored target is live");
+            assert_eq!(
+                snapshot
+                    .materialize_stored_value(CONTENT_FIELD, global_docid)
+                    .expect("materialize stored content"),
+                Some(b"needle exact stored bytes".to_vec())
+            );
+            assert_eq!(materialization_call_count(), 1);
+
+            assert!(
+                index
+                    .delete_document(&cx, "stored-target")
+                    .await
+                    .expect("tombstone stored target")
+            );
+            let tombstoned = index
+                .search_snapshot()
+                .expect("pin tombstoned successor snapshot");
+            assert_eq!(
+                tombstoned
+                    .materialize_stored_value(CONTENT_FIELD, global_docid)
+                    .expect("read tombstoned stored content"),
+                None
+            );
+            assert_eq!(
+                tombstoned
+                    .keeper
+                    .segments()
+                    .iter()
+                    .map(RecoveredSegment::document_id_materialization_call_count)
+                    .sum::<u64>(),
+                1
             );
         });
     }
