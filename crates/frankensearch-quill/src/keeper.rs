@@ -12491,15 +12491,12 @@ pub(crate) async fn drive_manifest_publish_to_checkpoint_for_test<F: std::future
 
     asupersync::time::timeout(asupersync::time::wall_now(), timeout, rendezvous)
         .await
-        .map_or_else(
-            |_| {
-                Err(format!(
-                    "publication did not reach {:?} within {timeout:?}",
-                    pause.checkpoint
-                ))
-            },
-            std::convert::identity,
-        )
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "publication did not reach {:?} within {timeout:?}",
+                pause.checkpoint
+            ))
+        })
 }
 
 #[cfg(test)]
