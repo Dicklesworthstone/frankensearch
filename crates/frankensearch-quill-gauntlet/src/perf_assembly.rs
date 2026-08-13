@@ -4240,11 +4240,7 @@ mod tests {
             sample.work_units = Some(work_units);
             sample.byte_count = Some(content_bytes);
             let stream_sequence = sample.block_id.saturating_mul(2)
-                + if sample.order == PerfSampleOrder::Second {
-                    1
-                } else {
-                    0
-                };
+                + u64::from(sample.order == PerfSampleOrder::Second);
             let tantivy_witness = stream_role == crate::perf::QG1_STREAM_ROLE_TANTIVY_NULL
                 || (stream_role == crate::perf::QG1_STREAM_ROLE_EFFECT
                     && sample.arm == PerfSampleArm::Control);

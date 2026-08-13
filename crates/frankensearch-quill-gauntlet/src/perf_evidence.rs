@@ -1775,7 +1775,7 @@ pub struct Qg1IncumbentScreenEvidence {
     /// Exact non-writer semantics held constant across every candidate.
     pub semantic_contract: Qg1TantivySemanticContract,
     /// Screen outcome: one uniquely fastest candidate, or an explicit
-    /// NoDecision carrying its stable reason.
+    /// `NoDecision` carrying its stable reason.
     pub screen: Qg1TantivyIncumbentScreen,
     /// Same-invocation T/Quill, T/T, and Q/Q decision. Required exactly when
     /// the screen selected a candidate; forbidden when it did not.
@@ -1787,7 +1787,7 @@ impl Qg1IncumbentScreenEvidence {
     /// Whether this screen froze one uniquely fastest incumbent arm.
     ///
     /// An incomplete screen is not a failure of the run — it is a valid
-    /// NoDecision — but it can never headline, which is what the gate fold
+    /// `NoDecision` — but it can never headline, which is what the gate fold
     /// consumes this for.
     #[must_use]
     pub fn has_selection(&self) -> bool {
@@ -1892,7 +1892,7 @@ impl Qg1IncumbentScreenEvidence {
     /// A `ShippingAuto` selection is refused here rather than reported: its
     /// materialized width is chosen by Tantivy at runtime and is typed
     /// unobservable, so it can never satisfy the frozen observed-width
-    /// requirement. Such a screen must be recorded as NoDecision — accepting it
+    /// requirement. Such a screen must be recorded as `NoDecision` — accepting it
     /// with a relaxed or absent witness is exactly the weakening this refuses.
     ///
     /// # Errors
@@ -1977,7 +1977,7 @@ impl Qg1IncumbentScreenEvidence {
     }
 
     /// Reject a screen whose outcome is neither a selection nor a valid
-    /// NoDecision, before any authority work is attempted.
+    /// `NoDecision`, before any authority work is attempted.
     fn validate_shape(&self) -> Result<(), EvidenceArtifactError> {
         let inconsistent = |reason: String| EvidenceArtifactError::InconsistentArtifact { reason };
         // Refuse an unobservable selected width before anything else, so a
@@ -4098,15 +4098,17 @@ pub mod qg6_test_fixture {
         contract: &Qg6SemanticContract,
     ) {
         let mut timeline_ns = 0_u64;
-        for pair in samples.chunks_exact_mut(2) {
+        let (pairs, remainder) = samples.as_chunks_mut::<2>();
+        assert!(remainder.is_empty(), "paired QG-6 fixture");
+        for pair in pairs {
             assert_eq!(pair[0].block_id, pair[1].block_id, "paired QG-6 fixture");
             let (left, right) = pair.split_at_mut(1);
-            let (first, second) = if left[0].order == PerfSampleOrder::First {
-                (&mut left[0], &mut right[0])
+            let ordered = if left[0].order == PerfSampleOrder::First {
+                [&mut left[0], &mut right[0]]
             } else {
-                (&mut right[0], &mut left[0])
+                [&mut right[0], &mut left[0]]
             };
-            for sample in [first, second] {
+            for sample in ordered {
                 let observed_ms = sample.observed_value.expect("QG-6 fixture gauge");
                 let elapsed = std::time::Duration::try_from_secs_f64(observed_ms / 1_000.0)
                     .expect("finite positive QG-6 fixture latency");
@@ -4119,7 +4121,6 @@ pub mod qg6_test_fixture {
                 timeline_ns = sample.ended_ns + 1_000;
             }
         }
-        assert!(samples.chunks_exact(2).remainder().is_empty());
         for sample in samples {
             let group_id = sample.group_id.expect("QG-6 fixture group");
             let group_index = usize::try_from(group_id).expect("QG-6 group index");
@@ -4425,12 +4426,8 @@ mod tests {
         }
 
         for sample in &mut samples {
-            let stream_sequence = sample.block_id * 2
-                + if sample.order == PerfSampleOrder::Second {
-                    1
-                } else {
-                    0
-                };
+            let stream_sequence =
+                sample.block_id * 2 + u64::from(sample.order == PerfSampleOrder::Second);
             let tantivy_witness = stream_role == crate::perf::QG1_STREAM_ROLE_TANTIVY_NULL
                 || (stream_role == crate::perf::QG1_STREAM_ROLE_EFFECT
                     && sample.arm == PerfSampleArm::Control);
