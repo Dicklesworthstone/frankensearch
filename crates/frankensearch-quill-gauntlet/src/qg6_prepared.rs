@@ -5493,9 +5493,18 @@ mod tests {
         set_residual_role_latencies(&mut observations, [100, 100, 80, 80, 160, 160]);
 
         let admitted = admit_residual(observations).expect("known effect admits");
-        assert_eq!(admitted.joint_contrasts.old_b_minus_old_a, 0.0);
-        assert_eq!(admitted.joint_contrasts.current_b_minus_current_a, 0.0);
-        assert_eq!(admitted.joint_contrasts.tantivy_b_minus_tantivy_a, 0.0);
+        assert_eq!(
+            admitted.joint_contrasts.old_b_minus_old_a.to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert_eq!(
+            admitted.joint_contrasts.current_b_minus_current_a.to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert_eq!(
+            admitted.joint_contrasts.tantivy_b_minus_tantivy_a.to_bits(),
+            0.0_f64.to_bits()
+        );
         let expected_current_old = Duration::from_nanos(80).as_secs_f64().ln()
             - Duration::from_nanos(100).as_secs_f64().ln();
         let expected_current_tantivy = Duration::from_nanos(80).as_secs_f64().ln()
