@@ -4433,7 +4433,8 @@ mod tests {
         const PAIRS: usize = 12;
         const CONTENT_BYTES: u64 = 64_000;
 
-        let canonical = PerfMatrixSpec::complete()
+        let matrix = PerfMatrixSpec::complete();
+        let canonical = matrix
             .for_gate(PerfGate::Qg1)
             .into_iter()
             .find(|cell| cell.fixture == spec.fixture && cell.metric == spec.metric)
