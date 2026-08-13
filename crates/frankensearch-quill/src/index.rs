@@ -2052,6 +2052,8 @@ struct ParallelBudgetAdmission {
     batch_logical_upper_bound: usize,
     projected_logical_upper_bound: usize,
     arena_chunk_bytes: usize,
+    #[cfg(test)]
+    budget_worker_slots: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5734,46 +5736,121 @@ impl QuillWriterState {
             return Ok(None);
         }
 
-        let mut analyzer = FrankensearchTokenizer::default();
-        let mut batch_logical_upper_bound = 0_usize;
-        for document in documents {
-            #[cfg(feature = "conformance-internals")]
-            self.reader
-                .conformance_controller
-                .checkpoint(ConformanceCancellationStage::ParallelBudgetAdmission, cx);
-            check_cancel(cx, "parallel budget admission")?;
-            let Some(consumed_before_document) =
-                initial_logical_bytes.checked_add(batch_logical_upper_bound)
-            else {
-                return Ok(None);
-            };
-            let Some(remaining_budget) = logical_budget_bytes.checked_sub(consumed_before_document)
-            else {
-                return Ok(None);
-            };
-            let Some(document_bound) = parallel_document_logical_upper_bound(
-                self.schema,
-                &mut analyzer,
-                document,
-                remaining_budget,
-            )?
-            else {
-                return Ok(None);
-            };
-            let ParallelDocumentBudgetBound::Within(document_upper_bound) = document_bound else {
-                return Ok(None);
-            };
-            let Some(charged) = batch_logical_upper_bound.checked_add(document_upper_bound) else {
-                return Ok(None);
-            };
-            batch_logical_upper_bound = charged;
-            if initial_logical_bytes
-                .checked_add(batch_logical_upper_bound)
-                .is_none_or(|projected| projected >= logical_budget_bytes)
-            {
-                return Ok(None);
+        #[cfg(feature = "conformance-internals")]
+        let conformance_serial = self.reader.conformance_controller.is_armed();
+        #[cfg(not(feature = "conformance-internals"))]
+        let conformance_serial = false;
+        #[cfg(test)]
+        let mut budget_worker_slots = 0_usize;
+
+        let batch_logical_upper_bound = if conformance_serial {
+            let mut analyzer = FrankensearchTokenizer::default();
+            let mut admitted_batch_bytes = 0_usize;
+            for document in documents {
+                #[cfg(feature = "conformance-internals")]
+                self.reader
+                    .conformance_controller
+                    .checkpoint(ConformanceCancellationStage::ParallelBudgetAdmission, cx);
+                check_cancel(cx, "parallel budget admission")?;
+                let Some(consumed_before_document) =
+                    initial_logical_bytes.checked_add(admitted_batch_bytes)
+                else {
+                    return Ok(None);
+                };
+                let Some(remaining_budget) =
+                    logical_budget_bytes.checked_sub(consumed_before_document)
+                else {
+                    return Ok(None);
+                };
+                let Some(document_bound) = parallel_document_logical_upper_bound(
+                    self.schema,
+                    &mut analyzer,
+                    document,
+                    remaining_budget,
+                )?
+                else {
+                    return Ok(None);
+                };
+                let ParallelDocumentBudgetBound::Within(document_upper_bound) = document_bound
+                else {
+                    return Ok(None);
+                };
+                let Some(charged) = admitted_batch_bytes.checked_add(document_upper_bound) else {
+                    return Ok(None);
+                };
+                admitted_batch_bytes = charged;
+                if initial_logical_bytes
+                    .checked_add(admitted_batch_bytes)
+                    .is_none_or(|projected| projected >= logical_budget_bytes)
+                {
+                    return Ok(None);
+                }
             }
-        }
+            admitted_batch_bytes
+        } else {
+            check_cancel(cx, "parallel budget admission")?;
+            let mut document_bounds = Vec::new();
+            document_bounds
+                .try_reserve_exact(documents.len())
+                .map_err(|_| invalid_state("could not reserve parallel budget document bounds"))?;
+            document_bounds.resize_with(documents.len(), || None);
+            #[cfg(test)]
+            let budget_observation = ParallelBatchObservation::default();
+            let documents_per_worker = documents.len().div_ceil(active_shards).max(1);
+            #[cfg(test)]
+            if self.force_ingest_overlap_rendezvous {
+                budget_observation.arm_rendezvous(active_shards);
+            }
+            document_bounds
+                .par_chunks_mut(documents_per_worker)
+                .zip(documents.par_chunks(documents_per_worker))
+                .for_each(|(slots, chunk)| {
+                    #[cfg(test)]
+                    let shard_guard = budget_observation.enter_shard();
+                    let mut analyzer = FrankensearchTokenizer::default();
+                    for (slot, document) in slots.iter_mut().zip(chunk) {
+                        *slot = Some(parallel_document_logical_upper_bound(
+                            self.schema,
+                            &mut analyzer,
+                            document,
+                            logical_budget_bytes,
+                        ));
+                    }
+                    #[cfg(test)]
+                    shard_guard.completed();
+                });
+            let mut admitted_batch_bytes = 0_usize;
+            for document_bound in document_bounds {
+                let Some(document_bound) = document_bound else {
+                    return Err(invalid_state(
+                        "parallel budget worker did not publish its document bound",
+                    ));
+                };
+                let Some(document_bound) = document_bound? else {
+                    return Ok(None);
+                };
+                let ParallelDocumentBudgetBound::Within(document_upper_bound) = document_bound
+                else {
+                    return Ok(None);
+                };
+                let Some(charged) = admitted_batch_bytes.checked_add(document_upper_bound) else {
+                    return Ok(None);
+                };
+                admitted_batch_bytes = charged;
+                if initial_logical_bytes
+                    .checked_add(admitted_batch_bytes)
+                    .is_none_or(|projected| projected >= logical_budget_bytes)
+                {
+                    return Ok(None);
+                }
+            }
+            check_cancel(cx, "parallel budget admission")?;
+            #[cfg(test)]
+            {
+                budget_worker_slots = budget_observation.snapshot().distinct_worker_slots;
+            }
+            admitted_batch_bytes
+        };
         let Some(projected_logical_upper_bound) =
             initial_logical_bytes.checked_add(batch_logical_upper_bound)
         else {
@@ -5788,6 +5865,8 @@ impl QuillWriterState {
             batch_logical_upper_bound,
             projected_logical_upper_bound,
             arena_chunk_bytes: parallel_arena_chunk_bytes(batch_logical_upper_bound, active_shards),
+            #[cfg(test)]
+            budget_worker_slots,
         }))
     }
 
@@ -26476,6 +26555,44 @@ mod tests {
                 "width {active_shards} selected {chunk_bytes} bytes per shard ({aggregate_chunk_slack} aggregate)",
             );
         }
+    }
+
+    #[test]
+    fn parallel_budget_preflight_uses_the_scoped_worker_pool() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-worker budget preflight pool");
+        pool.install(|| {
+            run_with_cx(|cx| async move {
+                let mut index = QuillIndex::in_memory(QuillConfig {
+                    max_ingest_shards: 4,
+                    max_visibility_lag_ms: 60_000,
+                    ..QuillConfig::default()
+                })
+                .expect("parallel budget preflight index");
+                let documents = parallel_budget_fixture_documents(5_000);
+                let writer = index.writer_mut();
+                writer.force_ingest_overlap_rendezvous = true;
+                let plan = plan_parallel_ingest(
+                    documents.len(),
+                    writer.shard_router.shard_count(),
+                    rayon::current_num_threads(),
+                )
+                .expect("plan parallel budget preflight fixture");
+                assert_eq!(plan.active_shards, 4);
+
+                let admission = writer
+                    .parallel_budget_admission(&cx, &documents, plan.active_shards)
+                    .expect("estimate parallel budget preflight fixture")
+                    .expect("default budget admits preflight fixture");
+                assert!(
+                    admission.budget_worker_slots >= 2,
+                    "a 5,000-document preflight on a four-worker pool must not collapse to one worker",
+                );
+                assert!(admission.budget_worker_slots <= plan.active_shards);
+            });
+        });
     }
 
     #[test]
