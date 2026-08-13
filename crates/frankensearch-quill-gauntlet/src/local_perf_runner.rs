@@ -3869,9 +3869,13 @@ fn start_qg1_authority_forwarder(
 }
 
 fn finish_qg1_authority_forwarder(forwarder: Qg1AuthorityForwarder) -> Result<(), String> {
-    forwarder
-        .join
-        .join()
+    let Qg1AuthorityForwarder { events, join } = forwarder;
+    // A child may pipeline COMPLETE behind a register that the parent rejects.
+    // In that case the forwarder is already waiting for the COMPLETE response,
+    // whose sender is retained by the queued event. Drop the receiver before
+    // joining so the queued sender closes and the forwarder can terminate.
+    drop(events);
+    join.join()
         .map_err(|_| "QG-1 authority stdout forwarder panicked".to_owned())?
 }
 
