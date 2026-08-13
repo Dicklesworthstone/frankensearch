@@ -3456,7 +3456,7 @@ mod tests {
                 .iter()
                 .map(|term| DeltaTermPosting {
                     field_ord: 1,
-                    term: *term,
+                    term,
                     frequency: 1,
                     positions: Some(&position),
                 })

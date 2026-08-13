@@ -1414,7 +1414,7 @@ pub struct PostingCursor<'a> {
     /// backward path invisible to exactly the tests meant to bound it. Test
     /// builds only.
     #[cfg(test)]
-    decoded_blocks: usize,
+    decoded_blocks: std::cell::Cell<usize>,
 }
 
 /// The one block retained behind a cursor for backward predecessor reads.
@@ -1469,7 +1469,7 @@ impl Clone for PostingCursor<'_> {
             decoded_count: self.decoded_count,
             back: None,
             #[cfg(test)]
-            decoded_blocks: self.decoded_blocks,
+            decoded_blocks: std::cell::Cell::new(self.decoded_blocks.get()),
         }
     }
 }
@@ -1499,7 +1499,7 @@ impl<'a> PostingCursor<'a> {
             decoded_count: 0,
             back: None,
             #[cfg(test)]
-            decoded_blocks: 0,
+            decoded_blocks: std::cell::Cell::new(0),
         };
         if !cursor.blocks.as_slice().is_empty() {
             cursor.load_block(0)?;
@@ -1516,7 +1516,7 @@ impl<'a> PostingCursor<'a> {
     /// The metadata cross-check is the same one [`Self::load_block`] applies,
     /// because a read-only probe reads the same durable bytes and must refuse
     /// the same drift.
-    fn decode_block(&mut self, block_index: usize) -> Result<DecodedBlock, PostingCodecError> {
+    fn decode_block(&self, block_index: usize) -> Result<DecodedBlock, PostingCodecError> {
         let block = self.blocks.as_slice().get(block_index).ok_or(
             PostingCodecError::ArithmeticOverflow {
                 block_offset: self.bytes.len(),
@@ -1542,9 +1542,8 @@ impl<'a> PostingCursor<'a> {
         // Counted here, at the decode that actually happened, so a forward load
         // and a backward read are both visible to the same counter.
         #[cfg(test)]
-        {
-            self.decoded_blocks = self.decoded_blocks.saturating_add(1);
-        }
+        self.decoded_blocks
+            .set(self.decoded_blocks.get().saturating_add(1));
         Ok(decoded)
     }
 
@@ -1560,7 +1559,7 @@ impl<'a> PostingCursor<'a> {
     #[cfg(test)]
     #[must_use]
     pub(crate) const fn decoded_blocks(&self) -> usize {
-        self.decoded_blocks
+        self.decoded_blocks.get()
     }
 
     /// Current posting, including a valid `u32::MAX` docid when present.
@@ -1823,20 +1822,18 @@ impl<'a> PostingCursor<'a> {
                         field: "retained backward block",
                     })?;
                 let within = back.docs.partition_point(|doc| *doc < target);
-                Ok(match within.checked_sub(1) {
-                    Some(previous) => Some(back.docs[previous]),
-                    None => earlier,
-                })
+                Ok(within
+                    .checked_sub(1)
+                    .map_or(earlier, |previous| Some(back.docs[previous])))
             }
             ArrivalPlan::Decode { index, earlier } => {
                 let decoded = self.decode_block(index)?;
                 let count = usize::from(decoded.posting_count);
                 let answer = {
                     let within = decoded.docs[..count].partition_point(|doc| *doc < target);
-                    match within.checked_sub(1) {
-                        Some(previous) => Some(decoded.docs[previous]),
-                        None => earlier,
-                    }
+                    within
+                        .checked_sub(1)
+                        .map_or(earlier, |previous| Some(decoded.docs[previous]))
                 };
                 // Retaining the block is an optimisation, so it is allowed to
                 // fail: a cursor that cannot reserve keeps answering, and simply
