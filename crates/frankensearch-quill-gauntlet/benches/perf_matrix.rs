@@ -4041,7 +4041,7 @@ fn measure_metric_with_query_and_qg1_writer_mode(
         PerfGate::Qg1 => {
             bulk_metric_with_qg1_writer_mode(context, spec, arm, qg1_tantivy_writer_mode)
         }
-        PerfGate::Qg2 => qg2_bulk_metric_continuous(
+        PerfGate::Qg2 if is_qg2_continuous_update_cell(spec) => qg2_bulk_metric_continuous(
             context,
             spec,
             arm,
@@ -4049,6 +4049,9 @@ fn measure_metric_with_query_and_qg1_writer_mode(
                 .scale
                 .document_count(spec.document_count.expect("QG-2 update document count")),
         ),
+        // Any other QG-2 cell keeps its prior summed-call behaviour rather than
+        // being retyped by association.
+        PerfGate::Qg2 => bulk_metric(context, spec, arm),
         PerfGate::Qg8 => bulk_metric(context, spec, arm),
         PerfGate::Qg3 if spec.metric == "docs_per_second" => bulk_metric(context, spec, arm),
         PerfGate::Qg3 => MetricMeasurement::gauge(watch_metric(context, spec, arm)),
@@ -4087,16 +4090,33 @@ struct EvidenceContext {
     sample_provenance: PerfSampleProvenance,
 }
 
+/// Whether this cell is a QG-2 update cell measured as ONE continuous
+/// first-feed-through-searchable-and-quiescent interval.
+///
+/// Routing, semantic typing, and the work denominator all key on this single
+/// predicate so they cannot drift apart: a cell that is measured continuously
+/// but typed as a gauge would publish a rate no clock ever checks again, and a
+/// cell typed as throughput without a continuous interval fails closed in
+/// `qg1_sample_window`. It is deliberately narrow — only the update cells that
+/// actually route through `qg2_bulk_metric_continuous` qualify, so no other
+/// QG-2 cell and no other gate is retyped.
+fn is_qg2_continuous_update_cell(spec: &PerfCellSpec) -> bool {
+    spec.gate == PerfGate::Qg2 && spec.metric == "docs_per_second" && spec.document_count.is_some()
+}
+
 fn metric_semantics(spec: &PerfCellSpec) -> PerfMetricSemantics {
-    // A QG-1 engine-indexing cell derives its rate from one continuous
-    // first-feed-through-quiescence interval over an exact document count, so it
-    // is a native throughput operation and the estimator recomputes it from the
-    // sample itself. Every other rate in this matrix — the QG-1 tokenizer
-    // diagnostic, QG-2/QG-3/QG-8 bulk indexing, QG-3 updates — is a sum of
-    // independently timed calls that excludes the gaps between them. Typing one
-    // of those as Throughput would silently redefine it as work over the outer
-    // sample window, a different and unmeasured quantity, so they stay gauges.
-    if qg1_producer_coverage(spec) == Some(Qg1ProducerCoverage::EngineIndexingLifecycle) {
+    // A QG-1 engine-indexing cell and a QG-2 update cell each derive their rate
+    // from one continuous first-feed-through-searchable-and-quiescent interval
+    // over an exact document count, so both are native throughput operations
+    // and the estimator recomputes them from the sample itself. Every other rate
+    // in this matrix — the QG-1 tokenizer diagnostic, QG-3/QG-8 bulk indexing,
+    // QG-3 updates — is still a sum of independently timed calls that excludes
+    // the gaps between them. Typing one of those as Throughput would silently
+    // redefine it as work over the outer sample window, a different and
+    // unmeasured quantity, so they stay gauges.
+    if qg1_producer_coverage(spec) == Some(Qg1ProducerCoverage::EngineIndexingLifecycle)
+        || is_qg2_continuous_update_cell(spec)
+    {
         return PerfMetricSemantics::Throughput;
     }
     match spec.metric.as_str() {
@@ -4117,6 +4137,19 @@ fn operation_scope(spec: &PerfCellSpec) -> PerfOperationScope {
 }
 
 fn raw_sample_work(context: &BenchContext, spec: &PerfCellSpec) -> (Option<u64>, Option<u64>) {
+    // A QG-2 continuous update cell publishes a real work denominator: the
+    // exact document count its one interval processed. It has no prepared-input
+    // content-byte binding, so bytes stay absent rather than being invented.
+    if is_qg2_continuous_update_cell(spec) {
+        let document_count = context
+            .scale
+            .document_count(spec.document_count.expect("QG-2 update document count"));
+        assert!(
+            document_count > 0,
+            "QG-2 throughput sample requires a positive document denominator"
+        );
+        return (Some(document_count), None);
+    }
     if qg1_producer_coverage(spec).is_none() {
         return (None, None);
     }
@@ -8444,6 +8477,53 @@ mod qg2_continuous_tests {
             assert!(
                 interval.elapsed_ns > interval.feed_and_commit_ns,
                 "{arm:?} unplanted interval must still cover more than its summed calls"
+            );
+
+            // DOWNSTREAM CONSUMPTION, asserted exactly rather than assumed. The
+            // denominator the runner would publish must be the work this
+            // interval processed, and the window the estimator would recompute
+            // over must be the interval itself — not the outer call.
+            let (declared_work, declared_bytes) = super::raw_sample_work(&context, &spec);
+            assert_eq!(
+                declared_work,
+                Some(interval.work_units),
+                "{arm:?} raw sample must declare the work its continuous interval processed"
+            );
+            assert_eq!(
+                declared_bytes, None,
+                "{arm:?} QG-2 has no prepared content-byte binding to declare"
+            );
+            let offsets = super::Qg1IntervalOffsets {
+                work_units: interval.work_units,
+                started_ns: 0,
+                elapsed_ns: interval.elapsed_ns,
+            };
+            let window = super::qg1_sample_window(
+                super::metric_semantics(&spec),
+                declared_work,
+                0,
+                interval.elapsed_ns,
+                Some(offsets),
+            )
+            .expect("QG-2 throughput window must be publishable from its own interval");
+            assert_eq!(
+                window.ended_ns - window.started_ns,
+                interval.elapsed_ns,
+                "{arm:?} published window must be the continuous interval, not the outer call"
+            );
+            // The same window fails closed if the denominator is not the work
+            // the interval measured, which is what stops a rate being attached
+            // to time it was not measured over.
+            assert!(
+                super::qg1_sample_window(
+                    super::metric_semantics(&spec),
+                    Some(interval.work_units + 1),
+                    0,
+                    interval.elapsed_ns,
+                    Some(offsets),
+                )
+                .is_err(),
+                "{arm:?} a mismatched work denominator must refuse to publish"
             );
         }
     }
