@@ -2213,9 +2213,10 @@ impl DivergenceRegisterLedger {
     ///
     /// # Errors
     ///
-    /// Returns an error when the artifact cannot yield a divergence binding,
-    /// when its hash scheme is not the v7 address this schema admits, or when
-    /// the assembled observation fails its own validation.
+    /// Returns an error when the artifact does not meet current built-in
+    /// admission, cannot yield a divergence binding, has a hash scheme other
+    /// than the v9 address this schema admits, or when the assembled observation
+    /// fails its own validation.
     pub fn observation_from_artifact(
         artifact: &ArtifactObject,
         header: DivergenceRegisterEventHeader,
@@ -2226,6 +2227,11 @@ impl DivergenceRegisterLedger {
         narrative: DivergenceObservationNarrative,
         diagnostic: RedactedDivergenceDiagnostic,
     ) -> Result<DivergenceObservationEvent, GauntletError> {
+        // Retained witnesses intentionally validate only against their own
+        // historical dependency record. A current observation emits CurrentV2,
+        // so minting one must first prove the artifact is admissible under the
+        // current v3 dependency contract.
+        artifact.validate_current_builtin_integrity()?;
         Self::observation_from_binding(
             &artifact.divergence_binding()?,
             header,
@@ -10633,6 +10639,37 @@ mod tests {
             payload_sha256: "b".repeat(64),
             marker: "<redacted:campaign-query>".to_owned(),
         }
+    }
+
+    #[test]
+    fn current_observation_mint_refuses_retained_v9_v2_witness() {
+        const RETAINED_V9: &[u8] =
+            include_bytes!("../fixtures/artifact-object-v9-div010-live.json");
+
+        let witness = RetainedArtifactWitness::decode(RETAINED_V9)
+            .expect("committed v9/v2 witness must remain byte-verifiable");
+        let error = DivergenceRegisterLedger::observation_from_artifact(
+            witness.object(),
+            ingestion_header(),
+            "DIV-010",
+            DivergenceClass::ScoreEpsilon,
+            ingestion_fixture(),
+            vec!["c".repeat(64)],
+            ingestion_narrative(),
+            ingestion_diagnostic(),
+        )
+        .expect_err(
+            "a retained v2 dependency must be rejected before a CurrentV2 observation is emitted",
+        );
+
+        assert!(
+            matches!(
+                &error,
+                GauntletError::InvalidContract { reason }
+                    if reason == "stored oracle dependency contract is malformed or internally inconsistent"
+            ),
+            "current observation mint must use current v3 dependency admission: {error}"
+        );
     }
 
     /// The identity fields come from the ARTIFACT, not from the caller. There

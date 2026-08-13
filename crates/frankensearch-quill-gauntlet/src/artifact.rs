@@ -7915,6 +7915,34 @@ mod tests {
                 .is_err(),
             "historical v2 evidence must never enter the current built-in admission path",
         );
+
+        let mut changed_dependency_field = witness.object().clone();
+        let ArtifactOracleDependency::BuiltInTantivy { contract } =
+            &mut changed_dependency_field.oracle_dependency
+        else {
+            panic!("committed retained witness lost its built-in dependency role")
+        };
+        contract.tantivy_version = "0.26.2".to_owned();
+        assert!(
+            changed_dependency_field
+                .validate_retained_builtin_integrity()
+                .is_err(),
+            "retained verification must reject a changed v2 dependency field",
+        );
+
+        let mut changed_dependency_hash = witness.object().clone();
+        let ArtifactOracleDependency::BuiltInTantivy { contract } =
+            &mut changed_dependency_hash.oracle_dependency
+        else {
+            panic!("committed retained witness lost its built-in dependency role")
+        };
+        contract.tantivy_checksum_sha256 = "0".repeat(64);
+        assert!(
+            changed_dependency_hash
+                .validate_retained_builtin_integrity()
+                .is_err(),
+            "retained verification must reject a changed v2 dependency checksum",
+        );
     }
 
     /// The read-only half of the v7 -> v8 object migration (bd-bxya1).
