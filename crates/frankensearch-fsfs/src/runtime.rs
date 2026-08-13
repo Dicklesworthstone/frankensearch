@@ -8221,6 +8221,8 @@ impl FsfsRuntime {
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
 
         let embedder = self.resolve_fast_embedder()?;
+        let mut index = VectorIndex::open(&vector_path)?;
+        Self::admit_vector_generation_for_embedder(&index, embedder.as_ref())?;
         let dimension = embedder.dimension();
 
         // Read input lines from --file or stdin.
@@ -8315,10 +8317,10 @@ impl FsfsRuntime {
             entries.push((id.clone(), embedding));
         }
 
-        // Open index and append, refencing the held lease at the publication
-        // boundary so a substituted lock file aborts before any WAL mutation.
+        // The generation was admitted above. Re-check the lease at the
+        // publication boundary so a substituted lock file aborts before any
+        // WAL mutation.
         publication_lease.fence("append-batch WAL publication")?;
-        let mut index = VectorIndex::open(&vector_path)?;
         index.append_batch(&entries)?;
 
         let count = entries.len();
@@ -11620,6 +11622,19 @@ impl FsfsRuntime {
         Ok(())
     }
 
+    /// Admit an already-open vector generation before any WAL mutation.
+    ///
+    /// Search already refuses hash and identity-mismatched generations. Append
+    /// and watch used to open the same file and write into it, so a hash
+    /// control artifact could absorb later semantic vectors (or vice versa)
+    /// as long as the widths matched.
+    fn admit_vector_generation_for_embedder(
+        index: &VectorIndex,
+        embedder: &dyn Embedder,
+    ) -> SearchResult<()> {
+        Self::validate_fast_embedder_for_vector_index(index, embedder, cfg!(test))
+    }
+
     fn semantic_retry_disposition(error: &SearchError) -> SemanticRetryDisposition {
         if matches!(error, SearchError::Cancelled { .. }) {
             SemanticRetryDisposition::Cancelled
@@ -11976,13 +11991,12 @@ impl FsfsRuntime {
                 offline: Some(self.config.indexing.offline),
             };
             let embedder =
-                EmbedderStack::auto_detect_with_options(Some(&configured_root), &options).and_then(
-                    |stack| {
+                EmbedderStack::auto_detect_semantic_with_options(Some(&configured_root), &options)
+                    .and_then(|stack| {
                         let embedder = stack.fast_arc();
                         Self::ensure_semantic_embedder_admissible(embedder.as_ref(), false)?;
                         Ok(embedder)
-                    },
-                );
+                    });
 
             #[cfg(not(feature = "semantic-loaders"))]
             let embedder = embedder.inspect_err(|_| {
@@ -12477,6 +12491,7 @@ impl FsfsRuntime {
         .await?;
         let vector_index = VectorIndex::open(&vector_path)?;
         let embedder = self.resolve_fast_embedder()?;
+        Self::admit_vector_generation_for_embedder(&vector_index, embedder.as_ref())?;
 
         info!(
             target_root = %target_root.display(),
@@ -22836,7 +22851,7 @@ mod tests {
                 .expect("commit empty lexical");
             drop(lexical_seed);
             let vector_writer =
-                VectorIndex::create(&vector_path, "hash", 256).expect("create vector index");
+                VectorIndex::create(&vector_path, "fnv1a-256", 256).expect("create vector index");
             vector_writer.finish().expect("finish vector index");
 
             let db_path = temp.path().join("fsfs-watch-storage.db");
@@ -25206,6 +25221,79 @@ mod tests {
                 found: 384
             }
         ));
+    }
+
+    #[test]
+    fn append_batch_refuses_identity_mismatched_vector_generation() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let index_root = temp.path().join("index");
+            fs::create_dir_all(index_root.join("vector")).expect("vector dir");
+            let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+            VectorIndex::create(&vector_path, "verified-semantic", 256)
+                .expect("create foreign vector generation")
+                .finish()
+                .expect("finish foreign vector generation");
+
+            let input_file = temp.path().join("docs.jsonl");
+            fs::write(&input_file, "{\"id\":\"doc-1\",\"text\":\"hello\"}\n")
+                .expect("write append-batch input");
+
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                command: CliCommand::AppendBatch,
+                index_dir: Some(index_root),
+                input_file: Some(input_file),
+                format: OutputFormat::Json,
+                ..CliInput::default()
+            });
+            let error = runtime
+                .run_append_batch_command(&cx)
+                .await
+                .expect_err("append-batch must not write into a foreign generation");
+            assert!(
+                matches!(error, SearchError::UnverifiableRemoteSpace { .. }),
+                "append-batch must fail closed on embedder/generation identity mismatch, got {error}"
+            );
+        });
+    }
+
+    #[test]
+    fn live_ingest_refuses_identity_mismatched_vector_generation() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let target_root = temp.path().join("project");
+            fs::create_dir_all(target_root.join("src")).expect("project dirs");
+
+            let index_root = temp.path().join("index");
+            fs::create_dir_all(index_root.join("vector")).expect("vector dir");
+            let lexical_path = index_root.join("lexical");
+            let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+            let lexical_seed = create_test_quill(&cx, &lexical_path).await;
+            lexical_seed
+                .commit(&cx)
+                .await
+                .expect("commit empty lexical");
+            drop(lexical_seed);
+            VectorIndex::create(&vector_path, "verified-semantic", 256)
+                .expect("create foreign vector generation")
+                .finish()
+                .expect("finish foreign vector generation");
+
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                command: CliCommand::Watch,
+                target_path: Some(target_root),
+                index_dir: Some(index_root),
+                watch: true,
+                ..CliInput::default()
+            });
+            let Err(error) = runtime.build_live_ingest_pipeline(&cx).await else {
+                panic!("watch ingest must not attach to a foreign generation");
+            };
+            assert!(
+                matches!(error, SearchError::UnverifiableRemoteSpace { .. }),
+                "live ingest must fail closed on embedder/generation identity mismatch, got {error}"
+            );
+        });
     }
 
     #[test]

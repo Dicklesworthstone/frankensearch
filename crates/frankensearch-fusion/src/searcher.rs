@@ -1752,6 +1752,16 @@ impl TwoTierSearcher {
                         None,
                     );
                 }
+                if is_shipped_hash_embedder(self.fast_embedder.as_ref())
+                    && self.quality_embedder.is_none()
+                    && metrics.skip_reason.is_none()
+                {
+                    // No lexical arm to short-circuit to: hash vectors still
+                    // run as an explicit control path, but they are never
+                    // unlabeled semantic hits (bd-a6zt).
+                    metrics.skip_reason =
+                        Some("non_semantic_fast_embedder_vector_control".to_owned());
+                }
                 if let Some(lexical) = lexical_results.as_ref()
                     && should_lexical_short_circuit(
                         query_class,
@@ -6853,6 +6863,55 @@ mod tests {
             assert_eq!(
                 initial_skip.as_deref(),
                 Some("non_semantic_fast_embedder_lexical_short_circuit")
+            );
+        });
+    }
+
+    #[test]
+    fn non_semantic_fast_embedder_without_lexical_marks_vector_control() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let embedder: Arc<dyn Embedder> = Arc::new(NonSemanticEmbedder::new("fnv1a-test", 4));
+            let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
+
+            let mut initial_skip = None;
+            let mut initial_sources = Vec::new();
+            let metrics = searcher
+                .search(
+                    &cx,
+                    "rust ownership",
+                    5,
+                    |_| None,
+                    |phase| {
+                        if let SearchPhase::Initial {
+                            results, metrics, ..
+                        } = phase
+                        {
+                            initial_sources = results.iter().map(|hit| hit.source).collect();
+                            initial_skip = metrics.skip_reason;
+                        }
+                    },
+                )
+                .await
+                .expect("hash vector control path should still return hits");
+
+            assert!(
+                !initial_sources.is_empty(),
+                "explicit hash control still searches the hash generation"
+            );
+            assert!(
+                initial_sources
+                    .iter()
+                    .all(|source| matches!(source, ScoreSource::SemanticFast)),
+                "hash control hits keep the vector source; skip_reason carries the truth"
+            );
+            assert_eq!(
+                metrics.skip_reason.as_deref(),
+                Some("non_semantic_fast_embedder_vector_control")
+            );
+            assert_eq!(
+                initial_skip.as_deref(),
+                Some("non_semantic_fast_embedder_vector_control")
             );
         });
     }

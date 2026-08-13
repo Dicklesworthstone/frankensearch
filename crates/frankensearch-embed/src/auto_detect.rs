@@ -337,6 +337,23 @@ impl EmbedderStack {
         Self::auto_detect_with(model_root)?.require_semantic()
     }
 
+    /// Like [`Self::auto_detect_with_options`], then [`Self::require_semantic`].
+    ///
+    /// Hosts that already have an explicit offline/remote policy should use
+    /// this instead of detecting a hash-only stack and discarding it later.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::EmbedderUnavailable`] when no semantic model is
+    /// present, plus the same policy errors as
+    /// [`Self::auto_detect_with_options`].
+    pub fn auto_detect_semantic_with_options(
+        model_root: Option<&Path>,
+        options: &DetectOptions,
+    ) -> SearchResult<Self> {
+        Self::auto_detect_with_options(model_root, options)?.require_semantic()
+    }
+
     /// Fail closed when this stack has no semantic fast embedder.
     ///
     /// Hash remains available via [`Self::auto_detect`] and
@@ -2278,6 +2295,13 @@ mod tests {
         ));
         assert!(matches!(
             EmbedderStack::auto_detect_semantic_with(Some(temp.path())),
+            Err(SearchError::EmbedderUnavailable { .. })
+        ));
+        assert!(matches!(
+            EmbedderStack::auto_detect_semantic_with_options(
+                Some(temp.path()),
+                &DetectOptions::default()
+            ),
             Err(SearchError::EmbedderUnavailable { .. })
         ));
     }
