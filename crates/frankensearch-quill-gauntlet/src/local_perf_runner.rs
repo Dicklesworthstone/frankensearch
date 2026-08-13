@@ -8263,10 +8263,7 @@ mod tests {
     ) -> Result<(), String> {
         let expected_witness = qg1_process_tree_test_execution_witness(test_name);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let witness_count = stdout
-            .lines()
-            .filter(|line| *line == expected_witness)
-            .count();
+        let witness_count = stdout.matches(expected_witness.as_str()).count();
         if output.status.success() && witness_count == 1 {
             return Ok(());
         }
@@ -8290,6 +8287,36 @@ mod tests {
         assert!(
             error.contains("witness count 0"),
             "the empty-filter rejection must name the missing execution witness: {error}"
+        );
+    }
+
+    #[test]
+    fn qg1_process_tree_isolation_accepts_witness_prefixed_by_libtest_status() {
+        let test_name = "local_perf_runner::tests::qg1_actual_parent_wait_kill_reap_covers_final_ack_and_exact_startup_set";
+        let witness = qg1_process_tree_test_execution_witness(test_name);
+        let output = std::process::Output {
+            status: ExitStatus::from_raw(0),
+            stdout: format!("test {test_name} ... {witness}ok\n").into_bytes(),
+            stderr: Vec::new(),
+        };
+        verify_qg1_process_tree_test_execution(test_name, &output)
+            .expect("a once-emitted witness may share libtest's status line");
+    }
+
+    #[test]
+    fn qg1_process_tree_isolation_refuses_duplicate_witnesses() {
+        let test_name = "local_perf_runner::tests::qg1_actual_parent_wait_kill_reap_covers_final_ack_and_exact_startup_set";
+        let witness = qg1_process_tree_test_execution_witness(test_name);
+        let output = std::process::Output {
+            status: ExitStatus::from_raw(0),
+            stdout: format!("{witness}\n{witness}\n").into_bytes(),
+            stderr: Vec::new(),
+        };
+        let error = verify_qg1_process_tree_test_execution(test_name, &output)
+            .expect_err("duplicate witnesses must not prove one isolated fixture execution");
+        assert!(
+            error.contains("witness count 2"),
+            "the duplicate-witness rejection must name both emissions: {error}"
         );
     }
 
