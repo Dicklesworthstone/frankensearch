@@ -2542,6 +2542,25 @@ struct FsfsIndexStatus {
     vector_generation_is_hash: bool,
 }
 
+impl FsfsIndexStatus {
+    /// Operator-facing readiness for dashboards and the status table.
+    ///
+    /// A present hash/fnv control artifact is not a ready semantic index.
+    fn dashboard_state_label(&self) -> &'static str {
+        if !self.exists {
+            "missing"
+        } else if self.vector_generation_is_hash {
+            "hash control (not semantic)"
+        } else {
+            "ready"
+        }
+    }
+
+    fn dashboard_state_is_healthy(&self) -> bool {
+        self.exists && !self.vector_generation_is_hash
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct FsfsFlushPayload {
     index_path: String,
@@ -13457,7 +13476,15 @@ impl FsfsRuntime {
             stdout,
             "{} {}   {} {}",
             paint("status:", "38;5;244", no_color),
-            paint("ready", "1;32", no_color),
+            paint(
+                payload.index.dashboard_state_label(),
+                if payload.index.dashboard_state_is_healthy() {
+                    "1;32"
+                } else {
+                    "1;31"
+                },
+                no_color,
+            ),
             paint("model cache:", "38;5;244", no_color),
             mode_summary
         )
@@ -13468,6 +13495,15 @@ impl FsfsRuntime {
             truncate_middle(&payload.index.path, width.saturating_sub(14))
         )
         .map_err(tui_io_error)?;
+        if let Some(generation_id) = payload.index.vector_generation_id.as_deref() {
+            let class = if payload.index.vector_generation_is_hash {
+                paint("hash control", "31", no_color)
+            } else {
+                paint("semantic", "32", no_color)
+            };
+            writeln!(stdout, "vector generation: {generation_id}  class={class}")
+                .map_err(tui_io_error)?;
+        }
         writeln!(stdout, "{}", paint(&rule, "38;5;24", no_color)).map_err(tui_io_error)?;
         writeln!(stdout, "{}", paint("CORPUS", "1;38;5;81", no_color)).map_err(tui_io_error)?;
         writeln!(
@@ -15746,7 +15782,7 @@ fn render_existing_index_dashboard_frame(
         return;
     }
     let layout = Flex::vertical()
-        .constraints([Constraint::Fixed(5), Constraint::Fill, Constraint::Fixed(3)])
+        .constraints([Constraint::Fixed(6), Constraint::Fill, Constraint::Fixed(3)])
         .split(area);
     let body = Flex::horizontal()
         .constraints([Constraint::Percentage(57.0), Constraint::Percentage(43.0)])
@@ -15809,6 +15845,7 @@ fn render_existing_index_dashboard_frame(
     } else {
         ui_fg(no_color, PackedRgba::rgb(255, 156, 156)).bold()
     };
+    let index_title = format!(" index {} ", payload.index.dashboard_state_label());
 
     Paragraph::new(Text::from_lines(vec![
         Line::from_spans(vec![
@@ -15835,13 +15872,29 @@ fn render_existing_index_dashboard_frame(
             ),
             ui_fg(no_color, PackedRgba::rgb(175, 195, 229)),
         )),
+        Line::from(Span::styled(
+            payload.index.vector_generation_id.as_ref().map_or_else(
+                || format!("status: {}", payload.index.dashboard_state_label()),
+                |id| {
+                    format!(
+                        "status: {}  generation={id}",
+                        payload.index.dashboard_state_label()
+                    )
+                },
+            ),
+            if payload.index.dashboard_state_is_healthy() {
+                ui_fg(no_color, PackedRgba::rgb(131, 231, 157))
+            } else {
+                ui_fg(no_color, PackedRgba::rgb(255, 156, 156)).bold()
+            },
+        )),
     ]))
     .block(
         Block::new()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(ui_fg(no_color, PackedRgba::rgb(67, 160, 255)))
-            .title(" index ready "),
+            .title(index_title.as_str()),
     )
     .render(layout[0], frame);
 
@@ -17958,13 +18011,15 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
         ),
         None => paint("unknown", "90", no_color),
     };
-    let index_exists = if !status.index.exists {
-        paint("missing", "31", no_color)
-    } else if status.index.vector_generation_is_hash {
-        paint("hash control (not semantic)", "31", no_color)
-    } else {
-        paint("ready", "32", no_color)
-    };
+    let index_exists = paint(
+        status.index.dashboard_state_label(),
+        if status.index.dashboard_state_is_healthy() {
+            "32"
+        } else {
+            "31"
+        },
+        no_color,
+    );
     let vector_pct = ratio_percent(
         status.index.vector_index_bytes,
         status.index.size_bytes.max(1),
@@ -27449,6 +27504,32 @@ mod tests {
         assert!(
             !table.contains("hash control (not semantic)"),
             "semantic generation must not be labeled hash control: {table}"
+        );
+    }
+
+    #[test]
+    fn dashboard_state_label_refuses_to_call_a_hash_index_ready() {
+        let mut payload = test_dashboard_status_payload();
+        assert_eq!(payload.index.dashboard_state_label(), "ready");
+        assert!(payload.index.dashboard_state_is_healthy());
+
+        payload.index.vector_generation_id = Some("fnv1a-256".to_owned());
+        payload.index.vector_generation_dimension = Some(256);
+        payload.index.vector_generation_is_hash = true;
+        assert_eq!(
+            payload.index.dashboard_state_label(),
+            "hash control (not semantic)"
+        );
+        assert!(!payload.index.dashboard_state_is_healthy());
+
+        let table = render_status_table(&payload, true);
+        assert!(
+            table.contains("hash control (not semantic)"),
+            "shared dashboard label must reach the status table: {table}"
+        );
+        assert!(
+            !table.contains("state: ready"),
+            "hash control must not share the ready label: {table}"
         );
     }
 
