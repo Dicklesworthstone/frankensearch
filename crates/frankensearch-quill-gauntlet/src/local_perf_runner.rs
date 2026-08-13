@@ -7831,6 +7831,39 @@ mod tests {
         std::process::exit(0);
     }
 
+    /// Shared in-process ACK transport for the forwarder core.
+    ///
+    /// The core writes the child's acknowledgement bytes into its `Write` half.
+    /// A plain `Vec` moved into the forwarding thread would swallow them, so the
+    /// test could not tell a real acknowledgement from none at all. This retains
+    /// a second handle to the same buffer so the exact bytes are observable
+    /// after the thread joins.
+    #[derive(Clone, Default)]
+    struct SharedAckWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl SharedAckWriter {
+        fn written(&self) -> Vec<u8> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl Write for SharedAckWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn qg1_forwarder_preserves_full_and_partial_magic_after_complete_in_run_log() {
         let mut created = None;
@@ -7901,9 +7934,15 @@ mod tests {
                 "the forwarding core must be driven from byte zero of the register magic"
             );
             let (sender, events) = mpsc::sync_channel(4);
-            let ack_sink = Vec::new();
+            let ack_writer = SharedAckWriter::default();
+            let ack_transport = ack_writer.clone();
             let join = thread::spawn(move || {
-                qg1_forward_child_stdout(ack_sink, std::io::Cursor::new(stream), child_log, sender)
+                qg1_forward_child_stdout(
+                    ack_transport,
+                    std::io::Cursor::new(stream),
+                    child_log,
+                    sender,
+                )
             });
             let forwarder = Qg1AuthorityForwarder { events, join };
             match forwarder
@@ -7934,6 +7973,17 @@ mod tests {
             }
             finish_qg1_authority_forwarder(forwarder)
                 .expect("finish production QG-1 stdout forwarder");
+            // Observed after the join, so this is the exact byte stream the core
+            // wrote back to the child. The core acknowledges the COMPLETE and
+            // nothing else: register admission is reported to the parent over
+            // the event channel and writes no bytes to this transport. Asserting
+            // full equality therefore pins BOTH facts — the final ACK is present
+            // and byte-exact, and no register-time bytes preceded it.
+            assert_eq!(
+                ack_writer.written(),
+                Qg1StartupHandshakeV1::final_ack_frame(),
+                "the forwarder core must write exactly one byte-exact final ACK and nothing before it"
+            );
         }
         retained_log_reader
             .seek(SeekFrom::Start(0))
