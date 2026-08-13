@@ -12737,7 +12737,7 @@ fn validate_query_lowering(
         Query::Phrase {
             fields,
             terms,
-            slop,
+            slop: _,
             prefix,
         } => {
             if terms.is_empty() {
@@ -12771,11 +12771,6 @@ fn validate_query_lowering(
             if *prefix && terms.len() == 1 {
                 return Err(QuillIndexError::UnsupportedQuery {
                     detail: "phrase prefix requires at least two positioned terms".to_owned(),
-                });
-            }
-            if *slop != 0 {
-                return Err(QuillIndexError::UnsupportedQuery {
-                    detail: format!("phrase slop={slop} prefix={prefix}"),
                 });
             }
             for term in terms {
@@ -12901,6 +12896,7 @@ fn lower_leaf_exact_phrase<'a>(
     field_ord: u16,
     field_boost: f32,
     terms: &[crate::query::PositionedTerm],
+    slop: u32,
     final_term: Option<&[u8]>,
     inherited_boost: f32,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
@@ -12969,18 +12965,20 @@ fn lower_leaf_exact_phrase<'a>(
     let bm25 = Bm25FieldSnapshot::new(stats)?;
     let boost = inherited_boost * field_boost;
     let scorer = match leaf {
-        QueryLeaf::Sealed(segment) => PhraseScorer::new_with_checkpoint(
+        QueryLeaf::Sealed(segment) => PhraseScorer::new_with_slop_and_checkpoint(
             phrase_terms,
             owned_fieldnorms(segment, schema, field_ord)?,
             bm25,
             boost,
+            slop,
             Some(clone_query_checkpoint_for_argus(checkpoint)),
         )?,
-        QueryLeaf::Delta(delta) => PhraseScorer::new_with_checkpoint(
+        QueryLeaf::Delta(delta) => PhraseScorer::new_with_slop_and_checkpoint(
             phrase_terms,
             DeltaFieldNorms::new(delta, field_ord),
             bm25,
             boost,
+            slop,
             Some(clone_query_checkpoint_for_argus(checkpoint)),
         )?,
     };
@@ -13454,11 +13452,6 @@ fn lower_query_with_mode<'a>(
                     detail: "phrase prefix requires at least two positioned terms".to_owned(),
                 });
             }
-            if *slop != 0 {
-                return Err(QuillIndexError::UnsupportedQuery {
-                    detail: format!("phrase slop={slop} prefix={prefix}"),
-                });
-            }
             if terms.len() == 1 {
                 let term = &terms[0];
                 let mut clauses = Vec::new();
@@ -13517,6 +13510,8 @@ fn lower_query_with_mode<'a>(
                         invalid_state("could not allocate phrase-prefix expansion clauses")
                     })?;
                     for expansion in &expansions {
+                        // Tantivy's parsed phrase-prefix path constructs a
+                        // PhrasePrefixQuery without carrying the parsed slop.
                         clauses.push(ScorerClause::should(lower_leaf_exact_phrase(
                             checkpoint,
                             leaf,
@@ -13526,6 +13521,7 @@ fn lower_query_with_mode<'a>(
                             field.field_id,
                             field.boost,
                             terms,
+                            0,
                             Some(expansion),
                             inherited_boost,
                         )?));
@@ -13540,6 +13536,7 @@ fn lower_query_with_mode<'a>(
                         field.field_id,
                         field.boost,
                         terms,
+                        *slop,
                         None,
                         inherited_boost,
                     )?));
@@ -26060,8 +26057,8 @@ mod tests {
                 Query::Phrase {
                     fields: vec![crate::query::QueryField::new(1, 1.0)],
                     terms: vec![
-                        crate::query::PositionedTerm::new(0, "alpha"),
-                        crate::query::PositionedTerm::new(1, "beta"),
+                        crate::query::PositionedTerm::new(1, "alpha"),
+                        crate::query::PositionedTerm::new(0, "beta"),
                     ],
                     slop: 1,
                     prefix: false,
@@ -27264,6 +27261,120 @@ mod tests {
                 Some(u64::try_from(DOCUMENT_COUNT).expect("document count fits u64")),
             );
             assert_eq!(phrase.hits.len(), DOCUMENT_COUNT);
+        });
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn public_phrase_slop_matches_tantivy_ids_order_and_score_bits() {
+        use frankensearch_lexical::tantivy_crate::{
+            Index, TantivyDocument,
+            collector::TopDocs,
+            doc,
+            query::QueryParser,
+            schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions},
+        };
+
+        run_with_cx(|cx| async move {
+            let corpus = [
+                ("exact", "a b c"),
+                ("one-gap", "a x b c"),
+                ("two-gaps", "a x b x c"),
+                ("left-swap", "b a c"),
+                ("right-swap", "a c b"),
+                ("twice", "a b c a b c"),
+            ];
+
+            let quill = QuillIndex::in_memory(deterministic_config()).expect("construct Quill");
+            let documents = corpus
+                .iter()
+                .map(|(id, content)| IndexableDocument::new(*id, *content))
+                .collect::<Vec<_>>();
+            quill
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index public Quill slop corpus");
+            quill.commit(&cx).await.expect("commit Quill slop corpus");
+
+            let mut schema_builder = Schema::builder();
+            let indexing = TextFieldIndexing::default()
+                .set_tokenizer("default")
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+            let content = schema_builder.add_text_field(
+                "content",
+                TextOptions::default().set_indexing_options(indexing),
+            );
+            let tantivy = Index::create_in_ram(schema_builder.build());
+            let mut writer = tantivy
+                .writer_with_num_threads::<TantivyDocument>(1, 15_000_000)
+                .expect("construct Tantivy writer");
+            for (_, text) in corpus {
+                writer
+                    .add_document(doc!(content => text))
+                    .expect("index Tantivy slop document");
+            }
+            writer.commit().expect("commit Tantivy slop corpus");
+            drop(writer);
+            let reader = tantivy.reader().expect("open Tantivy slop reader");
+            let searcher = reader.searcher();
+            let parser = QueryParser::for_index(&tantivy, vec![content]);
+
+            for raw_query in ["content:\"a b c\"~1", "content:\"a b c\"~2"] {
+                let quill_ranked = quill
+                    .search_paginated(&cx, raw_query, corpus.len(), 0, true)
+                    .expect("execute public Quill phrase-slop query")
+                    .hits
+                    .into_iter()
+                    .map(|hit| (hit.document_id, hit.score.to_bits()))
+                    .collect::<Vec<_>>();
+                let parsed = parser
+                    .parse_query(raw_query)
+                    .expect("parse Tantivy phrase-slop query");
+                let tantivy_ranked = searcher
+                    .search(
+                        parsed.as_ref(),
+                        &TopDocs::with_limit(corpus.len()).order_by_score(),
+                    )
+                    .expect("execute Tantivy phrase-slop query")
+                    .into_iter()
+                    .map(|(score, address)| {
+                        assert_eq!(address.segment_ord, 0);
+                        (
+                            corpus[usize::try_from(address.doc_id).expect("doc id fits")]
+                                .0
+                                .to_owned(),
+                            score.to_bits(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(quill_ranked, tantivy_ranked, "query={raw_query}");
+            }
+
+            #[cfg(feature = "bench-internals")]
+            {
+                let zero_slop_prefix = DefaultQueryParser::new(DEFAULT_SCHEMA)
+                    .expect("construct phrase-prefix parser")
+                    .parse("content:\"a b c\"*")
+                    .query;
+                let mut ignored_slop_prefix = zero_slop_prefix.clone();
+                assert!(matches!(
+                    &ignored_slop_prefix,
+                    Query::Phrase { prefix: true, .. }
+                ));
+                if let Query::Phrase { slop, .. } = &mut ignored_slop_prefix {
+                    *slop = u32::MAX;
+                }
+
+                let zero_slop = quill
+                    .search_preparsed_paginated(&cx, &zero_slop_prefix, corpus.len(), 0, true)
+                    .expect("execute zero-slop phrase prefix");
+                let ignored_slop = quill
+                    .search_preparsed_paginated(&cx, &ignored_slop_prefix, corpus.len(), 0, true)
+                    .expect("execute phrase prefix carrying ignored slop");
+                assert!(!zero_slop.hits.is_empty());
+                assert!(zero_slop.hits.len() < corpus.len());
+                assert_eq!(ignored_slop, zero_slop);
+            }
         });
     }
 

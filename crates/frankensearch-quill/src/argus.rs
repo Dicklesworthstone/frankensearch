@@ -2714,7 +2714,7 @@ impl<'a> PhraseSlot<'a> {
     }
 }
 
-/// Exact-adjacency phrase scorer over positioned posting cursors.
+/// Phrase scorer over positioned posting cursors.
 ///
 /// Candidate documents are intersected before positions are decoded. The
 /// scorer owns and reuses every positional scratch buffer, so advancing after
@@ -2730,9 +2730,194 @@ pub struct PhraseScorer<'a> {
     segment_num_docs: u32,
     current: Option<u32>,
     current_frequency: u32,
+    slop: u32,
     decode_scratch: Vec<u32>,
     position_indices: Vec<usize>,
+    slop_positions: Vec<u32>,
+    slop_costs: Vec<u32>,
+    slop_positions_buffer: Vec<u32>,
+    slop_costs_buffer: Vec<u32>,
     checkpoint: Option<Arc<dyn QueryWorkCheckpoint + 'a>>,
+}
+
+fn intersect_phrase_positions_with_slop(
+    left_positions: &mut Vec<u32>,
+    right_positions: &[u32],
+    slop: u32,
+    update_left: bool,
+) -> usize {
+    let mut left_index = 0;
+    let mut right_index = 0;
+    let mut count = 0;
+    let left_len = left_positions.len();
+    while left_index < left_len && right_index < right_positions.len() {
+        let left = left_positions[left_index];
+        let right = right_positions[right_index];
+        if left.abs_diff(right) <= slop {
+            while left_index + 1 < left_len {
+                let next_left = left_positions[left_index + 1];
+                if next_left > right {
+                    break;
+                }
+                left_index += 1;
+            }
+            if update_left {
+                left_positions[count] = right;
+            }
+            count += 1;
+            left_index += 1;
+            right_index += 1;
+        } else if left < right {
+            left_index += 1;
+        } else {
+            right_index += 1;
+        }
+    }
+    if update_left {
+        left_positions.truncate(count);
+    }
+    count
+}
+
+#[allow(clippy::too_many_arguments)]
+fn intersect_phrase_positions_carrying_slop(
+    left_positions: &mut Vec<u32>,
+    left_slops: &mut Vec<u32>,
+    right_positions: &[u32],
+    max_slop: u32,
+    update_left: bool,
+    positions_buffer: &mut Vec<u32>,
+    slops_buffer: &mut Vec<u32>,
+) -> Result<u32, ArgusError> {
+    if left_positions.is_empty() || right_positions.is_empty() {
+        if update_left {
+            left_positions.clear();
+            left_slops.clear();
+        }
+        return Ok(0);
+    }
+
+    if update_left {
+        positions_buffer.clear();
+        slops_buffer.clear();
+        let capacity = left_positions.len().saturating_add(right_positions.len());
+        positions_buffer
+            .try_reserve(capacity)
+            .map_err(|_| ArgusError::Allocation {
+                resource: "phrase slop positions",
+                count: capacity,
+            })?;
+        slops_buffer
+            .try_reserve(capacity)
+            .map_err(|_| ArgusError::Allocation {
+                resource: "phrase slop costs",
+                count: capacity,
+            })?;
+    }
+
+    let add = |value: (u32, u32),
+               positions: &mut Vec<u32>,
+               slops: &mut Vec<u32>|
+     -> Result<(), ArgusError> {
+        if update_left {
+            if positions.last() == Some(&value.1) {
+                let Some(last_slop) = slops.last_mut() else {
+                    return Err(ArgusError::CursorInvariant(
+                        "a retained slop position has no cost",
+                    ));
+                };
+                *last_slop = (*last_slop).min(value.0);
+            } else {
+                positions.push(value.1);
+                slops.push(value.0);
+            }
+        }
+        Ok(())
+    };
+
+    let mut left_index = 0;
+    let mut right_index = 0;
+    let mut count = 0_u32;
+    loop {
+        let left = left_positions[left_index];
+        let slop_so_far = left_slops.get(left_index).copied().unwrap_or(0);
+        let right = right_positions[right_index];
+        let distance = slop_so_far
+            .checked_add(left.abs_diff(right))
+            .filter(|distance| *distance <= max_slop);
+        if let Some(distance) = distance {
+            let (smaller, larger, mut smaller_index, smaller_positions) = if left < right {
+                (left, right, left_index, left_positions.as_slice())
+            } else {
+                (right, left, right_index, right_positions)
+            };
+            let mut new_slop = distance;
+            add((new_slop, smaller), positions_buffer, slops_buffer)?;
+            while smaller_index + 1 < smaller_positions.len() {
+                let next = smaller_positions[smaller_index + 1];
+                if next > larger {
+                    break;
+                }
+                smaller_index += 1;
+                if let Some(candidate_slop) = slop_so_far.checked_add(next.abs_diff(larger)) {
+                    new_slop = candidate_slop;
+                    add((new_slop, next), positions_buffer, slops_buffer)?;
+                }
+            }
+            add((new_slop, larger), positions_buffer, slops_buffer)?;
+            count = count
+                .checked_add(1)
+                .ok_or(ArgusError::CursorInvariant("phrase frequency exceeds u32"))?;
+            left_index += 1;
+            right_index += 1;
+        } else if left < right {
+            left_index += 1;
+        } else {
+            right_index += 1;
+        }
+
+        if left_index >= left_positions.len() || right_index >= right_positions.len() {
+            if left_index >= left_positions.len() {
+                let Some(&left) = left_positions.last() else {
+                    return Err(ArgusError::CursorInvariant(
+                        "phrase slop positions became empty",
+                    ));
+                };
+                let slop_so_far = left_slops.last().copied().unwrap_or(0);
+                for &right in &right_positions[right_index..] {
+                    if let Some(new_slop) = slop_so_far.checked_add(left.abs_diff(right))
+                        && new_slop <= max_slop
+                    {
+                        add((new_slop, right), positions_buffer, slops_buffer)?;
+                    }
+                }
+            } else {
+                let Some(&right) = right_positions.last() else {
+                    return Err(ArgusError::CursorInvariant(
+                        "phrase slop right positions became empty",
+                    ));
+                };
+                for (offset, &left) in left_positions[left_index..].iter().enumerate() {
+                    let slop_index = left_index + offset;
+                    let slop_so_far = left_slops.get(slop_index).copied().unwrap_or(0);
+                    if let Some(new_slop) = slop_so_far.checked_add(left.abs_diff(right))
+                        && new_slop <= max_slop
+                    {
+                        add((new_slop, left), positions_buffer, slops_buffer)?;
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    if update_left {
+        std::mem::swap(left_positions, positions_buffer);
+        std::mem::swap(left_slops, slops_buffer);
+        positions_buffer.clear();
+        slops_buffer.clear();
+    }
+    Ok(count)
 }
 
 impl<'a> PhraseScorer<'a> {
@@ -2757,7 +2942,30 @@ impl<'a> PhraseScorer<'a> {
     where
         F: FieldNormReader + 'a,
     {
-        Self::new_with_checkpoint(terms, fieldnorms, snapshot, field_boost, None)
+        Self::new_with_slop_and_checkpoint(terms, fieldnorms, snapshot, field_boost, 0, None)
+    }
+
+    /// Build and initially align one phrase scorer with a shared slop budget.
+    ///
+    /// Slop is accumulated across every adjacent query-term pair after query
+    /// offsets are applied. Reordering is therefore possible but costs the
+    /// distance moved in both directions, matching Tantivy's phrase-query
+    /// contract. A zero budget retains the exact-adjacency fast path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same construction errors as [`Self::new`].
+    pub fn new_with_slop<F>(
+        terms: Vec<PhraseTerm<'a>>,
+        fieldnorms: F,
+        snapshot: Bm25FieldSnapshot,
+        field_boost: f32,
+        slop: u32,
+    ) -> Result<Self, ArgusError>
+    where
+        F: FieldNormReader + 'a,
+    {
+        Self::new_with_slop_and_checkpoint(terms, fieldnorms, snapshot, field_boost, slop, None)
     }
 
     /// Build one exact phrase scorer with a coarse position-verification
@@ -2776,6 +2984,27 @@ impl<'a> PhraseScorer<'a> {
         fieldnorms: F,
         snapshot: Bm25FieldSnapshot,
         field_boost: f32,
+        checkpoint: Option<Arc<dyn QueryWorkCheckpoint + 'a>>,
+    ) -> Result<Self, ArgusError>
+    where
+        F: FieldNormReader + 'a,
+    {
+        Self::new_with_slop_and_checkpoint(terms, fieldnorms, snapshot, field_boost, 0, checkpoint)
+    }
+
+    /// Build one phrase scorer with slop and a coarse position-verification
+    /// checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same construction errors as [`Self::new`], plus typed
+    /// cancellation or fuel exhaustion from the initial alignment.
+    pub fn new_with_slop_and_checkpoint<F>(
+        terms: Vec<PhraseTerm<'a>>,
+        fieldnorms: F,
+        snapshot: Bm25FieldSnapshot,
+        field_boost: f32,
+        max_slop: u32,
         checkpoint: Option<Arc<dyn QueryWorkCheckpoint + 'a>>,
     ) -> Result<Self, ArgusError>
     where
@@ -2952,8 +3181,13 @@ impl<'a> PhraseScorer<'a> {
             segment_num_docs,
             current: None,
             current_frequency: 0,
+            slop: max_slop,
             decode_scratch: Vec::new(),
             position_indices,
+            slop_positions: Vec::new(),
+            slop_costs: Vec::new(),
+            slop_positions_buffer: Vec::new(),
+            slop_costs_buffer: Vec::new(),
             checkpoint,
         };
         scorer.align()?;
@@ -3023,6 +3257,9 @@ impl<'a> PhraseScorer<'a> {
         for slot_index in 0..self.slots.len() {
             self.decode_slot_positions(slot_index, doc)?;
         }
+        if self.slop != 0 {
+            return self.phrase_frequency_with_slop();
+        }
         self.position_indices.fill(0);
         let first_position = self.slots[0].position;
         let (slots, position_indices) = (&self.slots, &mut self.position_indices);
@@ -3055,6 +3292,74 @@ impl<'a> PhraseScorer<'a> {
             }
         }
         Ok(frequency)
+    }
+
+    fn phrase_frequency_with_slop(&mut self) -> Result<u32, ArgusError> {
+        let max_query_position = self
+            .slots
+            .last()
+            .map(|slot| slot.position)
+            .ok_or(ArgusError::CursorInvariant("phrase has no position slots"))?;
+        for slot in &mut self.slots {
+            let offset = max_query_position - slot.position;
+            for position in &mut slot.positions {
+                *position = position
+                    .checked_add(offset)
+                    .ok_or(ArgusError::CursorInvariant(
+                        "phrase position plus query offset exceeds u32",
+                    ))?;
+            }
+        }
+
+        self.slop_positions.clear();
+        let first_positions = &self.slots[0].positions;
+        self.slop_positions
+            .try_reserve(first_positions.len())
+            .map_err(|_| ArgusError::Allocation {
+                resource: "phrase slop positions",
+                count: first_positions.len(),
+            })?;
+        self.slop_positions.extend_from_slice(first_positions);
+        self.slop_costs.clear();
+
+        for slot_index in 1..self.slots.len() - 1 {
+            intersect_phrase_positions_carrying_slop(
+                &mut self.slop_positions,
+                &mut self.slop_costs,
+                &self.slots[slot_index].positions,
+                self.slop,
+                true,
+                &mut self.slop_positions_buffer,
+                &mut self.slop_costs_buffer,
+            )?;
+            if self.slop_positions.is_empty() {
+                return Ok(0);
+            }
+        }
+
+        let final_positions = &self
+            .slots
+            .last()
+            .ok_or(ArgusError::CursorInvariant("phrase has no final slot"))?
+            .positions;
+        if self.slots.len() == 2 {
+            return u32::try_from(intersect_phrase_positions_with_slop(
+                &mut self.slop_positions,
+                final_positions,
+                self.slop,
+                false,
+            ))
+            .map_err(|_| ArgusError::CursorInvariant("phrase frequency exceeds u32"));
+        }
+        intersect_phrase_positions_carrying_slop(
+            &mut self.slop_positions,
+            &mut self.slop_costs,
+            final_positions,
+            self.slop,
+            false,
+            &mut self.slop_positions_buffer,
+            &mut self.slop_costs_buffer,
+        )
     }
 
     fn decode_slot_positions(&mut self, slot_index: usize, doc: u32) -> Result<(), ArgusError> {
@@ -9828,6 +10133,112 @@ mod tests {
     }
 
     #[test]
+    fn phrase_slop_shares_one_budget_and_charges_transposition_twice()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let lengths = [Some(8); 4];
+        let encoded =
+            EncodedDocLenSection::encode(0, 4, &[5], &[DocLenFieldInput::new(5, &lengths)])?;
+        let section = encoded.section(&[5])?;
+        let field = section.field(5).expect("field exists");
+        let snapshot = snapshot(5, 32, 4)?;
+
+        let build = |slop| {
+            let first = PositionedVecCursor::new(
+                vec![(0, vec![0]), (1, vec![0]), (2, vec![1]), (3, vec![0])],
+                4,
+                4,
+            );
+            let second = PositionedVecCursor::new(
+                vec![(0, vec![2]), (1, vec![3]), (2, vec![0]), (3, vec![2])],
+                4,
+                4,
+            );
+            let third = PositionedVecCursor::new(
+                vec![(0, vec![3]), (1, vec![4]), (2, vec![2]), (3, vec![4])],
+                4,
+                4,
+            );
+            PhraseScorer::new_with_slop(
+                vec![
+                    PhraseTerm::new(5, 0, first, 4),
+                    PhraseTerm::new(5, 1, second, 4),
+                    PhraseTerm::new(5, 2, third, 4),
+                ],
+                field,
+                snapshot.clone(),
+                1.0,
+                slop,
+            )
+        };
+
+        let mut one = build(1)?;
+        assert_eq!(one.doc(), Some(0), "one inserted token spends one unit");
+        assert_eq!(
+            one.next()?,
+            None,
+            "transposition and two independent gaps exceed one shared unit"
+        );
+
+        let mut two = build(2)?;
+        assert_eq!(two.doc(), Some(0));
+        assert_eq!(
+            two.next()?,
+            Some(1),
+            "two gaps spend the complete shared budget"
+        );
+        assert_eq!(two.next()?, Some(3), "two independent gaps spend two units");
+        assert_eq!(two.next()?, None);
+
+        let build_transposition = |slop| {
+            PhraseScorer::new_with_slop(
+                vec![
+                    PhraseTerm::new(5, 0, PositionedVecCursor::new(vec![(2, vec![1])], 1, 4), 1),
+                    PhraseTerm::new(5, 1, PositionedVecCursor::new(vec![(2, vec![0])], 1, 4), 1),
+                ],
+                field,
+                snapshot.clone(),
+                1.0,
+                slop,
+            )
+        };
+        assert_eq!(build_transposition(1)?.doc(), None);
+        assert_eq!(build_transposition(2)?.doc(), Some(2));
+
+        let mut three = build(3)?;
+        assert_eq!(three.doc(), Some(0));
+        assert_eq!(three.next()?, Some(1));
+        assert_eq!(
+            three.next()?,
+            Some(2),
+            "three-term transposition spends three"
+        );
+        assert_eq!(three.next()?, Some(3));
+        assert_eq!(three.next()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn phrase_slop_overflow_cannot_become_a_match() -> Result<(), ArgusError> {
+        let mut positions = vec![u32::MAX];
+        let mut slops = vec![u32::MAX];
+        let mut positions_buffer = Vec::new();
+        let mut slops_buffer = Vec::new();
+        assert_eq!(
+            intersect_phrase_positions_carrying_slop(
+                &mut positions,
+                &mut slops,
+                &[0],
+                u32::MAX,
+                false,
+                &mut positions_buffer,
+                &mut slops_buffer,
+            )?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
     fn phrase_cost_estimate_follows_tantivy_child_cost_order()
     -> Result<(), Box<dyn std::error::Error>> {
         let lengths = [Some(2); 12];
@@ -10055,6 +10466,127 @@ mod tests {
             .map(|hit| (hit.global_docid, hit.score.to_bits()))
             .collect::<Vec<_>>();
         assert_eq!(quill_ranked, oracle_ranked);
+        Ok(())
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn phrase_slop_matches_tantivy_docs_ranks_and_score_bits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use frankensearch_lexical::tantivy_crate::{
+            Index, TantivyDocument, Term,
+            collector::TopDocs,
+            doc,
+            query::PhraseQuery,
+            schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions},
+        };
+
+        let mut schema_builder = Schema::builder();
+        let indexing = TextFieldIndexing::default()
+            .set_tokenizer("default")
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+        let body = schema_builder.add_text_field(
+            "body",
+            TextOptions::default().set_indexing_options(indexing),
+        );
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer = index.writer_with_num_threads::<TantivyDocument>(1, 15_000_000)?;
+        let corpus = [
+            "a b c",
+            "a x b c",
+            "a x b x c",
+            "b a c",
+            "a c b",
+            "a b c a b c",
+        ];
+        for text in corpus {
+            writer.add_document(doc!(body => text))?;
+        }
+        writer.commit()?;
+        drop(writer);
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        let lengths = [Some(3), Some(4), Some(5), Some(3), Some(3), Some(6)];
+        let encoded =
+            EncodedDocLenSection::encode(0, 6, &[0], &[DocLenFieldInput::new(0, &lengths)])?;
+        let section = encoded.section(&[0])?;
+        let field = section.field(0).expect("field exists");
+        let snapshot = snapshot(0, 24, 6)?;
+        let build = |slop| {
+            let a = PositionedVecCursor::new(
+                vec![
+                    (0, vec![0]),
+                    (1, vec![0]),
+                    (2, vec![0]),
+                    (3, vec![1]),
+                    (4, vec![0]),
+                    (5, vec![0, 3]),
+                ],
+                6,
+                6,
+            );
+            let b = PositionedVecCursor::new(
+                vec![
+                    (0, vec![1]),
+                    (1, vec![2]),
+                    (2, vec![2]),
+                    (3, vec![0]),
+                    (4, vec![2]),
+                    (5, vec![1, 4]),
+                ],
+                6,
+                6,
+            );
+            let c = PositionedVecCursor::new(
+                vec![
+                    (0, vec![2]),
+                    (1, vec![3]),
+                    (2, vec![4]),
+                    (3, vec![2]),
+                    (4, vec![1]),
+                    (5, vec![2, 5]),
+                ],
+                6,
+                6,
+            );
+            PhraseScorer::new_with_slop(
+                vec![
+                    PhraseTerm::new(0, 0, a, 6),
+                    PhraseTerm::new(0, 1, b, 6),
+                    PhraseTerm::new(0, 2, c, 6),
+                ],
+                field,
+                snapshot.clone(),
+                1.0,
+                slop,
+            )
+        };
+
+        for slop in [1, 2] {
+            let mut oracle = PhraseQuery::new(vec![
+                Term::from_field_text(body, "a"),
+                Term::from_field_text(body, "b"),
+                Term::from_field_text(body, "c"),
+            ]);
+            oracle.set_slop(slop);
+            let oracle_ranked = searcher
+                .search(&oracle, &TopDocs::with_limit(corpus.len()).order_by_score())?
+                .into_iter()
+                .map(|(score, address)| {
+                    assert_eq!(address.segment_ord, 0);
+                    (address.doc_id, score.to_bits())
+                })
+                .collect::<Vec<_>>();
+
+            let mut quill = ReferenceScorer::phrase(build(slop)?);
+            let quill_ranked = quill
+                .top_k(corpus.len(), &AllLiveDocs)?
+                .into_iter()
+                .map(|hit| (hit.global_docid, hit.score.to_bits()))
+                .collect::<Vec<_>>();
+            assert_eq!(quill_ranked, oracle_ranked, "slop={slop}");
+        }
         Ok(())
     }
 
