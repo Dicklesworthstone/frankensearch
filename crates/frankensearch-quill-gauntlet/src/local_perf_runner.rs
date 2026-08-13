@@ -7571,11 +7571,13 @@ pub fn failed_attempt_receipt_for_test(
     threshold_bytes: &[u8],
     prebinding_bytes: &[u8],
     bound_bytes: &[u8],
+    external_qg1_authorities: &[&Qg1ExpectedAuthority],
     code: i64,
 ) -> Vec<u8> {
-    // A failed-attempt receipt binds no completed evidence, so it presents no
-    // external authority. Passing `&[]` states that explicitly at the call site
-    // instead of inheriting it from a defaulting wrapper.
+    // The temporary completed template must verify authority-bound QG-1
+    // evidence against its externally retained authority. The final failed
+    // receipt below clears every completed-evidence and nested-runner binding,
+    // so the emitted failure remains authority-free.
     let completed_bytes = completed_attempt_receipt_for_test(
         artifact,
         fixture_selector,
@@ -7583,7 +7585,7 @@ pub fn failed_attempt_receipt_for_test(
         threshold_bytes,
         prebinding_bytes,
         bound_bytes,
-        &[],
+        external_qg1_authorities,
     );
     let mut receipt = LocalPerfAttemptReceipt::from_verified_slice(&completed_bytes)
         .expect("parse completed H2 test receipt");
