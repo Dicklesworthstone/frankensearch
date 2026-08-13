@@ -12010,7 +12010,10 @@ impl ManifestPublisher {
         let unresolved_directory = self.directory.clone();
         let directory =
             spawn_blocking(move || normalize_publish_directory(unresolved_directory)).await;
+        #[cfg(test)]
         let publish_lock = self.publish_lock(&directory);
+        #[cfg(not(test))]
+        let publish_lock = publish_lock_for_normalized_directory(directory.clone());
         let publication_read_state = self.publication_read_state.clone();
         let guard = OwnedMutexGuard::lock(publish_lock, cx)
             .await
@@ -12077,8 +12080,8 @@ impl ManifestPublisher {
         publish_lock_for_directory(&self.directory)
     }
 
+    #[cfg(test)]
     fn publish_lock(&self, directory: &Path) -> Arc<Mutex<()>> {
-        #[cfg(test)]
         if let Some(publish_lock) = &self.publish_lock_override {
             return Arc::clone(publish_lock);
         }
