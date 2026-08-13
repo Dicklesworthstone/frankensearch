@@ -138,6 +138,7 @@ struct LoadedBaseline {
 /// * duplicate — a repeated authority digest is refused before conversion;
 /// * wrong run/source — the pin's campaign run and source revision must equal
 ///   the evidence identity supplied by the caller.
+///
 /// Returns the verified authorities AND a content-addressed evidence entry for
 /// the pin and every register file, in canonical order (pin first, then
 /// registers by sorted name).
@@ -235,7 +236,12 @@ fn load_qg1_authority_set(
         // unexpected entries while claiming a COMPLETE pinned set is the same
         // class of lie as admitting an extra one: the set would be reported
         // complete without the operator ever learning what else was there.
-        if !name.ends_with(".json") {
+        // Compared through `Path::extension` rather than a `.json` suffix so
+        // the admitted set stays exactly what `publish_qg1_authority_entry`
+        // writes (`{digest}.json`, always lowercase). An uppercase `.JSON` is
+        // still refused here, as it was before, and a bare `.json` with no
+        // stem — which no digest can produce — is refused too.
+        if Path::new(name).extension() != Some(OsStr::new("json")) {
             return Err(format!(
                 "QG-1 authority directory {} holds unexpected entry {name}; a pinned register \
                  directory may contain only its register files",
@@ -657,15 +663,9 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
     // Archive the trust inputs alongside the artifacts they admitted, in
     // canonical arm order. Without this the decision record would hash every
     // artifact it judged and none of the authorities that let it judge them.
-    evaluation
-        .evidence
-        .extend(baseline_authority_evidence.into_iter());
-    evaluation
-        .evidence
-        .extend(candidate_authority_evidence.into_iter());
-    evaluation
-        .evidence
-        .extend(rerun_authority_evidence.into_iter());
+    evaluation.evidence.extend(baseline_authority_evidence);
+    evaluation.evidence.extend(candidate_authority_evidence);
+    evaluation.evidence.extend(rerun_authority_evidence);
 
     let history_plan = plan_history_if_allowed(
         &args,
