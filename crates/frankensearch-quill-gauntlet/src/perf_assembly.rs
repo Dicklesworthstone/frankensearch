@@ -3033,7 +3033,7 @@ struct SemanticCellProjection {
     ordinal: usize,
     provenance: SemanticEvidenceProvenance,
     runner_identity: SemanticRunnerIdentity,
-    cell: EvidenceCell,
+    cell: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -3135,7 +3135,7 @@ fn semantic_cell_set_seal(
             ordinal: mapping.ordinal,
             provenance: semantic_provenance(&artifact.provenance),
             runner_identity: semantic_runner_identity(identity)?,
-            cell: semantic_cell(cell),
+            cell: semantic_cell(cell)?,
         });
     }
     let preimage = SemanticCellSetPreimage {
@@ -3274,7 +3274,7 @@ fn semantic_json_object(
     Ok(value)
 }
 
-fn semantic_cell(cell: &EvidenceCell) -> EvidenceCell {
+fn semantic_cell(cell: &EvidenceCell) -> Result<serde_json::Value, PerfEvidenceAssemblyError> {
     let mut semantic = cell.clone();
     if let EvidenceCellBody::Paired {
         paired,
@@ -3287,7 +3287,73 @@ fn semantic_cell(cell: &EvidenceCell) -> EvidenceCell {
             clear_paired_run_ids(null);
         }
     }
-    semantic
+    let mut value = serde_json::to_value(semantic)?;
+    normalize_qg1_session_commitments(&mut value);
+    Ok(value)
+}
+
+/// Keep the structural QG-1 authority transcript in the semantic projection
+/// while discarding only one-run opaque capability commitments and the
+/// receipts derived from them. Those values are independently authenticated
+/// before an assembly is admitted; including their random entropy here would
+/// make identical measurements compare as different semantic evidence.
+fn normalize_qg1_session_commitments(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(authority) = object.get_mut("qg1_lifecycle_authority") {
+                normalize_qg1_authority_capabilities(authority);
+            }
+            if let Some(binding) = object.get_mut("qg1_sample_binding") {
+                normalize_qg1_binding_receipts(binding);
+            }
+            for value in object.values_mut() {
+                normalize_qg1_session_commitments(value);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                normalize_qg1_session_commitments(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_qg1_authority_capabilities(authority: &mut serde_json::Value) {
+    let Some(authority) = authority.as_object_mut() else {
+        return;
+    };
+    authority.insert(
+        "authority_sha256".to_owned(),
+        serde_json::Value::String(String::new()),
+    );
+    if let Some(serde_json::Value::Array(rows)) = authority.get_mut("issued_rows") {
+        for row in rows {
+            if let Some(row) = row.as_object_mut() {
+                row.insert(
+                    "producer_capability_sha256".to_owned(),
+                    serde_json::Value::String(String::new()),
+                );
+            }
+        }
+    }
+}
+
+fn normalize_qg1_binding_receipts(binding: &mut serde_json::Value) {
+    let Some(binding) = binding.as_object_mut() else {
+        return;
+    };
+    for field in [
+        "stream_id_sha256",
+        "lifecycle_authority_sha256",
+        "stream_role_identity_sha256",
+        "producer_capability_sha256",
+        "producer_capability_tag_sha256",
+        "lifecycle_receipt_id_sha256",
+        "lifecycle_receipt_sha256",
+    ] {
+        binding.insert(field.to_owned(), serde_json::Value::String(String::new()));
+    }
 }
 
 fn clear_paired_run_ids(paired: &mut crate::PairedExperimentResult) {
@@ -3660,6 +3726,7 @@ pub enum PerfEvidenceAssemblyError {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::{Deref, DerefMut};
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::{Mutex, OnceLock};
 
@@ -3703,6 +3770,34 @@ mod tests {
             manifest: None,
             corpus: 'b',
         };
+    }
+
+    /// One fixture-exact QG-1 source plus the independently retained
+    /// authorities minted before its canonical throughput rows were produced.
+    #[derive(Clone)]
+    struct AuthorityBoundTestArtifact {
+        artifact: PerfEvidenceArtifact,
+        expected_authorities: Vec<Qg1ExpectedAuthority>,
+    }
+
+    impl AuthorityBoundTestArtifact {
+        fn authority_refs(&self) -> Vec<&Qg1ExpectedAuthority> {
+            self.expected_authorities.iter().collect()
+        }
+    }
+
+    impl Deref for AuthorityBoundTestArtifact {
+        type Target = PerfEvidenceArtifact;
+
+        fn deref(&self) -> &Self::Target {
+            &self.artifact
+        }
+    }
+
+    impl DerefMut for AuthorityBoundTestArtifact {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.artifact
+        }
     }
 
     fn test_profile() -> MachineProfileKey {
@@ -3838,18 +3933,14 @@ mod tests {
         }
     }
 
-    fn throughput_stream(
+    fn raw_throughput_stream(
         run_id: &str,
         identity: TestIdentity,
+        scope: &PerfOperationScope,
         control_elapsed_ns: u64,
         treatment_elapsed_ns: u64,
         sample_id_base: u64,
     ) -> Vec<PerfRawSample> {
-        let scope = crate::perf::perf_operation_scope(
-            PerfGate::Qg1,
-            "bulk/tiny/1/positions_on",
-            "docs_per_second",
-        );
         let provenance = sample_provenance(run_id, identity);
         #[allow(clippy::cast_precision_loss)]
         let control_observed = 10_000.0 * 1_000_000_000.0 / control_elapsed_ns as f64;
@@ -3916,29 +4007,148 @@ mod tests {
     }
 
     fn paired_results(
+        contract: &PlanCellContract,
         run_id: &str,
         identity: TestIdentity,
         invalid_control_null: bool,
         config: &PairedEstimatorConfig,
-    ) -> (PairedExperimentResult, PairedExperimentResult) {
-        let effect = throughput_stream(run_id, identity, 100_000, 80_000, 0);
-        let control_null = throughput_stream(
+    ) -> (
+        PairedExperimentResult,
+        PairedExperimentResult,
+        Option<Qg1ExpectedAuthority>,
+    ) {
+        const PAIRS: usize = 30;
+        const CONTENT_BYTES: u64 = 64_000;
+
+        let scope = crate::perf::perf_operation_scope(
+            PerfGate::Qg1,
+            &contract.spec.fixture,
+            &contract.spec.metric,
+        );
+        let control_null_elapsed_ns = if invalid_control_null {
+            50_000
+        } else {
+            100_000
+        };
+        if contract.spec.metric != "docs_per_second" {
+            let effect = raw_throughput_stream(run_id, identity, &scope, 100_000, 80_000, 0);
+            let control_null = raw_throughput_stream(
+                run_id,
+                identity,
+                &scope,
+                100_000,
+                control_null_elapsed_ns,
+                10_000,
+            );
+            let treatment_null =
+                raw_throughput_stream(run_id, identity, &scope, 80_000, 80_000, 20_000);
+            return (
+                estimate_paired_experiment(&effect, &control_null, config)
+                    .expect("paired non-throughput QG-1 experiment"),
+                estimate_paired_experiment(&effect, &treatment_null, config)
+                    .expect("non-throughput treatment-arm Q/Q null"),
+                None,
+            );
+        }
+
+        let work_units = contract
+            .spec
+            .document_count
+            .expect("canonical QG-1 throughput cell has a document count");
+        let provenance = sample_provenance(run_id, identity);
+        let schedule =
+            seeded_balanced_pair_order(PAIRS, 0x4834_5eed).expect("QG-1 authority schedule");
+        let mut config = config.clone();
+        let producer = config
+            .install_qg1_lifecycle_authority(
+                scope.clone(),
+                provenance.corpus_sha256.clone(),
+                "a".repeat(64),
+                "b".repeat(64),
+                work_units,
+                CONTENT_BYTES,
+                1,
+                vec![Qg1BatchCoverage {
+                    document_start: 0,
+                    document_count: work_units,
+                }],
+                format!("synthetic-{:08}", work_units.saturating_sub(1)),
+                u64::try_from(PAIRS).expect("QG-1 pair count fits u64"),
+                vec![
+                    (
+                        crate::perf::QG1_STREAM_ROLE_EFFECT.to_owned(),
+                        0,
+                        0,
+                        schedule.clone(),
+                    ),
+                    (
+                        crate::perf::QG1_STREAM_ROLE_TANTIVY_NULL.to_owned(),
+                        0,
+                        10_000,
+                        schedule.clone(),
+                    ),
+                    (
+                        crate::perf::QG1_STREAM_ROLE_QUILL_NULL.to_owned(),
+                        0,
+                        20_000,
+                        schedule,
+                    ),
+                ],
+            )
+            .expect("mint QG-1 authority before the first raw row");
+        let expected_authority = producer.expected_authority().clone();
+        let effect = authority_bound_qg1_stream(
             run_id,
             identity,
+            &scope,
+            &producer,
+            crate::perf::QG1_STREAM_ROLE_EFFECT,
             100_000,
-            if invalid_control_null {
-                50_000
-            } else {
-                100_000
-            },
-            10_000,
+            80_000,
+            0,
+            work_units,
+            CONTENT_BYTES,
         );
-        let treatment_null = throughput_stream(run_id, identity, 80_000, 80_000, 20_000);
+        let control_null = authority_bound_qg1_stream(
+            run_id,
+            identity,
+            &scope,
+            &producer,
+            crate::perf::QG1_STREAM_ROLE_TANTIVY_NULL,
+            100_000,
+            control_null_elapsed_ns,
+            10_000,
+            work_units,
+            CONTENT_BYTES,
+        );
+        let treatment_null = authority_bound_qg1_stream(
+            run_id,
+            identity,
+            &scope,
+            &producer,
+            crate::perf::QG1_STREAM_ROLE_QUILL_NULL,
+            80_000,
+            80_000,
+            20_000,
+            work_units,
+            CONTENT_BYTES,
+        );
         (
-            estimate_paired_experiment(&effect, &control_null, config)
-                .expect("paired QG-1 experiment"),
-            estimate_paired_experiment(&effect, &treatment_null, config)
-                .expect("treatment-arm Q/Q null"),
+            estimate_paired_experiment_against_qg1_authority(
+                &effect,
+                &control_null,
+                &config,
+                Some(&expected_authority),
+            )
+            .expect("authority-bound paired QG-1 experiment"),
+            estimate_paired_experiment_against_qg1_authority(
+                &effect,
+                &treatment_null,
+                &config,
+                Some(&expected_authority),
+            )
+            .expect("authority-bound treatment-arm Q/Q null"),
+            Some(expected_authority),
         )
     }
 
@@ -3946,6 +4156,7 @@ mod tests {
         contract: &PlanCellContract,
         paired: &PairedExperimentResult,
         treatment_null: &PairedExperimentResult,
+        expected_authority: Option<&Qg1ExpectedAuthority>,
         policy: &EvidencePolicy,
     ) -> EvidenceCell {
         let role = contract.role.expect("runnable cell role");
@@ -3969,25 +4180,6 @@ mod tests {
                     },
                 ],
             });
-        let retarget = |source: &PairedExperimentResult| {
-            let mut result = source.clone();
-            let scope = crate::perf::perf_operation_scope(
-                PerfGate::Qg1,
-                &contract.spec.fixture,
-                &contract.spec.metric,
-            );
-            result.scope = scope.clone();
-            for sample in result
-                .effect_samples
-                .iter_mut()
-                .chain(&mut result.null_samples)
-            {
-                sample.scope = scope.clone();
-            }
-            result
-        };
-        let paired = retarget(paired);
-        let treatment_null = retarget(treatment_null);
         let mut cell = EvidenceCell::evaluate(
             EvidenceCellSpec {
                 gate: PerfGate::Qg1,
@@ -4000,21 +4192,35 @@ mod tests {
                 cold_cache: None,
                 concurrency_witness,
             },
-            paired,
+            paired.clone(),
             policy,
         )
         .expect("evaluate QG-1 test cell");
-        cell.attach_treatment_arm_null(treatment_null, policy)
-            .expect("attach same-invocation Q/Q null");
+        if let Some(expected_authority) = expected_authority {
+            cell.attach_treatment_arm_null_against_qg1_authority(
+                treatment_null.clone(),
+                policy,
+                Some(expected_authority),
+            )
+            .expect("attach authority-bound same-invocation Q/Q null");
+        } else {
+            cell.attach_treatment_arm_null(treatment_null.clone(), policy)
+                .expect("attach same-invocation Q/Q null");
+        }
         cell
     }
 
-    fn seal_unbound(artifact: &mut PerfEvidenceArtifact) -> Vec<u8> {
+    fn seal_unbound(
+        artifact: &mut PerfEvidenceArtifact,
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+    ) -> Vec<u8> {
         artifact.artifact_sha256.clear();
         let unsealed = serde_json::to_string_pretty(artifact).expect("unsealed evidence JSON");
         artifact.artifact_sha256 = sha256_hex(unsealed.as_bytes());
         let bytes = serde_json::to_vec_pretty(artifact).expect("sealed evidence JSON");
-        artifact.verify_integrity().expect("unbound evidence seal");
+        artifact
+            .verify_integrity_against_qg1_authorities(external_qg1_authorities)
+            .expect("unbound evidence seal");
         bytes
     }
 
@@ -4024,7 +4230,7 @@ mod tests {
         run_label: &str,
         invalid_ordinal: Option<usize>,
         identity: TestIdentity,
-    ) -> PerfEvidenceArtifact {
+    ) -> Vec<AuthorityBoundTestArtifact> {
         shard_with_partial_code(
             ordinals,
             run_id,
@@ -4042,7 +4248,7 @@ mod tests {
         invalid_ordinal: Option<usize>,
         identity: TestIdentity,
         partial_no_claim_code: &str,
-    ) -> PerfEvidenceArtifact {
+    ) -> Vec<AuthorityBoundTestArtifact> {
         shard_with_contract(
             ordinals,
             run_id,
@@ -4067,23 +4273,86 @@ mod tests {
         force_source_no_claim: bool,
         policy: EvidencePolicy,
         estimator: &PairedEstimatorConfig,
-    ) -> PerfEvidenceArtifact {
+    ) -> Vec<AuthorityBoundTestArtifact> {
         let contract = PlanContract::reconstruct(&test_plan()).expect("test plan contract");
-        let (valid_paired, valid_treatment_null) =
-            paired_results(run_id, identity, false, estimator);
-        let invalid = invalid_ordinal.map(|_| paired_results(run_id, identity, true, estimator));
+        let runnable_count = contract
+            .cells
+            .iter()
+            .filter(|cell| cell.applicability.is_runnable())
+            .count();
+        let fixture_groups = if ordinals.len() == runnable_count {
+            vec![(run_id.to_owned(), ordinals.to_vec())]
+        } else {
+            let mut by_fixture = BTreeMap::<String, Vec<usize>>::new();
+            for ordinal in ordinals {
+                by_fixture
+                    .entry(contract.cells[*ordinal].spec.fixture.clone())
+                    .or_default()
+                    .push(*ordinal);
+            }
+            by_fixture
+                .into_values()
+                .enumerate()
+                .map(|(index, fixture_ordinals)| {
+                    (format!("{run_id}-fixture-{index}"), fixture_ordinals)
+                })
+                .collect()
+        };
+        fixture_groups
+            .into_iter()
+            .map(|(fixture_run_id, fixture_ordinals)| {
+                fixture_shard_with_contract(
+                    &contract,
+                    &fixture_ordinals,
+                    &fixture_run_id,
+                    invalid_ordinal,
+                    identity,
+                    partial_no_claim_code,
+                    force_source_no_claim,
+                    &policy,
+                    estimator,
+                    runnable_count,
+                )
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fixture_shard_with_contract(
+        contract: &PlanContract,
+        ordinals: &[usize],
+        run_id: &str,
+        invalid_ordinal: Option<usize>,
+        identity: TestIdentity,
+        partial_no_claim_code: &str,
+        force_source_no_claim: bool,
+        policy: &EvidencePolicy,
+        estimator: &PairedEstimatorConfig,
+        runnable_count: usize,
+    ) -> AuthorityBoundTestArtifact {
+        let mut expected_authorities = Vec::new();
         let cells = ordinals
             .iter()
             .map(|ordinal| {
                 let contract_cell = &contract.cells[*ordinal];
-                let (paired, treatment_null) = if invalid_ordinal == Some(*ordinal) {
-                    let (paired, treatment_null) =
-                        invalid.as_ref().expect("invalid pair requested");
-                    (paired, treatment_null)
-                } else {
-                    (&valid_paired, &valid_treatment_null)
-                };
-                evidence_cell(contract_cell, paired, treatment_null, &policy)
+                let (paired, treatment_null, expected_authority) = paired_results(
+                    contract_cell,
+                    run_id,
+                    identity,
+                    invalid_ordinal == Some(*ordinal),
+                    estimator,
+                );
+                let cell = evidence_cell(
+                    contract_cell,
+                    &paired,
+                    &treatment_null,
+                    expected_authority.as_ref(),
+                    policy,
+                );
+                if let Some(expected_authority) = expected_authority {
+                    expected_authorities.push(expected_authority);
+                }
+                cell
             })
             .collect::<Vec<_>>();
         let configured_widths = ordinals
@@ -4100,16 +4369,11 @@ mod tests {
         let mut artifact = PerfEvidenceArtifact::assemble(
             PerfGate::Qg1,
             test_plan(),
-            policy,
+            policy.clone(),
             evidence_provenance(run_id, configured_widths, document_count, identity),
             cells,
         )
         .expect("assemble source evidence shard");
-        let runnable_count = contract
-            .cells
-            .iter()
-            .filter(|cell| cell.applicability.is_runnable())
-            .count();
         if ordinals.len() != runnable_count || force_source_no_claim {
             let message = if partial_no_claim_code == PERF_ASSEMBLY_PARTIAL_SHARD_NO_CLAIM_CODE {
                 PERF_ASSEMBLY_PARTIAL_SHARD_NO_CLAIM_DETAIL
@@ -4118,9 +4382,9 @@ mod tests {
             };
             artifact.force_no_claim(partial_no_claim_code, message);
         }
-        let prebinding_bytes = seal_unbound(&mut artifact);
-        let threshold = threshold_artifact_for(&artifact);
-        let threshold_bytes = threshold
+        let authority_refs = expected_authorities.iter().collect::<Vec<_>>();
+        let prebinding_bytes = seal_unbound(&mut artifact, &authority_refs);
+        let threshold_bytes = threshold_artifact_for(&artifact)
             .to_json_pretty()
             .expect("canonical threshold artifact")
             .into_bytes();
@@ -4148,72 +4412,21 @@ mod tests {
             &prebinding_bytes,
         );
         let sealed = artifact
-            .bind_machine_class_identity_and_seal(runner, &threshold_bytes, &prebinding_bytes)
-            .expect("bind source runner receipt");
-        PerfEvidenceArtifact::from_verified_slice(&sealed).expect("reload source evidence")
-    }
-
-    fn retarget_paired_run(result: &mut PairedExperimentResult, run_id: &str) {
-        result.provenance.run_id = run_id.to_owned();
-        for sample in result
-            .effect_samples
-            .iter_mut()
-            .chain(result.null_samples.iter_mut())
-        {
-            sample.provenance.run_id = run_id.to_owned();
+            .bind_machine_class_identity_and_seal_against_qg1_authorities(
+                runner,
+                &threshold_bytes,
+                &prebinding_bytes,
+                &authority_refs,
+            )
+            .expect("bind authority-aware source runner receipt");
+        AuthorityBoundTestArtifact {
+            artifact: PerfEvidenceArtifact::from_verified_slice_against_qg1_authorities(
+                &sealed,
+                &authority_refs,
+            )
+            .expect("reload authority-aware source evidence"),
+            expected_authorities,
         }
-        result
-            .verify_recomputed()
-            .expect("retargeted paired test evidence");
-    }
-
-    fn retarget_cell_run(cell: &mut EvidenceCell, run_id: &str) {
-        if let EvidenceCellBody::Paired {
-            paired,
-            treatment_arm_null,
-            ..
-        } = &mut cell.body
-        {
-            retarget_paired_run(paired, run_id);
-            if let Some(treatment_arm_null) = treatment_arm_null {
-                retarget_paired_run(treatment_arm_null, run_id);
-            }
-        }
-    }
-
-    fn bind_test_artifact(mut artifact: PerfEvidenceArtifact) -> PerfEvidenceArtifact {
-        let prebinding_bytes = seal_unbound(&mut artifact);
-        let threshold_bytes = threshold_artifact_for(&artifact)
-            .to_json_pretty()
-            .expect("canonical split threshold")
-            .into_bytes();
-        let runner = crate::machine_class_registry::admitted_test_identity_for_artifacts(
-            PerfGate::Qg1.label(),
-            &artifact.provenance.build.git_revision,
-            artifact
-                .provenance
-                .build
-                .cargo_lock_sha256
-                .as_deref()
-                .expect("Cargo.lock hash"),
-            &artifact.provenance.build.executable_sha256,
-            &artifact.provenance.build.command_sha256,
-            artifact
-                .provenance
-                .build
-                .environment_sha256
-                .as_deref()
-                .expect("environment hash"),
-            &artifact.provenance.run_id,
-            &artifact.provenance.run_id,
-            &artifact.provenance.run_window,
-            &threshold_bytes,
-            &prebinding_bytes,
-        );
-        let sealed = artifact
-            .bind_machine_class_identity_and_seal(runner, &threshold_bytes, &prebinding_bytes)
-            .expect("bind split test runner receipt");
-        PerfEvidenceArtifact::from_verified_slice(&sealed).expect("reload split test evidence")
     }
 
     fn authority_bound_qg1_stream(
@@ -4228,9 +4441,10 @@ mod tests {
         work_units: u64,
         content_bytes: u64,
     ) -> Vec<PerfRawSample> {
-        let mut samples = throughput_stream(
+        let mut samples = raw_throughput_stream(
             run_id,
             identity,
+            scope,
             control_elapsed_ns,
             treatment_elapsed_ns,
             sample_id_base,
@@ -4525,75 +4739,10 @@ mod tests {
         )
     }
 
-    fn normalize_h2_test_artifact(artifact: PerfEvidenceArtifact) -> Vec<PerfEvidenceArtifact> {
-        let runnable_count = runnable_ordinals().len();
-        let fixtures = artifact
-            .cells
-            .iter()
-            .map(|cell| cell.spec.fixture.clone())
-            .collect::<BTreeSet<_>>();
-        if artifact.cells.len() == runnable_count || fixtures.len() == 1 {
-            return vec![artifact];
-        }
-        let original_reason = artifact.admission_no_claim.clone();
-        let contract = PlanContract::reconstruct(&artifact.applicability_plan)
-            .expect("split test plan contract");
-        fixtures
-            .into_iter()
-            .enumerate()
-            .map(|(index, fixture)| {
-                let run_id = format!("{}-fixture-{index}", artifact.provenance.run_id);
-                let mut cells = artifact
-                    .cells
-                    .iter()
-                    .filter(|cell| cell.spec.fixture == fixture)
-                    .cloned()
-                    .collect::<Vec<_>>();
-                for cell in &mut cells {
-                    retarget_cell_run(cell, &run_id);
-                }
-                let mut provenance = artifact.provenance.clone();
-                provenance.run_id = run_id;
-                provenance.machine.execution.configured_engine_thread_widths = cells
-                    .iter()
-                    .filter_map(|cell| {
-                        contract
-                            .ordinals
-                            .get(&cell.cell_id)
-                            .map(|ordinal| contract.cells[*ordinal].configured_threads)
-                    })
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
-                provenance.corpus.document_count = cells
-                    .iter()
-                    .filter_map(|cell| {
-                        contract
-                            .ordinals
-                            .get(&cell.cell_id)
-                            .and_then(|ordinal| contract.cells[*ordinal].spec.document_count)
-                    })
-                    .max()
-                    .expect("fixture-scoped QG-1 evidence has a document count");
-                let mut split = PerfEvidenceArtifact::assemble(
-                    PerfGate::Qg1,
-                    artifact.applicability_plan.clone(),
-                    artifact.policy.clone(),
-                    provenance,
-                    cells,
-                )
-                .expect("assemble fixture-scoped test evidence");
-                let (code, message) = original_reason.as_ref().map_or(
-                    (
-                        PERF_ASSEMBLY_PARTIAL_SHARD_NO_CLAIM_CODE,
-                        PERF_ASSEMBLY_PARTIAL_SHARD_NO_CLAIM_DETAIL,
-                    ),
-                    |reason| (reason.code.as_str(), reason.message.as_str()),
-                );
-                split.force_no_claim(code, message);
-                bind_test_artifact(split)
-            })
-            .collect()
+    fn normalize_h2_test_artifact(
+        artifact: AuthorityBoundTestArtifact,
+    ) -> Vec<AuthorityBoundTestArtifact> {
+        vec![artifact]
     }
 
     fn completed_test_attempt_directory(
@@ -4673,7 +4822,9 @@ mod tests {
         directory
     }
 
-    fn test_attempt_bundle(artifact: &PerfEvidenceArtifact) -> VerifiedLocalPerfAttemptBundle {
+    fn test_attempt_bundle(
+        artifact: &AuthorityBoundTestArtifact,
+    ) -> VerifiedLocalPerfAttemptBundle {
         static CACHE: OnceLock<Mutex<BTreeMap<String, VerifiedLocalPerfAttemptBundle>>> =
             OnceLock::new();
         let key = sha256_hex(
@@ -4684,24 +4835,60 @@ mod tests {
         if let Some(bundle) = cache.get(&key).cloned() {
             return bundle;
         }
-        let directory = completed_test_attempt_directory(artifact, &[]);
-        let bundle = VerifiedLocalPerfAttemptBundle::load_verified(directory.path())
-            .expect("load exact completed H2 test bundle through production boundary");
+        let authority_refs = artifact.authority_refs();
+        let directory = completed_test_attempt_directory(artifact, &authority_refs);
+        let bundle = VerifiedLocalPerfAttemptBundle::load_verified_against_qg1_authorities(
+            directory.path(),
+            &authority_refs,
+        )
+        .expect("load exact completed H2 test bundle through authority-aware production boundary");
         cache.insert(key, bundle.clone());
         bundle
     }
 
-    fn assemble_test(
-        completed: Vec<PerfEvidenceArtifact>,
+    trait IntoAuthorityBoundTestArtifacts {
+        fn into_authority_bound_test_artifacts(self) -> Vec<AuthorityBoundTestArtifact>;
+    }
+
+    impl IntoAuthorityBoundTestArtifacts for AuthorityBoundTestArtifact {
+        fn into_authority_bound_test_artifacts(self) -> Vec<AuthorityBoundTestArtifact> {
+            vec![self]
+        }
+    }
+
+    impl IntoAuthorityBoundTestArtifacts for Vec<AuthorityBoundTestArtifact> {
+        fn into_authority_bound_test_artifacts(self) -> Vec<AuthorityBoundTestArtifact> {
+            self
+        }
+    }
+
+    fn assemble_test<T>(
+        completed: Vec<T>,
         failed: Vec<VerifiedLocalPerfAttemptBundle>,
-    ) -> Result<PerfEvidenceAssemblyArtifact, PerfEvidenceAssemblyError> {
-        let mut attempts = completed
+    ) -> Result<PerfEvidenceAssemblyArtifact, PerfEvidenceAssemblyError>
+    where
+        T: IntoAuthorityBoundTestArtifacts,
+    {
+        let completed = completed
             .into_iter()
+            .flat_map(|artifact| artifact.into_authority_bound_test_artifacts())
             .flat_map(normalize_h2_test_artifact)
-            .map(|artifact| test_attempt_bundle(&artifact))
             .collect::<Vec<_>>();
-        attempts.extend(failed);
-        PerfEvidenceAssemblyArtifact::assemble(attempts)
+        let authority_refs = completed
+            .iter()
+            .map(AuthorityBoundTestArtifact::authority_refs)
+            .collect::<Vec<_>>();
+        let mut attempts = completed
+            .iter()
+            .zip(&authority_refs)
+            .map(|(artifact, authorities)| (test_attempt_bundle(artifact), authorities.as_slice()))
+            .collect::<Vec<_>>();
+        attempts.extend(
+            failed
+                .into_iter()
+                .map(|failed| (failed, &[] as &[&Qg1ExpectedAuthority])),
+        );
+        PerfEvidenceAssemblyArtifact::assemble_against_qg1_authorities(attempts)
     }
 
     #[test]
@@ -4876,10 +5063,10 @@ mod tests {
             .collect()
     }
 
-    fn complete_shards_with_prefix(prefix: &str) -> Vec<PerfEvidenceArtifact> {
+    fn complete_shards_with_prefix(prefix: &str) -> Vec<AuthorityBoundTestArtifact> {
         let ordinals = runnable_ordinals();
         let midpoint = ordinals.len() / 2;
-        vec![
+        [
             shard(
                 &ordinals[..midpoint],
                 &format!("{prefix}-a"),
@@ -4895,10 +5082,13 @@ mod tests {
                 TestIdentity::PRIMARY,
             ),
         ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
-    fn complete_shards() -> Vec<PerfEvidenceArtifact> {
-        static SHARDS: OnceLock<Vec<PerfEvidenceArtifact>> = OnceLock::new();
+    fn complete_shards() -> Vec<AuthorityBoundTestArtifact> {
+        static SHARDS: OnceLock<Vec<AuthorityBoundTestArtifact>> = OnceLock::new();
         SHARDS
             .get_or_init(|| complete_shards_with_prefix("complete"))
             .clone()
@@ -5514,7 +5704,8 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let artifact = normalize_h2_test_artifact(complete_shards().remove(0)).remove(0);
-        let valid = completed_test_attempt_directory(&artifact, &[]);
+        let authority_refs = artifact.authority_refs();
+        let valid = completed_test_attempt_directory(&artifact, &authority_refs);
         let receipt_bytes = fs::read(valid.path().join("QG-1.attempt.json"))
             .expect("exact completed attempt receipt");
 
@@ -5593,7 +5784,8 @@ mod tests {
     #[test]
     fn attempt_loader_rejects_substitution_but_failed_receipts_ignore_orphans() {
         let artifact = normalize_h2_test_artifact(complete_shards().remove(0)).remove(0);
-        let valid = completed_test_attempt_directory(&artifact, &[]);
+        let authority_refs = artifact.authority_refs();
+        let valid = completed_test_attempt_directory(&artifact, &authority_refs);
         let substituted = private_tempdir("substituted completed attempt");
         let substituted_artifacts = substituted.path().join("artifacts");
         fs::create_dir(&substituted_artifacts).expect("create substituted artifact directory");
@@ -5704,7 +5896,12 @@ mod tests {
             None,
             TestIdentity::PRIMARY,
         );
-        let failed = failed_test_attempt_bundle(&failed_source, 17);
+        let failed = failed_test_attempt_bundle(
+            failed_source
+                .first()
+                .expect("one fixture-exact failed source"),
+            17,
+        );
         let assembly =
             assemble_test(vec![first], vec![failed.clone()]).expect("assembly retaining failure");
         assert_eq!(assembly.failed_shards().len(), 1);
@@ -5889,10 +6086,11 @@ mod tests {
             .metric
             .clone_from(&not_applicable.spec.metric);
         source.artifact_sha256.clear();
-        let unsealed = serde_json::to_string_pretty(&source).unwrap();
+        let unsealed = serde_json::to_string_pretty(&source.artifact).unwrap();
         source.artifact_sha256 = sha256_hex(unsealed.as_bytes());
 
-        let bytes = serde_json::to_vec_pretty(&source).expect("canonical hostile evidence bytes");
+        let bytes =
+            serde_json::to_vec_pretty(&source.artifact).expect("canonical hostile evidence bytes");
         assert!(matches!(
             PerfEvidenceArtifact::from_verified_slice(&bytes),
             Err(EvidenceArtifactError::InconsistentArtifact { ref reason })
@@ -5940,7 +6138,8 @@ mod tests {
         );
         stale.provenance.manifest_sha256 = "8".repeat(64);
         stale.artifact_sha256.clear();
-        let unsealed = serde_json::to_string_pretty(&stale).expect("stale unsealed evidence");
+        let unsealed =
+            serde_json::to_string_pretty(&stale.artifact).expect("stale unsealed evidence");
         stale.artifact_sha256 = sha256_hex(unsealed.as_bytes());
         assert!(matches!(
             stale.verify_integrity(),
