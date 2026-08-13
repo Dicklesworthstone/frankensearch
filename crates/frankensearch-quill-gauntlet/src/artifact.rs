@@ -4198,6 +4198,7 @@ pub struct PinnedDirectory {
     display_path: PathBuf,
 }
 
+#[cfg(feature = "fuzz-harness")]
 #[cfg(any(
     target_os = "android",
     target_os = "ios",
@@ -4219,6 +4220,7 @@ struct PinnedRegularFileIdentity {
     changed_nanoseconds: i64,
 }
 
+#[cfg(feature = "fuzz-harness")]
 #[cfg(any(
     target_os = "android",
     target_os = "ios",
@@ -4234,6 +4236,7 @@ pub(crate) struct PinnedRegularFile {
     post_io_sha256: [u8; 32],
 }
 
+#[cfg(feature = "fuzz-harness")]
 #[cfg(any(
     target_os = "android",
     target_os = "ios",
@@ -4622,6 +4625,7 @@ fn pinned_directory_before_sync(path: &Path) {
 )))]
 pub struct PinnedDirectory;
 
+#[cfg(feature = "fuzz-harness")]
 #[cfg(not(any(
     target_os = "android",
     target_os = "ios",
@@ -4741,6 +4745,7 @@ impl PinnedDirectory {
 
     /// Open or create one direct child directory through this pinned
     /// descriptor.  The resulting capability never follows a child symlink.
+    #[cfg(feature = "fuzz-harness")]
     pub(crate) fn ensure_child_directory(&self, name: &OsStr) -> Result<Self, GauntletError> {
         self.ensure_child(name)
     }
@@ -4785,7 +4790,7 @@ impl PinnedDirectory {
         name: &OsStr,
         max_bytes: u64,
     ) -> Result<Vec<u8>, GauntletError> {
-        let (bytes, _) = self.read_regular_bounded_open(name, max_bytes)?;
+        let (bytes, _, _) = self.read_regular_bounded_file(name, max_bytes)?;
         Ok(bytes)
     }
 
@@ -4793,11 +4798,29 @@ impl PinnedDirectory {
     /// Callers that expose a successful public operation must bind the final
     /// directory entry with [`Self::authenticate_regular_child`] before they
     /// release the returned handle.
+    #[cfg(feature = "fuzz-harness")]
     pub(crate) fn read_regular_bounded_open(
         &self,
         name: &OsStr,
         max_bytes: u64,
     ) -> Result<(Vec<u8>, PinnedRegularFile), GauntletError> {
+        let (bytes, file, after) = self.read_regular_bounded_file(name, max_bytes)?;
+        let post_io_sha256: [u8; 32] = Sha256::digest(&bytes).into();
+        Ok((
+            bytes,
+            PinnedRegularFile {
+                file,
+                post_io_identity: self.regular_file_identity(name, &after)?,
+                post_io_sha256,
+            },
+        ))
+    }
+
+    fn read_regular_bounded_file(
+        &self,
+        name: &OsStr,
+        max_bytes: u64,
+    ) -> Result<(Vec<u8>, File, rustix::fs::Stat), GauntletError> {
         use rustix::fs::{FileType, Mode, OFlags, fstat, openat};
         use rustix::io::Errno;
 
@@ -4853,15 +4876,7 @@ impl PinnedDirectory {
                 path: self.display_path.join(name),
             });
         }
-        let post_io_sha256: [u8; 32] = Sha256::digest(&bytes).into();
-        Ok((
-            bytes,
-            PinnedRegularFile {
-                file,
-                post_io_identity: self.regular_file_identity(name, &after)?,
-                post_io_sha256,
-            },
-        ))
+        Ok((bytes, file, after))
     }
 
     /// Bind a regular child name to a still-open descriptor after I/O.  Both
@@ -4869,6 +4884,7 @@ impl PinnedDirectory {
     /// stat must match the post-I/O device, inode, type, size, and timestamps.
     /// The descriptor is then re-read and compared to its post-I/O SHA-256 so
     /// an equal-length rewrite of the same inode cannot pass as authentic.
+    #[cfg(feature = "fuzz-harness")]
     pub(crate) fn authenticate_regular_child(
         &self,
         name: &OsStr,
@@ -4906,6 +4922,7 @@ impl PinnedDirectory {
 
     /// Sync the held directory after a final child entry is authenticated and
     /// before its public operation returns success.
+    #[cfg(feature = "fuzz-harness")]
     pub(crate) fn sync_directory(&self) -> Result<(), GauntletError> {
         #[cfg(all(test, feature = "fuzz-harness"))]
         pinned_directory_before_sync(&self.display_path);
@@ -4915,6 +4932,7 @@ impl PinnedDirectory {
     /// Reject a display path whose current directory object is no longer the
     /// one held by this capability.  Re-opening uses the same no-follow walk,
     /// so an inserted symlink is rejected as well.
+    #[cfg(feature = "fuzz-harness")]
     pub(crate) fn verify_display_path_identity(&self) -> Result<(), GauntletError> {
         use rustix::fs::fstat;
 
@@ -4936,6 +4954,7 @@ impl PinnedDirectory {
     /// either publish outcome as successful. A race that loses the no-replace
     /// publish leaves its completed staging entry intact and returns `Ok(None)`
     /// so callers can authenticate the winner.
+    #[cfg(feature = "fuzz-harness")]
     pub(crate) fn write_regular_create_new_and_read_back(
         &self,
         name: &OsStr,
@@ -5050,6 +5069,7 @@ impl PinnedDirectory {
         }
     }
 
+    #[cfg(feature = "fuzz-harness")]
     fn regular_file_sha256(
         &self,
         name: &OsStr,
@@ -5102,6 +5122,7 @@ impl PinnedDirectory {
         Ok(hasher.finalize().into())
     }
 
+    #[cfg(feature = "fuzz-harness")]
     fn regular_file_identity(
         &self,
         name: &OsStr,
@@ -5588,6 +5609,7 @@ impl PinnedDirectory {
         Self::unsupported()
     }
 
+    #[cfg(feature = "fuzz-harness")]
     pub(crate) fn ensure_child_directory(&self, _name: &OsStr) -> Result<Self, GauntletError> {
         Self::unsupported()
     }
@@ -5612,6 +5634,7 @@ impl PinnedDirectory {
         Self::unsupported()
     }
 
+    #[cfg(feature = "fuzz-harness")]
     pub(crate) fn read_regular_bounded_open(
         &self,
         _name: &OsStr,
@@ -5620,10 +5643,12 @@ impl PinnedDirectory {
         Self::unsupported()
     }
 
+    #[cfg(feature = "fuzz-harness")]
     pub(crate) fn verify_display_path_identity(&self) -> Result<(), GauntletError> {
         Self::unsupported()
     }
 
+    #[cfg(feature = "fuzz-harness")]
     pub(crate) fn authenticate_regular_child(
         &self,
         _name: &OsStr,
@@ -5632,10 +5657,12 @@ impl PinnedDirectory {
         Self::unsupported()
     }
 
+    #[cfg(feature = "fuzz-harness")]
     pub(crate) fn sync_directory(&self) -> Result<(), GauntletError> {
         Self::unsupported()
     }
 
+    #[cfg(feature = "fuzz-harness")]
     pub(crate) fn write_regular_create_new_and_read_back(
         &self,
         _name: &OsStr,
