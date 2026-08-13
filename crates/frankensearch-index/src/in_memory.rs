@@ -630,19 +630,15 @@ fn write_sidecar_u32_values(
     digest: &mut Sha256,
     values: &[u32],
 ) -> SearchResult<()> {
+    const U32_BYTES: usize = std::mem::size_of::<u32>();
+
     let mut buffer = [0_u8; 4096];
-    for chunk in values.chunks(buffer.len() / std::mem::size_of::<u32>()) {
-        for (slot, value) in buffer
-            .chunks_exact_mut(std::mem::size_of::<u32>())
-            .zip(chunk)
-        {
-            slot.copy_from_slice(&value.to_le_bytes());
+    for chunk in values.chunks(buffer.len() / U32_BYTES) {
+        let (slots, _) = buffer.as_chunks_mut::<U32_BYTES>();
+        for (slot, value) in slots.iter_mut().zip(chunk) {
+            *slot = value.to_le_bytes();
         }
-        write_sidecar_piece(
-            file,
-            digest,
-            &buffer[..chunk.len() * std::mem::size_of::<u32>()],
-        )?;
+        write_sidecar_piece(file, digest, &buffer[..std::mem::size_of_val(chunk)])?;
     }
     Ok(())
 }
@@ -653,19 +649,15 @@ fn write_sidecar_f32_values(
     digest: &mut Sha256,
     values: &[f32],
 ) -> SearchResult<()> {
+    const F32_BYTES: usize = std::mem::size_of::<f32>();
+
     let mut buffer = [0_u8; 4096];
-    for chunk in values.chunks(buffer.len() / std::mem::size_of::<f32>()) {
-        for (slot, value) in buffer
-            .chunks_exact_mut(std::mem::size_of::<f32>())
-            .zip(chunk)
-        {
-            slot.copy_from_slice(&value.to_le_bytes());
+    for chunk in values.chunks(buffer.len() / F32_BYTES) {
+        let (slots, _) = buffer.as_chunks_mut::<F32_BYTES>();
+        for (slot, value) in slots.iter_mut().zip(chunk) {
+            *slot = value.to_le_bytes();
         }
-        write_sidecar_piece(
-            file,
-            digest,
-            &buffer[..chunk.len() * std::mem::size_of::<f32>()],
-        )?;
+        write_sidecar_piece(file, digest, &buffer[..std::mem::size_of_val(chunk)])?;
     }
     Ok(())
 }
@@ -763,16 +755,19 @@ impl<'a> SidecarCursor<'a> {
 
     #[cfg(test)]
     fn f32_vec(&mut self, field: &str, len: usize, nonnegative: bool) -> SearchResult<Vec<f32>> {
+        const F32_BYTES: usize = std::mem::size_of::<f32>();
+
         let byte_len = len
-            .checked_mul(std::mem::size_of::<f32>())
+            .checked_mul(F32_BYTES)
             .ok_or_else(|| residual_sidecar_error(field, "payload length overflow"))?;
         let bytes = self.take(field, byte_len)?;
         let mut values = Vec::new();
         values
             .try_reserve_exact(len)
             .map_err(|_| residual_sidecar_error(field, "allocation failed"))?;
-        for chunk in bytes.chunks_exact(std::mem::size_of::<f32>()) {
-            let value = f32::from_le_bytes(chunk.try_into().expect("chunks have f32 width"));
+        let (chunks, _) = bytes.as_chunks::<F32_BYTES>();
+        for chunk in chunks {
+            let value = f32::from_le_bytes(*chunk);
             if !value.is_finite() || (nonnegative && value < 0.0) {
                 return Err(residual_sidecar_error(
                     field,
@@ -874,9 +869,8 @@ fn open_exact_residual_sidecar_file(path: &Path) -> SearchResult<Option<(File, r
     use rustix::fs::{FileType, Mode, OFlags, fstat, openat};
     use rustix::io::Errno;
 
-    let (directory, name) = match open_exact_residual_sidecar_parent(path) {
-        Ok(parts) => parts,
-        Err(_) => return Ok(None),
+    let Ok((directory, name)) = open_exact_residual_sidecar_parent(path) else {
+        return Ok(None);
     };
     let descriptor = match openat(
         &directory,
@@ -944,15 +938,15 @@ fn read_sidecar_u32_values<R: Read>(
     digest: &mut Sha256,
     values: &[u32],
 ) -> SearchResult<bool> {
+    const U32_BYTES: usize = std::mem::size_of::<u32>();
+
     let mut expected = [0_u8; 4096];
-    for values in values.chunks(expected.len() / std::mem::size_of::<u32>()) {
-        for (slot, value) in expected
-            .chunks_exact_mut(std::mem::size_of::<u32>())
-            .zip(values)
-        {
-            slot.copy_from_slice(&value.to_le_bytes());
+    for values in values.chunks(expected.len() / U32_BYTES) {
+        let (slots, _) = expected.as_chunks_mut::<U32_BYTES>();
+        for (slot, value) in slots.iter_mut().zip(values) {
+            *slot = value.to_le_bytes();
         }
-        let byte_len = values.len() * std::mem::size_of::<u32>();
+        let byte_len = std::mem::size_of_val(values);
         if !read_sidecar_piece(reader, digest, &expected[..byte_len])? {
             return Ok(false);
         }
@@ -966,15 +960,15 @@ fn read_sidecar_f32_values<R: Read>(
     digest: &mut Sha256,
     values: &[f32],
 ) -> SearchResult<bool> {
+    const F32_BYTES: usize = std::mem::size_of::<f32>();
+
     let mut expected = [0_u8; 4096];
-    for values in values.chunks(expected.len() / std::mem::size_of::<f32>()) {
-        for (slot, value) in expected
-            .chunks_exact_mut(std::mem::size_of::<f32>())
-            .zip(values)
-        {
-            slot.copy_from_slice(&value.to_le_bytes());
+    for values in values.chunks(expected.len() / F32_BYTES) {
+        let (slots, _) = expected.as_chunks_mut::<F32_BYTES>();
+        for (slot, value) in slots.iter_mut().zip(values) {
+            *slot = value.to_le_bytes();
         }
-        let byte_len = values.len() * std::mem::size_of::<f32>();
+        let byte_len = std::mem::size_of_val(values);
         if !read_sidecar_piece(reader, digest, &expected[..byte_len])? {
             return Ok(false);
         }
@@ -1109,8 +1103,9 @@ fn exact_residual_sidecar_stream_is_self_consistent(
     path: &Path,
     layout: &ExactResidualLayout,
 ) -> SearchResult<bool> {
-    /// Bounded stack chunk: the read is streaming precisely so an untrusted
-    /// candidate never turns into a second full-size heap image.
+    /// Bounded streaming chunk: the read is streaming precisely so an untrusted
+    /// candidate never turns into a second full-size heap image. The buffer is
+    /// this fixed size regardless of the candidate's declared length.
     const CHUNK_BYTES: usize = 64 * 1024;
 
     let Some((mut file, before)) = open_exact_residual_sidecar_file(path)? else {
@@ -1129,7 +1124,7 @@ fn exact_residual_sidecar_stream_is_self_consistent(
     };
 
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; CHUNK_BYTES];
+    let mut buffer = vec![0_u8; CHUNK_BYTES];
     let mut remaining = digested_bytes;
     while remaining != 0 {
         let wanted = remaining.min(CHUNK_BYTES);
@@ -1834,25 +1829,24 @@ impl InMemoryVectorIndex {
         cache_dir: &Path,
     ) -> SearchResult<Self> {
         let index = Self::from_admitted_v2(source)?;
-        let candidates = match index.exact_residual_sidecar_cache_candidates(cache_dir) {
-            Ok(Some(candidates)) => candidates,
+        let Ok(Some(candidates)) = index.exact_residual_sidecar_cache_candidates(cache_dir) else {
             // A cache directory that cannot be safely enumerated, or exhausts
             // its fixed discovery/comparison budget, is unavailable. Do not
             // build a large sidecar merely to discard it after an inevitable
             // publication failure; flat exact search is already the semantic
             // default. In this case publication is deliberately skipped.
-            Ok(None) | Err(_) => return Ok(index),
+            return Ok(index);
         };
         // Candidate verification is a read-only path: a valid immutable
         // sidecar must remain reusable from a read-only cache root. Its full
         // source-derived comparison is necessary before attachment, but must
         // not require a publication capability that reuse never consumes.
         #[cfg(target_os = "linux")]
-        let candidate_layout =
-            match ExactResidualLayout::for_shape(index.record_count(), index.dimension) {
-                Ok(layout) => layout,
-                Err(_) => return Ok(index),
-            };
+        let Ok(candidate_layout) =
+            ExactResidualLayout::for_shape(index.record_count(), index.dimension)
+        else {
+            return Ok(index);
+        };
         let mut derived = None;
         for candidate in candidates {
             // Fail-cheap admission. Discovery filters on the header alone, so a
@@ -1869,9 +1863,8 @@ impl InMemoryVectorIndex {
                 Ok(false) | Err(_) => continue,
             }
             if derived.is_none() {
-                let sidecar = match index.build_exact_residual_sidecar() {
-                    Ok(sidecar) => sidecar,
-                    Err(_) => return Ok(index),
+                let Ok(sidecar) = index.build_exact_residual_sidecar() else {
+                    return Ok(index);
                 };
                 derived = Some(sidecar);
             }
@@ -1900,9 +1893,8 @@ impl InMemoryVectorIndex {
         // repeated here.
         #[cfg(target_os = "linux")]
         let reserved_publication = {
-            let candidate = match index.next_exact_residual_sidecar_cache_path(cache_dir) {
-                Ok(candidate) => candidate,
-                Err(_) => return Ok(index),
+            let Ok(candidate) = index.next_exact_residual_sidecar_cache_path(cache_dir) else {
+                return Ok(index);
             };
             match acquire_exact_residual_sidecar_publication(&candidate) {
                 Ok(capability) => capability,
@@ -1929,16 +1921,18 @@ impl InMemoryVectorIndex {
             Err(_) => return Ok(index),
         }
         for _ in 0..EXACT_RESIDUAL_CACHE_ATTEMPTS {
-            let candidate = match index.next_exact_residual_sidecar_cache_path(cache_dir) {
-                Ok(candidate) => candidate,
-                Err(_) => break,
+            let Ok(candidate) = index.next_exact_residual_sidecar_cache_path(cache_dir) else {
+                break;
             };
             match publish_exact_residual_sidecar(&candidate, &sidecar) {
                 Ok(ExactResidualPublication::Published) => {
                     let _ = index.exact_residual_sidecar.set(sidecar);
                     break;
                 }
-                Ok(ExactResidualPublication::DestinationExists) => continue,
+                // A concurrent owner claimed this name; the next attempt draws
+                // a fresh one. This is the final statement of the loop body, so
+                // falling through is exactly one more attempt.
+                Ok(ExactResidualPublication::DestinationExists) => {}
                 Err(_) => break,
             }
         }
@@ -2004,18 +1998,16 @@ impl InMemoryVectorIndex {
             return Ok(None);
         };
         let prefix = self.exact_residual_generation_cache_prefix()?;
-        let layout = match ExactResidualLayout::for_shape(self.record_count(), self.dimension) {
-            Ok(layout) => layout,
-            Err(_) => return Ok(None),
+        let Ok(layout) = ExactResidualLayout::for_shape(self.record_count(), self.dimension) else {
+            return Ok(None);
         };
         let comparison_limit = EXACT_RESIDUAL_CACHE_COMPARISON_CANDIDATE_LIMIT
             .min(EXACT_RESIDUAL_CACHE_COMPARISON_BYTE_BUDGET / layout.encoded_bytes);
         if comparison_limit == 0 {
             return Ok(None);
         }
-        let mut entries = match std::fs::read_dir(cache_dir) {
-            Ok(entries) => entries,
-            Err(_) => return Ok(None),
+        let Ok(mut entries) = std::fs::read_dir(cache_dir) else {
+            return Ok(None);
         };
         let mut paths = Vec::new();
         paths
@@ -2047,7 +2039,11 @@ impl InMemoryVectorIndex {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            if !name.starts_with(&prefix) || !name.ends_with(".fsrs") {
+            // These names are generated by this module, so the suffix match is
+            // deliberately exact: a differently-cased name is not one of ours
+            // and must not be admitted. `strip_suffix` states that exactness
+            // directly instead of a case-folding extension comparison.
+            if !name.starts_with(&prefix) || name.strip_suffix(".fsrs").is_none() {
                 continue;
             }
             let header_matches = exact_residual_sidecar_header_matches_source(
@@ -2263,6 +2259,16 @@ impl InMemoryVectorIndex {
     ///
     /// Legacy and caller-built in-memory indexes have no source-generation
     /// witness, so they are deliberately rejected instead of fabricating one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the create-only publication capability cannot be
+    /// acquired, when the sidecar cannot be derived from this generation
+    /// (including a legacy or caller-built index carrying no source-generation
+    /// witness), when the descriptor-bound link or parent-directory sync fails,
+    /// or when the destination already exists, since a published sidecar is
+    /// immutable and is never overwritten. On a non-Linux target it always
+    /// returns an unsupported-platform error.
     pub fn write_exact_residual_sidecar(&self, path: &Path) -> SearchResult<()> {
         #[cfg(target_os = "linux")]
         {
@@ -2296,6 +2302,12 @@ impl InMemoryVectorIndex {
     /// mismatched, or already-replaced sidecar returns `false` and leaves the
     /// established f16 flat scan selected.  The non-error result is intentional:
     /// sidecars are an optional optimization, never part of semantic admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when re-deriving the comparison sidecar from the
+    /// admitted source fails. A missing, malformed, stale, or mismatched
+    /// sidecar is reported as `Ok(false)`, never as an error.
     pub fn try_open_exact_residual_sidecar(&self, path: &Path) -> SearchResult<bool> {
         let Some(source) = self.residual_source_binding.as_ref() else {
             return Ok(false);
@@ -2317,10 +2329,7 @@ impl InMemoryVectorIndex {
         // Once it matches, compare every serialized field and whole-file digest
         // directly from one descriptor with fixed stack buffers. This holds only
         // the trusted derived sidecar, never a second 512 MiB raw byte image.
-        let expected = match self.build_exact_residual_sidecar() {
-            Ok(expected) => expected,
-            Err(error) => return Err(error),
-        };
+        let expected = self.build_exact_residual_sidecar()?;
         #[cfg(target_os = "linux")]
         let exactly_matches =
             exact_residual_sidecar_stream_matches_derived(path, &expected).unwrap_or(false);
@@ -2338,7 +2347,7 @@ impl InMemoryVectorIndex {
     /// it is allowed to prune a candidate.  This makes a finite, rehashed payload
     /// mutation fail closed rather than merely look structurally well-formed.
     #[cfg(test)]
-    fn admit_exact_residual_sidecar(&self, sidecar: ExactResidualSidecar) -> SearchResult<bool> {
+    fn admit_exact_residual_sidecar(&self, sidecar: &ExactResidualSidecar) -> SearchResult<bool> {
         let Some(source) = self.residual_source_binding.as_ref() else {
             return Ok(false);
         };
@@ -2977,17 +2986,14 @@ impl InMemoryVectorIndex {
                 census: ResidualPruningCensus::default(),
             });
         }
-        let transformed = match ResidualQueryTransform::from_query(query, sidecar) {
-            Ok(transformed) => transformed,
+        let Ok(transformed) = ResidualQueryTransform::from_query(query, sidecar) else {
             // The transform and suffix norms belong exclusively to the
             // optional cache. Any preparation failure must be indistinguishable
             // from no cache: run the incumbent sequential exact scan.
-            Err(_) => {
-                return Ok(ResidualScanOutcome {
-                    heap: self.scan_sequential(query, limit, filter)?,
-                    census: ResidualPruningCensus::default(),
-                });
-            }
+            return Ok(ResidualScanOutcome {
+                heap: self.scan_sequential(query, limit, filter)?,
+                census: ResidualPruningCensus::default(),
+            });
         };
         if !transformed.f32_flat_envelope_is_finite {
             return Ok(ResidualScanOutcome {
@@ -3021,16 +3027,13 @@ impl InMemoryVectorIndex {
                 census: ResidualPruningCensus::default(),
             });
         }
-        let transformed = match ResidualQueryTransform::from_query(query, sidecar) {
-            Ok(transformed) => transformed,
+        let Ok(transformed) = ResidualQueryTransform::from_query(query, sidecar) else {
             // See the sequential route: cache-only preparation can never
             // change the result or error surface of the parallel exact scan.
-            Err(_) => {
-                return Ok(ResidualScanOutcome {
-                    heap: self.scan_parallel(query, limit, filter, row_chunk_size)?,
-                    census: ResidualPruningCensus::default(),
-                });
-            }
+            return Ok(ResidualScanOutcome {
+                heap: self.scan_parallel(query, limit, filter, row_chunk_size)?,
+                census: ResidualPruningCensus::default(),
+            });
         };
         if !transformed.f32_flat_envelope_is_finite {
             return Ok(ResidualScanOutcome {
@@ -3163,14 +3166,14 @@ impl InMemoryVectorIndex {
             let group_start = group * sidecar.lanes;
             let active_lanes = (sidecar.count - group_start).min(sidecar.lanes);
             let mut survives = [false; EXACT_RESIDUAL_LANES];
-            for lane in 0..active_lanes {
+            for (lane, survives_lane) in survives[..active_lanes].iter_mut().enumerate() {
                 let index = group_start + lane;
-                let passed = filter.map_or(true, |current_filter| {
+                let passed = filter.is_none_or(|current_filter| {
                     doc_id_hashes
                         .and_then(|hashes| current_filter.matches_doc_id_hash(hashes[index], None))
                         .unwrap_or_else(|| current_filter.matches(&self.doc_ids[index], None))
                 });
-                survives[lane] = passed;
+                *survives_lane = passed;
                 if passed {
                     census.eligible_lanes = census.eligible_lanes.saturating_add(1);
                 }
@@ -3247,8 +3250,8 @@ impl InMemoryVectorIndex {
             // The sidecar is an eliminator, never a scorer.  Survivors use the
             // exact incumbent operation, which makes the visible score and total
             // order identical to the flat path rather than merely numerically close.
-            for lane in 0..active_lanes {
-                if !survives[lane] {
+            for (lane, &survived) in survives[..active_lanes].iter().enumerate() {
+                if !survived {
                     continue;
                 }
                 let index = group_start + lane;
@@ -4148,7 +4151,7 @@ mod tests {
                     .expect("finite centroid norm has an outward f64 root");
             let mut partial = [0.0_f64; EXACT_RESIDUAL_LANES];
             for block_index in 0..sidecar.block_count() {
-                for lane in 0..active_lanes {
+                for (lane, &partial_lane) in partial[..active_lanes].iter().enumerate() {
                     let suffix_offset =
                         (group * (sidecar.block_count() + 1) + block_index) * sidecar.lanes + lane;
                     let upper_bound = residual_lane_upper_bound(
@@ -4159,7 +4162,7 @@ mod tests {
                         centroid_norm,
                         f64::from(sidecar.suffix_norms[suffix_offset]),
                         f64::from(sidecar.correction_norms[group * sidecar.lanes + lane]),
-                        partial[lane],
+                        partial_lane,
                     );
                     let exact_score =
                         dot_product_f16_f32(index.vector_slice(group_start + lane), query)
@@ -4176,8 +4179,8 @@ mod tests {
                     let query_value = f64::from(transformed.transformed[transformed_dimension]);
                     let base = group * sidecar.dimension * sidecar.lanes
                         + transformed_dimension * sidecar.lanes;
-                    for lane in 0..active_lanes {
-                        partial[lane] += query_value * f64::from(sidecar.residuals[base + lane]);
+                    for (lane, partial_lane) in partial[..active_lanes].iter_mut().enumerate() {
+                        *partial_lane += query_value * f64::from(sidecar.residuals[base + lane]);
                     }
                 }
             }
@@ -4573,10 +4576,8 @@ mod tests {
         for vector in vectors.iter_mut().skip(EXACT_RESIDUAL_LANES) {
             vector[0] = -1.0;
         }
-        let doc_ids = (0..count)
-            .map(|row| format!("read-only-candidate-{row}"))
-            .collect::<Vec<_>>();
-        let rows: Vec<(String, Vec<f32>)> = doc_ids.into_iter().zip(vectors).collect();
+        let doc_ids = (0..count).map(|row| format!("read-only-candidate-{row}"));
+        let rows: Vec<(String, Vec<f32>)> = doc_ids.zip(vectors).collect();
         let (binding, _) =
             write_fsvi_v2_fixture(&source_path, "residual-read-only", dimension, 57, &rows);
         let admitted = crate::VectorIndex::open_admitted_v2(&source_path, &binding)
@@ -5667,7 +5668,7 @@ mod tests {
         let flat = index.clone();
         assert!(
             index
-                .admit_exact_residual_sidecar(decoded)
+                .admit_exact_residual_sidecar(&decoded)
                 .expect("admit source-derived sidecar")
         );
         let filter = PredicateFilter::new("even ids", |id| {
@@ -5740,7 +5741,7 @@ mod tests {
             .expect("build witnessed sidecar");
         assert!(
             cached
-                .admit_exact_residual_sidecar(sidecar)
+                .admit_exact_residual_sidecar(&sidecar)
                 .expect("admit verified sidecar")
         );
         let query = make_normalized_vec(dimension, 4.25);
@@ -5757,7 +5758,12 @@ mod tests {
             },
         ];
 
-        let injections: [(&str, fn(), fn() -> bool); 2] = [
+        // A named allocation-failure injection site: the hook that arms the
+        // next failure, paired with the predicate that reports whether it is
+        // still pending.
+        type AllocationInjection = (&'static str, fn(), fn() -> bool);
+
+        let injections: [AllocationInjection; 2] = [
             (
                 "transform",
                 fail_next_residual_query_transform_allocation,
@@ -5901,7 +5907,7 @@ mod tests {
         );
         assert!(
             !index
-                .admit_exact_residual_sidecar(forged)
+                .admit_exact_residual_sidecar(&forged)
                 .expect("reject rehashed transformed forgery")
         );
         assert!(index.exact_residual_sidecar.get().is_none());
@@ -5923,7 +5929,7 @@ mod tests {
             .expect("empty exact sidecar is structurally valid");
         assert!(
             empty
-                .admit_exact_residual_sidecar(sidecar)
+                .admit_exact_residual_sidecar(&sidecar)
                 .expect("admit empty source-derived sidecar")
         );
         assert!(
@@ -5985,7 +5991,7 @@ mod tests {
         );
         assert!(
             !index
-                .admit_exact_residual_sidecar(foreign)
+                .admit_exact_residual_sidecar(&foreign)
                 .expect("foreign sidecar is rejected after re-derivation")
         );
         assert!(index.exact_residual_sidecar.get().is_none());
@@ -6130,7 +6136,7 @@ mod tests {
         assert_residual_bounds_cover_exact_scores(&index, &sidecar, &query);
         assert!(
             index
-                .admit_exact_residual_sidecar(sidecar)
+                .admit_exact_residual_sidecar(&sidecar)
                 .expect("admit exact SIMD sidecar")
         );
 
@@ -6187,8 +6193,14 @@ mod tests {
                     (0..dimension)
                         .map(|column| {
                             finite_f16_bits(
-                                seed.rotate_left(((row + column) % 16) as u32)
-                                    .wrapping_add((column * 211) as u16),
+                                seed.rotate_left(
+                                    u32::try_from((row + column) % 16)
+                                        .expect("a modulo-16 rotation fits u32"),
+                                )
+                                .wrapping_add(
+                                    u16::try_from(column * 211)
+                                        .expect("a bounded property column product fits u16"),
+                                ),
                             )
                         })
                         .collect()
@@ -6199,7 +6211,9 @@ mod tests {
                 .take(dimension)
                 .enumerate()
                 .map(|(column, &bits)| {
-                    bounded_finite_f32_bits(bits.rotate_right((column % 32) as u32))
+                    bounded_finite_f32_bits(bits.rotate_right(
+                        u32::try_from(column % 32).expect("a modulo-32 rotation fits u32"),
+                    ))
                 })
                 .collect();
             let mut index = InMemoryVectorIndex::from_vectors(
@@ -6240,7 +6254,7 @@ mod tests {
             .expect("build sidecar from admitted test source");
         assert!(
             index
-                .admit_exact_residual_sidecar(sidecar)
+                .admit_exact_residual_sidecar(&sidecar)
                 .expect("admit exact sidecar")
         );
         let query = {
@@ -6293,7 +6307,7 @@ mod tests {
         let sidecar = index.build_exact_residual_sidecar().expect("build sidecar");
         assert!(
             index
-                .admit_exact_residual_sidecar(sidecar)
+                .admit_exact_residual_sidecar(&sidecar)
                 .expect("admit sidecar")
         );
         let query = {
@@ -6343,7 +6357,7 @@ mod tests {
         let sidecar = index.build_exact_residual_sidecar().expect("build sidecar");
         assert!(
             index
-                .admit_exact_residual_sidecar(sidecar)
+                .admit_exact_residual_sidecar(&sidecar)
                 .expect("admit sidecar")
         );
         let query = make_normalized_vec(dimension, 4.0);
@@ -6387,7 +6401,7 @@ mod tests {
             .expect("build nonselective sidecar");
         assert!(
             index
-                .admit_exact_residual_sidecar(sidecar)
+                .admit_exact_residual_sidecar(&sidecar)
                 .expect("admit nonselective sidecar")
         );
         let params = SearchParams {
@@ -6438,7 +6452,7 @@ mod tests {
         let sidecar = index.build_exact_residual_sidecar().expect("build sidecar");
         assert!(
             index
-                .admit_exact_residual_sidecar(sidecar)
+                .admit_exact_residual_sidecar(&sidecar)
                 .expect("admit sidecar")
         );
         let query = vec![f32::MAX; dimension];
@@ -6536,7 +6550,7 @@ mod tests {
                 .expect("build target-scale sidecar");
             assert!(
                 index
-                    .admit_exact_residual_sidecar(sidecar)
+                    .admit_exact_residual_sidecar(&sidecar)
                     .expect("admit sidecar")
             );
             let census_outcome = index
