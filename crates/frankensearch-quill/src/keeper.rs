@@ -44,7 +44,8 @@ use crate::quiver::{
     EncodedPostingList, EncodedStatsSection, EncodedStoredMetaSection, FieldStats,
     IdHashCodecError, IdHashLookupPlan, IdHashSection, IdMapCodecError, IdMapEntry,
     IdMapEntryInput, IdMapPresence, IdMapSection, NumericEntry, NumericFieldInput, NumericSection,
-    PositionList, Posting, PostingList, StatsSection, StoredMetaFieldInput, StoredMetaSection,
+    PositionList, Posting, PostingList, StatsSection, StoredMetaCodecError, StoredMetaFieldInput,
+    StoredMetaLookup, StoredMetaSection, ValidatedStoredMetaLookupPlan,
     ValidatedTermPruningMetadata, aggregate_field_stats,
 };
 use crate::schema::{FieldKind, SchemaDescriptor};
@@ -2265,6 +2266,80 @@ impl TermDictionaryCacheCounters {
     }
 }
 
+/// Successful-only lazy cache for one immutable segment's validated
+/// STOREDMETA layout. The owned ranges remain bound to their exact source
+/// slice; the cache never retains a borrowed view into the segment bytes.
+struct StoredMetaLookupCache {
+    expected_field_ords: Box<[u16]>,
+    plan: OnceLock<ValidatedStoredMetaLookupPlan>,
+    #[cfg(test)]
+    lookup_calls: AtomicU64,
+    #[cfg(test)]
+    successful_plan_builds: AtomicU64,
+}
+
+impl StoredMetaLookupCache {
+    fn new(schema: SchemaDescriptor) -> Self {
+        let expected_field_ords = schema
+            .fields
+            .iter()
+            .filter(|field| field.stored)
+            .map(|field| field.id)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            expected_field_ords,
+            plan: OnceLock::new(),
+            #[cfg(test)]
+            lookup_calls: AtomicU64::new(0),
+            #[cfg(test)]
+            successful_plan_builds: AtomicU64::new(0),
+        }
+    }
+
+    fn lookup<'a>(
+        &'a self,
+        bytes: &'a [u8],
+        docid_lo: u64,
+        docid_hi: u64,
+    ) -> Result<StoredMetaLookup<'a>, StoredMetaCodecError> {
+        #[cfg(test)]
+        self.lookup_calls.fetch_add(1, AtomicOrdering::Relaxed);
+        if let Some(plan) = self.plan.get() {
+            return StoredMetaSection::from_validated_metadata(bytes, plan);
+        }
+
+        // Validate speculatively before publishing. Concurrent first readers
+        // may duplicate this bounded CPU work, but none can block an
+        // asupersync worker on a cancellation-blind mutex. Failed validation
+        // is never retained; exactly one successful plan wins publication.
+        let plan = StoredMetaSection::validate_metadata(
+            bytes,
+            docid_lo,
+            docid_hi,
+            &self.expected_field_ords,
+        )?;
+        if self.plan.set(plan).is_ok() {
+            #[cfg(test)]
+            self.successful_plan_builds
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        let plan = self
+            .plan
+            .get()
+            .expect("STOREDMETA plan must be initialized after successful validation");
+        StoredMetaSection::from_validated_metadata(bytes, plan)
+    }
+
+    #[cfg(test)]
+    fn counts(&self) -> (u64, u64) {
+        (
+            self.lookup_calls.load(AtomicOrdering::Relaxed),
+            self.successful_plan_builds.load(AtomicOrdering::Relaxed),
+        )
+    }
+}
+
 /// A full-prefix FSLX witness authenticated against one MANIFEST binding.
 ///
 /// Mapped and arbitrary byte-backed readers mint this receipt only after a
@@ -2331,6 +2406,7 @@ pub struct RecoveredSegment {
     live_doc_count: u32,
     rank_pruning_cache: Arc<RankPruningCache>,
     term_dictionary_metadata: Arc<ValidatedTermDictionaryMetadata>,
+    stored_meta_lookup_cache: Arc<StoredMetaLookupCache>,
     /// Whole-file xxh3 witness authenticated against the exact immutable
     /// backing and manifest binding. Owned tombstone-only rebinds carry this
     /// receipt unchanged after their O(1) successor admission.
@@ -2510,6 +2586,22 @@ impl RecoveredSegment {
         })?;
         let live_doc_count = manifest.live_doc_count();
 
+        // A tombstone-only owned rebind may retain a STOREDMETA plan only
+        // when its exact immutable backing is structurally the same. This
+        // check intentionally does not touch STOREDMETA: corrupted payloads
+        // must remain lazy until a stored-value request reaches them.
+        let stored_meta_lookup_cache = match reuse_from {
+            Some(previous)
+                if Arc::ptr_eq(&previous.reader, &reader)
+                    && previous.authenticated_file_witness.file_xxh3()
+                        == authenticated_file_witness.file_xxh3()
+                    && schema == previous.term_dictionary_metadata.schema() =>
+            {
+                Arc::clone(&previous.stored_meta_lookup_cache)
+            }
+            _ => Arc::new(StoredMetaLookupCache::new(schema)),
+        };
+
         // Reuse the predecessor's validated TERMDICT metadata only when every
         // content-identity witness proves the backing is byte-identical to
         // what that metadata was completely validated against.
@@ -2574,6 +2666,7 @@ impl RecoveredSegment {
             live_doc_count,
             rank_pruning_cache,
             term_dictionary_metadata,
+            stored_meta_lookup_cache,
             authenticated_file_witness,
             #[cfg(test)]
             term_dictionary_cache_counters,
@@ -2827,6 +2920,22 @@ impl RecoveredSegment {
     pub(crate) fn document_id_materialization_call_count(&self) -> u64 {
         self.document_id_materialization_calls
             .load(AtomicOrdering::Relaxed)
+    }
+
+    /// Borrow the validated STOREDMETA lookup for this segment's exact live
+    /// section bytes. The plan initializes only after the caller's lazy
+    /// section checksum access succeeds.
+    pub(crate) fn stored_meta_lookup<'a>(
+        &'a self,
+        bytes: &'a [u8],
+    ) -> Result<StoredMetaLookup<'a>, StoredMetaCodecError> {
+        self.stored_meta_lookup_cache
+            .lookup(bytes, self.manifest.docid_lo, self.manifest.docid_hi)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stored_meta_lookup_cache_counts(&self) -> (u64, u64) {
+        self.stored_meta_lookup_cache.counts()
     }
 
     fn contains_identity_row(&self, global_docid: u32) -> bool {

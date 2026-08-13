@@ -92,7 +92,7 @@ use crate::quiver::{
     BlockMaxError, DocLenCodecError, DocLenField, DocLenSection, EncodedNumericSection,
     NumericEntry, NumericField, NumericFieldInput, NumericSection, NumericValue,
     PositionCodecError, PositionList, Posting, PostingCodecError, PostingList, SnapshotFieldStats,
-    StoredMetaCodecError, StoredMetaSection,
+    StoredMetaCodecError,
 };
 use crate::schema::{Analyzer, DEFAULT_SCHEMA, FieldKind, SchemaDescriptor};
 use crate::scribe::{
@@ -973,21 +973,8 @@ impl QuillSearchSnapshot {
         let Some(segment) = self.keeper.live_segment_for_docid(global_docid) else {
             return Ok(None);
         };
-        let manifest = segment.manifest();
-        let stored_fields = self
-            .keeper
-            .schema()
-            .fields
-            .iter()
-            .filter(|field| field.stored)
-            .map(|field| field.id)
-            .collect::<Vec<_>>();
-        let stored = StoredMetaSection::parse(
-            required_section(segment, SectionKind::STOREDMETA)?,
-            manifest.docid_lo,
-            manifest.docid_hi,
-            &stored_fields,
-        )?;
+        let stored =
+            segment.stored_meta_lookup(required_section(segment, SectionKind::STOREDMETA)?)?;
         Ok(stored
             .field(field_ord)
             .and_then(|field| field.get(u64::from(global_docid)))
@@ -18940,6 +18927,106 @@ mod tests {
                     .map(RecoveredSegment::document_id_materialization_call_count)
                     .sum::<u64>(),
                 1
+            );
+        });
+    }
+
+    #[test]
+    fn stored_value_hydration_parent_red_reuses_one_plan_for_two_sealed_winners() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(QuillConfig {
+                deterministic_ingest: true,
+                tier_fanout: usize::MAX,
+                ..QuillConfig::default()
+            })
+            .expect("create same-segment stored-value index");
+            for document in [
+                IndexableDocument::new("stored-first", "needle first payload")
+                    .with_metadata("path", "src/first.rs"),
+                IndexableDocument::new("stored-second", "needle second payload")
+                    .with_metadata("path", "src/second.rs"),
+            ] {
+                LexicalWrite::index_document(&index, &cx, &document)
+                    .await
+                    .expect("stage stored-value winner");
+            }
+            LexicalWrite::commit(&index, &cx)
+                .await
+                .expect("seal both stored-value winners together");
+
+            let snapshot = index.search_snapshot().expect("pin sealed winner snapshot");
+            assert_eq!(snapshot.keeper.segments().len(), 1);
+            let segment = &snapshot.keeper.segments()[0];
+            let exact_segment_bytes = segment.source_bytes().to_vec();
+            assert_eq!(segment.stored_meta_lookup_cache_counts(), (0, 0));
+
+            let first_docid = snapshot
+                .resolve_document_id("stored-first")
+                .expect("resolve first winner")
+                .expect("first winner is live");
+            let second_docid = snapshot
+                .resolve_document_id("stored-second")
+                .expect("resolve second winner")
+                .expect("second winner is live");
+
+            let batch = LexicalRead::search_candidates(&index, &cx, "needle", 10)
+                .await
+                .expect("select two deferred stored-value winners");
+            let (mut winners, pin) = batch.into_parts();
+            assert_eq!(
+                winners.len(),
+                2,
+                "fixture must hydrate two same-segment winners"
+            );
+            assert!(winners.iter().all(|winner| winner.metadata.is_none()));
+
+            LexicalRead::hydrate_candidates(&index, &cx, pin.as_ref(), &mut winners)
+                .await
+                .expect("hydrate both stored-value winners");
+            for winner in &winners {
+                match winner.doc_id.as_str() {
+                    "stored-first" => assert_eq!(
+                        winner.metadata.as_deref(),
+                        Some(&serde_json::json!({"path": "src/first.rs"}))
+                    ),
+                    "stored-second" => assert_eq!(
+                        winner.metadata.as_deref(),
+                        Some(&serde_json::json!({"path": "src/second.rs"}))
+                    ),
+                    other => panic!("unexpected stored-value winner {other}"),
+                }
+            }
+            assert_eq!(segment.source_bytes(), exact_segment_bytes.as_slice());
+            let plan_counts = segment.stored_meta_lookup_cache_counts();
+            assert_eq!(plan_counts, (2, 1));
+
+            assert_eq!(
+                snapshot
+                    .materialize_stored_value(u16::MAX, first_docid)
+                    .expect("read absent stored field"),
+                None,
+                "an absent stored value must remain absent"
+            );
+            assert!(
+                index
+                    .delete_document(&cx, "stored-second")
+                    .await
+                    .expect("tombstone second winner")
+            );
+            let tombstoned = index
+                .search_snapshot()
+                .expect("pin tombstoned same-backing successor");
+            assert_eq!(
+                tombstoned
+                    .materialize_stored_value(CONTENT_FIELD, second_docid)
+                    .expect("read tombstoned stored content"),
+                None,
+                "a tombstoned row must not materialize stored bytes"
+            );
+            assert_eq!(
+                tombstoned.keeper.segments()[0].stored_meta_lookup_cache_counts(),
+                (3, 1),
+                "tombstone-only rebinds share the one plan only for the exact immutable backing"
             );
         });
     }

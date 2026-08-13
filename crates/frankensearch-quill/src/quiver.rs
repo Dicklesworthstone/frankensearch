@@ -10490,6 +10490,10 @@ pub enum StoredMetaCodecError {
         /// Actual size.
         actual: usize,
     },
+    /// A cached lookup plan was paired with bytes other than the exact source
+    /// it completely validated.
+    #[error("validated STOREDMETA metadata is bound to a different byte source")]
+    DifferentByteSource,
     /// Concatenation requires at least one validated source section.
     #[error("cannot concatenate an empty STOREDMETA section list")]
     EmptyConcat,
@@ -10521,6 +10525,52 @@ struct StoredMetaFieldMeta {
     presence: Range<usize>,
     offsets: Range<usize>,
     blob: Range<usize>,
+}
+
+/// Owned, allocation-bounded metadata produced by one complete STOREDMETA
+/// validation.
+///
+/// This remains crate-private so callers cannot pair the validated ranges with
+/// unrelated bytes. [`StoredMetaSection::from_validated_metadata`] proves the
+/// exact live slice address and length before exposing a borrowed lookup.
+#[derive(Debug)]
+pub(crate) struct ValidatedStoredMetaLookupPlan {
+    source_start: usize,
+    source_len: usize,
+    docid_lo: u64,
+    fields: Vec<StoredMetaFieldMeta>,
+}
+
+/// Cheap borrowed lookup over one exact STOREDMETA source validated by a
+/// [`ValidatedStoredMetaLookupPlan`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StoredMetaLookup<'a> {
+    bytes: &'a [u8],
+    docid_lo: u64,
+    fields: &'a [StoredMetaFieldMeta],
+}
+
+impl<'a> StoredMetaLookup<'a> {
+    /// Bind one stored field for repeated zero-copy lookups.
+    #[must_use]
+    pub(crate) fn field(self, field_ord: u16) -> Option<StoredMetaField<'a>> {
+        let index = self
+            .fields
+            .binary_search_by_key(&field_ord, |field| field.field_ord)
+            .ok()?;
+        self.field_at(index)
+    }
+
+    fn field_at(self, index: usize) -> Option<StoredMetaField<'a>> {
+        let field = self.fields.get(index)?;
+        Some(StoredMetaField {
+            field_ord: field.field_ord,
+            docid_lo: self.docid_lo,
+            presence: self.bytes.get(field.presence.clone())?,
+            offsets: self.bytes.get(field.offsets.clone())?,
+            blob: self.bytes.get(field.blob.clone())?,
+        })
+    }
 }
 
 /// Owned canonical bytes produced by the fresh-seal STOREDMETA writer.
@@ -11856,6 +11906,41 @@ impl<'a> StoredMetaSection<'a> {
             docid_lo,
             docid_hi,
             fields,
+        })
+    }
+
+    /// Perform one complete validation and retain only owned lookup metadata.
+    ///
+    /// The returned plan is bound to this exact byte slice by address and
+    /// length. It owns ranges only, never references the source bytes.
+    pub(crate) fn validate_metadata(
+        bytes: &'a [u8],
+        docid_lo: u64,
+        docid_hi: u64,
+        expected_field_ords: &[u16],
+    ) -> Result<ValidatedStoredMetaLookupPlan, StoredMetaCodecError> {
+        let section = Self::parse(bytes, docid_lo, docid_hi, expected_field_ords)?;
+        Ok(ValidatedStoredMetaLookupPlan {
+            source_start: bytes.as_ptr() as usize,
+            source_len: bytes.len(),
+            docid_lo: section.docid_lo,
+            fields: section.fields,
+        })
+    }
+
+    /// Construct a cheap borrowed lookup over the exact bytes validated by
+    /// [`Self::validate_metadata`].
+    pub(crate) fn from_validated_metadata<'b>(
+        bytes: &'b [u8],
+        metadata: &'b ValidatedStoredMetaLookupPlan,
+    ) -> Result<StoredMetaLookup<'b>, StoredMetaCodecError> {
+        if bytes.len() != metadata.source_len || bytes.as_ptr() as usize != metadata.source_start {
+            return Err(StoredMetaCodecError::DifferentByteSource);
+        }
+        Ok(StoredMetaLookup {
+            bytes,
+            docid_lo: metadata.docid_lo,
+            fields: &metadata.fields,
         })
     }
 
