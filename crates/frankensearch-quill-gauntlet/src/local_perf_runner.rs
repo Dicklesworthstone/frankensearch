@@ -226,6 +226,8 @@ static QG1_FORWARDER_TEST_ARTIFACT_NONCE: AtomicU64 = AtomicU64::new(1);
 #[cfg(test)]
 const QG1_PROCESS_TREE_TEST_ENV: &str = "QUILL_PERF_TEST_QG1_PROCESS_TREE";
 #[cfg(test)]
+const QG1_PROCESS_TREE_TEST_EXECUTION_PREFIX: &str = "qg1-process-tree-fixture-executed:";
+#[cfg(test)]
 const QG1_FORWARDER_TEST_CREATE_ATTEMPTS: u64 = 64;
 const EMBEDDED_PRODUCER_CONTRACT_VERSION: &str = env!("QUILL_PERF_PRODUCER_CONTRACT_VERSION");
 const EMBEDDED_PRODUCER_GIT_REVISION: &str = env!("QUILL_PERF_PRODUCER_GIT_REVISION");
@@ -8235,7 +8237,9 @@ mod tests {
     /// exercises the real parent wait/kill/reap boundary; it merely owns a
     /// process tree with no sibling test children.
     fn qg1_process_tree_test_runs_in_isolated_child(test_name: &str) -> bool {
+        let execution_witness = qg1_process_tree_test_execution_witness(test_name);
         if std::env::var_os(QG1_PROCESS_TREE_TEST_ENV).as_deref() == Some(OsStr::new(test_name)) {
+            println!("{execution_witness}");
             return false;
         }
 
@@ -8244,13 +8248,49 @@ mod tests {
             .env(QG1_PROCESS_TREE_TEST_ENV, test_name)
             .output()
             .expect("run isolated QG-1 process-tree fixture");
-        assert!(
-            output.status.success(),
-            "isolated QG-1 process-tree fixture {test_name:?} failed; stdout {:?}; stderr {:?}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        verify_qg1_process_tree_test_execution(test_name, &output)
+            .unwrap_or_else(|error| panic!("{error}"));
         true
+    }
+
+    fn qg1_process_tree_test_execution_witness(test_name: &str) -> String {
+        format!("{QG1_PROCESS_TREE_TEST_EXECUTION_PREFIX}{test_name}")
+    }
+
+    fn verify_qg1_process_tree_test_execution(
+        test_name: &str,
+        output: &std::process::Output,
+    ) -> Result<(), String> {
+        let expected_witness = qg1_process_tree_test_execution_witness(test_name);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let witness_count = stdout
+            .lines()
+            .filter(|line| *line == expected_witness)
+            .count();
+        if output.status.success() && witness_count == 1 {
+            return Ok(());
+        }
+        Err(format!(
+            "isolated QG-1 process-tree fixture {test_name:?} must exit successfully after exactly one execution witness {expected_witness:?}; status {:?}; witness count {witness_count}; stdout {stdout:?}; stderr {:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+
+    #[test]
+    fn qg1_process_tree_isolation_refuses_successful_zero_test_output() {
+        let test_name = "local_perf_runner::tests::qg1_actual_parent_wait_kill_reap_covers_final_ack_and_exact_startup_set";
+        let output = std::process::Output {
+            status: ExitStatus::from_raw(0),
+            stdout: b"running 0 tests\n\ntest result: ok. 0 passed; 0 failed\n".to_vec(),
+            stderr: Vec::new(),
+        };
+        let error = verify_qg1_process_tree_test_execution(test_name, &output)
+            .expect_err("a successful empty libtest filter must not prove fixture execution");
+        assert!(
+            error.contains("witness count 0"),
+            "the empty-filter rejection must name the missing execution witness: {error}"
+        );
     }
 
     fn qg1_wait_result_for_test(
