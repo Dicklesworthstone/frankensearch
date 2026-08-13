@@ -1436,6 +1436,27 @@ struct Qg2ContinuousMeasurement {
     work_units: u64,
     origin: Instant,
     elapsed_ns: u64,
+    /// The retired shape, measured in this same invocation: the feed's own
+    /// timing plus the commit's own timing, summed. Retained as a diagnostic so
+    /// tail inclusion can be proved against the interval that produced it,
+    /// rather than against a second run whose cache and scheduler state differ.
+    /// The published value is never computed from this.
+    feed_and_commit_ns: u64,
+    /// Why the engine is quiescent at the terminal endpoint. A successful tail
+    /// search proves VISIBILITY; it does not by itself prove the writer side
+    /// settled, so the basis is recorded separately and asserted separately.
+    quiescence: Qg2QuiescenceBasis,
+}
+
+/// The engine-specific fact that establishes quiescence at a QG-2 endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Qg2QuiescenceBasis {
+    /// The terminal commit published a new Keeper generation, so no publication
+    /// is still in flight behind the tail that was just read.
+    QuillPublishedGeneration { delta: u64 },
+    /// Tantivy's writer workers joined without rearming a replacement writer,
+    /// so no merge or write thread is still running behind the retained reader.
+    TantivyWorkersJoined { rearmed: bool },
 }
 
 /// One measured cell value, plus the continuous interval behind it when the
@@ -2865,9 +2886,29 @@ fn qg2_bulk_metric_continuous(
     arm: EngineArm,
     count: u64,
 ) -> MetricMeasurement {
+    qg2_bulk_metric_continuous_with_planted_tail_delay(context, spec, arm, count, None)
+}
+
+/// [`qg2_bulk_metric_continuous`] with a bounded delay planted between the
+/// terminal commit and the terminal searchable/quiescent endpoint.
+///
+/// Production always passes `None`, so the shipping path is byte-identical to
+/// the function above. The seam exists because tail inclusion cannot be proved
+/// by comparing two runs: scheduler and cache variation can make a run that
+/// covers MORE lifecycle finish sooner. Planting a known interval inside the
+/// endpoint and measuring both shapes in ONE invocation makes the difference
+/// deterministic — the delay is by construction inside the continuous span and
+/// outside the summed feed-plus-commit span.
+fn qg2_bulk_metric_continuous_with_planted_tail_delay(
+    context: &BenchContext,
+    spec: &PerfCellSpec,
+    arm: EngineArm,
+    count: u64,
+    planted_tail_delay: Option<Duration>,
+) -> MetricMeasurement {
     let corpus = corpus_for(count);
     let tail_document_id = generated_tail_document_id(&corpus, count);
-    let (origin, elapsed_ns) = match arm {
+    let (origin, elapsed_ns, feed_and_commit_ns, quiescence) = match arm {
         EngineArm::Quill => {
             let index = quill_in_memory(spec);
             let generation_before = index
@@ -2879,8 +2920,13 @@ fn qg2_bulk_metric_continuous(
             // The interval opens at the first feed: corpus and index
             // construction are setup, not update throughput.
             let origin = Instant::now();
-            let _ = index_batches(context, &index, &corpus, count, None);
-            let _ = commit(context, &index);
+            let feed = index_batches(context, &index, &corpus, count, None);
+            let commit_elapsed = commit(context, &index);
+            let feed_and_commit_ns = u64::try_from((feed + commit_elapsed).as_nanos())
+                .expect("summed feed and commit fits u64 ns");
+            if let Some(delay) = planted_tail_delay {
+                std::thread::sleep(delay);
+            }
             let visible = index
                 .benchmark_search_exact_id(&tail_document_id)
                 .expect("QG-2 Quill terminal exact-ID probe");
@@ -2894,10 +2940,15 @@ fn qg2_bulk_metric_continuous(
                 .loaded_manifest()
                 .manifest
                 .generation;
+            // Quiescence basis, stated rather than inferred: a tail that reads
+            // back proves visibility only. What proves nothing is still in
+            // flight behind it is that the terminal commit actually published a
+            // generation, so that delta is the recorded basis.
+            let delta = generation_after.saturating_sub(generation_before);
             assert!(
-                generation_after > generation_before,
-                "QG-2 Quill terminal commit must publish a new generation before the tail is \
-                 searchable"
+                delta > 0,
+                "QG-2 Quill terminal commit must publish a new generation; a tail that merely \
+                 reads back does not establish quiescence"
             );
             assert_eq!(
                 visible
@@ -2905,16 +2956,26 @@ fn qg2_bulk_metric_continuous(
                     .map(String::from)
                     .collect::<Vec<_>>()
                     .as_slice(),
-                [tail_document_id.clone()],
+                std::slice::from_ref(&tail_document_id),
                 "QG-2 Quill interval must end with the exact tail document searchable"
             );
-            (origin, elapsed_ns)
+            (
+                origin,
+                elapsed_ns,
+                feed_and_commit_ns,
+                Qg2QuiescenceBasis::QuillPublishedGeneration { delta },
+            )
         }
         EngineArm::Tantivy => {
             let index = tantivy_in_memory(spec);
             let origin = Instant::now();
-            let _ = index_batches(context, &index, &corpus, count, None);
-            let _ = commit(context, &index);
+            let feed = index_batches(context, &index, &corpus, count, None);
+            let commit_elapsed = commit(context, &index);
+            let feed_and_commit_ns = u64::try_from((feed + commit_elapsed).as_nanos())
+                .expect("summed feed and commit fits u64 ns");
+            if let Some(delay) = planted_tail_delay {
+                std::thread::sleep(delay);
+            }
             // Symmetric endpoint: Tantivy's writer workers must have settled
             // before its retained reader answers, which is the same
             // searchable-and-quiescent state the Quill arm ends in.
@@ -2935,10 +2996,20 @@ fn qg2_bulk_metric_continuous(
                     .map(String::from)
                     .collect::<Vec<_>>()
                     .as_slice(),
-                [tail_document_id.clone()],
+                std::slice::from_ref(&tail_document_id),
                 "QG-2 Tantivy interval must end with the exact tail document searchable"
             );
-            (origin, elapsed_ns)
+            (
+                origin,
+                elapsed_ns,
+                feed_and_commit_ns,
+                // Symmetric basis: the writer workers joined and no replacement
+                // writer was armed, so nothing is still running behind the
+                // retained reader that just answered.
+                Qg2QuiescenceBasis::TantivyWorkersJoined {
+                    rearmed: terminal_join_receipt.writer_rearmed,
+                },
+            )
         }
     };
     assert!(
@@ -2952,6 +3023,8 @@ fn qg2_bulk_metric_continuous(
             work_units: count,
             origin,
             elapsed_ns,
+            feed_and_commit_ns,
+            quiescence,
         }),
     }
 }
@@ -8248,19 +8321,56 @@ mod qg2_continuous_tests {
                 measurement.value.is_finite() && measurement.value > 0.0,
                 "{arm:?} QG-2 cell must return positive finite throughput"
             );
+            // Quiescence is asserted on its own basis, not inferred from the
+            // tail search succeeding: visibility and a settled writer side are
+            // different claims, and only the second one licenses ending the
+            // interval here.
+            match interval.quiescence {
+                super::Qg2QuiescenceBasis::QuillPublishedGeneration { delta } => {
+                    assert_eq!(
+                        arm,
+                        super::EngineArm::Quill,
+                        "the published-generation basis belongs to the Quill arm"
+                    );
+                    assert!(
+                        delta > 0,
+                        "Quill quiescence requires the terminal commit to have published"
+                    );
+                }
+                super::Qg2QuiescenceBasis::TantivyWorkersJoined { rearmed } => {
+                    assert_eq!(
+                        arm,
+                        super::EngineArm::Tantivy,
+                        "the joined-workers basis belongs to the Tantivy arm"
+                    );
+                    assert!(
+                        !rearmed,
+                        "Tantivy quiescence requires the terminal join to leave no replacement \
+                         writer armed"
+                    );
+                }
+            }
+            assert!(
+                interval.elapsed_ns > interval.feed_and_commit_ns,
+                "{arm:?} unplanted interval must still cover more than its summed calls"
+            );
         }
     }
 
-    /// PLANTED NEGATIVE: the summed-call shape this correction replaced.
+    /// PLANTED NEGATIVE: the summed-call shape this correction replaced, proved
+    /// against a delay planted inside the endpoint that shape drops.
     ///
-    /// Summing an independently timed feed and an independently timed commit
-    /// reproduces the old value, and it is strictly smaller than the continuous
-    /// interval because it drops everything after the commit returns — the tail
-    /// becoming searchable and the engine going quiescent. That difference is
-    /// the tail loss, and asserting it is what fails closed if anyone restores
-    /// the sum.
+    /// Comparing two runs would prove nothing: a run covering MORE lifecycle can
+    /// finish sooner when cache and scheduler state differ, so a
+    /// cross-invocation `>` is flaky and says nothing about inclusion. Both
+    /// shapes are therefore measured in ONE invocation, with a known interval
+    /// planted after the commit returns and before the terminal
+    /// searchable/quiescent endpoint. That interval is inside the continuous
+    /// span by construction and outside the summed span by construction, so
+    /// their difference is bounded below by the planted delay on a single
+    /// monotonic clock.
     #[test]
-    fn summed_feed_and_commit_loses_the_searchable_tail() {
+    fn summed_feed_and_commit_excludes_the_planted_terminal_tail() {
         let spec = qg2_spec();
         let context = super::BenchContext::for_selected(
             super::MatrixScale::Smoke,
@@ -8269,38 +8379,56 @@ mod qg2_continuous_tests {
         let count = context
             .scale
             .document_count(spec.document_count.expect("QG-2 document count"));
-        let corpus = super::corpus_for(count);
+        const PLANTED_TAIL_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+        let planted_ns =
+            u64::try_from(PLANTED_TAIL_DELAY.as_nanos()).expect("planted delay fits u64 ns");
 
-        // Exactly the defect: two independent timings, summed.
-        let index = super::quill_in_memory(&spec);
-        let feed = super::index_batches(&context, &index, &corpus, count, None);
-        let commit = super::commit(&context, &index);
-        let summed_ns =
-            u64::try_from((feed + commit).as_nanos()).expect("summed monotonic ns fits u64");
+        for arm in [super::EngineArm::Quill, super::EngineArm::Tantivy] {
+            let measurement = super::qg2_bulk_metric_continuous_with_planted_tail_delay(
+                &context,
+                &spec,
+                arm,
+                count,
+                Some(PLANTED_TAIL_DELAY),
+            );
+            let interval = measurement
+                .qg2_continuous
+                .as_ref()
+                .expect("the continuous path publishes its interval");
 
-        let continuous =
-            super::qg2_bulk_metric_continuous(&context, &spec, super::EngineArm::Quill, count);
-        let interval = continuous
-            .qg2_continuous
-            .as_ref()
-            .expect("the continuous path publishes its interval");
-        assert!(
-            interval.elapsed_ns > summed_ns,
-            "the continuous interval must strictly contain the summed calls; summed {summed_ns}ns \
-             vs continuous {}ns means the searchable-and-quiescent tail was not measured",
-            interval.elapsed_ns
-        );
-        assert!(
-            super::throughput_per_second(count, summed_ns)
-                > super::throughput_per_second(count, interval.elapsed_ns),
-            "the summed shape reports a faster rate than the interval it omits time from, which is \
-             exactly why it can never be the published QG-2 value"
-        );
+            // The retired shape stops when the commit returns, so it cannot
+            // have observed one nanosecond of the planted tail.
+            assert!(
+                interval.elapsed_ns > interval.feed_and_commit_ns,
+                "{arm:?} continuous interval must strictly exceed the summed feed and commit it \
+                 contains"
+            );
+            let tail_ns = interval.elapsed_ns - interval.feed_and_commit_ns;
+            assert!(
+                tail_ns >= planted_ns,
+                "{arm:?} continuous endpoint must include the planted {planted_ns}ns tail, but it \
+                 covered only {tail_ns}ns beyond the summed calls, so the terminal \
+                 searchable-and-quiescent state was not inside the measured span"
+            );
+
+            // The same fact as the consequence that matters, stated on this one
+            // invocation's own numbers rather than across runs or engines.
+            assert!(
+                super::throughput_per_second(count, interval.feed_and_commit_ns)
+                    > super::throughput_per_second(count, interval.elapsed_ns),
+                "{arm:?} summed shape must report the faster rate it obtains by dropping the tail"
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    // A child module inherits none of the root's imports, so every bare name
+    // below would otherwise have to be re-imported per function. Bringing the
+    // parent scope in is the module-structure fix, not a lint silencer.
+    use super::*;
+
     fn qg1_handshake_test_producer() -> frankensearch_quill_gauntlet::Qg1LifecycleProducer {
         use frankensearch_quill_gauntlet::{
             PairedEstimatorConfig, PerfMetricSemantics, PerfOperationScope, PerfSampleArm,
@@ -8352,8 +8480,12 @@ mod tests {
             .expect("construct one real pre-timing QG-1 producer")
     }
 
+    /// Parent-visible because `main` dispatches to it under the same
+    /// `cfg(test)` barrier. A child module's private items are not visible to
+    /// its parent, and the honest fix is to widen exactly this one helper
+    /// rather than to hide the call site that needs it.
     #[test]
-    fn qg1_authority_subprocess_helper() {
+    pub(super) fn qg1_authority_subprocess_helper() {
         if std::env::var_os(super::QG1_AUTHORITY_SUBPROCESS_ENV).is_none() {
             return;
         }
