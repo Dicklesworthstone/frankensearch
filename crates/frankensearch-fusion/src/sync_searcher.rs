@@ -733,6 +733,7 @@ impl SyncTwoTierSearcher {
                     vectors_searched: phase1_vectors_searched,
                     lexical_candidates: metrics.lexical_candidates,
                     fused_count: initial_results.len(),
+                    skip_reason: metrics.skip_reason.clone(),
                 },
             });
         }
@@ -960,6 +961,7 @@ impl SyncTwoTierSearcher {
                     vectors_searched: quality_count,
                     lexical_candidates: metrics.lexical_candidates,
                     fused_count: refined_results.len(),
+                    skip_reason: None,
                 },
                 rank_changes,
             });

@@ -4015,6 +4015,14 @@ pub struct PhaseMetrics {
     pub lexical_candidates: usize,
     /// Number of results after fusion.
     pub fused_count: usize,
+    /// Why this phase skipped semantic work, when it did.
+    ///
+    /// Absent on a healthy semantic Initial. Present when results are
+    /// lexical-only or otherwise degraded (hash embedder, missing quality
+    /// index, circuit breaker, …). Callers that treat Initial as "semantic
+    /// hits" must inspect this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
 }
 
 /// Structured telemetry for a completed search request.
@@ -6328,6 +6336,7 @@ mod tests {
                 vectors_searched: 1000,
                 lexical_candidates: 50,
                 fused_count: 10,
+                skip_reason: None,
             },
         };
         if let SearchPhase::Initial { latency, .. } = phase {
@@ -6731,6 +6740,7 @@ mod tests {
             vectors_searched: 500,
             lexical_candidates: 30,
             fused_count: 10,
+            skip_reason: None,
         };
         let json = serde_json::to_string(&metrics).unwrap();
         let decoded: PhaseMetrics = serde_json::from_str(&json).unwrap();
@@ -6799,6 +6809,7 @@ mod tests {
                 vectors_searched: 2000,
                 lexical_candidates: 100,
                 fused_count: 20,
+                skip_reason: None,
             },
             rank_changes: RankChanges {
                 promoted: 4,
@@ -6842,6 +6853,7 @@ mod tests {
                 vectors_searched: 2000,
                 lexical_candidates: 100,
                 fused_count: 20,
+                skip_reason: None,
             },
         };
         assert!(matches!(phase, SearchPhase::Reranked { .. }));
@@ -6865,6 +6877,7 @@ mod tests {
                 vectors_searched: 0,
                 lexical_candidates: 0,
                 fused_count: 0,
+                skip_reason: None,
             },
         };
         let dbg = format!("{phase:?}");

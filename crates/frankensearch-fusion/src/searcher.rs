@@ -1085,6 +1085,7 @@ impl TwoTierSearcher {
                 vectors_searched: metrics.phase1_vectors_searched,
                 lexical_candidates: metrics.lexical_candidates,
                 fused_count: display_hits.len(),
+                skip_reason: metrics.skip_reason.clone(),
             },
         });
 
@@ -1276,6 +1277,7 @@ impl TwoTierSearcher {
                                 vectors_searched: metrics.phase2_vectors_searched,
                                 lexical_candidates: metrics.lexical_candidates,
                                 fused_count: refined_count,
+                                skip_reason: None,
                             },
                             rank_changes: metrics.rank_changes.clone(),
                         });
@@ -1349,6 +1351,7 @@ impl TwoTierSearcher {
                                             vectors_searched: metrics.phase2_vectors_searched,
                                             lexical_candidates: metrics.lexical_candidates,
                                             fused_count: reranked_count,
+                                            skip_reason: None,
                                         },
                                     });
                                 }
@@ -6813,6 +6816,7 @@ mod tests {
                 .with_lexical(lexical);
 
             let mut initial_results = Vec::new();
+            let mut initial_skip = None;
             let metrics = searcher
                 .search(
                     &cx,
@@ -6820,8 +6824,12 @@ mod tests {
                     5,
                     |_| None,
                     |phase| {
-                        if let SearchPhase::Initial { results, .. } = phase {
+                        if let SearchPhase::Initial {
+                            results, metrics, ..
+                        } = phase
+                        {
                             initial_results = results;
+                            initial_skip = metrics.skip_reason;
                         }
                     },
                 )
@@ -6840,6 +6848,10 @@ mod tests {
             assert_eq!(metrics.lexical_candidates, 3);
             assert_eq!(
                 metrics.skip_reason.as_deref(),
+                Some("non_semantic_fast_embedder_lexical_short_circuit")
+            );
+            assert_eq!(
+                initial_skip.as_deref(),
                 Some("non_semantic_fast_embedder_lexical_short_circuit")
             );
         });
