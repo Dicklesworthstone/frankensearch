@@ -5051,6 +5051,15 @@ mod tests {
                 producer_capability_tag_sha256: String::new(),
                 lifecycle_receipt_id_sha256: String::new(),
                 lifecycle_receipt_sha256: String::new(),
+                tantivy_writer_witness_sha256: tantivy_witness.then(|| {
+                    sha256_hex(
+                        format!(
+                            "fixture-tantivy-witness-v1\\0:{stream_role}:{}:{}:{:?}",
+                            sample.block_id, sample.sample_id, sample.order
+                        )
+                        .as_bytes(),
+                    )
+                }),
                 prepared_corpus_sha256: sample.provenance.corpus_sha256.clone(),
                 prepared_input_sha256: String::new(),
                 prepared_manifest_sha256: "a".repeat(64),
@@ -6408,7 +6417,11 @@ mod tests {
 
         assert!(matches!(
             assembly.verify_integrity_against_qg1_authorities(&source_authorities),
-            Err(PerfEvidenceAssemblyError::LocalPerf(_))
+            Err(PerfEvidenceAssemblyError::Evidence(
+                EvidenceArtifactError::InvalidProvenance { ref reason }
+            )) if reason.contains(
+                "artifact manifest does not name the supplied pre-binding evidence bytes"
+            )
         ));
     }
 

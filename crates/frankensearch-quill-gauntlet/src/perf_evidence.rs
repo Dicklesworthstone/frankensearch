@@ -4490,6 +4490,15 @@ mod tests {
                 producer_capability_tag_sha256: String::new(),
                 lifecycle_receipt_id_sha256: String::new(),
                 lifecycle_receipt_sha256: String::new(),
+                tantivy_writer_witness_sha256: tantivy_witness.then(|| {
+                    let mut hasher = Sha256::new();
+                    hasher.update(b"fixture-tantivy-witness-v1\0");
+                    hasher.update(stream_role.as_bytes());
+                    hasher.update(sample.block_id.to_le_bytes());
+                    hasher.update(sample.sample_id.to_le_bytes());
+                    hasher.update(format!("{:?}", sample.order).as_bytes());
+                    lower_hex(&hasher.finalize())
+                }),
                 prepared_corpus_sha256: sample.provenance.corpus_sha256.clone(),
                 prepared_input_sha256: String::new(),
                 prepared_manifest_sha256: "a".repeat(64),

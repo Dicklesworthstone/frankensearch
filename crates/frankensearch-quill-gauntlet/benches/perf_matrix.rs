@@ -1353,6 +1353,7 @@ impl Qg1ContinuousTimingReceipt {
 /// produce no binding and therefore cannot become a throughput headline.
 fn qg1_live_sample_binding(
     continuous: Option<&Qg1ContinuousMeasurement>,
+    tantivy_writer_witness_sha256: Option<&str>,
     elapsed_ns: u64,
     scope: &PerfOperationScope,
     provenance: &PerfSampleProvenance,
@@ -1373,6 +1374,9 @@ fn qg1_live_sample_binding(
     }
     let continuous = continuous?;
     let receipt = &continuous.lifecycle_receipt;
+    if (receipt.arm == EngineArm::Tantivy) != tantivy_writer_witness_sha256.is_some() {
+        return None;
+    }
     receipt.validate().ok()?;
     if receipt.interval_ended_ns != elapsed_ns || continuous.elapsed_ns != elapsed_ns {
         return None;
@@ -1452,6 +1456,7 @@ fn qg1_live_sample_binding(
         producer_capability_tag_sha256: String::new(),
         lifecycle_receipt_id_sha256: String::new(),
         lifecycle_receipt_sha256: String::new(),
+        tantivy_writer_witness_sha256: tantivy_writer_witness_sha256.map(str::to_owned),
         prepared_corpus_sha256: provenance.corpus_sha256.clone(),
         prepared_input_sha256: String::new(),
         prepared_manifest_sha256: receipt.prepared_input.manifest_sha256.clone(),
@@ -1548,6 +1553,12 @@ struct MetricMeasurement {
     value: f64,
     continuous: Option<Qg1ContinuousMeasurement>,
     qg2_continuous: Option<Qg2ContinuousMeasurement>,
+    /// Construction-specific witness of the exact Tantivy index timed by this
+    /// measurement. Quill measurements carry no witness.
+    tantivy_writer_witness_sha256: Option<String>,
+    /// Descriptive receipt retained only for deriving the shared semantic
+    /// contract; admission uses the construction-specific witness above.
+    tantivy_writer_receipt: Option<BenchmarkWriterReceipt>,
 }
 
 impl MetricMeasurement {
@@ -1557,6 +1568,8 @@ impl MetricMeasurement {
             value,
             continuous: None,
             qg2_continuous: None,
+            tantivy_writer_witness_sha256: None,
+            tantivy_writer_receipt: None,
         }
     }
 }
@@ -2188,23 +2201,6 @@ fn qg1_validate_writer_receipt(
     }
 }
 
-fn qg1_attest_writer_constructor(
-    spec: &PerfCellSpec,
-    writer_mode: Qg1TantivyWriterMode,
-) -> BenchmarkWriterReceipt {
-    let mut index = qg1_tantivy_in_memory(spec, writer_mode);
-    let attestation = index
-        .take_benchmark_writer_attestation()
-        .expect("QG-1 benchmark constructor must mint a one-shot attestation");
-    qg1_validate_writer_receipt(spec, writer_mode, attestation.receipt());
-    let receipt = attestation.receipt().clone();
-    black_box(attestation.construction_id());
-    index
-        .benchmark_join_workers()
-        .expect("join QG-1 constructor-attestation writer");
-    receipt
-}
-
 fn tantivy_create(path: &Path, spec: &PerfCellSpec) -> TantivyIndex {
     TantivyIndex::create_with_benchmark_config(
         path,
@@ -2790,7 +2786,7 @@ fn qg1_bulk_metric_continuous(
         Some(Qg1ProducerCoverage::EngineIndexingLifecycle),
         "continuous QG-1 engine lifecycle is reserved for docs_per_second indexing arms"
     );
-    let measurement = match arm {
+    let (measurement, tantivy_writer_witness_sha256, tantivy_writer_receipt) = match arm {
         EngineArm::Quill => {
             let prepared_input = context.qg1_sample_input(count);
             let index = quill_in_memory(spec);
@@ -2846,18 +2842,14 @@ fn qg1_bulk_metric_continuous(
                 generation_delta,
                 measurement.elapsed_ns,
             );
-            measurement
+            (measurement, None, None)
         }
         EngineArm::Tantivy => {
             let prepared_input = context.qg1_sample_input(count);
             let writer_mode = tantivy_writer_mode.unwrap_or_else(|| Qg1TantivyWriterMode::Fixed {
                 writer_threads: spec.threads.unwrap_or(1),
             });
-            let index = qg1_tantivy_in_memory(spec, writer_mode);
-            let receipt = index
-                .benchmark_writer_receipt()
-                .expect("QG-1 Tantivy arm uses an authenticated benchmark constructor");
-            qg1_validate_writer_receipt(spec, writer_mode, receipt);
+            let mut index = qg1_tantivy_in_memory(spec, writer_mode);
             assert_eq!(
                 index.benchmark_materialized_writer_threads(),
                 qg1_expected_materialized_width(writer_mode),
@@ -2877,6 +2869,15 @@ fn qg1_bulk_metric_continuous(
                 &mut interval,
             );
             qg1_terminal_commit(context, &index, &mut interval);
+            let attestation = index
+                .take_benchmark_writer_attestation()
+                .expect("QG-1 Tantivy arm must retain its live constructor attestation");
+            qg1_validate_writer_receipt(spec, writer_mode, attestation.receipt());
+            let writer_witness_sha256 = qg1_incumbent_digest(
+                "tantivy.writer-construction-witness",
+                &(attestation.construction_id(), attestation.receipt()),
+            );
+            let writer_receipt = attestation.receipt().clone();
             let (retained_search_owner, terminal_join_receipt) = index
                 .benchmark_join_workers_retaining_reader()
                 .expect("join QG-1 Tantivy terminal workers while retaining a read handle");
@@ -2908,7 +2909,11 @@ fn qg1_bulk_metric_continuous(
                 quill_config(spec).max_visibility_lag_ms,
                 measurement.elapsed_ns,
             );
-            measurement
+            (
+                measurement,
+                Some(writer_witness_sha256),
+                Some(writer_receipt),
+            )
         }
     };
     assert_eq!(
@@ -2923,6 +2928,8 @@ fn qg1_bulk_metric_continuous(
         value: throughput_per_second(measurement.work_units, measurement.elapsed_ns),
         continuous: Some(measurement),
         qg2_continuous: None,
+        tantivy_writer_witness_sha256,
+        tantivy_writer_receipt,
     }
 }
 
@@ -3101,6 +3108,8 @@ fn qg2_bulk_metric_continuous_with_planted_tail_delay(
             feed_and_commit_ns,
             quiescence,
         }),
+        tantivy_writer_witness_sha256: None,
+        tantivy_writer_receipt: None,
     }
 }
 
@@ -5265,6 +5274,7 @@ impl<'a> PairedStreamRunner<'a> {
             );
             qg1_live_sample_binding(
                 measurement.continuous.as_ref(),
+                measurement.tantivy_writer_witness_sha256.as_deref(),
                 window.ended_ns - window.started_ns,
                 self.scope,
                 &self.evidence.sample_provenance,
@@ -6369,13 +6379,21 @@ fn qg1_collect_live_incumbent(
         .expect("live QG-1 incumbent collection requires a preregistered screen");
     let scope = operation_scope(spec);
     let cell_seed = evidence.config.bootstrap_seed ^ fixture_seed(&spec.fixture);
+    let semantic_measurement = measure_metric_with_query_and_qg1_writer_mode(
+        context,
+        spec,
+        EngineArm::Tantivy,
+        None,
+        Some(Qg1TantivyWriterMode::ShippingAuto),
+    );
+    let semantic_receipt = semantic_measurement
+        .tantivy_writer_receipt
+        .as_ref()
+        .expect("timed ShippingAuto QG-1 construction retains its typed receipt");
     let candidates = preregister_qg1_tantivy_incumbents(
         spec,
         &incumbent.screen_plan,
-        &qg1_live_semantic_contract(
-            spec,
-            &qg1_attest_writer_constructor(spec, Qg1TantivyWriterMode::ShippingAuto),
-        ),
+        &qg1_live_semantic_contract(spec, semantic_receipt),
     )
     .expect("preregister live QG-1 Tantivy incumbents");
     assert_eq!(
@@ -6392,9 +6410,6 @@ fn qg1_collect_live_incumbent(
         .enumerate()
         .map(|(candidate_index, (candidate, pilot_startup))| {
             assert_eq!(candidate.writer_mode, pilot_startup.writer_mode);
-            let constructor_receipt = qg1_attest_writer_constructor(spec, candidate.writer_mode);
-            let constructor_receipt_sha256 =
-                qg1_incumbent_digest("tantivy.writer-constructor", &constructor_receipt);
             let seed = cell_seed
                 ^ u64::try_from(candidate_index)
                     .expect("QG-1 candidate index fits u64")
@@ -6448,10 +6463,10 @@ fn qg1_collect_live_incumbent(
                 Some(expected_authority),
             )
             .expect("estimate producer-backed QG-1 candidate pilot");
+            let observed_writer_threads = qg1_expected_materialized_width(candidate.writer_mode);
             Qg1TantivyIncumbentPilot::from_experiment(
                 candidate,
-                constructor_receipt.materialized_width.authenticated(),
-                constructor_receipt_sha256,
+                observed_writer_threads,
                 &shipping_auto_config_sha256,
                 experiment,
                 qg1_live_observation_ids(&format!("pilot-effect-{candidate_index}"), &effect),
@@ -6476,8 +6491,6 @@ fn qg1_collect_live_incumbent(
     .expect("screen live QG-1 Tantivy incumbents");
     discard_concurrency_observations(spec);
     let decision = screen.selected_candidate.as_ref().map(|selected| {
-        let selected_receipt = qg1_attest_writer_constructor(spec, selected.writer_mode);
-        qg1_validate_writer_receipt(spec, selected.writer_mode, &selected_receipt);
         let [effect, tantivy_null, quill_null] = qg1_run_incumbent_streams_round_interleaved(
             [
                 qg1_incumbent_stream_runner(
@@ -8340,6 +8353,7 @@ fn main() {
         tests::assert_qg9_cache_eviction_request();
         tests::assert_manifest_gate_contract();
         tests::assert_qg1_authority_handshake_contract();
+        tests::assert_qg1_timed_fixed_writer_receipt_rejects_detached_fixed_one_substitution();
         eprintln!(
             "[quill-perf-self-check] H1 immutable producer and continuous-timing contracts passed"
         );
@@ -8769,6 +8783,32 @@ mod tests {
         (status, output)
     }
 
+    fn qg1_assert_verified_register_invariants(entry_bytes: &[u8]) {
+        let child = Qg1AuthorityRegisterEntryV1::from_verified_slice(entry_bytes)
+            .expect("child emits a verified authority register");
+        assert_eq!(
+            child.to_json_bytes().expect("canonical register"),
+            entry_bytes
+        );
+        let child = child
+            .verified_registration()
+            .expect("complete child register");
+        let parent = qg1_handshake_test_producer()
+            .register_entry()
+            .verified_registration()
+            .expect("complete parent register");
+        assert_eq!(child.operation_id, parent.operation_id);
+        assert_eq!(child.role, parent.role);
+        assert!(
+            child.authority_sha256.len() == 64
+                && child
+                    .authority_sha256
+                    .bytes()
+                    .all(|b| { b.is_ascii_digit() || (b'a'..=b'f').contains(&b) })
+        );
+        assert_ne!(child.authority_sha256, parent.authority_sha256);
+    }
+
     // Ordinary `cfg(test)` helper, not a `#[test]` item. This bench is
     // `harness = false`, so test-attribute items are stripped and any ordinary
     // caller of one fails to resolve. `assert_qg1_authority_handshake_contract`
@@ -8777,14 +8817,7 @@ mod tests {
         let (mut child, register_receiver) = qg1_start_authority_subprocess();
         let (sequence, entry_bytes, register_count, stdout) =
             qg1_receive_subprocess_register(&mut child, &register_receiver);
-        let expected = qg1_handshake_test_producer().register_entry();
-        assert_eq!(
-            entry_bytes,
-            expected
-                .to_json_bytes()
-                .expect("serialize real register entry"),
-            "the child emitted the complete real producer register before work"
-        );
+        qg1_assert_verified_register_invariants(&entry_bytes);
         assert_eq!(sequence, 1, "the startup register sequence begins at one");
         assert_eq!(
             register_count, 1,
@@ -8818,14 +8851,7 @@ mod tests {
             let (mut child, register_receiver) = qg1_start_authority_subprocess();
             let (_sequence, entry_bytes, register_count, stdout) =
                 qg1_receive_subprocess_register(&mut child, &register_receiver);
-            let expected = qg1_handshake_test_producer().register_entry();
-            assert_eq!(
-                entry_bytes,
-                expected
-                    .to_json_bytes()
-                    .expect("serialize real register entry"),
-                "every negative reaches the actual production barrier before refusal"
-            );
+            qg1_assert_verified_register_invariants(&entry_bytes);
             assert_eq!(
                 register_count, 1,
                 "negative transcript has one complete register"
@@ -9217,37 +9243,83 @@ mod tests {
                 ],
             )
             .expect("freeze hostile test lifecycle authority");
-        let binding_from_receipt = |receipt: super::Qg1ContinuousTimingReceipt,
-                                    stream_role: &str,
-                                    stream_sequence: u64,
-                                    sample_id: u64,
-                                    block_id: u64,
-                                    arm: PerfSampleArm| {
-            let continuous = super::Qg1ContinuousMeasurement {
-                work_units: receipt.document_count,
-                origin: std::time::Instant::now(),
-                elapsed_ns: receipt.interval_ended_ns,
-                prepared_input: receipt.prepared_input.clone(),
-                lifecycle_receipt: receipt,
+        let tantivy_witness = "a".repeat(64);
+        let binding_from_receipt =
+            |receipt: super::Qg1ContinuousTimingReceipt,
+             stream_role: &str,
+             stream_sequence: u64,
+             sample_id: u64,
+             block_id: u64,
+             arm: PerfSampleArm,
+             producer_config: &PairedEstimatorConfig,
+             producer_for_binding: &Qg1LifecycleProducer| {
+                let writer_witness =
+                    (receipt.arm == EngineArm::Tantivy).then_some(tantivy_witness.as_str());
+                let continuous = super::Qg1ContinuousMeasurement {
+                    work_units: receipt.document_count,
+                    origin: std::time::Instant::now(),
+                    elapsed_ns: receipt.interval_ended_ns,
+                    prepared_input: receipt.prepared_input.clone(),
+                    lifecycle_receipt: receipt,
+                };
+                super::qg1_live_sample_binding(
+                    Some(&continuous),
+                    writer_witness,
+                    continuous.elapsed_ns,
+                    &scope,
+                    &provenance,
+                    producer_config,
+                    producer_for_binding,
+                    stream_role,
+                    stream_sequence,
+                    sample_id,
+                    block_id,
+                    arm,
+                    match arm {
+                        PerfSampleArm::Control => PerfSampleOrder::First,
+                        PerfSampleArm::Treatment => PerfSampleOrder::Second,
+                    },
+                )
             };
-            super::qg1_live_sample_binding(
-                Some(&continuous),
-                continuous.elapsed_ns,
-                &scope,
-                &provenance,
-                &config,
-                &producer,
-                stream_role,
-                stream_sequence,
-                sample_id,
-                block_id,
-                arm,
-                match arm {
-                    PerfSampleArm::Control => PerfSampleOrder::First,
-                    PerfSampleArm::Treatment => PerfSampleOrder::Second,
-                },
+        let mut probe_config = PairedEstimatorConfig::predeclared(0x5147_314c_5052_4f42);
+        let probe_producer = probe_config
+            .install_qg1_lifecycle_authority(
+                scope.clone(),
+                provenance.corpus_sha256.clone(),
+                authority_receipt.prepared_input.manifest_sha256.clone(),
+                authority_receipt
+                    .prepared_input
+                    .indexed_content_sha256
+                    .clone(),
+                authority_receipt.prepared_input.document_count,
+                authority_receipt.prepared_input.content_bytes,
+                authority_receipt.prepared_input.batch_count,
+                authority_receipt
+                    .batches
+                    .iter()
+                    .map(|batch| Qg1BatchCoverage {
+                        document_start: batch.document_start,
+                        document_count: batch.document_count,
+                    })
+                    .collect(),
+                authority_receipt.prepared_input.tail_document_id.clone(),
+                10,
+                vec![
+                    (
+                        "qg1.effect.tantivy_vs_quill.v1".to_owned(),
+                        0,
+                        0,
+                        vec![PerfSampleArm::Control; 10],
+                    ),
+                    (
+                        "qg1.null.tantivy.v1".to_owned(),
+                        0,
+                        10_000,
+                        vec![PerfSampleArm::Control; 10],
+                    ),
+                ],
             )
-        };
+            .expect("freeze probe lifecycle authority");
         let proved_binding = binding_from_receipt(
             hostile_tantivy_continuous_receipt(),
             "qg1.null.tantivy.v1",
@@ -9255,6 +9327,8 @@ mod tests {
             10_000,
             0,
             PerfSampleArm::Control,
+            &probe_config,
+            &probe_producer,
         );
         assert!(
             proved_binding.is_some(),
@@ -9268,6 +9342,8 @@ mod tests {
                 10_000,
                 0,
                 PerfSampleArm::Control,
+                &probe_config,
+                &probe_producer,
             )
             .is_none(),
             "a consumed QG-1 producer capability must not be reissued"
@@ -9320,6 +9396,7 @@ mod tests {
             !config.qg1_expected_authority_matches(foreign_producer.expected_authority()),
             "two independently issued producers must never be interchangeable"
         );
+        let foreign_tantivy_witness = "a".repeat(64);
         let foreign_binding = |producer_config: &PairedEstimatorConfig,
                                producer: &Qg1LifecycleProducer| {
             let receipt = hostile_tantivy_continuous_receipt();
@@ -9332,6 +9409,7 @@ mod tests {
             };
             super::qg1_live_sample_binding(
                 Some(&continuous),
+                Some(foreign_tantivy_witness.as_str()),
                 continuous.elapsed_ns,
                 &scope,
                 &provenance,
@@ -9360,6 +9438,8 @@ mod tests {
             0,
             0,
             PerfSampleArm::Control,
+            &config,
+            &producer,
         );
         assert!(
             no_claim_binding.is_none(),
@@ -9409,6 +9489,8 @@ mod tests {
                                     control_sample_id,
                                     block_id,
                                     PerfSampleArm::Control,
+                                    &config,
+                                    &producer,
                                 )
                             }),
                             tantivy_config_sha256: None,
@@ -9436,6 +9518,8 @@ mod tests {
                                     treatment_sample_id,
                                     block_id,
                                     PerfSampleArm::Treatment,
+                                    &config,
+                                    &producer,
                                 )
                             }),
                             tantivy_config_sha256: None,
@@ -9460,15 +9544,15 @@ mod tests {
             estimate_paired_experiment(&valid_effect, &valid_null, &config).is_err(),
             "the authority-free estimator must refuse canonical QG-1 throughput evidence"
         );
+        let proved_result = estimate_paired_experiment_against_qg1_authority(
+            &valid_effect,
+            &valid_null,
+            &config,
+            Some(producer.expected_authority()),
+        );
         assert!(
-            estimate_paired_experiment_against_qg1_authority(
-                &valid_effect,
-                &valid_null,
-                &config,
-                Some(producer.expected_authority()),
-            )
-            .is_ok(),
-            "proved QG-1 lifecycle bindings must reach the live estimator"
+            proved_result.is_ok(),
+            "proved bindings rejected: {proved_result:?}"
         );
         let no_claim_effect = stream(
             no_claim_binding.map(|_| unproved.clone()),
@@ -9498,6 +9582,8 @@ mod tests {
                 30_000,
                 0,
                 PerfSampleArm::Control,
+                &config,
+                &producer,
             )
             .map(|_| hostile_tantivy_continuous_receipt()),
             Some(quill_receipt),
@@ -9705,6 +9791,170 @@ mod tests {
         assert_qg1_real_terminal_visibility_contract();
     }
 
+    pub fn assert_qg1_timed_fixed_writer_receipt_rejects_detached_fixed_one_substitution() {
+        let spec = PerfMatrixSpec::complete()
+            .for_gate(PerfGate::Qg1)
+            .into_iter()
+            .filter(|cell| {
+                cell.metric == "docs_per_second"
+                    && cell.corpus == Some(PerfCorpus::Tiny)
+                    && cell.threads == Some(1)
+                    && cell.positions == Some(PositionMode::On)
+            })
+            .min_by_key(|cell| cell.document_count)
+            .expect("smallest canonical QG-1 fixed-width cell")
+            .clone();
+        let context = BenchContext::for_selected(MatrixScale::Full, std::slice::from_ref(&spec));
+        let evidence = EvidenceContext {
+            config: PairedEstimatorConfig::predeclared(0x5147_3157_5243_5054),
+            policy: EvidencePolicy::predeclared(),
+            sample_provenance: PerfSampleProvenance {
+                run_id: "qg1-real-fixed-receipt-substitution".to_owned(),
+                executable_sha256: "a".repeat(64),
+                corpus_sha256: "b".repeat(64),
+                input_identity: None,
+                worker_id: "qg1-real-fixed-receipt-substitution".to_owned(),
+                build_profile: "release-perf".to_owned(),
+            },
+        };
+        let startups = construct_qg1_startup_producers(
+            &context,
+            std::slice::from_ref(&spec),
+            PERF_MIN_RUNS,
+            &evidence,
+            MachineProfileKey::new(
+                HardwareClassId::TrjZen35995wx,
+                ExecutionProfileId::Physical64,
+            )
+            .expect("canonical physical QG-1 profile"),
+            2,
+            &[1, 2],
+        );
+        let startup = startups
+            .for_spec(&spec)
+            .expect("selected QG-1 cell retains its startup producer");
+        let collected = qg1_collect_live_incumbent(
+            &context,
+            &spec,
+            EvidenceRole::Required,
+            PERF_MIN_RUNS,
+            &evidence,
+            startup,
+        );
+        let fixed_one = collected
+            .screen
+            .pilots
+            .iter()
+            .find(|pilot| {
+                pilot.candidate.writer_mode == Qg1TantivyWriterMode::Fixed { writer_threads: 1 }
+            })
+            .expect("real QG-1 screen measured Fixed(1)")
+            .clone();
+        let detached_fixed_one = qg1_bulk_metric_continuous(
+            &context,
+            &spec,
+            EngineArm::Tantivy,
+            spec.document_count
+                .expect("QG-1 fixed cell has a document count"),
+            Some(Qg1TantivyWriterMode::Fixed { writer_threads: 1 }),
+        )
+        .tantivy_writer_witness_sha256
+        .expect("detached real Fixed(1) constructor retains a timed receipt");
+        let original_witness = fixed_one
+            .experiment
+            .effect_samples
+            .iter()
+            .find(|sample| sample.arm == PerfSampleArm::Treatment)
+            .and_then(|sample| {
+                sample
+                    .qg1_sample_binding
+                    .as_ref()
+                    .and_then(|binding| binding.tantivy_writer_witness_sha256.as_ref())
+            })
+            .expect("original Fixed(1) pilot retains a row witness");
+        assert_ne!(
+            original_witness, &detached_fixed_one,
+            "detached Fixed(1) construction must mint a distinct witness"
+        );
+        let mut substituted_experiment = fixed_one.experiment.clone();
+        let substituted = substituted_experiment
+            .effect_samples
+            .iter_mut()
+            .find(|sample| sample.arm == PerfSampleArm::Treatment)
+            .expect("one sealed Fixed(1) treatment row");
+        substituted
+            .qg1_sample_binding
+            .as_mut()
+            .expect("substituted sample binding")
+            .tantivy_writer_witness_sha256 = Some(detached_fixed_one);
+        let substituted_pilot = Qg1TantivyIncumbentPilot::from_experiment(
+            fixed_one.candidate.clone(),
+            fixed_one.observed_writer_threads,
+            &collected.screen.candidates[0].config_sha256,
+            substituted_experiment.clone(),
+            qg1_live_observation_ids(
+                "hostile-fixed-one-effect",
+                &substituted_experiment.effect_samples,
+            ),
+            qg1_live_observation_ids(
+                "hostile-fixed-one-null",
+                &substituted_experiment.null_samples,
+            ),
+        )
+        .expect("detached substitution gets a distinct recomputed seal");
+        assert_ne!(
+            substituted_pilot.writer_witness_transcript_sha256,
+            fixed_one.writer_witness_transcript_sha256,
+            "detached substitution must not preserve the original pilot transcript"
+        );
+        let retained_authorities = startups.retained_authorities();
+        let mut tampered_screen = collected.screen.clone();
+        let fixed_one_slot = tampered_screen
+            .pilots
+            .iter()
+            .position(|pilot| pilot.candidate == fixed_one.candidate)
+            .expect("sealed Fixed(1) pilot is present in the screen");
+        tampered_screen.pilots[fixed_one_slot] = substituted_pilot;
+        let tampered_result = Qg1TantivyIncumbentScreen::screen_against_qg1_authorities(
+            &spec,
+            tampered_screen.screen_plan.clone(),
+            &tampered_screen.candidates[0].semantic_contract,
+            tampered_screen.pilots.clone(),
+            &retained_authorities,
+        )
+        .expect("authority failure is represented as a safe no-decision screen");
+        assert!(tampered_result.selected_candidate.is_none());
+        assert!(
+            tampered_result
+                .no_decision_reason
+                .as_deref()
+                .is_some_and(|reason| {
+                    reason.contains("valid configuration-bound throughput evidence")
+                })
+        );
+        let replayed: Qg1TantivyIncumbentScreen = serde_json::from_slice(
+            &serde_json::to_vec(&collected.screen)
+                .expect("serialize live QG-1 screen with timed writer receipts"),
+        )
+        .expect("deserialize live QG-1 screen with timed writer receipts");
+        assert_eq!(
+            Qg1TantivyIncumbentScreen::screen_against_qg1_authorities(
+                &spec,
+                replayed.screen_plan.clone(),
+                &replayed.candidates[0].semantic_contract,
+                replayed.pilots.clone(),
+                &retained_authorities,
+            )
+            .expect("authority-aware replay retains timed writer receipt bindings"),
+            replayed,
+        );
+    }
+
+    #[test]
+    fn qg1_timed_fixed_writer_receipt_rejects_detached_fixed_one_substitution() {
+        assert_qg1_timed_fixed_writer_receipt_rejects_detached_fixed_one_substitution();
+    }
+
     pub fn assert_qg1_raw_sample_work_contract() {
         use frankensearch_quill_gauntlet::{PerfGate, PerfMatrixSpec};
 
@@ -9750,9 +10000,19 @@ mod tests {
         let mut lifecycle_receipt = hostile_tantivy_continuous_receipt();
         lifecycle_receipt.document_count = prepared_input.binding.document_count;
         lifecycle_receipt.prepared_input = prepared_input.binding.clone();
-        lifecycle_receipt.batches[0].document_count = 6;
-        lifecycle_receipt.batches[1].document_start = 6;
-        lifecycle_receipt.batches[1].document_count = 6;
+        let rebound_tail = prepared_input.binding.tail_document_id.clone();
+        let rebound_join = lifecycle_receipt
+            .terminal_tantivy_join
+            .expect("hostile lifecycle receipt retains its join receipt");
+        lifecycle_receipt.terminal_searchability =
+            super::Qg1TerminalFact::exact_tail_visible(rebound_tail.clone());
+        lifecycle_receipt.terminal_quiescence =
+            super::Qg1TerminalFact::tantivy_join_then_exact_tail(rebound_tail, rebound_join);
+        lifecycle_receipt.batches.truncate(1);
+        lifecycle_receipt.batches[0].document_start = 0;
+        lifecycle_receipt.batches[0].document_count = 12;
+        lifecycle_receipt.prepared_input.batch_count = 1;
+        lifecycle_receipt.recorded_batch_count = 1;
         lifecycle_receipt
             .validate()
             .expect("hostile lifecycle receipt is rebound to this measured prepared input");
@@ -9816,7 +10076,7 @@ mod tests {
         );
 
         let mut non_qg1 = qg1;
-        non_qg1.gate = PerfGate::Qg2;
+        non_qg1.gate = PerfGate::Qg3;
         assert_eq!(super::raw_sample_work(&context, &non_qg1), (None, None));
     }
 
@@ -10017,14 +10277,16 @@ mod tests {
         );
 
         // The retired summed-call form drops the gaps between calls. With the
-        // corrected end-at-quiescence fixture it reports 135 ns of work inside
-        // the actual 155 ns interval, still inflating the same 20 documents.
+        // corrected end-at-quiescence fixture it reports 160 ns of work inside
+        // the actual 180 ns interval, still inflating the same 20 documents.
         let receipt = hostile_tantivy_continuous_receipt();
         let continuous_rate =
             super::throughput_per_second(receipt.document_count, receipt.interval_ended_ns);
-        let summed_rate = super::throughput_per_second(receipt.document_count, 135);
+        let summed_call_ns = [20_u64, 25, 10, 25, 55, 25].into_iter().sum::<u64>();
+        assert_eq!(summed_call_ns, 160);
+        let summed_rate = super::throughput_per_second(receipt.document_count, summed_call_ns);
         assert!(
-            summed_rate > continuous_rate * 1.14 && summed_rate < continuous_rate * 1.15,
+            summed_rate > continuous_rate * 1.12 && summed_rate < continuous_rate * 1.13,
             "summed-call timing must overstate the rate: {summed_rate} vs {continuous_rate}"
         );
     }
@@ -10078,8 +10340,17 @@ mod tests {
             phase: PerfSamplePhase::Measurement,
             scope: scope(semantics),
             provenance: provenance.clone(),
-            started_ns: block_id.wrapping_mul(100_000_000),
-            ended_ns: block_id.wrapping_mul(100_000_000) + elapsed_ns,
+            started_ns: block_id.wrapping_mul(100_000_000)
+                + match order {
+                    PerfSampleOrder::First => 0,
+                    PerfSampleOrder::Second => 10_000_000,
+                },
+            ended_ns: block_id.wrapping_mul(100_000_000)
+                + match order {
+                    PerfSampleOrder::First => 0,
+                    PerfSampleOrder::Second => 10_000_000,
+                }
+                + elapsed_ns,
             work_units: Some(WORK_UNITS),
             byte_count: Some(WORK_UNITS * 1_024),
             observed_value: Some(observed_value),

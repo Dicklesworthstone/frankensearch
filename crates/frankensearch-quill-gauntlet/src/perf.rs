@@ -62,7 +62,7 @@ pub const PAIRED_ESTIMATOR_SCHEMA_VERSION: &str = "quill-paired-estimator-v1";
 /// closed when an older binding cannot name its receipt fields.
 const QG1_LIFECYCLE_AUTHORITY_SCHEMA_VERSION: &str =
     "frankensearch.quill.qg1-lifecycle-authority.v3";
-const QG1_LIFECYCLE_BINDING_SCHEMA_VERSION: &str = "frankensearch.quill.qg1-lifecycle-binding.v6";
+const QG1_LIFECYCLE_BINDING_SCHEMA_VERSION: &str = "frankensearch.quill.qg1-lifecycle-binding.v7";
 /// Canonical fresh-decision T/Quill stream role.
 pub const QG1_STREAM_ROLE_EFFECT: &str = "qg1.effect.tantivy_vs_quill.v1";
 /// Canonical fresh-decision Tantivy/Tantivy null stream role.
@@ -727,9 +727,10 @@ pub struct Qg1TantivyIncumbentPilot {
     /// no accessor, so that candidate must retain `None` rather than inventing
     /// a materialized width. Fixed-width constructors retain `Some(width)`.
     pub observed_writer_threads: Option<usize>,
-    /// Digest of the typed receipt minted by the constructor that was
-    /// exercised for this pilot.
-    pub writer_constructor_receipt_sha256: String,
+    /// Digest of the typed receipt minted by the constructor that timed this
+    /// candidate's pilot rows. The sealing constructor verifies it against the
+    /// treatment and A/A raw samples before retaining it here.
+    pub writer_witness_transcript_sha256: String,
     /// Raw paired candidate/control and candidate A/A evidence.
     pub experiment: PairedExperimentResult,
     /// Sealed bindings for the candidate/control effect records.
@@ -756,7 +757,7 @@ impl Qg1TantivyIncumbentPilot {
         );
         update_length_framed(
             &mut hasher,
-            self.writer_constructor_receipt_sha256.as_bytes(),
+            self.writer_witness_transcript_sha256.as_bytes(),
         );
         update_length_framed(&mut hasher, experiment.as_slice());
         update_length_framed(&mut hasher, observations.as_slice());
@@ -887,6 +888,10 @@ pub enum Qg1TantivyIncumbentError {
         "QG-1 incumbent decision stream does not bind every raw arm to its expected configuration"
     )]
     DecisionCandidateMismatch,
+    #[error(
+        "QG-1 incumbent Tantivy samples do not retain the writer receipt from the selected candidate"
+    )]
+    WriterReceiptMismatch,
     #[error(
         "QG-1 incumbent raw-observation binding is malformed or no longer matches its raw sample"
     )]
@@ -1049,6 +1054,21 @@ fn qg1_validate_raw_observations(
             PerfSampleArm::Control => (control_engine_id, control_engine_config_sha256),
             PerfSampleArm::Treatment => (treatment_engine_id, treatment_engine_config_sha256),
         };
+        let witness_ok = if engine_id == QG1_TANTIVY_ENGINE_ID {
+            sample
+                .qg1_sample_binding
+                .as_ref()
+                .and_then(|binding| binding.tantivy_writer_witness_sha256.as_deref())
+                .is_some_and(is_lower_hex_digest)
+        } else {
+            sample
+                .qg1_sample_binding
+                .as_ref()
+                .is_none_or(|binding| binding.tantivy_writer_witness_sha256.is_none())
+        };
+        if !witness_ok {
+            return Err(Qg1TantivyIncumbentError::WriterReceiptMismatch);
+        }
         if observation.raw_sample_sha256 != qg1_raw_sample_sha256(sample)?
             || !is_lower_hex_digest(&observation.observation_id_sha256)
             || observation.engine_id != engine_id
@@ -1080,6 +1100,63 @@ fn qg1_insert_observation_ids<'a>(
     Ok(())
 }
 
+fn qg1_writer_witness_transcript_sha256<'a>(
+    samples: impl Iterator<Item = &'a PerfRawSample>,
+) -> Result<String, Qg1TantivyIncumbentError> {
+    let mut witnesses = Vec::new();
+    let mut seen = BTreeSet::new();
+    for sample in samples {
+        let Some(witness) = sample
+            .qg1_sample_binding
+            .as_ref()
+            .and_then(|binding| binding.tantivy_writer_witness_sha256.as_deref())
+        else {
+            return Err(Qg1TantivyIncumbentError::WriterReceiptMismatch);
+        };
+        if !is_lower_hex_digest(witness) || !seen.insert(witness.to_owned()) {
+            return Err(Qg1TantivyIncumbentError::WriterReceiptMismatch);
+        }
+        witnesses.push(witness);
+    }
+    serde_json::to_vec(&witnesses)
+        .map(|bytes| lower_sha256_hex(&bytes))
+        .map_err(|_| Qg1TantivyIncumbentError::WriterReceiptMismatch)
+}
+
+fn qg1_insert_writer_witnesses<'a>(
+    samples: impl Iterator<Item = &'a PerfRawSample>,
+    seen: &mut BTreeSet<String>,
+) -> Result<(), Qg1TantivyIncumbentError> {
+    for sample in samples {
+        let is_tantivy = sample
+            .qg1_sample_binding
+            .as_ref()
+            .is_some_and(|binding| binding.engine_id() == QG1_TANTIVY_ENGINE_ID);
+        if is_tantivy {
+            let witness = sample
+                .qg1_sample_binding
+                .as_ref()
+                .and_then(|binding| binding.tantivy_writer_witness_sha256.as_ref())
+                .ok_or(Qg1TantivyIncumbentError::WriterReceiptMismatch)?;
+            if !seen.insert(witness.clone()) {
+                return Err(Qg1TantivyIncumbentError::WriterReceiptMismatch);
+            }
+        } else if sample
+            .qg1_sample_binding
+            .as_ref()
+            .is_some_and(|binding| binding.engine_id() == QG1_QUILL_ENGINE_ID)
+            && sample
+                .qg1_sample_binding
+                .as_ref()
+                .and_then(|binding| binding.tantivy_writer_witness_sha256.as_ref())
+                .is_some()
+        {
+            return Err(Qg1TantivyIncumbentError::WriterReceiptMismatch);
+        }
+    }
+    Ok(())
+}
+
 impl Qg1TantivyIncumbentPilot {
     /// Seal one live QG-1 Tantivy pilot without exposing receipt hashing to the
     /// producer. The caller supplies immutable observation IDs emitted by the
@@ -1087,12 +1164,11 @@ impl Qg1TantivyIncumbentPilot {
     ///
     /// # Errors
     ///
-    /// Rejects malformed candidate identity, constructor receipts, raw sample
-    /// bindings, or observation IDs.
+    /// Rejects malformed candidate identity, timed writer-receipt mismatches,
+    /// raw sample bindings, or observation IDs.
     pub fn from_experiment(
         candidate: Qg1TantivyIncumbentCandidate,
         observed_writer_threads: Option<usize>,
-        writer_constructor_receipt_sha256: String,
         shipping_auto_config_sha256: &str,
         experiment: PairedExperimentResult,
         effect_observation_ids: Vec<String>,
@@ -1114,14 +1190,18 @@ impl Qg1TantivyIncumbentPilot {
             &candidate.config_sha256,
             null_observation_ids,
         )?;
-        if !is_lower_hex_digest(&writer_constructor_receipt_sha256) {
-            return Err(Qg1TantivyIncumbentError::StreamReceiptMismatch);
-        }
+        let writer_witness_transcript_sha256 = qg1_writer_witness_transcript_sha256(
+            experiment
+                .effect_samples
+                .iter()
+                .filter(|sample| sample.arm == PerfSampleArm::Treatment)
+                .chain(experiment.null_samples.iter()),
+        )?;
         let mut pilot = Self {
             candidate,
             stream_receipt_sha256: String::new(),
             observed_writer_threads,
-            writer_constructor_receipt_sha256,
+            writer_witness_transcript_sha256,
             experiment,
             effect_observations,
             null_observations,
@@ -1369,6 +1449,7 @@ impl Qg1TantivyIncumbentScreen {
         let shipping_auto = &candidates[0];
         let mut seen_stream_receipts = BTreeSet::new();
         let mut seen_observation_ids = BTreeSet::new();
+        let mut seen_writer_witnesses = BTreeSet::new();
         let mut run_id = None;
         let mut scope = None;
         let mut provenance = None;
@@ -1377,9 +1458,21 @@ impl Qg1TantivyIncumbentScreen {
             pilot
                 .candidate
                 .validate_against(cell, &screen_plan, semantic_contract)?;
+            let recomputed_writer_transcript = qg1_writer_witness_transcript_sha256(
+                pilot
+                    .experiment
+                    .effect_samples
+                    .iter()
+                    .filter(|sample| sample.arm == PerfSampleArm::Treatment)
+                    .chain(pilot.experiment.null_samples.iter()),
+            )?;
+            if !is_lower_hex_digest(&pilot.writer_witness_transcript_sha256)
+                || pilot.writer_witness_transcript_sha256 != recomputed_writer_transcript
+            {
+                return Err(Qg1TantivyIncumbentError::WriterReceiptMismatch);
+            }
             if &pilot.candidate != expected
                 || pilot.stream_receipt_sha256 != pilot.recomputed_stream_receipt_sha256()?
-                || !is_lower_hex_digest(&pilot.writer_constructor_receipt_sha256)
                 || !seen_stream_receipts.insert(pilot.stream_receipt_sha256.clone())
             {
                 return Ok(no_decision(
@@ -1404,6 +1497,12 @@ impl Qg1TantivyIncumbentScreen {
                     "candidate materialized an infeasible writer width".to_owned(),
                 ));
             }
+            qg1_validate_pilot_observations(
+                pilot,
+                &shipping_auto.config_sha256,
+                screen_plan.work_units,
+                screen_plan.content_bytes,
+            )?;
             if !qg1_valid_throughput_experiment(
                 &pilot.experiment,
                 resolve_qg1_expected_authority_for_live_decision(
@@ -1428,11 +1527,13 @@ impl Qg1TantivyIncumbentScreen {
                     "candidate pilot effect and null were not round-interleaved".to_owned(),
                 ));
             }
-            qg1_validate_pilot_observations(
-                pilot,
-                &shipping_auto.config_sha256,
-                screen_plan.work_units,
-                screen_plan.content_bytes,
+            qg1_insert_writer_witnesses(
+                pilot
+                    .experiment
+                    .effect_samples
+                    .iter()
+                    .chain(pilot.experiment.null_samples.iter()),
+                &mut seen_writer_witnesses,
             )?;
             qg1_insert_observation_ids(
                 pilot
@@ -1596,7 +1697,16 @@ impl Qg1TantivyIncumbentScreen {
             return Err(Qg1TantivyIncumbentError::StreamReceiptMismatch);
         }
         let mut seen_observation_ids = BTreeSet::new();
+        let mut seen_writer_witnesses = BTreeSet::new();
         for pilot in &recomputed_screen.pilots {
+            qg1_insert_writer_witnesses(
+                pilot
+                    .experiment
+                    .effect_samples
+                    .iter()
+                    .chain(pilot.experiment.null_samples.iter()),
+                &mut seen_writer_witnesses,
+            )?;
             qg1_insert_observation_ids(
                 pilot
                     .effect_observations
@@ -1615,6 +1725,7 @@ impl Qg1TantivyIncumbentScreen {
             recomputed_screen.screen_plan.work_units,
             recomputed_screen.screen_plan.content_bytes,
             &mut seen_observation_ids,
+            &mut seen_writer_witnesses,
         )?;
         Ok(())
     }
@@ -1695,6 +1806,7 @@ impl Qg1TantivyIncumbentDecision {
         expected_work_units: u64,
         expected_content_bytes: u64,
         seen_observation_ids: &mut BTreeSet<String>,
+        seen_writer_witnesses: &mut BTreeSet<String>,
     ) -> Result<(PairedExperimentResult, PairedExperimentResult), Qg1TantivyIncumbentError> {
         // The decision is its own producer invocation, so it shares the
         // pilots' estimator policy but never their sealed authority.
@@ -1760,6 +1872,7 @@ impl Qg1TantivyIncumbentDecision {
                 expected_work_units,
                 expected_content_bytes,
             )?;
+            qg1_insert_writer_witnesses(stream.samples.iter(), seen_writer_witnesses)?;
             if !receipts.insert(stream.stream_receipt_sha256.clone()) {
                 return Err(Qg1TantivyIncumbentError::StreamReceiptMismatch);
             }
@@ -3879,7 +3992,7 @@ fn qg1_producer_capability_tag_sha256(
     provenance: &PerfSampleProvenance,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"frankensearch.quill.qg1-producer-capability-tag.v1\0");
+    hasher.update(b"frankensearch.quill.qg1-producer-capability-tag.v2\0");
     update_length_framed(&mut hasher, capability);
     for value in [
         binding.stream_id_sha256.as_bytes(),
@@ -3904,6 +4017,14 @@ fn qg1_producer_capability_tag_sha256(
     update_length_framed(&mut hasher, qg1_arm_id(binding.raw_arm).as_bytes());
     update_length_framed(&mut hasher, qg1_order_id(binding.raw_order).as_bytes());
     update_length_framed(&mut hasher, &binding.terminal_endpoint_ns.to_le_bytes());
+    update_length_framed(
+        &mut hasher,
+        binding
+            .tantivy_writer_witness_sha256
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
     let witness = serde_json::to_vec(&binding.lifecycle_witness)
         .expect("QG-1 lifecycle witness serializes for its producer capability tag");
     update_length_framed(&mut hasher, &witness);
@@ -4749,6 +4870,9 @@ pub struct Qg1SampleBinding {
     /// Digest over the receipt identity, frozen prepared input, terminal
     /// endpoint, and exactly-one arm-specific witness.
     pub lifecycle_receipt_sha256: String,
+    /// Exact timed Tantivy construction witness, absent for Quill rows.
+    #[serde(default)]
+    pub tantivy_writer_witness_sha256: Option<String>,
     /// Invocation-wide QG-1 corpus identity copied from raw provenance.
     pub prepared_corpus_sha256: String,
     /// Digest of the complete frozen prepared input, including its batch
@@ -4862,7 +4986,7 @@ impl Qg1SampleBinding {
 
     fn recomputed_lifecycle_receipt_id_sha256(&self) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(b"frankensearch.quill.qg1-lifecycle-receipt-id.v4\0");
+        hasher.update(b"frankensearch.quill.qg1-lifecycle-receipt-id.v5\0");
         for value in [
             self.schema_version.as_bytes(),
             self.stream_id_sha256.as_bytes(),
@@ -4873,6 +4997,10 @@ impl Qg1SampleBinding {
             self.stream_role_identity_sha256.as_bytes(),
             self.producer_capability_sha256.as_bytes(),
             self.producer_capability_tag_sha256.as_bytes(),
+            self.tantivy_writer_witness_sha256
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
         ] {
             update_length_framed(&mut hasher, value);
         }
@@ -4884,7 +5012,7 @@ impl Qg1SampleBinding {
 
     fn recomputed_lifecycle_receipt_sha256(&self) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(b"frankensearch.quill.qg1-lifecycle-receipt.v4\0");
+        hasher.update(b"frankensearch.quill.qg1-lifecycle-receipt.v5\0");
         for value in [
             self.schema_version.as_bytes(),
             self.lifecycle_receipt_id_sha256.as_bytes(),
@@ -4896,6 +5024,10 @@ impl Qg1SampleBinding {
             self.lifecycle_authority_sha256.as_bytes(),
             self.stream_role_identity_sha256.as_bytes(),
             self.producer_capability_sha256.as_bytes(),
+            self.tantivy_writer_witness_sha256
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
         ] {
             update_length_framed(&mut hasher, value);
         }
@@ -4937,6 +5069,21 @@ impl Qg1SampleBinding {
             || self.raw_order != raw.order
         {
             return Err("QG-1 lifecycle receipt is not uniquely bound to its raw row");
+        }
+        match self.lifecycle_witness.engine_id() {
+            QG1_TANTIVY_ENGINE_ID
+                if self
+                    .tantivy_writer_witness_sha256
+                    .as_deref()
+                    .is_some_and(is_lower_hex_digest) => {}
+            QG1_QUILL_ENGINE_ID if self.tantivy_writer_witness_sha256.is_none() => {}
+            QG1_TANTIVY_ENGINE_ID => {
+                return Err("QG-1 Tantivy binding lacks a valid construction witness");
+            }
+            QG1_QUILL_ENGINE_ID => {
+                return Err("QG-1 Quill binding carries a construction witness");
+            }
+            _ => return Err("QG-1 lifecycle binding has an unknown engine witness"),
         }
         if self.prepared_corpus_sha256 != raw.provenance.corpus_sha256
             || self.prepared_input_sha256 != self.recomputed_prepared_input_sha256()
@@ -8416,6 +8563,14 @@ mod tests {
             producer_capability_tag_sha256: String::new(),
             lifecycle_receipt_id_sha256: String::new(),
             lifecycle_receipt_sha256: String::new(),
+            tantivy_writer_witness_sha256: (engine_id == QG1_TANTIVY_ENGINE_ID).then(|| {
+                lower_sha256_hex(
+                    format!(
+                        "qg1-test-binding:{stream_role}:{stream_sequence}:{block_id}:{sample_id}"
+                    )
+                    .as_bytes(),
+                )
+            }),
             prepared_corpus_sha256: provenance.corpus_sha256.clone(),
             prepared_input_sha256: String::new(),
             prepared_manifest_sha256: "a".repeat(64),
@@ -8677,7 +8832,6 @@ mod tests {
         Qg1TantivyIncumbentPilot::from_experiment(
             candidate,
             observed_writer_threads,
-            "9".repeat(64),
             &shipping_auto_config_sha256,
             experiment,
             qg1_observation_ids(&effect_observation_label, &effect),
@@ -10475,7 +10629,6 @@ mod tests {
         pilots[0] = Qg1TantivyIncumbentPilot::from_experiment(
             original.candidate,
             original.observed_writer_threads,
-            original.writer_constructor_receipt_sha256,
             &shipping_auto_config_sha256,
             experiment,
             original
@@ -10843,6 +10996,109 @@ mod tests {
             Err(Qg1TantivyIncumbentError::ObservationReuse)
         );
 
+        let mut reused_writer_pilot = pilots.clone();
+        let copied_witness = reused_writer_pilot[0]
+            .experiment
+            .effect_samples
+            .iter()
+            .find_map(|sample| {
+                sample
+                    .qg1_sample_binding
+                    .as_ref()
+                    .and_then(|binding| binding.tantivy_writer_witness_sha256.clone())
+            })
+            .expect("first pilot has a Tantivy witness");
+        let target_sample = reused_writer_pilot[1]
+            .experiment
+            .effect_samples
+            .iter_mut()
+            .find(|sample| {
+                sample
+                    .qg1_sample_binding
+                    .as_ref()
+                    .and_then(|binding| binding.tantivy_writer_witness_sha256.as_ref())
+                    .is_some()
+            })
+            .expect("second pilot has a Tantivy witness");
+        target_sample
+            .qg1_sample_binding
+            .as_mut()
+            .expect("target sample binding")
+            .tantivy_writer_witness_sha256 = Some(copied_witness);
+        let target_binding = target_sample
+            .qg1_sample_binding
+            .as_mut()
+            .expect("target sample binding");
+        let pilot2_authority = pilots[1]
+            .experiment
+            .config
+            .qg1_expected_authority
+            .as_ref()
+            .expect("second pilot retains expected authority");
+        let issued_row = pilot2_authority
+            .authority
+            .issued_row_for(
+                &target_binding.stream_role,
+                target_binding.stream_sequence,
+                target_binding.raw_block_id,
+                target_binding.raw_sample_id,
+                target_binding.raw_arm,
+                target_binding.raw_order,
+            )
+            .expect("target row is issued by pilot authority");
+        let capability = qg1_test_capability(
+            &target_binding.stream_role,
+            issued_row.block_id,
+            issued_row.stream_sequence % 2,
+            issued_row.sample_id,
+        );
+        target_binding.producer_capability_sha256 = lower_sha256_hex(&capability);
+        target_binding.producer_capability_tag_sha256 = qg1_producer_capability_tag_sha256(
+            &capability,
+            target_binding,
+            &target_sample.scope,
+            &target_sample.provenance,
+        );
+        target_binding.seal_lifecycle_receipt(&target_sample.scope, &target_sample.provenance);
+        let duplicate_pilot = &reused_writer_pilot[1];
+        let rebuilt_experiment = estimate_paired_experiment_against_qg1_authority(
+            &duplicate_pilot.experiment.effect_samples,
+            &duplicate_pilot.experiment.null_samples,
+            &duplicate_pilot.experiment.config,
+            duplicate_pilot
+                .experiment
+                .config
+                .qg1_expected_authority
+                .as_ref(),
+        )
+        .expect("duplicate witness pilot remains locally authority-valid");
+        let rebuilt = Qg1TantivyIncumbentPilot::from_experiment(
+            duplicate_pilot.candidate.clone(),
+            duplicate_pilot.observed_writer_threads,
+            &pilots[0].candidate.config_sha256,
+            rebuilt_experiment,
+            duplicate_pilot
+                .effect_observations
+                .iter()
+                .map(|observation| observation.observation_id_sha256.clone())
+                .collect(),
+            duplicate_pilot
+                .null_observations
+                .iter()
+                .map(|observation| observation.observation_id_sha256.clone())
+                .collect(),
+        );
+        reused_writer_pilot[1] = rebuilt.expect("rebuild locally authority-valid duplicate pilot");
+        assert_eq!(
+            Qg1TantivyIncumbentScreen::screen(
+                &cell,
+                screen_plan.clone(),
+                &semantic_contract,
+                reused_writer_pilot,
+            ),
+            Err(Qg1TantivyIncumbentError::WriterReceiptMismatch)
+        );
+
         let screen =
             Qg1TantivyIncumbentScreen::screen(&cell, screen_plan, &semantic_contract, pilots)
                 .expect("valid incumbent screen");
@@ -10884,6 +11140,109 @@ mod tests {
         assert_eq!(
             screen.validate_decision(&cell, &semantic_contract, &wrong_bytes),
             Err(Qg1TantivyIncumbentError::ObservationBindingMismatch)
+        );
+
+        let mut reused_writer_decision = decision.clone();
+        let copied_witness = screen.pilots[0]
+            .experiment
+            .effect_samples
+            .iter()
+            .find_map(|sample| {
+                sample
+                    .qg1_sample_binding
+                    .as_ref()
+                    .and_then(|binding| binding.tantivy_writer_witness_sha256.clone())
+            })
+            .expect("pilot witness for decision reuse");
+        let decision_sample = reused_writer_decision
+            .tantivy_null
+            .samples
+            .iter_mut()
+            .find(|sample| {
+                sample
+                    .qg1_sample_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.engine_id() == QG1_TANTIVY_ENGINE_ID)
+            })
+            .expect("decision Tantivy sample");
+        let binding = decision_sample
+            .qg1_sample_binding
+            .as_mut()
+            .expect("decision binding");
+        binding.tantivy_writer_witness_sha256 = Some(copied_witness);
+        let authority = reused_writer_decision
+            .estimator_config
+            .qg1_expected_authority
+            .as_ref()
+            .expect("decision authority");
+        let row = authority
+            .authority
+            .issued_row_for(
+                &binding.stream_role,
+                binding.stream_sequence,
+                binding.raw_block_id,
+                binding.raw_sample_id,
+                binding.raw_arm,
+                binding.raw_order,
+            )
+            .expect("decision row authority");
+        let capability = qg1_test_capability(
+            &binding.stream_role,
+            row.block_id,
+            row.stream_sequence % 2,
+            row.sample_id,
+        );
+        binding.producer_capability_sha256 = lower_sha256_hex(&capability);
+        binding.producer_capability_tag_sha256 = qg1_producer_capability_tag_sha256(
+            &capability,
+            binding,
+            &decision_sample.scope,
+            &decision_sample.provenance,
+        );
+        binding.seal_lifecycle_receipt(&decision_sample.scope, &decision_sample.provenance);
+        let ids = reused_writer_decision
+            .tantivy_null
+            .observations
+            .iter()
+            .map(|observation| observation.observation_id_sha256.clone())
+            .collect();
+        reused_writer_decision.tantivy_null.observations = qg1_bind_raw_observations(
+            &reused_writer_decision.tantivy_null.samples,
+            &reused_writer_decision.tantivy_null.control_engine_id,
+            &reused_writer_decision
+                .tantivy_null
+                .control_engine_config_sha256,
+            &reused_writer_decision.tantivy_null.treatment_engine_id,
+            &reused_writer_decision
+                .tantivy_null
+                .treatment_engine_config_sha256,
+            ids,
+        )
+        .expect("rebind duplicate decision observations");
+        reused_writer_decision.tantivy_null.stream_receipt_sha256 = reused_writer_decision
+            .tantivy_null
+            .recomputed_stream_receipt_sha256()
+            .expect("rebind duplicate decision receipt");
+        assert!(
+            reused_writer_decision
+                .tantivy_null
+                .validate_against(
+                    Qg1TantivyDecisionStreamKind::TantivyNull,
+                    QG1_TANTIVY_ENGINE_ID,
+                    selected.config_sha256.as_str(),
+                    QG1_TANTIVY_ENGINE_ID,
+                    selected.config_sha256.as_str(),
+                    &reused_writer_decision.estimator_config,
+                    &qg1_throughput_scope(&cell),
+                    &reused_writer_decision.tantivy_null.samples[0].provenance,
+                    screen.screen_plan.work_units,
+                    screen.screen_plan.content_bytes,
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            screen.validate_decision(&cell, &semantic_contract, &reused_writer_decision),
+            Err(Qg1TantivyIncumbentError::WriterReceiptMismatch)
         );
 
         let mut reused_decision_observation = decision;
