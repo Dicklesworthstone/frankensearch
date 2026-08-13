@@ -18618,20 +18618,28 @@ mod tests {
             .find(|entry| entry.kind == SectionKind::DOCLEN)
             .expect("doclen entry");
         let doclen_offset = usize::try_from(doclen.offset)?;
+        let doclen_len = usize::try_from(doclen.len)?;
         let mut bytes = encoded.as_bytes().to_vec();
         bytes[doclen_offset] ^= 0x80;
+        assert_ne!(
+            xxhash_rust::xxh3::xxh3_64(&bytes[doclen_offset..doclen_offset + doclen_len]),
+            doclen.xxh3,
+            "the DOCLEN payload mutation must deliberately leave its section witness stale"
+        );
         let file_xxh3 = reseal_test_segment_file_witness(&mut bytes)?;
-        std::fs::write(directory.path().join(canonical_segment_name(0xabc)), bytes)?;
-        let segment = ManifestSegment {
-            segment_id: 0xabc,
-            seal_seq: 1,
-            file_len: encoded.file_len(),
+        assert_ne!(
             file_xxh3,
-            docid_lo: 10,
-            docid_hi: 20,
-            doc_count: 1,
-            tombstones: TombstoneSet::new(),
-        };
+            encoded.file_xxh3(),
+            "the payload mutation must rewrite the FSLX whole-file witness"
+        );
+        assert_eq!(
+            SegmentReader::from_owned(bytes.clone(), DEFAULT_SCHEMA)?.verify_file_witness()?,
+            file_xxh3,
+            "the mutated fixture must retain a self-consistent FSLX trailer"
+        );
+        std::fs::write(directory.path().join(canonical_segment_name(0xabc)), bytes)?;
+        let mut segment = manifest_segment(&encoded, 1);
+        segment.file_xxh3 = file_xxh3;
         let manifest = durable_test_manifest(1, vec![segment]);
         write_manifest(&directory.path().join("MANIFEST"), &manifest)?;
         let before = directory_bytes(directory.path())?;
@@ -18837,23 +18845,31 @@ mod tests {
             .find(|entry| entry.kind == SectionKind::TERMDICT)
             .expect("TERMDICT entry");
         let term_dictionary_offset = usize::try_from(term_dictionary.offset)?;
+        let term_dictionary_len = usize::try_from(term_dictionary.len)?;
         let mut bytes = encoded.as_bytes().to_vec();
         bytes[term_dictionary_offset] ^= 0x80;
-        let file_xxh3 = reseal_test_segment_file_witness(&mut bytes)?;
-        std::fs::write(directory.path().join(canonical_segment_name(0xacd)), bytes)?;
-        let manifest = durable_test_manifest(
-            1,
-            vec![ManifestSegment {
-                segment_id: 0xacd,
-                seal_seq: 1,
-                file_len: encoded.file_len(),
-                file_xxh3,
-                docid_lo: 10,
-                docid_hi: 20,
-                doc_count: 1,
-                tombstones: TombstoneSet::new(),
-            }],
+        assert_ne!(
+            xxhash_rust::xxh3::xxh3_64(
+                &bytes[term_dictionary_offset..term_dictionary_offset + term_dictionary_len]
+            ),
+            term_dictionary.xxh3,
+            "the TERMDICT payload mutation must deliberately leave its section witness stale"
         );
+        let file_xxh3 = reseal_test_segment_file_witness(&mut bytes)?;
+        assert_ne!(
+            file_xxh3,
+            encoded.file_xxh3(),
+            "the payload mutation must rewrite the FSLX whole-file witness"
+        );
+        assert_eq!(
+            SegmentReader::from_owned(bytes.clone(), DEFAULT_SCHEMA)?.verify_file_witness()?,
+            file_xxh3,
+            "the mutated fixture must retain a self-consistent FSLX trailer"
+        );
+        std::fs::write(directory.path().join(canonical_segment_name(0xacd)), bytes)?;
+        let mut segment = manifest_segment(&encoded, 1);
+        segment.file_xxh3 = file_xxh3;
+        let manifest = durable_test_manifest(1, vec![segment]);
         write_manifest(&directory.path().join("MANIFEST"), &manifest)?;
         let before = directory_bytes(directory.path())?;
 
