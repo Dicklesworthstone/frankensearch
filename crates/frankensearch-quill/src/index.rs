@@ -770,6 +770,21 @@ struct DeltaLeaseLookup {
     delta_index: usize,
 }
 
+#[cfg(test)]
+thread_local! {
+    static DELTA_LEASE_OVERLAP_COMPARISONS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_delta_lease_overlap_comparisons() {
+    DELTA_LEASE_OVERLAP_COMPARISONS.with(|comparisons| comparisons.set(0));
+}
+
+#[cfg(test)]
+fn delta_lease_overlap_comparisons() -> usize {
+    DELTA_LEASE_OVERLAP_COMPARISONS.with(Cell::get)
+}
+
 pub struct QuillSearchSnapshot {
     snapshot_epoch: u64,
     keeper: Arc<KeeperSnapshot>,
@@ -1028,6 +1043,22 @@ fn build_delta_lease_lookup(
         });
     }
     lookup.sort_unstable_by_key(|entry| entry.lease_base);
+    for pair in lookup.windows(2) {
+        #[cfg(test)]
+        DELTA_LEASE_OVERLAP_COMPARISONS.with(|comparisons| {
+            comparisons.set(comparisons.get() + 1);
+        });
+        let first = pair[0];
+        let second = pair[1];
+        if first.lease_end > second.lease_base {
+            return Err(SnapshotError::OverlappingDeltaLeases {
+                first_base: first.lease_base,
+                first_end: first.lease_end,
+                second_base: second.lease_base,
+                second_end: second.lease_end,
+            });
+        }
+    }
     Ok(lookup)
 }
 
@@ -1062,18 +1093,6 @@ fn validate_delta_table(
                         keeper_hi: segment.docid_hi,
                     });
                 }
-            }
-        }
-    }
-    for (index, first) in deltas.iter().enumerate() {
-        for second in &deltas[index + 1..] {
-            if first.lease_base() < second.lease_end() && second.lease_base() < first.lease_end() {
-                return Err(SnapshotError::OverlappingDeltaLeases {
-                    first_base: first.lease_base(),
-                    first_end: first.lease_end(),
-                    second_base: second.lease_base(),
-                    second_end: second.lease_end(),
-                });
             }
         }
     }
@@ -20535,6 +20554,7 @@ mod tests {
         let first = Arc::new(first.freeze(generation));
         let tombstoned = Arc::new(tombstoned.freeze(generation));
         let third = Arc::new(third.freeze(generation));
+        reset_delta_lease_overlap_comparisons();
         let snapshot = QuillSearchSnapshot::compose(
             0,
             keeper,
@@ -20545,6 +20565,11 @@ mod tests {
             ],
         )
         .expect("compose shuffled nonoverlapping Delta leases");
+        assert_eq!(
+            delta_lease_overlap_comparisons(),
+            snapshot.delta_count() - 1,
+            "sorted Delta lease validation compares each adjacent pair exactly once"
+        );
 
         for (actual, expected) in
             snapshot
