@@ -1603,6 +1603,10 @@ struct ParallelShardWork {
     shard: usize,
     assignment: ParallelShardAssignment,
     state: ScribeShardState,
+    /// Canonical metadata moved from the adaptive budget proof into the exact
+    /// shard that consumes it. Entries are dropped as documents accumulate,
+    /// so cached bytes do not remain resident beside their copied columns.
+    prepared_metadata: Option<Vec<Option<Vec<u8>>>>,
 }
 
 /// Monotonic identity for one shared-nothing ingest batch, so worker ids in a
@@ -1744,6 +1748,12 @@ struct ParallelBatchObservation {
     rendezvous_width: AtomicUsize,
     #[cfg(test)]
     rendezvous_arrived: AtomicUsize,
+    /// Test-only proof that the adaptive budget pass prepared and the actual
+    /// workers consumed one canonical metadata image per document.
+    #[cfg(test)]
+    prepared_metadata_documents: AtomicUsize,
+    #[cfg(test)]
+    reused_metadata_documents: AtomicUsize,
 }
 
 impl Default for ParallelBatchObservation {
@@ -1764,6 +1774,10 @@ impl Default for ParallelBatchObservation {
             rendezvous_width: AtomicUsize::new(0),
             #[cfg(test)]
             rendezvous_arrived: AtomicUsize::new(0),
+            #[cfg(test)]
+            prepared_metadata_documents: AtomicUsize::new(0),
+            #[cfg(test)]
+            reused_metadata_documents: AtomicUsize::new(0),
         }
     }
 }
@@ -1831,6 +1845,18 @@ impl ParallelBatchObservation {
         self.rendezvous_width.store(width, Ordering::Release);
     }
 
+    #[cfg(test)]
+    fn record_prepared_metadata(&self, documents: usize) {
+        self.prepared_metadata_documents
+            .fetch_add(documents, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    fn record_reused_metadata(&self) {
+        self.reused_metadata_documents
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
     /// Set the terminal state. A SUCCESS terminal is set only after the whole
     /// ingest operation has finished, never because the parallel attempt
     /// returned `Ok`.
@@ -1862,6 +1888,10 @@ impl ParallelBatchObservation {
             peak_shards_in_flight: self.peak_in_flight.load(Ordering::Acquire),
             identity_degraded: self.identity_degraded.load(Ordering::Acquire),
             shared_nothing_declined: self.shared_nothing_declined.load(Ordering::Acquire),
+            #[cfg(test)]
+            prepared_metadata_documents: self.prepared_metadata_documents.load(Ordering::Acquire),
+            #[cfg(test)]
+            reused_metadata_documents: self.reused_metadata_documents.load(Ordering::Acquire),
         }
     }
 
@@ -2012,6 +2042,10 @@ struct ParallelWorkerWitness {
     peak_shards_in_flight: usize,
     identity_degraded: bool,
     shared_nothing_declined: bool,
+    #[cfg(test)]
+    prepared_metadata_documents: usize,
+    #[cfg(test)]
+    reused_metadata_documents: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2044,7 +2078,7 @@ struct ParallelIngestReceipt {
     worker_witness: ParallelWorkerWitness,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ParallelBudgetAdmission {
     logical_budget_bytes: usize,
     initial_logical_bytes: usize,
@@ -2052,13 +2086,20 @@ struct ParallelBudgetAdmission {
     batch_logical_upper_bound: usize,
     projected_logical_upper_bound: usize,
     arena_chunk_bytes: usize,
+    /// Canonical metadata prepared by the normal adaptive budget proof.
+    /// Conformance-armed admission preserves its original serial semantics
+    /// and deliberately leaves this absent.
+    prepared_metadata: Option<Vec<Option<Vec<u8>>>>,
     #[cfg(test)]
     budget_worker_slots: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ParallelDocumentBudgetBound {
-    Within(usize),
+    Within {
+        logical_upper_bound: usize,
+        canonical_metadata: Option<Vec<u8>>,
+    },
     ReachesCeiling,
 }
 
@@ -2407,7 +2448,25 @@ fn parallel_document_logical_upper_bound(
     }
 
     debug_assert!(upper_bound < exclusive_ceiling);
-    Ok(Some(ParallelDocumentBudgetBound::Within(upper_bound)))
+    Ok(Some(ParallelDocumentBudgetBound::Within {
+        logical_upper_bound: upper_bound,
+        canonical_metadata: Some(metadata),
+    }))
+}
+
+fn retain_prepared_metadata_within_budget(
+    metadata: Vec<u8>,
+    retained_bytes: &AtomicUsize,
+    exclusive_ceiling: usize,
+) -> Option<Vec<u8>> {
+    retained_bytes
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |retained| {
+            retained
+                .checked_add(metadata.len())
+                .filter(|projected| *projected < exclusive_ceiling)
+        })
+        .ok()
+        .map(|_| metadata)
 }
 
 fn parallel_arena_chunk_bytes(batch_logical_upper_bound: usize, active_shards: usize) -> usize {
@@ -5743,7 +5802,7 @@ impl QuillWriterState {
         #[cfg(test)]
         let mut budget_worker_slots = 0_usize;
 
-        let batch_logical_upper_bound = if conformance_serial {
+        let (batch_logical_upper_bound, prepared_metadata) = if conformance_serial {
             let mut analyzer = FrankensearchTokenizer::default();
             let mut admitted_batch_bytes = 0_usize;
             for document in documents {
@@ -5771,7 +5830,10 @@ impl QuillWriterState {
                 else {
                     return Ok(None);
                 };
-                let ParallelDocumentBudgetBound::Within(document_upper_bound) = document_bound
+                let ParallelDocumentBudgetBound::Within {
+                    logical_upper_bound: document_upper_bound,
+                    canonical_metadata: _,
+                } = document_bound
                 else {
                     return Ok(None);
                 };
@@ -5786,7 +5848,7 @@ impl QuillWriterState {
                     return Ok(None);
                 }
             }
-            admitted_batch_bytes
+            (admitted_batch_bytes, None)
         } else {
             check_cancel(cx, "parallel budget admission")?;
             let mut document_bounds = Vec::new();
@@ -5794,6 +5856,14 @@ impl QuillWriterState {
                 .try_reserve_exact(documents.len())
                 .map_err(|_| invalid_state("could not reserve parallel budget document bounds"))?;
             document_bounds.resize_with(documents.len(), || None);
+            let mut prepared_metadata = Vec::new();
+            prepared_metadata
+                .try_reserve_exact(documents.len())
+                .map_err(|_| invalid_state("could not reserve prepared parallel metadata"))?;
+            let retained_metadata_bytes = AtomicUsize::new(0);
+            let prepared_metadata_cache_ceiling = logical_budget_bytes
+                .checked_sub(initial_logical_bytes)
+                .expect("initial logical use is below the configured budget");
             #[cfg(test)]
             let budget_observation = ParallelBatchObservation::default();
             let documents_per_worker = documents.len().div_ceil(active_shards).max(1);
@@ -5809,12 +5879,33 @@ impl QuillWriterState {
                     let shard_guard = budget_observation.enter_shard();
                     let mut analyzer = FrankensearchTokenizer::default();
                     for (slot, document) in slots.iter_mut().zip(chunk) {
-                        *slot = Some(parallel_document_logical_upper_bound(
+                        let document_bound = parallel_document_logical_upper_bound(
                             self.schema,
                             &mut analyzer,
                             document,
                             logical_budget_bytes,
-                        ));
+                        )
+                        .map(|bound| {
+                            bound.map(|bound| match bound {
+                                ParallelDocumentBudgetBound::Within {
+                                    logical_upper_bound,
+                                    canonical_metadata,
+                                } => ParallelDocumentBudgetBound::Within {
+                                    logical_upper_bound,
+                                    canonical_metadata: canonical_metadata.and_then(|metadata| {
+                                        retain_prepared_metadata_within_budget(
+                                            metadata,
+                                            &retained_metadata_bytes,
+                                            prepared_metadata_cache_ceiling,
+                                        )
+                                    }),
+                                },
+                                ParallelDocumentBudgetBound::ReachesCeiling => {
+                                    ParallelDocumentBudgetBound::ReachesCeiling
+                                }
+                            })
+                        });
+                        *slot = Some(document_bound);
                     }
                     #[cfg(test)]
                     shard_guard.completed();
@@ -5829,7 +5920,10 @@ impl QuillWriterState {
                 let Some(document_bound) = document_bound? else {
                     return Ok(None);
                 };
-                let ParallelDocumentBudgetBound::Within(document_upper_bound) = document_bound
+                let ParallelDocumentBudgetBound::Within {
+                    logical_upper_bound: document_upper_bound,
+                    canonical_metadata,
+                } = document_bound
                 else {
                     return Ok(None);
                 };
@@ -5843,13 +5937,14 @@ impl QuillWriterState {
                 {
                     return Ok(None);
                 }
+                prepared_metadata.push(canonical_metadata);
             }
             check_cancel(cx, "parallel budget admission")?;
             #[cfg(test)]
             {
                 budget_worker_slots = budget_observation.snapshot().distinct_worker_slots;
             }
-            admitted_batch_bytes
+            (admitted_batch_bytes, Some(prepared_metadata))
         };
         let Some(projected_logical_upper_bound) =
             initial_logical_bytes.checked_add(batch_logical_upper_bound)
@@ -5865,6 +5960,7 @@ impl QuillWriterState {
             batch_logical_upper_bound,
             projected_logical_upper_bound,
             arena_chunk_bytes: parallel_arena_chunk_bytes(batch_logical_upper_bound, active_shards),
+            prepared_metadata,
             #[cfg(test)]
             budget_worker_slots,
         }))
@@ -6026,6 +6122,7 @@ impl QuillWriterState {
                     current_lease_base: Some(batch_span.lease_base),
                     scratch_metadata: Vec::new(),
                 },
+                prepared_metadata: None,
             });
         }
 
@@ -6047,6 +6144,9 @@ impl QuillWriterState {
                     Self::accumulate_parallel_shard(
                         &mut work.state,
                         documents,
+                        None,
+                        #[cfg(test)]
+                        None,
                         work.assignment,
                         cx,
                         &checkpoint,
@@ -6210,11 +6310,22 @@ impl QuillWriterState {
         }
 
         let active_shard_count = plan.active_shards;
-        let Some(budget_admission) =
+        let Some(mut budget_admission) =
             self.parallel_budget_admission(cx, documents, active_shard_count)?
         else {
             return Ok(None);
         };
+        #[cfg(test)]
+        observation.record_prepared_metadata(
+            budget_admission
+                .prepared_metadata
+                .as_ref()
+                .map_or(0, Vec::len),
+        );
+        let mut prepared_metadata = budget_admission
+            .prepared_metadata
+            .take()
+            .map(Vec::into_iter);
         let mut planned_router = self.shard_router.clone();
         let prior_grant_count = self.docid_allocator.lease_grants().len();
         let mut planned_allocator = self.docid_allocator.speculative_clone();
@@ -6254,6 +6365,20 @@ impl QuillWriterState {
             if count_u32 > remaining {
                 return Ok(None);
             }
+            let shard_prepared_metadata = if let Some(metadata) = prepared_metadata.as_mut() {
+                let mut shard_metadata = Vec::new();
+                shard_metadata.try_reserve_exact(count).map_err(|_| {
+                    invalid_state("could not reserve parallel shard prepared metadata")
+                })?;
+                for _ in 0..count {
+                    shard_metadata.push(metadata.next().ok_or_else(|| {
+                        invalid_state("prepared metadata ended before the parallel plan")
+                    })?);
+                }
+                Some(shard_metadata)
+            } else {
+                None
+            };
             let allocated = planned_allocator
                 .alloc_batch(shard, count_u32)
                 .map_err(|error| invalid_state(error.to_string()))?;
@@ -6278,7 +6403,16 @@ impl QuillWriterState {
                     current_lease_base: Some(span.lease_base),
                     scratch_metadata: Vec::new(),
                 },
+                prepared_metadata: shard_prepared_metadata,
             });
+        }
+        if prepared_metadata
+            .as_mut()
+            .is_some_and(|metadata| metadata.next().is_some())
+        {
+            return Err(invalid_state(
+                "prepared metadata extends beyond the parallel plan",
+            ));
         }
 
         let checkpoint = ParallelIngestCheckpoint::new(&self.reader);
@@ -6296,9 +6430,13 @@ impl QuillWriterState {
                 // and never as completed.
                 let shard_guard = observation.enter_shard();
                 catch_parallel_ingest_worker(work.shard, || {
+                    let prepared_metadata = work.prepared_metadata.take();
                     Self::accumulate_parallel_shard(
                         &mut work.state,
                         documents,
+                        prepared_metadata,
+                        #[cfg(test)]
+                        Some(observation),
                         work.assignment,
                         cx,
                         &checkpoint,
@@ -6415,6 +6553,8 @@ impl QuillWriterState {
     fn accumulate_parallel_shard(
         state: &mut ScribeShardState,
         documents: &[IndexableDocument],
+        prepared_metadata: Option<Vec<Option<Vec<u8>>>>,
+        #[cfg(test)] metadata_observation: Option<&ParallelBatchObservation>,
         assignment: ParallelShardAssignment,
         cx: &Cx,
         checkpoint: &ParallelIngestCheckpoint,
@@ -6423,6 +6563,7 @@ impl QuillWriterState {
         let shard_documents = documents
             .get(assignment.document_start..assignment.document_end)
             .ok_or_else(|| invalid_state("parallel shard document range is outside the batch"))?;
+        let mut prepared_metadata = prepared_metadata.map(Vec::into_iter);
         if shard_documents.len()
             != usize::try_from(assignment.span.len)
                 .map_err(|_| invalid_state("parallel shard span length does not fit usize"))?
@@ -6431,18 +6572,26 @@ impl QuillWriterState {
                 "parallel shard document range differs from its Q1 span",
             ));
         }
+        if prepared_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.len() != shard_documents.len())
+        {
+            return Err(invalid_state(
+                "prepared metadata range differs from its parallel document range",
+            ));
+        }
         state
             .identities
             .try_reserve(shard_documents.len())
             .map_err(|_| invalid_state("could not reserve parallel shard identities"))?;
-        for (offset, document) in shard_documents.iter().enumerate() {
+        for (document_offset, document) in shard_documents.iter().enumerate() {
             checkpoint.check(cx)?;
-            let offset = u32::try_from(offset)
+            let span_offset = u32::try_from(document_offset)
                 .map_err(|_| invalid_state("parallel shard offset does not fit u32"))?;
             let doc_ord = assignment
                 .span
                 .ord_start
-                .checked_add(offset)
+                .checked_add(span_offset)
                 .ok_or_else(|| invalid_state("lease-relative document ordinal overflow"))?;
             let global_docid = assignment
                 .span
@@ -6450,7 +6599,30 @@ impl QuillWriterState {
                 .checked_add(u64::from(doc_ord))
                 .filter(|docid| *docid < MAX_GLOBAL_DOCID_EXCLUSIVE)
                 .ok_or_else(|| invalid_state("global Q1 document-id space exhausted"))?;
-            let metadata = canonical_metadata(&document.metadata)?;
+            let fallback_metadata;
+            let prepared_metadata_for_document = if let Some(prepared) = prepared_metadata.as_mut()
+            {
+                Some(
+                    prepared
+                        .next()
+                        .ok_or_else(|| invalid_state("prepared metadata document is missing"))?,
+                )
+            } else {
+                None
+            };
+            let metadata = match prepared_metadata_for_document {
+                Some(Some(ref metadata)) => {
+                    #[cfg(test)]
+                    if let Some(observation) = metadata_observation {
+                        observation.record_reused_metadata();
+                    }
+                    metadata.as_slice()
+                }
+                Some(None) | None => {
+                    fallback_metadata = canonical_metadata(&document.metadata)?;
+                    fallback_metadata.as_slice()
+                }
+            };
             let title = document.title.as_deref().unwrap_or("");
             let indexed = [
                 IndexedFieldValue::new(ID_FIELD, &document.id),
@@ -6458,11 +6630,11 @@ impl QuillWriterState {
                 IndexedFieldValue::new(TITLE_FIELD, title),
             ];
             let numeric = [IndexedNumericValue::u64(ORD_FIELD, global_docid)];
-            let stored = [StoredFieldValue::new(METADATA_FIELD, &metadata)];
+            let stored = [StoredFieldValue::new(METADATA_FIELD, metadata)];
             state
                 .accumulator
                 .add_document_with_values(doc_ord, &indexed, &numeric, &stored)?;
-            let content_hash = canonical_document_content_hash(document, &metadata)?;
+            let content_hash = canonical_document_content_hash(document, metadata)?;
             state.identities.push(PendingIdentity {
                 doc_ord,
                 document_id: document.id.clone(),
@@ -26399,14 +26571,17 @@ mod tests {
                 parallel_document_logical_upper_bound(schema, &mut analyzer, document, usize::MAX)
                     .expect("estimate budget-bound document")
                     .expect("shipping-shaped schema has a bound");
-            let ParallelDocumentBudgetBound::Within(document_upper_bound) = document_bound else {
-                panic!("unbounded fixture must not reach the rejection ceiling");
+            let ParallelDocumentBudgetBound::Within {
+                logical_upper_bound: document_upper_bound,
+                canonical_metadata: Some(metadata),
+            } = document_bound
+            else {
+                panic!("unbounded fixture must produce reusable canonical metadata");
             };
             cumulative_upper_bound = cumulative_upper_bound
                 .checked_add(document_upper_bound)
                 .expect("fixture upper bound fits usize");
 
-            let metadata = canonical_metadata(&document.metadata).expect("canonical metadata");
             let title = document.title.as_deref().unwrap_or("");
             let indexed = [
                 IndexedFieldValue::new(ID_FIELD, &document.id),
@@ -26503,8 +26678,12 @@ mod tests {
         )
         .expect("estimate token-ceiling fixture")
         .expect("shipping schema has token-ceiling bound");
-        let ParallelDocumentBudgetBound::Within(full) = full else {
-            panic!("unbounded token fixture must produce a complete bound");
+        let ParallelDocumentBudgetBound::Within {
+            logical_upper_bound: full,
+            canonical_metadata: Some(full_metadata),
+        } = full
+        else {
+            panic!("unbounded token fixture must produce reusable canonical metadata");
         };
 
         let mut equality_analyzer = FrankensearchTokenizer::default();
@@ -26520,16 +26699,56 @@ mod tests {
         );
 
         let mut fitting_analyzer = FrankensearchTokenizer::default();
-        assert_eq!(
-            parallel_document_logical_upper_bound(
-                DEFAULT_SCHEMA,
-                &mut fitting_analyzer,
-                &document,
-                full.checked_add(1).expect("fixture bound fits usize"),
+        let fitting = parallel_document_logical_upper_bound(
+            DEFAULT_SCHEMA,
+            &mut fitting_analyzer,
+            &document,
+            full.checked_add(1).expect("fixture bound fits usize"),
+        )
+        .expect("estimate token-bound fit")
+        .expect("fitting token bound is present");
+        let ParallelDocumentBudgetBound::Within {
+            logical_upper_bound: fitting_bound,
+            canonical_metadata: Some(fitting_metadata),
+        } = fitting
+        else {
+            panic!("one byte of slack must admit reusable canonical metadata");
+        };
+        assert_eq!(fitting_bound, full);
+        assert_eq!(fitting_metadata, full_metadata);
+    }
+
+    #[test]
+    fn prepared_metadata_retention_respects_the_exclusive_batch_budget() {
+        let retained_bytes = AtomicUsize::new(0);
+        let exclusive_ceiling = 10;
+
+        assert!(
+            retain_prepared_metadata_within_budget(
+                vec![0_u8; 4],
+                &retained_bytes,
+                exclusive_ceiling,
             )
-            .expect("estimate token-bound fit"),
-            Some(ParallelDocumentBudgetBound::Within(full)),
+            .is_some()
         );
+        assert!(
+            retain_prepared_metadata_within_budget(
+                vec![0_u8; 5],
+                &retained_bytes,
+                exclusive_ceiling,
+            )
+            .is_some()
+        );
+        assert!(
+            retain_prepared_metadata_within_budget(
+                vec![0_u8; 1],
+                &retained_bytes,
+                exclusive_ceiling,
+            )
+            .is_none(),
+            "the cache must not reach the exclusive ceiling",
+        );
+        assert_eq!(retained_bytes.load(Ordering::Acquire), 9);
     }
 
     #[cfg(feature = "bench-internals")]
@@ -27523,6 +27742,24 @@ mod tests {
                     .await
                     .expect("run shared-nothing ingest")
                     .expect("250 documents at width 4 take the shared-nothing route");
+                let actual_hashes = writer
+                    .shards
+                    .iter()
+                    .flat_map(|shard| shard.identities.iter())
+                    .map(|identity| (identity.document_id.as_str(), identity.content_hash))
+                    .collect::<BTreeMap<_, _>>();
+                assert_eq!(actual_hashes.len(), documents.len());
+                for document in &documents {
+                    assert_eq!(
+                        actual_hashes.get(document.id.as_str()).copied(),
+                        Some(
+                            indexable_document_content_hash(document)
+                                .expect("derive independent canonical document witness"),
+                        ),
+                        "prepared metadata must remain paired with document {}",
+                        document.id,
+                    );
+                }
                 // Identities are retained, not just counted.
                 assert_eq!(
                     observation.sorted_worker_ids().len(),
@@ -27554,6 +27791,16 @@ mod tests {
                 // `overlap_witness_records_real_rayon_overlap_and_one_thread_negative`.
                 assert!(witness.peak_shards_in_flight >= 1);
                 assert!(witness.peak_shards_in_flight <= witness.completed_shards);
+                assert_eq!(
+                    witness.prepared_metadata_documents,
+                    documents.len(),
+                    "the adaptive budget proof must prepare one canonical metadata image per document",
+                );
+                assert_eq!(
+                    witness.reused_metadata_documents,
+                    documents.len(),
+                    "the real shared-nothing workers must reuse every prepared metadata image",
+                );
                 // The receipt carries no terminal by construction: a route
                 // cannot know the whole-operation outcome. Terminal lives on
                 // the observation and is published only by the recorder.
