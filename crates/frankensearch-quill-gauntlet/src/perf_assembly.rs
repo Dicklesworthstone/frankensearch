@@ -6129,20 +6129,29 @@ mod tests {
     #[test]
     fn stale_normative_manifest_is_rejected_at_source_integrity_boundary() {
         let ordinals = runnable_ordinals();
-        let mut stale = shard(
+        let mut sources = shard(
             &ordinals,
             "stale-manifest",
             "stale-manifest-runner",
             None,
             TestIdentity::PRIMARY,
         );
-        stale.provenance.manifest_sha256 = "8".repeat(64);
-        stale.artifact_sha256.clear();
+        assert_eq!(
+            sources.len(),
+            1,
+            "full-gate fixture has one source artifact"
+        );
+        let mut stale = sources.pop().expect("full-gate source artifact");
+        let authority_refs = stale.authority_refs();
+        stale.artifact.provenance.manifest_sha256 = "8".repeat(64);
+        stale.artifact.artifact_sha256.clear();
         let unsealed =
             serde_json::to_string_pretty(&stale.artifact).expect("stale unsealed evidence");
-        stale.artifact_sha256 = sha256_hex(unsealed.as_bytes());
+        stale.artifact.artifact_sha256 = sha256_hex(unsealed.as_bytes());
         assert!(matches!(
-            stale.verify_integrity(),
+            stale
+                .artifact
+                .verify_integrity_against_qg1_authorities(&authority_refs),
             Err(EvidenceArtifactError::InvalidProvenance { ref reason })
                 if reason.contains("manifest digest differs")
         ));
