@@ -5,6 +5,8 @@
 //! their composite statistics, scorer adapters, and seal transaction are
 //! assembled here; later mixed-state beads wire them into the public writer loop.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::{Bound, Deref};
 use std::path::{Path, PathBuf};
@@ -14447,12 +14449,11 @@ fn open_sealed_term_cursor<'a>(
     checkpoint: &QueryCheckpointHandle<'_>,
 ) -> Result<(SealedPostingCursor<'a>, DocLenField<'a>), QuillIndexError> {
     let manifest = segment.manifest();
-    let expected = term_field_ords(schema);
-    let doclen = DocLenSection::parse(
+    let doclen = DocLenSection::parse_schema(
         required_section(segment, SectionKind::DOCLEN)?,
         manifest.docid_lo,
         manifest.docid_hi,
-        &expected,
+        schema,
     )?;
     let fieldnorms = doclen
         .field(field_ord)
@@ -14802,13 +14803,12 @@ fn owned_fieldnorms(
     schema: SchemaDescriptor,
     field_ord: u16,
 ) -> Result<OwnedFieldNorms, QuillIndexError> {
-    let expected = term_field_ords(schema);
     let manifest = segment.manifest();
-    let section = DocLenSection::parse(
+    let section = DocLenSection::parse_schema(
         required_section(segment, SectionKind::DOCLEN)?,
         manifest.docid_lo,
         manifest.docid_hi,
-        &expected,
+        schema,
     )?;
     let field = section
         .field(field_ord)
@@ -14853,7 +14853,14 @@ fn span<'a>(
         .ok_or_else(|| invalid_state(format!("{name} span lies outside its section")))
 }
 
+#[cfg(test)]
+thread_local! {
+    static TERM_FIELD_ORD_BRIDGE_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
 fn term_field_ords(schema: SchemaDescriptor) -> Vec<u16> {
+    TERM_FIELD_ORD_BRIDGE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
     schema
         .fields
         .iter()
@@ -14866,6 +14873,16 @@ fn term_field_ords(schema: SchemaDescriptor) -> Vec<u16> {
             | crate::schema::FieldKind::U64 { .. } => None,
         })
         .collect()
+}
+
+#[cfg(test)]
+fn reset_term_field_ord_bridge_calls() {
+    TERM_FIELD_ORD_BRIDGE_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+fn term_field_ord_bridge_calls() -> usize {
+    TERM_FIELD_ORD_BRIDGE_CALLS.with(Cell::get)
 }
 
 #[cfg(test)]
@@ -24347,6 +24364,7 @@ mod tests {
                     .reader
                     .query_checkpoint(&cx, "arrival_path_lowering", u64::MAX, u64::MAX);
 
+            reset_term_field_ord_bridge_calls();
             let sealed_scorer = lower_leaf_term(
                 QueryLeaf::Sealed(&keeper.segments()[0]),
                 &composed,
@@ -24363,6 +24381,11 @@ mod tests {
                 sealed_scorer.arrival_path_is_validated(),
                 "the shipping sealed lowering must reach the validated arrival path, \
                  or the seeking fill is unreachable in production"
+            );
+            assert_eq!(
+                term_field_ord_bridge_calls(),
+                0,
+                "shipping sealed lowering must validate DOCLEN directly from the schema iterator",
             );
 
             let keeper = Arc::new(

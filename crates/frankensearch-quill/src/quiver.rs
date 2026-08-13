@@ -5894,7 +5894,50 @@ impl<'a> DocLenSection<'a> {
         expected_field_ords: &[u16],
         limits: DocLenLimits,
     ) -> Result<Self, DocLenCodecError> {
-        validate_doclen_expected_fields(expected_field_ords, limits.max_fields)?;
+        Self::parse_with_expected_fields(
+            bytes,
+            docid_lo,
+            docid_hi,
+            expected_field_ords.iter().copied(),
+            expected_field_ords.len(),
+            limits,
+        )
+    }
+
+    pub(crate) fn parse_schema(
+        bytes: &'a [u8],
+        docid_lo: u64,
+        docid_hi: u64,
+        schema: SchemaDescriptor,
+    ) -> Result<Self, DocLenCodecError> {
+        let expected_fields = doclen_schema_field_ords(schema);
+        let field_count = expected_fields.clone().count();
+        Self::parse_with_expected_fields(
+            bytes,
+            docid_lo,
+            docid_hi,
+            expected_fields,
+            field_count,
+            DocLenLimits::default(),
+        )
+    }
+
+    fn parse_with_expected_fields<I>(
+        bytes: &'a [u8],
+        docid_lo: u64,
+        docid_hi: u64,
+        expected_field_ords: I,
+        field_count: usize,
+        limits: DocLenLimits,
+    ) -> Result<Self, DocLenCodecError>
+    where
+        I: Clone + Iterator<Item = u16>,
+    {
+        validate_doclen_expected_field_iter(
+            expected_field_ords.clone(),
+            field_count,
+            limits.max_fields,
+        )?;
         let span = checked_doclen_span(docid_lo, docid_hi, limits)?;
         let section_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         if section_len > limits.max_section_bytes {
@@ -5904,12 +5947,11 @@ impl<'a> DocLenSection<'a> {
                 limit: limits.max_section_bytes,
             });
         }
-        let directory_len = expected_field_ords
-            .len()
-            .checked_mul(DOCLEN_DIRECTORY_ENTRY_LEN)
-            .ok_or(DocLenCodecError::ArithmeticOverflow {
+        let directory_len = field_count.checked_mul(DOCLEN_DIRECTORY_ENTRY_LEN).ok_or(
+            DocLenCodecError::ArithmeticOverflow {
                 field: "directory length",
-            })?;
+            },
+        )?;
         if bytes.len() < directory_len {
             return Err(DocLenCodecError::Truncated {
                 expected: directory_len,
@@ -5917,10 +5959,11 @@ impl<'a> DocLenSection<'a> {
             });
         }
 
-        let canonical_len = doclen_layout_len(expected_field_ords, span, limits)?;
+        let canonical_len =
+            doclen_layout_len_iter(expected_field_ords.clone(), field_count, span, limits)?;
         let mut previous_end = directory_len;
         let mut canonical_cursor = directory_len;
-        for (index, &expected_field) in expected_field_ords.iter().enumerate() {
+        for (index, expected_field) in expected_field_ords.enumerate() {
             let canonical_offset =
                 align_doclen(canonical_cursor).ok_or(DocLenCodecError::ArithmeticOverflow {
                     field: "aligned column offset",
@@ -5998,7 +6041,7 @@ impl<'a> DocLenSection<'a> {
             bytes,
             docid_lo,
             docid_hi,
-            field_count: expected_field_ords.len(),
+            field_count,
         })
     }
 
@@ -6110,23 +6153,49 @@ fn validate_doclen_expected_fields(
     expected_field_ords: &[u16],
     max_fields: usize,
 ) -> Result<(), DocLenCodecError> {
-    if expected_field_ords.len() > max_fields {
+    validate_doclen_expected_field_iter(
+        expected_field_ords.iter().copied(),
+        expected_field_ords.len(),
+        max_fields,
+    )
+}
+
+fn validate_doclen_expected_field_iter<I>(
+    expected_field_ords: I,
+    field_count: usize,
+    max_fields: usize,
+) -> Result<(), DocLenCodecError>
+where
+    I: Iterator<Item = u16>,
+{
+    if field_count > max_fields {
         return Err(DocLenCodecError::ResourceLimit {
             resource: "field count",
-            actual: u64::try_from(expected_field_ords.len()).unwrap_or(u64::MAX),
+            actual: u64::try_from(field_count).unwrap_or(u64::MAX),
             limit: u64::try_from(max_fields).unwrap_or(u64::MAX),
         });
     }
-    for (index, pair) in expected_field_ords.windows(2).enumerate() {
-        if pair[0] >= pair[1] {
+    let mut previous = None;
+    for (index, current) in expected_field_ords.enumerate() {
+        if let Some(previous_field) = previous
+            && previous_field >= current
+        {
             return Err(DocLenCodecError::NonAscendingFields {
-                index: index + 1,
-                previous: pair[0],
-                current: pair[1],
+                index,
+                previous: previous_field,
+                current,
             });
         }
+        previous = Some(current);
     }
     Ok(())
+}
+
+fn doclen_schema_field_ords(schema: SchemaDescriptor) -> impl Clone + Iterator<Item = u16> {
+    schema.fields.iter().filter_map(|field| match field.kind {
+        FieldKind::Keyword | FieldKind::Text { .. } => Some(field.id),
+        FieldKind::StoredOnly | FieldKind::I64 { .. } | FieldKind::U64 { .. } => None,
+    })
 }
 
 fn validate_doclen_field_set(
@@ -6218,19 +6287,22 @@ fn doclen_layout(
     Ok((offsets, cursor))
 }
 
-fn doclen_layout_len(
-    field_ords: &[u16],
+fn doclen_layout_len_iter<I>(
+    field_ords: I,
+    field_count: usize,
     span: usize,
     limits: DocLenLimits,
-) -> Result<usize, DocLenCodecError> {
-    let directory_len = field_ords
-        .len()
-        .checked_mul(DOCLEN_DIRECTORY_ENTRY_LEN)
-        .ok_or(DocLenCodecError::ArithmeticOverflow {
+) -> Result<usize, DocLenCodecError>
+where
+    I: Iterator<Item = u16>,
+{
+    let directory_len = field_count.checked_mul(DOCLEN_DIRECTORY_ENTRY_LEN).ok_or(
+        DocLenCodecError::ArithmeticOverflow {
             field: "directory length",
-        })?;
+        },
+    )?;
     let mut cursor = directory_len;
-    for &field_ord in field_ords {
+    for field_ord in field_ords {
         let offset = align_doclen(cursor).ok_or(DocLenCodecError::ArithmeticOverflow {
             field: "aligned column offset",
         })?;
