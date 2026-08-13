@@ -7646,7 +7646,17 @@ mod tests {
         resolve_run_selection(plan, Some(&selection)).expect("resolved exact fixture selection")
     }
 
-    fn qg1_register_entry_for_target(operation_id: &str) -> Qg1AuthorityRegisterEntryV1 {
+    /// Mint one production-shaped authority for `operation_id` over the exact
+    /// issued stream set the caller names.
+    ///
+    /// The stream-role set is the whole of what `verified_registration` reads
+    /// to authenticate a role, so it is the only thing that varies between a
+    /// pilot and a decision authority here. Everything else stays identical, so
+    /// the two entries differ only where the role derivation looks.
+    fn qg1_register_entry_with_streams(
+        operation_id: &str,
+        issued_streams: Vec<(String, u64, u64, Vec<crate::PerfSampleArm>)>,
+    ) -> Qg1AuthorityRegisterEntryV1 {
         let mut config = crate::PairedEstimatorConfig::predeclared(0x5147_3148_534b_5445);
         config
             .install_qg1_lifecycle_authority(
@@ -7668,29 +7678,64 @@ mod tests {
                 }],
                 "synthetic-00000000".to_owned(),
                 1,
-                vec![
-                    (
-                        "qg1.effect.tantivy_vs_quill.v1".to_owned(),
-                        0,
-                        0,
-                        vec![crate::PerfSampleArm::Control],
-                    ),
-                    (
-                        "qg1.null.tantivy.v1".to_owned(),
-                        0,
-                        1_000_000,
-                        vec![crate::PerfSampleArm::Control],
-                    ),
-                    (
-                        "qg1.null.quill.v1".to_owned(),
-                        2_000_000,
-                        2_000_000,
-                        vec![crate::PerfSampleArm::Control],
-                    ),
-                ],
+                issued_streams,
             )
             .expect("build a production-shaped QG-1 authority")
             .register_entry()
+    }
+
+    /// The canonical fresh-decision triple, which `verified_registration`
+    /// authenticates as [`Qg1AuthorityRoleV1::Decision`].
+    fn qg1_register_entry_for_target(operation_id: &str) -> Qg1AuthorityRegisterEntryV1 {
+        qg1_register_entry_with_streams(
+            operation_id,
+            vec![
+                (
+                    crate::perf::QG1_STREAM_ROLE_EFFECT.to_owned(),
+                    0,
+                    0,
+                    vec![crate::PerfSampleArm::Control],
+                ),
+                (
+                    crate::perf::QG1_STREAM_ROLE_TANTIVY_NULL.to_owned(),
+                    0,
+                    1_000_000,
+                    vec![crate::PerfSampleArm::Control],
+                ),
+                (
+                    crate::perf::QG1_STREAM_ROLE_QUILL_NULL.to_owned(),
+                    2_000_000,
+                    2_000_000,
+                    vec![crate::PerfSampleArm::Control],
+                ),
+            ],
+        )
+    }
+
+    /// The canonical pilot pair, which `verified_registration` authenticates as
+    /// [`Qg1AuthorityRoleV1::Pilot`].
+    ///
+    /// A selected engine-lifecycle cell is complete only with exactly one
+    /// decision AND at least one pilot, so a fixture that stages the decision
+    /// alone is refused at the COMPLETE frame and never receives an ACK.
+    fn qg1_pilot_register_entry_for_target(operation_id: &str) -> Qg1AuthorityRegisterEntryV1 {
+        qg1_register_entry_with_streams(
+            operation_id,
+            vec![
+                (
+                    crate::perf::QG1_STREAM_ROLE_TANTIVY_PILOT_EFFECT.to_owned(),
+                    0,
+                    0,
+                    vec![crate::PerfSampleArm::Control],
+                ),
+                (
+                    crate::perf::QG1_STREAM_ROLE_TANTIVY_PILOT_NULL.to_owned(),
+                    0,
+                    1_000_000,
+                    vec![crate::PerfSampleArm::Control],
+                ),
+            ],
+        )
     }
 
     #[test]
@@ -8083,6 +8128,25 @@ mod tests {
         stdout.flush().expect("flush wait-test authority entry");
     }
 
+    /// Emit the pilot half of a complete engine-lifecycle cell. Only the
+    /// accepted-ACK case needs it; every refusal case below deliberately stages
+    /// a decision alone and must keep doing so.
+    fn qg1_write_wait_test_pilot_register(operation_id: &str, sequence: u64) {
+        let entry = qg1_pilot_register_entry_for_target(operation_id);
+        let entry_bytes = entry
+            .to_json_bytes()
+            .expect("serialize wait-test pilot authority");
+        let frame = Qg1StartupHandshakeV1::register_frame(sequence, &entry_bytes)
+            .expect("frame bounded wait-test pilot authority");
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(&frame)
+            .expect("write wait-test pilot authority register");
+        stdout
+            .flush()
+            .expect("flush wait-test pilot authority entry");
+    }
+
     fn qg1_write_wait_test_complete(register_count: u64) {
         let mut stdout = std::io::stdout().lock();
         stdout
@@ -8108,7 +8172,11 @@ mod tests {
         match case.to_string_lossy().as_ref() {
             "ack" => {
                 qg1_write_wait_test_register("QG-1.bulk/tiny/1/positions_on.docs_per_second", 1);
-                qg1_write_wait_test_complete(1);
+                qg1_write_wait_test_pilot_register(
+                    "QG-1.bulk/tiny/1/positions_on.docs_per_second",
+                    2,
+                );
+                qg1_write_wait_test_complete(2);
                 qg1_read_wait_test_ack();
                 println!("qg1-wait-child-work-after-ack");
             }
@@ -8290,14 +8358,31 @@ mod tests {
             // then consumes exactly the final-ACK bytes from stdin and only
             // afterwards does post-ACK work, which is the ordering this case
             // exists to prove.
-            let entry =
-                qg1_register_entry_for_target("QG-1.bulk/tiny/1/positions_on.docs_per_second");
-            let entry_bytes = entry
-                .to_json_bytes()
-                .expect("serialize wait-boundary authority");
-            let mut frames = Qg1StartupHandshakeV1::register_frame(1, &entry_bytes)
-                .expect("frame bounded wait-boundary authority");
-            frames.extend_from_slice(&Qg1StartupHandshakeV1::complete_frame(1));
+            // A selected engine-lifecycle cell is complete only with exactly
+            // one decision AND at least one pilot, so both roles are staged for
+            // the SAME operation id. Staging the decision alone is refused at
+            // the COMPLETE frame and the child never receives an ACK, which is
+            // a refusal of the fixture rather than a test of the wait boundary.
+            let decision_bytes =
+                qg1_register_entry_for_target("QG-1.bulk/tiny/1/positions_on.docs_per_second")
+                    .to_json_bytes()
+                    .expect("serialize wait-boundary decision authority");
+            let pilot_bytes = qg1_pilot_register_entry_for_target(
+                "QG-1.bulk/tiny/1/positions_on.docs_per_second",
+            )
+            .to_json_bytes()
+            .expect("serialize wait-boundary pilot authority");
+            assert_ne!(
+                decision_bytes, pilot_bytes,
+                "the two staged roles must be distinct authorities, not a replay"
+            );
+            let mut frames = Qg1StartupHandshakeV1::register_frame(1, &decision_bytes)
+                .expect("frame bounded wait-boundary decision authority");
+            frames.extend_from_slice(
+                &Qg1StartupHandshakeV1::register_frame(2, &pilot_bytes)
+                    .expect("frame bounded wait-boundary pilot authority"),
+            );
+            frames.extend_from_slice(&Qg1StartupHandshakeV1::complete_frame(2));
             assert!(
                 frames.starts_with(Qg1StartupHandshakeV1::REGISTER_MAGIC),
                 "the staged child stream must begin at byte zero with the register magic"
@@ -8494,6 +8579,39 @@ mod tests {
             qg1_expected_authority_cell_ids(&one_engine_selection)
                 .expect("one-engine expected authority set"),
             "accepted ACK case carries the exact selected engine authority map"
+        );
+        // The cell-id set alone cannot see a missing role: a decision-only set
+        // has the same keys and is exactly what the parent refuses. Pin both
+        // roles, one digest each, and nothing else retained.
+        let selected_cell = "QG-1/bulk/tiny/1/positions_on/docs_per_second".to_owned();
+        assert_eq!(
+            accepted.digests_for(&selected_cell, Qg1AuthorityRoleV1::Pilot),
+            1,
+            "the ACKed cell retains exactly one pilot authority; accepted map {:?}",
+            accepted.role_digests.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            accepted.digests_for(&selected_cell, Qg1AuthorityRoleV1::Decision),
+            1,
+            "the ACKed cell retains exactly one decision authority; accepted map {:?}",
+            accepted.role_digests.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            accepted.total(),
+            2,
+            "the ACKed set is exactly the staged pilot and decision pair"
+        );
+        assert_eq!(
+            accepted
+                .role_digests
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                (selected_cell.clone(), Qg1AuthorityRoleV1::Pilot),
+                (selected_cell, Qg1AuthorityRoleV1::Decision),
+            ]),
+            "no surplus role-qualified entry was retained for an unselected cell"
         );
         assert!(
             run_log
