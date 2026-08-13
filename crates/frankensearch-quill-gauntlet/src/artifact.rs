@@ -1088,10 +1088,14 @@ impl ArtifactObject {
         // than silently read as v8 (bd-bxya1).
         match generation {
             ArtifactGeneration::Current | ArtifactGeneration::RetainedV9 => {
-                self.comparator_config.validate_stored_v9()?
+                self.comparator_config.validate_stored_v9()?;
             }
-            ArtifactGeneration::RetainedV8 => self.comparator_config.validate_stored_v8()?,
-            ArtifactGeneration::RetainedV7 => self.comparator_config.validate_stored_v7()?,
+            ArtifactGeneration::RetainedV8 => {
+                self.comparator_config.validate_stored_v8()?;
+            }
+            ArtifactGeneration::RetainedV7 => {
+                self.comparator_config.validate_stored_v7()?;
+            }
         }
         if matches!(
             generation,

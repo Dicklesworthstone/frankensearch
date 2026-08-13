@@ -1052,7 +1052,7 @@ impl<'a> Qg1PreparedSampleInput<'a> {
             .last()
             .ok_or_else(|| "QG-1 prepared input requires a tail document".to_owned())?
             .id
-            .to_string();
+            .clone();
         let binding = Qg1PreparedSampleBinding {
             manifest_sha256: prefix.manifest_sha256.clone(),
             indexed_content_sha256: prefix.indexed_content_sha256.clone(),
@@ -2701,10 +2701,7 @@ fn qg1_quill_terminal_searchability(
     interval.mark_terminal_searchable_quiescence();
     match result {
         Ok(results) => {
-            let document_ids = results
-                .into_iter()
-                .map(|document_id| String::from(document_id))
-                .collect::<Vec<_>>();
+            let document_ids = results.into_iter().map(String::from).collect::<Vec<_>>();
             // Borrow rather than move: the identifier is still needed by the
             // no-claim message below and by the error arm.
             let fact = if document_ids.as_slice() == std::slice::from_ref(&expected_document_id) {
@@ -2853,7 +2850,7 @@ fn qg1_bulk_metric_continuous(
         }
         EngineArm::Tantivy => {
             let prepared_input = context.qg1_sample_input(count);
-            let writer_mode = tantivy_writer_mode.unwrap_or(Qg1TantivyWriterMode::Fixed {
+            let writer_mode = tantivy_writer_mode.unwrap_or_else(|| Qg1TantivyWriterMode::Fixed {
                 writer_threads: spec.threads.unwrap_or(1),
             });
             let index = qg1_tantivy_in_memory(spec, writer_mode);
@@ -4321,15 +4318,12 @@ fn construct_qg1_startup_producers(
                 prepared.binding.content_bytes,
             )
             .expect("freeze live QG-1 Tantivy incumbent screen plan");
-            let writer_modes = std::iter::once(Qg1TantivyWriterMode::ShippingAuto)
+            let pilots = std::iter::once(Qg1TantivyWriterMode::ShippingAuto)
                 .chain(
                     widths
                         .into_iter()
                         .map(|writer_threads| Qg1TantivyWriterMode::Fixed { writer_threads }),
                 )
-                .collect::<Vec<_>>();
-            let pilots = writer_modes
-                .into_iter()
                 .enumerate()
                 .map(|(candidate_index, writer_mode)| {
                     let mut estimator_config = evidence.config.clone();
@@ -4383,7 +4377,7 @@ fn construct_qg1_startup_producers(
 }
 
 fn qg1_wait_for_authority_ack(
-    receiver: mpsc::Receiver<Result<Vec<u8>, String>>,
+    receiver: &mpsc::Receiver<Result<Vec<u8>, String>>,
     timeout: Duration,
 ) -> Result<Vec<u8>, String> {
     receiver
@@ -4473,7 +4467,7 @@ fn require_qg1_pre_timing_authority_ack(selected_qg1: bool, producers: &[Qg1Star
         let _ = sender.send(result);
     });
     let acknowledgement =
-        qg1_wait_for_authority_ack(receiver, Qg1StartupHandshakeV1::STARTUP_TIMEOUT)
+        qg1_wait_for_authority_ack(&receiver, Qg1StartupHandshakeV1::STARTUP_TIMEOUT)
             .unwrap_or_else(|error| panic!("{error}"));
     Qg1StartupHandshakeV1::validate_final_ack(&acknowledgement)
         .unwrap_or_else(|error| panic!("{error}"));
@@ -4659,12 +4653,9 @@ fn qg1_live_startup_operation_id(entry_bytes: &[u8]) -> Result<(String, String),
 fn qg1_live_startup_discriminator_positive_child() -> Result<(), String> {
     let expected_operation_ids = qg1_live_startup_discriminator_selected_operation_ids()?;
     let mut child = qg1_live_startup_discriminator_child(Qg1LiveStartupDiscriminatorMode::Child)?;
-    let mut stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            qg1_live_startup_discriminator_abort(&mut child);
-            return Err("live QG-1 startup child lacks stdout".to_owned());
-        }
+    let Some(mut stdout) = child.stdout.take() else {
+        qg1_live_startup_discriminator_abort(&mut child);
+        return Err("live QG-1 startup child lacks stdout".to_owned());
     };
     let transcript = (|| -> Result<(), String> {
         let mut next_sequence = 1_u64;
@@ -4740,12 +4731,9 @@ fn qg1_live_startup_discriminator_positive_child() -> Result<(), String> {
         );
     }
 
-    let mut stdin = match child.stdin.take() {
-        Some(stdin) => stdin,
-        None => {
-            qg1_live_startup_discriminator_abort(&mut child);
-            return Err("live QG-1 startup child lacks stdin".to_owned());
-        }
+    let Some(mut stdin) = child.stdin.take() else {
+        qg1_live_startup_discriminator_abort(&mut child);
+        return Err("live QG-1 startup child lacks stdin".to_owned());
     };
     stdin
         .write_all(&Qg1StartupHandshakeV1::final_ack_frame())
@@ -4799,12 +4787,9 @@ fn qg1_live_startup_discriminator_positive_child() -> Result<(), String> {
 fn qg1_live_startup_discriminator_rejects_preamble() -> Result<(), String> {
     let mut child =
         qg1_live_startup_discriminator_child(Qg1LiveStartupDiscriminatorMode::Preamble)?;
-    let mut stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            qg1_live_startup_discriminator_abort(&mut child);
-            return Err("preamble QG-1 startup child lacks stdout".to_owned());
-        }
+    let Some(mut stdout) = child.stdout.take() else {
+        qg1_live_startup_discriminator_abort(&mut child);
+        return Err("preamble QG-1 startup child lacks stdout".to_owned());
     };
     if Qg1StartupHandshakeV1::read_control_frame(&mut stdout).is_ok() {
         qg1_live_startup_discriminator_abort(&mut child);
@@ -4826,12 +4811,9 @@ fn qg1_live_startup_discriminator_rejects_preamble() -> Result<(), String> {
 
 fn qg1_live_startup_discriminator_non_qg_child() -> Result<(), String> {
     let mut child = qg1_live_startup_discriminator_child(Qg1LiveStartupDiscriminatorMode::NonQg)?;
-    let mut stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            qg1_live_startup_discriminator_abort(&mut child);
-            return Err("non-QG startup child lacks stdout".to_owned());
-        }
+    let Some(mut stdout) = child.stdout.take() else {
+        qg1_live_startup_discriminator_abort(&mut child);
+        return Err("non-QG startup child lacks stdout".to_owned());
     };
     let mut ordinary = Vec::new();
     stdout
@@ -6265,8 +6247,8 @@ fn qg1_incumbent_stream_runner<'a>(
     )
 }
 
-fn qg1_run_incumbent_streams_round_interleaved<'a, const N: usize>(
-    mut runners: [PairedStreamRunner<'a>; N],
+fn qg1_run_incumbent_streams_round_interleaved<const N: usize>(
+    mut runners: [PairedStreamRunner<'_>; N],
     rounds: usize,
 ) -> [Vec<PerfRawSample>; N] {
     assert!(N >= 2, "QG-1 interleaving requires multiple streams");
@@ -6769,8 +6751,7 @@ fn collect_cell(
         };
     }
 
-    let mut qg1_no_decision_screen = None;
-    if let Some(startup) = qg1_startup_producer
+    let qg1_no_decision_screen = if let Some(startup) = qg1_startup_producer
         && startup.incumbent.is_some()
     {
         let incumbent = qg1_collect_live_incumbent(context, spec, role, runs, evidence, startup);
@@ -6792,8 +6773,10 @@ fn collect_cell(
                 && incumbent.screen.no_decision_reason.is_some(),
             "an incomplete QG-1 screen must be an explicit NoDecision"
         );
-        qg1_no_decision_screen = Some(incumbent.screen);
-    }
+        Some(incumbent.screen)
+    } else {
+        None
+    };
 
     let scope = operation_scope(spec);
     // Preserve the legacy origin for every non-QG-1 gate. QG-1 deliberately
@@ -8045,7 +8028,9 @@ fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
             (paths, reloaded)
         };
         let mut normalized_reloaded = reloaded.clone();
-        normalized_reloaded.artifact_sha256 = artifact.artifact_sha256.clone();
+        normalized_reloaded
+            .artifact_sha256
+            .clone_from(&artifact.artifact_sha256);
         assert_eq!(
             normalized_reloaded, artifact,
             "persisted QG evidence must match every source field except its writer-computed seal"
@@ -8409,7 +8394,7 @@ mod qg2_continuous_tests {
     /// `QUILL_PERF_QG2_SELF_CHECK`. A `#[test]` item here would be stripped by
     /// `harness = false` and would therefore never execute, which is not
     /// evidence of anything.
-    pub(super) fn assert_qg2_continuous_interval_contract() {
+    pub fn assert_qg2_continuous_interval_contract() {
         let spec = qg2_spec();
         let context = super::BenchContext::for_selected(
             super::MatrixScale::Smoke,
@@ -8542,7 +8527,7 @@ mod qg2_continuous_tests {
     /// monotonic clock.
     /// Ordinary `cfg(test)` helper, reached from `main` under the same
     /// environment switch as the contract above.
-    pub(super) fn assert_qg2_summed_shape_excludes_the_planted_tail() {
+    pub fn assert_qg2_summed_shape_excludes_the_planted_tail() {
         let spec = qg2_spec();
         let context = super::BenchContext::for_selected(
             super::MatrixScale::Smoke,
@@ -8660,7 +8645,7 @@ mod tests {
     /// Ordinary `cfg(test)` helper rather than a `#[test]` item: under
     /// `harness = false` a test-attribute item is stripped, so `main` could not
     /// call it at all.
-    pub(super) fn qg1_authority_subprocess_helper() {
+    pub fn qg1_authority_subprocess_helper() {
         if std::env::var_os(super::QG1_AUTHORITY_SUBPROCESS_ENV).is_none() {
             return;
         }
@@ -8706,10 +8691,12 @@ mod tests {
         Ok((sequence, entry_bytes, register_count, stdout))
     }
 
-    fn qg1_start_authority_subprocess() -> (
-        std::process::Child,
-        mpsc::Receiver<Result<(u64, Vec<u8>, u64, std::process::ChildStdout), String>>,
-    ) {
+    type Qg1AuthorityTranscript = (u64, Vec<u8>, u64, std::process::ChildStdout);
+    type Qg1AuthorityTranscriptReceiver = mpsc::Receiver<Result<Qg1AuthorityTranscript, String>>;
+    type Qg1DeferredOutput = (Vec<u8>, std::process::ChildStdout);
+    type Qg1DeferredOutputReceiver = mpsc::Receiver<Result<Qg1DeferredOutput, String>>;
+
+    fn qg1_start_authority_subprocess() -> (std::process::Child, Qg1AuthorityTranscriptReceiver) {
         let current_test = std::env::current_exe().expect("current benchmark test executable");
         let mut child = Command::new(current_test)
             .env(super::QG1_AUTHORITY_SUBPROCESS_ENV, "1")
@@ -8731,8 +8718,8 @@ mod tests {
 
     fn qg1_receive_subprocess_register(
         child: &mut std::process::Child,
-        receiver: mpsc::Receiver<Result<(u64, Vec<u8>, u64, std::process::ChildStdout), String>>,
-    ) -> (u64, Vec<u8>, u64, std::process::ChildStdout) {
+        receiver: &Qg1AuthorityTranscriptReceiver,
+    ) -> Qg1AuthorityTranscript {
         match receiver.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(register)) => register,
             Ok(Err(error)) => panic!("same-binary authority subprocess failed: {error}"),
@@ -8746,7 +8733,7 @@ mod tests {
 
     fn qg1_assert_no_post_register_work_before_ack(
         stdout: std::process::ChildStdout,
-    ) -> mpsc::Receiver<Result<(Vec<u8>, std::process::ChildStdout), String>> {
+    ) -> Qg1DeferredOutputReceiver {
         let (sender, receiver) = mpsc::sync_channel(1);
         thread::spawn(move || {
             let mut stdout = stdout;
@@ -8769,7 +8756,7 @@ mod tests {
 
     fn qg1_finish_subprocess(
         child: &mut std::process::Child,
-        receiver: mpsc::Receiver<Result<(Vec<u8>, std::process::ChildStdout), String>>,
+        receiver: &Qg1DeferredOutputReceiver,
     ) -> (std::process::ExitStatus, Vec<u8>) {
         let (mut output, mut stdout) = receiver
             .recv_timeout(Duration::from_secs(15))
@@ -8789,7 +8776,7 @@ mod tests {
     fn qg1_authority_ack_is_a_real_pre_sampling_barrier() {
         let (mut child, register_receiver) = qg1_start_authority_subprocess();
         let (sequence, entry_bytes, register_count, stdout) =
-            qg1_receive_subprocess_register(&mut child, register_receiver);
+            qg1_receive_subprocess_register(&mut child, &register_receiver);
         let expected = qg1_handshake_test_producer().register_entry();
         assert_eq!(
             entry_bytes,
@@ -8810,7 +8797,7 @@ mod tests {
             .expect("write exact final ACK");
         stdin.flush().expect("flush exact final ACK");
         drop(stdin);
-        let (status, output) = qg1_finish_subprocess(&mut child, post_register);
+        let (status, output) = qg1_finish_subprocess(&mut child, &post_register);
         assert!(status.success(), "valid ACK subprocess failed: {status}");
         assert!(
             output
@@ -8830,7 +8817,7 @@ mod tests {
         for case in [AckCase::Malformed, AckCase::Missing, AckCase::Timeout] {
             let (mut child, register_receiver) = qg1_start_authority_subprocess();
             let (_sequence, entry_bytes, register_count, stdout) =
-                qg1_receive_subprocess_register(&mut child, register_receiver);
+                qg1_receive_subprocess_register(&mut child, &register_receiver);
             let expected = qg1_handshake_test_producer().register_entry();
             assert_eq!(
                 entry_bytes,
@@ -8857,7 +8844,7 @@ mod tests {
                 }
                 AckCase::Missing => drop(stdin),
                 AckCase::Timeout => {
-                    let (status, output) = qg1_finish_subprocess(&mut child, post_register);
+                    let (status, output) = qg1_finish_subprocess(&mut child, &post_register);
                     assert!(
                         !status.success(),
                         "withheld ACK must make the same-binary helper refuse before work"
@@ -8872,7 +8859,7 @@ mod tests {
                     continue;
                 }
             }
-            let (status, output) = qg1_finish_subprocess(&mut child, post_register);
+            let (status, output) = qg1_finish_subprocess(&mut child, &post_register);
             assert!(
                 !status.success(),
                 "malformed and missing final ACKs must make the helper refuse"
@@ -9083,8 +9070,7 @@ mod tests {
         // it sums every feed/commit/search/join call represented in the hostile
         // timeline. It still loses every gap between calls, exactly the
         // undercount caused by adding independent `Instant::elapsed()` results.
-        let old_summed_call_ns =
-            (20 - 0) + (65 - 40) + (75 - 65) + (100 - 75) + (155 - 100) + (180 - 155);
+        let old_summed_call_ns = [20_u64, 25, 10, 25, 55, 25].into_iter().sum::<u64>();
         assert_eq!(old_summed_call_ns, 160);
         assert_eq!(receipt.interval_ended_ns, 180);
         assert!(

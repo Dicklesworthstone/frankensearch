@@ -87,7 +87,7 @@ impl OracleVersionContract {
             && self.lexical_package == ORACLE_V3_LEXICAL_PACKAGE
             && self.lexical_package_version == ORACLE_V3_LEXICAL_PACKAGE_VERSION
             && self.lexical_contract_audit_revision == ORACLE_V3_LEXICAL_CONTRACT_AUDIT_REVISION;
-        if (!matches_v3 && !(permit_retained_v2 && matches_v2))
+        if !(matches_v3 || permit_retained_v2 && matches_v2)
             || !is_lower_hex(&self.tantivy_checksum_sha256, 64)
             || !is_lower_hex(&self.lexical_contract_audit_revision, 40)
         {

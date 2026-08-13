@@ -1174,10 +1174,12 @@ fn load_native_qg1_authorities(
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
-    if entries.len() != pin.target_count()
-        || seen_digests.len() != entries.len()
-        || pinned_digests != seen_digest_refs
-    {
+    let entry_count_matches_pin = entries.len() == pin.target_count();
+    let register_digests_are_unique = seen_digests.len() == entries.len();
+    let digest_sets_match = pinned_digests == seen_digest_refs;
+    let complete_census =
+        entry_count_matches_pin && register_digests_are_unique && digest_sets_match;
+    if !complete_census {
         return Err(PerfEvidenceAssemblyError::InvalidAttemptBundle {
             reason: "native QG-1 authority register census does not exactly equal its complete pin"
                 .to_owned(),
@@ -4802,7 +4804,7 @@ mod tests {
             identity,
             partial_no_claim_code,
             false,
-            test_policy(),
+            &test_policy(),
             &estimator_config(),
         )
     }
@@ -4816,7 +4818,7 @@ mod tests {
         identity: TestIdentity,
         partial_no_claim_code: &str,
         force_source_no_claim: bool,
-        policy: EvidencePolicy,
+        policy: &EvidencePolicy,
         estimator: &PairedEstimatorConfig,
     ) -> Vec<AuthorityBoundTestArtifact> {
         let contract = PlanContract::reconstruct(&test_plan()).expect("test plan contract");
@@ -4854,7 +4856,7 @@ mod tests {
                     identity,
                     partial_no_claim_code,
                     force_source_no_claim,
-                    &policy,
+                    policy,
                     estimator,
                     runnable_count,
                 )
@@ -5539,9 +5541,9 @@ mod tests {
         PerfEvidenceAssemblyArtifact::assemble_against_qg1_authorities(attempts)
     }
 
-    fn source_authorities_for_test<'a>(
-        sources: &'a [AuthorityBoundTestArtifact],
-    ) -> Vec<(String, Vec<&'a Qg1ExpectedAuthority>)> {
+    fn source_authorities_for_test(
+        sources: &[AuthorityBoundTestArtifact],
+    ) -> Vec<(String, Vec<&Qg1ExpectedAuthority>)> {
         sources
             .iter()
             .map(|source| {
@@ -6960,7 +6962,7 @@ mod tests {
             TestIdentity::PRIMARY,
             PERF_ASSEMBLY_PARTIAL_SHARD_NO_CLAIM_CODE,
             false,
-            policy,
+            &policy,
             &estimator_config(),
         );
         assert_incompatible_field(
@@ -6978,7 +6980,7 @@ mod tests {
             TestIdentity::PRIMARY,
             PERF_ASSEMBLY_PARTIAL_SHARD_NO_CLAIM_CODE,
             false,
-            test_policy(),
+            &test_policy(),
             &estimator,
         );
         assert_incompatible_field(
@@ -7052,7 +7054,7 @@ mod tests {
             TestIdentity::PRIMARY,
             PERF_ASSEMBLY_PARTIAL_SHARD_NO_CLAIM_CODE,
             true,
-            test_policy(),
+            &test_policy(),
             &estimator_config(),
         );
         let assembly = assemble_test(vec![source], Vec::new()).unwrap();
