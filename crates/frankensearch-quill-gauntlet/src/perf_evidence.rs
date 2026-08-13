@@ -2497,7 +2497,7 @@ impl PerfEvidenceArtifact {
     ///
     /// Returns [`EvidenceArtifactError::InconsistentArtifact`] for a non-QG-1
     /// artifact, a screen whose outcome is neither a unique selection nor a
-    /// valid NoDecision, or a projection that is missing, extra, duplicated, or
+    /// valid `NoDecision`, or a projection that is missing, extra, duplicated, or
     /// out of canonical `cell_id` order.
     pub fn attach_qg1_incumbent_screens(
         &mut self,
