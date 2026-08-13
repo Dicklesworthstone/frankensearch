@@ -622,7 +622,7 @@ fn print_help() {
          [--child-deadline-ms N] [--child-term-grace-ms N] \
          [--child-log-byte-cap N] [--child-log-dir PATH]\n\
          hnsw_patch_ab --pinned-run --elf PATH --remote-root DIR --local-dir DIR \
-         [--worker-id ID] [--workers-json PATH] -- [ELF-ARGS]\n\
+         [--worker-id ID] [--workers-json PATH] [--ssh] -- [ELF-ARGS]\n\
          hnsw_patch_ab --pinned-retrieve --remote-root DIR --local-dir DIR \
          [--worker-id ID]\n\
          --pinned-run pins exactly one worker, runs the attested ELF there, \
@@ -5549,6 +5549,194 @@ impl RemoteTransport for LocalPinnedTransport {
     }
 }
 
+struct SshPinnedTransport {
+    worker: WorkerIdentity,
+    remote_root: String,
+    elf: PathBuf,
+    elf_args: Vec<String>,
+    deadline: Duration,
+    term_grace: Duration,
+    ssh: PathBuf,
+    scp: PathBuf,
+    staging: PathBuf,
+    extra_env: BTreeMap<String, String>,
+}
+
+impl SshPinnedTransport {
+    fn target(&self) -> String {
+        format!("{}@{}", self.worker.user, self.worker.host)
+    }
+
+    fn remote_file(&self, name: &str) -> Result<String, DynError> {
+        if !safe_relative_source_path(name)
+            || self.remote_root.is_empty()
+            || self.remote_root.contains('\n')
+            || self.remote_root.contains('\0')
+            || self.remote_root.contains("..")
+        {
+            return Err("unsafe SSH remote artifact path".into());
+        }
+        Ok(format!(
+            "{}/{}",
+            self.remote_root.trim_end_matches('/'),
+            name
+        ))
+    }
+
+    fn run_ssh(&self, remote_command: &str, label: &str) -> Result<i32, DynError> {
+        let journal = Arc::new(ChildJournal::create_new(
+            &self.staging.join(format!("{label}-ssh-journal.jsonl")),
+        )?);
+        let mut command = Command::new(&self.ssh);
+        for (key, value) in &self.extra_env {
+            command.env(key, value);
+        }
+        command.args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=20",
+            self.target().as_str(),
+            "--",
+            remote_command,
+        ]);
+        let executed = run_bounded_child(
+            command,
+            ChildExecutionLimits {
+                deadline: self.deadline,
+                term_grace: self.term_grace,
+                stdout_byte_cap: DEFAULT_CHILD_LOG_BYTE_CAP,
+                stderr_byte_cap: DEFAULT_CHILD_LOG_BYTE_CAP,
+            },
+            &self.staging.join(format!("{label}.stdout")),
+            &self.staging.join(format!("{label}.stderr")),
+            &journal,
+            &ChildIdentity {
+                label: label.to_owned(),
+            },
+        )?;
+        Ok(match executed.termination {
+            ChildTermination::Exited(code) => code,
+            ChildTermination::Signaled(_)
+            | ChildTermination::TimedOutTerminated
+            | ChildTermination::TimedOutKilled => 2,
+        })
+    }
+
+    fn scp_put(&self, local: &Path, remote_name: &str) -> Result<(), DynError> {
+        let remote = format!("{}:{}", self.target(), self.remote_file(remote_name)?);
+        let mut command = Command::new(&self.scp);
+        for (key, value) in &self.extra_env {
+            command.env(key, value);
+        }
+        let status = command
+            .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=20"])
+            .arg(local)
+            .arg(&remote)
+            .stdin(Stdio::null())
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("scp put {} -> {remote} failed: {status:?}", local.display()).into())
+        }
+    }
+
+    fn scp_get(&self, remote_name: &str, local: &Path) -> Result<(), DynError> {
+        let remote = format!("{}:{}", self.target(), self.remote_file(remote_name)?);
+        if let Some(parent) = local.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut command = Command::new(&self.scp);
+        for (key, value) in &self.extra_env {
+            command.env(key, value);
+        }
+        let status = command
+            .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=20"])
+            .arg(&remote)
+            .arg(local)
+            .stdin(Stdio::null())
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("scp get {remote} failed: {status:?}").into())
+        }
+    }
+
+    fn plant_remote_receipt(&self, spec: &RemoteRunSpec) -> Result<(), DynError> {
+        let mut files = BTreeMap::new();
+        for path in spec.required_paths() {
+            if path == PINNED_RETRIEVE_RECEIPT {
+                continue;
+            }
+            let local = self.staging.join(format!("probe-{path}"));
+            if self.scp_get(&path, &local).is_ok()
+                && let Ok(bytes) = fs::read(&local)
+            {
+                files.insert(path, bytes);
+            }
+        }
+        write_artifact_receipt(&mut files, spec);
+        let receipt = files
+            .get(PINNED_RETRIEVE_RECEIPT)
+            .ok_or("failed to seal SSH artifact receipt")?;
+        let local = self.staging.join(PINNED_RETRIEVE_RECEIPT);
+        persist_create_new(&local, receipt)?;
+        self.scp_put(&local, PINNED_RETRIEVE_RECEIPT)
+    }
+}
+
+impl RemoteTransport for SshPinnedTransport {
+    fn worker(&self) -> WorkerIdentity {
+        self.worker.clone()
+    }
+
+    fn run_attested_elf(&self, spec: &RemoteRunSpec) -> Result<i32, DynError> {
+        if !self.elf.is_file() {
+            return Err(format!("attested ELF is not a file: {}", self.elf.display()).into());
+        }
+        fs::create_dir_all(&self.staging)?;
+        let mkdir = format!("mkdir -p -- {}", shell_single_quote(&self.remote_root)?);
+        let mkdir_status = self.run_ssh(&mkdir, "ssh-mkdir")?;
+        if mkdir_status != 0 {
+            return Err(format!("remote mkdir failed with exit {mkdir_status}").into());
+        }
+        self.scp_put(&self.elf, "hnsw_patch_ab")?;
+        let identity = serde_json::to_string_pretty(&self.worker)?;
+        let identity_path = self.staging.join("worker-identity.json");
+        persist_create_new(&identity_path, identity.as_bytes())?;
+        self.scp_put(&identity_path, "worker-identity.json")?;
+        let mut remote = format!(
+            "chmod +x -- {root}/hnsw_patch_ab && cd -- {root} && ./hnsw_patch_ab",
+            root = shell_single_quote(&self.remote_root)?
+        );
+        for arg in &self.elf_args {
+            remote.push(' ');
+            remote.push_str(&shell_single_quote(arg)?);
+        }
+        let exit = self.run_ssh(&remote, "ssh-elf")?;
+        self.plant_remote_receipt(spec)?;
+        Ok(exit)
+    }
+
+    fn fetch_file(&self, remote_path: &str) -> Result<Vec<u8>, DynError> {
+        let local = self.staging.join(format!("fetch-{remote_path}"));
+        if local.exists() {
+            fs::remove_file(&local)?;
+        }
+        self.scp_get(remote_path, &local)?;
+        fs::read(&local).map_err(|error| format!("read fetched {remote_path}: {error}").into())
+    }
+}
+
+fn shell_single_quote(value: &str) -> Result<String, DynError> {
+    if value.bytes().any(|byte| matches!(byte, b'\n' | b'\0')) {
+        return Err("refusing to shell-quote a path that contains a newline".into());
+    }
+    Ok(format!("'{}'", value.replace('\'', "'\\''")))
+}
+
 fn emit_wrapper_outcome(outcome: &PinnedRetrieveOutcome) -> Result<(), DynError> {
     println!(
         "{}",
@@ -5586,11 +5774,28 @@ fn pinned_run_main(args: &[String]) -> Result<(), DynError> {
     let mut elf = None;
     let mut deadline_ms = DEFAULT_CHILD_DEADLINE_SMOKE_MS;
     let mut term_grace_ms = DEFAULT_CHILD_TERM_GRACE_MS;
+    let mut use_ssh = false;
+    let mut ssh = PathBuf::from("ssh");
+    let mut scp = PathBuf::from("scp");
     let mut elf_args = Vec::new();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--pinned-run" => index += 1,
+            "--ssh" => {
+                use_ssh = true;
+                index += 1;
+            }
+            "--ssh-bin" => {
+                ssh = PathBuf::from(required_value(args, index)?);
+                use_ssh = true;
+                index += 2;
+            }
+            "--scp-bin" => {
+                scp = PathBuf::from(required_value(args, index)?);
+                use_ssh = true;
+                index += 2;
+            }
             "--remote-root" => {
                 remote_root = Some(PathBuf::from(required_value(args, index)?));
                 index += 2;
@@ -5640,7 +5845,7 @@ fn pinned_run_main(args: &[String]) -> Result<(), DynError> {
         )
         .into());
     }
-    if remote_root.exists() && remote_root.read_dir()?.next().is_some() {
+    if !use_ssh && remote_root.exists() && remote_root.read_dir()?.next().is_some() {
         return Err(format!(
             "refusing to reuse a non-empty remote root: {}",
             remote_root.display()
@@ -5649,16 +5854,35 @@ fn pinned_run_main(args: &[String]) -> Result<(), DynError> {
     }
     let roster = load_worker_roster(workers_json.as_deref())?;
     let worker = select_pinned_worker(&roster, worker_id.as_deref())?.clone();
-    let transport = LocalPinnedTransport {
-        worker,
-        remote_root,
-        elf,
-        elf_args,
-        deadline: Duration::from_millis(deadline_ms),
-        term_grace: Duration::from_millis(term_grace_ms),
-    };
     let spec = RemoteRunSpec::decision_default();
-    let outcome = run_pinned_worker_measurement(&transport, &spec, &local_dir, true)?;
+    let deadline = Duration::from_millis(deadline_ms);
+    let term_grace = Duration::from_millis(term_grace_ms);
+    let outcome = if use_ssh {
+        let staging = local_dir.join(".ssh-staging");
+        let transport = SshPinnedTransport {
+            worker,
+            remote_root: remote_root.display().to_string(),
+            elf,
+            elf_args,
+            deadline,
+            term_grace,
+            ssh,
+            scp,
+            staging,
+            extra_env: BTreeMap::new(),
+        };
+        run_pinned_worker_measurement(&transport, &spec, &local_dir, true)?
+    } else {
+        let transport = LocalPinnedTransport {
+            worker,
+            remote_root,
+            elf,
+            elf_args,
+            deadline,
+            term_grace,
+        };
+        run_pinned_worker_measurement(&transport, &spec, &local_dir, true)?
+    };
     emit_wrapper_outcome(&outcome)
 }
 
@@ -7109,5 +7333,93 @@ source = "git+https://github.com/Dicklesworthstone/hnswlib-rs?rev={CANDIDATE_REV
     #[test]
     fn workspace_fixed_inputs_include_the_admission_contract() {
         assert!(WORKSPACE_SOURCE_FIXED_INPUTS.contains(&ADMISSION_CONTRACT_RELATIVE_PATH));
+    }
+
+    #[cfg(unix)]
+    fn write_exec(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(path, body).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn fake_ssh_tools(root: &Path) -> (PathBuf, PathBuf) {
+        let ssh = root.join("fake-ssh");
+        let scp = root.join("fake-scp");
+        write_exec(
+            &ssh,
+            "#!/bin/sh\n\
+             root=${FAKE_REMOTE_ROOT:?}\n\
+             cmd=\n\
+             while [ $# -gt 0 ]; do\n\
+               if [ \"$1\" = -- ]; then shift; cmd=$*; break; fi\n\
+               shift\n\
+             done\n\
+             mkdir -p \"$root\"\n\
+             cd \"$root\" || exit 1\n\
+             sh -c \"$cmd\"\n",
+        );
+        write_exec(
+            &scp,
+            "#!/bin/sh\n\
+             root=${FAKE_REMOTE_ROOT:?}\n\
+             while [ \"$1\" = -o ]; do shift 2; done\n\
+             src=$1 dest=$2\n\
+             map() { case \"$1\" in *:*) echo \"$root/${1#*:}\" ;; *) echo \"$1\" ;; esac; }\n\
+             src=$(map \"$src\")\n\
+             dest=$(map \"$dest\")\n\
+             mkdir -p \"$(dirname \"$dest\")\"\n\
+             cp -- \"$src\" \"$dest\"\n",
+        );
+        (ssh, scp)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_pinned_run_executes_on_the_selected_worker_and_retrieves_quarantine() {
+        let tools = tempfile::tempdir().unwrap();
+        let remote_fs = tools.path().join("remote-fs");
+        fs::create_dir_all(&remote_fs).unwrap();
+        let (ssh, scp) = fake_ssh_tools(tools.path());
+        let elf = tools.path().join("fixture-elf");
+        write_fixture_elf(&elf, "quarantine", 2);
+        let local = tempfile::tempdir().unwrap();
+        let local_dir = local.path().join("retrieved");
+        let worker = WorkerIdentity {
+            id: "hz2".to_owned(),
+            host: "10.0.0.2".to_owned(),
+            user: "root".to_owned(),
+        };
+        let mut extra_env = BTreeMap::new();
+        extra_env.insert(
+            "FAKE_REMOTE_ROOT".to_owned(),
+            remote_fs.display().to_string(),
+        );
+        let transport = SshPinnedTransport {
+            worker: worker.clone(),
+            remote_root: "work".to_owned(),
+            elf,
+            elf_args: Vec::new(),
+            deadline: Duration::from_secs(5),
+            term_grace: Duration::from_millis(200),
+            ssh,
+            scp,
+            staging: local.path().join("staging"),
+            extra_env,
+        };
+        let outcome = run_pinned_worker_measurement(
+            &transport,
+            &RemoteRunSpec::decision_default(),
+            &local_dir,
+            true,
+        )
+        .expect("ssh pinned run");
+        assert_eq!(outcome.worker, worker);
+        assert_eq!(outcome.remote_exit_code, 2);
+        assert_eq!(outcome.classification, PerformanceClaimStatus::Quarantine);
+        assert_eq!(wrapper_preserved_exit_code(&outcome), 2);
+        assert!(local_dir.join(PINNED_RETRIEVE_REPORT).is_file());
     }
 }
