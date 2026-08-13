@@ -2637,8 +2637,8 @@ impl TantivyIndex {
 
     /// Delete a document by its ID.
     ///
-    /// The deletion is staged; call
-    /// [`commit`](frankensearch_core::traits::LexicalWrite::commit) to persist.
+    /// A successful return commits the deletion and refreshes the readable
+    /// generation before releasing the writer lock.
     ///
     /// # Errors
     ///
@@ -2646,11 +2646,30 @@ impl TantivyIndex {
     /// or cancelled.
     pub async fn delete_document(&self, cx: &Cx, doc_id: &str) -> SearchResult<()> {
         let term = Term::from_field_text(self.fields.id, doc_id);
-        self.writer
+        let mut writer = self
+            .writer
             .lock(cx)
             .await
-            .map_err(|e| Self::map_writer_lock_error("tantivy.delete", e))?
-            .delete_term(term);
+            .map_err(|error| Self::map_writer_lock_error("tantivy.delete", error))?;
+        writer.delete_term(term);
+        writer
+            .commit()
+            .map_err(|error| SearchError::SubsystemError {
+                subsystem: "tantivy",
+                source: Box::new(error),
+            })?;
+
+        self.reader
+            .reload()
+            .map_err(|error| SearchError::SubsystemError {
+                subsystem: "tantivy",
+                source: Box::new(error),
+            })?;
+
+        let actual = Self::checked_searcher_doc_count(&self.reader.searcher())?;
+        self.doc_count.store(actual, Ordering::Relaxed);
+
+        debug!(doc_count = actual, %doc_id, "tantivy delete committed and reloaded");
         Ok(())
     }
 
@@ -3615,7 +3634,7 @@ mod tests {
     // The split capabilities, so `idx.search(..)` / `idx.doc_count()` resolve
     // now that the combined trait is gone. B1 deliberately kept these out of
     // module scope to avoid method ambiguity while both surfaces coexisted.
-    use frankensearch_core::traits::{LexicalRead as _, LexicalWrite};
+    use frankensearch_core::traits::{LexicalRead, LexicalWrite};
     use frankensearch_core::types::IndexableDocument;
 
     /// Helper: run async test code with a `Cx`.
@@ -5356,6 +5375,44 @@ mod tests {
             assert!(
                 !results.iter().any(|r| r.doc_id == "doc-1"),
                 "deleted document should not appear"
+            );
+        });
+    }
+
+    #[test]
+    fn delete_document_publishes_to_public_lexical_readers_before_return() {
+        let idx = TantivyIndex::in_memory().expect("create");
+        run_with_cx(|cx| async move {
+            let retained = IndexableDocument::new("retained", "delete visibility sentinel");
+            let deleted = IndexableDocument::new("deleted", "delete visibility sentinel");
+            LexicalWrite::index_documents(&idx, &cx, &[retained, deleted])
+                .await
+                .expect("index documents through the public write trait");
+            LexicalWrite::commit(&idx, &cx)
+                .await
+                .expect("publish documents through the public write trait");
+
+            assert_eq!(
+                LexicalRead::doc_count(&idx).expect("count published documents"),
+                2
+            );
+
+            idx.delete_document(&cx, "deleted")
+                .await
+                .expect("delete must publish before returning");
+
+            let hits = LexicalRead::search(&idx, &cx, "delete visibility sentinel", 10)
+                .await
+                .expect("public lexical reader must see the committed deletion");
+            assert_eq!(
+                hits.iter()
+                    .map(|hit| hit.doc_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["retained"]
+            );
+            assert_eq!(
+                LexicalRead::doc_count(&idx).expect("count refreshed readable generation"),
+                1
             );
         });
     }
