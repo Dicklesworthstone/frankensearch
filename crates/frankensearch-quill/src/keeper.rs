@@ -15,7 +15,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, SystemTime};
 
 use arc_swap::ArcSwap;
@@ -106,12 +106,13 @@ const TOMBSTONE_BITMAP_MIN_CARDINALITY: u64 = 3_584;
 const TOMBSTONE_BITMAP_BYTES: usize = 8_192;
 const MAX_TOMBSTONE_CHUNKS: usize = 65_536;
 
-// Construction initializes this once outside the async publication path. The
-// asupersync mutex serializes every filesystem mutation within the process;
-// every public mutation path additionally requires a retained cross-process
-// `KeeperWriter` admission. Its owned guard is moved into blocking work so a
-// cancelled async caller cannot release serialization before that work exits.
-static PUBLISH_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
+// Each canonical index directory has one in-process serializer. Public
+// mutations also require retained cross-process `KeeperWriter` admission, so
+// distinct directories must not convoy behind one process-global mutex. The
+// owned guard moves into blocking work; a cancelled async caller therefore
+// cannot release same-directory serialization before that work exits.
+static PUBLISH_LOCKS: OnceLock<std::sync::Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>> =
+    OnceLock::new();
 
 /// Pack semantic-version components into the durable `engine_version` word.
 ///
@@ -4525,7 +4526,7 @@ impl KeeperWriter {
         let Some(pending) = self.pending_publication else {
             return Ok(false);
         };
-        let guard = writer_mutation_guard(cx).await?;
+        let guard = writer_mutation_guard(cx, &self.admission.directory).await?;
         self.admission.ensure_directory_identity()?;
         let directory = self.admission.directory.clone();
         let installed = open_snapshot_blocking(directory, self.snapshot.schema()).await?;
@@ -4669,7 +4670,7 @@ impl KeeperWriter {
         cx: &Cx,
         proposed: &Manifest,
     ) -> Result<bool, KeeperError> {
-        let guard = writer_mutation_guard(cx).await?;
+        let guard = writer_mutation_guard(cx, &self.admission.directory).await?;
         let admission = Arc::clone(&self.admission);
         let protection = self.protection.clone();
         let schema = self.snapshot.schema();
@@ -4700,7 +4701,7 @@ impl KeeperWriter {
         cx: &Cx,
         pending: PendingSegmentFile,
     ) -> Result<PathBuf, KeeperError> {
-        let guard = writer_mutation_guard(cx).await?;
+        let guard = writer_mutation_guard(cx, &self.admission.directory).await?;
         let admission = Arc::clone(&self.admission);
         let protection = self.protection.clone();
         spawn_blocking(move || {
@@ -4764,7 +4765,7 @@ impl KeeperWriter {
         cx: &Cx,
         encoded: Arc<EncodedSegment>,
     ) -> Result<PathBuf, KeeperError> {
-        let guard = writer_mutation_guard(cx).await?;
+        let guard = writer_mutation_guard(cx, &self.admission.directory).await?;
         let admission = Arc::clone(&self.admission);
         let protection = self.protection.clone();
         spawn_blocking(move || {
@@ -4834,7 +4835,7 @@ impl KeeperWriter {
         }
 
         let ConcatMergeArtifact { encoded, manifest } = artifact;
-        let guard = writer_mutation_guard(cx).await?;
+        let guard = writer_mutation_guard(cx, &self.admission.directory).await?;
         let admission = Arc::clone(&self.admission);
         let pending = spawn_blocking(move || {
             let _guard = guard;
@@ -4908,7 +4909,7 @@ impl KeeperWriter {
         &mut self,
         cx: &Cx,
     ) -> Result<GarbageCollectionReport, KeeperError> {
-        let guard = writer_mutation_guard(cx).await?;
+        let guard = writer_mutation_guard(cx, &self.admission.directory).await?;
         let admission = Arc::clone(&self.admission);
         let schema = self.snapshot.schema();
         let options = self.garbage_options;
@@ -7070,13 +7071,19 @@ fn reconcile_encoded_segment(
     Ok(Some(published))
 }
 
-async fn writer_mutation_guard(cx: &Cx) -> Result<OwnedMutexGuard<()>, KeeperError> {
+async fn writer_mutation_guard(
+    cx: &Cx,
+    directory: &Path,
+) -> Result<OwnedMutexGuard<()>, KeeperError> {
     if cx.is_cancel_requested() {
         return Err(KeeperError::WriterAdmissionCancelled);
     }
-    let guard = OwnedMutexGuard::lock(global_publish_lock(), cx)
-        .await
-        .map_err(|source| KeeperError::PublishLock { source })?;
+    let guard = OwnedMutexGuard::lock(
+        publish_lock_for_normalized_directory(directory.to_path_buf()),
+        cx,
+    )
+    .await
+    .map_err(|source| KeeperError::PublishLock { source })?;
     if cx.is_cancel_requested() {
         return Err(KeeperError::WriterAdmissionCancelled);
     }
@@ -11821,7 +11828,8 @@ fn release_generation_claim(_: &GenerationClaimGuard) {}
 #[derive(Debug, Clone)]
 struct ManifestPublisher {
     directory: PathBuf,
-    publish_lock: Arc<Mutex<()>>,
+    #[cfg(test)]
+    publish_lock_override: Option<Arc<Mutex<()>>>,
     publication_read_state: Option<PublicationReadState>,
 }
 
@@ -11838,7 +11846,8 @@ impl ManifestPublisher {
     fn new(directory: impl Into<PathBuf>) -> Self {
         Self {
             directory: directory.into(),
-            publish_lock: global_publish_lock(),
+            #[cfg(test)]
+            publish_lock_override: None,
             publication_read_state: None,
         }
     }
@@ -11853,7 +11862,8 @@ impl ManifestPublisher {
     ) -> Self {
         Self {
             directory: directory.into(),
-            publish_lock: global_publish_lock(),
+            #[cfg(test)]
+            publish_lock_override: None,
             publication_read_state,
         }
     }
@@ -11865,7 +11875,7 @@ impl ManifestPublisher {
     ) -> Self {
         Self {
             directory: directory.into(),
-            publish_lock,
+            publish_lock_override: Some(publish_lock),
             publication_read_state: None,
         }
     }
@@ -11994,8 +12004,13 @@ impl ManifestPublisher {
                 source: LockError::Cancelled,
             });
         }
-        let directory = self.directory.clone();
-        let publish_lock = Arc::clone(&self.publish_lock);
+        // Resolve before choosing the directory-scoped lock, then carry the
+        // exact resolved target through the blocking choreography. This keeps
+        // a late-created symlink alias in the same serializer as its target.
+        let unresolved_directory = self.directory.clone();
+        let directory =
+            spawn_blocking(move || normalize_publish_directory(unresolved_directory)).await;
+        let publish_lock = self.publish_lock(&directory);
         let publication_read_state = self.publication_read_state.clone();
         let guard = OwnedMutexGuard::lock(publish_lock, cx)
             .await
@@ -12005,7 +12020,7 @@ impl ManifestPublisher {
                 source: LockError::Cancelled,
             });
         }
-        // Encode only after admission to the process-global critical section.
+        // Encode only after admission to the same-directory critical section.
         // Otherwise every waiter could retain its own 64 MiB output buffer.
         //
         // The publisher owns the freshness witness: a caller that left
@@ -12032,11 +12047,10 @@ impl ManifestPublisher {
             });
         }
         spawn_blocking(move || {
-            // Filesystem resolution is blocking I/O. Resolve the publication
-            // target once inside the blocking phase, then use that same path
+            // Use the exact target that selected the in-process serializer
             // for inspection, the generation claim, renames, and directory
-            // fsync so a late-created alias cannot split the operation.
-            let directory = normalize_publish_directory(directory);
+            // fsync; resolving it again could split a late alias from its
+            // lock after the claim boundary.
             match protection {
                 ManifestProtection::Disabled => {
                     publish_manifest_locked(directory, &bytes, guard, claim, publication_read_state)
@@ -12057,14 +12071,39 @@ impl ManifestPublisher {
 
     #[cfg(test)]
     fn publish_lock_for_test(&self) -> Arc<Mutex<()>> {
-        Arc::clone(&self.publish_lock)
+        if let Some(publish_lock) = &self.publish_lock_override {
+            return Arc::clone(publish_lock);
+        }
+        publish_lock_for_directory(&self.directory)
+    }
+
+    fn publish_lock(&self, directory: &Path) -> Arc<Mutex<()>> {
+        #[cfg(test)]
+        if let Some(publish_lock) = &self.publish_lock_override {
+            return Arc::clone(publish_lock);
+        }
+        publish_lock_for_normalized_directory(directory.to_path_buf())
     }
 }
 
-fn global_publish_lock() -> Arc<Mutex<()>> {
-    Arc::clone(
-        PUBLISH_LOCK.get_or_init(|| Arc::new(Mutex::with_name("quill.manifest_publish", ()))),
-    )
+#[cfg(test)]
+fn publish_lock_for_directory(directory: &Path) -> Arc<Mutex<()>> {
+    let directory = normalize_publish_directory(directory.to_path_buf());
+    publish_lock_for_normalized_directory(directory)
+}
+
+fn publish_lock_for_normalized_directory(directory: PathBuf) -> Arc<Mutex<()>> {
+    let locks = PUBLISH_LOCKS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&directory).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::with_name("quill.manifest_publish", ()));
+    locks.insert(directory, Arc::downgrade(&lock));
+    lock
 }
 
 fn normalize_publish_directory(directory: PathBuf) -> PathBuf {
