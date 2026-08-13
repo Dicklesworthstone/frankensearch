@@ -9583,8 +9583,9 @@ impl QuillReader {
         } else {
             TopDocsCollector::new(limit, offset)?
         };
-        let topdocs_root = !exact_count && limit != 0;
-        let rank_pruning = topdocs_root && query_has_prunable_root_union(query, 1.0);
+        let topdocs_root = limit != 0;
+        let rank_pruning =
+            !exact_count && topdocs_root && query_has_prunable_root_union(query, 1.0);
         let sealed_docs: u64 = keeper
             .segments()
             .iter()
@@ -18072,7 +18073,7 @@ mod tests {
             .expect("fan-out fixture snapshot is authoritative");
         let rank_pruning =
             !exact_count && limit != 0 && query_has_prunable_root_union(&parsed.query, 1.0);
-        let topdocs_root = !exact_count && limit != 0;
+        let topdocs_root = limit != 0;
         let mut collector = if exact_count {
             TopDocsCollector::with_exact_count(limit, offset)
         } else {
@@ -24968,39 +24969,28 @@ mod tests {
             "two direct term children are MaxScore-capable"
         );
 
-        // Nested multi-field unions stay POSTINGS-only while
-        // `GROUPED_MAX_SCORE_ENABLED` is false. The runtime candidate is
-        // rank-safe and prunes, but its release A/B failed the performance
-        // gate (see that constant's docs), so shipping does not pay to open
-        // BLOCKMAX for these terms.
-        // When `GROUPED_MAX_SCORE_ENABLED` flips to `true`, this assertion is
-        // the one to invert — the shape assertions below stay as they are.
-        let nested_two = parser.parse("alpha OR beta");
+        let default_two = parser.parse("alpha OR beta");
         assert!(
-            !query_has_prunable_root_union(&nested_two.query, 1.0),
-            "nested field unions must not open BLOCKMAX while grouped MaxScore is gated off"
+            query_has_prunable_root_union(&default_two.query, 1.0),
+            "four direct default-field terms are MaxScore-capable"
         );
 
-        let nested_nine = parser
+        let default_nine = parser
             .parse("alpha OR beta OR gamma OR delta OR epsilon OR zeta OR eta OR theta OR iota");
         assert!(
-            !query_has_prunable_root_union(&nested_nine.query, 1.0),
-            "nine default multi-field children cannot supply physical BMW blocks, and grouped \
-             MaxScore stops at MAX_SCORE_MAX_CLAUSES"
+            query_has_prunable_root_union(&default_nine.query, 1.0),
+            "eighteen direct default-field terms are BMW-capable"
         );
 
-        // Shape classification is pinned directly so it cannot rot while the
-        // gate is closed: these are the inputs that decide eligibility the
-        // moment `GROUPED_MAX_SCORE_ENABLED` flips.
         assert!(
             matches!(
-                prunable_scorer_shape(&nested_two.query, 1.0),
+                prunable_scorer_shape(&default_two.query, 1.0),
                 Some(PrunableScorerShape::Union {
-                    children: 2,
-                    kind: UnionChildKind::TermGroups,
+                    children: 4,
+                    kind: UnionChildKind::DirectTerms,
                 })
             ),
-            "a default two-word query lowers to two pure-term groups"
+            "a default two-word query lowers to four direct frequency-term leaves"
         );
         assert!(
             matches!(
@@ -25012,23 +25002,20 @@ mod tests {
             ),
             "field-scoped children lower to direct terms, not groups"
         );
-        // A root mixing a direct term with a multi-field group satisfies neither
-        // the all-direct-terms nor the all-groupable runtime branch, so it can
-        // never be admitted regardless of the gate.
         let mixed = parser.parse("content:alpha OR beta");
         assert!(
             matches!(
                 prunable_scorer_shape(&mixed.query, 1.0),
                 Some(PrunableScorerShape::Union {
-                    children: 2,
-                    kind: UnionChildKind::Mixed,
+                    children: 3,
+                    kind: UnionChildKind::DirectTerms,
                 })
             ),
-            "a mixed direct-term/group root is consumed by no pruning strategy"
+            "a field-scoped term plus one default term lowers to three direct leaves"
         );
         assert!(
-            !query_has_prunable_root_union(&mixed.query, 1.0),
-            "a mixed root must never open BLOCKMAX"
+            query_has_prunable_root_union(&mixed.query, 1.0),
+            "three direct term children are MaxScore-capable"
         );
 
         let direct_nine = parser.parse(
@@ -25236,8 +25223,8 @@ mod tests {
             }
             assert_eq!(
                 segment.cached_rank_pruning_term_count(),
-                2,
-                "nested fallback must not validate title BLOCKMAX metadata"
+                3,
+                "flat default-field leaves validate the three present terms, not absent title:beta"
             );
         });
     }
