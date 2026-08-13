@@ -1425,16 +1425,30 @@ struct Qg1ContinuousMeasurement {
     lifecycle_receipt: Qg1ContinuousTimingReceipt,
 }
 
+/// One continuous QG-2 update interval.
+///
+/// Deliberately carries no prepared-input binding and no lifecycle receipt: QG-2
+/// has neither, and manufacturing them here would file QG-2 work under QG-1
+/// attestations it never earned. What it does carry is the only thing the
+/// estimator needs to type a rate — the work the interval processed and the
+/// single monotonic span it processed that work in.
+struct Qg2ContinuousMeasurement {
+    work_units: u64,
+    origin: Instant,
+    elapsed_ns: u64,
+}
+
 /// One measured cell value, plus the continuous interval behind it when the
 /// producer actually measured one.
 ///
-/// Only QG-1's engine-indexing cells carry `continuous`. Every other cell in
-/// this matrix reports a value assembled from independently timed calls, and the
-/// absence of an interval here is what stops such a value from being typed as
-/// throughput downstream.
+/// QG-1's engine-indexing cells carry `continuous`; QG-2's update cells carry
+/// `qg2_continuous`. Every other cell in this matrix reports a value assembled
+/// from independently timed calls, and the absence of an interval here is what
+/// stops such a value from being typed as throughput downstream.
 struct MetricMeasurement {
     value: f64,
     continuous: Option<Qg1ContinuousMeasurement>,
+    qg2_continuous: Option<Qg2ContinuousMeasurement>,
 }
 
 impl MetricMeasurement {
@@ -1443,6 +1457,7 @@ impl MetricMeasurement {
         Self {
             value,
             continuous: None,
+            qg2_continuous: None,
         }
     }
 }
@@ -2806,6 +2821,133 @@ fn qg1_bulk_metric_continuous(
     MetricMeasurement {
         value: throughput_per_second(measurement.work_units, measurement.elapsed_ns),
         continuous: Some(measurement),
+        qg2_continuous: None,
+    }
+}
+
+/// The exact identifier of the last document a generated feed of `count`
+/// documents writes, resolved through the same corpus conversion the feed
+/// itself uses so the probe cannot drift from what was indexed.
+fn generated_tail_document_id(corpus: &SyntheticCorpus, count: u64) -> String {
+    let tail_ordinal = count
+        .checked_sub(1)
+        .expect("a QG-2 continuous feed indexes at least one document");
+    let document: IndexableDocument = corpus
+        .document_at(tail_ordinal % corpus.len())
+        .expect("generated tail document ordinal")
+        .into();
+    document.id
+}
+
+/// Measure one QG-2 update cell as a single continuous interval.
+///
+/// The defect this replaces summed two independently timed calls — the batch
+/// feed and the terminal commit — and stopped there. Two sums are not one
+/// interval: the time between them is unattributed, and stopping at commit
+/// stops before the work a user is actually waiting for, which is the update
+/// becoming *searchable* and the engine going *quiescent*. Everything after the
+/// first feed and up to that terminal state is inside the measured span here,
+/// and both arms end at the same kind of endpoint: a tail-document search
+/// served by a retained reader, after the engine's writer side has settled.
+///
+/// This deliberately does not reuse `qg1_bulk_metric_continuous`: that path
+/// asserts QG-1 producer coverage, consumes a QG-1 prepared input, and emits
+/// QG-1 lifecycle receipts. Sharing its SHAPE is correct; sharing its
+/// attestations would file QG-2 work under QG-1 authority.
+fn qg2_bulk_metric_continuous(
+    context: &BenchContext,
+    spec: &PerfCellSpec,
+    arm: EngineArm,
+    count: u64,
+) -> MetricMeasurement {
+    let corpus = corpus_for(count);
+    let tail_document_id = generated_tail_document_id(&corpus, count);
+    let (origin, elapsed_ns) = match arm {
+        EngineArm::Quill => {
+            let index = quill_in_memory(spec);
+            let generation_before = index
+                .snapshot()
+                .expect("benchmark snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
+            // The interval opens at the first feed: corpus and index
+            // construction are setup, not update throughput.
+            let origin = Instant::now();
+            let _ = index_batches(context, &index, &corpus, count, None);
+            let _ = commit(context, &index);
+            let visible = index
+                .benchmark_search_exact_id(&tail_document_id)
+                .expect("QG-2 Quill terminal exact-ID probe");
+            // Closed the instant the retained read owner returns, before any
+            // proof bookkeeping, so converting the result into an assertion
+            // cannot extend the measured state.
+            let elapsed_ns = u64::try_from(origin.elapsed().as_nanos()).expect("monotonic ns");
+            let generation_after = index
+                .snapshot()
+                .expect("benchmark snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
+            assert!(
+                generation_after > generation_before,
+                "QG-2 Quill terminal commit must publish a new generation before the tail is \
+                 searchable"
+            );
+            assert_eq!(
+                visible
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                [tail_document_id.clone()],
+                "QG-2 Quill interval must end with the exact tail document searchable"
+            );
+            (origin, elapsed_ns)
+        }
+        EngineArm::Tantivy => {
+            let index = tantivy_in_memory(spec);
+            let origin = Instant::now();
+            let _ = index_batches(context, &index, &corpus, count, None);
+            let _ = commit(context, &index);
+            // Symmetric endpoint: Tantivy's writer workers must have settled
+            // before its retained reader answers, which is the same
+            // searchable-and-quiescent state the Quill arm ends in.
+            let (retained_search_owner, terminal_join_receipt) = index
+                .benchmark_join_workers_retaining_reader()
+                .expect("join QG-2 Tantivy terminal workers while retaining a read handle");
+            assert!(
+                !terminal_join_receipt.writer_rearmed,
+                "QG-2 terminal Tantivy worker fence must not construct a replacement writer"
+            );
+            let visible = retained_search_owner
+                .benchmark_search_exact_id(&tail_document_id)
+                .expect("QG-2 Tantivy terminal exact-ID probe");
+            let elapsed_ns = u64::try_from(origin.elapsed().as_nanos()).expect("monotonic ns");
+            assert_eq!(
+                visible
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                [tail_document_id.clone()],
+                "QG-2 Tantivy interval must end with the exact tail document searchable"
+            );
+            (origin, elapsed_ns)
+        }
+    };
+    assert!(
+        elapsed_ns > 0,
+        "QG-2 continuous interval must span positive monotonic time"
+    );
+    MetricMeasurement {
+        value: throughput_per_second(count, elapsed_ns),
+        continuous: None,
+        qg2_continuous: Some(Qg2ContinuousMeasurement {
+            work_units: count,
+            origin,
+            elapsed_ns,
+        }),
     }
 }
 
@@ -3743,7 +3885,15 @@ fn measure_metric_with_query_and_qg1_writer_mode(
         PerfGate::Qg1 => {
             bulk_metric_with_qg1_writer_mode(context, spec, arm, qg1_tantivy_writer_mode)
         }
-        PerfGate::Qg2 | PerfGate::Qg8 => bulk_metric(context, spec, arm),
+        PerfGate::Qg2 => qg2_bulk_metric_continuous(
+            context,
+            spec,
+            arm,
+            context
+                .scale
+                .document_count(spec.document_count.expect("QG-2 update document count")),
+        ),
+        PerfGate::Qg8 => bulk_metric(context, spec, arm),
         PerfGate::Qg3 if spec.metric == "docs_per_second" => bulk_metric(context, spec, arm),
         PerfGate::Qg3 => MetricMeasurement::gauge(watch_metric(context, spec, arm)),
         PerfGate::Qg4 => MetricMeasurement::gauge(commit_metric(context, spec, arm)),
@@ -4878,20 +5028,45 @@ impl<'a> PairedStreamRunner<'a> {
             qg1_tantivy_writer_mode,
         ));
         let call_ended_ns = u64::try_from(self.origin.elapsed().as_nanos()).expect("monotonic ns");
-        let (work_units, byte_count) = qg1_raw_sample_denominator(
-            (self.work_units, self.byte_count),
-            measurement.continuous.as_ref(),
-        )
-        .expect("QG-1 raw sample denominator must bind the prepared measured input");
-        let continuous = measurement
-            .continuous
-            .as_ref()
-            .map(|interval| Qg1IntervalOffsets {
-                work_units: interval.work_units,
-                started_ns: u64::try_from(interval.origin.duration_since(self.origin).as_nanos())
+        // A QG-2 interval carries its own denominator, so the published work is
+        // the work that interval actually processed rather than whatever the
+        // plan declared. The window check below then has something to hold it
+        // to, which is what stops a QG-2 rate being attached to time it was not
+        // measured over.
+        let (work_units, byte_count, continuous) = if let Some(interval) =
+            measurement.qg2_continuous.as_ref()
+        {
+            (
+                Some(interval.work_units),
+                self.byte_count,
+                Some(Qg1IntervalOffsets {
+                    work_units: interval.work_units,
+                    started_ns: u64::try_from(
+                        interval.origin.duration_since(self.origin).as_nanos(),
+                    )
                     .expect("monotonic ns"),
-                elapsed_ns: interval.elapsed_ns,
-            });
+                    elapsed_ns: interval.elapsed_ns,
+                }),
+            )
+        } else {
+            let (work_units, byte_count) = qg1_raw_sample_denominator(
+                (self.work_units, self.byte_count),
+                measurement.continuous.as_ref(),
+            )
+            .expect("QG-1 raw sample denominator must bind the prepared measured input");
+            let continuous = measurement
+                .continuous
+                .as_ref()
+                .map(|interval| Qg1IntervalOffsets {
+                    work_units: interval.work_units,
+                    started_ns: u64::try_from(
+                        interval.origin.duration_since(self.origin).as_nanos(),
+                    )
+                    .expect("monotonic ns"),
+                    elapsed_ns: interval.elapsed_ns,
+                });
+            (work_units, byte_count, continuous)
+        };
         let window = qg1_sample_window(
             self.scope.semantics,
             work_units,
@@ -8010,6 +8185,113 @@ fn main() {
     let mut criterion = Criterion::default().configure_from_args();
     bench_matrix(&mut criterion, &identity);
     criterion.final_summary();
+}
+
+#[cfg(test)]
+mod qg2_continuous_tests {
+    /// The smallest normative QG-2 update cell, taken from the frozen matrix so
+    /// the test cannot drift onto a shape the manifest does not ship.
+    fn qg2_spec() -> frankensearch_quill_gauntlet::PerfCellSpec {
+        frankensearch_quill_gauntlet::PerfMatrixSpec::complete()
+            .for_gate(frankensearch_quill_gauntlet::PerfGate::Qg2)
+            .into_iter()
+            .find(|spec| spec.metric == "docs_per_second")
+            .cloned()
+            .expect("the frozen matrix ships a QG-2 throughput cell")
+    }
+
+    /// THE PRODUCTION PATH, both arms: one continuous interval that ends at a
+    /// searchable, quiescent tail, carrying the work it processed.
+    ///
+    /// The endpoint assertions live inside `qg2_bulk_metric_continuous` itself,
+    /// so a regression that stops at commit — before the update is searchable —
+    /// fails there rather than being quietly reported as a faster number here.
+    #[test]
+    fn qg2_update_cells_measure_one_continuous_searchable_interval() {
+        let spec = qg2_spec();
+        let context = super::BenchContext::for_selected(
+            super::MatrixScale::Smoke,
+            std::slice::from_ref(&spec),
+        );
+        let count = context
+            .scale
+            .document_count(spec.document_count.expect("QG-2 document count"));
+        assert_eq!(
+            super::metric_semantics(&spec),
+            frankensearch_quill_gauntlet::PerfMetricSemantics::Throughput,
+            "a QG-2 update cell publishes native throughput, not a gauge"
+        );
+        for arm in [super::EngineArm::Quill, super::EngineArm::Tantivy] {
+            let measurement = super::qg2_bulk_metric_continuous(&context, &spec, arm, count);
+            assert!(
+                measurement.continuous.is_none(),
+                "{arm:?} QG-2 interval must not present itself as QG-1 lifecycle evidence"
+            );
+            let interval = measurement
+                .qg2_continuous
+                .as_ref()
+                .expect("every QG-2 arm publishes its continuous interval");
+            assert_eq!(
+                interval.work_units, count,
+                "{arm:?} QG-2 interval must cover the exact requested document count"
+            );
+            assert!(
+                interval.elapsed_ns > 0,
+                "{arm:?} QG-2 interval must span positive monotonic time"
+            );
+            assert!(
+                measurement.value.is_finite() && measurement.value > 0.0,
+                "{arm:?} QG-2 cell must return positive finite throughput"
+            );
+        }
+    }
+
+    /// PLANTED NEGATIVE: the summed-call shape this correction replaced.
+    ///
+    /// Summing an independently timed feed and an independently timed commit
+    /// reproduces the old value, and it is strictly smaller than the continuous
+    /// interval because it drops everything after the commit returns — the tail
+    /// becoming searchable and the engine going quiescent. That difference is
+    /// the tail loss, and asserting it is what fails closed if anyone restores
+    /// the sum.
+    #[test]
+    fn summed_feed_and_commit_loses_the_searchable_tail() {
+        let spec = qg2_spec();
+        let context = super::BenchContext::for_selected(
+            super::MatrixScale::Smoke,
+            std::slice::from_ref(&spec),
+        );
+        let count = context
+            .scale
+            .document_count(spec.document_count.expect("QG-2 document count"));
+        let corpus = super::corpus_for(count);
+
+        // Exactly the defect: two independent timings, summed.
+        let index = super::quill_in_memory(&spec);
+        let feed = super::index_batches(&context, &index, &corpus, count, None);
+        let commit = super::commit(&context, &index);
+        let summed_ns =
+            u64::try_from((feed + commit).as_nanos()).expect("summed monotonic ns fits u64");
+
+        let continuous =
+            super::qg2_bulk_metric_continuous(&context, &spec, super::EngineArm::Quill, count);
+        let interval = continuous
+            .qg2_continuous
+            .as_ref()
+            .expect("the continuous path publishes its interval");
+        assert!(
+            interval.elapsed_ns > summed_ns,
+            "the continuous interval must strictly contain the summed calls; summed {summed_ns}ns \
+             vs continuous {}ns means the searchable-and-quiescent tail was not measured",
+            interval.elapsed_ns
+        );
+        assert!(
+            super::throughput_per_second(count, summed_ns)
+                > super::throughput_per_second(count, interval.elapsed_ns),
+            "the summed shape reports a faster rate than the interval it omits time from, which is \
+             exactly why it can never be the published QG-2 value"
+        );
+    }
 }
 
 #[cfg(test)]
