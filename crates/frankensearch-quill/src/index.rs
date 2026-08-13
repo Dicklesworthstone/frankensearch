@@ -119,6 +119,14 @@ const MIN_ARENA_CHUNK_BYTES: usize = 4096;
 const INTERNAL_PARALLEL_INGEST_SHARDS: usize = 4;
 const CONTENT_HASH_DOMAIN: &[u8] = b"frankensearch.quill.idmap-content.v2\0";
 
+fn ingest_parallelism_at_construction() -> usize {
+    if rayon::current_thread_index().is_some() {
+        rayon::current_num_threads()
+    } else {
+        std::thread::available_parallelism().map_or(1, usize::from)
+    }
+}
+
 /// Typed failure from the scalar shipping facade.
 #[derive(Debug, Error)]
 pub enum QuillIndexError {
@@ -4865,7 +4873,7 @@ impl QuillWriterState {
         let manifest = &initial_snapshot.loaded_manifest().manifest;
         let initial_generation = manifest.generation;
         let next_lease_base = next_lease_boundary(manifest.docid_high_watermark)?;
-        let detected_parallelism = std::thread::available_parallelism().map_or(1, usize::from);
+        let detected_parallelism = ingest_parallelism_at_construction();
         let shard_router = ShardRouter::from_config(&config, detected_parallelism);
         let docid_allocator = DocIdAllocator::open(next_lease_base, shard_router.shard_count())
             .map_err(|error| invalid_state(error.to_string()))?;
@@ -26422,6 +26430,30 @@ mod tests {
                 "width {active_shards} selected {chunk_bytes} bytes per shard ({aggregate_chunk_slack} aggregate)",
             );
         }
+    }
+
+    #[test]
+    fn writer_construction_uses_scoped_rayon_pool_width() {
+        let host_parallelism = std::thread::available_parallelism().map_or(1, usize::from);
+        let scoped_width = if host_parallelism == 1 { 2 } else { 1 };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(scoped_width)
+            .build()
+            .expect("build scoped writer-construction pool");
+
+        pool.install(|| {
+            let mut index = QuillIndex::in_memory(QuillConfig {
+                max_ingest_shards: host_parallelism.saturating_add(1),
+                ..QuillConfig::default()
+            })
+            .expect("construct index in scoped pool");
+
+            assert_eq!(
+                index.writer_mut().shard_router.shard_count(),
+                scoped_width,
+                "writer construction must use the active scoped pool, not host parallelism"
+            );
+        });
     }
 
     #[test]
