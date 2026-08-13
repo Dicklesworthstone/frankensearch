@@ -827,6 +827,19 @@ fn dir_size_bytes(dir: &Path) -> u64 {
     })
 }
 
+/// The lexical engine admitted by [`open_hybrid`].
+///
+/// [`Self::Quill`] is the default facade authority. [`Self::TantivyOracle`]
+/// is an explicitly selected rollback/oracle reader; it never means that the
+/// default `lexical` facade alias resolved to Tantivy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LexicalReaderBackend {
+    /// The default Quill lexical reader.
+    Quill,
+    /// The explicit Tantivy oracle or accepted rollback reader.
+    TantivyOracle,
+}
+
 /// The opened arms of a hybrid index directory (bd-8nqz.3).
 #[derive(Clone)]
 pub struct HybridIndexParts {
@@ -835,12 +848,19 @@ pub struct HybridIndexParts {
     /// Active lexical reader for `<dir>/lexical`, when one exists and a
     /// lexical backend is compiled in.
     pub lexical: Option<Arc<dyn LexicalRead>>,
+    /// Actual lexical engine behind [`Self::lexical`].
+    ///
+    /// A caller that requires Quill's semantic behavior can fail closed when
+    /// this is [`Some(LexicalReaderBackend::TantivyOracle)`]. It is `None`
+    /// exactly when [`Self::lexical`] is absent.
+    pub lexical_backend: Option<LexicalReaderBackend>,
 }
 
 impl std::fmt::Debug for HybridIndexParts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HybridIndexParts")
             .field("has_lexical", &self.lexical.is_some())
+            .field("lexical_backend", &self.lexical_backend)
             .finish_non_exhaustive()
     }
 }
@@ -864,8 +884,10 @@ impl std::fmt::Debug for HybridIndexParts {
 /// Returns an error when the vector index cannot be opened, or when a
 /// lexical directory exists but its index fails to open (a corrupt lexical
 /// arm is reported, never silently dropped). A missing lexical directory
-/// yields `lexical: None`, as does a build without a lexical backend
-/// compiled in.
+/// yields `lexical: None` and `lexical_backend: None`, as does a build without
+/// a lexical backend compiled in. When the arm is present,
+/// `lexical_backend` records whether it is the default Quill reader or an
+/// explicit Tantivy oracle/rollback reader.
 pub async fn open_hybrid(
     cx: &Cx,
     data_dir: impl AsRef<Path>,
@@ -875,13 +897,17 @@ pub async fn open_hybrid(
     let vectors = Arc::new(TwoTierIndex::open(data_dir, config)?);
 
     let lexical_dir = data_dir.join("lexical");
-    let lexical = if lexical_dir.is_dir() {
+    let (lexical, lexical_backend) = if lexical_dir.is_dir() {
         open_lexical_reader(cx, &lexical_dir).await?
     } else {
-        None
+        (None, None)
     };
 
-    Ok(HybridIndexParts { vectors, lexical })
+    Ok(HybridIndexParts {
+        vectors,
+        lexical,
+        lexical_backend,
+    })
 }
 
 /// Open the default synchronous product for exactly admitted FSVI v2 tiers.
@@ -946,7 +972,10 @@ pub fn open_admitted_v2_sync_with_residual_sidecar_cache(
 }
 
 #[cfg(feature = "quill")]
-async fn open_lexical_reader(cx: &Cx, dir: &Path) -> SearchResult<Option<Arc<dyn LexicalRead>>> {
+async fn open_lexical_reader(
+    cx: &Cx,
+    dir: &Path,
+) -> SearchResult<(Option<Arc<dyn LexicalRead>>, Option<LexicalReaderBackend>)> {
     // bd-8nqz.2: the Quill path stays bound to the lexical *root*, not the
     // engine child selected during this call. `RootBoundQuillSearchIndex`
     // validates CURRENT before its atomic refresh swap, so a future refresh
@@ -956,7 +985,7 @@ async fn open_lexical_reader(cx: &Cx, dir: &Path) -> SearchResult<Option<Arc<dyn
         source: Box::new(source),
     })?;
     match layout {
-        LexicalLayout::Empty => Ok(None),
+        LexicalLayout::Empty => Ok((None, None)),
         // NOTE: deliberately two arms, not an or-pattern — `pointer` is only
         // bound in the BlueGreen variant, so `DirectQuill | BlueGreen {..} if
         // pointer.engine() == ...` is E0408 (pointer not bound in all
@@ -964,25 +993,31 @@ async fn open_lexical_reader(cx: &Cx, dir: &Path) -> SearchResult<Option<Arc<dyn
         // downstream workspaces such as mcp_agent_mail_rust).
         LexicalLayout::DirectQuill => {
             let index = RootBoundQuillSearchIndex::open(cx, dir, QuillConfig::default()).await?;
-            Ok(Some(Arc::new(index)))
+            Ok((Some(Arc::new(index)), Some(LexicalReaderBackend::Quill)))
         }
         LexicalLayout::BlueGreen { ref pointer, .. }
             if pointer.engine() == BlueGreenEngine::Quill =>
         {
             let index = RootBoundQuillSearchIndex::open(cx, dir, QuillConfig::default()).await?;
-            Ok(Some(Arc::new(index)))
+            Ok((Some(Arc::new(index)), Some(LexicalReaderBackend::Quill)))
         }
         #[cfg(feature = "lexical-tantivy")]
         LexicalLayout::DirectTantivy => {
             let index = TantivyIndex::open(dir)?;
-            Ok(Some(Arc::new(index)))
+            Ok((
+                Some(Arc::new(index)),
+                Some(LexicalReaderBackend::TantivyOracle),
+            ))
         }
         #[cfg(feature = "lexical-tantivy")]
         LexicalLayout::BlueGreen { ref pointer, .. }
             if pointer.engine() == BlueGreenEngine::Tantivy =>
         {
             let index = TantivyIndex::open(&pointer.engine_dir(dir))?;
-            Ok(Some(Arc::new(index)))
+            Ok((
+                Some(Arc::new(index)),
+                Some(LexicalReaderBackend::TantivyOracle),
+            ))
         }
         ref layout => Err(SearchError::InvalidConfig {
             field: "data_dir/lexical".to_owned(),
@@ -996,14 +1031,23 @@ async fn open_lexical_reader(cx: &Cx, dir: &Path) -> SearchResult<Option<Arc<dyn
 }
 
 #[cfg(all(feature = "lexical", not(feature = "quill")))]
-async fn open_lexical_reader(_cx: &Cx, dir: &Path) -> SearchResult<Option<Arc<dyn LexicalRead>>> {
+async fn open_lexical_reader(
+    _cx: &Cx,
+    dir: &Path,
+) -> SearchResult<(Option<Arc<dyn LexicalRead>>, Option<LexicalReaderBackend>)> {
     let index = TantivyIndex::open(dir)?;
-    Ok(Some(Arc::new(index)))
+    Ok((
+        Some(Arc::new(index)),
+        Some(LexicalReaderBackend::TantivyOracle),
+    ))
 }
 
 #[cfg(not(any(feature = "lexical", feature = "quill")))]
-async fn open_lexical_reader(_cx: &Cx, _dir: &Path) -> SearchResult<Option<Arc<dyn LexicalRead>>> {
-    Ok(None)
+async fn open_lexical_reader(
+    _cx: &Cx,
+    _dir: &Path,
+) -> SearchResult<(Option<Arc<dyn LexicalRead>>, Option<LexicalReaderBackend>)> {
+    Ok((None, None))
 }
 
 #[cfg(feature = "quill")]
@@ -2539,10 +2583,9 @@ mod tests {
             )
             .unwrap();
 
-            let lexical = open_lexical_reader(&cx, &lexical_root)
-                .await
-                .unwrap()
-                .expect("published Tantivy generation must open");
+            let (lexical, backend) = open_lexical_reader(&cx, &lexical_root).await.unwrap();
+            assert_eq!(backend, Some(LexicalReaderBackend::TantivyOracle));
+            let lexical = lexical.expect("published Tantivy generation must open");
             let hits = lexical.search(&cx, "rollback", 5).await.unwrap();
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0].doc_id, "tantivy-doc");
@@ -2664,6 +2707,8 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(parts.vectors.doc_count(), 2);
+            #[cfg(feature = "quill")]
+            assert_eq!(parts.lexical_backend, Some(LexicalReaderBackend::Quill));
             let lexical = parts.lexical.expect("lexical arm must be attached");
             let hits = lexical.search(&cx, "Alpha", 5).await.unwrap();
             assert!(!hits.is_empty(), "trait-object search must answer");
@@ -2689,6 +2734,7 @@ mod tests {
                 .unwrap();
             assert_eq!(parts.vectors.doc_count(), 1);
             assert!(parts.lexical.is_none());
+            assert!(parts.lexical_backend.is_none());
         });
     }
 
