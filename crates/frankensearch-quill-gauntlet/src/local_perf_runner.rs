@@ -8335,12 +8335,26 @@ mod tests {
                 // `dd` only CAPTURES here; `cmp` is what proves it. A short read
                 // yields a shorter file and `cmp` fails on length, and any wrong
                 // same-length payload fails on content. The post-ACK marker is
-                // emitted ONLY on exact match, and the shell's exit status is
-                // `cmp`'s on mismatch, so a bad ACK fails the fixture closed
-                // rather than printing the marker anyway.
+                // emitted ONLY on exact match, so a bad ACK fails the fixture
+                // closed rather than printing the marker anyway.
+                //
+                // Each stage exits with its OWN code and keeps its stderr, so a
+                // failure names itself instead of collapsing to a bare nonzero:
+                //   91 = the staged frames could not be emitted at all
+                //   92 = the ACK capture itself failed
+                //   93 = the ACK arrived but is not byte-exact
+                // `cmp` is deliberately not `-s`: its message distinguishes the
+                // two cases source could not separate — "EOF on <observed>"
+                // means no ACK ever arrived and this fixture is reporting an
+                // upstream refusal, while a differing byte means the ACK
+                // arrived and the expectation is what is wrong. `dd` keeps its
+                // stderr for the same reason; the fixture inherits stderr, so
+                // both surface in the failing run.
                 .arg(format!(
-                    "cat \"$1\"; dd bs=1 count={ack_len} of=\"$3\" 2>/dev/null; \
-                     cmp -s \"$2\" \"$3\" && echo qg1-wait-child-work-after-ack"
+                    "cat \"$1\" || exit 91; \
+                     dd bs=1 count={ack_len} of=\"$3\" || exit 92; \
+                     cmp \"$2\" \"$3\" || exit 93; \
+                     echo qg1-wait-child-work-after-ack"
                 ))
                 .arg("qg1-wait-boundary-child")
                 .arg(&frames_path)
@@ -8453,13 +8467,23 @@ mod tests {
         };
         let (status, _, accepted, failure, run_log) =
             qg1_wait_result_for_test("ack", &one_engine_selection);
+        // Success criteria are unchanged; only the report is. A bare nonzero
+        // could not say whether the parent refused before ever sending an ACK
+        // or the ACK arrived and differed, so the three facts that separate
+        // those are carried into the message: the child's own staged exit code,
+        // the parent's handshake verdict, and the retained run log.
         assert!(
             status.success(),
-            "accepted authority child exits successfully"
+            "accepted authority child must exit successfully; child status {status:?} \
+             (91 = staged frames not emitted, 92 = ACK capture failed, 93 = ACK not byte-exact); \
+             parent handshake failure {failure:?}; retained run log {:?}",
+            String::from_utf8_lossy(&run_log)
         );
         assert!(
             failure.is_none(),
-            "accepted authority has no parent handshake failure"
+            "accepted authority has no parent handshake failure; got {failure:?}; \
+             retained run log {:?}",
+            String::from_utf8_lossy(&run_log)
         );
         assert_eq!(
             accepted
