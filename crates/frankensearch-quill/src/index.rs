@@ -4445,6 +4445,7 @@ impl PublicationReadPauseControl {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 state = next;
             }
+            drop(state);
         }
         Ok(())
     }
@@ -8235,6 +8236,7 @@ impl QuillReader {
                     .wait(state)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
+            drop(state);
         }
     }
 
