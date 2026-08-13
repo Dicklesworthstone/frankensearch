@@ -517,7 +517,7 @@ impl ProjectDetailScreen {
         lines
     }
 
-    fn summary_lines(&self) -> Vec<Line> {
+    fn summary_lines(&self) -> Vec<Line<'_>> {
         let Some(project) = self.selected_project() else {
             return vec![Line::from(
                 "No project selected. Press Enter on a fleet row to open Project Detail.",

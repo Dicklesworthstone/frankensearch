@@ -621,7 +621,7 @@ impl ActionTimelineScreen {
         format!("density: {}", Self::sparkline(&normalized))
     }
 
-    fn incident_badge_line(&self, events: &[LifecycleEvent]) -> Line {
+    fn incident_badge_line(&self, events: &[LifecycleEvent]) -> Line<'_> {
         let status = if events
             .iter()
             .any(|event| matches!(Self::event_severity(event), EventSeverity::Critical))
@@ -648,7 +648,7 @@ impl ActionTimelineScreen {
         ])
     }
 
-    fn severity_pills_line(&self) -> Line {
+    fn severity_pills_line(&self) -> Line<'_> {
         let mut spans = vec![
             Span::styled("filters:", self.palette.style_muted()),
             Span::raw(" "),
