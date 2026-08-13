@@ -27,6 +27,7 @@ use crate::perf::{PerfQueryClass, QG6_QUERY_GROUPS};
 const QG6_QUERY_MANIFEST_VERSION: &str = "frankensearch-qg6-query-manifest-v3";
 const QG6_RESULT_RECEIPT_VERSION: &str = "frankensearch-qg6-result-receipt-v1";
 const QG6_RESULT_SEQUENCE_VERSION: &str = "frankensearch-qg6-result-sequence-v1";
+const QG6_TIMING_LEAF_RECEIPT_VERSION: &str = "frankensearch-qg6-timing-leaf-receipt-v1";
 const QG6_SEMANTIC_CONTRACT_VERSION: &str = "frankensearch-qg6-semantic-contract-v1";
 const QG6_QUERY_IDENTITY_VERSION: &str = "frankensearch-qg6-query-identity-v1";
 const QG6_QUERY_GENERATOR_REVISION: &str = "frankensearch-qg6-frozen-80-query-generator-v2";
@@ -72,6 +73,7 @@ const MAX_QUERY_TEXT_BYTES: usize = 16 * 1_024;
 const MAX_DOC_ID_BYTES: usize = 4 * 1_024;
 const MAX_UNSUPPORTED_REASON_CODE_BYTES: usize = 64;
 const MAX_K: usize = 100_000;
+const MAX_TIMING_LEAVES_PER_SAMPLE: usize = 128;
 
 /// Frozen support state and any reviewed cross-engine result divergence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +209,29 @@ pub enum Qg6SampleOrder {
     First,
     /// Second arm invoked in the block.
     Second,
+}
+
+const fn qg6_arm_role_tag(role: Qg6ArmRole) -> u8 {
+    match role {
+        Qg6ArmRole::NullLeft => 0,
+        Qg6ArmRole::NullRight => 1,
+        Qg6ArmRole::EffectControl => 2,
+        Qg6ArmRole::EffectTreatment => 3,
+    }
+}
+
+const fn qg6_comparison_tag(comparison: Qg6Comparison) -> u8 {
+    match comparison {
+        Qg6Comparison::Null => 0,
+        Qg6Comparison::Effect => 1,
+    }
+}
+
+const fn qg6_sample_order_tag(order: Qg6SampleOrder) -> u8 {
+    match order {
+        Qg6SampleOrder::First => 0,
+        Qg6SampleOrder::Second => 1,
+    }
 }
 
 /// Lifecycle phase attached to a bounded failure diagnostic.
@@ -1315,7 +1340,14 @@ pub fn qg6_result_sequence_sha256(
     receipt: &Qg6ResultReceipt,
     work_units: u64,
 ) -> Result<String, Qg6HarnessError> {
-    if work_units == 0 || !is_lower_hex_sha256(&receipt.receipt_sha256) {
+    qg6_result_digest_sequence_sha256(&receipt.receipt_sha256, work_units)
+}
+
+fn qg6_result_digest_sequence_sha256(
+    receipt_sha256: &str,
+    work_units: u64,
+) -> Result<String, Qg6HarnessError> {
+    if work_units == 0 || !is_lower_hex_sha256(receipt_sha256) {
         return Err(Qg6HarnessError::InvalidSpec {
             reason: "QG-6 result sequence requires positive work and a valid receipt".to_owned(),
         });
@@ -1323,7 +1355,7 @@ pub fn qg6_result_sequence_sha256(
     let mut hasher = Sha256::new();
     hash_len_prefixed(&mut hasher, QG6_RESULT_SEQUENCE_VERSION.as_bytes());
     hasher.update(work_units.to_le_bytes());
-    hash_len_prefixed(&mut hasher, receipt.receipt_sha256.as_bytes());
+    hash_len_prefixed(&mut hasher, receipt_sha256.as_bytes());
     Ok(lower_hex(hasher.finalize()))
 }
 
@@ -1408,8 +1440,138 @@ pub struct Qg6PairBlock {
     pub second: Qg6ArmRole,
 }
 
+/// One exact same-invocation search interval retained within a timed sample.
+///
+/// The runner records the interval around the search call only. Result
+/// normalization and parity verification remain outside that interval, while
+/// the result receipt still binds the leaf to the observed native result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg6SearchTimingLeafReceipt {
+    /// Schema identifier for this exact leaf receipt.
+    pub schema_version: String,
+    /// Parent paired block identifier.
+    pub block_id: u64,
+    /// Parent timed-sample identifier.
+    pub sample_id: u64,
+    /// Stable redacted query identifier.
+    pub query_id: String,
+    /// Index into the frozen query manifest.
+    pub query_index: usize,
+    /// Null or effect comparison shared with the parent sample.
+    pub comparison: Qg6Comparison,
+    /// Logical arm shared with the parent sample.
+    pub arm: Qg6ArmRole,
+    /// Execution order shared with the parent sample.
+    pub order: Qg6SampleOrder,
+    /// Strictly increasing ordinal inside the parent sample.
+    pub leaf_ordinal: u64,
+    /// Monotonic start offset relative to the measurement origin.
+    pub started_ns: u64,
+    /// Monotonic end offset relative to the measurement origin.
+    pub ended_ns: u64,
+    /// Exact raw monotonic interval in nanoseconds.
+    pub observed_latency_ns: u64,
+    /// Same interval in milliseconds for later raw-sample binding.
+    pub observed_latency_ms: f64,
+    /// Self-sealed digest of the result observed for this exact invocation.
+    pub result_receipt_sha256: String,
+    /// Domain-separated self-seal over every leaf field above.
+    pub receipt_sha256: String,
+}
+
+impl Qg6SearchTimingLeafReceipt {
+    fn from_observation(
+        block_id: u64,
+        sample_id: u64,
+        query: &Qg6QuerySpec,
+        query_index: usize,
+        comparison: Qg6Comparison,
+        arm: Qg6ArmRole,
+        order: Qg6SampleOrder,
+        leaf_ordinal: u64,
+        started_ns: u64,
+        ended_ns: u64,
+        result_receipt_sha256: String,
+    ) -> Result<Self, Qg6HarnessError> {
+        let elapsed_ns = ended_ns
+            .checked_sub(started_ns)
+            .filter(|elapsed| *elapsed != 0)
+            .ok_or_else(|| Qg6HarnessError::InvalidSpec {
+                reason: "QG-6 timing leaf has an invalid monotonic interval".to_owned(),
+            })?;
+        let mut receipt = Self {
+            schema_version: QG6_TIMING_LEAF_RECEIPT_VERSION.to_owned(),
+            block_id,
+            sample_id,
+            query_id: query.id().to_owned(),
+            query_index,
+            comparison,
+            arm,
+            order,
+            leaf_ordinal,
+            started_ns,
+            ended_ns,
+            observed_latency_ns: elapsed_ns,
+            observed_latency_ms: nanoseconds_to_millis(elapsed_ns),
+            result_receipt_sha256,
+            receipt_sha256: String::new(),
+        };
+        receipt.receipt_sha256 = receipt.recomputed_sha256()?;
+        receipt.verify()?;
+        Ok(receipt)
+    }
+
+    fn recomputed_sha256(&self) -> Result<String, Qg6HarnessError> {
+        let mut hasher = Sha256::new();
+        hash_len_prefixed(&mut hasher, QG6_TIMING_LEAF_RECEIPT_VERSION.as_bytes());
+        hash_len_prefixed(&mut hasher, self.schema_version.as_bytes());
+        hasher.update(self.block_id.to_le_bytes());
+        hasher.update(self.sample_id.to_le_bytes());
+        hash_len_prefixed(&mut hasher, self.query_id.as_bytes());
+        hasher.update(usize_to_u64(self.query_index)?.to_le_bytes());
+        hasher.update([qg6_comparison_tag(self.comparison)]);
+        hasher.update([qg6_arm_role_tag(self.arm)]);
+        hasher.update([qg6_sample_order_tag(self.order)]);
+        hasher.update(self.leaf_ordinal.to_le_bytes());
+        hasher.update(self.started_ns.to_le_bytes());
+        hasher.update(self.ended_ns.to_le_bytes());
+        hasher.update(self.observed_latency_ns.to_le_bytes());
+        hasher.update(self.observed_latency_ms.to_bits().to_le_bytes());
+        hash_len_prefixed(&mut hasher, self.result_receipt_sha256.as_bytes());
+        Ok(lower_hex(hasher.finalize()))
+    }
+
+    fn verify(&self) -> Result<(), Qg6HarnessError> {
+        let elapsed_ns = self
+            .ended_ns
+            .checked_sub(self.started_ns)
+            .filter(|elapsed| *elapsed != 0)
+            .ok_or_else(|| Qg6HarnessError::InvalidSpec {
+                reason: "QG-6 timing leaf has an invalid monotonic interval".to_owned(),
+            })?;
+        if self.schema_version != QG6_TIMING_LEAF_RECEIPT_VERSION
+            || self.query_id.is_empty()
+            || self.query_id.len() > MAX_QUERY_ID_BYTES
+            || self.query_index >= MAX_QUERY_COUNT
+            || self.observed_latency_ns != elapsed_ns
+            || !self.observed_latency_ms.is_finite()
+            || self.observed_latency_ms <= 0.0
+            || self.observed_latency_ms != nanoseconds_to_millis(elapsed_ns)
+            || !is_lower_hex_sha256(&self.result_receipt_sha256)
+            || self.receipt_sha256 != self.recomputed_sha256()?
+        {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: "QG-6 timing leaf receipt is malformed or has an invalid self-seal"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// One directly observed timed sample.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Qg6TimedSample {
     /// Paired block shared with exactly one other arm.
     pub block_id: u64,
@@ -1435,10 +1597,125 @@ pub struct Qg6TimedSample {
     pub subsample_count: u64,
     /// Digest over every independently recomputed result receipt.
     pub result_sha256: String,
+    /// Ordered same-invocation raw timing leaves summarized by this p50 sample.
+    pub timing_leaves: Vec<Qg6SearchTimingLeafReceipt>,
+    /// Domain-separated seal over the ordered leaf receipts and parent sample facts.
+    pub timing_leaves_sha256: String,
+}
+
+impl Qg6TimedSample {
+    /// Verify the bounded ordered leaf receipts that support this p50 sample.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing, extra, reordered, non-finite, overlapping, or
+    /// out-of-parent intervals, as well as a leaf/result digest that cannot
+    /// reproduce the parent sample's p50 and result sequence.
+    pub fn verify_timing_leaves(&self) -> Result<(), Qg6HarnessError> {
+        let expected_count =
+            usize::try_from(self.subsample_count).map_err(|_| Qg6HarnessError::InvalidSpec {
+                reason: "QG-6 timing leaf cardinality does not fit usize".to_owned(),
+            })?;
+        if expected_count == 0
+            || expected_count > MAX_TIMING_LEAVES_PER_SAMPLE
+            || self.timing_leaves.len() != expected_count
+            || self.started_ns >= self.ended_ns
+            || self.observed_latency_ns == 0
+            || !is_lower_hex_sha256(&self.result_sha256)
+            || !is_lower_hex_sha256(&self.timing_leaves_sha256)
+        {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: "QG-6 timing leaf receipt has invalid cardinality or parent facts"
+                    .to_owned(),
+            });
+        }
+
+        let mut latencies_ns = Vec::new();
+        latencies_ns
+            .try_reserve_exact(expected_count)
+            .map_err(|_| Qg6HarnessError::InvalidSpec {
+                reason: "QG-6 timing leaf validation allocation failed".to_owned(),
+            })?;
+        let mut previous_ended_ns = None;
+        let mut result_receipt_sha256 = None;
+        for (index, leaf) in self.timing_leaves.iter().enumerate() {
+            leaf.verify()?;
+            let expected_ordinal = usize_to_u64(index)?;
+            if leaf.block_id != self.block_id
+                || leaf.sample_id != self.sample_id
+                || leaf.query_id != self.query_id
+                || leaf.query_index != self.query_index
+                || leaf.comparison != self.comparison
+                || leaf.arm != self.arm
+                || leaf.order != self.order
+                || leaf.leaf_ordinal != expected_ordinal
+                || leaf.started_ns < self.started_ns
+                || leaf.ended_ns > self.ended_ns
+                || previous_ended_ns.is_some_and(|previous| leaf.started_ns < previous)
+            {
+                return Err(Qg6HarnessError::InvalidSpec {
+                    reason: "QG-6 timing leaves do not have the exact parent order and interval"
+                        .to_owned(),
+                });
+            }
+            if result_receipt_sha256
+                .replace(leaf.result_receipt_sha256.as_str())
+                .is_some_and(|previous| previous != leaf.result_receipt_sha256.as_str())
+            {
+                return Err(Qg6HarnessError::InvalidSpec {
+                    reason: "QG-6 timing leaves disagree on their result receipt".to_owned(),
+                });
+            }
+            previous_ended_ns = Some(leaf.ended_ns);
+            let latency_ns = leaf.ended_ns.checked_sub(leaf.started_ns).ok_or_else(|| {
+                Qg6HarnessError::InvalidSpec {
+                    reason: "QG-6 timing leaf interval changed after verification".to_owned(),
+                }
+            })?;
+            latencies_ns.push(latency_ns);
+        }
+        latencies_ns.sort_unstable();
+        let result_receipt_sha256 =
+            result_receipt_sha256.ok_or_else(|| Qg6HarnessError::InvalidSpec {
+                reason: "QG-6 timing leaf receipt has no result binding".to_owned(),
+            })?;
+        if self.observed_latency_ns != median_sorted_u64(&latencies_ns)
+            || self.result_sha256
+                != qg6_result_digest_sequence_sha256(result_receipt_sha256, self.subsample_count)?
+            || self.timing_leaves_sha256 != self.recomputed_timing_leaves_sha256()?
+        {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: "QG-6 timing leaves do not reproduce their parent sample".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn recomputed_timing_leaves_sha256(&self) -> Result<String, Qg6HarnessError> {
+        let mut hasher = Sha256::new();
+        hash_len_prefixed(&mut hasher, QG6_TIMING_LEAF_RECEIPT_VERSION.as_bytes());
+        hasher.update(self.block_id.to_le_bytes());
+        hasher.update(self.sample_id.to_le_bytes());
+        hash_len_prefixed(&mut hasher, self.query_id.as_bytes());
+        hasher.update(usize_to_u64(self.query_index)?.to_le_bytes());
+        hasher.update([qg6_comparison_tag(self.comparison)]);
+        hasher.update([qg6_arm_role_tag(self.arm)]);
+        hasher.update([qg6_sample_order_tag(self.order)]);
+        hasher.update(self.started_ns.to_le_bytes());
+        hasher.update(self.ended_ns.to_le_bytes());
+        hasher.update(self.observed_latency_ns.to_le_bytes());
+        hasher.update(self.subsample_count.to_le_bytes());
+        hash_len_prefixed(&mut hasher, self.result_sha256.as_bytes());
+        hasher.update(usize_to_u64(self.timing_leaves.len())?.to_le_bytes());
+        for leaf in &self.timing_leaves {
+            hash_len_prefixed(&mut hasher, leaf.receipt_sha256.as_bytes());
+        }
+        Ok(lower_hex(hasher.finalize()))
+    }
 }
 
 /// Output of one prepared four-arm measurement.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Qg6Measurement {
     /// Frozen identity shared by all four arms.
     pub identity: Qg6ExperimentIdentity,
@@ -2015,6 +2292,12 @@ impl<A> Qg6ValidatedExperiment<A> {
                     .to_owned(),
             });
         }
+        if searches_per_sample > MAX_TIMING_LEAVES_PER_SAMPLE {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: "QG-6 prepared measurement exceeds the bounded timing-leaf limit"
+                    .to_owned(),
+            });
+        }
         let schedule = seeded_interleaved_four_arm_schedule(
             self.prepared.queries.len(),
             rounds_per_query,
@@ -2042,6 +2325,13 @@ impl<A> Qg6ValidatedExperiment<A> {
                 (Qg6SampleOrder::First, block.first),
                 (Qg6SampleOrder::Second, block.second),
             ] {
+                let sample_id = block
+                    .block_id
+                    .checked_mul(2)
+                    .and_then(|base| base.checked_add(u64::from(order == Qg6SampleOrder::Second)))
+                    .ok_or_else(|| Qg6HarnessError::InvalidSpec {
+                        reason: "timed sample ID overflow".to_owned(),
+                    })?;
                 let started_ns = monotonic_ns(origin);
                 let mut latencies_ns = Vec::new();
                 latencies_ns
@@ -2049,7 +2339,13 @@ impl<A> Qg6ValidatedExperiment<A> {
                     .map_err(|_| Qg6HarnessError::InvalidSpec {
                         reason: "QG-6 latency subsample allocation failed".to_owned(),
                     })?;
-                for _ in 0..searches_per_sample {
+                let mut timing_leaves = Vec::new();
+                timing_leaves
+                    .try_reserve_exact(searches_per_sample)
+                    .map_err(|_| Qg6HarnessError::InvalidSpec {
+                        reason: "QG-6 timing-leaf allocation failed".to_owned(),
+                    })?;
+                for leaf_ordinal in 0..searches_per_sample {
                     let search_started_ns = monotonic_ns(origin);
                     let result = search(
                         self.prepared.arms.get(role),
@@ -2057,9 +2353,12 @@ impl<A> Qg6ValidatedExperiment<A> {
                         black_box(self.prepared.identity.k),
                         Qg6Phase::Measurement,
                     );
-                    let mut search_ended_ns = monotonic_ns(origin);
+                    let search_ended_ns = monotonic_ns(origin);
                     if search_ended_ns <= search_started_ns {
-                        search_ended_ns = search_started_ns.saturating_add(1);
+                        return Err(Qg6HarnessError::InvalidSpec {
+                            reason: "QG-6 timed search has an invalid monotonic interval"
+                                .to_owned(),
+                        });
                     }
                     self.prepared.lifecycle.arm_mut(role).timed_search_calls += 1;
                     let result = result.map_err(|error| {
@@ -2080,22 +2379,32 @@ impl<A> Qg6ValidatedExperiment<A> {
                         self.expected_results[block.query_index].get(role),
                         &observed.receipt,
                     )?;
-                    latencies_ns.push(search_ended_ns.saturating_sub(search_started_ns).max(1));
+                    let leaf = Qg6SearchTimingLeafReceipt::from_observation(
+                        block.block_id,
+                        sample_id,
+                        query,
+                        block.query_index,
+                        block.comparison,
+                        role,
+                        order,
+                        usize_to_u64(leaf_ordinal)?,
+                        search_started_ns,
+                        search_ended_ns,
+                        observed.receipt.receipt_sha256,
+                    )?;
+                    latencies_ns.push(leaf.observed_latency_ns);
+                    timing_leaves.push(leaf);
                 }
-                let mut ended_ns = monotonic_ns(origin);
+                let ended_ns = monotonic_ns(origin);
                 if ended_ns <= started_ns {
-                    ended_ns = started_ns.saturating_add(1);
+                    return Err(Qg6HarnessError::InvalidSpec {
+                        reason: "QG-6 timed sample has an invalid monotonic interval".to_owned(),
+                    });
                 }
                 latencies_ns.sort_unstable();
                 let observed_latency_ns = median_sorted_u64(&latencies_ns);
-                let sample_id = block
-                    .block_id
-                    .checked_mul(2)
-                    .and_then(|base| base.checked_add(u64::from(order == Qg6SampleOrder::Second)))
-                    .ok_or_else(|| Qg6HarnessError::InvalidSpec {
-                        reason: "timed sample ID overflow".to_owned(),
-                    })?;
-                samples.push(Qg6TimedSample {
+                let subsample_count = usize_to_u64(searches_per_sample)?;
+                let mut sample = Qg6TimedSample {
                     block_id: block.block_id,
                     sample_id,
                     query_id: query.id().to_owned(),
@@ -2106,12 +2415,17 @@ impl<A> Qg6ValidatedExperiment<A> {
                     started_ns,
                     ended_ns,
                     observed_latency_ns,
-                    subsample_count: usize_to_u64(searches_per_sample)?,
+                    subsample_count,
                     result_sha256: qg6_result_sequence_sha256(
                         self.expected_results[block.query_index].get(role),
-                        usize_to_u64(searches_per_sample)?,
+                        subsample_count,
                     )?,
-                });
+                    timing_leaves,
+                    timing_leaves_sha256: String::new(),
+                };
+                sample.timing_leaves_sha256 = sample.recomputed_timing_leaves_sha256()?;
+                sample.verify_timing_leaves()?;
+                samples.push(sample);
             }
         }
         self.run_postflight(search, normalize)?;
@@ -4311,6 +4625,11 @@ fn median_sorted_u64(values: &[u64]) -> u64 {
     }
 }
 
+#[allow(clippy::cast_precision_loss)]
+fn nanoseconds_to_millis(nanoseconds: u64) -> f64 {
+    nanoseconds as f64 / 1_000_000.0
+}
+
 fn normalize_query_text(text: &str) -> String {
     let nfc = text.nfc().collect::<String>();
     nfc.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -6030,12 +6349,24 @@ mod tests {
 
         assert_eq!(measurement.searches_per_sample, 3);
         assert_eq!(measurement.samples.len(), 4 * 2 * 4);
-        assert!(
-            measurement
-                .samples
-                .iter()
-                .all(|sample| sample.subsample_count == 3 && sample.observed_latency_ns > 0)
-        );
+        assert!(measurement.samples.iter().all(|sample| {
+            sample.subsample_count == 3
+                && sample.observed_latency_ns > 0
+                && sample.verify_timing_leaves().is_ok()
+                && sample.timing_leaves.len() == 3
+                && sample
+                    .timing_leaves
+                    .iter()
+                    .enumerate()
+                    .all(|(index, leaf)| {
+                        leaf.leaf_ordinal == u64::try_from(index).expect("bounded leaf ordinal")
+                            && leaf.started_ns < leaf.ended_ns
+                            && leaf.observed_latency_ms.is_finite()
+                            && leaf.observed_latency_ms > 0.0
+                            && leaf.result_receipt_sha256
+                                == sample.timing_leaves[0].result_receipt_sha256
+                    })
+        }));
         for role in Qg6ArmRole::ALL {
             assert_eq!(
                 measurement.lifecycle.arm(role).timed_search_calls,
@@ -6043,6 +6374,74 @@ mod tests {
             );
             assert_eq!(measurement.lifecycle.arm(role).postflight_search_calls, 4);
         }
+    }
+
+    #[test]
+    fn timing_leaves_fail_closed_on_cardinality_order_nonfinite_interval_and_result_mutations() {
+        let mut preflight = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize| {
+            black_box(arm.role);
+            Ok(Qg6SearchResult::from(canonical_result(query)))
+        };
+        let validated = prepare()
+            .validate_exact_parity(&mut preflight)
+            .expect("exact parity");
+        let mut search = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize, _phase: Qg6Phase| {
+            black_box(arm.role);
+            Ok(Qg6SearchResult::from(canonical_result(query)))
+        };
+        let measurement = validated
+            .measure_query_p50_with_normalizer(1, 1, 3, 0x5eed, &mut search, &mut |result| result)
+            .expect("timing leaves");
+        let sample = measurement.samples[0].clone();
+        sample
+            .verify_timing_leaves()
+            .expect("honest timing leaves verify");
+
+        let mut missing = sample.clone();
+        missing.timing_leaves.pop();
+        missing.timing_leaves_sha256 = missing
+            .recomputed_timing_leaves_sha256()
+            .expect("reseal missing leaves");
+        assert!(missing.verify_timing_leaves().is_err());
+
+        let mut reordered = sample.clone();
+        reordered.timing_leaves.swap(0, 1);
+        reordered.timing_leaves_sha256 = reordered
+            .recomputed_timing_leaves_sha256()
+            .expect("reseal reordered leaves");
+        assert!(reordered.verify_timing_leaves().is_err());
+
+        let mut nonfinite = sample.clone();
+        nonfinite.timing_leaves[0].observed_latency_ms = f64::NAN;
+        nonfinite.timing_leaves[0].receipt_sha256 = nonfinite.timing_leaves[0]
+            .recomputed_sha256()
+            .expect("reseal nonfinite leaf");
+        nonfinite.timing_leaves_sha256 = nonfinite
+            .recomputed_timing_leaves_sha256()
+            .expect("reseal nonfinite leaves");
+        assert!(nonfinite.verify_timing_leaves().is_err());
+
+        let mut invalid_interval = sample.clone();
+        invalid_interval.timing_leaves[0].ended_ns = invalid_interval.timing_leaves[0].started_ns;
+        invalid_interval.timing_leaves[0].observed_latency_ns = 0;
+        invalid_interval.timing_leaves[0].observed_latency_ms = 0.0;
+        invalid_interval.timing_leaves[0].receipt_sha256 = invalid_interval.timing_leaves[0]
+            .recomputed_sha256()
+            .expect("reseal invalid interval leaf");
+        invalid_interval.timing_leaves_sha256 = invalid_interval
+            .recomputed_timing_leaves_sha256()
+            .expect("reseal invalid interval leaves");
+        assert!(invalid_interval.verify_timing_leaves().is_err());
+
+        let mut changed_result = sample;
+        changed_result.timing_leaves[0].result_receipt_sha256 = "f".repeat(64);
+        changed_result.timing_leaves[0].receipt_sha256 = changed_result.timing_leaves[0]
+            .recomputed_sha256()
+            .expect("reseal changed result leaf");
+        changed_result.timing_leaves_sha256 = changed_result
+            .recomputed_timing_leaves_sha256()
+            .expect("reseal changed result leaves");
+        assert!(changed_result.verify_timing_leaves().is_err());
     }
 
     #[test]
@@ -6060,6 +6459,34 @@ mod tests {
         let error = validated
             .measure_query_p50_with_normalizer(1, 2, 0, 0x5eed, &mut search, &mut |result| result)
             .expect_err("zero-sized p50 subsample");
+
+        assert!(matches!(error, Qg6HarnessError::InvalidSpec { .. }));
+    }
+
+    #[test]
+    fn p50_subsamples_reject_unbounded_timing_leaf_cardinality() {
+        let mut preflight = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize| {
+            black_box(arm.role);
+            Ok(Qg6SearchResult::from(canonical_result(query)))
+        };
+        let validated = prepare()
+            .validate_exact_parity(&mut preflight)
+            .expect("exact parity");
+        let mut search = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize, _phase: Qg6Phase| {
+            black_box(arm.role);
+            Ok(Qg6SearchResult::from(canonical_result(query)))
+        };
+
+        let error = validated
+            .measure_query_p50_with_normalizer(
+                1,
+                1,
+                MAX_TIMING_LEAVES_PER_SAMPLE + 1,
+                0x5eed,
+                &mut search,
+                &mut |result| result,
+            )
+            .expect_err("unbounded timing leaves must fail closed");
 
         assert!(matches!(error, Qg6HarnessError::InvalidSpec { .. }));
     }
