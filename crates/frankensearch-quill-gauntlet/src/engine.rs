@@ -12075,8 +12075,6 @@ mod tests {
     #[cfg(feature = "fuzz-harness")]
     #[test]
     fn scalar_g1a_fuzz_shrink_factories_create_independent_fresh_lifecycles() {
-        use crate::runner::DifferentialCampaignEngine;
-
         let (mut make_subject, mut make_oracle) = QuillSubject::scalar_g1a_fuzz_shrink_factories();
         let mut first_subject = make_subject().expect("first fresh fuzz subject");
         let mut second_subject = make_subject().expect("second fresh fuzz subject");
