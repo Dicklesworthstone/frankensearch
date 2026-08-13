@@ -10621,6 +10621,21 @@ pub struct BorrowedStoredMetaSection<'a> {
     total_len: usize,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static STORED_META_MATERIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_stored_meta_materializations() {
+    STORED_META_MATERIALIZATIONS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn stored_meta_materializations() -> usize {
+    STORED_META_MATERIALIZATIONS.with(std::cell::Cell::get)
+}
+
 impl BorrowedStoredMetaSection<'_> {
     /// Exact durable length of the section this will emit.
     #[must_use]
@@ -10672,17 +10687,29 @@ impl BorrowedStoredMetaSection<'_> {
     ///
     /// This reintroduces the copy the borrowed form exists to avoid, so it is
     /// for tests and for callers that genuinely need an owned section.
-    #[must_use]
-    pub fn to_encoded(&self) -> EncodedStoredMetaSection {
-        let mut bytes = Vec::with_capacity(self.total_len);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoredMetaCodecError::Allocation`] when the exact owned
+    /// section buffer cannot be reserved.
+    pub fn to_encoded(&self) -> Result<EncodedStoredMetaSection, StoredMetaCodecError> {
+        #[cfg(test)]
+        STORED_META_MATERIALIZATIONS.with(|calls| calls.set(calls.get() + 1));
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(self.total_len)
+            .map_err(|_| StoredMetaCodecError::Allocation {
+                resource: "materialized stored metadata section",
+                bytes: self.total_len,
+            })?;
         self.write_into(&mut bytes);
-        EncodedStoredMetaSection {
+        Ok(EncodedStoredMetaSection {
             bytes,
             docid_lo: self.docid_lo,
             docid_hi: self.docid_hi,
             field_count: self.field_count,
             blob_bytes: self.blob_bytes,
-        }
+        })
     }
 }
 
@@ -10885,13 +10912,13 @@ impl EncodedStoredMetaSection {
         lease_docid_base: u64,
         accumulator: &ColumnarAccumulator<A>,
     ) -> Result<Self, StoredMetaCodecError> {
-        Ok(BorrowedStoredMetaSection::encode_accumulator(
+        BorrowedStoredMetaSection::encode_accumulator(
             docid_lo,
             docid_hi,
             lease_docid_base,
             accumulator,
         )?
-        .to_encoded())
+        .to_encoded()
     }
 
     /// Owned counterpart of
@@ -10908,14 +10935,14 @@ impl EncodedStoredMetaSection {
         accumulator: &ColumnarAccumulator<A>,
         limits: StoredMetaLimits,
     ) -> Result<Self, StoredMetaCodecError> {
-        Ok(BorrowedStoredMetaSection::encode_accumulator_with_limits(
+        BorrowedStoredMetaSection::encode_accumulator_with_limits(
             docid_lo,
             docid_hi,
             lease_docid_base,
             accumulator,
             limits,
         )?
-        .to_encoded())
+        .to_encoded()
     }
 }
 
@@ -11151,12 +11178,18 @@ impl<'a> BorrowedStoredMetaSection<'a> {
             }
         })?;
 
+        let directory_len = expected_field_ords
+            .len()
+            .checked_mul(STORED_META_DIRECTORY_ENTRY_LEN)
+            .ok_or(StoredMetaCodecError::ArithmeticOverflow {
+                field: "directory length",
+            })?;
         let mut bytes = Vec::new();
         bytes
-            .try_reserve_exact(expected_field_ords.len() * STORED_META_DIRECTORY_ENTRY_LEN)
+            .try_reserve_exact(directory_len)
             .map_err(|_| StoredMetaCodecError::Allocation {
                 resource: "section directory bytes",
-                bytes: expected_field_ords.len() * STORED_META_DIRECTORY_ENTRY_LEN,
+                bytes: directory_len,
             })?;
         for (&field_ord, &offset) in expected_field_ords.iter().zip(&field_offsets) {
             bytes.extend_from_slice(&field_ord.to_le_bytes());
@@ -11172,6 +11205,13 @@ impl<'a> BorrowedStoredMetaSection<'a> {
         prefixes.push(bytes);
 
         let presence_len = stored_meta_presence_len(span)?;
+        let field_prefix_len = span
+            .checked_add(1)
+            .and_then(|count| count.checked_mul(std::mem::size_of::<u32>()))
+            .and_then(|offsets_len| presence_len.checked_add(offsets_len))
+            .ok_or(StoredMetaCodecError::ArithmeticOverflow {
+                field: "field prefix length",
+            })?;
         for ((field, &field_offset), &blob_len) in
             stored_fields.iter().zip(&field_offsets).zip(&blob_lengths)
         {
@@ -11179,6 +11219,12 @@ impl<'a> BorrowedStoredMetaSection<'a> {
             // Prefix-local: this field's presence bitmap starts at 0 of its own
             // run, where the owned writer indexed from the section start.
             let mut bytes = Vec::new();
+            bytes.try_reserve_exact(field_prefix_len).map_err(|_| {
+                StoredMetaCodecError::Allocation {
+                    resource: "field prefix bytes",
+                    bytes: field_prefix_len,
+                }
+            })?;
             let presence_start = 0_usize;
             let presence_end = presence_start.checked_add(presence_len).ok_or(
                 StoredMetaCodecError::ArithmeticOverflow {

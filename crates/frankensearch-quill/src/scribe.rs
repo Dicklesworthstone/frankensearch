@@ -55,14 +55,19 @@ use crate::grimoire::{
     TermSectionLengths,
 };
 use crate::quiver::{
-    BlockMaxError, DocLenCodecError, DocLenFieldInput, EncodedDocLenSection, EncodedIdHashSection,
-    EncodedIdMapSection, EncodedNumericSection, EncodedPositionList, EncodedPostingList,
-    EncodedStatsSection, EncodedStoredMetaSection, FieldStats, IdHashCodecError, IdMapCodecError,
-    IdMapEntryInput, NumericCodecError, NumericEntry, NumericFieldInput, NumericValue,
-    PositionCodecError, Posting, StatsCodecError, StoredMetaCodecError, StoredMetaFieldInput,
+    BlockMaxError, BorrowedStoredMetaSection, DocLenCodecError, DocLenFieldInput,
+    EncodedDocLenSection, EncodedIdHashSection, EncodedIdMapSection, EncodedNumericSection,
+    EncodedPositionList, EncodedPostingList, EncodedStatsSection, EncodedStoredMetaSection,
+    FieldStats, IdHashCodecError, IdMapCodecError, IdMapEntryInput, NumericCodecError,
+    NumericEntry, NumericFieldInput, NumericValue, PositionCodecError, Posting, StatsCodecError,
+    StoredMetaCodecError, StoredMetaFieldInput,
 };
 use crate::schema::{Analyzer as AnalyzerKind, FieldKind, SchemaDescriptor};
-use crate::segment::{EncodedSegment, SectionInput, SectionKind, SegmentHeaderInput};
+#[cfg(feature = "bench-internals")]
+use crate::segment::SectionInput;
+use crate::segment::{
+    EncodedSegment, PlannedSection, SectionKind, SegmentAssembler, SegmentHeaderInput,
+};
 
 /// Default arena chunk size. 1 MiB amortizes chunk-vector growth while
 /// keeping per-shard reset cheap; term corpora that exceed it simply add
@@ -3206,6 +3211,14 @@ pub enum FlushMode {
     Scalar,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum StoredMetaBuildMode {
+    #[default]
+    Borrowed,
+    #[cfg(feature = "bench-internals")]
+    Staged,
+}
+
 /// Typed failures from [`flush_accumulator`].
 #[derive(Debug, Error)]
 pub enum FlushError {
@@ -3421,6 +3434,32 @@ pub fn flush_accumulator_with_mode<A: TokenAnalyzer>(
     input: FlushSegmentInput<'_>,
     mode: FlushMode,
 ) -> Result<EncodedSegment, FlushError> {
+    flush_accumulator_with_stored_meta_mode(accumulator, input, mode, StoredMetaBuildMode::Borrowed)
+}
+
+/// Seal one shard with the former materialized STOREDMETA section.
+///
+/// This benchmark-only control retains the shipping radix and segment
+/// assembler while restoring the full intermediate STOREDMETA byte image.
+///
+/// # Errors
+///
+/// Returns [`FlushError`] under the same conditions as [`flush_accumulator`].
+#[cfg(feature = "bench-internals")]
+pub fn flush_accumulator_with_staged_stored_meta<A: TokenAnalyzer>(
+    accumulator: &ColumnarAccumulator<A>,
+    input: FlushSegmentInput<'_>,
+    mode: FlushMode,
+) -> Result<EncodedSegment, FlushError> {
+    flush_accumulator_with_stored_meta_mode(accumulator, input, mode, StoredMetaBuildMode::Staged)
+}
+
+fn flush_accumulator_with_stored_meta_mode<A: TokenAnalyzer>(
+    accumulator: &ColumnarAccumulator<A>,
+    input: FlushSegmentInput<'_>,
+    mode: FlushMode,
+    stored_meta_mode: StoredMetaBuildMode,
+) -> Result<EncodedSegment, FlushError> {
     let flush_span = tracing::info_span!(
         target: crate::tracing_conventions::TARGET,
         crate::tracing_conventions::SCRIBE_FLUSH,
@@ -3436,6 +3475,7 @@ pub fn flush_accumulator_with_mode<A: TokenAnalyzer>(
         output_bytes = tracing::field::Empty,
         duration_us = tracing::field::Empty,
         mode = ?mode,
+        stored_meta_mode = ?stored_meta_mode,
     );
     let _flush_timer = crate::tracing_conventions::StageTimer::new(&flush_span);
     let _flush_entered = flush_span.enter();
@@ -3519,12 +3559,25 @@ pub fn flush_accumulator_with_mode<A: TokenAnalyzer>(
     let stored_meta = if accumulator.stored_fields().is_empty() {
         None
     } else {
-        Some(EncodedStoredMetaSection::encode_accumulator(
-            docid_lo,
-            docid_hi,
-            input.lease_docid_base,
-            accumulator,
-        )?)
+        Some(match stored_meta_mode {
+            StoredMetaBuildMode::Borrowed => {
+                AccumulatorStoredMeta::Borrowed(BorrowedStoredMetaSection::encode_accumulator(
+                    docid_lo,
+                    docid_hi,
+                    input.lease_docid_base,
+                    accumulator,
+                )?)
+            }
+            #[cfg(feature = "bench-internals")]
+            StoredMetaBuildMode::Staged => {
+                AccumulatorStoredMeta::Staged(EncodedStoredMetaSection::encode_accumulator(
+                    docid_lo,
+                    docid_hi,
+                    input.lease_docid_base,
+                    accumulator,
+                )?)
+            }
+        })
     };
     let stats_rows = accumulator
         .fields()
@@ -3532,24 +3585,43 @@ pub fn flush_accumulator_with_mode<A: TokenAnalyzer>(
         .map(|field| FieldStats::new(field.field_ord(), field.total_tokens(), doc_count))
         .collect::<Vec<_>>();
     let stats = EncodedStatsSection::encode(&expected_field_ords, &stats_rows, doc_count)?;
-    let encoded = encode_canonical_segment(
-        DeltaFlushInput {
-            segment_id: input.segment_id,
-            created_unix_s: input.created_unix_s,
-            engine_version: input.engine_version,
-        },
-        schema,
-        docid_lo,
-        docid_hi,
-        doc_count,
-        (postings_bytes, positions_bytes, blockmax_bytes, term_inputs),
-        &doclen,
-        &id_map,
-        &id_hash,
-        numeric.as_ref(),
-        stored_meta.as_ref(),
-        &stats,
-    )?;
+    let segment_input = DeltaFlushInput {
+        segment_id: input.segment_id,
+        created_unix_s: input.created_unix_s,
+        engine_version: input.engine_version,
+    };
+    let term_streams = (postings_bytes, positions_bytes, blockmax_bytes, term_inputs);
+    let encoded = match stored_meta.as_ref() {
+        #[cfg(feature = "bench-internals")]
+        Some(AccumulatorStoredMeta::Staged(section)) => encode_canonical_segment_staged(
+            segment_input,
+            schema,
+            docid_lo,
+            docid_hi,
+            doc_count,
+            term_streams,
+            &doclen,
+            &id_map,
+            &id_hash,
+            numeric.as_ref(),
+            Some(section),
+            &stats,
+        )?,
+        _ => encode_canonical_segment(
+            segment_input,
+            schema,
+            docid_lo,
+            docid_hi,
+            doc_count,
+            term_streams,
+            &doclen,
+            &id_map,
+            &id_hash,
+            numeric.as_ref(),
+            stored_meta.as_ref().map(AccumulatorStoredMeta::source),
+            &stats,
+        )?,
+    };
     flush_span.record("result_count", u64::from(doc_count));
     flush_span.record("output_bytes", encoded.file_len());
     Ok(encoded)
@@ -3636,7 +3708,9 @@ pub fn flush_delta_snapshot(
         &id_map,
         &id_hash,
         numeric.as_ref(),
-        stored_meta.as_ref(),
+        stored_meta
+            .as_ref()
+            .map(|stored_meta| StoredMetaSource::Encoded(stored_meta.as_bytes())),
         &stats,
     )
     .map(Some)
@@ -3870,8 +3944,163 @@ fn encode_delta_stored_meta<'a>(
     )?))
 }
 
+enum AccumulatorStoredMeta<'a> {
+    Borrowed(BorrowedStoredMetaSection<'a>),
+    #[cfg(feature = "bench-internals")]
+    Staged(EncodedStoredMetaSection),
+}
+
+impl<'a> AccumulatorStoredMeta<'a> {
+    fn source<'view>(&'view self) -> StoredMetaSource<'view, 'a> {
+        match self {
+            Self::Borrowed(section) => StoredMetaSource::Borrowed(section),
+            #[cfg(feature = "bench-internals")]
+            Self::Staged(section) => StoredMetaSource::Encoded(section.as_bytes()),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StoredMetaSource<'view, 'data> {
+    Encoded(&'view [u8]),
+    Borrowed(&'view BorrowedStoredMetaSection<'data>),
+}
+
+impl StoredMetaSource<'_, '_> {
+    fn len(self) -> usize {
+        match self {
+            Self::Encoded(bytes) => bytes.len(),
+            Self::Borrowed(section) => section.len(),
+        }
+    }
+
+    fn write_into(self, output: &mut Vec<u8>) {
+        match self {
+            Self::Encoded(bytes) => output.extend_from_slice(bytes),
+            Self::Borrowed(section) => section.write_into(output),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_canonical_segment(
+    input: DeltaFlushInput,
+    schema: SchemaDescriptor,
+    docid_lo: u64,
+    docid_hi: u64,
+    doc_count: u32,
+    term_streams: OrderedTermStreams<'_>,
+    doclen: &EncodedDocLenSection,
+    id_map: &EncodedIdMapSection,
+    id_hash: &EncodedIdHashSection,
+    numeric: Option<&EncodedNumericSection>,
+    stored_meta: Option<StoredMetaSource<'_, '_>>,
+    stats: &EncodedStatsSection,
+) -> Result<EncodedSegment, FlushError> {
+    let (postings_bytes, positions_bytes, blockmax_bytes, term_inputs) = term_streams;
+    let term_sections = TermSectionLengths {
+        postings: durable_len(&postings_bytes, "POSTINGS length")?,
+        positions: schema_has_positions(schema)
+            .then(|| durable_len(&positions_bytes, "POSITIONS length"))
+            .transpose()?,
+        blockmax: durable_len(&blockmax_bytes, "BLOCKMAX length")?,
+    };
+    let termdict = EncodedTermDictionary::encode_sorted(schema, term_sections, &term_inputs)?;
+
+    let mut planned = Vec::new();
+    planned
+        .try_reserve_exact(10)
+        .map_err(|_| FlushError::Allocation {
+            resource: "section plan",
+            count: 10,
+        })?;
+    planned.push(PlannedSection::new(
+        SectionKind::TERMDICT,
+        termdict.as_bytes().len(),
+    ));
+    planned.push(PlannedSection::new(
+        SectionKind::POSTINGS,
+        postings_bytes.len(),
+    ));
+    if schema_has_positions(schema) {
+        planned.push(PlannedSection::new(
+            SectionKind::POSITIONS,
+            positions_bytes.len(),
+        ));
+    }
+    planned.push(PlannedSection::new(
+        SectionKind::BLOCKMAX,
+        blockmax_bytes.len(),
+    ));
+    planned.push(PlannedSection::new(
+        SectionKind::DOCLEN,
+        doclen.as_bytes().len(),
+    ));
+    planned.push(PlannedSection::new(
+        SectionKind::IDMAP,
+        id_map.as_bytes().len(),
+    ));
+    planned.push(PlannedSection::new(
+        SectionKind::IDHASH,
+        id_hash.as_bytes().len(),
+    ));
+    if let Some(numeric) = numeric {
+        planned.push(PlannedSection::new(
+            SectionKind::NUMERIC,
+            numeric.as_bytes().len(),
+        ));
+    }
+    if let Some(stored_meta) = stored_meta {
+        planned.push(PlannedSection::new(
+            SectionKind::STOREDMETA,
+            stored_meta.len(),
+        ));
+    }
+    planned.push(PlannedSection::new(
+        SectionKind::STATS,
+        stats.as_bytes().len(),
+    ));
+
+    let mut assembler = SegmentAssembler::new(
+        SegmentHeaderInput {
+            segment_id: input.segment_id,
+            schema,
+            docid_lo,
+            docid_hi,
+            doc_count,
+            created_unix_s: input.created_unix_s,
+            engine_version: input.engine_version,
+        },
+        &planned,
+    )?;
+    assembler.copy_section(SectionKind::TERMDICT, termdict.as_bytes())?;
+    assembler.copy_section(SectionKind::POSTINGS, &postings_bytes)?;
+    if schema_has_positions(schema) {
+        assembler.copy_section(SectionKind::POSITIONS, &positions_bytes)?;
+    }
+    assembler.copy_section(SectionKind::BLOCKMAX, &blockmax_bytes)?;
+    assembler.copy_section(SectionKind::DOCLEN, doclen.as_bytes())?;
+    assembler.copy_section(SectionKind::IDMAP, id_map.as_bytes())?;
+    assembler.copy_section(SectionKind::IDHASH, id_hash.as_bytes())?;
+    if let Some(numeric) = numeric {
+        assembler.copy_section(SectionKind::NUMERIC, numeric.as_bytes())?;
+    }
+    if let Some(stored_meta) = stored_meta {
+        assembler.write_section(SectionKind::STOREDMETA, |output| {
+            stored_meta.write_into(output);
+        })?;
+    }
+    assembler.copy_section(SectionKind::STATS, stats.as_bytes())?;
+    assembler.finish().map_err(FlushError::from)
+}
+
+/// Exact pre-borrowed-emission writer retained only as a same-invocation
+/// benchmark incumbent. It materializes STOREDMETA and then copies every
+/// section through `EncodedSegment::encode`, matching the former shipping
+/// composition rather than sharing the candidate's final assembler.
+#[cfg(feature = "bench-internals")]
+#[allow(clippy::too_many_arguments)]
+fn encode_canonical_segment_staged(
     input: DeltaFlushInput,
     schema: SchemaDescriptor,
     docid_lo: u64,
@@ -3899,7 +4128,7 @@ fn encode_canonical_segment(
     sections
         .try_reserve_exact(10)
         .map_err(|_| FlushError::Allocation {
-            resource: "section inputs",
+            resource: "staged section inputs",
             count: 10,
         })?;
     sections.push(SectionInput::new(
@@ -7871,6 +8100,7 @@ mod tests {
 
     #[test]
     fn radix_flush_is_byte_identical_and_reopens_every_section() {
+        crate::quiver::reset_stored_meta_materializations();
         let mut accumulator =
             ColumnarAccumulator::new(MIXED_POSITION_SCHEMA).expect("valid mixed schema");
         accumulator
@@ -7909,6 +8139,19 @@ mod tests {
 
         let first = flush_accumulator(&accumulator, input).expect("first flush");
         let second = flush_accumulator(&accumulator, input).expect("second flush");
+        assert_eq!(
+            crate::quiver::stored_meta_materializations(),
+            0,
+            "shipping accumulator flush must emit borrowed STOREDMETA directly"
+        );
+        let owned_control = EncodedStoredMetaSection::encode_accumulator(
+            65_538,
+            65_542,
+            input.lease_docid_base,
+            &accumulator,
+        )
+        .expect("the former owned STOREDMETA control still encodes");
+        assert_eq!(crate::quiver::stored_meta_materializations(), 1);
         assert_eq!(first.as_bytes(), second.as_bytes());
         assert_eq!(accumulator.document_ords(), &[2, 5]);
 
@@ -8155,6 +8398,14 @@ mod tests {
         assert_eq!(stored_field.get(65_538), Some(b"stored-a".as_slice()));
         assert_eq!(stored_field.get(65_539), None);
         assert_eq!(stored_field.get(65_541), Some(b"stored-b".as_slice()));
+        assert_eq!(
+            reader
+                .section(SectionKind::STOREDMETA)
+                .expect("STOREDMETA checksum")
+                .expect("STOREDMETA required"),
+            owned_control.as_bytes(),
+            "borrowed shipping emission must remain byte-identical to the owned control"
+        );
     }
 
     // ── E1.8: Scribe unit/property tests (tokenizer/CASS parity, accumulator
