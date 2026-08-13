@@ -1557,7 +1557,11 @@ impl Qg6SearchTimingLeafReceipt {
             || self.observed_latency_ns != elapsed_ns
             || !self.observed_latency_ms.is_finite()
             || self.observed_latency_ms <= 0.0
-            || self.observed_latency_ms != nanoseconds_to_millis(elapsed_ns)
+            // Bit equality, not approximate equality: this field is required to
+            // BE the derived conversion, and the receipt hash at
+            // `recomputed_sha256` already seals it by bits. A tolerance here
+            // would admit a value the seal would then refuse.
+            || self.observed_latency_ms.to_bits() != nanoseconds_to_millis(elapsed_ns).to_bits()
             || !is_lower_hex_sha256(&self.result_receipt_sha256)
             || self.receipt_sha256 != self.recomputed_sha256()?
         {
@@ -3560,7 +3564,12 @@ fn validate_residual_williams_balance(
     let mut role_ordinal_counts = [[0_u8; QG6_R1_RESIDUAL_ROLE_COUNT]; QG6_R1_RESIDUAL_ROLE_COUNT];
     let mut before_counts = [[0_u8; QG6_R1_RESIDUAL_ROLE_COUNT]; QG6_R1_RESIDUAL_ROLE_COUNT];
     let mut predecessor_counts = [[0_u8; QG6_R1_RESIDUAL_ROLE_COUNT]; QG6_R1_RESIDUAL_ROLE_COUNT];
-    for row in schedule.chunks_exact(QG6_R1_RESIDUAL_ROLE_COUNT) {
+    // `as_chunks` carries the row width in the type rather than in a runtime
+    // argument, so a row cannot be observed short. The trailing remainder is
+    // discarded exactly as `chunks_exact` discarded it; this is a typing
+    // change, not a validation change.
+    let (rows, _) = schedule.as_chunks::<QG6_R1_RESIDUAL_ROLE_COUNT>();
+    for row in rows {
         for leaf in row {
             role_ordinal_counts[leaf.role.index()][usize::from(leaf.ordinal)] += 1;
         }
@@ -3775,7 +3784,10 @@ fn validate_residual_execution_williams_order(
     ordered: &[Qg6ResidualLeafObservation],
 ) -> Result<(), Qg6ResidualValidationError> {
     let mut observed_sweeps = BTreeSet::new();
-    for row in ordered.chunks_exact(QG6_R1_RESIDUAL_ROLE_COUNT) {
+    // Same typing change as the schedule scan above: the width moves into the
+    // type and the discarded remainder keeps `chunks_exact` behaviour.
+    let (rows, _) = ordered.as_chunks::<QG6_R1_RESIDUAL_ROLE_COUNT>();
+    for row in rows {
         let sweep = row[0].sweep;
         if !observed_sweeps.insert(sweep)
             || row
@@ -4170,14 +4182,18 @@ fn residual_joint_contrast_vector(
             .sum::<f64>();
         total / QG6_R1_RESIDUAL_ROLE_COUNT_F64
     });
-    let old_mean =
-        (means[Qg6ResidualArmRole::OldA.index()] + means[Qg6ResidualArmRole::OldB.index()]) / 2.0;
-    let current_mean = (means[Qg6ResidualArmRole::CurrentA.index()]
-        + means[Qg6ResidualArmRole::CurrentB.index()])
-        / 2.0;
-    let tantivy_mean = (means[Qg6ResidualArmRole::TantivyA.index()]
-        + means[Qg6ResidualArmRole::TantivyB.index()])
-        / 2.0;
+    let old_mean = f64::midpoint(
+        means[Qg6ResidualArmRole::OldA.index()],
+        means[Qg6ResidualArmRole::OldB.index()],
+    );
+    let current_mean = f64::midpoint(
+        means[Qg6ResidualArmRole::CurrentA.index()],
+        means[Qg6ResidualArmRole::CurrentB.index()],
+    );
+    let tantivy_mean = f64::midpoint(
+        means[Qg6ResidualArmRole::TantivyA.index()],
+        means[Qg6ResidualArmRole::TantivyB.index()],
+    );
     Qg6ResidualJointContrastVector {
         old_b_minus_old_a: means[Qg6ResidualArmRole::OldB.index()]
             - means[Qg6ResidualArmRole::OldA.index()],
@@ -5384,7 +5400,8 @@ mod tests {
         let mut role_ordinal_counts = BTreeMap::new();
         let mut before_counts = BTreeMap::new();
         let mut predecessor_counts = BTreeMap::new();
-        for row in schedule.chunks_exact(6) {
+        let (rows, _) = schedule.as_chunks::<QG6_R1_RESIDUAL_ROLE_COUNT>();
+        for row in rows {
             for leaf in row {
                 *role_ordinal_counts
                     .entry((leaf.role, leaf.ordinal))
@@ -5430,27 +5447,38 @@ mod tests {
             36
         );
         let log_latency = |latency_ns| Duration::from_nanos(latency_ns).as_secs_f64().ln();
+        // Bit equality throughout: these assert that the estimator reproduced
+        // the exact contrast, so an approximate comparison would admit a drift
+        // the receipt seals would reject.
         assert_eq!(
-            admitted.joint_contrasts.old_b_minus_old_a,
-            log_latency(101) - log_latency(100)
+            admitted.joint_contrasts.old_b_minus_old_a.to_bits(),
+            (log_latency(101) - log_latency(100)).to_bits()
         );
         assert_eq!(
-            admitted.joint_contrasts.current_b_minus_current_a,
-            log_latency(103) - log_latency(102)
+            admitted.joint_contrasts.current_b_minus_current_a.to_bits(),
+            (log_latency(103) - log_latency(102)).to_bits()
         );
         assert_eq!(
-            admitted.joint_contrasts.tantivy_b_minus_tantivy_a,
-            log_latency(105) - log_latency(104)
+            admitted.joint_contrasts.tantivy_b_minus_tantivy_a.to_bits(),
+            (log_latency(105) - log_latency(104)).to_bits()
         );
         assert_eq!(
-            admitted.joint_contrasts.current_mean_minus_old_mean,
-            ((log_latency(102) + log_latency(103)) / 2.0)
-                - ((log_latency(100) + log_latency(101)) / 2.0)
+            admitted
+                .joint_contrasts
+                .current_mean_minus_old_mean
+                .to_bits(),
+            (f64::midpoint(log_latency(102), log_latency(103))
+                - f64::midpoint(log_latency(100), log_latency(101)))
+            .to_bits()
         );
         assert_eq!(
-            admitted.joint_contrasts.current_mean_minus_tantivy_mean,
-            ((log_latency(102) + log_latency(103)) / 2.0)
-                - ((log_latency(104) + log_latency(105)) / 2.0)
+            admitted
+                .joint_contrasts
+                .current_mean_minus_tantivy_mean
+                .to_bits(),
+            (f64::midpoint(log_latency(102), log_latency(103))
+                - f64::midpoint(log_latency(104), log_latency(105)))
+            .to_bits()
         );
     }
 
@@ -5468,12 +5496,18 @@ mod tests {
         let expected_current_tantivy = Duration::from_nanos(80).as_secs_f64().ln()
             - Duration::from_nanos(160).as_secs_f64().ln();
         assert_eq!(
-            admitted.joint_contrasts.current_mean_minus_old_mean,
-            expected_current_old
+            admitted
+                .joint_contrasts
+                .current_mean_minus_old_mean
+                .to_bits(),
+            expected_current_old.to_bits()
         );
         assert_eq!(
-            admitted.joint_contrasts.current_mean_minus_tantivy_mean,
-            expected_current_tantivy
+            admitted
+                .joint_contrasts
+                .current_mean_minus_tantivy_mean
+                .to_bits(),
+            expected_current_tantivy.to_bits()
         );
         assert!(
             (admitted.joint_contrasts.current_mean_minus_old_mean - 0.8_f64.ln()).abs() < 1e-12
