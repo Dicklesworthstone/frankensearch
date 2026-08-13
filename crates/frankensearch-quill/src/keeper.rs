@@ -4560,10 +4560,24 @@ impl KeeperWriter {
             return Ok(false);
         };
         let guard = writer_mutation_guard(cx, &self.admission.directory).await?;
-        self.admission.ensure_directory_identity()?;
-        let directory = self.admission.directory.clone();
-        let installed = open_snapshot_blocking(directory, self.snapshot.schema()).await?;
-        drop(guard);
+        let admission = Arc::clone(&self.admission);
+        let protection = self.protection.clone();
+        let schema = self.snapshot.schema();
+        let installed = spawn_blocking(move || {
+            let _guard = guard;
+            admission.ensure_directory_identity()?;
+            #[cfg(feature = "durability")]
+            if matches!(&protection, WriterProtection::Enabled { .. }) {
+                recover_writer_directory(&admission, schema, &protection)?;
+                admission.ensure_directory_identity()?;
+            }
+            #[cfg(not(feature = "durability"))]
+            let _ = protection;
+            let installed = KeeperSnapshot::open(&admission.directory, schema)?;
+            admission.ensure_directory_identity()?;
+            Ok::<KeeperSnapshot, KeeperError>(installed)
+        })
+        .await?;
         let retained_generation = self.snapshot.loaded_manifest().manifest.generation;
         let installed_generation = installed.loaded_manifest().manifest.generation;
         if installed_generation < retained_generation {

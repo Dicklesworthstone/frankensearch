@@ -24196,6 +24196,103 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "durability")]
+    #[test]
+    fn dropped_durable_commit_reconciliation_repairs_corrupted_fslx_on_the_live_index() {
+        let _pause_serial = crate::keeper::manifest_publish_pause_test_serial_guard();
+        run_with_blocking_cx(|cx| async move {
+            let directory =
+                tempfile::tempdir().expect("temporary dropped durable-commit directory");
+            let protector = test_file_protector();
+            let index = QuillIndex::create_durable(
+                &cx,
+                directory.path(),
+                deterministic_config(),
+                protector,
+            )
+            .await
+            .expect("create durable dropped-commit index");
+            let generation = index
+                .snapshot()
+                .expect("fresh durable dropped-commit snapshot is authoritative")
+                .loaded_manifest()
+                .manifest
+                .generation;
+            index
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("dropped-durable-commit", "alpha durable repair"),
+                )
+                .await
+                .expect("stage durable dropped-commit document");
+
+            let pause = crate::keeper::pause_manifest_publish_at_checkpoint_for_test(
+                directory.path(),
+                crate::keeper::PublishCheckpoint::TempMovedToCurrent,
+            );
+            let mut commit = Box::pin(index.commit(&cx));
+            crate::keeper::drive_manifest_publish_to_checkpoint_for_test(
+                &mut commit,
+                &pause,
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("reach bounded dropped durable-commit rendezvous");
+            drop(commit);
+
+            assert_public_authority_refuses_stale_publication(
+                &index,
+                &cx,
+                "alpha",
+                "dropped-durable-commit",
+            )
+            .await;
+            let installed = Manifest::from_bytes(
+                &std::fs::read(directory.path().join("MANIFEST"))
+                    .expect("read durable dropped-commit MANIFEST"),
+            )
+            .expect("decode durable dropped-commit MANIFEST");
+            assert_eq!(installed.generation, generation + 1);
+            assert_eq!(installed.segments.len(), 1);
+            let segment_path = directory.path().join(format!(
+                "seg-{:016x}.fslx",
+                installed.segments[0].segment_id
+            ));
+            let intact = std::fs::read(&segment_path).expect("read durable successor FSLX");
+            let mut corrupt = intact.clone();
+            corrupt[0] ^= 0x80;
+            std::fs::write(&segment_path, &corrupt).expect("corrupt one FSLX byte after publish");
+            assert!(matches!(
+                KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA),
+                Err(KeeperError::SegmentOpen { path, .. }) if path == segment_path
+            ));
+
+            pause.release();
+            let reconciled = index
+                .reconcile_publication(&cx)
+                .await
+                .expect("live durable reconciliation repairs the abandoned FSLX");
+            assert_eq!(reconciled.keeper_generation(), generation + 1);
+            assert_eq!(
+                std::fs::read(&segment_path).expect("read repaired FSLX"),
+                intact
+            );
+            assert!(
+                !index.has_uncommitted_changes(),
+                "live reconciliation must resolve the retained commit retry state"
+            );
+            assert_public_authority_observes_reconciled_single_document(
+                &index,
+                &cx,
+                generation + 1,
+                "alpha",
+                "dropped-durable-commit",
+                1,
+            )
+            .await;
+        });
+    }
+
     #[test]
     fn dropped_ordinary_delete_requires_public_reconciliation_before_reads() {
         let _pause_serial = crate::keeper::manifest_publish_pause_test_serial_guard();
