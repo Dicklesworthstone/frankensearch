@@ -8293,22 +8293,48 @@ mod tests {
             );
             write_new_sync_at(&run_directories.run.handle, "qg1-wait-frames.bin", &frames)
                 .expect("stage create-new QG-1 wait-boundary child frames");
+            // The expected final ACK is staged as BYTES so the child can prove
+            // it received exactly them. A byte COUNT is not that proof: a
+            // count-only read succeeds on a short EOF and accepts any wrong
+            // payload of the same length, which is strictly weaker than the
+            // `validate_final_ack` the Rust helper performed. `cmp` against the
+            // staged frame rejects both, so nothing was traded away by moving
+            // the child out of libtest.
+            let expected_ack = Qg1StartupHandshakeV1::final_ack_frame();
+            write_new_sync_at(
+                &run_directories.run.handle,
+                "qg1-wait-expected-ack.bin",
+                &expected_ack,
+            )
+            .expect("stage create-new QG-1 wait-boundary expected final ACK");
             run_directories
                 .run
                 .handle
                 .sync_all()
                 .expect("sync staged QG-1 wait-boundary child frames");
             let frames_path = run_directories.run.path.join("qg1-wait-frames.bin");
-            let ack_len = Qg1StartupHandshakeV1::final_ack_len();
+            let expected_ack_path = run_directories.run.path.join("qg1-wait-expected-ack.bin");
+            // Uniquely scoped by the per-invocation run directory, so no two
+            // fixtures can observe each other's captured ACK.
+            let observed_ack_path = run_directories.run.path.join("qg1-wait-observed-ack.bin");
+            let ack_len = expected_ack.len();
             let mut command = Command::new("/bin/sh");
             command
                 .arg("-c")
+                // `dd` only CAPTURES here; `cmp` is what proves it. A short read
+                // yields a shorter file and `cmp` fails on length, and any wrong
+                // same-length payload fails on content. The post-ACK marker is
+                // emitted ONLY on exact match, and the shell's exit status is
+                // `cmp`'s on mismatch, so a bad ACK fails the fixture closed
+                // rather than printing the marker anyway.
                 .arg(format!(
-                    "cat \"$1\"; dd bs=1 count={ack_len} of=/dev/null 2>/dev/null; \
-                     echo qg1-wait-child-work-after-ack"
+                    "cat \"$1\"; dd bs=1 count={ack_len} of=\"$3\" 2>/dev/null; \
+                     cmp -s \"$2\" \"$3\" && echo qg1-wait-child-work-after-ack"
                 ))
                 .arg("qg1-wait-boundary-child")
-                .arg(&frames_path);
+                .arg(&frames_path)
+                .arg(&expected_ack_path)
+                .arg(&observed_ack_path);
             command
         } else {
             let current_test = std::env::current_exe().expect("current test executable");
