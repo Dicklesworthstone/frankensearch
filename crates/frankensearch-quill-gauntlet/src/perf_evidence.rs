@@ -7064,9 +7064,26 @@ mod tests {
             .expect("partial required evidence remains durable");
         assert_eq!(
             partial_required.gate_status,
-            EvidenceDecisionStatus::MeasuredProvisional
+            EvidenceDecisionStatus::NoDecision,
+            "the QG-1 fold refuses a required cell with no exact incumbent-screen coverage"
+        );
+        assert!(
+            partial_required.admission_no_claim.is_none(),
+            "the refusal comes from the production fold, not an injected no-claim override"
+        );
+        assert!(
+            partial_required
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "evidence.qg1_incumbent_screen_missing"),
+            "the fold must name the missing QG-1 incumbent-screen coverage: {:?}",
+            partial_required.reasons
         );
         assert!(!partial_required.ratchet_admissible());
+        assert!(matches!(
+            partial_required.apply_gate_decision(EvidenceDecisionStatus::Allow),
+            Err(EvidenceArtifactError::NotClaimEligible)
+        ));
 
         let mut diagnostic_spec = cell_spec(PerfGate::Qg1, EvidenceRole::Diagnostic);
         diagnostic_spec.fixture = "tokenize_only/medium".to_owned();
@@ -7093,12 +7110,20 @@ mod tests {
         assert!(!partial_diagnostic.ratchet_admissible());
 
         let directory = tempfile::tempdir().expect("partial evidence directory");
-        let paths = partial_diagnostic
-            .write_atomic(directory.path())
-            .expect("persist partial diagnostic evidence");
-        let reloaded = PerfEvidenceArtifact::load_verified(&paths.json)
-            .expect("partial diagnostic evidence remains loadable");
+        let paths = partial_required
+            .write_atomic_against_qg1_authorities(directory.path(), &[&expected_authority])
+            .expect("persist partial required no-claim evidence");
+        let reloaded = PerfEvidenceArtifact::load_verified_against_qg1_authorities(
+            &paths.json,
+            &[&expected_authority],
+        )
+        .expect("partial required no-claim evidence remains loadable");
+        assert_eq!(reloaded.gate_status, EvidenceDecisionStatus::NoDecision);
         assert!(!reloaded.ratchet_admissible());
+        assert_eq!(
+            reloaded.cells, partial_required.cells,
+            "the no-claim artifact retains its measured raw-cell evidence exactly"
+        );
     }
 
     #[test]
