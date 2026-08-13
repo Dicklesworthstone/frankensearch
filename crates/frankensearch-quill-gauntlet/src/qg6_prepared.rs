@@ -2637,8 +2637,9 @@ const QG6_R1_RESIDUAL_COMPLETED_OUTCOME_CODE: &str = "completed";
 const QG6_R1_RESIDUAL_ROLE_COUNT_F64: f64 = 6.0;
 const QG6_R1_RESIDUAL_MAX_LATENCY: Duration = Duration::from_secs(60);
 
-/// The six physically independent timing roles required by the QG-6 R1
-/// residual diagnostic. This is deliberately separate from [`Qg6ArmRole`]:
+/// Six physically independent timing roles for the QG-6 R1 residual diagnostic.
+///
+/// This is deliberately separate from [`Qg6ArmRole`]:
 /// the latter is the four-arm formal QG-6 gate and cannot be relabelled into
 /// this diagnostic's Old/Current/Tantivy A/A and A/B topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -2681,7 +2682,9 @@ impl Qg6ResidualArmRole {
     }
 }
 
-/// Separate cache/lifecycle strata. A meta-block may contain one stratum only;
+/// Separate cache/lifecycle strata.
+///
+/// A meta-block may contain one stratum only;
 /// mixing first-touch, ranked miss, and generation-rebind observations makes a
 /// residual estimate uninterpretable and is rejected before estimation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2879,8 +2882,9 @@ pub struct Qg6ResidualLeafObservation {
     pub latency_ns: u64,
 }
 
-/// Five contrasts that must be resampled together by a later hierarchical
-/// bootstrap. This type deliberately contains one vector per admitted
+/// Five contrasts resampled together by a later hierarchical bootstrap.
+///
+/// This type deliberately contains one vector per admitted
 /// query/meta-block rather than independent per-contrast samples, preserving
 /// their covariance for the next estimator stage.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2991,38 +2995,38 @@ impl Qg6ResidualProducerAuthority {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Qg6ResidualRoleBuildProvenance {
-    source_sha256: String,
-    cargo_lock_sha256: String,
-    timing_elf_sha256: String,
-    source_build_receipt_sha256: String,
+    source: String,
+    cargo_lock: String,
+    timing_elf: String,
+    source_build: String,
 }
 
 impl From<&Qg6ResidualLeafObservation> for Qg6ResidualRoleBuildProvenance {
     fn from(leaf: &Qg6ResidualLeafObservation) -> Self {
         Self {
-            source_sha256: leaf.source_sha256.clone(),
-            cargo_lock_sha256: leaf.cargo_lock_sha256.clone(),
-            timing_elf_sha256: leaf.timing_elf_sha256.clone(),
-            source_build_receipt_sha256: leaf.source_build_receipt_sha256.clone(),
+            source: leaf.source_sha256.clone(),
+            cargo_lock: leaf.cargo_lock_sha256.clone(),
+            timing_elf: leaf.timing_elf_sha256.clone(),
+            source_build: leaf.source_build_receipt_sha256.clone(),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Qg6ResidualPhysicalArmProvenance {
-    instance_receipt_sha256: String,
-    backing_instance_receipt_sha256: String,
-    ranked_cache_receipt_sha256: String,
-    path_receipt_sha256: String,
+    instance: String,
+    backing: String,
+    ranked_cache: String,
+    path: String,
 }
 
 impl From<&Qg6ResidualLeafObservation> for Qg6ResidualPhysicalArmProvenance {
     fn from(leaf: &Qg6ResidualLeafObservation) -> Self {
         Self {
-            instance_receipt_sha256: leaf.instance_receipt_sha256.clone(),
-            backing_instance_receipt_sha256: leaf.backing_instance_receipt_sha256.clone(),
-            ranked_cache_receipt_sha256: leaf.ranked_cache_receipt_sha256.clone(),
-            path_receipt_sha256: leaf.path_receipt_sha256.clone(),
+            instance: leaf.instance_receipt_sha256.clone(),
+            backing: leaf.backing_instance_receipt_sha256.clone(),
+            ranked_cache: leaf.ranked_cache_receipt_sha256.clone(),
+            path: leaf.path_receipt_sha256.clone(),
         }
     }
 }
@@ -3045,8 +3049,9 @@ pub fn qg6_residual_williams_schedule(
     Ok(schedule)
 }
 
-/// Verify a supplied six-role residual schedule before any physical leaf may
-/// be observed. One role mapping and row/execution randomization are allowed;
+/// Verify a six-role residual schedule before any physical leaf is observed.
+///
+/// One role mapping and row/execution randomization are allowed;
 /// arbitrary per-row column permutations and prefixes are rejected.
 ///
 /// # Errors
@@ -3899,21 +3904,21 @@ fn validate_residual_role_build_provenance(
     let current_b = &provenances[Qg6ResidualArmRole::CurrentB.index()];
     let tantivy_a = &provenances[Qg6ResidualArmRole::TantivyA.index()];
     let tantivy_b = &provenances[Qg6ResidualArmRole::TantivyB.index()];
-    if old_a.source_sha256 != old_b.source_sha256
-        || current_a.source_sha256 != current_b.source_sha256
-        || tantivy_a.source_sha256 != tantivy_b.source_sha256
-        || old_a.source_sha256 == current_a.source_sha256
-        || old_a.source_sha256 == tantivy_a.source_sha256
-        || current_a.source_sha256 == tantivy_a.source_sha256
+    if old_a.source != old_b.source
+        || current_a.source != current_b.source
+        || tantivy_a.source != tantivy_b.source
+        || old_a.source == current_a.source
+        || old_a.source == tantivy_a.source
+        || current_a.source == tantivy_a.source
         || provenances
             .iter()
-            .any(|provenance| provenance.cargo_lock_sha256 != old_a.cargo_lock_sha256)
+            .any(|provenance| provenance.cargo_lock != old_a.cargo_lock)
         || provenances
             .iter()
-            .any(|provenance| provenance.timing_elf_sha256 != old_a.timing_elf_sha256)
+            .any(|provenance| provenance.timing_elf != old_a.timing_elf)
         || provenances
             .iter()
-            .map(|provenance| &provenance.source_build_receipt_sha256)
+            .map(|provenance| &provenance.source_build)
             .collect::<BTreeSet<_>>()
             .len()
             != QG6_R1_RESIDUAL_ROLE_COUNT
@@ -3939,10 +3944,10 @@ fn validate_residual_physical_provenance(
     for leaf in ordered {
         let candidate = Qg6ResidualPhysicalArmProvenance::from(leaf);
         if first_touch {
-            if !instances.insert(candidate.instance_receipt_sha256.clone())
-                || !backing_instances.insert(candidate.backing_instance_receipt_sha256.clone())
-                || !ranked_caches.insert(candidate.ranked_cache_receipt_sha256.clone())
-                || !paths.insert(candidate.path_receipt_sha256.clone())
+            if !instances.insert(candidate.instance.clone())
+                || !backing_instances.insert(candidate.backing.clone())
+                || !ranked_caches.insert(candidate.ranked_cache.clone())
+                || !paths.insert(candidate.path.clone())
             {
                 return Err(Qg6ResidualValidationError::ProvenanceMismatch {
                     reason: "residual first-touch leaves reuse an instance, backing identity, ranked-cache, or path receipt"
@@ -3965,10 +3970,10 @@ fn validate_residual_physical_provenance(
     }
     if !first_touch {
         for provenance in by_role.iter().flatten() {
-            if !instances.insert(provenance.instance_receipt_sha256.clone())
-                || !backing_instances.insert(provenance.backing_instance_receipt_sha256.clone())
-                || !ranked_caches.insert(provenance.ranked_cache_receipt_sha256.clone())
-                || !paths.insert(provenance.path_receipt_sha256.clone())
+            if !instances.insert(provenance.instance.clone())
+                || !backing_instances.insert(provenance.backing.clone())
+                || !ranked_caches.insert(provenance.ranked_cache.clone())
+                || !paths.insert(provenance.path.clone())
             {
                 return Err(Qg6ResidualValidationError::ProvenanceMismatch {
                     reason: "residual physical roles share an instance, backing identity, ranked-cache, or path receipt"
