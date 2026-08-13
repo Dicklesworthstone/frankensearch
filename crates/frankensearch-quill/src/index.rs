@@ -26926,6 +26926,112 @@ mod tests {
         assert_ingest_span_reports(&captured, "cancelled", false);
     }
 
+    /// The cancelled receipt above refuses on a pre-flight flag, before any
+    /// shard exists, so its counts are all zero and it cannot witness a drain.
+    /// This arms the production `ParallelIngest` checkpoint instead, so
+    /// cancellation lands INSIDE a worker — after the recorder and with shards
+    /// already in flight — through the fully public driver.
+    ///
+    /// `parallel_route` is deliberately asserted ABSENT. It is recorded only
+    /// from a published receipt, and a cancelled batch propagates before that
+    /// point, so the route is success-only evidence and the terminal plus the
+    /// shard counts are what carry a failure.
+    #[cfg(feature = "conformance-internals")]
+    #[test]
+    fn shipping_driver_cancelled_mid_ingest_records_the_shard_drain() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-thread mid-ingest cancellation pool");
+        let captured = pool.install(|| {
+            capture_ingest_spans(|| {
+                run_with_cx(|cx| async move {
+                    let config = QuillConfig {
+                        max_ingest_shards: 4,
+                        max_visibility_lag_ms: 60_000,
+                        // Generous enough that the shared-nothing route is not
+                        // declined on budget, so a real fan-out is under way
+                        // when the checkpoint fires.
+                        scribe_shard_budget_bytes: 512 * 1024 * 1024,
+                        ..QuillConfig::default()
+                    };
+                    let index =
+                        QuillIndex::in_memory(config).expect("mid-ingest cancellation index");
+                    let documents = (0..250)
+                        .map(|ordinal| {
+                            IndexableDocument::new(
+                                format!("cancel-mid-doc-{ordinal:05}"),
+                                "alpha beta gamma delta",
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let controller = index.conformance_cancellation_controller();
+                    controller
+                        .arm(ConformanceCancellationStage::ParallelIngest, 3)
+                        .expect("arm mid-worker cancellation");
+                    let error = index
+                        .index_documents(&cx, &documents)
+                        .await
+                        .expect_err("an armed parallel worker checkpoint must cancel the batch");
+                    assert!(
+                        matches!(
+                            error,
+                            QuillIndexError::Cancelled {
+                                phase: "parallel index worker"
+                            }
+                        ),
+                        "cancellation must be observed by a worker, not earlier: {error:?}",
+                    );
+                    assert!(controller.fired());
+                    controller.disarm();
+                });
+            })
+        });
+
+        assert_ingest_span_reports(&captured, "cancelled", false);
+        assert!(
+            !captured.contains("parallel_route="),
+            "a cancelled batch publishes no route receipt, captured:\n{captured}",
+        );
+        let started = ingest_span_field(&captured, "parallel_started_shards")
+            .parse::<u64>()
+            .expect("started shards is a count");
+        let completed = ingest_span_field(&captured, "parallel_completed_shards")
+            .parse::<u64>()
+            .expect("completed shards is a count");
+        let peak = ingest_span_field(&captured, "parallel_peak_shards_in_flight")
+            .parse::<u64>()
+            .expect("peak shards in flight is a count");
+        assert!(
+            started >= 1,
+            "cancellation must land after a shard started, captured:\n{captured}",
+        );
+        // The drain witness, and the whole reason this case is distinct from
+        // the pre-flight refusal above: a cancelled worker returns without
+        // counting a completion, so completed must trail started. Both are
+        // zero on the pre-flight path, which satisfies no strict inequality.
+        assert!(
+            completed < started,
+            "a cancelled shard must not be counted complete: {completed} of {started}, \
+             captured:\n{captured}",
+        );
+        assert!(
+            (1..=started).contains(&peak),
+            "peak {peak} must be a real in-flight count no greater than {started}, \
+             captured:\n{captured}",
+        );
+        assert_eq!(
+            ingest_span_field(&captured, "parallel_identity_degraded"),
+            "false",
+            "captured:\n{captured}",
+        );
+        assert_eq!(
+            ingest_span_field(&captured, "parallel_unidentified_shards"),
+            "0",
+            "captured:\n{captured}",
+        );
+    }
+
     #[test]
     fn shipping_driver_success_receipt_binds_route_terminal_and_real_overlap() {
         // 250 documents at width 4 activate exactly 3 shards, and the route
