@@ -5563,12 +5563,6 @@ pub enum DocLenCodecError {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct DocLenFieldMeta {
-    field_ord: u16,
-    range: Range<usize>,
-}
-
 /// Owned canonical bytes produced by the fresh-seal DOCLEN writer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EncodedDocLenSection {
@@ -5690,10 +5684,10 @@ impl EncodedDocLenSection {
         };
         validate_doclen_expected_fields(expected_field_ords, limits.max_fields)?;
         for (section_index, section) in sections.iter().enumerate() {
-            let compared = expected_field_ords.len().max(section.fields.len());
+            let compared = expected_field_ords.len().max(section.field_count());
             for field_index in 0..compared {
                 let expected = expected_field_ords.get(field_index).copied();
-                let actual = section.fields.get(field_index).map(|field| field.field_ord);
+                let actual = section.field_at(field_index).map(DocLenField::field_ord);
                 if expected != actual {
                     return Err(DocLenCodecError::UnexpectedField {
                         index: field_index,
@@ -5759,14 +5753,14 @@ impl EncodedDocLenSection {
                             field: "concat gap end",
                         })?;
                 bytes.resize(gap_end, DOCLEN_HOLE_FIELDNORM_ID);
-                let field = section.fields.get(field_index).ok_or_else(|| {
+                let field = section.field_at(field_index).ok_or_else(|| {
                     DocLenCodecError::UnexpectedField {
                         index: field_index,
                         expected: expected_field_ords.get(field_index).copied(),
                         actual: None,
                     }
                 })?;
-                bytes.extend_from_slice(&section.bytes[field.range.clone()]);
+                bytes.extend_from_slice(field.fieldnorm_ids());
                 cursor = section.docid_hi;
             }
         }
@@ -5861,7 +5855,7 @@ pub struct DocLenSection<'a> {
     bytes: &'a [u8],
     docid_lo: u64,
     docid_hi: u64,
-    fields: Vec<DocLenFieldMeta>,
+    field_count: usize,
 }
 
 impl<'a> DocLenSection<'a> {
@@ -5870,8 +5864,8 @@ impl<'a> DocLenSection<'a> {
     /// # Errors
     ///
     /// Rejects field drift, noncanonical offsets or padding, truncation,
-    /// trailing bytes, arithmetic overflow, resource abuse, and allocation
-    /// failure.
+    /// trailing bytes, arithmetic overflow, and resource abuse. Validation is
+    /// allocation-free.
     pub fn parse(
         bytes: &'a [u8],
         docid_lo: u64,
@@ -5923,22 +5917,14 @@ impl<'a> DocLenSection<'a> {
             });
         }
 
-        let (canonical_offsets, canonical_len) = doclen_layout(expected_field_ords, span, limits)?;
-        let mut fields = Vec::new();
-        fields
-            .try_reserve_exact(expected_field_ords.len())
-            .map_err(|_| DocLenCodecError::Allocation {
-                resource: "field metadata",
-                bytes: expected_field_ords
-                    .len()
-                    .saturating_mul(std::mem::size_of::<DocLenFieldMeta>()),
-            })?;
+        let canonical_len = doclen_layout_len(expected_field_ords, span, limits)?;
         let mut previous_end = directory_len;
-        for (index, (&expected_field, &canonical_offset)) in expected_field_ords
-            .iter()
-            .zip(&canonical_offsets)
-            .enumerate()
-        {
+        let mut canonical_cursor = directory_len;
+        for (index, &expected_field) in expected_field_ords.iter().enumerate() {
+            let canonical_offset =
+                align_doclen(canonical_cursor).ok_or(DocLenCodecError::ArithmeticOverflow {
+                    field: "aligned column offset",
+                })?;
             let entry = index * DOCLEN_DIRECTORY_ENTRY_LEN;
             let actual_field = u16::from_le_bytes([bytes[entry], bytes[entry + 1]]);
             if actual_field != expected_field {
@@ -5993,11 +5979,8 @@ impl<'a> DocLenSection<'a> {
                     actual: bytes.len(),
                 });
             }
-            fields.push(DocLenFieldMeta {
-                field_ord: expected_field,
-                range: canonical_offset..end,
-            });
             previous_end = end;
+            canonical_cursor = end;
         }
         if bytes.len() > canonical_len {
             return Err(DocLenCodecError::TrailingBytes {
@@ -6015,7 +5998,7 @@ impl<'a> DocLenSection<'a> {
             bytes,
             docid_lo,
             docid_hi,
-            fields,
+            field_count: expected_field_ords.len(),
         })
     }
 
@@ -6039,35 +6022,89 @@ impl<'a> DocLenSection<'a> {
 
     /// Number of validated schema fields.
     #[must_use]
-    pub fn field_count(&self) -> usize {
-        self.fields.len()
+    pub const fn field_count(&self) -> usize {
+        self.field_count
     }
 
     /// Bind one field once before the scoring loop.
     #[must_use]
     pub fn field(&self, field_ord: u16) -> Option<DocLenField<'a>> {
-        let index = self
-            .fields
-            .binary_search_by_key(&field_ord, |field| field.field_ord)
-            .ok()?;
-        let field = self.fields.get(index)?;
-        Some(DocLenField {
-            field_ord,
-            docid_lo: self.docid_lo,
-            fieldnorm_ids: self.bytes.get(field.range.clone())?,
-        })
+        let mut lo = 0;
+        let mut hi = self.field_count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let candidate = self.field_at(mid)?;
+            if candidate.field_ord() < field_ord {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        self.field_at(lo)
+            .filter(|candidate| candidate.field_ord() == field_ord)
     }
 
     /// Iterate borrowed field views in schema order.
     #[must_use]
     pub fn fields(&self) -> impl ExactSizeIterator<Item = DocLenField<'a>> + '_ {
-        self.fields.iter().map(|field| DocLenField {
-            field_ord: field.field_ord,
+        DocLenFields {
+            section: self,
+            next_index: 0,
+        }
+    }
+
+    fn field_at(&self, index: usize) -> Option<DocLenField<'a>> {
+        if index >= self.field_count {
+            return None;
+        }
+        let entry = index.checked_mul(DOCLEN_DIRECTORY_ENTRY_LEN)?;
+        let field_ord = u16::from_le_bytes([
+            *self.bytes.get(entry)?,
+            *self.bytes.get(entry.checked_add(1)?)?,
+        ]);
+        let offset_start = entry.checked_add(2)?;
+        let field_offset = usize::try_from(u32::from_le_bytes([
+            *self.bytes.get(offset_start)?,
+            *self.bytes.get(offset_start.checked_add(1)?)?,
+            *self.bytes.get(offset_start.checked_add(2)?)?,
+            *self.bytes.get(offset_start.checked_add(3)?)?,
+        ]))
+        .ok()?;
+        let span = usize::try_from(self.docid_hi.checked_sub(self.docid_lo)?).ok()?;
+        let field_end = field_offset.checked_add(span)?;
+        Some(DocLenField {
+            field_ord,
             docid_lo: self.docid_lo,
-            fieldnorm_ids: &self.bytes[field.range.clone()],
+            fieldnorm_ids: self.bytes.get(field_offset..field_end)?,
         })
     }
 }
+
+#[derive(Clone, Debug)]
+struct DocLenFields<'section, 'bytes> {
+    section: &'section DocLenSection<'bytes>,
+    next_index: usize,
+}
+
+impl<'bytes> Iterator for DocLenFields<'_, 'bytes> {
+    type Item = DocLenField<'bytes>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let index = self.next_index;
+        if index >= self.section.field_count() {
+            return None;
+        }
+        self.next_index += 1;
+        self.section.field_at(index)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.section.field_count().saturating_sub(self.next_index);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for DocLenFields<'_, '_> {}
 
 fn validate_doclen_expected_fields(
     expected_field_ords: &[u16],
@@ -6179,6 +6216,42 @@ fn doclen_layout(
         });
     }
     Ok((offsets, cursor))
+}
+
+fn doclen_layout_len(
+    field_ords: &[u16],
+    span: usize,
+    limits: DocLenLimits,
+) -> Result<usize, DocLenCodecError> {
+    let directory_len = field_ords
+        .len()
+        .checked_mul(DOCLEN_DIRECTORY_ENTRY_LEN)
+        .ok_or(DocLenCodecError::ArithmeticOverflow {
+            field: "directory length",
+        })?;
+    let mut cursor = directory_len;
+    for &field_ord in field_ords {
+        let offset = align_doclen(cursor).ok_or(DocLenCodecError::ArithmeticOverflow {
+            field: "aligned column offset",
+        })?;
+        if u32::try_from(offset).is_err() {
+            return Err(DocLenCodecError::OffsetUnrepresentable { field_ord, offset });
+        }
+        cursor = offset
+            .checked_add(span)
+            .ok_or(DocLenCodecError::ArithmeticOverflow {
+                field: "column end",
+            })?;
+    }
+    let section_len = u64::try_from(cursor).unwrap_or(u64::MAX);
+    if section_len > limits.max_section_bytes {
+        return Err(DocLenCodecError::ResourceLimit {
+            resource: "section bytes",
+            actual: section_len,
+            limit: limits.max_section_bytes,
+        });
+    }
+    Ok(cursor)
 }
 
 fn align_doclen(value: usize) -> Option<usize> {
@@ -15552,6 +15625,8 @@ mod tests {
 
     #[test]
     fn doclen_roundtrip_quantizes_aligns_and_keeps_presence_external() -> TestResult {
+        assert!(!std::mem::needs_drop::<DocLenSection<'static>>());
+
         let expected_fields = [1_u16, 2];
         let content = [Some(0), Some(41), None, Some(2_013_265_944), Some(u32::MAX)];
         let title = [Some(1), Some(42), Some(0), Some(65), Some(100)];
@@ -15571,6 +15646,7 @@ mod tests {
         assert_eq!(section.docid_lo(), 10);
         assert_eq!(section.docid_hi(), 15);
         assert_eq!(section.field_count(), 2);
+        assert_eq!(section.fields().len(), 2);
         assert_eq!(
             section
                 .fields()
@@ -15578,6 +15654,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected_fields
         );
+        assert!(section.field(0).is_none());
+        assert!(section.field(3).is_none());
         let content = section.field(1).ok_or("content DOCLEN field")?;
         assert_eq!(content.fieldnorm_ids(), &[0, 40, 0, 255, 255]);
         assert_eq!(content.fieldnorm_id(9), None);
