@@ -4099,7 +4099,6 @@ pub mod qg6_test_fixture {
     ) {
         let mut timeline_ns = 0_u64;
         let (pairs, remainder) = samples.as_chunks_mut::<2>();
-        assert!(remainder.is_empty(), "paired QG-6 fixture");
         for pair in pairs {
             assert_eq!(pair[0].block_id, pair[1].block_id, "paired QG-6 fixture");
             let (left, right) = pair.split_at_mut(1);
@@ -4121,6 +4120,7 @@ pub mod qg6_test_fixture {
                 timeline_ns = sample.ended_ns + 1_000;
             }
         }
+        assert!(remainder.is_empty(), "paired QG-6 fixture");
         for sample in samples {
             let group_id = sample.group_id.expect("QG-6 fixture group");
             let group_index = usize::try_from(group_id).expect("QG-6 group index");
