@@ -7798,7 +7798,7 @@ mod tests {
     }
 
     /// Planted width negatives. A shipping-auto selection has no observable
-    /// materialized writer width, so it is a NoDecision and never an excuse for
+    /// materialized writer width, so it is a `NoDecision` and never an excuse for
     /// a relaxed witness; and a frozen fixed width the cell's witness does not
     /// prove was materialized is rejected rather than accepted.
     #[test]
@@ -8053,7 +8053,7 @@ mod tests {
     }
 
     /// Planted negatives on the attachment boundary: a screen that is neither a
-    /// selection nor a valid NoDecision, one that claims both, one that selects
+    /// selection nor a valid `NoDecision`, one that claims both, one that selects
     /// without its decision, and one attached to evidence that never measured
     /// a QG-1 incumbent at all.
     #[test]
