@@ -10129,11 +10129,11 @@ impl QuillReader {
         snippet_config: &SnippetConfig,
         snapshot: &QuillSearchSnapshot,
     ) -> Result<Vec<QuillSnippetHit>, QuillIndexError> {
+        check_cancel(cx, "search")?;
         let query_type = classify_query(query);
         if query_type == QueryExplanation::Empty {
             return Ok(Vec::new());
         }
-        check_cancel(cx, "search")?;
         let mut parsed = self.default_parser()?.parse_lenient(query);
         let _canonicalization = canonicalize_query(&mut parsed.query);
         let rank_work_upper_bound = query_work_upper_bound(

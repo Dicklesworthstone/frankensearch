@@ -667,6 +667,12 @@ fn cancelled_cx_still_rejects_on_an_empty_query_class_matrix() {
                 index.search_results(&cx, "", LIMIT).map(|hits| hits.len()),
             ),
             (
+                "empty snippet query",
+                index
+                    .search_with_snippets(&cx, " \t ", LIMIT, &SnippetConfig::default())
+                    .map(|hits| hits.len()),
+            ),
+            (
                 "offset past the end",
                 index
                     .search_paginated(&cx, QUERY, LIMIT, 9_999, true)
