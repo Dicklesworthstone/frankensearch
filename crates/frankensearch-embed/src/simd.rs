@@ -112,7 +112,7 @@ pub fn accumulate_model2vec_rows(
     accumulate_model2vec_rows_base(sum, embeddings, token_ids, vocab_size)
 }
 
-/// Validate the safe public Model2Vec accumulation inputs before architecture-
+/// Validate the safe public `Model2Vec` accumulation inputs before architecture-
 /// specific code can form raw pointers.
 #[inline]
 fn validate_model2vec_accumulation_shape(
@@ -500,7 +500,13 @@ mod tests {
     fn model2vec_native_256_short_matches_the_actual_former_route_bit_for_bit() {
         const VOCAB: usize = 7;
         const DIMENSIONS: usize = 256;
-        const OOV_TOKEN: u32 = VOCAB as u32 + 1;
+        // Fixture invariant: this vocabulary is a small literal, so every id in
+        // it addresses as a u32 token. The conversion is checked rather than
+        // truncating because a fixture grown past u32 would silently stop
+        // producing an out-of-vocabulary id, and this test would keep passing
+        // while no longer discriminating the OOV path at all.
+        let oov_token =
+            u32::try_from(VOCAB).expect("fixture vocabulary must fit a u32 token id") + 1;
 
         let mut embeddings: Vec<f32> = (0..VOCAB * DIMENSIONS)
             .map(|index| {
@@ -535,10 +541,10 @@ mod tests {
             ("arbitrary-initial", special_initial_sum),
         ] {
             for &tokens in &[1_usize, 2, 3, 4, 8, 16, 32, 64, 511, 512, 513] {
-                let all_oov = vec![OOV_TOKEN; tokens];
+                let all_oov = vec![oov_token; tokens];
                 let interleaved: Vec<u32> = (0..tokens)
                     .map(|position| match position % 13 {
-                        0 | 2 | 4 | 5 | 8 | 10 => OOV_TOKEN,
+                        0 | 2 | 4 | 5 | 8 | 10 => oov_token,
                         1 => 0,
                         3 => 1,
                         6 => 2,
