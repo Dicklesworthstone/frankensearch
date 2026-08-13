@@ -8,14 +8,21 @@
 //! aggregator, and [`ReplacementAuthorizationV1`] is the only type in the
 //! repository whose `authorizes_replacement` can answer `true`.
 //!
-//! **No grant is currently harvestable.** [`authorize`] refuses every bundle,
-//! including a complete and clean one, because conformance alone may not
-//! authorize the flip and no validated all-required-target QG WIN release
-//! state can yet be consumed (bd-quill-e8-perf-doctrine-x4e4.15.1; see
-//! `require_consumable_qg_release_authority`). The value type still answers
-//! `true` if one is ever held — that is the contract a future real grant must
-//! satisfy — but nothing outside this module can construct one today. Read a
-//! passing conformance suite as "correct", never as "authorized".
+//! **Conformance alone still cannot authorize the flip.** [`authorize`] refuses
+//! every bundle, including a complete and clean one, because it presents no QG
+//! release state at all (bd-quill-e8-perf-doctrine-x4e4.15.1). Read a passing
+//! conformance suite as "correct", never as "authorized".
+//!
+//! [`authorize_with_qg_release`] is the entry that can answer `Ok`, and only
+//! against a retained release state that covers every required gate exactly
+//! once with artifacts that replay against their externally retained
+//! `Qg1ExpectedAuthority` references, were measured at this candidate by a
+//! clean tree, are bound to an admitted machine class, are ratchet-admissible,
+//! and record an `Allow` decision. Every one of those facts is read out of the
+//! artifacts; no caller-supplied verdict participates. Whether such a release
+//! state exists today is a question about the QG manifests, not about this
+//! module: this module's job is to consume one correctly if it is presented and
+//! to refuse precisely if it is not.
 //!
 //! # What this module is NOT
 //!
@@ -41,6 +48,8 @@ use crate::campaign_contract::{
 };
 use crate::comparator::QuillCancellationReceipt;
 use crate::native_enriched_witness::{AcceptedCandidateBindingV1, VerifiedNativeEnrichedReceiptV1};
+use crate::perf::{PerfGate, Qg1ExpectedAuthority};
+use crate::perf_evidence::{EvidenceDecisionStatus, PerfEvidenceArtifact};
 use crate::runner::{CampaignReport, DivergenceRegisterLedger};
 
 /// Stable schema identity for a terminal replacement authorization.
@@ -393,20 +402,55 @@ fn require_binding(
     Ok(())
 }
 
+/// One retained QG artifact paired with the exact external expectations needed
+/// to replay it outside the process that produced it.
+///
+/// The pairing is the whole point. A `PerfEvidenceArtifact` carrying QG-1 cells
+/// cannot authenticate itself — `Qg1ExpectedAuthority` is deliberately not
+/// serializable, so the expectations must arrive from whoever retained them —
+/// and an artifact presented without them is refused by its own replay rather
+/// than admitted on its own say-so.
+#[derive(Debug, Clone, Copy)]
+pub struct RetainedQgReleaseArtifactV1<'evidence> {
+    /// The gate slot this artifact is presented FOR.
+    ///
+    /// Compared against the artifact's own `gate`, so a QG-2 artifact filed in
+    /// the QG-1 slot is a named refusal rather than a silent substitution.
+    pub gate: PerfGate,
+    /// The sealed evidence artifact exactly as persisted.
+    pub artifact: &'evidence PerfEvidenceArtifact,
+    /// Externally retained QG-1 expectations for this artifact.
+    ///
+    /// Gates that carry no QG-1 authority present an empty slice. A QG-1
+    /// artifact whose expectations are absent, foreign, or duplicated fails
+    /// closed inside [`PerfEvidenceArtifact::verify_integrity_against_qg1_authorities`],
+    /// which is where that judgement belongs.
+    pub retained_qg1_authorities: &'evidence [&'evidence Qg1ExpectedAuthority],
+}
+
+/// The complete terminal QG release state offered for consumption.
+///
+/// Deliberately a set of ARTIFACTS rather than a verdict: the caller cannot
+/// hand in the answer being gated on, exactly as the core-v3 and CASS slots
+/// take a report and a matrix instead of a pre-derived binding. Every verdict
+/// below is read out of the artifacts themselves.
+#[derive(Debug, Clone, Copy)]
+pub struct QgReleaseAuthorityRequestV1<'evidence> {
+    /// One entry per required gate, in any order.
+    pub artifacts: &'evidence [RetainedQgReleaseArtifactV1<'evidence>],
+}
+
 /// Refuse a terminal replacement authorization, naming the reason.
 ///
-/// **This function cannot currently return `Ok`.** Every conformance slot below
-/// is still checked in full and still refuses for its own reason first, so a
-/// dirty producer, a foreign candidate, or an incomplete campaign matrix is
-/// reported as such. A bundle that clears all of them then meets a terminal
-/// refusal from `require_consumable_qg_release_authority`, because
-/// conformance alone may not authorize the flip and no validated
-/// all-required-target QG WIN release state is consumable yet
-/// (bd-quill-e8-perf-doctrine-x4e4.15.1).
+/// **This function cannot return `Ok`.** It presents no QG release state, so a
+/// bundle that clears every conformance slot below still meets the terminal
+/// refusal (bd-quill-e8-perf-doctrine-x4e4.15.1). Every slot is checked in full
+/// and still refuses for its own reason first, so a dirty producer, a foreign
+/// candidate, or an incomplete campaign matrix is reported as such.
 ///
-/// The `Ok` arm is retained rather than removed: it is the shape a future real
-/// grant must produce once that state exists, and every caller that matches on
-/// it keeps compiling.
+/// Callers that hold a retained QG release state use
+/// [`authorize_with_qg_release`]; this entry is conformance-only and is kept so
+/// every existing caller compiles and keeps its exact prior behaviour.
 ///
 /// # Errors
 ///
@@ -417,6 +461,30 @@ fn require_binding(
 /// — after all of those pass — for the absent QG WIN release state.
 pub fn authorize(
     bundle: &ReplacementEvidenceBundleV1<'_>,
+) -> Result<ReplacementAuthorizationV1, GauntletError> {
+    authorize_with_qg_release(bundle, None)
+}
+
+/// Authorize the replacement against conformance evidence AND a retained QG
+/// release state.
+///
+/// This is the entry a real release consumes. [`authorize`] remains the
+/// conformance-only entry and delegates here with no release state, which still
+/// refuses terminally — conformance alone may not authorize the flip, and that
+/// has not changed.
+///
+/// # Errors
+///
+/// Returns every refusal [`authorize`] can, and — after all of them pass —
+/// refuses when the retained release state is absent, does not cover every
+/// required gate exactly once, files an artifact under a gate it does not
+/// belong to, cannot be replayed against its retained expectations, was not
+/// produced from the candidate under authorization by a clean tree, is not
+/// bound to an admitted machine class, is not ratchet-admissible, or does not
+/// carry an `Allow` promotion decision.
+pub fn authorize_with_qg_release(
+    bundle: &ReplacementEvidenceBundleV1<'_>,
+    qg_release: Option<&QgReleaseAuthorityRequestV1<'_>>,
 ) -> Result<ReplacementAuthorizationV1, GauntletError> {
     let candidate = bundle.candidate_source_revision;
     if !is_canonical_git_revision(candidate) {
@@ -541,7 +609,7 @@ pub fn authorize(
     // is load-bearing: a bundle that fails an existing slot must still refuse
     // for THAT slot's reason, so this cannot mask a dirty producer, a foreign
     // candidate, or an incomplete campaign matrix behind a performance answer.
-    require_consumable_qg_release_authority()?;
+    require_consumable_qg_release_authority(qg_release, candidate)?;
 
     Ok(ReplacementAuthorizationV1 {
         schema_version: REPLACEMENT_AUTHORIZATION_SCHEMA_VERSION.to_owned(),
@@ -568,30 +636,150 @@ pub fn authorize(
 /// `Quarantine`, or measured on a machine class the gate does not apply to.
 /// That is the hole this closes.
 ///
-/// It takes no argument on purpose. A `Option<...>` slot on
-/// [`ReplacementEvidenceBundleV1`] would let the caller hand in the very
-/// verdict being gated on, which is the failure mode this module already
-/// refuses for the core and CASS slots by taking reports and matrices rather
-/// than pre-derived bindings.
+/// It takes ARTIFACTS, never a verdict. A verdict slot would let the caller
+/// hand in the very answer being gated on, which is the failure mode this
+/// module already refuses for the core and CASS slots by taking a report and a
+/// matrix rather than pre-derived bindings. Every judgement below —
+/// admissibility, promotion decision, candidate, machine class — is read out of
+/// the artifact, and no caller-supplied string participates.
 ///
-/// It cannot be satisfied today, and the reason is upstream rather than here: a
-/// persisted `PerfEvidenceArtifact` carrying a QG-1 cell cannot be verified
-/// outside the process that produced it. `PerfEvidenceArtifact::load_verified`
-/// passes an empty external expectation set, and `Qg1ExpectedAuthority`
-/// has no serialization by deliberate design, so no consumer outside the bench
-/// can present a verified QG-1 WIN. Until an independently retained authority
-/// register exists, the honest terminal answer is refusal: this gate admits
-/// nothing rather than admitting everything, which is what it did before.
+/// The refusal this replaced was unconditional because a persisted
+/// `PerfEvidenceArtifact` carrying QG-1 cells could not be replayed outside its
+/// producing process. That is now expressible: the caller presents the
+/// externally retained `Qg1ExpectedAuthority` references alongside each
+/// artifact, and replay authenticates against them. An absent release state
+/// still refuses, so [`authorize`] behaves exactly as before.
 ///
-/// The replacement for this function is a real consumption of that register's
-/// verified artifact — not a relaxation of this refusal.
-fn require_consumable_qg_release_authority() -> Result<(), GauntletError> {
-    Err(GauntletError::InvalidContract {
-        reason: "replacement authorization requires a validated all-required-target QG WIN \
-                 release state, and no such state is consumable: verified QG release evidence \
-                 cannot be replayed outside its producing process"
-            .to_owned(),
-    })
+/// # Errors
+///
+/// Refuses for an absent release state, a gate that is missing or presented
+/// more than once, an artifact filed under a gate it does not belong to, a
+/// replay that fails against the retained expectations (which also proves the
+/// seal), evidence not produced from this candidate by a clean tree, an
+/// unbound machine class, non-ratchet-admissible evidence, and any promotion
+/// decision other than `Allow`.
+fn require_consumable_qg_release_authority(
+    request: Option<&QgReleaseAuthorityRequestV1<'_>>,
+    candidate: &str,
+) -> Result<(), GauntletError> {
+    let Some(request) = request else {
+        return Err(GauntletError::InvalidContract {
+            reason: "replacement authorization requires a validated all-required-target QG WIN \
+                     release state, and none was presented: conformance alone may not authorize \
+                     the flip"
+                .to_owned(),
+        });
+    };
+
+    // Every required gate, in the normative manifest order, so a refusal always
+    // names the earliest failing gate rather than whichever entry the caller
+    // happened to list first.
+    for gate in PerfGate::ALL {
+        let mut matching = request.artifacts.iter().filter(|entry| entry.gate == gate);
+        let entry = match (matching.next(), matching.next()) {
+            (Some(entry), None) => entry,
+            (None, _) => {
+                return Err(GauntletError::InvalidContract {
+                    reason: format!(
+                        "QG release state is missing required gate {gate}; an all-required-target \
+                         WIN cannot rest on a partial matrix"
+                    ),
+                });
+            }
+            (Some(_), Some(_)) => {
+                return Err(GauntletError::InvalidContract {
+                    reason: format!(
+                        "QG release state presents gate {gate} more than once; a duplicated gate \
+                         cannot name one release state"
+                    ),
+                });
+            }
+        };
+
+        // A swapped artifact is a substitution, not a mislabel: refuse before
+        // any of its content is read, so a foreign artifact can never be
+        // partially credited to this gate.
+        if entry.artifact.gate != gate {
+            return Err(GauntletError::ManifestMismatch {
+                reason: format!(
+                    "QG release state files {} evidence under gate {gate}",
+                    entry.artifact.gate
+                ),
+            });
+        }
+
+        // Replay against the retained expectations. This also re-derives the
+        // seal, so an unsealed or edited artifact refuses here, and a QG-1
+        // artifact whose expectations are absent, foreign, or duplicated fails
+        // closed inside the artifact rather than being judged by this module.
+        entry
+            .artifact
+            .verify_integrity_against_qg1_authorities(entry.retained_qg1_authorities)
+            .map_err(|error| GauntletError::InvalidContract {
+                reason: format!(
+                    "gate {gate} evidence does not replay against its retained authorities: \
+                     {error}"
+                ),
+            })?;
+
+        let build = &entry.artifact.provenance.build;
+        if build.git_dirty || build.git_revision != candidate {
+            return Err(GauntletError::ManifestMismatch {
+                reason: format!(
+                    "gate {gate} evidence was measured at {}{} but the authorization is for \
+                     {candidate}",
+                    build.git_revision,
+                    if build.git_dirty { " (dirty)" } else { "" }
+                ),
+            });
+        }
+
+        // Machine applicability: an artifact with no admitted runner identity
+        // was never bound to a machine class the gate applies to.
+        if entry.artifact.machine_class.identity().is_none() {
+            return Err(GauntletError::InvalidContract {
+                reason: format!(
+                    "gate {gate} evidence carries no admitted machine-class identity, so its \
+                     applicability to this release is unproven"
+                ),
+            });
+        }
+
+        // NoDecision, InvalidNull, an incomplete QG-1 incumbent screen, and
+        // partial plan coverage all land here, which is why the verdict is read
+        // from admissibility rather than from a status string.
+        if !entry.artifact.ratchet_admissible() {
+            return Err(GauntletError::InvalidContract {
+                reason: format!(
+                    "gate {gate} evidence is not ratchet-admissible (status {}), so it cannot \
+                     carry a WIN",
+                    entry.artifact.gate_status
+                ),
+            });
+        }
+
+        match entry.artifact.gate_decision {
+            Some(EvidenceDecisionStatus::Allow) => {}
+            Some(decision) => {
+                return Err(GauntletError::InvalidContract {
+                    reason: format!(
+                        "gate {gate} evidence records decision {decision}, which can never \
+                         authorize a replacement"
+                    ),
+                });
+            }
+            None => {
+                return Err(GauntletError::InvalidContract {
+                    reason: format!(
+                        "gate {gate} evidence records no promotion decision, so no WIN was ever \
+                         adjudicated"
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1300,6 +1488,119 @@ mod tests {
             assert!(
                 message.contains("is not the registered census"),
                 "a forged census must refuse against the registered state, got: {message}"
+            );
+        });
+    }
+
+    /// PLANTED NEGATIVE: no release state at all.
+    ///
+    /// The refusal must now be about ABSENT INPUT, not about consumption being
+    /// impossible. The old message claimed verified QG evidence "cannot be
+    /// replayed outside its producing process"; that claim is what this slice
+    /// removed, and a gate that keeps asserting it after gaining the ability to
+    /// replay would be refusing for a reason that is no longer true.
+    #[test]
+    fn an_absent_qg_release_state_refuses_for_absence_rather_than_impossibility() {
+        let candidate = "a".repeat(40);
+        let error = require_consumable_qg_release_authority(None, &candidate)
+            .expect_err("an absent release state can never authorize")
+            .to_string();
+        assert!(
+            error.contains("none was presented"),
+            "the refusal must name the absent input, got: {error}"
+        );
+        assert!(
+            !error.contains("cannot be replayed outside its producing process"),
+            "the gate must no longer claim consumption is impossible, got: {error}"
+        );
+    }
+
+    /// PLANTED NEGATIVE: a release state that covers no gate at all.
+    ///
+    /// Refusal names the FIRST required gate in normative order, so a partial
+    /// matrix cannot be reported as a generic incompleteness.
+    #[test]
+    fn an_empty_qg_release_set_refuses_naming_the_first_missing_gate() {
+        let candidate = "a".repeat(40);
+        let request = QgReleaseAuthorityRequestV1 { artifacts: &[] };
+        let error = require_consumable_qg_release_authority(Some(&request), &candidate)
+            .expect_err("an empty release set can never authorize")
+            .to_string();
+        assert!(
+            error.contains(PerfGate::Qg1.label()) && error.contains("missing required gate"),
+            "an empty set must refuse for the first required gate, got: {error}"
+        );
+    }
+
+    /// THE MODEL SEAM, without activating any manifest: the required coverage
+    /// is the whole normative gate set, and the refusal walks it in that order.
+    ///
+    /// A positive grant cannot be written here, and the reason is a real limit
+    /// rather than an omission: a genuine complete release set needs ten sealed
+    /// `PerfEvidenceArtifact`s each carrying an admitted runner identity, and no
+    /// unit test in this crate can mint even one — the same limit that keeps the
+    /// enriched-receipt slot untestable above. Asserting per-gate independence
+    /// would need nine artifacts per case, so this pins what is genuinely
+    /// checkable and claims nothing further.
+    #[test]
+    fn the_required_release_coverage_is_the_whole_normative_gate_set() {
+        assert_eq!(
+            PerfGate::ALL.len(),
+            10,
+            "the release state must cover QG-1 through QG-10"
+        );
+        let candidate = "a".repeat(40);
+        let request = QgReleaseAuthorityRequestV1 { artifacts: &[] };
+        let error = require_consumable_qg_release_authority(Some(&request), &candidate)
+            .expect_err("an empty release set can never authorize")
+            .to_string();
+        assert!(
+            error.contains(PerfGate::Qg1.label()),
+            "refusal names the first gate in normative order, got: {error}"
+        );
+    }
+
+    /// The terminal gate must never mask an earlier slot's refusal, which is
+    /// the precedence the conformance slots were ordered for. A bundle missing
+    /// the CASS matrix refuses for THAT slot even when a release state is
+    /// present and itself unsatisfiable.
+    #[test]
+    fn the_qg_release_gate_never_masks_an_earlier_slot_refusal() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let core = accepted_report();
+            let candidate = core.producer_build_identity.source_git_revision.clone();
+            let cancellation = cancellation_receipt_for(&cx, &candidate).await;
+            let cass = cass_cells();
+            let census = registered_census();
+            let complete = bundle(&core, &cass, &cancellation, &candidate, &census);
+            let request = QgReleaseAuthorityRequestV1 { artifacts: &[] };
+
+            let emptied = ReplacementEvidenceBundleV1 {
+                cass_total: None,
+                ..complete
+            };
+            let masked = authorize_with_qg_release(&emptied, Some(&request))
+                .expect_err("an incomplete bundle can never authorize")
+                .to_string();
+            assert!(
+                masked.contains(ReplacementEvidenceSlotV1::CassTotalBinding.slot_name()),
+                "the earlier slot must still refuse first, got: {masked}"
+            );
+            assert!(
+                !masked.contains("QG release state"),
+                "the terminal gate must not answer for an earlier slot, got: {masked}"
+            );
+
+            // The conformance-only entry is exactly the release-bearing entry
+            // with no release state, so its behaviour cannot drift.
+            assert_eq!(
+                authorize(&complete)
+                    .expect_err("a bundle without an enriched receipt can never authorize")
+                    .to_string(),
+                authorize_with_qg_release(&complete, None)
+                    .expect_err("a bundle without an enriched receipt can never authorize")
+                    .to_string(),
+                "authorize must delegate without changing behaviour"
             );
         });
     }
