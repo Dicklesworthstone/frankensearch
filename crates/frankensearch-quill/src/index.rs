@@ -1346,7 +1346,6 @@ impl SnapshotPublisher {
     /// retained process-local publication plan. This is deliberately fallible:
     /// callers retain their retry state until it passes.
     fn validate_prepared_sealed(
-        &self,
         keeper: &KeeperSnapshot,
         prepared: &PreparedSealedPublication,
     ) -> Result<(), SnapshotError> {
@@ -1712,7 +1711,7 @@ impl ParallelIngestTerminal {
 /// Cost is per SHARD, never per document — but it is NOT free, and an earlier
 /// revision of this comment wrongly claimed "two atomic RMWs, non-perturbing".
 /// A successful shard performs FIVE atomic read-modify-writes (`started`,
-/// `in_flight` up, `peak` fetch_max, `completed`, `in_flight` down) plus one
+/// `in_flight` up, `peak` `fetch_max`, `completed`, `in_flight` down) plus one
 /// acquisition of a mutex CONTENDED by every other shard in the batch. The
 /// work is per shard and never per token. Its cost has NOT been measured, so
 /// no characterisation of it — cheap, negligible, non-perturbing — is made
@@ -1844,13 +1843,13 @@ impl ParallelBatchObservation {
     }
 
     fn snapshot(&self) -> ParallelWorkerWitness {
-        let mut worker_ids = match self.worker_ids.lock() {
-            Ok(ids) => ids.clone(),
-            Err(_) => {
+        let mut worker_ids = self.worker_ids.lock().map_or_else(
+            |_| {
                 self.identity_degraded.store(true, Ordering::Release);
                 Vec::new()
-            }
-        };
+            },
+            |ids| ids.clone(),
+        );
         worker_ids.sort_unstable();
         worker_ids.dedup();
         ParallelWorkerWitness {
@@ -1871,13 +1870,13 @@ impl ParallelBatchObservation {
     /// These are rayon worker indices, meaningful only inside the pool that
     /// ran this batch. They are not global thread identities.
     fn sorted_worker_ids(&self) -> Vec<usize> {
-        let mut ids = match self.worker_ids.lock() {
-            Ok(ids) => ids.clone(),
-            Err(_) => {
+        let mut ids = self.worker_ids.lock().map_or_else(
+            |_| {
                 self.identity_degraded.store(true, Ordering::Release);
                 Vec::new()
-            }
-        };
+            },
+            |ids| ids.clone(),
+        );
         ids.sort_unstable();
         ids.dedup();
         ids
@@ -4383,12 +4382,14 @@ struct PendingDeltaSeal {
 }
 
 #[cfg(test)]
-#[derive(Default)]
-struct PublicationReadPauseState {
-    armed: bool,
-    consumed: bool,
-    reached: bool,
-    released: bool,
+#[derive(Clone, Copy, Default)]
+enum PublicationReadPauseState {
+    #[default]
+    Idle,
+    Armed,
+    Reached,
+    ReleasedBeforeReached,
+    ReleasedAfterReached,
 }
 
 /// Test-only rendezvous immediately after pinning an `Arc` and before the
@@ -4422,34 +4423,51 @@ struct QuillReader {
 impl PublicationReadPauseControl {
     fn wait_until_reached(&self, timeout: Duration) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
-        let mut state = self
-            .pause
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while !state.reached {
-            let now = Instant::now();
-            if now >= deadline {
-                return Err("reader did not reach the authority double-read pause".to_owned());
-            }
-            let (next, _) = self
+        {
+            let mut state = self
                 .pause
-                .wake
-                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .state
+                .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state = next;
+            while !matches!(
+                *state,
+                PublicationReadPauseState::Reached
+                    | PublicationReadPauseState::ReleasedAfterReached
+            ) {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err("reader did not reach the authority double-read pause".to_owned());
+                }
+                let (next, _) = self
+                    .pause
+                    .wake
+                    .wait_timeout(state, deadline.saturating_duration_since(now))
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state = next;
+            }
         }
         Ok(())
     }
 
     fn release(&self) {
-        let mut state = self
-            .pause
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.released = true;
-        state.armed = false;
+        {
+            let mut state = self
+                .pause
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *state = match *state {
+                PublicationReadPauseState::Reached
+                | PublicationReadPauseState::ReleasedAfterReached => {
+                    PublicationReadPauseState::ReleasedAfterReached
+                }
+                PublicationReadPauseState::Idle
+                | PublicationReadPauseState::Armed
+                | PublicationReadPauseState::ReleasedBeforeReached => {
+                    PublicationReadPauseState::ReleasedBeforeReached
+                }
+            };
+        }
         self.pause.wake.notify_all();
     }
 }
@@ -5121,8 +5139,7 @@ impl QuillWriterState {
                 .pending_delta_seal
                 .as_ref()
                 .expect("checked pending Delta seal remains present");
-            self.published_snapshot
-                .validate_prepared_sealed(authority.as_ref(), &pending.prepared)?;
+            SnapshotPublisher::validate_prepared_sealed(authority.as_ref(), &pending.prepared)?;
             let next_lease_base = self.next_lease_base.max(pending.successor_watermark);
             let docid_allocator =
                 DocIdAllocator::open(next_lease_base, self.shard_router.shard_count())
@@ -5144,8 +5161,7 @@ impl QuillWriterState {
             let prepared = self
                 .published_snapshot
                 .prepare_sealed_manifest(self.schema, manifest)?;
-            self.published_snapshot
-                .validate_prepared_sealed(authority.as_ref(), &prepared)?;
+            SnapshotPublisher::validate_prepared_sealed(authority.as_ref(), &prepared)?;
             let installed = self
                 .reader
                 .install_validated_prepared_sealed(authority, prepared)?;
@@ -5431,8 +5447,7 @@ impl QuillWriterState {
             .pending_delta_seal
             .as_ref()
             .expect("published Delta seal retains its prepared local swap");
-        self.published_snapshot
-            .validate_prepared_sealed(authority.as_ref(), &pending.prepared)?;
+        SnapshotPublisher::validate_prepared_sealed(authority.as_ref(), &pending.prepared)?;
         let next_lease_base = self.next_lease_base.max(pending.successor_watermark);
         let docid_allocator =
             DocIdAllocator::open(next_lease_base, self.shard_router.shard_count())
@@ -7167,8 +7182,10 @@ impl QuillWriterState {
                 // proven Keeper view for this synchronous bridge; strict
                 // authority resumes immediately after installation below.
                 let authority = Arc::new(self.proven_authority_snapshot()?.clone());
-                self.published_snapshot
-                    .validate_prepared_sealed(authority.as_ref(), &prepared_publication)?;
+                SnapshotPublisher::validate_prepared_sealed(
+                    authority.as_ref(),
+                    &prepared_publication,
+                )?;
                 self.reader
                     .install_validated_prepared_sealed(authority, prepared_publication)?;
                 record_snapshot_fields(&open_span, self.authority_snapshot()?);
@@ -7292,8 +7309,7 @@ impl QuillWriterState {
             }
         }
         let authority = Arc::new(self.proven_authority_snapshot()?.clone());
-        self.published_snapshot
-            .validate_prepared_sealed(authority.as_ref(), &prepared)?;
+        SnapshotPublisher::validate_prepared_sealed(authority.as_ref(), &prepared)?;
         self.reader
             .install_validated_prepared_sealed(authority, prepared)?;
         Ok(())
@@ -7360,8 +7376,7 @@ impl QuillWriterState {
             }
         }
         let authority = Arc::new(self.proven_authority_snapshot()?.clone());
-        self.published_snapshot
-            .validate_prepared_sealed(authority.as_ref(), &prepared_publication)?;
+        SnapshotPublisher::validate_prepared_sealed(authority.as_ref(), &prepared_publication)?;
         self.reader
             .install_validated_prepared_sealed(authority, prepared_publication)?;
         self.next_seal_seq = next_seal_seq;
@@ -7456,8 +7471,7 @@ impl QuillWriterState {
             let prepared_publication = self
                 .published_snapshot
                 .prepare_sealed_manifest(self.schema, &authority.loaded_manifest().manifest)?;
-            self.published_snapshot
-                .validate_prepared_sealed(authority, &prepared_publication)?;
+            SnapshotPublisher::validate_prepared_sealed(authority, &prepared_publication)?;
             self.reader.install_validated_prepared_sealed(
                 Arc::new(authority.clone()),
                 prepared_publication,
@@ -7576,8 +7590,7 @@ impl QuillWriterState {
             }
         }
         let authority = Arc::new(self.proven_authority_snapshot()?.clone());
-        self.published_snapshot
-            .validate_prepared_sealed(authority.as_ref(), &prepared)?;
+        SnapshotPublisher::validate_prepared_sealed(authority.as_ref(), &prepared)?;
         self.reader
             .install_validated_prepared_sealed(authority, prepared)?;
         Ok(deleted)
@@ -7613,8 +7626,7 @@ impl QuillWriterState {
             }
         }
         let authority = Arc::new(self.proven_authority_snapshot()?.clone());
-        self.published_snapshot
-            .validate_prepared_sealed(authority.as_ref(), &prepared)?;
+        SnapshotPublisher::validate_prepared_sealed(authority.as_ref(), &prepared)?;
         self.reader
             .install_validated_prepared_sealed(authority, prepared)?;
         Ok(())
@@ -8183,16 +8195,21 @@ impl QuillReader {
 
     #[cfg(test)]
     fn arm_publication_read_pause_for_test(&self) -> PublicationReadPauseControl {
-        let mut state = self
-            .publication_read_pause
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(!state.armed, "only one publication-read pause may be armed");
-        state.armed = true;
-        state.consumed = false;
-        state.reached = false;
-        state.released = false;
+        {
+            let mut state = self
+                .publication_read_pause
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                !matches!(
+                    *state,
+                    PublicationReadPauseState::Armed | PublicationReadPauseState::Reached
+                ),
+                "only one publication-read pause may be armed"
+            );
+            *state = PublicationReadPauseState::Armed;
+        }
         PublicationReadPauseControl {
             pause: Arc::clone(&self.publication_read_pause),
         }
@@ -8200,23 +8217,24 @@ impl QuillReader {
 
     #[cfg(test)]
     fn pause_after_pinned_snapshot_for_test(&self) {
-        let mut state = self
-            .publication_read_pause
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !state.armed || state.consumed {
-            return;
-        }
-        state.consumed = true;
-        state.reached = true;
-        self.publication_read_pause.wake.notify_all();
-        while !state.released {
-            state = self
+        {
+            let mut state = self
                 .publication_read_pause
-                .wake
-                .wait(state)
+                .state
+                .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !matches!(*state, PublicationReadPauseState::Armed) {
+                return;
+            }
+            *state = PublicationReadPauseState::Reached;
+            self.publication_read_pause.wake.notify_all();
+            while !matches!(*state, PublicationReadPauseState::ReleasedAfterReached) {
+                state = self
+                    .publication_read_pause
+                    .wake
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
         }
     }
 
@@ -20479,8 +20497,7 @@ mod tests {
                 while !writer_started.load(Ordering::SeqCst) {
                     yield_now().await;
                 }
-                writer_publisher
-                    .validate_prepared_sealed(successor.as_ref(), &prepared)
+                SnapshotPublisher::validate_prepared_sealed(successor.as_ref(), &prepared)
                     .expect("prepared seal successor remains valid");
                 writer_publisher.install_validated_prepared_sealed(successor, prepared);
                 writer_finished.store(true, Ordering::SeqCst);
@@ -22522,9 +22539,8 @@ mod tests {
     ) {
         macro_rules! assert_refused {
             ($result:expr, $facade:literal) => {{
-                let error = match $result {
-                    Ok(_) => panic!(concat!($facade, " must fail closed")),
-                    Err(error) => error,
+                let Err(error) = $result else {
+                    panic!(concat!($facade, " must fail closed"));
                 };
                 assert!(
                     is_reconciliation_required(&error),
@@ -26899,7 +26915,7 @@ mod tests {
             return &body[..end];
         }
         let end = rest
-            .find(|c: char| c == ' ' || c == ',' || c == '}' || c == '\n')
+            .find(|c: char| [' ', ',', '}', '\n'].contains(&c))
             .unwrap_or(rest.len());
         &rest[..end]
     }
@@ -27299,7 +27315,7 @@ mod tests {
         // concurrently running test and leak if this thread unwound before
         // restoring it. The expected panic message on stderr is the cheaper
         // price, so the hook is left alone.
-        let poisoned = std::thread::spawn(move || {
+        let join_result = std::thread::spawn(move || {
             let _guard = poisoner
                 .worker_ids
                 .lock()
@@ -27307,7 +27323,7 @@ mod tests {
             panic!("expected: poisoning the worker-id lock for the fail-closed test");
         })
         .join();
-        assert!(poisoned.is_err());
+        assert!(join_result.is_err());
         assert!(observation.worker_ids.is_poisoned());
 
         // WRITE branch: `enter_shard` must run inside a pool so a worker index
