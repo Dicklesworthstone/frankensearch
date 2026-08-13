@@ -1979,20 +1979,6 @@ impl RecoveredSegmentBacking {
         matches!(self, Self::Mapped(_))
     }
 
-    fn validate_witnesses(
-        &self,
-        path: &Path,
-        manifest: &ManifestSegment,
-    ) -> Result<(), KeeperError> {
-        match self {
-            Self::Mapped(reader) => validate_segment_witnesses(path, manifest, reader, || {
-                verified_file_witness(path, reader)
-            }),
-            Self::Owned(reader) => validate_segment_witnesses(path, manifest, reader, || {
-                verified_file_witness(path, reader)
-            }),
-        }
-    }
 }
 
 fn required_identity_section<'a>(
@@ -2279,6 +2265,46 @@ impl TermDictionaryCacheCounters {
     }
 }
 
+/// A full-prefix FSLX witness authenticated against one MANIFEST binding.
+///
+/// This receipt is minted only after a fresh trailer-witness recomputation
+/// over the actual prefix and [`validate_segment_witnesses`] binds that value
+/// to the manifest. It is safe to carry across an owned
+/// tombstone-only rebind only with the exact same immutable backing allocation.
+#[derive(Clone)]
+struct AuthenticatedFileWitness {
+    file_xxh3: u64,
+    #[cfg(test)]
+    full_prefix_hash_count: Arc<AtomicU64>,
+}
+
+impl AuthenticatedFileWitness {
+    #[cfg(test)]
+    fn mint_after_full_prefix_validation(
+        file_xxh3: u64,
+        full_prefix_hash_count: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            file_xxh3,
+            full_prefix_hash_count,
+        }
+    }
+
+    #[cfg(not(test))]
+    fn mint_after_full_prefix_validation(file_xxh3: u64) -> Self {
+        Self { file_xxh3 }
+    }
+
+    const fn file_xxh3(&self) -> u64 {
+        self.file_xxh3
+    }
+
+    #[cfg(test)]
+    fn full_prefix_hash_count(&self) -> u64 {
+        self.full_prefix_hash_count.load(AtomicOrdering::Relaxed)
+    }
+}
+
 #[derive(Clone)]
 pub struct RecoveredSegment {
     path: PathBuf,
@@ -2289,11 +2315,10 @@ pub struct RecoveredSegment {
     live_doc_count: u32,
     rank_pruning_cache: Arc<RankPruningCache>,
     term_dictionary_metadata: Arc<ValidatedTermDictionaryMetadata>,
-    /// Whole-file xxh3 witness of the exact bytes the retained TERMDICT
-    /// metadata was completely validated against. Recorded from the
-    /// trailer-verified reader at validation time and carried unchanged
-    /// across tombstone-only rebinds of the same immutable backing.
-    term_dictionary_file_xxh3: u64,
+    /// Whole-file xxh3 witness authenticated against the exact immutable
+    /// backing and manifest binding. Owned tombstone-only rebinds carry this
+    /// receipt unchanged after their O(1) successor admission.
+    authenticated_file_witness: AuthenticatedFileWitness,
     #[cfg(test)]
     term_dictionary_cache_counters: Arc<TermDictionaryCacheCounters>,
 }
@@ -2304,12 +2329,14 @@ impl RecoveredSegment {
         manifest: ManifestSegment,
         reader: SegmentReader<ReadOnlyMappedFile>,
         schema: SchemaDescriptor,
+        authenticated_file_witness: AuthenticatedFileWitness,
     ) -> Result<Self, KeeperError> {
         Self::bind_backing(
             path,
             manifest,
             RecoveredSegmentBacking::Mapped(reader),
             schema,
+            authenticated_file_witness,
         )
     }
 
@@ -2325,14 +2352,14 @@ impl RecoveredSegment {
                 source,
             }
         })?;
-        validate_segment_witnesses(&path, &manifest, &reader, || {
-            verified_file_witness(&path, &reader)
-        })?;
+        let authenticated_file_witness =
+            authenticate_segment_witness(&path, &manifest, &reader)?;
         Self::bind_backing(
             path,
             manifest,
             RecoveredSegmentBacking::Owned(reader),
             schema,
+            authenticated_file_witness,
         )
     }
 
@@ -2341,6 +2368,7 @@ impl RecoveredSegment {
         manifest: ManifestSegment,
         reader: RecoveredSegmentBacking,
         schema: SchemaDescriptor,
+        authenticated_file_witness: AuthenticatedFileWitness,
     ) -> Result<Self, KeeperError> {
         Self::bind_shared(
             path,
@@ -2348,6 +2376,7 @@ impl RecoveredSegment {
             Arc::new(reader),
             Arc::new(RankPruningCache::new()),
             schema,
+            authenticated_file_witness,
             None,
         )
     }
@@ -2365,16 +2394,15 @@ impl RecoveredSegment {
     /// same `Arc` allocation, the trailer-verified whole-file xxh3 recorded
     /// at validation time must equal this reader's, the schema must match,
     /// and the live TERMDICT slice must still be the exact address/length
-    /// the metadata was minted for. Any witness mismatch falls back to one
-    /// complete fresh validation of the immutable owned bytes, so reuse can
-    /// never weaken admission; it can only skip re-validating bytes that
-    /// were already proven valid.
+    /// the metadata was minted for. Any witness mismatch rejects this rebind;
+    /// a replacement backing must enter through a fresh authenticated binding.
     fn bind_shared(
         path: PathBuf,
         manifest: ManifestSegment,
         reader: Arc<RecoveredSegmentBacking>,
         rank_pruning_cache: Arc<RankPruningCache>,
         schema: SchemaDescriptor,
+        authenticated_file_witness: AuthenticatedFileWitness,
         reuse_from: Option<&Self>,
     ) -> Result<Self, KeeperError> {
         // TRUST BOUNDARY: in-place rebind (any binding that names a
@@ -2390,6 +2418,15 @@ impl RecoveredSegment {
                     "mapped segment {} cannot rebind in place; a durable reopen \
                      is required (validated TERMDICT metadata reuse is owned-only)",
                     path.display()
+                ),
+            });
+        }
+        if authenticated_file_witness.file_xxh3() != reader.file_xxh3() {
+            return Err(KeeperError::InvalidTransition {
+                detail: format!(
+                    "authenticated file_xxh3 {:#018x} disagrees with retained backing {:#018x}",
+                    authenticated_file_witness.file_xxh3(),
+                    reader.file_xxh3()
                 ),
             });
         }
@@ -2441,13 +2478,28 @@ impl RecoveredSegment {
         // Reuse the predecessor's validated TERMDICT metadata only when every
         // content-identity witness proves the backing is byte-identical to
         // what that metadata was completely validated against.
-        let reused_metadata = reuse_from.and_then(|previous| {
-            let identical_backing = Arc::ptr_eq(&previous.reader, &reader)
-                && previous.term_dictionary_file_xxh3 == reader.file_xxh3()
-                && schema == previous.term_dictionary_metadata.schema()
-                && validated_term_dictionary_is_bound(&reader, &previous.term_dictionary_metadata);
-            identical_backing.then(|| Arc::clone(&previous.term_dictionary_metadata))
-        });
+        let reused_metadata = match reuse_from {
+            Some(previous) => {
+                let identical_backing = Arc::ptr_eq(&previous.reader, &reader)
+                    && previous.authenticated_file_witness.file_xxh3()
+                        == authenticated_file_witness.file_xxh3()
+                    && schema == previous.term_dictionary_metadata.schema()
+                    && validated_term_dictionary_is_bound(
+                        &reader,
+                        &previous.term_dictionary_metadata,
+                    );
+                if !identical_backing {
+                    return Err(KeeperError::InvalidTransition {
+                        detail: format!(
+                            "owned segment {} lost its authenticated immutable backing during rebind",
+                            path.display()
+                        ),
+                    });
+                }
+                Some(Arc::clone(&previous.term_dictionary_metadata))
+            }
+            None => None,
+        };
         #[cfg(test)]
         let term_dictionary_cache_counters = match (&reused_metadata, reuse_from) {
             // A reused binding shares its predecessor's counters so the
@@ -2473,11 +2525,6 @@ impl RecoveredSegment {
                 metadata
             }
         };
-        // Manifest admission just recomputed this trailer witness from the
-        // actual backing bytes. On reuse it was also proven equal to the
-        // predecessor's recorded witness, so recording it preserves the
-        // anchor to the originally validated content across rebind chains.
-        let term_dictionary_file_xxh3 = reader.file_xxh3();
         Ok(Self {
             path,
             manifest,
@@ -2487,7 +2534,7 @@ impl RecoveredSegment {
             live_doc_count,
             rank_pruning_cache,
             term_dictionary_metadata,
-            term_dictionary_file_xxh3,
+            authenticated_file_witness,
             #[cfg(test)]
             term_dictionary_cache_counters,
         })
@@ -2495,24 +2542,91 @@ impl RecoveredSegment {
 
     /// Rebind this immutable backing under a successor manifest generation.
     ///
-    /// Tombstones live in the MANIFEST, not in the FSLX image, so a
-    /// tombstone-only rebind re-checks the manifest witnesses against the
-    /// backing and then reuses the already-validated TERMDICT metadata via
-    /// [`Self::bind_shared`]'s identity-gated reuse path instead of
-    /// re-validating unchanged bytes. Rebind is owned-only: a mapped backing
-    /// is rejected there with a typed reopen-required transition error and
-    /// must go through a durable reopen instead.
+    /// Tombstones live in the MANIFEST, not in the FSLX image, so an owned
+    /// tombstone-only rebind retains its authenticated whole-file receipt
+    /// rather than rehashing the immutable prefix. Rebind is owned-only: a
+    /// mapped backing is rejected there with a typed reopen-required
+    /// transition error and must go through a durable reopen instead.
     fn rebind(&self, manifest: ManifestSegment) -> Result<Self, KeeperError> {
-        self.reader.validate_witnesses(&self.path, &manifest)?;
+        self.rebind_with_backing(manifest, Arc::clone(&self.reader))
+    }
+
+    fn rebind_with_backing(
+        &self,
+        manifest: ManifestSegment,
+        reader: Arc<RecoveredSegmentBacking>,
+    ) -> Result<Self, KeeperError> {
+        self.validate_owned_rebind_admission(&manifest, &reader)?;
         let schema = self.term_dictionary_metadata.schema();
         Self::bind_shared(
             self.path.clone(),
             manifest,
-            Arc::clone(&self.reader),
+            reader,
             Arc::clone(&self.rank_pruning_cache),
             schema,
+            self.authenticated_file_witness.clone(),
             Some(self),
         )
+    }
+
+    /// Constant-time successor admission for an immutable owned backing.
+    ///
+    /// The in-memory publication path has already run
+    /// [`validate_manifest_successor`], which establishes the successor's
+    /// complete generation-level transition. This local check makes the
+    /// receipt dependency explicit before reusing it: the exact owned Arc,
+    /// its authenticated trailer value, and all retained per-segment immutable
+    /// metadata must still match the predecessor.
+    fn validate_owned_rebind_admission(
+        &self,
+        successor: &ManifestSegment,
+        reader: &Arc<RecoveredSegmentBacking>,
+    ) -> Result<(), KeeperError> {
+        if self.reader.is_mapped() || reader.is_mapped() {
+            return Err(KeeperError::InvalidTransition {
+                detail: format!(
+                    "mapped segment {} cannot rebind in place; a durable reopen \
+                     is required (validated TERMDICT metadata reuse is owned-only)",
+                    self.path.display()
+                ),
+            });
+        }
+        if !Arc::ptr_eq(&self.reader, reader) {
+            return Err(KeeperError::InvalidTransition {
+                detail: format!(
+                    "owned segment {} rebind requires the predecessor's exact authenticated \
+                     immutable backing",
+                    self.path.display()
+                ),
+            });
+        }
+        if self.manifest.file_xxh3 != self.authenticated_file_witness.file_xxh3()
+            || self.authenticated_file_witness.file_xxh3() != self.reader.file_xxh3()
+        {
+            return Err(KeeperError::InvalidTransition {
+                detail: format!(
+                    "owned segment {} retained backing no longer agrees with its authenticated \
+                     file_xxh3",
+                    self.path.display()
+                ),
+            });
+        }
+        if self.manifest.segment_id != successor.segment_id
+            || self.manifest.seal_seq != successor.seal_seq
+            || self.manifest.file_len != successor.file_len
+            || self.manifest.file_xxh3 != successor.file_xxh3
+            || self.manifest.docid_lo != successor.docid_lo
+            || self.manifest.docid_hi != successor.docid_hi
+            || self.manifest.doc_count != successor.doc_count
+        {
+            return Err(KeeperError::InvalidTransition {
+                detail: format!(
+                    "immutable metadata changed for retained segment {:#018x}",
+                    self.manifest.segment_id
+                ),
+            });
+        }
+        Ok(())
     }
 
     pub(crate) fn term_dictionary(
@@ -2566,6 +2680,12 @@ impl RecoveredSegment {
         self.term_dictionary_cache_counters
             .metadata_reuses
             .load(AtomicOrdering::Relaxed)
+    }
+
+    /// Test-only count of full-prefix hashes used to authenticate this immutable binding.
+    #[cfg(test)]
+    pub(crate) fn authenticated_file_witness_hash_count(&self) -> u64 {
+        self.authenticated_file_witness.full_prefix_hash_count()
     }
 
     /// Estimated payload bytes retained by this binding's validated TERMDICT
@@ -3043,14 +3163,14 @@ impl KeeperSnapshot {
                     source,
                 }
             })?;
-            validate_segment_witnesses(&path, manifest_segment, &reader, || {
-                verified_file_witness(&path, &reader)
-            })?;
+            let authenticated_file_witness =
+                authenticate_segment_witness(&path, manifest_segment, &reader)?;
             segments.push(RecoveredSegment::bind(
                 path,
                 manifest_segment.clone(),
                 reader,
                 schema,
+                authenticated_file_witness,
             )?);
         }
 
@@ -9828,6 +9948,18 @@ fn validate_proposed_manifest_segments(
         })?;
         let file_xxh3 = fully_verified_file_witness(&path, &reader)?;
         validate_segment_witnesses(&path, manifest_segment, &reader, || Ok(file_xxh3))?;
+        #[cfg(test)]
+        let full_prefix_hash_count = Arc::new(AtomicU64::new(0));
+        #[cfg(test)]
+        full_prefix_hash_count.fetch_add(1, AtomicOrdering::Relaxed);
+        #[cfg(test)]
+        let authenticated_file_witness = AuthenticatedFileWitness::mint_after_full_prefix_validation(
+            file_xxh3,
+            full_prefix_hash_count,
+        );
+        #[cfg(not(test))]
+        let authenticated_file_witness =
+            AuthenticatedFileWitness::mint_after_full_prefix_validation(file_xxh3);
         #[cfg(feature = "durability")]
         if let WriterProtection::Enabled { protector, .. } = protection {
             let sidecar = FileProtector::sidecar_path(&path);
@@ -9848,8 +9980,13 @@ fn validate_proposed_manifest_segments(
         }
         #[cfg(not(feature = "durability"))]
         let _ = protection;
-        let _validated_segment =
-            RecoveredSegment::bind(path, manifest_segment.clone(), reader, schema)?;
+        let _validated_segment = RecoveredSegment::bind(
+            path,
+            manifest_segment.clone(),
+            reader,
+            schema,
+            authenticated_file_witness,
+        )?;
     }
     Ok(())
 }
@@ -9867,6 +10004,43 @@ fn verified_file_witness(
             path: path.to_path_buf(),
             source,
         })
+}
+
+/// Authenticate a MANIFEST segment binding against the backing FSLX bytes.
+///
+/// `validate_segment_witnesses` retains the cheap header and length checks
+/// before this helper reaches the full-prefix hash closure. A successful
+/// return mints an [`AuthenticatedFileWitness`] for a recovered segment.
+fn authenticate_segment_witness(
+    path: &Path,
+    manifest: &ManifestSegment,
+    reader: &SegmentReader<impl AsRef<[u8]>>,
+) -> Result<AuthenticatedFileWitness, KeeperError> {
+    let mut verified_file_xxh3 = None;
+    #[cfg(test)]
+    let full_prefix_hash_count = Arc::new(AtomicU64::new(0));
+    validate_segment_witnesses(path, manifest, reader, || {
+        #[cfg(test)]
+        full_prefix_hash_count.fetch_add(1, AtomicOrdering::Relaxed);
+        let file_xxh3 = verified_file_witness(path, reader)?;
+        verified_file_xxh3 = Some(file_xxh3);
+        Ok(file_xxh3)
+    })?;
+    let file_xxh3 = verified_file_xxh3.ok_or_else(|| KeeperError::InvalidTransition {
+        detail: format!(
+            "segment {} completed witness validation without a full-prefix receipt",
+            path.display()
+        ),
+    })?;
+    #[cfg(test)]
+    let authenticated_file_witness = AuthenticatedFileWitness::mint_after_full_prefix_validation(
+        file_xxh3,
+        full_prefix_hash_count,
+    );
+    #[cfg(not(test))]
+    let authenticated_file_witness =
+        AuthenticatedFileWitness::mint_after_full_prefix_validation(file_xxh3);
+    Ok(authenticated_file_witness)
 }
 
 /// Fully validate a segment and retain the one freshly recomputed prefix
@@ -18126,6 +18300,16 @@ mod tests {
             published.segments()[1].term_dictionary_cache_counts(),
             (1, 0)
         );
+        assert_eq!(
+            published.segments()[0].authenticated_file_witness_hash_count(),
+            1,
+            "initial owned binding must mint exactly one authenticated whole-file witness"
+        );
+        assert_eq!(
+            published.segments()[1].authenticated_file_witness_hash_count(),
+            1,
+            "each distinct owned backing receives its own authenticated witness"
+        );
         std::thread::scope(|scope| {
             let segment = &published.segments()[0];
             for _ in 0..4 {
@@ -18171,6 +18355,11 @@ mod tests {
             1
         );
         assert_eq!(
+            rebound.segments()[0].authenticated_file_witness_hash_count(),
+            1,
+            "an owned tombstone-only rebind must perform zero new whole-file hashes"
+        );
+        assert_eq!(
             published.segments()[0].term_dictionary_cache_counts(),
             (1, 128),
             "the prior snapshot observes the same shared backing counters"
@@ -18195,11 +18384,16 @@ mod tests {
             1,
             "no rebind in the chain may repeat a complete validation"
         );
+        assert_eq!(
+            chained_snapshot.segments()[0].authenticated_file_witness_hash_count(),
+            1,
+            "the retained owned backing must carry its original full-prefix receipt across rebinds"
+        );
         Ok(())
     }
 
     #[test]
-    fn term_dictionary_reuse_witness_mismatch_falls_back_to_fresh_validation() -> TestResult {
+    fn owned_rebind_rejects_manifest_witness_changes_and_backing_substitution() -> TestResult {
         let original = KeeperSnapshot::in_memory(DEFAULT_SCHEMA)?;
         let first = encoded_identity_test_segment(0xd01, 0, &[Some("wit-a")])?;
         let second = encoded_identity_test_segment(0xd02, 65_536, &[Some("wit-b")])?;
@@ -18211,31 +18405,51 @@ mod tests {
             panic!("fixture publishes exactly two segments");
         };
 
-        // A predecessor naming a DIFFERENT immutable backing must never leak
-        // its validated metadata into this binding: the Arc identity witness
-        // fails first and the binding falls back to one complete validation.
-        let rebound = RecoveredSegment::bind_shared(
-            seg_b.path.clone(),
-            seg_b.manifest.clone(),
-            Arc::clone(&seg_b.reader),
-            Arc::clone(&seg_b.rank_pruning_cache),
-            DEFAULT_SCHEMA,
-            Some(seg_a),
-        )?;
+        let baseline_a_hashes = seg_a.authenticated_file_witness_hash_count();
+        let baseline_b_hashes = seg_b.authenticated_file_witness_hash_count();
+
+        // A hostile successor cannot retarget the predecessor's authenticated
+        // whole-file receipt by changing its MANIFEST witness.
+        let mut changed_witness = seg_a.manifest.clone();
+        changed_witness.file_xxh3 ^= 1;
         assert!(
-            !Arc::ptr_eq(
-                &rebound.term_dictionary_metadata,
-                &seg_a.term_dictionary_metadata
+            matches!(
+                seg_a.rebind(changed_witness),
+                Err(KeeperError::InvalidTransition { detail })
+                    if detail.contains("immutable metadata changed")
             ),
-            "cross-backing reuse must be rejected"
+            "owned rebind must reject a successor with a changed MANIFEST file witness"
         );
         assert_eq!(
-            rebound.term_dictionary_cache_counts(),
-            (1, 0),
-            "the fallback path performs exactly one complete fresh validation"
+            seg_a.authenticated_file_witness_hash_count(),
+            baseline_a_hashes,
+            "rejected manifest witness changes must not trigger a new whole-file hash"
         );
-        assert_eq!(rebound.term_dictionary_metadata_reuse_count(), 0);
-        assert_eq!(rebound.term_dictionary(DEFAULT_SCHEMA)?.term_count(), 0);
+
+        // A predecessor naming a different owned Arc must reject rather than
+        // borrowing either the backing or authenticated receipt from it.
+        let mut successor = seg_a.manifest.clone();
+        assert!(successor.tombstones.insert(0)?);
+        assert!(
+            matches!(
+                seg_a.rebind_with_backing(successor, Arc::clone(&seg_b.reader)),
+                Err(KeeperError::InvalidTransition { detail })
+                    if detail.contains("exact authenticated immutable backing")
+            ),
+            "owned rebind must reject backing substitution before metadata reuse"
+        );
+        assert_eq!(
+            seg_a.authenticated_file_witness_hash_count(),
+            baseline_a_hashes,
+            "rejected backing substitution must not trigger a new whole-file hash"
+        );
+        assert_eq!(
+            seg_b.authenticated_file_witness_hash_count(),
+            baseline_b_hashes,
+            "the substituted backing must not be rehashed while rejecting the transition"
+        );
+        assert_eq!(seg_a.term_dictionary_metadata_reuse_count(), 0);
+        assert_eq!(seg_b.term_dictionary_metadata_reuse_count(), 0);
         Ok(())
     }
 
