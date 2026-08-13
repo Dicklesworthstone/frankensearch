@@ -6106,7 +6106,7 @@ fn qg1_collect_live_incumbent(
                 candidate,
                 constructor_receipt.materialized_width.authenticated(),
                 constructor_receipt_sha256,
-                shipping_auto_config_sha256.clone(),
+                &shipping_auto_config_sha256,
                 experiment,
                 qg1_live_observation_ids(&format!("pilot-effect-{candidate_index}"), &effect),
                 qg1_live_observation_ids(&format!("pilot-null-{candidate_index}"), &null),

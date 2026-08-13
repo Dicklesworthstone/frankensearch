@@ -539,10 +539,7 @@ impl Qg1TantivyIncumbentScreenPlan {
                 .preregistered_writer_widths
                 .windows(2)
                 .any(|widths| widths[0] >= widths[1])
-            || self
-                .preregistered_writer_widths
-                .iter()
-                .any(|width| *width == 0)
+            || self.preregistered_writer_widths.contains(&0)
         {
             return Err(Qg1TantivyIncumbentError::InvalidScreenPlan);
         }
@@ -1087,11 +1084,16 @@ impl Qg1TantivyIncumbentPilot {
     /// Seal one live QG-1 Tantivy pilot without exposing receipt hashing to the
     /// producer. The caller supplies immutable observation IDs emitted by the
     /// runner; engine/config and raw-content bindings are derived here.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed candidate identity, constructor receipts, raw sample
+    /// bindings, or observation IDs.
     pub fn from_experiment(
         candidate: Qg1TantivyIncumbentCandidate,
         observed_writer_threads: Option<usize>,
         writer_constructor_receipt_sha256: String,
-        shipping_auto_config_sha256: String,
+        shipping_auto_config_sha256: &str,
         experiment: PairedExperimentResult,
         effect_observation_ids: Vec<String>,
         null_observation_ids: Vec<String>,
@@ -1099,7 +1101,7 @@ impl Qg1TantivyIncumbentPilot {
         let effect_observations = qg1_bind_raw_observations(
             &experiment.effect_samples,
             QG1_TANTIVY_ENGINE_ID,
-            &shipping_auto_config_sha256,
+            shipping_auto_config_sha256,
             QG1_TANTIVY_ENGINE_ID,
             &candidate.config_sha256,
             effect_observation_ids,
@@ -1133,6 +1135,11 @@ impl Qg1TantivyBoundStream {
     /// Seal one raw decision stream with explicit engine/config identity and
     /// immutable producer observation IDs. This is the live-producer boundary;
     /// callers cannot supply an arbitrary stream receipt.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed engine/config identities, invalid raw samples,
+    /// observation reuse, or an unsealable stream receipt.
     pub fn from_raw_samples(
         kind: Qg1TantivyDecisionStreamKind,
         control_engine_id: String,
@@ -1518,6 +1525,11 @@ impl Qg1TantivyIncumbentScreen {
     /// Validate the same-invocation T/Quill, T/T, and Q/Q streams against this
     /// provisional selection. Passing this method remains evidence only; it
     /// does not freeze a gate or claim that Quill won.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a decision whose cell, semantic contract, candidate, streams,
+    /// authorities, or recomputed estimates do not exactly match the screen.
     pub fn validate_decision(
         &self,
         cell: &PerfCellSpec,
@@ -2473,7 +2485,7 @@ fn validate_perf_manifest_schema_bindings(
 /// restatement of it. Restating the rules has now drifted from them twice —
 /// missing gate presence, field placement, the positive QG-1 primary target
 /// width, and the exact schema set — so the readers call it instead.
-pub(crate) fn validate_normative_manifest(
+pub fn validate_normative_manifest(
     manifest: &str,
     gate: PerfGate,
 ) -> Result<(), PerfApplicabilityPlanError> {
@@ -2488,7 +2500,7 @@ pub(crate) fn validate_normative_manifest(
 /// nine. A contract reader asking "would planning accept this file?" must ask
 /// for all ten, which is what this does. Still no restatement: every rule comes
 /// from the live entry point.
-pub(crate) fn validate_normative_manifest_all_gates(
+pub fn validate_normative_manifest_all_gates(
     manifest: &str,
 ) -> Result<(), PerfApplicabilityPlanError> {
     for gate in PerfGate::ALL {
@@ -3807,8 +3819,7 @@ impl Qg1LifecycleAuthority {
             .binary_search_by(|row| {
                 (row.stream_role.as_str(), row.stream_sequence).cmp(&(stream_role, stream_sequence))
             })
-            .ok()
-            .is_some_and(|index| {
+            .is_ok_and(|index| {
                 let row = &self.issued_rows[index];
                 row.block_id == block_id
                     && row.sample_id == sample_id
@@ -3900,6 +3911,7 @@ fn qg1_producer_capability_tag_sha256(
 }
 
 /// Immutable pre-timing authority retained independently from mutable samples.
+///
 /// It deliberately has no serialization implementation: persisted evidence must
 /// receive it from the producer's retained authority store, never from itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3970,7 +3982,7 @@ impl Qg1ExpectedAuthority {
 /// set that fails to name this producer exactly once is a failure of that
 /// assertion, never an invitation to fall back to the artifact's own copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Qg1AuthoritySelection<'a> {
+pub enum Qg1AuthoritySelection<'a> {
     /// No external set was supplied at all.
     NoExternalSet,
     /// Exactly one supplied expectation issued this configuration's authority.
@@ -3986,7 +3998,7 @@ pub(crate) enum Qg1AuthoritySelection<'a> {
 /// producer invocations, so a consumer retains a set and each seam resolves
 /// its own. Duplicates count as ambiguity: two matches cannot name a single
 /// producer, even when they are equal.
-pub(crate) fn select_qg1_expected_authority<'a>(
+pub fn select_qg1_expected_authority<'a>(
     authorities: &[&'a Qg1ExpectedAuthority],
     config: &PairedEstimatorConfig,
 ) -> Qg1AuthoritySelection<'a> {
@@ -4010,7 +4022,7 @@ pub(crate) fn select_qg1_expected_authority<'a>(
 /// external set is asking to be bound by exactly that. A supplied set that
 /// cannot name this producer resolves to `None`: a wrong or duplicated set is
 /// never rescued by the embedded copy.
-pub(crate) fn resolve_qg1_expected_authority_for_live_decision<'a>(
+pub fn resolve_qg1_expected_authority_for_live_decision<'a>(
     authorities: &[&'a Qg1ExpectedAuthority],
     config: &'a PairedEstimatorConfig,
 ) -> Option<&'a Qg1ExpectedAuthority> {
@@ -4029,7 +4041,7 @@ pub(crate) fn resolve_qg1_expected_authority_for_live_decision<'a>(
 /// this producer exactly once can authenticate QG-1 evidence here; every other
 /// outcome is `None`, which those seams treat as fail-closed. This is what
 /// keeps a live cell from authenticating itself through its own configuration.
-pub(crate) fn resolve_qg1_expected_authority_for_replay<'a>(
+pub fn resolve_qg1_expected_authority_for_replay<'a>(
     authorities: &[&'a Qg1ExpectedAuthority],
     config: &PairedEstimatorConfig,
 ) -> Option<&'a Qg1ExpectedAuthority> {
@@ -4230,7 +4242,6 @@ impl Qg1TargetPinV1 {
     }
 
     /// The complete required-target set this pin names.
-    #[must_use]
     pub fn required_targets(&self) -> impl Iterator<Item = &str> {
         self.target_authorities.keys().map(String::as_str)
     }
@@ -4670,10 +4681,14 @@ impl Qg1LifecycleProducer {
         if lower_sha256_hex(&capability) != row.producer_capability_sha256 {
             return None;
         }
-        binding.lifecycle_authority_sha256 = authority.authority_sha256.clone();
+        binding
+            .lifecycle_authority_sha256
+            .clone_from(&authority.authority_sha256);
         binding.stream_role_identity_sha256 =
             authority.stream_role_identity_sha256(&binding.stream_role)?;
-        binding.producer_capability_sha256 = row.producer_capability_sha256.clone();
+        binding
+            .producer_capability_sha256
+            .clone_from(&row.producer_capability_sha256);
         binding.seal_lifecycle_receipt(scope, provenance);
         binding.producer_capability_tag_sha256 =
             qg1_producer_capability_tag_sha256(&capability, &binding, scope, provenance);
@@ -4998,6 +5013,10 @@ impl Qg1SampleBinding {
         scope: &PerfOperationScope,
         provenance: &PerfSampleProvenance,
     ) -> bool {
+        let prepared_corpus_matches_provenance =
+            self.prepared_corpus_sha256 == provenance.corpus_sha256;
+        let recorded_batch_count_is_complete =
+            self.recorded_batch_count == authority.prepared_batch_count;
         authority.validate().is_ok()
             && authority.scope == *scope
             && authority.provenance_corpus_sha256 == provenance.corpus_sha256
@@ -5024,14 +5043,14 @@ impl Qg1SampleBinding {
                 self.raw_arm,
                 self.raw_order,
             )
-            && self.prepared_corpus_sha256 == provenance.corpus_sha256
+            && prepared_corpus_matches_provenance
             && self.prepared_input_sha256 == authority.prepared_input_sha256
             && self.prepared_manifest_sha256 == authority.prepared_manifest_sha256
             && self.indexed_content_sha256 == authority.indexed_content_sha256
             && self.document_count == authority.document_count
             && self.content_bytes == authority.content_bytes
             && self.prepared_batch_count == authority.prepared_batch_count
-            && self.recorded_batch_count == authority.prepared_batch_count
+            && recorded_batch_count_is_complete
             && self.batch_coverage == authority.batch_coverage
             && self.tail_document_id == authority.tail_document_id
     }
@@ -5261,13 +5280,17 @@ impl PairedEstimatorConfig {
         self.bootstrap_resamples == expected.bootstrap_resamples
             && self.min_pairs == expected.min_pairs
             && self.max_order_imbalance == expected.max_order_imbalance
-            && self.max_null_center_log == expected.max_null_center_log
-            && self.max_null_ci_half_width_log == expected.max_null_ci_half_width_log
-            && self.max_null_log_mad == expected.max_null_log_mad
-            && self.max_null_order_effect_log == expected.max_null_order_effect_log
-            && self.max_null_drift_log == expected.max_null_drift_log
-            && self.summary_direction_dead_band_log == expected.summary_direction_dead_band_log
-            && self.max_reproduction_delta_log == expected.max_reproduction_delta_log
+            && self.max_null_center_log.to_bits() == expected.max_null_center_log.to_bits()
+            && self.max_null_ci_half_width_log.to_bits()
+                == expected.max_null_ci_half_width_log.to_bits()
+            && self.max_null_log_mad.to_bits() == expected.max_null_log_mad.to_bits()
+            && self.max_null_order_effect_log.to_bits()
+                == expected.max_null_order_effect_log.to_bits()
+            && self.max_null_drift_log.to_bits() == expected.max_null_drift_log.to_bits()
+            && self.summary_direction_dead_band_log.to_bits()
+                == expected.summary_direction_dead_band_log.to_bits()
+            && self.max_reproduction_delta_log.to_bits()
+                == expected.max_reproduction_delta_log.to_bits()
     }
 
     /// Freeze the complete QG-1 prepared-cell authority before any warmup or
@@ -6581,7 +6604,9 @@ fn estimate_paired_experiment_inner(
 }
 
 /// Estimate a live or replayed QG-1 experiment against authority retained
-/// outside its mutable raw samples. Generic callers retain the exact previous
+/// outside its mutable raw samples.
+///
+/// Generic callers retain the exact previous
 /// contract by supplying `None`; an authority-bearing QG-1 invocation must
 /// supply the producer-retained expectation.
 ///
@@ -8653,7 +8678,7 @@ mod tests {
             candidate,
             observed_writer_threads,
             "9".repeat(64),
-            shipping_auto_config_sha256,
+            &shipping_auto_config_sha256,
             experiment,
             qg1_observation_ids(&effect_observation_label, &effect),
             qg1_observation_ids(&null_observation_label, &null),
@@ -10451,7 +10476,7 @@ mod tests {
             original.candidate,
             original.observed_writer_threads,
             original.writer_constructor_receipt_sha256,
-            shipping_auto_config_sha256,
+            &shipping_auto_config_sha256,
             experiment,
             original
                 .effect_observations
