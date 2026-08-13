@@ -744,6 +744,9 @@ pub struct PerfEvidenceAssemblyCompatibility {
     machine: PerfAssemblyMachineIdentity,
     corpus: PerfAssemblyCorpusIdentity,
     policy: EvidencePolicy,
+    // This is the canonical estimator policy projection: QG-1 lifecycle
+    // authority is independently authenticated per raw stream and is not a
+    // cross-shard policy field.
     estimator: PairedEstimatorConfig,
 }
 
@@ -770,6 +773,24 @@ impl PerfEvidenceAssemblyCompatibility {
     #[must_use]
     pub const fn max_exercised_cell_width(&self) -> u64 {
         self.max_exercised_cell_width
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.profile == other.profile
+            && self.capacity_semantics == other.capacity_semantics
+            && self.execution_capacity == other.execution_capacity
+            && self.max_exercised_cell_width == other.max_exercised_cell_width
+            && self.canonicalization == other.canonicalization
+            && self.runner_hardware_sha256 == other.runner_hardware_sha256
+            && self.runner_execution_identity_sha256 == other.runner_execution_identity_sha256
+            && self.runner_durability_sha256 == other.runner_durability_sha256
+            && self.manifest_sha256 == other.manifest_sha256
+            && self.run_window == other.run_window
+            && self.build == other.build
+            && self.machine == other.machine
+            && self.corpus == other.corpus
+            && self.policy == other.policy
+            && self.estimator.matches_estimator_policy(&other.estimator)
     }
 }
 
@@ -1860,7 +1881,22 @@ impl PerfEvidenceAssemblyArtifact {
     /// Returns [`PerfEvidenceAssemblyError::IncompleteAssembly`] with the
     /// bounded retry predicate when any Applicable/Required cell is missing.
     pub fn require_complete(&self) -> Result<(), PerfEvidenceAssemblyError> {
-        self.verify_integrity()?;
+        self.require_complete_against_qg1_authorities(&[])
+    }
+
+    /// Require exact Required-cell coverage after replaying every completed
+    /// source against the independently retained QG-1 authorities keyed by
+    /// its exact bound-evidence SHA-256.
+    ///
+    /// # Errors
+    ///
+    /// Refuses absent, foreign, or duplicate authority before reporting
+    /// coverage, so incomplete evidence cannot bypass provenance replay.
+    pub fn require_complete_against_qg1_authorities(
+        &self,
+        source_authorities: &[(&str, &[&Qg1ExpectedAuthority])],
+    ) -> Result<(), PerfEvidenceAssemblyError> {
+        self.verify_integrity_against_qg1_authorities(source_authorities)?;
         if self.is_complete() {
             Ok(())
         } else {
@@ -1883,7 +1919,21 @@ impl PerfEvidenceAssemblyArtifact {
     /// Returns the Required-coverage error first, then a separately typed
     /// Diagnostic-coverage error. Missing diagnostics block adjudication.
     pub fn require_full_plan_coverage(&self) -> Result<(), PerfEvidenceAssemblyError> {
-        self.require_complete()?;
+        self.require_full_plan_coverage_against_qg1_authorities(&[])
+    }
+
+    /// Require exact Required and Diagnostic coverage after authority-aware
+    /// replay of every completed QG-1 source.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same coverage errors as [`Self::require_full_plan_coverage`]
+    /// after rejecting an incomplete or mismatched retained authority set.
+    pub fn require_full_plan_coverage_against_qg1_authorities(
+        &self,
+        source_authorities: &[(&str, &[&Qg1ExpectedAuthority])],
+    ) -> Result<(), PerfEvidenceAssemblyError> {
+        self.require_complete_against_qg1_authorities(source_authorities)?;
         if self.missing_diagnostic_cell_ids.is_empty() {
             Ok(())
         } else {
@@ -1905,7 +1955,22 @@ impl PerfEvidenceAssemblyArtifact {
     /// Returns the ordinary incomplete error for holes, or a typed durable
     /// `NoClaim` error carrying exact cell/status/reason diagnostics.
     pub fn require_adjudicable(&self) -> Result<(), PerfEvidenceAssemblyError> {
-        self.require_full_plan_coverage()?;
+        self.require_adjudicable_against_qg1_authorities(&[])
+    }
+
+    /// Require complete, claim-eligible evidence after authority-aware replay
+    /// keyed by each exact completed source input.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same coverage and durable `NoClaim` errors as
+    /// [`Self::require_adjudicable`] after rejecting any missing, foreign, or
+    /// duplicate retained QG-1 authority.
+    pub fn require_adjudicable_against_qg1_authorities(
+        &self,
+        source_authorities: &[(&str, &[&Qg1ExpectedAuthority])],
+    ) -> Result<(), PerfEvidenceAssemblyError> {
+        self.require_full_plan_coverage_against_qg1_authorities(source_authorities)?;
         if self.readiness == PerfEvidenceAssemblyReadiness::ReadyForAdjudication {
             Ok(())
         } else {
@@ -2197,9 +2262,25 @@ impl PerfEvidenceAssemblyArtifact {
     ///
     /// Returns a verification, serialization, or filesystem error.
     pub fn write_atomic(&self, output_dir: &Path) -> Result<PathBuf, PerfEvidenceAssemblyError> {
+        self.write_atomic_against_qg1_authorities(output_dir, &[])
+    }
+
+    /// Atomically persist one content-addressed assembly after replaying every
+    /// completed QG-1 source against its independently retained authority
+    /// slice, keyed by exact bound-evidence SHA-256.
+    ///
+    /// # Errors
+    ///
+    /// Rejects absent, foreign, or duplicate authority before staging and again
+    /// when reloading an existing or newly published canonical file.
+    pub fn write_atomic_against_qg1_authorities(
+        &self,
+        output_dir: &Path,
+        source_authorities: &[(&str, &[&Qg1ExpectedAuthority])],
+    ) -> Result<PathBuf, PerfEvidenceAssemblyError> {
         use rustix::fs::{FlockOperation, Mode, OFlags, RenameFlags, flock, openat, renameat_with};
 
-        self.verify_integrity()?;
+        self.verify_integrity_against_qg1_authorities(source_authorities)?;
         let canonical = self.to_json_pretty()?;
         let destination_name = OsString::from(self.destination_basename()?);
         let destination = output_dir.join(&destination_name);
@@ -2214,7 +2295,10 @@ impl PerfEvidenceAssemblyArtifact {
         if let Some((existing_bytes, existing_identity)) =
             read_owned_regular_at(&directory, &destination_name, canonical.len())?
         {
-            let existing = Self::from_verified_slice(&existing_bytes)?;
+            let existing = Self::from_verified_slice_against_qg1_authorities(
+                &existing_bytes,
+                source_authorities,
+            )?;
             verify_named_assembly_identity(
                 &directory,
                 &destination_name,
@@ -2305,7 +2389,10 @@ impl PerfEvidenceAssemblyArtifact {
             )?;
         if persisted_identity != temporary_identity
             || persisted_bytes != canonical
-            || Self::from_verified_slice(&persisted_bytes)? != *self
+            || Self::from_verified_slice_against_qg1_authorities(
+                &persisted_bytes,
+                source_authorities,
+            )? != *self
         {
             return Err(unsafe_assembly_path(
                 "published assembly differs from the exact verified staged inode",
@@ -2764,7 +2851,7 @@ fn derive_assembly(
         validate_selected_widths(artifact, &contract)?;
         let shard_compatibility = compatibility_from_artifact(artifact)?;
         if let Some(expected) = &compatibility {
-            if expected != &shard_compatibility {
+            if !expected.matches(&shard_compatibility) {
                 return Err(first_compatibility_difference(
                     expected,
                     &shard_compatibility,
@@ -3490,7 +3577,7 @@ fn compatibility_from_artifact(
             });
         }
         match &estimator {
-            Some(expected) if expected != &paired.config => {
+            Some(expected) if !expected.matches_estimator_policy(&paired.config) => {
                 return Err(PerfEvidenceAssemblyError::IncompatibleShard {
                     field: "estimator",
                     detail: format!(
@@ -3499,7 +3586,7 @@ fn compatibility_from_artifact(
                     ),
                 });
             }
-            None => estimator = Some(paired.config.clone()),
+            None => estimator = Some(estimator_policy_projection(&paired.config)?),
             Some(_) => {}
         }
     }
@@ -3571,13 +3658,37 @@ fn first_compatibility_difference(
         "corpus_identity"
     } else if expected.policy != actual.policy {
         "evidence_policy"
-    } else {
+    } else if !expected
+        .estimator
+        .matches_estimator_policy(&actual.estimator)
+    {
         "estimator"
+    } else {
+        unreachable!("compatibility difference must name one checked field")
     };
     PerfEvidenceAssemblyError::IncompatibleShard {
         field,
         detail: format!("source run {run_id} differs from the first completed shard"),
     }
+}
+
+fn estimator_policy_projection(
+    config: &PairedEstimatorConfig,
+) -> Result<PairedEstimatorConfig, PerfEvidenceAssemblyError> {
+    let mut serialized = serde_json::to_value(config)?;
+    let object = serialized.as_object_mut().ok_or_else(|| {
+        PerfEvidenceAssemblyError::InconsistentAssembly {
+            reason: "paired estimator configuration does not serialize as an object".to_owned(),
+        }
+    })?;
+    object.remove("qg1_lifecycle_authority");
+    let policy = serde_json::from_value(serialized)?;
+    if !config.matches_estimator_policy(&policy) {
+        return Err(PerfEvidenceAssemblyError::InconsistentAssembly {
+            reason: "authority-stripped estimator projection changed estimator policy".to_owned(),
+        });
+    }
+    Ok(policy)
 }
 
 fn hash_serialized<T: Serialize>(
@@ -4888,6 +4999,32 @@ mod tests {
         PerfEvidenceAssemblyArtifact::assemble_against_qg1_authorities(attempts)
     }
 
+    fn source_authorities_for_test<'a>(
+        sources: &'a [AuthorityBoundTestArtifact],
+    ) -> Vec<(String, Vec<&'a Qg1ExpectedAuthority>)> {
+        sources
+            .iter()
+            .map(|source| {
+                (
+                    sha256_hex(
+                        &canonical_evidence_bytes(source)
+                            .expect("canonical authority-bound source evidence"),
+                    ),
+                    source.authority_refs(),
+                )
+            })
+            .collect()
+    }
+
+    fn source_authority_slices<'a>(
+        source_authorities: &'a [(String, Vec<&'a Qg1ExpectedAuthority>)],
+    ) -> Vec<(&'a str, &'a [&'a Qg1ExpectedAuthority])> {
+        source_authorities
+            .iter()
+            .map(|(source_sha256, authorities)| (source_sha256.as_str(), authorities.as_slice()))
+            .collect()
+    }
+
     #[test]
     fn fixture_shard_reloads_canonical_authority_prebinding_before_runner_binding() {
         let ordinal = runnable_ordinals()
@@ -5010,7 +5147,7 @@ mod tests {
     }
 
     fn failed_test_attempt_bundle(
-        artifact: &PerfEvidenceArtifact,
+        artifact: &AuthorityBoundTestArtifact,
         code: i64,
     ) -> VerifiedLocalPerfAttemptBundle {
         let fixtures = artifact
@@ -5031,6 +5168,7 @@ mod tests {
         let bound_bytes = canonical_evidence_bytes(artifact).expect("failed-template bound bytes");
         let threshold_bytes = canonical_threshold_bytes(&threshold_artifact_for(artifact))
             .expect("failed-template threshold bytes");
+        let authority_refs = artifact.authority_refs();
         let receipt_bytes = crate::local_perf_runner::failed_attempt_receipt_for_test(
             artifact,
             Some(fixture),
@@ -5038,6 +5176,7 @@ mod tests {
             &threshold_bytes,
             &prebinding_bytes,
             &bound_bytes,
+            &authority_refs,
             code,
         );
         let directory = private_tempdir("failed H2 attempt bundle");
@@ -5049,7 +5188,10 @@ mod tests {
             .expect("load exact failed H2 test bundle through production boundary")
     }
 
-    fn assert_h2_lifecycle_boundary(assembly: &PerfEvidenceAssemblyArtifact) {
+    fn assert_h2_lifecycle_boundary(
+        assembly: &PerfEvidenceAssemblyArtifact,
+        source_authorities: &[(&str, &[&Qg1ExpectedAuthority])],
+    ) {
         let codes = assembly
             .non_adjudicable_sources()
             .iter()
@@ -5077,7 +5219,7 @@ mod tests {
                 PerfEvidenceAssemblyReadiness::NoClaimInvalidEvidence
             );
             assert!(matches!(
-                assembly.require_adjudicable(),
+                assembly.require_adjudicable_against_qg1_authorities(source_authorities),
                 Err(PerfEvidenceAssemblyError::NonAdjudicableAssembly { .. })
             ));
         }
@@ -5157,8 +5299,10 @@ mod tests {
     #[test]
     fn canonical_matrix_and_input_permutations_are_byte_identical() {
         let shards = complete_shards();
+        let retained_authorities = source_authorities_for_test(&shards);
+        let source_authorities = source_authority_slices(&retained_authorities);
         let forward = assemble_test(shards.clone(), Vec::new()).expect("forward assembly");
-        let reverse = assemble_test(shards.into_iter().rev().collect(), Vec::new())
+        let reverse = assemble_test(shards.clone().into_iter().rev().collect(), Vec::new())
             .expect("reverse assembly");
 
         assert_eq!(
@@ -5171,9 +5315,13 @@ mod tests {
         assert_eq!(forward.counts.not_applicable_cells, 16);
         assert!(forward.is_complete());
         assert!(forward.has_full_plan_coverage());
-        forward.require_complete().expect("complete coverage");
-        assert_h2_lifecycle_boundary(&forward);
-        forward.verify_integrity().expect("verified assembly");
+        forward
+            .require_complete_against_qg1_authorities(&source_authorities)
+            .expect("complete coverage against retained QG-1 authorities");
+        assert_h2_lifecycle_boundary(&forward, &source_authorities);
+        forward
+            .verify_integrity_against_qg1_authorities(&source_authorities)
+            .expect("verified assembly against retained QG-1 authorities");
     }
 
     #[test]
@@ -5201,7 +5349,7 @@ mod tests {
     fn missing_diagnostics_block_adjudication_before_h2_lifecycle_no_claims() {
         let ordinals = ordinals_for(PerfCellApplicability::Required);
         let midpoint = ordinals.len() / 2;
-        let shards = vec![
+        let shards = [
             shard(
                 &ordinals[..midpoint],
                 "required-only-a",
@@ -5216,8 +5364,13 @@ mod tests {
                 None,
                 TestIdentity::PRIMARY,
             ),
-        ];
-        let assembly = assemble_test(shards, Vec::new()).expect("Required-only assembly");
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let retained_authorities = source_authorities_for_test(&shards);
+        let source_authorities = source_authority_slices(&retained_authorities);
+        let assembly = assemble_test(shards.clone(), Vec::new()).expect("Required-only assembly");
 
         assert!(assembly.is_complete());
         assert!(!assembly.has_full_plan_coverage());
@@ -5228,11 +5381,11 @@ mod tests {
             PerfEvidenceAssemblyReadiness::NoClaimIncomplete
         );
         assert!(matches!(
-            assembly.require_full_plan_coverage(),
+            assembly.require_full_plan_coverage_against_qg1_authorities(&source_authorities),
             Err(PerfEvidenceAssemblyError::IncompleteDiagnosticCoverage { missing: 2, .. })
         ));
         assert!(matches!(
-            assembly.require_adjudicable(),
+            assembly.require_adjudicable_against_qg1_authorities(&source_authorities),
             Err(PerfEvidenceAssemblyError::IncompleteDiagnosticCoverage { missing: 2, .. })
         ));
     }
@@ -5242,7 +5395,7 @@ mod tests {
         let ordinals = runnable_ordinals();
         let diagnostic = ordinals_for(PerfCellApplicability::Diagnostic)[0];
         let midpoint = ordinals.len() / 2;
-        let shards = vec![
+        let shards = [
             shard(
                 &ordinals[..midpoint],
                 "invalid-diagnostic-a",
@@ -5257,22 +5410,27 @@ mod tests {
                 Some(diagnostic),
                 TestIdentity::PRIMARY,
             ),
-        ];
-        let assembly = assemble_test(shards, Vec::new())
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let retained_authorities = source_authorities_for_test(&shards);
+        let source_authorities = source_authority_slices(&retained_authorities);
+        let assembly = assemble_test(shards.clone(), Vec::new())
             .expect("assembly retaining an invalid Diagnostic cell");
 
         assert!(assembly.has_full_plan_coverage());
         assert!(assembly.non_adjudicable_cells().iter().any(|cell| {
             cell.ordinal() == diagnostic && cell.role() == EvidenceRole::Diagnostic
         }));
-        assert_h2_lifecycle_boundary(&assembly);
+        assert_h2_lifecycle_boundary(&assembly, &source_authorities);
     }
 
     #[test]
     fn arbitrary_partial_source_no_claim_cannot_be_laundered_into_readiness() {
         let ordinals = runnable_ordinals();
         let midpoint = ordinals.len() / 2;
-        let shards = vec![
+        let shards = [
             shard_with_partial_code(
                 &ordinals[..midpoint],
                 "source-no-claim-a",
@@ -5288,8 +5446,14 @@ mod tests {
                 None,
                 TestIdentity::PRIMARY,
             ),
-        ];
-        let assembly = assemble_test(shards, Vec::new()).expect("source NoClaim remains durable");
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let retained_authorities = source_authorities_for_test(&shards);
+        let source_authorities = source_authority_slices(&retained_authorities);
+        let assembly =
+            assemble_test(shards.clone(), Vec::new()).expect("source NoClaim remains durable");
 
         assert!(assembly.is_complete());
         assert!(
@@ -5303,7 +5467,7 @@ mod tests {
             PerfEvidenceAssemblyReadiness::NoClaimInvalidEvidence
         );
         assert!(matches!(
-            assembly.require_adjudicable(),
+            assembly.require_adjudicable_against_qg1_authorities(&source_authorities),
             Err(PerfEvidenceAssemblyError::NonAdjudicableAssembly { .. })
         ));
     }
@@ -5313,7 +5477,7 @@ mod tests {
         let required = ordinals_for(PerfCellApplicability::Required);
         let diagnostics = ordinals_for(PerfCellApplicability::Diagnostic);
         let midpoint = required.len() / 2;
-        let shards = vec![
+        let shards = [
             shard(
                 &required[..midpoint],
                 "diagnostic-source-required-a",
@@ -5336,9 +5500,14 @@ mod tests {
                 TestIdentity::PRIMARY,
                 "evidence.gate_without_required_cells",
             ),
-        ];
-        let assembly =
-            assemble_test(shards, Vec::new()).expect("diagnostic source NoClaim remains durable");
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let retained_authorities = source_authorities_for_test(&shards);
+        let source_authorities = source_authority_slices(&retained_authorities);
+        let assembly = assemble_test(shards.clone(), Vec::new())
+            .expect("diagnostic source NoClaim remains durable");
 
         assert!(assembly.has_full_plan_coverage());
         assert!(
@@ -5347,7 +5516,7 @@ mod tests {
                 .iter()
                 .any(|source| { source.reason().code == "evidence.gate_without_required_cells" })
         );
-        assert_h2_lifecycle_boundary(&assembly);
+        assert_h2_lifecycle_boundary(&assembly, &source_authorities);
     }
 
     #[test]
@@ -5360,41 +5529,58 @@ mod tests {
 
     #[test]
     fn incomplete_receipt_is_durable_and_never_advances_latest() {
-        let first = complete_shards().remove(0);
-        let assembly = assemble_test(vec![first], Vec::new()).expect("durable partial assembly");
+        let sources = vec![complete_shards().remove(0)];
+        let retained_authorities = source_authorities_for_test(&sources);
+        let source_authorities = source_authority_slices(&retained_authorities);
+        let assembly =
+            assemble_test(sources.clone(), Vec::new()).expect("durable partial assembly");
         assert!(!assembly.is_complete());
         assert_eq!(
             assembly.readiness(),
             PerfEvidenceAssemblyReadiness::NoClaimIncomplete
         );
         assert!(matches!(
-            assembly.require_adjudicable(),
+            assembly.require_adjudicable_against_qg1_authorities(&source_authorities),
             Err(PerfEvidenceAssemblyError::IncompleteAssembly { .. })
         ));
 
+        assert!(
+            assembly
+                .write_atomic(private_tempdir("authority-free assembly tempdir").path())
+                .is_err(),
+            "the authority-free persistence entry must reject a QG-1 assembly"
+        );
+
         let directory = private_tempdir("assembly tempdir");
         let path = assembly
-            .write_atomic(directory.path())
+            .write_atomic_against_qg1_authorities(directory.path(), &source_authorities)
             .expect("persist assembly");
         let basename = path.file_name().unwrap().to_string_lossy();
         assert!(basename.contains("trj-zen3-5995wx"));
         assert!(basename.contains("physical-64"));
         assert!(!basename.contains("latest"));
         assert_eq!(
-            PerfEvidenceAssemblyArtifact::load_verified(&path).unwrap(),
+            PerfEvidenceAssemblyArtifact::load_verified_against_qg1_authorities(
+                &path,
+                &source_authorities,
+            )
+            .unwrap(),
             assembly
         );
     }
 
     #[test]
     fn content_addressed_publication_is_idempotent_and_never_clobbers() {
-        let assembly = assemble_test(complete_shards(), Vec::new()).unwrap();
+        let sources = complete_shards();
+        let retained_authorities = source_authorities_for_test(&sources);
+        let source_authorities = source_authority_slices(&retained_authorities);
+        let assembly = assemble_test(sources.clone(), Vec::new()).unwrap();
         let directory = private_tempdir("assembly publication tempdir");
         let first = assembly
-            .write_atomic(directory.path())
+            .write_atomic_against_qg1_authorities(directory.path(), &source_authorities)
             .expect("first publication");
         let second = assembly
-            .write_atomic(directory.path())
+            .write_atomic_against_qg1_authorities(directory.path(), &source_authorities)
             .expect("idempotent publication");
         assert_eq!(first, second);
 
@@ -5405,7 +5591,11 @@ mod tests {
                 .expect("destination basename"),
         );
         fs::write(&collision, b"not an assembly").expect("seed collision");
-        assert!(assembly.write_atomic(collision_dir.path()).is_err());
+        assert!(
+            assembly
+                .write_atomic_against_qg1_authorities(collision_dir.path(), &source_authorities)
+                .is_err()
+        );
         assert_eq!(
             fs::read(collision).expect("collision remains"),
             b"not an assembly"
@@ -5423,7 +5613,11 @@ mod tests {
         pending_name.push(".pending");
         fs::hard_link(&victim, hardlink_dir.path().join(pending_name))
             .expect("seed hardlinked pending path");
-        assert!(assembly.write_atomic(hardlink_dir.path()).is_err());
+        assert!(
+            assembly
+                .write_atomic_against_qg1_authorities(hardlink_dir.path(), &source_authorities)
+                .is_err()
+        );
         assert_eq!(
             fs::read(victim).expect("hardlink victim remains"),
             b"do not append",
@@ -5435,10 +5629,13 @@ mod tests {
     fn publication_rejects_output_and_final_path_aliases() {
         use std::os::unix::fs::{MetadataExt as _, symlink};
 
-        let assembly = assemble_test(complete_shards(), Vec::new()).unwrap();
+        let sources = complete_shards();
+        let retained_authorities = source_authorities_for_test(&sources);
+        let source_authorities = source_authority_slices(&retained_authorities);
+        let assembly = assemble_test(sources.clone(), Vec::new()).unwrap();
         let canonical_dir = private_tempdir("canonical assembly directory");
         let canonical_path = assembly
-            .write_atomic(canonical_dir.path())
+            .write_atomic_against_qg1_authorities(canonical_dir.path(), &source_authorities)
             .expect("publish canonical assembly fixture");
         let canonical_bytes = fs::read(&canonical_path).expect("canonical assembly bytes");
         let destination_name = assembly
@@ -5448,7 +5645,7 @@ mod tests {
         let new_output_parent = private_tempdir("new-output parent");
         let new_output = new_output_parent.path().join("assembly");
         let new_output_path = assembly
-            .write_atomic(&new_output)
+            .write_atomic_against_qg1_authorities(&new_output, &source_authorities)
             .expect("securely create one missing output leaf");
         assert_eq!(new_output_path.parent(), Some(new_output.as_path()));
         let new_output_metadata = fs::symlink_metadata(&new_output).expect("new output metadata");
@@ -5458,7 +5655,11 @@ mod tests {
         let symlink_root = private_tempdir("symlink-root parent");
         let aliased_output = symlink_root.path().join("aliased-output");
         symlink(canonical_dir.path(), &aliased_output).expect("seed output-directory symlink");
-        assert!(assembly.write_atomic(&aliased_output).is_err());
+        assert!(
+            assembly
+                .write_atomic_against_qg1_authorities(&aliased_output, &source_authorities)
+                .is_err()
+        );
         assert_eq!(
             fs::read(&canonical_path).expect("canonical bytes after output alias rejection"),
             canonical_bytes
@@ -5470,7 +5671,11 @@ mod tests {
             final_symlink_dir.path().join(&destination_name),
         )
         .expect("seed final symlink");
-        assert!(assembly.write_atomic(final_symlink_dir.path()).is_err());
+        assert!(
+            assembly
+                .write_atomic_against_qg1_authorities(final_symlink_dir.path(), &source_authorities)
+                .is_err()
+        );
         assert_eq!(
             fs::read(&canonical_path).expect("canonical bytes after final symlink rejection"),
             canonical_bytes
@@ -5482,7 +5687,14 @@ mod tests {
             final_hardlink_dir.path().join(&destination_name),
         )
         .expect("seed final hardlink");
-        assert!(assembly.write_atomic(final_hardlink_dir.path()).is_err());
+        assert!(
+            assembly
+                .write_atomic_against_qg1_authorities(
+                    final_hardlink_dir.path(),
+                    &source_authorities
+                )
+                .is_err()
+        );
         assert_eq!(
             fs::read(&canonical_path).expect("canonical bytes after final hardlink rejection"),
             canonical_bytes
@@ -5510,14 +5722,20 @@ mod tests {
                 TestIdentity::PRIMARY,
             ),
         ];
-        let assembly = assemble_test(shards, Vec::new()).expect("authentic invalid-null assembly");
-        assembly.require_complete().expect("coverage is complete");
+        let shards = shards.into_iter().flatten().collect::<Vec<_>>();
+        let retained_authorities = source_authorities_for_test(&shards);
+        let source_authorities = source_authority_slices(&retained_authorities);
+        let assembly =
+            assemble_test(shards.clone(), Vec::new()).expect("authentic invalid-null assembly");
+        assembly
+            .require_complete_against_qg1_authorities(&source_authorities)
+            .expect("coverage is complete");
         assert_eq!(
             assembly.readiness(),
             PerfEvidenceAssemblyReadiness::NoClaimInvalidEvidence
         );
         let error = assembly
-            .require_adjudicable()
+            .require_adjudicable_against_qg1_authorities(&source_authorities)
             .expect_err("invalid null cannot be adjudicated");
         let (cells, diagnostics) = match error {
             PerfEvidenceAssemblyError::NonAdjudicableAssembly {
@@ -5559,7 +5777,10 @@ mod tests {
 
     #[test]
     fn nested_raw_tamper_cannot_be_hidden_by_an_outer_reseal() {
-        let mut assembly = assemble_test(complete_shards(), Vec::new()).unwrap();
+        let sources = complete_shards();
+        let retained_authorities = source_authorities_for_test(&sources);
+        let source_authorities = source_authority_slices(&retained_authorities);
+        let mut assembly = assemble_test(sources.clone(), Vec::new()).unwrap();
         let body = &mut assembly.source_shards[0].artifact.cells[0].body;
         assert!(matches!(body, EvidenceCellBody::Paired { .. }));
         if let EvidenceCellBody::Paired { paired, .. } = body {
@@ -5571,14 +5792,17 @@ mod tests {
         reseal_assembly(&mut assembly);
 
         assert!(matches!(
-            assembly.verify_integrity(),
+            assembly.verify_integrity_against_qg1_authorities(&source_authorities),
             Err(PerfEvidenceAssemblyError::LocalPerf(_))
         ));
     }
 
     #[test]
     fn fabricated_matrix_projection_fails_after_inner_and_outer_reseal() {
-        let mut assembly = assemble_test(complete_shards(), Vec::new()).unwrap();
+        let sources = complete_shards();
+        let retained_authorities = source_authorities_for_test(&sources);
+        let source_authorities = source_authority_slices(&retained_authorities);
+        let mut assembly = assemble_test(sources.clone(), Vec::new()).unwrap();
         assembly.matrix_manifest.cells[0].spec.fixture = "fabricated/fixture".to_owned();
         assembly.matrix_manifest.matrix_manifest_sha256.clear();
         assembly.matrix_manifest.matrix_manifest_sha256 = assembly
@@ -5587,7 +5811,7 @@ mod tests {
             .expect("matrix reseal");
         reseal_assembly(&mut assembly);
         assert!(matches!(
-            assembly.verify_integrity(),
+            assembly.verify_integrity_against_qg1_authorities(&source_authorities),
             Err(PerfEvidenceAssemblyError::MatrixManifestMismatch { .. })
         ));
     }
@@ -5857,7 +6081,13 @@ mod tests {
             )
             .expect("write substituted child input");
         }
-        assert!(VerifiedLocalPerfAttemptBundle::load_verified(substituted.path()).is_err());
+        assert!(
+            VerifiedLocalPerfAttemptBundle::load_verified_against_qg1_authorities(
+                substituted.path(),
+                &authority_refs,
+            )
+            .is_err()
+        );
 
         let run_log_bytes = format!("runner-log:{}", artifact.provenance.run_id).into_bytes();
         let prebinding_bytes = artifact
@@ -5866,6 +6096,7 @@ mod tests {
         let bound_bytes = canonical_evidence_bytes(&artifact).expect("orphan bound evidence");
         let threshold_bytes = canonical_threshold_bytes(&threshold_artifact_for(&artifact))
             .expect("orphan threshold evidence");
+        let authority_refs = artifact.authority_refs();
         let failed_receipt = crate::local_perf_runner::failed_attempt_receipt_for_test(
             &artifact,
             Some(&artifact.cells[0].spec.fixture),
@@ -5873,6 +6104,7 @@ mod tests {
             &threshold_bytes,
             &prebinding_bytes,
             &bound_bytes,
+            &authority_refs,
             23,
         );
         let failed = private_tempdir("failed attempt with completed orphans");
@@ -5914,6 +6146,8 @@ mod tests {
     #[test]
     fn failed_attempt_is_sealed_preserved_and_contributes_no_cell() {
         let first = complete_shards().remove(0);
+        let retained_authorities = source_authorities_for_test(std::slice::from_ref(&first));
+        let source_authorities = source_authority_slices(&retained_authorities);
         let missing = ordinals_for(PerfCellApplicability::Required)
             .last()
             .copied()
@@ -5942,8 +6176,8 @@ mod tests {
                 .expect("one fixture-exact failed source"),
             17,
         );
-        let assembly =
-            assemble_test(vec![first], vec![failed.clone()]).expect("assembly retaining failure");
+        let assembly = assemble_test(vec![first.clone()], vec![failed.clone()])
+            .expect("assembly retaining failure");
         assert_eq!(assembly.failed_shards().len(), 1);
         assert_eq!(assembly.failed_shards()[0].process(), failed.process());
         assert_eq!(assembly.counts.failed_shards, 1);
@@ -5960,7 +6194,9 @@ mod tests {
                 .missing_required_cell_ids()
                 .contains(&contract.cells[missing].cell_id)
         );
-        assembly.verify_integrity().expect("failed attempt reloads");
+        assembly
+            .verify_integrity_against_qg1_authorities(&source_authorities)
+            .expect("failed attempt reloads against the retained QG-1 authority");
     }
 
     #[test]
@@ -6004,6 +6240,55 @@ mod tests {
             None,
             TestIdentity::PRIMARY,
         );
+
+        let independent_authority = shard(
+            &ordinals[midpoint..],
+            "independent-authority",
+            "independent-authority-runner",
+            None,
+            TestIdentity::PRIMARY,
+        );
+        let first_estimator = first
+            .iter()
+            .flat_map(|source| source.cells.iter())
+            .find_map(|cell| match &cell.body {
+                EvidenceCellBody::Paired { paired, .. } => Some(paired.config.clone()),
+                EvidenceCellBody::Facts { .. } => None,
+            })
+            .expect("first source carries paired QG-1 evidence");
+        let independent_estimator = independent_authority
+            .iter()
+            .flat_map(|source| source.cells.iter())
+            .find_map(|cell| match &cell.body {
+                EvidenceCellBody::Paired { paired, .. } => Some(paired.config.clone()),
+                EvidenceCellBody::Facts { .. } => None,
+            })
+            .expect("independent source carries paired QG-1 evidence");
+        assert_ne!(
+            first_estimator, independent_estimator,
+            "independent QG-1 source lifecycles retain distinct authorities"
+        );
+        assert!(
+            first_estimator.matches_estimator_policy(&independent_estimator),
+            "authority entropy is not estimator policy drift"
+        );
+        assert_eq!(
+            estimator_policy_projection(&first_estimator).expect("first policy projection"),
+            estimator_policy_projection(&independent_estimator)
+                .expect("independent policy projection"),
+            "the persisted compatibility DTO is deterministic after authority stripping"
+        );
+        let independent_sources = [first.clone(), independent_authority]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let retained_authorities = source_authorities_for_test(&independent_sources);
+        let source_authorities = source_authority_slices(&retained_authorities);
+        let independent_assembly = assemble_test(independent_sources.clone(), Vec::new())
+            .expect("independently retained QG-1 authorities share one estimator policy");
+        independent_assembly
+            .verify_integrity_against_qg1_authorities(&source_authorities)
+            .expect("authority-aware replay retains each independently sealed source");
 
         let source_drift = shard(
             &ordinals[midpoint..],
@@ -6089,7 +6374,10 @@ mod tests {
 
     #[test]
     fn profile_and_cross_class_substitution_fail_after_outer_reseal() {
-        let original = assemble_test(complete_shards(), Vec::new()).unwrap();
+        let sources = complete_shards();
+        let retained_authorities = source_authorities_for_test(&sources);
+        let source_authorities = source_authority_slices(&retained_authorities);
+        let original = assemble_test(sources.clone(), Vec::new()).unwrap();
         let substitutions = [
             MachineProfileKey::new(HardwareClassId::TrjZen35995wx, ExecutionProfileId::Smt2_128)
                 .unwrap(),
@@ -6101,7 +6389,7 @@ mod tests {
             substituted.applicability_plan.profile = profile;
             reseal_assembly(&mut substituted);
             assert!(matches!(
-                substituted.verify_integrity(),
+                substituted.verify_integrity_against_qg1_authorities(&source_authorities),
                 Err(PerfEvidenceAssemblyError::MatrixManifestMismatch { .. })
             ));
         }
