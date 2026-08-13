@@ -2705,28 +2705,6 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
             }
         }
 
-        let resolved_numeric_values = self
-            .numeric_fields
-            .iter()
-            .map(|field| {
-                numeric_values
-                    .iter()
-                    .find(|value| value.field_ord == field.field_ord)
-                    .map(|value| value.value)
-                    .or_else(|| {
-                        stored_values
-                            .iter()
-                            .find(|value| value.field_ord == field.field_ord)
-                            .and_then(|value| {
-                                numeric_value_from_le_bytes(
-                                    self.schema.fields[usize::from(field.field_ord)].kind,
-                                    value.bytes,
-                                )
-                            })
-                    })
-            })
-            .collect::<Vec<_>>();
-
         for field in &mut self.fields {
             field.begin_document();
         }
@@ -2814,7 +2792,23 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
             oversized_tokens += dropped;
         }
 
-        for (field, value) in self.numeric_fields.iter_mut().zip(resolved_numeric_values) {
+        let schema_fields = self.schema.fields;
+        for field in &mut self.numeric_fields {
+            let value = numeric_values
+                .iter()
+                .find(|value| value.field_ord == field.field_ord)
+                .map(|value| value.value)
+                .or_else(|| {
+                    stored_values
+                        .iter()
+                        .find(|value| value.field_ord == field.field_ord)
+                        .and_then(|value| {
+                            numeric_value_from_le_bytes(
+                                schema_fields[usize::from(field.field_ord)].kind,
+                                value.bytes,
+                            )
+                        })
+                });
             field.append_document(value);
         }
 
