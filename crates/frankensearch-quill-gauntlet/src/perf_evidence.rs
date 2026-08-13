@@ -4198,8 +4198,16 @@ mod tests {
     const TEST_MACHINE_FINGERPRINT: &str =
         "linux-x86_64-test-machine-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores";
 
-    fn scope() -> PerfOperationScope {
-        perf_operation_scope(PerfGate::Qg1, "bulk/tiny/1/positions_on", "docs_per_second")
+    fn gauge_scope() -> PerfOperationScope {
+        perf_operation_scope(
+            PerfGate::Qg2,
+            "bulk/medium/1/positions_on",
+            "docs_per_second",
+        )
+    }
+
+    fn latency_scope() -> PerfOperationScope {
+        perf_operation_scope(PerfGate::Qg6, "query/identifier/k10/100k", "latency_ms")
     }
 
     fn sample_provenance(run_id: &str) -> PerfSampleProvenance {
@@ -4281,13 +4289,13 @@ mod tests {
         });
     }
 
-    fn gauge_stream(
+    fn gauge_stream_for_scope(
+        scope: &PerfOperationScope,
         pairs: &[(f64, f64)],
         sample_id_base: u64,
         block_id_base: u64,
         group_id: Option<u64>,
     ) -> Vec<PerfRawSample> {
-        let scope = scope();
         let provenance = sample_provenance("run-a");
         let order = seeded_balanced_pair_order(pairs.len(), 0x00c0_ffee).expect("order");
         let mut samples = Vec::with_capacity(pairs.len() * 2);
@@ -4295,7 +4303,7 @@ mod tests {
             let index = u64::try_from(index).expect("index");
             push_gauge_block(
                 &mut samples,
-                &scope,
+                scope,
                 &provenance,
                 block_id_base + index,
                 sample_id_base + index * 2,
@@ -4308,12 +4316,27 @@ mod tests {
         samples
     }
 
+    fn gauge_stream(
+        pairs: &[(f64, f64)],
+        sample_id_base: u64,
+        block_id_base: u64,
+        group_id: Option<u64>,
+    ) -> Vec<PerfRawSample> {
+        gauge_stream_for_scope(
+            &gauge_scope(),
+            pairs,
+            sample_id_base,
+            block_id_base,
+            group_id,
+        )
+    }
+
     fn grouped_gauge_stream(
         pairs: &[(u64, f64, f64)],
         sample_id_base: u64,
         force_control_first: Option<bool>,
     ) -> Vec<PerfRawSample> {
-        let scope = scope();
+        let scope = gauge_scope();
         let provenance = sample_provenance("run-a");
         let order = seeded_balanced_pair_order(pairs.len(), 0x00c0_ffee).expect("order");
         let mut samples = Vec::with_capacity(pairs.len() * 2);
@@ -4362,14 +4385,23 @@ mod tests {
         producer: &Qg1LifecycleProducer,
         stream_role: &str,
         first_arms: &[PerfSampleArm],
-        control_elapsed_ns: u64,
-        treatment_elapsed_ns: u64,
+        elapsed_pairs_ns: &[(u64, u64)],
         sample_id_base: u64,
         work_units: u64,
         content_bytes: u64,
     ) -> Vec<PerfRawSample> {
+        assert_eq!(
+            first_arms.len(),
+            elapsed_pairs_ns.len(),
+            "every issued QG-1 pair needs exact control/treatment timings"
+        );
         let mut samples = Vec::with_capacity(first_arms.len() * 2);
-        for (index, first_arm) in first_arms.iter().copied().enumerate() {
+        for (index, (first_arm, (control_elapsed_ns, treatment_elapsed_ns))) in first_arms
+            .iter()
+            .copied()
+            .zip(elapsed_pairs_ns.iter().copied())
+            .enumerate()
+        {
             let block_id = u64::try_from(index).expect("QG-1 test block ID");
             let base = block_id * 1_000_000;
             let control_first = first_arm == PerfSampleArm::Control;
@@ -4489,9 +4521,20 @@ mod tests {
         expected_authority: Qg1ExpectedAuthority,
     }
 
-    fn valid_qg1_experiment_for_spec(spec: &EvidenceCellSpec, ratio: f64) -> Qg1ExperimentFixture {
+    fn qg1_experiment_for_spec(
+        spec: &EvidenceCellSpec,
+        ratio: f64,
+        tantivy_null_control_elapsed_ns: &[u64],
+    ) -> Qg1ExperimentFixture {
         const PAIRS: usize = 12;
         const CONTENT_BYTES: u64 = 64_000;
+        const BASE_ELAPSED_NS: u64 = 100_000;
+
+        assert_eq!(
+            tantivy_null_control_elapsed_ns.len(),
+            PAIRS,
+            "the QG-1 null fixture must fill every pre-issued pair"
+        );
 
         let matrix = PerfMatrixSpec::complete();
         let canonical = matrix
@@ -4509,7 +4552,13 @@ mod tests {
             seeded_balanced_pair_order(PAIRS, 0x00c0_ffee).expect("QG-1 authority schedule");
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let control_elapsed_ns = (ratio * 100_000.0).round() as u64;
-        let treatment_elapsed_ns = 100_000;
+        let effect_elapsed_ns = vec![(control_elapsed_ns, BASE_ELAPSED_NS); PAIRS];
+        let tantivy_null_elapsed_ns = tantivy_null_control_elapsed_ns
+            .iter()
+            .copied()
+            .map(|control| (control, BASE_ELAPSED_NS))
+            .collect::<Vec<_>>();
+        let quill_null_elapsed_ns = vec![(BASE_ELAPSED_NS, BASE_ELAPSED_NS); PAIRS];
         let mut estimator = config();
         let producer = estimator
             .install_qg1_lifecycle_authority(
@@ -4555,8 +4604,7 @@ mod tests {
             &producer,
             crate::perf::QG1_STREAM_ROLE_EFFECT,
             &schedule,
-            control_elapsed_ns,
-            treatment_elapsed_ns,
+            &effect_elapsed_ns,
             0,
             work_units,
             CONTENT_BYTES,
@@ -4567,8 +4615,7 @@ mod tests {
             &producer,
             crate::perf::QG1_STREAM_ROLE_TANTIVY_NULL,
             &schedule,
-            control_elapsed_ns,
-            control_elapsed_ns,
+            &tantivy_null_elapsed_ns,
             10_000,
             work_units,
             CONTENT_BYTES,
@@ -4579,8 +4626,7 @@ mod tests {
             &producer,
             crate::perf::QG1_STREAM_ROLE_QUILL_NULL,
             &schedule,
-            treatment_elapsed_ns,
-            treatment_elapsed_ns,
+            &quill_null_elapsed_ns,
             20_000,
             work_units,
             CONTENT_BYTES,
@@ -4604,6 +4650,10 @@ mod tests {
             treatment_arm_null,
             expected_authority,
         }
+    }
+
+    fn valid_qg1_experiment_for_spec(spec: &EvidenceCellSpec, ratio: f64) -> Qg1ExperimentFixture {
+        qg1_experiment_for_spec(spec, ratio, &[100_000; 12])
     }
 
     fn bind_samples_to_spec(samples: &mut [PerfRawSample], spec: &EvidenceCellSpec) {
@@ -4724,12 +4774,22 @@ mod tests {
     }
 
     fn seal_unbound_artifact(artifact: &mut PerfEvidenceArtifact) -> Vec<u8> {
+        seal_unbound_artifact_against_qg1_authorities(artifact, &[])
+    }
+
+    fn seal_unbound_artifact_against_qg1_authorities(
+        artifact: &mut PerfEvidenceArtifact,
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+    ) -> Vec<u8> {
         let bytes = artifact
             .sealed_json()
             .expect("seal unbound test evidence")
             .into_bytes();
-        *artifact = PerfEvidenceArtifact::from_verified_slice(&bytes)
-            .expect("reload unbound test evidence");
+        *artifact = PerfEvidenceArtifact::from_verified_slice_against_qg1_authorities(
+            &bytes,
+            external_qg1_authorities,
+        )
+        .expect("reload unbound test evidence");
         bytes
     }
 
@@ -5159,24 +5219,19 @@ mod tests {
 
     #[test]
     fn invalid_null_stays_durable_and_cannot_claim_or_ratchet() {
-        let noisy_null = (0..12)
-            .map(|index| {
-                let epsilon: f64 = if index % 2 == 0 { 0.35 } else { -0.30 };
-                (100.0, 100.0 * (1.0 + epsilon))
-            })
+        let spec = cell_spec(PerfGate::Qg1, EvidenceRole::Required);
+        let noisy_null_control_elapsed_ns = (0..12)
+            .map(|index| if index % 2 == 0 { 135_000 } else { 70_000 })
             .collect::<Vec<_>>();
-        let effect = gauge_stream(&effect_pairs(12, 1.10), 0, 0, None);
-        let null = gauge_stream(&noisy_null, 10_000, 0, None);
-        let experiment = estimate_paired_experiment(&effect, &null, &config()).expect("estimate");
+        let Qg1ExperimentFixture {
+            paired: experiment,
+            expected_authority,
+            ..
+        } = qg1_experiment_for_spec(&spec, 1.10, &noisy_null_control_elapsed_ns);
         assert_eq!(experiment.status, PairedEvidenceStatus::InvalidNull);
         assert_eq!(experiment.claim_state, PairedClaimState::NoDecision);
 
-        let cell = EvidenceCell::evaluate(
-            cell_spec(PerfGate::Qg1, EvidenceRole::Required),
-            experiment,
-            &policy(),
-        )
-        .expect("cell");
+        let cell = EvidenceCell::evaluate(spec, experiment, &policy()).expect("cell");
         assert_eq!(cell.status, EvidenceDecisionStatus::InvalidNull);
         assert!(!cell.claim_eligible());
 
@@ -5197,20 +5252,25 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = artifact
-            .write_atomic(dir.path())
+            .write_atomic_against_qg1_authorities(dir.path(), &[&expected_authority])
             .expect("durable invalid run");
-        let reloaded = PerfEvidenceArtifact::load_verified(&paths.json).expect("reload");
+        let reloaded = PerfEvidenceArtifact::load_verified_against_qg1_authorities(
+            &paths.json,
+            &[&expected_authority],
+        )
+        .expect("reload");
         assert_eq!(reloaded.gate_status, EvidenceDecisionStatus::InvalidNull);
     }
 
     #[test]
     fn unverified_machine_binding_is_explicit_durable_and_nonpromotable() {
+        let (cell, expected_authority) = provisional_cell_with_authority();
         let artifact = PerfEvidenceArtifact::assemble(
             PerfGate::Qg1,
             plan_binding(PerfGate::Qg1),
             policy(),
             evidence_provenance(PerfGate::Qg1),
-            vec![provisional_cell()],
+            vec![cell],
         )
         .expect("unverified evidence artifact");
         assert!(matches!(
@@ -5221,10 +5281,13 @@ mod tests {
 
         let directory = tempfile::tempdir().expect("unverified evidence directory");
         let paths = artifact
-            .write_atomic(directory.path())
+            .write_atomic_against_qg1_authorities(directory.path(), &[&expected_authority])
             .expect("persist explicit unverified evidence");
-        let reloaded =
-            PerfEvidenceArtifact::load_verified(&paths.json).expect("reload unverified evidence");
+        let reloaded = PerfEvidenceArtifact::load_verified_against_qg1_authorities(
+            &paths.json,
+            &[&expected_authority],
+        )
+        .expect("reload unverified evidence");
         assert!(matches!(
             &reloaded.machine_class,
             MachineClassEvidenceBinding::Unverified { .. }
@@ -5628,7 +5691,7 @@ mod tests {
             PairedEvidenceStatus::ContradictorySummaries
         );
         let cell = EvidenceCell::evaluate(
-            cell_spec(PerfGate::Qg1, EvidenceRole::Required),
+            cell_spec(PerfGate::Qg2, EvidenceRole::Required),
             experiment,
             &policy(),
         )
@@ -5647,6 +5710,7 @@ mod tests {
 
     fn hierarchical_stream_with_ratio(ratio: f64, sample_id_base: u64) -> Vec<PerfRawSample> {
         let mut samples = Vec::new();
+        let scope = latency_scope();
         let group_scales = [1.0, 10.0, 100.0, 1_000.0];
         let mut sample_id = sample_id_base;
         for (group_index, scale) in group_scales.iter().enumerate() {
@@ -5660,7 +5724,13 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let block_base = group * 100;
-            samples.extend(gauge_stream(&pairs, sample_id, block_base, Some(group)));
+            samples.extend(gauge_stream_for_scope(
+                &scope,
+                &pairs,
+                sample_id,
+                block_base,
+                Some(group),
+            ));
             sample_id += u64::try_from(pairs.len() * 2).expect("sample count");
         }
         samples
@@ -5723,7 +5793,8 @@ mod tests {
             Err(PairedEstimatorError::GroupMismatch { .. })
         ));
 
-        let single_group = gauge_stream(&effect_pairs(12, 1.10), 0, 0, Some(7));
+        let single_group =
+            gauge_stream_for_scope(&latency_scope(), &effect_pairs(12, 1.10), 0, 0, Some(7));
         assert!(matches!(
             estimate_hierarchical_latency(&single_group, &config(), &policy()),
             Err(PairedEstimatorError::InsufficientGroups { .. })
@@ -6591,8 +6662,8 @@ mod tests {
             procedure: "same-process reopen; OS page cache not dropped".to_owned(),
             verified: false,
         });
-        let cell =
-            EvidenceCell::evaluate(unproven, valid_experiment(1.10), &policy()).expect("cell");
+        let experiment = valid_experiment_for_spec(&unproven, 1.10);
+        let cell = EvidenceCell::evaluate(unproven, experiment, &policy()).expect("cell");
         assert_eq!(cell.status, EvidenceDecisionStatus::NoDecision);
         assert!(
             cell.reasons
@@ -6606,7 +6677,8 @@ mod tests {
             procedure: "echo 3 > drop_caches before reopen".to_owned(),
             verified: true,
         });
-        let cell = EvidenceCell::evaluate(proven, valid_experiment(1.10), &policy()).expect("cell");
+        let experiment = valid_experiment_for_spec(&proven, 1.10);
+        let cell = EvidenceCell::evaluate(proven, experiment, &policy()).expect("cell");
         assert_eq!(cell.status, EvidenceDecisionStatus::MeasuredProvisional);
     }
 
@@ -6923,12 +6995,13 @@ mod tests {
                 if reason.contains("applicability plan requires Required")
         ));
 
+        let (cell, expected_authority) = provisional_cell_with_authority();
         let mut not_applicable = PerfEvidenceArtifact::assemble(
             PerfGate::Qg1,
             plan_binding(PerfGate::Qg1),
             policy(),
             evidence_provenance(PerfGate::Qg1),
-            vec![provisional_cell()],
+            vec![cell],
         )
         .expect("applicable QG-1 artifact");
         not_applicable.cells[0].spec.fixture = "bulk/tiny/96/positions_on".to_owned();
@@ -6947,7 +7020,10 @@ mod tests {
         )
         .expect("persist not-applicable artifact");
         assert!(matches!(
-            PerfEvidenceArtifact::load_verified(&not_applicable_path),
+            PerfEvidenceArtifact::load_verified_against_qg1_authorities(
+                &not_applicable_path,
+                &[&expected_authority],
+            ),
             Err(EvidenceArtifactError::InconsistentArtifact { reason })
                 if reason.contains("is not applicable to profile")
         ));
@@ -6955,16 +7031,20 @@ mod tests {
 
     #[test]
     fn partial_plan_evidence_is_durable_but_never_ratchet_admissible() {
+        let (cell, expected_authority) = provisional_cell_with_authority();
         let mut partial_required = PerfEvidenceArtifact::assemble(
             PerfGate::Qg1,
             plan_binding(PerfGate::Qg1),
             policy(),
             evidence_provenance(PerfGate::Qg1),
-            vec![provisional_cell()],
+            vec![cell],
         )
         .expect("partial required QG-1 evidence");
         let threshold_bytes = b"qg1-partial-threshold";
-        let prebinding_bytes = seal_unbound_artifact(&mut partial_required);
+        let prebinding_bytes = seal_unbound_artifact_against_qg1_authorities(
+            &mut partial_required,
+            &[&expected_authority],
+        );
         let identity = admitted_identity(
             PerfGate::Qg1,
             threshold_bytes,
@@ -6972,10 +7052,15 @@ mod tests {
             "qg1-partial-primary",
         );
         partial_required
-            .bind_machine_class_identity_and_seal(identity, threshold_bytes, &prebinding_bytes)
+            .bind_machine_class_identity_and_seal_against_qg1_authorities(
+                identity,
+                threshold_bytes,
+                &prebinding_bytes,
+                &[&expected_authority],
+            )
             .expect("bind and seal partial required evidence");
         partial_required
-            .verify_integrity()
+            .verify_integrity_against_qg1_authorities(&[&expected_authority])
             .expect("partial required evidence remains durable");
         assert_eq!(
             partial_required.gate_status,
@@ -7187,7 +7272,7 @@ mod tests {
     fn two_clean_process_replays_reproduce_within_tolerance() {
         let first = valid_experiment(1.10);
         let second_effect = {
-            let scope = scope();
+            let scope = gauge_scope();
             let provenance = sample_provenance("run-b");
             let order = seeded_balanced_pair_order(12, 0x00c0_ffee).expect("order");
             let mut samples = Vec::new();
@@ -7208,7 +7293,7 @@ mod tests {
             samples
         };
         let second_null = {
-            let scope = scope();
+            let scope = gauge_scope();
             let provenance = sample_provenance("run-b");
             let order = seeded_balanced_pair_order(12, 0x00c0_ffee).expect("order");
             let mut samples = Vec::new();
@@ -7546,12 +7631,13 @@ mod tests {
             Err(EvidenceArtifactError::InvalidProvenance { .. })
         ));
 
+        let (cell, expected_authority) = provisional_cell_with_authority();
         let mut witness_drift = PerfEvidenceArtifact::assemble(
             PerfGate::Qg1,
             plan_binding(PerfGate::Qg1),
             policy(),
             evidence_provenance(PerfGate::Qg1),
-            vec![provisional_cell()],
+            vec![cell],
         )
         .expect("QG-1 witness mutation fixture");
         let witness = witness_drift.cells[0]
@@ -7575,7 +7661,10 @@ mod tests {
             "qg1-hostile-concurrency-witness",
         );
         assert!(matches!(
-            PerfEvidenceArtifact::from_verified_slice(&bytes),
+            PerfEvidenceArtifact::from_verified_slice_against_qg1_authorities(
+                &bytes,
+                &[&expected_authority],
+            ),
             Err(EvidenceArtifactError::InconsistentArtifact { .. })
         ));
     }
