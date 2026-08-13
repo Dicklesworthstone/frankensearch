@@ -10457,7 +10457,7 @@ mod tests {
             screen_plan.work_units,
             screen_plan.content_bytes,
             "one-live-invocation",
-            10_000_000,
+            5_000_000,
             1_000_000,
             300_000,
         );
@@ -10471,9 +10471,11 @@ mod tests {
             "the paired ShippingAuto-controlled estimand must recover the fixed_4 incumbent"
         );
         assert!(
-            pilots[3].experiment.effect.ci95_low_ratio
-                > pilots[2].experiment.effect.ci95_high_ratio,
-            "the fixture must keep fixed_4's paired ratio interval distinct from fixed_2"
+            pilots[..3].iter().all(|pilot| {
+                pilots[3].experiment.effect.ci95_low_ratio
+                    > pilot.experiment.effect.ci95_high_ratio
+            }),
+            "the fixture must keep fixed_4's paired ratio interval distinct from ShippingAuto, Fixed1, and Fixed2"
         );
         let screen =
             Qg1TantivyIncumbentScreen::screen(&cell, screen_plan, &semantic_contract, pilots)
