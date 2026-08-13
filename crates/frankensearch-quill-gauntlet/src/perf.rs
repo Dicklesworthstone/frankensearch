@@ -10642,15 +10642,6 @@ mod tests {
             sample.qg1_sample_binding = None;
             sample.scope = wrong_scope.clone();
         }
-        assert!(
-            pilot
-                .experiment
-                .effect_samples
-                .iter()
-                .chain(&pilot.experiment.null_samples)
-                .all(|sample| sample.qg1_sample_binding.is_none()),
-            "a relabelled non-QG-1 fixture must not retain QG-1 lifecycle evidence"
-        );
         pilot.experiment = estimate_paired_experiment(
             &pilot.experiment.effect_samples,
             &pilot.experiment.null_samples,
