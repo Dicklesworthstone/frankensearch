@@ -7401,6 +7401,7 @@ pub fn completed_attempt_receipt_for_test(
     threshold_bytes: &[u8],
     prebinding_bytes: &[u8],
     bound_bytes: &[u8],
+    external_qg1_authorities: &[&Qg1ExpectedAuthority],
 ) -> Vec<u8> {
     let identity = artifact
         .machine_class
@@ -7510,9 +7511,15 @@ pub fn completed_attempt_receipt_for_test(
     verified
         .verify_run_log(run_log_bytes)
         .expect("verify H2 test run log");
+    // Authority-aware self-check. `verify_bound_evidence` forwards an empty
+    // authority slice, so a QG-1 receipt would self-verify without ever
+    // presenting the retained external authority its replay depends on. Taking
+    // the set from the caller means this helper proves what the production
+    // consumer proves, and a caller with no authorities must say so explicitly
+    // by passing `&[]` rather than getting that silently.
     verified
-        .verify_bound_evidence(bound_bytes)
-        .expect("verify H2 test bound evidence");
+        .verify_bound_evidence_against_qg1_authorities(bound_bytes, external_qg1_authorities)
+        .expect("verify H2 test bound evidence against its retained QG-1 authorities");
     bytes
 }
 
@@ -7526,6 +7533,9 @@ pub fn failed_attempt_receipt_for_test(
     bound_bytes: &[u8],
     code: i64,
 ) -> Vec<u8> {
+    // A failed-attempt receipt binds no completed evidence, so it presents no
+    // external authority. Passing `&[]` states that explicitly at the call site
+    // instead of inheriting it from a defaulting wrapper.
     let completed_bytes = completed_attempt_receipt_for_test(
         artifact,
         fixture_selector,
@@ -7533,6 +7543,7 @@ pub fn failed_attempt_receipt_for_test(
         threshold_bytes,
         prebinding_bytes,
         bound_bytes,
+        &[],
     );
     let mut receipt = LocalPerfAttemptReceipt::from_verified_slice(&completed_bytes)
         .expect("parse completed H2 test receipt");
