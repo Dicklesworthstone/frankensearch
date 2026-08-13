@@ -295,6 +295,10 @@ fn analyze_admitted_borrowed<A: TokenAnalyzer + ?Sized>(
 #[derive(Debug, Clone, Default)]
 pub struct FrankensearchTokenizer {
     token: AnalyzedToken,
+    /// Test-only discriminator for callers that accidentally cross the owned
+    /// compatibility bridge when the borrowed token stream is sufficient.
+    #[cfg(test)]
+    owned_bridge_calls: usize,
 }
 
 impl sealed::Sealed for FrankensearchTokenizer {}
@@ -595,6 +599,10 @@ impl TokenAnalyzer for FrankensearchTokenizer {
         text: &str,
         sink: &mut dyn FnMut(&AnalyzedToken),
     ) {
+        #[cfg(test)]
+        {
+            self.owned_bridge_calls += 1;
+        }
         let mut token = AnalyzedToken::default();
         self.analyze_borrowed(analyzer, text, &mut |borrowed| {
             token.text.clear();
@@ -726,6 +734,13 @@ impl TokenAnalyzer for FrankensearchTokenizer {
         self.token.offset_from = 0;
         self.token.offset_to = 0;
         self.token.position_length = 0;
+    }
+}
+
+#[cfg(test)]
+impl FrankensearchTokenizer {
+    pub(crate) const fn owned_bridge_calls(&self) -> usize {
+        self.owned_bridge_calls
     }
 }
 

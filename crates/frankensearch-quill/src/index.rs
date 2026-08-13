@@ -2429,7 +2429,7 @@ fn parallel_document_logical_upper_bound(
             2 * std::mem::size_of::<u32>() + usize::from(positions) * std::mem::size_of::<u32>();
         let mut overflowed = false;
         let mut reached_ceiling = false;
-        analyzer.analyze(analyzer_kind, text, &mut |token| {
+        analyzer.analyze_borrowed(analyzer_kind, text, &mut |token| {
             if token.text.len() <= MAX_TERM_BYTES
                 && !overflowed
                 && !reached_ceiling
@@ -26716,6 +26716,11 @@ mod tests {
         };
         assert_eq!(fitting_bound, full);
         assert_eq!(fitting_metadata, full_metadata);
+        assert_eq!(
+            fitting_analyzer.owned_bridge_calls(),
+            0,
+            "the count-only budget pass must consume borrowed tokens without copying them through the owned compatibility bridge",
+        );
     }
 
     #[test]
