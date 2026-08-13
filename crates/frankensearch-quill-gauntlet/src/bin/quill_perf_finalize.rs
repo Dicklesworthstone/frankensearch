@@ -176,13 +176,40 @@ where
 }
 
 fn run_assembly(args: &AssemblyArgs) -> Result<FinalizeOutcome, Box<dyn Error>> {
-    let attempts = args
+    let loaded = args
         .attempt_dirs
         .iter()
-        .map(|path| VerifiedLocalPerfAttemptBundle::load_verified(path))
+        .map(|path| VerifiedLocalPerfAttemptBundle::load_verified_native_qg1(path))
         .collect::<Result<Vec<_>, _>>()?;
-    let assembly = PerfEvidenceAssemblyArtifact::assemble(attempts)?;
-    let output_path = assembly.write_atomic(&args.output_dir)?;
+    let (attempts, authority_sets): (Vec<_>, Vec<_>) = loaded.into_iter().unzip();
+    let authority_refs = authority_sets
+        .iter()
+        .map(|authorities| authorities.iter().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let source_authority_sets = attempts
+        .iter()
+        .zip(&authority_refs)
+        .filter_map(|(attempt, authorities)| {
+            attempt
+                .process()
+                .receipt()
+                .bound_evidence_sha256()
+                .map(|source_sha256| (source_sha256.to_owned(), authorities.clone()))
+        })
+        .collect::<Vec<_>>();
+    let assembly = PerfEvidenceAssemblyArtifact::assemble_against_qg1_authorities(
+        attempts
+            .into_iter()
+            .zip(&authority_refs)
+            .map(|(attempt, authorities)| (attempt, authorities.as_slice()))
+            .collect(),
+    )?;
+    let source_authorities = source_authority_sets
+        .iter()
+        .map(|(source_sha256, authorities)| (source_sha256.as_str(), authorities.as_slice()))
+        .collect::<Vec<_>>();
+    let output_path =
+        assembly.write_atomic_against_qg1_authorities(&args.output_dir, &source_authorities)?;
     // write_atomic pins the output directory and independently reopens the
     // owned final inode through that held directory descriptor before it
     // returns. A second pathname-based reload here would discard that proof
@@ -827,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn assembly_uses_the_descriptor_verified_publication_without_path_reload() {
+    fn assembly_uses_native_source_keyed_authorities_without_generic_fallbacks() {
         let source = production_source();
         let assembly_body = source
             .split("fn run_assembly(")
@@ -836,16 +863,30 @@ mod tests {
             .expect("production assembly body");
         let attempt_loader = unique_marker_offset(
             assembly_body,
-            "VerifiedLocalPerfAttemptBundle::load_verified(path)",
+            "VerifiedLocalPerfAttemptBundle::load_verified_native_qg1(path)",
         );
-        let assembly = unique_marker_offset(
+        let source_key = unique_marker_offset(assembly_body, ".bound_evidence_sha256()");
+        let authority_assembly = unique_marker_offset(
             assembly_body,
-            "PerfEvidenceAssemblyArtifact::assemble(attempts)",
+            "PerfEvidenceAssemblyArtifact::assemble_against_qg1_authorities(",
         );
-        let publication =
-            unique_marker_offset(assembly_body, "assembly.write_atomic(&args.output_dir)");
-        assert!(attempt_loader < assembly);
-        assert!(assembly < publication);
+        let publication = unique_marker_offset(
+            assembly_body,
+            ".write_atomic_against_qg1_authorities(&args.output_dir, &source_authorities)",
+        );
+        assert!(attempt_loader < source_key);
+        assert!(source_key < authority_assembly);
+        assert!(authority_assembly < publication);
+        for generic in [
+            "VerifiedLocalPerfAttemptBundle::load_verified(path)",
+            "PerfEvidenceAssemblyArtifact::assemble(attempts)",
+            "assembly.write_atomic(&args.output_dir)",
+        ] {
+            assert!(
+                !assembly_body.contains(generic),
+                "live assembly regressed to authority-free call {generic:?}"
+            );
+        }
         assert!(
             !assembly_body[publication..].contains("load_verified"),
             "the descriptor-verified publication boundary must not be followed by a pathname reload"

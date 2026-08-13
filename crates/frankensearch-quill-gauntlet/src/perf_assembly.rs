@@ -32,7 +32,7 @@ use crate::{
     PerfApplicabilityPlanError, PerfCellApplicability, PerfCellApplicabilityReason, PerfCellResult,
     PerfCellSpec, PerfEvidenceArtifact, PerfExecutionProvenance, PerfGate, PerfGateArtifact,
     PerfMatrixSpec, PerfMetricSemantics, PerfProducerOs, PerfRawSample, PerfSampleArm,
-    Qg1ExpectedAuthority, VerifiedRunnerIdentity,
+    Qg1AuthorityRegisterEntryV1, Qg1ExpectedAuthority, Qg1TargetPinV1, VerifiedRunnerIdentity,
 };
 
 #[cfg(test)]
@@ -72,6 +72,9 @@ const MATRIX_MANIFEST_HASH_DOMAIN: &[u8] =
     b"frankensearch.quill.perf-evidence-assembly-matrix.v1\0";
 const SEMANTIC_CELL_SET_HASH_DOMAIN: &[u8] =
     b"frankensearch.quill.perf-evidence-semantic-cell-set.v1\0";
+const QG1_TARGET_PIN_FILE_NAME: &str = "qg1-target-pin.json";
+const QG1_AUTHORITY_DIRECTORY_NAME: &str = "qg1-authorities";
+const QG1_TARGET_PIN_MAX_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AssemblyFileIdentity {
@@ -261,6 +264,14 @@ fn read_bounded_owned_regular_at(
     name: &OsStr,
     maximum_len: usize,
 ) -> Result<Vec<u8>, PerfEvidenceAssemblyError> {
+    Ok(read_bounded_owned_regular_with_identity_at(directory, name, maximum_len)?.0)
+}
+
+fn read_bounded_owned_regular_with_identity_at(
+    directory: &File,
+    name: &OsStr,
+    maximum_len: usize,
+) -> Result<(Vec<u8>, AssemblyFileIdentity), PerfEvidenceAssemblyError> {
     use rustix::fs::{Mode, OFlags, openat};
 
     let descriptor = match openat(
@@ -302,7 +313,58 @@ fn read_bounded_owned_regular_at(
             "attempt input changed identity or length while its bounded bytes were read",
         ));
     }
-    Ok(bytes)
+    Ok((bytes, identity))
+}
+
+fn read_optional_bounded_owned_regular_at(
+    directory: &File,
+    name: &OsStr,
+    maximum_len: usize,
+) -> Result<Option<(Vec<u8>, AssemblyFileIdentity)>, PerfEvidenceAssemblyError> {
+    use rustix::fs::{Mode, OFlags, openat};
+    use rustix::io::Errno;
+
+    let descriptor = match openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(Errno::NOENT) => return Ok(None),
+        Err(Errno::LOOP | Errno::NOTDIR) => {
+            return Err(unsafe_assembly_path(
+                "attempt authority input is a symlink or unsafe path alias",
+            ));
+        }
+        Err(error) => return Err(std::io::Error::from(error).into()),
+    };
+    let file = File::from(descriptor);
+    let identity = checked_owned_regular_identity(&file, maximum_len, false)?;
+    let initial_len = usize::try_from(file.metadata()?.len()).map_err(|_| {
+        unsafe_assembly_path("attempt authority input length cannot be represented in memory")
+    })?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(initial_len).map_err(|error| {
+        unsafe_assembly_path(format!("unable to reserve attempt-authority read: {error}"))
+    })?;
+    (&file)
+        .take(
+            u64::try_from(maximum_len)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        )
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > maximum_len
+        || bytes.len() != initial_len
+        || checked_owned_regular_identity(&file, maximum_len, false)? != identity
+        || usize::try_from(file.metadata()?.len()).ok() != Some(initial_len)
+    {
+        return Err(unsafe_assembly_path(
+            "attempt authority input changed identity or length while its bounded bytes were read",
+        ));
+    }
+    Ok(Some((bytes, identity)))
 }
 
 fn open_private_child_directory_at(
@@ -334,6 +396,39 @@ fn open_private_child_directory_at(
         ));
     }
     Ok(directory)
+}
+
+fn open_optional_private_child_directory_at(
+    parent: &File,
+    name: &OsStr,
+) -> Result<Option<File>, PerfEvidenceAssemblyError> {
+    use rustix::fs::{Mode, OFlags, openat};
+    use rustix::io::Errno;
+    use rustix::process::geteuid;
+
+    let descriptor = match openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(Errno::NOENT) => return Ok(None),
+        Err(Errno::LOOP | Errno::NOTDIR) => {
+            return Err(unsafe_assembly_path(
+                "attempt authority directory is a symlink or unsafe path alias",
+            ));
+        }
+        Err(error) => return Err(std::io::Error::from(error).into()),
+    };
+    let directory = File::from(descriptor);
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() || metadata.uid() != geteuid().as_raw() || metadata.mode() & 0o022 != 0 {
+        return Err(unsafe_assembly_path(
+            "attempt authority directory must be effective-user-owned and not group/world writable",
+        ));
+    }
+    Ok(Some(directory))
 }
 
 fn verify_named_assembly_identity(
@@ -874,6 +969,276 @@ pub struct VerifiedLocalPerfAttemptBundle {
     completed: Option<PerfAssemblyCompletedInputs>,
 }
 
+fn load_attempt_process(
+    directory: &File,
+) -> Result<PerfAssemblyProcessReceipt, PerfEvidenceAssemblyError> {
+    let attempt_bytes = read_bounded_owned_regular_at(
+        directory,
+        OsStr::new("QG-1.attempt.json"),
+        PERF_ASSEMBLY_MAX_RECEIPT_BYTES,
+    )?;
+    let receipt = LocalPerfAttemptReceipt::from_verified_slice(&attempt_bytes)?;
+    if receipt.gate() != PerfGate::Qg1.label() {
+        return Err(PerfEvidenceAssemblyError::InvalidAttemptBundle {
+            reason: "attempt bundle is not an exact QG-1 receipt".to_owned(),
+        });
+    }
+    let run_log_bytes = if receipt.run_log_sha256().is_some() {
+        Some(read_bounded_owned_regular_at(
+            directory,
+            OsStr::new("run.log"),
+            PERF_ASSEMBLY_MAX_ARTIFACT_BYTES,
+        )?)
+    } else {
+        None
+    };
+    let process = PerfAssemblyProcessReceipt {
+        process_receipt_sha256: sha256_hex(&attempt_bytes),
+        receipt,
+        run_log_bytes,
+    };
+    process.verify()?;
+    Ok(process)
+}
+
+fn attempt_source_git_revision(
+    receipt: &LocalPerfAttemptReceipt,
+) -> Result<String, PerfEvidenceAssemblyError> {
+    let value = serde_json::to_value(receipt)?;
+    value
+        .get("build")
+        .and_then(|build| build.get("git_revision"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| PerfEvidenceAssemblyError::InvalidAttemptBundle {
+            reason: "verified attempt receipt has no source git revision".to_owned(),
+        })
+}
+
+fn canonical_native_qg1_pin(bytes: &[u8]) -> Result<Qg1TargetPinV1, PerfEvidenceAssemblyError> {
+    let value = crate::machine_class_registry::parse_strict_json(bytes).map_err(|error| {
+        PerfEvidenceAssemblyError::InvalidAttemptBundle {
+            reason: format!("native QG-1 target pin is not strict JSON: {error}"),
+        }
+    })?;
+    let pin: Qg1TargetPinV1 = serde_json::from_value(value.clone()).map_err(|error| {
+        PerfEvidenceAssemblyError::InvalidAttemptBundle {
+            reason: format!("native QG-1 target pin does not decode: {error}"),
+        }
+    })?;
+    pin.verify()
+        .map_err(|error| PerfEvidenceAssemblyError::InvalidAttemptBundle {
+            reason: format!("native QG-1 target pin does not verify: {error}"),
+        })?;
+    if serde_json::to_value(&pin)? != value || serde_json::to_vec(&pin)?.as_slice() != bytes {
+        return Err(PerfEvidenceAssemblyError::InvalidAttemptBundle {
+            reason: "native QG-1 target pin is not its exact canonical encoding".to_owned(),
+        });
+    }
+    Ok(pin)
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn census_native_qg1_authority_directory(
+    directory: &File,
+) -> Result<Vec<OsString>, PerfEvidenceAssemblyError> {
+    let initial_identity = assembly_file_identity(&directory.metadata()?);
+    let mut census = rustix::fs::Dir::read_from(directory).map_err(std::io::Error::from)?;
+    let mut names = Vec::new();
+    while let Some(entry) = census.read() {
+        let entry = entry.map_err(std::io::Error::from)?;
+        let name = entry.file_name().to_str().map_err(|_| {
+            PerfEvidenceAssemblyError::InvalidAttemptBundle {
+                reason: "native QG-1 authority directory contains a non-UTF-8 entry".to_owned(),
+            }
+        })?;
+        if name == "." || name == ".." {
+            continue;
+        }
+        let digest = name
+            .strip_suffix(".json")
+            .filter(|digest| is_lower_sha256(digest));
+        if digest.is_none() {
+            return Err(PerfEvidenceAssemblyError::InvalidAttemptBundle {
+                reason: format!(
+                    "native QG-1 authority directory contains unexpected entry {name:?}"
+                ),
+            });
+        }
+        names.push(OsString::from(name));
+    }
+    names.sort_unstable();
+    if names.windows(2).any(|pair| pair[0] == pair[1])
+        || assembly_file_identity(&directory.metadata()?) != initial_identity
+    {
+        return Err(unsafe_assembly_path(
+            "native QG-1 authority directory changed during its exact census",
+        ));
+    }
+    Ok(names)
+}
+
+fn load_native_qg1_authorities(
+    directory: &File,
+    process: &PerfAssemblyProcessReceipt,
+) -> Result<Vec<Qg1ExpectedAuthority>, PerfEvidenceAssemblyError> {
+    let pin = read_optional_bounded_owned_regular_at(
+        directory,
+        OsStr::new(QG1_TARGET_PIN_FILE_NAME),
+        QG1_TARGET_PIN_MAX_BYTES,
+    )?;
+    let authority_directory = open_optional_private_child_directory_at(
+        directory,
+        OsStr::new(QG1_AUTHORITY_DIRECTORY_NAME),
+    )?;
+    let (pin_bytes, pin_identity, authority_directory) = match (pin, authority_directory) {
+        (None, None) => return Ok(Vec::new()),
+        (Some((pin_bytes, pin_identity)), Some(authority_directory)) => {
+            (pin_bytes, pin_identity, authority_directory)
+        }
+        _ => {
+            return Err(PerfEvidenceAssemblyError::InvalidAttemptBundle {
+                reason:
+                    "native QG-1 attempt must retain both its target pin and authority directory"
+                        .to_owned(),
+            });
+        }
+    };
+    let authority_directory_identity = assembly_file_identity(&authority_directory.metadata()?);
+    let pin = canonical_native_qg1_pin(&pin_bytes)?;
+    let source_git_revision = attempt_source_git_revision(&process.receipt)?;
+    if pin.campaign_run_id() != process.receipt.run_id()
+        || pin.source_git_revision() != source_git_revision
+    {
+        return Err(PerfEvidenceAssemblyError::InvalidAttemptBundle {
+            reason: "native QG-1 target pin names another attempt run or source revision"
+                .to_owned(),
+        });
+    }
+
+    let names = census_native_qg1_authority_directory(&authority_directory)?;
+    let mut entries = Vec::with_capacity(names.len());
+    let mut seen_digests = BTreeSet::new();
+    let mut retained_files = Vec::with_capacity(names.len());
+    for name in &names {
+        let (bytes, identity) = read_bounded_owned_regular_with_identity_at(
+            &authority_directory,
+            name,
+            crate::Qg1StartupHandshakeV1::MAX_REGISTER_BYTES,
+        )?;
+        let entry = Qg1AuthorityRegisterEntryV1::from_verified_slice(&bytes).map_err(|error| {
+            PerfEvidenceAssemblyError::InvalidAttemptBundle {
+                reason: format!("native QG-1 authority register does not verify: {error}"),
+            }
+        })?;
+        if entry.to_json_bytes().map_err(|error| {
+            PerfEvidenceAssemblyError::InvalidAttemptBundle {
+                reason: format!("native QG-1 authority register does not encode: {error}"),
+            }
+        })? != bytes
+        {
+            return Err(PerfEvidenceAssemblyError::InvalidAttemptBundle {
+                reason: "native QG-1 authority register is not its exact canonical encoding"
+                    .to_owned(),
+            });
+        }
+        let expected_name = format!("{}.json", entry.digest());
+        if name.as_os_str() != OsStr::new(&expected_name)
+            || !seen_digests.insert(entry.digest().to_owned())
+        {
+            return Err(PerfEvidenceAssemblyError::InvalidAttemptBundle {
+                reason:
+                    "native QG-1 authority register is duplicated or stored under another digest"
+                        .to_owned(),
+            });
+        }
+        pin.require_pinned_target(&entry).map_err(|error| {
+            PerfEvidenceAssemblyError::InvalidAttemptBundle {
+                reason: format!("native QG-1 authority register is not pinned: {error}"),
+            }
+        })?;
+        retained_files.push((name.clone(), bytes, identity));
+        entries.push(entry);
+    }
+    let pinned_digests = pin
+        .targets()
+        .map(|(_, target)| target.authority_sha256.as_str())
+        .collect::<BTreeSet<_>>();
+    let seen_digest_refs = seen_digests
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if entries.len() != pin.target_count()
+        || seen_digests.len() != entries.len()
+        || pinned_digests != seen_digest_refs
+    {
+        return Err(PerfEvidenceAssemblyError::InvalidAttemptBundle {
+            reason: "native QG-1 authority register census does not exactly equal its complete pin"
+                .to_owned(),
+        });
+    }
+
+    // Only after the complete source-independent pin/register relation has
+    // verified may serialized entries become replay authorities.
+    let authorities = entries
+        .iter()
+        .map(|entry| {
+            entry.to_expected_authority(&pin).map_err(|error| {
+                PerfEvidenceAssemblyError::InvalidAttemptBundle {
+                    reason: format!(
+                        "native QG-1 authority register could not become an expectation: {error}"
+                    ),
+                }
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let reloaded_authority_directory =
+        open_private_child_directory_at(directory, OsStr::new(QG1_AUTHORITY_DIRECTORY_NAME))?;
+    if assembly_file_identity(&reloaded_authority_directory.metadata()?)
+        != authority_directory_identity
+        || census_native_qg1_authority_directory(&reloaded_authority_directory)? != names
+    {
+        return Err(unsafe_assembly_path(
+            "native QG-1 authority directory changed before verification completed",
+        ));
+    }
+    for (name, expected_bytes, expected_identity) in retained_files {
+        let (observed_bytes, observed_identity) =
+            read_owned_regular_at(&reloaded_authority_directory, &name, expected_bytes.len())?
+                .ok_or_else(|| {
+                    unsafe_assembly_path(
+                        "native QG-1 authority register disappeared during verification",
+                    )
+                })?;
+        if observed_bytes != expected_bytes || observed_identity != expected_identity {
+            return Err(unsafe_assembly_path(
+                "native QG-1 authority register changed during verification",
+            ));
+        }
+    }
+    let (observed_pin, observed_pin_identity) = read_owned_regular_at(
+        directory,
+        OsStr::new(QG1_TARGET_PIN_FILE_NAME),
+        pin_bytes.len(),
+    )?
+    .ok_or_else(|| {
+        unsafe_assembly_path("native QG-1 target pin disappeared during verification")
+    })?;
+    if observed_pin != pin_bytes || observed_pin_identity != pin_identity {
+        return Err(unsafe_assembly_path(
+            "native QG-1 target pin changed during verification",
+        ));
+    }
+    Ok(authorities)
+}
+
 impl VerifiedLocalPerfAttemptBundle {
     /// Load one canonical absolute private attempt directory and verify the
     /// exact H2 receipt/log/runner/manifest/threshold/evidence chain.
@@ -906,42 +1271,69 @@ impl VerifiedLocalPerfAttemptBundle {
     ) -> Result<Self, PerfEvidenceAssemblyError> {
         let directory = open_pinned_assembly_directory(attempt_dir, true)?;
         let directory_identity = verify_pinned_assembly_directory(attempt_dir, &directory, true)?;
-        let attempt_bytes = read_bounded_owned_regular_at(
+        let process = load_attempt_process(&directory)?;
+        Self::load_from_pinned_attempt(
+            attempt_dir,
             &directory,
-            OsStr::new("QG-1.attempt.json"),
-            PERF_ASSEMBLY_MAX_RECEIPT_BYTES,
-        )?;
-        let receipt = LocalPerfAttemptReceipt::from_verified_slice(&attempt_bytes)?;
-        if receipt.gate() != PerfGate::Qg1.label() {
-            return Err(PerfEvidenceAssemblyError::InvalidAttemptBundle {
-                reason: "attempt bundle is not an exact QG-1 receipt".to_owned(),
-            });
-        }
-        let run_log_bytes = if receipt.run_log_sha256().is_some() {
-            Some(read_bounded_owned_regular_at(
-                &directory,
-                OsStr::new("run.log"),
-                PERF_ASSEMBLY_MAX_ARTIFACT_BYTES,
-            )?)
+            directory_identity,
+            process,
+            external_qg1_authorities,
+        )
+    }
+
+    /// Load one native producer attempt together with its independently
+    /// retained, pre-ACK QG-1 authorities.
+    ///
+    /// The attempt directory is opened once and all pin, register, receipt, and
+    /// evidence inputs are read relative to that held descriptor. Completed
+    /// lifecycle evidence requires the exact canonical pin/register census the
+    /// producer retained before timing. Failed receipts return no authorities
+    /// and ignore any orphan completed inputs beside them.
+    ///
+    /// # Errors
+    ///
+    /// Rejects every failure of [`Self::load_verified_against_qg1_authorities`]
+    /// plus a missing, one-sided, noncanonical, foreign, incomplete, duplicated,
+    /// or concurrently substituted native authority store.
+    pub fn load_verified_native_qg1(
+        attempt_dir: &Path,
+    ) -> Result<(Self, Vec<Qg1ExpectedAuthority>), PerfEvidenceAssemblyError> {
+        let directory = open_pinned_assembly_directory(attempt_dir, true)?;
+        let directory_identity = verify_pinned_assembly_directory(attempt_dir, &directory, true)?;
+        let process = load_attempt_process(&directory)?;
+        let authorities = if process.receipt.outcome() == LocalPerfAttemptOutcome::Completed {
+            load_native_qg1_authorities(&directory, &process)?
         } else {
-            None
+            Vec::new()
         };
-        let process = PerfAssemblyProcessReceipt {
-            process_receipt_sha256: sha256_hex(&attempt_bytes),
-            receipt,
-            run_log_bytes,
-        };
-        process.verify()?;
+        let authority_refs = authorities.iter().collect::<Vec<_>>();
+        let bundle = Self::load_from_pinned_attempt(
+            attempt_dir,
+            &directory,
+            directory_identity,
+            process,
+            &authority_refs,
+        )?;
+        Ok((bundle, authorities))
+    }
+
+    fn load_from_pinned_attempt(
+        attempt_dir: &Path,
+        directory: &File,
+        directory_identity: AssemblyFileIdentity,
+        process: PerfAssemblyProcessReceipt,
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+    ) -> Result<Self, PerfEvidenceAssemblyError> {
         let completed = if process.receipt.outcome() == LocalPerfAttemptOutcome::Completed {
             Some(load_completed_attempt(
-                &directory,
+                directory,
                 &process,
                 external_qg1_authorities,
             )?)
         } else {
             None
         };
-        if verify_pinned_assembly_directory(attempt_dir, &directory, true)? != directory_identity {
+        if verify_pinned_assembly_directory(attempt_dir, directory, true)? != directory_identity {
             return Err(unsafe_assembly_path(
                 "attempt directory changed identity while its exact bundle was loaded",
             ));
@@ -2710,7 +3102,7 @@ fn derive_assembly(
     let mut run_ids = BTreeSet::new();
     let mut measured = BTreeMap::<usize, PerfEvidenceCellSource>::new();
     let mut non_adjudicable_sources = Vec::new();
-    let mut compatibility = None;
+    let mut compatibility: Option<PerfEvidenceAssemblyCompatibility> = None;
     let mut reference_identity: Option<&VerifiedRunnerIdentity> = None;
     let runnable_count = contract
         .cells
@@ -3550,7 +3942,7 @@ fn compatibility_from_artifact(
             ),
         }
     })?;
-    let mut estimator = None;
+    let mut estimator: Option<PairedEstimatorConfig> = None;
     for cell in &artifact.cells {
         let EvidenceCellBody::Paired {
             paired,
@@ -3849,8 +4241,9 @@ mod tests {
         PairedExperimentResult, PerfConcurrencyEngine, PerfConcurrencyObserver,
         PerfConcurrencyWitness, PerfOperationScope, PerfRawSample, PerfSampleArm, PerfSampleOrder,
         PerfSamplePhase, PerfSampleProvenance, Qg1BatchCoverage, Qg1ExpectedAuthority,
-        Qg1LifecycleProducer, Qg1LifecycleWitness, Qg1SampleBinding, estimate_paired_experiment,
-        estimate_paired_experiment_against_qg1_authority, seeded_balanced_pair_order,
+        Qg1LifecycleProducer, Qg1LifecycleWitness, Qg1PinnedAuthorityTargetV1, Qg1SampleBinding,
+        estimate_paired_experiment, estimate_paired_experiment_against_qg1_authority,
+        seeded_balanced_pair_order,
     };
 
     const RUN_WINDOW: &str = "qg1-h4-test-window";
@@ -3889,6 +4282,7 @@ mod tests {
     struct AuthorityBoundTestArtifact {
         artifact: PerfEvidenceArtifact,
         expected_authorities: Vec<Qg1ExpectedAuthority>,
+        native_authority_registers: Vec<Qg1AuthorityRegisterEntryV1>,
     }
 
     impl AuthorityBoundTestArtifact {
@@ -4126,7 +4520,7 @@ mod tests {
     ) -> (
         PairedExperimentResult,
         PairedExperimentResult,
-        Option<Qg1ExpectedAuthority>,
+        Option<(Qg1ExpectedAuthority, Qg1AuthorityRegisterEntryV1)>,
     ) {
         const PAIRS: usize = 30;
         const CONTENT_BYTES: u64 = 64_000;
@@ -4207,6 +4601,7 @@ mod tests {
                 ],
             )
             .expect("mint QG-1 authority before the first raw row");
+        let register_entry = producer.register_entry();
         let expected_authority = producer.expected_authority().clone();
         let effect = authority_bound_qg1_stream(
             run_id,
@@ -4259,8 +4654,61 @@ mod tests {
                 Some(&expected_authority),
             )
             .expect("authority-bound treatment-arm Q/Q null"),
-            Some(expected_authority),
+            Some((expected_authority, register_entry)),
         )
+    }
+
+    fn qg1_pilot_register_entry(
+        contract: &PlanCellContract,
+        run_id: &str,
+        identity: TestIdentity,
+    ) -> Qg1AuthorityRegisterEntryV1 {
+        const PAIRS: usize = 30;
+        const CONTENT_BYTES: u64 = 64_000;
+
+        let scope = crate::perf::perf_operation_scope(
+            PerfGate::Qg1,
+            &contract.spec.fixture,
+            &contract.spec.metric,
+        );
+        let work_units = contract
+            .spec
+            .document_count
+            .expect("canonical QG-1 throughput cell has a document count");
+        let provenance = sample_provenance(run_id, identity);
+        let schedule = seeded_balanced_pair_order(PAIRS, 0x4834_5eed).expect("QG-1 pilot schedule");
+        estimator_config()
+            .install_qg1_lifecycle_authority(
+                scope,
+                provenance.corpus_sha256,
+                "a".repeat(64),
+                "b".repeat(64),
+                work_units,
+                CONTENT_BYTES,
+                1,
+                vec![Qg1BatchCoverage {
+                    document_start: 0,
+                    document_count: work_units,
+                }],
+                format!("synthetic-{:08}", work_units.saturating_sub(1)),
+                u64::try_from(PAIRS).expect("QG-1 pair count fits u64"),
+                vec![
+                    (
+                        crate::perf::QG1_STREAM_ROLE_TANTIVY_PILOT_EFFECT.to_owned(),
+                        0,
+                        30_000,
+                        schedule.clone(),
+                    ),
+                    (
+                        crate::perf::QG1_STREAM_ROLE_TANTIVY_PILOT_NULL.to_owned(),
+                        0,
+                        40_000,
+                        schedule,
+                    ),
+                ],
+            )
+            .expect("mint QG-1 pilot authority before any raw row")
+            .register_entry()
     }
 
     fn evidence_cell(
@@ -4428,11 +4876,12 @@ mod tests {
         runnable_count: usize,
     ) -> AuthorityBoundTestArtifact {
         let mut expected_authorities = Vec::new();
+        let mut native_authority_registers = Vec::new();
         let cells = ordinals
             .iter()
             .map(|ordinal| {
                 let contract_cell = &contract.cells[*ordinal];
-                let (paired, treatment_null, expected_authority) = paired_results(
+                let (paired, treatment_null, authority) = paired_results(
                     contract_cell,
                     run_id,
                     identity,
@@ -4443,10 +4892,16 @@ mod tests {
                     contract_cell,
                     &paired,
                     &treatment_null,
-                    expected_authority.as_ref(),
+                    authority.as_ref().map(|(expected, _)| expected),
                     policy,
                 );
-                if let Some(expected_authority) = expected_authority {
+                if let Some((expected_authority, decision_register)) = authority {
+                    native_authority_registers.push(qg1_pilot_register_entry(
+                        contract_cell,
+                        run_id,
+                        identity,
+                    ));
+                    native_authority_registers.push(decision_register);
                     expected_authorities.push(expected_authority);
                 }
                 cell
@@ -4534,6 +4989,7 @@ mod tests {
             )
             .expect("reload authority-aware source evidence"),
             expected_authorities,
+            native_authority_registers,
         }
     }
 
@@ -4930,6 +5386,90 @@ mod tests {
         directory
     }
 
+    fn native_qg1_authority_store_bytes(
+        artifact: &AuthorityBoundTestArtifact,
+    ) -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
+        let mut pilot_indexes = BTreeMap::<String, usize>::new();
+        let mut targets = BTreeMap::new();
+        let mut registers = Vec::new();
+        for entry in &artifact.native_authority_registers {
+            let registration = entry
+                .verified_registration()
+                .expect("native test register has one authenticated role");
+            let target_id = match registration.role {
+                crate::Qg1AuthorityRoleV1::Pilot => {
+                    let index = pilot_indexes
+                        .entry(registration.operation_id.clone())
+                        .or_default();
+                    let target_id = format!("{}#pilot/{index}", registration.operation_id);
+                    *index += 1;
+                    target_id
+                }
+                crate::Qg1AuthorityRoleV1::Decision => {
+                    format!("{}#decision", registration.operation_id)
+                }
+            };
+            let target = Qg1PinnedAuthorityTargetV1 {
+                operation_id: registration.operation_id,
+                role: registration.role,
+                authority_sha256: registration.authority_sha256,
+            };
+            assert!(
+                targets.insert(target_id, target).is_none(),
+                "native test pin repeats a target"
+            );
+            registers.push((
+                format!("{}.json", entry.digest()),
+                entry
+                    .to_json_bytes()
+                    .expect("canonical native register bytes"),
+            ));
+        }
+        let pin = Qg1TargetPinV1::new(
+            artifact.provenance.run_id.clone(),
+            artifact.provenance.build.git_revision.clone(),
+            true,
+            targets,
+        )
+        .expect("complete native QG-1 test pin");
+        registers.sort_by(|left, right| left.0.cmp(&right.0));
+        (
+            serde_json::to_vec(&pin).expect("canonical native QG-1 pin bytes"),
+            registers,
+        )
+    }
+
+    fn write_native_qg1_authority_store(
+        directory: &Path,
+        pin_bytes: &[u8],
+        registers: &[(String, Vec<u8>)],
+    ) {
+        fs::write(directory.join(QG1_TARGET_PIN_FILE_NAME), pin_bytes)
+            .expect("write native QG-1 target pin");
+        let authority_directory = directory.join(QG1_AUTHORITY_DIRECTORY_NAME);
+        fs::create_dir(&authority_directory).expect("create native QG-1 authority directory");
+        fs::set_permissions(&authority_directory, fs::Permissions::from_mode(0o700))
+            .expect("make native QG-1 authority directory private");
+        for (name, bytes) in registers {
+            fs::write(authority_directory.join(name), bytes)
+                .expect("write native QG-1 authority register");
+        }
+    }
+
+    fn native_qg1_test_artifact(run_id: &str) -> AuthorityBoundTestArtifact {
+        let contract = PlanContract::reconstruct(&test_plan()).expect("test plan contract");
+        let ordinal = contract
+            .cells
+            .iter()
+            .position(|cell| {
+                cell.applicability.is_runnable() && cell.spec.metric == "docs_per_second"
+            })
+            .expect("test plan has a runnable QG-1 lifecycle cell");
+        let mut artifacts = shard(&[ordinal], run_id, run_id, None, TestIdentity::PRIMARY);
+        assert_eq!(artifacts.len(), 1, "one native lifecycle fixture shard");
+        artifacts.pop().expect("one native lifecycle fixture shard")
+    }
+
     fn test_attempt_bundle(
         artifact: &AuthorityBoundTestArtifact,
     ) -> VerifiedLocalPerfAttemptBundle {
@@ -5144,6 +5684,79 @@ mod tests {
             .is_err(),
             "duplicate candidate authorities must remain ambiguous and fail closed"
         );
+    }
+
+    #[test]
+    fn native_qg1_attempt_loads_assembles_and_persists_with_source_keyed_authorities() {
+        let artifact = native_qg1_test_artifact("native-qg1-good");
+        let template_authorities = artifact.authority_refs();
+        let directory = completed_test_attempt_directory(&artifact, &template_authorities);
+        let (pin_bytes, registers) = native_qg1_authority_store_bytes(&artifact);
+        write_native_qg1_authority_store(directory.path(), &pin_bytes, &registers);
+
+        let (bundle, authorities) =
+            VerifiedLocalPerfAttemptBundle::load_verified_native_qg1(directory.path())
+                .expect("native QG-1 attempt reloads its independently retained authority set");
+        assert_eq!(authorities.len(), registers.len());
+        let authority_refs = authorities.iter().collect::<Vec<_>>();
+        let source_sha256 = bundle
+            .process()
+            .receipt()
+            .bound_evidence_sha256()
+            .expect("completed native attempt binds exact evidence")
+            .to_owned();
+        let assembly = PerfEvidenceAssemblyArtifact::assemble_against_qg1_authorities(vec![(
+            bundle,
+            authority_refs.as_slice(),
+        )])
+        .expect("native QG-1 attempt assembles against its owned authorities");
+        let output = private_tempdir("native QG-1 assembly output");
+        let path = assembly
+            .write_atomic_against_qg1_authorities(
+                output.path(),
+                &[(source_sha256.as_str(), authority_refs.as_slice())],
+            )
+            .expect("native QG-1 assembly persists after source-keyed replay");
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn native_qg1_attempt_rejects_missing_swapped_and_duplicate_authorities() {
+        let artifact = native_qg1_test_artifact("native-qg1-refusals");
+        let template_authorities = artifact.authority_refs();
+        let (pin_bytes, registers) = native_qg1_authority_store_bytes(&artifact);
+        assert!(
+            registers.len() >= 2,
+            "native pin has pilot and decision registers"
+        );
+
+        let missing = completed_test_attempt_directory(&artifact, &template_authorities);
+        write_native_qg1_authority_store(missing.path(), &pin_bytes, &registers[..1]);
+        assert!(matches!(
+            VerifiedLocalPerfAttemptBundle::load_verified_native_qg1(missing.path()),
+            Err(PerfEvidenceAssemblyError::InvalidAttemptBundle { ref reason })
+                if reason.contains("register census does not exactly equal")
+        ));
+
+        let foreign = native_qg1_test_artifact("native-qg1-foreign");
+        let (_, foreign_registers) = native_qg1_authority_store_bytes(&foreign);
+        let swapped = completed_test_attempt_directory(&artifact, &template_authorities);
+        write_native_qg1_authority_store(swapped.path(), &pin_bytes, &foreign_registers);
+        assert!(matches!(
+            VerifiedLocalPerfAttemptBundle::load_verified_native_qg1(swapped.path()),
+            Err(PerfEvidenceAssemblyError::InvalidAttemptBundle { ref reason })
+                if reason.contains("authority register is not pinned")
+        ));
+
+        let mut duplicate_registers = registers.clone();
+        duplicate_registers.push(("0".repeat(64) + ".json", registers[0].1.clone()));
+        let duplicate = completed_test_attempt_directory(&artifact, &template_authorities);
+        write_native_qg1_authority_store(duplicate.path(), &pin_bytes, &duplicate_registers);
+        assert!(matches!(
+            VerifiedLocalPerfAttemptBundle::load_verified_native_qg1(duplicate.path()),
+            Err(PerfEvidenceAssemblyError::InvalidAttemptBundle { ref reason })
+                if reason.contains("authority register is duplicated or stored under another digest")
+        ));
     }
 
     fn failed_test_attempt_bundle(
@@ -6134,13 +6747,15 @@ mod tests {
             )
             .expect("write orphan completed child input");
         }
-        let loaded = VerifiedLocalPerfAttemptBundle::load_verified(failed.path())
-            .expect("failed receipt ignores completed orphans");
+        let (loaded, failed_authorities) =
+            VerifiedLocalPerfAttemptBundle::load_verified_native_qg1(failed.path())
+                .expect("native failed receipt ignores completed orphans");
         assert_eq!(
             loaded.process().receipt().outcome(),
             LocalPerfAttemptOutcome::ExitedNonzero { code: 23 }
         );
         assert!(loaded.completed.is_none());
+        assert!(failed_authorities.is_empty());
     }
 
     #[test]
