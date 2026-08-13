@@ -7859,34 +7859,6 @@ mod tests {
         assert_eq!(last_sequence, Some(1));
     }
 
-    #[test]
-    fn qg1_trailing_partial_magic_helper() {
-        let Some(mode) = std::env::var_os("QUILL_PERF_TEST_QG1_TRAILING_MAGIC") else {
-            return;
-        };
-        qg1_write_wait_test_register("QG-1.bulk/tiny/1/positions_on.docs_per_second", 1);
-        qg1_write_wait_test_complete(1);
-        qg1_read_wait_test_ack();
-        let bytes = match mode.to_string_lossy().as_ref() {
-            "full" => {
-                let mut bytes = Qg1StartupHandshakeV1::REGISTER_MAGIC.to_vec();
-                bytes.extend_from_slice(b"ordinary-post-complete-data");
-                bytes
-            }
-            "partial" => Qg1StartupHandshakeV1::REGISTER_MAGIC
-                [..Qg1StartupHandshakeV1::REGISTER_MAGIC.len() - 1]
-                .to_vec(),
-            unexpected => panic!("unexpected trailing-magic mode {unexpected:?}"),
-        };
-        std::io::stdout()
-            .write_all(&bytes)
-            .expect("write ordinary post-COMPLETE bytes");
-        std::io::stdout()
-            .flush()
-            .expect("flush ordinary post-COMPLETE bytes");
-        std::process::exit(0);
-    }
-
     /// Shared in-process ACK transport for the forwarder core.
     ///
     /// The core writes the child's acknowledgement bytes into its `Write` half.
@@ -8114,128 +8086,101 @@ mod tests {
         );
     }
 
-    fn qg1_write_wait_test_register(operation_id: &str, sequence: u64) {
+    fn qg1_wait_test_register_frame(operation_id: &str, sequence: u64) -> Vec<u8> {
         let entry = qg1_register_entry_for_target(operation_id);
         let entry_bytes = entry
             .to_json_bytes()
             .expect("serialize wait-test authority");
-        let frame = Qg1StartupHandshakeV1::register_frame(sequence, &entry_bytes)
-            .expect("frame bounded wait-test authority");
-        let mut stdout = std::io::stdout().lock();
-        stdout
-            .write_all(&frame)
-            .expect("write wait-test authority register");
-        stdout.flush().expect("flush wait-test authority entry");
+        Qg1StartupHandshakeV1::register_frame(sequence, &entry_bytes)
+            .expect("frame bounded wait-test authority")
     }
 
-    /// Emit the pilot half of a complete engine-lifecycle cell. Only the
-    /// accepted-ACK case needs it; every refusal case below deliberately stages
-    /// a decision alone and must keep doing so.
-    fn qg1_write_wait_test_pilot_register(operation_id: &str, sequence: u64) {
+    fn qg1_wait_test_pilot_register_frame(operation_id: &str, sequence: u64) -> Vec<u8> {
         let entry = qg1_pilot_register_entry_for_target(operation_id);
         let entry_bytes = entry
             .to_json_bytes()
             .expect("serialize wait-test pilot authority");
-        let frame = Qg1StartupHandshakeV1::register_frame(sequence, &entry_bytes)
-            .expect("frame bounded wait-test pilot authority");
-        let mut stdout = std::io::stdout().lock();
-        stdout
-            .write_all(&frame)
-            .expect("write wait-test pilot authority register");
-        stdout
-            .flush()
-            .expect("flush wait-test pilot authority entry");
+        Qg1StartupHandshakeV1::register_frame(sequence, &entry_bytes)
+            .expect("frame bounded wait-test pilot authority")
     }
 
-    fn qg1_write_wait_test_complete(register_count: u64) {
-        let mut stdout = std::io::stdout().lock();
-        stdout
-            .write_all(&Qg1StartupHandshakeV1::complete_frame(register_count))
-            .expect("write wait-test authority COMPLETE");
-        stdout.flush().expect("flush wait-test authority COMPLETE");
-    }
-
-    fn qg1_read_wait_test_ack() {
-        let mut acknowledgement = vec![0_u8; Qg1StartupHandshakeV1::final_ack_len()];
-        std::io::stdin()
-            .read_exact(&mut acknowledgement)
-            .expect("parent must emit the sole final ACK after COMPLETE");
-        Qg1StartupHandshakeV1::validate_final_ack(&acknowledgement)
-            .expect("wait-test child received the fixed final ACK frame");
-    }
-
-    #[test]
-    fn qg1_wait_boundary_child_helper() {
-        let Some(case) = std::env::var_os("QUILL_PERF_TEST_QG1_WAIT_CASE") else {
-            return;
-        };
-        match case.to_string_lossy().as_ref() {
+    fn qg1_wait_test_frames(case: &str) -> Vec<u8> {
+        match case {
             "ack" => {
-                qg1_write_wait_test_register("QG-1.bulk/tiny/1/positions_on.docs_per_second", 1);
-                qg1_write_wait_test_pilot_register(
+                let mut frames = qg1_wait_test_register_frame(
+                    "QG-1.bulk/tiny/1/positions_on.docs_per_second",
+                    1,
+                );
+                frames.extend_from_slice(&qg1_wait_test_pilot_register_frame(
                     "QG-1.bulk/tiny/1/positions_on.docs_per_second",
                     2,
-                );
-                qg1_write_wait_test_complete(2);
-                qg1_read_wait_test_ack();
-                println!("qg1-wait-child-work-after-ack");
+                ));
+                frames.extend_from_slice(&Qg1StartupHandshakeV1::complete_frame(2));
+                frames
             }
-            "malformed" => {
-                std::io::stdout()
-                    .write_all(b"not-a-qg1-startup-frame")
-                    .expect("write malformed wait-test frame");
-                std::io::stdout()
-                    .flush()
-                    .expect("flush malformed wait-test frame");
-                std::thread::sleep(Qg1StartupHandshakeV1::STARTUP_TIMEOUT + Duration::from_secs(1));
-            }
-            "partial" => {
-                std::io::stdout()
-                    .write_all(&Qg1StartupHandshakeV1::REGISTER_MAGIC[..4])
-                    .expect("write partial wait-test frame start");
-                std::io::stdout()
-                    .flush()
-                    .expect("flush partial wait-test frame start");
-                std::thread::sleep(Qg1StartupHandshakeV1::STARTUP_TIMEOUT + Duration::from_secs(1));
-            }
-            "timeout" => {
-                std::thread::sleep(Qg1StartupHandshakeV1::STARTUP_TIMEOUT + Duration::from_secs(1));
-            }
-            "missing" => {
-                qg1_write_wait_test_complete(0);
-                qg1_read_wait_test_ack();
-            }
+            "malformed" => b"not-a-qg1-startup-frame".to_vec(),
+            "partial" => Qg1StartupHandshakeV1::REGISTER_MAGIC[..4].to_vec(),
+            "missing" | "tokenizer_zero" => Qg1StartupHandshakeV1::complete_frame(0),
             "replay" => {
-                qg1_write_wait_test_register("QG-1.bulk/tiny/1/positions_on.docs_per_second", 1);
-                qg1_write_wait_test_register("QG-1.bulk/tiny/2/positions_on.docs_per_second", 1);
-                qg1_write_wait_test_complete(2);
-                qg1_read_wait_test_ack();
-                println!("qg1-wait-child-work-after-ack");
+                let mut frames = qg1_wait_test_register_frame(
+                    "QG-1.bulk/tiny/1/positions_on.docs_per_second",
+                    1,
+                );
+                frames.extend_from_slice(&qg1_wait_test_register_frame(
+                    "QG-1.bulk/tiny/2/positions_on.docs_per_second",
+                    1,
+                ));
+                frames.extend_from_slice(&Qg1StartupHandshakeV1::complete_frame(2));
+                frames
             }
             "extra" => {
-                qg1_write_wait_test_register("QG-1.bulk/tiny/1/positions_on.docs_per_second", 1);
-                qg1_write_wait_test_register("QG-1.bulk/tiny/2/positions_on.docs_per_second", 2);
-                qg1_write_wait_test_complete(2);
-                qg1_read_wait_test_ack();
+                let mut frames = qg1_wait_test_register_frame(
+                    "QG-1.bulk/tiny/1/positions_on.docs_per_second",
+                    1,
+                );
+                frames.extend_from_slice(&qg1_wait_test_register_frame(
+                    "QG-1.bulk/tiny/2/positions_on.docs_per_second",
+                    2,
+                ));
+                frames.extend_from_slice(&Qg1StartupHandshakeV1::complete_frame(2));
+                frames
             }
             "count_mismatch" => {
-                qg1_write_wait_test_register("QG-1.bulk/tiny/1/positions_on.docs_per_second", 1);
-                qg1_write_wait_test_complete(0);
-                qg1_read_wait_test_ack();
-            }
-            "tokenizer_zero" => {
-                qg1_write_wait_test_complete(0);
-                qg1_read_wait_test_ack();
-                println!("qg1-wait-tokenizer-work-after-ack");
+                let mut frames = qg1_wait_test_register_frame(
+                    "QG-1.bulk/tiny/1/positions_on.docs_per_second",
+                    1,
+                );
+                frames.extend_from_slice(&Qg1StartupHandshakeV1::complete_frame(0));
+                frames
             }
             "tokenizer_surplus" => {
-                qg1_write_wait_test_register("QG-1.bulk/tiny/1/positions_on.docs_per_second", 1);
-                qg1_write_wait_test_complete(1);
-                qg1_read_wait_test_ack();
-                println!("qg1-wait-tokenizer-work-after-ack");
+                let mut frames = qg1_wait_test_register_frame(
+                    "QG-1.bulk/tiny/1/positions_on.docs_per_second",
+                    1,
+                );
+                frames.extend_from_slice(&Qg1StartupHandshakeV1::complete_frame(1));
+                frames
             }
-            "natural_exit" => {}
+            "timeout" | "natural_exit" => Vec::new(),
             unexpected => panic!("unexpected QG-1 wait-boundary child case {unexpected:?}"),
+        }
+    }
+
+    fn qg1_expected_wait_test_failure(case: &str) -> &'static str {
+        match case {
+            "malformed" => "QG-1 startup control must begin at stdout offset zero",
+            "partial" | "timeout" => {
+                "QG-1 startup authority did not complete before the total deadline"
+            }
+            "missing" => "expected exactly 1 decision and at least 1 pilot authority",
+            "extra" | "tokenizer_surplus" => "is not exactly one frozen selected target",
+            "count_mismatch" => {
+                "QG-1 startup COMPLETE count 0 does not match received 1 or accepted 1"
+            }
+            "replay" => {
+                "QG-1 authority register sequence 1 is stale, replayed, or out of order; expected 2"
+            }
+            unexpected => panic!("case {unexpected:?} has no rejection contract"),
         }
     }
 
@@ -8252,7 +8197,7 @@ mod tests {
         qg1_wait_result_for_test_with_startup_budget(
             case,
             selection,
-            Qg1StartupHandshakeV1::STARTUP_TIMEOUT,
+            Duration::from_secs(2),
             Duration::ZERO,
         )
     }
@@ -8344,49 +8289,44 @@ mod tests {
         let run_log = create_new_file_at(&run_directories.run.handle, "run.log")
             .expect("create-new retained QG-1 wait test run log");
         let mut handshake_log = run_log.try_clone().expect("clone retained test run log");
-        let mut command = if case == "ack" {
-            // A libtest child writes its harness banner to fd 1 before the
-            // helper can emit, so byte zero would not be the register magic and
-            // the production offset-zero rule would refuse it. That rule is
-            // correct and stays strict; the CHILD changes instead. This is a
-            // real OS process with its own group, so actual parent
-            // wait/kill/reap containment and the startup deadline are still
-            // exercised end to end -- only the harness noise is gone.
+        let mut command = if case == "natural_exit" {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "exit 0", "qg1-wait-boundary-child"]);
+            command
+        } else if case == "timeout" {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "sleep 5", "qg1-wait-boundary-child"]);
+            command
+        } else {
+            // Libtest writes a harness banner to fd 1 before a test helper can
+            // emit its control frame. That made every hostile case collapse
+            // onto the offset-zero parser guard instead of reaching the gate it
+            // named. Stage every case descriptor-relatively and use a bare
+            // shell child, so byte zero is the real producer byte while the
+            // parent still exercises its real wait/kill/reap boundary.
             //
             // The frames are precomputed here and staged descriptor-relatively,
             // so the child's first write is the register frame at byte zero. It
             // then consumes exactly the final-ACK bytes from stdin and only
-            // afterwards does post-ACK work, which is the ordering this case
-            // exists to prove.
-            // A selected engine-lifecycle cell is complete only with exactly
-            // one decision AND at least one pilot, so both roles are staged for
-            // the SAME operation id. Staging the decision alone is refused at
-            // the COMPLETE frame and the child never receives an ACK, which is
-            // a refusal of the fixture rather than a test of the wait boundary.
-            let decision_bytes =
-                qg1_register_entry_for_target("QG-1.bulk/tiny/1/positions_on.docs_per_second")
-                    .to_json_bytes()
-                    .expect("serialize wait-boundary decision authority");
-            let pilot_bytes = qg1_pilot_register_entry_for_target(
-                "QG-1.bulk/tiny/1/positions_on.docs_per_second",
-            )
-            .to_json_bytes()
-            .expect("serialize wait-boundary pilot authority");
-            assert_ne!(
-                decision_bytes, pilot_bytes,
-                "the two staged roles must be distinct authorities, not a replay"
-            );
-            let mut frames = Qg1StartupHandshakeV1::register_frame(1, &decision_bytes)
-                .expect("frame bounded wait-boundary decision authority");
-            frames.extend_from_slice(
-                &Qg1StartupHandshakeV1::register_frame(2, &pilot_bytes)
-                    .expect("frame bounded wait-boundary pilot authority"),
-            );
-            frames.extend_from_slice(&Qg1StartupHandshakeV1::complete_frame(2));
-            assert!(
-                frames.starts_with(Qg1StartupHandshakeV1::REGISTER_MAGIC),
-                "the staged child stream must begin at byte zero with the register magic"
-            );
+            // afterwards does post-ACK work. Refusal cases block while awaiting
+            // the same ACK; the parent closes or kills them at the named gate.
+            let frames = qg1_wait_test_frames(case);
+            match case {
+                "malformed" => assert_eq!(frames, b"not-a-qg1-startup-frame"),
+                "partial" => assert_eq!(
+                    frames,
+                    Qg1StartupHandshakeV1::REGISTER_MAGIC[..4],
+                    "the partial case must hold an exact proper prefix open"
+                ),
+                "missing" | "tokenizer_zero" => assert!(
+                    frames.starts_with(Qg1StartupHandshakeV1::COMPLETE_MAGIC),
+                    "zero-register cases must begin at byte zero with COMPLETE"
+                ),
+                _ => assert!(
+                    frames.starts_with(Qg1StartupHandshakeV1::REGISTER_MAGIC),
+                    "register cases must begin at byte zero with REGISTER"
+                ),
+            }
             write_new_sync_at(&run_directories.run.handle, "qg1-wait-frames.bin", &frames)
                 .expect("stage create-new QG-1 wait-boundary child frames");
             // The expected final ACK is staged as BYTES so the child can prove
@@ -8415,44 +8355,52 @@ mod tests {
             let observed_ack_path = run_directories.run.path.join("qg1-wait-observed-ack.bin");
             let ack_len = expected_ack.len();
             let mut command = Command::new("/bin/sh");
-            command
-                .arg("-c")
-                // `dd` only CAPTURES here; `cmp` is what proves it. A short read
-                // yields a shorter file and `cmp` fails on length, and any wrong
-                // same-length payload fails on content. The post-ACK marker is
-                // emitted ONLY on exact match, so a bad ACK fails the fixture
-                // closed rather than printing the marker anyway.
-                //
-                // Each stage exits with its OWN code and keeps its stderr, so a
-                // failure names itself instead of collapsing to a bare nonzero:
-                //   91 = the staged frames could not be emitted at all
-                //   92 = the ACK capture itself failed
-                //   93 = the ACK arrived but is not byte-exact
-                // `cmp` is deliberately not `-s`: its message distinguishes the
-                // two cases source could not separate — "EOF on <observed>"
-                // means no ACK ever arrived and this fixture is reporting an
-                // upstream refusal, while a differing byte means the ACK
-                // arrived and the expectation is what is wrong. `dd` keeps its
-                // stderr for the same reason; the fixture inherits stderr, so
-                // both surface in the failing run.
-                .arg(format!(
-                    "cat \"$1\" || exit 91; \
+            if case == "partial" {
+                command
+                    .args([
+                        "-c",
+                        "cat \"$1\" || exit 91; sleep 5",
+                        "qg1-wait-boundary-child",
+                    ])
+                    .arg(&frames_path);
+            } else {
+                let marker = if case == "tokenizer_zero" {
+                    "qg1-wait-tokenizer-work-after-ack"
+                } else {
+                    "qg1-wait-child-work-after-ack"
+                };
+                command
+                    .arg("-c")
+                    // `dd` only CAPTURES here; `cmp` is what proves it. A short read
+                    // yields a shorter file and `cmp` fails on length, and any wrong
+                    // same-length payload fails on content. The post-ACK marker is
+                    // emitted ONLY on exact match, so a bad ACK fails the fixture
+                    // closed rather than printing the marker anyway.
+                    //
+                    // Each stage exits with its OWN code and keeps its stderr, so a
+                    // failure names itself instead of collapsing to a bare nonzero:
+                    //   91 = the staged frames could not be emitted at all
+                    //   92 = the ACK capture itself failed
+                    //   93 = the ACK arrived but is not byte-exact
+                    // `cmp` is deliberately not `-s`: its message distinguishes the
+                    // two cases source could not separate — "EOF on <observed>"
+                    // means no ACK ever arrived and this fixture is reporting an
+                    // upstream refusal, while a differing byte means the ACK
+                    // arrived and the expectation is what is wrong. `dd` keeps its
+                    // stderr for the same reason; the fixture inherits stderr, so
+                    // both surface in the failing run.
+                    .arg(format!(
+                        "cat \"$1\" || exit 91; \
                      dd bs=1 count={ack_len} of=\"$3\" || exit 92; \
                      cmp \"$2\" \"$3\" || exit 93; \
-                     echo qg1-wait-child-work-after-ack"
-                ))
-                .arg("qg1-wait-boundary-child")
-                .arg(&frames_path)
-                .arg(&expected_ack_path)
-                .arg(&observed_ack_path);
-            command
-        } else {
-            let current_test = std::env::current_exe().expect("current test executable");
-            let helper_name = "local_perf_runner::tests::qg1_wait_boundary_child_helper";
-            let mut command = Command::new(current_test);
-            command
-                .args(["--exact", helper_name, "--nocapture", "--test-threads=1"])
-                .env("QUILL_PERF_TEST_QG1_WAIT_CASE", case);
+                     printf '%s\\n' \"$4\""
+                    ))
+                    .arg("qg1-wait-boundary-child")
+                    .arg(&frames_path)
+                    .arg(&expected_ack_path)
+                    .arg(&observed_ack_path)
+                    .arg(marker);
+            }
             command
         };
         command
@@ -8629,6 +8577,19 @@ mod tests {
         ] {
             let (status, recovery, accepted, failure, run_log) =
                 qg1_wait_result_for_test(case, &one_engine_selection);
+            let failure_text = failure
+                .as_deref()
+                .expect("every planted hostile child must name its rejected handshake");
+            assert!(
+                failure_text.contains(qg1_expected_wait_test_failure(case)),
+                "{case} reached the wrong handshake gate: {failure_text:?}"
+            );
+            if case != "malformed" {
+                assert!(
+                    !failure_text.contains("startup control must begin at stdout offset zero"),
+                    "{case} must not false-green on a stray child banner: {failure_text:?}"
+                );
+            }
             let outcome = qg1_authority_handshake_outcome(
                 PerfGate::Qg1,
                 &one_engine_selection,
@@ -8683,6 +8644,17 @@ mod tests {
             accepted.total(),
             1,
             "replayed sequence is refused before second publication"
+        );
+        let replay_failure = failure
+            .as_deref()
+            .expect("replayed sequence leaves an observable handshake rejection");
+        assert!(
+            replay_failure.contains(qg1_expected_wait_test_failure("replay")),
+            "replay reached the wrong handshake gate: {replay_failure:?}"
+        );
+        assert!(
+            !replay_failure.contains("startup control must begin at stdout offset zero"),
+            "replay must not false-green on a stray child banner: {replay_failure:?}"
         );
         assert!(
             qg1_authority_handshake_outcome(
@@ -8744,6 +8716,17 @@ mod tests {
         assert!(
             failure.is_some(),
             "the planted tokenizer-only authority must leave an observable rejected handshake"
+        );
+        let tokenizer_failure = failure
+            .as_deref()
+            .expect("tokenizer surplus leaves an observable handshake rejection");
+        assert!(
+            tokenizer_failure.contains(qg1_expected_wait_test_failure("tokenizer_surplus")),
+            "tokenizer surplus reached the wrong handshake gate: {tokenizer_failure:?}"
+        );
+        assert!(
+            !tokenizer_failure.contains("startup control must begin at stdout offset zero"),
+            "tokenizer surplus must not false-green on a stray child banner: {tokenizer_failure:?}"
         );
         assert!(
             qg1_authority_handshake_outcome(
