@@ -9629,7 +9629,7 @@ impl QuillReader {
         }
         if fan_out {
             check_cancel(cx, "search")?;
-            let template = collector.empty_like()?;
+            let collector_shape = &*collector;
             let schema = self.schema;
             let glob_expansion_limit = self.config.glob_expansion_limit;
             let segment_count = keeper.segments().len();
@@ -9644,7 +9644,7 @@ impl QuillReader {
                     if let Some(profile) = profile {
                         profile.record_segment_lowered(1);
                     }
-                    let mut local = template.empty_like()?;
+                    let mut local = collector_shape.empty_like()?;
                     let score_span = tracing::info_span!(
                         target: crate::tracing_conventions::TARGET,
                         crate::tracing_conventions::ARGUS_SCORE,
