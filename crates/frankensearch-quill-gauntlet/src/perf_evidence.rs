@@ -4578,8 +4578,7 @@ mod tests {
         let mut null = gauge_stream(&quiet_null_pairs(12), 10_000, 0, None);
         bind_samples_to_spec(&mut effect, spec);
         bind_samples_to_spec(&mut null, spec);
-        estimate_paired_experiment(&effect, &null, &config())
-            .expect("valid non-QG experiment")
+        estimate_paired_experiment(&effect, &null, &config()).expect("valid non-QG experiment")
     }
 
     fn valid_treatment_arm_null_for_spec(

@@ -10472,8 +10472,7 @@ mod tests {
         );
         assert!(
             pilots[..3].iter().all(|pilot| {
-                pilots[3].experiment.effect.ci95_low_ratio
-                    > pilot.experiment.effect.ci95_high_ratio
+                pilots[3].experiment.effect.ci95_low_ratio > pilot.experiment.effect.ci95_high_ratio
             }),
             "the fixture must keep fixed_4's paired ratio interval distinct from ShippingAuto, Fixed1, and Fixed2"
         );
