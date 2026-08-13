@@ -3305,14 +3305,43 @@ pub enum PerfSamplePhase {
     Measurement,
 }
 
+/// Upper bound on ordered timing leaves one QG-6 sample may carry.
+///
+/// A raw leaf vector is the only unbounded-by-construction field a QG-6 sample
+/// has, so it gets an explicit ceiling rather than inheriting the sample-count
+/// bound that governs everything else.
+pub const QG6_MAX_TIMING_LEAVES_PER_SAMPLE: usize = 4_096;
+
 /// Compact per-row binding into the cell-local QG-6 semantic contract.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `observed_value` on the parent sample is the MEDIAN across that sample's
+/// per-arm search subsample, so a percentile computed from parent values alone
+/// is a percentile of medians and has already lost its tail. The ordered leaves
+/// carried here are the individual timings that median summarized, which is
+/// what a true p50/p99 must be recomputed from.
+///
+/// The three leaf fields are required, deliberately: an artifact written before
+/// they existed fails to decode rather than presenting as a QG-6 sample with no
+/// tail evidence, which is the fail-closed behaviour this binding already has
+/// for its other fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Qg6SampleBinding {
     /// Stable redacted query ID resolved through `group_id`.
     pub query_id: String,
     /// Domain-separated digest of the validated role receipt sequence.
     pub result_sequence_sha256: String,
+    /// Number of ordered same-invocation timing leaves the parent sample's
+    /// median summarized. Retained separately from the vector so a truncated
+    /// leaf list is a mismatch rather than a silently shorter stream.
+    pub timing_leaf_count: u64,
+    /// Domain-separated seal the producer computed over those ordered leaf
+    /// receipts. Recomputation against it belongs to the evidence layer; this
+    /// binding carries the identity so the comparison is possible at all.
+    pub timing_leaves_sha256: String,
+    /// Ordered raw per-search latencies in milliseconds, in the producer's
+    /// leaf order, in the same unit as `observed_value`.
+    pub timing_leaves_ms: Vec<f64>,
 }
 
 impl Qg6SampleBinding {
@@ -3320,6 +3349,15 @@ impl Qg6SampleBinding {
         !self.query_id.is_empty()
             && self.query_id.len() <= 256
             && is_lower_hex_digest(&self.result_sequence_sha256)
+            && is_lower_hex_digest(&self.timing_leaves_sha256)
+            && self.timing_leaf_count > 0
+            && self.timing_leaves_ms.len() <= QG6_MAX_TIMING_LEAVES_PER_SAMPLE
+            && usize::try_from(self.timing_leaf_count)
+                .is_ok_and(|count| count == self.timing_leaves_ms.len())
+            && self
+                .timing_leaves_ms
+                .iter()
+                .all(|leaf| leaf.is_finite() && *leaf >= 0.0)
     }
 }
 
