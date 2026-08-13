@@ -6142,12 +6142,13 @@ mod tests {
             "full-gate fixture has one source artifact"
         );
         let mut stale = sources.pop().expect("full-gate source artifact");
-        let authority_refs = stale.authority_refs();
+        let expected_authorities = stale.expected_authorities.clone();
         stale.artifact.provenance.manifest_sha256 = "8".repeat(64);
         stale.artifact.artifact_sha256.clear();
         let unsealed =
             serde_json::to_string_pretty(&stale.artifact).expect("stale unsealed evidence");
         stale.artifact.artifact_sha256 = sha256_hex(unsealed.as_bytes());
+        let authority_refs = expected_authorities.iter().collect::<Vec<_>>();
         assert!(matches!(
             stale
                 .artifact
