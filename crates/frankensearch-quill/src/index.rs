@@ -7513,7 +7513,15 @@ impl QuillWriterState {
                 }
 
                 // Seal shards that filled their budget, or that still have a
-                // span waiting behind a lease boundary.
+                // span waiting behind a lease boundary. Lease cuts remain
+                // ordered because a later span cannot be consumed until its
+                // predecessor is installed. Budget cuts are independent, so
+                // build every crossing shard together instead of serializing
+                // several full accumulated-segment encodes on this one batch.
+                let mut budget_flushes = Vec::new();
+                budget_flushes
+                    .try_reserve_exact(allocations.len())
+                    .map_err(|_| invalid_state("could not reserve budget flush set"))?;
                 for (shard, _, spans) in &allocations {
                     let Some(span) = spans.get(round) else {
                         continue;
@@ -7525,18 +7533,30 @@ impl QuillWriterState {
                     if !boundary_pending && !budget_reached {
                         continue;
                     }
-                    let trigger = if boundary_pending {
-                        LifecycleTrigger::LeaseBoundary
+                    if boundary_pending {
+                        self.flush_shard(cx, *shard, LifecycleTrigger::LeaseBoundary)
+                            .await?;
+                        if allow_automatic_publication {
+                            self.publish_bulk_cadence_if_due(cx).await?;
+                        }
                     } else {
-                        LifecycleTrigger::ArenaBudget
-                    };
-                    self.flush_shard(cx, *shard, trigger).await?;
-                    if !boundary_pending {
-                        self.shards[*shard].current_lease_base = Some(span.lease_base);
+                        budget_flushes.push((*shard, span.lease_base));
                     }
-                    if allow_automatic_publication {
-                        self.publish_bulk_cadence_if_due(cx).await?;
-                    }
+                }
+                let mut budget_shards = Vec::new();
+                budget_shards
+                    .try_reserve_exact(budget_flushes.len())
+                    .map_err(|_| invalid_state("could not reserve parallel budget flush plan"))?;
+                budget_shards.extend(budget_flushes.iter().map(|(shard, _)| *shard));
+                self.flush_selected_shards(
+                    cx,
+                    &budget_shards,
+                    LifecycleTrigger::ArenaBudget,
+                    allow_automatic_publication,
+                )
+                .await?;
+                for (shard, lease_base) in budget_flushes {
+                    self.shards[shard].current_lease_base = Some(lease_base);
                 }
             }
         }
@@ -8227,16 +8247,39 @@ impl QuillWriterState {
             .enumerate()
             .filter_map(|(shard, state)| (state.accumulator.document_count() != 0).then_some(shard))
             .collect::<Vec<_>>();
-        if nonempty.len() < 2 || rayon::current_num_threads() < 2 {
-            for shard in nonempty {
+        self.flush_selected_shards(cx, &nonempty, trigger, false)
+            .await
+    }
+
+    async fn flush_selected_shards(
+        &mut self,
+        cx: &Cx,
+        shards: &[usize],
+        trigger: LifecycleTrigger,
+        allow_automatic_publication: bool,
+    ) -> Result<(), QuillIndexError> {
+        // Bulk cadence is part of the segment-identity contract: a cadence
+        // publication advances the authority generation used by the next
+        // segment ID. Keep that mode on the original ordered seal/publish
+        // sequence. Ordinary ingest has no publication between these installs,
+        // so its independent encodes may be built together without changing
+        // their identities or seal sequence.
+        if shards.len() < 2
+            || rayon::current_num_threads() < 2
+            || (allow_automatic_publication && self.config.bulk_load_mode)
+        {
+            for &shard in shards {
                 self.flush_shard(cx, shard, trigger).await?;
+                if allow_automatic_publication {
+                    self.publish_bulk_cadence_if_due(cx).await?;
+                }
             }
             return Ok(());
         }
 
         check_cancel(cx, "parallel flush")?;
         let built = {
-            let plans = self.plan_parallel_shard_flushes(&nonempty)?;
+            let plans = self.plan_parallel_shard_flushes(shards)?;
             plans
                 .par_iter()
                 .map(Self::build_planned_shard_flush)
@@ -8271,6 +8314,9 @@ impl QuillWriterState {
             }
             .instrument(instrumented)
             .await?;
+            if allow_automatic_publication {
+                self.publish_bulk_cadence_if_due(cx).await?;
+            }
         }
         Ok(())
     }
@@ -28970,6 +29016,102 @@ mod tests {
         assert_eq!(
             ingest_span_field(&captured, "parallel_unidentified_shards"),
             "0",
+        );
+    }
+
+    #[test]
+    fn shipping_fanout_builds_simultaneous_budget_seals_in_parallel() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-thread budget-seal pool");
+        let captured = pool.install(|| {
+            capture_ingest_spans(|| {
+                run_with_cx(|cx| async move {
+                    let mut index = QuillIndex::in_memory(QuillConfig {
+                        max_ingest_shards: 4,
+                        max_visibility_lag_ms: 60_000,
+                        scribe_shard_budget_bytes: 512 * 1024 * 1024,
+                        ..QuillConfig::default()
+                    })
+                    .expect("budget-seal index");
+                    let first = (0..256)
+                        .map(|ordinal| {
+                            IndexableDocument::new(
+                                format!("budget-seal-first-{ordinal:05}"),
+                                "alpha beta gamma delta",
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    index
+                        .index_documents(&cx, &first)
+                        .await
+                        .expect("populate every production ingest shard");
+
+                    let writer = index.writer_mut();
+                    let populated_shards = writer
+                        .shards
+                        .iter()
+                        .filter(|shard| shard.accumulator.document_count() != 0)
+                        .count();
+                    assert_eq!(populated_shards, 4);
+                    let current_maximum = writer
+                        .shards
+                        .iter()
+                        .map(|shard| shard.accumulator.bytes_used())
+                        .max()
+                        .expect("writer has ingest shards");
+                    writer.reader.config.scribe_shard_budget_bytes = current_maximum + 1;
+
+                    let second = (0..1_024)
+                        .map(|ordinal| {
+                            IndexableDocument::new(
+                                format!("budget-seal-second-{ordinal:05}"),
+                                "budget seal ".repeat(1_000),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    index
+                        .index_documents(&cx, &second)
+                        .await
+                        .expect("cross every shard budget through the shipping driver");
+
+                    let committed = index.commit(&cx).await.expect("publish budget-seal index");
+                    assert_eq!(committed.doc_count(), 1_280);
+                    assert_eq!(committed.segments().len(), 4);
+                    let seal_sequences = committed
+                        .loaded_manifest()
+                        .manifest
+                        .segments
+                        .iter()
+                        .map(|segment| segment.seal_seq)
+                        .collect::<Vec<_>>();
+                    assert_eq!(seal_sequences, vec![1, 2, 3, 4]);
+                    assert_pairwise_disjoint_manifest(
+                        &committed.loaded_manifest().manifest.segments,
+                    );
+                    drop(committed);
+                    assert_eq!(
+                        index
+                            .search_paginated(&cx, "budget", 1_024, 0, true)
+                            .expect("search committed budget-seal index")
+                            .total_count,
+                        Some(1_024),
+                    );
+                });
+            })
+        });
+
+        let parallel_budget_seals = captured
+            .lines()
+            .filter(|line| {
+                line.contains("action=\"install_parallel_build\"")
+                    && line.contains("trigger=\"arena_budget\"")
+            })
+            .count();
+        assert_eq!(
+            parallel_budget_seals, 4,
+            "every simultaneously crossing shard must use the parallel build path:\n{captured}",
         );
     }
 
