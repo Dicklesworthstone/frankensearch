@@ -4210,20 +4210,6 @@ mod tests {
         cell
     }
 
-    fn seal_unbound(
-        artifact: &mut PerfEvidenceArtifact,
-        external_qg1_authorities: &[&Qg1ExpectedAuthority],
-    ) -> Vec<u8> {
-        artifact.artifact_sha256.clear();
-        let unsealed = serde_json::to_string_pretty(artifact).expect("unsealed evidence JSON");
-        artifact.artifact_sha256 = sha256_hex(unsealed.as_bytes());
-        let bytes = serde_json::to_vec_pretty(artifact).expect("sealed evidence JSON");
-        artifact
-            .verify_integrity_against_qg1_authorities(external_qg1_authorities)
-            .expect("unbound evidence seal");
-        bytes
-    }
-
     fn shard(
         ordinals: &[usize],
         run_id: &str,
@@ -4383,11 +4369,22 @@ mod tests {
             artifact.force_no_claim(partial_no_claim_code, message);
         }
         let authority_refs = expected_authorities.iter().collect::<Vec<_>>();
-        let prebinding_bytes = seal_unbound(&mut artifact, &authority_refs);
-        let threshold_bytes = threshold_artifact_for(&artifact)
-            .to_json_pretty()
-            .expect("canonical threshold artifact")
-            .into_bytes();
+        let prebinding_bytes = artifact
+            .reconstructed_prebinding_bytes()
+            .expect("reconstruct canonical authority-bound fixture prebinding bytes");
+        artifact = PerfEvidenceArtifact::from_verified_slice_against_qg1_authorities(
+            &prebinding_bytes,
+            &authority_refs,
+        )
+        .expect("reload exact authority-bound fixture prebinding bytes");
+        assert_eq!(
+            canonical_evidence_bytes(&artifact)
+                .expect("serialize reloaded canonical fixture prebinding evidence"),
+            prebinding_bytes,
+            "fixture runner binding must receive the exact canonical prebinding identity"
+        );
+        let threshold_bytes = canonical_threshold_bytes(&threshold_artifact_for(&artifact))
+            .expect("canonical threshold artifact");
         let runner = crate::machine_class_registry::admitted_test_identity_for_artifacts(
             PerfGate::Qg1.label(),
             &artifact.provenance.build.git_revision,
@@ -4889,6 +4886,49 @@ mod tests {
                 .map(|failed| (failed, &[] as &[&Qg1ExpectedAuthority])),
         );
         PerfEvidenceAssemblyArtifact::assemble_against_qg1_authorities(attempts)
+    }
+
+    #[test]
+    fn fixture_shard_reloads_canonical_authority_prebinding_before_runner_binding() {
+        let ordinal = runnable_ordinals()
+            .into_iter()
+            .next()
+            .expect("test plan has a runnable QG-1 cell");
+        let mut fixtures = shard(
+            &[ordinal],
+            "fixture-prebinding-exact",
+            "fixture-prebinding-exact-runner",
+            None,
+            TestIdentity::PRIMARY,
+        );
+        assert_eq!(fixtures.len(), 1, "one cell produces one fixture shard");
+        let fixture = fixtures.pop().expect("one fixture shard");
+        let authority_refs = fixture.authority_refs();
+        let prebinding_bytes = fixture
+            .artifact
+            .reconstructed_prebinding_bytes()
+            .expect("reconstruct fixture prebinding identity");
+        let prebinding = PerfEvidenceArtifact::from_verified_slice_against_qg1_authorities(
+            &prebinding_bytes,
+            &authority_refs,
+        )
+        .expect("external QG-1 authority authenticates exact fixture prebinding bytes");
+        assert_eq!(
+            canonical_evidence_bytes(&prebinding).expect("canonical fixture prebinding bytes"),
+            prebinding_bytes,
+            "fixture prebinding identity must survive canonical reconstruction and authority-aware reload"
+        );
+        assert_ne!(
+            canonical_evidence_bytes(&fixture.artifact).expect("canonical bound fixture bytes"),
+            prebinding_bytes,
+            "fixture runner binding must not be mistaken for the prebinding identity"
+        );
+        let directory = completed_test_attempt_directory(&fixture.artifact, &authority_refs);
+        VerifiedLocalPerfAttemptBundle::load_verified_against_qg1_authorities(
+            directory.path(),
+            &authority_refs,
+        )
+        .expect("production attempt reload preserves the authority-bound prebinding identity");
     }
 
     #[test]
