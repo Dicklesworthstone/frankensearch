@@ -2033,10 +2033,13 @@ fn parent_main(mut config: Config) -> Result<(), DynError> {
         "report_validated",
         &format!(
             "\"correctness_passed\":{},\"measurement_admissible\":{},\
-             \"performance_claim_status\":\"{}\"",
+             \"performance_claim_status\":\"{}\",\"admission_contract\":{},\
+             \"admission_contract_sha256\":{}",
             report.validation.correctness_passed,
             report.validation.measurement_admissible,
-            report.validation.performance_claim_status.label()
+            report.validation.performance_claim_status.label(),
+            serde_json::to_string(ADMISSION_CONTRACT_RELATIVE_PATH)?,
+            serde_json::to_string(&admission_contract_sha256())?
         ),
     );
     if !report.validation.correctness_passed {
