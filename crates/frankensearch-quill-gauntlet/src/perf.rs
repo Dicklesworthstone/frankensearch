@@ -8390,6 +8390,23 @@ mod tests {
             .collect()
     }
 
+    fn qg1_bind_tantivy_candidate_identities(
+        samples: &mut [PerfRawSample],
+        control_engine_id: &str,
+        control_engine_config_sha256: &str,
+        treatment_engine_id: &str,
+        treatment_engine_config_sha256: &str,
+    ) {
+        for sample in samples {
+            let (engine_id, config_sha256) = match sample.arm {
+                PerfSampleArm::Control => (control_engine_id, control_engine_config_sha256),
+                PerfSampleArm::Treatment => (treatment_engine_id, treatment_engine_config_sha256),
+            };
+            sample.tantivy_config_sha256 =
+                (engine_id == QG1_TANTIVY_ENGINE_ID).then(|| config_sha256.to_owned());
+        }
+    }
+
     fn qg1_duration_stream(
         scope: &PerfOperationScope,
         provenance: &PerfSampleProvenance,
@@ -8502,6 +8519,8 @@ mod tests {
         sample_id_base: u64,
     ) -> Qg1TantivyIncumbentPilot {
         let provenance = provenance(run_id);
+        let candidate_config_sha256 = candidate.config_sha256.clone();
+        let shipping_auto_config_sha256 = shipping_auto.config_sha256.clone();
         let control_durations = [control_duration; PERF_MIN_RUNS];
         let treatment_durations = [treatment_duration; PERF_MIN_RUNS];
         // Each candidate is its own producer invocation, so each pilot seals a
@@ -8518,7 +8537,7 @@ mod tests {
                 (QG1_STREAM_ROLE_TANTIVY_PILOT_NULL, sample_id_base + 10_000),
             ],
         );
-        let effect = qg1_duration_stream(
+        let mut effect = qg1_duration_stream(
             scope,
             &provenance,
             &control_durations,
@@ -8532,7 +8551,14 @@ mod tests {
             QG1_TANTIVY_ENGINE_ID,
             QG1_STREAM_ROLE_TANTIVY_PILOT_EFFECT,
         );
-        let null = qg1_duration_stream(
+        qg1_bind_tantivy_candidate_identities(
+            &mut effect,
+            QG1_TANTIVY_ENGINE_ID,
+            &shipping_auto_config_sha256,
+            QG1_TANTIVY_ENGINE_ID,
+            &candidate_config_sha256,
+        );
+        let mut null = qg1_duration_stream(
             scope,
             &provenance,
             &control_durations,
@@ -8545,6 +8571,13 @@ mod tests {
             QG1_TANTIVY_ENGINE_ID,
             QG1_TANTIVY_ENGINE_ID,
             QG1_STREAM_ROLE_TANTIVY_PILOT_NULL,
+        );
+        qg1_bind_tantivy_candidate_identities(
+            &mut null,
+            QG1_TANTIVY_ENGINE_ID,
+            &candidate_config_sha256,
+            QG1_TANTIVY_ENGINE_ID,
+            &candidate_config_sha256,
         );
         let mut estimator_config = estimator_config();
         estimator_config.qg1_lifecycle_authority = Some(authority.clone());
@@ -8566,7 +8599,7 @@ mod tests {
             candidate,
             observed_writer_threads,
             "9".repeat(64),
-            shipping_auto.config_sha256.clone(),
+            shipping_auto_config_sha256,
             experiment,
             qg1_observation_ids(&effect_observation_label, &effect),
             qg1_observation_ids(&null_observation_label, &null),
@@ -8630,7 +8663,7 @@ mod tests {
             Qg1TantivyDecisionStreamKind::TantivyNull => 200_000,
             Qg1TantivyDecisionStreamKind::QuillNull => 300_000,
         };
-        let effect = qg1_duration_stream(
+        let mut effect = qg1_duration_stream(
             &scope,
             &provenance,
             &durations,
@@ -8651,6 +8684,13 @@ mod tests {
                 Qg1TantivyDecisionStreamKind::TantivyNull => QG1_STREAM_ROLE_TANTIVY_NULL,
                 Qg1TantivyDecisionStreamKind::QuillNull => QG1_STREAM_ROLE_QUILL_NULL,
             },
+        );
+        qg1_bind_tantivy_candidate_identities(
+            &mut effect,
+            control_engine_id,
+            control_engine_config_sha256,
+            treatment_engine_id,
+            treatment_engine_config_sha256,
         );
         let observation_ids = qg1_observation_ids(kind.stable_id(), &effect);
         Qg1TantivyBoundStream::from_raw_samples(
@@ -8901,28 +8941,36 @@ mod tests {
         );
 
         let assert_rejected = |effect: Vec<PerfRawSample>, label: &str| {
+            let rejection = estimate_paired_experiment_against_qg1_authority(
+                &effect,
+                &null,
+                &config,
+                Some(&expected_authority),
+            );
             assert!(
-                estimate_paired_experiment_against_qg1_authority(
-                    &effect,
-                    &null,
-                    &config,
-                    Some(&expected_authority),
-                )
-                .is_err(),
-                "the live estimator accepted hostile QG-1 lifecycle mutation: {label}"
+                matches!(
+                    &rejection,
+                    Err(PairedEstimatorError::InvalidProvenance { .. })
+                ),
+                "the live estimator accepted or misclassified hostile QG-1 lifecycle mutation \
+                 {label}: {rejection:?}"
             );
         };
         let assert_streams_rejected =
             |effect: Vec<PerfRawSample>, null: Vec<PerfRawSample>, label: &str| {
+                let rejection = estimate_paired_experiment_against_qg1_authority(
+                    &effect,
+                    &null,
+                    &config,
+                    Some(&expected_authority),
+                );
                 assert!(
-                    estimate_paired_experiment_against_qg1_authority(
-                        &effect,
-                        &null,
-                        &config,
-                        Some(&expected_authority),
-                    )
-                    .is_err(),
-                    "the live estimator accepted hostile QG-1 stream mutation: {label}"
+                    matches!(
+                        &rejection,
+                        Err(PairedEstimatorError::InvalidProvenance { .. })
+                    ),
+                    "the live estimator accepted or misclassified hostile QG-1 stream mutation \
+                     {label}: {rejection:?}"
                 );
             };
 
@@ -8959,6 +9007,22 @@ mod tests {
             .collect::<Vec<_>>();
         let suffix_block =
             u64::try_from(PERF_MIN_RUNS - 1).expect("QG-1 hostile suffix block fits u64");
+        let target_block_start = cloned_fast_pair
+            .iter()
+            .filter(|sample| sample.block_id == suffix_block)
+            .map(|sample| sample.started_ns)
+            .min()
+            .expect("suffix pair exists");
+        let fast_first_duration = fast_pair
+            .iter()
+            .find(|sample| sample.order == PerfSampleOrder::First)
+            .map(|sample| sample.ended_ns - sample.started_ns)
+            .expect("fast source has a first sample");
+        let fast_second_duration = fast_pair
+            .iter()
+            .find(|sample| sample.order == PerfSampleOrder::Second)
+            .map(|sample| sample.ended_ns - sample.started_ns)
+            .expect("fast source has a second sample");
         for sample in cloned_fast_pair
             .iter_mut()
             .filter(|sample| sample.block_id == suffix_block)
@@ -8967,8 +9031,15 @@ mod tests {
                 .iter()
                 .find(|candidate| candidate.arm == sample.arm)
                 .expect("fast source pair has the matching arm");
-            sample.started_ns = replacement.started_ns;
-            sample.ended_ns = replacement.ended_ns;
+            let (started_ns, elapsed_ns) = match sample.order {
+                PerfSampleOrder::First => (target_block_start, fast_first_duration),
+                PerfSampleOrder::Second => (
+                    target_block_start + fast_first_duration + 1_000,
+                    fast_second_duration,
+                ),
+            };
+            sample.started_ns = started_ns;
+            sample.ended_ns = started_ns + elapsed_ns;
             sample.work_units = replacement.work_units;
             sample.byte_count = replacement.byte_count;
             sample.observed_value = replacement.observed_value;
@@ -8987,6 +9058,7 @@ mod tests {
             forged_binding.raw_block_id = sample.block_id;
             forged_binding.raw_arm = sample.arm;
             forged_binding.raw_order = sample.order;
+            forged_binding.terminal_endpoint_ns = elapsed_ns;
             forged_binding.producer_capability_sha256 = authority
                 .issued_row_for(
                     &forged_binding.stream_role,
@@ -9010,13 +9082,16 @@ mod tests {
             "a fully resealed destination-ID clone must not reach any authority-free public estimator"
         );
         assert!(
-            estimate_paired_experiment_against_qg1_authority(
+            matches!(
+                estimate_paired_experiment_against_qg1_authority(
                 &cloned_fast_pair,
                 &null,
                 &config,
                 Some(&expected_authority),
-            )
-            .is_err(),
+                ),
+                Err(PairedEstimatorError::InvalidProvenance { reason })
+                    if reason == "QG-1 estimation requires an independently retained expected authority"
+            ),
             "independent authority must reject exact suffix slots copied from fast rows after full resealing"
         );
         // The forged rows stay publicly self-consistent, so the guard is
@@ -10189,6 +10264,11 @@ mod tests {
             reloaded_without_authority.selected_candidate.is_none(),
             "reloaded QG-1 pilots must not select an arm without their retained authority"
         );
+        assert_eq!(
+            reloaded_without_authority.no_decision_reason.as_deref(),
+            Some("candidate pilot lacks valid configuration-bound throughput evidence"),
+            "authority-free replay must stop at the pilot authority boundary"
+        );
         let reloaded_screen = Qg1TantivyIncumbentScreen::screen_against_qg1_authorities(
             &cell,
             screen_plan,
@@ -10201,11 +10281,10 @@ mod tests {
             reloaded_screen.selected_candidate.is_some(),
             "the externally supplied retained authority admits reloaded QG-1 pilots"
         );
-        assert!(
-            reloaded_screen
-                .validate_decision(&cell, &semantic_contract, &decision)
-                .is_err(),
-            "the authority-free decision entry must keep refusing reloaded QG-1 evidence"
+        assert_eq!(
+            reloaded_screen.validate_decision(&cell, &semantic_contract, &decision),
+            Err(Qg1TantivyIncumbentError::ScreenSelectionMismatch),
+            "the authority-free decision entry must reject the reloaded screen at its pilot authority boundary"
         );
         reloaded_screen
             .validate_decision_against_qg1_authorities(
@@ -10242,7 +10321,11 @@ mod tests {
                 rejected.selected_candidate.is_none(),
                 "{label} retained authority must produce NoDecision, never a winner"
             );
-            assert!(rejected.no_decision_reason.is_some());
+            assert_eq!(
+                rejected.no_decision_reason.as_deref(),
+                Some("candidate pilot lacks valid configuration-bound throughput evidence"),
+                "{label} retained authority must fail at the expected pilot authority boundary"
+            );
         }
 
         // Planted negative: policy is still compared exactly. Only the sealed
@@ -10591,35 +10674,50 @@ mod tests {
         for sample in effect_samples.iter_mut().chain(null_samples.iter_mut()) {
             sample.work_units = Some(screen_plan.work_units - 1);
         }
-        // Deliberately degraded fixture: the samples keep their canonical QG-1
-        // scope, which the public estimator now refuses outright, so the
-        // private body builds the pilot the screen must still reject.
-        wrong_work_pilot.experiment = estimate_paired_experiment_inner(
-            &wrong_work_pilot.experiment.effect_samples,
-            &wrong_work_pilot.experiment.null_samples,
-            &estimator_config(),
-        )
-        .expect("wrong denominator remains generically estimable");
-        wrong_work_pilot.stream_receipt_sha256 = wrong_work_pilot
-            .recomputed_stream_receipt_sha256()
-            .expect("wrong-work pilot receipt");
-        let wrong_work = Qg1TantivyIncumbentScreen::screen(
-            &cell,
-            screen_plan.clone(),
-            &semantic_contract,
-            wrong_work_pilots,
-        )
-        .expect("wrong QG-1 denominator is a fail-closed no-decision receipt");
-        assert!(wrong_work.selected_candidate.is_none());
-
+        let expected_authority = wrong_work_pilot
+            .experiment
+            .config
+            .qg1_expected_authority
+            .as_ref()
+            .expect("live pilot retains its authority")
+            .clone();
+        assert_eq!(
+            estimate_paired_experiment_against_qg1_authority(
+                &wrong_work_pilot.experiment.effect_samples,
+                &wrong_work_pilot.experiment.null_samples,
+                &wrong_work_pilot.experiment.config,
+                Some(&expected_authority),
+            ),
+            Err(PairedEstimatorError::InvalidProvenance {
+                reason: "QG-1 raw denominator differs from its lifecycle-bound prepared input"
+                    .to_owned(),
+            }),
+            "the lifecycle-bound public estimator must reject a mutated QG-1 denominator before a screen can consume it"
+        );
         let mut mixed_estimator_pilots = pilots.clone();
-        let alternate_config = PairedEstimatorConfig::predeclared(0xa11c_e55e);
-        mixed_estimator_pilots[1].experiment = estimate_paired_experiment_inner(
+        let mut alternate_config = PairedEstimatorConfig::predeclared(0xa11c_e55e);
+        alternate_config.qg1_lifecycle_authority = mixed_estimator_pilots[1]
+            .experiment
+            .config
+            .qg1_lifecycle_authority
+            .clone();
+        alternate_config.qg1_expected_authority = mixed_estimator_pilots[1]
+            .experiment
+            .config
+            .qg1_expected_authority
+            .clone();
+        let expected_authority = alternate_config
+            .qg1_expected_authority
+            .as_ref()
+            .expect("alternate live pilot retains its authority")
+            .clone();
+        mixed_estimator_pilots[1].experiment = estimate_paired_experiment_against_qg1_authority(
             &mixed_estimator_pilots[1].experiment.effect_samples,
             &mixed_estimator_pilots[1].experiment.null_samples,
             &alternate_config,
+            Some(&expected_authority),
         )
-        .expect("alternate predeclared estimator remains structurally valid");
+        .expect("alternate predeclared estimator remains lifecycle-authenticated");
         mixed_estimator_pilots[1].stream_receipt_sha256 = mixed_estimator_pilots[1]
             .recomputed_stream_receipt_sha256()
             .expect("alternate-estimator pilot receipt");
@@ -10826,6 +10924,9 @@ mod tests {
             "one-live-invocation",
         );
         infeasible_pilots[0].observed_writer_threads = Some(5);
+        infeasible_pilots[0].stream_receipt_sha256 = infeasible_pilots[0]
+            .recomputed_stream_receipt_sha256()
+            .expect("reseal infeasible-width pilot");
         let screen = Qg1TantivyIncumbentScreen::screen(
             &cell,
             screen_plan,
