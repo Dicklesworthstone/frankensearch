@@ -127,8 +127,7 @@ pub struct WatchBatchOutcome {
 /// deliberately without its `Send` bound.
 ///
 /// `SearchFuture` is the pattern this follows and would be the default choice,
-/// but the live sink's `apply_batch_inner` is declared
-/// `#[allow(clippy::future_not_send)]`: its future is genuinely not `Send`, so
+/// but the live sink's `apply_batch_inner` future is genuinely not `Send`, so
 /// it cannot coerce into a `Send`-bounded box. Dropping the bound is sound
 /// here because an ingest future is always created and driven on one thread —
 /// either the caller's task in [`FsWatcher::process_events_now`] or the local
@@ -510,6 +509,15 @@ impl WatcherStop {
         self.requested.load(Ordering::Acquire)
     }
 
+    /// Acquire the wait lock and publish the test-only park observation while
+    /// that lock is demonstrably held.
+    fn lock_for_park(&self) -> MutexGuard<'_, ()> {
+        let guard = lock_or_recover(&self.wait_lock);
+        #[cfg(test)]
+        self.notify_observer(&self.park_observer);
+        guard
+    }
+
     /// Park for at most `duration`, returning early only for a real stop.
     ///
     /// A single `wait_timeout` is not a wait for `duration` — a condvar may
@@ -528,15 +536,9 @@ impl WatcherStop {
         if self.is_requested() {
             return true;
         }
-        let guard = lock_or_recover(&self.wait_lock);
-        // Announced while the lock is still held: a notifier that then
-        // acquires `wait_lock` can only do so once this thread has released
-        // it into the wait below, which is what makes "parked" observable.
-        #[cfg(test)]
-        self.notify_observer(&self.park_observer);
-        let (_guard, _timed_out) = self
+        let (guard, _timed_out) = self
             .wait_cv
-            .wait_timeout_while(guard, duration, |()| {
+            .wait_timeout_while(self.lock_for_park(), duration, |()| {
                 // Runs on entry and on every wakeup, under `wait_lock`: the
                 // one point at which the waiter has demonstrably processed a
                 // notification and is choosing whether to re-park.
@@ -545,6 +547,7 @@ impl WatcherStop {
                 !self.is_requested()
             })
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(guard);
         self.is_requested()
     }
 }
@@ -571,6 +574,20 @@ fn distinct_roots(roots: &[PathBuf]) -> BTreeSet<&Path> {
 /// resets the counter, so real work always gets its passes.
 const MAX_UNSETTLED_PASSES: u32 = 2;
 
+/// One-shot operator authority over the currently held legacy baseline.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum RebuildAuthorization {
+    #[default]
+    Withheld,
+    Authorized,
+}
+
+impl RebuildAuthorization {
+    const fn is_authorized(self) -> bool {
+        matches!(self, Self::Authorized)
+    }
+}
+
 #[derive(Default)]
 struct ReconciliationState {
     /// Paths believed to be indexed. Bookkeeping for upserts; on its own it is
@@ -591,7 +608,7 @@ struct ReconciliationState {
     /// the inherited legacy names that were held when it was granted. One-shot
     /// and consumed only by a pass that actually adjudicated them; a later
     /// legacy import revokes it rather than broadening its scope.
-    rebuild_authorized: bool,
+    rebuild_authorization: RebuildAuthorization,
     /// Consecutive complete passes that concluded without adjudicating.
     unsettled_passes: u32,
 }
@@ -758,7 +775,7 @@ impl CatchupEvents {
             return Ok(());
         };
         let mut state = lock_or_recover(&commitment.reconciliation);
-        match state.commit_complete_pass(
+        let result = match state.commit_complete_pass(
             &commitment.plan,
             commitment.snapshot,
             commitment.identities,
@@ -783,7 +800,9 @@ impl CatchupEvents {
                 let _ = state.require_for_events(&self.events);
                 Err(error)
             }
-        }
+        };
+        drop(state);
+        result
     }
 }
 
@@ -868,13 +887,13 @@ impl RootIdentity {
     /// Read the identity of an opened root, mirroring the device+inode pair
     /// the publication lease already uses for the same purpose.
     #[cfg(unix)]
-    fn of(metadata: &fs::Metadata) -> Option<Self> {
+    fn of(metadata: &fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt;
 
-        Some(Self {
+        Self {
             device: metadata.dev(),
             inode: metadata.ino(),
-        })
+        }
     }
 
     /// Non-Unix targets expose no stable identity pair here. Returning `None`
@@ -994,7 +1013,7 @@ impl ReconciliationState {
         // An operator grant is for the legacy record they could inspect. A
         // later crash-recovery import changes that record, so retaining the
         // grant would let it authorize names the operator never approved.
-        self.rebuild_authorized = false;
+        self.rebuild_authorization = RebuildAuthorization::Withheld;
         // Union, never replace: each inherited record names files some earlier
         // regime indexed, and dropping one to make room for the next would lose
         // exactly the names that have no other evidence behind them.
@@ -1032,15 +1051,15 @@ impl ReconciliationState {
     /// action taken for one state could silently authorize a different
     /// crash-recovery record that did not exist when the action was taken.
     fn authorize_rebuild(&mut self) {
-        if self.rebuild_authorized
-            || !self
+        if self.rebuild_authorization.is_authorized()
+            || self
                 .authority
                 .legacy()
-                .is_some_and(|legacy| !legacy.is_empty())
+                .is_none_or(FileSnapshot::is_empty)
         {
             return;
         }
-        self.rebuild_authorized = true;
+        self.rebuild_authorization = RebuildAuthorization::Authorized;
     }
 
     /// Decide what a complete scan may conclude, committing nothing.
@@ -1074,7 +1093,8 @@ impl ReconciliationState {
         }
         let identities = completeness.root_identities();
         let adjudicate = |baseline: &FileSnapshot, legacy: Option<&FileSnapshot>| {
-            let adjudicates_legacy = self.rebuild_authorized && legacy.is_some();
+            let adjudicates_legacy =
+                self.rebuild_authorization.is_authorized() && legacy.is_some();
             let mut deletion_baseline = baseline.clone();
             if let Some(legacy) = legacy.filter(|_| adjudicates_legacy) {
                 deletion_baseline.extend(legacy.iter().map(|(path, at)| (path.clone(), *at)));
@@ -1145,7 +1165,7 @@ impl ReconciliationState {
                 let legacy = if plan.adjudicates_legacy {
                     // Spent: the names were folded into this pass's baseline
                     // and every survivor of them has just been re-observed.
-                    self.rebuild_authorized = false;
+                    self.rebuild_authorization = RebuildAuthorization::Withheld;
                     None
                 } else {
                     retained
@@ -1280,7 +1300,9 @@ impl ReconciliationState {
     }
 }
 
+#[derive(Default)]
 enum WatcherLifecycle {
+    #[default]
     Stopped,
     Starting {
         generation: u64,
@@ -1296,12 +1318,6 @@ enum WatcherLifecycle {
         generation: u64,
         stop: Arc<WatcherStop>,
     },
-}
-
-impl Default for WatcherLifecycle {
-    fn default() -> Self {
-        Self::Stopped
-    }
 }
 
 #[derive(Default)]
@@ -1822,11 +1838,12 @@ impl FsWatcher {
     /// # Errors
     ///
     /// Returns any downstream ingest error.
-    pub async fn process_events_now(
-        &self,
-        cx: &Cx,
-        events: &[WatchEvent],
-    ) -> SearchResult<WatchBatchOutcome> {
+    pub fn process_events_now<'a>(
+        &'a self,
+        cx: &'a Cx,
+        events: &'a [WatchEvent],
+    ) -> WatchIngestFuture<'a, WatchBatchOutcome> {
+        Box::pin(async move {
         for event in events {
             self.stats.mark_event(event.observed_at_ms);
         }
@@ -1896,7 +1913,8 @@ impl FsWatcher {
         let outcome = prepared.outcome(reindexed);
         self.stats.add_reindexed(outcome.reindexed);
         self.stats.add_skipped(outcome.skipped);
-        Ok(outcome)
+            Ok(outcome)
+        })
     }
 
     /// Collect a filtered file snapshot for crash-recovery comparisons.
@@ -1994,20 +2012,17 @@ impl FsWatcher {
                 completeness.reject_swapped_roots(&authority.root_identities);
             }
             if completeness.is_complete() && completeness.identity_is_trustworthy() {
-                let plan = match state.plan_complete_pass(&self.roots, &completeness, token)? {
-                    Some(plan) => plan,
-                    None => {
-                        state.require_full_scan()?;
-                        return Ok(CatchupEvents {
-                            events: Self::diff_snapshots(
-                                &FileSnapshot::new(),
-                                &current,
-                                now_millis(),
-                                &completeness,
-                            ),
-                            commitment: None,
-                        });
-                    }
+                let Some(plan) = state.plan_complete_pass(&self.roots, &completeness, token)? else {
+                    state.require_full_scan()?;
+                    return Ok(CatchupEvents {
+                        events: Self::diff_snapshots(
+                            &FileSnapshot::new(),
+                            &current,
+                            now_millis(),
+                            &completeness,
+                        ),
+                        commitment: None,
+                    });
                 };
                 let mut baseline = plan.deletion_baseline.clone().unwrap_or_default();
                 if plan.adjudicates() {
@@ -2021,6 +2036,7 @@ impl FsWatcher {
                         baseline.entry(path.clone()).or_insert(0);
                     }
                 }
+                drop(state);
                 // The returned events are not yet applied. Deferring this
                 // commit is what keeps a stale delete owed if a caller drops
                 // the batch or its sink fails partway through it.
@@ -2037,6 +2053,7 @@ impl FsWatcher {
                 // Short or unidentifiable: report what was seen, adjudicate
                 // nothing, and leave a complete pass owed.
                 state.require_full_scan()?;
+                drop(state);
                 (FileSnapshot::new(), None)
             }
         };
@@ -2114,7 +2131,7 @@ impl Drop for FsWatcher {
         match &mut control.lifecycle {
             WatcherLifecycle::Stopped => {}
             WatcherLifecycle::Starting { stop, .. } | WatcherLifecycle::Stopping { stop, .. } => {
-                stop.request()
+                stop.request();
             }
             WatcherLifecycle::Running {
                 stop, ingest_task, ..
@@ -2278,9 +2295,11 @@ fn run_producer_supervisor(context: &ProducerContext) -> SearchResult<()> {
                 // the backoff or constructing a replacement watcher, so the
                 // ingest task cannot resume ordinary event processing without
                 // first reconciling the filesystem-authoritative snapshot.
-                if let Err(reconciliation_error) =
-                    lock_or_recover(&context.reconciliation).require_full_scan()
-                {
+                let debt_result = {
+                    let mut reconciliation_state = lock_or_recover(&context.reconciliation);
+                    reconciliation_state.require_full_scan()
+                };
+                if let Err(reconciliation_error) = debt_result {
                     warn!(
                         producer_error = %error,
                         error = %reconciliation_error,
@@ -2658,19 +2677,20 @@ impl PreparedWatchBatch {
     }
 }
 
-async fn run_ingest_loop(
-    cx: &Cx,
-    roots: &[PathBuf],
-    discovery: &DiscoveryConfig,
-    ingest: &dyn WatchIngestPipeline,
-    ready_batches: &ReadyBatchQueue,
-    stop: &WatcherStop,
-    stats: &WatcherStatsInner,
-    reconciliation: &ReconciliationTracker,
+fn run_ingest_loop<'a>(
+    cx: &'a Cx,
+    roots: &'a [PathBuf],
+    discovery: &'a DiscoveryConfig,
+    ingest: &'a dyn WatchIngestPipeline,
+    ready_batches: &'a ReadyBatchQueue,
+    stop: &'a WatcherStop,
+    stats: &'a WatcherStatsInner,
+    reconciliation: &'a ReconciliationTracker,
     batch_size: usize,
-    producer_done: &AtomicBool,
-    snapshot_collector: &SnapshotCollector,
-) -> SearchResult<()> {
+    producer_done: &'a AtomicBool,
+    snapshot_collector: &'a SnapshotCollector,
+) -> WatchIngestFuture<'a, ()> {
+    Box::pin(async move {
     const IDLE_POLL: Duration = Duration::from_millis(10);
     const MAX_RECONCILIATION_ATTEMPTS: usize = 3;
     let mut reconciliation_attempts = 0_usize;
@@ -2825,7 +2845,6 @@ async fn run_ingest_loop(
                         if cx.is_cancel_requested() {
                             return Err(cancelled_ingest_error(cx));
                         }
-                        continue;
                     }
                     Err(error) => {
                         // A real collector failure is different from an
@@ -2841,7 +2860,6 @@ async fn run_ingest_loop(
                             return Err(error);
                         }
                         asupersync::time::sleep(cx.now(), IDLE_POLL).await;
-                        continue;
                     }
                 }
             }
@@ -2858,7 +2876,8 @@ async fn run_ingest_loop(
                 asupersync::time::sleep(cx.now(), IDLE_POLL).await;
             }
         }
-    }
+        }
+    })
 }
 
 /// The cancellation this task must report, carrying the caller's own reason.
@@ -2885,18 +2904,19 @@ fn cancelled_ingest_error(cx: &Cx) -> SearchError {
 /// ahead of it, which keeps the authoritative-rescan ordering the loop above
 /// depends on.
 #[allow(clippy::too_many_arguments)]
-async fn drain_final_batches(
-    cx: &Cx,
-    roots: &[PathBuf],
-    discovery: &DiscoveryConfig,
-    ingest: &dyn WatchIngestPipeline,
-    ready_batches: &ReadyBatchQueue,
-    stop: &WatcherStop,
-    stats: &WatcherStatsInner,
-    reconciliation: &ReconciliationTracker,
-    producer_done: &AtomicBool,
-    snapshot_collector: &SnapshotCollector,
-) -> SearchResult<()> {
+fn drain_final_batches<'a>(
+    cx: &'a Cx,
+    roots: &'a [PathBuf],
+    discovery: &'a DiscoveryConfig,
+    ingest: &'a dyn WatchIngestPipeline,
+    ready_batches: &'a ReadyBatchQueue,
+    stop: &'a WatcherStop,
+    stats: &'a WatcherStatsInner,
+    reconciliation: &'a ReconciliationTracker,
+    producer_done: &'a AtomicBool,
+    snapshot_collector: &'a SnapshotCollector,
+) -> WatchIngestFuture<'a, ()> {
+    Box::pin(async move {
     const PRODUCER_FLUSH_POLLS: usize = 2_000;
     const MAX_FINAL_BATCHES: usize = 4_096;
     const DRAIN_POLL: Duration = Duration::from_millis(1);
@@ -3015,7 +3035,8 @@ async fn drain_final_batches(
     // Bound reached: what is still queued becomes the next pass's work rather
     // than work that silently disappeared.
     fold_queue_into_reconciliation(ready_batches, reconciliation)?;
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Move everything still queued into the pending candidate set, so a pass that
@@ -3070,24 +3091,25 @@ async fn finish_watcher_tasks(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_authoritative_reconciliation(
-    cx: &Cx,
-    roots: &[PathBuf],
-    discovery: &DiscoveryConfig,
-    ingest: &dyn WatchIngestPipeline,
-    reconciliation: &ReconciliationTracker,
-    ready_batches: &ReadyBatchQueue,
-    stats: &WatcherStatsInner,
+fn run_authoritative_reconciliation<'a>(
+    cx: &'a Cx,
+    roots: &'a [PathBuf],
+    discovery: &'a DiscoveryConfig,
+    ingest: &'a dyn WatchIngestPipeline,
+    reconciliation: &'a ReconciliationTracker,
+    ready_batches: &'a ReadyBatchQueue,
+    stats: &'a WatcherStatsInner,
     batch_size: usize,
-    snapshot_collector: &SnapshotCollector,
-    abort: &dyn Fn() -> bool,
-) -> SearchResult<()> {
+    snapshot_collector: &'a SnapshotCollector,
+    abort: &'a dyn Fn() -> bool,
+) -> WatchIngestFuture<'a, ()> {
+    Box::pin(async move {
     let (token, affected_paths, authority_identities) = {
-        let state = lock_or_recover(reconciliation);
+        let reconciliation_state = lock_or_recover(reconciliation);
         (
-            state.planning_token()?,
-            state.affected_paths.clone(),
-            state
+            reconciliation_state.planning_token()?,
+            reconciliation_state.affected_paths.clone(),
+            reconciliation_state
                 .established_authority(roots)
                 .map(|authority| authority.root_identities.clone()),
         )
@@ -3131,9 +3153,9 @@ async fn run_authoritative_reconciliation(
         // and `SubsystemError` is the classification `is_retryable_error`
         // already honours, so the ingest loop's bounded attempts, its
         // interruptible sleep, and its stop/cancel checks all apply unchanged.
-        let mut state = lock_or_recover(reconciliation);
-        state.required = true;
-        drop(state);
+        let mut reconciliation_state = lock_or_recover(reconciliation);
+        reconciliation_state.required = true;
+        drop(reconciliation_state);
         let unresolved = completeness
             .unresolved_paths()
             .map(Path::display)
@@ -3158,17 +3180,15 @@ async fn run_authoritative_reconciliation(
     // operation is applied.
     let scan_identities = completeness.root_identities().clone();
     let plan = {
-        let mut state = lock_or_recover(reconciliation);
-        let plan = match state.plan_complete_pass(roots, &completeness, token)? {
-            Some(plan) => plan,
-            None => {
-                // A mutation succeeded while this walk was in flight. Its owner
-                // retained exact debt; do not attach this older snapshot to the
-                // newer lineage or apply another stale conclusion.
-                state.require_full_scan()?;
-                return Ok(());
-            }
+        let mut reconciliation_state = lock_or_recover(reconciliation);
+        let Some(plan) = reconciliation_state.plan_complete_pass(roots, &completeness, token)? else {
+            // A mutation succeeded while this walk was in flight. Its owner
+            // retained exact debt; do not attach this older snapshot to the
+            // newer lineage or apply another stale conclusion.
+            reconciliation_state.require_full_scan()?;
+            return Ok(());
         };
+        drop(reconciliation_state);
         plan
     };
     match plan.outcome {
@@ -3221,8 +3241,8 @@ async fn run_authoritative_reconciliation(
         // concurrent mutation that advanced it means these events describe a
         // filesystem state that is no longer the one being reconciled.
         let lineage = {
-            let state = lock_or_recover(reconciliation);
-            state.planning_token()
+            let reconciliation_state = lock_or_recover(reconciliation);
+            reconciliation_state.planning_token()
         };
         let lineage_matches = match lineage {
             Ok(current) => current == token,
@@ -3265,20 +3285,20 @@ async fn run_authoritative_reconciliation(
             // again while the reconciliation state is locked, before this
             // applied chunk can advance authority, clear debt, or contribute
             // to the staged publication below.
-            let mut state = lock_or_recover(reconciliation);
+            let mut reconciliation_state = lock_or_recover(reconciliation);
             if cx.is_cancel_requested() || abort() {
-                state.require_for_events(&attempted_prefix)?;
+                reconciliation_state.require_for_events(&attempted_prefix)?;
                 return Err(reconciliation_abort_error(cx));
             }
-            let lineage_matches = match state.planning_token() {
+            let lineage_matches = match reconciliation_state.planning_token() {
                 Ok(current) => current == token,
                 Err(error) => {
-                    let _ = state.require_for_events(&attempted_prefix);
+                    let _ = reconciliation_state.require_for_events(&attempted_prefix);
                     return Err(error);
                 }
             };
             if !lineage_matches {
-                state.require_for_events(&attempted_prefix)?;
+                reconciliation_state.require_for_events(&attempted_prefix)?;
                 return Err(SearchError::SubsystemError {
                     subsystem: "fsfs-watcher",
                     source: Box::new(io::Error::other(
@@ -3286,6 +3306,7 @@ async fn run_authoritative_reconciliation(
                     )),
                 });
             }
+            drop(reconciliation_state);
         }
         let outcome = prepared.outcome(reindexed);
         staged_reindexed = staged_reindexed.saturating_add(outcome.reindexed);
@@ -3294,21 +3315,21 @@ async fn run_authoritative_reconciliation(
 
     // Only a complete pass reaches here; the incomplete one returned above
     // before applying anything.
-    let mut state = lock_or_recover(reconciliation);
+    let mut reconciliation_state = lock_or_recover(reconciliation);
     if cx.is_cancel_requested() || abort() {
         // The last apply may have returned just before this lock. Retain only
         // the attempted prefix so no authority or telemetry is published
         // after cancellation, without inventing debt for an untouched tail.
         if !attempted_prefix.is_empty() {
-            state.require_for_events(&attempted_prefix)?;
+            reconciliation_state.require_for_events(&attempted_prefix)?;
         }
         return Err(reconciliation_abort_error(cx));
     }
-    let lineage_matches = match state.planning_token() {
+    let lineage_matches = match reconciliation_state.planning_token() {
         Ok(current) => current == token,
         Err(error) => {
             if !attempted_prefix.is_empty() {
-                let _ = state.require_for_events(&attempted_prefix);
+                let _ = reconciliation_state.require_for_events(&attempted_prefix);
             }
             return Err(error);
         }
@@ -3318,17 +3339,17 @@ async fn run_authoritative_reconciliation(
         // conclusion describes a state that no longer exists, so nothing is
         // installed and nothing is counted — the next pass does both.
         if !attempted_prefix.is_empty() {
-            state.require_for_events(&attempted_prefix)?;
+            reconciliation_state.require_for_events(&attempted_prefix)?;
         }
         return Ok(());
     }
-    match state.commit_complete_pass(&plan, current, scan_identities) {
+    match reconciliation_state.commit_complete_pass(&plan, current, scan_identities) {
         Ok(true) => {}
         Ok(false) => {
             // Authority was rebound while this pass was applying. Fail closed: the
             // conclusion is dropped and a fresh pass is owed.
             if !attempted_prefix.is_empty() {
-                state.require_for_events(&attempted_prefix)?;
+                reconciliation_state.require_for_events(&attempted_prefix)?;
             }
             return Ok(());
         }
@@ -3336,15 +3357,16 @@ async fn run_authoritative_reconciliation(
             // The typed counter failure leaves the lineage poisoned, but the
             // operations that already crossed the sink boundary remain debt.
             if !attempted_prefix.is_empty() {
-                let _ = state.require_for_events(&attempted_prefix);
+                let _ = reconciliation_state.require_for_events(&attempted_prefix);
             }
             return Err(error);
         }
     }
-    drop(state);
+    drop(reconciliation_state);
     stats.add_reindexed(staged_reindexed);
     stats.add_skipped(staged_skipped);
-    Ok(())
+        Ok(())
+    })
 }
 
 fn reconciliation_abort_error(cx: &Cx) -> SearchError {
@@ -3493,6 +3515,7 @@ fn record_successful_events(
             return Err(error);
         }
     }
+    drop(state);
     Ok(RecordSuccessfulEventsOutcome::Recorded)
 }
 
@@ -3904,6 +3927,9 @@ fn collect_snapshot_for_root(
         }
         Err(error) => return Err(error.into()),
     };
+    #[cfg(unix)]
+    let opened_identity = Some(RootIdentity::of(&root_metadata));
+    #[cfg(not(unix))]
     let opened_identity = RootIdentity::of(&root_metadata);
     completeness.record_root_identity(root, opened_identity);
 
@@ -4072,16 +4098,18 @@ fn collect_snapshot_for_root(
     // Comparing the still-open handle against a fresh lookup catches a root
     // unmounted, renamed away, or replaced at any point during the walk — the
     // cases whose snapshots are indistinguishable from a real empty tree.
-    let reopened_identity = fs::File::open(root)
+    let reopened_metadata = fs::File::open(root)
         .and_then(|handle| handle.metadata())
-        .ok()
-        .as_ref()
-        .and_then(RootIdentity::of);
-    let still_open_identity = opened_root
-        .metadata()
-        .ok()
-        .as_ref()
-        .and_then(RootIdentity::of);
+        .ok();
+    let still_open_metadata = opened_root.metadata().ok();
+    #[cfg(unix)]
+    let reopened_identity = reopened_metadata.as_ref().map(RootIdentity::of);
+    #[cfg(not(unix))]
+    let reopened_identity = reopened_metadata.as_ref().and_then(RootIdentity::of);
+    #[cfg(unix)]
+    let still_open_identity = still_open_metadata.as_ref().map(RootIdentity::of);
+    #[cfg(not(unix))]
+    let still_open_identity = still_open_metadata.as_ref().and_then(RootIdentity::of);
     // A platform with no identity is degraded, not unresolved: the scan is a
     // truthful listing and may upsert, it simply cannot authorize deletes.
     // Recording it unresolved instead would fail every pass on such a target.
@@ -4283,6 +4311,9 @@ mod tests {
             .iter()
             .map(|root| {
                 let metadata = fs::metadata(root).expect("identity fixture root must exist");
+                #[cfg(unix)]
+                let identity = super::RootIdentity::of(&metadata);
+                #[cfg(not(unix))]
                 let identity = super::RootIdentity::of(&metadata)
                     .expect("identity fixture requires a platform with root identity");
                 (root.clone(), identity)
@@ -4302,17 +4333,19 @@ mod tests {
     /// Exercise the public catch-up handoff against a real sink. The caller
     /// still owns acknowledgement, which deliberately makes a dropped or
     /// rejected capability fail closed through `CatchupEvents::Drop`.
-    async fn apply_catchup_events(
-        cx: &Cx,
-        discovery: &DiscoveryConfig,
-        pipeline: &dyn WatchIngestPipeline,
-        catchup: &CatchupEvents,
-    ) -> SearchResult<()> {
-        let prepared = super::prepare_event_batch(discovery, catchup.events());
-        if !prepared.ops.is_empty() {
-            pipeline.apply_batch(cx, &prepared.ops).await?;
-        }
-        Ok(())
+    fn apply_catchup_events<'a>(
+        cx: &'a Cx,
+        discovery: &'a DiscoveryConfig,
+        pipeline: &'a dyn WatchIngestPipeline,
+        catchup: &'a CatchupEvents,
+    ) -> WatchIngestFuture<'a, ()> {
+        Box::pin(async move {
+            let prepared = super::prepare_event_batch(discovery, catchup.events());
+            if !prepared.ops.is_empty() {
+                pipeline.apply_batch(cx, &prepared.ops).await?;
+            }
+            Ok(())
+        })
     }
 
     /// `WatcherStop::request` must publish the flag and the notify inside
@@ -4446,6 +4479,7 @@ mod tests {
                     .wait(announced)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
+            drop(announced);
         }
         {
             // Blocks until the waiter releases `wait_lock` into the condvar.
@@ -4481,6 +4515,7 @@ mod tests {
                 observed.0 >= 2,
                 "the synthetic wakeup was never processed, so nothing was exercised"
             );
+            drop(observed);
         }
 
         stop.request();
@@ -5390,6 +5425,7 @@ mod tests {
         let state = lock_or_recover(&reconciliation);
         assert!(state.required);
         assert!(state.affected_paths.contains(&batch[0].path));
+        drop(state);
     }
 
     #[test]
@@ -5529,7 +5565,7 @@ mod tests {
         // Parked = "the walk reached this fixture's directory". Released only
         // by the releaser below, so the scan cannot finish on its own.
         let parked = Arc::new((Mutex::new((false, false)), Condvar::new()));
-        let _probe = {
+        let probe_guard = {
             let parked = Arc::clone(&parked);
             let owned_root = root.clone();
             // Scoped to this guard: a concurrently running test's observer is
@@ -5550,6 +5586,7 @@ mod tests {
                         .wait(state)
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
+                drop(state);
             }))
         };
 
@@ -5584,6 +5621,7 @@ mod tests {
                                     .wait(state)
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                             }
+                            drop(state);
                         }
                         while !stop.is_requested() {
                             thread::sleep(Duration::from_millis(1));
@@ -5600,7 +5638,7 @@ mod tests {
             }
         });
 
-        drop(_probe);
+        drop(probe_guard);
         assert!(
             stop_result.is_ok(),
             "stop_checked must not surface a failure for an ordinary stop: {stop_result:?}"
@@ -5654,15 +5692,16 @@ mod tests {
                               discovery: &DiscoveryConfig,
                               abort: &dyn Fn() -> bool| {
                             {
-                                let (state, changed) = &*scanning_for_task;
-                                let mut state = lock_or_recover(state);
-                                state.0 = true;
-                                changed.notify_all();
-                                while !state.1 {
-                                    state = changed
-                                        .wait(state)
+                                let (scan_state, scan_changed) = &*scanning_for_task;
+                                let mut scan_status = lock_or_recover(scan_state);
+                                scan_status.0 = true;
+                                scan_changed.notify_all();
+                                while !scan_status.1 {
+                                    scan_status = scan_changed
+                                        .wait(scan_status)
                                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                                 }
+                                drop(scan_status);
                             }
                             let result = collect_snapshot_from_roots(roots, discovery, abort);
                             completed_for_task.fetch_add(1, Ordering::AcqRel);
@@ -5687,19 +5726,20 @@ mod tests {
 
             // Wait for the scan to actually be in flight, then stop.
             {
-                let (state, changed) = &*scanning;
-                let mut state = lock_or_recover(state);
-                while !state.0 {
-                    state = changed
-                        .wait(state)
+                let (scan_state, scan_changed) = &*scanning;
+                let mut scan_status = lock_or_recover(scan_state);
+                while !scan_status.0 {
+                    scan_status = scan_changed
+                        .wait(scan_status)
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
+                drop(scan_status);
             }
             stop.request();
             {
-                let (state, changed) = &*scanning;
-                lock_or_recover(state).1 = true;
-                changed.notify_all();
+                let (scan_state, scan_changed) = &*scanning;
+                lock_or_recover(scan_state).1 = true;
+                scan_changed.notify_all();
             }
 
             task.join(&cx)
@@ -5748,7 +5788,9 @@ mod tests {
             // that a later unrelated crash-recovery snapshot can inherit.
             watcher.authorize_deletion_authority_rebuild();
             assert!(
-                !lock_or_recover(&watcher.reconciliation).rebuild_authorized,
+                !lock_or_recover(&watcher.reconciliation)
+                    .rebuild_authorization
+                    .is_authorized(),
                 "a rebuild request with no held legacy baseline must be rejected immediately"
             );
 
@@ -6006,15 +6048,16 @@ mod tests {
             fs::remove_file(&newly_indexed).expect("remove partially indexed file");
 
             {
-                let state = lock_or_recover(&watcher.reconciliation);
+                let reconciliation_state = lock_or_recover(&watcher.reconciliation);
                 assert!(
-                    state.required,
+                    reconciliation_state.required,
                     "partial application must leave reconciliation owed"
                 );
                 assert!(
-                    state.affected_paths.contains(&newly_indexed),
+                    reconciliation_state.affected_paths.contains(&newly_indexed),
                     "the partially applied path must be retained exactly"
                 );
+                drop(reconciliation_state);
             }
 
             let retry = watcher
@@ -6032,9 +6075,13 @@ mod tests {
             retry
                 .acknowledge_applied()
                 .expect("retry acknowledgement commits the recovered authority");
-            let state = lock_or_recover(&watcher.reconciliation);
-            assert!(!state.required, "acknowledged retry settles the exact debt");
-            assert!(state.affected_paths.is_empty());
+            let reconciliation_state = lock_or_recover(&watcher.reconciliation);
+            assert!(
+                !reconciliation_state.required,
+                "acknowledged retry settles the exact debt"
+            );
+            assert!(reconciliation_state.affected_paths.is_empty());
+            drop(reconciliation_state);
         });
     }
 
@@ -6072,13 +6119,18 @@ mod tests {
             fs::remove_file(&stale).expect("remove stale fixture");
 
             let (reconciliation, replacement_snapshot, replacement_identities) = {
-                let state = lock_or_recover(&watcher.reconciliation);
-                let authority = state.authority.established().expect("initial authority");
-                (
+                let reconciliation_state = lock_or_recover(&watcher.reconciliation);
+                let authority = reconciliation_state
+                    .authority
+                    .established()
+                    .expect("initial authority");
+                let result = (
                     Arc::clone(&watcher.reconciliation),
                     authority.snapshot.clone(),
                     authority.root_identities.clone(),
-                )
+                );
+                drop(reconciliation_state);
+                result
             };
             let observed_root = root.clone();
             let advanced = Arc::new(AtomicBool::new(false));
@@ -6116,11 +6168,12 @@ mod tests {
             apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &stale_plan)
                 .await
                 .expect("the rejected-plan receipt still applies only safe upserts");
-            let state = lock_or_recover(&watcher.reconciliation);
+            let reconciliation_state = lock_or_recover(&watcher.reconciliation);
             assert!(
-                state.required,
+                reconciliation_state.required,
                 "the token mismatch leaves a fresh pass owed"
             );
+            drop(reconciliation_state);
         });
     }
 
@@ -6174,10 +6227,14 @@ mod tests {
                 .acknowledge_applied()
                 .expect_err("an epoch change after apply must reject the old authority commit");
 
-            let state = lock_or_recover(&watcher.reconciliation);
-            assert!(state.required, "the acknowledgement race remains owed");
-            assert!(state.affected_paths.contains(&stale));
-            assert!(state.affected_paths.contains(&late));
+            let reconciliation_state = lock_or_recover(&watcher.reconciliation);
+            assert!(
+                reconciliation_state.required,
+                "the acknowledgement race remains owed"
+            );
+            assert!(reconciliation_state.affected_paths.contains(&stale));
+            assert!(reconciliation_state.affected_paths.contains(&late));
+            drop(reconciliation_state);
         });
     }
 
@@ -6194,14 +6251,14 @@ mod tests {
             .expect("first legacy import has an available epoch");
         state.authorize_rebuild();
         assert!(
-            state.rebuild_authorized,
+            state.rebuild_authorization.is_authorized(),
             "a held legacy record may receive an explicit rebuild grant"
         );
         state
             .inherit_legacy(&later)
             .expect("later legacy import has an available epoch");
         assert!(
-            !state.rebuild_authorized,
+            !state.rebuild_authorization.is_authorized(),
             "a later legacy import must revoke a grant scoped to the earlier record"
         );
     }
@@ -6236,7 +6293,7 @@ mod tests {
                 authority: super::DeletionAuthorityState::UnverifiedLegacy {
                     legacy: legacy.clone(),
                 },
-                rebuild_authorized: false,
+                rebuild_authorization: super::RebuildAuthorization::Withheld,
                 unsettled_passes: 0,
             }));
             let queue: ReadyBatchQueue = Arc::new(Mutex::new(VecDeque::new()));
@@ -6258,7 +6315,7 @@ mod tests {
             .await
             .expect("a probationary pass still succeeds; it simply derives no deletes");
 
-            let state = lock_or_recover(&reconciliation);
+            let reconciliation_state = lock_or_recover(&reconciliation);
             assert!(
                 !pipeline
                     .all_ops()
@@ -6268,28 +6325,29 @@ mod tests {
                 pipeline.all_ops()
             );
             assert_eq!(
-                state.indexed_snapshot, legacy,
+                reconciliation_state.indexed_snapshot, legacy,
                 "the legacy baseline must survive the probationary pass untouched"
             );
             assert_eq!(
-                state.authority.legacy(),
+                reconciliation_state.authority.legacy(),
                 Some(&legacy),
                 "the inherited names must be carried forward, not consumed by a pass that \
                  adjudicated nothing"
             );
             assert!(
                 matches!(
-                    &state.authority,
+                    &reconciliation_state.authority,
                     super::DeletionAuthorityState::Probationary { .. }
                 ),
                 "a first trustworthy observation is a candidate, never authority"
             );
-            assert!(state.required, "a second scan is still owed");
+            assert!(reconciliation_state.required, "a second scan is still owed");
             assert!(
-                state.affected_paths.contains(&stale),
+                reconciliation_state.affected_paths.contains(&stale),
                 "pending delete candidates must not be forgotten by a pass that could not \
                  adjudicate them"
             );
+            drop(reconciliation_state);
         });
     }
 
@@ -6332,7 +6390,7 @@ mod tests {
                     },
                     legacy: None,
                 },
-                rebuild_authorized: false,
+                rebuild_authorization: super::RebuildAuthorization::Withheld,
                 unsettled_passes: 0,
             }));
             let queue: ReadyBatchQueue = Arc::new(Mutex::new(VecDeque::new()));
@@ -6358,19 +6416,20 @@ mod tests {
                 "nothing may be applied, and above all nothing deleted, got {:?}",
                 pipeline.all_ops()
             );
-            let state = lock_or_recover(&reconciliation);
-            assert!(state.required, "a confirming pass is owed");
+            let reconciliation_state = lock_or_recover(&reconciliation);
+            assert!(reconciliation_state.required, "a confirming pass is owed");
             assert!(
-                state
+                reconciliation_state
                     .established_authority(std::slice::from_ref(&root))
                     .is_none(),
                 "a map that cannot cover the configured roots is not deletion authority"
             );
             assert_eq!(
-                state.authority.legacy(),
+                reconciliation_state.authority.legacy(),
                 Some(&held),
                 "the names it held must be retired into the unverified state, not dropped"
             );
+            drop(reconciliation_state);
         });
     }
 
@@ -6409,7 +6468,7 @@ mod tests {
                             },
                             legacy: None,
                         },
-                        rebuild_authorized: false,
+                        rebuild_authorization: super::RebuildAuthorization::Withheld,
                         unsettled_passes: 0,
                     }))
                 };
@@ -6518,12 +6577,16 @@ mod tests {
             );
             let snapshot = stats.snapshot();
             assert_eq!(snapshot.files_reindexed, 0);
-            let state = lock_or_recover(&reconciliation);
-            assert!(state.required, "an incomplete pass stays required");
+            let reconciliation_state = lock_or_recover(&reconciliation);
             assert!(
-                state.authority.established().is_none(),
+                reconciliation_state.required,
+                "an incomplete pass stays required"
+            );
+            assert!(
+                reconciliation_state.authority.established().is_none(),
                 "an incomplete pass must not seed the authoritative baseline"
             );
+            drop(reconciliation_state);
         });
     }
 
@@ -6662,7 +6725,7 @@ mod tests {
             // after the whole scan proved nothing: the scan had already
             // recorded it, so no `NotFound` was ever exercised.
             let moved_aside = temp.path().join("g3f-vanishing-moved.rs");
-            let _probe = {
+            let probe_guard = {
                 let vanishing_for_probe = vanishing.clone();
                 let moved_for_probe = moved_aside.clone();
                 install_scan_observer(Arc::new(move |probe: ScanProbe, path: &Path| {
@@ -6694,15 +6757,16 @@ mod tests {
             )
             .await
             .expect("a file vanishing mid-pass is a real absence, not an unresolved path");
-            drop(_probe);
+            drop(probe_guard);
             assert!(
                 !vanishing.exists(),
                 "the probe must actually have removed the file inside the listing window"
             );
 
-            let state = lock_or_recover(&reconciliation);
-            assert!(!state.required, "the pass settled");
-            assert!(state.authority.established().is_some());
+            let reconciliation_state = lock_or_recover(&reconciliation);
+            assert!(!reconciliation_state.required, "the pass settled");
+            assert!(reconciliation_state.authority.established().is_some());
+            drop(reconciliation_state);
         });
     }
 
@@ -6740,9 +6804,14 @@ mod tests {
                     .expect("fixture epoch is available");
             }
             let (before_snapshot, before_generation) = {
-                let state = lock_or_recover(&reconciliation);
-                let authority = state.authority.established().expect("baseline authority");
-                (authority.snapshot.clone(), authority.generation)
+                let reconciliation_state = lock_or_recover(&reconciliation);
+                let authority = reconciliation_state
+                    .authority
+                    .established()
+                    .expect("baseline authority");
+                let result = (authority.snapshot.clone(), authority.generation);
+                drop(reconciliation_state);
+                result
             };
             let changed = root.join("changed.rs");
             fs::write(&changed, "fn changed() {}\n").expect("write changed fixture");
@@ -6791,29 +6860,20 @@ mod tests {
             // harmless. The join itself is bounded so a regression reports a
             // test failure instead of wedging the test runtime forever.
             drop(release_guard);
-            let joined =
-                match asupersync::time::timeout(cx.now(), Duration::from_secs(1), task.join(&cx))
-                    .await
-                {
-                    Ok(joined) => joined,
-                    Err(_) => {
-                        task.abort_with_reason(CancelReason::user(
-                            "parked reconciliation test cleanup timed out",
-                        ));
-                        let _ = asupersync::time::timeout(
-                            cx.now(),
-                            Duration::from_secs(1),
-                            task.join(&cx),
-                        )
-                        .await;
-                        let join_timed_out = true;
-                        assert!(
-                            !join_timed_out,
-                            "parked reconciliation did not finish within the bounded cleanup window"
-                        );
-                        return;
-                    }
-                };
+            let Ok(joined) =
+                asupersync::time::timeout(cx.now(), Duration::from_secs(1), task.join(&cx)).await
+            else {
+                task.abort_with_reason(CancelReason::user(
+                    "parked reconciliation test cleanup timed out",
+                ));
+                let _ = asupersync::time::timeout(
+                    cx.now(),
+                    Duration::from_secs(1),
+                    task.join(&cx),
+                )
+                .await;
+                panic!("parked reconciliation did not finish within the bounded cleanup window");
+            };
             assert!(
                 reached_apply,
                 "the reconciliation never reached the parked apply boundary"
@@ -6830,19 +6890,22 @@ mod tests {
                 1,
                 "the parked sink must really have crossed its apply boundary"
             );
-            let state = lock_or_recover(&reconciliation);
-            let authority = state.authority.established().expect("retained authority");
+            let reconciliation_state = lock_or_recover(&reconciliation);
+            let authority = reconciliation_state
+                .authority
+                .established()
+                .expect("retained authority");
             assert_eq!(authority.snapshot, before_snapshot);
             assert_eq!(authority.generation, before_generation);
             assert!(
-                state.required,
+                reconciliation_state.required,
                 "post-apply stop must retain reconciliation debt"
             );
             assert!(
-                state.affected_paths.contains(&changed),
+                reconciliation_state.affected_paths.contains(&changed),
                 "the applied chunk must be remembered for the next pass"
             );
-            drop(state);
+            drop(reconciliation_state);
             let snapshot = stats.snapshot();
             assert_eq!(snapshot.files_reindexed, 0);
             assert_eq!(snapshot.files_skipped, 0);
@@ -6916,10 +6979,10 @@ mod tests {
                 "a swapped root must delete nothing, got {:?}",
                 pipeline.all_ops()
             );
-            let state = lock_or_recover(&reconciliation);
-            assert!(state.required);
+            let reconciliation_state = lock_or_recover(&reconciliation);
+            assert!(reconciliation_state.required);
             assert!(
-                state
+                reconciliation_state
                     .authority
                     .established()
                     .expect("baseline from the first pass")
@@ -6927,6 +6990,7 @@ mod tests {
                     .contains_key(&indexed),
                 "the authoritative baseline must survive the swap"
             );
+            drop(reconciliation_state);
         });
     }
 
@@ -7006,16 +7070,17 @@ mod tests {
                     .any(|op| matches!(op, WatchIngestOp::Delete { .. })),
                 "a scan that cannot identify its roots must never delete"
             );
-            let state = lock_or_recover(&reconciliation);
+            let reconciliation_state = lock_or_recover(&reconciliation);
             assert!(
-                !state.required,
+                !reconciliation_state.required,
                 "a degraded pass must not re-arm itself; re-arming is the rescan hot loop"
             );
             assert!(
-                state.authority.established().is_none(),
+                reconciliation_state.authority.established().is_none(),
                 "a degraded scan must never become deletion authority"
             );
-            assert!(state.indexed_snapshot.contains_key(&present));
+            assert!(reconciliation_state.indexed_snapshot.contains_key(&present));
+            drop(reconciliation_state);
         });
     }
 
@@ -7178,6 +7243,7 @@ mod tests {
                     !state.required,
                     "the bounded changing-observation hold must stop self-rearming"
                 );
+                drop(state);
             }
 
             let outcome = watcher
@@ -7193,6 +7259,7 @@ mod tests {
                     state.authority.established().is_none(),
                     "rearming confirmation must not promote deletion authority"
                 );
+                drop(state);
             }
 
             // The replacement root did not move after its candidate scan, so
@@ -7218,6 +7285,7 @@ mod tests {
                 state.authority.legacy().is_some(),
                 "confirmation establishes only current-root authority, not deletion over legacy"
             );
+            drop(state);
         });
     }
 
@@ -7251,6 +7319,7 @@ mod tests {
                     .expect("fixture lineage is available"),
                 "the fixture must start from real, covering authority"
             );
+            drop(state);
         }
         let established = lock_or_recover(&reconciliation)
             .authority
@@ -7298,6 +7367,7 @@ mod tests {
             state.required,
             "the rebind attempt must hand the question to a pass that can adjudicate it"
         );
+        drop(state);
     }
 
     /// A completed bookkeeping walk remains the only path that advances an
@@ -7330,6 +7400,7 @@ mod tests {
                         .expect("fixture lineage is available"),
                     "control fixture must start from established authority"
                 );
+                drop(state);
             }
             let before_generation = lock_or_recover(&watcher.reconciliation)
                 .authority
@@ -7396,7 +7467,9 @@ mod tests {
             let (before_snapshot, before_generation) = {
                 let state = lock_or_recover(&watcher.reconciliation);
                 let authority = state.authority.established().expect("startup authority");
-                (authority.snapshot.clone(), authority.generation)
+                let result = (authority.snapshot.clone(), authority.generation);
+                drop(state);
+                result
             };
             let before_stats = watcher.stats();
             let stop = {
@@ -7408,7 +7481,9 @@ mod tests {
                 let WatcherLifecycle::Running { stop, .. } = &control.lifecycle else {
                     return;
                 };
-                Arc::clone(stop)
+                let stop = Arc::clone(stop);
+                drop(control);
+                stop
             };
             *lock_or_recover(&pipeline.stop_after_success) = Some((Arc::clone(&stop), 1));
 
@@ -7511,7 +7586,9 @@ mod tests {
             let (before_snapshot, before_generation) = {
                 let state = lock_or_recover(&watcher.reconciliation);
                 let authority = state.authority.established().expect("startup authority");
-                (authority.snapshot.clone(), authority.generation)
+                let result = (authority.snapshot.clone(), authority.generation);
+                drop(state);
+                result
             };
             let before_stats = watcher.stats();
             let stop = {
@@ -7523,7 +7600,9 @@ mod tests {
                 let WatcherLifecycle::Running { stop, .. } = &control.lifecycle else {
                     return;
                 };
-                Arc::clone(stop)
+                let stop = Arc::clone(stop);
+                drop(control);
+                stop
             };
 
             // `(parked, released, test_timed_out)`. The third bit lets the
@@ -7546,6 +7625,7 @@ mod tests {
                             .wait(state)
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                     }
+                    drop(state);
                 }))
             };
             let (released_tx, released_rx) = std::sync::mpsc::sync_channel(1);
@@ -7569,6 +7649,7 @@ mod tests {
                     stop_for_releaser.request();
                     state.1 = true;
                     changed.notify_all();
+                    drop(state);
                     let _ = released_tx.send(true);
                 })
             };
@@ -7579,35 +7660,36 @@ mod tests {
                 Some(12),
             )]);
 
-            let mut released = None;
+            let mut release_result = None;
             for _ in 0..1_000 {
                 if let Ok(value) = released_rx.try_recv() {
-                    released = Some(value);
+                    release_result = Some(value);
                     break;
                 }
                 asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
             }
-            if released.is_none() {
+            if release_result.is_none() {
                 {
                     let (state, changed) = &*parked;
                     let mut state = lock_or_recover(state);
                     state.2 = true;
                     state.1 = true;
                     changed.notify_all();
+                    drop(state);
                 }
                 for _ in 0..1_000 {
                     if let Ok(value) = released_rx.try_recv() {
-                        released = Some(value);
+                        release_result = Some(value);
                         break;
                     }
                     asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
                 }
             }
-            if released.is_some() {
+            if release_result.is_some() {
                 releaser.join().expect("bounded releaser thread");
             }
             assert_eq!(
-                released,
+                release_result,
                 Some(true),
                 "post-apply scan never reached the bounded probe handshake"
             );
@@ -7675,7 +7757,9 @@ mod tests {
             let (before_snapshot, before_generation) = {
                 let state = lock_or_recover(&watcher.reconciliation);
                 let authority = state.authority.established().expect("startup authority");
-                (authority.snapshot.clone(), authority.generation)
+                let result = (authority.snapshot.clone(), authority.generation);
+                drop(state);
+                result
             };
             let before_stats = watcher.stats();
             let stop = {
@@ -7687,7 +7771,9 @@ mod tests {
                 let WatcherLifecycle::Running { stop, .. } = &control.lifecycle else {
                     return;
                 };
-                Arc::clone(stop)
+                let stop = Arc::clone(stop);
+                drop(control);
+                stop
             };
             let first_entry = Arc::new(AtomicBool::new(false));
             let entry_after_stop = Arc::new(AtomicBool::new(false));
@@ -7903,16 +7989,24 @@ mod tests {
                 lock_or_recover(&queue).is_empty(),
                 "no later batch may remain stranded after the first bookkeeping abort"
             );
-            let state = lock_or_recover(&reconciliation);
-            assert!(state.required, "the stopped drain must leave a rescan owed");
+            let reconciliation_state = lock_or_recover(&reconciliation);
             assert!(
-                state.affected_paths.contains(&first_event.path),
+                reconciliation_state.required,
+                "the stopped drain must leave a rescan owed"
+            );
+            assert!(
+                reconciliation_state
+                    .affected_paths
+                    .contains(&first_event.path),
                 "the applied lease must become reconciliation debt"
             );
             assert!(
-                state.affected_paths.contains(&later_event.path),
+                reconciliation_state
+                    .affected_paths
+                    .contains(&later_event.path),
                 "every later ready batch must be folded into the same debt"
             );
+            drop(reconciliation_state);
         });
     }
 
@@ -7980,12 +8074,13 @@ mod tests {
                 "nothing may be applied ahead of an owed authoritative pass, got {:?}",
                 pipeline.all_ops()
             );
-            let state = lock_or_recover(&reconciliation);
-            assert!(state.required, "the rescan is still owed");
+            let reconciliation_state = lock_or_recover(&reconciliation);
+            assert!(reconciliation_state.required, "the rescan is still owed");
             assert!(
-                state.affected_paths.contains(&queued),
+                reconciliation_state.affected_paths.contains(&queued),
                 "the queued work must survive as a candidate for that pass"
             );
+            drop(reconciliation_state);
             assert!(lock_or_recover(&queue).is_empty());
         });
     }
@@ -8217,7 +8312,7 @@ mod tests {
                     authority: authority_over(prior_snapshot.clone(), &fixture_roots),
                     legacy: None,
                 },
-                rebuild_authorized: false,
+                rebuild_authorization: super::RebuildAuthorization::Withheld,
                 unsettled_passes: 0,
             }));
             let pipeline = EpochAdvancingPipeline {
@@ -8247,13 +8342,14 @@ mod tests {
             .expect("first rescan applies before the injected epoch advance");
 
             {
-                let state = lock_or_recover(&reconciliation);
-                assert_eq!(state.epoch, 2);
-                assert!(state.required);
-                assert_eq!(state.indexed_snapshot, prior_snapshot);
-                assert!(state.baseline_initialized);
-                assert!(state.affected_paths.contains(&prior_path));
-                assert!(state.affected_paths.contains(&late_path));
+                let reconciliation_state = lock_or_recover(&reconciliation);
+                assert_eq!(reconciliation_state.epoch, 2);
+                assert!(reconciliation_state.required);
+                assert_eq!(reconciliation_state.indexed_snapshot, prior_snapshot);
+                assert!(reconciliation_state.baseline_initialized);
+                assert!(reconciliation_state.affected_paths.contains(&prior_path));
+                assert!(reconciliation_state.affected_paths.contains(&late_path));
+                drop(reconciliation_state);
             }
 
             fs::write(&late_path, "fn late() {}\n").expect("write late fixture");
@@ -8276,12 +8372,13 @@ mod tests {
             .await
             .expect("second rescan advances the stable epoch");
 
-            let state = lock_or_recover(&reconciliation);
+            let reconciliation_state = lock_or_recover(&reconciliation);
             assert_eq!(pipeline.attempts.load(Ordering::Acquire), 2);
-            assert_eq!(state.indexed_snapshot, expected_snapshot);
-            assert!(state.baseline_initialized);
-            assert!(!state.required);
-            assert!(state.affected_paths.is_empty());
+            assert_eq!(reconciliation_state.indexed_snapshot, expected_snapshot);
+            assert!(reconciliation_state.baseline_initialized);
+            assert!(!reconciliation_state.required);
+            assert!(reconciliation_state.affected_paths.is_empty());
+            drop(reconciliation_state);
         });
     }
 
@@ -8352,13 +8449,17 @@ mod tests {
             );
             assert_eq!(stats.snapshot().files_reindexed, 0);
             {
-                let state = lock_or_recover(&reconciliation);
-                assert!(state.required, "the failed pass remains owed");
+                let reconciliation_state = lock_or_recover(&reconciliation);
+                assert!(
+                    reconciliation_state.required,
+                    "the failed pass remains owed"
+                );
                 assert_eq!(
-                    state.affected_paths,
+                    reconciliation_state.affected_paths,
                     BTreeSet::from([first.clone(), second.clone()]),
                     "only the successful and currently attempted chunks are exact debt"
                 );
+                drop(reconciliation_state);
             }
 
             fs::remove_file(&first).expect("remove the already-upserted path before retry");
@@ -8399,9 +8500,10 @@ mod tests {
             assert_eq!(snapshot.files_reindexed, 2);
             assert_eq!(snapshot.files_skipped, 0);
             assert_eq!(snapshot.errors, 0);
-            let state = lock_or_recover(&reconciliation);
-            assert!(!state.required);
-            assert!(state.affected_paths.is_empty());
+            let reconciliation_state = lock_or_recover(&reconciliation);
+            assert!(!reconciliation_state.required);
+            assert!(reconciliation_state.affected_paths.is_empty());
+            drop(reconciliation_state);
         });
     }
 
@@ -8427,14 +8529,16 @@ mod tests {
         );
         assert_eq!(old_epoch_token.epoch, u64::MAX);
 
-        let mut generation_state = ReconciliationState::default();
-        generation_state.authority = super::DeletionAuthorityState::Established {
-            authority: super::DeletionAuthority {
-                snapshot: FileSnapshot::new(),
-                root_identities: BTreeMap::new(),
-                generation: u64::MAX,
+        let mut generation_state = ReconciliationState {
+            authority: super::DeletionAuthorityState::Established {
+                authority: super::DeletionAuthority {
+                    snapshot: FileSnapshot::new(),
+                    root_identities: BTreeMap::new(),
+                    generation: u64::MAX,
+                },
+                legacy: None,
             },
-            legacy: None,
+            ..ReconciliationState::default()
         };
         let old_generation_token = generation_state
             .planning_token()
@@ -8486,6 +8590,7 @@ mod tests {
                     panic!("watcher should be running");
                 };
                 ingest_task.abort();
+                drop(control);
             }
             let _stop_error = watcher
                 .stop_checked(&cx)
@@ -8572,6 +8677,7 @@ mod tests {
 
             let control = lock_or_recover(&watcher.control);
             assert!(matches!(&control.lifecycle, WatcherLifecycle::Stopped));
+            drop(control);
         });
     }
 
@@ -8820,7 +8926,9 @@ mod tests {
                 let WatcherLifecycle::Running { stop, .. } = &control.lifecycle else {
                     panic!("existing root should keep watcher generation running");
                 };
-                Arc::clone(stop)
+                let stop = Arc::clone(stop);
+                drop(control);
+                stop
             };
 
             drop(watcher);
@@ -8851,6 +8959,7 @@ mod tests {
                     WatcherLifecycle::Running { producer, .. } => producer.is_finished(),
                     WatcherLifecycle::Starting { .. } | WatcherLifecycle::Stopping { .. } => false,
                 });
+                drop(control);
             }
 
             // Create the root and start again. Both terminal handles are drained
@@ -8869,6 +8978,7 @@ mod tests {
                     !finished,
                     "watcher should replace finished producer handle on restart"
                 );
+                drop(control);
             }
 
             watcher
@@ -9083,7 +9193,7 @@ mod tests {
         let test_task = scheduler.handle().spawn(async move {
             let cx = Cx::current().expect("runtime task installs a spawn-capable Cx");
             let mut local_task = cx
-                .spawn_local(move |local_cx| test(local_cx))
+                .spawn_local(test)
                 .expect("spawn local watcher test task");
             local_task
                 .join(&cx)
