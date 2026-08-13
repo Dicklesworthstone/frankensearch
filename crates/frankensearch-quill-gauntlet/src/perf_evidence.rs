@@ -7661,6 +7661,17 @@ mod tests {
             .expect("attach the canonical projection");
         let mut dropped = attached;
         dropped.qg1_incumbent_screens.clear();
+        // Attaching deliberately clears the content seal, and dropping the
+        // projection changes the bytes again, so an unsealed object stops at
+        // the hash gate before the fold recomputation can adjudicate it.
+        // Resealing hash-consistently is what makes the assertion below
+        // exercise the coverage/refold rule it names rather than the seal.
+        let dropped: PerfEvidenceArtifact = serde_json::from_str(
+            &dropped
+                .sealed_json()
+                .expect("reseal the dropped projection"),
+        )
+        .expect("the resealed dropped projection re-parses");
         assert!(
             matches!(
                 dropped.verify_integrity_against_qg1_authorities(&[]),
@@ -7753,7 +7764,20 @@ mod tests {
         let paths = artifact
             .write_atomic(directory.path())
             .expect("the authority-free writer still serves non-QG evidence");
+        // `provisional_artifact` binds a runner identity, which intentionally
+        // clears the content seal, while the writer seals a clone. What lands
+        // on disk is therefore the sealed projection of this fixture, not the
+        // unsealed fixture object, so the exactness this test pins is against
+        // that sealed form and the bytes that carry it.
+        let sealed = artifact.sealed_json().expect("canonical sealed bytes");
+        let expected: PerfEvidenceArtifact =
+            serde_json::from_str(&sealed).expect("the canonical sealed bytes re-parse");
         let reloaded = PerfEvidenceArtifact::load_verified(&paths.json).expect("reload");
-        assert_eq!(reloaded, artifact);
+        assert_eq!(reloaded, expected);
+        assert_eq!(
+            std::fs::read_to_string(&paths.json).expect("persisted evidence bytes"),
+            sealed,
+            "the writer persists exactly the canonical sealed bytes"
+        );
     }
 }
