@@ -16800,7 +16800,7 @@ fn render_context_radar_markdown_text(
     preview_format: ContextPreviewFormat,
     no_color: bool,
     width: u16,
-) -> Text {
+) -> Text<'static> {
     let width = width.max(12);
     let markdown_source = if preview_format == ContextPreviewFormat::Html {
         normalize_html_fragment_for_markdown(source)
@@ -22200,7 +22200,7 @@ mod tests {
                 .expect("test seam records the authoritative vector path")
                 .clone();
 
-            let mut reopened = VectorIndex::open_read_only(&vector_path)
+            let reopened = VectorIndex::open_read_only(&vector_path)
                 .expect("reopen authoritative compacted vector artifact");
             assert_eq!(
                 reopened.wal_record_count(),
