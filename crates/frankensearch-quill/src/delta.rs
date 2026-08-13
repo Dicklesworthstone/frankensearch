@@ -848,14 +848,37 @@ impl DeltaSnapshot {
     /// cache materializes the complete retained ID slice in one operation.
     #[must_use]
     pub(crate) fn ordered_terms(&self) -> DeltaOrderedTerms<'_> {
-        let term_ids = self
-            .ordered_term_ids
-            .get_or_init(|| self.segment.terms.sorted_ids().into_boxed_slice());
+        let term_ids = self.cached_ordered_term_ids();
         DeltaOrderedTerms {
             delta: &self.segment,
             term_ids,
             next_term: 0,
         }
+    }
+
+    /// Canonically ordered terms for one field in this immutable generation.
+    ///
+    /// The cached composite order begins with big-endian field bytes, so the
+    /// selected field is one contiguous subslice of the single retained ID
+    /// buffer. Query lowering must pre-admit the first view before calling
+    /// this method.
+    #[must_use]
+    pub(crate) fn ordered_terms_for_field(&self, field_ord: u16) -> DeltaOrderedTerms<'_> {
+        let term_ids = self.cached_ordered_term_ids();
+        let first = term_ids
+            .partition_point(|term_id| self.segment.terms.field_and_term(*term_id).0 < field_ord);
+        let past_last = term_ids
+            .partition_point(|term_id| self.segment.terms.field_and_term(*term_id).0 <= field_ord);
+        DeltaOrderedTerms {
+            delta: &self.segment,
+            term_ids: &term_ids[first..past_last],
+            next_term: 0,
+        }
+    }
+
+    fn cached_ordered_term_ids(&self) -> &[u32] {
+        self.ordered_term_ids
+            .get_or_init(|| self.segment.terms.sorted_ids().into_boxed_slice())
     }
 
     /// Number of physical rows retained by this immutable delta generation.
@@ -1056,6 +1079,12 @@ impl<'a> Iterator for DeltaOrderedTerms<'a> {
             delta: self.delta,
             term_index,
         })
+    }
+}
+
+impl ExactSizeIterator for DeltaOrderedTerms<'_> {
+    fn len(&self) -> usize {
+        self.term_ids.len() - self.next_term
     }
 }
 
@@ -3791,6 +3820,80 @@ mod tests {
             rebound.ordered_term_ids.get().is_none(),
             "rebinding must not copy a predecessor cache into a new owner"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn frozen_snapshot_field_ordered_terms_visit_only_requested_candidates()
+    -> Result<(), DeltaError> {
+        const OUTER_FIELD_TERMS: u32 = 32;
+
+        let mut delta = DeltaSegment::new(TEST_SCHEMA, 0, usize::MAX)?;
+        for docid in 0..OUTER_FIELD_TERMS {
+            let keyword_term = format!("keyword-{docid:02}");
+            let plain_term = format!("plain-{docid:02}");
+            delta.apply_document(
+                docid,
+                DocId::from(format!("outer-{docid}")),
+                &norms(1, 0, 1),
+                &[
+                    DeltaTermPosting {
+                        field_ord: 0,
+                        term: keyword_term.as_bytes(),
+                        frequency: 1,
+                        positions: None,
+                    },
+                    DeltaTermPosting {
+                        field_ord: 2,
+                        term: plain_term.as_bytes(),
+                        frequency: 1,
+                        positions: None,
+                    },
+                ],
+            )?;
+        }
+        let positions = [0];
+        for (offset, term) in [&b"alpha"[..], &b"omega"[..]].into_iter().enumerate() {
+            let docid = OUTER_FIELD_TERMS
+                + u32::try_from(offset).expect("two target terms fit the Delta docid domain");
+            delta.apply_document(
+                docid,
+                DocId::from(format!("target-{offset}")),
+                &norms(0, 1, 0),
+                &[DeltaTermPosting {
+                    field_ord: 1,
+                    term,
+                    frequency: 1,
+                    positions: Some(&positions),
+                }],
+            )?;
+        }
+        let frozen = delta.freeze(7);
+        let global_view = frozen.ordered_terms();
+        let field_view = frozen.ordered_terms_for_field(1);
+        let field_start = usize::try_from(OUTER_FIELD_TERMS).expect("bounded fixture length");
+
+        assert_eq!(global_view.len(), field_start * 2 + 2);
+        assert_eq!(
+            field_view.len(),
+            2,
+            "the view must retain only field-1 candidates"
+        );
+        assert_eq!(
+            field_view.term_ids.as_ptr(),
+            global_view.term_ids[field_start..].as_ptr(),
+            "the field view must be a subslice of the one retained ID backing"
+        );
+        let mut visited = 0;
+        let observed = field_view
+            .inspect(|_| visited += 1)
+            .map(|term| term.term().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            visited, 2,
+            "the field view must not visit surrounding fields"
+        );
+        assert_eq!(observed, [b"alpha".to_vec(), b"omega".to_vec()]);
         Ok(())
     }
 

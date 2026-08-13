@@ -13978,19 +13978,22 @@ fn snapshot_string_range_terms(
             QueryWorkKind::DictionaryBlock,
             delta_ordered_view_blocks(delta.segment().term_count()),
         )?;
-        for (term_index, term) in delta.ordered_terms().enumerate() {
+        let field_terms = delta.ordered_terms_for_field(field_ord);
+        if delta.segment().term_count() != 0 {
+            // A nonempty Delta still needs to surface cancellation after its
+            // cached view was obtained, even when this requested field is empty.
+            checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
+        }
+        for (term_index, term) in field_terms.enumerate() {
             // Ordered-view blocks are paid above. Keep a zero-unit boundary
             // so cancellation during a long range walk is still observed.
-            if term_index % 16 == 0 {
+            if term_index != 0 && term_index % 16 == 0 {
                 checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
             }
             // Both tests are O(1) now that the live count is taken at freeze,
             // so this expansion costs the dictionary blocks it already
             // admits and nothing more.
-            if term.field_ord() == field_ord
-                && term.live_doc_freq() != 0
-                && term_in_string_range(term.term(), &lower, &upper)
-            {
+            if term.live_doc_freq() != 0 && term_in_string_range(term.term(), &lower, &upper) {
                 terms.insert(term.term().to_vec());
             }
         }
@@ -14390,20 +14393,26 @@ fn snapshot_glob_terms(
                 delta_ordered_view_blocks(delta.segment().term_count()),
             )?;
         }
-        for (term_index, term) in delta.ordered_terms().enumerate() {
+        let field_terms = delta.ordered_terms_for_field(field_ord);
+        if delta.segment().term_count() != 0 {
+            if let Some(checkpoint) = checkpoint {
+                // A nonempty Delta still needs to surface cancellation after
+                // its cached view was obtained, even when this field is empty.
+                checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
+            }
+        }
+        for (term_index, term) in field_terms.enumerate() {
             // The blocks are paid for above, so this admits ZERO units: it
             // charges no fuel and moves no counter, and exists only so that a
             // cancellation during a long walk is still surfaced promptly.
-            if let Some(checkpoint) = checkpoint.filter(|_| term_index % 16 == 0) {
+            if let Some(checkpoint) = checkpoint.filter(|_| term_index != 0 && term_index % 16 == 0)
+            {
                 checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
             }
             // The live count is taken at freeze, so this stays O(1) per term
             // even on the `checkpoint == None` path, which has nothing to
             // admit against and previously walked every chain unmetered.
-            if term.field_ord() == field_ord
-                && term.live_doc_freq() != 0
-                && star_glob_matches(pattern, term.term())
-            {
+            if term.live_doc_freq() != 0 && star_glob_matches(pattern, term.term()) {
                 insert_glob_term(&mut terms, field_ord, term.term().to_vec(), expansion_limit)?;
             }
         }
