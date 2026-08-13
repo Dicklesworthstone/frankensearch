@@ -7956,7 +7956,11 @@ mod tests {
                     created = Some((run_log_path, run_log));
                     break;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                // Collision on this PID/nonce pair: fall through to the next
+                // attempt, which mints a fresh nonce. The match is the loop
+                // body's last statement, so this is the same control flow the
+                // explicit `continue` had.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => {
                     panic!("create-new forwarder run-log artifact {run_log_path:?} failed: {error}")
                 }
@@ -8286,7 +8290,10 @@ mod tests {
                     run_directory = Some(run_leaf);
                     break;
                 }
-                Err(error) if error == rustix::io::Errno::EXIST => continue,
+                // Same retry-on-collision fall-through as the run-log artifact
+                // loop above: the create-only `mkdirat` stays the discriminator,
+                // only the redundant `continue` goes.
+                Err(error) if error == rustix::io::Errno::EXIST => {}
                 Err(error) => panic!("create-new retained QG-1 wait directory failed: {error}"),
             }
         }
