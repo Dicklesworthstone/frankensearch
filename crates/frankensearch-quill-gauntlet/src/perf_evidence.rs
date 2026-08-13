@@ -4031,9 +4031,10 @@ pub enum EvidenceArtifactError {
 #[cfg(test)]
 pub mod qg6_test_fixture {
     use super::*;
-    use crate::perf::Qg6SampleBinding;
+    use crate::perf::{PerfSampleOrder, Qg6SampleBinding};
     use crate::qg6_prepared::{
-        Qg6ExperimentIdentity, Qg6FourArmResultReceipts, Qg6RankedHitReceipt, Qg6ResultReceipt,
+        Qg6Comparison, Qg6ExperimentIdentity, Qg6FourArmResultReceipts, Qg6RankedHitReceipt,
+        Qg6ResultReceipt, Qg6SampleOrder, Qg6SearchTimingLeafReceipt, Qg6TimedSample,
         query_manifest_sha256,
     };
 
@@ -4096,6 +4097,29 @@ pub mod qg6_test_fixture {
         identity: &PerfInputIdentity,
         contract: &Qg6SemanticContract,
     ) {
+        let mut timeline_ns = 0_u64;
+        for pair in samples.chunks_exact_mut(2) {
+            assert_eq!(pair[0].block_id, pair[1].block_id, "paired QG-6 fixture");
+            let (left, right) = pair.split_at_mut(1);
+            let (first, second) = if left[0].order == PerfSampleOrder::First {
+                (&mut left[0], &mut right[0])
+            } else {
+                (&mut right[0], &mut left[0])
+            };
+            for sample in [first, second] {
+                let observed_ms = sample.observed_value.expect("QG-6 fixture gauge");
+                let elapsed = std::time::Duration::try_from_secs_f64(observed_ms / 1_000.0)
+                    .expect("finite positive QG-6 fixture latency");
+                let elapsed_ns =
+                    u64::try_from(elapsed.as_nanos()).expect("bounded QG-6 fixture latency");
+                assert!(elapsed_ns > 0, "positive QG-6 fixture latency");
+                sample.started_ns = timeline_ns;
+                sample.ended_ns = timeline_ns + elapsed_ns;
+                sample.observed_value = Some(elapsed_ns as f64 / 1_000_000.0);
+                timeline_ns = sample.ended_ns + 1_000;
+            }
+        }
+        assert!(samples.chunks_exact(2).remainder().is_empty());
         for sample in samples {
             let group_id = sample.group_id.expect("QG-6 fixture group");
             let group_index = usize::try_from(group_id).expect("QG-6 group index");
@@ -4103,10 +4127,56 @@ pub mod qg6_test_fixture {
             let role = qg6_role(effect_stream, sample.arm);
             sample.work_units = Some(1);
             sample.provenance.input_identity = Some(identity.clone());
+            let comparison = if effect_stream {
+                Qg6Comparison::Effect
+            } else {
+                Qg6Comparison::Null
+            };
+            let order = match sample.order {
+                PerfSampleOrder::First => Qg6SampleOrder::First,
+                PerfSampleOrder::Second => Qg6SampleOrder::Second,
+            };
+            let leaf = Qg6SearchTimingLeafReceipt::from_observation(
+                sample.block_id,
+                sample.sample_id,
+                &group.query.query_id,
+                group_index,
+                comparison,
+                role,
+                order,
+                0,
+                sample.started_ns,
+                sample.ended_ns,
+                group.roles.get(role).receipt_sha256.clone(),
+            )
+            .expect("sealed QG-6 timing leaf");
+            let mut timed_sample = Qg6TimedSample {
+                block_id: sample.block_id,
+                sample_id: sample.sample_id,
+                query_id: group.query.query_id.clone(),
+                query_index: group_index,
+                comparison,
+                arm: role,
+                order,
+                started_ns: sample.started_ns,
+                ended_ns: sample.ended_ns,
+                observed_latency_ns: sample.ended_ns - sample.started_ns,
+                subsample_count: 1,
+                result_sha256: qg6_result_sequence_sha256(group.roles.get(role), 1)
+                    .expect("QG-6 sequence digest"),
+                timing_leaves: vec![leaf],
+                timing_leaves_sha256: String::new(),
+            };
+            timed_sample.timing_leaves_sha256 = timed_sample
+                .recomputed_timing_leaves_sha256()
+                .expect("QG-6 timing leaf seal");
+            timed_sample
+                .verify_timing_leaves()
+                .expect("valid QG-6 timing fixture");
             sample.qg6_sample_binding = Some(Qg6SampleBinding {
                 query_id: group.query.query_id.clone(),
-                result_sequence_sha256: qg6_result_sequence_sha256(group.roles.get(role), 1)
-                    .expect("QG-6 sequence digest"),
+                result_sequence_sha256: timed_sample.result_sha256.clone(),
+                timed_sample,
             });
         }
     }
@@ -4282,13 +4352,6 @@ mod tests {
         let effect = gauge_stream(&effect_pairs(12, ratio), 0, 0, None);
         let null = gauge_stream(&quiet_null_pairs(12), 10_000, 0, None);
         estimate_paired_experiment(&effect, &null, &config()).expect("valid experiment")
-    }
-
-    fn valid_treatment_arm_null_experiment(ratio: f64) -> PairedExperimentResult {
-        let effect = gauge_stream(&effect_pairs(12, ratio), 0, 0, None);
-        let null = gauge_stream(&quiet_null_pairs(12), 20_000, 20_000, None);
-        estimate_paired_experiment(&effect, &null, &config())
-            .expect("valid treatment-arm null experiment")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4546,20 +4609,6 @@ mod tests {
         }
     }
 
-    fn bind_experiment_to_spec(
-        mut experiment: PairedExperimentResult,
-        spec: &EvidenceCellSpec,
-    ) -> PairedExperimentResult {
-        let scope = perf_operation_scope(spec.gate, &spec.fixture, &spec.metric);
-        let mut provenance = sample_provenance("run-a");
-        provenance.input_identity = spec.input_identity.clone();
-        experiment.scope = scope.clone();
-        experiment.provenance = provenance.clone();
-        bind_samples_to_spec(&mut experiment.effect_samples, spec);
-        bind_samples_to_spec(&mut experiment.null_samples, spec);
-        experiment
-    }
-
     fn bind_samples_to_spec(samples: &mut [PerfRawSample], spec: &EvidenceCellSpec) {
         let scope = perf_operation_scope(spec.gate, &spec.fixture, &spec.metric);
         let mut provenance = sample_provenance("run-a");
@@ -4579,13 +4628,6 @@ mod tests {
         bind_samples_to_spec(&mut effect, spec);
         bind_samples_to_spec(&mut null, spec);
         estimate_paired_experiment(&effect, &null, &config()).expect("valid non-QG experiment")
-    }
-
-    fn valid_treatment_arm_null_for_spec(
-        spec: &EvidenceCellSpec,
-        ratio: f64,
-    ) -> PairedExperimentResult {
-        bind_experiment_to_spec(valid_treatment_arm_null_experiment(ratio), spec)
     }
 
     fn policy() -> EvidencePolicy {
@@ -4990,7 +5032,7 @@ mod tests {
             sample
                 .qg6_sample_binding
                 .as_mut()
-                .expect("QG-6 compact binding")
+                .expect("QG-6 authenticated binding")
                 .query_id = query_ids[group_index].clone();
         }
     }
@@ -5034,7 +5076,7 @@ mod tests {
                 let binding = sample
                     .qg6_sample_binding
                     .as_mut()
-                    .expect("QG-6 compact binding");
+                    .expect("QG-6 authenticated binding");
                 binding.query_id.clone_from(&group.query.query_id);
                 binding.result_sequence_sha256 =
                     qg6_result_sequence_sha256(group.roles.get(role), work_units)
@@ -5694,13 +5736,13 @@ mod tests {
     #[test]
     fn qg6_rows_without_groups_or_semantic_bindings_fail_closed() {
         let spec = cell_spec(PerfGate::Qg6, EvidenceRole::Required);
-        let effect = gauge_stream(&effect_pairs(12, 1.10), 0, 0, None);
-        let null = gauge_stream(&quiet_null_pairs(12), 10_000, 0, None);
-        let experiment =
-            estimate_paired_experiment(&effect, &null, &config()).expect("QG-6 estimate");
+        let mut effect = gauge_stream(&effect_pairs(12, 1.10), 0, 0, None);
+        let mut null = gauge_stream(&quiet_null_pairs(12), 10_000, 0, None);
+        bind_samples_to_spec(&mut effect, &spec);
+        bind_samples_to_spec(&mut null, &spec);
         assert!(matches!(
-            EvidenceCell::evaluate(spec, experiment, &policy()),
-            Err(EvidenceArtifactError::InconsistentArtifact { .. })
+            estimate_paired_experiment(&effect, &null, &config()),
+            Err(PairedEstimatorError::InvalidProvenance { .. })
         ));
     }
 
@@ -5714,6 +5756,8 @@ mod tests {
             .expect("QG-6 semantic contract");
         let mut effect = qg6_hierarchical_stream_with_ratio(1.02, 0);
         let mut null = qg6_hierarchical_stream_with_ratio(1.0, 10_000);
+        bind_samples_to_spec(&mut effect, &spec);
+        bind_samples_to_spec(&mut null, &spec);
         qg6_test_fixture::attach_stream(&mut effect, true, expected_identity, contract);
         qg6_test_fixture::attach_stream(&mut null, false, expected_identity, contract);
         let experiment =
@@ -6131,7 +6175,7 @@ mod tests {
             let binding = paired.effect_samples[0]
                 .qg6_sample_binding
                 .as_mut()
-                .expect("compact QG-6 binding");
+                .expect("authenticated QG-6 binding");
             match mutation {
                 "query_id" => binding.query_id = "identifier-hostile-binding".to_owned(),
                 "result_sequence_sha256" => {
@@ -6155,15 +6199,63 @@ mod tests {
                     PerfEvidenceArtifact::load_verified(&path),
                     Err(EvidenceArtifactError::InconsistentArtifact { .. })
                 ),
-                "compact binding field {mutation} escaped reload verification"
+                "authenticated binding field {mutation} escaped reload verification"
             );
         }
+    }
+
+    #[test]
+    fn qg6_outer_reseal_rejects_authenticated_timing_leaf_mutation() {
+        let mut artifact = qg6_artifact();
+        unbind_test_artifact(&mut artifact);
+        let EvidenceCellBody::Paired { paired, .. } = &mut artifact.cells[0].body else {
+            unreachable!("QG-6 must be paired");
+        };
+        let leaf = &mut paired.effect_samples[0]
+            .qg6_sample_binding
+            .as_mut()
+            .expect("authenticated QG-6 binding")
+            .timed_sample
+            .timing_leaves[0];
+        leaf.observed_latency_ns = leaf
+            .observed_latency_ns
+            .checked_add(1)
+            .expect("bounded hostile latency");
+
+        let directory = tempfile::tempdir().expect("QG-6 artifact directory");
+        let path = directory.path().join("qg6-timing-leaf-mutation.json");
+        fs::write(
+            &path,
+            artifact
+                .sealed_json()
+                .expect("outer-reseal timing leaf mutation"),
+        )
+        .expect("persist timing leaf mutation");
+        let error = PerfEvidenceArtifact::load_verified(&path)
+            .expect_err("mutated authenticated QG-6 timing leaf must fail closed");
+        assert!(
+            matches!(
+                error,
+                EvidenceArtifactError::Estimator(PairedEstimatorError::InvalidProvenance { .. })
+            ),
+            "unexpected timing-leaf rejection: {error:?}"
+        );
     }
 
     #[test]
     fn qg6_sealed_reload_rejects_one_groups_extra_balanced_pair() {
         let mut artifact = qg6_artifact();
         unbind_test_artifact(&mut artifact);
+        let identity = artifact.cells[0]
+            .spec
+            .input_identity
+            .clone()
+            .expect("QG-6 input identity");
+        let contract = artifact.cells[0]
+            .spec
+            .qg6_semantic_contract
+            .clone()
+            .expect("QG-6 semantic contract");
         let EvidenceCellBody::Paired { paired, .. } = &mut artifact.cells[0].body else {
             unreachable!("QG-6 must be paired");
         };
@@ -6196,6 +6288,7 @@ mod tests {
             sample.started_ns += 1_000_000_000;
             sample.ended_ns += 1_000_000_000;
         }
+        qg6_test_fixture::attach_stream(&mut extra, true, &identity, &contract);
         paired.effect_samples.extend(extra);
         let recomputed = estimate_paired_experiment(
             &paired.effect_samples,
@@ -6469,6 +6562,8 @@ mod tests {
             .collect::<Vec<_>>();
         let mut effect = grouped_gauge_stream(&effect_pairs, 0, Some(true));
         let mut null = grouped_gauge_stream(&null_pairs, 10_000, Some(true));
+        bind_samples_to_spec(&mut effect, &spec);
+        bind_samples_to_spec(&mut null, &spec);
         qg6_test_fixture::attach_stream(&mut effect, true, identity, contract);
         qg6_test_fixture::attach_stream(&mut null, false, identity, contract);
 

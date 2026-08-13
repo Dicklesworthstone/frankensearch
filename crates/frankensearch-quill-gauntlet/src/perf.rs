@@ -30,6 +30,7 @@ use crate::machine_class_registry::{
 use crate::perf_assembly::PERF_EVIDENCE_ASSEMBLY_SCHEMA_VERSION;
 use crate::perf_evidence::PERF_EVIDENCE_SCHEMA_VERSION;
 use crate::perf_ratchet::PERF_HISTORY_POINTER_SCHEMA_VERSION;
+use crate::qg6_prepared::{Qg6ArmRole, Qg6SampleOrder, Qg6TimedSample};
 
 /// Version of the JSON emitted by the QG matrix harness.
 pub const PERF_ARTIFACT_SCHEMA_VERSION: &str = "quill-perf-artifact-v7";
@@ -3305,14 +3306,7 @@ pub enum PerfSamplePhase {
     Measurement,
 }
 
-/// Upper bound on ordered timing leaves one QG-6 sample may carry.
-///
-/// A raw leaf vector is the only unbounded-by-construction field a QG-6 sample
-/// has, so it gets an explicit ceiling rather than inheriting the sample-count
-/// bound that governs everything else.
-pub const QG6_MAX_TIMING_LEAVES_PER_SAMPLE: usize = 4_096;
-
-/// Compact per-row binding into the cell-local QG-6 semantic contract.
+/// Per-row binding into the cell-local QG-6 semantic contract.
 ///
 /// `observed_value` on the parent sample is the MEDIAN across that sample's
 /// per-arm search subsample, so a percentile computed from parent values alone
@@ -3320,10 +3314,10 @@ pub const QG6_MAX_TIMING_LEAVES_PER_SAMPLE: usize = 4_096;
 /// carried here are the individual timings that median summarized, which is
 /// what a true p50/p99 must be recomputed from.
 ///
-/// The three leaf fields are required, deliberately: an artifact written before
-/// they existed fails to decode rather than presenting as a QG-6 sample with no
-/// tail evidence, which is the fail-closed behaviour this binding already has
-/// for its other fields.
+/// The complete timed sample is required deliberately. An artifact written
+/// before the authenticated leaf table existed fails to decode rather than
+/// presenting an asserted leaf digest that the evidence layer cannot
+/// recompute.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Qg6SampleBinding {
@@ -3331,17 +3325,9 @@ pub struct Qg6SampleBinding {
     pub query_id: String,
     /// Domain-separated digest of the validated role receipt sequence.
     pub result_sequence_sha256: String,
-    /// Number of ordered same-invocation timing leaves the parent sample's
-    /// median summarized. Retained separately from the vector so a truncated
-    /// leaf list is a mismatch rather than a silently shorter stream.
-    pub timing_leaf_count: u64,
-    /// Domain-separated seal the producer computed over those ordered leaf
-    /// receipts. Recomputation against it belongs to the evidence layer; this
-    /// binding carries the identity so the comparison is possible at all.
-    pub timing_leaves_sha256: String,
-    /// Ordered raw per-search latencies in milliseconds, in the producer's
-    /// leaf order, in the same unit as `observed_value`.
-    pub timing_leaves_ms: Vec<f64>,
+    /// Complete parent sample and its ordered, individually self-sealed search
+    /// receipts. The evidence layer replays every leaf and the parent seal.
+    pub timed_sample: Qg6TimedSample,
 }
 
 impl Qg6SampleBinding {
@@ -3349,15 +3335,37 @@ impl Qg6SampleBinding {
         !self.query_id.is_empty()
             && self.query_id.len() <= 256
             && is_lower_hex_digest(&self.result_sequence_sha256)
-            && is_lower_hex_digest(&self.timing_leaves_sha256)
-            && self.timing_leaf_count > 0
-            && self.timing_leaves_ms.len() <= QG6_MAX_TIMING_LEAVES_PER_SAMPLE
-            && usize::try_from(self.timing_leaf_count)
-                .is_ok_and(|count| count == self.timing_leaves_ms.len())
-            && self
-                .timing_leaves_ms
-                .iter()
-                .all(|leaf| leaf.is_finite() && *leaf >= 0.0)
+            && self.query_id == self.timed_sample.query_id
+            && self.result_sequence_sha256 == self.timed_sample.result_sha256
+            && self.timed_sample.verify_timing_leaves().is_ok()
+    }
+
+    fn validate_against(&self, sample: &PerfRawSample) -> bool {
+        let expected_arm = match sample.arm {
+            PerfSampleArm::Control => matches!(
+                self.timed_sample.arm,
+                Qg6ArmRole::NullLeft | Qg6ArmRole::EffectControl
+            ),
+            PerfSampleArm::Treatment => matches!(
+                self.timed_sample.arm,
+                Qg6ArmRole::NullRight | Qg6ArmRole::EffectTreatment
+            ),
+        };
+        let expected_order = match sample.order {
+            PerfSampleOrder::First => Qg6SampleOrder::First,
+            PerfSampleOrder::Second => Qg6SampleOrder::Second,
+        };
+        self.validate()
+            && self.timed_sample.block_id == sample.block_id
+            && self.timed_sample.sample_id == sample.sample_id
+            && self.timed_sample.order == expected_order
+            && expected_arm
+            && sample.group_id == u64::try_from(self.timed_sample.query_index).ok()
+            && sample.work_units == Some(self.timed_sample.subsample_count)
+            && self.timed_sample.started_ns == sample.started_ns
+            && self.timed_sample.ended_ns == sample.ended_ns
+            && sample.observed_value
+                == Some(self.timed_sample.observed_latency_ns as f64 / 1_000_000.0)
     }
 }
 
@@ -5016,7 +5024,7 @@ impl Qg1SampleBinding {
                 self.raw_arm,
                 self.raw_order,
             )
-            && self.prepared_corpus_sha256 == authority.provenance_corpus_sha256
+            && self.prepared_corpus_sha256 == provenance.corpus_sha256
             && self.prepared_input_sha256 == authority.prepared_input_sha256
             && self.prepared_manifest_sha256 == authority.prepared_manifest_sha256
             && self.indexed_content_sha256 == authority.indexed_content_sha256
@@ -5097,11 +5105,12 @@ impl PerfRawSample {
             self.provenance.input_identity.is_some(),
             self.qg6_sample_binding.as_ref(),
         ) {
-            (true, Some(binding)) if binding.validate() => {}
+            (true, Some(binding)) if binding.validate_against(self) => {}
             (true, _) => {
                 return Err(PairedEstimatorError::InvalidProvenance {
-                    reason: "prepared-input samples require one valid compact QG-6 result binding"
-                        .to_owned(),
+                    reason:
+                        "prepared-input samples require one valid authenticated QG-6 result binding"
+                            .to_owned(),
                 });
             }
             (false, None) => {}
@@ -5960,8 +5969,10 @@ fn qg1_validate_experiment_streams(
             if effect.lifecycle_authority_sha256 == null.lifecycle_authority_sha256
                 && matches!(
                     (effect.role.as_str(), null.role.as_str()),
-                    (QG1_STREAM_ROLE_EFFECT, QG1_STREAM_ROLE_TANTIVY_NULL)
-                        | (QG1_STREAM_ROLE_EFFECT, QG1_STREAM_ROLE_QUILL_NULL)
+                    (
+                        QG1_STREAM_ROLE_EFFECT,
+                        QG1_STREAM_ROLE_TANTIVY_NULL | QG1_STREAM_ROLE_QUILL_NULL
+                    )
                         | (
                             QG1_STREAM_ROLE_TANTIVY_PILOT_EFFECT,
                             QG1_STREAM_ROLE_TANTIVY_PILOT_NULL

@@ -5369,17 +5369,7 @@ fn qg6_raw_sample(
         qg6_sample_binding: Some(Qg6SampleBinding {
             query_id: sample.query_id.clone(),
             result_sequence_sha256: sample.result_sha256.clone(),
-            // The leaves the parent median summarized, carried in the parent's
-            // own unit and order so a downstream p50/p99 is recomputed from the
-            // individual searches rather than from a stream of medians.
-            timing_leaf_count: u64::try_from(sample.timing_leaves.len())
-                .expect("QG-6 timing leaf count"),
-            timing_leaves_sha256: sample.timing_leaves_sha256.clone(),
-            timing_leaves_ms: sample
-                .timing_leaves
-                .iter()
-                .map(|leaf| leaf.observed_latency_ns / 1_000_000.0)
-                .collect(),
+            timed_sample: sample.clone(),
         }),
         qg1_sample_binding: None,
         tantivy_config_sha256: None,

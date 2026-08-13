@@ -1481,10 +1481,10 @@ pub struct Qg6SearchTimingLeafReceipt {
 }
 
 impl Qg6SearchTimingLeafReceipt {
-    fn from_observation(
+    pub(crate) fn from_observation(
         block_id: u64,
         sample_id: u64,
-        query: &Qg6QuerySpec,
+        query_id: &str,
         query_index: usize,
         comparison: Qg6Comparison,
         arm: Qg6ArmRole,
@@ -1504,7 +1504,7 @@ impl Qg6SearchTimingLeafReceipt {
             schema_version: QG6_TIMING_LEAF_RECEIPT_VERSION.to_owned(),
             block_id,
             sample_id,
-            query_id: query.id().to_owned(),
+            query_id: query_id.to_owned(),
             query_index,
             comparison,
             arm,
@@ -1691,7 +1691,7 @@ impl Qg6TimedSample {
         Ok(())
     }
 
-    fn recomputed_timing_leaves_sha256(&self) -> Result<String, Qg6HarnessError> {
+    pub(crate) fn recomputed_timing_leaves_sha256(&self) -> Result<String, Qg6HarnessError> {
         let mut hasher = Sha256::new();
         hash_len_prefixed(&mut hasher, QG6_TIMING_LEAF_RECEIPT_VERSION.as_bytes());
         hasher.update(self.block_id.to_le_bytes());
@@ -2382,7 +2382,7 @@ impl<A> Qg6ValidatedExperiment<A> {
                     let leaf = Qg6SearchTimingLeafReceipt::from_observation(
                         block.block_id,
                         sample_id,
-                        query,
+                        query.id(),
                         block.query_index,
                         block.comparison,
                         role,
@@ -5573,6 +5573,7 @@ mod tests {
         {
             leaf.ranked_cache_receipt_sha256 = old_a_cache_receipt.clone();
         }
+        finalize_residual_execution_order(&mut observations);
         assert!(matches!(
             admit_residual(observations),
             Err(Qg6ResidualValidationError::ProvenanceMismatch { .. })
@@ -6390,7 +6391,7 @@ mod tests {
             Ok(Qg6SearchResult::from(canonical_result(query)))
         };
         let measurement = validated
-            .measure_query_p50_with_normalizer(1, 1, 3, 0x5eed, &mut search, &mut |result| result)
+            .measure_query_p50_with_normalizer(1, 2, 3, 0x5eed, &mut search, &mut |result| result)
             .expect("timing leaves");
         let sample = measurement.samples[0].clone();
         sample
