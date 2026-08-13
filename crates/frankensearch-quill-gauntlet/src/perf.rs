@@ -10308,11 +10308,12 @@ mod tests {
             original.experiment.config.qg1_expected_authority.as_ref(),
         )
         .expect("whole-stream scheduling remains individually valid paired evidence");
+        let shipping_auto_config_sha256 = original.candidate.config_sha256.clone();
         pilots[0] = Qg1TantivyIncumbentPilot::from_experiment(
             original.candidate,
             original.observed_writer_threads,
             original.writer_constructor_receipt_sha256,
-            original.shipping_auto_config_sha256,
+            shipping_auto_config_sha256,
             experiment,
             original
                 .effect_observations
