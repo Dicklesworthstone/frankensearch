@@ -1300,7 +1300,10 @@ mod tests {
             ));
             match std::fs::create_dir(&dir) {
                 Ok(()) => return dir,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                // A name this process already minted: fall through to the next
+                // nonce. The match is the loop body's final expression, so an
+                // empty arm retries exactly as an explicit `continue` did.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => panic!("create unique admitted-v2 sync directory: {error}"),
             }
         }
