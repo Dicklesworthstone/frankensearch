@@ -2073,6 +2073,19 @@ enum IngestParallelismPolicy {
     ScalarTopologyConformance,
 }
 
+/// Proof that the complete ingest batch passed the mutation-free admission
+/// check before any route touched writer state.
+///
+/// Keeping this as a private capability makes the parallel helpers state their
+/// real precondition without rescanning every document after the public driver
+/// has already established it. Shipping callers obtain the value only from
+/// [`QuillWriterState::validate_batch_admission`]; route-level unit tests may
+/// construct it directly to isolate planner and budget behavior.
+#[derive(Debug, Clone, Copy)]
+struct ValidatedBatchAdmission<'a> {
+    documents: &'a [IndexableDocument],
+}
+
 #[derive(Clone)]
 struct ParallelIngestCheckpoint {
     #[cfg(feature = "conformance-internals")]
@@ -5839,11 +5852,12 @@ impl QuillWriterState {
     async fn try_index_documents_internal_parallel(
         &mut self,
         cx: &Cx,
-        documents: &[IndexableDocument],
+        admission: ValidatedBatchAdmission<'_>,
         replacement_ids: &BTreeSet<&str>,
         allow_automatic_publication: bool,
         observation: &ParallelBatchObservation,
     ) -> Result<Option<ParallelIngestReceipt>, QuillIndexError> {
+        let documents = admission.documents;
         if !replacement_ids.is_empty()
             || !self.shard_router.is_deterministic()
             || !matches!(&self.backend, IndexBackend::Memory(_))
@@ -5887,29 +5901,6 @@ impl QuillWriterState {
             .saturating_div(plan.active_shards.max(1))
             .saturating_div(PARALLEL_ARENA_BUDGET_DIVISOR)
             .clamp(MIN_ARENA_CHUNK_BYTES, DEFAULT_ARENA_CHUNK_BYTES);
-
-        // Redundant when reached through `index_documents_with_replacements`,
-        // which admits the whole batch first, and deliberately kept anyway:
-        // this helper is also called directly by tests, so it owns its own
-        // precondition rather than inheriting one. Removing it would leave
-        // those callers unvalidated (bd-quill-rejected-ingest-publishes-partial-batch-aihri).
-        let authority = self.authority_snapshot()?;
-        let mut batch_ids = BTreeSet::new();
-        for document in documents {
-            check_cancel(cx, "internal parallel index validation")?;
-            if document.id.is_empty() {
-                return Err(invalid_state("document id must be nonempty"));
-            }
-            if !batch_ids.insert(document.id.as_str())
-                || self.uncommitted_ids.contains(&document.id)
-                || authority.resolve_document_id(&document.id)?.is_some()
-            {
-                return Err(invalid_state(format!(
-                    "duplicate live document id {:?}",
-                    document.id
-                )));
-            }
-        }
 
         let document_count = u32::try_from(documents.len())
             .map_err(|_| invalid_state("ingest batch document count does not fit u32"))?;
@@ -6123,11 +6114,12 @@ impl QuillWriterState {
     async fn try_index_documents_parallel(
         &mut self,
         cx: &Cx,
-        documents: &[IndexableDocument],
+        admission: ValidatedBatchAdmission<'_>,
         replacement_ids: &BTreeSet<&str>,
         allow_automatic_publication: bool,
         observation: &ParallelBatchObservation,
     ) -> Result<Option<ParallelIngestReceipt>, QuillIndexError> {
+        let documents = admission.documents;
         let shard_count = self.shards.len();
         let verified_pool_capacity = rayon::current_num_threads();
         let plan = plan_parallel_ingest(documents.len(), shard_count, verified_pool_capacity)?;
@@ -6136,27 +6128,6 @@ impl QuillWriterState {
             || plan.route == ParallelIngestRoute::Serial
         {
             return Ok(None);
-        }
-
-        // Same as the internal-parallel route: redundant under
-        // `index_documents_with_replacements`, retained because direct callers
-        // exist and this helper owns its own precondition.
-        let authority = self.authority_snapshot()?;
-        let mut batch_ids = BTreeSet::new();
-        for document in documents {
-            check_cancel(cx, "parallel index validation")?;
-            if document.id.is_empty() {
-                return Err(invalid_state("document id must be nonempty"));
-            }
-            if !batch_ids.insert(document.id.as_str())
-                || self.uncommitted_ids.contains(&document.id)
-                || authority.resolve_document_id(&document.id)?.is_some()
-            {
-                return Err(invalid_state(format!(
-                    "duplicate live document id {:?}",
-                    document.id
-                )));
-            }
         }
 
         let active_shard_count = plan.active_shards;
@@ -6504,13 +6475,13 @@ impl QuillWriterState {
                 // allocator or uncommitted-id state, and before the commit-retry
                 // guard is armed, so a refused batch leaves the writer exactly as
                 // it found it (bd-quill-rejected-ingest-publishes-partial-batch-aihri).
-                self.validate_batch_admission(cx, documents, replacement_ids)?;
+                let admission = self.validate_batch_admission(cx, documents, replacement_ids)?;
                 let parallel_receipt = match parallelism_policy {
                     IngestParallelismPolicy::Adaptive => {
                         let internal = self
                             .try_index_documents_internal_parallel(
                                 cx,
-                                documents,
+                                admission,
                                 replacement_ids,
                                 allow_automatic_publication,
                                 &observation,
@@ -6521,7 +6492,7 @@ impl QuillWriterState {
                             Ok(None) => {
                                 self.try_index_documents_parallel(
                                     cx,
-                                    documents,
+                                    admission,
                                     replacement_ids,
                                     allow_automatic_publication,
                                     &observation,
@@ -6718,12 +6689,12 @@ impl QuillWriterState {
     /// # Errors
     ///
     /// Returns typed cancellation, empty-id, or duplicate-id failures.
-    fn validate_batch_admission(
+    fn validate_batch_admission<'a>(
         &self,
         cx: &Cx,
-        documents: &[IndexableDocument],
+        documents: &'a [IndexableDocument],
         replacement_ids: &BTreeSet<&str>,
-    ) -> Result<(), QuillIndexError> {
+    ) -> Result<ValidatedBatchAdmission<'a>, QuillIndexError> {
         let authority = self.authority_snapshot()?;
         let mut batch_ids = BTreeSet::new();
         for document in documents {
@@ -6742,7 +6713,7 @@ impl QuillWriterState {
                 )));
             }
         }
-        Ok(())
+        Ok(ValidatedBatchAdmission { documents })
     }
 
     /// Route and accumulate one bounded batch into a single shard.
@@ -26569,7 +26540,9 @@ mod tests {
                         writer
                             .try_index_documents_parallel(
                                 &cx,
-                                &documents,
+                                ValidatedBatchAdmission {
+                                    documents: &documents,
+                                },
                                 &BTreeSet::new(),
                                 false,
                                 &ParallelBatchObservation::default(),
@@ -26626,7 +26599,9 @@ mod tests {
                 let receipt = writer
                     .try_index_documents_parallel(
                         &cx,
-                        &documents,
+                        ValidatedBatchAdmission {
+                            documents: &documents,
+                        },
                         &BTreeSet::new(),
                         false,
                         &ParallelBatchObservation::default(),
@@ -26709,7 +26684,9 @@ mod tests {
                 let receipt = writer
                     .try_index_documents_parallel(
                         &cx,
-                        &documents,
+                        ValidatedBatchAdmission {
+                            documents: &documents,
+                        },
                         &BTreeSet::new(),
                         false,
                         &observation,
@@ -26768,7 +26745,9 @@ mod tests {
                 let declined = writer
                     .try_index_documents_parallel(
                         &cx,
-                        &documents,
+                        ValidatedBatchAdmission {
+                            documents: &documents,
+                        },
                         &BTreeSet::new(),
                         false,
                         &observation,
@@ -27417,7 +27396,9 @@ mod tests {
                 let receipt = writer
                     .try_index_documents_parallel(
                         &cx,
-                        &documents,
+                        ValidatedBatchAdmission {
+                            documents: &documents,
+                        },
                         &BTreeSet::new(),
                         false,
                         &observation,
@@ -27493,7 +27474,9 @@ mod tests {
                 let first = writer
                     .try_index_documents_parallel(
                         &cx,
-                        &documents,
+                        ValidatedBatchAdmission {
+                            documents: &documents,
+                        },
                         &BTreeSet::new(),
                         false,
                         &ParallelBatchObservation::default(),
@@ -27585,7 +27568,9 @@ mod tests {
                 let second = writer
                     .try_index_documents_parallel(
                         &cx,
-                        &second_documents,
+                        ValidatedBatchAdmission {
+                            documents: &second_documents,
+                        },
                         &BTreeSet::new(),
                         false,
                         &ParallelBatchObservation::default(),
@@ -27662,7 +27647,9 @@ mod tests {
                     writer
                         .try_index_documents_parallel(
                             &cx,
-                            &documents,
+                            ValidatedBatchAdmission {
+                                documents: &documents,
+                            },
                             &BTreeSet::new(),
                             false,
                             &ParallelBatchObservation::default(),
