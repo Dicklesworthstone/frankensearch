@@ -5342,14 +5342,18 @@ mod tests {
                                 got_initial = true;
                                 initial_rank_bytes = results
                                     .iter()
-                                    .map(|result| (result.doc_id.clone(), result.score.to_bits()))
+                                    .map(|result| {
+                                        (result.doc_id.to_string(), result.score.to_bits())
+                                    })
                                     .collect();
                             }
                             SearchPhase::Refined { results, .. } => {
                                 got_refined = true;
                                 refined_rank_bytes = results
                                     .iter()
-                                    .map(|result| (result.doc_id.clone(), result.score.to_bits()))
+                                    .map(|result| {
+                                        (result.doc_id.to_string(), result.score.to_bits())
+                                    })
                                     .collect();
                             }
                             SearchPhase::Reranked { .. } => got_refined = true,
@@ -5363,9 +5367,29 @@ mod tests {
             assert_eq!(phase_count, 2);
             assert!(got_initial);
             assert!(got_refined);
-            // Identical fast/quality tiers are a non-cancelled control: the
-            // Initial-to-Refined boundary must not change ordering or score bits.
-            assert_eq!(initial_rank_bytes, refined_rank_bytes);
+            // Initial preserves the fast index's deterministic top-k tie order;
+            // Refined reorders the retained equal-score candidates by canonical
+            // doc_id through the blend path.
+            assert_eq!(
+                initial_rank_bytes,
+                vec![
+                    ("doc-8".to_owned(), 1.0_f32.to_bits()),
+                    ("doc-0".to_owned(), 1.0_f32.to_bits()),
+                    ("doc-4".to_owned(), 1.0_f32.to_bits()),
+                    ("doc-9".to_owned(), 0.0_f32.to_bits()),
+                    ("doc-1".to_owned(), 0.0_f32.to_bits()),
+                ]
+            );
+            assert_eq!(
+                refined_rank_bytes,
+                vec![
+                    ("doc-0".to_owned(), 1.0_f32.to_bits()),
+                    ("doc-4".to_owned(), 1.0_f32.to_bits()),
+                    ("doc-8".to_owned(), 1.0_f32.to_bits()),
+                    ("doc-1".to_owned(), 0.0_f32.to_bits()),
+                    ("doc-2".to_owned(), 0.0_f32.to_bits()),
+                ]
+            );
             assert!(metrics.quality_embed_ms > 0.0);
         });
     }
