@@ -340,14 +340,13 @@ impl Default for RankedQueryCache {
 impl RankedQueryCache {
     fn get_raw(
         &self,
+        fingerprint: u64,
         snapshot_epoch: u64,
         query: &str,
         limit: usize,
         offset: usize,
         exact_count: bool,
     ) -> Option<QuillSearchResult> {
-        let fingerprint =
-            raw_query_cache_fingerprint(snapshot_epoch, query, limit, offset, exact_count);
         self.find(fingerprint, |cached| {
             cached.snapshot_epoch == snapshot_epoch
                 && cached.limit == limit
@@ -399,6 +398,7 @@ impl RankedQueryCache {
 
     fn insert_raw(
         &self,
+        fingerprint: u64,
         snapshot_epoch: u64,
         query: &str,
         limit: usize,
@@ -406,8 +406,6 @@ impl RankedQueryCache {
         exact_count: bool,
         result: &QuillSearchResult,
     ) {
-        let fingerprint =
-            raw_query_cache_fingerprint(snapshot_epoch, query, limit, offset, exact_count);
         self.insert(Arc::new(CachedRankedQuery {
             fingerprint,
             snapshot_epoch,
@@ -8926,8 +8924,18 @@ impl QuillReader {
         let cache_enabled = self.ranked_query_cache_enabled();
         #[cfg(feature = "pruning-conformance")]
         let cache_enabled = cache_enabled && pruning_trace.is_none();
-        if cache_enabled {
+        let cache_fingerprint = cache_enabled.then(|| {
+            raw_query_cache_fingerprint(
+                snapshot.snapshot_epoch(),
+                query,
+                limit,
+                offset,
+                exact_count,
+            )
+        });
+        if let Some(fingerprint) = cache_fingerprint {
             if let Some(result) = self.published_snapshot.ranked_query_cache.get_raw(
+                fingerprint,
                 snapshot.snapshot_epoch(),
                 query,
                 limit,
@@ -9020,8 +9028,9 @@ impl QuillReader {
         if let Some(total_count) = result.total_count {
             query_span.record("total_count", total_count);
         }
-        if cache_enabled {
+        if let Some(fingerprint) = cache_fingerprint {
             self.published_snapshot.ranked_query_cache.insert_raw(
+                fingerprint,
                 snapshot.snapshot_epoch(),
                 query,
                 limit,
@@ -16077,14 +16086,25 @@ mod tests {
             doc_count: 11,
             diagnostics: Vec::new(),
         };
-        cache.insert_raw(4, "rust", 10, 2, false, &raw_result);
+        let raw_fingerprint = raw_query_cache_fingerprint(4, "rust", 10, 2, false);
+        cache.insert_raw(raw_fingerprint, 4, "rust", 10, 2, false, &raw_result);
+        let get_raw = |snapshot_epoch, query, limit, offset, exact_count| {
+            cache.get_raw(
+                raw_fingerprint,
+                snapshot_epoch,
+                query,
+                limit,
+                offset,
+                exact_count,
+            )
+        };
 
-        assert_eq!(cache.get_raw(4, "rust", 10, 2, false), Some(raw_result));
-        assert!(cache.get_raw(5, "rust", 10, 2, false).is_none());
-        assert!(cache.get_raw(4, "Rust", 10, 2, false).is_none());
-        assert!(cache.get_raw(4, "rust", 11, 2, false).is_none());
-        assert!(cache.get_raw(4, "rust", 10, 3, false).is_none());
-        assert!(cache.get_raw(4, "rust", 10, 2, true).is_none());
+        assert_eq!(get_raw(4, "rust", 10, 2, false), Some(raw_result));
+        assert!(get_raw(5, "rust", 10, 2, false).is_none());
+        assert!(get_raw(4, "Rust", 10, 2, false).is_none());
+        assert!(get_raw(4, "rust", 11, 2, false).is_none());
+        assert!(get_raw(4, "rust", 10, 3, false).is_none());
+        assert!(get_raw(4, "rust", 10, 2, true).is_none());
 
         let query = Query::Boost {
             query: Box::new(Query::All),
@@ -18010,6 +18030,8 @@ mod tests {
                     .search_snapshot()
                     .expect("pruning fixture snapshot is authoritative");
                 let snapshot_epoch = snapshot.snapshot_epoch();
+                let fingerprint =
+                    raw_query_cache_fingerprint(snapshot_epoch, QUERY, LIMIT, OFFSET, EXACT_COUNT);
                 let expected_doc_counts = index
                     .snapshot()
                     .expect("pruning fixture snapshot is authoritative")
@@ -18021,7 +18043,14 @@ mod tests {
 
                 assert!(
                     cache
-                        .get_raw(snapshot_epoch, QUERY, LIMIT, OFFSET, EXACT_COUNT)
+                        .get_raw(
+                            fingerprint,
+                            snapshot_epoch,
+                            QUERY,
+                            LIMIT,
+                            OFFSET,
+                            EXACT_COUNT,
+                        )
                         .is_none(),
                     "fixture must begin cold for {expected_mode:?}",
                 );
@@ -18029,7 +18058,14 @@ mod tests {
                     .search_paginated(&cx, QUERY, LIMIT, OFFSET, EXACT_COUNT)
                     .expect("ordinary search warms the ranked query cache");
                 assert_eq!(
-                    cache.get_raw(snapshot_epoch, QUERY, LIMIT, OFFSET, EXACT_COUNT),
+                    cache.get_raw(
+                        fingerprint,
+                        snapshot_epoch,
+                        QUERY,
+                        LIMIT,
+                        OFFSET,
+                        EXACT_COUNT,
+                    ),
                     Some(warm.clone()),
                     "ordinary search must populate the exact raw-query cache key for {expected_mode:?}",
                 );
