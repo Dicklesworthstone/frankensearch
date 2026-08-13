@@ -5728,7 +5728,7 @@ mod tests {
     /// This drives the public API rather than the collect/diff helpers.
     #[test]
     fn catchup_retains_inherited_names_and_deletes_only_under_rebuild_authority() {
-        run_on_runtime_task(|cx| async move {
+        run_on_local_runtime_task(|cx| async move {
             let temp = tempdir().expect("tempdir");
             let root = temp.path().join("g3r-catchup");
             let blocked = temp.path().join("g3r-catchup-blocked");
@@ -5861,7 +5861,7 @@ mod tests {
     /// the next public catch-up derive it again.
     #[test]
     fn discarded_catchup_delete_remains_owed_and_is_rederived() {
-        run_on_runtime_task(|cx| async move {
+        run_on_local_runtime_task(|cx| async move {
             let temp = tempdir().expect("tempdir");
             let root = temp.path().join("g4-catchup-transactional");
             fs::create_dir_all(&root).expect("create root");
@@ -5952,7 +5952,7 @@ mod tests {
     /// makes its delete rederivable.
     #[test]
     fn partial_catchup_apply_keeps_vanished_new_path_as_delete_debt() {
-        run_on_runtime_task(|cx| async move {
+        run_on_local_runtime_task(|cx| async move {
             let temp = tempdir().expect("tempdir");
             let root = temp.path().join("g4-catchup-partial-apply");
             fs::create_dir_all(&root).expect("create root");
@@ -6044,7 +6044,7 @@ mod tests {
     /// required to change for that live authority advance.
     #[test]
     fn catchup_rejects_generation_advanced_during_public_scan() {
-        run_on_runtime_task(|cx| async move {
+        run_on_local_runtime_task(|cx| async move {
             let temp = tempdir().expect("tempdir");
             let root = temp.path().join("g4-catchup-prescan-generation");
             fs::create_dir_all(&root).expect("create root");
@@ -6129,7 +6129,7 @@ mod tests {
     /// that older conclusion and retain its actual operations as exact debt.
     #[test]
     fn catchup_ack_epoch_race_retains_already_applied_operations() {
-        run_on_runtime_task(|cx| async move {
+        run_on_local_runtime_task(|cx| async move {
             let temp = tempdir().expect("tempdir");
             let root = temp.path().join("g4-catchup-ack-epoch");
             fs::create_dir_all(&root).expect("create root");
@@ -6215,7 +6215,7 @@ mod tests {
     /// pass did *not* change, which no other test here did.
     #[test]
     fn probationary_pass_preserves_the_legacy_baseline_and_stays_owed() {
-        run_on_runtime_task(|cx| async move {
+        run_on_local_runtime_task(|cx| async move {
             let temp = tempdir().expect("tempdir");
             let root = temp.path().join("g3s-probation");
             fs::create_dir_all(&root).expect("create root");
@@ -6304,7 +6304,7 @@ mod tests {
     /// leave the watcher believing it holds authority.
     #[test]
     fn uncovered_authority_is_demoted_instead_of_authorizing_deletion() {
-        run_on_runtime_task(|cx| async move {
+        run_on_local_runtime_task(|cx| async move {
             let temp = tempdir().expect("tempdir");
             let root = temp.path().join("g3r-no-authority");
             fs::create_dir_all(&root).expect("create root");
@@ -6385,7 +6385,7 @@ mod tests {
     /// once the identities genuinely cover the roots.
     #[test]
     fn empty_authority_without_identity_cannot_delete_its_affected_paths() {
-        run_on_runtime_task(|cx| async move {
+        run_on_local_runtime_task(|cx| async move {
             let temp = tempdir().expect("tempdir");
             let root = temp.path().join("g4-empty-authority");
             fs::create_dir_all(&root).expect("create root");
@@ -6478,7 +6478,7 @@ mod tests {
     /// and does not stall a stop.
     #[test]
     fn unavailable_root_fails_the_whole_pass_and_stops_promptly() {
-        run_on_runtime_task(|cx| async move {
+        run_on_local_runtime_task(|cx| async move {
             let temp = tempdir().expect("tempdir");
             let present_root = temp.path().join("g3f-present");
             let absent_root = temp.path().join("g3f-absent");
@@ -6532,7 +6532,7 @@ mod tests {
     /// the path across the incomplete pass.
     #[test]
     fn delete_suppressed_during_incompleteness_is_recovered_when_completeness_returns() {
-        run_on_runtime_task(|cx| async move {
+        run_on_local_runtime_task(|cx| async move {
             let temp = tempdir().expect("tempdir");
             let root = temp.path().join("g3f-recover");
             let blocked = temp.path().join("g3f-recover-blocked");
@@ -6640,7 +6640,7 @@ mod tests {
     /// absence, not an unresolved path: the pass still completes.
     #[test]
     fn target_that_disappears_between_checks_still_completes() {
-        run_on_runtime_task(|cx| async move {
+        run_on_local_runtime_task(|cx| async move {
             let temp = tempdir().expect("tempdir");
             let root = temp.path().join("g3f-vanishing");
             fs::create_dir_all(&root).expect("create root");
@@ -6711,7 +6711,7 @@ mod tests {
     /// lock and suppress the pass's authority and staged statistics.
     #[test]
     fn stopped_reconciliation_after_parked_apply_keeps_debt_and_authority() {
-        run_on_runtime_task(|cx| async move {
+        run_on_local_runtime_task(|cx| async move {
             let temp = tempdir().expect("tempdir");
             let root = temp.path().join("g4-reconcile-post-apply-stop");
             fs::create_dir_all(&root).expect("create root");
@@ -6853,7 +6853,7 @@ mod tests {
     /// it reads as a perfectly complete scan of an empty one.
     #[test]
     fn swapped_root_identity_is_incomplete_rather_than_a_mass_delete() {
-        run_on_runtime_task(|cx| async move {
+        run_on_local_runtime_task(|cx| async move {
             let temp = tempdir().expect("tempdir");
             let root = temp.path().join("g3f-identity");
             fs::create_dir_all(&root).expect("create root");
@@ -6940,7 +6940,7 @@ mod tests {
     /// authority, and leave nothing owed.
     #[test]
     fn degraded_identity_pass_upserts_and_does_not_rearm_the_rescan() {
-        run_on_runtime_task(|cx| async move {
+        run_on_local_runtime_task(|cx| async move {
             let temp = tempdir().expect("tempdir");
             let root = temp.path().join("g4-degraded");
             fs::create_dir_all(&root).expect("create root");
@@ -7028,7 +7028,7 @@ mod tests {
     /// into permanent paralysis by a configuration typo.
     #[test]
     fn duplicate_roots_do_not_forfeit_deletion_authority() {
-        run_on_runtime_task(|cx| async move {
+        run_on_local_runtime_task(|cx| async move {
             let temp = tempdir().expect("tempdir");
             let root = temp.path().join("g4-duplicate");
             fs::create_dir_all(&root).expect("create root");
@@ -7105,7 +7105,7 @@ mod tests {
     /// the unconfirmed candidate as deletion authority itself.
     #[test]
     fn successful_public_event_rearms_held_probation_for_stable_confirmation() {
-        run_on_runtime_task(|cx| async move {
+        run_on_local_runtime_task(|cx| async move {
             let temp = tempdir().expect("tempdir");
             let root = temp.path().join("g4-probation-rearm");
             fs::create_dir_all(&root).expect("create first root");
@@ -7167,10 +7167,13 @@ mod tests {
             {
                 let state = lock_or_recover(&watcher.reconciliation);
                 assert!(
-                    matches!(state.authority, DeletionAuthorityState::Probationary { .. }),
+                    matches!(
+                        &state.authority,
+                        super::DeletionAuthorityState::Probationary { .. }
+                    ),
                     "changing observations must not grant deletion authority"
                 );
-                assert_eq!(state.unsettled_passes, MAX_UNSETTLED_PASSES);
+                assert_eq!(state.unsettled_passes, super::MAX_UNSETTLED_PASSES);
                 assert!(
                     !state.required,
                     "the bounded changing-observation hold must stop self-rearming"
@@ -7301,7 +7304,7 @@ mod tests {
     /// established authority and publishes the batch's success counters.
     #[test]
     fn noncancelled_post_apply_bookkeeping_records_exact_authority_and_stats() {
-        run_on_runtime_task(|cx| async move {
+        run_on_local_runtime_task(|cx| async move {
             let temp = tempdir().expect("tempdir");
             let root = temp.path().join("g4-record-control");
             fs::create_dir_all(&root).expect("create root");
@@ -7585,12 +7588,13 @@ mod tests {
                 asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
             }
             if released.is_none() {
-                let (state, changed) = &*parked;
-                let mut state = lock_or_recover(state);
-                state.2 = true;
-                state.1 = true;
-                changed.notify_all();
-                drop(state);
+                {
+                    let (state, changed) = &*parked;
+                    let mut state = lock_or_recover(state);
+                    state.2 = true;
+                    state.1 = true;
+                    changed.notify_all();
+                }
                 for _ in 0..1_000 {
                     if let Ok(value) = released_rx.try_recv() {
                         released = Some(value);
@@ -9060,6 +9064,33 @@ mod tests {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+
+    /// Runtime-worker lane for tests that exercise the intentionally local
+    /// future returned by `WatchIngestPipeline::apply_batch` or retain a
+    /// synchronous, non-`Sync` abort probe across an await.
+    ///
+    /// Keep this separate from `run_on_runtime_task`: public lifecycle tests use
+    /// that helper to preserve their scheduler-handoff `Send` contract.
+    fn run_on_local_runtime_task<F, Fut>(test: F)
+    where
+        F: FnOnce(Cx) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + 'static,
+    {
+        let scheduler = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build watcher test runtime");
+        let test_task = scheduler.handle().spawn(async move {
+            let cx = Cx::current().expect("runtime task installs a spawn-capable Cx");
+            let mut local_task = cx
+                .spawn_local(move |local_cx| test(local_cx))
+                .expect("spawn local watcher test task");
+            local_task
+                .join(&cx)
+                .await
+                .expect("local watcher test task terminal result");
+        });
+        scheduler.block_on(test_task);
     }
 
     fn run_on_runtime_task<F, Fut>(test: F)
