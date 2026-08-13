@@ -13745,12 +13745,20 @@ fn snapshot_string_range_terms(
         }
     }
     for delta in snapshot.delta_snapshots() {
-        let mut admitted_block = None;
+        // `sorted_terms` materialises and radix-sorts the complete ordered
+        // view before yielding its first term. Admit that bounded work from
+        // the O(1) term count before the allocation/sort can begin; otherwise
+        // a cancelled or under-budget range still pays the whole cost before
+        // observing its first checkpoint.
+        checkpoint.admit(
+            QueryWorkKind::DictionaryBlock,
+            delta_ordered_view_blocks(delta.segment().term_count()),
+        )?;
         for (term_index, term) in delta.segment().sorted_terms().iter().enumerate() {
-            let block = term_index / 16;
-            if Some(block) != admitted_block {
-                checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
-                admitted_block = Some(block);
+            // Ordered-view blocks are paid above. Keep a zero-unit boundary
+            // so cancellation during a long range walk is still observed.
+            if term_index % 16 == 0 {
+                checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
             }
             // Both tests are O(1) now that the live count is taken at freeze,
             // so this expansion costs the dictionary blocks it already
@@ -26541,6 +26549,41 @@ mod tests {
                     .expect("default fuel budget must cover fixture docset collection");
             }
         });
+    }
+
+    #[test]
+    fn delta_string_range_preflights_the_complete_ordered_view() {
+        let cx = Cx::for_testing();
+        let keeper = Arc::new(KeeperSnapshot::in_memory(DEFAULT_SCHEMA).expect("genesis Keeper"));
+        let generation = keeper.loaded_manifest().manifest.generation;
+        let mut delta = DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("range Delta");
+        let content = "t00 t01 t02 t03 t04 t05 t06 t07 t08 t09 t10 t11 t12 t13 t14 t15";
+        apply_tokenized_delta_document(&mut delta, 0, "range-doc", content);
+        assert_eq!(delta.term_count(), 17, "ID plus sixteen content terms");
+        let ordered_view_blocks = delta_ordered_view_blocks(delta.term_count());
+        assert_eq!(ordered_view_blocks, 2);
+        let snapshot =
+            QuillSearchSnapshot::compose(0, keeper, vec![Arc::new(delta.freeze(generation))])
+                .expect("compose Delta-only range snapshot");
+        assert_eq!(snapshot.keeper_snapshot().segments().len(), 0);
+
+        let budget = ordered_view_blocks - 1;
+        let limited: QueryCheckpointHandle<'_> =
+            QueryCheckpoint::new(&cx, "range_ordered_view", budget, ordered_view_blocks);
+        let refused = snapshot_string_range_terms(
+            &limited,
+            &snapshot,
+            DEFAULT_SCHEMA,
+            CONTENT_FIELD,
+            Bound::Unbounded,
+            Bound::Unbounded,
+        )
+        .expect_err("the complete ordered view must be admitted before it is built");
+        assert_eq!(
+            fuel_diagnostics(&refused),
+            (budget, 0, 0, 0, 0, 0),
+            "an under-budget range must refuse before any ordered-view work is recorded"
+        );
     }
 
     #[test]
