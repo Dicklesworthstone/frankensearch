@@ -194,6 +194,15 @@ impl Qg1StartupHandshakeV1 {
 
 #[cfg(test)]
 static QG1_FORWARDER_TEST_ARTIFACT_NONCE: AtomicU64 = AtomicU64::new(1);
+/// Serializes ONLY the QG-1 tests that spawn a child into this test binary.
+///
+/// Descendant containment is per test binary, so a sibling QG-1 child still
+/// running in a parallel test is a genuine pre-existing descendant that
+/// production is right to refuse. This narrows the interference to the
+/// fixtures that cause it instead of serializing the suite or relaxing
+/// containment.
+#[cfg(test)]
+static QG1_CHILD_PROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 const QG1_FORWARDER_TEST_CREATE_ATTEMPTS: u64 = 64;
 const EMBEDDED_PRODUCER_CONTRACT_VERSION: &str = env!("QUILL_PERF_PRODUCER_CONTRACT_VERSION");
@@ -3764,9 +3773,19 @@ fn qg1_validate_complete_authority_set(
     Ok(())
 }
 
-fn qg1_forward_child_stdout(
-    mut stdin: std::process::ChildStdin,
-    mut stdout: std::process::ChildStdout,
+/// Raw forwarding core, generic over its transport.
+///
+/// Production drives this with the child's real `ChildStdout`/`ChildStdin`
+/// through [`start_qg1_authority_forwarder`]. Keeping the core generic lets a
+/// test drive the identical parsing, ACK, and post-COMPLETE copy logic over an
+/// in-process pipe whose byte zero is the register magic — a libtest child
+/// spawned with `--nocapture` writes its harness banner to fd 1 before the
+/// helper can emit, so byte zero would otherwise never be the magic. The
+/// offset-zero rule is production behavior and is deliberately not relaxed for
+/// the test; the transport is what changes.
+fn qg1_forward_child_stdout<R: Read, W: Write>(
+    mut stdin: W,
+    mut stdout: R,
     mut run_log: File,
     events: mpsc::SyncSender<Qg1AuthorityForwarderEvent>,
 ) -> Result<(), String> {
@@ -7845,20 +7864,48 @@ mod tests {
         let mut retained_log_reader = run_log
             .try_clone()
             .expect("retain a descriptor for the create-new run-log artifact");
-        let current_test = std::env::current_exe().expect("current test executable");
-        let helper_name = "local_perf_runner::tests::qg1_trailing_partial_magic_helper";
         for mode in ["full", "partial"] {
             let child_log = run_log.try_clone().expect("clone retained run-log writer");
-            let mut child = Command::new(&current_test)
-                .args(["--exact", helper_name, "--nocapture", "--test-threads=1"])
-                .env("QUILL_PERF_TEST_QG1_TRAILING_MAGIC", mode)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("spawn post-COMPLETE magic forwarder helper");
-            let forwarder = start_qg1_authority_forwarder(&mut child, child_log)
-                .expect("start the production QG-1 stdout forwarder");
+            // Driven over an in-process transport rather than a spawned libtest
+            // child: with `--nocapture` the harness banner reaches fd 1 before
+            // the helper can emit, so byte zero would not be the register
+            // magic and the production offset-zero rule would refuse it. That
+            // rule is correct and unchanged; only the transport moves. The
+            // bytes below are exactly what the helper wrote, so this still
+            // exercises the production parsing, ACK, and post-COMPLETE raw copy
+            // through `qg1_forward_child_stdout`.
+            let mut stream = Vec::new();
+            let entry =
+                qg1_register_entry_for_target("QG-1.bulk/tiny/1/positions_on.docs_per_second");
+            let entry_bytes = entry
+                .to_json_bytes()
+                .expect("serialize forwarder-test authority");
+            stream.extend_from_slice(
+                &Qg1StartupHandshakeV1::register_frame(1, &entry_bytes)
+                    .expect("frame bounded forwarder-test authority"),
+            );
+            stream.extend_from_slice(&Qg1StartupHandshakeV1::complete_frame(1));
+            match mode {
+                "full" => {
+                    stream.extend_from_slice(Qg1StartupHandshakeV1::REGISTER_MAGIC);
+                    stream.extend_from_slice(b"ordinary-post-complete-data");
+                }
+                "partial" => stream.extend_from_slice(
+                    &Qg1StartupHandshakeV1::REGISTER_MAGIC
+                        [..Qg1StartupHandshakeV1::REGISTER_MAGIC.len() - 1],
+                ),
+                unexpected => panic!("unexpected trailing-magic mode {unexpected:?}"),
+            }
+            assert!(
+                stream.starts_with(Qg1StartupHandshakeV1::REGISTER_MAGIC),
+                "the forwarding core must be driven from byte zero of the register magic"
+            );
+            let (sender, events) = mpsc::sync_channel(4);
+            let ack_sink = Vec::new();
+            let join = thread::spawn(move || {
+                qg1_forward_child_stdout(ack_sink, std::io::Cursor::new(stream), child_log, sender)
+            });
+            let forwarder = Qg1AuthorityForwarder { events, join };
             match forwarder
                 .events
                 .recv_timeout(Duration::from_secs(5))
@@ -7885,18 +7932,6 @@ mod tests {
                 }
                 unexpected => panic!("expected startup COMPLETE, got {unexpected:?}"),
             }
-            let status = child.wait().expect("wait post-COMPLETE helper");
-            let mut helper_stderr = String::new();
-            child
-                .stderr
-                .take()
-                .expect("captured post-COMPLETE helper stderr")
-                .read_to_string(&mut helper_stderr)
-                .expect("read captured post-COMPLETE helper stderr");
-            assert!(
-                status.success(),
-                "post-COMPLETE helper must exit normally; stderr: {helper_stderr}"
-            );
             finish_qg1_authority_forwarder(forwarder)
                 .expect("finish production QG-1 stdout forwarder");
         }
@@ -8105,6 +8140,18 @@ mod tests {
         Option<String>,
         Vec<u8>,
     ) {
+        // Held across the whole fixture, so it is acquired BEFORE the spawn and
+        // before `LocalPerfDescendantScope::enter()` below. Descendant
+        // containment is established per test binary, and every QG-1 child
+        // test spawns into that one binary: a sibling QG-1 child still running
+        // in another parallel test is a pre-existing descendant, which is a
+        // true observation the production scope is right to refuse. Serializing
+        // only these child-process fixtures removes the interference without
+        // touching production containment, and is narrower than a global test
+        // lock. Poison is tolerated so one failing case cannot cascade.
+        let _child_process_guard = QG1_CHILD_PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let output_parent_path = std::env::temp_dir();
         let output_parent = pin_directory(&output_parent_path, false)
             .expect("pin test parent directory without creating or deleting it");
