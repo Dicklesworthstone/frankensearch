@@ -5,9 +5,7 @@
 //! their composite statistics, scorer adapters, and seal transaction are
 //! assembled here; later mixed-state beads wire them into the public writer loop.
 
-#[cfg(feature = "pruning-conformance")]
-use std::collections::HashMap;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::{Bound, Deref};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -4412,6 +4410,126 @@ impl QueryWorkShape {
         }
         Ok(())
     }
+}
+
+/// Snapshot-global BM25 statistics reused only by syntactic exact terms.
+///
+/// Ranked and identifier-only search lower the same query independently for
+/// every sealed segment. Without this query-local table, each lowering opens
+/// every sealed dictionary again to recompute an identical global document
+/// frequency. Entries are populated lazily at the exact-term lowering boundary
+/// so creating the table adds no unmetered query walk. The table lives for one
+/// pinned snapshot invocation and cannot cross either a query or publication
+/// boundary.
+struct PreparedSnapshotDocFreqs {
+    entries: StdMutex<HashMap<u16, HashMap<Vec<u8>, u64>>>,
+}
+
+impl PreparedSnapshotDocFreqs {
+    fn new() -> Self {
+        Self {
+            entries: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    fn get_or_compute(
+        &self,
+        checkpoint: &QueryCheckpointHandle<'_>,
+        snapshot: &QuillSearchSnapshot,
+        field_ord: u16,
+        term: &[u8],
+    ) -> Result<u64, QuillIndexError> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = entries
+            .get(&field_ord)
+            .and_then(|field_entries| field_entries.get(term))
+            .copied()
+        {
+            drop(entries);
+            replay_ranking_snapshot_doc_freq_admissions(checkpoint, snapshot)?;
+            return Ok(cached);
+        }
+
+        // The cache is optional work. Surface cancellation before allocating
+        // its owned key, but charge no fuel because the baseline query-work
+        // ceiling already accounts only for physical dictionary operations.
+        checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
+        let mut owned_term = Vec::new();
+        if owned_term.try_reserve_exact(term.len()).is_err() {
+            drop(entries);
+            return checkpointed_snapshot_doc_freq(
+                checkpoint,
+                snapshot,
+                field_ord,
+                term,
+                SnapshotDocFreqDeltaAdmission::Ranking,
+            );
+        }
+        owned_term.extend_from_slice(term);
+
+        checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
+        let mut new_field_entries = None;
+        let reserve_failed = if let Some(field_entries) = entries.get_mut(&field_ord) {
+            field_entries.try_reserve(1).is_err()
+        } else if entries.try_reserve(1).is_err() {
+            true
+        } else {
+            checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
+            let mut field_entries = HashMap::new();
+            if field_entries.try_reserve(1).is_err() {
+                true
+            } else {
+                new_field_entries = Some(field_entries);
+                false
+            }
+        };
+        if reserve_failed {
+            drop(entries);
+            return checkpointed_snapshot_doc_freq(
+                checkpoint,
+                snapshot,
+                field_ord,
+                term,
+                SnapshotDocFreqDeltaAdmission::Ranking,
+            );
+        }
+
+        let computed = checkpointed_snapshot_doc_freq(
+            checkpoint,
+            snapshot,
+            field_ord,
+            term,
+            SnapshotDocFreqDeltaAdmission::Ranking,
+        )?;
+        if let Some(mut field_entries) = new_field_entries {
+            field_entries.insert(owned_term, computed);
+            entries.insert(field_ord, field_entries);
+        } else if let Some(field_entries) = entries.get_mut(&field_ord) {
+            field_entries.insert(owned_term, computed);
+        }
+        drop(entries);
+        Ok(computed)
+    }
+}
+
+fn prepare_snapshot_doc_freqs(snapshot: &QuillSearchSnapshot) -> Option<PreparedSnapshotDocFreqs> {
+    if snapshot.keeper_snapshot().segments().len() < 2 {
+        return None;
+    }
+    Some(PreparedSnapshotDocFreqs::new())
+}
+
+fn replay_ranking_snapshot_doc_freq_admissions(
+    checkpoint: &QueryCheckpointHandle<'_>,
+    snapshot: &QuillSearchSnapshot,
+) -> Result<(), QuillIndexError> {
+    for _ in snapshot.keeper_snapshot().segments() {
+        checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9222,12 +9340,14 @@ impl QuillReader {
         );
         let metering = concrete_checkpoint.metering();
         let checkpoint: QueryCheckpointHandle<'_> = concrete_checkpoint;
+        let prepared_doc_freqs = prepare_snapshot_doc_freqs(snapshot);
         self.collect_sealed_segments(
             cx,
             &checkpoint,
             &mut collector,
             &parsed.query,
             snapshot,
+            prepared_doc_freqs.as_ref(),
             rank_pruning,
             topdocs_root,
             #[cfg(feature = "pruning-conformance")]
@@ -9336,6 +9456,7 @@ impl QuillReader {
         if let Some(profile) = profile {
             profile.bind_work_plan(work_upper_bound, metering)?;
         }
+        let prepared_doc_freqs = prepare_snapshot_doc_freqs(snapshot);
         let keeper = snapshot.keeper_snapshot();
         let segment_count = keeper
             .segments()
@@ -9378,6 +9499,7 @@ impl QuillReader {
             &mut collector,
             query,
             snapshot,
+            prepared_doc_freqs.as_ref(),
             rank_pruning,
             topdocs_root,
             #[cfg(feature = "pruning-conformance")]
@@ -9415,6 +9537,7 @@ impl QuillReader {
                 1.0,
                 QueryLeaf::Delta(delta),
                 snapshot,
+                prepared_doc_freqs.as_ref(),
                 self.schema,
                 self.config.glob_expansion_limit,
                 rank_pruning,
@@ -9486,6 +9609,7 @@ impl QuillReader {
         collector: &mut TopDocsCollector,
         query: &Query,
         snapshot: &QuillSearchSnapshot,
+        prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
         rank_pruning: bool,
         topdocs_root: bool,
         #[cfg(feature = "pruning-conformance")] pruning_trace: Option<
@@ -9543,6 +9667,7 @@ impl QuillReader {
                         1.0,
                         QueryLeaf::Sealed(segment),
                         snapshot,
+                        prepared_doc_freqs,
                         schema,
                         glob_expansion_limit,
                         rank_pruning,
@@ -9601,6 +9726,7 @@ impl QuillReader {
                     1.0,
                     QueryLeaf::Sealed(segment),
                     snapshot,
+                    prepared_doc_freqs,
                     self.schema,
                     self.config.glob_expansion_limit,
                     rank_pruning,
@@ -9638,6 +9764,7 @@ impl QuillReader {
         collector: &mut DocSetCollector,
         query: &Query,
         snapshot: &QuillSearchSnapshot,
+        prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
         fan_out: bool,
     ) -> Result<(), QuillIndexError> {
         let keeper = snapshot.keeper_snapshot();
@@ -9674,6 +9801,7 @@ impl QuillReader {
                         1.0,
                         QueryLeaf::Sealed(segment),
                         snapshot,
+                        prepared_doc_freqs,
                         schema,
                         glob_expansion_limit,
                     )?;
@@ -9711,6 +9839,7 @@ impl QuillReader {
                     1.0,
                     QueryLeaf::Sealed(segment),
                     snapshot,
+                    prepared_doc_freqs,
                     self.schema,
                     self.config.glob_expansion_limit,
                 )?;
@@ -9746,12 +9875,14 @@ impl QuillReader {
         );
         let metering = concrete_checkpoint.metering();
         let checkpoint: QueryCheckpointHandle<'_> = concrete_checkpoint;
+        let prepared_doc_freqs = prepare_snapshot_doc_freqs(snapshot);
         self.collect_docids_sealed(
             cx,
             &checkpoint,
             &mut collector,
             &parsed.query,
             snapshot,
+            prepared_doc_freqs.as_ref(),
             fan_out && !metering,
         )?;
         Ok(collector.finish())
@@ -9778,6 +9909,7 @@ impl QuillReader {
         );
         let metering = concrete_checkpoint.metering();
         let checkpoint: QueryCheckpointHandle<'_> = concrete_checkpoint;
+        let prepared_doc_freqs = prepare_snapshot_doc_freqs(snapshot);
         let keeper = snapshot.keeper_snapshot();
         let segment_count = keeper
             .segments()
@@ -9790,7 +9922,15 @@ impl QuillReader {
             .map(|segment| u64::from(segment.doc_count()))
             .sum();
         let fan_out = sealed_segment_fanout(keeper.segments().len(), sealed_docs) && !metering;
-        self.collect_docids_sealed(cx, &checkpoint, &mut collector, query, snapshot, fan_out)?;
+        self.collect_docids_sealed(
+            cx,
+            &checkpoint,
+            &mut collector,
+            query,
+            snapshot,
+            prepared_doc_freqs.as_ref(),
+            fan_out,
+        )?;
         for delta in snapshot.delta_snapshots() {
             checkpoint.admit(QueryWorkKind::Segment, 1)?;
             let score_span = tracing::info_span!(
@@ -9817,6 +9957,7 @@ impl QuillReader {
                 1.0,
                 QueryLeaf::Delta(delta),
                 snapshot,
+                prepared_doc_freqs.as_ref(),
                 self.schema,
                 self.config.glob_expansion_limit,
             )?;
@@ -10348,12 +10489,14 @@ impl QuillIndex {
         );
         let metering = concrete_checkpoint.metering();
         let checkpoint: QueryCheckpointHandle<'_> = concrete_checkpoint;
+        let prepared_doc_freqs = prepare_snapshot_doc_freqs(snapshot);
         self.reader.collect_sealed_segments(
             cx,
             &checkpoint,
             collector,
             query,
             snapshot,
+            prepared_doc_freqs.as_ref(),
             rank_pruning,
             topdocs_root,
             #[cfg(feature = "pruning-conformance")]
@@ -12608,6 +12751,7 @@ fn lower_query<'a>(
     inherited_boost: f32,
     leaf: QueryLeaf<'a>,
     snapshot: &QuillSearchSnapshot,
+    prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
     schema: SchemaDescriptor,
     glob_expansion_limit: usize,
     rank_pruning: bool,
@@ -12620,6 +12764,7 @@ fn lower_query<'a>(
         inherited_boost,
         leaf,
         snapshot,
+        prepared_doc_freqs,
         schema,
         glob_expansion_limit,
         QueryLoweringMode::Scored,
@@ -12635,6 +12780,7 @@ fn lower_query_unscored<'a>(
     inherited_boost: f32,
     leaf: QueryLeaf<'a>,
     snapshot: &QuillSearchSnapshot,
+    prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
     schema: SchemaDescriptor,
     glob_expansion_limit: usize,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
@@ -12645,6 +12791,7 @@ fn lower_query_unscored<'a>(
         inherited_boost,
         leaf,
         snapshot,
+        prepared_doc_freqs,
         schema,
         glob_expansion_limit,
         QueryLoweringMode::Unscored,
@@ -13009,6 +13156,7 @@ fn lower_query_with_mode<'a>(
     inherited_boost: f32,
     leaf: QueryLeaf<'a>,
     snapshot: &QuillSearchSnapshot,
+    prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
     schema: SchemaDescriptor,
     glob_expansion_limit: usize,
     mode: QueryLoweringMode,
@@ -13038,6 +13186,7 @@ fn lower_query_with_mode<'a>(
                     schema,
                     field.field_id,
                     text.as_bytes(),
+                    prepared_doc_freqs,
                     inherited_boost * field.boost,
                     rank_pruning,
                     checkpoint,
@@ -13072,6 +13221,7 @@ fn lower_query_with_mode<'a>(
                         schema,
                         field.field_id,
                         term.text.as_bytes(),
+                        prepared_doc_freqs,
                         inherited_boost * field.boost,
                         false,
                         checkpoint,
@@ -13093,13 +13243,21 @@ fn lower_query_with_mode<'a>(
                     .try_reserve_exact(terms.len())
                     .map_err(|_| invalid_state("could not allocate phrase terms"))?;
                 for term in terms {
-                    let snapshot_doc_freq = checkpointed_snapshot_doc_freq(
-                        checkpoint,
-                        snapshot,
-                        field.field_id,
-                        term.text.as_bytes(),
-                        SnapshotDocFreqDeltaAdmission::Ranking,
-                    )?;
+                    let snapshot_doc_freq = match prepared_doc_freqs {
+                        Some(prepared) => prepared.get_or_compute(
+                            checkpoint,
+                            snapshot,
+                            field.field_id,
+                            term.text.as_bytes(),
+                        )?,
+                        None => checkpointed_snapshot_doc_freq(
+                            checkpoint,
+                            snapshot,
+                            field.field_id,
+                            term.text.as_bytes(),
+                            SnapshotDocFreqDeltaAdmission::Ranking,
+                        )?,
+                    };
                     phrase_terms.push(match leaf {
                         QueryLeaf::Sealed(segment) => {
                             let cursor = open_owned_cursor(
@@ -13184,6 +13342,7 @@ fn lower_query_with_mode<'a>(
                         inherited_boost,
                         leaf,
                         snapshot,
+                        prepared_doc_freqs,
                         schema,
                         glob_expansion_limit,
                         mode,
@@ -13214,6 +13373,7 @@ fn lower_query_with_mode<'a>(
                 boost,
                 leaf,
                 snapshot,
+                prepared_doc_freqs,
                 schema,
                 glob_expansion_limit,
                 mode,
@@ -13850,7 +14010,7 @@ fn lower_leaf_string_predicate<'a>(
         .map_err(|_| invalid_state("could not allocate string predicate clauses"))?;
     for term in terms {
         clauses.push(ScorerClause::should(lower_leaf_term(
-            leaf, snapshot, schema, field_ord, &term, 1.0, false, checkpoint,
+            leaf, snapshot, schema, field_ord, &term, None, 1.0, false, checkpoint,
         )?));
     }
     let matching = lower_boolean(
@@ -14138,18 +14298,22 @@ fn lower_leaf_term<'a>(
     schema: SchemaDescriptor,
     field_ord: u16,
     term: &[u8],
+    prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
     boost: f32,
     rank_pruning: bool,
     checkpoint: &QueryCheckpointHandle<'a>,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     let stats = composite_snapshot_field(snapshot, field_ord)?;
-    let doc_freq = checkpointed_snapshot_doc_freq(
-        checkpoint,
-        snapshot,
-        field_ord,
-        term,
-        SnapshotDocFreqDeltaAdmission::Ranking,
-    )?;
+    let doc_freq = match prepared_doc_freqs {
+        Some(prepared) => prepared.get_or_compute(checkpoint, snapshot, field_ord, term)?,
+        None => checkpointed_snapshot_doc_freq(
+            checkpoint,
+            snapshot,
+            field_ord,
+            term,
+            SnapshotDocFreqDeltaAdmission::Ranking,
+        )?,
+    };
     let record_option = term_record_option(schema, field_ord)?;
     match leaf {
         QueryLeaf::Sealed(segment) => {
@@ -17748,6 +17912,7 @@ mod tests {
         );
         let metering = checkpoint.metering();
         let checkpoint: QueryCheckpointHandle<'_> = checkpoint;
+        let prepared_doc_freqs = prepare_snapshot_doc_freqs(&snapshot);
         index
             .reader
             .collect_docids_sealed(
@@ -17756,6 +17921,7 @@ mod tests {
                 &mut collector,
                 &parsed.query,
                 &snapshot,
+                prepared_doc_freqs.as_ref(),
                 fan_out && !metering,
             )
             .expect("sealed docid collection");
@@ -18789,9 +18955,10 @@ mod tests {
                 }
                 QuillProfiledSearchOutcome::Failed { error, receipt } => (error, receipt),
             };
-            assert!(
-                matches!(error, QuillIndexError::Cancelled { ref phase } if *phase == "search")
-            );
+            assert!(matches!(
+                error,
+                QuillIndexError::Cancelled { phase } if phase == "search"
+            ));
             assert_eq!(receipt.cache(), QuillProfileCacheDisposition::NotChecked);
             assert_eq!(receipt.fanout_eligible(), None);
             assert_eq!(receipt.execution(), None);
@@ -19031,9 +19198,9 @@ mod tests {
             assert_eq!(receipt.cache(), QuillProfileCacheDisposition::Miss);
             assert_eq!(receipt.fanout_eligible(), Some(false));
             assert_eq!(receipt.execution(), Some(QuillProfileExecutionMode::Serial));
-            assert_eq!(receipt.counters().0, 2);
-            assert_eq!(receipt.counters().1, 4);
-            assert_eq!(receipt.counters().2, 6);
+            assert_eq!(receipt.counters().0, 1);
+            assert_eq!(receipt.counters().1, 2);
+            assert_eq!(receipt.counters().2, 4);
             assert_eq!(receipt.counters().3, 2);
             assert!(receipt.counters().4 > 0);
         });
@@ -19041,7 +19208,85 @@ mod tests {
 
     #[cfg(feature = "profile-internals")]
     #[test]
-    fn profiled_fragmented_snapshot_records_fanout_eligibility_and_rayon() {
+    fn dynamic_string_terms_cannot_consume_the_exact_term_cache() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("dynamic isolation profile directory");
+            let writer = QuillIndex::create(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("create dynamic isolation profile writer");
+            for ordinal in 0..2 {
+                LexicalWrite::index_document(
+                    &writer,
+                    &cx,
+                    &IndexableDocument::new(format!("dynamic-{ordinal}"), "alpha"),
+                )
+                .await
+                .expect("stage dynamic isolation profile document");
+                LexicalWrite::commit(&writer, &cx)
+                    .await
+                    .expect("publish dynamic isolation profile segment");
+            }
+            let snapshot = writer
+                .search_snapshot()
+                .expect("dynamic isolation snapshot is authoritative");
+            let reader = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("open dynamic isolation profile reader");
+            let query = Query::Boolean {
+                clauses: vec![
+                    crate::query::BooleanClause::new(
+                        Occur::Should,
+                        Query::Term {
+                            fields: vec![crate::query::QueryField::new(CONTENT_FIELD, 1.0)],
+                            text: "alpha".to_owned(),
+                        },
+                    ),
+                    crate::query::BooleanClause::new(
+                        Occur::Should,
+                        Query::Set {
+                            field_id: CONTENT_FIELD,
+                            values: vec![QueryValue::Str("alpha".to_owned())],
+                        },
+                    ),
+                ],
+                operator: None,
+            };
+            let profile = QuillProfileSession::new(
+                snapshot.snapshot_epoch(),
+                snapshot
+                    .keeper_snapshot()
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                2,
+                0,
+            );
+            let result = reader
+                .reader
+                .execute_ranked_query_inner(
+                    &cx,
+                    &query,
+                    &snapshot,
+                    10,
+                    0,
+                    true,
+                    Vec::new(),
+                    None,
+                    None,
+                    Some(&profile),
+                )
+                .expect("execute exact-plus-dynamic isolation query");
+            assert_eq!(result.hits.len(), 2);
+            assert_eq!(profile.snapshot_doc_freq_calls.load(Ordering::Acquire), 3);
+            assert_eq!(profile.global_doc_freq_probes.load(Ordering::Acquire), 6);
+            assert_eq!(profile.term_dictionary_views.load(Ordering::Acquire), 10);
+            assert_eq!(profile.segments_lowered.load(Ordering::Acquire), 2);
+        });
+    }
+
+    #[cfg(feature = "profile-internals")]
+    #[test]
+    fn profiled_fragmented_snapshot_reuses_snapshot_term_statistics() {
         run_with_cx(|cx| async move {
             let directory = tempfile::tempdir().expect("fragmented profile directory");
             // The fixture needs SEGMENT_COUNT_FANOUT_THRESHOLD segments to stay
@@ -19053,7 +19298,7 @@ mod tests {
             // fan-out tests.
             let fragmented_config = QuillConfig {
                 tier_fanout: SEGMENT_COUNT_FANOUT_THRESHOLD
-                    .checked_add(1)
+                    .checked_add(2)
                     .expect("fan-out threshold leaves room for its tier policy"),
                 ..deterministic_config()
             };
@@ -19079,8 +19324,9 @@ mod tests {
                 // Field-qualified on purpose: a bare term expands across BOTH
                 // parser default fields (content and title), so every counter
                 // below would be doubled by field fan-out rather than by
-                // segment fan-out. The counter algebra this test documents --
-                // (N, N*N, N*N + N) -- is the single-field model.
+                // segment fan-out. The counter algebra this test documents is
+                // the single-field model: one snapshot-global scan plus one
+                // local cursor opening per segment.
                 .search_paginated_with_profile(&cx, "content:alpha", 16, 0, false)
                 .expect("execute fragmented profiled search");
             let (result, receipt) = match outcome {
@@ -19092,17 +19338,126 @@ mod tests {
             let expected_segments = u64::try_from(SEGMENT_COUNT_FANOUT_THRESHOLD)
                 .expect("fan-out threshold fits the profile receipt");
             assert_eq!(result.hits.len(), SEGMENT_COUNT_FANOUT_THRESHOLD);
+            for (ordinal, hit) in result.hits.iter().enumerate() {
+                assert_eq!(hit.document_id, format!("fragmented-{ordinal}"));
+            }
+            assert!(
+                result
+                    .hits
+                    .windows(2)
+                    .all(|hits| hits[0].score.to_bits() == hits[1].score.to_bits()),
+                "equal-length exact-term rows must retain identical BM25 score bits"
+            );
             assert_eq!(receipt.segment_counts(), (expected_segments, 0));
             assert_eq!(receipt.cache(), QuillProfileCacheDisposition::Miss);
             assert_eq!(receipt.fanout_eligible(), Some(true));
             assert_eq!(receipt.execution(), Some(QuillProfileExecutionMode::Rayon));
-            assert_eq!(receipt.counters().0, expected_segments);
-            assert_eq!(receipt.counters().1, expected_segments * expected_segments);
-            assert_eq!(
-                receipt.counters().2,
-                expected_segments * expected_segments + expected_segments
-            );
+            assert_eq!(receipt.counters().0, 1);
+            assert_eq!(receipt.counters().1, expected_segments);
+            assert_eq!(receipt.counters().2, expected_segments * 2);
             assert_eq!(receipt.counters().3, expected_segments);
+
+            let successor_ordinal = SEGMENT_COUNT_FANOUT_THRESHOLD;
+            LexicalWrite::index_document(
+                &writer,
+                &cx,
+                &IndexableDocument::new(
+                    format!("fragmented-{successor_ordinal}"),
+                    format!("profiled alpha fragmented {successor_ordinal}"),
+                ),
+            )
+            .await
+            .expect("stage successor fragmented profile document");
+            LexicalWrite::commit(&writer, &cx)
+                .await
+                .expect("publish successor fragmented profile segment");
+            assert!(
+                reader
+                    .refresh(&cx)
+                    .await
+                    .expect("refresh fragmented profile reader"),
+                "the read handle must adopt the successor publication"
+            );
+            let successor = reader
+                .search_paginated_with_profile(&cx, "content:alpha", 16, 0, false)
+                .expect("execute successor fragmented profiled search");
+            let (successor_result, successor_receipt) = match successor {
+                QuillProfiledSearchOutcome::Completed { result, receipt } => (result, receipt),
+                QuillProfiledSearchOutcome::Failed { error, .. } => {
+                    panic!("successor fragmented profile search unexpectedly failed: {error}")
+                }
+            };
+            let successor_segments = expected_segments + 1;
+            assert_eq!(successor_result.hits.len(), successor_ordinal + 1);
+            for (ordinal, hit) in successor_result.hits.iter().enumerate() {
+                assert_eq!(hit.document_id, format!("fragmented-{ordinal}"));
+            }
+            assert_eq!(successor_receipt.segment_counts(), (successor_segments, 0));
+            assert_eq!(
+                successor_receipt.cache(),
+                QuillProfileCacheDisposition::Miss
+            );
+            assert_eq!(successor_receipt.fanout_eligible(), Some(true));
+            assert_eq!(
+                successor_receipt.execution(),
+                Some(QuillProfileExecutionMode::Rayon)
+            );
+            assert_eq!(successor_receipt.counters().0, 1);
+            assert_eq!(successor_receipt.counters().1, successor_segments);
+            assert_eq!(successor_receipt.counters().2, successor_segments * 2);
+            assert_eq!(successor_receipt.counters().3, successor_segments);
+        });
+    }
+
+    #[test]
+    fn cached_snapshot_term_statistics_preserve_fuel_admission_boundaries() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("cached DF fuel directory");
+            let config = QuillConfig {
+                tier_fanout: 3,
+                ..deterministic_config()
+            };
+            let writer = QuillIndex::create(&cx, directory.path(), config)
+                .await
+                .expect("create cached DF fuel writer");
+            for ordinal in 0..2 {
+                LexicalWrite::index_document(
+                    &writer,
+                    &cx,
+                    &IndexableDocument::new(format!("fuel-{ordinal}"), "alpha"),
+                )
+                .await
+                .expect("stage cached DF fuel document");
+                LexicalWrite::commit(&writer, &cx)
+                    .await
+                    .expect("publish cached DF fuel segment");
+            }
+            let snapshot = writer
+                .search_snapshot()
+                .expect("cached DF fuel snapshot is authoritative");
+            assert_eq!(snapshot.keeper_snapshot().segments().len(), 2);
+            let prepared = PreparedSnapshotDocFreqs::new();
+            let checkpoint: QueryCheckpointHandle<'_> =
+                QueryCheckpoint::new(&cx, "cached_df_fuel", 3, 4);
+
+            assert_eq!(
+                prepared
+                    .get_or_compute(&checkpoint, &snapshot, CONTENT_FIELD, b"alpha")
+                    .expect("first snapshot DF scan is admitted"),
+                2
+            );
+            let error = prepared
+                .get_or_compute(&checkpoint, &snapshot, CONTENT_FIELD, b"alpha")
+                .expect_err("the cached hit must replay both dictionary admissions");
+            assert!(matches!(
+                error,
+                QuillIndexError::QueryFuelExhausted {
+                    budget: 3,
+                    consumed: 3,
+                    dictionary_blocks: 3,
+                    ..
+                }
+            ));
         });
     }
 
@@ -23954,6 +24309,7 @@ mod tests {
                 DEFAULT_SCHEMA,
                 CONTENT_FIELD,
                 b"alpha",
+                None,
                 1.0,
                 true,
                 &checkpoint,
@@ -23986,6 +24342,7 @@ mod tests {
                 DEFAULT_SCHEMA,
                 CONTENT_FIELD,
                 b"alpha",
+                None,
                 1.0,
                 true,
                 &delta_checkpoint,
@@ -24413,6 +24770,7 @@ mod tests {
                 1.0,
                 QueryLeaf::Sealed(segment),
                 &live_snapshot,
+                None,
                 DEFAULT_SCHEMA,
                 1_024,
                 true,
