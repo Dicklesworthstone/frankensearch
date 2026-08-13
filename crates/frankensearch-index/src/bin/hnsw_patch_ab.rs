@@ -13,9 +13,11 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use frankensearch_index::recall_certificate::mean_recall_lower_bound_bernstein;
@@ -51,6 +53,13 @@ const PRIMARY_EF_SEARCH: usize = 100;
 const FULL_ADMISSION_HOLD: &str = "bd-u3wt.1 is open: full performance admission requires a \
     frozen corpus/config contract, ABBA-paired multi-graph query timings, build/start/end source \
     binding review, multiplicity control, and supported tail inference";
+const DEFAULT_CHILD_DEADLINE_SMOKE_MS: u64 = 600_000;
+const DEFAULT_CHILD_DEADLINE_FULL_MS: u64 = 3_600_000;
+const DEFAULT_CHILD_TERM_GRACE_MS: u64 = 5_000;
+const DEFAULT_CHILD_LOG_BYTE_CAP: u64 = 8 * 1024 * 1024;
+const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const CHILD_REAP_AFTER_KILL: Duration = Duration::from_secs(2);
+const CHILD_STREAM_SYNC_EVERY: u64 = 64 * 1024;
 
 include!(concat!(
     env!("OUT_DIR"),
@@ -127,6 +136,10 @@ struct Config {
     child_size: Option<usize>,
     child_repetition: Option<usize>,
     child_slot: Option<usize>,
+    child_deadline_ms: u64,
+    child_term_grace_ms: u64,
+    child_log_byte_cap: u64,
+    child_log_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -154,6 +167,10 @@ impl Config {
             child_size: None,
             child_repetition: None,
             child_slot: None,
+            child_deadline_ms: DEFAULT_CHILD_DEADLINE_SMOKE_MS,
+            child_term_grace_ms: DEFAULT_CHILD_TERM_GRACE_MS,
+            child_log_byte_cap: DEFAULT_CHILD_LOG_BYTE_CAP,
+            child_log_dir: None,
         }
     }
 
@@ -181,6 +198,10 @@ impl Config {
             child_size: None,
             child_repetition: None,
             child_slot: None,
+            child_deadline_ms: DEFAULT_CHILD_DEADLINE_FULL_MS,
+            child_term_grace_ms: DEFAULT_CHILD_TERM_GRACE_MS,
+            child_log_byte_cap: DEFAULT_CHILD_LOG_BYTE_CAP,
+            child_log_dir: None,
         }
     }
 
@@ -298,6 +319,25 @@ impl Config {
                 "--child-slot" => {
                     config.child_slot =
                         Some(parse_usize(required_value(&args, index)?, "child-slot")?);
+                    index += 2;
+                }
+                "--child-deadline-ms" => {
+                    config.child_deadline_ms =
+                        parse_u64(required_value(&args, index)?, "child-deadline-ms")?;
+                    index += 2;
+                }
+                "--child-term-grace-ms" => {
+                    config.child_term_grace_ms =
+                        parse_u64(required_value(&args, index)?, "child-term-grace-ms")?;
+                    index += 2;
+                }
+                "--child-log-byte-cap" => {
+                    config.child_log_byte_cap =
+                        parse_u64(required_value(&args, index)?, "child-log-byte-cap")?;
+                    index += 2;
+                }
+                "--child-log-dir" => {
+                    config.child_log_dir = Some(PathBuf::from(required_value(&args, index)?));
                     index += 2;
                 }
                 "--help" | "-h" => {
@@ -446,6 +486,28 @@ impl Config {
         if child_fields.iter().any(|set| *set) && !child_fields.iter().all(|set| *set) {
             return Err("child mode requires engine, size, repetition, and slot together".into());
         }
+        if self.child_deadline_ms == 0
+            || self.child_term_grace_ms == 0
+            || self.child_log_byte_cap == 0
+        {
+            return Err(
+                "child deadline, term-grace, and log byte cap must be non-zero milliseconds/bytes"
+                    .into(),
+            );
+        }
+        if self.child_deadline_ms <= self.child_term_grace_ms {
+            return Err("child deadline must exceed the terminate-then-kill grace window".into());
+        }
+        if let Some(path) = &self.child_log_dir
+            && path.exists()
+            && !path.is_dir()
+        {
+            return Err(format!(
+                "child log dir exists and is not a directory: {}",
+                path.display()
+            )
+            .into());
+        }
         Ok(())
     }
 
@@ -521,6 +583,12 @@ fn parse_usize(value: &str, field: &str) -> Result<usize, DynError> {
         .map_err(|_| format!("invalid --{field} value {value:?}").into())
 }
 
+fn parse_u64(value: &str, field: &str) -> Result<u64, DynError> {
+    value
+        .parse()
+        .map_err(|_| format!("invalid --{field} value {value:?}").into())
+}
+
 fn parse_usize_list(value: &str, field: &str) -> Result<Vec<usize>, DynError> {
     let parsed: Result<Vec<_>, _> = value.split(',').map(|part| part.parse::<usize>()).collect();
     let values = parsed.map_err(|_| format!("invalid --{field} list {value:?}"))?;
@@ -546,7 +614,9 @@ fn print_help() {
          [--holdout-queries N] [--query-passes N] \
          [--build-repetitions N] [--warmup-passes N] \
          [--corpus-slab PATH] [--corpus-manifest PATH] \
-         [--corpus-source-manifest PATH] [--output PATH]"
+         [--corpus-source-manifest PATH] [--output PATH] \
+         [--child-deadline-ms N] [--child-term-grace-ms N] \
+         [--child-log-byte-cap N] [--child-log-dir PATH]"
     );
 }
 
@@ -1711,12 +1781,24 @@ fn observe_build_queries(
         .collect()
 }
 
-fn parent_main(config: Config) -> Result<(), DynError> {
+fn parent_main(mut config: Config) -> Result<(), DynError> {
     let executable = env::current_exe()?;
     let executable_sha256_before = sha256_file(&executable)?;
     let workspace = workspace_root()?;
     let workspace_source_receipt_start = workspace_source_receipt(&workspace)?;
     let build_source_receipt = embedded_build_attestation().workspace_source_receipt;
+    let child_log_dir = prepare_child_log_dir(&config)?;
+    config.child_log_dir = Some(child_log_dir.clone());
+    let journal = Arc::new(ChildJournal::create_new(
+        &child_log_dir.join("child-journal.jsonl"),
+    )?);
+    structured_log(
+        "child_log_dir",
+        &format!(
+            "\"path\":{}",
+            serde_json::to_string(&child_log_dir.display().to_string())?
+        ),
+    );
     if !workspace_source_binding_is_complete(
         &build_source_receipt,
         &workspace_source_receipt_start,
@@ -1739,6 +1821,8 @@ fn parent_main(config: Config) -> Result<(), DynError> {
             size,
             &corpus.hash,
             &executable_sha256_before,
+            &child_log_dir,
+            &journal,
         )?;
         let build_summary = summarize_build_samples(&build_samples)?;
         let replicated_quality_cells =
@@ -1872,13 +1956,444 @@ fn parent_main(config: Config) -> Result<(), DynError> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ChildExecutionLimits {
+    deadline: Duration,
+    term_grace: Duration,
+    stdout_byte_cap: u64,
+    stderr_byte_cap: u64,
+}
+
+impl Config {
+    fn child_execution_limits(&self) -> ChildExecutionLimits {
+        ChildExecutionLimits {
+            deadline: Duration::from_millis(self.child_deadline_ms),
+            term_grace: Duration::from_millis(self.child_term_grace_ms),
+            stdout_byte_cap: self.child_log_byte_cap,
+            stderr_byte_cap: self.child_log_byte_cap,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ChildIdentity {
+    label: String,
+}
+
+impl ChildIdentity {
+    fn cell(engine: EngineKind, size: usize, repetition: usize, slot: usize) -> Self {
+        Self {
+            label: format!("{}-size{size}-rep{repetition}-slot{slot}", engine.label()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChildTermination {
+    Exited(i32),
+    Signaled(i32),
+    TimedOutTerminated,
+    TimedOutKilled,
+}
+
+impl ChildTermination {
+    fn summary(self) -> String {
+        match self {
+            Self::Exited(code) => format!("exited {code}"),
+            Self::Signaled(signal) => format!("signaled {signal}"),
+            Self::TimedOutTerminated => "timed out (SIGTERM)".to_owned(),
+            Self::TimedOutKilled => "timed out (SIGKILL)".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BoundedChildResult {
+    termination: ChildTermination,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    stdout_bytes: u64,
+    stderr_bytes: u64,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    elapsed: Duration,
+    pid: u32,
+}
+
+struct ChildJournal {
+    file: Mutex<fs::File>,
+}
+
+impl ChildJournal {
+    fn create_new(path: &Path) -> Result<Self, DynError> {
+        let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        Ok(Self {
+            file: Mutex::new(file),
+        })
+    }
+
+    fn record(&self, event: &str, fields: &str) -> Result<(), DynError> {
+        let unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_millis();
+        let event_json =
+            serde_json::to_string(event).unwrap_or_else(|_| "\"serialization_error\"".to_owned());
+        let line = if fields.is_empty() {
+            format!("{{\"schema\":\"{SCHEMA}\",\"event\":{event_json},\"unix_ms\":{unix_ms}}}\n")
+        } else {
+            format!(
+                "{{\"schema\":\"{SCHEMA}\",\"event\":{event_json},{fields},\"unix_ms\":{unix_ms}}}\n"
+            )
+        };
+        {
+            let mut file = self
+                .file
+                .lock()
+                .map_err(|_| "child journal lock poisoned")?;
+            file.write_all(line.as_bytes())?;
+            file.flush()?;
+            file.sync_all()?;
+        }
+        Ok(())
+    }
+}
+
+fn prepare_child_log_dir(config: &Config) -> Result<PathBuf, DynError> {
+    if let Some(dir) = &config.child_log_dir {
+        fs::create_dir_all(dir)?;
+        return Ok(dir.clone());
+    }
+    if let Some(output) = &config.output {
+        let mut dir = output.clone();
+        dir.set_extension("child-logs");
+        fs::create_dir_all(&dir)?;
+        return Ok(dir);
+    }
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_millis();
+    let dir = env::temp_dir().join(format!("hnsw-patch-ab-{}-{stamp}", std::process::id()));
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+struct StreamStats {
+    bytes: u64,
+    truncated: bool,
+}
+
+fn stream_pipe_to_file(
+    mut reader: impl Read + Send + 'static,
+    path: PathBuf,
+    cap: u64,
+    journal: Arc<ChildJournal>,
+    stream: &'static str,
+    identity: String,
+) -> thread::JoinHandle<Result<StreamStats, String>> {
+    thread::spawn(move || {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| format!("open {}: {error}", path.display()))?;
+        let mut written = 0_u64;
+        let mut truncated = false;
+        let mut since_sync = 0_u64;
+        let mut buf = [0_u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let n = u64::try_from(n).unwrap_or(u64::MAX);
+                    if written < cap {
+                        let room = cap - written;
+                        let take = n.min(room);
+                        let take_usize = usize::try_from(take).unwrap_or(buf.len());
+                        file.write_all(&buf[..take_usize])
+                            .map_err(|error| format!("write {}: {error}", path.display()))?;
+                        written += take;
+                        since_sync += take;
+                        if take < n && !truncated {
+                            truncated = true;
+                            let _ = journal.record(
+                                "child_stream_truncated",
+                                &format!(
+                                    "\"stream\":\"{stream}\",\"bytes_written\":{written},\
+                                     \"byte_cap\":{cap},\"identity\":{}",
+                                    serde_json::to_string(&identity)
+                                        .unwrap_or_else(|_| "\"serialization_error\"".to_owned())
+                                ),
+                            );
+                        }
+                    } else if !truncated {
+                        truncated = true;
+                        let _ = journal.record(
+                            "child_stream_truncated",
+                            &format!(
+                                "\"stream\":\"{stream}\",\"bytes_written\":{written},\
+                                 \"byte_cap\":{cap},\"identity\":{}",
+                                serde_json::to_string(&identity)
+                                    .unwrap_or_else(|_| "\"serialization_error\"".to_owned())
+                            ),
+                        );
+                    }
+                    if since_sync >= CHILD_STREAM_SYNC_EVERY {
+                        file.flush()
+                            .map_err(|error| format!("flush {}: {error}", path.display()))?;
+                        since_sync = 0;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    return Err(format!("read {stream} for {}: {error}", path.display()));
+                }
+            }
+        }
+        file.flush()
+            .map_err(|error| format!("flush {}: {error}", path.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("sync {}: {error}", path.display()))?;
+        Ok(StreamStats {
+            bytes: written,
+            truncated,
+        })
+    })
+}
+
+#[cfg(unix)]
+fn signal_process_group(pid: u32, signal: i32) -> Result<(), DynError> {
+    let status = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg("--")
+        .arg(format!("-{pid}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        return Ok(());
+    }
+    if process_exists(pid) {
+        Err(format!("kill -{signal} -- -{pid} failed: {status:?}").into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg("--")
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+fn classify_child_status(
+    status: std::process::ExitStatus,
+    sent_term: bool,
+    sent_kill: bool,
+) -> ChildTermination {
+    use std::os::unix::process::ExitStatusExt;
+
+    if let Some(signal) = status.signal() {
+        if sent_kill && signal == libc::SIGKILL {
+            return ChildTermination::TimedOutKilled;
+        }
+        if sent_term && signal == libc::SIGTERM {
+            return ChildTermination::TimedOutTerminated;
+        }
+        return ChildTermination::Signaled(signal);
+    }
+    ChildTermination::Exited(status.code().unwrap_or(1))
+}
+
+#[cfg(not(unix))]
+fn classify_child_status(
+    status: std::process::ExitStatus,
+    _sent_term: bool,
+    _sent_kill: bool,
+) -> ChildTermination {
+    ChildTermination::Exited(status.code().unwrap_or(1))
+}
+
+fn run_bounded_child(
+    mut command: Command,
+    limits: ChildExecutionLimits,
+    stdout_path: &Path,
+    stderr_path: &Path,
+    journal: &Arc<ChildJournal>,
+    identity: &ChildIdentity,
+) -> Result<BoundedChildResult, DynError> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
+    let identity_json = serde_json::to_string(&identity.label)
+        .unwrap_or_else(|_| "\"serialization_error\"".to_owned());
+    journal.record(
+        "child_spawn_start",
+        &format!(
+            "\"identity\":{identity_json},\"deadline_ms\":{},\"term_grace_ms\":{},\
+             \"stdout_byte_cap\":{},\"stderr_byte_cap\":{}",
+            limits.deadline.as_millis(),
+            limits.term_grace.as_millis(),
+            limits.stdout_byte_cap,
+            limits.stderr_byte_cap
+        ),
+    )?;
+
+    let started = Instant::now();
+    let mut child = command.spawn().map_err(|error| -> DynError {
+        let _ = journal.record(
+            "child_spawn_failed",
+            &format!("\"identity\":{identity_json},\"error\":{error:?}"),
+        );
+        format!("failed to spawn {}: {error}", identity.label).into()
+    })?;
+    let pid = child.id();
+    journal.record(
+        "child_spawned",
+        &format!("\"identity\":{identity_json},\"pid\":{pid}"),
+    )?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("child stdout pipe was not captured")?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or("child stderr pipe was not captured")?;
+    let stdout_thread = stream_pipe_to_file(
+        stdout,
+        stdout_path.to_path_buf(),
+        limits.stdout_byte_cap,
+        Arc::clone(journal),
+        "stdout",
+        identity.label.clone(),
+    );
+    let stderr_thread = stream_pipe_to_file(
+        stderr,
+        stderr_path.to_path_buf(),
+        limits.stderr_byte_cap,
+        Arc::clone(journal),
+        "stderr",
+        identity.label.clone(),
+    );
+
+    let deadline = started + limits.deadline;
+    let mut sent_term = false;
+    let mut sent_kill = false;
+    let mut term_at = None;
+    let mut kill_at = None;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None => {
+                let now = Instant::now();
+                if !sent_term && now >= deadline {
+                    journal.record(
+                        "child_timeout_term",
+                        &format!("\"identity\":{identity_json},\"pid\":{pid}"),
+                    )?;
+                    #[cfg(unix)]
+                    signal_process_group(pid, libc::SIGTERM)?;
+                    #[cfg(not(unix))]
+                    child.kill()?;
+                    sent_term = true;
+                    term_at = Some(now);
+                } else if sent_term
+                    && !sent_kill
+                    && term_at.is_some_and(|sent| now >= sent + limits.term_grace)
+                {
+                    journal.record(
+                        "child_timeout_kill",
+                        &format!("\"identity\":{identity_json},\"pid\":{pid}"),
+                    )?;
+                    #[cfg(unix)]
+                    signal_process_group(pid, libc::SIGKILL)?;
+                    #[cfg(not(unix))]
+                    child.kill()?;
+                    sent_kill = true;
+                    kill_at = Some(now);
+                } else if sent_kill
+                    && kill_at.is_some_and(|sent| now >= sent + CHILD_REAP_AFTER_KILL)
+                {
+                    journal.record(
+                        "child_unreaped",
+                        &format!("\"identity\":{identity_json},\"pid\":{pid}"),
+                    )?;
+                    return Err(format!(
+                        "child {} pid {pid} survived SIGKILL for {:?}",
+                        identity.label, CHILD_REAP_AFTER_KILL
+                    )
+                    .into());
+                }
+                thread::sleep(CHILD_POLL_INTERVAL);
+            }
+        }
+    };
+
+    let stdout_stats = stdout_thread
+        .join()
+        .map_err(|_| format!("stdout reader for {} panicked", identity.label))??;
+    let stderr_stats = stderr_thread
+        .join()
+        .map_err(|_| format!("stderr reader for {} panicked", identity.label))??;
+    let termination = classify_child_status(status, sent_term, sent_kill);
+    let elapsed = started.elapsed();
+    journal.record(
+        "child_reaped",
+        &format!(
+            "\"identity\":{identity_json},\"pid\":{pid},\"termination\":{},\
+             \"elapsed_ms\":{},\"stdout_bytes\":{},\"stderr_bytes\":{},\
+             \"stdout_truncated\":{},\"stderr_truncated\":{}",
+            serde_json::to_string(&termination.summary())
+                .unwrap_or_else(|_| "\"serialization_error\"".to_owned()),
+            elapsed.as_millis(),
+            stdout_stats.bytes,
+            stderr_stats.bytes,
+            stdout_stats.truncated,
+            stderr_stats.truncated
+        ),
+    )?;
+    Ok(BoundedChildResult {
+        termination,
+        stdout_path: stdout_path.to_path_buf(),
+        stderr_path: stderr_path.to_path_buf(),
+        stdout_bytes: stdout_stats.bytes,
+        stderr_bytes: stderr_stats.bytes,
+        stdout_truncated: stdout_stats.truncated,
+        stderr_truncated: stderr_stats.truncated,
+        elapsed,
+        pid,
+    })
+}
+
 fn collect_build_samples(
     executable: &Path,
     config: &Config,
     size: usize,
     expected_corpus_sha256: &str,
     expected_executable_sha256: &str,
+    child_log_dir: &Path,
+    journal: &Arc<ChildJournal>,
 ) -> Result<Vec<BuildSample>, DynError> {
+    let limits = config.child_execution_limits();
     let mut samples = Vec::with_capacity(config.build_repetitions * 4);
     for repetition in 0..config.build_repetitions {
         let schedule = if repetition % 2 == 0 {
@@ -1897,19 +2412,42 @@ fn collect_build_samples(
             ]
         };
         for (slot, engine) in schedule.into_iter().enumerate() {
-            let output = Command::new(executable)
-                .args(config.child_args(engine, size, repetition, slot))
-                .stdin(Stdio::null())
-                .output()?;
-            if !output.status.success() {
+            let identity = ChildIdentity::cell(engine, size, repetition, slot);
+            let stdout_path = child_log_dir.join(format!("{}.stdout", identity.label));
+            let stderr_path = child_log_dir.join(format!("{}.stderr", identity.label));
+            let mut command = Command::new(executable);
+            command.args(config.child_args(engine, size, repetition, slot));
+            let executed = run_bounded_child(
+                command,
+                limits,
+                &stdout_path,
+                &stderr_path,
+                journal,
+                &identity,
+            )?;
+            if !matches!(executed.termination, ChildTermination::Exited(0)) {
+                let stderr = fs::read_to_string(&executed.stderr_path).unwrap_or_default();
                 return Err(format!(
-                    "{} child failed for size {size}, repetition {repetition}, slot {slot}: {}",
+                    "{} child {} pid {} after {:?} (stdout_bytes={} stderr_bytes={}) \
+                     for size {size}, repetition {repetition}, slot {slot}; \
+                     stderr {}: {}{}",
                     engine.label(),
-                    String::from_utf8_lossy(&output.stderr)
+                    executed.termination.summary(),
+                    executed.pid,
+                    executed.elapsed,
+                    executed.stdout_bytes,
+                    executed.stderr_bytes,
+                    executed.stderr_path.display(),
+                    stderr.trim(),
+                    if executed.stdout_truncated || executed.stderr_truncated {
+                        " (log truncated)"
+                    } else {
+                        ""
+                    }
                 )
                 .into());
             }
-            let stdout = String::from_utf8(output.stdout)?;
+            let stdout = fs::read_to_string(&executed.stdout_path)?;
             let payloads: Vec<_> = stdout
                 .lines()
                 .filter_map(|line| line.strip_prefix(CHILD_SENTINEL))
@@ -4853,5 +5391,193 @@ source = "git+https://github.com/Dicklesworthstone/hnswlib-rs?rev={CANDIDATE_REV
             bootstrap_median_95_low: low,
             bootstrap_median_95_high: high,
         }
+    }
+
+    #[test]
+    fn child_limits_reject_zero_and_grace_not_shorter_than_deadline() {
+        let mut config = Config::smoke();
+        config.child_deadline_ms = 0;
+        assert!(config.validate().is_err());
+        config = Config::smoke();
+        config.child_term_grace_ms = config.child_deadline_ms;
+        assert!(config.validate().is_err());
+        config = Config::smoke();
+        config.child_log_byte_cap = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[cfg(unix)]
+    fn run_fixture(
+        command: Command,
+        label: &str,
+        deadline_ms: u64,
+        grace_ms: u64,
+        cap: u64,
+    ) -> (BoundedChildResult, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = Arc::new(
+            ChildJournal::create_new(&directory.path().join("child-journal.jsonl")).unwrap(),
+        );
+        let stdout = directory.path().join("stdout");
+        let stderr = directory.path().join("stderr");
+        let result = run_bounded_child(
+            command,
+            ChildExecutionLimits {
+                deadline: Duration::from_millis(deadline_ms),
+                term_grace: Duration::from_millis(grace_ms),
+                stdout_byte_cap: cap,
+                stderr_byte_cap: cap,
+            },
+            &stdout,
+            &stderr,
+            &journal,
+            &ChildIdentity {
+                label: label.to_owned(),
+            },
+        )
+        .expect("bounded child fixture must complete");
+        (result, directory)
+    }
+
+    #[cfg(unix)]
+    fn journal_events(directory: &tempfile::TempDir) -> String {
+        fs::read_to_string(directory.path().join("child-journal.jsonl")).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_child_success_persists_stdout_and_journal() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf 'ok\\n'"]);
+        let (result, directory) = run_fixture(command, "success", 2_000, 200, 4096);
+        assert_eq!(result.termination, ChildTermination::Exited(0));
+        assert_eq!(fs::read_to_string(&result.stdout_path).unwrap(), "ok\n");
+        assert!(!result.stdout_truncated);
+        assert!(result.stderr_path.exists());
+        assert!(!result.stderr_truncated);
+        assert!(result.elapsed < Duration::from_secs(2));
+        let _ = result.stderr_bytes;
+        let journal = journal_events(&directory);
+        assert!(journal.contains("child_spawned"));
+        assert!(journal.contains("child_reaped"));
+        assert!(!process_exists(result.pid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_child_nonzero_exit_is_observed() {
+        let (result, _) = run_fixture(Command::new("/bin/false"), "nonzero", 2_000, 200, 4096);
+        assert_eq!(result.termination, ChildTermination::Exited(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_child_timeout_sends_term_and_reaps() {
+        let started = Instant::now();
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let (result, directory) = run_fixture(command, "timeout-term", 200, 200, 4096);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "timeout path hung: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(result.termination, ChildTermination::TimedOutTerminated);
+        let journal = journal_events(&directory);
+        assert!(journal.contains("child_timeout_term"));
+        assert!(!process_exists(result.pid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_child_forced_kill_after_ignored_term() {
+        let started = Instant::now();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "trap \"\" TERM; exec /bin/sleep 30"]);
+        let (result, directory) = run_fixture(command, "timeout-kill", 200, 150, 4096);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "kill path hung: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(result.termination, ChildTermination::TimedOutKilled);
+        let journal = journal_events(&directory);
+        assert!(journal.contains("child_timeout_term"));
+        assert!(journal.contains("child_timeout_kill"));
+        assert!(!process_exists(result.pid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_child_signal_is_classified() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "kill -ABRT $$"]);
+        let (result, _) = run_fixture(command, "signal", 2_000, 200, 4096);
+        assert_eq!(
+            result.termination,
+            ChildTermination::Signaled(libc::SIGABRT)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_child_chatty_output_is_capped_and_durable() {
+        let mut command = Command::new("/bin/dd");
+        command.args([
+            "if=/dev/zero",
+            "of=/dev/stdout",
+            "bs=1024",
+            "count=64",
+            "status=none",
+        ]);
+        let (result, directory) = run_fixture(command, "chatty", 5_000, 200, 4096);
+        assert_eq!(result.termination, ChildTermination::Exited(0));
+        assert!(result.stdout_truncated);
+        assert_eq!(result.stdout_bytes, 4096);
+        assert_eq!(
+            fs::metadata(&result.stdout_path).unwrap().len(),
+            4096,
+            "capped stdout file must not grow past the byte cap"
+        );
+        assert!(journal_events(&directory).contains("child_stream_truncated"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_child_partial_log_survives_timeout() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf 'PARTIAL\\n'; exec /bin/sleep 30"]);
+        let (result, directory) = run_fixture(command, "partial-log", 200, 200, 4096);
+        let _keep_logs = directory;
+        assert_eq!(result.termination, ChildTermination::TimedOutTerminated);
+        assert_eq!(
+            fs::read_to_string(&result.stdout_path).unwrap(),
+            "PARTIAL\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_child_kills_orphans_in_the_dedicated_process_group() {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            " /bin/sleep 60 & printf 'ORPHAN_PID=%s\\n' \"$!\"; exec /bin/sleep 60",
+        ]);
+        let (result, directory) = run_fixture(command, "orphan", 250, 200, 4096);
+        let _keep_logs = directory;
+        assert_eq!(result.termination, ChildTermination::TimedOutTerminated);
+        let stdout = fs::read_to_string(&result.stdout_path).unwrap();
+        let orphan = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("ORPHAN_PID="))
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .expect("child must report the background pid");
+        assert!(
+            !process_exists(result.pid),
+            "leader {} still alive",
+            result.pid
+        );
+        assert!(!process_exists(orphan), "orphan {orphan} still alive");
     }
 }
