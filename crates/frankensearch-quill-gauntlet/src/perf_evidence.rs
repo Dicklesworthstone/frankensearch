@@ -4574,7 +4574,12 @@ mod tests {
         if spec.gate == PerfGate::Qg1 && spec.metric == "docs_per_second" {
             return valid_qg1_experiment_for_spec(spec, ratio).paired;
         }
-        bind_experiment_to_spec(valid_experiment(ratio), spec)
+        let mut effect = gauge_stream(&effect_pairs(12, ratio), 0, 0, None);
+        let mut null = gauge_stream(&quiet_null_pairs(12), 10_000, 0, None);
+        bind_samples_to_spec(&mut effect, spec);
+        bind_samples_to_spec(&mut null, spec);
+        estimate_paired_experiment(&effect, &null, &config())
+            .expect("valid non-QG experiment")
     }
 
     fn valid_treatment_arm_null_for_spec(
