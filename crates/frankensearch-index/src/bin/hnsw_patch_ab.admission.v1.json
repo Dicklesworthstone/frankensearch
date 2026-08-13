@@ -1,0 +1,23 @@
+{
+  "schema": "frankensearch-index.hnsw-patch-ab.admission-contract.v1",
+  "profile": "full",
+  "sizes": [50000, 100000],
+  "dimension": 128,
+  "clusters": 256,
+  "noise": 0.15,
+  "m": 16,
+  "ef_construction": 200,
+  "max_layer": 16,
+  "ef_search": [40, 100, 200],
+  "k": 10,
+  "holdout_queries": 300,
+  "query_passes": 10,
+  "build_repetitions": 10,
+  "warmup_passes": 2,
+  "primary_size": 100000,
+  "primary_ef_search": 100,
+  "primary_family": "query_latency",
+  "graphs_per_engine_per_block": 2,
+  "min_tail_n_p95": 20,
+  "min_tail_n_p99": 100
+}

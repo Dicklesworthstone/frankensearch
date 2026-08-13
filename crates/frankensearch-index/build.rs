@@ -18,6 +18,7 @@ const WORKSPACE_SOURCE_FIXED_INPUTS: &[&str] = &[
     "crates/frankensearch-core/Cargo.toml",
     "crates/frankensearch-index/Cargo.toml",
     "crates/frankensearch-index/build.rs",
+    "crates/frankensearch-index/src/bin/hnsw_patch_ab.admission.v1.json",
 ];
 
 fn main() {

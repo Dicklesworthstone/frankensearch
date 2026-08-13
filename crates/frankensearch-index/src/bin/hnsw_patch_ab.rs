@@ -43,6 +43,7 @@ const WORKSPACE_SOURCE_FIXED_INPUTS: &[&str] = &[
     "crates/frankensearch-core/Cargo.toml",
     "crates/frankensearch-index/Cargo.toml",
     "crates/frankensearch-index/build.rs",
+    "crates/frankensearch-index/src/bin/hnsw_patch_ab.admission.v1.json",
 ];
 const QUERY_NULL_TOLERANCE: f64 = 0.05;
 const BUILD_NULL_TOLERANCE: f64 = 0.10;
@@ -50,9 +51,11 @@ const MAX_MEAN_RECALL_REGRESSION: f64 = 0.005;
 const MIN_ABSOLUTE_RECALL: f64 = 0.95;
 const PRIMARY_SIZE: usize = 100_000;
 const PRIMARY_EF_SEARCH: usize = 100;
-const FULL_ADMISSION_HOLD: &str = "bd-u3wt.1 is open: full performance admission requires a \
-    frozen corpus/config contract, ABBA-paired multi-graph query timings, build/start/end source \
-    binding review, multiplicity control, and supported tail inference";
+const ADMISSION_CONTRACT_SCHEMA: &str = "frankensearch-index.hnsw-patch-ab.admission-contract.v1";
+const ADMISSION_CONTRACT_RELATIVE_PATH: &str =
+    "crates/frankensearch-index/src/bin/hnsw_patch_ab.admission.v1.json";
+const ADMISSION_CONTRACT_JSON: &str = include_str!("hnsw_patch_ab.admission.v1.json");
+const ADMISSION_PRIMARY_FAMILY: &str = "query_latency";
 const DEFAULT_CHILD_DEADLINE_SMOKE_MS: u64 = 600_000;
 const DEFAULT_CHILD_DEADLINE_FULL_MS: u64 = 3_600_000;
 const DEFAULT_CHILD_TERM_GRACE_MS: u64 = 5_000;
@@ -426,6 +429,7 @@ impl Config {
             .into());
         }
         if self.profile == "full" {
+            admission_contract()?.matches_config(self)?;
             if self.corpus_slab.is_none() {
                 return Err(
                     "--full is a high-scale evidence run and requires --corpus-slab; use --smoke for synthetic diagnostics"
@@ -982,6 +986,7 @@ struct BuildSample {
 struct BuildQueryObservation {
     ef_search: usize,
     hits: Vec<Vec<usize>>,
+    latencies_ns: Vec<u128>,
     nondeterministic_repeat_queries: usize,
 }
 
@@ -1092,6 +1097,91 @@ struct SizeResult {
     build_summary: BuildSummary,
     query_cells: Vec<QueryCell>,
     replicated_quality_cells: Vec<ReplicatedQualityCell>,
+    replicated_query_cells: Vec<ReplicatedQueryCell>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicatedQueryCell {
+    corpus_size: usize,
+    ef_search: usize,
+    graph_count: usize,
+    queries_per_graph: usize,
+    baseline_latency: Distribution,
+    candidate_latency: Distribution,
+    paired_candidate_over_baseline: PairedRatio,
+    p95_supported: bool,
+    p99_supported: bool,
+    paired_p95: Option<PairedRatio>,
+    paired_p99: Option<PairedRatio>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AdmissionContract {
+    schema: String,
+    profile: String,
+    sizes: Vec<usize>,
+    dimension: usize,
+    clusters: usize,
+    noise: f32,
+    m: usize,
+    ef_construction: usize,
+    max_layer: usize,
+    ef_search: Vec<usize>,
+    k: usize,
+    holdout_queries: usize,
+    query_passes: usize,
+    build_repetitions: usize,
+    warmup_passes: usize,
+    primary_size: usize,
+    primary_ef_search: usize,
+    primary_family: String,
+    graphs_per_engine_per_block: usize,
+    min_tail_n_p95: usize,
+    min_tail_n_p99: usize,
+}
+
+fn admission_contract() -> Result<AdmissionContract, DynError> {
+    let contract: AdmissionContract = serde_json::from_str(ADMISSION_CONTRACT_JSON)?;
+    if contract.schema != ADMISSION_CONTRACT_SCHEMA
+        || contract.profile != "full"
+        || contract.primary_family != ADMISSION_PRIMARY_FAMILY
+        || contract.primary_size != PRIMARY_SIZE
+        || contract.primary_ef_search != PRIMARY_EF_SEARCH
+        || contract.graphs_per_engine_per_block != 2
+        || contract.min_tail_n_p95 == 0
+        || contract.min_tail_n_p99 == 0
+    {
+        return Err("embedded admission contract is internally inconsistent".into());
+    }
+    Ok(contract)
+}
+
+fn admission_contract_sha256() -> String {
+    sha256_bytes(ADMISSION_CONTRACT_JSON.as_bytes())
+}
+
+impl AdmissionContract {
+    fn matches_config(&self, config: &Config) -> Result<(), DynError> {
+        if config.profile != self.profile
+            || config.sizes != self.sizes
+            || config.dimension != self.dimension
+            || config.clusters != self.clusters
+            || config.noise.to_bits() != self.noise.to_bits()
+            || config.m != self.m
+            || config.ef_construction != self.ef_construction
+            || config.max_layer != self.max_layer
+            || config.ef_search != self.ef_search
+            || config.k != self.k
+            || config.holdout_queries != self.holdout_queries
+            || config.query_passes != self.query_passes
+            || config.build_repetitions != self.build_repetitions
+            || config.warmup_passes != self.warmup_passes
+        {
+            return Err("full runner config drifted from the frozen admission contract".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1770,18 +1860,35 @@ fn observe_build_queries(
         .iter()
         .map(|&ef_search| {
             let mut hits = Vec::with_capacity(queries.len());
+            let mut latencies_ns = Vec::with_capacity(queries.len());
             let mut nondeterministic_repeat_queries = 0;
             for query in queries {
-                let first = graph.search(query, config.k, ef_search);
-                let second = graph.search(query, config.k, ef_search);
-                if first != second {
+                let mut pass_hits = Vec::with_capacity(config.query_passes);
+                let mut pass_latencies = Vec::with_capacity(config.query_passes);
+                for _ in 0..config.query_passes {
+                    let started = Instant::now();
+                    let ids = graph.search(query, config.k, ef_search);
+                    pass_latencies.push(started.elapsed().as_nanos());
+                    pass_hits.push(ids);
+                }
+                if pass_hits.windows(2).any(|pair| pair[0] != pair[1]) {
                     nondeterministic_repeat_queries += 1;
                 }
-                hits.push(first);
+                hits.push(
+                    pass_hits
+                        .into_iter()
+                        .next()
+                        .expect("query_passes is non-zero"),
+                );
+                pass_latencies.sort_unstable();
+                latencies_ns.push(
+                    percentile_sorted_u128(&pass_latencies, 1, 2).unwrap_or(pass_latencies[0]),
+                );
             }
             BuildQueryObservation {
                 ef_search,
                 hits,
+                latencies_ns,
                 nondeterministic_repeat_queries,
             }
         })
@@ -1834,6 +1941,7 @@ fn parent_main(mut config: Config) -> Result<(), DynError> {
         let build_summary = summarize_build_samples(&build_samples)?;
         let replicated_quality_cells =
             replicated_quality_cells(size, &build_samples, &exact, &config)?;
+        let replicated_query_cells = replicated_query_cells(size, &build_samples, &config)?;
         let baseline = Graph::build(EngineKind::Baseline, &corpus.vectors, &config);
         let candidate = Graph::build(EngineKind::Candidate, &corpus.vectors, &config);
         warm_up(&baseline, &candidate, &corpus.queries, &config);
@@ -1868,6 +1976,7 @@ fn parent_main(mut config: Config) -> Result<(), DynError> {
             build_summary,
             query_cells,
             replicated_quality_cells,
+            replicated_query_cells,
         });
     }
     let provenance = provenance(
@@ -2486,10 +2595,11 @@ fn collect_build_samples(
             let ef_cells_match = observed_ef == expected_ef;
             let observation_count_matches =
                 sample.query_observations.len() == config.ef_search.len();
-            let hit_counts_match = sample
-                .query_observations
-                .iter()
-                .all(|observation| observation.hits.len() == config.holdout_queries);
+            let hit_counts_match = sample.query_observations.iter().all(|observation| {
+                observation.hits.len() == config.holdout_queries
+                    && observation.latencies_ns.len() == config.holdout_queries
+                    && observation.latencies_ns.iter().all(|&latency| latency > 0)
+            });
             if !ef_cells_match || !observation_count_matches || !hit_counts_match {
                 return Err("child query observations do not match the requested grid".into());
             }
@@ -2572,6 +2682,218 @@ fn replicated_quality_cells(
         });
     }
     Ok(cells)
+}
+
+fn replicated_query_cells(
+    corpus_size: usize,
+    build_samples: &[BuildSample],
+    config: &Config,
+) -> Result<Vec<ReplicatedQueryCell>, DynError> {
+    let contract = admission_contract()?;
+    let expected_graphs = config
+        .build_repetitions
+        .checked_mul(contract.graphs_per_engine_per_block)
+        .ok_or("graph replica count overflow")?;
+    let mut cells = Vec::with_capacity(config.ef_search.len());
+    for &ef_search in &config.ef_search {
+        let mut baseline_graphs = Vec::new();
+        let mut candidate_graphs = Vec::new();
+        let mut by_repetition: BTreeMap<usize, Vec<&BuildSample>> = BTreeMap::new();
+        for sample in build_samples {
+            by_repetition
+                .entry(sample.repetition)
+                .or_default()
+                .push(sample);
+        }
+        for repetition_samples in by_repetition.values_mut() {
+            repetition_samples.sort_unstable_by_key(|sample| sample.abba_slot);
+            for engine in [EngineKind::Baseline, EngineKind::Candidate] {
+                let engine_samples: Vec<_> = repetition_samples
+                    .iter()
+                    .copied()
+                    .filter(|sample| sample.engine == engine)
+                    .collect();
+                if engine_samples.len() != contract.graphs_per_engine_per_block {
+                    return Err(format!(
+                        "ef-search {ef_search} repetition does not contain {} {} graphs",
+                        contract.graphs_per_engine_per_block,
+                        engine.label()
+                    )
+                    .into());
+                }
+                for sample in engine_samples {
+                    let observation = sample
+                        .query_observations
+                        .iter()
+                        .find(|observation| observation.ef_search == ef_search)
+                        .ok_or_else(|| {
+                            format!(
+                                "{} sample is missing query latencies for ef-search {ef_search}",
+                                engine.label()
+                            )
+                        })?;
+                    if observation.latencies_ns.len() != config.holdout_queries {
+                        return Err(
+                            "replicated query latency grid does not match holdout queries".into(),
+                        );
+                    }
+                    match engine {
+                        EngineKind::Baseline => {
+                            baseline_graphs.push(observation.latencies_ns.clone());
+                        }
+                        EngineKind::Candidate => {
+                            candidate_graphs.push(observation.latencies_ns.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if baseline_graphs.len() != expected_graphs || candidate_graphs.len() != expected_graphs {
+            return Err(format!(
+                "ef-search {ef_search} lacks {expected_graphs} paired graph replicas per engine"
+            )
+            .into());
+        }
+        let baseline_flat: Vec<u128> = baseline_graphs.iter().flatten().copied().collect();
+        let candidate_flat: Vec<u128> = candidate_graphs.iter().flatten().copied().collect();
+        let p95_supported = config.holdout_queries >= contract.min_tail_n_p95
+            && expected_graphs >= contract.min_tail_n_p95;
+        let p99_supported = config.holdout_queries >= contract.min_tail_n_p99
+            && expected_graphs >= contract.min_tail_n_p99;
+        let paired_p95 = if p95_supported {
+            Some(paired_graph_tail_ratio(
+                &candidate_graphs,
+                &baseline_graphs,
+                19,
+                20,
+                0x7a11_0001_u64 ^ corpus_size as u64 ^ ((ef_search as u64) << 32),
+            )?)
+        } else {
+            None
+        };
+        let paired_p99 = if p99_supported {
+            Some(paired_graph_tail_ratio(
+                &candidate_graphs,
+                &baseline_graphs,
+                99,
+                100,
+                0x7a11_0002_u64 ^ corpus_size as u64 ^ ((ef_search as u64) << 32),
+            )?)
+        } else {
+            None
+        };
+        cells.push(ReplicatedQueryCell {
+            corpus_size,
+            ef_search,
+            graph_count: expected_graphs,
+            queries_per_graph: config.holdout_queries,
+            baseline_latency: distribution(&baseline_flat)?,
+            candidate_latency: distribution(&candidate_flat)?,
+            paired_candidate_over_baseline: hierarchical_paired_latency_ratio(
+                &candidate_graphs,
+                &baseline_graphs,
+                0x7a11_0000_u64 ^ corpus_size as u64 ^ ((ef_search as u64) << 32),
+            )?,
+            p95_supported,
+            p99_supported,
+            paired_p95,
+            paired_p99,
+        });
+    }
+    Ok(cells)
+}
+
+fn paired_graph_tail_ratio(
+    candidate: &[Vec<u128>],
+    baseline: &[Vec<u128>],
+    numerator: usize,
+    denominator: usize,
+    seed: u64,
+) -> Result<PairedRatio, DynError> {
+    if candidate.len() != baseline.len() || candidate.is_empty() {
+        return Err("paired tail ratio requires equal non-empty graph grids".into());
+    }
+    let mut candidate_tails = Vec::with_capacity(candidate.len());
+    let mut baseline_tails = Vec::with_capacity(baseline.len());
+    for (candidate_graph, baseline_graph) in candidate.iter().zip(baseline) {
+        if candidate_graph.len() != baseline_graph.len() || candidate_graph.is_empty() {
+            return Err("paired tail graphs must contain the same queries".into());
+        }
+        let mut candidate_sorted = candidate_graph.clone();
+        let mut baseline_sorted = baseline_graph.clone();
+        candidate_sorted.sort_unstable();
+        baseline_sorted.sort_unstable();
+        candidate_tails.push(percentile_sorted_u128(
+            &candidate_sorted,
+            numerator,
+            denominator,
+        )?);
+        baseline_tails.push(percentile_sorted_u128(
+            &baseline_sorted,
+            numerator,
+            denominator,
+        )?);
+    }
+    paired_ratio(&candidate_tails, &baseline_tails, seed)
+}
+
+fn hierarchical_paired_latency_ratio(
+    candidate: &[Vec<u128>],
+    baseline: &[Vec<u128>],
+    mut seed: u64,
+) -> Result<PairedRatio, DynError> {
+    if candidate.len() != baseline.len()
+        || candidate.is_empty()
+        || candidate
+            .iter()
+            .zip(baseline)
+            .any(|(candidate_graph, baseline_graph)| {
+                candidate_graph.len() != baseline_graph.len()
+                    || candidate_graph.is_empty()
+                    || candidate_graph.contains(&0)
+                    || baseline_graph.contains(&0)
+            })
+    {
+        return Err("hierarchical latency pairing requires identical positive query grids".into());
+    }
+    const RESAMPLES: usize = 2_000;
+    let mut ratios = Vec::with_capacity(RESAMPLES);
+    for _ in 0..RESAMPLES {
+        let mut sample_ratios = Vec::new();
+        for _ in 0..candidate.len() {
+            seed = xorshift64(seed.max(1));
+            let graph = usize::try_from(seed % candidate.len() as u64)
+                .map_err(|_| "latency graph bootstrap index does not fit usize")?;
+            for _ in 0..candidate[graph].len() {
+                seed = xorshift64(seed.max(1));
+                let query = usize::try_from(seed % candidate[graph].len() as u64)
+                    .map_err(|_| "latency query bootstrap index does not fit usize")?;
+                sample_ratios.push(ratio(candidate[graph][query], baseline[graph][query])?);
+            }
+        }
+        ratios.push(percentile_f64(&sample_ratios, 1, 2)?);
+    }
+    let observed: Vec<f64> = candidate
+        .iter()
+        .zip(baseline)
+        .flat_map(|(candidate_graph, baseline_graph)| {
+            candidate_graph
+                .iter()
+                .zip(baseline_graph)
+                .map(|(&left, &right)| ratio(left, right).unwrap_or(f64::NAN))
+        })
+        .collect();
+    if observed.iter().any(|value| !value.is_finite()) {
+        return Err("hierarchical latency pairing produced a non-finite ratio".into());
+    }
+    Ok(PairedRatio {
+        count: candidate.len() * candidate[0].len(),
+        geometric_mean: observed.iter().map(|value| value.ln()).sum::<f64>()
+            / observed.len() as f64,
+        median: percentile_f64(&observed, 1, 2)?,
+        bootstrap_median_95_low: percentile_f64(&ratios, 1, 40)?,
+        bootstrap_median_95_high: percentile_f64(&ratios, 39, 40)?,
+    })
 }
 
 fn replicated_quality_metrics(
@@ -3448,6 +3770,9 @@ fn validate_report(
         && observed_sizes == configured_sizes
         && observed_query_cells == expected_query_cells
         && observed_build_samples == expected_build_samples
+        && results
+            .iter()
+            .all(|result| result.replicated_query_cells.len() == config.ef_search.len())
         && results.iter().all(|result| {
             result.corpus_sha256.len() == 64
                 && result.build_summary.baseline_latency.count == config.build_repetitions
@@ -3662,6 +3987,29 @@ fn validate_report(
         }
     }
     collect_profile_admission_blockers(config, &mut performance_blockers);
+    if let Ok(contract) = admission_contract() {
+        for result in results {
+            for cell in &result.replicated_query_cells {
+                if result.corpus_size == contract.primary_size
+                    && cell.ef_search == contract.primary_ef_search
+                    && (!cell.p95_supported || !cell.p99_supported)
+                {
+                    performance_blockers.insert(
+                        "primary query-latency cell lacks supported p95/p99 uncertainty".to_owned(),
+                    );
+                }
+                if cell.graph_count
+                    != config.build_repetitions * contract.graphs_per_engine_per_block
+                    || cell.queries_per_graph != config.holdout_queries
+                {
+                    performance_blockers.insert(
+                        "replicated query-latency grid does not match the admission contract"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+    }
     if config.corpus_slab.is_none() {
         performance_blockers.insert("no real LE-f32 corpus slab was supplied".to_owned());
     }
@@ -3741,11 +4089,13 @@ fn collect_profile_admission_blockers(
     config: &Config,
     performance_blockers: &mut BTreeSet<String>,
 ) {
-    if config.profile == "full" {
-        performance_blockers.insert(FULL_ADMISSION_HOLD.to_owned());
-    } else {
+    if config.profile != "full" {
         performance_blockers
             .insert("smoke/synthetic profiles are diagnostic, never decision-grade".to_owned());
+        return;
+    }
+    if let Err(error) = admission_contract().and_then(|contract| contract.matches_config(config)) {
+        performance_blockers.insert(error.to_string());
     }
 }
 
@@ -3793,9 +4143,6 @@ fn classify_performance(
             ],
             &mut reasons,
         );
-        if result.corpus_size == PRIMARY_SIZE && build == MetricDecision::Win {
-            primary_win = true;
-        }
         accumulate_metric_decision(build, &mut valid_loss, &mut undecidable);
 
         let rss = classify_safety_ratio(
@@ -3818,16 +4165,16 @@ fn classify_performance(
         );
         accumulate_metric_decision(artifact, &mut valid_loss, &mut undecidable);
 
-        for query in &result.query_cells {
+        for query in &result.replicated_query_cells {
             let query_decision = classify_timing_ratio(
                 &format!(
-                    "{}-vector ef={} query latency",
+                    "{}-vector ef={} replicated query latency",
                     result.corpus_size, query.ef_search
                 ),
                 &query.paired_candidate_over_baseline,
                 [
-                    &query.paired_baseline_aa_null,
-                    &query.paired_candidate_aa_null,
+                    &result.build_summary.paired_baseline_aa_null,
+                    &result.build_summary.paired_candidate_aa_null,
                 ],
                 &mut reasons,
             );
@@ -3838,6 +4185,34 @@ fn classify_performance(
                 primary_win = true;
             }
             accumulate_metric_decision(query_decision, &mut valid_loss, &mut undecidable);
+            if let Some(tail) = query.paired_p95.as_ref() {
+                accumulate_metric_decision(
+                    classify_safety_ratio(
+                        &format!(
+                            "{}-vector ef={} replicated query p95",
+                            result.corpus_size, query.ef_search
+                        ),
+                        Some(tail),
+                        &mut reasons,
+                    ),
+                    &mut valid_loss,
+                    &mut undecidable,
+                );
+            }
+            if let Some(tail) = query.paired_p99.as_ref() {
+                accumulate_metric_decision(
+                    classify_safety_ratio(
+                        &format!(
+                            "{}-vector ef={} replicated query p99",
+                            result.corpus_size, query.ef_search
+                        ),
+                        Some(tail),
+                        &mut reasons,
+                    ),
+                    &mut valid_loss,
+                    &mut undecidable,
+                );
+            }
         }
     }
     let status = finalize_performance_status(primary_win, valid_loss, undecidable, &mut reasons);
@@ -3863,8 +4238,8 @@ fn finalize_performance_status(
         PerformanceClaimStatus::Allow
     } else {
         reasons.push(
-            "all required cells proved non-regression, but neither predeclared 100k build nor \
-             100k/ef=100 query latency established a material win"
+            "all required cells proved non-regression, but the predeclared primary \
+             query-latency family at 100k/ef=100 did not establish a material win"
                 .to_owned(),
         );
         PerformanceClaimStatus::NoClaim
@@ -5491,7 +5866,10 @@ mod tests {
 
         let mut full = BTreeSet::new();
         collect_profile_admission_blockers(&Config::full(), &mut full);
-        assert_eq!(full, BTreeSet::from([FULL_ADMISSION_HOLD.to_owned()]));
+        assert!(
+            full.is_empty(),
+            "full profile is gated by the frozen contract and replica/tail proofs, not a blanket hold: {full:?}"
+        );
     }
 
     #[test]
@@ -6530,5 +6908,203 @@ source = "git+https://github.com/Dicklesworthstone/hnswlib-rs?rev={CANDIDATE_REV
             error.contains("missing") || error.contains("report.json"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn admission_contract_is_frozen_and_rejects_single_field_drift() {
+        let contract = admission_contract().unwrap();
+        assert_eq!(contract.primary_family, ADMISSION_PRIMARY_FAMILY);
+        assert_eq!(sha256_bytes(ADMISSION_CONTRACT_JSON.as_bytes()).len(), 64);
+        Config::full().matches_admission_or_test();
+        let mut drifted = Config::full();
+        drifted.holdout_queries = 299;
+        assert!(
+            admission_contract()
+                .unwrap()
+                .matches_config(&drifted)
+                .is_err()
+        );
+        drifted = Config::full();
+        drifted.ef_search = vec![40, 100];
+        assert!(
+            admission_contract()
+                .unwrap()
+                .matches_config(&drifted)
+                .is_err()
+        );
+        let mut json: serde_json::Value = serde_json::from_str(ADMISSION_CONTRACT_JSON).unwrap();
+        json["primary_family"] = serde_json::json!("build_latency");
+        assert!(serde_json::from_value::<AdmissionContract>(json).is_ok());
+        assert!(
+            admission_contract()
+                .unwrap()
+                .primary_family
+                .eq(ADMISSION_PRIMARY_FAMILY)
+        );
+    }
+
+    #[test]
+    fn admission_contract_parser_rejects_unknown_fields_and_replaced_bytes() {
+        assert!(
+            serde_json::from_str::<AdmissionContract>(&ADMISSION_CONTRACT_JSON.replace(
+                "frankensearch-index.hnsw-patch-ab.admission-contract.v1",
+                "frankensearch-index.hnsw-patch-ab.admission-contract.v0"
+            ))
+            .is_ok()
+        );
+        let extra = ADMISSION_CONTRACT_JSON.trim_end_matches('}').to_owned() + ",\"extra\":1}";
+        assert!(serde_json::from_str::<AdmissionContract>(&extra).is_err());
+        assert_ne!(
+            sha256_bytes(b"not-the-contract"),
+            admission_contract_sha256()
+        );
+    }
+
+    #[test]
+    fn replicated_query_pairing_rejects_a_mismatched_grid() {
+        let config = Config::smoke();
+        let sample = BuildSample {
+            engine: EngineKind::Baseline,
+            corpus_size: 1_000,
+            corpus_sha256: "a".repeat(64),
+            repetition: 0,
+            abba_slot: 0,
+            elapsed_ns: 1,
+            rss_before_kib: None,
+            rss_after_kib: None,
+            rss_delta_kib: None,
+            peak_rss_kib: None,
+            topology: valid_topology(1_000),
+            artifact: ArtifactMetrics {
+                graph_bytes: 1,
+                data_bytes: 1,
+                total_bytes: 2,
+            },
+            query_observations: vec![BuildQueryObservation {
+                ef_search: 40,
+                hits: vec![vec![0]; config.holdout_queries],
+                latencies_ns: vec![10; config.holdout_queries - 1],
+                nondeterministic_repeat_queries: 0,
+            }],
+            executable_sha256: "b".repeat(64),
+        };
+        assert!(replicated_query_cells(1_000, &[sample], &config).is_err());
+    }
+
+    fn non_regression_ratio() -> PairedRatio {
+        test_ratio(1.0, 0.99, 1.01)
+    }
+
+    fn win_ratio() -> PairedRatio {
+        test_ratio(0.90, 0.88, 0.93)
+    }
+
+    fn loss_ratio() -> PairedRatio {
+        test_ratio(1.10, 1.06, 1.14)
+    }
+
+    fn fixture_distribution() -> Distribution {
+        Distribution {
+            count: 20,
+            min_ns: 1,
+            p50_ns: 10,
+            p95_ns: Some(20),
+            p99_ns: Some(30),
+            max_ns: 40,
+            samples_ns: vec![10; 20],
+        }
+    }
+
+    fn fixture_build_summary(build: PairedRatio) -> BuildSummary {
+        let safety = non_regression_ratio();
+        BuildSummary {
+            baseline_latency: fixture_distribution(),
+            candidate_latency: fixture_distribution(),
+            baseline_aa_latency: fixture_distribution(),
+            candidate_aa_latency: fixture_distribution(),
+            candidate_over_baseline_p50: build.median,
+            baseline_aa_null_ratio_p50: 1.0,
+            candidate_aa_null_ratio_p50: 1.0,
+            paired_candidate_over_baseline: build,
+            paired_baseline_aa_null: non_regression_ratio(),
+            paired_candidate_aa_null: non_regression_ratio(),
+            baseline_median_peak_rss_kib: Some(100),
+            candidate_median_peak_rss_kib: Some(100),
+            candidate_over_baseline_peak_rss: Some(1.0),
+            paired_candidate_over_baseline_peak_rss: Some(non_regression_ratio()),
+            baseline_median_artifact_bytes: 100,
+            candidate_median_artifact_bytes: 100,
+            candidate_over_baseline_artifact_bytes: 1.0,
+            paired_candidate_over_baseline_artifact_bytes: safety,
+        }
+    }
+
+    fn fixture_size_result(query: PairedRatio, build: PairedRatio) -> SizeResult {
+        SizeResult {
+            corpus_size: PRIMARY_SIZE,
+            corpus_sha256: "a".repeat(64),
+            build_samples: Vec::new(),
+            build_summary: fixture_build_summary(build),
+            query_cells: Vec::new(),
+            replicated_quality_cells: Vec::new(),
+            replicated_query_cells: vec![ReplicatedQueryCell {
+                corpus_size: PRIMARY_SIZE,
+                ef_search: PRIMARY_EF_SEARCH,
+                graph_count: 20,
+                queries_per_graph: 300,
+                baseline_latency: fixture_distribution(),
+                candidate_latency: fixture_distribution(),
+                paired_candidate_over_baseline: query,
+                p95_supported: true,
+                p99_supported: true,
+                paired_p95: Some(non_regression_ratio()),
+                paired_p99: Some(non_regression_ratio()),
+            }],
+        }
+    }
+
+    impl Config {
+        fn matches_admission_or_test(&self) {
+            admission_contract()
+                .unwrap()
+                .matches_config(self)
+                .expect("Config::full must match the frozen contract");
+        }
+    }
+
+    #[test]
+    fn primary_query_family_controls_allow_and_ignores_build_only_wins() {
+        let config = Config::full();
+        let (allow, _) = classify_performance(
+            &[fixture_size_result(win_ratio(), non_regression_ratio())],
+            &config,
+        )
+        .unwrap();
+        assert_eq!(allow, PerformanceClaimStatus::Allow);
+
+        let (no_claim, _) = classify_performance(
+            &[fixture_size_result(non_regression_ratio(), win_ratio())],
+            &config,
+        )
+        .unwrap();
+        assert_eq!(no_claim, PerformanceClaimStatus::NoClaim);
+
+        let (block, _) =
+            classify_performance(&[fixture_size_result(loss_ratio(), win_ratio())], &config)
+                .unwrap();
+        assert_eq!(block, PerformanceClaimStatus::Block);
+    }
+
+    #[test]
+    fn hierarchical_latency_pairing_rejects_unequal_graphs() {
+        let error = hierarchical_paired_latency_ratio(&[vec![10, 20]], &[vec![10]], 7)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("identical"), "{error}");
+    }
+
+    #[test]
+    fn workspace_fixed_inputs_include_the_admission_contract() {
+        assert!(WORKSPACE_SOURCE_FIXED_INPUTS.contains(&ADMISSION_CONTRACT_RELATIVE_PATH));
     }
 }
