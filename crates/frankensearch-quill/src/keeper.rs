@@ -1978,7 +1978,6 @@ impl RecoveredSegmentBacking {
     const fn is_mapped(&self) -> bool {
         matches!(self, Self::Mapped(_))
     }
-
 }
 
 fn required_identity_section<'a>(
@@ -2352,8 +2351,7 @@ impl RecoveredSegment {
                 source,
             }
         })?;
-        let authenticated_file_witness =
-            authenticate_segment_witness(&path, &manifest, &reader)?;
+        let authenticated_file_witness = authenticate_segment_witness(&path, &manifest, &reader)?;
         Self::bind_backing(
             path,
             manifest,
@@ -9953,10 +9951,11 @@ fn validate_proposed_manifest_segments(
         #[cfg(test)]
         full_prefix_hash_count.fetch_add(1, AtomicOrdering::Relaxed);
         #[cfg(test)]
-        let authenticated_file_witness = AuthenticatedFileWitness::mint_after_full_prefix_validation(
-            file_xxh3,
-            full_prefix_hash_count,
-        );
+        let authenticated_file_witness =
+            AuthenticatedFileWitness::mint_after_full_prefix_validation(
+                file_xxh3,
+                full_prefix_hash_count,
+            );
         #[cfg(not(test))]
         let authenticated_file_witness =
             AuthenticatedFileWitness::mint_after_full_prefix_validation(file_xxh3);
@@ -12408,7 +12407,7 @@ pub(crate) fn fail_manifest_publish_at_checkpoint_for_test(
 impl ManifestPublishPauseControl {
     /// Poll the checkpoint event, retaining this task's waker until the real
     /// blocking choreography completes the checkpoint.
-    fn poll_reached(&self, task_cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+    fn poll_reached(&self, task_cx: &std::task::Context<'_>) -> std::task::Poll<()> {
         let mut event = self
             .event
             .lock()
@@ -12490,13 +12489,17 @@ pub(crate) async fn drive_manifest_publish_to_checkpoint_for_test<F: std::future
         }
     });
 
-    match asupersync::time::timeout(asupersync::time::wall_now(), timeout, rendezvous).await {
-        Ok(result) => result,
-        Err(_) => Err(format!(
-            "publication did not reach {:?} within {timeout:?}",
-            pause.checkpoint
-        )),
-    }
+    asupersync::time::timeout(asupersync::time::wall_now(), timeout, rendezvous)
+        .await
+        .map_or_else(
+            |_| {
+                Err(format!(
+                    "publication did not reach {:?} within {timeout:?}",
+                    pause.checkpoint
+                ))
+            },
+            std::convert::identity,
+        )
 }
 
 #[cfg(test)]
@@ -18405,8 +18408,8 @@ mod tests {
             panic!("fixture publishes exactly two segments");
         };
 
-        let baseline_a_hashes = seg_a.authenticated_file_witness_hash_count();
-        let baseline_b_hashes = seg_b.authenticated_file_witness_hash_count();
+        let predecessor_witness_hashes = seg_a.authenticated_file_witness_hash_count();
+        let substituted_backing_witness_hashes = seg_b.authenticated_file_witness_hash_count();
 
         // A hostile successor cannot retarget the predecessor's authenticated
         // whole-file receipt by changing its MANIFEST witness.
@@ -18422,7 +18425,7 @@ mod tests {
         );
         assert_eq!(
             seg_a.authenticated_file_witness_hash_count(),
-            baseline_a_hashes,
+            predecessor_witness_hashes,
             "rejected manifest witness changes must not trigger a new whole-file hash"
         );
 
@@ -18440,12 +18443,12 @@ mod tests {
         );
         assert_eq!(
             seg_a.authenticated_file_witness_hash_count(),
-            baseline_a_hashes,
+            predecessor_witness_hashes,
             "rejected backing substitution must not trigger a new whole-file hash"
         );
         assert_eq!(
             seg_b.authenticated_file_witness_hash_count(),
-            baseline_b_hashes,
+            substituted_backing_witness_hashes,
             "the substituted backing must not be rehashed while rejecting the transition"
         );
         assert_eq!(seg_a.term_dictionary_metadata_reuse_count(), 0);
