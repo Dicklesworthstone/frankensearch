@@ -4981,6 +4981,11 @@ struct QuillWriterState {
     /// out the rendezvous deadline on every batch.
     #[cfg(test)]
     force_ingest_overlap_rendezvous: bool,
+    /// Documents actually analyzed by the adaptive budget proof. This is
+    /// per-index and test-only so a regression can distinguish bounded-wave
+    /// refusal from eagerly analyzing the whole rejected batch.
+    #[cfg(test)]
+    parallel_budget_documents_analyzed: AtomicUsize,
 }
 
 impl Deref for QuillWriterState {
@@ -5342,6 +5347,8 @@ impl QuillWriterState {
             ingest_retry_required: false,
             #[cfg(test)]
             force_ingest_overlap_rendezvous: false,
+            #[cfg(test)]
+            parallel_budget_documents_analyzed: AtomicUsize::new(0),
         })
     }
 
@@ -6111,10 +6118,12 @@ impl QuillWriterState {
         } else {
             check_cancel(cx, "parallel budget admission")?;
             let mut document_bounds = Vec::new();
+            let documents_per_wave = active_shards
+                .checked_mul(FANOUT_WAVE_SHARD_DOCUMENTS)
+                .ok_or_else(|| invalid_state("parallel budget wave width overflow"))?;
             document_bounds
-                .try_reserve_exact(documents.len())
+                .try_reserve_exact(documents.len().min(documents_per_wave))
                 .map_err(|_| invalid_state("could not reserve parallel budget document bounds"))?;
-            document_bounds.resize_with(documents.len(), || None);
             let mut prepared_metadata = Vec::new();
             prepared_metadata
                 .try_reserve_exact(documents.len())
@@ -6125,78 +6134,88 @@ impl QuillWriterState {
                 .expect("initial logical use is below the configured budget");
             #[cfg(test)]
             let budget_observation = ParallelBatchObservation::default();
-            let documents_per_worker = documents.len().div_ceil(active_shards).max(1);
             #[cfg(test)]
             if self.force_ingest_overlap_rendezvous {
                 budget_observation.arm_rendezvous(active_shards);
             }
-            document_bounds
-                .par_chunks_mut(documents_per_worker)
-                .zip(documents.par_chunks(documents_per_worker))
-                .for_each(|(slots, chunk)| {
-                    #[cfg(test)]
-                    let shard_guard = budget_observation.enter_shard();
-                    let mut analyzer = FrankensearchTokenizer::default();
-                    for (slot, document) in slots.iter_mut().zip(chunk) {
-                        let document_bound = parallel_document_logical_upper_bound(
-                            self.schema,
-                            &mut analyzer,
-                            document,
-                            logical_budget_bytes,
-                        )
-                        .map(|bound| {
-                            bound.map(|bound| match bound {
-                                ParallelDocumentBudgetBound::Within {
-                                    logical_upper_bound,
-                                    canonical_metadata,
-                                } => ParallelDocumentBudgetBound::Within {
-                                    logical_upper_bound,
-                                    canonical_metadata: canonical_metadata.and_then(|metadata| {
-                                        retain_prepared_metadata_within_budget(
-                                            metadata,
-                                            &retained_metadata_bytes,
-                                            prepared_metadata_cache_ceiling,
-                                        )
-                                    }),
-                                },
-                                ParallelDocumentBudgetBound::ReachesCeiling => {
-                                    ParallelDocumentBudgetBound::ReachesCeiling
-                                }
-                            })
-                        });
-                        *slot = Some(document_bound);
-                    }
-                    #[cfg(test)]
-                    shard_guard.completed();
-                });
             let mut admitted_batch_bytes = 0_usize;
-            for document_bound in document_bounds {
-                let Some(document_bound) = document_bound else {
-                    return Err(invalid_state(
-                        "parallel budget worker did not publish its document bound",
-                    ));
-                };
-                let Some(document_bound) = document_bound? else {
-                    return Ok(None);
-                };
-                let ParallelDocumentBudgetBound::Within {
-                    logical_upper_bound: document_upper_bound,
-                    canonical_metadata,
-                } = document_bound
-                else {
-                    return Ok(None);
-                };
-                let Some(charged) = admitted_batch_bytes.checked_add(document_upper_bound) else {
-                    return Ok(None);
-                };
-                admitted_batch_bytes = charged;
-                if initial_logical_bytes
-                    .checked_add(admitted_batch_bytes)
-                    .is_none_or(|projected| projected >= logical_budget_bytes)
-                {
-                    return Ok(None);
+            for wave in documents.chunks(documents_per_wave) {
+                document_bounds.clear();
+                document_bounds.resize_with(wave.len(), || None);
+                let documents_per_worker = wave.len().div_ceil(active_shards).max(1);
+                document_bounds
+                    .par_chunks_mut(documents_per_worker)
+                    .zip(wave.par_chunks(documents_per_worker))
+                    .for_each(|(slots, chunk)| {
+                        #[cfg(test)]
+                        let shard_guard = budget_observation.enter_shard();
+                        let mut analyzer = FrankensearchTokenizer::default();
+                        for (slot, document) in slots.iter_mut().zip(chunk) {
+                            #[cfg(test)]
+                            self.parallel_budget_documents_analyzed
+                                .fetch_add(1, Ordering::AcqRel);
+                            let document_bound = parallel_document_logical_upper_bound(
+                                self.schema,
+                                &mut analyzer,
+                                document,
+                                logical_budget_bytes,
+                            )
+                            .map(|bound| {
+                                bound.map(|bound| match bound {
+                                    ParallelDocumentBudgetBound::Within {
+                                        logical_upper_bound,
+                                        canonical_metadata,
+                                    } => ParallelDocumentBudgetBound::Within {
+                                        logical_upper_bound,
+                                        canonical_metadata: canonical_metadata.and_then(
+                                            |metadata| {
+                                                retain_prepared_metadata_within_budget(
+                                                    metadata,
+                                                    &retained_metadata_bytes,
+                                                    prepared_metadata_cache_ceiling,
+                                                )
+                                            },
+                                        ),
+                                    },
+                                    ParallelDocumentBudgetBound::ReachesCeiling => {
+                                        ParallelDocumentBudgetBound::ReachesCeiling
+                                    }
+                                })
+                            });
+                            *slot = Some(document_bound);
+                        }
+                        #[cfg(test)]
+                        shard_guard.completed();
+                    });
+                for document_bound in &mut document_bounds {
+                    let Some(document_bound) = document_bound.take() else {
+                        return Err(invalid_state(
+                            "parallel budget worker did not publish its document bound",
+                        ));
+                    };
+                    let Some(document_bound) = document_bound? else {
+                        return Ok(None);
+                    };
+                    let ParallelDocumentBudgetBound::Within {
+                        logical_upper_bound: document_upper_bound,
+                        canonical_metadata,
+                    } = document_bound
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(charged) = admitted_batch_bytes.checked_add(document_upper_bound)
+                    else {
+                        return Ok(None);
+                    };
+                    admitted_batch_bytes = charged;
+                    if initial_logical_bytes
+                        .checked_add(admitted_batch_bytes)
+                        .is_none_or(|projected| projected >= logical_budget_bytes)
+                    {
+                        return Ok(None);
+                    }
+                    prepared_metadata.push(canonical_metadata);
                 }
-                prepared_metadata.push(canonical_metadata);
             }
             check_cancel(cx, "parallel budget admission")?;
             #[cfg(test)]
@@ -28208,6 +28227,63 @@ mod tests {
                     "a 5,000-document preflight on a four-worker pool must not collapse to one worker",
                 );
                 assert!(admission.budget_worker_slots <= plan.active_shards);
+            });
+        });
+    }
+
+    #[test]
+    fn qg1_shaped_parallel_budget_refusal_stops_after_the_first_bounded_wave() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .expect("build eight-worker QG-1-shaped budget pool");
+        pool.install(|| {
+            run_with_cx(|cx| async move {
+                let mut index = QuillIndex::in_memory(QuillConfig {
+                    scribe_shard_budget_bytes: 50_000_000 / 8,
+                    max_ingest_shards: 8,
+                    max_visibility_lag_ms: 60_000,
+                    ..QuillConfig::default()
+                })
+                .expect("QG-1-shaped budget-refusal index");
+                let documents = (0..5_000)
+                    .map(|ordinal| {
+                        IndexableDocument::new(
+                            format!("qg1-shaped-{ordinal:05}"),
+                            "common ranked synthetic token ".repeat(120),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let writer = index.writer_mut();
+                let plan = plan_parallel_ingest(
+                    documents.len(),
+                    writer.shard_router.shard_count(),
+                    rayon::current_num_threads(),
+                )
+                .expect("plan QG-1-shaped budget-refusal fixture");
+                assert_eq!(plan.active_shards, 8);
+
+                assert!(
+                    writer
+                        .parallel_budget_admission(&cx, &documents, plan.active_shards)
+                        .expect("evaluate QG-1-shaped budget-refusal fixture")
+                        .is_none(),
+                    "the 6.25 MB QG-1 budget must reject the 5,000-document fixture",
+                );
+                let analyzed = writer
+                    .parallel_budget_documents_analyzed
+                    .load(Ordering::Acquire);
+                assert_eq!(
+                    analyzed,
+                    plan.active_shards
+                        .checked_mul(FANOUT_WAVE_SHARD_DOCUMENTS)
+                        .expect("bounded analysis wave fits usize"),
+                    "refusal must finish the first issued wave but launch no successor wave",
+                );
+                assert!(
+                    analyzed < documents.len(),
+                    "a rejected batch must not be analyzed to exhaustion",
+                );
             });
         });
     }
