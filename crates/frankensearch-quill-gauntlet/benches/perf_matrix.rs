@@ -2606,7 +2606,9 @@ fn qg1_quill_terminal_searchability(
                 .into_iter()
                 .map(|document_id| String::from(document_id))
                 .collect::<Vec<_>>();
-            let fact = if document_ids == [expected_document_id] {
+            // Borrow rather than move: the identifier is still needed by the
+            // no-claim message below and by the error arm.
+            let fact = if document_ids.as_slice() == std::slice::from_ref(&expected_document_id) {
                 Qg1TerminalFact::exact_tail_visible(expected_document_id.clone())
             } else {
                 Qg1TerminalFact::no_claim(format!(
@@ -2640,7 +2642,10 @@ fn qg1_tantivy_terminal_searchability(
                 .into_iter()
                 .map(String::from)
                 .collect::<Vec<_>>();
-            let fact = if observed_document_ids == [expected_document_id] {
+            // Borrow rather than move, for the same reason as the Quill arm.
+            let fact = if observed_document_ids.as_slice()
+                == std::slice::from_ref(&expected_document_id)
+            {
                 Qg1TerminalFact::exact_tail_visible(expected_document_id.clone())
             } else {
                 Qg1TerminalFact::no_claim(format!(
