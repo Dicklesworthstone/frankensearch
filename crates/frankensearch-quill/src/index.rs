@@ -4369,13 +4369,25 @@ impl QueryWorkShape {
                 let fields = u64::try_from(fields.len()).unwrap_or(u64::MAX);
                 self.posting_streams = self.posting_streams.saturating_add(fields);
             }
-            Query::Phrase { fields, terms, .. } => {
+            Query::Phrase {
+                fields,
+                terms,
+                prefix,
+                ..
+            } => {
                 let fields = u64::try_from(fields.len()).unwrap_or(u64::MAX);
                 let terms = u64::try_from(terms.len()).unwrap_or(u64::MAX);
-                let streams = fields.saturating_mul(terms);
+                let expansions = if *prefix {
+                    self.dictionary_scans = self.dictionary_scans.saturating_add(fields);
+                    u64::try_from(glob_expansion_limit).unwrap_or(u64::MAX)
+                } else {
+                    1
+                };
+                let phrase_fields = fields.saturating_mul(expansions);
+                let streams = phrase_fields.saturating_mul(terms);
                 self.posting_streams = self.posting_streams.saturating_add(streams);
                 self.phrase_streams = self.phrase_streams.saturating_add(streams);
-                self.phrase_fields = self.phrase_fields.saturating_add(fields);
+                self.phrase_fields = self.phrase_fields.saturating_add(phrase_fields);
             }
             Query::Boolean { clauses, .. } => {
                 for clause in clauses {
@@ -12649,7 +12661,12 @@ fn validate_query_lowering(
                     .into());
                 }
             }
-            if *slop != 0 || *prefix {
+            if *prefix && terms.len() == 1 {
+                return Err(QuillIndexError::UnsupportedQuery {
+                    detail: "phrase prefix requires at least two positioned terms".to_owned(),
+                });
+            }
+            if *slop != 0 {
                 return Err(QuillIndexError::UnsupportedQuery {
                     detail: format!("phrase slop={slop} prefix={prefix}"),
                 });
@@ -12765,6 +12782,102 @@ fn validate_cumulative_boost(inherited: f32, factor: f32) -> Result<f32, QuillIn
             detail: format!("non-finite cumulative boost bits 0x{:08x}", boost.to_bits()),
         })
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_leaf_exact_phrase<'a>(
+    checkpoint: &QueryCheckpointHandle<'a>,
+    leaf: QueryLeaf<'a>,
+    snapshot: &QuillSearchSnapshot,
+    prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
+    schema: SchemaDescriptor,
+    field_ord: u16,
+    field_boost: f32,
+    terms: &[crate::query::PositionedTerm],
+    final_term: Option<&[u8]>,
+    inherited_boost: f32,
+) -> Result<ReferenceScorer<'a>, QuillIndexError> {
+    let stats = composite_snapshot_field(snapshot, field_ord)?;
+    let mut phrase_terms = Vec::new();
+    phrase_terms
+        .try_reserve_exact(terms.len())
+        .map_err(|_| invalid_state("could not allocate phrase terms"))?;
+    for (index, term) in terms.iter().enumerate() {
+        let term_bytes = if index + 1 == terms.len() {
+            final_term.unwrap_or(term.text.as_bytes())
+        } else {
+            term.text.as_bytes()
+        };
+        let snapshot_doc_freq = match prepared_doc_freqs {
+            Some(prepared) => {
+                prepared.get_or_compute(checkpoint, snapshot, field_ord, term_bytes)?
+            }
+            None => checkpointed_snapshot_doc_freq(
+                checkpoint,
+                snapshot,
+                field_ord,
+                term_bytes,
+                SnapshotDocFreqDeltaAdmission::Ranking,
+            )?,
+        };
+        phrase_terms.push(match leaf {
+            QueryLeaf::Sealed(segment) => {
+                let cursor = open_owned_cursor(
+                    segment,
+                    schema,
+                    field_ord,
+                    term_bytes,
+                    true,
+                    Some(checkpoint),
+                )?;
+                PhraseTerm::new(
+                    field_ord,
+                    term.position,
+                    CheckpointPostingCursor::new(
+                        cursor,
+                        clone_query_checkpoint_for_argus(checkpoint),
+                    )?,
+                    snapshot_doc_freq,
+                )
+            }
+            QueryLeaf::Delta(delta) => {
+                let cursor = DeltaPostingCursor::new_admitted(
+                    delta,
+                    field_ord,
+                    term_bytes,
+                    checkpoint.as_ref(),
+                )?;
+                PhraseTerm::new(
+                    field_ord,
+                    term.position,
+                    CheckpointPostingCursor::new(
+                        cursor,
+                        clone_query_checkpoint_for_argus(checkpoint),
+                    )?,
+                    snapshot_doc_freq,
+                )
+            }
+        });
+    }
+    let bm25 = Bm25FieldSnapshot::new(stats)?;
+    let boost = inherited_boost * field_boost;
+    let scorer = match leaf {
+        QueryLeaf::Sealed(segment) => PhraseScorer::new_with_checkpoint(
+            phrase_terms,
+            owned_fieldnorms(segment, schema, field_ord)?,
+            bm25,
+            boost,
+            Some(clone_query_checkpoint_for_argus(checkpoint)),
+        )?,
+        QueryLeaf::Delta(delta) => PhraseScorer::new_with_checkpoint(
+            phrase_terms,
+            DeltaFieldNorms::new(delta, field_ord),
+            bm25,
+            boost,
+            Some(clone_query_checkpoint_for_argus(checkpoint)),
+        )?,
+    };
+    Ok(ReferenceScorer::phrase(scorer))
 }
 
 fn lower_query<'a>(
@@ -13229,7 +13342,12 @@ fn lower_query_with_mode<'a>(
             slop,
             prefix,
         } => {
-            if *slop != 0 || *prefix {
+            if *prefix && terms.len() == 1 {
+                return Err(QuillIndexError::UnsupportedQuery {
+                    detail: "phrase prefix requires at least two positioned terms".to_owned(),
+                });
+            }
+            if *slop != 0 {
                 return Err(QuillIndexError::UnsupportedQuery {
                     detail: format!("phrase slop={slop} prefix={prefix}"),
                 });
@@ -13259,88 +13377,66 @@ fn lower_query_with_mode<'a>(
                 );
             }
             let mut clauses = Vec::new();
+            if !*prefix {
+                clauses
+                    .try_reserve_exact(fields.len())
+                    .map_err(|_| invalid_state("could not allocate phrase field clauses"))?;
+            }
             for field in fields {
-                let stats = composite_snapshot_field(snapshot, field.field_id)?;
-                let mut phrase_terms: Vec<PhraseTerm<'a>> = Vec::new();
-                phrase_terms
-                    .try_reserve_exact(terms.len())
-                    .map_err(|_| invalid_state("could not allocate phrase terms"))?;
-                for term in terms {
-                    let snapshot_doc_freq = match prepared_doc_freqs {
-                        Some(prepared) => prepared.get_or_compute(
+                if *prefix {
+                    let final_term = terms.last().ok_or_else(|| {
+                        invalid_state("validated phrase prefix lost its final term")
+                    })?;
+                    let final_bytes = final_term.text.as_bytes();
+                    let pattern_len = final_bytes
+                        .len()
+                        .checked_add(1)
+                        .ok_or_else(|| invalid_state("phrase-prefix pattern length overflow"))?;
+                    let mut pattern = Vec::new();
+                    pattern.try_reserve_exact(pattern_len).map_err(|_| {
+                        invalid_state("could not allocate phrase-prefix dictionary pattern")
+                    })?;
+                    pattern.extend_from_slice(final_bytes);
+                    pattern.push(b'*');
+                    let expansions = snapshot_glob_terms(
+                        Some(checkpoint),
+                        snapshot,
+                        schema,
+                        field.field_id,
+                        &pattern,
+                        glob_expansion_limit,
+                    )?;
+                    clauses.try_reserve(expansions.len()).map_err(|_| {
+                        invalid_state("could not allocate phrase-prefix expansion clauses")
+                    })?;
+                    for expansion in &expansions {
+                        clauses.push(ScorerClause::should(lower_leaf_exact_phrase(
                             checkpoint,
+                            leaf,
                             snapshot,
+                            prepared_doc_freqs,
+                            schema,
                             field.field_id,
-                            term.text.as_bytes(),
-                        )?,
-                        None => checkpointed_snapshot_doc_freq(
-                            checkpoint,
-                            snapshot,
-                            field.field_id,
-                            term.text.as_bytes(),
-                            SnapshotDocFreqDeltaAdmission::Ranking,
-                        )?,
-                    };
-                    phrase_terms.push(match leaf {
-                        QueryLeaf::Sealed(segment) => {
-                            let cursor = open_owned_cursor(
-                                segment,
-                                schema,
-                                field.field_id,
-                                term.text.as_bytes(),
-                                true,
-                                Some(checkpoint),
-                            )?;
-                            PhraseTerm::new(
-                                field.field_id,
-                                term.position,
-                                CheckpointPostingCursor::new(
-                                    cursor,
-                                    clone_query_checkpoint_for_argus(checkpoint),
-                                )?,
-                                snapshot_doc_freq,
-                            )
-                        }
-                        QueryLeaf::Delta(delta) => {
-                            // As above: the construction pull is admitted as
-                            // it walks, not after it.
-                            let cursor = DeltaPostingCursor::new_admitted(
-                                delta,
-                                field.field_id,
-                                term.text.as_bytes(),
-                                checkpoint.as_ref(),
-                            )?;
-                            PhraseTerm::new(
-                                field.field_id,
-                                term.position,
-                                CheckpointPostingCursor::new(
-                                    cursor,
-                                    clone_query_checkpoint_for_argus(checkpoint),
-                                )?,
-                                snapshot_doc_freq,
-                            )
-                        }
-                    });
+                            field.boost,
+                            terms,
+                            Some(expansion),
+                            inherited_boost,
+                        )?));
+                    }
+                } else {
+                    clauses.push(ScorerClause::should(lower_leaf_exact_phrase(
+                        checkpoint,
+                        leaf,
+                        snapshot,
+                        prepared_doc_freqs,
+                        schema,
+                        field.field_id,
+                        field.boost,
+                        terms,
+                        None,
+                        inherited_boost,
+                    )?));
                 }
-                let bm25 = Bm25FieldSnapshot::new(stats)?;
-                let boost = inherited_boost * field.boost;
-                let scorer = match leaf {
-                    QueryLeaf::Sealed(segment) => PhraseScorer::new_with_checkpoint(
-                        phrase_terms,
-                        owned_fieldnorms(segment, schema, field.field_id)?,
-                        bm25,
-                        boost,
-                        Some(clone_query_checkpoint_for_argus(checkpoint)),
-                    )?,
-                    QueryLeaf::Delta(delta) => PhraseScorer::new_with_checkpoint(
-                        phrase_terms,
-                        DeltaFieldNorms::new(delta, field.field_id),
-                        bm25,
-                        boost,
-                        Some(clone_query_checkpoint_for_argus(checkpoint)),
-                    )?,
-                };
-                clauses.push(ScorerClause::should(ReferenceScorer::phrase(scorer)));
             }
             lower_boolean(
                 clauses,
@@ -25707,6 +25803,23 @@ mod tests {
                 );
             }
 
+            let phrase_prefix = Query::Phrase {
+                fields: vec![crate::query::QueryField::new(1, 1.0)],
+                terms: vec![
+                    crate::query::PositionedTerm::new(0, "alpha"),
+                    crate::query::PositionedTerm::new(1, "alp"),
+                ],
+                slop: 0,
+                prefix: true,
+            };
+            let delta_evidence = execute_typed_query(&all_delta, &cx, &phrase_prefix);
+            let mixed_evidence = execute_typed_query(&mixed, &cx, &phrase_prefix);
+            let sealed_evidence = execute_typed_query(&all_sealed, &cx, &phrase_prefix);
+            assert_eq!(mixed_evidence, delta_evidence);
+            assert_eq!(sealed_evidence, delta_evidence);
+            assert_eq!(delta_evidence.1, vec![0]);
+            assert_eq!(delta_evidence.0.total_count, Some(1));
+
             for empty_range in [
                 Query::Range {
                     field_id: 1,
@@ -26984,6 +27097,12 @@ mod tests {
                 .expect("phrase query");
             assert_eq!(phrase.total_count, Some(1));
             assert_eq!(phrase.hits[0].document_id, "rust-1");
+
+            let phrase_prefix = index
+                .search_paginated(&cx, "\"rust own\"*", 10, 0, true)
+                .expect("phrase-prefix query");
+            assert_eq!(phrase_prefix.total_count, Some(1));
+            assert_eq!(phrase_prefix.hits[0].document_id, "rust-1");
 
             let boolean = index
                 .search_paginated(&cx, "rust AND systems", 10, 0, true)

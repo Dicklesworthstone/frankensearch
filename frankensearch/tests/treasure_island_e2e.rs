@@ -702,6 +702,37 @@ mod lexical {
         }
     }
 
+    #[cfg(feature = "lexical-tantivy")]
+    #[test]
+    fn public_phrase_prefix_matches_tantivy_oracle() {
+        super::quiet_logging();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let docs = vec![
+                IndexableDocument::new("phrase-prefix-hit", "compass companion route"),
+                IndexableDocument::new("wrong-order", "companion compass route"),
+                IndexableDocument::new("wrong-prefix", "compass harbor route"),
+            ];
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let quill = build_quill_index(&cx, &tmp.path().join("quill"), &docs).await;
+            let tantivy = build_tantivy_index(&cx, &tmp.path().join("tantivy"), &docs).await;
+            let query = r#""compass comp"*"#;
+
+            let tantivy_ids = public_observation(&tantivy, &cx, query, 10)
+                .await
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>();
+            assert_eq!(tantivy_ids, ["phrase-prefix-hit"]);
+
+            let quill_ids = public_observation(&quill, &cx, query, 10)
+                .await
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>();
+            assert_eq!(quill_ids, tantivy_ids);
+        });
+    }
+
     #[test]
     fn fixture_source_qrels_and_chunk_manifest_are_frozen() {
         super::quiet_logging();
