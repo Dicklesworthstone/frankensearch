@@ -1210,7 +1210,9 @@ fn load_completed_attempt(
             reason: "bound evidence is not exact canonical pretty JSON".to_owned(),
         });
     }
-    process.receipt.verify_bound_evidence(&bound_bytes)?;
+    process
+        .receipt
+        .verify_bound_evidence_against_qg1_authorities(&bound_bytes, external_qg1_authorities)?;
     let prebinding_artifact = PerfEvidenceArtifact::from_verified_slice_against_qg1_authorities(
         &prebinding_bytes,
         external_qg1_authorities,
@@ -1309,7 +1311,9 @@ fn verify_completed_inputs(
     let bound_bytes = canonical_evidence_bytes(&completed.artifact)?;
     let prebinding_bytes = canonical_evidence_bytes(&completed.prebinding_artifact)?;
     let threshold_bytes = canonical_threshold_bytes(&completed.threshold_artifact)?;
-    process.receipt.verify_bound_evidence(&bound_bytes)?;
+    process
+        .receipt
+        .verify_bound_evidence_against_qg1_authorities(&bound_bytes, external_qg1_authorities)?;
     verify_threshold_evidence_join(&completed.threshold_artifact, &completed.artifact)?;
     if completed.artifact.reconstructed_prebinding_bytes()? != prebinding_bytes
         || sha256_hex(&bound_bytes) != completed.bound_evidence_file_sha256
@@ -4596,7 +4600,10 @@ mod tests {
             .collect()
     }
 
-    fn completed_test_attempt_directory(artifact: &PerfEvidenceArtifact) -> TempDir {
+    fn completed_test_attempt_directory(
+        artifact: &PerfEvidenceArtifact,
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+    ) -> TempDir {
         let runnable_count = runnable_ordinals().len();
         let fixture_selector = (artifact.cells.len() != runnable_count).then(|| {
             let fixtures = artifact
@@ -4633,6 +4640,7 @@ mod tests {
             &threshold_bytes,
             &prebinding_bytes,
             &bound_bytes,
+            external_qg1_authorities,
         );
 
         let directory = private_tempdir("completed H2 attempt bundle");
@@ -4680,7 +4688,7 @@ mod tests {
         if let Some(bundle) = cache.get(&key).cloned() {
             return bundle;
         }
-        let directory = completed_test_attempt_directory(artifact);
+        let directory = completed_test_attempt_directory(artifact, &[]);
         let bundle = VerifiedLocalPerfAttemptBundle::load_verified(directory.path())
             .expect("load exact completed H2 test bundle through production boundary");
         cache.insert(key, bundle.clone());
@@ -4703,13 +4711,13 @@ mod tests {
     #[test]
     fn authority_aware_assembly_binds_each_qg1_shard_to_its_retained_authorities() {
         let (artifact, expected_authority) = authority_bound_qg1_shard("assembly-authority-good");
-        let directory = completed_test_attempt_directory(&artifact);
+        let exact_authorities = [&expected_authority];
+        let directory = completed_test_attempt_directory(&artifact, &exact_authorities);
         assert!(
             VerifiedLocalPerfAttemptBundle::load_verified(directory.path()).is_err(),
             "the authority-free H2 loader must refuse an authority-bearing QG-1 shard"
         );
 
-        let exact_authorities = [&expected_authority];
         let bundle = VerifiedLocalPerfAttemptBundle::load_verified_against_qg1_authorities(
             directory.path(),
             &exact_authorities,
@@ -5510,7 +5518,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let artifact = normalize_h2_test_artifact(complete_shards().remove(0)).remove(0);
-        let valid = completed_test_attempt_directory(&artifact);
+        let valid = completed_test_attempt_directory(&artifact, &[]);
         let receipt_bytes = fs::read(valid.path().join("QG-1.attempt.json"))
             .expect("exact completed attempt receipt");
 
@@ -5589,7 +5597,7 @@ mod tests {
     #[test]
     fn attempt_loader_rejects_substitution_but_failed_receipts_ignore_orphans() {
         let artifact = normalize_h2_test_artifact(complete_shards().remove(0)).remove(0);
-        let valid = completed_test_attempt_directory(&artifact);
+        let valid = completed_test_attempt_directory(&artifact, &[]);
         let substituted = private_tempdir("substituted completed attempt");
         let substituted_artifacts = substituted.path().join("artifacts");
         fs::create_dir(&substituted_artifacts).expect("create substituted artifact directory");
