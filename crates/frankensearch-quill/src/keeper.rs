@@ -2267,10 +2267,13 @@ impl TermDictionaryCacheCounters {
 
 /// A full-prefix FSLX witness authenticated against one MANIFEST binding.
 ///
-/// This receipt is minted only after a fresh trailer-witness recomputation
-/// over the actual prefix and [`validate_segment_witnesses`] binds that value
-/// to the manifest. It is safe to carry across an owned
-/// tombstone-only rebind only with the exact same immutable backing allocation.
+/// Mapped and arbitrary byte-backed readers mint this receipt only after a
+/// fresh trailer-witness recomputation over the actual prefix. A freshly
+/// encoded owned segment may instead carry the witness computed while its
+/// canonical immutable bytes were assembled. Both paths bind the witness to
+/// the MANIFEST through [`validate_segment_witnesses`]. It is safe to carry
+/// the receipt across an owned tombstone-only rebind only with the exact same
+/// immutable backing allocation.
 #[derive(Clone)]
 struct AuthenticatedFileWitness {
     file_xxh3: u64,
@@ -2292,6 +2295,19 @@ impl AuthenticatedFileWitness {
 
     #[cfg(not(test))]
     fn mint_after_full_prefix_validation(file_xxh3: u64) -> Self {
+        Self { file_xxh3 }
+    }
+
+    #[cfg(test)]
+    fn mint_from_fresh_owned_encoding(file_xxh3: u64) -> Self {
+        Self {
+            file_xxh3,
+            full_prefix_hash_count: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[cfg(not(test))]
+    fn mint_from_fresh_owned_encoding(file_xxh3: u64) -> Self {
         Self { file_xxh3 }
     }
 
@@ -2346,13 +2362,30 @@ impl RecoveredSegment {
         encoded: EncodedSegment,
         schema: SchemaDescriptor,
     ) -> Result<Self, KeeperError> {
+        // `EncodedSegment` is the private canonical assembly product: its
+        // prefix witness was computed while the exact immutable byte image
+        // was built and is retained alongside the shared backing. Reuse that
+        // receipt here instead of hashing the same newly assembled prefix a
+        // second time. Mapped, borrowed, and arbitrary owned byte readers do
+        // not enter this seam and continue through full-prefix verification.
+        let encoded_file_xxh3 = encoded.file_xxh3();
         let reader = SegmentReader::from_encoded(encoded, schema).map_err(|source| {
             KeeperError::SegmentOpen {
                 path: path.clone(),
                 source,
             }
         })?;
-        let authenticated_file_witness = authenticate_segment_witness(&path, &manifest, &reader)?;
+        if reader.file_xxh3() != encoded_file_xxh3 {
+            return Err(KeeperError::InvalidTransition {
+                detail: format!(
+                    "fresh owned encoding witness {encoded_file_xxh3:#018x} disagrees with parsed trailer {:#018x}",
+                    reader.file_xxh3()
+                ),
+            });
+        }
+        validate_segment_witnesses(&path, &manifest, &reader, || Ok(encoded_file_xxh3))?;
+        let authenticated_file_witness =
+            AuthenticatedFileWitness::mint_from_fresh_owned_encoding(encoded_file_xxh3);
         Self::bind_backing(
             path,
             manifest,
@@ -18344,13 +18377,13 @@ mod tests {
         );
         assert_eq!(
             published.segments()[0].authenticated_file_witness_hash_count(),
-            1,
-            "initial owned binding must mint exactly one authenticated whole-file witness"
+            0,
+            "fresh owned binding must reuse the encoder's authenticated whole-file witness"
         );
         assert_eq!(
             published.segments()[1].authenticated_file_witness_hash_count(),
-            1,
-            "each distinct owned backing receives its own authenticated witness"
+            0,
+            "each fresh owned backing must avoid a redundant whole-prefix hash"
         );
         std::thread::scope(|scope| {
             let segment = &published.segments()[0];
@@ -18398,7 +18431,7 @@ mod tests {
         );
         assert_eq!(
             rebound.segments()[0].authenticated_file_witness_hash_count(),
-            1,
+            0,
             "an owned tombstone-only rebind must perform zero new whole-file hashes"
         );
         assert_eq!(
@@ -18428,7 +18461,7 @@ mod tests {
         );
         assert_eq!(
             chained_snapshot.segments()[0].authenticated_file_witness_hash_count(),
-            1,
+            0,
             "the retained owned backing must carry its original full-prefix receipt across rebinds"
         );
         Ok(())
@@ -18903,6 +18936,11 @@ mod tests {
         let snapshot = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
         assert_eq!(directory_bytes(directory.path())?, before);
         assert_eq!(snapshot.segments().len(), 1);
+        assert_eq!(
+            snapshot.segments()[0].authenticated_file_witness_hash_count(),
+            1,
+            "durable mapped recovery must still recompute the exact backing's whole-file witness"
+        );
         assert_eq!(
             snapshot.segments()[0].term_dictionary_cache_counts(),
             (1, 0)
