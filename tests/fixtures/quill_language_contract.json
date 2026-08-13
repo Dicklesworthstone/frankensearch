@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "contract_version": "1.0.1",
+  "contract_version": "1.0.3",
   "oracle": {
     "engine": "tantivy",
-    "version": "0.26.1",
+    "version": "0.27.0",
     "lockfile": "Cargo.lock",
     "default_conformance": "RankExact",
     "score_epsilon": 0.0001

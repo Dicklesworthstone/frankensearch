@@ -468,9 +468,9 @@ mod tests {
         let root: Value = serde_json::from_str(LANGUAGE_CONTRACT_FIXTURE)
             .expect("quill language contract fixture must be valid JSON");
         assert_eq!(root["schema_version"], 1);
-        assert_eq!(root["contract_version"], "1.0.1");
+        assert_eq!(root["contract_version"], "1.0.3");
         assert_eq!(root["oracle"]["engine"], "tantivy");
-        assert_eq!(root["oracle"]["version"], "0.26.1");
+        assert_eq!(root["oracle"]["version"], "0.27.0");
         assert_eq!(
             root["fixture_execution"]["lexical_loader_executes"],
             serde_json::json!(["schema", "analyzers", "helpers", "bm25_operation_order"])

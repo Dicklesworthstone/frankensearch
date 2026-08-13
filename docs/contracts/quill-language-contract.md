@@ -1,19 +1,21 @@
 # Quill Language and Scoring Contract
 
-**Contract version:** 1.0.2
+**Contract version:** 1.0.3
 
 **Owning bead:** `bd-quill-e0-contracts-j53p.1`
 
-**Oracle:** Tantivy 0.26.1, pinned by `Cargo.lock`
+**Oracle:** Tantivy 0.27.0, pinned by `Cargo.lock`
 **Contract fixture:** `tests/fixtures/quill_language_contract.json`
 
 **Amendment 1.0.1:** Corrects the default-parser duplicate fixture to match the pinned grammar's pre-analysis stable deduplication of exact raw siblings. Programmatically constructed scoring duplicates remain distinct in the post-parse canonicalizer.
 
 **Amendment 1.0.2:** Pins the E5 mixed-residency execution surface: string and numeric ranges and sets, bounded globs, exact-count pagination, and scoreless global-id collection now execute identically across Delta, sealed, and mixed snapshots with invariant physical scoring history.
 
+**Amendment 1.0.3:** Advances the current executable oracle identity to the `Cargo.lock`-pinned Tantivy 0.27.0 dependency after the complete language-contract fixture passed against that linked implementation. Source-specific 0.26.1 behavior and defect-provenance references below remain historical evidence and are not relabeled.
+
 This document defines what “the same results as Tantivy” means for Quill. It is normative for the used lexical surface in `COMPREHENSIVE_PLAN_FOR_THE_QUILL_LEXICAL_ENGINE.md` §3.1, §5, and §8. Quill code does not merge past gate G0 unless its scalar reference path satisfies this contract. The lexical-crate loader currently executes schema, analyzer, helper, and BM25 operation-order goldens and structurally validates the other records; the G1/G2 differential runner is responsible for executing canonical query trees, lifecycle rows, and cross-engine result comparisons.
 
-The conformance target is the observable behavior of frankensearch, not every Tantivy API. Analyzer behavior is pinned to the shipping scalar implementations. Query and scoring behavior is pinned to the shipping adapters plus the Tantivy 0.26.1 source used as the oracle. Intentional departures belong in `docs/contracts/quill-divergence-register.md`; an unclassified departure is a failure.
+The conformance target is the observable behavior of frankensearch, not every Tantivy API. Analyzer behavior is pinned to the shipping scalar implementations. Query and scoring behavior is pinned to the shipping adapters plus the Tantivy 0.27.0 source used as the current oracle. Intentional departures belong in `docs/contracts/quill-divergence-register.md`; an unclassified departure is a failure.
 
 ## 1. Normative sources and precedence
 
@@ -24,7 +26,7 @@ When sources disagree, apply this order:
    - `crates/frankensearch-lexical/src/lib.rs`
    - `crates/frankensearch-lexical/src/cass_compat.rs`
    - `crates/frankensearch-core/src/traits.rs`
-3. Tantivy 0.26.1 for scoring, Boolean `Occur`, parser-default, and token-admission semantics.
+3. Tantivy 0.27.0 for scoring, Boolean `Occur`, parser-default, and token-admission semantics.
 4. The comprehensive Quill plan.
 
 The fixture distinguishes harvested queries from constructed boundary cases and records source paths or source facts for that query-class corpus. Analyzer and scoring rows are constructed contract vectors whose normative source is this section plus the pinned implementation named above. A later source discovery that contradicts a fixture requires a contract-version amendment, not a silent code change.
