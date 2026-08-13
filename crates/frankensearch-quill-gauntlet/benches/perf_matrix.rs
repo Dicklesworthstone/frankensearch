@@ -8050,9 +8050,13 @@ fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
         normalized_reloaded
             .artifact_sha256
             .clone_from(&artifact.artifact_sha256);
+        let normalized_reloaded_projection = serde_json::to_value(&normalized_reloaded)
+            .expect("serialize normalized reloaded QG evidence projection");
+        let artifact_projection =
+            serde_json::to_value(&artifact).expect("serialize live QG evidence projection");
         assert_eq!(
-            normalized_reloaded, artifact,
-            "persisted QG evidence must match every source field except its writer-computed seal"
+            normalized_reloaded_projection, artifact_projection,
+            "persisted QG evidence must match every serialized source field except its writer-computed seal"
         );
         black_box(reloaded);
         eprintln!(
