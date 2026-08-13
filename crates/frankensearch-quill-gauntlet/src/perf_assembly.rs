@@ -4314,11 +4314,17 @@ mod tests {
             .spec
             .document_count
             .expect("QG-1 throughput cell has a document count");
-        let scope = crate::perf::perf_operation_scope(
-            PerfGate::Qg1,
-            &contract_cell.spec.fixture,
-            &contract_cell.spec.metric,
-        );
+        let scope = PerfOperationScope {
+            operation_id: format!(
+                "{}.{}.{}",
+                PerfGate::Qg1,
+                contract_cell.spec.fixture,
+                contract_cell.spec.metric
+            ),
+            version: 1,
+            semantics: PerfMetricSemantics::Throughput,
+            unit: "docs/s".to_owned(),
+        };
         let sample_provenance = sample_provenance(run_id, identity);
         let schedule =
             seeded_balanced_pair_order(PAIRS, 0x4834_5eed).expect("QG-1 authority schedule");
@@ -4732,6 +4738,14 @@ mod tests {
             authority_bound_qg1_shard("assembly-authority-foreign");
         let wrong_authorities = [&foreign_authority];
         assert!(
+            VerifiedLocalPerfAttemptBundle::load_verified_against_qg1_authorities(
+                directory.path(),
+                &wrong_authorities,
+            )
+            .is_err(),
+            "a foreign authority must be rejected at the H2 loader boundary"
+        );
+        assert!(
             PerfEvidenceAssemblyArtifact::assemble_against_qg1_authorities(vec![(
                 bundle.clone(),
                 &wrong_authorities
@@ -4739,7 +4753,21 @@ mod tests {
             .is_err(),
             "a foreign QG-1 authority must not authenticate this shard"
         );
+        assert!(
+            assembly
+                .verify_integrity_against_qg1_authorities(&[(source_sha256, &wrong_authorities)])
+                .is_err(),
+            "a source-keyed authority assignment must not accept another shard's authority"
+        );
         let duplicate_authorities = [&expected_authority, &expected_authority];
+        assert!(
+            VerifiedLocalPerfAttemptBundle::load_verified_against_qg1_authorities(
+                directory.path(),
+                &duplicate_authorities,
+            )
+            .is_err(),
+            "duplicate authorities must remain ambiguous at the H2 loader boundary"
+        );
         assert!(
             PerfEvidenceAssemblyArtifact::assemble_against_qg1_authorities(vec![(
                 bundle,
