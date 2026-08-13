@@ -2499,6 +2499,13 @@ impl LiveIngestPipeline {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublishedVectorGeneration {
+    id: String,
+    dimension: usize,
+    is_hash_control: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct FsfsStatusPayload {
     version: String,
@@ -2525,6 +2532,14 @@ struct FsfsIndexStatus {
     metadata_bytes: u64,
     embedding_cache_bytes: u64,
     index_freshness: Option<IndexFreshnessPayload>,
+    /// Published fast-tier embedder identity, when a readable FSVI exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vector_generation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vector_generation_dimension: Option<usize>,
+    /// True when that identity is a hash/fnv control artifact.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    vector_generation_is_hash: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -9905,6 +9920,7 @@ impl FsfsRuntime {
         let index_root = self.resolve_status_index_root()?;
         let sentinel = Self::read_index_sentinel(&index_root)?;
         let stale_files = Self::count_stale_files(&index_root, sentinel.as_ref())?;
+        let published_vector = Self::inspect_published_vector_generation(&index_root);
 
         let storage_paths = IndexStoragePaths {
             vector_index_roots: vec![index_root.join("vector")],
@@ -9982,6 +9998,11 @@ impl FsfsRuntime {
                 metadata_bytes: usage.catalog_bytes,
                 embedding_cache_bytes: usage.embedding_cache_bytes,
                 index_freshness: lexical_stats.map(Self::index_freshness_payload),
+                vector_generation_id: published_vector.as_ref().map(|value| value.id.clone()),
+                vector_generation_dimension: published_vector.as_ref().map(|value| value.dimension),
+                vector_generation_is_hash: published_vector
+                    .as_ref()
+                    .is_some_and(|value| value.is_hash_control),
             },
             models: self.collect_model_statuses()?,
             config: config_status,
@@ -11687,6 +11708,22 @@ impl FsfsRuntime {
         embedder: &dyn Embedder,
     ) -> SearchResult<()> {
         Self::validate_fast_embedder_for_vector_index(index, embedder, cfg!(test))
+    }
+
+    /// Observational identity of the published FSVI, if it can be opened.
+    ///
+    /// Status and doctor must not fail the whole command when the file is
+    /// missing or unreadable; those cases stay `None` and are reported as
+    /// absent rather than as a healthy semantic generation.
+    fn inspect_published_vector_generation(index_root: &Path) -> Option<PublishedVectorGeneration> {
+        let index = VectorIndex::open_read_only(&index_root.join(FSFS_VECTOR_INDEX_FILE)).ok()?;
+        let id = index.embedder_id().to_owned();
+        let is_hash_control = Self::is_legacy_hash_vector_generation(&id);
+        Some(PublishedVectorGeneration {
+            id,
+            dimension: index.dimension(),
+            is_hash_control,
+        })
     }
 
     fn semantic_retry_disposition(error: &SearchError) -> SemanticRetryDisposition {
@@ -17921,10 +17958,12 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
         ),
         None => paint("unknown", "90", no_color),
     };
-    let index_exists = if status.index.exists {
-        paint("ready", "32", no_color)
-    } else {
+    let index_exists = if !status.index.exists {
         paint("missing", "31", no_color)
+    } else if status.index.vector_generation_is_hash {
+        paint("hash control (not semantic)", "31", no_color)
+    } else {
+        paint("ready", "32", no_color)
     };
     let vector_pct = ratio_percent(
         status.index.vector_index_bytes,
@@ -18005,6 +18044,21 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
         truncate_middle(&status.index.path, width.saturating_sub(10))
     );
     let _ = writeln!(out, "  state: {index_exists}");
+    if let Some(generation_id) = status.index.vector_generation_id.as_deref() {
+        let class = if status.index.vector_generation_is_hash {
+            paint("hash control", "31", no_color)
+        } else {
+            paint("semantic", "32", no_color)
+        };
+        let dimension = status
+            .index
+            .vector_generation_dimension
+            .map_or_else(|| "unknown".to_owned(), |value| value.to_string());
+        let _ = writeln!(
+            out,
+            "  vector generation: {generation_id}  dim={dimension}  class={class}"
+        );
+    }
     let _ = writeln!(
         out,
         "  files: indexed={}  discovered={}  skipped={}",
@@ -19965,6 +20019,9 @@ mod tests {
                 lexical_index_bytes: 512 * 1024,
                 metadata_bytes: 0,
                 embedding_cache_bytes: 0,
+                vector_generation_id: None,
+                vector_generation_dimension: None,
+                vector_generation_is_hash: false,
                 index_freshness: Some(IndexFreshnessPayload {
                     published_generation: 7,
                     last_publish_unix: Some(1_700_000_000),
@@ -27309,6 +27366,89 @@ mod tests {
                 && check.detail.contains("dimension=256"),
             "doctor should report the published identity: {}",
             check.detail
+        );
+    }
+
+    #[test]
+    fn status_reports_hash_vector_generation_as_not_semantic() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+        fs::create_dir_all(vector_path.parent().expect("vector path parent"))
+            .expect("create vector directory");
+        VectorIndex::create(&vector_path, "fnv1a-256", 256)
+            .expect("create hash control generation")
+            .finish()
+            .expect("finish hash control generation");
+
+        let mut config = FsfsConfig::default();
+        config.storage.index_dir = index_root.display().to_string();
+        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            command: CliCommand::Status,
+            index_dir: Some(index_root),
+            ..CliInput::default()
+        });
+        let payload = runtime
+            .collect_status_payload()
+            .expect("status must stay observational");
+        assert_eq!(
+            payload.index.vector_generation_id.as_deref(),
+            Some("fnv1a-256")
+        );
+        assert_eq!(payload.index.vector_generation_dimension, Some(256));
+        assert!(payload.index.vector_generation_is_hash);
+
+        let table = render_status_table(&payload, true);
+        assert!(
+            table.contains("hash control (not semantic)"),
+            "status table must not call a hash generation ready: {table}"
+        );
+        assert!(
+            table.contains("fnv1a-256") && table.contains("class="),
+            "status table must name the hash identity: {table}"
+        );
+    }
+
+    #[test]
+    fn status_reports_semantic_vector_generation_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+        fs::create_dir_all(vector_path.parent().expect("vector path parent"))
+            .expect("create vector directory");
+        VectorIndex::create(&vector_path, "potion-multilingual-128m", 256)
+            .expect("create semantic generation")
+            .finish()
+            .expect("finish semantic generation");
+
+        let mut config = FsfsConfig::default();
+        config.storage.index_dir = index_root.display().to_string();
+        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            command: CliCommand::Status,
+            index_dir: Some(index_root),
+            ..CliInput::default()
+        });
+        let payload = runtime
+            .collect_status_payload()
+            .expect("status must stay observational");
+        assert_eq!(
+            payload.index.vector_generation_id.as_deref(),
+            Some("potion-multilingual-128m")
+        );
+        assert!(!payload.index.vector_generation_is_hash);
+
+        let table = render_status_table(&payload, true);
+        assert!(
+            table.contains("state: ready"),
+            "semantic generation remains ready: {table}"
+        );
+        assert!(
+            table.contains("potion-multilingual-128m") && table.contains("class="),
+            "status table must name the semantic identity: {table}"
+        );
+        assert!(
+            !table.contains("hash control (not semantic)"),
+            "semantic generation must not be labeled hash control: {table}"
         );
     }
 
