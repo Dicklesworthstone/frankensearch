@@ -1877,6 +1877,7 @@ impl Qg1IncumbentScreenEvidence {
             .find(|cell| {
                 format!("{}/{}/{}", PerfGate::Qg1, cell.fixture, cell.metric) == self.cell_id
             })
+            .cloned()
             .ok_or_else(|| EvidenceArtifactError::InconsistentArtifact {
                 reason: format!(
                     "QG-1 incumbent screen names cell {:?}, which is not in the frozen matrix",
@@ -2430,7 +2431,7 @@ impl PerfEvidenceArtifact {
             &selected_widths,
         )?;
         let admission_no_claim = None;
-        let (gate_status, reasons) = Self::fold(gate, &cells, admission_no_claim.as_ref(), None);
+        let (gate_status, reasons) = Self::fold(gate, &cells, admission_no_claim.as_ref(), &[]);
         Ok(Self {
             schema_version: PERF_EVIDENCE_SCHEMA_VERSION.to_owned(),
             gate,
@@ -7250,6 +7251,7 @@ mod tests {
             .for_gate(PerfGate::Qg1)
             .into_iter()
             .find(|cell| format!("{}/{}/{}", PerfGate::Qg1, cell.fixture, cell.metric) == cell_id)
+            .cloned()
             .expect("the screened cell is a frozen QG-1 matrix cell")
     }
 
