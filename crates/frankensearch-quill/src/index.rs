@@ -67,7 +67,7 @@ use crate::argus::{
     ConformanceUnionRefillStrategy,
 };
 use crate::config::QuillConfig;
-use crate::delta::DeltaSnapshot;
+use crate::delta::{DeltaSnapshot, DeltaStoredMaterialization};
 use crate::error::QuillError;
 use crate::grimoire::{
     ByteSpan, MAX_TERM_BYTES, TermDictionary, TermDictionaryError, star_glob_matches,
@@ -763,10 +763,18 @@ pub enum SnapshotError {
 /// hybrid lifecycle contract: sealed tombstones remain in Keeper's at-seal
 /// counts until compaction, while Delta-local tombstones are excluded
 /// immediately because those rows will never be sealed.
+#[derive(Clone, Copy, Debug)]
+struct DeltaLeaseLookup {
+    lease_base: u64,
+    lease_end: u64,
+    delta_index: usize,
+}
+
 pub struct QuillSearchSnapshot {
     snapshot_epoch: u64,
     keeper: Arc<KeeperSnapshot>,
     deltas: Box<[Arc<DeltaSnapshot>]>,
+    delta_lease_lookup: Vec<DeltaLeaseLookup>,
     field_stats: Box<[SnapshotFieldStats]>,
     bm25_doc_count: u64,
     live_doc_count: u64,
@@ -781,6 +789,7 @@ impl QuillSearchSnapshot {
         let schema = keeper.schema();
         let manifest = &keeper.loaded_manifest().manifest;
         validate_delta_table(schema, manifest, &deltas)?;
+        let delta_lease_lookup = build_delta_lease_lookup(&deltas)?;
 
         let delta_live_doc_count = delta_live_document_count(&deltas)?;
         let bm25_doc_count = keeper
@@ -807,6 +816,7 @@ impl QuillSearchSnapshot {
             snapshot_epoch,
             keeper,
             deltas: deltas.into_boxed_slice(),
+            delta_lease_lookup,
             field_stats,
             bm25_doc_count,
             live_doc_count,
@@ -900,9 +910,8 @@ impl QuillSearchSnapshot {
         self.keeper
             .materialize_document_id(global_docid)
             .or_else(|| {
-                self.deltas
-                    .iter()
-                    .find_map(|delta| delta.materialize_document_id(global_docid))
+                self.delta_for_docid(global_docid)?
+                    .materialize_document_id(global_docid)
             })
     }
 
@@ -962,11 +971,12 @@ impl QuillSearchSnapshot {
         field_ord: u16,
         global_docid: u32,
     ) -> Result<Option<Vec<u8>>, QuillIndexError> {
-        for delta in &self.deltas {
-            if delta.is_live_document(global_docid) {
-                return Ok(delta
-                    .stored_value(field_ord, global_docid)
-                    .map(<[u8]>::to_vec));
+        if let Some(delta) = self.delta_for_docid(global_docid) {
+            match delta.materialize_stored_value(field_ord, global_docid) {
+                DeltaStoredMaterialization::NotLive => {}
+                DeltaStoredMaterialization::Live(stored) => {
+                    return Ok(stored.map(<[u8]>::to_vec));
+                }
             }
         }
 
@@ -986,6 +996,39 @@ impl QuillSearchSnapshot {
     pub fn keeper_snapshot_arc(&self) -> Arc<KeeperSnapshot> {
         Arc::clone(&self.keeper)
     }
+
+    fn delta_for_docid(&self, global_docid: u32) -> Option<&DeltaSnapshot> {
+        let global_docid = u64::from(global_docid);
+        let predecessor = self
+            .delta_lease_lookup
+            .partition_point(|entry| entry.lease_base <= global_docid)
+            .checked_sub(1)?;
+        let entry = self.delta_lease_lookup.get(predecessor)?;
+        (global_docid < entry.lease_end)
+            .then(|| self.deltas.get(entry.delta_index))?
+            .map(Arc::as_ref)
+    }
+}
+
+fn build_delta_lease_lookup(
+    deltas: &[Arc<DeltaSnapshot>],
+) -> Result<Vec<DeltaLeaseLookup>, SnapshotError> {
+    let mut lookup = Vec::new();
+    lookup
+        .try_reserve_exact(deltas.len())
+        .map_err(|_| SnapshotError::Allocation {
+            resource: "Delta lease lookup index",
+            additional: deltas.len(),
+        })?;
+    for (delta_index, delta) in deltas.iter().enumerate() {
+        lookup.push(DeltaLeaseLookup {
+            lease_base: delta.lease_base(),
+            lease_end: delta.lease_end(),
+            delta_index,
+        });
+    }
+    lookup.sort_unstable_by_key(|entry| entry.lease_base);
+    Ok(lookup)
 }
 
 fn validate_delta_table(
@@ -1226,6 +1269,7 @@ struct PreparedSealedPublication {
     live_doc_count: u64,
     delta_live_doc_count: u64,
     deltas: Box<[Arc<DeltaSnapshot>]>,
+    delta_lease_lookup: Vec<DeltaLeaseLookup>,
 }
 
 /// Lock-free publisher for one authoritative Keeper plus all-Delta view.
@@ -1280,6 +1324,7 @@ impl SnapshotPublisher {
         let current = self.current.load_full();
         validate_complete_keeper_transition(&current.keeper.loaded_manifest().manifest, proposed)?;
         validate_delta_table(schema, proposed, &deltas)?;
+        let delta_lease_lookup = build_delta_lease_lookup(&deltas)?;
         let snapshot_epoch = current
             .snapshot_epoch()
             .checked_add(1)
@@ -1314,6 +1359,7 @@ impl SnapshotPublisher {
             live_doc_count,
             delta_live_doc_count,
             deltas: deltas.into_boxed_slice(),
+            delta_lease_lookup,
         })
     }
 
@@ -1357,6 +1403,7 @@ impl SnapshotPublisher {
             live_doc_count: current.live_doc_count,
             delta_live_doc_count: 0,
             deltas: Box::default(),
+            delta_lease_lookup: Vec::new(),
         })
     }
 
@@ -1470,6 +1517,7 @@ impl SnapshotPublisher {
             snapshot_epoch: prepared.snapshot_epoch,
             keeper,
             deltas: prepared.deltas,
+            delta_lease_lookup: prepared.delta_lease_lookup,
             field_stats: prepared.field_stats,
             bm25_doc_count: prepared.bm25_doc_count,
             live_doc_count: prepared.live_doc_count,
@@ -20434,6 +20482,133 @@ mod tests {
                 shard_count: 1
             })
         ));
+    }
+
+    #[test]
+    fn snapshot_delta_lease_lookup_selects_only_the_owner_without_reordering_deltas() {
+        let keeper = Arc::new(KeeperSnapshot::in_memory(DEFAULT_SCHEMA).expect("genesis Keeper"));
+        let generation = keeper.loaded_manifest().manifest.generation;
+
+        let mut first =
+            DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("first aligned Delta lease");
+        let first_docid = u32::try_from(first.lease_base()).expect("first docid fits u32");
+        apply_sealable_delta_document(&mut first, first_docid, "lease-first", "first-value", 1);
+
+        let mut tombstoned = DeltaSegment::new(DEFAULT_SCHEMA, first.lease_end(), usize::MAX)
+            .expect("successor aligned Delta lease");
+        let tombstoned_docid =
+            u32::try_from(tombstoned.lease_base()).expect("tombstoned docid fits u32");
+        apply_sealable_delta_document(
+            &mut tombstoned,
+            tombstoned_docid,
+            "lease-tombstone",
+            "tombstone-value",
+            1,
+        );
+        assert_eq!(
+            tombstoned.delete_delta_id("lease-tombstone"),
+            Some(tombstoned_docid)
+        );
+
+        let gap = DeltaSegment::new(DEFAULT_SCHEMA, tombstoned.lease_end(), usize::MAX)
+            .expect("aligned unused gap lease");
+        let mut third = DeltaSegment::new(DEFAULT_SCHEMA, gap.lease_end(), usize::MAX)
+            .expect("third aligned Delta lease");
+        let third_docid = u32::try_from(third.lease_base()).expect("third docid fits u32");
+        apply_sealable_delta_document(&mut third, third_docid, "lease-third", "third-value", 1);
+
+        let first = Arc::new(first.freeze(generation));
+        let tombstoned = Arc::new(tombstoned.freeze(generation));
+        let third = Arc::new(third.freeze(generation));
+        let snapshot = QuillSearchSnapshot::compose(
+            0,
+            keeper,
+            vec![
+                Arc::clone(&third),
+                Arc::clone(&first),
+                Arc::clone(&tombstoned),
+            ],
+        )
+        .expect("compose shuffled nonoverlapping Delta leases");
+
+        for (actual, expected) in
+            snapshot
+                .delta_snapshots()
+                .iter()
+                .zip([&third, &first, &tombstoned])
+        {
+            assert!(
+                Arc::ptr_eq(actual, expected),
+                "lease lookup must not reorder the primary Delta table"
+            );
+        }
+
+        let reset_attempts = || {
+            third.reset_materialization_attempts();
+            first.reset_materialization_attempts();
+            tombstoned.reset_materialization_attempts();
+        };
+        let attempts = || {
+            [
+                third.materialization_attempts(),
+                first.materialization_attempts(),
+                tombstoned.materialization_attempts(),
+            ]
+        };
+
+        reset_attempts();
+        assert_eq!(
+            snapshot.materialize_document_id(first_docid).as_deref(),
+            Some("lease-first")
+        );
+        assert_eq!(
+            attempts(),
+            [0, 1, 0],
+            "only the lease owner may materialize an ID hit"
+        );
+
+        reset_attempts();
+        assert_eq!(
+            snapshot
+                .materialize_stored_value(CONTENT_FIELD, first_docid)
+                .expect("materialize selected stored value"),
+            Some(b"first-value".to_vec())
+        );
+        assert_eq!(
+            attempts(),
+            [0, 1, 0],
+            "only the lease owner may materialize stored bytes"
+        );
+
+        reset_attempts();
+        assert_eq!(snapshot.materialize_document_id(tombstoned_docid), None);
+        assert_eq!(
+            attempts(),
+            [0, 0, 1],
+            "a tombstoned selected row must not scan nonowners"
+        );
+
+        reset_attempts();
+        assert_eq!(
+            snapshot
+                .materialize_stored_value(CONTENT_FIELD, tombstoned_docid)
+                .expect("materialize tombstoned selected row"),
+            None
+        );
+        assert_eq!(
+            attempts(),
+            [0, 0, 1],
+            "stored tombstone validation must remain within the selected Delta"
+        );
+
+        let gap_docid = u32::try_from(gap.lease_base()).expect("gap docid fits u32");
+        reset_attempts();
+        assert_eq!(snapshot.materialize_document_id(gap_docid), None);
+        assert_eq!(
+            attempts(),
+            [0, 0, 0],
+            "a lease gap must not probe any Delta"
+        );
     }
 
     #[test]

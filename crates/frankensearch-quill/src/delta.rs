@@ -7,6 +7,8 @@
 use std::marker::PhantomData;
 use std::mem::size_of;
 use std::sync::OnceLock;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ahash::{AHashMap, AHashSet};
@@ -833,6 +835,16 @@ pub struct DeltaSnapshot {
     ordered_term_ids: OnceLock<Box<[u32]>>,
     keeper_generation: u64,
     lineage_id: u64,
+    #[cfg(test)]
+    materialization_attempts: AtomicUsize,
+}
+
+/// Stored-value materialization outcome for one selected Delta row.
+pub(crate) enum DeltaStoredMaterialization<'a> {
+    /// The row is absent or tombstoned in this Delta.
+    NotLive,
+    /// The row is live; its requested stored field may still be absent.
+    Live(Option<&'a [u8]>),
 }
 
 impl DeltaSnapshot {
@@ -988,6 +1000,8 @@ impl DeltaSnapshot {
     /// Materialize one visible row's stable external identifier.
     #[must_use]
     pub fn materialize_document_id(&self, global_docid: u32) -> Option<DocId> {
+        #[cfg(test)]
+        self.record_materialization_attempt();
         let row = self
             .segment
             .document_docids
@@ -1027,6 +1041,40 @@ impl DeltaSnapshot {
     #[must_use]
     pub fn stored_value(&self, field_ord: u16, global_docid: u32) -> Option<&[u8]> {
         self.segment.stored_value(field_ord, global_docid)
+    }
+
+    /// Materialize stored bytes only when this snapshot owns a live row.
+    ///
+    /// The outcome distinguishes a missing or tombstoned row from a live row
+    /// whose requested stored field is absent.
+    #[must_use]
+    pub(crate) fn materialize_stored_value(
+        &self,
+        field_ord: u16,
+        global_docid: u32,
+    ) -> DeltaStoredMaterialization<'_> {
+        #[cfg(test)]
+        self.record_materialization_attempt();
+        if !self.is_live_document(global_docid) {
+            return DeltaStoredMaterialization::NotLive;
+        }
+        DeltaStoredMaterialization::Live(self.segment.stored_value(field_ord, global_docid))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_materialization_attempts(&self) {
+        self.materialization_attempts.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn materialization_attempts(&self) -> usize {
+        self.materialization_attempts.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn record_materialization_attempt(&self) {
+        self.materialization_attempts
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Live-only fieldnorm byte for one visible row in this generation.
@@ -1282,6 +1330,8 @@ impl DeltaSegment {
             // Rebinding deliberately preserves this witness; a later freeze
             // must never be replaceable by an earlier, shorter snapshot.
             lineage_id: snapshot_owner_id,
+            #[cfg(test)]
+            materialization_attempts: AtomicUsize::new(0),
         }
     }
 
