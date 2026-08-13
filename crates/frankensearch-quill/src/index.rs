@@ -67,7 +67,7 @@ use crate::argus::{
     ConformanceUnionRefillStrategy,
 };
 use crate::config::QuillConfig;
-use crate::delta::DeltaSnapshot;
+use crate::delta::{DeltaSnapshot, DeltaStoredMaterialization};
 use crate::error::QuillError;
 use crate::grimoire::{
     ByteSpan, MAX_TERM_BYTES, TermDictionary, TermDictionaryError, star_glob_matches,
@@ -92,7 +92,7 @@ use crate::quiver::{
     BlockMaxError, DocLenCodecError, DocLenField, DocLenSection, EncodedNumericSection,
     NumericEntry, NumericField, NumericFieldInput, NumericSection, NumericValue,
     PositionCodecError, PositionList, Posting, PostingCodecError, PostingList, SnapshotFieldStats,
-    StoredMetaCodecError, StoredMetaSection,
+    StoredMetaCodecError,
 };
 use crate::schema::{Analyzer, DEFAULT_SCHEMA, FieldKind, SchemaDescriptor};
 use crate::scribe::{
@@ -763,10 +763,18 @@ pub enum SnapshotError {
 /// hybrid lifecycle contract: sealed tombstones remain in Keeper's at-seal
 /// counts until compaction, while Delta-local tombstones are excluded
 /// immediately because those rows will never be sealed.
+#[derive(Clone, Copy, Debug)]
+struct DeltaLeaseLookup {
+    lease_base: u64,
+    lease_end: u64,
+    delta_index: usize,
+}
+
 pub struct QuillSearchSnapshot {
     snapshot_epoch: u64,
     keeper: Arc<KeeperSnapshot>,
     deltas: Box<[Arc<DeltaSnapshot>]>,
+    delta_lease_lookup: Vec<DeltaLeaseLookup>,
     field_stats: Box<[SnapshotFieldStats]>,
     bm25_doc_count: u64,
     live_doc_count: u64,
@@ -781,6 +789,7 @@ impl QuillSearchSnapshot {
         let schema = keeper.schema();
         let manifest = &keeper.loaded_manifest().manifest;
         validate_delta_table(schema, manifest, &deltas)?;
+        let delta_lease_lookup = build_delta_lease_lookup(&deltas)?;
 
         let delta_live_doc_count = delta_live_document_count(&deltas)?;
         let bm25_doc_count = keeper
@@ -807,6 +816,7 @@ impl QuillSearchSnapshot {
             snapshot_epoch,
             keeper,
             deltas: deltas.into_boxed_slice(),
+            delta_lease_lookup,
             field_stats,
             bm25_doc_count,
             live_doc_count,
@@ -900,9 +910,8 @@ impl QuillSearchSnapshot {
         self.keeper
             .materialize_document_id(global_docid)
             .or_else(|| {
-                self.deltas
-                    .iter()
-                    .find_map(|delta| delta.materialize_document_id(global_docid))
+                self.delta_for_docid(global_docid)?
+                    .materialize_document_id(global_docid)
             })
     }
 
@@ -962,37 +971,20 @@ impl QuillSearchSnapshot {
         field_ord: u16,
         global_docid: u32,
     ) -> Result<Option<Vec<u8>>, QuillIndexError> {
-        for delta in &self.deltas {
-            if delta.is_live_document(global_docid) {
-                return Ok(delta
-                    .stored_value(field_ord, global_docid)
-                    .map(<[u8]>::to_vec));
+        if let Some(delta) = self.delta_for_docid(global_docid) {
+            match delta.materialize_stored_value(field_ord, global_docid) {
+                DeltaStoredMaterialization::NotLive => {}
+                DeltaStoredMaterialization::Live(stored) => {
+                    return Ok(stored.map(<[u8]>::to_vec));
+                }
             }
         }
 
-        let Some(segment) = self
-            .keeper
-            .segments()
-            .iter()
-            .find(|segment| segment.materialize_document_id(global_docid).is_some())
-        else {
+        let Some(segment) = self.keeper.live_segment_for_docid(global_docid) else {
             return Ok(None);
         };
-        let manifest = segment.manifest();
-        let stored_fields = self
-            .keeper
-            .schema()
-            .fields
-            .iter()
-            .filter(|field| field.stored)
-            .map(|field| field.id)
-            .collect::<Vec<_>>();
-        let stored = StoredMetaSection::parse(
-            required_section(segment, SectionKind::STOREDMETA)?,
-            manifest.docid_lo,
-            manifest.docid_hi,
-            &stored_fields,
-        )?;
+        let stored =
+            segment.stored_meta_lookup(required_section(segment, SectionKind::STOREDMETA)?)?;
         Ok(stored
             .field(field_ord)
             .and_then(|field| field.get(u64::from(global_docid)))
@@ -1004,6 +996,39 @@ impl QuillSearchSnapshot {
     pub fn keeper_snapshot_arc(&self) -> Arc<KeeperSnapshot> {
         Arc::clone(&self.keeper)
     }
+
+    fn delta_for_docid(&self, global_docid: u32) -> Option<&DeltaSnapshot> {
+        let global_docid = u64::from(global_docid);
+        let predecessor = self
+            .delta_lease_lookup
+            .partition_point(|entry| entry.lease_base <= global_docid)
+            .checked_sub(1)?;
+        let entry = self.delta_lease_lookup.get(predecessor)?;
+        (global_docid < entry.lease_end)
+            .then(|| self.deltas.get(entry.delta_index))?
+            .map(Arc::as_ref)
+    }
+}
+
+fn build_delta_lease_lookup(
+    deltas: &[Arc<DeltaSnapshot>],
+) -> Result<Vec<DeltaLeaseLookup>, SnapshotError> {
+    let mut lookup = Vec::new();
+    lookup
+        .try_reserve_exact(deltas.len())
+        .map_err(|_| SnapshotError::Allocation {
+            resource: "Delta lease lookup index",
+            additional: deltas.len(),
+        })?;
+    for (delta_index, delta) in deltas.iter().enumerate() {
+        lookup.push(DeltaLeaseLookup {
+            lease_base: delta.lease_base(),
+            lease_end: delta.lease_end(),
+            delta_index,
+        });
+    }
+    lookup.sort_unstable_by_key(|entry| entry.lease_base);
+    Ok(lookup)
 }
 
 fn validate_delta_table(
@@ -1244,6 +1269,7 @@ struct PreparedSealedPublication {
     live_doc_count: u64,
     delta_live_doc_count: u64,
     deltas: Box<[Arc<DeltaSnapshot>]>,
+    delta_lease_lookup: Vec<DeltaLeaseLookup>,
 }
 
 /// Lock-free publisher for one authoritative Keeper plus all-Delta view.
@@ -1298,6 +1324,7 @@ impl SnapshotPublisher {
         let current = self.current.load_full();
         validate_complete_keeper_transition(&current.keeper.loaded_manifest().manifest, proposed)?;
         validate_delta_table(schema, proposed, &deltas)?;
+        let delta_lease_lookup = build_delta_lease_lookup(&deltas)?;
         let snapshot_epoch = current
             .snapshot_epoch()
             .checked_add(1)
@@ -1332,6 +1359,7 @@ impl SnapshotPublisher {
             live_doc_count,
             delta_live_doc_count,
             deltas: deltas.into_boxed_slice(),
+            delta_lease_lookup,
         })
     }
 
@@ -1375,6 +1403,7 @@ impl SnapshotPublisher {
             live_doc_count: current.live_doc_count,
             delta_live_doc_count: 0,
             deltas: Box::default(),
+            delta_lease_lookup: Vec::new(),
         })
     }
 
@@ -1488,6 +1517,7 @@ impl SnapshotPublisher {
             snapshot_epoch: prepared.snapshot_epoch,
             keeper,
             deltas: prepared.deltas,
+            delta_lease_lookup: prepared.delta_lease_lookup,
             field_stats: prepared.field_stats,
             bm25_doc_count: prepared.bm25_doc_count,
             live_doc_count: prepared.live_doc_count,
@@ -9583,8 +9613,9 @@ impl QuillReader {
         } else {
             TopDocsCollector::new(limit, offset)?
         };
-        let topdocs_root = !exact_count && limit != 0;
-        let rank_pruning = topdocs_root && query_has_prunable_root_union(query, 1.0);
+        let topdocs_root = limit != 0;
+        let rank_pruning =
+            !exact_count && topdocs_root && query_has_prunable_root_union(query, 1.0);
         let sealed_docs: u64 = keeper
             .segments()
             .iter()
@@ -12000,9 +12031,9 @@ impl SnippetTailWorkShape {
 
 /// Dictionary-block ceiling for one Delta generation's ordered term view.
 ///
-/// `DeltaSegment::sorted_terms` materialises AND radix-sorts every term id in
-/// the generation before the first term can be examined, so this ceiling is
-/// what the tail must admit BEFORE that view is built. The bound and the
+/// `DeltaSnapshot::ordered_terms` materialises AND radix-sorts every term id
+/// on its first view before the first term can be examined, so this ceiling is
+/// what the tail must admit BEFORE that cache can be built. The bound and the
 /// admission both derive from this one function on purpose: metering is armed
 /// by `upper_bound > budget`, so a unit the bound does not cover could refuse
 /// a query whose real work fits its budget.
@@ -12569,6 +12600,7 @@ fn merge_field_stats(
         .collect())
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct OwnedFieldNorms {
     field_ord: u16,
@@ -12576,6 +12608,7 @@ struct OwnedFieldNorms {
     values: Vec<u8>,
 }
 
+#[cfg(test)]
 impl FieldNormReader for OwnedFieldNorms {
     fn field_ord(&self) -> u16 {
         self.field_ord
@@ -12737,7 +12770,7 @@ fn validate_query_lowering(
         Query::Phrase {
             fields,
             terms,
-            slop,
+            slop: _,
             prefix,
         } => {
             if terms.is_empty() {
@@ -12771,11 +12804,6 @@ fn validate_query_lowering(
             if *prefix && terms.len() == 1 {
                 return Err(QuillIndexError::UnsupportedQuery {
                     detail: "phrase prefix requires at least two positioned terms".to_owned(),
-                });
-            }
-            if *slop != 0 {
-                return Err(QuillIndexError::UnsupportedQuery {
-                    detail: format!("phrase slop={slop} prefix={prefix}"),
                 });
             }
             for term in terms {
@@ -12901,6 +12929,7 @@ fn lower_leaf_exact_phrase<'a>(
     field_ord: u16,
     field_boost: f32,
     terms: &[crate::query::PositionedTerm],
+    slop: u32,
     final_term: Option<&[u8]>,
     inherited_boost: f32,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
@@ -12969,18 +12998,20 @@ fn lower_leaf_exact_phrase<'a>(
     let bm25 = Bm25FieldSnapshot::new(stats)?;
     let boost = inherited_boost * field_boost;
     let scorer = match leaf {
-        QueryLeaf::Sealed(segment) => PhraseScorer::new_with_checkpoint(
+        QueryLeaf::Sealed(segment) => PhraseScorer::new_with_slop_and_checkpoint(
             phrase_terms,
-            owned_fieldnorms(segment, schema, field_ord)?,
+            borrowed_fieldnorms(segment, schema, field_ord)?,
             bm25,
             boost,
+            slop,
             Some(clone_query_checkpoint_for_argus(checkpoint)),
         )?,
-        QueryLeaf::Delta(delta) => PhraseScorer::new_with_checkpoint(
+        QueryLeaf::Delta(delta) => PhraseScorer::new_with_slop_and_checkpoint(
             phrase_terms,
             DeltaFieldNorms::new(delta, field_ord),
             bm25,
             boost,
+            slop,
             Some(clone_query_checkpoint_for_argus(checkpoint)),
         )?,
     };
@@ -13454,11 +13485,6 @@ fn lower_query_with_mode<'a>(
                     detail: "phrase prefix requires at least two positioned terms".to_owned(),
                 });
             }
-            if *slop != 0 {
-                return Err(QuillIndexError::UnsupportedQuery {
-                    detail: format!("phrase slop={slop} prefix={prefix}"),
-                });
-            }
             if terms.len() == 1 {
                 let term = &terms[0];
                 let mut clauses = Vec::new();
@@ -13517,6 +13543,8 @@ fn lower_query_with_mode<'a>(
                         invalid_state("could not allocate phrase-prefix expansion clauses")
                     })?;
                     for expansion in &expansions {
+                        // Tantivy's parsed phrase-prefix path constructs a
+                        // PhrasePrefixQuery without carrying the parsed slop.
                         clauses.push(ScorerClause::should(lower_leaf_exact_phrase(
                             checkpoint,
                             leaf,
@@ -13526,6 +13554,7 @@ fn lower_query_with_mode<'a>(
                             field.field_id,
                             field.boost,
                             terms,
+                            0,
                             Some(expansion),
                             inherited_boost,
                         )?));
@@ -13540,6 +13569,7 @@ fn lower_query_with_mode<'a>(
                         field.field_id,
                         field.boost,
                         terms,
+                        *slop,
                         None,
                         inherited_boost,
                     )?));
@@ -13971,28 +14001,31 @@ fn snapshot_string_range_terms(
         }
     }
     for delta in snapshot.delta_snapshots() {
-        // `sorted_terms` materialises and radix-sorts the complete ordered
-        // view before yielding its first term. Admit that bounded work from
-        // the O(1) term count before the allocation/sort can begin; otherwise
-        // a cancelled or under-budget range still pays the whole cost before
-        // observing its first checkpoint.
+        // `ordered_terms` materialises and radix-sorts the complete ordered
+        // view on its first use before yielding its first term. Admit that
+        // bounded work from the O(1) term count before the cache can be built;
+        // otherwise a cancelled or under-budget range still pays the whole
+        // cost before observing its first checkpoint.
         checkpoint.admit(
             QueryWorkKind::DictionaryBlock,
             delta_ordered_view_blocks(delta.segment().term_count()),
         )?;
-        for (term_index, term) in delta.segment().sorted_terms().iter().enumerate() {
+        let field_terms = delta.ordered_terms_for_field(field_ord);
+        if delta.segment().term_count() != 0 {
+            // A nonempty Delta still needs to surface cancellation after its
+            // cached view was obtained, even when this requested field is empty.
+            checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
+        }
+        for (term_index, term) in field_terms.enumerate() {
             // Ordered-view blocks are paid above. Keep a zero-unit boundary
             // so cancellation during a long range walk is still observed.
-            if term_index % 16 == 0 {
+            if term_index != 0 && term_index % 16 == 0 {
                 checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
             }
             // Both tests are O(1) now that the live count is taken at freeze,
             // so this expansion costs the dictionary blocks it already
             // admits and nothing more.
-            if term.field_ord() == field_ord
-                && term.live_doc_freq() != 0
-                && term_in_string_range(term.term(), &lower, &upper)
-            {
+            if term.live_doc_freq() != 0 && term_in_string_range(term.term(), &lower, &upper) {
                 terms.insert(term.term().to_vec());
             }
         }
@@ -14376,38 +14409,42 @@ fn snapshot_glob_terms(
         }
     }
     for delta in snapshot.delta_snapshots() {
-        // `sorted_terms` is not a cursor: it allocates one id per term and
-        // MSD-radix-sorts the whole set (`TermInterner::sorted_ids`) before
-        // the first term is examined. Admitting per 16-term block DURING the
-        // walk therefore charged nothing for the one allocation that scales
-        // with the generation, and a cancelled or zero-fuel query still paid
-        // for it in full. The ceiling comes from the O(1) `term_count` and is
-        // admitted BEFORE the ordered view exists.
+        // `ordered_terms` is not a cursor: its first use allocates one id per
+        // term and MSD-radix-sorts the whole set (`TermInterner::sorted_ids`)
+        // before the first term is examined. Admitting per 16-term block
+        // DURING that initial walk would charge nothing for the one allocation
+        // that scales with the generation, and a cancelled or zero-fuel query
+        // would still pay for it in full. The ceiling comes from the O(1)
+        // `term_count` and is admitted BEFORE the ordered view exists.
         //
-        // A chunked ordered traversal would be better still, but the ordering
-        // is produced wholesale by `TermInterner::sorted_ids` in `scribe.rs`
-        // and there is no lazy ordered cursor to drive; conservative
-        // pre-admission is the bounded option available here.
+        // The cache retains the wholesale order per frozen generation; the
+        // first lookup remains conservatively pre-admitted.
         if let Some(checkpoint) = checkpoint {
             checkpoint.admit(
                 QueryWorkKind::DictionaryBlock,
                 delta_ordered_view_blocks(delta.segment().term_count()),
             )?;
         }
-        for (term_index, term) in delta.segment().sorted_terms().iter().enumerate() {
+        let field_terms = delta.ordered_terms_for_field(field_ord);
+        if delta.segment().term_count() != 0 {
+            if let Some(checkpoint) = checkpoint {
+                // A nonempty Delta still needs to surface cancellation after
+                // its cached view was obtained, even when this field is empty.
+                checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
+            }
+        }
+        for (term_index, term) in field_terms.enumerate() {
             // The blocks are paid for above, so this admits ZERO units: it
             // charges no fuel and moves no counter, and exists only so that a
             // cancellation during a long walk is still surfaced promptly.
-            if let Some(checkpoint) = checkpoint.filter(|_| term_index % 16 == 0) {
+            if let Some(checkpoint) = checkpoint.filter(|_| term_index != 0 && term_index % 16 == 0)
+            {
                 checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
             }
             // The live count is taken at freeze, so this stays O(1) per term
             // even on the `checkpoint == None` path, which has nothing to
             // admit against and previously walked every chain unmetered.
-            if term.field_ord() == field_ord
-                && term.live_doc_freq() != 0
-                && star_glob_matches(pattern, term.term())
-            {
+            if term.live_doc_freq() != 0 && star_glob_matches(pattern, term.term()) {
                 insert_glob_term(&mut terms, field_ord, term.term().to_vec(), expansion_limit)?;
             }
         }
@@ -14691,16 +14728,7 @@ fn open_sealed_term_cursor<'a>(
     rank_pruning: bool,
     checkpoint: &QueryCheckpointHandle<'_>,
 ) -> Result<(SealedPostingCursor<'a>, DocLenField<'a>), QuillIndexError> {
-    let manifest = segment.manifest();
-    let doclen = DocLenSection::parse_schema(
-        required_section(segment, SectionKind::DOCLEN)?,
-        manifest.docid_lo,
-        manifest.docid_hi,
-        schema,
-    )?;
-    let fieldnorms = doclen
-        .field(field_ord)
-        .ok_or_else(|| invalid_state(format!("DOCLEN has no field {field_ord}")))?;
+    let fieldnorms = borrowed_fieldnorms(segment, schema, field_ord)?;
     let dictionary = open_dictionary(segment, schema)?;
     let found = dictionary.lookup(field_ord, term)?;
     // The lookup has to come first — it is what tells us whether a block will
@@ -15041,11 +15069,11 @@ fn open_owned_cursor(
     })
 }
 
-fn owned_fieldnorms(
+fn borrowed_fieldnorms(
     segment: &RecoveredSegment,
     schema: SchemaDescriptor,
     field_ord: u16,
-) -> Result<OwnedFieldNorms, QuillIndexError> {
+) -> Result<DocLenField<'_>, QuillIndexError> {
     let manifest = segment.manifest();
     let section = DocLenSection::parse_schema(
         required_section(segment, SectionKind::DOCLEN)?,
@@ -15053,9 +15081,20 @@ fn owned_fieldnorms(
         manifest.docid_hi,
         schema,
     )?;
-    let field = section
+    section
         .field(field_ord)
-        .ok_or_else(|| invalid_state(format!("DOCLEN has no field {field_ord}")))?;
+        .ok_or_else(|| invalid_state(format!("DOCLEN has no field {field_ord}")))
+}
+
+#[cfg(test)]
+fn owned_fieldnorms(
+    segment: &RecoveredSegment,
+    schema: SchemaDescriptor,
+    field_ord: u16,
+) -> Result<OwnedFieldNorms, QuillIndexError> {
+    OWNED_FIELDNORM_BRIDGE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+    let manifest = segment.manifest();
+    let field = borrowed_fieldnorms(segment, schema, field_ord)?;
     Ok(OwnedFieldNorms {
         field_ord,
         docid_lo: manifest.docid_lo,
@@ -15099,6 +15138,7 @@ fn span<'a>(
 #[cfg(test)]
 thread_local! {
     static TERM_FIELD_ORD_BRIDGE_CALLS: Cell<usize> = const { Cell::new(0) };
+    static OWNED_FIELDNORM_BRIDGE_CALLS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -15126,6 +15166,16 @@ fn reset_term_field_ord_bridge_calls() {
 #[cfg(test)]
 fn term_field_ord_bridge_calls() -> usize {
     TERM_FIELD_ORD_BRIDGE_CALLS.with(Cell::get)
+}
+
+#[cfg(test)]
+fn reset_owned_fieldnorm_bridge_calls() {
+    OWNED_FIELDNORM_BRIDGE_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+fn owned_fieldnorm_bridge_calls() -> usize {
+    OWNED_FIELDNORM_BRIDGE_CALLS.with(Cell::get)
 }
 
 #[cfg(test)]
@@ -18075,7 +18125,7 @@ mod tests {
             .expect("fan-out fixture snapshot is authoritative");
         let rank_pruning =
             !exact_count && limit != 0 && query_has_prunable_root_union(&parsed.query, 1.0);
-        let topdocs_root = !exact_count && limit != 0;
+        let topdocs_root = limit != 0;
         let mut collector = if exact_count {
             TopDocsCollector::with_exact_count(limit, offset)
         } else {
@@ -18850,6 +18900,196 @@ mod tests {
             assert!(
                 ids("NOT alpha AND NOT beta").await.is_empty(),
                 "an exclusion-only conjunction must still match nothing"
+            );
+        });
+    }
+
+    #[test]
+    fn stored_value_hydration_does_not_rematerialize_candidate_identity() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(QuillConfig {
+                deterministic_ingest: true,
+                tier_fanout: usize::MAX,
+                ..QuillConfig::default()
+            })
+            .expect("create multi-segment stored-value index");
+            for document in [
+                IndexableDocument::new("segment-one", "alpha filler"),
+                IndexableDocument::new("segment-two", "beta filler"),
+                IndexableDocument::new("stored-target", "needle exact stored bytes")
+                    .with_metadata("path", "src/target.rs"),
+            ] {
+                LexicalWrite::index_document(&index, &cx, &document)
+                    .await
+                    .expect("index one segment fixture document");
+                LexicalWrite::commit(&index, &cx)
+                    .await
+                    .expect("seal one fixture segment");
+            }
+
+            let snapshot = index.search_snapshot().expect("pin fixture snapshot");
+            assert_eq!(snapshot.keeper.segments().len(), 3);
+            let materialization_call_count = || {
+                snapshot
+                    .keeper
+                    .segments()
+                    .iter()
+                    .map(RecoveredSegment::document_id_materialization_call_count)
+                    .sum::<u64>()
+            };
+            assert_eq!(materialization_call_count(), 0);
+
+            let batch = LexicalRead::search_candidates(&index, &cx, "needle", 10)
+                .await
+                .expect("search deferred candidate");
+            let (mut candidates, pin) = batch.into_parts();
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].doc_id, "stored-target");
+            assert_eq!(materialization_call_count(), 1);
+
+            LexicalRead::hydrate_candidates(&index, &cx, pin.as_ref(), &mut candidates)
+                .await
+                .expect("hydrate deferred candidate metadata");
+            assert_eq!(
+                candidates[0].metadata.as_deref(),
+                Some(&serde_json::json!({"path": "src/target.rs"}))
+            );
+
+            let global_docid = snapshot
+                .resolve_document_id("stored-target")
+                .expect("resolve stored target")
+                .expect("stored target is live");
+            assert_eq!(
+                snapshot
+                    .materialize_stored_value(CONTENT_FIELD, global_docid)
+                    .expect("materialize stored content"),
+                Some(b"needle exact stored bytes".to_vec())
+            );
+            assert_eq!(materialization_call_count(), 1);
+
+            assert!(
+                index
+                    .delete_document(&cx, "stored-target")
+                    .await
+                    .expect("tombstone stored target")
+            );
+            let tombstoned = index
+                .search_snapshot()
+                .expect("pin tombstoned successor snapshot");
+            assert_eq!(
+                tombstoned
+                    .materialize_stored_value(CONTENT_FIELD, global_docid)
+                    .expect("read tombstoned stored content"),
+                None
+            );
+            assert_eq!(
+                tombstoned
+                    .keeper
+                    .segments()
+                    .iter()
+                    .map(RecoveredSegment::document_id_materialization_call_count)
+                    .sum::<u64>(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn stored_value_hydration_parent_red_reuses_one_plan_for_two_sealed_winners() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(QuillConfig {
+                deterministic_ingest: true,
+                tier_fanout: usize::MAX,
+                ..QuillConfig::default()
+            })
+            .expect("create same-segment stored-value index");
+            for document in [
+                IndexableDocument::new("stored-first", "needle first payload")
+                    .with_metadata("path", "src/first.rs"),
+                IndexableDocument::new("stored-second", "needle second payload")
+                    .with_metadata("path", "src/second.rs"),
+            ] {
+                LexicalWrite::index_document(&index, &cx, &document)
+                    .await
+                    .expect("stage stored-value winner");
+            }
+            LexicalWrite::commit(&index, &cx)
+                .await
+                .expect("seal both stored-value winners together");
+
+            let snapshot = index.search_snapshot().expect("pin sealed winner snapshot");
+            assert_eq!(snapshot.keeper.segments().len(), 1);
+            let segment = &snapshot.keeper.segments()[0];
+            let exact_segment_bytes = segment.source_bytes().to_vec();
+            assert_eq!(segment.stored_meta_lookup_cache_counts(), (0, 0));
+
+            let first_docid = snapshot
+                .resolve_document_id("stored-first")
+                .expect("resolve first winner")
+                .expect("first winner is live");
+            let second_docid = snapshot
+                .resolve_document_id("stored-second")
+                .expect("resolve second winner")
+                .expect("second winner is live");
+
+            let batch = LexicalRead::search_candidates(&index, &cx, "needle", 10)
+                .await
+                .expect("select two deferred stored-value winners");
+            let (mut winners, pin) = batch.into_parts();
+            assert_eq!(
+                winners.len(),
+                2,
+                "fixture must hydrate two same-segment winners"
+            );
+            assert!(winners.iter().all(|winner| winner.metadata.is_none()));
+
+            LexicalRead::hydrate_candidates(&index, &cx, pin.as_ref(), &mut winners)
+                .await
+                .expect("hydrate both stored-value winners");
+            for winner in &winners {
+                match winner.doc_id.as_str() {
+                    "stored-first" => assert_eq!(
+                        winner.metadata.as_deref(),
+                        Some(&serde_json::json!({"path": "src/first.rs"}))
+                    ),
+                    "stored-second" => assert_eq!(
+                        winner.metadata.as_deref(),
+                        Some(&serde_json::json!({"path": "src/second.rs"}))
+                    ),
+                    other => panic!("unexpected stored-value winner {other}"),
+                }
+            }
+            assert_eq!(segment.source_bytes(), exact_segment_bytes.as_slice());
+            let plan_counts = segment.stored_meta_lookup_cache_counts();
+            assert_eq!(plan_counts, (2, 1));
+
+            assert_eq!(
+                snapshot
+                    .materialize_stored_value(u16::MAX, first_docid)
+                    .expect("read absent stored field"),
+                None,
+                "an absent stored value must remain absent"
+            );
+            assert!(
+                index
+                    .delete_document(&cx, "stored-second")
+                    .await
+                    .expect("tombstone second winner")
+            );
+            let tombstoned = index
+                .search_snapshot()
+                .expect("pin tombstoned same-backing successor");
+            assert_eq!(
+                tombstoned
+                    .materialize_stored_value(CONTENT_FIELD, second_docid)
+                    .expect("read tombstoned stored content"),
+                None,
+                "a tombstoned row must not materialize stored bytes"
+            );
+            assert_eq!(
+                tombstoned.keeper.segments()[0].stored_meta_lookup_cache_counts(),
+                (3, 1),
+                "tombstone-only rebinds share the one plan only for the exact immutable backing"
             );
         });
     }
@@ -20257,6 +20497,133 @@ mod tests {
                 shard_count: 1
             })
         ));
+    }
+
+    #[test]
+    fn snapshot_delta_lease_lookup_selects_only_the_owner_without_reordering_deltas() {
+        let keeper = Arc::new(KeeperSnapshot::in_memory(DEFAULT_SCHEMA).expect("genesis Keeper"));
+        let generation = keeper.loaded_manifest().manifest.generation;
+
+        let mut first =
+            DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("first aligned Delta lease");
+        let first_docid = u32::try_from(first.lease_base()).expect("first docid fits u32");
+        apply_sealable_delta_document(&mut first, first_docid, "lease-first", "first-value", 1);
+
+        let mut tombstoned = DeltaSegment::new(DEFAULT_SCHEMA, first.lease_end(), usize::MAX)
+            .expect("successor aligned Delta lease");
+        let tombstoned_docid =
+            u32::try_from(tombstoned.lease_base()).expect("tombstoned docid fits u32");
+        apply_sealable_delta_document(
+            &mut tombstoned,
+            tombstoned_docid,
+            "lease-tombstone",
+            "tombstone-value",
+            1,
+        );
+        assert_eq!(
+            tombstoned.delete_delta_id("lease-tombstone"),
+            Some(tombstoned_docid)
+        );
+
+        let gap = DeltaSegment::new(DEFAULT_SCHEMA, tombstoned.lease_end(), usize::MAX)
+            .expect("aligned unused gap lease");
+        let mut third = DeltaSegment::new(DEFAULT_SCHEMA, gap.lease_end(), usize::MAX)
+            .expect("third aligned Delta lease");
+        let third_docid = u32::try_from(third.lease_base()).expect("third docid fits u32");
+        apply_sealable_delta_document(&mut third, third_docid, "lease-third", "third-value", 1);
+
+        let first = Arc::new(first.freeze(generation));
+        let tombstoned = Arc::new(tombstoned.freeze(generation));
+        let third = Arc::new(third.freeze(generation));
+        let snapshot = QuillSearchSnapshot::compose(
+            0,
+            keeper,
+            vec![
+                Arc::clone(&third),
+                Arc::clone(&first),
+                Arc::clone(&tombstoned),
+            ],
+        )
+        .expect("compose shuffled nonoverlapping Delta leases");
+
+        for (actual, expected) in
+            snapshot
+                .delta_snapshots()
+                .iter()
+                .zip([&third, &first, &tombstoned])
+        {
+            assert!(
+                Arc::ptr_eq(actual, expected),
+                "lease lookup must not reorder the primary Delta table"
+            );
+        }
+
+        let reset_attempts = || {
+            third.reset_materialization_attempts();
+            first.reset_materialization_attempts();
+            tombstoned.reset_materialization_attempts();
+        };
+        let attempts = || {
+            [
+                third.materialization_attempts(),
+                first.materialization_attempts(),
+                tombstoned.materialization_attempts(),
+            ]
+        };
+
+        reset_attempts();
+        assert_eq!(
+            snapshot.materialize_document_id(first_docid).as_deref(),
+            Some("lease-first")
+        );
+        assert_eq!(
+            attempts(),
+            [0, 1, 0],
+            "only the lease owner may materialize an ID hit"
+        );
+
+        reset_attempts();
+        assert_eq!(
+            snapshot
+                .materialize_stored_value(CONTENT_FIELD, first_docid)
+                .expect("materialize selected stored value"),
+            Some(b"first-value".to_vec())
+        );
+        assert_eq!(
+            attempts(),
+            [0, 1, 0],
+            "only the lease owner may materialize stored bytes"
+        );
+
+        reset_attempts();
+        assert_eq!(snapshot.materialize_document_id(tombstoned_docid), None);
+        assert_eq!(
+            attempts(),
+            [0, 0, 1],
+            "a tombstoned selected row must not scan nonowners"
+        );
+
+        reset_attempts();
+        assert_eq!(
+            snapshot
+                .materialize_stored_value(CONTENT_FIELD, tombstoned_docid)
+                .expect("materialize tombstoned selected row"),
+            None
+        );
+        assert_eq!(
+            attempts(),
+            [0, 0, 1],
+            "stored tombstone validation must remain within the selected Delta"
+        );
+
+        let gap_docid = u32::try_from(gap.lease_base()).expect("gap docid fits u32");
+        reset_attempts();
+        assert_eq!(snapshot.materialize_document_id(gap_docid), None);
+        assert_eq!(
+            attempts(),
+            [0, 0, 0],
+            "a lease gap must not probe any Delta"
+        );
     }
 
     #[test]
@@ -24971,39 +25338,28 @@ mod tests {
             "two direct term children are MaxScore-capable"
         );
 
-        // Nested multi-field unions stay POSTINGS-only while
-        // `GROUPED_MAX_SCORE_ENABLED` is false. The runtime candidate is
-        // rank-safe and prunes, but its release A/B failed the performance
-        // gate (see that constant's docs), so shipping does not pay to open
-        // BLOCKMAX for these terms.
-        // When `GROUPED_MAX_SCORE_ENABLED` flips to `true`, this assertion is
-        // the one to invert — the shape assertions below stay as they are.
-        let nested_two = parser.parse("alpha OR beta");
+        let default_two = parser.parse("alpha OR beta");
         assert!(
-            !query_has_prunable_root_union(&nested_two.query, 1.0),
-            "nested field unions must not open BLOCKMAX while grouped MaxScore is gated off"
+            query_has_prunable_root_union(&default_two.query, 1.0),
+            "four direct default-field terms are MaxScore-capable"
         );
 
-        let nested_nine = parser
+        let default_nine = parser
             .parse("alpha OR beta OR gamma OR delta OR epsilon OR zeta OR eta OR theta OR iota");
         assert!(
-            !query_has_prunable_root_union(&nested_nine.query, 1.0),
-            "nine default multi-field children cannot supply physical BMW blocks, and grouped \
-             MaxScore stops at MAX_SCORE_MAX_CLAUSES"
+            query_has_prunable_root_union(&default_nine.query, 1.0),
+            "eighteen direct default-field terms are BMW-capable"
         );
 
-        // Shape classification is pinned directly so it cannot rot while the
-        // gate is closed: these are the inputs that decide eligibility the
-        // moment `GROUPED_MAX_SCORE_ENABLED` flips.
         assert!(
             matches!(
-                prunable_scorer_shape(&nested_two.query, 1.0),
+                prunable_scorer_shape(&default_two.query, 1.0),
                 Some(PrunableScorerShape::Union {
-                    children: 2,
-                    kind: UnionChildKind::TermGroups,
+                    children: 4,
+                    kind: UnionChildKind::DirectTerms,
                 })
             ),
-            "a default two-word query lowers to two pure-term groups"
+            "a default two-word query lowers to four direct frequency-term leaves"
         );
         assert!(
             matches!(
@@ -25015,23 +25371,20 @@ mod tests {
             ),
             "field-scoped children lower to direct terms, not groups"
         );
-        // A root mixing a direct term with a multi-field group satisfies neither
-        // the all-direct-terms nor the all-groupable runtime branch, so it can
-        // never be admitted regardless of the gate.
         let mixed = parser.parse("content:alpha OR beta");
         assert!(
             matches!(
                 prunable_scorer_shape(&mixed.query, 1.0),
                 Some(PrunableScorerShape::Union {
-                    children: 2,
-                    kind: UnionChildKind::Mixed,
+                    children: 3,
+                    kind: UnionChildKind::DirectTerms,
                 })
             ),
-            "a mixed direct-term/group root is consumed by no pruning strategy"
+            "a field-scoped term plus one default term lowers to three direct leaves"
         );
         assert!(
-            !query_has_prunable_root_union(&mixed.query, 1.0),
-            "a mixed root must never open BLOCKMAX"
+            query_has_prunable_root_union(&mixed.query, 1.0),
+            "three direct term children are MaxScore-capable"
         );
 
         let direct_nine = parser.parse(
@@ -25239,8 +25592,8 @@ mod tests {
             }
             assert_eq!(
                 segment.cached_rank_pruning_term_count(),
-                2,
-                "nested fallback must not validate title BLOCKMAX metadata"
+                3,
+                "flat default-field leaves validate the three present terms, not absent title:beta"
             );
         });
     }
@@ -26060,8 +26413,8 @@ mod tests {
                 Query::Phrase {
                     fields: vec![crate::query::QueryField::new(1, 1.0)],
                     terms: vec![
-                        crate::query::PositionedTerm::new(0, "alpha"),
-                        crate::query::PositionedTerm::new(1, "beta"),
+                        crate::query::PositionedTerm::new(1, "alpha"),
+                        crate::query::PositionedTerm::new(0, "beta"),
                     ],
                     slop: 1,
                     prefix: false,
@@ -27256,6 +27609,7 @@ mod tests {
                 assert_eq!(positions, &expected_positions, "posting ordinal {ordinal}");
             }
 
+            reset_owned_fieldnorm_bridge_calls();
             let phrase = index
                 .search_paginated(&cx, "\"anchor anchor\"", DOCUMENT_COUNT, 0, true)
                 .expect("execute checkpointed phrase query across both seam families");
@@ -27264,6 +27618,125 @@ mod tests {
                 Some(u64::try_from(DOCUMENT_COUNT).expect("document count fits u64")),
             );
             assert_eq!(phrase.hits.len(), DOCUMENT_COUNT);
+            assert_eq!(
+                owned_fieldnorm_bridge_calls(),
+                0,
+                "shipping sealed phrase lowering must borrow the validated DOCLEN field",
+            );
+        });
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn public_phrase_slop_matches_tantivy_ids_order_and_score_bits() {
+        use frankensearch_lexical::tantivy_crate::{
+            Index, TantivyDocument,
+            collector::TopDocs,
+            doc,
+            query::QueryParser,
+            schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions},
+        };
+
+        run_with_cx(|cx| async move {
+            let corpus = [
+                ("exact", "a b c"),
+                ("one-gap", "a x b c"),
+                ("two-gaps", "a x b x c"),
+                ("left-swap", "b a c"),
+                ("right-swap", "a c b"),
+                ("twice", "a b c a b c"),
+            ];
+
+            let quill = QuillIndex::in_memory(deterministic_config()).expect("construct Quill");
+            let documents = corpus
+                .iter()
+                .map(|(id, content)| IndexableDocument::new(*id, *content))
+                .collect::<Vec<_>>();
+            quill
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index public Quill slop corpus");
+            quill.commit(&cx).await.expect("commit Quill slop corpus");
+
+            let mut schema_builder = Schema::builder();
+            let indexing = TextFieldIndexing::default()
+                .set_tokenizer("default")
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+            let content = schema_builder.add_text_field(
+                "content",
+                TextOptions::default().set_indexing_options(indexing),
+            );
+            let tantivy = Index::create_in_ram(schema_builder.build());
+            let mut writer = tantivy
+                .writer_with_num_threads::<TantivyDocument>(1, 15_000_000)
+                .expect("construct Tantivy writer");
+            for (_, text) in corpus {
+                writer
+                    .add_document(doc!(content => text))
+                    .expect("index Tantivy slop document");
+            }
+            writer.commit().expect("commit Tantivy slop corpus");
+            drop(writer);
+            let reader = tantivy.reader().expect("open Tantivy slop reader");
+            let searcher = reader.searcher();
+            let parser = QueryParser::for_index(&tantivy, vec![content]);
+
+            for raw_query in ["content:\"a b c\"~1", "content:\"a b c\"~2"] {
+                let quill_ranked = quill
+                    .search_paginated(&cx, raw_query, corpus.len(), 0, true)
+                    .expect("execute public Quill phrase-slop query")
+                    .hits
+                    .into_iter()
+                    .map(|hit| (hit.document_id, hit.score.to_bits()))
+                    .collect::<Vec<_>>();
+                let parsed = parser
+                    .parse_query(raw_query)
+                    .expect("parse Tantivy phrase-slop query");
+                let tantivy_ranked = searcher
+                    .search(
+                        parsed.as_ref(),
+                        &TopDocs::with_limit(corpus.len()).order_by_score(),
+                    )
+                    .expect("execute Tantivy phrase-slop query")
+                    .into_iter()
+                    .map(|(score, address)| {
+                        assert_eq!(address.segment_ord, 0);
+                        (
+                            corpus[usize::try_from(address.doc_id).expect("doc id fits")]
+                                .0
+                                .to_owned(),
+                            score.to_bits(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(quill_ranked, tantivy_ranked, "query={raw_query}");
+            }
+
+            #[cfg(feature = "bench-internals")]
+            {
+                let zero_slop_prefix = DefaultQueryParser::new(DEFAULT_SCHEMA)
+                    .expect("construct phrase-prefix parser")
+                    .parse("content:\"a b c\"*")
+                    .query;
+                let mut ignored_slop_prefix = zero_slop_prefix.clone();
+                assert!(matches!(
+                    &ignored_slop_prefix,
+                    Query::Phrase { prefix: true, .. }
+                ));
+                if let Query::Phrase { slop, .. } = &mut ignored_slop_prefix {
+                    *slop = u32::MAX;
+                }
+
+                let zero_slop = quill
+                    .search_preparsed_paginated(&cx, &zero_slop_prefix, corpus.len(), 0, true)
+                    .expect("execute zero-slop phrase prefix");
+                let ignored_slop = quill
+                    .search_preparsed_paginated(&cx, &ignored_slop_prefix, corpus.len(), 0, true)
+                    .expect("execute phrase prefix carrying ignored slop");
+                assert!(!zero_slop.hits.is_empty());
+                assert!(zero_slop.hits.len() < corpus.len());
+                assert_eq!(ignored_slop, zero_slop);
+            }
         });
     }
 

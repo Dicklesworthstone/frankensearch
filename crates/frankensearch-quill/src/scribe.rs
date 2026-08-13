@@ -81,6 +81,21 @@ pub const FIELD_PREFIX_BYTES: usize = 2;
 /// a later stage rebases the offsets to global document IDs.
 pub const DOC_ORDS_PER_LEASE: u32 = 1 << 16;
 
+#[cfg(test)]
+std::thread_local! {
+    static SORTED_IDS_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_sorted_ids_calls() {
+    SORTED_IDS_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+fn sorted_ids_calls() -> usize {
+    SORTED_IDS_CALLS.with(std::cell::Cell::get)
+}
+
 /// One token emitted by a Quill analyzer.
 ///
 /// Offsets are half-open byte offsets into the original input. Positions are
@@ -1611,7 +1626,8 @@ impl<S: BuildHasher> TermInterner<S> {
 
     /// Ids sorted by composite key bytes — exactly the on-disk TERMDICT order
     /// (FSLX §5.1: the BE field prefix makes byte order equal (field, term)
-    /// order). Called once per flush. Large buckets use an in-place MSD radix
+    /// order). Used by flushes and immutable snapshot caches to materialize
+    /// canonical term order. Large buckets use an in-place MSD radix
     /// partition so shared prefixes are inspected once per byte instead of by
     /// every comparison; small buckets finish with the comparison sorter to
     /// avoid clearing a 257-way histogram for a handful of ids.
@@ -1620,6 +1636,8 @@ impl<S: BuildHasher> TermInterner<S> {
     /// Panics if the id space exceeds `u32` (unreachable; see [`Self::intern`]).
     #[must_use]
     pub fn sorted_ids(&self) -> Vec<u32> {
+        #[cfg(test)]
+        SORTED_IDS_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
         let mut ids: Vec<u32> =
             (0..u32::try_from(self.spans.len()).expect("term id space exceeds u32")).collect();
         self.sort_ids_msd(&mut ids);
@@ -4524,19 +4542,19 @@ fn encode_delta_term_streams<'a>(
     expected_field_ords: &[u16],
     doclen_columns: &[Vec<Option<u32>>],
 ) -> Result<OrderedTermStreams<'a>, FlushError> {
-    let sorted_terms = snapshot.segment().sorted_terms();
+    let term_count = snapshot.segment().term_count();
     let mut postings_bytes = Vec::new();
     let mut positions_bytes = Vec::new();
     let mut blockmax_bytes = Vec::new();
     let mut inputs = Vec::new();
     inputs
-        .try_reserve_exact(sorted_terms.len())
+        .try_reserve_exact(term_count)
         .map_err(|_| FlushError::Allocation {
             resource: "Delta TERMDICT inputs",
-            count: sorted_terms.len(),
+            count: term_count,
         })?;
 
-    for term in sorted_terms {
+    for term in snapshot.ordered_terms() {
         let field_ord = term.field_ord();
         let field_index = expected_field_ords.binary_search(&field_ord).map_err(|_| {
             FlushError::InvalidTokenColumn {
@@ -5282,6 +5300,7 @@ impl ShardRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::delta::{DeltaFieldNorm, DeltaSegment, DeltaTermPosting};
     use crate::grimoire::TermDictionary;
     use crate::quiver::{IdHashSection, IdMapSection, PositionList, PostingList, StatsSection};
     use crate::schema::{CASS_SEMANTIC_SCHEMA, DEFAULT_SCHEMA, FSFS_CHUNK_SCHEMA, FieldDescriptor};
@@ -5374,6 +5393,76 @@ mod tests {
         name: "scribe-mixed-positions-v1",
         fields: &MIXED_POSITION_FIELDS,
     };
+
+    const DELTA_STREAMING_FIELDS: [FieldDescriptor; 1] = [FieldDescriptor {
+        id: 0,
+        name: "term",
+        kind: FieldKind::Keyword,
+        stored: false,
+    }];
+    const DELTA_STREAMING_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+        name: "scribe-delta-streaming-v1",
+        fields: &DELTA_STREAMING_FIELDS,
+    };
+
+    fn delta_streaming_snapshot() -> DeltaSnapshot {
+        let mut delta = DeltaSegment::new(DELTA_STREAMING_SCHEMA, 0, usize::MAX)
+            .expect("valid Delta streaming fixture");
+        let first_norms = [DeltaFieldNorm {
+            field_ord: 0,
+            raw_length: 2,
+            fieldnorm_id: fieldnorm_to_id(2),
+        }];
+        let first_postings = [
+            DeltaTermPosting {
+                field_ord: 0,
+                term: b"zeta",
+                frequency: 1,
+                positions: None,
+            },
+            DeltaTermPosting {
+                field_ord: 0,
+                term: b"alpha",
+                frequency: 1,
+                positions: None,
+            },
+        ];
+        delta
+            .apply_document_with_values(
+                0,
+                DocId::from("delta-first"),
+                0x11,
+                &first_norms,
+                &first_postings,
+                &[],
+                &[],
+            )
+            .expect("first Delta fixture document");
+
+        let second_norms = [DeltaFieldNorm {
+            field_ord: 0,
+            raw_length: 1,
+            fieldnorm_id: fieldnorm_to_id(1),
+        }];
+        let second_postings = [DeltaTermPosting {
+            field_ord: 0,
+            term: b"beta",
+            frequency: 1,
+            positions: None,
+        }];
+        delta
+            .apply_document_with_values(
+                1,
+                DocId::from("delta-second"),
+                0x22,
+                &second_norms,
+                &second_postings,
+                &[],
+                &[],
+            )
+            .expect("second Delta fixture document");
+        delta.freeze(7)
+    }
 
     const UNSUPPORTED_ANALYZER_FIELDS: [FieldDescriptor; 1] = [FieldDescriptor {
         id: 0,
@@ -7740,6 +7829,44 @@ mod tests {
             .saturating_add(accumulator.seen_fields.capacity().div_ceil(8))
             .saturating_add(accumulator.analyzer.bytes_reserved());
         assert_eq!(accumulator.bytes_reserved(), exact_components);
+    }
+
+    #[test]
+    fn delta_flush_reuses_a_primed_snapshot_term_order_without_byte_drift() {
+        let input = DeltaFlushInput {
+            segment_id: 0xfeed_beef,
+            created_unix_s: 1_700_000_000,
+            engine_version: 0x0001_0002,
+        };
+        let canonical = flush_delta_snapshot(&delta_streaming_snapshot(), input)
+            .expect("unprimed Delta flush")
+            .expect("nonempty Delta snapshot seals");
+
+        let snapshot = delta_streaming_snapshot();
+        reset_sorted_ids_calls();
+        let primed_terms = snapshot
+            .ordered_terms()
+            .map(|term| term.term().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            primed_terms,
+            [b"alpha".to_vec(), b"beta".to_vec(), b"zeta".to_vec()]
+        );
+        assert_eq!(
+            sorted_ids_calls(),
+            1,
+            "priming must build the immutable snapshot's one canonical ID order"
+        );
+
+        let streamed = flush_delta_snapshot(&snapshot, input)
+            .expect("primed Delta flush")
+            .expect("nonempty primed Delta snapshot seals");
+        assert_eq!(streamed.as_bytes(), canonical.as_bytes());
+        assert_eq!(
+            sorted_ids_calls(),
+            1,
+            "a primed Delta flush must reuse the cached IDs instead of sorting a second full view"
+        );
     }
 
     #[test]

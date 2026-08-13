@@ -6,6 +6,9 @@
 
 use std::marker::PhantomData;
 use std::mem::size_of;
+use std::sync::OnceLock;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ahash::{AHashMap, AHashSet};
@@ -829,8 +832,19 @@ pub struct DeltaSegment {
 #[derive(Debug)]
 pub struct DeltaSnapshot {
     segment: DeltaSegment,
+    ordered_term_ids: OnceLock<Box<[u32]>>,
     keeper_generation: u64,
     lineage_id: u64,
+    #[cfg(test)]
+    materialization_attempts: AtomicUsize,
+}
+
+/// Stored-value materialization outcome for one selected Delta row.
+pub(crate) enum DeltaStoredMaterialization<'a> {
+    /// The row is absent or tombstoned in this Delta.
+    NotLive,
+    /// The row is live; its requested stored field may still be absent.
+    Live(Option<&'a [u8]>),
 }
 
 impl DeltaSnapshot {
@@ -838,6 +852,45 @@ impl DeltaSnapshot {
     #[must_use]
     pub const fn segment(&self) -> &DeltaSegment {
         &self.segment
+    }
+
+    /// Canonically ordered term views for this immutable generation.
+    ///
+    /// Query lowering must pre-admit the first view before calling this; the
+    /// cache materializes the complete retained ID slice in one operation.
+    #[must_use]
+    pub(crate) fn ordered_terms(&self) -> DeltaOrderedTerms<'_> {
+        let term_ids = self.cached_ordered_term_ids();
+        DeltaOrderedTerms {
+            delta: &self.segment,
+            term_ids,
+            next_term: 0,
+        }
+    }
+
+    /// Canonically ordered terms for one field in this immutable generation.
+    ///
+    /// The cached composite order begins with big-endian field bytes, so the
+    /// selected field is one contiguous subslice of the single retained ID
+    /// buffer. Query lowering must pre-admit the first view before calling
+    /// this method.
+    #[must_use]
+    pub(crate) fn ordered_terms_for_field(&self, field_ord: u16) -> DeltaOrderedTerms<'_> {
+        let term_ids = self.cached_ordered_term_ids();
+        let first = term_ids
+            .partition_point(|term_id| self.segment.terms.field_and_term(*term_id).0 < field_ord);
+        let past_last = term_ids
+            .partition_point(|term_id| self.segment.terms.field_and_term(*term_id).0 <= field_ord);
+        DeltaOrderedTerms {
+            delta: &self.segment,
+            term_ids: &term_ids[first..past_last],
+            next_term: 0,
+        }
+    }
+
+    fn cached_ordered_term_ids(&self) -> &[u32] {
+        self.ordered_term_ids
+            .get_or_init(|| self.segment.terms.sorted_ids().into_boxed_slice())
     }
 
     /// Number of physical rows retained by this immutable delta generation.
@@ -947,6 +1000,8 @@ impl DeltaSnapshot {
     /// Materialize one visible row's stable external identifier.
     #[must_use]
     pub fn materialize_document_id(&self, global_docid: u32) -> Option<DocId> {
+        #[cfg(test)]
+        self.record_materialization_attempt();
         let row = self
             .segment
             .document_docids
@@ -988,6 +1043,40 @@ impl DeltaSnapshot {
         self.segment.stored_value(field_ord, global_docid)
     }
 
+    /// Materialize stored bytes only when this snapshot owns a live row.
+    ///
+    /// The outcome distinguishes a missing or tombstoned row from a live row
+    /// whose requested stored field is absent.
+    #[must_use]
+    pub(crate) fn materialize_stored_value(
+        &self,
+        field_ord: u16,
+        global_docid: u32,
+    ) -> DeltaStoredMaterialization<'_> {
+        #[cfg(test)]
+        self.record_materialization_attempt();
+        if !self.is_live_document(global_docid) {
+            return DeltaStoredMaterialization::NotLive;
+        }
+        DeltaStoredMaterialization::Live(self.segment.stored_value(field_ord, global_docid))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_materialization_attempts(&self) {
+        self.materialization_attempts.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn materialization_attempts(&self) -> usize {
+        self.materialization_attempts.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn record_materialization_attempt(&self) {
+        self.materialization_attempts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Live-only fieldnorm byte for one visible row in this generation.
     #[must_use]
     pub fn live_fieldnorm_id(&self, field_ord: u16, global_docid: u32) -> Option<u8> {
@@ -1017,6 +1106,33 @@ impl DeltaSnapshot {
         let first = u64::from(*self.segment.document_docids.first()?);
         let last = u64::from(*self.segment.document_docids.last()?);
         Some((first, last + 1))
+    }
+}
+
+/// Allocation-free traversal of one frozen Delta generation's canonical order.
+#[derive(Debug, Clone)]
+pub(crate) struct DeltaOrderedTerms<'a> {
+    delta: &'a DeltaSegment,
+    term_ids: &'a [u32],
+    next_term: usize,
+}
+
+impl<'a> Iterator for DeltaOrderedTerms<'a> {
+    type Item = DeltaTerm<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let term_index = *self.term_ids.get(self.next_term)?;
+        self.next_term += 1;
+        Some(DeltaTerm {
+            delta: self.delta,
+            term_index,
+        })
+    }
+}
+
+impl ExactSizeIterator for DeltaOrderedTerms<'_> {
+    fn len(&self) -> usize {
+        self.term_ids.len() - self.next_term
     }
 }
 
@@ -1207,12 +1323,15 @@ impl DeltaSegment {
         // chains, already exact.
         DeltaSnapshot {
             segment,
+            ordered_term_ids: OnceLock::new(),
             keeper_generation,
             // Each frozen epoch is a distinct publication candidate, even
             // when two freezes observe the same mutable Delta generation.
             // Rebinding deliberately preserves this witness; a later freeze
             // must never be replaceable by an earlier, shorter snapshot.
             lineage_id: snapshot_owner_id,
+            #[cfg(test)]
+            materialization_attempts: AtomicUsize::new(0),
         }
     }
 
@@ -3695,6 +3814,136 @@ mod tests {
             1
         );
         assert_eq!(frozen.live_total_tokens(1), Some(2));
+        Ok(())
+    }
+
+    #[test]
+    fn frozen_snapshot_ordered_terms_reuse_one_backing_and_isolate_successors()
+    -> Result<(), DeltaError> {
+        let mut delta = DeltaSegment::new(TEST_SCHEMA, 0, usize::MAX)?;
+        apply_positioned(&mut delta, 0, "zeta", b"zeta", &[0])?;
+        apply_positioned(&mut delta, 1, "alpha", b"alpha", &[0])?;
+        let frozen = delta.freeze(7);
+
+        let first_view = frozen.ordered_terms();
+        let first_backing = first_view.term_ids.as_ptr();
+        let first_terms = first_view
+            .map(|term| term.term().to_vec())
+            .collect::<Vec<_>>();
+        let second_view = frozen.ordered_terms();
+        let second_backing = second_view.term_ids.as_ptr();
+        let second_terms = second_view
+            .map(|term| term.term().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(first_terms, [b"alpha".to_vec(), b"zeta".to_vec()]);
+        assert_eq!(second_terms, first_terms);
+        assert_eq!(
+            first_backing, second_backing,
+            "later readers must reuse the first frozen snapshot's retained IDs"
+        );
+
+        apply_positioned(&mut delta, 2, "middle", b"middle", &[0])?;
+        let successor = delta.freeze(8);
+        let successor_view = successor.ordered_terms();
+        assert_eq!(
+            successor_view
+                .clone()
+                .map(|term| term.term().to_vec())
+                .collect::<Vec<_>>(),
+            [b"alpha".to_vec(), b"middle".to_vec(), b"zeta".to_vec()]
+        );
+        assert_ne!(
+            first_backing,
+            successor_view.term_ids.as_ptr(),
+            "a successor freeze must retain its own generation's IDs"
+        );
+        assert_eq!(
+            frozen
+                .ordered_terms()
+                .map(|term| term.term().to_vec())
+                .collect::<Vec<_>>(),
+            first_terms,
+            "a mutable successor must not change the frozen ordered view"
+        );
+        let rebound = frozen.rebind_keeper_generation(9);
+        assert!(
+            rebound.ordered_term_ids.get().is_none(),
+            "rebinding must not copy a predecessor cache into a new owner"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn frozen_snapshot_field_ordered_terms_visit_only_requested_candidates()
+    -> Result<(), DeltaError> {
+        const OUTER_FIELD_TERMS: u32 = 32;
+
+        let mut delta = DeltaSegment::new(TEST_SCHEMA, 0, usize::MAX)?;
+        for docid in 0..OUTER_FIELD_TERMS {
+            let keyword_term = format!("keyword-{docid:02}");
+            let plain_term = format!("plain-{docid:02}");
+            delta.apply_document(
+                docid,
+                DocId::from(format!("outer-{docid}")),
+                &norms(1, 0, 1),
+                &[
+                    DeltaTermPosting {
+                        field_ord: 0,
+                        term: keyword_term.as_bytes(),
+                        frequency: 1,
+                        positions: None,
+                    },
+                    DeltaTermPosting {
+                        field_ord: 2,
+                        term: plain_term.as_bytes(),
+                        frequency: 1,
+                        positions: None,
+                    },
+                ],
+            )?;
+        }
+        let positions = [0];
+        for (offset, term) in [&b"alpha"[..], &b"omega"[..]].into_iter().enumerate() {
+            let docid = OUTER_FIELD_TERMS
+                + u32::try_from(offset).expect("two target terms fit the Delta docid domain");
+            delta.apply_document(
+                docid,
+                DocId::from(format!("target-{offset}")),
+                &norms(0, 1, 0),
+                &[DeltaTermPosting {
+                    field_ord: 1,
+                    term,
+                    frequency: 1,
+                    positions: Some(&positions),
+                }],
+            )?;
+        }
+        let frozen = delta.freeze(7);
+        let global_view = frozen.ordered_terms();
+        let field_view = frozen.ordered_terms_for_field(1);
+        let field_start = usize::try_from(OUTER_FIELD_TERMS).expect("bounded fixture length");
+
+        assert_eq!(global_view.len(), field_start * 2 + 2);
+        assert_eq!(
+            field_view.len(),
+            2,
+            "the view must retain only field-1 candidates"
+        );
+        assert_eq!(
+            field_view.term_ids.as_ptr(),
+            global_view.term_ids[field_start..].as_ptr(),
+            "the field view must be a subslice of the one retained ID backing"
+        );
+        let mut visited = 0;
+        let observed = field_view
+            .inspect(|_| visited += 1)
+            .map(|term| term.term().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            visited, 2,
+            "the field view must not visit surrounding fields"
+        );
+        assert_eq!(observed, [b"alpha".to_vec(), b"omega".to_vec()]);
         Ok(())
     }
 

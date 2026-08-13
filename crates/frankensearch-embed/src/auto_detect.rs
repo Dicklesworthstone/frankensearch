@@ -314,6 +314,50 @@ impl EmbedderStack {
         Self::auto_detect_with_options(model_root, &DetectOptions::default())
     }
 
+    /// Auto-detect and refuse a hash-only stack.
+    ///
+    /// Use this when the caller asked for semantic search. [`Self::auto_detect`]
+    /// still returns `HashOnly` for tests and explicit control policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::EmbedderUnavailable`] when no semantic model is
+    /// present.
+    pub fn auto_detect_semantic() -> SearchResult<Self> {
+        Self::auto_detect()?.require_semantic()
+    }
+
+    /// Like [`Self::auto_detect_with`], then [`Self::require_semantic`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::EmbedderUnavailable`] when no semantic model is
+    /// present.
+    pub fn auto_detect_semantic_with(model_root: Option<&Path>) -> SearchResult<Self> {
+        Self::auto_detect_with(model_root)?.require_semantic()
+    }
+
+    /// Fail closed when this stack has no semantic fast embedder.
+    ///
+    /// Hash remains available via [`Self::auto_detect`] and
+    /// [`Self::from_parts`]. This method is the typed refusal hosts should
+    /// call instead of checking [`TwoTierAvailability::HashOnly`] themselves.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::EmbedderUnavailable`] for a hash-only stack.
+    pub fn require_semantic(self) -> SearchResult<Self> {
+        if matches!(self.availability, TwoTierAvailability::HashOnly) {
+            return Err(SearchError::EmbedderUnavailable {
+                model: "semantic".to_owned(),
+                reason: self.degradation_message().unwrap_or_else(|| {
+                    "no semantic model; hash-only stacks are not a working search engine".to_owned()
+                }),
+            });
+        }
+        Ok(self)
+    }
+
     /// Auto-detect embedders under caller-supplied policy (bd-p6z6.2).
     ///
     /// Callers (fsfs config, library hosts) pass policy EXPLICITLY instead
@@ -2228,6 +2272,14 @@ mod tests {
         assert_eq!(stack.availability(), TwoTierAvailability::HashOnly);
         assert_eq!(stack.fast().category(), ModelCategory::HashEmbedder);
         assert!(stack.quality().is_none());
+        assert!(matches!(
+            stack.require_semantic(),
+            Err(SearchError::EmbedderUnavailable { .. })
+        ));
+        assert!(matches!(
+            EmbedderStack::auto_detect_semantic_with(Some(temp.path())),
+            Err(SearchError::EmbedderUnavailable { .. })
+        ));
     }
 
     #[cfg(all(

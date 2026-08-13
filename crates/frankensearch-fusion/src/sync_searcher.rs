@@ -733,6 +733,7 @@ impl SyncTwoTierSearcher {
                     vectors_searched: phase1_vectors_searched,
                     lexical_candidates: metrics.lexical_candidates,
                     fused_count: initial_results.len(),
+                    skip_reason: metrics.skip_reason.clone(),
                 },
             });
         }
@@ -960,6 +961,7 @@ impl SyncTwoTierSearcher {
                     vectors_searched: quality_count,
                     lexical_candidates: metrics.lexical_candidates,
                     fused_count: refined_results.len(),
+                    skip_reason: None,
                 },
                 rank_changes,
             });
@@ -1463,7 +1465,7 @@ mod tests {
     #[test]
     fn admitted_v2_default_product_preserves_exact_result_across_cache_states() {
         // The first record fixes the global int8 scale at one. The remaining
-        // zero rows and the final 0.003 f16 row then all quantize to the same
+        // tiny orthogonal rows and the final 0.003 f16 row then all quantize to the same
         // int8 pass-1 score for query [0, 1]. The approximate candidate route
         // cannot retain the final exact winner. The default product scan must
         // return that winner both with an attached sidecar and with a hostile
@@ -1498,8 +1500,8 @@ mod tests {
             .expect("write global scale row");
         for row in 0..CORPUS_ROWS - 2 {
             writer
-                .write_record(&format!("zero-{row:05}"), &[0.0, 0.0])
-                .expect("write zero candidate");
+                .write_record(&format!("zero-{row:05}"), &[0.003, 0.0])
+                .expect("write orthogonal candidate");
         }
         writer
             .write_record("exact-winner", &[0.0, 0.003])

@@ -2593,8 +2593,12 @@ mod tests {
 
             let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
             let original_bytes = std::fs::read(&fast_path).expect("read original fast index");
-            let changed =
-                RefreshWorker::new(config, queue.clone(), changed_embedder.clone(), cache);
+            let changed = RefreshWorker::new(
+                config,
+                queue.clone(),
+                changed_embedder.clone(),
+                cache.clone(),
+            );
 
             submit(&queue, "doc-new", "new generation");
             let embed_baseline = changed_embedder.embed_invocations();
@@ -2616,11 +2620,13 @@ mod tests {
                 original_bytes,
                 "failed refresh must not re-stamp the existing generation"
             );
-            let reopened = VectorIndex::open(&fast_path).expect("reopen original fast index");
-            assert_eq!(reopened.embedder_id(), "stub-fast");
-            let live_ids = reopened.live_doc_ids().expect("live ids");
-            assert_eq!(live_ids.len(), 1);
-            assert!(live_ids.contains("doc-old"));
+            let current = cache.current();
+            assert_eq!(current.fast_embedder_id(), "stub-fast");
+            let live_ids = current
+                .iter_doc_ids()
+                .collect::<SearchResult<Vec<_>>>()
+                .expect("read cached live IDs");
+            assert_eq!(live_ids, vec!["doc-old"]);
         });
     }
 
@@ -2682,13 +2688,14 @@ mod tests {
                 original_quality_bytes,
                 "refusal must not replace the quality generation"
             );
-            assert_eq!(cache.current().doc_count(), 1);
-            let fast = VectorIndex::open(&fast_path).expect("open fast index");
-            let quality = VectorIndex::open(&quality_path).expect("open quality index");
-            assert_eq!(fast.embedder_id(), "stub-fast");
-            assert_eq!(quality.embedder_id(), "stub-quality");
-            assert_eq!(fast.live_doc_ids().expect("fast live ids").len(), 1);
-            assert_eq!(quality.live_doc_ids().expect("quality live ids").len(), 1);
+            let current = cache.current();
+            assert_eq!(current.doc_count(), 1);
+            assert!(current.has_quality_index());
+            let live_doc_ids = current
+                .iter_doc_ids()
+                .collect::<SearchResult<Vec<_>>>()
+                .expect("read cached live document IDs");
+            assert_eq!(live_doc_ids, vec!["doc-old"]);
 
             let pending = queue.drain_batch();
             assert_eq!(pending.len(), 1);
@@ -3048,7 +3055,8 @@ mod tests {
             let config =
                 RefreshWorkerConfig::new(&dir).with_poll_interval(Duration::from_millis(10));
             let fast = Arc::new(StubEmbedder::new("stub-fast", 256));
-            let worker = RefreshWorker::new(config, queue.clone(), fast.clone(), cache.clone());
+            let worker =
+                RefreshWorker::new(config.clone(), queue.clone(), fast.clone(), cache.clone());
 
             submit(&queue, "doc-keep", "kept document");
             submit(&queue, "doc-delete", "doomed document");
@@ -3057,6 +3065,8 @@ mod tests {
 
             // Out-of-band mutations through the public index API, exactly
             // as an application deleting/appending between cycles does.
+            drop(worker);
+            drop(cache);
             let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
             {
                 let mut index =
@@ -3067,6 +3077,18 @@ mod tests {
                     .append("doc-wal", &vec![0.25_f32; dim])
                     .expect("wal append");
             }
+            let fast_bytes = std::fs::read(&fast_path).expect("read mutated fast tier");
+            let wal_path = frankensearch_index::wal::wal_path_for(&fast_path);
+            let wal_bytes = std::fs::read(&wal_path).expect("read mutated WAL");
+            let cache = Arc::new(
+                IndexCache::open(
+                    &dir,
+                    TwoTierConfig::default(),
+                    Box::new(SentinelFileDetector::new()),
+                )
+                .expect("open mutated generation"),
+            );
+            let worker = RefreshWorker::new(config, queue.clone(), fast.clone(), cache.clone());
 
             submit(&queue, "doc-new", "new document");
             let embed_baseline = fast.embed_invocations();
@@ -3075,9 +3097,22 @@ mod tests {
                 .await
                 .expect_err("legacy WAL-bearing generation must not be republished");
             assert_no_embed_invocations_since(&fast, embed_baseline);
+            assert_eq!(
+                std::fs::read(&fast_path).expect("reread fast tier"),
+                fast_bytes,
+                "refusal must not replace the tombstone-bearing main artifact"
+            );
+            assert_eq!(
+                std::fs::read(&wal_path).expect("reread WAL"),
+                wal_bytes,
+                "refusal must not drop the WAL-resident append"
+            );
 
+            drop(worker);
+            drop(cache);
             let preserved =
                 frankensearch_index::VectorIndex::open(&fast_path).expect("reopen fast tier");
+            assert_eq!(preserved.embedder_id(), "stub-fast");
             let live = preserved.live_doc_ids().expect("live ids");
             assert!(
                 !live.contains("doc-delete"),
@@ -4219,11 +4254,13 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = temp_index_dir("r2-corrupt-trailer-invariance");
             let queue = make_queue(100);
-            let (worker, _cache, embedder) = make_worker(queue.clone(), &dir, 256);
+            let (worker, cache, embedder) = make_worker(queue.clone(), &dir, 256);
 
             submit(&queue, "doc-1", "First document");
             worker.run_cycle(&cx).await.expect("bootstrap cycle");
 
+            drop(worker);
+            drop(cache);
             let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
             {
                 let mut index = VectorIndex::open(&fast_path).expect("fixture open");
@@ -4244,6 +4281,20 @@ mod tests {
             }
             let wal_bytes = std::fs::read(&wal_path).expect("read wal");
             let manifest_before = dir_manifest(&dir);
+            let cache = Arc::new(
+                IndexCache::open(
+                    &dir,
+                    TwoTierConfig::default(),
+                    Box::new(SentinelFileDetector::new()),
+                )
+                .expect("open corrupt-WAL generation"),
+            );
+            let worker = RefreshWorker::new(
+                RefreshWorkerConfig::new(&dir).with_poll_interval(Duration::from_millis(10)),
+                queue.clone(),
+                embedder.clone(),
+                cache,
+            );
 
             // Control arm: the mutable open truncates this trailer.
             {
@@ -4562,11 +4613,13 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = temp_index_dir("r2-all-tombstoned-fail-closed");
             let queue = make_queue(100);
-            let (worker, _cache, embedder) = make_worker(queue.clone(), &dir, 256);
+            let (worker, cache, embedder) = make_worker(queue.clone(), &dir, 256);
 
             submit(&queue, "doc-1", "First document");
             worker.run_cycle(&cx).await.expect("bootstrap cycle");
 
+            drop(worker);
+            drop(cache);
             let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
             {
                 let mut index = VectorIndex::open(&fast_path).expect("fixture open");
@@ -4574,6 +4627,20 @@ mod tests {
                 assert_eq!(index.live_count(), 0);
             }
             let fast_bytes = std::fs::read(&fast_path).expect("read tombstoned artifact");
+            let cache = Arc::new(
+                IndexCache::open(
+                    &dir,
+                    TwoTierConfig::default(),
+                    Box::new(SentinelFileDetector::new()),
+                )
+                .expect("open tombstoned generation"),
+            );
+            let worker = RefreshWorker::new(
+                RefreshWorkerConfig::new(&dir).with_poll_interval(Duration::from_millis(10)),
+                queue.clone(),
+                embedder.clone(),
+                cache,
+            );
 
             submit(&queue, "doc-2", "Second document");
             let embed_baseline = embedder.embed_invocations();
@@ -4657,6 +4724,20 @@ mod tests {
             submit(&queue, "doc-old", "old generation document");
             worker.run_cycle(&cx).await.expect("bootstrap cycle");
             let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+            let served_dir = temp_index_dir("r3-crash-state-served-generation");
+            let served_fast_path = served_dir.join(VECTOR_INDEX_FAST_FILENAME);
+            std::fs::copy(&fast_path, &served_fast_path).expect("copy served generation");
+            drop(worker);
+            drop(cache);
+            let cache = Arc::new(
+                IndexCache::open_with_paths(
+                    TwoTierIndexPaths::new(served_fast_path),
+                    &dir,
+                    TwoTierConfig::default(),
+                    Box::new(SentinelFileDetector::new()),
+                )
+                .expect("open retained served generation"),
+            );
             {
                 let mut index = VectorIndex::open(&fast_path).expect("open old generation");
                 let dim = index.dimension();
@@ -4710,6 +4791,12 @@ mod tests {
             let fast_bytes = std::fs::read(&fast_path).expect("read crash-state main");
             let wal_bytes = std::fs::read(&wal_path).expect("read crash-state wal");
             let manifest_before = dir_manifest(&dir);
+            let worker = RefreshWorker::new(
+                RefreshWorkerConfig::new(&dir).with_poll_interval(Duration::from_millis(10)),
+                queue.clone(),
+                embedder.clone(),
+                cache.clone(),
+            );
 
             // The refusing cycle: fail closed, pre-drain, zero embedding.
             submit(&queue, "doc-2", "second document");
@@ -4744,6 +4831,7 @@ mod tests {
             // foreign row was never merged anywhere.
             let current = cache.current();
             let ids: Vec<String> = current.iter_doc_ids().filter_map(Result::ok).collect();
+            assert_eq!(ids, vec!["doc-old".to_owned()]);
             assert!(
                 !ids.iter().any(|id| id == "foreign-doc"),
                 "no foreign WAL row may reach the served generation: {ids:?}"
