@@ -1195,6 +1195,44 @@ fn validate_complete_keeper_transition(
     })
 }
 
+fn validate_durable_keeper_catch_up(
+    current: &Manifest,
+    proposed: &Manifest,
+) -> Result<bool, SnapshotError> {
+    if proposed.generation < current.generation {
+        return Err(SnapshotError::KeeperGenerationRegression {
+            current: current.generation,
+            proposed: proposed.generation,
+        });
+    }
+    if proposed.generation == current.generation {
+        return if proposed == current {
+            Ok(false)
+        } else {
+            Err(SnapshotError::KeeperGenerationCollision {
+                generation: proposed.generation,
+            })
+        };
+    }
+    if proposed.schema_id != current.schema_id {
+        return Err(SnapshotError::KeeperTransition {
+            detail: format!(
+                "durable catch-up changed schema_id from {:#018x} to {:#018x}",
+                current.schema_id, proposed.schema_id
+            ),
+        });
+    }
+    if proposed.docid_high_watermark < current.docid_high_watermark {
+        return Err(SnapshotError::KeeperTransition {
+            detail: format!(
+                "durable catch-up rolled docid_high_watermark back from {} to {}",
+                current.docid_high_watermark, proposed.docid_high_watermark
+            ),
+        });
+    }
+    Ok(true)
+}
+
 struct PreparedSealedPublication {
     snapshot_epoch: u64,
     expected_keeper_generation: u64,
@@ -1490,6 +1528,48 @@ impl SnapshotPublisher {
             }
             keeper = Arc::clone(&next.keeper);
             deltas = clone_delta_arcs(&next.deltas)?;
+        }
+    }
+
+    /// Advance a read-only view to a fully authenticated newer durable
+    /// snapshot, including when the reader did not observe every intermediate
+    /// generation.
+    ///
+    /// Writer publication continues to use [`Self::publish_complete`] and its
+    /// exact-successor validation. This path accepts only forward generations
+    /// with the same schema and a non-regressing document-id watermark, and it
+    /// never discards process-local Delta epochs.
+    fn publish_durable_catch_up(
+        &self,
+        keeper: &Arc<KeeperSnapshot>,
+    ) -> Result<Option<Arc<QuillSearchSnapshot>>, SnapshotError> {
+        loop {
+            let current = self.current.load_full();
+            if !current.deltas.is_empty() {
+                return Err(SnapshotError::KeeperTransition {
+                    detail: "durable read-only catch-up cannot discard active Delta epochs"
+                        .to_owned(),
+                });
+            }
+            if !validate_durable_keeper_catch_up(
+                &current.keeper.loaded_manifest().manifest,
+                &keeper.loaded_manifest().manifest,
+            )? {
+                return Ok(None);
+            }
+            let epoch = current
+                .snapshot_epoch()
+                .checked_add(1)
+                .ok_or(SnapshotError::EpochExhausted)?;
+            let next = Arc::new(QuillSearchSnapshot::compose(
+                epoch,
+                Arc::clone(keeper),
+                Vec::new(),
+            )?);
+            let previous = self.current.compare_and_swap(&current, Arc::clone(&next));
+            if Arc::ptr_eq(&current, &previous) {
+                return Ok(Some(next));
+            }
         }
     }
 
@@ -8622,6 +8702,19 @@ impl QuillReader {
         Ok(installed)
     }
 
+    fn publish_durable_catch_up(
+        &self,
+        keeper: &Arc<KeeperSnapshot>,
+    ) -> Result<Option<Arc<QuillSearchSnapshot>>, QuillIndexError> {
+        PublicationReadState::validate_generation(keeper.loaded_manifest().manifest.generation)?;
+        let installed = self.published_snapshot.publish_durable_catch_up(keeper)?;
+        if let Some(snapshot) = &installed {
+            self.publication_read_state
+                .stabilize(snapshot.keeper_generation())?;
+        }
+        Ok(installed)
+    }
+
     #[cfg(not(feature = "conformance-internals"))]
     #[inline]
     #[allow(
@@ -10305,14 +10398,10 @@ impl QuillSearchIndex {
             spawn_blocking(move || KeeperSnapshot::open(directory, DEFAULT_SCHEMA)).await?;
         check_cancel(cx, "read-only index refresh")?;
 
-        let current_generation = self.reader.published_snapshot.load().keeper_generation();
-        let next_generation = snapshot.loaded_manifest().manifest.generation;
-        if next_generation == current_generation {
-            return Ok(false);
-        }
-        self.reader
-            .publish_complete(Arc::new(snapshot), Vec::new())?;
-        Ok(true)
+        Ok(self
+            .reader
+            .publish_durable_catch_up(&Arc::new(snapshot))?
+            .is_some())
     }
 
     /// Execute a paginated ranked query against the pinned publication.

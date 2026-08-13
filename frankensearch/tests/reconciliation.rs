@@ -58,6 +58,65 @@ fn facade_reexports_split_lexical_reader_contract() {
     accepts_prelude_reexport(None);
 }
 
+#[cfg(feature = "quill")]
+#[test]
+fn quill_read_only_refresh_catches_up_across_multiple_generations() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let directory = temp_dir("quill-reader-generation-catch-up");
+        let writer = frankensearch::QuillIndex::create(
+            &cx,
+            &directory,
+            frankensearch::QuillConfig::default(),
+        )
+        .await
+        .expect("create durable Quill writer");
+        let reader = frankensearch::QuillSearchIndex::open(
+            &cx,
+            &directory,
+            frankensearch::QuillConfig::default(),
+        )
+        .await
+        .expect("open read-only Quill index at genesis");
+        let initial_generation = reader.keeper_generation();
+
+        for (document_id, content) in [
+            ("refresh-first", "alpha first generation"),
+            ("refresh-second", "alpha second generation"),
+        ] {
+            writer
+                .index_document(
+                    &cx,
+                    &frankensearch::IndexableDocument::new(document_id, content),
+                )
+                .await
+                .expect("stage one refresh fixture document");
+            writer
+                .commit(&cx)
+                .await
+                .expect("publish one refresh fixture generation");
+        }
+
+        assert!(reader.refresh(&cx).await.expect("catch up read-only index"));
+        assert_eq!(
+            reader.keeper_generation(),
+            initial_generation + 2,
+            "one refresh must advance directly across both durable publications"
+        );
+        let mut document_ids = reader
+            .search_doc_ids(&cx, "alpha", 10)
+            .expect("search caught-up read-only index")
+            .into_iter()
+            .map(|hit| hit.document_id)
+            .collect::<Vec<_>>();
+        document_ids.sort_unstable();
+        assert_eq!(document_ids, ["refresh-first", "refresh-second"]);
+        assert!(
+            !reader.refresh(&cx).await.expect("repeat current refresh"),
+            "refreshing an already-current reader must report no change"
+        );
+    });
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 1. Canonicalization
 // ═══════════════════════════════════════════════════════════════════════════
