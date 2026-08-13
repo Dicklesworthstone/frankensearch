@@ -101,6 +101,12 @@ impl Qg1StartupHandshakeV1 {
     pub const MAX_REGISTER_BYTES: usize = 1_048_576;
     pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
+    /// Frame one bounded authority register entry for the startup handshake.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed message when the entry is empty, exceeds
+    /// [`Self::MAX_REGISTER_BYTES`], or has a length that cannot be encoded.
     pub fn register_frame(sequence: u64, entry: &[u8]) -> Result<Vec<u8>, String> {
         if entry.is_empty() || entry.len() > Self::MAX_REGISTER_BYTES {
             return Err("QG-1 startup register payload is outside the fixed bound".to_owned());
@@ -115,6 +121,17 @@ impl Qg1StartupHandshakeV1 {
         Ok(frame)
     }
 
+    /// Read exactly one startup control frame from the child's stdout.
+    ///
+    /// The scan begins at stdout offset zero and refuses any byte that is not a
+    /// prefix of a known magic, so ordinary output can never be reinterpreted
+    /// as a control frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed message for a truncated magic, header, or payload, a
+    /// payload outside the fixed bound, or bytes that do not begin at offset
+    /// zero with a known magic.
     pub fn read_control_frame(reader: &mut impl Read) -> Result<Qg1StartupControlFrameV1, String> {
         let mut magic = Vec::with_capacity(Self::REGISTER_MAGIC.len());
         loop {
@@ -177,14 +194,24 @@ impl Qg1StartupHandshakeV1 {
         frame
     }
 
+    /// The exact bytes the parent writes to acknowledge a complete set.
+    #[must_use]
     pub fn final_ack_frame() -> Vec<u8> {
         Self::ACK_MAGIC.to_vec()
     }
 
+    /// Length of [`Self::final_ack_frame`], for an exact-length child read.
+    #[must_use]
     pub fn final_ack_len() -> usize {
         Self::ACK_MAGIC.len()
     }
 
+    /// Accept only a byte-exact final acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed message when the frame is malformed, missing, or a
+    /// replay of anything other than the exact acknowledgement bytes.
     pub fn validate_final_ack(frame: &[u8]) -> Result<(), String> {
         (frame == Self::ACK_MAGIC)
             .then_some(())
@@ -3889,6 +3916,23 @@ fn finish_qg1_authority_forwarder(forwarder: Qg1AuthorityForwarder) -> Result<()
         .map_err(|_| "QG-1 authority stdout forwarder panicked".to_owned())?
 }
 
+/// Everything the QG-1 authority wait boundary reports to its caller.
+///
+/// Named rather than repeated inline because both the wait loop and its
+/// root-exit finisher return exactly this shape, and an anonymous six-element
+/// tuple stated none of it: the terminal status, any recovered wait-error
+/// class, how the owned process group had to be recovered, the retained
+/// role-qualified authority set, the parent's handshake verdict, and the
+/// descendant reconciliation pair of quiescence plus observed descendant count.
+type Qg1AuthorityWaitOutcome = (
+    ExitStatus,
+    Option<LocalPerfIoErrorKind>,
+    LocalPerfProcessGroupRecovery,
+    AcceptedQg1Authorities,
+    Option<String>,
+    (LocalPerfProcessTreeQuiescence, u32),
+);
+
 fn finish_qg1_authority_after_root_exit(
     child: &mut Child,
     root_process_identity: LocalPerfRootProcessIdentity,
@@ -3900,17 +3944,7 @@ fn finish_qg1_authority_after_root_exit(
     mut process_group_recovery: LocalPerfProcessGroupRecovery,
     accepted: AcceptedQg1Authorities,
     mut handshake_failure: Option<String>,
-) -> Result<
-    (
-        ExitStatus,
-        Option<LocalPerfIoErrorKind>,
-        LocalPerfProcessGroupRecovery,
-        AcceptedQg1Authorities,
-        Option<String>,
-        (LocalPerfProcessTreeQuiescence, u32),
-    ),
-    LocalPerfRunError,
-> {
+) -> Result<Qg1AuthorityWaitOutcome, LocalPerfRunError> {
     if let Some(error) = handshake_failure.as_deref() {
         writeln!(run_log, "[qg1-authority-handshake] rejected: {error}")?;
         run_log.sync_all()?;
@@ -3955,17 +3989,7 @@ fn wait_for_qg1_authority_child(
     campaign_run_id: &str,
     source_git_revision: &str,
     source_worktree_clean: bool,
-) -> Result<
-    (
-        ExitStatus,
-        Option<LocalPerfIoErrorKind>,
-        LocalPerfProcessGroupRecovery,
-        AcceptedQg1Authorities,
-        Option<String>,
-        (LocalPerfProcessTreeQuiescence, u32),
-    ),
-    LocalPerfRunError,
-> {
+) -> Result<Qg1AuthorityWaitOutcome, LocalPerfRunError> {
     let mut accepted = AcceptedQg1Authorities::new();
     let mut last_sequence = None;
     let mut received_register_count = 0_u64;
@@ -4239,9 +4263,9 @@ fn wait_for_qg1_authority_child(
                     Some(error),
                 );
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                continue;
-            }
+            // A poll timeout is the ordinary idle tick: fall through to the
+            // next deadline check rather than restating the loop.
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return finish_qg1_authority_after_root_exit(
                     child,
