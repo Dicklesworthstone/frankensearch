@@ -733,6 +733,60 @@ mod lexical {
         });
     }
 
+    #[cfg(feature = "lexical-tantivy")]
+    #[test]
+    fn public_single_batch_upsert_is_last_write_wins_by_identity() {
+        super::quiet_logging();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let documents = vec![
+                IndexableDocument::new("duplicate", "stalealpha").with_metadata("revision", "old"),
+                IndexableDocument::new("middle", "middlebeta"),
+                IndexableDocument::new("duplicate", "livegamma").with_metadata("revision", "new"),
+            ];
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let quill = build_quill_index(&cx, &tmp.path().join("quill"), &documents).await;
+            let tantivy = build_tantivy_index(&cx, &tmp.path().join("tantivy"), &documents).await;
+
+            for (label, index) in [
+                ("Quill", &quill as &dyn LexicalRead),
+                ("Tantivy", &tantivy as &dyn LexicalRead),
+            ] {
+                assert_eq!(
+                    index.doc_count().expect("published document count"),
+                    2,
+                    "{label} must publish only the final revision of a repeated batch identity"
+                );
+                assert!(
+                    LexicalRead::search(index, &cx, "stalealpha", 10)
+                        .await
+                        .expect("search stale revision")
+                        .is_empty(),
+                    "{label} must delete the superseded revision"
+                );
+                let live = LexicalRead::search(index, &cx, "livegamma", 10)
+                    .await
+                    .expect("search live revision");
+                assert_eq!(live.len(), 1, "{label} live revision count");
+                assert_eq!(live[0].doc_id.as_str(), "duplicate");
+                assert_eq!(
+                    live[0].metadata.as_deref(),
+                    Some(&serde_json::json!({ "revision": "new" })),
+                    "{label} must retain metadata from the final revision"
+                );
+
+                let mut identities =
+                    LexicalRead::search(index, &cx, "id: IN [duplicate middle]", 10)
+                        .await
+                        .expect("search final identity set")
+                        .into_iter()
+                        .map(|hit| hit.doc_id.to_string())
+                        .collect::<Vec<_>>();
+                identities.sort_unstable();
+                assert_eq!(identities, ["duplicate", "middle"]);
+            }
+        });
+    }
+
     #[test]
     fn fixture_source_qrels_and_chunk_manifest_are_frozen() {
         super::quiet_logging();

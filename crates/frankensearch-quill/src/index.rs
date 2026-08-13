@@ -11133,16 +11133,34 @@ impl QuillIndex {
         cx: &Cx,
         documents: &[IndexableDocument],
     ) -> Result<(), QuillIndexError> {
-        let mut unique = BTreeSet::new();
-        for document in documents {
-            if !unique.insert(document.id.as_str()) {
-                return Err(invalid_state(format!(
-                    "duplicate document id {:?} in one upsert batch",
-                    document.id
-                )));
-            }
+        check_cancel(cx, "upsert documents")?;
+        let mut final_positions = HashMap::new();
+        final_positions
+            .try_reserve(documents.len())
+            .map_err(|_| invalid_state("could not reserve upsert identity map"))?;
+        for (position, document) in documents.iter().enumerate() {
+            check_cancel(cx, "upsert documents")?;
+            final_positions.insert(document.id.as_str(), position);
         }
 
+        let canonical = if final_positions.len() == documents.len() {
+            None
+        } else {
+            let mut canonical = Vec::new();
+            canonical
+                .try_reserve_exact(final_positions.len())
+                .map_err(|_| invalid_state("could not reserve canonical upsert batch"))?;
+            for (position, document) in documents.iter().enumerate() {
+                check_cancel(cx, "upsert documents")?;
+                if final_positions.get(document.id.as_str()) == Some(&position) {
+                    canonical.push(document.clone());
+                }
+            }
+            Some(canonical)
+        };
+        drop(final_positions);
+
+        let documents = canonical.as_deref().unwrap_or(documents);
         let mut writer = self.lock_writer(cx, "upsert writer lock").await?;
         writer.upsert_documents(cx, documents).await
     }
