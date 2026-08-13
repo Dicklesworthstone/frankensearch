@@ -1331,13 +1331,23 @@ impl LocalPerfAttemptReceipt {
     }
 
     /// Prove that exact completed bound-evidence bytes are the object named by
-    /// this process receipt.
+    /// this process receipt, carrying no retained QG-1 authority.
+    ///
+    /// Crate-private on purpose. Forwarding an empty authority set is a QG-1
+    /// *refusal*, not a relaxation: authority-bearing evidence reaching this
+    /// entry is rejected for having no retained authority to authenticate it,
+    /// which reads like unusable evidence rather than the wrong call. Release
+    /// and ratchet consumers must therefore use
+    /// [`Self::verify_bound_evidence_against_qg1_authorities`] and pass the
+    /// authorities they independently retained; this entry exists for
+    /// non-QG-1 receipts and for the in-crate negatives that pin the refusal.
     ///
     /// # Errors
     ///
     /// Rejects a failed-attempt receipt, or substituted, truncated, or
-    /// otherwise different bound-evidence bytes.
-    pub fn verify_bound_evidence(
+    /// otherwise different bound-evidence bytes, and rejects any QG-1 evidence
+    /// because no retained authority is supplied.
+    pub(crate) fn verify_bound_evidence(
         &self,
         bound_evidence_bytes: &[u8],
     ) -> Result<(), LocalPerfRunError> {
