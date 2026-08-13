@@ -1456,6 +1456,7 @@ impl Qg1TantivyIncumbentScreen {
                             .to_owned(),
                     ));
                 }
+                (Some(_), Some(_), Some(_)) => {}
                 (None, None, None) => {
                     run_id = Some(pilot.experiment.provenance.run_id.clone());
                     scope = Some(pilot.experiment.scope.clone());
@@ -7153,11 +7154,15 @@ pub fn perf_metric_unit(metric: &str) -> &'static str {
 /// Reconstruct the exact operation scope emitted for one canonical cell.
 #[must_use]
 pub fn perf_operation_scope(gate: PerfGate, fixture: &str, metric: &str) -> PerfOperationScope {
-    let semantics = match metric {
-        "docs_per_second" | "tokenize_docs_per_second" | "updates_per_second" => {
-            PerfMetricSemantics::GaugeHigherIsBetter
+    let semantics = if gate == PerfGate::Qg1 && metric == "docs_per_second" {
+        PerfMetricSemantics::Throughput
+    } else {
+        match metric {
+            "docs_per_second" | "tokenize_docs_per_second" | "updates_per_second" => {
+                PerfMetricSemantics::GaugeHigherIsBetter
+            }
+            _ => PerfMetricSemantics::GaugeLowerIsBetter,
         }
-        _ => PerfMetricSemantics::GaugeLowerIsBetter,
     };
     PerfOperationScope {
         operation_id: format!("{gate}.{fixture}.{metric}"),
@@ -9822,6 +9827,7 @@ mod tests {
         forged_binding.raw_block_id = destination.block_id;
         forged_binding.raw_arm = destination.arm;
         forged_binding.raw_order = destination.order;
+        forged_binding.terminal_endpoint_ns = destination.ended_ns - destination.started_ns;
         forged_binding.producer_capability_sha256 = authority
             .issued_row_for(
                 &forged_binding.stream_role,
@@ -11561,6 +11567,25 @@ mod tests {
         let qg10 = matrix.for_gate(PerfGate::Qg10);
         assert_eq!(qg10.len(), 1);
         assert_eq!(qg10[0].threads, Some(1));
+    }
+
+    #[test]
+    fn perf_operation_scope_marks_only_qg1_docs_per_second_as_throughput() {
+        let qg1_cell = qg1_bulk_cell(1);
+        let qg1_scope = perf_operation_scope(qg1_cell.gate, &qg1_cell.fixture, &qg1_cell.metric);
+        assert_eq!(qg1_scope.semantics, PerfMetricSemantics::Throughput);
+        assert!(is_canonical_qg1_throughput_scope(&qg1_scope));
+
+        let non_qg1_scope = perf_operation_scope(
+            PerfGate::Qg2,
+            "bulk/medium/1/positions_on",
+            "docs_per_second",
+        );
+        assert_eq!(
+            non_qg1_scope.semantics,
+            PerfMetricSemantics::GaugeHigherIsBetter
+        );
+        assert!(!is_canonical_qg1_throughput_scope(&non_qg1_scope));
     }
 
     #[test]
