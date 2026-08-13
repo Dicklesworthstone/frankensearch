@@ -269,8 +269,14 @@ pub struct TwoTierSearcher {
     embedding_cache_capacity: Option<usize>,
     resource_cpu_state: Mutex<Option<CpuJiffiesSnapshot>>,
     #[cfg(test)]
-    cancellation_test_hook: Option<Arc<dyn Fn(&Cx, CancellationTestBoundary) + Send + Sync>>,
+    cancellation_test_hook: Option<CancellationTestHook>,
 }
+
+/// The test-only cancellation hook, named once so its three uses — the builder
+/// field, the builder method, and the tests that install one — cannot drift
+/// apart and none of them has to restate the bound.
+#[cfg(test)]
+type CancellationTestHook = Arc<dyn Fn(&Cx, CancellationTestBoundary) + Send + Sync>;
 
 /// Test-only seam for cancelling the real invocation context at a publication boundary.
 #[cfg(test)]
@@ -408,10 +414,7 @@ impl TwoTierSearcher {
     }
 
     #[cfg(test)]
-    fn with_cancellation_test_hook(
-        mut self,
-        hook: Arc<dyn Fn(&Cx, CancellationTestBoundary) + Send + Sync>,
-    ) -> Self {
+    fn with_cancellation_test_hook(mut self, hook: CancellationTestHook) -> Self {
         self.cancellation_test_hook = Some(hook);
         self
     }
@@ -5427,7 +5430,10 @@ mod tests {
                 ]
             ));
 
-            let terminal_lifecycle_events: Vec<_> = adapter
+            // Counted rather than collected: the assertion below only ever asked
+            // how many matched, and the predicate, its order, and what it
+            // discriminates are unchanged.
+            let terminal_lifecycle_events = adapter
                 .telemetry_events()
                 .into_iter()
                 .filter(|envelope| {
@@ -5441,10 +5447,9 @@ mod tests {
                         } if reason.starts_with("cancelled:initial_to_quality:")
                     )
                 })
-                .collect();
+                .count();
             assert_eq!(
-                terminal_lifecycle_events.len(),
-                1,
+                terminal_lifecycle_events, 1,
                 "post-Initial cancellation must emit one terminal lifecycle telemetry event"
             );
         });
@@ -5510,7 +5515,8 @@ mod tests {
                     AdapterLifecycleEvent::SessionStop { .. },
                 ]
             ));
-            let terminal_lifecycle_events: Vec<_> = adapter
+            // Counted rather than collected, as above.
+            let terminal_lifecycle_events = adapter
                 .telemetry_events()
                 .into_iter()
                 .filter(|envelope| {
@@ -5524,10 +5530,9 @@ mod tests {
                         } if reason.starts_with("cancelled:quality_embed_to_prf:")
                     )
                 })
-                .collect();
+                .count();
             assert_eq!(
-                terminal_lifecycle_events.len(),
-                1,
+                terminal_lifecycle_events, 1,
                 "quality-embed cancellation must emit one terminal lifecycle telemetry event"
             );
         });
@@ -5814,7 +5819,7 @@ mod tests {
                 let adapter = Arc::new(RecordingHostAdapter::new(
                     "refined_construction_cancellation",
                 ));
-                let hook: Arc<dyn Fn(&Cx, CancellationTestBoundary) + Send + Sync> =
+                let hook: CancellationTestHook =
                     Arc::new(|cx: &Cx, boundary: CancellationTestBoundary| {
                         if boundary == CancellationTestBoundary::RefinedResultConstruction {
                             cx.cancel_with(
@@ -5879,7 +5884,7 @@ mod tests {
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
             let adapter = Arc::new(RecordingHostAdapter::new("phase3_explanation_cancellation"));
-            let hook: Arc<dyn Fn(&Cx, CancellationTestBoundary) + Send + Sync> =
+            let hook: CancellationTestHook =
                 Arc::new(|cx: &Cx, boundary: CancellationTestBoundary| {
                     if boundary == CancellationTestBoundary::Phase3Explanation {
                         cx.cancel_with(

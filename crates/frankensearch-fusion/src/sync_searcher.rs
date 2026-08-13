@@ -1617,7 +1617,10 @@ mod tests {
             ));
             match std::fs::create_dir(&dir) {
                 Ok(()) => return dir,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                // Falling out of the match is the next attempt: this arm is the
+                // last statement in the loop body, so an explicit `continue`
+                // says nothing the control flow does not already say.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => panic!("create unique temp dir: {error}"),
             }
         }
