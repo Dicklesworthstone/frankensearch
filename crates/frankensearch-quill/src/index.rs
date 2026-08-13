@@ -12600,6 +12600,7 @@ fn merge_field_stats(
         .collect())
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct OwnedFieldNorms {
     field_ord: u16,
@@ -12607,6 +12608,7 @@ struct OwnedFieldNorms {
     values: Vec<u8>,
 }
 
+#[cfg(test)]
 impl FieldNormReader for OwnedFieldNorms {
     fn field_ord(&self) -> u16 {
         self.field_ord
@@ -12998,7 +13000,7 @@ fn lower_leaf_exact_phrase<'a>(
     let scorer = match leaf {
         QueryLeaf::Sealed(segment) => PhraseScorer::new_with_slop_and_checkpoint(
             phrase_terms,
-            owned_fieldnorms(segment, schema, field_ord)?,
+            borrowed_fieldnorms(segment, schema, field_ord)?,
             bm25,
             boost,
             slop,
@@ -14726,16 +14728,7 @@ fn open_sealed_term_cursor<'a>(
     rank_pruning: bool,
     checkpoint: &QueryCheckpointHandle<'_>,
 ) -> Result<(SealedPostingCursor<'a>, DocLenField<'a>), QuillIndexError> {
-    let manifest = segment.manifest();
-    let doclen = DocLenSection::parse_schema(
-        required_section(segment, SectionKind::DOCLEN)?,
-        manifest.docid_lo,
-        manifest.docid_hi,
-        schema,
-    )?;
-    let fieldnorms = doclen
-        .field(field_ord)
-        .ok_or_else(|| invalid_state(format!("DOCLEN has no field {field_ord}")))?;
+    let fieldnorms = borrowed_fieldnorms(segment, schema, field_ord)?;
     let dictionary = open_dictionary(segment, schema)?;
     let found = dictionary.lookup(field_ord, term)?;
     // The lookup has to come first — it is what tells us whether a block will
@@ -15076,11 +15069,11 @@ fn open_owned_cursor(
     })
 }
 
-fn owned_fieldnorms(
+fn borrowed_fieldnorms(
     segment: &RecoveredSegment,
     schema: SchemaDescriptor,
     field_ord: u16,
-) -> Result<OwnedFieldNorms, QuillIndexError> {
+) -> Result<DocLenField<'_>, QuillIndexError> {
     let manifest = segment.manifest();
     let section = DocLenSection::parse_schema(
         required_section(segment, SectionKind::DOCLEN)?,
@@ -15088,9 +15081,20 @@ fn owned_fieldnorms(
         manifest.docid_hi,
         schema,
     )?;
-    let field = section
+    section
         .field(field_ord)
-        .ok_or_else(|| invalid_state(format!("DOCLEN has no field {field_ord}")))?;
+        .ok_or_else(|| invalid_state(format!("DOCLEN has no field {field_ord}")))
+}
+
+#[cfg(test)]
+fn owned_fieldnorms(
+    segment: &RecoveredSegment,
+    schema: SchemaDescriptor,
+    field_ord: u16,
+) -> Result<OwnedFieldNorms, QuillIndexError> {
+    OWNED_FIELDNORM_BRIDGE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+    let manifest = segment.manifest();
+    let field = borrowed_fieldnorms(segment, schema, field_ord)?;
     Ok(OwnedFieldNorms {
         field_ord,
         docid_lo: manifest.docid_lo,
@@ -15134,6 +15138,7 @@ fn span<'a>(
 #[cfg(test)]
 thread_local! {
     static TERM_FIELD_ORD_BRIDGE_CALLS: Cell<usize> = const { Cell::new(0) };
+    static OWNED_FIELDNORM_BRIDGE_CALLS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -15161,6 +15166,16 @@ fn reset_term_field_ord_bridge_calls() {
 #[cfg(test)]
 fn term_field_ord_bridge_calls() -> usize {
     TERM_FIELD_ORD_BRIDGE_CALLS.with(Cell::get)
+}
+
+#[cfg(test)]
+fn reset_owned_fieldnorm_bridge_calls() {
+    OWNED_FIELDNORM_BRIDGE_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+fn owned_fieldnorm_bridge_calls() -> usize {
+    OWNED_FIELDNORM_BRIDGE_CALLS.with(Cell::get)
 }
 
 #[cfg(test)]
@@ -27594,6 +27609,7 @@ mod tests {
                 assert_eq!(positions, &expected_positions, "posting ordinal {ordinal}");
             }
 
+            reset_owned_fieldnorm_bridge_calls();
             let phrase = index
                 .search_paginated(&cx, "\"anchor anchor\"", DOCUMENT_COUNT, 0, true)
                 .expect("execute checkpointed phrase query across both seam families");
@@ -27602,6 +27618,11 @@ mod tests {
                 Some(u64::try_from(DOCUMENT_COUNT).expect("document count fits u64")),
             );
             assert_eq!(phrase.hits.len(), DOCUMENT_COUNT);
+            assert_eq!(
+                owned_fieldnorm_bridge_calls(),
+                0,
+                "shipping sealed phrase lowering must borrow the validated DOCLEN field",
+            );
         });
     }
 
