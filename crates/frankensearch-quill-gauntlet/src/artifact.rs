@@ -29,12 +29,13 @@ use crate::version_contract::{OracleVersionContract, oracle_version_contract};
 
 /// Which generation an object is being held to.
 ///
-/// `Current` is the admission path. `RetainedV7` exists only so a witness a
+/// `Current` is the admission path. `Retained*` exists only so a witness a
 /// committed ledger already recorded stays checkable under the frozen contract
 /// that produced it; it confers no admission and nothing mints it (bd-bxya1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArtifactGeneration {
     Current,
+    RetainedV9,
     RetainedV8,
     RetainedV7,
 }
@@ -953,16 +954,17 @@ impl ArtifactObject {
 
     /// Validate a RETAINED witness under its own generation (bd-bxya1).
     ///
-    /// A committed register ledger holds v7 witness addresses, and the v8 bump
-    /// kept those addresses admissible ON PURPOSE — ingestion is a mint and
-    /// takes the current generation only, while an already-recorded join must
-    /// still be checkable or the archive stops being evidence. Every
+    /// A committed register ledger holds v7-v9 witness addresses. Ingestion is
+    /// a mint and takes the current dependency contract only, while an
+    /// already-recorded join must still be checkable or the archive stops being
+    /// evidence. Every
     /// structural check below is the same one [`Self::validate`] runs; what
     /// changes is which generation's frozen contract the stored configuration
     /// and the report re-derivation are held to.
     ///
-    /// This grants no admission: `validate_stored_object_schema` still refuses
-    /// v7 everywhere admission is decided, and nothing here mints anything.
+    /// This grants no admission: current validation rejects retained v7/v8
+    /// schemas and the historical v2 dependency record, and nothing here mints
+    /// anything.
     pub(crate) fn validate_retained_witness(&self) -> Result<(), GauntletError> {
         self.validate_as(self.retained_generation())
     }
@@ -971,6 +973,7 @@ impl ArtifactObject {
         match self.object_schema_version {
             ARTIFACT_OBJECT_V7_SCHEMA_VERSION => ArtifactGeneration::RetainedV7,
             ARTIFACT_OBJECT_V8_SCHEMA_VERSION => ArtifactGeneration::RetainedV8,
+            ARTIFACT_OBJECT_V9_SCHEMA_VERSION => ArtifactGeneration::RetainedV9,
             _ => ArtifactGeneration::Current,
         }
     }
@@ -980,6 +983,14 @@ impl ArtifactObject {
             ArtifactGeneration::Current => {
                 validate_stored_object_schema(self.object_schema_version)
                     .map_err(|reason| GauntletError::InvalidContract { reason })?;
+            }
+            ArtifactGeneration::RetainedV9 => {
+                if self.object_schema_version != ARTIFACT_OBJECT_V9_SCHEMA_VERSION {
+                    return Err(GauntletError::InvalidContract {
+                        reason: "retained-witness validation is only for the v9 generation"
+                            .to_owned(),
+                    });
+                }
             }
             ArtifactGeneration::RetainedV7 => {
                 if self.object_schema_version != ARTIFACT_OBJECT_V7_SCHEMA_VERSION {
@@ -1043,7 +1054,11 @@ impl ArtifactObject {
                 ArtifactExecutionRole::BuiltInExecution,
                 ArtifactOracleDependency::BuiltInTantivy { contract },
             ) => {
-                contract.validate_stored_structure()?;
+                if generation == ArtifactGeneration::Current {
+                    contract.validate_stored_structure()?;
+                } else {
+                    contract.validate_retained_structure()?;
+                }
                 if !self.engines.has_builtin_profile()
                     || self.engines.comparison_mode != crate::ComparisonMode::CrossEngine
                     || self.engines.oracle.crate_version != contract.lexical_package_version
@@ -1072,11 +1087,17 @@ impl ArtifactObject {
         // a v7 configuration that somehow carried one would be refused rather
         // than silently read as v8 (bd-bxya1).
         match generation {
-            ArtifactGeneration::Current => self.comparator_config.validate_stored_v9()?,
+            ArtifactGeneration::Current | ArtifactGeneration::RetainedV9 => {
+                self.comparator_config.validate_stored_v9()?
+            }
             ArtifactGeneration::RetainedV8 => self.comparator_config.validate_stored_v8()?,
             ArtifactGeneration::RetainedV7 => self.comparator_config.validate_stored_v7()?,
         }
-        if generation != ArtifactGeneration::Current && self.oracle_bug_control.is_some() {
+        if matches!(
+            generation,
+            ArtifactGeneration::RetainedV7 | ArtifactGeneration::RetainedV8
+        ) && self.oracle_bug_control.is_some()
+        {
             return Err(GauntletError::InvalidContract {
                 reason: "retained pre-v9 artifact cannot carry a cross-case oracle control"
                     .to_owned(),
@@ -1120,13 +1141,15 @@ impl ArtifactObject {
         // answer, which is exactly what a version boundary means it need not
         // give.
         let recomputed = match generation {
-            ArtifactGeneration::Current => compare_observations_stored_v9(
-                self.comparison.subject.clone(),
-                self.comparison.oracle.clone(),
-                self.comparator_config,
-                &self.case,
-                self.oracle_bug_control.as_ref(),
-            )?,
+            ArtifactGeneration::Current | ArtifactGeneration::RetainedV9 => {
+                compare_observations_stored_v9(
+                    self.comparison.subject.clone(),
+                    self.comparison.oracle.clone(),
+                    self.comparator_config,
+                    &self.case,
+                    self.oracle_bug_control.as_ref(),
+                )?
+            }
             ArtifactGeneration::RetainedV8 => compare_observations_stored_v8(
                 self.comparison.subject.clone(),
                 self.comparison.oracle.clone(),
@@ -1153,7 +1176,7 @@ impl ArtifactObject {
     /// authority beyond [`ArtifactTrustCeiling::IntegrityOnly`].
     pub(crate) fn validate_stored_builtin_integrity(&self) -> Result<(), GauntletError> {
         self.validate()?;
-        self.stored_builtin_integrity_evidence()
+        self.stored_builtin_integrity_evidence(ArtifactGeneration::Current)
     }
 
     /// The same integrity claim, held to the object's OWN generation, for a
@@ -1164,16 +1187,23 @@ impl ArtifactObject {
     /// which the schema bump touched.
     pub(crate) fn validate_retained_builtin_integrity(&self) -> Result<(), GauntletError> {
         self.validate_retained_witness()?;
-        self.stored_builtin_integrity_evidence()
+        self.stored_builtin_integrity_evidence(self.retained_generation())
     }
 
-    fn stored_builtin_integrity_evidence(&self) -> Result<(), GauntletError> {
+    fn stored_builtin_integrity_evidence(
+        &self,
+        generation: ArtifactGeneration,
+    ) -> Result<(), GauntletError> {
         self.producer_build_identity.validate_stored_sealed_v2()?;
         self.producer_build_identity
             .require_features(&["tantivy_oracle"])?;
         match &self.oracle_dependency {
             ArtifactOracleDependency::BuiltInTantivy { contract } => {
-                contract.validate_stored_structure()?;
+                if generation == ArtifactGeneration::Current {
+                    contract.validate_stored_structure()?;
+                } else {
+                    contract.validate_retained_structure()?;
+                }
             }
             ArtifactOracleDependency::LegacyMissing
             | ArtifactOracleDependency::DiagnosticUnspecified => {
@@ -7861,6 +7891,30 @@ mod tests {
         object
             .validate_retained_witness()
             .expect("retained v8 object must remain byte-verifiable");
+    }
+
+    #[test]
+    fn retained_v9_v2_witness_is_readable_but_cannot_enter_current_validation() {
+        const RETAINED_V9: &[u8] =
+            include_bytes!("../fixtures/artifact-object-v9-div010-live.json");
+
+        let witness = RetainedArtifactWitness::decode(RETAINED_V9)
+            .expect("committed v9/v2 witness must remain byte-verifiable");
+        assert_eq!(
+            witness.object().object_schema_version,
+            ARTIFACT_OBJECT_V9_SCHEMA_VERSION
+        );
+        assert!(
+            witness.object().validate().is_err(),
+            "a v2 dependency record must never validate as current v3 evidence",
+        );
+        assert!(
+            witness
+                .object()
+                .validate_current_builtin_integrity()
+                .is_err(),
+            "historical v2 evidence must never enter the current built-in admission path",
+        );
     }
 
     /// The read-only half of the v7 -> v8 object migration (bd-bxya1).

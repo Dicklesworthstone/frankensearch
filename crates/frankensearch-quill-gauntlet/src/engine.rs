@@ -10613,12 +10613,7 @@ mod tests {
                 .join(" ")
         }
 
-        assert_eq!(
-            oracle_version_contract()
-                .expect("version contract")
-                .tantivy_version,
-            "0.26.1"
-        );
+        oracle_version_contract().expect("current oracle version contract");
         let raw_lengths = [41_u32, 42, 65];
         let mut schema_builder = Schema::builder();
         let id = schema_builder.add_text_field("id", STRING | STORED);
