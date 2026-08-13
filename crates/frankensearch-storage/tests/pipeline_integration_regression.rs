@@ -623,12 +623,19 @@ fn worker_reclaims_stale_jobs_on_startup_and_logs_exit() {
                 SqliteValue::Integer(1),
                 SqliteValue::Integer(claimed[0].job_id),
             ];
+            // Real async FrankenSQLite call through the same `Cx` the worker
+            // below uses. This is the actual production statement path, not a
+            // shim: it plants the stale `started_at` that the reclaim
+            // assertion depends on, so weakening it would make
+            // `reclaimed_on_startup` prove nothing.
             storage
                 .connection()
                 .execute_with_params(
+                    &cx,
                     "UPDATE embedding_jobs SET started_at = ?1 WHERE job_id = ?2;",
                     &params,
                 )
+                .await
                 .expect("stale timestamp update should succeed");
 
             let shutdown = AtomicBool::new(false);
