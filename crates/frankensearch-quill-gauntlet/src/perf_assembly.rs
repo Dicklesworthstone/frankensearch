@@ -4474,14 +4474,14 @@ mod tests {
             PERF_ASSEMBLY_PARTIAL_SHARD_NO_CLAIM_CODE,
             PERF_ASSEMBLY_PARTIAL_SHARD_NO_CLAIM_DETAIL,
         );
-        artifact.artifact_sha256.clear();
-        let unsealed = serde_json::to_string_pretty(&artifact).expect("authority prebinding JSON");
-        artifact.artifact_sha256 = sha256_hex(unsealed.as_bytes());
-        let prebinding_bytes =
-            serde_json::to_vec_pretty(&artifact).expect("authority prebinding bytes");
-        artifact
-            .verify_integrity_against_qg1_authorities(&[&expected_authority])
-            .expect("authority-bound prebinding artifact verifies");
+        let prebinding_bytes = artifact
+            .reconstructed_prebinding_bytes()
+            .expect("canonical authority prebinding bytes");
+        artifact = PerfEvidenceArtifact::from_verified_slice_against_qg1_authorities(
+            &prebinding_bytes,
+            &[&expected_authority],
+        )
+        .expect("reload exact authority prebinding source");
         let threshold_bytes = canonical_threshold_bytes(&threshold_artifact_for(&artifact))
             .expect("authority-bound threshold bytes");
         let runner = crate::machine_class_registry::admitted_test_identity_for_artifacts(
