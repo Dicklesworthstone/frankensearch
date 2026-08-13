@@ -12719,14 +12719,26 @@ fn validate_query_lowering(
                 }
                 Ok(())
             }
-            FieldKind::I64 { indexed: true, .. } | FieldKind::U64 { indexed: true, .. } => {
-                numeric_query_values(schema, *field_id, values).map(|_| ())
+            FieldKind::I64 { indexed: true, .. }
+            | FieldKind::I64 {
+                indexed: false,
+                fast: true,
             }
-            FieldKind::I64 { indexed: false, .. } | FieldKind::U64 { indexed: false, .. } => {
-                Err(QuillIndexError::UnsupportedQuery {
-                    detail: format!("set names non-indexed numeric field {field_id}"),
-                })
+            | FieldKind::U64 { indexed: true, .. }
+            | FieldKind::U64 {
+                indexed: false,
+                fast: true,
+            } => numeric_query_values(schema, *field_id, values).map(|_| ()),
+            FieldKind::I64 {
+                indexed: false,
+                fast: false,
             }
+            | FieldKind::U64 {
+                indexed: false,
+                fast: false,
+            } => Err(QuillIndexError::UnsupportedQuery {
+                detail: format!("set names non-indexed and non-fast numeric field {field_id}"),
+            }),
             FieldKind::StoredOnly => Err(QuillIndexError::UnsupportedQuery {
                 detail: format!("set names stored-only field {field_id}"),
             }),
@@ -13888,15 +13900,29 @@ fn lower_leaf_set<'a>(
                 mode,
             )
         }
-        FieldKind::I64 { indexed: true, .. } | FieldKind::U64 { indexed: true, .. } => {
+        FieldKind::I64 { indexed: true, .. }
+        | FieldKind::I64 {
+            indexed: false,
+            fast: true,
+        }
+        | FieldKind::U64 { indexed: true, .. }
+        | FieldKind::U64 {
+            indexed: false,
+            fast: true,
+        } => {
             let values = numeric_query_values(schema, field_ord, values)?;
             lower_leaf_numeric_set(leaf, schema, field_ord, &values, boost, mode)
         }
-        FieldKind::I64 { indexed: false, .. } | FieldKind::U64 { indexed: false, .. } => {
-            Err(QuillIndexError::UnsupportedQuery {
-                detail: format!("set names non-indexed numeric field {field_ord}"),
-            })
+        FieldKind::I64 {
+            indexed: false,
+            fast: false,
         }
+        | FieldKind::U64 {
+            indexed: false,
+            fast: false,
+        } => Err(QuillIndexError::UnsupportedQuery {
+            detail: format!("set names non-indexed and non-fast numeric field {field_ord}"),
+        }),
         FieldKind::StoredOnly => Err(QuillIndexError::UnsupportedQuery {
             detail: format!("set names stored-only field {field_ord}"),
         }),
@@ -13909,7 +13935,11 @@ fn numeric_query_values(
     values: &[QueryValue],
 ) -> Result<Vec<NumericValue>, QuillIndexError> {
     match query_field_kind(schema, field_ord)? {
-        FieldKind::I64 { indexed: true, .. } => {
+        FieldKind::I64 { indexed: true, .. }
+        | FieldKind::I64 {
+            indexed: false,
+            fast: true,
+        } => {
             let mut unique = BTreeSet::new();
             for value in values {
                 let QueryValue::I64(value) = value else {
@@ -13921,7 +13951,11 @@ fn numeric_query_values(
             }
             Ok(unique.into_iter().map(NumericValue::I64).collect())
         }
-        FieldKind::U64 { indexed: true, .. } => {
+        FieldKind::U64 { indexed: true, .. }
+        | FieldKind::U64 {
+            indexed: false,
+            fast: true,
+        } => {
             let mut unique = BTreeSet::new();
             for value in values {
                 let QueryValue::U64(value) = value else {
@@ -13933,8 +13967,14 @@ fn numeric_query_values(
             }
             Ok(unique.into_iter().map(NumericValue::U64).collect())
         }
-        FieldKind::I64 { indexed: false, .. }
-        | FieldKind::U64 { indexed: false, .. }
+        FieldKind::I64 {
+            indexed: false,
+            fast: false,
+        }
+        | FieldKind::U64 {
+            indexed: false,
+            fast: false,
+        }
         | FieldKind::Keyword
         | FieldKind::Text { .. }
         | FieldKind::StoredOnly => Err(QuillIndexError::UnsupportedQuery {
@@ -26029,17 +26069,14 @@ mod tests {
     }
 
     #[test]
-    fn default_fast_only_ord_range_executes_and_validates_before_leaf_iteration() {
+    fn default_fast_only_ord_range_and_set_execute_before_leaf_iteration() {
         run_with_cx(|cx| async move {
             let index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
-            let empty_set_error = index
+            let empty_set = index
                 .search_paginated(&cx, "ord: IN [0 1]", 10, 0, true)
-                .expect_err("fast-only set is unsupported before any leaf exists");
-            assert!(matches!(
-                &empty_set_error,
-                QuillIndexError::UnsupportedQuery { detail }
-                    if detail == "set names non-indexed numeric field 4"
-            ));
+                .expect("fast-only set is valid against an empty snapshot");
+            assert!(empty_set.hits.is_empty());
+            assert_eq!(empty_set.total_count, Some(0));
             let empty_range = index
                 .search_paginated(&cx, "ord:[0 TO 1]", 10, 0, true)
                 .expect("fast-only range is valid against an empty snapshot");
@@ -26114,10 +26151,32 @@ mod tests {
                     .iter()
                     .all(|hit| hit.score.to_bits() == 2.5_f32.to_bits())
             );
-            let populated_set_error = index
+            let populated_set = index
                 .search_paginated(&cx, "ord: IN [0 1]", 10, 0, true)
-                .expect_err("fast-only set remains unsupported with sealed leaves");
-            assert_eq!(populated_set_error.to_string(), empty_set_error.to_string());
+                .expect("execute default fast-only set");
+            assert_eq!(populated_set.total_count, Some(2));
+            assert_eq!(
+                populated_set
+                    .hits
+                    .iter()
+                    .map(|hit| (hit.document_id.as_str(), hit.score.to_bits()))
+                    .collect::<Vec<_>>(),
+                vec![("rust-1", 1.0_f32.to_bits()), ("rust-2", 1.0_f32.to_bits())]
+            );
+            assert_eq!(
+                index
+                    .collect_docids(&cx, "ord: IN [0 1]")
+                    .expect("collect fast-only set docids"),
+                vec![0, 1]
+            );
+            assert!(
+                index
+                    .search_paginated(&cx, "ord: IN [0 1 1]^2.5", 10, 0, true)
+                    .expect("execute boosted deduplicated fast-only set")
+                    .hits
+                    .iter()
+                    .all(|hit| hit.score.to_bits() == 2.5_f32.to_bits())
+            );
         });
     }
 
