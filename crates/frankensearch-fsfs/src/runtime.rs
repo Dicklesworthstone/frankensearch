@@ -6989,6 +6989,7 @@ impl FsfsRuntime {
         let mut snippets: ahash::AHashMap<&str, &str> = ahash::AHashMap::new();
         let mut best_lexical_rank: ahash::AHashMap<&str, usize> = ahash::AHashMap::new();
         let mut best_semantic_rank: ahash::AHashMap<&str, usize> = ahash::AHashMap::new();
+        let mut best_hash_rank: ahash::AHashMap<&str, usize> = ahash::AHashMap::new();
         let mut appeared_in_count: ahash::AHashMap<&str, usize> = ahash::AHashMap::new();
 
         for payload in payloads {
@@ -7016,6 +7017,12 @@ impl FsfsRuntime {
                         .and_modify(|existing| *existing = (*existing).min(sr))
                         .or_insert(sr);
                 }
+                if let Some(hr) = hit.hash_rank {
+                    best_hash_rank
+                        .entry(key)
+                        .and_modify(|existing| *existing = (*existing).min(hr))
+                        .or_insert(hr);
+                }
             }
         }
 
@@ -7035,6 +7042,7 @@ impl FsfsRuntime {
             .map(|(idx, (path, score))| {
                 let lexical_rank = best_lexical_rank.get(path).copied();
                 let semantic_rank = best_semantic_rank.get(path).copied();
+                let hash_rank = best_hash_rank.get(path).copied();
                 let in_multiple = appeared_in_count.get(path).copied().unwrap_or(0) > 1;
                 SearchHitPayload {
                     rank: idx.saturating_add(1),
@@ -7043,7 +7051,7 @@ impl FsfsRuntime {
                     snippet: snippets.get(path).map(|&s| s.to_owned()),
                     lexical_rank,
                     semantic_rank,
-                    hash_rank: None,
+                    hash_rank,
                     in_both_sources: in_multiple,
                 }
             })
@@ -28808,6 +28816,55 @@ mod tests {
         assert!(session.vector_generation_is_hash);
         assert_eq!(session.hits[0].hash_rank, Some(0));
         assert_eq!(session.hits[0].semantic_rank, None);
+    }
+
+    #[test]
+    fn fuse_expanded_payloads_keeps_hash_ranks_off_semantic_rank() {
+        let hash_hit = SearchHitPayload {
+            rank: 1,
+            path: "src/lib.rs".to_owned(),
+            score: 0.2,
+            snippet: None,
+            lexical_rank: Some(1),
+            semantic_rank: None,
+            hash_rank: Some(0),
+            in_both_sources: true,
+        };
+        let original = SearchPayload::new(
+            "ownership",
+            SearchOutputPhase::Initial,
+            1,
+            vec![hash_hit.clone()],
+        )
+        .with_vector_generation("fnv1a-256", true);
+        let synonym = SearchPayload::new(
+            "owning",
+            SearchOutputPhase::Initial,
+            1,
+            vec![SearchHitPayload {
+                rank: 2,
+                hash_rank: Some(3),
+                ..hash_hit
+            }],
+        )
+        .with_vector_generation("fnv1a-256", true);
+
+        let fused = FsfsRuntime::fuse_expanded_payloads("ownership", &[original, synonym], 5, 60.0);
+        assert!(fused.vector_generation_is_hash);
+        assert_eq!(fused.hits.len(), 1);
+        assert_eq!(fused.hits[0].path, "src/lib.rs");
+        assert_eq!(
+            fused.hits[0].hash_rank,
+            Some(0),
+            "cross-query fusion must keep the best hash rank, not drop it: {:?}",
+            fused.hits[0]
+        );
+        assert_eq!(
+            fused.hits[0].semantic_rank, None,
+            "hash-control fusion must not invent a semantic rank: {:?}",
+            fused.hits[0]
+        );
+        assert_eq!(fused.hits[0].lexical_rank, Some(1));
     }
 
     #[test]
