@@ -278,17 +278,27 @@ impl fmt::Debug for EmbedderStack {
     }
 }
 
+fn classify_stack_availability(
+    fast: &dyn Embedder,
+    quality: Option<&dyn Embedder>,
+) -> TwoTierAvailability {
+    if !fast.is_semantic() {
+        TwoTierAvailability::HashOnly
+    } else if quality.is_some_and(Embedder::is_semantic) {
+        TwoTierAvailability::Full
+    } else {
+        TwoTierAvailability::FastOnly
+    }
+}
+
 impl EmbedderStack {
     /// Build from explicit parts.
+    ///
+    /// Availability follows embedder identity, not slot occupancy: two hash
+    /// control embedders are [`TwoTierAvailability::HashOnly`], not `Full`.
     #[must_use]
     pub fn from_parts(fast: Arc<dyn Embedder>, quality: Option<Arc<dyn Embedder>>) -> Self {
-        let availability = if quality.is_some() {
-            TwoTierAvailability::Full
-        } else if fast.is_semantic() {
-            TwoTierAvailability::FastOnly
-        } else {
-            TwoTierAvailability::HashOnly
-        };
+        let availability = classify_stack_availability(fast.as_ref(), quality.as_deref());
         Self {
             fast,
             quality,
@@ -535,13 +545,8 @@ impl EmbedderStack {
             .clone()
             .map(|embedder| maybe_wrap_mrl(embedder, target_dim))
             .transpose()?;
-        self.availability = if self.quality.is_some() {
-            TwoTierAvailability::Full
-        } else if self.fast.is_semantic() {
-            TwoTierAvailability::FastOnly
-        } else {
-            TwoTierAvailability::HashOnly
-        };
+        self.availability =
+            classify_stack_availability(self.fast.as_ref(), self.quality.as_deref());
         Ok(self)
     }
 
@@ -2502,6 +2507,44 @@ mod tests {
         serde_json::Value::Object(vocab)
     }
 
+    struct SemanticTestEmbedder {
+        id: &'static str,
+        dimension: usize,
+    }
+
+    impl SemanticTestEmbedder {
+        const fn new(id: &'static str, dimension: usize) -> Self {
+            Self { id, dimension }
+        }
+    }
+
+    impl Embedder for SemanticTestEmbedder {
+        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            let dim = self.dimension;
+            Box::pin(async move { Ok(vec![0.0; dim]) })
+        }
+
+        fn dimension(&self) -> usize {
+            self.dimension
+        }
+
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn model_name(&self) -> &str {
+            self.id
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
     #[cfg(feature = "hash")]
     #[test]
     fn from_parts_hash_only_availability() {
@@ -2516,10 +2559,23 @@ mod tests {
 
     #[cfg(feature = "hash")]
     #[test]
-    fn from_parts_with_quality_is_full() {
+    fn from_parts_two_hash_embedders_is_hash_only() {
         let fast: Arc<dyn Embedder> = Arc::new(crate::hash_embedder::HashEmbedder::default_256());
         let quality: Arc<dyn Embedder> =
             Arc::new(crate::hash_embedder::HashEmbedder::default_384());
+        let stack = EmbedderStack::from_parts(fast, Some(quality));
+        assert_eq!(stack.availability(), TwoTierAvailability::HashOnly);
+        assert!(
+            stack.require_semantic().is_err(),
+            "two hash embedders must not pass require_semantic"
+        );
+    }
+
+    #[cfg(feature = "hash")]
+    #[test]
+    fn from_parts_semantic_pair_is_full() {
+        let fast: Arc<dyn Embedder> = Arc::new(SemanticTestEmbedder::new("test-fast", 4));
+        let quality: Arc<dyn Embedder> = Arc::new(SemanticTestEmbedder::new("test-quality", 4));
         let stack = EmbedderStack::from_parts(fast, Some(quality));
         assert_eq!(stack.availability(), TwoTierAvailability::Full);
         assert!(stack.quality().is_some());
@@ -2528,6 +2584,17 @@ mod tests {
             stack.quality_embedder().unwrap().id(),
             stack.quality().unwrap().id()
         );
+    }
+
+    #[cfg(feature = "hash")]
+    #[test]
+    fn from_parts_semantic_plus_hash_quality_is_fast_only() {
+        let fast: Arc<dyn Embedder> = Arc::new(SemanticTestEmbedder::new("test-fast", 4));
+        let quality: Arc<dyn Embedder> =
+            Arc::new(crate::hash_embedder::HashEmbedder::default_384());
+        let stack = EmbedderStack::from_parts(fast, Some(quality));
+        assert_eq!(stack.availability(), TwoTierAvailability::FastOnly);
+        assert!(stack.require_semantic().is_ok());
     }
 
     #[cfg(feature = "hash")]
@@ -2680,9 +2747,8 @@ mod tests {
     #[cfg(feature = "hash")]
     #[test]
     fn diagnose_full_has_no_suggestions() {
-        let fast: Arc<dyn Embedder> = Arc::new(crate::hash_embedder::HashEmbedder::default_256());
-        let quality: Arc<dyn Embedder> =
-            Arc::new(crate::hash_embedder::HashEmbedder::default_384());
+        let fast: Arc<dyn Embedder> = Arc::new(SemanticTestEmbedder::new("test-fast", 4));
+        let quality: Arc<dyn Embedder> = Arc::new(SemanticTestEmbedder::new("test-quality", 4));
         let stack = EmbedderStack::from_parts(fast, Some(quality));
         let diag = stack.diagnose();
         assert_eq!(diag.availability, TwoTierAvailability::Full);
@@ -2692,9 +2758,8 @@ mod tests {
     #[cfg(feature = "hash")]
     #[test]
     fn degradation_message_none_when_full() {
-        let fast: Arc<dyn Embedder> = Arc::new(crate::hash_embedder::HashEmbedder::default_256());
-        let quality: Arc<dyn Embedder> =
-            Arc::new(crate::hash_embedder::HashEmbedder::default_384());
+        let fast: Arc<dyn Embedder> = Arc::new(SemanticTestEmbedder::new("test-fast", 4));
+        let quality: Arc<dyn Embedder> = Arc::new(SemanticTestEmbedder::new("test-quality", 4));
         let stack = EmbedderStack::from_parts(fast, Some(quality));
         assert!(stack.degradation_message().is_none());
     }
@@ -2781,7 +2846,7 @@ mod tests {
         let display = format!("{diag}");
         assert!(display.contains("minimal"));
         assert!(display.contains("/tmp/test-cache"));
-        assert!(display.contains("hash fallback"));
+        assert!(display.contains("hash control"));
         assert!(display.contains("Fix something"));
     }
 
