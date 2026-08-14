@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use asupersync::Cx;
-use tracing::instrument;
+use tracing::{instrument, warn};
 
 use frankensearch_core::config::TwoTierConfig;
 use frankensearch_core::error::{SearchError, SearchResult};
@@ -328,7 +328,18 @@ impl IndexBuilder {
         }
 
         let fast_embedder = stack.fast_arc();
-        let quality_embedder = stack.quality_arc();
+        let quality_embedder = stack.quality_arc().and_then(|quality| {
+            if fast_embedder.is_semantic() && quality.is_semantic() {
+                Some(quality)
+            } else {
+                warn!(
+                    fast_embedder = %fast_embedder.id(),
+                    quality_embedder = %quality.id(),
+                    "dropping non-semantic quality embedder; a hash control stack does not write a quality generation"
+                );
+                None
+            }
+        });
 
         // Create index builder.
         let mut index_builder = match TwoTierIndex::create(&self.data_dir, self.config) {
@@ -1628,6 +1639,35 @@ mod tests {
                 stats.is_degraded_generation(),
                 "hash-only generations are permanently non-semantic and must say so",
             );
+        });
+    }
+
+    #[cfg(feature = "hash")]
+    #[test]
+    fn build_does_not_write_a_hash_quality_generation() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let hash_stack = EmbedderStack::from_parts(
+                Arc::new(frankensearch_embed::HashEmbedder::default_256()) as Arc<dyn Embedder>,
+                Some(
+                    Arc::new(frankensearch_embed::HashEmbedder::default_384()) as Arc<dyn Embedder>
+                ),
+            );
+            let stats = IndexBuilder::new(dir.path())
+                .with_embedder_stack(hash_stack)
+                .add_document("doc-1", "Hello world")
+                .build(&cx)
+                .await
+                .unwrap();
+
+            assert_eq!(stats.embedder_availability, TwoTierAvailability::HashOnly);
+            assert!(
+                !stats.has_quality_index,
+                "hash control must not mint a quality generation: quality_indexed={}",
+                stats.quality_indexed
+            );
+            let index = TwoTierIndex::open(dir.path(), TwoTierConfig::default()).unwrap();
+            assert!(!index.has_quality_index());
         });
     }
 

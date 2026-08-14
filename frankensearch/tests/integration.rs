@@ -1,7 +1,8 @@
 //! Integration tests for frankensearch (bd-3un.32).
 //!
-//! End-to-end tests exercising the full search pipeline using the hash embedder
-//! (no ML model downloads needed). All tests use default features only.
+//! End-to-end tests for the default `hash` feature plus semantic test doubles
+//! for the two-tier path. Hash is an explicit control fixture, not semantic
+//! search. All tests use default features only.
 //!
 //! Coverage:
 //! 1. Basic two-tier flow (`IndexBuilder` → `TwoTierSearcher`)
@@ -16,10 +17,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use asupersync::Cx;
 use frankensearch::prelude::*;
-use frankensearch::{EmbedderStack, HashEmbedder, IndexBuilder, TwoTierIndex, VectorIndex};
+use frankensearch::{
+    EmbedderStack, HashEmbedder, IndexBuilder, TwoTierAvailability, TwoTierIndex, VectorIndex,
+};
 use frankensearch_core::config::TwoTierConfig;
-use frankensearch_core::traits::Embedder;
+use frankensearch_core::traits::{Embedder, ModelCategory, SearchFuture};
 use frankensearch_core::types::SearchPhase;
 use frankensearch_index::{
     Quantization, VECTOR_INDEX_FAST_FILENAME, VECTOR_INDEX_QUALITY_FILENAME,
@@ -57,6 +61,76 @@ fn build_hash_index(name: &str, docs: &[(&str, &str)]) -> (PathBuf, usize) {
     }
     writer.finish().expect("finish");
     (dir, dim)
+}
+
+/// Deterministic semantic test double so two-tier tests do not pretend hash is quality.
+struct SemanticStubEmbedder {
+    id: &'static str,
+    dimension: usize,
+}
+
+impl SemanticStubEmbedder {
+    const fn new(id: &'static str, dimension: usize) -> Self {
+        Self { id, dimension }
+    }
+}
+
+impl Embedder for SemanticStubEmbedder {
+    fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+        let dim = self.dimension;
+        Box::pin(async move {
+            let mut vec = vec![0.0; dim];
+            if dim > 0 {
+                vec[text.len() % dim] = 1.0;
+            }
+            Ok(vec)
+        })
+    }
+
+    fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    fn id(&self) -> &str {
+        self.id
+    }
+
+    fn model_name(&self) -> &str {
+        self.id
+    }
+
+    fn is_semantic(&self) -> bool {
+        true
+    }
+
+    fn category(&self) -> ModelCategory {
+        ModelCategory::StaticEmbedder
+    }
+}
+
+/// Build a two-tier index with semantic test doubles (not hash control).
+fn build_two_tier_stub_index(name: &str, docs: &[(&str, &str)]) -> PathBuf {
+    let dir = temp_dir(name);
+    let docs = docs.to_vec();
+    asupersync::test_utils::run_test_with_cx(|cx| {
+        let dir = dir.clone();
+        async move {
+            let stack = EmbedderStack::from_parts(
+                Arc::new(SemanticStubEmbedder::new("stub-fast", 8)) as Arc<dyn Embedder>,
+                Some(Arc::new(SemanticStubEmbedder::new("stub-quality", 16)) as Arc<dyn Embedder>),
+            );
+            let mut builder = IndexBuilder::new(&dir).with_embedder_stack(stack);
+            for (id, text) in docs {
+                builder = builder.add_document(id, text);
+            }
+            let stats = builder.build(&cx).await.expect("build two-tier stub index");
+            assert!(
+                stats.has_quality_index,
+                "semantic stubs must write a quality generation"
+            );
+        }
+    });
+    dir
 }
 
 /// Build a two-tier index with separate fast (256d) and quality (384d) embeddings.
@@ -309,11 +383,11 @@ fn fast_only_mode_yields_only_initial_phase() {
 #[test]
 fn two_tier_search_yields_initial_then_refined() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
-        let dir = build_two_tier_hash_index("two-tier-phases", TEST_CORPUS);
+        let dir = build_two_tier_stub_index("two-tier-phases", TEST_CORPUS);
         let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
 
-        let fast: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
-        let quality: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_384());
+        let fast: Arc<dyn Embedder> = Arc::new(SemanticStubEmbedder::new("stub-fast", 8));
+        let quality: Arc<dyn Embedder> = Arc::new(SemanticStubEmbedder::new("stub-quality", 16));
 
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
             .with_quality_embedder(quality);
@@ -480,7 +554,41 @@ fn index_builder_with_two_tier() {
         let stats = builder.build(&cx).await.unwrap();
 
         assert_eq!(stats.doc_count, 20);
-        assert!(stats.has_quality_index);
+        assert_eq!(stats.embedder_availability, TwoTierAvailability::HashOnly);
+        assert!(
+            !stats.has_quality_index,
+            "two hash embedders must not mint a quality generation"
+        );
+    });
+}
+
+#[test]
+fn leftover_hash_quality_index_is_not_refined() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let dir = build_two_tier_hash_index("hash-quality-not-refined", TEST_CORPUS);
+        let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
+        assert!(
+            index.has_quality_index(),
+            "fixture still writes a hash quality file so the searcher must refuse it"
+        );
+
+        let searcher = TwoTierSearcher::new(
+            index,
+            Arc::new(HashEmbedder::default_256()) as Arc<dyn Embedder>,
+            TwoTierConfig::default(),
+        )
+        .with_quality_embedder(Arc::new(HashEmbedder::default_384()) as Arc<dyn Embedder>);
+
+        let (_, metrics) = searcher
+            .search_collect(&cx, "distributed consensus", 5)
+            .await
+            .unwrap();
+
+        assert_eq!(metrics.phase2_vectors_searched, 0);
+        assert_eq!(
+            metrics.skip_reason.as_deref(),
+            Some("non_semantic_fast_embedder_vector_control")
+        );
     });
 }
 
@@ -491,11 +599,11 @@ fn index_builder_with_two_tier() {
 #[test]
 fn quality_weight_affects_refined_ranking() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
-        let dir = build_two_tier_hash_index("quality-weight", TEST_CORPUS);
+        let dir = build_two_tier_stub_index("quality-weight", TEST_CORPUS);
         let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
 
-        let fast: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
-        let quality: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_384());
+        let fast: Arc<dyn Embedder> = Arc::new(SemanticStubEmbedder::new("stub-fast", 8));
+        let quality: Arc<dyn Embedder> = Arc::new(SemanticStubEmbedder::new("stub-quality", 16));
 
         // Low quality weight → fast tier dominates
         let config_low = TwoTierConfig {
@@ -704,11 +812,11 @@ fn index_builder_empty_documents_rejected() {
 #[test]
 fn refined_phase_reports_rank_changes() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
-        let dir = build_two_tier_hash_index("rank-changes", TEST_CORPUS);
+        let dir = build_two_tier_stub_index("rank-changes", TEST_CORPUS);
         let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
 
-        let fast: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
-        let quality: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_384());
+        let fast: Arc<dyn Embedder> = Arc::new(SemanticStubEmbedder::new("stub-fast", 8));
+        let quality: Arc<dyn Embedder> = Arc::new(SemanticStubEmbedder::new("stub-quality", 16));
 
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
             .with_quality_embedder(quality);
@@ -737,11 +845,11 @@ fn refined_phase_reports_rank_changes() {
 #[test]
 fn metrics_capture_both_phases() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
-        let dir = build_two_tier_hash_index("metrics-phases", TEST_CORPUS);
+        let dir = build_two_tier_stub_index("metrics-phases", TEST_CORPUS);
         let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
 
-        let fast: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
-        let quality: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_384());
+        let fast: Arc<dyn Embedder> = Arc::new(SemanticStubEmbedder::new("stub-fast", 8));
+        let quality: Arc<dyn Embedder> = Arc::new(SemanticStubEmbedder::new("stub-quality", 16));
 
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
             .with_quality_embedder(quality);

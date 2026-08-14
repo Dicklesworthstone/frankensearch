@@ -186,8 +186,7 @@ fn main() {
             let corpus = corpus.clone();
             async move {
                 let fast = Arc::new(HashEmbedder::default_256()) as Arc<dyn Embedder>;
-                let quality = Arc::new(HashEmbedder::default_384()) as Arc<dyn Embedder>;
-                let stack = EmbedderStack::from_parts(fast, Some(quality));
+                let stack = EmbedderStack::from_parts(fast, None);
 
                 let mut builder = IndexBuilder::new(&build_dir).with_embedder_stack(stack);
                 for (id, text) in &corpus {
@@ -201,15 +200,13 @@ fn main() {
 
         // Search
         let fast: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
-        let quality: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_384());
         let index =
             Arc::new(TwoTierIndex::open(&build_dir, TwoTierConfig::default()).expect("open"));
         let searcher = TwoTierSearcher::new(
             Arc::clone(&index),
             Arc::clone(&fast),
             TwoTierConfig::default(),
-        )
-        .with_quality_embedder(quality);
+        );
 
         let search_iters = 100;
         let start = Instant::now();
@@ -222,7 +219,7 @@ fn main() {
             });
         }
         let search_ms = start.elapsed().as_secs_f64() * 1000.0 / f64::from(search_iters);
-        report("Two-tier search (5 docs)", search_ms, "ms", 10.0);
+        report("Hash-control search (5 docs)", search_ms, "ms", 10.0);
     }
 
     // ── Cleanup ───────────────────────────────────────────────────────────
