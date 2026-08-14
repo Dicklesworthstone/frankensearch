@@ -318,10 +318,10 @@ impl From<&FusedCandidate> for FusionContext {
             fused_score: value.fused_score,
             lexical_rank: value.lexical_rank,
             semantic_rank: value.semantic_rank,
-            hash_rank: None,
+            hash_rank: value.hash_rank,
             lexical_score: value.lexical_score,
             semantic_score: value.semantic_score,
-            hash_score: None,
+            hash_score: value.hash_score,
             in_both_sources: value.in_both_sources,
             vector_generation_is_hash: false,
         }

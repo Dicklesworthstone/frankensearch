@@ -1762,10 +1762,10 @@ impl ExplainSession {
                 final_score: sanitize_explain_score(candidate.fused_score),
                 lexical_rank: candidate.lexical_rank,
                 semantic_rank: candidate.semantic_rank,
-                hash_rank: None,
+                hash_rank: candidate.hash_rank,
                 lexical_score: candidate.lexical_score,
                 semantic_score: candidate.semantic_score,
-                hash_score: None,
+                hash_score: candidate.hash_score,
                 in_both_sources: candidate.in_both_sources,
             })
             .collect();
@@ -7297,8 +7297,10 @@ impl FsfsRuntime {
                 prior_boost: 0.0,
                 lexical_rank: hit.lexical_rank,
                 semantic_rank: hit.semantic_rank,
+                hash_rank: hit.hash_rank,
                 lexical_score: None,
                 semantic_score: None,
+                hash_score: None,
                 in_both_sources: hit.in_both_sources,
             })
             .collect::<Vec<_>>();
@@ -7687,8 +7689,10 @@ impl FsfsRuntime {
                 prior_boost: 0.0,
                 lexical_rank: Some(rank),
                 semantic_rank: None,
+                hash_rank: None,
                 lexical_score: Some(lexical.score),
                 semantic_score: None,
+                hash_score: None,
                 in_both_sources: false,
             });
         }
@@ -22120,8 +22124,10 @@ mod tests {
                 prior_boost: 0.0,
                 lexical_rank: Some(0),
                 semantic_rank: None,
+                hash_rank: None,
                 lexical_score: Some(9.0),
                 semantic_score: None,
+                hash_score: None,
                 in_both_sources: false,
             },
             FusedCandidate {
@@ -22130,8 +22136,10 @@ mod tests {
                 prior_boost: 0.0,
                 lexical_rank: Some(1),
                 semantic_rank: None,
+                hash_rank: None,
                 lexical_score: Some(10.0),
                 semantic_score: None,
+                hash_score: None,
                 in_both_sources: false,
             },
         ];
@@ -22163,8 +22171,10 @@ mod tests {
             prior_boost: 0.0,
             lexical_rank: Some(0),
             semantic_rank: None,
+            hash_rank: None,
             lexical_score: Some(11.0),
             semantic_score: None,
+            hash_score: None,
             in_both_sources: false,
         }];
         let lexical_full = vec![
@@ -22194,8 +22204,10 @@ mod tests {
                 prior_boost: 0.0,
                 lexical_rank: None,
                 semantic_rank: Some(0),
+                hash_rank: None,
                 lexical_score: None,
                 semantic_score: Some(0.95),
+                hash_score: None,
                 in_both_sources: false,
             },
             FusedCandidate {
@@ -22204,8 +22216,10 @@ mod tests {
                 prior_boost: 0.0,
                 lexical_rank: Some(0),
                 semantic_rank: Some(1),
+                hash_rank: None,
                 lexical_score: Some(12.0),
                 semantic_score: Some(0.90),
+                hash_score: None,
                 in_both_sources: true,
             },
         ];
@@ -22216,8 +22230,10 @@ mod tests {
                 prior_boost: 0.0,
                 lexical_rank: Some(0),
                 semantic_rank: Some(1),
+                hash_rank: None,
                 lexical_score: Some(12.0),
                 semantic_score: Some(0.90),
+                hash_score: None,
                 in_both_sources: true,
             },
             FusedCandidate {
@@ -22226,8 +22242,10 @@ mod tests {
                 prior_boost: 0.0,
                 lexical_rank: None,
                 semantic_rank: Some(0),
+                hash_rank: None,
                 lexical_score: None,
                 semantic_score: Some(0.95),
+                hash_score: None,
                 in_both_sources: false,
             },
             FusedCandidate {
@@ -22236,8 +22254,10 @@ mod tests {
                 prior_boost: 0.0,
                 lexical_rank: None,
                 semantic_rank: Some(2),
+                hash_rank: None,
                 lexical_score: None,
                 semantic_score: Some(0.10),
+                hash_score: None,
                 in_both_sources: false,
             },
             FusedCandidate {
@@ -22246,8 +22266,10 @@ mod tests {
                 prior_boost: 0.0,
                 lexical_rank: None,
                 semantic_rank: Some(3),
+                hash_rank: None,
                 lexical_score: None,
                 semantic_score: Some(0.05),
+                hash_score: None,
                 in_both_sources: false,
             },
         ];
@@ -22269,8 +22291,10 @@ mod tests {
                 prior_boost: 0.0,
                 lexical_rank: Some(0),
                 semantic_rank: Some(0),
+                hash_rank: None,
                 lexical_score: Some(10.0),
                 semantic_score: Some(1.0),
+                hash_score: None,
                 in_both_sources: true,
             },
             FusedCandidate {
@@ -22279,8 +22303,10 @@ mod tests {
                 prior_boost: 0.0,
                 lexical_rank: Some(1),
                 semantic_rank: Some(1),
+                hash_rank: None,
                 lexical_score: Some(9.0),
                 semantic_score: Some(0.9),
+                hash_score: None,
                 in_both_sources: true,
             },
         ];
@@ -22293,8 +22319,10 @@ mod tests {
                 prior_boost: 0.0,
                 lexical_rank: None,
                 semantic_rank: Some(2),
+                hash_rank: None,
                 lexical_score: None,
                 semantic_score: Some(0.1),
+                hash_score: None,
                 in_both_sources: false,
             },
         ];
@@ -28814,8 +28842,10 @@ mod tests {
                     prior_boost: 0.0,
                     lexical_rank: None,
                     semantic_rank: Some(0),
+                    hash_rank: None,
                     lexical_score: None,
                     semantic_score: Some(0.1),
+                    hash_score: None,
                     in_both_sources: false,
                 }],
             )
@@ -28833,6 +28863,50 @@ mod tests {
         assert!(session.vector_generation_is_hash);
         assert_eq!(session.hits[0].hash_rank, Some(0));
         assert_eq!(session.hits[0].semantic_rank, None);
+    }
+
+    #[test]
+    fn persist_explain_session_copies_fused_hash_rank() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+        fs::create_dir_all(vector_path.parent().expect("vector parent"))
+            .expect("create vector dir");
+        VectorIndex::create(&vector_path, "fnv1a-256", 256)
+            .expect("create hash generation")
+            .finish()
+            .expect("finish hash generation");
+        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            index_dir: Some(index_root.clone()),
+            ..CliInput::default()
+        });
+        runtime
+            .persist_explain_session(
+                &index_root,
+                "ownership",
+                SearchOutputPhase::Initial,
+                &[FusedCandidate {
+                    doc_id: "src/lib.rs".into(),
+                    fused_score: 0.1,
+                    prior_boost: 0.0,
+                    lexical_rank: None,
+                    semantic_rank: None,
+                    hash_rank: Some(3),
+                    lexical_score: None,
+                    semantic_score: None,
+                    hash_score: Some(0.4),
+                    in_both_sources: false,
+                }],
+            )
+            .expect("persist fused hash rank");
+        let session = runtime
+            .load_explain_session()
+            .expect("load explain session")
+            .expect("session exists");
+        assert_eq!(session.hits[0].hash_rank, Some(3));
+        assert_eq!(session.hits[0].semantic_rank, None);
+        assert_eq!(session.hits[0].hash_score, Some(0.4));
+        assert_eq!(session.hits[0].semantic_score, None);
     }
 
     #[test]

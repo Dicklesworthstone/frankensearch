@@ -410,8 +410,14 @@ pub struct FusedCandidate {
     pub prior_boost: f64,
     pub lexical_rank: Option<usize>,
     pub semantic_rank: Option<usize>,
+    /// Rank in the hash-control vector list. Never set together with
+    /// `semantic_rank`: a hash generation is not a semantic source.
+    pub hash_rank: Option<usize>,
     pub lexical_score: Option<f32>,
     pub semantic_score: Option<f32>,
+    /// Vector score from a hash-control generation. Never set together with
+    /// `semantic_score`.
+    pub hash_score: Option<f32>,
     pub in_both_sources: bool,
 }
 
@@ -868,8 +874,10 @@ impl QueryExecutionOrchestrator {
                         prior_boost: 0.0,
                         lexical_rank: Some(rank),
                         semantic_rank: None,
+                        hash_rank: None,
                         lexical_score: Some(lexical_score),
                         semantic_score: None,
+                        hash_score: None,
                         in_both_sources: false,
                     },
                 );
@@ -902,8 +910,10 @@ impl QueryExecutionOrchestrator {
                         prior_boost: 0.0,
                         lexical_rank: None,
                         semantic_rank: Some(rank),
+                        hash_rank: None,
                         lexical_score: None,
                         semantic_score: Some(semantic_score),
+                        hash_score: None,
                         in_both_sources: false,
                     },
                 );
@@ -955,8 +965,10 @@ impl QueryExecutionOrchestrator {
                     prior_boost: 0.0,
                     lexical_rank: Some(rank),
                     semantic_rank: None,
+                    hash_rank: None,
                     lexical_score: Some(lexical_score),
                     semantic_score: None,
+                    hash_score: None,
                     in_both_sources: false,
                 });
         }
@@ -989,8 +1001,10 @@ impl QueryExecutionOrchestrator {
                     prior_boost: 0.0,
                     lexical_rank: None,
                     semantic_rank: Some(rank),
+                    hash_rank: None,
                     lexical_score: None,
                     semantic_score: Some(semantic_score),
+                    hash_score: None,
                     in_both_sources: false,
                 });
         }
@@ -1026,9 +1040,9 @@ impl QueryExecutionOrchestrator {
             .enumerate()
             .map(|(idx, candidate)| {
                 let (semantic_rank, hash_rank) = if vector_is_hash {
-                    (None, candidate.semantic_rank)
+                    (None, candidate.hash_rank.or(candidate.semantic_rank))
                 } else {
-                    (candidate.semantic_rank, None)
+                    (candidate.semantic_rank, candidate.hash_rank)
                 };
                 SearchHitPayload {
                     rank: idx.saturating_add(1),
@@ -1550,8 +1564,10 @@ mod tests {
                 prior_boost: 0.0,
                 lexical_rank: Some(0),
                 semantic_rank: Some(1),
+                hash_rank: None,
                 lexical_score: Some(1.0),
                 semantic_score: Some(0.9),
+                hash_score: None,
                 in_both_sources: true,
             },
             super::FusedCandidate {
@@ -1560,8 +1576,10 @@ mod tests {
                 prior_boost: 0.0,
                 lexical_rank: Some(3),
                 semantic_rank: None,
+                hash_rank: None,
                 lexical_score: Some(0.4),
                 semantic_score: None,
+                hash_score: None,
                 in_both_sources: false,
             },
         ];
@@ -1606,8 +1624,10 @@ mod tests {
             prior_boost: 0.0,
             lexical_rank: None,
             semantic_rank: Some(0),
+            hash_rank: None,
             lexical_score: None,
             semantic_score: Some(0.4),
+            hash_score: None,
             in_both_sources: false,
         }];
         let payload = orchestrator.build_search_payload_for_vector_lane(
@@ -2444,8 +2464,10 @@ mod tests {
             prior_boost: 0.0,
             lexical_rank: None,
             semantic_rank: None,
+            hash_rank: None,
             lexical_score: None,
             semantic_score: None,
+            hash_score: None,
             in_both_sources: false,
         };
         let b = super::FusedCandidate {
@@ -2454,8 +2476,10 @@ mod tests {
             prior_boost: 0.0,
             lexical_rank: None,
             semantic_rank: None,
+            hash_rank: None,
             lexical_score: None,
             semantic_score: None,
+            hash_score: None,
             in_both_sources: false,
         };
         assert_eq!(super::fused_cmp(&a, &b), std::cmp::Ordering::Less);
@@ -2469,8 +2493,10 @@ mod tests {
             prior_boost: 0.0,
             lexical_rank: None,
             semantic_rank: None,
+            hash_rank: None,
             lexical_score: None,
             semantic_score: None,
+            hash_score: None,
             in_both_sources: true,
         };
         let b = super::FusedCandidate {
@@ -2479,8 +2505,10 @@ mod tests {
             prior_boost: 0.0,
             lexical_rank: None,
             semantic_rank: None,
+            hash_rank: None,
             lexical_score: None,
             semantic_score: None,
+            hash_score: None,
             in_both_sources: false,
         };
         // a in_both=true should sort first (compare right.in_both > left.in_both → Less)
@@ -2495,8 +2523,10 @@ mod tests {
             prior_boost: 0.0,
             lexical_rank: None,
             semantic_rank: None,
+            hash_rank: None,
             lexical_score: None,
             semantic_score: None,
+            hash_score: None,
             in_both_sources: false,
         };
         let b = super::FusedCandidate {
@@ -2505,8 +2535,10 @@ mod tests {
             prior_boost: 0.0,
             lexical_rank: None,
             semantic_rank: None,
+            hash_rank: None,
             lexical_score: None,
             semantic_score: None,
+            hash_score: None,
             in_both_sources: false,
         };
         // "alpha" < "beta" alphabetically → a sorts first

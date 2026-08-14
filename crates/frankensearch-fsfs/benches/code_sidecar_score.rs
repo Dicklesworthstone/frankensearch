@@ -71,8 +71,10 @@ fn build_fixture(n: usize) -> (CodeStructureSidecar, Vec<FusedCandidate>) {
             prior_boost: 0.0,
             lexical_rank: Some(i),
             semantic_rank: None,
+            hash_rank: None,
             lexical_score: None,
             semantic_score: None,
+            hash_score: None,
             in_both_sources: false,
         });
     }
