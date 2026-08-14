@@ -614,6 +614,8 @@ impl OutputWarningCode {
     pub const FAST_ONLY_RESULTS: &str = "fast_only_results";
     /// Embedding fell back to hash embedder.
     pub const HASH_FALLBACK: &str = "hash_fallback";
+    /// Search ran without a published vector generation.
+    pub const NO_VECTOR_INDEX: &str = "no_vector_index";
     /// Schema version is newer than consumer expects.
     pub const SCHEMA_NEWER: &str = "schema_version_newer";
 }
@@ -625,6 +627,7 @@ pub const ALL_OUTPUT_WARNING_CODES: &[&str] = &[
     OutputWarningCode::RERANK_SKIPPED,
     OutputWarningCode::FAST_ONLY_RESULTS,
     OutputWarningCode::HASH_FALLBACK,
+    OutputWarningCode::NO_VECTOR_INDEX,
     OutputWarningCode::SCHEMA_NEWER,
 ];
 

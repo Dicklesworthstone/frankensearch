@@ -5153,7 +5153,7 @@ impl FsfsRuntime {
         }
 
         let meta = meta_for_format("search", self.cli_input.format).with_duration_ms(elapsed_ms);
-        let warnings = Self::search_hash_fallback_warnings(&payload);
+        let warnings = Self::search_generation_warnings(&payload);
         let envelope =
             OutputEnvelope::success(payload, meta, iso_timestamp_now()).with_warnings(warnings);
         let stdout = std::io::stdout();
@@ -7134,6 +7134,9 @@ impl FsfsRuntime {
             if is_hash && payload.skip_reason.is_none() {
                 payload.skip_reason = Some("non_semantic_fast_embedder_vector_control".to_owned());
             }
+        } else if !matches!(mode, SearchExecutionMode::LexicalOnly) && payload.skip_reason.is_none()
+        {
+            payload.skip_reason = Some("no_vector_index".to_owned());
         }
         if payload.skip_reason.is_none() {
             payload.skip_reason = match mode {
@@ -7158,17 +7161,24 @@ impl FsfsRuntime {
         )
     }
 
-    fn search_hash_fallback_warnings(payload: &SearchPayload) -> Vec<OutputWarning> {
-        if !payload.vector_generation_is_hash {
-            return Vec::new();
+    fn search_generation_warnings(payload: &SearchPayload) -> Vec<OutputWarning> {
+        let mut warnings = Vec::new();
+        if payload.vector_generation_is_hash {
+            let generation = payload.vector_generation_id.as_deref().unwrap_or("hash");
+            warnings.push(OutputWarning::new(
+                OutputWarningCode::HASH_FALLBACK,
+                format!(
+                    "vector generation `{generation}` is a hash control artifact, not semantic search"
+                ),
+            ));
         }
-        let generation = payload.vector_generation_id.as_deref().unwrap_or("hash");
-        vec![OutputWarning::new(
-            OutputWarningCode::HASH_FALLBACK,
-            format!(
-                "vector generation `{generation}` is a hash control artifact, not semantic search"
-            ),
-        )]
+        if payload.skip_reason.as_deref() == Some("no_vector_index") {
+            warnings.push(OutputWarning::new(
+                OutputWarningCode::NO_VECTOR_INDEX,
+                "no published vector generation; this result is not semantic search".to_owned(),
+            ));
+        }
+        warnings
     }
 
     #[must_use]
@@ -27891,7 +27901,7 @@ mod tests {
             Some("non_semantic_fast_embedder_vector_control")
         );
 
-        let warnings = FsfsRuntime::search_hash_fallback_warnings(&payload);
+        let warnings = FsfsRuntime::search_generation_warnings(&payload);
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].code, OutputWarningCode::HASH_FALLBACK);
 
@@ -27900,6 +27910,48 @@ mod tests {
         assert_eq!(ready["vector_generation_id"], "fnv1a-256");
         assert_eq!(ready["vector_generation_is_hash"], true);
         assert_eq!(ready["semantic_admitted"], false);
+    }
+
+    #[test]
+    fn search_payload_names_a_missing_vector_generation() {
+        let resources = SearchExecutionResources {
+            index_root: PathBuf::from("/tmp/missing-vector"),
+            generation_fingerprint: "test".to_owned(),
+            lexical_index: None,
+            shadow_observer: None,
+            shadow_pressure_sampler: None,
+            vector_index: None,
+            fast_embedder: None,
+            quality_embedder: None,
+            fast_embedder_attempted: true,
+            quality_embedder_attempted: true,
+            degradation_advice: Vec::new(),
+        };
+
+        let full = FsfsRuntime::annotate_search_payload(
+            SearchPayload::new("query", SearchOutputPhase::Initial, 0, Vec::new()),
+            &resources,
+            SearchExecutionMode::Full,
+        );
+        assert!(full.vector_generation_id.is_none());
+        assert!(!full.vector_generation_is_hash);
+        assert_eq!(full.skip_reason.as_deref(), Some("no_vector_index"));
+        let warnings = FsfsRuntime::search_generation_warnings(&full);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, OutputWarningCode::NO_VECTOR_INDEX);
+
+        let lexical = FsfsRuntime::annotate_search_payload(
+            SearchPayload::new("query", SearchOutputPhase::Initial, 0, Vec::new()),
+            &resources,
+            SearchExecutionMode::LexicalOnly,
+        );
+        assert_eq!(lexical.skip_reason.as_deref(), Some("lexical_only"));
+        assert!(FsfsRuntime::search_generation_warnings(&lexical).is_empty());
+
+        let ready = FsfsRuntime::search_serve_ready_event("json", &resources);
+        assert_eq!(ready["semantic_admitted"], false);
+        assert_eq!(ready["vector_generation_is_hash"], false);
+        assert!(ready["vector_generation_id"].is_null());
     }
 
     #[test]
