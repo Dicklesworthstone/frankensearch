@@ -519,6 +519,7 @@ impl StorageBackedJobRunner {
         worker_id: &str,
     ) -> SearchResult<BatchProcessResult> {
         ensure_non_empty(worker_id, "worker_id")?;
+        pipeline_checkpoint(cx, "storage.pipeline.process_batch")?;
         let total_start = Instant::now();
         let claimed = self
             .queue
@@ -539,6 +540,7 @@ impl StorageBackedJobRunner {
 
         let embed_start = Instant::now();
         for job in &claimed {
+            pipeline_checkpoint(cx, "storage.pipeline.process_batch")?;
             let job_started = Instant::now();
             let doc = self.storage.get_document(&job.doc_id)?;
             let Some(doc) = doc else {
@@ -858,6 +860,7 @@ impl StorageBackedJobRunner {
         let mut idle_cycles = 0_usize;
 
         while !shutdown.load(Ordering::Relaxed) {
+            pipeline_checkpoint(cx, "storage.pipeline.run_worker")?;
             let batch = self.process_batch(cx, worker_id).await?;
             if batch.jobs_claimed == 0 {
                 idle_cycles += 1;
@@ -870,7 +873,7 @@ impl StorageBackedJobRunner {
                     break;
                 }
                 asupersync::time::sleep(
-                    asupersync::time::wall_now(),
+                    cx.now(),
                     Duration::from_millis(self.config.worker_idle_sleep_ms),
                 )
                 .await;
@@ -1269,6 +1272,15 @@ fn row_blob_32(row: &fsqlite::Row, index: usize, field: &str) -> SearchResult<[u
     let mut out = [0_u8; 32];
     out.copy_from_slice(bytes);
     Ok(out)
+}
+
+fn pipeline_checkpoint(cx: &Cx, phase: &'static str) -> SearchResult<()> {
+    cx.checkpoint().map_err(|error| SearchError::Cancelled {
+        phase: phase.to_owned(),
+        reason: cx
+            .cancel_reason()
+            .map_or_else(|| error.to_string(), |reason| reason.to_string()),
+    })
 }
 
 fn usize_to_u64(value: usize) -> u64 {
@@ -2325,6 +2337,39 @@ mod tests {
             assert!(
                 sink.entries().is_empty(),
                 "hash tier should not persist vectors"
+            );
+        });
+    }
+
+    #[test]
+    fn process_batch_stops_at_checkpoint_when_cancelled() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let sink = Arc::new(InMemoryVectorSink::default());
+            let fast = Arc::new(StubEmbedder::new("fast-tier", 2, None, 1.0));
+            let runner = make_runner(
+                JobQueueConfig::default(),
+                PipelineConfig::default(),
+                fast,
+                None,
+                Arc::clone(&sink),
+            );
+
+            runner
+                .ingest(IngestRequest::new("doc-cancel", "cancel me"))
+                .expect("ingest should enqueue a processable job");
+
+            cx.cancel_with(asupersync::CancelKind::User, Some("pipeline cancel probe"));
+            let error = runner
+                .process_batch(&cx, "worker-cancel")
+                .await
+                .expect_err("cancelled process_batch must not complete the job");
+            assert!(
+                matches!(error, SearchError::Cancelled { ref phase, .. } if phase == "storage.pipeline.process_batch"),
+                "expected process_batch checkpoint cancel, got {error:?}"
+            );
+            assert!(
+                sink.entries().is_empty(),
+                "cancelled process_batch must not persist vectors"
             );
         });
     }
