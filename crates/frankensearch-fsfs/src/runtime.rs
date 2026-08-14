@@ -3172,12 +3172,31 @@ fn missing_asset_reason(tag: &str, triple: &str, asset_names: &[String]) -> Stri
     } else {
         asset_names.join(", ")
     };
-    format!(
-        "release {tag} has no prebuilt binary for {triple}; build from source \
-         (git clone https://github.com/{GITHUB_OWNER}/{GITHUB_REPO} && \
-         cargo build --release -p frankensearch-fsfs) or wait for a release \
-         that ships this target (assets on this release: {available})"
-    )
+    let requested = release_asset_filename(tag, triple);
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+    let ext = if triple.contains("windows") {
+        "zip"
+    } else {
+        "tar.xz"
+    };
+    let lite_sibling = format!("fsfs-lite-{version}-{triple}.{ext}");
+    if !requested.starts_with("fsfs-lite-") && release_has_asset(asset_names, &lite_sibling) {
+        format!(
+            "release {tag} has no full (embedded-model) binary for {triple}; \
+             lite archive `{lite_sibling}` is present but has no semantic models \
+             and is not a substitute. Build from source \
+             (git clone https://github.com/{GITHUB_OWNER}/{GITHUB_REPO} && \
+             cargo build --release -p frankensearch-fsfs) or wait for a full \
+             asset (assets on this release: {available})"
+        )
+    } else {
+        format!(
+            "release {tag} has no prebuilt binary for {triple}; build from source \
+             (git clone https://github.com/{GITHUB_OWNER}/{GITHUB_REPO} && \
+             cargo build --release -p frankensearch-fsfs) or wait for a release \
+             that ships this target (assets on this release: {available})"
+        )
+    }
 }
 
 /// Extract the expected SHA-256 hash for a given asset filename from a
@@ -29166,6 +29185,25 @@ mod tests {
         assert!(reason.contains("aarch64-apple-darwin"));
         assert!(reason.contains("build from source"));
         assert!(reason.contains("fsfs-lite-1.4.3-x86_64-unknown-linux-musl.tar.xz"));
+        assert!(
+            !reason.contains("not a substitute"),
+            "a different triple's lite archive is not this target's lite sibling: {reason}"
+        );
+    }
+
+    #[test]
+    fn missing_asset_reason_names_same_triple_lite_without_calling_it_full() {
+        let assets = vec![
+            "fsfs-lite-1.6.0-aarch64-apple-darwin.tar.xz".to_owned(),
+            "fsfs-lite-1.6.0-x86_64-unknown-linux-musl.tar.xz".to_owned(),
+        ];
+        let reason = super::missing_asset_reason("v1.6.0", "aarch64-apple-darwin", &assets);
+        assert!(
+            reason.contains("fsfs-lite-1.6.0-aarch64-apple-darwin.tar.xz")
+                && reason.contains("not a substitute")
+                && reason.contains("no semantic models"),
+            "Apple Silicon update must name the lite sibling without treating it as full: {reason}"
+        );
     }
 
     #[test]

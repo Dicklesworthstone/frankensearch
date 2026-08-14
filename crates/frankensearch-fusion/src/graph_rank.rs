@@ -61,7 +61,7 @@ impl GraphRanker {
                 ScoredResult {
                     doc_id: doc_id.into(),
                     score: score_f32,
-                    source: ScoreSource::SemanticFast,
+                    source: ScoreSource::Hybrid,
                     index: None,
                     fast_score: Some(score_f32),
                     quality_score: None,
@@ -619,6 +619,12 @@ mod tests {
             assert!(
                 results.iter().any(|result| result.doc_id == "doc-c"),
                 "second hop should get propagated graph signal"
+            );
+            assert!(
+                results
+                    .iter()
+                    .all(|result| result.source == frankensearch_core::types::ScoreSource::Hybrid),
+                "graph PageRank is not a semantic embedding score"
             );
         });
     }
