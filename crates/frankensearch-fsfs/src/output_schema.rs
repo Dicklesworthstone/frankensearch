@@ -1296,7 +1296,14 @@ mod tests {
         let decoded: SearchPayload = serde_json::from_str(&json).expect("deserialize payload");
         assert_eq!(decoded, payload);
         assert_eq!(decoded.returned_hits, 2);
-        assert_eq!(decoded.degradation_advice.len(), 8);
+        assert_eq!(decoded.degradation_advice.len(), 9);
+        assert_eq!(
+            decoded
+                .degradation_advice
+                .get("degrade.advice.hash_control")
+                .map(|advice| advice.reason_code.as_str()),
+            Some("degrade.advice.hash_control")
+        );
         assert_eq!(
             decoded
                 .degradation_advice

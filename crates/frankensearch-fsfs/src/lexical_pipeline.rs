@@ -1043,8 +1043,8 @@ mod tests {
                 index
                     .search_doc_ids(&cx, "alpha", 10)
                     .expect("query Quill")
-                    .into_iter()
-                    .map(|hit| hit.document_id)
+                    .iter()
+                    .map(|hit| hit.document_id.clone())
                     .collect::<Vec<_>>(),
                 vec!["doc-a"]
             );
@@ -1075,8 +1075,8 @@ mod tests {
                 index
                     .search_doc_ids(&cx, "gamma", 10)
                     .expect("query updated Quill text")
-                    .into_iter()
-                    .map(|hit| hit.document_id)
+                    .iter()
+                    .map(|hit| hit.document_id.clone())
                     .collect::<Vec<_>>(),
                 vec!["doc-a"]
             );
@@ -1126,8 +1126,8 @@ mod tests {
                 index
                     .search_doc_ids(&cx, "delta", 10)
                     .expect("query mixed upsert")
-                    .into_iter()
-                    .map(|hit| hit.document_id)
+                    .iter()
+                    .map(|hit| hit.document_id.clone())
                     .collect::<Vec<_>>(),
                 vec!["doc-c"]
             );
@@ -1179,8 +1179,8 @@ mod tests {
                 index
                     .search_doc_ids(&cx, "epsilon", 10)
                     .expect("query cross-flush upsert")
-                    .into_iter()
-                    .map(|hit| hit.document_id)
+                    .iter()
+                    .map(|hit| hit.document_id.clone())
                     .collect::<Vec<_>>(),
                 vec!["doc-d"]
             );
@@ -1285,8 +1285,8 @@ mod tests {
                 index
                     .search_doc_ids(&cx, "replacement", 10)
                     .expect("query replacement content")
-                    .into_iter()
-                    .map(|hit| hit.document_id)
+                    .iter()
+                    .map(|hit| hit.document_id.clone())
                     .collect::<Vec<_>>(),
                 vec!["changed"]
             );
@@ -1413,8 +1413,8 @@ mod tests {
                     index
                         .search_doc_ids(&cx, "common", documents.len())
                         .expect("query result artifact")
-                        .into_iter()
-                        .map(|hit| (hit.document_id, hit.score.to_bits()))
+                        .iter()
+                        .map(|hit| (hit.document_id.clone(), hit.score.to_bits()))
                         .collect::<Vec<_>>()
                 };
                 assert_eq!(

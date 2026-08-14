@@ -1392,6 +1392,40 @@ impl OpsStorage {
             "opening ops storage connection"
         );
 
+        const OPEN_ATTEMPTS: usize = 12;
+        let mut pending = Some(config);
+        let mut last_error = None;
+        for attempt in 0..OPEN_ATTEMPTS {
+            let last_attempt = attempt + 1 == OPEN_ATTEMPTS;
+            let attempt_config = if last_attempt {
+                pending
+                    .take()
+                    .expect("final open attempt still owns config")
+            } else {
+                pending
+                    .as_ref()
+                    .expect("open retry still owns config")
+                    .clone()
+            };
+            match Self::open_once(attempt_config) {
+                Ok(storage) => return Ok(storage),
+                Err(error) if !last_attempt && is_retryable_storage_contention(&error) => {
+                    tracing::debug!(
+                        target: "frankensearch.ops.storage",
+                        attempt = attempt + 1,
+                        error = %error,
+                        "retrying ops storage open after transient snapshot contention"
+                    );
+                    last_error = Some(error);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.expect("open retry loop retains the last contention error"))
+    }
+
+    fn open_once(config: OpsStorageConfig) -> SearchResult<Self> {
         let conn = AsyncConnection::open_sync(config.db_path.to_string_lossy().to_string())
             .map_err(ops_error)?;
         let storage = Self {
@@ -3712,6 +3746,14 @@ where
         subsystem: "ops-storage",
         source: Box::new(source),
     }
+}
+
+fn is_retryable_storage_contention(error: &SearchError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("busysnapshot")
+        || message.contains("busy")
+        || message.contains("locked")
+        || message.contains("snapshot")
 }
 
 #[cfg(test)]

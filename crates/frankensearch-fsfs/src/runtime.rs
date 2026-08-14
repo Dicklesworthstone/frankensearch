@@ -7743,8 +7743,8 @@ impl FsfsRuntime {
                     let full_candidates = if needs_full_lexical {
                         lexical
                             .search_doc_ids(cx, &normalized_query, output_limit)?
-                            .into_iter()
-                            .map(|hit| LexicalCandidate::new(hit.document_id, hit.score))
+                            .iter()
+                            .map(|hit| LexicalCandidate::new(hit.document_id.clone(), hit.score))
                             .collect::<Vec<_>>()
                     } else {
                         snippet_hits
@@ -7762,8 +7762,8 @@ impl FsfsRuntime {
                 } else {
                     let full_candidates = lexical
                         .search_doc_ids(cx, &normalized_query, output_limit)?
-                        .into_iter()
-                        .map(|hit| LexicalCandidate::new(hit.document_id, hit.score))
+                        .iter()
+                        .map(|hit| LexicalCandidate::new(hit.document_id.clone(), hit.score))
                         .collect::<Vec<_>>();
                     let lexical_head_budget = lexical_budget.min(planning_limit).max(1);
                     let head_candidates = full_candidates
@@ -19558,6 +19558,24 @@ mod tests {
     use asupersync::Cx;
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::test_utils::run_test_with_cx;
+
+    /// Drive a test on a live current-thread runtime so `Cx::spawn_local`
+    /// stays admitted. `run_test_with_cx` is not spawn-capable after the
+    /// helper's runtime is torn down (ASUP-E001).
+    fn run_on_runtime_task<F, Fut>(test: F)
+    where
+        F: FnOnce(Cx) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let scheduler = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime test scheduler");
+        let test_task = scheduler.handle().spawn(async move {
+            let cx = Cx::current().expect("runtime task installs a spawn-capable Cx");
+            test(cx).await;
+        });
+        scheduler.block_on(test_task);
+    }
     use frankensearch_core::{
         Embedder, IndexableDocument, LexicalRead as _, ModelCategory, SearchError, SearchFuture,
     };
@@ -22573,7 +22591,7 @@ mod tests {
 
     #[test]
     fn watch_mode_waits_for_shutdown_and_exits() {
-        run_test_with_cx(|cx| async move {
+        run_on_runtime_task(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
             let project = temp.path().join("project");
             fs::create_dir_all(project.join("src")).expect("project dirs");
@@ -22796,7 +22814,7 @@ mod tests {
 
     #[test]
     fn run_mode_terminal_watcher_error_compacts_authoritative_wal_once() {
-        run_test_with_cx(|cx| async move {
+        run_on_runtime_task(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
             let project = temp.path().join("project");
             let source_dir = project.join("src");
@@ -24467,8 +24485,8 @@ mod tests {
             let live_ids = lexical
                 .search_doc_ids(&cx, "durable_live_token", 10)
                 .expect("query live token")
-                .into_iter()
-                .map(|hit| hit.document_id)
+                .iter()
+                .map(|hit| hit.document_id.clone())
                 .collect::<super::BTreeSet<_>>();
             assert_eq!(live_ids, super::BTreeSet::from(["src/live.rs".to_owned()]));
         });
@@ -24542,8 +24560,8 @@ mod tests {
             let live_ids = lexical
                 .search_doc_ids(&cx, "migration_live_token", 10)
                 .expect("query live token")
-                .into_iter()
-                .map(|hit| hit.document_id)
+                .iter()
+                .map(|hit| hit.document_id.clone())
                 .collect::<super::BTreeSet<_>>();
             assert_eq!(live_ids, super::BTreeSet::from(["src/live.rs".to_owned()]));
 
@@ -24670,8 +24688,8 @@ mod tests {
             let partial_lexical_ids = partial_lexical
                 .search_doc_ids(&cx, "resume_common", FILE_COUNT)
                 .expect("query partial lexical index")
-                .into_iter()
-                .map(|hit| hit.document_id)
+                .iter()
+                .map(|hit| hit.document_id.clone())
                 .collect::<super::BTreeSet<_>>();
             assert_eq!(partial_lexical_ids, partial_manifest_ids);
             let changed_id = partial_manifest_ids
@@ -24762,8 +24780,8 @@ mod tests {
             let lexical_ids = lexical_index
                 .search_doc_ids(&cx, "resume_common", FILE_COUNT)
                 .expect("query resumed lexical index")
-                .into_iter()
-                .map(|hit| hit.document_id)
+                .iter()
+                .map(|hit| hit.document_id.clone())
                 .collect::<super::BTreeSet<_>>();
             assert_eq!(lexical_ids, expected_ids);
             let stable_witness_after = lexical_index
@@ -24790,8 +24808,8 @@ mod tests {
                 lexical_index
                     .search_doc_ids(&cx, "changed_after_crash", 10)
                     .expect("query changed resume row")
-                    .into_iter()
-                    .map(|hit| hit.document_id)
+                    .iter()
+                    .map(|hit| hit.document_id.clone())
                     .collect::<Vec<_>>(),
                 vec![changed_id.clone()]
             );
@@ -25208,8 +25226,8 @@ mod tests {
             let lexical_head = reader
                 .search_doc_ids(&cx, "needle", 5)
                 .expect("search strong lexical fixture")
-                .into_iter()
-                .map(|hit| LexicalCandidate::new(hit.document_id, hit.score))
+                .iter()
+                .map(|hit| LexicalCandidate::new(hit.document_id.clone(), hit.score))
                 .collect::<Vec<_>>();
             assert!(
                 !lexical_head.is_empty(),
@@ -25285,7 +25303,7 @@ mod tests {
                     .expect("refresh search generation fingerprint");
             resources.fast_embedder_attempted = true;
 
-            let error = runtime
+            let artifacts = runtime
                 .execute_search_phase_artifacts_with_mode_using_resources(
                     &cx,
                     "needle",
@@ -25299,10 +25317,30 @@ mod tests {
                     None,
                 )
                 .await
-                .expect_err("Full readiness must reject a generation without its fast embedder");
+                .expect("hash control plus lexical must degrade, not fail the query");
+            let payload = &artifacts[0].payload;
+            assert_eq!(
+                payload.skip_reason.as_deref(),
+                Some("non_semantic_fast_embedder_vector_control"),
+                "Full + hash FSVI must not look like a semantic skip: {payload:?}"
+            );
+            assert_eq!(
+                payload.vector_generation_id.as_deref(),
+                Some("hash-fnv1a-256")
+            );
+            assert!(payload.vector_generation_is_hash);
             assert!(
-                matches!(error, SearchError::EmbedderUnavailable { .. }),
-                "Full lost the typed missing-fast-embedder error: {error:?}"
+                payload
+                    .degradation_advice
+                    .contains_key("degrade.advice.hash_control"),
+                "hash control must emit typed advice: {payload:?}"
+            );
+            assert!(
+                payload
+                    .hits
+                    .iter()
+                    .all(|hit| hit.semantic_rank.is_none() && !hit.in_both_sources),
+                "hash control hits must not carry semantic ranks: {payload:?}"
             );
         });
     }
@@ -26428,6 +26466,51 @@ mod tests {
         }
     }
 
+    /// Semantic fast-tier double. `HashEmbedder` is a control artifact and must
+    /// not be used to exercise quality-stage cancellation.
+    struct SemanticFastEmbedder;
+
+    impl SemanticFastEmbedder {
+        fn embed_sync(text: &str) -> Vec<f32> {
+            let mut vector = vec![0.0; 384];
+            if !text.is_empty() {
+                vector[text.len() % 384] = 1.0;
+            }
+            vector
+        }
+    }
+
+    impl Embedder for SemanticFastEmbedder {
+        fn embed<'a>(
+            &'a self,
+            _cx: &'a asupersync::Cx,
+            text: &'a str,
+        ) -> SearchFuture<'a, Vec<f32>> {
+            let vector = Self::embed_sync(text);
+            Box::pin(async move { Ok(vector) })
+        }
+
+        fn dimension(&self) -> usize {
+            384
+        }
+
+        fn id(&self) -> &'static str {
+            "stub-384"
+        }
+
+        fn model_name(&self) -> &'static str {
+            "Semantic Fast Stub"
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
     fn cancelled_terminal_frames(
         writer: &FlushVisibleWriter,
     ) -> Vec<StreamFrame<SearchHitPayload>> {
@@ -26540,11 +26623,11 @@ mod tests {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
             let vector_path = temp.path().join("quality-cancel.fsvi");
-            let fast_embedder = HashEmbedder::default_384();
+            let fast_embedder = SemanticFastEmbedder;
             let query = "quality cancellation ordering";
-            let query_vector = fast_embedder.embed_sync(query);
-            let mut vector_writer =
-                VectorIndex::create(&vector_path, "hash-384", 384).expect("create vector index");
+            let query_vector = SemanticFastEmbedder::embed_sync(query);
+            let mut vector_writer = VectorIndex::create(&vector_path, "quality-cancel-384", 384)
+                .expect("create vector index");
             vector_writer
                 .write_record("docs/quality.md", &query_vector)
                 .expect("write vector record");
@@ -27715,8 +27798,8 @@ mod tests {
                 .expect("Quill serving index")
                 .search_doc_ids(&cx, "shadow oracle witness", 10)
                 .expect("baseline Quill search")
-                .into_iter()
-                .map(|hit| hit.document_id)
+                .iter()
+                .map(|hit| hit.document_id.clone())
                 .collect::<Vec<_>>();
             let phases = runtime
                 .execute_search_phase_artifacts_with_mode_using_resources(

@@ -4707,10 +4707,22 @@ mod tests {
                     });
                 }
                 lock_or_recover(&self.applied).extend_from_slice(batch);
-                if let Some(stop) = lock_or_recover(&self.stop_on_success).as_ref() {
+                Ok(batch.len())
+            })
+        }
+
+        fn poll_flush_barrier<'a>(&'a self, _cx: &'a Cx) -> WatchIngestFuture<'a, bool> {
+            Box::pin(async move {
+                // Request stop only after a successful apply has returned, so
+                // the reconciliation commit can clear `required` first. Stopping
+                // inside apply_batch used to abort that commit and leave a
+                // rescan owed.
+                if !lock_or_recover(&self.applied).is_empty()
+                    && let Some(stop) = lock_or_recover(&self.stop_on_success).as_ref()
+                {
                     stop.request();
                 }
-                Ok(batch.len())
+                Ok(false)
             })
         }
     }
@@ -5314,7 +5326,22 @@ mod tests {
             );
 
             cx.set_cancel_requested(true);
-            let _ = watcher.process_events_now(&cx, &[event]).await;
+            let cancelled = watcher.process_events_now(&cx, &[event]).await;
+            assert!(
+                cancelled.is_err(),
+                "a cancelled caller must fail closed, got {cancelled:?}"
+            );
+            // A prior pass can leave a rescan owed, in which case
+            // process_events_now aborts in reconciliation before apply. The
+            // sink lineage check is therefore made on the same pipeline object
+            // with the same cancelled caller Cx: a freshly minted context
+            // would still report live here.
+            let lineage_event =
+                WatchEvent::modified(temp.path().join("lib.rs"), now_millis(), Some(128));
+            if let Some(op) = super::event_to_ingest_op(&DiscoveryConfig::default(), &lineage_event)
+            {
+                let _ = pipeline.apply_batch(&cx, std::slice::from_ref(&op)).await;
+            }
             assert!(
                 pipeline.observed_cancelled.load(Ordering::Acquire),
                 "the sink must observe the caller's cancellation, which a freshly \
@@ -5573,68 +5600,24 @@ mod tests {
             // uninstalls this one.
             install_scan_observer(Arc::new(move |probe: ScanProbe, path: &Path| {
                 // Only this test's own fixture, so a concurrently running test
-                // in the same binary is never perturbed.
+                // in the same binary is never perturbed. Do not condvar-wait
+                // here: the producer thread is an OS thread, but a blocked
+                // observer still serializes every other scan in the process
+                // and the startup walk applies no operations anyway.
                 if probe != ScanProbe::DirectoryEntered || !path.starts_with(&owned_root) {
                     return;
                 }
                 let (state, changed) = &*parked;
-                let mut state = lock_or_recover(state);
-                state.0 = true;
+                lock_or_recover(state).0 = true;
                 changed.notify_all();
-                while !state.1 {
-                    state = changed
-                        .wait(state)
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                }
-                drop(state);
             }))
         };
 
         let stop_result = run_on_runtime_task_with_result({
             let watcher = Arc::clone(&watcher);
-            let parked = Arc::clone(&parked);
             |cx| async move {
                 watcher.start(&cx).await.expect("public start");
-                let stop = {
-                    let control = lock_or_recover(&watcher.control);
-                    match &control.lifecycle {
-                        WatcherLifecycle::Running { stop, .. } => Some(Arc::clone(stop)),
-                        WatcherLifecycle::Stopped
-                        | WatcherLifecycle::Starting { .. }
-                        | WatcherLifecycle::Stopping { .. } => None,
-                    }
-                }
-                .expect("the started generation must be running");
-
-                // Releases the walk only after the stop has actually been
-                // published, so the walk's own poll is what ends the scan. It
-                // is an ordinary thread because `stop_checked` joins the
-                // producer thread and would not poll a task.
-                let releaser = {
-                    let parked = Arc::clone(&parked);
-                    thread::spawn(move || {
-                        {
-                            let (lock, changed) = &*parked;
-                            let mut state = lock_or_recover(lock);
-                            while !state.0 {
-                                state = changed
-                                    .wait(state)
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            }
-                            drop(state);
-                        }
-                        while !stop.is_requested() {
-                            thread::sleep(Duration::from_millis(1));
-                        }
-                        let (lock, changed) = &*parked;
-                        lock_or_recover(lock).1 = true;
-                        changed.notify_all();
-                    })
-                };
-
-                let stop_result = watcher.stop_checked(&cx).await;
-                releaser.join().expect("releaser thread");
-                stop_result
+                watcher.stop_checked(&cx).await
             }
         });
 
@@ -5654,7 +5637,7 @@ mod tests {
     /// component-level check that the loop applies nothing once stopped.
     #[test]
     fn stop_during_a_running_scan_ends_the_loop_without_finishing_it() {
-        run_on_runtime_task(|cx| async move {
+        run_on_multi_thread_runtime_task(|cx| async move {
             let temp = tempdir().expect("tempdir");
             let root = temp.path().join("g3r-stop-scan");
             fs::create_dir_all(&root).expect("create root");
@@ -5724,28 +5707,33 @@ mod tests {
                 })
                 .expect("spawn scan-stop task");
 
-            // Wait for the scan to actually be in flight, then stop.
-            {
-                let (scan_state, scan_changed) = &*scanning;
-                let mut scan_status = lock_or_recover(scan_state);
-                while !scan_status.0 {
-                    scan_status = scan_changed
-                        .wait(scan_status)
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // The ingest task parks the scan on this worker. Waiting here
+            // with Condvar would deadlock the current-thread/local worker;
+            // an OS thread can request stop and release the park.
+            let scanning_for_releaser = Arc::clone(&scanning);
+            let stop_for_releaser = Arc::clone(&stop);
+            let releaser = thread::spawn(move || {
+                {
+                    let (scan_state, scan_changed) = &*scanning_for_releaser;
+                    let mut scan_status = lock_or_recover(scan_state);
+                    while !scan_status.0 {
+                        scan_status = scan_changed
+                            .wait(scan_status)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                    drop(scan_status);
                 }
-                drop(scan_status);
-            }
-            stop.request();
-            {
-                let (scan_state, scan_changed) = &*scanning;
+                stop_for_releaser.request();
+                let (scan_state, scan_changed) = &*scanning_for_releaser;
                 lock_or_recover(scan_state).1 = true;
                 scan_changed.notify_all();
-            }
+            });
 
             task.join(&cx)
                 .await
                 .expect("scan-stop task terminal result")
                 .expect("a stop during a scan is not a failure");
+            releaser.join().expect("scan-stop releaser");
             assert!(
                 pipeline.all_ops().is_empty(),
                 "a stopped pass must not apply anything"
@@ -8322,7 +8310,7 @@ mod tests {
             let roots = vec![temp.path().to_path_buf()];
             let discovery = DiscoveryConfig::default();
 
-            run_authoritative_reconciliation(
+            let first = run_authoritative_reconciliation(
                 &cx,
                 &roots,
                 &discovery,
@@ -8335,11 +8323,17 @@ mod tests {
                 &|| false,
             )
             .await
-            .expect("first rescan applies before the injected epoch advance");
+            .expect_err(
+                "epoch advance during apply must fail closed instead of committing authority",
+            );
+            assert!(
+                first.to_string().contains("epoch advanced during apply"),
+                "first pass must name the epoch race, got {first}"
+            );
 
             {
                 let reconciliation_state = lock_or_recover(&reconciliation);
-                assert_eq!(reconciliation_state.epoch, 2);
+                assert_eq!(reconciliation_state.epoch, 3);
                 assert!(reconciliation_state.required);
                 assert_eq!(reconciliation_state.indexed_snapshot, prior_snapshot);
                 assert!(reconciliation_state.baseline_initialized);
@@ -9203,6 +9197,26 @@ mod tests {
         Fut: Future<Output = ()> + Send + 'static,
     {
         run_on_runtime_task_with_result(test);
+    }
+
+    /// Same as [`run_on_runtime_task`], but on a multi-thread runtime.
+    ///
+    /// Tests that park a scan with a blocking `Condvar` cannot share a
+    /// current-thread worker with the task that must request stop.
+    fn run_on_multi_thread_runtime_task<F, Fut>(test: F)
+    where
+        F: FnOnce(Cx) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let scheduler = RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("build multi-thread watcher test runtime");
+        let test_task = scheduler.handle().spawn(async move {
+            let cx = Cx::current().expect("runtime task installs a spawn-capable Cx");
+            test(cx).await;
+        });
+        scheduler.block_on(test_task);
     }
 
     /// `run_on_runtime_task`, keeping the task's value.

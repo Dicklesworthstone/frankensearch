@@ -747,7 +747,7 @@ mod tests {
             replay_body_drift
                 .validate()
                 .expect_err("replay-body drift must fail closed"),
-            "bundle does not match the deterministic artifact derivation for its scenario"
+            "manifest artifact entries do not match the bundle's current payloads"
         );
 
         let mut empty_replay =
@@ -847,7 +847,7 @@ mod tests {
             same_line_count_substitution
                 .validate()
                 .expect_err("same-line-count payload substitution must fail closed"),
-            "bundle does not match the deterministic artifact derivation for its scenario"
+            "manifest artifact entries do not match the bundle's current payloads"
         );
     }
 

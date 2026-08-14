@@ -5901,9 +5901,9 @@ mod tests {
         let forged_hits = index
             .resolve_heap(forged_outcome.heap)
             .expect("resolve forged scan");
-        assert_ne!(
+        assert_eq!(
             forged_hits, expected,
-            "the planted finite forgery would corrupt the exact winner without re-derivation"
+            "a transformed forgery must not change the exact winner: preparation failure falls back to the incumbent flat scan"
         );
         assert!(
             !index

@@ -6,6 +6,33 @@ Entries correspond to [GitHub Releases](https://github.com/Dicklesworthstone/fra
 
 ---
 
+## [v1.6.0](https://github.com/Dicklesworthstone/frankensearch/compare/v1.5.0...v1.6.0) -- 2026-08-14
+
+Product CLI `fsfs` 1.6.0. Crate versions stay decoupled (workspace members 0.2.x, facade 0.3.2). 481 commits since v1.5.0.
+
+### Hash control is no longer presented as semantic search
+
+Hash / FNV / JL vector generations are labeled as control artifacts everywhere an operator or agent can read them: doctor, status, dashboards, search JSON (`skip_reason`, `vector_generation_id`, `vector_generation_is_hash`), table/CSV/explain ranks (`[L H]`, `hash_rank`), stream start, and degradation advice (`degrade.advice.hash_control`).
+
+- `auto_detect` / `require_semantic` no longer classify a two-hash stack as `Full`.
+- `IndexBuilder` will not write a quality FSVI from a hash embedder.
+- `TwoTierSearcher` will not refine quality from hash-control ranks.
+- Full search with a hash FSVI and a lexical index continues as lexical plus typed hash-control advice; it does not pretend to be semantic. Full search with no vector index still fails closed (`IndexNotFound`).
+- FrankenSQLite edges are lockstep on crates.io **0.3.1** (same 0.3 API: autocommit durability, concurrent-open prepare, freelist safety).
+
+### Storage schema
+
+Current storage `SCHEMA_VERSION` is **7** (FTS5 rebuild-version marker). Fresh databases still bootstrap directly to latest; historical v1–v6 fixtures migrate.
+
+### Not in this release
+
+- Mach-O ArtifactStore F1 (needs Darwin/unsafe).
+- Live 50k/100k `--full` corpus numbers were not re-run for this tag.
+- Windows assets remain absent (same as v1.5.0: no Windows build host).
+- GitHub Actions is not used; binaries are produced with dsr.
+
+---
+
 ## [Unreleased — proposed v1.4.0](https://github.com/Dicklesworthstone/frankensearch/compare/v1.3.0...HEAD) -- 2026-04-24 through 2026-07-29
 
 > **Scope window: v1.3.0..HEAD (~1,375 commits), reconstructed as one epoch.** This window is too

@@ -687,18 +687,12 @@ mod tests {
     #[test]
     fn bootstrap_migrates_legacy_schema_versions() {
         let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
-
-        conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);",
-        )
-        .expect("schema_version table should be creatable");
-        let params = [SqliteValue::Integer(SCHEMA_VERSION - 1)];
-        conn.execute_with_params_sync("INSERT INTO schema_version(version) VALUES (?1);", &params)
-            .expect("legacy marker row should insert");
+        let previous = SCHEMA_VERSION - 1;
+        seed_historical_schema(&conn, previous);
 
         assert_eq!(
             current_version_optional(&conn).expect("version should read"),
-            Some(SCHEMA_VERSION - 1)
+            Some(previous)
         );
         bootstrap(&conn).expect("legacy schema should migrate to latest");
         assert_eq!(
@@ -707,7 +701,11 @@ mod tests {
         );
         assert!(
             index_exists(&conn, "search_history", "idx_history_query"),
-            "migration should create search history index"
+            "v6 search-history index must survive the v7 rebuild-marker migration"
+        );
+        assert!(
+            table_exists(&conn, "frankensearch_fts5_rebuild_version"),
+            "v7 migration must create the FTS5 rebuild-version marker table"
         );
     }
 
@@ -873,8 +871,8 @@ mod tests {
     // ── Schema version constant ─────────────────────────────────────────
 
     #[test]
-    fn schema_version_is_six() {
-        assert_eq!(SCHEMA_VERSION, 6);
+    fn schema_version_is_seven() {
+        assert_eq!(SCHEMA_VERSION, 7);
     }
 
     // ── Migration array invariants ──────────────────────────────────────
