@@ -78,6 +78,10 @@ const MIN_MEASUREMENT_RUNS: usize = 10;
 const MAX_MEASUREMENT_RUNS: usize = 100;
 const MEASUREMENT_WARMUP_ROUNDS: &str = "1";
 const MEASUREMENT_BOOTSTRAP_SEED: &str = "5860671082138523204";
+// Cargo discovers this checked-in file, but the receipt-bound `RUSTFLAGS`
+// environment takes precedence over its sole setting. Pinning the exact bytes
+// prevents any additional Cargo setting from entering the promotion build.
+const TRACKED_REPOSITORY_CARGO_CONFIG: &[u8] = b"# Parallel rustc front-end (nightly). Added by build-settings sweep.\n[build]\nrustflags = [\"-Z\", \"threads=4\"]\n";
 const WAIT_RECOVERY_POLL_ATTEMPTS: usize = 100;
 const WAIT_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Fixed startup-only QG-1 authority wire protocol.
@@ -728,7 +732,7 @@ struct CapturedBuild {
     measurement_environment: BTreeMap<OsString, OsString>,
     environment_policy_bytes: Vec<u8>,
     tool_identities: Vec<ResolvedTool>,
-    cargo_config_candidates: Vec<PathBuf>,
+    cargo_config_policy: CargoConfigPolicy,
     executable_path: PathBuf,
     executable: File,
     executable_identity: FileIdentity,
@@ -796,7 +800,30 @@ struct ControlledEnvironments {
     policy_sha256: String,
     policy_bytes: Vec<u8>,
     tools: Vec<ResolvedTool>,
-    cargo_config_candidates: Vec<PathBuf>,
+    cargo_config_policy: CargoConfigPolicy,
+}
+
+#[derive(Debug)]
+struct CargoConfigPolicy {
+    tracked_repository_config: PathBuf,
+    forbidden_candidates: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CargoConfigFilesystemStamp {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+#[derive(Debug)]
+struct CargoConfigGuard {
+    paths: BTreeMap<PathBuf, Option<CargoConfigFilesystemStamp>>,
 }
 
 #[derive(Debug)]
@@ -5035,8 +5062,8 @@ fn controlled_environments(
     let cargo_home = canonical_environment_directory("CARGO_HOME", Some(&home.join(".cargo")))?;
     let rustup_home = canonical_environment_directory("RUSTUP_HOME", Some(&home.join(".rustup")))?;
     let repository_root = capture_repository_root()?;
-    let cargo_config_candidates = cargo_config_candidates(&repository_root, &cargo_home);
-    reject_cargo_config_candidates(&cargo_config_candidates)?;
+    let cargo_config_policy = cargo_config_policy(&repository_root, &cargo_home);
+    verify_cargo_config_policy(&cargo_config_policy)?;
     let path = required_unicode_environment("PATH")?;
     validate_absolute_path_list(&path)?;
     let rustup = resolve_path_tool("rustup", &path)?;
@@ -5311,7 +5338,18 @@ fn controlled_environments(
         rustup.path.display().to_string(),
     );
     policy.insert("tool.rustup_sha256".to_owned(), rustup.sha256.clone());
-    for (index, candidate) in cargo_config_candidates.iter().enumerate() {
+    policy.insert(
+        "cargo_config.tracked_path".to_owned(),
+        unicode_os(
+            cargo_config_policy.tracked_repository_config.as_os_str(),
+            "tracked repository Cargo configuration path",
+        )?,
+    );
+    policy.insert(
+        "cargo_config.discovered_but_rustflags_overridden_sha256".to_owned(),
+        sha256_hex(TRACKED_REPOSITORY_CARGO_CONFIG),
+    );
+    for (index, candidate) in cargo_config_policy.forbidden_candidates.iter().enumerate() {
         policy.insert(
             format!("cargo_config_absence.{index}"),
             unicode_os(candidate.as_os_str(), "Cargo configuration candidate path")?,
@@ -5330,38 +5368,117 @@ fn controlled_environments(
         policy_sha256,
         policy_bytes,
         tools: vec![cargo, rustc, git, rustup],
-        cargo_config_candidates,
+        cargo_config_policy,
     })
 }
 
-fn cargo_config_candidates(repository_root: &Path, cargo_home: &Path) -> Vec<PathBuf> {
+fn cargo_config_policy(repository_root: &Path, cargo_home: &Path) -> CargoConfigPolicy {
+    let tracked_repository_config = repository_root.join(".cargo").join("config.toml");
     let mut candidates = BTreeSet::new();
     for ancestor in repository_root.ancestors() {
         candidates.insert(ancestor.join(".cargo").join("config"));
-        candidates.insert(ancestor.join(".cargo").join("config.toml"));
+        let config_toml = ancestor.join(".cargo").join("config.toml");
+        if config_toml != tracked_repository_config {
+            candidates.insert(config_toml);
+        }
     }
     candidates.insert(cargo_home.join("config"));
     candidates.insert(cargo_home.join("config.toml"));
-    candidates.into_iter().collect()
+    candidates.remove(&tracked_repository_config);
+    CargoConfigPolicy {
+        tracked_repository_config,
+        forbidden_candidates: candidates.into_iter().collect(),
+    }
 }
 
-fn reject_cargo_config_candidates(candidates: &[PathBuf]) -> Result<(), LocalPerfRunError> {
-    reject_cargo_config_candidates_with(candidates, Path::try_exists)
+fn verify_cargo_config_policy(policy: &CargoConfigPolicy) -> Result<(), LocalPerfRunError> {
+    verify_cargo_config_policy_with(policy, Path::try_exists, |path| fs::read(path))
 }
 
-fn reject_cargo_config_candidates_with(
-    candidates: &[PathBuf],
+fn verify_cargo_config_policy_with(
+    policy: &CargoConfigPolicy,
     mut exists: impl FnMut(&Path) -> std::io::Result<bool>,
+    mut read: impl FnMut(&Path) -> std::io::Result<Vec<u8>>,
 ) -> Result<(), LocalPerfRunError> {
-    for candidate in candidates {
+    let tracked_bytes = read(&policy.tracked_repository_config)?;
+    if tracked_bytes != TRACKED_REPOSITORY_CARGO_CONFIG {
+        return Err(LocalPerfRunError::Invalid(
+            "promotion build requires the exact receipt-bound tracked repository .cargo/config.toml"
+                .to_owned(),
+        ));
+    }
+    for candidate in &policy.forbidden_candidates {
         if exists(candidate)? {
             return Err(LocalPerfRunError::Invalid(
-                "promotion build rejects Cargo configuration from the repository, an ancestor directory, or CARGO_HOME"
+                "promotion build rejects unbound repository, ancestor, or CARGO_HOME Cargo configuration"
                     .to_owned(),
             ));
         }
     }
     Ok(())
+}
+
+fn cargo_config_filesystem_stamp(
+    path: &Path,
+) -> Result<Option<CargoConfigFilesystemStamp>, LocalPerfRunError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(CargoConfigFilesystemStamp {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        mode: metadata.mode(),
+        length: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    }))
+}
+
+fn capture_cargo_config_guard(
+    policy: &CargoConfigPolicy,
+) -> Result<CargoConfigGuard, LocalPerfRunError> {
+    verify_cargo_config_policy(policy)?;
+    let mut watched_paths = BTreeSet::new();
+    for config_path in
+        std::iter::once(&policy.tracked_repository_config).chain(&policy.forbidden_candidates)
+    {
+        watched_paths.insert(config_path.clone());
+        let mut ancestor = config_path.parent();
+        while let Some(path) = ancestor {
+            if cargo_config_filesystem_stamp(path)?.is_some() {
+                watched_paths.insert(path.to_owned());
+                break;
+            }
+            ancestor = path.parent();
+        }
+    }
+    let paths = watched_paths
+        .into_iter()
+        .map(|path| {
+            let stamp = cargo_config_filesystem_stamp(&path)?;
+            Ok((path, stamp))
+        })
+        .collect::<Result<_, LocalPerfRunError>>()?;
+    Ok(CargoConfigGuard { paths })
+}
+
+fn verify_cargo_config_guard(
+    policy: &CargoConfigPolicy,
+    guard: &CargoConfigGuard,
+) -> Result<(), LocalPerfRunError> {
+    for (path, expected) in &guard.paths {
+        if cargo_config_filesystem_stamp(path)?.as_ref() != expected.as_ref() {
+            return Err(LocalPerfRunError::Invalid(format!(
+                "Cargo configuration path or discovery directory changed during the promotion build: {}",
+                path.display()
+            )));
+        }
+    }
+    verify_cargo_config_policy(policy)
 }
 
 #[derive(Debug, Clone)]
@@ -5737,7 +5854,7 @@ fn prepare_benchmark(
 ) -> Result<CapturedBuild, LocalPerfRunError> {
     verify_pinned_directory(target)?;
     verify_resolved_tools(&environments.tools)?;
-    reject_cargo_config_candidates(&environments.cargo_config_candidates)?;
+    let cargo_config_guard = capture_cargo_config_guard(&environments.cargo_config_policy)?;
     let cargo_path = environments
         .measurement
         .get(OsStr::new("CARGO"))
@@ -5764,13 +5881,13 @@ fn prepare_benchmark(
         .env_clear()
         .envs(&environments.build);
     let output = cargo.output()?;
+    verify_cargo_config_guard(&environments.cargo_config_policy, &cargo_config_guard)?;
     if !output.status.success() {
         return Err(LocalPerfRunError::Invalid(format!(
             "typed benchmark build failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    reject_cargo_config_candidates(&environments.cargo_config_candidates)?;
     verify_resolved_tools(&environments.tools)?;
 
     let mut executables = BTreeSet::new();
@@ -5861,7 +5978,7 @@ fn prepare_benchmark(
         measurement_environment: environments.measurement,
         environment_policy_bytes: environments.policy_bytes,
         tool_identities: environments.tools,
-        cargo_config_candidates: environments.cargo_config_candidates,
+        cargo_config_policy: environments.cargo_config_policy,
         executable_path: executable,
         executable: executable_handle,
         executable_identity,
@@ -5875,7 +5992,7 @@ fn verify_prepared_build(
 ) -> Result<(), LocalPerfRunError> {
     verify_pinned_directory(target)?;
     verify_resolved_tools(&expected.tool_identities)?;
-    reject_cargo_config_candidates(&expected.cargo_config_candidates)?;
+    verify_cargo_config_policy(&expected.cargo_config_policy)?;
     verify_benchmark_path(
         &expected.executable_path,
         &expected.executable_identity,
@@ -10925,11 +11042,35 @@ mod tests {
     }
 
     #[test]
-    fn cargo_ancestor_configuration_is_rejected_before_build() {
-        let candidates = cargo_config_candidates(
+    fn exact_tracked_cargo_config_is_admitted_and_unbound_configs_reject() {
+        let policy = cargo_config_policy(
             Path::new("/registered/repository"),
             Path::new("/home/perf/.cargo"),
         );
+        assert_eq!(
+            policy.tracked_repository_config,
+            PathBuf::from("/registered/repository/.cargo/config.toml")
+        );
+        assert!(
+            !policy
+                .forbidden_candidates
+                .contains(&policy.tracked_repository_config)
+        );
+        verify_cargo_config_policy_with(
+            &policy,
+            |_| Ok(false),
+            |_| Ok(TRACKED_REPOSITORY_CARGO_CONFIG.to_vec()),
+        )
+        .expect("exact tracked Cargo configuration is receipt-bound");
+
+        let modified_error = verify_cargo_config_policy_with(
+            &policy,
+            |_| Ok(false),
+            |_| Ok(b"[build]\nrustflags = []\n".to_vec()),
+        )
+        .expect_err("modified tracked Cargo configuration must reject");
+        assert!(modified_error.to_string().contains("exact receipt-bound"));
+
         for hostile in [
             Path::new("/registered/repository/.cargo/config"),
             Path::new("/registered/.cargo/config.toml"),
@@ -10937,18 +11078,95 @@ mod tests {
             Path::new("/home/perf/.cargo/config.toml"),
         ] {
             assert!(
-                candidates.iter().any(|candidate| candidate == hostile),
+                policy
+                    .forbidden_candidates
+                    .iter()
+                    .any(|candidate| candidate == hostile),
                 "Cargo hierarchy omitted {}",
                 hostile.display()
             );
-            let error = reject_cargo_config_candidates_with(&candidates, |candidate| {
-                Ok(candidate == hostile)
-            })
+            let error = verify_cargo_config_policy_with(
+                &policy,
+                |candidate| Ok(candidate == hostile),
+                |_| Ok(TRACKED_REPOSITORY_CARGO_CONFIG.to_vec()),
+            )
             .expect_err("hostile Cargo configuration must reject");
-            assert!(error.to_string().contains("rejects Cargo configuration"));
+            assert!(error.to_string().contains("rejects unbound"));
         }
-        reject_cargo_config_candidates_with(&candidates, |_| Ok(false))
-            .expect("config-free Cargo hierarchy");
+    }
+
+    #[test]
+    fn checked_in_cargo_config_matches_the_promotion_build_contract() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(".cargo/config.toml");
+        assert_eq!(
+            fs::read(path).expect("checked-in workspace Cargo configuration"),
+            TRACKED_REPOSITORY_CARGO_CONFIG
+        );
+    }
+
+    #[test]
+    fn cargo_config_guard_rejects_a_transient_unbound_candidate() {
+        let directory = tempfile::tempdir().expect("Cargo configuration guard directory");
+        let repository = directory.path().join("repository");
+        let repository_cargo = repository.join(".cargo");
+        let cargo_home = directory.path().join("cargo-home");
+        fs::create_dir_all(&repository_cargo).expect("repository Cargo directory");
+        fs::create_dir_all(&cargo_home).expect("Cargo home directory");
+        fs::write(
+            repository_cargo.join("config.toml"),
+            TRACKED_REPOSITORY_CARGO_CONFIG,
+        )
+        .expect("tracked Cargo configuration");
+        let policy = cargo_config_policy(&repository, &cargo_home);
+        let guard = capture_cargo_config_guard(&policy).expect("pre-build Cargo config guard");
+
+        let transient = repository_cargo.join("config");
+        fs::write(&transient, b"[build]\nrustflags = []\n")
+            .expect("transient hostile Cargo configuration");
+        fs::rename(&transient, repository_cargo.join("parked-config"))
+            .expect("remove hostile configuration from Cargo discovery without deleting it");
+
+        verify_cargo_config_policy(&policy).expect("static policy looks restored");
+        assert!(
+            verify_cargo_config_guard(&policy, &guard)
+                .expect_err("transient Cargo configuration must invalidate the build")
+                .to_string()
+                .contains("changed during the promotion build")
+        );
+    }
+
+    #[test]
+    fn cargo_config_guard_rejects_a_restored_tracked_path() {
+        let directory = tempfile::tempdir().expect("Cargo configuration guard directory");
+        let repository = directory.path().join("repository");
+        let repository_cargo = repository.join(".cargo");
+        let cargo_home = directory.path().join("cargo-home");
+        fs::create_dir_all(&repository_cargo).expect("repository Cargo directory");
+        fs::create_dir_all(&cargo_home).expect("Cargo home directory");
+        let tracked = repository_cargo.join("config.toml");
+        fs::write(&tracked, TRACKED_REPOSITORY_CARGO_CONFIG).expect("tracked Cargo configuration");
+        let replacement = repository_cargo.join("hostile-replacement");
+        fs::write(&replacement, b"[build]\nrustflags = []\n")
+            .expect("hostile Cargo configuration replacement");
+        let policy = cargo_config_policy(&repository, &cargo_home);
+        let guard = capture_cargo_config_guard(&policy).expect("pre-build Cargo config guard");
+
+        let original = repository_cargo.join("original-config");
+        let parked_hostile = repository_cargo.join("parked-hostile-config");
+        fs::rename(&tracked, &original).expect("park original tracked configuration");
+        fs::rename(&replacement, &tracked).expect("install hostile tracked configuration");
+        fs::rename(&tracked, &parked_hostile).expect("park hostile tracked configuration");
+        fs::rename(&original, &tracked).expect("restore original tracked configuration");
+
+        verify_cargo_config_policy(&policy).expect("static policy looks restored");
+        assert!(
+            verify_cargo_config_guard(&policy, &guard)
+                .expect_err("restored Cargo configuration path must invalidate the build")
+                .to_string()
+                .contains("changed during the promotion build")
+        );
     }
 
     #[test]
