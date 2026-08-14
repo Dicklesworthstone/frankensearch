@@ -759,6 +759,37 @@ mod lexical {
 
     #[cfg(feature = "lexical-tantivy")]
     #[test]
+    fn public_redundant_deep_groups_match_tantivy_oracle() {
+        super::quiet_logging();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let docs = vec![
+                IndexableDocument::new("nested-hit", "depthneedle"),
+                IndexableDocument::new("negative-control", "haystack"),
+            ];
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let quill = build_quill_index(&cx, &tmp.path().join("quill"), &docs).await;
+            let tantivy = build_tantivy_index(&cx, &tmp.path().join("tantivy"), &docs).await;
+            let wrapper_count = frankensearch::quill::MAX_QUERY_DEPTH + 1;
+            let query = format!(
+                "{}depthneedle{}",
+                "(".repeat(wrapper_count),
+                ")".repeat(wrapper_count)
+            );
+
+            let tantivy_hits = public_observation(&tantivy, &cx, &query, 10).await;
+            assert_eq!(tantivy_hits.len(), 1);
+            assert_eq!(tantivy_hits[0].0, "nested-hit");
+
+            let quill_hits = public_observation(&quill, &cx, &query, 10).await;
+            assert_eq!(
+                quill_hits, tantivy_hits,
+                "semantically inert wrappers must not turn a valid public query into match-none"
+            );
+        });
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    #[test]
     fn public_unfielded_three_term_or_matches_tantivy_score_bits_and_order() {
         super::quiet_logging();
         asupersync::test_utils::run_test_with_cx(|cx| async move {

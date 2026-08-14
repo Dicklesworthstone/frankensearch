@@ -806,7 +806,8 @@ impl DefaultQueryParser {
         }
 
         let explanation = classify_query(query);
-        let tokens = lex(query, &mut diagnostics);
+        let mut tokens = lex(query, &mut diagnostics);
+        peel_redundant_outer_groups(&mut tokens);
         let mut grammar = Grammar {
             parser: *self,
             tokens,
@@ -1137,6 +1138,44 @@ enum LexToken {
         byte_offset: usize,
         boost: Option<String>,
     },
+}
+
+/// Remove balanced, unfielded, unboosted wrappers around the whole token
+/// stream before recursive descent. These groups are semantically inert, so
+/// charging them against the depth limit turns a valid term into match-none
+/// without protecting the parser from genuinely nested Boolean structure.
+fn peel_redundant_outer_groups(tokens: &mut Vec<LexToken>) {
+    let mut peel_count = tokens
+        .iter()
+        .take_while(|token| matches!(token, LexToken::LeftParen { field: None, .. }))
+        .count();
+    if peel_count == 0 {
+        return;
+    }
+
+    let token_count = tokens.len();
+    let mut depth = 0_usize;
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            LexToken::LeftParen { .. } => depth += 1,
+            LexToken::RightParen { boost, .. } => {
+                if depth == 0 {
+                    return;
+                }
+                if depth <= peel_count && (index != token_count - depth || boost.is_some()) {
+                    peel_count = depth - 1;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 || peel_count == 0 {
+        return;
+    }
+
+    tokens.drain(..peel_count);
+    tokens.truncate(tokens.len() - peel_count);
 }
 
 impl LexToken {
@@ -7078,17 +7117,34 @@ mod tests {
 
     #[test]
     fn recursive_depth_is_bounded() {
-        let query = format!(
-            "{}needle{}",
-            "(".repeat(MAX_QUERY_DEPTH + 20),
-            ")".repeat(MAX_QUERY_DEPTH + 20)
-        );
+        let mut query = "needle".to_owned();
+        for _ in 0..MAX_QUERY_DEPTH + 20 {
+            query = format!("needle OR ({query})");
+        }
         let parsed = parser().parse(&query);
         assert!(
             parsed
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.kind == QueryDiagnosticKind::DepthLimit)
+        );
+    }
+
+    #[test]
+    fn redundant_outer_groups_do_not_consume_the_depth_budget() {
+        let query = format!(
+            "{}needle{}",
+            "(".repeat(MAX_QUERY_DEPTH + 20),
+            ")".repeat(MAX_QUERY_DEPTH + 20)
+        );
+        let parsed = parser().parse(&query);
+        let unwrapped = parser().parse("needle");
+        assert_eq!(parsed.query, unwrapped.query);
+        assert!(
+            parsed
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.kind != QueryDiagnosticKind::DepthLimit)
         );
     }
 
