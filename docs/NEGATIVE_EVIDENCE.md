@@ -19039,3 +19039,60 @@ this workload. Reopen this allocation vein only if a fresh exact-corpus profile
 supports a materially different representation that removes row
 materialization or aggregate staging, with exact-byte parity and a new
 same-invocation null.
+
+### 2026-08-14 — REJECT: direct aggregate term streaming is slower than legacy staging
+
+**Comparison class: SELF-SPEEDUP / MAINTENANCE, not a QG-1 win.** This was the
+ledger-approved materially different retry of the preceding per-term scratch
+result. Instead of reusing full-term buffers, the candidate removed full-term
+`Posting`/position and encoded POSTINGS/POSITIONS/BLOCKMAX section
+materialization from the shipping scalar and Delta seal paths. It wrote each
+term with bounded 128-posting and per-document position-run scratch while
+preserving term-relative block offsets, transactional rollback, typed errors,
+structural-error precedence, and the durable wire format.
+
+The exact same-invocation cell used `scribe_flush_ab` with
+`QUILL_E17_LEVER=aggregate-term-writer`, `golden-medium`, eight threads, and 21
+rounds. Legacy and shipping used the identical prepared input and complete
+canonical FSLX seal. The harness ran legacy A/A, shipping A/A, and randomized
+A/B plus B/A order controls. Executing ELF SHA-256 was
+`ae709d41a08789ab4d542710eb55df68f2477187aeaa0ea0db6df28df6693bc3`.
+Exact output-byte parity and reopen validation passed; every arm produced
+267,430,390 bytes.
+
+| metric | result |
+|---|---:|
+| legacy A/A median | 1.0032 |
+| legacy A/A bootstrap median CI95 | [0.9936, 1.0078] |
+| shipping A/A median | 0.9981 |
+| shipping A/A bootstrap median CI95 | [0.9860, 1.0118] |
+| shipping / legacy median ratio | **1.0295** |
+| shipping / legacy bootstrap median CI95 | **[1.0215, 1.0391]** |
+| legacy peak RSS range | [2,589,675,520, 2,589,691,904] bytes |
+| shipping peak RSS range | [2,589,540,352, 2,589,556,736] bytes |
+
+Both nulls were admissible. Because the reported effect is shipping time
+divided by legacy time, the candidate was 2.95% slower and the entire effect
+CI was above 1.0. The small RSS reduction does not rescue a decisive throughput
+loss, and the result cannot meet the predeclared requirement that shipping be
+at least 3% faster without an RSS regression.
+
+- **files_touched:** `crates/frankensearch-quill/src/quiver.rs`,
+  `crates/frankensearch-quill/src/scribe.rs`, and
+  `crates/frankensearch-quill/benches/scribe_flush_ab.rs`; all candidate and
+  bench-control changes were restored to current HEAD after the verdict.
+- **correctness_proof:** exact output-byte parity and reopen validation passed;
+  each arm produced 267,430,390 bytes.
+- **evidence:** same-invocation legacy A/A, shipping A/A, and randomized A/B
+  plus B/A on the executing ELF identified above.
+- **commit:** uncommitted candidate; no shipping commit.
+- **retry_condition_predicate:** Retry only if a profiler attributes a
+  clearly-above-noise share to full-term `EncodedPostingList` /
+  `EncodedPositionList` aggregate staging on a wider indexing workload and a
+  materially different design removes that attributed work.
+
+**Decision: REJECT / NO-SHIP (`REJECT_SPEED_FLOOR`).** The implementation and
+bench-only selector were reverted. This measured retry closes the prior
+ledger-approved aggregate-staging escape hatch. Unless the retry predicate
+above is satisfied, do not retry bounded direct aggregate streaming, simple
+per-term scratch reuse, or a cosmetic variant of either design.
