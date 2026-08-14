@@ -1312,6 +1312,15 @@ impl<'a> Fts5DdlCursor<'a> {
     }
 }
 
+fn fts5_checkpoint(cx: &Cx, phase: &'static str) -> SearchResult<()> {
+    cx.checkpoint().map_err(|error| SearchError::Cancelled {
+        phase: phase.to_owned(),
+        reason: cx
+            .cancel_reason()
+            .map_or_else(|| error.to_string(), |reason| reason.to_string()),
+    })
+}
+
 fn persisted_fts5_metadata_error(table_name: &str, reason: &str) -> SearchError {
     SearchError::InvalidConfig {
         field: "fts5.persisted_metadata".to_owned(),
@@ -1335,11 +1344,12 @@ impl frankensearch_core::LexicalRead for Fts5LexicalSearch {
     #[instrument(skip_all, fields(query = %query, limit = limit))]
     fn search<'a>(
         &'a self,
-        _cx: &'a Cx,
+        cx: &'a Cx,
         query: &'a str,
         limit: usize,
     ) -> SearchFuture<'a, Vec<ScoredResult>> {
         Box::pin(async move {
+            fts5_checkpoint(cx, "fts5.search")?;
             let query = Self::truncate_query(query);
 
             if query.trim().is_empty() {
@@ -1402,10 +1412,11 @@ impl frankensearch_core::LexicalRead for Fts5LexicalSearch {
 impl frankensearch_core::LexicalWrite for Fts5LexicalSearch {
     fn index_document<'a>(
         &'a self,
-        _cx: &'a Cx,
+        cx: &'a Cx,
         doc: &'a IndexableDocument,
     ) -> SearchFuture<'a, ()> {
         Box::pin(async move {
+            fts5_checkpoint(cx, "fts5.index_document")?;
             let mut table = self.table.lock().map_err(lock_error)?;
             let mut rowid_map = self.rowid_map.lock().map_err(lock_error)?;
 
@@ -1424,14 +1435,16 @@ impl frankensearch_core::LexicalWrite for Fts5LexicalSearch {
 
     fn index_documents<'a>(
         &'a self,
-        _cx: &'a Cx,
+        cx: &'a Cx,
         docs: &'a [IndexableDocument],
     ) -> SearchFuture<'a, ()> {
         Box::pin(async move {
+            fts5_checkpoint(cx, "fts5.index_documents")?;
             let mut table = self.table.lock().map_err(lock_error)?;
             let mut rowid_map = self.rowid_map.lock().map_err(lock_error)?;
 
             for doc in docs {
+                fts5_checkpoint(cx, "fts5.index_documents")?;
                 if let Some(old_rowid) = rowid_map.get_rowid(&doc.id) {
                     table.delete_document(old_rowid);
                 }
