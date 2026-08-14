@@ -33,27 +33,26 @@ const QG6_QUERY_IDENTITY_VERSION: &str = "frankensearch-qg6-query-identity-v1";
 const QG6_QUERY_GENERATOR_REVISION: &str = "frankensearch-qg6-frozen-80-query-generator-v2";
 const QG6_CORPUS_GENERATOR_REVISION: &str =
     "frankensearch-quill-gauntlet/generator-v2;schema=2;zipf=s11;vocab=8192;max_doc=4096";
-/// GOLDEN-CHANGE (Quill AND-NOT lowering repair, 8a6c243f).
+/// GOLDEN-CHANGE (Quill default-field term parity, 50c14df5).
 ///
-/// This anchor hashes each normative query's PARSED AST, not just its text, and
-/// 8a6c243f deleted `wrap_not_for_and` from the Quill parser so that
-/// `A AND NOT B` stops lowering to an empty conjunction. Five of the eighty
-/// frozen queries carry that shape (`term00023 AND NOT term08191` and its four
-/// grouped/absent-term siblings), so their `parsed_ast_sha256` changed and the
-/// universe digest moved with them. The anchor did exactly its job -- it
-/// refused every QG-6 measurement taken against the pre-repair parser -- and it
-/// went unnoticed because 8a6c243f gated on a FILTERED gauntlet run (`e63_`,
-/// 31 tests) rather than the crate's lib suite; 51 tests were red on the trunk
-/// from that commit until bd-916qm.
+/// This anchor hashes each normative query's parsed AST, not just its text.
+/// Commit 50c14df5 intentionally changed an unfielded one-token query from one
+/// multi-field `Term` into an implicit `Boolean` with `Should` leaves for
+/// content and boosted title, matching Tantivy's default-field semantics. All
+/// normative ASTs containing a qualifying multi-default-field unfielded term
+/// therefore changed, potentially across query classes. The public
+/// `public_unfielded_three_term_or_matches_tantivy_score_bits_and_order` test
+/// independently witnesses that the parser change is intentional. Query text,
+/// sampling, class membership, support state, supported k, and generator
+/// revisions did not change.
 ///
-/// CONSEQUENCE, stated rather than buried: every artifact carrying
-/// `query_set_sha256 = 4e9ed3dc...` -- the nine committed
-/// `.bench-history/attempts/qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z/t*/`
-/// QG-1 evidence files -- was measured against the old query universe and is no
-/// longer comparable to anything measured here. Re-freezing records that; it
-/// does not restore their comparability.
+/// CONSEQUENCE: every artifact carrying the previous manifest identity
+/// `0d9176a839fc468eb0c3f8a4e427bd2e81f7b2998a0f8974c27f8cc47620b20b`
+/// was measured against the pre-50c14df5 query universe and is incomparable to
+/// evidence measured here. Re-freezing records that; it does not restore
+/// comparability or establish a performance win.
 const QG6_FROZEN_MANIFEST_SHA256: &str =
-    "0d9176a839fc468eb0c3f8a4e427bd2e81f7b2998a0f8974c27f8cc47620b20b";
+    "6207a48e57714f2acf39f34d0f30e20e1f3eaa209afafaa4b56cb5118ccca748";
 const EMPTY_DOCUMENT_ID_SHA256: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const QG6_AD_HOC_QUERY_GENERATOR_REVISION: &str = "frankensearch-qg6-ad-hoc-query-v1";
@@ -4702,6 +4701,7 @@ fn validate_query_shape(
         }
         PerfQueryClass::ShortKeyword => {
             matches!(query, Query::Term { .. } | Query::Glob { .. })
+                || is_implicit_short_keyword_default_field_expansion(query)
         }
         PerfQueryClass::NaturalLanguage => {
             matches!(query, Query::Boolean { operator: None, .. })
@@ -4728,6 +4728,83 @@ fn validate_query_shape(
             ),
         })
     }
+}
+
+fn is_implicit_short_keyword_default_field_expansion(query: &Query) -> bool {
+    let Query::Boolean {
+        clauses,
+        operator: None,
+    } = query
+    else {
+        return false;
+    };
+    if clauses.len() != 2 {
+        return false;
+    }
+
+    let Some(content_field_id) = DEFAULT_SCHEMA
+        .fields
+        .iter()
+        .find(|field| field.name == "content")
+        .map(|field| field.id)
+    else {
+        return false;
+    };
+    let Some(title_field_id) = DEFAULT_SCHEMA
+        .fields
+        .iter()
+        .find(|field| field.name == "title")
+        .map(|field| field.id)
+    else {
+        return false;
+    };
+    if content_field_id == title_field_id {
+        return false;
+    }
+
+    let mut normalized_text = None;
+    let mut saw_content = false;
+    let mut saw_title = false;
+    for clause in clauses {
+        if clause.occur != Occur::Should {
+            return false;
+        }
+        let Query::Term { fields, text } = &clause.query else {
+            return false;
+        };
+        let [field] = fields.as_slice() else {
+            return false;
+        };
+        if text.is_empty()
+            || text.split_whitespace().count() != 1
+            || normalize_query_text(text) != *text
+        {
+            return false;
+        }
+        if let Some(expected_text) = normalized_text {
+            if text != expected_text {
+                return false;
+            }
+        } else {
+            normalized_text = Some(text.as_str());
+        }
+
+        if field.field_id == content_field_id && field.boost.to_bits() == 1.0_f32.to_bits() {
+            if saw_content {
+                return false;
+            }
+            saw_content = true;
+        } else if field.field_id == title_field_id && field.boost.to_bits() == 2.0_f32.to_bits() {
+            if saw_title {
+                return false;
+            }
+            saw_title = true;
+        } else {
+            return false;
+        }
+    }
+
+    saw_content && saw_title
 }
 
 fn query_contains_phrase(query: &Query) -> bool {
@@ -5924,6 +6001,75 @@ mod tests {
             forward_hash,
             Qg6QuerySpec::normative_manifest_sha256().expect("normative hash")
         );
+    }
+
+    #[test]
+    fn frozen_short_keywords_accept_only_the_implicit_default_field_expansion() {
+        for (index, seed) in SHORT_KEYWORD_QUERY_SEEDS.iter().enumerate() {
+            let normalized = normalize_query_text(seed.text);
+            let (_, parsed) = parsed_ast_sha256(&normalized, &format!("short_keyword-{index:02}"))
+                .expect("frozen short keyword parses without recovery");
+            assert!(
+                is_implicit_short_keyword_default_field_expansion(&parsed.query),
+                "frozen short keyword {index} did not use the exact default-field expansion"
+            );
+            validate_query_shape(
+                PerfQueryClass::ShortKeyword,
+                &parsed.query,
+                &format!("short_keyword-{index:02}"),
+            )
+            .expect("frozen short keyword shape");
+        }
+    }
+
+    #[test]
+    fn short_keyword_shape_rejects_multi_token_explicit_mixed_and_duplicate_fields() {
+        let parse = |query_id: &str, text: &str| {
+            parsed_ast_sha256(&normalize_query_text(text), query_id)
+                .expect("hostile shape parses without recovery")
+                .1
+                .query
+        };
+        let rejects = |query_id: &str, query: &Query| {
+            assert!(
+                validate_query_shape(PerfQueryClass::ShortKeyword, query, query_id).is_err(),
+                "hostile short-keyword shape {query_id:?} was accepted"
+            );
+        };
+
+        rejects(
+            "short_keyword-multi-token",
+            &parse("short_keyword-multi-token", "term00001 term00002"),
+        );
+        rejects(
+            "short_keyword-explicit",
+            &parse("short_keyword-explicit", "term00001 OR term00002"),
+        );
+
+        let mut mixed = parse("short_keyword-mixed", "term00001");
+        let Query::Boolean { clauses, .. } = &mut mixed else {
+            panic!("shipping one-token query must use implicit default-field expansion");
+        };
+        clauses[1].query = Query::All;
+        rejects("short_keyword-mixed", &mixed);
+
+        let mut duplicate_field = parse("short_keyword-duplicate-field", "term00001");
+        let Query::Boolean { clauses, .. } = &mut duplicate_field else {
+            panic!("shipping one-token query must use implicit default-field expansion");
+        };
+        let Query::Term {
+            fields: first_fields,
+            ..
+        } = &clauses[0].query
+        else {
+            panic!("first default-field branch must be a term");
+        };
+        let first_fields = first_fields.clone();
+        let Query::Term { fields, .. } = &mut clauses[1].query else {
+            panic!("second default-field branch must be a term");
+        };
+        *fields = first_fields;
+        rejects("short_keyword-duplicate-field", &duplicate_field);
     }
 
     #[test]
