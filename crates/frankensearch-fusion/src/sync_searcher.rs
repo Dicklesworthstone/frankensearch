@@ -659,10 +659,14 @@ impl SyncTwoTierSearcher {
         // searcher's metric contract and `TwoTierMetrics` documentation.
         let phase1_vectors_searched = self.index.doc_count();
         metrics.phase1_vectors_searched = phase1_vectors_searched;
-        metrics.publish_vector_candidates(
-            fast_hits.len(),
-            frankensearch_core::is_hash_generation_id(sync_fast_embedder_id(&self.index)),
-        );
+        let hash_control = sync_fast_is_hash_control(&self.index);
+        metrics.publish_vector_candidates(fast_hits.len(), hash_control);
+        if hash_control && metrics.skip_reason.is_none() {
+            // Same contract as the async searcher: hash vectors still run as
+            // an explicit control path, but they are never unlabeled semantic
+            // hits and they do not schedule quality refinement.
+            metrics.skip_reason = Some("non_semantic_fast_embedder_vector_control".to_owned());
+        }
         // Typed zero-signal classification (bd-tqhc): an empty semantic lane
         // must carry why. Lazy — the non-empty path pays nothing.
         metrics.zero_signal = if fast_hits.is_empty() {
@@ -692,11 +696,7 @@ impl SyncTwoTierSearcher {
                 vector_hits_to_scored_results(
                     &fast_hits,
                     k,
-                    if self
-                        .index
-                        .fast_embedder_id()
-                        .is_some_and(frankensearch_core::is_hash_generation_id)
-                    {
+                    if hash_control {
                         ScoreSource::HashControl
                     } else {
                         ScoreSource::SemanticFast
@@ -751,23 +751,27 @@ impl SyncTwoTierSearcher {
             });
         }
 
-        // The quality arm needs three things: it must not be switched off, the
-        // index must have a quality tier, and — new here — the caller must
-        // have bound a QUALITY-space embedding for it. Without the third, the
-        // refined phase used to run anyway, scoring the quality index with the
-        // fast tier's vector.
-        let quality_query = admitted.quality.filter(|_| !self.config.fast_only);
+        // The quality arm needs four things: it must not be switched off, the
+        // index must have a quality tier, the caller must have bound a
+        // QUALITY-space embedding for it, and the fast lane must be semantic.
+        // A hash-control fast lane is a control path, not a first semantic
+        // pass, so a bound quality embedding does not schedule refinement.
+        let quality_query = admitted
+            .quality
+            .filter(|_| !self.config.fast_only && !hash_control);
         let Some(quality_query) = quality_query else {
             // Same vocabulary as the async searcher (searcher.rs) — the two
             // sides share one skip_reason contract; "fast_only" is the string
             // the fsfs surfaces document (bd-k3089 parity suite pins this).
-            metrics.skip_reason = Some(if self.config.fast_only {
-                "fast_only".to_owned()
-            } else if self.index.has_quality_index() {
-                "quality_query_embedding_absent".to_owned()
-            } else {
-                "quality_index_unavailable".to_owned()
-            });
+            if metrics.skip_reason.is_none() {
+                metrics.skip_reason = Some(if self.config.fast_only {
+                    "fast_only".to_owned()
+                } else if self.index.has_quality_index() {
+                    "quality_query_embedding_absent".to_owned()
+                } else {
+                    "quality_index_unavailable".to_owned()
+                });
+            }
             return Ok(SyncSearchOutcome {
                 phases,
                 final_results: initial_results,
@@ -907,7 +911,15 @@ impl SyncTwoTierSearcher {
                 sync_fast_embedder_id(&self.index),
             )
         } else {
-            unique_vector_hits_to_scored_results_owned(blended, k, ScoreSource::SemanticQuality)
+            unique_vector_hits_to_scored_results_owned(
+                blended,
+                k,
+                if hash_control {
+                    ScoreSource::HashControl
+                } else {
+                    ScoreSource::SemanticQuality
+                },
+            )
         };
 
         // Re-fusion ranks on blended semantic scores, but `fast_score` and
@@ -1304,6 +1316,11 @@ fn rrf_rank_contribution(rrf_k: f64, rank: usize) -> f64 {
 
 fn sync_fast_embedder_id(index: &InMemoryTwoTierIndex) -> &str {
     index.fast_embedder_id().unwrap_or("sync-fast-query")
+}
+
+#[must_use]
+fn sync_fast_is_hash_control(index: &InMemoryTwoTierIndex) -> bool {
+    frankensearch_core::is_hash_generation_id(sync_fast_embedder_id(index))
 }
 
 fn vector_hits_to_scored_results(
@@ -1933,6 +1950,59 @@ mod tests {
             "the index HAS a quality tier; the query simply bound nothing for it"
         );
         assert_eq!(metrics.phase2_vectors_searched, 0);
+    }
+
+    #[test]
+    fn hash_control_skips_quality_and_does_not_become_semantic_quality() {
+        let hash_bundle = EmbeddingIdentityBundleV1::explicit_test_model("fnv1a-256", 2);
+        let doc_ids = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let fast = InMemoryVectorIndex::from_vectors_with_identity(
+            doc_ids.clone(),
+            vec![vec![1.0, 0.0], vec![0.7, 0.3], vec![0.0, 1.0]],
+            2,
+            &hash_bundle.space,
+        )
+        .expect("hash-control fast index");
+        let quality = InMemoryVectorIndex::from_vectors(
+            doc_ids,
+            vec![vec![0.2, 0.8], vec![1.0, 0.0], vec![0.0, 1.0]],
+            2,
+        )
+        .expect("quality index");
+        let searcher = SyncTwoTierSearcher::new(
+            Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality))),
+            TwoTierConfig::default(),
+        );
+        let query = TieredQueryEmbeddings::progressive(
+            BoundQueryEmbedding::new(vec![1.0, 0.0], hash_bundle)
+                .expect("hash-control query binds"),
+            BoundQueryEmbedding::new(
+                vec![1.0, 0.0],
+                EmbeddingIdentityBundleV1::explicit_test_model("sync-fixture", 2),
+            )
+            .expect("quality query binds"),
+        );
+        let (results, metrics) = searcher
+            .search_collect(&query, 2)
+            .expect("hash-control search still returns hits");
+        assert!(!results.is_empty());
+        assert!(
+            results
+                .iter()
+                .all(|result| result.source == ScoreSource::HashControl),
+            "hash-control hits must not be relabeled SemanticQuality: {:?}",
+            results
+                .iter()
+                .map(|result| result.source)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(metrics.phase2_vectors_searched, 0);
+        assert_eq!(
+            metrics.skip_reason.as_deref(),
+            Some("non_semantic_fast_embedder_vector_control")
+        );
+        assert!(metrics.hash_control_candidates > 0);
+        assert_eq!(metrics.semantic_candidates, 0);
     }
 
     #[test]
