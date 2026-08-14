@@ -209,14 +209,18 @@ pub fn list_search_history(
 
     let limit_i64 = limit_to_i64(limit, "history.limit")?;
     let params = [SqliteValue::Integer(limit_i64)];
-    let rows = conn
-        .query_with_params_sync(
-            "SELECT id, query, query_class, result_count, phase1_latency_ms, \
+    let rows = retry_transient_storage(
+        || {
+            conn.query_with_params_sync(
+                "SELECT id, query, query_class, result_count, phase1_latency_ms, \
      phase2_latency_ms, top_results_json, searched_at \
      FROM search_history ORDER BY searched_at DESC LIMIT ?1;",
-            &params,
-        )
-        .map_err(map_storage_error)?;
+                &params,
+            )
+            .map_err(map_storage_error)
+        },
+        "search history list",
+    )?;
 
     let mut entries = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -241,15 +245,19 @@ pub fn search_history_prefix(
         SqliteValue::Text(pattern.into()),
         SqliteValue::Integer(limit_i64),
     ];
-    let rows = conn
-        .query_with_params_sync(
-            "SELECT id, query, query_class, result_count, phase1_latency_ms, \
+    let rows = retry_transient_storage(
+        || {
+            conn.query_with_params_sync(
+                "SELECT id, query, query_class, result_count, phase1_latency_ms, \
      phase2_latency_ms, top_results_json, searched_at \
      FROM search_history WHERE query LIKE ?1 ESCAPE '\\' \
      ORDER BY searched_at DESC LIMIT ?2;",
-            &params,
-        )
-        .map_err(map_storage_error)?;
+                &params,
+            )
+            .map_err(map_storage_error)
+        },
+        "search history prefix",
+    )?;
 
     let mut entries = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -473,13 +481,17 @@ pub fn list_bookmarks(conn: &AsyncConnection, limit: usize) -> SearchResult<Vec<
 
     let limit_i64 = limit_to_i64(limit, "bookmarks.limit")?;
     let params = [SqliteValue::Integer(limit_i64)];
-    let rows = conn
-        .query_with_params_sync(
-            "SELECT id, doc_id, query, note, created_at \
+    let rows = retry_transient_storage(
+        || {
+            conn.query_with_params_sync(
+                "SELECT id, doc_id, query, note, created_at \
      FROM bookmarks ORDER BY created_at DESC LIMIT ?1;",
-            &params,
-        )
-        .map_err(map_storage_error)?;
+                &params,
+            )
+            .map_err(map_storage_error)
+        },
+        "bookmark list",
+    )?;
 
     let mut bookmarks = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -490,9 +502,13 @@ pub fn list_bookmarks(conn: &AsyncConnection, limit: usize) -> SearchResult<Vec<
 
 /// Count total bookmarks.
 pub fn count_bookmarks(conn: &AsyncConnection) -> SearchResult<i64> {
-    let rows = conn
-        .query_sync("SELECT COUNT(*) FROM bookmarks;")
-        .map_err(map_storage_error)?;
+    let rows = retry_transient_storage(
+        || {
+            conn.query_sync("SELECT COUNT(*) FROM bookmarks;")
+                .map_err(map_storage_error)
+        },
+        "bookmark count",
+    )?;
     match rows.first().and_then(|r| r.get(0)) {
         Some(SqliteValue::Integer(count)) => Ok(*count),
         _ => Ok(0),
@@ -502,12 +518,16 @@ pub fn count_bookmarks(conn: &AsyncConnection) -> SearchResult<i64> {
 /// Check if a document is bookmarked.
 pub fn is_bookmarked(conn: &AsyncConnection, doc_id: &str) -> SearchResult<bool> {
     let params = [SqliteValue::Text(doc_id.to_owned().into())];
-    let rows = conn
-        .query_with_params_sync(
-            "SELECT 1 FROM bookmarks WHERE doc_id = ?1 LIMIT 1;",
-            &params,
-        )
-        .map_err(map_storage_error)?;
+    let rows = retry_transient_storage(
+        || {
+            conn.query_with_params_sync(
+                "SELECT 1 FROM bookmarks WHERE doc_id = ?1 LIMIT 1;",
+                &params,
+            )
+            .map_err(map_storage_error)
+        },
+        "bookmark exists",
+    )?;
     Ok(!rows.is_empty())
 }
 
