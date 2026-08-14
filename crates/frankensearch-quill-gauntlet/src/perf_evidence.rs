@@ -8344,9 +8344,14 @@ mod tests {
         let mut effect_pairs = Vec::new();
         let mut null_pairs = Vec::new();
         for group_id in QG6_QUERY_GROUP_IDS {
-            effect_pairs.extend((0..31).map(|_| (group_id, 1_000.0, 950.0)));
-            effect_pairs.extend((0..31).map(|_| (group_id, 10_000.0, 9_500.0)));
-            effect_pairs.extend((0..38).map(|_| (group_id, 1.0, 100_000.0)));
+            for round in 0..100 {
+                let (control, treatment) = match round % 10 {
+                    0 | 3 | 6 => (1_000.0, 950.0),
+                    1 | 4 | 7 => (10_000.0, 9_500.0),
+                    _ => (1.0, 100_000.0),
+                };
+                effect_pairs.push((group_id, control, treatment));
+            }
             null_pairs.extend([(group_id, 100.0, 100.0); 100]);
         }
         let quill_null_pairs = QG6_QUERY_GROUP_IDS
