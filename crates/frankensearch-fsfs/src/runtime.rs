@@ -12012,12 +12012,7 @@ impl FsfsRuntime {
 
     #[must_use]
     fn is_legacy_hash_vector_generation(embedder_id: &str) -> bool {
-        // Same identity family as `frankensearch::is_hash_generation_id`:
-        // `hash-384` and `hash-fnv1a-256` are control artifacts, not
-        // semantic generations. A prefix-6 slice of `hash-384` is `hash-3`
-        // and would miss a `fnv1a-`/`hash-fnv1a` exact match.
-        let id = embedder_id.to_ascii_lowercase();
-        id == "hash" || id.starts_with("hash-") || id.starts_with("fnv1a-") || id.starts_with("jl-")
+        frankensearch_core::is_hash_generation_id(embedder_id)
     }
 
     fn vector_generation_is_hash_control(resources: &SearchExecutionResources) -> bool {

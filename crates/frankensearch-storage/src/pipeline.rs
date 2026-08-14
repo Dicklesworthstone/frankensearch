@@ -19,9 +19,6 @@ use crate::schema::row_i64;
 
 const PIPELINE_SUBSYSTEM: &str = "storage_pipeline";
 const CORRELATION_METADATA_KEY: &str = "correlation_id";
-const HASH_EMBEDDER_PREFIX: &str = "fnv1a-";
-const JL_EMBEDDER_PREFIX: &str = "jl-";
-const LEGACY_HASH_EMBEDDER_ID: &str = "hash/fnv1a";
 const MAX_CONTENT_PREVIEW_CHARS: usize = 400;
 const MAX_SOURCE_FILE_BYTES: usize = 2 * 1024 * 1024;
 
@@ -1155,9 +1152,7 @@ fn pipeline_error(message: impl Into<String>) -> SearchError {
 }
 
 fn is_hash_embedder(embedder_id: &str) -> bool {
-    embedder_id.starts_with(HASH_EMBEDDER_PREFIX)
-        || embedder_id.starts_with(JL_EMBEDDER_PREFIX)
-        || embedder_id == LEGACY_HASH_EMBEDDER_ID
+    frankensearch_core::is_hash_generation_id(embedder_id)
 }
 
 fn read_source_text_with_limit(path: &str, max_bytes: usize) -> io::Result<String> {

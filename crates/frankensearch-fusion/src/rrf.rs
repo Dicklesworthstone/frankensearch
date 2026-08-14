@@ -1071,6 +1071,10 @@ mod tests {
             ScoreSource::HashControl
         );
         assert_eq!(
+            classify_fused_hit_source(&fused("legacy", None, Some(0), false), "hash/fnv1a"),
+            ScoreSource::HashControl
+        );
+        assert_eq!(
             classify_fused_hit_source(&fused("sem", None, Some(0), false), "minilm-l6-v2"),
             ScoreSource::SemanticFast
         );

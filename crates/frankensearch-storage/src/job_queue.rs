@@ -12,8 +12,6 @@ use serde::{Deserialize, Serialize};
 use crate::connection::{Storage, map_storage_error};
 
 const SUBSYSTEM: &str = "storage";
-const HASH_EMBEDDER_PREFIX: &str = "fnv1a-";
-const JL_EMBEDDER_PREFIX: &str = "jl-";
 const MAX_BACKOFF_EXPONENT: u32 = 20;
 const MAX_RETRY_DELAY_MS: u64 = 30_000;
 
@@ -1013,9 +1011,7 @@ fn document_exists(conn: &AsyncConnection, doc_id: &str) -> SearchResult<bool> {
 }
 
 fn is_hash_embedder(embedder_id: &str) -> bool {
-    embedder_id.starts_with(HASH_EMBEDDER_PREFIX)
-        || embedder_id.starts_with(JL_EMBEDDER_PREFIX)
-        || embedder_id == "hash/fnv1a"
+    frankensearch_core::is_hash_generation_id(embedder_id)
 }
 
 fn compute_retry_delay_ms(base_delay_ms: u64, exponent: u32) -> u64 {
@@ -1981,7 +1977,7 @@ mod tests {
     ///
     /// The test uses a channel pattern: worker threads send claim requests
     /// to a dispatcher that serializes queue operations through the storage
-    /// instance's dedicated FrankenSQLite worker, matching the production
+    /// instance's dedicated `FrankenSQLite` worker, matching the production
     /// single-queue ownership contract.
     #[test]
     fn concurrent_claim_once_through_shared_queue_has_no_double_assignment() {

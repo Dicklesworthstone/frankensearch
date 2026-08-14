@@ -647,12 +647,8 @@ fn source_from_explained(source: &ExplainedSource) -> ScoreComponentSource {
 }
 
 fn is_hash_control_embedder(embedder: &str) -> bool {
-    let id = embedder.to_ascii_lowercase();
-    id.contains("hash control")
-        || id == "hash"
-        || id.starts_with("hash-")
-        || id.starts_with("fnv1a-")
-        || id.starts_with("jl-")
+    embedder.to_ascii_lowercase().contains("hash control")
+        || frankensearch_core::is_hash_generation_id(embedder)
 }
 
 const fn phase_token(phase: ExplanationPhase) -> &'static str {

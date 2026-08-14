@@ -3957,7 +3957,11 @@ pub enum ScoreSource {
 #[must_use]
 pub fn is_hash_generation_id(embedder_id: &str) -> bool {
     let id = embedder_id.to_ascii_lowercase();
-    id == "hash" || id.starts_with("hash-") || id.starts_with("fnv1a-") || id.starts_with("jl-")
+    id == "hash"
+        || id.starts_with("hash-")
+        || id.starts_with("hash/")
+        || id.starts_with("fnv1a-")
+        || id.starts_with("jl-")
 }
 
 /// The final scored search result delivered to consumers.
@@ -6662,6 +6666,8 @@ mod tests {
         assert!(super::is_hash_generation_id("hash-fnv1a-256"));
         assert!(super::is_hash_generation_id("fnv1a-256"));
         assert!(super::is_hash_generation_id("jl-128"));
+        assert!(super::is_hash_generation_id("hash/fnv1a"));
+        assert!(super::is_hash_generation_id("HASH/FNV1A"));
         assert!(!super::is_hash_generation_id("minilm-l6-v2"));
         assert!(!super::is_hash_generation_id("potion-128m"));
         assert!(!super::is_hash_generation_id("stub-384"));
