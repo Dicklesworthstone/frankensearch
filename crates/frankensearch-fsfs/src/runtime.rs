@@ -12106,6 +12106,23 @@ impl FsfsRuntime {
         frankensearch_core::is_hash_generation_id(embedder_id)
     }
 
+    fn fast_lane_admission_event(embedder: &dyn Embedder) -> (&'static str, &'static str) {
+        if embedder.category() == ModelCategory::HashEmbedder
+            || !embedder.is_semantic()
+            || Self::is_legacy_hash_vector_generation(embedder.id())
+        {
+            (
+                "fsfs.hash_control_admitted",
+                "fsfs hash-control embedder matches the vector generation",
+            )
+        } else {
+            (
+                "fsfs.fast_semantic_admitted",
+                "fsfs fast semantic embedder matches the vector generation",
+            )
+        }
+    }
+
     fn vector_generation_is_hash_control(resources: &SearchExecutionResources) -> bool {
         resources
             .vector_index
@@ -12986,11 +13003,12 @@ impl FsfsRuntime {
                     }
                     return Err(error);
                 }
+                let (event, message) = Self::fast_lane_admission_event(embedder.as_ref());
                 info!(
-                    event = "fsfs.fast_semantic_admitted",
+                    event,
                     category = ?embedder.category(),
                     dimension = embedder.dimension(),
-                    "fsfs fast semantic embedder matches the vector generation"
+                    "{message}"
                 );
                 resources.fast_embedder = Some(embedder);
                 Ok(())
@@ -28761,6 +28779,17 @@ mod tests {
             "hash-only search must not blame a missing semantic embedder: {rendered}"
         );
         assert!(!rendered.contains("no admitted matching embedder"));
+    }
+
+    #[test]
+    fn hash_embedder_admission_event_is_not_named_semantic() {
+        let hash = HashEmbedder::default_256();
+        let (event, message) = FsfsRuntime::fast_lane_admission_event(&hash);
+        assert_eq!(event, "fsfs.hash_control_admitted");
+        assert!(
+            message.contains("hash-control") && !message.contains("semantic"),
+            "hash admission must not claim semantic: {message}"
+        );
     }
 
     #[test]
