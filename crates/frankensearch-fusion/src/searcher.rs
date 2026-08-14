@@ -1562,9 +1562,8 @@ impl TwoTierSearcher {
         let base_candidates =
             candidate_count(candidate_target, 0, self.config.candidate_multiplier.max(1));
 
-        let lexical_short_circuit = self.lexical.is_some()
-            && self.quality_embedder.is_none()
-            && is_shipped_hash_embedder(self.fast_embedder.as_ref());
+        let lexical_short_circuit =
+            self.lexical.is_some() && is_shipped_hash_embedder(self.fast_embedder.as_ref());
 
         // Adaptive budgets: identifiers lean lexical, NL leans semantic.
         let semantic_budget =
@@ -2793,7 +2792,10 @@ impl TwoTierSearcher {
 
     /// Whether quality refinement should run.
     fn should_run_quality(&self) -> bool {
-        !self.config.fast_only && self.quality_embedder.is_some() && self.index.has_quality_index()
+        !self.config.fast_only
+            && self.quality_embedder.is_some()
+            && self.index.has_quality_index()
+            && !is_shipped_hash_embedder(self.fast_embedder.as_ref())
     }
 
     fn phase_gate_should_skip_quality(&self) -> bool {
@@ -6917,6 +6919,55 @@ mod tests {
     }
 
     #[test]
+    fn hash_control_does_not_schedule_quality_refinement() {
+        let quality_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let quality = Arc::new(CountingEmbedder::new("quality", 4, quality_calls.clone()));
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index_with_quality(4);
+            let fast: Arc<dyn Embedder> = Arc::new(NonSemanticEmbedder::new("fnv1a-test", 4));
+            let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                .with_quality_embedder(quality)
+                .with_lexical(lexical);
+
+            let mut got_refined = false;
+            let metrics = searcher
+                .search(
+                    &cx,
+                    "rust ownership",
+                    5,
+                    |_| None,
+                    |phase| {
+                        if matches!(
+                            phase,
+                            SearchPhase::Refined { .. } | SearchPhase::Reranked { .. }
+                        ) {
+                            got_refined = true;
+                        }
+                    },
+                )
+                .await
+                .expect("hash control with lexical should stay lexical-only");
+
+            assert!(!got_refined);
+            assert!(!searcher.should_run_quality());
+            assert_eq!(metrics.phase1_vectors_searched, 0);
+            assert_eq!(metrics.semantic_candidates, 0);
+            assert_eq!(metrics.phase2_vectors_searched, 0);
+            assert_eq!(
+                metrics.skip_reason.as_deref(),
+                Some("non_semantic_fast_embedder_lexical_short_circuit")
+            );
+            assert_eq!(
+                quality_calls.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "quality must not refine hash-control ranks"
+            );
+        });
+    }
+
+    #[test]
     fn fast_embed_failure_without_lexical_returns_error() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = build_test_index(4);
@@ -9069,6 +9120,16 @@ mod tests {
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
             .with_quality_embedder(quality);
         assert!(searcher.should_run_quality());
+    }
+
+    #[test]
+    fn should_run_quality_false_when_fast_embedder_is_hash_control() {
+        let index = build_test_index_with_quality(4);
+        let fast = Arc::new(NonSemanticEmbedder::new("fnv1a-test", 4));
+        let quality = Arc::new(StubEmbedder::new("quality", 4));
+        let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+            .with_quality_embedder(quality);
+        assert!(!searcher.should_run_quality());
     }
 
     #[test]
