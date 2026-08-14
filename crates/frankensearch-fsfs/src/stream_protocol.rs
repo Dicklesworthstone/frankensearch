@@ -91,7 +91,7 @@ impl StreamStartedEvent {
 /// Progress event payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamProgressEvent {
-    /// Stable stage name (`retrieve.fast`, `retrieve.quality`, `rerank`, etc).
+    /// Stable stage name (`retrieve.fast`, `retrieve.hash_control`, `retrieve.quality`, `rerank`, etc).
     pub stage: String,
     /// Completed unit count for the stage.
     pub completed_units: u64,

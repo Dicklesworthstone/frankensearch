@@ -6299,6 +6299,11 @@ impl FsfsRuntime {
         writer: &mut W,
     ) -> SearchResult<()> {
         let (stage, reason_code, message) = match payload.phase {
+            SearchOutputPhase::Initial if payload.vector_generation_is_hash => (
+                "retrieve.hash_control",
+                "query.stream.initial_ready",
+                "initial hash-control results ready",
+            ),
             SearchOutputPhase::Initial => (
                 "retrieve.fast",
                 "query.stream.initial_ready",
@@ -26894,6 +26899,57 @@ mod tests {
                         || progress.reason_code == "query.stream.refinement_failed")
             }));
         });
+    }
+
+    #[test]
+    fn hash_control_stream_progress_is_not_named_fast_semantic() {
+        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            command: CliCommand::Search,
+            stream: true,
+            format: OutputFormat::Jsonl,
+            ..CliInput::default()
+        });
+        let payload = SearchPayload::new(
+            "auth middleware",
+            SearchOutputPhase::Initial,
+            1,
+            vec![SearchHitPayload {
+                rank: 1,
+                path: "src/auth.rs".to_owned(),
+                score: 0.5,
+                snippet: None,
+                lexical_rank: Some(0),
+                semantic_rank: None,
+                hash_rank: Some(0),
+                in_both_sources: true,
+            }],
+        )
+        .with_vector_generation("fnv1a-256", true);
+
+        let mut bytes = Vec::new();
+        let mut seq = 0_u64;
+        runtime
+            .emit_search_stream_payload(&payload, "stream-hash", &mut seq, &mut bytes)
+            .expect("emit hash-control payload");
+
+        let text = String::from_utf8(bytes).expect("utf8");
+        let progress: StreamFrame<SearchHitPayload> =
+            decode_stream_frame_ndjson(text.lines().next().expect("progress line"))
+                .expect("decode progress");
+        let StreamEvent::Progress(progress) = progress.event else {
+            panic!("expected progress frame");
+        };
+        assert_eq!(progress.stage, "retrieve.hash_control");
+        assert_eq!(progress.reason_code, "query.stream.initial_ready");
+        assert!(
+            progress.message.contains("hash-control"),
+            "progress message should name the control lane: {}",
+            progress.message
+        );
+        assert!(
+            !progress.stage.contains("semantic") && !progress.message.contains("semantic"),
+            "hash-control progress must not be labeled semantic"
+        );
     }
 
     #[test]
