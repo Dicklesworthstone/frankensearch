@@ -7476,6 +7476,21 @@ impl FsfsRuntime {
         }
     }
 
+    /// Hash/fnv/JL generations are cheap control artifacts, not MiniLM-cost
+    /// inference. Semantic VOI must not drop that lane when lexical looks strong.
+    #[must_use]
+    const fn apply_hash_control_lane_policy(
+        decision: SemanticVoiDecision,
+        hash_control: bool,
+        stage_enabled: bool,
+    ) -> SemanticVoiDecision {
+        if hash_control && stage_enabled {
+            SemanticVoiDecision::force_run("hash_control.voi.force.control_lane")
+        } else {
+            decision
+        }
+    }
+
     #[must_use]
     fn semantic_voi_decision(
         mode: SearchExecutionMode,
@@ -7950,32 +7965,56 @@ impl FsfsRuntime {
         } else {
             semantic_budget.min(planning_limit)
         };
-        let semantic_decision = Self::semantic_gate_decision(SemanticGateDecisionInput {
-            mode,
-            intent: plan.intent.intent,
-            query: &normalized_query,
-            output_limit,
-            lexical_head_candidates: &lexical_head_candidates,
-            semantic_stage_enabled: plan.semantic_stage.enabled,
-            lexical_stage_enabled: plan.lexical_stage.enabled,
-            force_full_semantic_recall,
-        });
-        info!(
-            phase = "semantic_gate",
-            mode_override = ?mode,
-            intent = ?plan.intent.intent,
-            lexical_head_candidates = lexical_head_candidates.len(),
-            semantic_budget,
-            output_limit,
-            force_full_semantic_recall,
-            lexical_tail_complete,
-            run_semantic = semantic_decision.run_semantic,
-            posterior_useful_per_mille = f64_to_per_mille(semantic_decision.posterior_useful),
-            expected_loss_run_per_mille = f64_to_per_mille(semantic_decision.expected_loss_run),
-            expected_loss_skip_per_mille = f64_to_per_mille(semantic_decision.expected_loss_skip),
-            reason_code = semantic_decision.reason_code,
-            "fsfs semantic-stage VOI decision"
+        let hash_control_lane = Self::vector_generation_is_hash_control(resources);
+        let semantic_decision = Self::apply_hash_control_lane_policy(
+            Self::semantic_gate_decision(SemanticGateDecisionInput {
+                mode,
+                intent: plan.intent.intent,
+                query: &normalized_query,
+                output_limit,
+                lexical_head_candidates: &lexical_head_candidates,
+                semantic_stage_enabled: plan.semantic_stage.enabled,
+                lexical_stage_enabled: plan.lexical_stage.enabled,
+                force_full_semantic_recall,
+            }),
+            hash_control_lane,
+            plan.semantic_stage.enabled,
         );
+        if hash_control_lane {
+            info!(
+                phase = "hash_control_gate",
+                mode_override = ?mode,
+                intent = ?plan.intent.intent,
+                lexical_head_candidates = lexical_head_candidates.len(),
+                semantic_budget,
+                output_limit,
+                force_full_semantic_recall,
+                lexical_tail_complete,
+                run_semantic = semantic_decision.run_semantic,
+                posterior_useful_per_mille = f64_to_per_mille(semantic_decision.posterior_useful),
+                expected_loss_run_per_mille = f64_to_per_mille(semantic_decision.expected_loss_run),
+                expected_loss_skip_per_mille = f64_to_per_mille(semantic_decision.expected_loss_skip),
+                reason_code = semantic_decision.reason_code,
+                "fsfs hash-control-stage VOI decision"
+            );
+        } else {
+            info!(
+                phase = "semantic_gate",
+                mode_override = ?mode,
+                intent = ?plan.intent.intent,
+                lexical_head_candidates = lexical_head_candidates.len(),
+                semantic_budget,
+                output_limit,
+                force_full_semantic_recall,
+                lexical_tail_complete,
+                run_semantic = semantic_decision.run_semantic,
+                posterior_useful_per_mille = f64_to_per_mille(semantic_decision.posterior_useful),
+                expected_loss_run_per_mille = f64_to_per_mille(semantic_decision.expected_loss_run),
+                expected_loss_skip_per_mille = f64_to_per_mille(semantic_decision.expected_loss_skip),
+                reason_code = semantic_decision.reason_code,
+                "fsfs semantic-stage VOI decision"
+            );
+        }
 
         // Full and FastOnly are explicit semantic-readiness contracts. A
         // favorable lexical head may still let VOI skip expensive inference,
@@ -8027,7 +8066,7 @@ impl FsfsRuntime {
             ) {
                 match embedder.embed(cx, &normalized_query).await {
                     Ok(query_embedding) => {
-                        // Classified lane (bd-tqhc): an empty semantic result
+                        // Classified lane (bd-tqhc): an empty vector result
                         // carries a typed ZeroSignalReason instead of being
                         // indistinguishable from "no relevant documents".
                         // Availability failures surface as operator advice;
@@ -8036,10 +8075,17 @@ impl FsfsRuntime {
                         {
                             Ok(classified) => {
                                 if let Some(reason) = classified.zero_signal {
-                                    debug!(
-                                        reason_code = reason.reason_code(),
-                                        "fsfs semantic lane returned zero results"
-                                    );
+                                    if hash_control_lane {
+                                        debug!(
+                                            reason_code = reason.reason_code(),
+                                            "fsfs hash-control lane returned zero results"
+                                        );
+                                    } else {
+                                        debug!(
+                                            reason_code = reason.reason_code(),
+                                            "fsfs semantic lane returned zero results"
+                                        );
+                                    }
                                     if let Some(zero_signal_advice) = advice_for_zero_signal(
                                         &normalized_query,
                                         Some(&resources.index_root),
@@ -21786,6 +21832,35 @@ mod tests {
         });
         assert!(!gate.run_semantic);
         assert_eq!(gate.reason_code, "semantic.voi.skip");
+    }
+
+    #[test]
+    fn hash_control_lane_is_not_skipped_by_semantic_voi() {
+        let lexical = vec![
+            LexicalCandidate::new("src/main.rs", 7.2),
+            LexicalCandidate::new("src/lib.rs", 2.1),
+            LexicalCandidate::new("README.md", 1.6),
+        ];
+        let voi = FsfsRuntime::semantic_voi_decision(
+            SearchExecutionMode::FastOnly,
+            QueryIntentClass::ShortKeyword,
+            "test",
+            20,
+            &lexical,
+        );
+        assert!(!voi.run_semantic);
+
+        let forced = FsfsRuntime::apply_hash_control_lane_policy(voi, true, true);
+        assert!(forced.run_semantic);
+        assert_eq!(forced.reason_code, "hash_control.voi.force.control_lane");
+
+        let skipped_when_stage_off = FsfsRuntime::apply_hash_control_lane_policy(voi, true, false);
+        assert!(!skipped_when_stage_off.run_semantic);
+        assert_eq!(skipped_when_stage_off.reason_code, voi.reason_code);
+
+        let semantic_untouched = FsfsRuntime::apply_hash_control_lane_policy(voi, false, true);
+        assert!(!semantic_untouched.run_semantic);
+        assert_eq!(semantic_untouched.reason_code, voi.reason_code);
     }
 
     #[test]
