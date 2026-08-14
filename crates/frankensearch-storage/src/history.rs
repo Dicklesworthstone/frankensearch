@@ -268,6 +268,10 @@ pub fn search_history_prefix(
 
 /// Count total search history entries.
 pub fn count_search_history(conn: &AsyncConnection) -> SearchResult<i64> {
+    retry_transient_storage(|| count_search_history_once(conn), "search history count")
+}
+
+fn count_search_history_once(conn: &AsyncConnection) -> SearchResult<i64> {
     let rows = conn
         .query_sync("SELECT COUNT(*) FROM search_history;")
         .map_err(map_storage_error)?;
@@ -281,7 +285,7 @@ pub fn count_search_history(conn: &AsyncConnection) -> SearchResult<i64> {
 pub fn truncate_search_history(conn: &AsyncConnection, max_entries: usize) -> SearchResult<i64> {
     let max_entries_i64 = limit_to_i64(max_entries, "history.max_entries")?;
     with_history_transaction(conn, |conn| {
-        let count = count_search_history(conn)?;
+        let count = count_search_history_once(conn)?;
         if count <= max_entries_i64 {
             return Ok(0);
         }
