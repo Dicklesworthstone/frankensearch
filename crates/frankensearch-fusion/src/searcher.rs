@@ -209,6 +209,26 @@ fn vector_exclusion_source(embedder: &dyn Embedder) -> &'static str {
     }
 }
 
+/// Quality evidence may attach to any hit; it must not relabel retrieval
+/// provenance. Lexical, hybrid, and hash-control stays stay put even when a
+/// quality cosine is present.
+#[must_use]
+const fn source_can_promote_to_quality(source: ScoreSource) -> bool {
+    !matches!(
+        source,
+        ScoreSource::Lexical | ScoreSource::Hybrid | ScoreSource::HashControl
+    )
+}
+
+#[must_use]
+const fn promoted_quality_source(source: ScoreSource, has_quality_score: bool) -> ScoreSource {
+    if has_quality_score && source_can_promote_to_quality(source) {
+        ScoreSource::SemanticQuality
+    } else {
+        source
+    }
+}
+
 /// Progressive two-tier search orchestrator.
 ///
 /// Coordinates fast-tier embedding, optional lexical search, RRF fusion,
@@ -2563,12 +2583,7 @@ impl TwoTierSearcher {
                 // fallback for winners the raw pool did not cover.
                 result.fast_score = fast_score;
                 result.quality_score = quality_score;
-                if quality_score.is_some()
-                    && result.source != ScoreSource::Lexical
-                    && result.source != ScoreSource::Hybrid
-                {
-                    result.source = ScoreSource::SemanticQuality;
-                }
+                result.source = promoted_quality_source(result.source, quality_score.is_some());
                 if result.metadata.is_none() {
                     result.metadata = initial.and_then(|initial| initial.metadata.clone());
                 }
@@ -2598,15 +2613,7 @@ impl TwoTierSearcher {
                 let quality_score = quality_scores_by_doc.get(hit.doc_id.as_str()).copied();
                 let original_source =
                     initial.map_or(ScoreSource::SemanticFast, |result| result.source);
-                let source = if quality_score.is_some()
-                    && original_source != ScoreSource::Lexical
-                    && original_source != ScoreSource::Hybrid
-                    && original_source != ScoreSource::HashControl
-                {
-                    ScoreSource::SemanticQuality
-                } else {
-                    original_source
-                };
+                let source = promoted_quality_source(original_source, quality_score.is_some());
 
                 let explanation = build_refined_explanation(
                     hit.score,
@@ -8741,6 +8748,41 @@ mod tests {
         }];
         let results = fused_hits_to_scored_results(&fused, &[], false, "fast-test", 60.0);
         assert_eq!(results[0].source, ScoreSource::SemanticFast);
+    }
+
+    #[test]
+    fn hash_control_does_not_promote_to_semantic_quality() {
+        assert!(!source_can_promote_to_quality(ScoreSource::HashControl));
+        assert!(!source_can_promote_to_quality(ScoreSource::Lexical));
+        assert!(!source_can_promote_to_quality(ScoreSource::Hybrid));
+        assert!(source_can_promote_to_quality(ScoreSource::SemanticFast));
+        assert!(source_can_promote_to_quality(ScoreSource::SemanticQuality));
+        assert!(source_can_promote_to_quality(ScoreSource::Reranked));
+
+        assert_eq!(
+            promoted_quality_source(ScoreSource::HashControl, true),
+            ScoreSource::HashControl
+        );
+        assert_eq!(
+            promoted_quality_source(ScoreSource::Lexical, true),
+            ScoreSource::Lexical
+        );
+        assert_eq!(
+            promoted_quality_source(ScoreSource::Hybrid, true),
+            ScoreSource::Hybrid
+        );
+        assert_eq!(
+            promoted_quality_source(ScoreSource::SemanticFast, true),
+            ScoreSource::SemanticQuality
+        );
+        assert_eq!(
+            promoted_quality_source(ScoreSource::SemanticFast, false),
+            ScoreSource::SemanticFast
+        );
+        assert_eq!(
+            promoted_quality_source(ScoreSource::HashControl, false),
+            ScoreSource::HashControl
+        );
     }
 
     #[test]
