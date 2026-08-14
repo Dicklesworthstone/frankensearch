@@ -762,6 +762,74 @@ mod lexical {
 
     #[cfg(feature = "lexical-tantivy")]
     #[test]
+    fn public_phrase_prefix_score_bits_match_tantivy_oracle() {
+        super::quiet_logging();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let docs = vec![IndexableDocument::new("hit", "anchor prefix")];
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let quill = build_quill_index(&cx, &tmp.path().join("quill"), &docs).await;
+            let tantivy = build_tantivy_index(&cx, &tmp.path().join("tantivy"), &docs).await;
+            let query = r#"content:"anchor pre"*"#;
+
+            let oracle = public_observation(&tantivy, &cx, query, 10).await;
+            assert_eq!(oracle, vec![("hit".to_owned(), 1.0_f32.to_bits())]);
+
+            let subject = public_observation(&quill, &cx, query, 10).await;
+            assert_eq!(subject, oracle);
+        });
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    #[test]
+    fn public_phrase_prefix_ranking_uses_fixed_frequency_not_suffix_idf() {
+        super::quiet_logging();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let docs = vec![
+                IndexableDocument::new(
+                    "fixed-frequency-first",
+                    "alpha anchor prevent alpha anchor nope",
+                ),
+                IndexableDocument::new(
+                    "rare-suffix-second",
+                    "alpha anchor prefix filler filler filler",
+                ),
+                IndexableDocument::new("prevent-df-control", "prevent"),
+            ];
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let quill = build_quill_index(&cx, &tmp.path().join("quill"), &docs).await;
+            let tantivy = build_tantivy_index(&cx, &tmp.path().join("tantivy"), &docs).await;
+            let query = r#"content:"alpha anchor pre"*"#;
+
+            let oracle_observation = public_observation(&tantivy, &cx, query, 10).await;
+            let oracle = oracle_observation
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                oracle,
+                vec![
+                    "fixed-frequency-first".to_owned(),
+                    "rare-suffix-second".to_owned(),
+                ]
+            );
+
+            let subject_observation = public_observation(&quill, &cx, query, 10).await;
+            let subject = subject_observation
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            let mut oracle_membership = oracle.clone();
+            oracle_membership.sort_unstable();
+            let mut subject_membership = subject.clone();
+            subject_membership.sort_unstable();
+            assert_eq!(subject_membership, oracle_membership);
+            assert_eq!(subject, oracle);
+            assert_eq!(subject_observation, oracle_observation);
+        });
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    #[test]
     fn public_phrase_prefix_caps_expansions_per_leaf_like_tantivy() {
         super::quiet_logging();
         asupersync::test_utils::run_test_with_cx(|cx| async move {

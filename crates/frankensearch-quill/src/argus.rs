@@ -2714,6 +2714,54 @@ impl<'a> PhraseSlot<'a> {
     }
 }
 
+fn validate_phrase_term_binding(
+    term: &PhraseTerm<'_>,
+    fieldnorms: &dyn FieldNormReader,
+    snapshot: &Bm25FieldSnapshot,
+    segment_num_docs: &mut Option<u32>,
+) -> Result<(), ArgusError> {
+    if term.field_ord != snapshot.field_ord() {
+        return Err(ArgusError::PhraseTermFieldMismatch {
+            term_field: term.field_ord,
+            stats_field: snapshot.field_ord(),
+        });
+    }
+    if term.snapshot_doc_freq > snapshot.doc_count() {
+        return Err(ArgusError::InvalidDocFrequency {
+            doc_freq: term.snapshot_doc_freq,
+            doc_count: snapshot.doc_count(),
+        });
+    }
+    let cursor_segment_num_docs = term.cursor.segment_num_docs();
+    if u64::from(cursor_segment_num_docs) > snapshot.doc_count() {
+        return Err(ArgusError::InvalidSnapshot {
+            field_ord: snapshot.field_ord(),
+            reason: "phrase segment num_docs exceeds snapshot BM25 document count",
+        });
+    }
+    if segment_num_docs
+        .replace(cursor_segment_num_docs)
+        .is_some_and(|previous| previous != cursor_segment_num_docs)
+    {
+        return Err(ArgusError::CursorInvariant(
+            "phrase cursors belong to different segment domains",
+        ));
+    }
+    validate_phrase_cursor_state(term.cursor.as_ref(), fieldnorms)?;
+    if term.cursor.doc().is_none() && (term.cursor.size_hint() != 0 || term.cursor.cost() != 0) {
+        return Err(ArgusError::CursorInvariant(
+            "an initially empty phrase cursor must have zero size and runtime cost",
+        ));
+    }
+    if term.cursor.doc().is_some() && term.snapshot_doc_freq == 0 {
+        return Err(ArgusError::InvalidSnapshot {
+            field_ord: snapshot.field_ord(),
+            reason: "a non-empty phrase cursor cannot have zero snapshot doc_freq",
+        });
+    }
+    Ok(())
+}
+
 /// Phrase scorer over positioned posting cursors.
 ///
 /// Candidate documents are intersected before positions are decoded. The
@@ -2721,6 +2769,8 @@ impl<'a> PhraseSlot<'a> {
 /// warm-up performs no per-document allocation.
 pub struct PhraseScorer<'a> {
     slots: Vec<PhraseSlot<'a>>,
+    prefix_gate: Vec<PhraseSlot<'a>>,
+    prefix_constant_score: bool,
     fieldnorms: Box<dyn FieldNormReader + 'a>,
     snapshot: Bm25FieldSnapshot,
     weight: f32,
@@ -3010,9 +3060,74 @@ impl<'a> PhraseScorer<'a> {
     where
         F: FieldNormReader + 'a,
     {
+        Self::new_internal(
+            terms,
+            None,
+            fieldnorms,
+            snapshot,
+            field_boost,
+            max_slop,
+            checkpoint,
+        )
+    }
+
+    /// Build a phrase-prefix scorer whose suffix alternatives gate membership
+    /// without contributing to the fixed phrase's BM25 weight.
+    ///
+    /// The fixed terms must occupy at least one query position. Every suffix
+    /// term must occupy the same final position at or after the fixed phrase.
+    /// A one-position fixed phrase follows pinned Tantivy and scores every
+    /// matching document as exactly `1.0`; longer fixed phrases retain the
+    /// ordinary fixed-phrase BM25 score and frequency.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same construction errors as [`Self::new`], plus malformed
+    /// suffix-position or empty-suffix failures and typed cancellation/fuel
+    /// exhaustion from initial alignment.
+    pub fn new_phrase_prefix_with_checkpoint<F>(
+        fixed_terms: Vec<PhraseTerm<'a>>,
+        suffix_terms: Vec<PhraseTerm<'a>>,
+        fieldnorms: F,
+        snapshot: Bm25FieldSnapshot,
+        field_boost: f32,
+        checkpoint: Option<Arc<dyn QueryWorkCheckpoint + 'a>>,
+    ) -> Result<Self, ArgusError>
+    where
+        F: FieldNormReader + 'a,
+    {
+        Self::new_internal(
+            fixed_terms,
+            Some(suffix_terms),
+            fieldnorms,
+            snapshot,
+            field_boost,
+            0,
+            checkpoint,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_internal<F>(
+        terms: Vec<PhraseTerm<'a>>,
+        prefix_terms: Option<Vec<PhraseTerm<'a>>>,
+        fieldnorms: F,
+        snapshot: Bm25FieldSnapshot,
+        field_boost: f32,
+        max_slop: u32,
+        checkpoint: Option<Arc<dyn QueryWorkCheckpoint + 'a>>,
+    ) -> Result<Self, ArgusError>
+    where
+        F: FieldNormReader + 'a,
+    {
+        let is_phrase_prefix = prefix_terms.is_some();
         if terms.is_empty() {
             return Err(ArgusError::InvalidPhrase {
-                reason: "an exact phrase requires positioned terms",
+                reason: if is_phrase_prefix {
+                    "a phrase prefix requires fixed positioned terms"
+                } else {
+                    "an exact phrase requires positioned terms"
+                },
             });
         }
         if fieldnorms.field_ord() != snapshot.field_ord() {
@@ -3044,47 +3159,7 @@ impl<'a> PhraseScorer<'a> {
         let mut segment_num_docs = None;
         let mut idf_sum = 0.0_f32;
         for term in terms {
-            if term.field_ord != snapshot.field_ord() {
-                return Err(ArgusError::PhraseTermFieldMismatch {
-                    term_field: term.field_ord,
-                    stats_field: snapshot.field_ord(),
-                });
-            }
-            if term.snapshot_doc_freq > snapshot.doc_count() {
-                return Err(ArgusError::InvalidDocFrequency {
-                    doc_freq: term.snapshot_doc_freq,
-                    doc_count: snapshot.doc_count(),
-                });
-            }
-            let cursor_segment_num_docs = term.cursor.segment_num_docs();
-            if u64::from(cursor_segment_num_docs) > snapshot.doc_count() {
-                return Err(ArgusError::InvalidSnapshot {
-                    field_ord: snapshot.field_ord(),
-                    reason: "phrase segment num_docs exceeds snapshot BM25 document count",
-                });
-            }
-            if segment_num_docs
-                .replace(cursor_segment_num_docs)
-                .is_some_and(|previous| previous != cursor_segment_num_docs)
-            {
-                return Err(ArgusError::CursorInvariant(
-                    "phrase cursors belong to different segment domains",
-                ));
-            }
-            validate_phrase_cursor_state(term.cursor.as_ref(), &fieldnorms)?;
-            if term.cursor.doc().is_none()
-                && (term.cursor.size_hint() != 0 || term.cursor.cost() != 0)
-            {
-                return Err(ArgusError::CursorInvariant(
-                    "an initially empty phrase cursor must have zero size and runtime cost",
-                ));
-            }
-            if term.cursor.doc().is_some() && term.snapshot_doc_freq == 0 {
-                return Err(ArgusError::InvalidSnapshot {
-                    field_ord: snapshot.field_ord(),
-                    reason: "a non-empty phrase cursor cannot have zero snapshot doc_freq",
-                });
-            }
+            validate_phrase_term_binding(&term, &fieldnorms, &snapshot, &mut segment_num_docs)?;
             idf_sum += idf(term.snapshot_doc_freq, snapshot.doc_count());
             if !idf_sum.is_finite() {
                 return Err(ArgusError::InvalidSnapshot {
@@ -3105,18 +3180,59 @@ impl<'a> PhraseScorer<'a> {
                 _ => slots.push(PhraseSlot::new(term.position, term.cursor)),
             }
         }
-        if slots.len() < 2 {
+        let mut prefix_gate: Vec<PhraseSlot<'a>> = Vec::new();
+        if let Some(prefix_terms) = prefix_terms {
+            if prefix_terms.is_empty() {
+                return Err(ArgusError::InvalidPhrase {
+                    reason: "a phrase prefix requires suffix alternatives",
+                });
+            }
+            let final_fixed_position =
+                slots
+                    .last()
+                    .map(|slot| slot.position)
+                    .ok_or(ArgusError::InvalidPhrase {
+                        reason: "a phrase prefix requires fixed positioned terms",
+                    })?;
+            prefix_gate
+                .try_reserve_exact(1)
+                .map_err(|_| ArgusError::Allocation {
+                    resource: "phrase-prefix gate",
+                    count: 1,
+                })?;
+            for term in prefix_terms {
+                validate_phrase_term_binding(&term, &fieldnorms, &snapshot, &mut segment_num_docs)?;
+                if term.position < final_fixed_position {
+                    return Err(ArgusError::InvalidPhrase {
+                        reason: "phrase-prefix suffix position precedes the fixed phrase",
+                    });
+                }
+                match prefix_gate.last_mut() {
+                    Some(gate) if term.position != gate.position => {
+                        return Err(ArgusError::InvalidPhrase {
+                            reason: "phrase-prefix suffix alternatives must share one position",
+                        });
+                    }
+                    Some(gate) => gate.push_alternative(term.cursor)?,
+                    None => prefix_gate.push(PhraseSlot::new(term.position, term.cursor)),
+                }
+            }
+        }
+        if slots.len() < 2 && prefix_gate.is_empty() {
             return Err(ArgusError::InvalidPhrase {
                 reason: "an exact phrase must span at least two positions",
             });
         }
-        if slots.iter().any(|slot| {
-            slot.alternatives
-                .iter()
-                .any(|cursor| cursor.doc().is_some())
-        }) && snapshot
-            .average_field_length()
-            .is_none_or(|average| average <= 0.0)
+        let prefix_constant_score = !prefix_gate.is_empty() && slots.len() == 1;
+        if !prefix_constant_score
+            && slots.iter().any(|slot| {
+                slot.alternatives
+                    .iter()
+                    .any(|cursor| cursor.doc().is_some())
+            })
+            && snapshot
+                .average_field_length()
+                .is_none_or(|average| average <= 0.0)
         {
             return Err(ArgusError::InvalidSnapshot {
                 field_ord: snapshot.field_ord(),
@@ -3132,6 +3248,14 @@ impl<'a> PhraseScorer<'a> {
                     segment_num_docs,
                 );
             }
+        }
+        if let Some(gate) = prefix_gate.last_mut()
+            && gate.alternatives.len() > 1
+        {
+            gate.size_hint = estimate_union(
+                gate.alternatives.iter().map(|cursor| cursor.size_hint()),
+                segment_num_docs,
+            );
         }
         let lead_slot = slots
             .iter()
@@ -3172,6 +3296,8 @@ impl<'a> PhraseScorer<'a> {
         }
         let mut scorer = Self {
             slots,
+            prefix_gate,
+            prefix_constant_score,
             fieldnorms: Box::new(fieldnorms),
             snapshot,
             weight,
@@ -3240,7 +3366,7 @@ impl<'a> PhraseScorer<'a> {
             }
 
             let frequency = self.phrase_frequency(target)?;
-            if frequency != 0 {
+            if frequency != 0 && self.phrase_prefix_matches(target)? {
                 self.current = Some(target);
                 self.current_frequency = frequency;
                 return Ok(self.current);
@@ -3292,6 +3418,60 @@ impl<'a> PhraseScorer<'a> {
             }
         }
         Ok(frequency)
+    }
+
+    fn phrase_prefix_matches(&mut self, doc: u32) -> Result<bool, ArgusError> {
+        let Some(gate) = self.prefix_gate.first_mut() else {
+            return Ok(true);
+        };
+        if gate.seek(doc, self.fieldnorms.as_ref())? != Some(doc) {
+            return Ok(false);
+        }
+        decode_phrase_slot_positions(
+            gate,
+            &mut self.decode_scratch,
+            self.snapshot.field_ord(),
+            doc,
+        )?;
+
+        self.position_indices.fill(0);
+        let first_position = self.slots[0].position;
+        let suffix_offset =
+            gate.position
+                .checked_sub(first_position)
+                .ok_or(ArgusError::InvalidPhrase {
+                    reason: "phrase-prefix suffix position precedes the fixed phrase",
+                })?;
+        for &base in &self.slots[0].positions {
+            let mut fixed_phrase_matches = true;
+            for slot_index in 1..self.slots.len() {
+                let offset = self.slots[slot_index].position - first_position;
+                let Some(target) = base.checked_add(offset) else {
+                    fixed_phrase_matches = false;
+                    break;
+                };
+                let positions = &self.slots[slot_index].positions;
+                let position_index = &mut self.position_indices[slot_index];
+                while positions
+                    .get(*position_index)
+                    .is_some_and(|position| *position < target)
+                {
+                    *position_index += 1;
+                }
+                if positions.get(*position_index) != Some(&target) {
+                    fixed_phrase_matches = false;
+                    break;
+                }
+            }
+            if fixed_phrase_matches
+                && base
+                    .checked_add(suffix_offset)
+                    .is_some_and(|target| gate.positions.binary_search(&target).is_ok())
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn phrase_frequency_with_slop(&mut self) -> Result<u32, ArgusError> {
@@ -3364,46 +3544,12 @@ impl<'a> PhraseScorer<'a> {
 
     fn decode_slot_positions(&mut self, slot_index: usize, doc: u32) -> Result<(), ArgusError> {
         let (slots, decode_scratch) = (&mut self.slots, &mut self.decode_scratch);
-        let slot = &mut slots[slot_index];
-        slot.positions.clear();
-        for cursor in &slot.alternatives {
-            if cursor.doc() != Some(doc) {
-                continue;
-            }
-            let frequency = cursor.freq().ok_or(ArgusError::CursorInvariant(
-                "positioned phrase cursor has no frequency",
-            ))?;
-            let handle = cursor
-                .positions_handle()
-                .ok_or_else(|| ArgusError::MissingPositions {
-                    field_ord: self.snapshot.field_ord(),
-                    global_docid: doc,
-                })?;
-            handle.decode_into(decode_scratch)?;
-            let expected = usize::try_from(frequency)
-                .map_err(|_| ArgusError::CursorInvariant("phrase frequency does not fit usize"))?;
-            if decode_scratch.len() != expected {
-                return Err(ArgusError::CursorInvariant(
-                    "decoded phrase position count differs from term frequency",
-                ));
-            }
-            let required = slot.positions.len().saturating_add(decode_scratch.len());
-            slot.positions
-                .try_reserve(decode_scratch.len())
-                .map_err(|_| ArgusError::Allocation {
-                    resource: "phrase slot positions",
-                    count: required,
-                })?;
-            slot.positions.extend_from_slice(decode_scratch);
-        }
-        slot.positions.sort_unstable();
-        slot.positions.dedup();
-        if slot.positions.is_empty() {
-            return Err(ArgusError::CursorInvariant(
-                "phrase candidate has no decoded positions",
-            ));
-        }
-        Ok(())
+        decode_phrase_slot_positions(
+            &mut slots[slot_index],
+            decode_scratch,
+            self.snapshot.field_ord(),
+            doc,
+        )
     }
 
     fn score(&self) -> Result<f32, ArgusError> {
@@ -3414,6 +3560,9 @@ impl<'a> PhraseScorer<'a> {
             return Err(ArgusError::CursorInvariant(
                 "current phrase match has zero frequency",
             ));
+        }
+        if self.prefix_constant_score {
+            return Ok(1.0);
         }
         let fieldnorm_id =
             self.fieldnorms
@@ -3426,6 +3575,53 @@ impl<'a> PhraseScorer<'a> {
         let norm = self.snapshot.tf_cache[usize::from(fieldnorm_id)];
         finite_score(self.weight * (frequency / (frequency + norm)), doc)
     }
+}
+
+fn decode_phrase_slot_positions(
+    slot: &mut PhraseSlot<'_>,
+    decode_scratch: &mut Vec<u32>,
+    field_ord: u16,
+    doc: u32,
+) -> Result<(), ArgusError> {
+    slot.positions.clear();
+    for cursor in &slot.alternatives {
+        if cursor.doc() != Some(doc) {
+            continue;
+        }
+        let frequency = cursor.freq().ok_or(ArgusError::CursorInvariant(
+            "positioned phrase cursor has no frequency",
+        ))?;
+        let handle = cursor
+            .positions_handle()
+            .ok_or(ArgusError::MissingPositions {
+                field_ord,
+                global_docid: doc,
+            })?;
+        handle.decode_into(decode_scratch)?;
+        let expected = usize::try_from(frequency)
+            .map_err(|_| ArgusError::CursorInvariant("phrase frequency does not fit usize"))?;
+        if decode_scratch.len() != expected {
+            return Err(ArgusError::CursorInvariant(
+                "decoded phrase position count differs from term frequency",
+            ));
+        }
+        let required = slot.positions.len().saturating_add(decode_scratch.len());
+        slot.positions
+            .try_reserve(decode_scratch.len())
+            .map_err(|_| ArgusError::Allocation {
+                resource: "phrase slot positions",
+                count: required,
+            })?;
+        slot.positions.extend_from_slice(decode_scratch);
+    }
+    slot.positions.sort_unstable();
+    slot.positions.dedup();
+    if slot.positions.is_empty() {
+        return Err(ArgusError::CursorInvariant(
+            "phrase candidate has no decoded positions",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_phrase_cursor_after_move(

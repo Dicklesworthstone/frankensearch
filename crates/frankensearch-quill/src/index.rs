@@ -13011,6 +13011,61 @@ fn validate_cumulative_boost(inherited: f32, factor: f32) -> Result<f32, QuillIn
 }
 
 #[allow(clippy::too_many_arguments)]
+fn lower_leaf_phrase_term<'a>(
+    checkpoint: &QueryCheckpointHandle<'a>,
+    leaf: QueryLeaf<'a>,
+    snapshot: &QuillSearchSnapshot,
+    prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
+    schema: SchemaDescriptor,
+    field_ord: u16,
+    position: u32,
+    term_bytes: &[u8],
+) -> Result<PhraseTerm<'a>, QuillIndexError> {
+    let snapshot_doc_freq = match prepared_doc_freqs {
+        Some(prepared) => prepared.get_or_compute(checkpoint, snapshot, field_ord, term_bytes)?,
+        None => checkpointed_snapshot_doc_freq(
+            checkpoint,
+            snapshot,
+            field_ord,
+            term_bytes,
+            SnapshotDocFreqDeltaAdmission::Ranking,
+        )?,
+    };
+    Ok(match leaf {
+        QueryLeaf::Sealed(segment) => {
+            let cursor = open_owned_cursor(
+                segment,
+                schema,
+                field_ord,
+                term_bytes,
+                true,
+                Some(checkpoint),
+            )?;
+            PhraseTerm::new(
+                field_ord,
+                position,
+                CheckpointPostingCursor::new(cursor, clone_query_checkpoint_for_argus(checkpoint))?,
+                snapshot_doc_freq,
+            )
+        }
+        QueryLeaf::Delta(delta) => {
+            let cursor = DeltaPostingCursor::new_admitted(
+                delta,
+                field_ord,
+                term_bytes,
+                checkpoint.as_ref(),
+            )?;
+            PhraseTerm::new(
+                field_ord,
+                position,
+                CheckpointPostingCursor::new(cursor, clone_query_checkpoint_for_argus(checkpoint))?,
+                snapshot_doc_freq,
+            )
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn lower_leaf_exact_phrase<'a>(
     checkpoint: &QueryCheckpointHandle<'a>,
     leaf: QueryLeaf<'a>,
@@ -13021,7 +13076,6 @@ fn lower_leaf_exact_phrase<'a>(
     field_boost: f32,
     terms: &[crate::query::PositionedTerm],
     slop: u32,
-    final_term: Option<&[u8]>,
     inherited_boost: f32,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     let stats = composite_snapshot_field(snapshot, field_ord)?;
@@ -13029,62 +13083,17 @@ fn lower_leaf_exact_phrase<'a>(
     phrase_terms
         .try_reserve_exact(terms.len())
         .map_err(|_| invalid_state("could not allocate phrase terms"))?;
-    for (index, term) in terms.iter().enumerate() {
-        let term_bytes = if index + 1 == terms.len() {
-            final_term.unwrap_or(term.text.as_bytes())
-        } else {
-            term.text.as_bytes()
-        };
-        let snapshot_doc_freq = match prepared_doc_freqs {
-            Some(prepared) => {
-                prepared.get_or_compute(checkpoint, snapshot, field_ord, term_bytes)?
-            }
-            None => checkpointed_snapshot_doc_freq(
-                checkpoint,
-                snapshot,
-                field_ord,
-                term_bytes,
-                SnapshotDocFreqDeltaAdmission::Ranking,
-            )?,
-        };
-        phrase_terms.push(match leaf {
-            QueryLeaf::Sealed(segment) => {
-                let cursor = open_owned_cursor(
-                    segment,
-                    schema,
-                    field_ord,
-                    term_bytes,
-                    true,
-                    Some(checkpoint),
-                )?;
-                PhraseTerm::new(
-                    field_ord,
-                    term.position,
-                    CheckpointPostingCursor::new(
-                        cursor,
-                        clone_query_checkpoint_for_argus(checkpoint),
-                    )?,
-                    snapshot_doc_freq,
-                )
-            }
-            QueryLeaf::Delta(delta) => {
-                let cursor = DeltaPostingCursor::new_admitted(
-                    delta,
-                    field_ord,
-                    term_bytes,
-                    checkpoint.as_ref(),
-                )?;
-                PhraseTerm::new(
-                    field_ord,
-                    term.position,
-                    CheckpointPostingCursor::new(
-                        cursor,
-                        clone_query_checkpoint_for_argus(checkpoint),
-                    )?,
-                    snapshot_doc_freq,
-                )
-            }
-        });
+    for term in terms {
+        phrase_terms.push(lower_leaf_phrase_term(
+            checkpoint,
+            leaf,
+            snapshot,
+            prepared_doc_freqs,
+            schema,
+            field_ord,
+            term.position,
+            term.text.as_bytes(),
+        )?);
     }
     let bm25 = Bm25FieldSnapshot::new(stats)?;
     let boost = inherited_boost * field_boost;
@@ -13103,6 +13112,89 @@ fn lower_leaf_exact_phrase<'a>(
             bm25,
             boost,
             slop,
+            Some(clone_query_checkpoint_for_argus(checkpoint)),
+        )?,
+    };
+    Ok(ReferenceScorer::phrase(scorer))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_leaf_phrase_prefix<'a>(
+    checkpoint: &QueryCheckpointHandle<'a>,
+    leaf: QueryLeaf<'a>,
+    snapshot: &QuillSearchSnapshot,
+    prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
+    schema: SchemaDescriptor,
+    field_ord: u16,
+    field_boost: f32,
+    terms: &[crate::query::PositionedTerm],
+    suffixes: &[Vec<u8>],
+    inherited_boost: f32,
+) -> Result<ReferenceScorer<'a>, QuillIndexError> {
+    if suffixes.is_empty() {
+        return Ok(ReferenceScorer::empty());
+    }
+    let (prefix_term, fixed_terms) = terms
+        .split_last()
+        .ok_or_else(|| invalid_state("validated phrase prefix lost its final term"))?;
+    if fixed_terms.is_empty() {
+        return Err(invalid_state(
+            "validated phrase prefix has no fixed phrase term",
+        ));
+    }
+
+    let mut lowered_fixed = Vec::new();
+    lowered_fixed
+        .try_reserve_exact(fixed_terms.len())
+        .map_err(|_| invalid_state("could not allocate fixed phrase-prefix terms"))?;
+    for term in fixed_terms {
+        lowered_fixed.push(lower_leaf_phrase_term(
+            checkpoint,
+            leaf,
+            snapshot,
+            prepared_doc_freqs,
+            schema,
+            field_ord,
+            term.position,
+            term.text.as_bytes(),
+        )?);
+    }
+
+    let mut lowered_suffixes = Vec::new();
+    lowered_suffixes
+        .try_reserve_exact(suffixes.len())
+        .map_err(|_| invalid_state("could not allocate phrase-prefix suffix terms"))?;
+    for suffix in suffixes {
+        lowered_suffixes.push(lower_leaf_phrase_term(
+            checkpoint,
+            leaf,
+            snapshot,
+            prepared_doc_freqs,
+            schema,
+            field_ord,
+            prefix_term.position,
+            suffix,
+        )?);
+    }
+
+    let stats = composite_snapshot_field(snapshot, field_ord)?;
+    let bm25 = Bm25FieldSnapshot::new(stats)?;
+    let boost = inherited_boost * field_boost;
+    let scorer = match leaf {
+        QueryLeaf::Sealed(segment) => PhraseScorer::new_phrase_prefix_with_checkpoint(
+            lowered_fixed,
+            lowered_suffixes,
+            borrowed_fieldnorms(segment, schema, field_ord)?,
+            bm25,
+            boost,
+            Some(clone_query_checkpoint_for_argus(checkpoint)),
+        )?,
+        QueryLeaf::Delta(delta) => PhraseScorer::new_phrase_prefix_with_checkpoint(
+            lowered_fixed,
+            lowered_suffixes,
+            DeltaFieldNorms::new(delta, field_ord),
+            bm25,
+            boost,
             Some(clone_query_checkpoint_for_argus(checkpoint)),
         )?,
     };
@@ -13601,11 +13693,9 @@ fn lower_query_with_mode<'a>(
                 );
             }
             let mut clauses = Vec::new();
-            if !*prefix {
-                clauses
-                    .try_reserve_exact(fields.len())
-                    .map_err(|_| invalid_state("could not allocate phrase field clauses"))?;
-            }
+            clauses
+                .try_reserve_exact(fields.len())
+                .map_err(|_| invalid_state("could not allocate phrase field clauses"))?;
             for field in fields {
                 if *prefix {
                     let final_term = terms.last().ok_or_else(|| {
@@ -13619,26 +13709,22 @@ fn lower_query_with_mode<'a>(
                         field.field_id,
                         final_bytes,
                     )?;
-                    clauses.try_reserve(expansions.len()).map_err(|_| {
-                        invalid_state("could not allocate phrase-prefix expansion clauses")
-                    })?;
-                    for expansion in &expansions {
-                        // Tantivy's parsed phrase-prefix path constructs a
-                        // PhrasePrefixQuery without carrying the parsed slop.
-                        clauses.push(ScorerClause::should(lower_leaf_exact_phrase(
-                            checkpoint,
-                            leaf,
-                            snapshot,
-                            prepared_doc_freqs,
-                            schema,
-                            field.field_id,
-                            field.boost,
-                            terms,
-                            0,
-                            Some(expansion),
-                            inherited_boost,
-                        )?));
-                    }
+                    // Tantivy scores the fixed phrase once and uses all suffix
+                    // expansions only to gate membership. Lowering one exact
+                    // scored phrase per suffix would both add suffix IDF and
+                    // multiply the fixed score for multi-suffix documents.
+                    clauses.push(ScorerClause::should(lower_leaf_phrase_prefix(
+                        checkpoint,
+                        leaf,
+                        snapshot,
+                        prepared_doc_freqs,
+                        schema,
+                        field.field_id,
+                        field.boost,
+                        terms,
+                        &expansions,
+                        inherited_boost,
+                    )?));
                 } else {
                     clauses.push(ScorerClause::should(lower_leaf_exact_phrase(
                         checkpoint,
@@ -13650,7 +13736,6 @@ fn lower_query_with_mode<'a>(
                         field.boost,
                         terms,
                         *slop,
-                        None,
                         inherited_boost,
                     )?));
                 }
