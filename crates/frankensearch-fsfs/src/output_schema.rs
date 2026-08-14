@@ -443,6 +443,15 @@ pub struct SearchPayload {
     pub degradation_advice: BTreeMap<String, DegradationAdvice>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub index_freshness: Option<IndexFreshnessPayload>,
+    /// Why the semantic lane did not fully participate, when that is known.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub skip_reason: Option<String>,
+    /// Published fast-tier embedder identity for the searched FSVI.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub vector_generation_id: Option<String>,
+    /// True when that identity is a hash/fnv control artifact.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vector_generation_is_hash: bool,
 }
 
 impl SearchPayload {
@@ -462,7 +471,25 @@ impl SearchPayload {
             hits,
             degradation_advice: BTreeMap::new(),
             index_freshness: None,
+            skip_reason: None,
+            vector_generation_id: None,
+            vector_generation_is_hash: false,
         }
+    }
+
+    /// Record why the semantic lane was skipped or is a control path.
+    #[must_use]
+    pub fn with_skip_reason(mut self, reason: impl Into<String>) -> Self {
+        self.skip_reason = Some(reason.into());
+        self
+    }
+
+    /// Bind the published vector generation that produced these hits.
+    #[must_use]
+    pub fn with_vector_generation(mut self, id: impl Into<String>, is_hash: bool) -> Self {
+        self.vector_generation_id = Some(id.into());
+        self.vector_generation_is_hash = is_hash;
+        self
     }
 
     #[must_use]
@@ -1292,6 +1319,43 @@ mod tests {
                 .get("degrade.advice.refinement_failed")
                 .map(|advice| advice.reason_code.as_str()),
             Some("degrade.advice.refinement_failed")
+        );
+        assert!(
+            !json.contains("skip_reason") && !json.contains("vector_generation"),
+            "absent generation/skip fields must stay omitted: {json}"
+        );
+    }
+
+    #[test]
+    fn search_payload_serializes_hash_generation_identity() {
+        let payload = SearchPayload::new(
+            "ownership",
+            SearchOutputPhase::Initial,
+            1,
+            vec![SearchHitPayload {
+                rank: 1,
+                path: "src/lib.rs".to_owned(),
+                score: 0.1,
+                snippet: None,
+                lexical_rank: None,
+                semantic_rank: Some(0),
+                in_both_sources: false,
+            }],
+        )
+        .with_skip_reason("non_semantic_fast_embedder_vector_control")
+        .with_vector_generation("fnv1a-256", true);
+
+        let json = serde_json::to_string(&payload).expect("serialize payload");
+        let decoded: SearchPayload = serde_json::from_str(&json).expect("deserialize payload");
+        assert_eq!(
+            decoded.skip_reason.as_deref(),
+            Some("non_semantic_fast_embedder_vector_control")
+        );
+        assert_eq!(decoded.vector_generation_id.as_deref(), Some("fnv1a-256"));
+        assert!(decoded.vector_generation_is_hash);
+        assert!(
+            json.contains("fnv1a-256") && json.contains("vector_generation_is_hash"),
+            "hash generation must be visible on the search wire: {json}"
         );
     }
 

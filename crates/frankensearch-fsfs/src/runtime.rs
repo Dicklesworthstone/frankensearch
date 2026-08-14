@@ -112,8 +112,8 @@ use crate::lifecycle::{
 };
 use crate::mount_info::{MountTable, read_system_mounts};
 use crate::output_schema::{
-    IndexFreshnessPayload, OutputEnvelope, OutputError, SearchHitPayload, SearchOutputPhase,
-    SearchPayload, error_code_for,
+    IndexFreshnessPayload, OutputEnvelope, OutputError, OutputWarning, OutputWarningCode,
+    SearchHitPayload, SearchOutputPhase, SearchPayload, error_code_for,
 };
 use crate::pressure::{
     DegradationControllerConfig, DegradationSignal, DegradationStateMachine, DegradationTransition,
@@ -5151,7 +5151,8 @@ impl FsfsRuntime {
         }
 
         let meta = meta_for_format("search", self.cli_input.format).with_duration_ms(elapsed_ms);
-        let envelope = OutputEnvelope::success(payload, meta, iso_timestamp_now());
+        let envelope = OutputEnvelope::success(payload.clone(), meta, iso_timestamp_now())
+            .with_warnings(Self::search_hash_fallback_warnings(&payload));
         let stdout = std::io::stdout();
         let mut writer = BufWriter::with_capacity(1 << 20, stdout.lock());
         emit_envelope(&envelope, self.cli_input.format, &mut writer)?;
@@ -5379,13 +5380,7 @@ impl FsfsRuntime {
         let mut hot_cache: HashMap<SearchCacheKey, Vec<SearchPayload>> = HashMap::new();
         let hot_cache_enabled = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
 
-        let ready = serde_json::json!({
-            "ok": true,
-            "event": "ready",
-            "schema_version": FSFS_SEARCH_SERVE_SCHEMA_VERSION,
-            "pid": std::process::id(),
-            "format": self.cli_input.format.to_string(),
-        });
+        let ready = Self::search_serve_ready_event(self.cli_input.format.to_string(), &resources);
         Self::emit_search_serve_json_line(&ready)?;
 
         loop {
@@ -5742,6 +5737,30 @@ impl FsfsRuntime {
             cached,
             payloads,
             error: None,
+        })
+    }
+
+    fn search_serve_ready_event(
+        format: impl Into<String>,
+        resources: &SearchExecutionResources,
+    ) -> serde_json::Value {
+        let generation = resources.vector_index.as_ref().map(|index| {
+            let id = index.embedder_id().to_owned();
+            let is_hash = Self::is_legacy_hash_vector_generation(&id);
+            (id, is_hash)
+        });
+        serde_json::json!({
+            "ok": true,
+            "event": "ready",
+            "schema_version": FSFS_SEARCH_SERVE_SCHEMA_VERSION,
+            "pid": std::process::id(),
+            "format": format.into(),
+            "vector_generation_id": generation.as_ref().map(|(id, _)| id.clone()),
+            "vector_generation_is_hash": generation.as_ref().is_some_and(|(_, is_hash)| *is_hash),
+            "semantic_admitted": generation
+                .as_ref()
+                .is_some_and(|(_, is_hash)| !*is_hash)
+                && resources.fast_embedder.is_some(),
         })
     }
 
@@ -6736,7 +6755,7 @@ impl FsfsRuntime {
             .collect();
 
         let freshness = payloads.iter().find_map(|payload| payload.index_freshness);
-        Self::attach_index_freshness(
+        let mut payload = Self::attach_index_freshness(
             SearchPayload::new(
                 original_query,
                 SearchOutputPhase::Refined,
@@ -6744,7 +6763,15 @@ impl FsfsRuntime {
                 hits,
             ),
             freshness,
-        )
+        );
+        if let Some(source) = payloads.first() {
+            payload.skip_reason.clone_from(&source.skip_reason);
+            payload
+                .vector_generation_id
+                .clone_from(&source.vector_generation_id);
+            payload.vector_generation_is_hash = source.vector_generation_is_hash;
+        }
+        payload
     }
 
     #[must_use]
@@ -7016,6 +7043,56 @@ impl FsfsRuntime {
     ) -> SearchPayload {
         payload.index_freshness = freshness;
         payload
+    }
+
+    fn annotate_search_payload(
+        mut payload: SearchPayload,
+        resources: &SearchExecutionResources,
+        mode: SearchExecutionMode,
+    ) -> SearchPayload {
+        if let Some(index) = resources.vector_index.as_ref() {
+            let id = index.embedder_id();
+            let is_hash = Self::is_legacy_hash_vector_generation(id);
+            payload.vector_generation_id = Some(id.to_owned());
+            payload.vector_generation_is_hash = is_hash;
+            if is_hash && payload.skip_reason.is_none() {
+                payload.skip_reason = Some("non_semantic_fast_embedder_vector_control".to_owned());
+            }
+        }
+        if payload.skip_reason.is_none() {
+            payload.skip_reason = match mode {
+                SearchExecutionMode::FastOnly => Some("fast_only".to_owned()),
+                SearchExecutionMode::LexicalOnly => Some("lexical_only".to_owned()),
+                SearchExecutionMode::Full => None,
+            };
+        }
+        payload
+    }
+
+    fn attach_search_context(
+        payload: SearchPayload,
+        freshness: Option<IndexFreshnessPayload>,
+        resources: &SearchExecutionResources,
+        mode: SearchExecutionMode,
+    ) -> SearchPayload {
+        Self::annotate_search_payload(
+            Self::attach_index_freshness(payload, freshness),
+            resources,
+            mode,
+        )
+    }
+
+    fn search_hash_fallback_warnings(payload: &SearchPayload) -> Vec<OutputWarning> {
+        if !payload.vector_generation_is_hash {
+            return Vec::new();
+        }
+        let generation = payload.vector_generation_id.as_deref().unwrap_or("hash");
+        vec![OutputWarning::new(
+            OutputWarningCode::HASH_FALLBACK,
+            format!(
+                "vector generation `{generation}` is a hash control artifact, not semantic search"
+            ),
+        )]
     }
 
     #[must_use]
@@ -7358,9 +7435,11 @@ impl FsfsRuntime {
             let artifact = SearchPhaseArtifact {
                 phase: SearchOutputPhase::Initial,
                 fused: Vec::new(),
-                payload: Self::attach_index_freshness(
+                payload: Self::attach_search_context(
                     SearchPayload::new(String::new(), SearchOutputPhase::Initial, 0, Vec::new()),
                     index_freshness,
+                    resources,
+                    mode,
                 ),
             };
             Self::validate_bound_search_resources(resources, mode)?;
@@ -7712,7 +7791,7 @@ impl FsfsRuntime {
             } else {
                 filtered_initial_head.clone()
             };
-        let payload = Self::attach_index_freshness(
+        let payload = Self::attach_search_context(
             Self::build_limited_payload(
                 orchestrator,
                 &normalized_query,
@@ -7723,6 +7802,8 @@ impl FsfsRuntime {
             )
             .with_degradation_advice(resources.degradation_advice.clone()),
             index_freshness,
+            resources,
+            mode,
         );
         let fusion_elapsed_ms = fusion_start.elapsed().as_millis();
 
@@ -7808,7 +7889,7 @@ impl FsfsRuntime {
                         &fused_initial,
                         output_limit,
                     );
-                    let refined_payload = Self::attach_index_freshness(
+                    let refined_payload = Self::attach_search_context(
                         Self::build_limited_payload(
                             orchestrator,
                             &normalized_query,
@@ -7818,6 +7899,8 @@ impl FsfsRuntime {
                             output_limit,
                         ),
                         index_freshness,
+                        resources,
+                        mode,
                     );
                     let refined_artifact = SearchPhaseArtifact {
                         phase: SearchOutputPhase::Refined,
@@ -7855,7 +7938,7 @@ impl FsfsRuntime {
                         &resources.index_root,
                         &error,
                     ));
-                    let failed_payload = Self::attach_index_freshness(
+                    let failed_payload = Self::attach_search_context(
                         Self::build_limited_payload(
                             orchestrator,
                             &normalized_query,
@@ -7866,6 +7949,8 @@ impl FsfsRuntime {
                         )
                         .with_degradation_advice(advice),
                         index_freshness,
+                        resources,
+                        mode,
                     );
                     let failed_artifact = SearchPhaseArtifact {
                         phase: SearchOutputPhase::RefinementFailed,
@@ -7887,7 +7972,7 @@ impl FsfsRuntime {
                         original_error: None,
                         replay_command: None,
                     }));
-                    let failed_payload = Self::attach_index_freshness(
+                    let failed_payload = Self::attach_search_context(
                         Self::build_limited_payload(
                             orchestrator,
                             &normalized_query,
@@ -7898,6 +7983,8 @@ impl FsfsRuntime {
                         )
                         .with_degradation_advice(advice),
                         index_freshness,
+                        resources,
+                        mode,
                     );
                     let failed_artifact = SearchPhaseArtifact {
                         phase: SearchOutputPhase::RefinementFailed,
@@ -19147,7 +19234,8 @@ mod tests {
         DiskBudgetAction, DiskBudgetStage, LifecycleTracker, ResourceLimits, WatchdogConfig,
     };
     use crate::output_schema::{
-        IndexFreshnessPayload, SearchHitPayload, SearchOutputPhase, SearchPayload,
+        IndexFreshnessPayload, OutputWarningCode, SearchHitPayload, SearchOutputPhase,
+        SearchPayload,
     };
     #[cfg(target_os = "linux")]
     use crate::pressure::HostPressureCollector;
@@ -27531,6 +27619,53 @@ mod tests {
             !table.contains("state: ready"),
             "hash control must not share the ready label: {table}"
         );
+    }
+
+    #[test]
+    fn search_payload_and_serve_ready_name_hash_vector_generations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let vector_path = temp.path().join("vector/index.fsvi");
+        fs::create_dir_all(vector_path.parent().expect("vector parent"))
+            .expect("create vector dir");
+        VectorIndex::create(&vector_path, "fnv1a-256", 256)
+            .expect("create hash generation")
+            .finish()
+            .expect("finish hash generation");
+        let resources = SearchExecutionResources {
+            index_root: temp.path().to_path_buf(),
+            generation_fingerprint: "test".to_owned(),
+            lexical_index: None,
+            shadow_observer: None,
+            shadow_pressure_sampler: None,
+            vector_index: Some(VectorIndex::open_read_only(&vector_path).expect("open hash index")),
+            fast_embedder: Some(Arc::new(HashEmbedder::default_256())),
+            quality_embedder: None,
+            fast_embedder_attempted: true,
+            quality_embedder_attempted: true,
+            degradation_advice: Vec::new(),
+        };
+
+        let payload = FsfsRuntime::annotate_search_payload(
+            SearchPayload::new("query", SearchOutputPhase::Initial, 0, Vec::new()),
+            &resources,
+            SearchExecutionMode::Full,
+        );
+        assert_eq!(payload.vector_generation_id.as_deref(), Some("fnv1a-256"));
+        assert!(payload.vector_generation_is_hash);
+        assert_eq!(
+            payload.skip_reason.as_deref(),
+            Some("non_semantic_fast_embedder_vector_control")
+        );
+
+        let warnings = FsfsRuntime::search_hash_fallback_warnings(&payload);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, OutputWarningCode::HASH_FALLBACK);
+
+        let ready = FsfsRuntime::search_serve_ready_event("json", &resources);
+        assert_eq!(ready["event"], "ready");
+        assert_eq!(ready["vector_generation_id"], "fnv1a-256");
+        assert_eq!(ready["vector_generation_is_hash"], true);
+        assert_eq!(ready["semantic_admitted"], false);
     }
 
     #[test]

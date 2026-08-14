@@ -501,6 +501,21 @@ fn render_search_table_with_options(
         "PHASE {phase_label}: {} hit(s) for \"{}\"",
         payload.returned_hits, payload.query
     );
+    if let Some(generation_id) = payload.vector_generation_id.as_deref() {
+        let class = if payload.vector_generation_is_hash {
+            paint("hash control", "31", color_enabled)
+        } else {
+            paint("semantic", "32", color_enabled)
+        };
+        let _ = writeln!(out, "vector generation: {generation_id}  class={class}");
+    }
+    if let Some(skip_reason) = payload.skip_reason.as_deref() {
+        let _ = writeln!(
+            out,
+            "skip reason: {}",
+            paint(skip_reason, "33", color_enabled)
+        );
+    }
 
     if payload.is_empty() {
         let _ = writeln!(
@@ -1471,6 +1486,35 @@ mod tests {
         assert!(
             output.contains('…'),
             "long snippet should be truncated with ellipsis: {output}"
+        );
+    }
+
+    #[test]
+    fn render_search_table_names_hash_generation_and_skip_reason() {
+        let payload = SearchPayload::new(
+            "ownership",
+            SearchOutputPhase::Initial,
+            1,
+            vec![SearchHitPayload {
+                rank: 1,
+                path: "src/lib.rs".to_owned(),
+                score: 0.1,
+                snippet: None,
+                lexical_rank: None,
+                semantic_rank: Some(0),
+                in_both_sources: false,
+            }],
+        )
+        .with_skip_reason("non_semantic_fast_embedder_vector_control")
+        .with_vector_generation("fnv1a-256", true);
+        let output = render_search_table_for_cli(&payload, Some(2), true);
+        assert!(
+            output.contains("fnv1a-256") && output.contains("hash control"),
+            "search table must name the hash generation: {output}"
+        );
+        assert!(
+            output.contains("non_semantic_fast_embedder_vector_control"),
+            "search table must surface skip_reason: {output}"
         );
     }
 
