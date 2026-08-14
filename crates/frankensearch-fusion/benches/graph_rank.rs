@@ -364,6 +364,7 @@ fn bench_graph_rank(c: &mut Criterion) {
         // personalization; a `None` here would mean the paired arm below times a no-op.
         let prod_out = ranker
             .rank_phase1(&cx, "graph rank query", &graph, &seeds, limit)
+            .expect("rank_phase1")
             .expect("rank_phase1 must return Some -- else this bench measures nothing");
         assert!(
             !prod_out.is_empty(),
@@ -382,6 +383,7 @@ fn bench_graph_rank(c: &mut Criterion) {
         // numbering, edge visit order, floating-point accumulation, tie-breaking, or output order.
         let siphash_out = ranker
             .rank_phase1_siphash(&cx, "graph rank query", &graph, &seeds, limit)
+            .expect("rank_phase1_siphash")
             .expect("rank_phase1_siphash must return Some -- else the legacy arm measures nothing");
         assert_eq!(
             siphash_out.len(),

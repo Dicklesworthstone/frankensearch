@@ -1899,15 +1899,19 @@ impl TwoTierSearcher {
                 {
                     #[cfg(feature = "graph")]
                     {
-                        self.document_graph.as_ref().and_then(|graph| {
-                            GraphRanker::new().rank_phase1(
-                                cx,
-                                semantic_query,
-                                graph.as_ref(),
-                                &fast_hits,
-                                semantic_budget,
-                            )
-                        })
+                        self.document_graph
+                            .as_ref()
+                            .map(|graph| {
+                                GraphRanker::new().rank_phase1(
+                                    cx,
+                                    semantic_query,
+                                    graph.as_ref(),
+                                    &fast_hits,
+                                    semantic_budget,
+                                )
+                            })
+                            .transpose()?
+                            .flatten()
                     }
                     #[cfg(not(feature = "graph"))]
                     {

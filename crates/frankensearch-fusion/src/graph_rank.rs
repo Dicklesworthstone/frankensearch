@@ -8,7 +8,7 @@ use std::hash::BuildHasher;
 
 use asupersync::Cx;
 use frankensearch_core::types::{ScoreSource, ScoredResult, VectorHit};
-use frankensearch_core::{DocumentGraph, GraphDocId};
+use frankensearch_core::{DocumentGraph, GraphDocId, SearchError, SearchResult};
 
 const DEFAULT_RESTART_PROBABILITY: f64 = 0.15;
 const DEFAULT_MAX_ITERATIONS: usize = 20;
@@ -112,7 +112,11 @@ impl GraphRanker {
     /// Compute graph-ranked candidates for phase-1 fusion.
     ///
     /// Seeds come from current semantic hits (query-matched docs).
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::Cancelled`] when the caller cancels during the
+    /// power iteration.
     pub fn rank_phase1(
         &self,
         cx: &Cx,
@@ -120,7 +124,7 @@ impl GraphRanker {
         graph: &DocumentGraph,
         seed_hits: &[VectorHit],
         limit: usize,
-    ) -> Option<Vec<ScoredResult>> {
+    ) -> SearchResult<Option<Vec<ScoredResult>>> {
         self.rank_phase1_with_hasher::<ahash::RandomState>(cx, query, graph, seed_hits, limit)
     }
 
@@ -129,8 +133,12 @@ impl GraphRanker {
     /// The production path uses aHash for this lookup-only map. Both arms share this function's
     /// implementation, and neither iterates the map, so changing the hasher cannot affect node
     /// numbering, edge visitation, floating-point accumulation, ties, or final ordering.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::Cancelled`] when the caller cancels during the
+    /// power iteration.
     #[cfg(any(test, feature = "bench-internals"))]
-    #[must_use]
     pub fn rank_phase1_siphash(
         &self,
         cx: &Cx,
@@ -138,7 +146,7 @@ impl GraphRanker {
         graph: &DocumentGraph,
         seed_hits: &[VectorHit],
         limit: usize,
-    ) -> Option<Vec<ScoredResult>> {
+    ) -> SearchResult<Option<Vec<ScoredResult>>> {
         self.rank_phase1_with_hasher::<std::collections::hash_map::RandomState>(
             cx, query, graph, seed_hits, limit,
         )
@@ -146,19 +154,19 @@ impl GraphRanker {
 
     fn rank_phase1_with_hasher<S: BuildHasher + Default>(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         _query: &str,
         graph: &DocumentGraph,
         seed_hits: &[VectorHit],
         limit: usize,
-    ) -> Option<Vec<ScoredResult>> {
+    ) -> SearchResult<Option<Vec<ScoredResult>>> {
         if graph.is_empty() || limit == 0 {
-            return None;
+            return Ok(None);
         }
 
         let personalization = Self::personalization_from_seed_hits(graph, seed_hits);
         if personalization.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         // Dense-index the graph ONCE and run the PageRank power iteration over
@@ -223,6 +231,14 @@ impl GraphRanker {
         let mut next = vec![0.0_f64; n];
 
         for _ in 0..self.max_iterations {
+            if let Err(error) = cx.checkpoint() {
+                return Err(SearchError::Cancelled {
+                    phase: "graph.rank_phase1".to_owned(),
+                    reason: cx
+                        .cancel_reason()
+                        .map_or_else(|| error.to_string(), |reason| reason.to_string()),
+                });
+            }
             next.fill(0.0);
 
             for &(i, w) in &seeds {
@@ -268,7 +284,7 @@ impl GraphRanker {
             .zip(ranks.iter())
             .map(|(&doc_id, &rank)| (doc_id.clone(), rank))
             .collect();
-        Self::finalize_scores(ranks_map, limit)
+        Ok(Self::finalize_scores(ranks_map, limit))
     }
 
     /// **Bench-only twin of [`Self::rank_phase1`] using a true flat CSR.** Not a shipping path.
@@ -555,7 +571,7 @@ impl GraphRanker {
             .zip(ranks.iter())
             .map(|(&doc_id, &rank)| (doc_id.clone(), rank))
             .collect();
-        Self::finalize_scores(ranks_map, limit)
+        Ok(Self::finalize_scores(ranks_map, limit))
     }
 }
 
@@ -576,7 +592,9 @@ mod tests {
                 score: 1.0,
                 doc_id: "doc-a".into(),
             }];
-            let results = GraphRanker::new().rank_phase1(&cx, "query", &graph, &seed_hits, 5);
+            let results = GraphRanker::new()
+                .rank_phase1(&cx, "query", &graph, &seed_hits, 5)
+                .expect("empty graph rank");
             assert!(results.is_none());
         });
     }
@@ -591,7 +609,9 @@ mod tests {
                 score: 1.0,
                 doc_id: "outside-graph".into(),
             }];
-            let results = GraphRanker::new().rank_phase1(&cx, "query", &graph, &seed_hits, 5);
+            let results = GraphRanker::new()
+                .rank_phase1(&cx, "query", &graph, &seed_hits, 5)
+                .expect("missing-seed graph rank");
             assert!(results.is_none());
         });
     }
@@ -610,6 +630,7 @@ mod tests {
 
             let results = GraphRanker::new()
                 .rank_phase1(&cx, "query", &graph, &seed_hits, 10)
+                .expect("graph rank")
                 .expect("graph rank should yield scores");
 
             assert!(
@@ -645,10 +666,12 @@ mod tests {
             let ranker = GraphRanker::new();
             let ahash = ranker
                 .rank_phase1(&cx, "query", &graph, &seed_hits, 10)
-                .expect("aHash graph rank");
+                .expect("aHash graph rank")
+                .expect("aHash graph rank yields scores");
             let siphash = ranker
                 .rank_phase1_siphash(&cx, "query", &graph, &seed_hits, 10)
-                .expect("SipHash graph rank");
+                .expect("SipHash graph rank")
+                .expect("SipHash graph rank yields scores");
 
             assert_eq!(ahash.len(), siphash.len());
             for (fast, legacy) in ahash.iter().zip(&siphash) {
@@ -791,7 +814,8 @@ mod tests {
 
             let got = GraphRanker::new()
                 .rank_phase1(&cx, "q", &graph, &seed_hits, 25)
-                .expect("dense graph rank");
+                .expect("dense graph rank")
+                .expect("dense graph rank yields scores");
             let want = rank_phase1_reference(&graph, &seed_hits, 25).expect("reference rank");
 
             let got_ids: Vec<&str> = got.iter().map(|r| r.doc_id.as_str()).collect();
