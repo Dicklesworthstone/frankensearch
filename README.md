@@ -441,18 +441,19 @@ If you want to embed `frankensearch` directly in your Rust app, this is the
 minimum end-to-end flow:
 
 ```rust,no_run
+use std::path::Path;
 use std::sync::Arc;
 
 use frankensearch::{
-    Embedder, EmbedderStack, HashEmbedder, IndexBuilder, TwoTierConfig, TwoTierIndex,
-    TwoTierSearcher,
+    EmbedderStack, IndexBuilder, TwoTierConfig, TwoTierIndex, TwoTierSearcher,
 };
 
 asupersync::test_utils::run_test_with_cx(|cx| async move {
-    // 1) Choose embedders (hash embedders shown for zero-dependency quickstart)
-    let fast = Arc::new(HashEmbedder::default_256()) as Arc<dyn Embedder>;
-    let quality = Arc::new(HashEmbedder::default_384()) as Arc<dyn Embedder>;
-    let stack = EmbedderStack::from_parts(fast, Some(quality));
+    // 1) Resolve a verified semantic embedder. HashEmbedder is a control
+    // double, not a semantic engine; auto_detect without models still
+    // returns that control stack.
+    let stack = EmbedderStack::auto_detect_semantic_with(Some(Path::new("./models")))
+        .expect("production search needs a verified semantic embedder");
 
     // 2) Build an index from documents
     IndexBuilder::new("./my_index")
@@ -463,15 +464,16 @@ asupersync::test_utils::run_test_with_cx(|cx| async move {
         .await
         .expect("index build should succeed");
 
-    // 3) Open and search
+    // 3) Open and search with the same semantic family
+    let stack = EmbedderStack::auto_detect_semantic_with(Some(Path::new("./models")))
+        .expect("search must use the same semantic family the index was built with");
     let index = Arc::new(
-        TwoTierIndex::open(std::path::Path::new("./my_index"), TwoTierConfig::default()).unwrap()
+        TwoTierIndex::open(Path::new("./my_index"), TwoTierConfig::default()).unwrap(),
     );
-    let searcher = TwoTierSearcher::new(
-        index,
-        Arc::new(HashEmbedder::default_256()) as Arc<dyn Embedder>,
-        TwoTierConfig::default(),
-    );
+    let mut searcher = TwoTierSearcher::new(index, stack.fast_arc(), TwoTierConfig::default());
+    if let Some(quality) = stack.quality_arc() {
+        searcher = searcher.with_quality_embedder(quality);
+    }
 
     let (results, metrics) = searcher
         .search_collect(&cx, "ownership rules", 10)
@@ -505,7 +507,7 @@ asupersync::test_utils::run_test_with_cx(|cx| async move {
 ```
 
 Notes:
-- For production semantic quality, use `model2vec` + `fastembed` (or `EmbedderStack::auto_detect_semantic_with`). `auto_detect` / `auto_detect_with` still return a hash-only stack when no model is present; that is a control policy, not a working semantic engine.
+- Use `EmbedderStack::auto_detect_semantic_with` (or explicit `model2vec` + `fastembed`). `auto_detect` / `auto_detect_with` still return a hash-only stack when no model is present; that is a control policy, not a working semantic engine. `IndexBuilder` without an explicit stack already refuses that hash-only fallback.
 - Enable `quill` for the native bulk-built lexical index; use `lexical-tantivy` only for the explicit Tantivy oracle/comparator lane during migration.
 - Enable `cass-compat` only when interoperating with the external CASS tool's
   schema-v8 Tantivy index at `<base>/index/v8/`. This foreign-format adapter is

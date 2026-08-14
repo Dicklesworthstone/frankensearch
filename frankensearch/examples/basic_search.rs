@@ -1,6 +1,8 @@
-//! Basic search example: build an index and search it with hash embedders.
+//! Hash-control fixture: build and search without a semantic model.
 //!
-//! This example requires only the default `hash` feature (no ML model downloads).
+//! This is not semantic search. `HashEmbedder` is an explicit control double
+//! so the default `hash` feature can run offline. Production code should use
+//! `EmbedderStack::auto_detect_semantic_with`.
 //!
 //! Run with: `cargo run --example basic_search`
 
@@ -47,10 +49,9 @@ fn main() {
         let dir = dir.clone();
         let documents = documents.clone();
         async move {
-            // Hash embedders are fast (~11μs) and require no model downloads.
+            // Explicit hash-control stack. This is not a semantic generation.
             let fast = Arc::new(HashEmbedder::default_256()) as Arc<dyn Embedder>;
-            let quality = Arc::new(HashEmbedder::default_384()) as Arc<dyn Embedder>;
-            let stack = EmbedderStack::from_parts(fast, Some(quality));
+            let stack = EmbedderStack::from_parts(fast, None);
 
             let mut builder = IndexBuilder::new(&dir).with_embedder_stack(stack);
             for (id, text) in &documents {
@@ -58,7 +59,7 @@ fn main() {
             }
             let stats = builder.build(&cx).await.expect("build index");
             println!(
-                "Index built: {} docs, quality_tier={}, {:.1}ms",
+                "Index built: {} docs, quality_tier={}, {:.1}ms (hash control, not semantic)",
                 stats.doc_count, stats.has_quality_index, stats.total_ms
             );
         }
@@ -99,11 +100,9 @@ fn main() {
 
     // ── Step 2: Open and search ───────────────────────────────────────────
     let fast: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
-    let quality: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_384());
     let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open index"));
 
-    let searcher = TwoTierSearcher::new(Arc::clone(&index), fast, TwoTierConfig::default())
-        .with_quality_embedder(quality);
+    let searcher = TwoTierSearcher::new(Arc::clone(&index), fast, TwoTierConfig::default());
 
     let queries = [
         "Rust memory safety",
@@ -134,15 +133,15 @@ fn main() {
                     );
                 }
                 println!(
-                    "  phase1={:.1}ms phase2={:.1}ms",
-                    metrics.phase1_total_ms, metrics.phase2_total_ms
+                    "  phase1={:.1}ms phase2={:.1}ms skip_reason={:?}",
+                    metrics.phase1_total_ms, metrics.phase2_total_ms, metrics.skip_reason
                 );
             }
         });
     }
 
     // ── Step 3: Progressive search (phase callbacks) ──────────────────────
-    println!("\n--- Progressive search demo ---");
+    println!("\n--- Progressive search demo (hash control: Initial only) ---");
     println!("Query: \"database indexing\"");
 
     asupersync::test_utils::run_test_with_cx(|cx| {

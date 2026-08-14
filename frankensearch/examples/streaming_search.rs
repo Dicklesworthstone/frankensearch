@@ -1,7 +1,8 @@
 //! Streaming/progressive search example.
 //!
-//! This demonstrates how to consume `SearchPhase` events as they arrive so a
-//! UI or agent can show initial results immediately, then refine them.
+//! The default `hash` feature runs this as an explicit hash-control fixture,
+//! not semantic two-tier search. Production code should detect a verified
+//! semantic embedder with `EmbedderStack::auto_detect_semantic_with`.
 //!
 //! Run with:
 //! - `cargo run --example streaming_search`
@@ -46,8 +47,7 @@ fn main() {
         let documents = documents.clone();
         async move {
             let fast = Arc::new(HashEmbedder::default_256()) as Arc<dyn Embedder>;
-            let quality = Arc::new(HashEmbedder::default_384()) as Arc<dyn Embedder>;
-            let stack = EmbedderStack::from_parts(fast, Some(quality));
+            let stack = EmbedderStack::from_parts(fast, None);
 
             let mut builder = IndexBuilder::new(&dir).with_embedder_stack(stack);
             for (doc_id, content) in &documents {
@@ -55,17 +55,15 @@ fn main() {
             }
             let stats = builder.build(&cx).await.expect("build index");
             println!(
-                "index_ready docs={} quality={} total_ms={:.2}",
+                "index_ready docs={} quality={} total_ms={:.2} (hash control, not semantic)",
                 stats.doc_count, stats.has_quality_index, stats.total_ms
             );
         }
     });
 
     let fast: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
-    let quality: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_384());
     let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open index"));
-    let searcher =
-        TwoTierSearcher::new(index, fast, TwoTierConfig::default()).with_quality_embedder(quality);
+    let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
 
     let query = "resilient retry policy for distributed workers";
     println!("query=\"{query}\"");
@@ -156,10 +154,11 @@ fn main() {
                 .expect("search");
 
             println!(
-                "event=done phase1_ms={:.2} phase2_ms={:.2} total_wall_ms={:.2}",
+                "event=done phase1_ms={:.2} phase2_ms={:.2} total_wall_ms={:.2} skip_reason={:?}",
                 metrics.phase1_total_ms,
                 metrics.phase2_total_ms,
-                wall_start.elapsed().as_secs_f64() * 1000.0
+                wall_start.elapsed().as_secs_f64() * 1000.0,
+                metrics.skip_reason
             );
         }
     });

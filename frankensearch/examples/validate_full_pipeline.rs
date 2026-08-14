@@ -1,7 +1,8 @@
 //! E2E validation: full frankensearch search pipeline (bd-3un.40).
 //!
-//! Exercises index building, two-tier search, phase progression, and
-//! result quality. Requires only the `hash` feature (no ML downloads).
+//! Exercises index building and search with the default `hash` feature.
+//! That path is an explicit hash-control fixture, not semantic two-tier
+//! search. Quality refinement is not scheduled from hash ranks.
 //!
 //! Run with: `cargo run --example validate_full_pipeline`
 
@@ -29,14 +30,12 @@ fn main() {
     std::fs::create_dir_all(&dir).expect("create temp dir");
 
     let fast_embedder = HashEmbedder::default_256();
-    let quality_embedder = HashEmbedder::default_384();
 
     asupersync::test_utils::run_test_with_cx(|cx| {
         let dir = dir.clone();
         async move {
             let fast = Arc::new(HashEmbedder::default_256()) as Arc<dyn Embedder>;
-            let quality = Arc::new(HashEmbedder::default_384()) as Arc<dyn Embedder>;
-            let stack = EmbedderStack::from_parts(fast, Some(quality));
+            let stack = EmbedderStack::from_parts(fast, None);
 
             let mut builder = IndexBuilder::new(&dir).with_embedder_stack(stack);
             for (id, text) in TEST_CORPUS {
@@ -60,14 +59,12 @@ fn main() {
     log_info("SEARCH", "Opening index and creating two-tier searcher...");
     let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open index"));
     let fast: Arc<dyn Embedder> = Arc::new(fast_embedder);
-    let quality_arc: Arc<dyn Embedder> = Arc::new(quality_embedder);
 
     let searcher = TwoTierSearcher::new(
         Arc::clone(&index),
         Arc::clone(&fast),
         TwoTierConfig::default(),
-    )
-    .with_quality_embedder(Arc::clone(&quality_arc));
+    );
 
     check(&mut pass, &mut fail, "Searcher creation", true);
 
@@ -180,41 +177,45 @@ fn main() {
         *fast_only_ok.lock().unwrap(),
     );
 
-    // two-tier → exactly 2 phases (Initial + Refined)
-    let two_tier_ok = Arc::new(Mutex::new(false));
-    let two_tier_ok_inner = two_tier_ok.clone();
+    // Hash control + an attached quality embedder still stays Initial-only.
+    let hash_control_ok = Arc::new(Mutex::new(false));
+    let hash_control_ok_inner = hash_control_ok.clone();
     asupersync::test_utils::run_test_with_cx(|cx| {
         let index = Arc::clone(&index);
         let fast = Arc::clone(&fast);
-        let quality = Arc::clone(&quality_arc);
         async move {
+            let quality = Arc::new(HashEmbedder::default_384()) as Arc<dyn Embedder>;
             let s = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
                 .with_quality_embedder(quality);
             let mut phases = Vec::new();
-            s.search(
-                &cx,
-                "test query",
-                5,
-                |_| None,
-                |p| {
-                    phases.push(match p {
-                        SearchPhase::Initial { .. } => "Initial",
-                        SearchPhase::Refined { .. } => "Refined",
-                        SearchPhase::Reranked { .. } => "Reranked",
-                        SearchPhase::RefinementFailed { .. } => "Failed",
-                    });
-                },
-            )
-            .await
-            .expect("search");
-            *two_tier_ok_inner.lock().unwrap() = phases == vec!["Initial", "Refined"];
+            let metrics = s
+                .search(
+                    &cx,
+                    "test query",
+                    5,
+                    |_| None,
+                    |p| {
+                        phases.push(match p {
+                            SearchPhase::Initial { .. } => "Initial",
+                            SearchPhase::Refined { .. } => "Refined",
+                            SearchPhase::Reranked { .. } => "Reranked",
+                            SearchPhase::RefinementFailed { .. } => "Failed",
+                        });
+                    },
+                )
+                .await
+                .expect("search");
+            *hash_control_ok_inner.lock().unwrap() = phases == vec!["Initial"]
+                && metrics.skip_reason.as_deref()
+                    == Some("non_semantic_fast_embedder_vector_control")
+                && metrics.phase2_vectors_searched == 0;
         }
     });
     check(
         &mut pass,
         &mut fail,
-        "two-tier yields Initial+Refined",
-        *two_tier_ok.lock().unwrap(),
+        "hash control stays Initial (not semantic refinement)",
+        *hash_control_ok.lock().unwrap(),
     );
 
     // ── Step 5: Persistence round-trip ──────────────────────────────────

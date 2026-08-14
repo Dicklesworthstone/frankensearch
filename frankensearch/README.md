@@ -72,18 +72,16 @@ Consumers receive results progressively via `SearchPhase` callbacks, so UIs can 
 ## Usage
 
 ```rust,no_run
+use std::path::Path;
 use std::sync::Arc;
 use frankensearch::prelude::*;
-use frankensearch::{EmbedderStack, HashEmbedder, IndexBuilder, TwoTierIndex};
-use frankensearch_core::traits::Embedder;
+use frankensearch::{EmbedderStack, IndexBuilder, TwoTierIndex};
 
 asupersync::test_utils::run_test_with_cx(|cx| async move {
-    // Build an index
-    let fast = Arc::new(HashEmbedder::default_256()) as Arc<dyn Embedder>;
-    let quality = Arc::new(HashEmbedder::default_384()) as Arc<dyn Embedder>;
-    let stack = EmbedderStack::from_parts(fast, Some(quality));
+    let stack = EmbedderStack::auto_detect_semantic_with(Some(Path::new("./models")))
+        .expect("production search needs a verified semantic embedder");
 
-    let stats = IndexBuilder::new("./my_index")
+    IndexBuilder::new("./my_index")
         .with_embedder_stack(stack)
         .add_document("doc-1", "Rust ownership and borrowing")
         .add_document("doc-2", "Python garbage collection")
@@ -91,13 +89,16 @@ asupersync::test_utils::run_test_with_cx(|cx| async move {
         .await
         .expect("build index");
 
-    // Search
-    let fast = Arc::new(HashEmbedder::default_256()) as Arc<dyn Embedder>;
+    let stack = EmbedderStack::auto_detect_semantic_with(Some(Path::new("./models")))
+        .expect("search must use the same semantic family the index was built with");
     let index = Arc::new(
-        TwoTierIndex::open(std::path::Path::new("./my_index"), TwoTierConfig::default()).unwrap()
+        TwoTierIndex::open(Path::new("./my_index"), TwoTierConfig::default()).unwrap(),
     );
-    let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
-    let (results, metrics) = searcher
+    let mut searcher = TwoTierSearcher::new(index, stack.fast_arc(), TwoTierConfig::default());
+    if let Some(quality) = stack.quality_arc() {
+        searcher = searcher.with_quality_embedder(quality);
+    }
+    let (results, _metrics) = searcher
         .search_collect(&cx, "memory management", 10)
         .await
         .expect("search");

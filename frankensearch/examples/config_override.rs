@@ -47,8 +47,7 @@ fn main() {
         let docs = docs.clone();
         async move {
             let fast = Arc::new(HashEmbedder::default_256()) as Arc<dyn Embedder>;
-            let quality = Arc::new(HashEmbedder::default_384()) as Arc<dyn Embedder>;
-            let stack = EmbedderStack::from_parts(fast, Some(quality));
+            let stack = EmbedderStack::from_parts(fast, None);
 
             let mut builder = IndexBuilder::new(&dir).with_embedder_stack(stack);
             for (doc_id, body) in docs {
@@ -59,10 +58,8 @@ fn main() {
     });
 
     let fast: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
-    let quality: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_384());
     let index = Arc::new(TwoTierIndex::open(&dir, effective_config.clone()).expect("open index"));
-    let searcher =
-        TwoTierSearcher::new(index, fast, effective_config.clone()).with_quality_embedder(quality);
+    let searcher = TwoTierSearcher::new(index, fast, effective_config.clone());
 
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let (results, metrics) = searcher
@@ -70,11 +67,12 @@ fn main() {
             .await
             .expect("search");
         println!(
-            "search_done hits={} phase1_ms={:.2} phase2_ms={:.2} fast_only={}",
+            "search_done hits={} phase1_ms={:.2} phase2_ms={:.2} fast_only={} skip_reason={:?}",
             results.len(),
             metrics.phase1_total_ms,
             metrics.phase2_total_ms,
-            effective_config.fast_only
+            effective_config.fast_only,
+            metrics.skip_reason
         );
     });
 

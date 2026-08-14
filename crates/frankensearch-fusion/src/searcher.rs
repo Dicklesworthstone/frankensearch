@@ -1433,7 +1433,9 @@ impl TwoTierSearcher {
                 },
             }
         } else if metrics.skip_reason.is_none() {
-            if self.should_run_quality() {
+            if is_shipped_hash_embedder(self.fast_embedder.as_ref()) {
+                metrics.skip_reason = Some("non_semantic_fast_embedder_vector_control".to_owned());
+            } else if self.should_run_quality() {
                 if quality_circuit_open {
                     metrics.skip_reason = Some("circuit_breaker_open".to_owned());
                 } else if quality_phase_gate_skip {
@@ -1752,12 +1754,11 @@ impl TwoTierSearcher {
                     );
                 }
                 if is_shipped_hash_embedder(self.fast_embedder.as_ref())
-                    && self.quality_embedder.is_none()
                     && metrics.skip_reason.is_none()
                 {
-                    // No lexical arm to short-circuit to: hash vectors still
-                    // run as an explicit control path, but they are never
-                    // unlabeled semantic hits (bd-a6zt).
+                    // Hash vectors still run as an explicit control path, but
+                    // they are never unlabeled semantic hits (bd-a6zt). A
+                    // quality embedder does not make this a semantic lane.
                     metrics.skip_reason =
                         Some("non_semantic_fast_embedder_vector_control".to_owned());
                 }
@@ -6963,6 +6964,28 @@ mod tests {
                 quality_calls.load(std::sync::atomic::Ordering::Relaxed),
                 0,
                 "quality must not refine hash-control ranks"
+            );
+        });
+    }
+
+    #[test]
+    fn hash_control_with_quality_attached_is_still_vector_control() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index_with_quality(4);
+            let fast: Arc<dyn Embedder> = Arc::new(NonSemanticEmbedder::new("fnv1a-test", 4));
+            let quality = Arc::new(StubEmbedder::new("quality", 4));
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                .with_quality_embedder(quality);
+
+            let metrics = searcher
+                .search(&cx, "rust ownership", 5, |_| None, |_| {})
+                .await
+                .expect("hash control search should still return hits");
+
+            assert_eq!(metrics.phase2_vectors_searched, 0);
+            assert_eq!(
+                metrics.skip_reason.as_deref(),
+                Some("non_semantic_fast_embedder_vector_control")
             );
         });
     }
