@@ -10,7 +10,38 @@ use frankensearch_core::{SearchError, SearchResult};
 use fsqlite::AsyncConnection;
 use fsqlite_types::value::SqliteValue;
 
-use crate::connection::map_storage_error;
+use crate::connection::{map_storage_error, retry_transient_storage, unretryable_rollback_error};
+
+fn with_history_transaction<T>(
+    conn: &AsyncConnection,
+    mut op: impl FnMut(&AsyncConnection) -> SearchResult<T>,
+) -> SearchResult<T> {
+    retry_transient_storage(
+        || {
+            conn.execute_sync("BEGIN CONCURRENT;")
+                .map_err(map_storage_error)?;
+            match op(conn) {
+                Ok(value) => {
+                    conn.commit_transaction_sync().map_err(|commit_err| {
+                        match conn.rollback_transaction_sync() {
+                            Ok(()) => map_storage_error(commit_err),
+                            Err(rollback_err) => unretryable_rollback_error(
+                                &map_storage_error(commit_err),
+                                &rollback_err,
+                            ),
+                        }
+                    })?;
+                    Ok(value)
+                }
+                Err(error) => match conn.rollback_transaction_sync() {
+                    Ok(()) => Err(error),
+                    Err(rollback_err) => Err(unretryable_rollback_error(&error, &rollback_err)),
+                },
+            }
+        },
+        "search history",
+    )
+}
 
 // ─── Search History ────────────────────────────────────────────────────────
 
@@ -41,6 +72,33 @@ pub struct SearchHistoryEntry {
 /// seconds, the existing entry is updated instead of creating a duplicate.
 #[allow(clippy::too_many_arguments)]
 pub fn record_search(
+    conn: &AsyncConnection,
+    query: &str,
+    query_class: Option<&str>,
+    result_count: Option<i64>,
+    phase1_latency_ms: Option<i64>,
+    phase2_latency_ms: Option<i64>,
+    top_results_json: Option<&str>,
+    searched_at: i64,
+    dedup_window_secs: i64,
+) -> SearchResult<()> {
+    with_history_transaction(conn, |conn| {
+        record_search_once(
+            conn,
+            query,
+            query_class,
+            result_count,
+            phase1_latency_ms,
+            phase2_latency_ms,
+            top_results_json,
+            searched_at,
+            dedup_window_secs,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_search_once(
     conn: &AsyncConnection,
     query: &str,
     query_class: Option<&str>,
@@ -213,22 +271,24 @@ pub fn count_search_history(conn: &AsyncConnection) -> SearchResult<i64> {
 
 /// Truncate search history to keep only the most recent `max_entries`.
 pub fn truncate_search_history(conn: &AsyncConnection, max_entries: usize) -> SearchResult<i64> {
-    let count = count_search_history(conn)?;
     let max_entries_i64 = limit_to_i64(max_entries, "history.max_entries")?;
-    if count <= max_entries_i64 {
-        return Ok(0);
-    }
+    with_history_transaction(conn, |conn| {
+        let count = count_search_history(conn)?;
+        if count <= max_entries_i64 {
+            return Ok(0);
+        }
 
-    let to_delete = count - max_entries_i64;
-    let params = [SqliteValue::Integer(to_delete)];
-    conn.execute_with_params_sync(
-        "DELETE FROM search_history WHERE id IN (\
+        let to_delete = count - max_entries_i64;
+        let params = [SqliteValue::Integer(to_delete)];
+        conn.execute_with_params_sync(
+            "DELETE FROM search_history WHERE id IN (\
      SELECT id FROM search_history ORDER BY searched_at ASC LIMIT ?1);",
-        &params,
-    )
-    .map_err(map_storage_error)?;
+            &params,
+        )
+        .map_err(map_storage_error)?;
 
-    Ok(to_delete)
+        Ok(to_delete)
+    })
 }
 
 fn parse_history_row(row: &fsqlite::Row) -> SearchResult<SearchHistoryEntry> {
@@ -297,6 +357,18 @@ pub fn add_bookmark(
     note: Option<&str>,
     created_at: i64,
 ) -> SearchResult<()> {
+    with_history_transaction(conn, |conn| {
+        add_bookmark_once(conn, doc_id, query, note, created_at)
+    })
+}
+
+fn add_bookmark_once(
+    conn: &AsyncConnection,
+    doc_id: &str,
+    query: Option<&str>,
+    note: Option<&str>,
+    created_at: i64,
+) -> SearchResult<()> {
     // Check for existing bookmark with same (doc_id, query) pair.
     // Handle NULL query explicitly since SQL NULL != NULL.
     let existing = if let Some(q) = query {
@@ -359,6 +431,10 @@ pub fn add_bookmark(
 
 /// Remove a bookmark by its row ID.
 pub fn remove_bookmark(conn: &AsyncConnection, bookmark_id: i64) -> SearchResult<bool> {
+    with_history_transaction(conn, |conn| remove_bookmark_once(conn, bookmark_id))
+}
+
+fn remove_bookmark_once(conn: &AsyncConnection, bookmark_id: i64) -> SearchResult<bool> {
     let params = [SqliteValue::Integer(bookmark_id)];
     let existed = !conn
         .query_with_params_sync("SELECT 1 FROM bookmarks WHERE id = ?1 LIMIT 1;", &params)
@@ -381,10 +457,12 @@ pub fn remove_bookmark(conn: &AsyncConnection, bookmark_id: i64) -> SearchResult
 
 /// Remove a bookmark by document ID (removes all bookmarks for that doc).
 pub fn remove_bookmark_by_doc(conn: &AsyncConnection, doc_id: &str) -> SearchResult<()> {
-    let params = [SqliteValue::Text(doc_id.to_owned().into())];
-    conn.execute_with_params_sync("DELETE FROM bookmarks WHERE doc_id = ?1;", &params)
-        .map_err(map_storage_error)?;
-    Ok(())
+    with_history_transaction(conn, |conn| {
+        let params = [SqliteValue::Text(doc_id.to_owned().into())];
+        conn.execute_with_params_sync("DELETE FROM bookmarks WHERE doc_id = ?1;", &params)
+            .map_err(map_storage_error)?;
+        Ok(())
+    })
 }
 
 /// List all bookmarks in most-recent-first order.
