@@ -149,15 +149,19 @@ impl Storage {
         ensure_non_empty(doc_id, "doc_id")?;
 
         let params = [SqliteValue::Text(doc_id.to_owned().into())];
-        let rows = self
-            .connection()
-            .query_with_params_sync(
-                "SELECT doc_id, source_path, content_preview, content_hash, content_length, \
+        let rows = retry_transient_storage(
+            || {
+                self.connection()
+                    .query_with_params_sync(
+                        "SELECT doc_id, source_path, content_preview, content_hash, content_length, \
             created_at, updated_at, metadata_json \
          FROM documents WHERE doc_id = ?1 LIMIT 1;",
-                &params,
-            )
-            .map_err(storage_error)?;
+                        &params,
+                    )
+                    .map_err(storage_error)
+            },
+            "document fetch",
+        )?;
 
         let Some(row) = rows.first() else {
             tracing::debug!(
@@ -226,10 +230,14 @@ impl Storage {
             SqliteValue::Text(embedder_id.to_owned().into()),
             SqliteValue::Integer(limit_i64),
         ];
-        let rows = self
-            .connection()
-            .query_with_params_sync(sql, &params)
-            .map_err(storage_error)?;
+        let rows = retry_transient_storage(
+            || {
+                self.connection()
+                    .query_with_params_sync(sql, &params)
+                    .map_err(storage_error)
+            },
+            "pending embedding query",
+        )?;
         let mut doc_ids = Vec::with_capacity(rows.len());
         for row in &rows {
             doc_ids.push(row_text(row, 0, "documents.doc_id")?.to_owned());
@@ -373,17 +381,21 @@ impl Storage {
         ensure_non_empty(embedder_id, "embedder_id")?;
 
         let params = [SqliteValue::Text(embedder_id.to_owned().into())];
-        let rows = self
-            .connection()
-            .query_with_params_sync(
-                "SELECT e.status, COUNT(*) \
+        let rows = retry_transient_storage(
+            || {
+                self.connection()
+                    .query_with_params_sync(
+                        "SELECT e.status, COUNT(*) \
          FROM embedding_status e \
          INNER JOIN documents d ON d.doc_id = e.doc_id \
          WHERE e.embedder_id = ?1 \
          GROUP BY status;",
-                &params,
-            )
-            .map_err(storage_error)?;
+                        &params,
+                    )
+                    .map_err(storage_error)
+            },
+            "embedding status count",
+        )?;
 
         let total_docs = i64_to_u64(count_documents(self.connection())?)?;
         let mut counts = StatusCounts::default();
@@ -560,12 +572,16 @@ pub fn list_document_ids(conn: &AsyncConnection, limit: usize) -> SearchResult<V
         reason: "limit does not fit in sqlite integer".to_owned(),
     })?;
     let params = [SqliteValue::Integer(limit_i64)];
-    let rows = conn
-        .query_with_params_sync(
-            "SELECT doc_id FROM documents ORDER BY updated_at DESC LIMIT ?1;",
-            &params,
-        )
-        .map_err(storage_error)?;
+    let rows = retry_transient_storage(
+        || {
+            conn.query_with_params_sync(
+                "SELECT doc_id FROM documents ORDER BY updated_at DESC LIMIT ?1;",
+                &params,
+            )
+            .map_err(storage_error)
+        },
+        "document id list",
+    )?;
     let mut ids = Vec::with_capacity(rows.len());
 
     for row in &rows {
@@ -576,9 +592,13 @@ pub fn list_document_ids(conn: &AsyncConnection, limit: usize) -> SearchResult<V
 }
 
 pub fn count_documents(conn: &AsyncConnection) -> SearchResult<i64> {
-    let rows = conn
-        .query_sync("SELECT COUNT(*) FROM documents;")
-        .map_err(storage_error)?;
+    let rows = retry_transient_storage(
+        || {
+            conn.query_sync("SELECT COUNT(*) FROM documents;")
+                .map_err(storage_error)
+        },
+        "document count",
+    )?;
     let row = rows.first().ok_or_else(|| SearchError::SubsystemError {
         subsystem: "storage",
         source: Box::new(std::io::Error::other(
