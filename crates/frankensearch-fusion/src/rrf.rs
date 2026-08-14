@@ -227,7 +227,9 @@ impl FusedHitScratch<'_> {
 /// # Arguments
 ///
 /// * `lexical` - Lexical (BM25) search results, in descending relevance order.
-/// * `semantic` - Semantic (vector) search results, in descending score order.
+/// * `semantic` - Vector search results, in descending score order.
+///   The list may be a semantic generation or a hash-control generation;
+///   fusion is rank-based and does not treat the name as a quality claim.
 /// * `limit` - Maximum number of results to return.
 /// * `offset` - Number of top results to skip (for pagination).
 /// * `config` - RRF parameters (K constant).
@@ -237,7 +239,7 @@ impl FusedHitScratch<'_> {
     skip(lexical, semantic),
     fields(
         lexical_count = lexical.len(),
-        semantic_count = semantic.len(),
+        vector_count = semantic.len(),
         k = config.k,
         limit,
         offset,
@@ -265,7 +267,7 @@ pub fn rrf_fuse(
     skip(lexical, semantic, graph),
     fields(
         lexical_count = lexical.len(),
-        semantic_count = semantic.len(),
+        vector_count = semantic.len(),
         graph_count = graph.len(),
         graph_weight,
         k = config.k,
@@ -519,7 +521,7 @@ fn minmax_norm(score: f32, min: f32, max: f32) -> f64 {
     skip(lexical, semantic),
     fields(
         lexical_count = lexical.len(),
-        semantic_count = semantic.len(),
+        vector_count = semantic.len(),
         limit,
         offset,
     )
@@ -663,7 +665,7 @@ pub fn pool_minmax_fuse(
     skip(lexical, semantic),
     fields(
         lexical_count = lexical.len(),
-        semantic_count = semantic.len(),
+        vector_count = semantic.len(),
         limit,
         offset,
     )

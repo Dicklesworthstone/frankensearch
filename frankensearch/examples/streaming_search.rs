@@ -80,11 +80,12 @@ fn main() {
                         metrics,
                     } => {
                         println!(
-                            "event=phase name=initial hits={} latency_ms={:.2} vectors_searched={} lexical_candidates={}",
+                            "event=phase name=initial hits={} latency_ms={:.2} vectors_searched={} lexical_candidates={} hash_control_candidates={}",
                             results.len(),
                             latency.as_secs_f64() * 1000.0,
                             metrics.vectors_searched,
-                            metrics.lexical_candidates
+                            metrics.lexical_candidates,
+                            metrics.hash_control_candidates
                         );
                         for (rank, hit) in results.iter().take(3).enumerate() {
                             println!(

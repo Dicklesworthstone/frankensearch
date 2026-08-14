@@ -70,6 +70,10 @@ pub mod field_names {
     pub const K: &str = "k";
     pub const LEXICAL_COUNT: &str = "lexical_count";
     pub const SEMANTIC_COUNT: &str = "semantic_count";
+    /// Vector-pool size at fusion time. The pool may be semantic or hash-control.
+    pub const VECTOR_COUNT: &str = "vector_count";
+    /// Hash/fnv/JL control-vector count. Not semantic.
+    pub const HASH_CONTROL_COUNT: &str = "hash_control_count";
     pub const FUSED_COUNT: &str = "fused_count";
     pub const OVERLAP_COUNT: &str = "overlap_count";
 }
@@ -167,6 +171,14 @@ mod tests {
     }
 
     #[test]
+    fn vector_and_hash_control_count_fields_are_not_semantic_count() {
+        assert_eq!(field_names::VECTOR_COUNT, "vector_count");
+        assert_eq!(field_names::HASH_CONTROL_COUNT, "hash_control_count");
+        assert_ne!(field_names::VECTOR_COUNT, field_names::SEMANTIC_COUNT);
+        assert_ne!(field_names::HASH_CONTROL_COUNT, field_names::SEMANTIC_COUNT);
+    }
+
+    #[test]
     fn field_names_are_non_empty() {
         let all_fields = [
             field_names::QUERY_LEN,
@@ -181,6 +193,8 @@ mod tests {
             field_names::K,
             field_names::LEXICAL_COUNT,
             field_names::SEMANTIC_COUNT,
+            field_names::VECTOR_COUNT,
+            field_names::HASH_CONTROL_COUNT,
             field_names::FUSED_COUNT,
             field_names::OVERLAP_COUNT,
         ];
