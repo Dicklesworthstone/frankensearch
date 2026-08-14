@@ -131,7 +131,7 @@ use crate::query_planning::{
 use crate::shutdown::{ShutdownCoordinator, ShutdownReason};
 use crate::stream_protocol::{
     StreamEvent, StreamFrame, StreamProgressEvent, StreamResultEvent, StreamStartedEvent,
-    is_retryable_error, terminal_event_completed, terminal_event_from_error,
+    StreamWarningEvent, is_retryable_error, terminal_event_completed, terminal_event_from_error,
 };
 use crate::tracing_setup::current_unicode_environment;
 use crate::watcher::{FsWatcher, WatchIngestOp, WatchIngestPipeline};
@@ -1702,6 +1702,10 @@ struct ExplainSession {
     phase: SearchOutputPhase,
     rrf_k: f64,
     hits: Vec<ExplainSessionHit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vector_generation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    vector_generation_is_hash: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1747,6 +1751,8 @@ impl ExplainSession {
             phase,
             rrf_k,
             hits,
+            vector_generation_id: None,
+            vector_generation_is_hash: false,
         }
     }
 
@@ -6193,6 +6199,25 @@ impl FsfsRuntime {
         Ok(socket_dir.join(format!("fsfs-query-{}.sock", &digest[..prefix_len])))
     }
 
+    fn search_stream_started_event(&self, query: &str, stream_id: &str) -> StreamStartedEvent {
+        let mut event =
+            StreamStartedEvent::new(stream_id, query, self.cli_input.format.to_string());
+        let Ok(index_root) = self.resolve_status_index_root() else {
+            return event;
+        };
+        if let Some(published) = Self::inspect_published_vector_generation(&index_root) {
+            event.vector_generation_id = Some(published.id);
+            event.vector_generation_is_hash = published.is_hash_control;
+            event.semantic_admitted = !published.is_hash_control;
+            if published.is_hash_control {
+                event.skip_reason = Some("non_semantic_fast_embedder_vector_control".to_owned());
+            }
+        } else {
+            event.skip_reason = Some("no_vector_index".to_owned());
+        }
+        event
+    }
+
     fn emit_search_stream_started<W: Write>(
         &self,
         query: &str,
@@ -6205,11 +6230,9 @@ impl FsfsRuntime {
             *seq,
             iso_timestamp_now(),
             "search",
-            StreamEvent::<SearchHitPayload>::Started(StreamStartedEvent {
-                stream_id: stream_id.to_owned(),
-                query: query.to_owned(),
-                format: self.cli_input.format.to_string(),
-            }),
+            StreamEvent::<SearchHitPayload>::Started(
+                self.search_stream_started_event(query, stream_id),
+            ),
         );
         emit_stream_frame(&frame, self.cli_input.format, writer)?;
         *seq = seq.saturating_add(1);
@@ -6255,6 +6278,18 @@ impl FsfsRuntime {
         );
         emit_stream_frame(&progress_frame, self.cli_input.format, writer)?;
         *seq = seq.saturating_add(1);
+
+        for warning in Self::search_generation_warnings(payload) {
+            let warning_frame = StreamFrame::new(
+                stream_id.to_owned(),
+                *seq,
+                iso_timestamp_now(),
+                "search",
+                StreamEvent::<SearchHitPayload>::Warning(StreamWarningEvent { warning }),
+            );
+            emit_stream_frame(&warning_frame, self.cli_input.format, writer)?;
+            *seq = seq.saturating_add(1);
+        }
 
         for hit in &payload.hits {
             let result_frame = StreamFrame::new(
@@ -6368,9 +6403,18 @@ impl FsfsRuntime {
             });
         }
         if let Some(semantic_score) = hit.semantic_score {
+            let embedder = session
+                .vector_generation_id
+                .as_deref()
+                .unwrap_or("fast-tier");
+            let embedder = if session.vector_generation_is_hash {
+                format!("{embedder} (hash control)")
+            } else {
+                embedder.to_owned()
+            };
             components.push(ScoreComponent {
                 source: ExplainedSource::SemanticFast {
-                    embedder: "fast-tier".to_owned(),
+                    embedder,
                     cosine_sim: f64::from(semantic_score),
                 },
                 raw_score: f64::from(semantic_score),
@@ -6419,17 +6463,36 @@ impl FsfsRuntime {
             in_both_sources: hit.in_both_sources,
         });
         let payload = FsfsExplanationPayload::new(session.query.clone(), ranking);
+        let warnings = if session.vector_generation_is_hash {
+            let generation = session.vector_generation_id.as_deref().unwrap_or("hash");
+            vec![OutputWarning::new(
+                OutputWarningCode::HASH_FALLBACK,
+                format!(
+                    "explained hit used vector generation `{generation}`, a hash control artifact, not semantic search"
+                ),
+            )]
+        } else {
+            Vec::new()
+        };
 
         if self.cli_input.format == OutputFormat::Table {
             println!(
                 "{}",
-                render_explain_table(result_id, &payload, hit, session.rrf_k)
+                render_explain_table(
+                    result_id,
+                    &payload,
+                    hit,
+                    session.rrf_k,
+                    session.vector_generation_is_hash,
+                    session.vector_generation_id.as_deref(),
+                )
             );
             return Ok(());
         }
 
         let meta = meta_for_format("explain", self.cli_input.format);
-        let envelope = OutputEnvelope::success(payload, meta, iso_timestamp_now());
+        let envelope =
+            OutputEnvelope::success(payload, meta, iso_timestamp_now()).with_warnings(warnings);
         let mut stdout = std::io::stdout();
         emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
         if self.cli_input.format != OutputFormat::Jsonl {
@@ -6455,7 +6518,11 @@ impl FsfsRuntime {
         phase: SearchOutputPhase,
         fused: &[FusedCandidate],
     ) -> SearchResult<()> {
-        let session = ExplainSession::from_fused(query, phase, self.config.search.rrf_k, fused);
+        let mut session = ExplainSession::from_fused(query, phase, self.config.search.rrf_k, fused);
+        if let Some(published) = Self::inspect_published_vector_generation(index_root) {
+            session.vector_generation_id = Some(published.id);
+            session.vector_generation_is_hash = published.is_hash_control;
+        }
         let path = Self::explain_session_path(index_root);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -15102,6 +15169,8 @@ fn render_explain_table(
     payload: &FsfsExplanationPayload,
     hit: &ExplainSessionHit,
     rrf_k: f64,
+    vector_generation_is_hash: bool,
+    vector_generation_id: Option<&str>,
 ) -> String {
     let lexical_score = hit
         .lexical_score
@@ -15127,7 +15196,14 @@ fn render_explain_table(
     lines.push(format!("Query: {}", payload.query));
     lines.push(String::new());
     lines.push(format!("Lexical (BM25): {lexical_score}"));
-    lines.push(format!("Semantic (fast): {semantic_fast_score}"));
+    if vector_generation_is_hash {
+        let generation = vector_generation_id.unwrap_or("hash");
+        lines.push(format!(
+            "Hash control ({generation}, not semantic): {semantic_fast_score}"
+        ));
+    } else {
+        lines.push(format!("Semantic (fast): {semantic_fast_score}"));
+    }
     lines.push(format!("Semantic (quality): {quality_score}"));
     lines.push(format!("Reranker: {rerank_score}"));
     lines.push(format!(
@@ -19350,22 +19426,23 @@ mod tests {
     use fsqlite_types::value::SqliteValue;
 
     use super::{
-        ContextPreviewFormat, EmbedderAvailability, FSFS_DAEMON_REQUEST_MAX_BYTES,
-        FSFS_SEARCH_SNIPPET_HEAD_LIMIT, FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL,
-        FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS, FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS,
-        FSFS_TUI_LEXICAL_DEBOUNCE_MS, FSFS_TUI_LEXICAL_DEBOUNCE_SHORT_QUERY_CAP_MS,
-        FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS, FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS,
-        FSFS_TUI_QUALITY_DEBOUNCE_MS, FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS,
-        FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS, FSFS_TUI_SEMANTIC_DEBOUNCE_MS, FsfsConfigStatus,
-        FsfsFlushAck, FsfsFlushRequest, FsfsIndexStatus, FsfsModelStatus, FsfsRuntime,
-        FsfsRuntimeStatus, FsfsStatusPayload, IndexStoragePaths, IndexingBatchEmbeddingOutcome,
-        InterfaceMode, LiveIngestPipeline, LiveVectorSink, SearchCacheRecord, SearchDashboardState,
-        SearchExecutionFlags, SearchExecutionMode, SearchExecutionResources, SearchServeRequest,
+        ContextPreviewFormat, EmbedderAvailability, ExplainSessionHit,
+        FSFS_DAEMON_REQUEST_MAX_BYTES, FSFS_SEARCH_SNIPPET_HEAD_LIMIT,
+        FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS,
+        FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS, FSFS_TUI_LEXICAL_DEBOUNCE_MS,
+        FSFS_TUI_LEXICAL_DEBOUNCE_SHORT_QUERY_CAP_MS, FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS,
+        FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS, FSFS_TUI_QUALITY_DEBOUNCE_MS,
+        FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS, FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS,
+        FSFS_TUI_SEMANTIC_DEBOUNCE_MS, FsfsConfigStatus, FsfsFlushAck, FsfsFlushRequest,
+        FsfsIndexStatus, FsfsModelStatus, FsfsRuntime, FsfsRuntimeStatus, FsfsStatusPayload,
+        IndexStoragePaths, IndexingBatchEmbeddingOutcome, InterfaceMode, LiveIngestPipeline,
+        LiveVectorSink, SearchCacheRecord, SearchDashboardState, SearchExecutionFlags,
+        SearchExecutionMode, SearchExecutionResources, SearchServeRequest,
         SemanticGateDecisionInput, SemanticRecallDecisionInput, VectorIndexWriteAction,
         VectorPipelineInput, VectorPipelinePlan, VectorSchedulingTier,
         degradation_controller_config_for_profile, detect_context_preview_format,
         is_likely_html_fragment, normalize_html_fragment_for_markdown, read_durable_json,
-        render_status_table,
+        render_explain_table, render_status_table,
     };
     use crate::adapters::cli::{CliCommand, CliInput, CompletionShell, OutputFormat};
     use crate::catalog::bootstrap_catalog_schema;
@@ -19373,6 +19450,7 @@ mod tests {
         DegradationOverrideMode, DiscoveryCandidate, DiscoveryScopeDecision, FsfsConfig,
         IngestionClass, PressureProfile,
     };
+    use crate::explanation_payload::{FsfsExplanationPayload, RankingExplanation};
     use crate::lifecycle::{
         DiskBudgetAction, DiskBudgetStage, LifecycleTracker, ResourceLimits, WatchdogConfig,
     };
@@ -19392,6 +19470,7 @@ mod tests {
         TOON_STREAM_RECORD_SEPARATOR_BYTE, decode_stream_frame_ndjson, decode_stream_frame_toon,
     };
     use crate::watcher::{WatchIngestOp, WatchIngestPipeline};
+    use frankensearch_core::{ExplanationPhase, HitExplanation};
     use frankensearch_storage::EmbeddingVectorSink;
 
     use std::process::{Command, Output, Stdio};
@@ -28036,6 +28115,65 @@ mod tests {
         assert!(
             hashed.contains("fnv1a-256") && hashed.contains("hash control"),
             "hash generation must beat model-cache readiness: {hashed}"
+        );
+
+        let started = runtime.search_stream_started_event("ownership", "stream-hash");
+        assert_eq!(started.vector_generation_id.as_deref(), Some("fnv1a-256"));
+        assert!(started.vector_generation_is_hash);
+        assert!(!started.semantic_admitted);
+        assert_eq!(
+            started.skip_reason.as_deref(),
+            Some("non_semantic_fast_embedder_vector_control")
+        );
+
+        runtime
+            .persist_explain_session(&index_root, "ownership", SearchOutputPhase::Initial, &[])
+            .expect("persist explain session");
+        let session = runtime
+            .load_explain_session()
+            .expect("load explain session")
+            .expect("explain session should name the hash generation");
+        assert_eq!(session.vector_generation_id.as_deref(), Some("fnv1a-256"));
+        assert!(session.vector_generation_is_hash);
+
+        let table = render_explain_table(
+            "R0",
+            &FsfsExplanationPayload::new(
+                "ownership",
+                RankingExplanation::from_hit_explanation(
+                    "src/lib.rs",
+                    &HitExplanation {
+                        final_score: 0.1,
+                        components: Vec::new(),
+                        phase: ExplanationPhase::Initial,
+                        rank_movement: None,
+                    },
+                    "query.explain.attached",
+                    920,
+                ),
+            ),
+            &ExplainSessionHit {
+                result_id: "R0".to_owned(),
+                rank: 1,
+                path: "src/lib.rs".to_owned(),
+                final_score: 0.1,
+                lexical_rank: None,
+                semantic_rank: Some(0),
+                lexical_score: None,
+                semantic_score: Some(0.1),
+                in_both_sources: false,
+            },
+            60.0,
+            true,
+            Some("fnv1a-256"),
+        );
+        assert!(
+            table.contains("Hash control (fnv1a-256, not semantic)"),
+            "explain table must not call a hash score semantic: {table}"
+        );
+        assert!(
+            !table.contains("Semantic (fast):"),
+            "explain table must not keep the semantic-fast label for hash: {table}"
         );
     }
 

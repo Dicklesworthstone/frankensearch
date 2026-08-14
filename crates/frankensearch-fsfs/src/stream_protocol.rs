@@ -49,7 +49,7 @@ pub enum StreamEventKind {
 }
 
 /// Started event payload, emitted exactly once as the first stream frame.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct StreamStartedEvent {
     /// Unique stream identifier for correlation (ULID format).
     pub stream_id: String,
@@ -57,6 +57,35 @@ pub struct StreamStartedEvent {
     pub query: String,
     /// Output format used for this stream.
     pub format: String,
+    /// Published fast-tier embedder identity, when a readable FSVI exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_generation_id: Option<String>,
+    /// True when that identity is a hash/fnv control artifact.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vector_generation_is_hash: bool,
+    /// True when a non-hash vector generation is published.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub semantic_admitted: bool,
+    /// Why this stream is not serving semantic search, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+}
+
+impl StreamStartedEvent {
+    /// Construct a started event with no published-generation annotation.
+    #[must_use]
+    pub fn new(
+        stream_id: impl Into<String>,
+        query: impl Into<String>,
+        format: impl Into<String>,
+    ) -> Self {
+        Self {
+            stream_id: stream_id.into(),
+            query: query.into(),
+            format: format.into(),
+            ..Self::default()
+        }
+    }
 }
 
 /// Progress event payload.
@@ -668,12 +697,7 @@ mod tests {
     #[test]
     fn event_kind_discriminator_is_stable() {
         assert_eq!(
-            StreamEvent::<()>::Started(StreamStartedEvent {
-                stream_id: "01TEST".into(),
-                query: "hello".into(),
-                format: "jsonl".into(),
-            })
-            .kind(),
+            StreamEvent::<()>::Started(StreamStartedEvent::new("01TEST", "hello", "jsonl")).kind(),
             StreamEventKind::Started
         );
         assert_eq!(
@@ -695,11 +719,11 @@ mod tests {
 
     #[test]
     fn started_event_ndjson_roundtrip() {
-        let frame = sample_frame(StreamEvent::Started(StreamStartedEvent {
-            stream_id: "01JAH9A2W8F8Q6GQ4C7M3N2P1R".into(),
-            query: "test query".into(),
-            format: "jsonl".into(),
-        }));
+        let frame = sample_frame(StreamEvent::Started(StreamStartedEvent::new(
+            "01JAH9A2W8F8Q6GQ4C7M3N2P1R",
+            "test query",
+            "jsonl",
+        )));
 
         let encoded = encode_stream_frame_ndjson(&frame).expect("encode started ndjson");
         assert!(encoded.contains("\"event\":\"started\""));
@@ -712,11 +736,11 @@ mod tests {
 
     #[test]
     fn started_event_toon_roundtrip() {
-        let frame = sample_frame(StreamEvent::Started(StreamStartedEvent {
-            stream_id: "01JAH9A2W8F8Q6GQ4C7M3N2P1R".into(),
-            query: "hello world".into(),
-            format: "toon".into(),
-        }));
+        let frame = sample_frame(StreamEvent::Started(StreamStartedEvent::new(
+            "01JAH9A2W8F8Q6GQ4C7M3N2P1R",
+            "hello world",
+            "toon",
+        )));
 
         let toon = encode_stream_frame_toon(&frame).expect("encode started toon");
         let decoded: StreamFrame<Vec<String>> =
@@ -726,11 +750,9 @@ mod tests {
 
     #[test]
     fn validate_started_frame() {
-        let frame = sample_frame(StreamEvent::Started(StreamStartedEvent {
-            stream_id: "01TEST".into(),
-            query: "q".into(),
-            format: "jsonl".into(),
-        }));
+        let frame = sample_frame(StreamEvent::Started(StreamStartedEvent::new(
+            "01TEST", "q", "jsonl",
+        )));
         let validation = validate_stream_frame(&frame);
         assert!(validation.valid);
     }
@@ -930,11 +952,11 @@ mod tests {
         let mut output = Vec::new();
 
         let events: Vec<StreamEvent<Vec<String>>> = vec![
-            StreamEvent::Started(StreamStartedEvent {
-                stream_id: stream_id.into(),
-                query: "lifecycle test".into(),
-                format: "jsonl".into(),
-            }),
+            StreamEvent::Started(StreamStartedEvent::new(
+                stream_id,
+                "lifecycle test",
+                "jsonl",
+            )),
             StreamEvent::Progress(StreamProgressEvent {
                 stage: "retrieve.fast".into(),
                 completed_units: 100,
@@ -1190,11 +1212,9 @@ mod tests {
 
     #[test]
     fn validate_empty_stream_id() {
-        let mut frame = sample_frame(StreamEvent::Started(StreamStartedEvent {
-            stream_id: "x".into(),
-            query: "q".into(),
-            format: "jsonl".into(),
-        }));
+        let mut frame = sample_frame(StreamEvent::Started(StreamStartedEvent::new(
+            "x", "q", "jsonl",
+        )));
         frame.stream_id = String::new();
         let validation = validate_stream_frame(&frame);
         assert!(!validation.valid);
@@ -1208,11 +1228,9 @@ mod tests {
 
     #[test]
     fn validate_empty_timestamp() {
-        let mut frame = sample_frame(StreamEvent::Started(StreamStartedEvent {
-            stream_id: "x".into(),
-            query: "q".into(),
-            format: "jsonl".into(),
-        }));
+        let mut frame = sample_frame(StreamEvent::Started(StreamStartedEvent::new(
+            "x", "q", "jsonl",
+        )));
         frame.ts = String::new();
         let validation = validate_stream_frame(&frame);
         assert!(!validation.valid);
@@ -1226,11 +1244,9 @@ mod tests {
 
     #[test]
     fn validate_empty_command() {
-        let mut frame = sample_frame(StreamEvent::Started(StreamStartedEvent {
-            stream_id: "x".into(),
-            query: "q".into(),
-            format: "jsonl".into(),
-        }));
+        let mut frame = sample_frame(StreamEvent::Started(StreamStartedEvent::new(
+            "x", "q", "jsonl",
+        )));
         frame.command = String::new();
         let validation = validate_stream_frame(&frame);
         assert!(!validation.valid);
@@ -1441,11 +1457,9 @@ mod tests {
 
     #[test]
     fn validate_wrong_protocol_version() {
-        let mut frame = sample_frame(StreamEvent::Started(StreamStartedEvent {
-            stream_id: "x".into(),
-            query: "q".into(),
-            format: "jsonl".into(),
-        }));
+        let mut frame = sample_frame(StreamEvent::Started(StreamStartedEvent::new(
+            "x", "q", "jsonl",
+        )));
         frame.v = 99;
         let validation = validate_stream_frame(&frame);
         assert!(!validation.valid);

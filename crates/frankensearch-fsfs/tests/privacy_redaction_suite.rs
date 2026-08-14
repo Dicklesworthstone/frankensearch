@@ -543,11 +543,11 @@ fn redaction_assertions_cover_logs_evidence_explain_and_streamed_outputs() {
         1,
         "2026-02-14T00:00:01Z",
         "search",
-        StreamEvent::<String>::Started(StreamStartedEvent {
-            stream_id: "stream-redaction-001".to_owned(),
-            query: format!("{redacted_query} {redacted_email}"),
-            format: "jsonl".to_owned(),
-        }),
+        StreamEvent::<String>::Started(StreamStartedEvent::new(
+            "stream-redaction-001",
+            format!("{redacted_query} {redacted_email}"),
+            "jsonl",
+        )),
     );
     let stream_ndjson = encode_stream_frame_ndjson(&stream_frame).expect("encode stream frame");
 
