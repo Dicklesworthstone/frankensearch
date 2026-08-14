@@ -1729,7 +1729,12 @@ struct ExplainSessionHit {
     path: String,
     final_score: f64,
     lexical_rank: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     semantic_rank: Option<usize>,
+    /// Rank in the hash-control vector list. Never set together with
+    /// `semantic_rank`: a hash generation is not a semantic source.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    hash_rank: Option<usize>,
     lexical_score: Option<f32>,
     semantic_score: Option<f32>,
     in_both_sources: bool,
@@ -1752,6 +1757,7 @@ impl ExplainSession {
                 final_score: sanitize_explain_score(candidate.fused_score),
                 lexical_rank: candidate.lexical_rank,
                 semantic_rank: candidate.semantic_rank,
+                hash_rank: None,
                 lexical_score: candidate.lexical_score,
                 semantic_score: candidate.semantic_score,
                 in_both_sources: candidate.in_both_sources,
@@ -1767,6 +1773,19 @@ impl ExplainSession {
             hits,
             vector_generation_id: None,
             vector_generation_is_hash: false,
+        }
+    }
+
+    fn remap_hash_control_ranks(&mut self) {
+        if !self.vector_generation_is_hash {
+            return;
+        }
+        for hit in &mut self.hits {
+            if hit.hash_rank.is_none() {
+                hit.hash_rank = hit.semantic_rank.take();
+            } else {
+                hit.semantic_rank = None;
+            }
         }
     }
 
@@ -6455,7 +6474,10 @@ impl FsfsRuntime {
                 source,
                 raw_score: f64::from(semantic_score),
                 normalized_score: f64::from(semantic_score),
-                rrf_contribution: rrf_contribution_for_rank(session.rrf_k, hit.semantic_rank),
+                rrf_contribution: rrf_contribution_for_rank(
+                    session.rrf_k,
+                    hit.hash_rank.or(hit.semantic_rank),
+                ),
                 weight: shared_weight,
             });
         }
@@ -6494,7 +6516,7 @@ impl FsfsRuntime {
             fused_score: hit.final_score,
             lexical_rank: hit.lexical_rank,
             semantic_rank: hit.semantic_rank,
-            hash_rank: None,
+            hash_rank: hit.hash_rank,
             lexical_score: hit.lexical_score,
             semantic_score: hit.semantic_score,
             in_both_sources: hit.in_both_sources,
@@ -6563,6 +6585,7 @@ impl FsfsRuntime {
             session.vector_generation_id = Some(published.id);
             session.vector_generation_is_hash = published.is_hash_control;
         }
+        session.remap_hash_control_ranks();
         let path = Self::explain_session_path(index_root);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -6590,12 +6613,13 @@ impl FsfsRuntime {
                 });
             }
         };
-        let session = serde_json::from_str::<ExplainSession>(&raw).map_err(|source| {
+        let mut session = serde_json::from_str::<ExplainSession>(&raw).map_err(|source| {
             SearchError::SubsystemError {
                 subsystem: "fsfs.explain.session",
                 source: Box::new(source),
             }
         })?;
+        session.remap_hash_control_ranks();
         Ok(Some(session))
     }
 
@@ -7214,7 +7238,7 @@ impl FsfsRuntime {
                 fused_score: hit.score,
                 prior_boost: 0.0,
                 lexical_rank: hit.lexical_rank,
-                semantic_rank: hit.semantic_rank,
+                semantic_rank: hit.hash_rank.or(hit.semantic_rank),
                 lexical_score: None,
                 semantic_score: None,
                 in_both_sources: hit.in_both_sources,
@@ -15330,14 +15354,14 @@ fn render_explain_table(
     let quality_score = "n/a";
     let rerank_score = "n/a";
     let lexical_rrf = rrf_contribution_for_rank(rrf_k, hit.lexical_rank);
-    let semantic_rrf = rrf_contribution_for_rank(rrf_k, hit.semantic_rank);
+    let vector_rank = hit.hash_rank.or(hit.semantic_rank);
+    let semantic_rrf = rrf_contribution_for_rank(rrf_k, vector_rank);
     let total_rrf = lexical_rrf + semantic_rrf;
     let lexical_rank = hit
         .lexical_rank
         .map_or_else(|| "-".to_owned(), |rank| rank.saturating_add(1).to_string());
-    let semantic_rank = hit
-        .semantic_rank
-        .map_or_else(|| "-".to_owned(), |rank| rank.saturating_add(1).to_string());
+    let semantic_rank =
+        vector_rank.map_or_else(|| "-".to_owned(), |rank| rank.saturating_add(1).to_string());
 
     let mut lines = Vec::new();
     lines.push(format!("Result ID: {requested_result_id}"));
@@ -28469,6 +28493,7 @@ mod tests {
                 final_score: 0.1,
                 lexical_rank: None,
                 semantic_rank: Some(0),
+                hash_rank: None,
                 lexical_score: None,
                 semantic_score: Some(0.1),
                 in_both_sources: false,
@@ -28493,6 +28518,53 @@ mod tests {
             !table.contains("semantic_rank=") && !table.contains("semantic_contrib="),
             "explain RRF line must not keep semantic rank labels for hash: {table}"
         );
+    }
+
+    #[test]
+    fn persist_explain_session_remaps_hash_ranks_off_semantic_rank() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+        fs::create_dir_all(vector_path.parent().expect("vector parent"))
+            .expect("create vector dir");
+        VectorIndex::create(&vector_path, "fnv1a-256", 256)
+            .expect("create hash generation")
+            .finish()
+            .expect("finish hash generation");
+        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            index_dir: Some(index_root.clone()),
+            ..CliInput::default()
+        });
+        runtime
+            .persist_explain_session(
+                &index_root,
+                "ownership",
+                SearchOutputPhase::Initial,
+                &[FusedCandidate {
+                    doc_id: "src/lib.rs".into(),
+                    fused_score: 0.1,
+                    prior_boost: 0.0,
+                    lexical_rank: None,
+                    semantic_rank: Some(0),
+                    lexical_score: None,
+                    semantic_score: Some(0.1),
+                    in_both_sources: false,
+                }],
+            )
+            .expect("persist hash explain session");
+        let raw = fs::read_to_string(index_root.join(super::FSFS_EXPLAIN_SESSION_FILE))
+            .expect("read explain session");
+        assert!(
+            raw.contains("hash_rank") && !raw.contains("semantic_rank"),
+            "persisted hash session must not keep semantic_rank: {raw}"
+        );
+        let session = runtime
+            .load_explain_session()
+            .expect("load explain session")
+            .expect("session exists");
+        assert!(session.vector_generation_is_hash);
+        assert_eq!(session.hits[0].hash_rank, Some(0));
+        assert_eq!(session.hits[0].semantic_rank, None);
     }
 
     #[test]
