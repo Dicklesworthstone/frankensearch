@@ -870,6 +870,11 @@ impl std::fmt::Debug for HybridIndexParts {
     }
 }
 
+fn is_hash_generation_id(embedder_id: &str) -> bool {
+    let id = embedder_id.to_ascii_lowercase();
+    id == "hash" || id.starts_with("hash-") || id.starts_with("fnv1a-") || id.starts_with("jl-")
+}
+
 /// Open every arm of an index directory produced by [`IndexBuilder`].
 ///
 /// The advertised hybrid flow used to build lexical data and then construct
@@ -895,11 +900,6 @@ impl std::fmt::Debug for HybridIndexParts {
 /// a lexical backend compiled in. When the arm is present,
 /// `lexical_backend` records whether it is the default Quill reader or an
 /// explicit Tantivy oracle/rollback reader.
-fn is_hash_generation_id(embedder_id: &str) -> bool {
-    let id = embedder_id.to_ascii_lowercase();
-    id == "hash" || id.starts_with("hash-") || id.starts_with("fnv1a-") || id.starts_with("jl-")
-}
-
 pub async fn open_hybrid(
     cx: &Cx,
     data_dir: impl AsRef<Path>,

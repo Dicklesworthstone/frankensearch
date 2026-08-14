@@ -844,8 +844,10 @@ mod lexical {
             let final_leaf = [IndexableDocument::new("final-leaf", "anchor p999")];
             let tmp = tempfile::tempdir().expect("tempdir");
 
-            let mut quill_config = QuillConfig::default();
-            quill_config.glob_expansion_limit = 50;
+            let quill_config = QuillConfig {
+                glob_expansion_limit: 50,
+                ..QuillConfig::default()
+            };
             let quill = QuillIndex::create(&cx, tmp.path().join("quill"), quill_config)
                 .await
                 .expect("create Quill index");
