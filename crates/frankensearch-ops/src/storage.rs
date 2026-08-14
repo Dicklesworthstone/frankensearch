@@ -1734,47 +1734,46 @@ impl OpsStorage {
     /// Returns an error when validation fails or the database write fails.
     pub fn upsert_resource_sample(&self, sample: &ResourceSampleRecord) -> SearchResult<()> {
         sample.validate()?;
-        let conn = self.connection();
 
-        // Ensure the referenced project and instance exist (FK constraints).
-        ensure_project_exists(conn, &sample.project_key, sample.ts_ms)?;
-        ensure_instance_exists(conn, &sample.instance_id, &sample.project_key, sample.ts_ms)?;
+        // Delete-then-insert must be one retryable transaction. Autocommit
+        // leaves a hole if INSERT fails after DELETE, and FrankenSQLite
+        // transients (Busy/SnapshotTooOld/SchemaChanged) need a clean retry.
+        self.with_transaction(|conn| {
+            ensure_project_exists(conn, &sample.project_key, sample.ts_ms)?;
+            ensure_instance_exists(conn, &sample.instance_id, &sample.project_key, sample.ts_ms)?;
 
-        // Delete-then-insert upsert: FrankenSQLite does not yet support
-        // ON CONFLICT(...) DO UPDATE and query_with_params may not reliably
-        // detect existing rows, so we delete any conflicting row first.
-        let key_params = [
-            SqliteValue::Text(sample.project_key.clone().into()),
-            SqliteValue::Text(sample.instance_id.clone().into()),
-            SqliteValue::Integer(sample.ts_ms),
-        ];
-        conn.execute_with_params_sync(
-            "DELETE FROM resource_samples \
+            let key_params = [
+                SqliteValue::Text(sample.project_key.clone().into()),
+                SqliteValue::Text(sample.instance_id.clone().into()),
+                SqliteValue::Integer(sample.ts_ms),
+            ];
+            conn.execute_with_params_sync(
+                "DELETE FROM resource_samples \
          WHERE project_key = ?1 AND instance_id = ?2 AND ts_ms = ?3;",
-            &key_params,
-        )
-        .map_err(ops_error)?;
+                &key_params,
+            )
+            .map_err(ops_error)?;
 
-        let params = [
-            SqliteValue::Text(sample.project_key.clone().into()),
-            SqliteValue::Text(sample.instance_id.clone().into()),
-            optional_f64(sample.cpu_pct),
-            optional_u64(sample.rss_bytes, "rss_bytes")?,
-            optional_u64(sample.io_read_bytes, "io_read_bytes")?,
-            optional_u64(sample.io_write_bytes, "io_write_bytes")?,
-            optional_u64(sample.queue_depth, "queue_depth")?,
-            SqliteValue::Integer(sample.ts_ms),
-        ];
-        conn.execute_with_params_sync(
-            "INSERT INTO resource_samples(\
+            let params = [
+                SqliteValue::Text(sample.project_key.clone().into()),
+                SqliteValue::Text(sample.instance_id.clone().into()),
+                optional_f64(sample.cpu_pct),
+                optional_u64(sample.rss_bytes, "rss_bytes")?,
+                optional_u64(sample.io_read_bytes, "io_read_bytes")?,
+                optional_u64(sample.io_write_bytes, "io_write_bytes")?,
+                optional_u64(sample.queue_depth, "queue_depth")?,
+                SqliteValue::Integer(sample.ts_ms),
+            ];
+            conn.execute_with_params_sync(
+                "INSERT INTO resource_samples(\
             project_key, instance_id, cpu_pct, rss_bytes, io_read_bytes, io_write_bytes, \
             queue_depth, ts_ms\
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);",
-            &params,
-        )
-        .map_err(ops_error)?;
-
-        Ok(())
+                &params,
+            )
+            .map_err(ops_error)?;
+            Ok(())
+        })
     }
 
     /// Insert an evidence link while enforcing `(alert_id, evidence_uri)` uniqueness.
