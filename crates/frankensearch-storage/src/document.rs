@@ -8,7 +8,7 @@ use fsqlite::{AsyncConnection, Row};
 use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::Storage;
+use crate::connection::{Storage, retry_transient_storage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CrudErrorKind {
@@ -434,10 +434,14 @@ impl Storage {
         ensure_non_empty(doc_id, "doc_id")?;
 
         let params = [SqliteValue::Text(doc_id.to_owned().into())];
-        let deleted = self
-            .connection()
-            .execute_with_params_sync("DELETE FROM documents WHERE doc_id = ?1;", &params)
-            .map_err(storage_error)?;
+        let deleted = retry_transient_storage(
+            || {
+                self.connection()
+                    .execute_with_params_sync("DELETE FROM documents WHERE doc_id = ?1;", &params)
+                    .map_err(storage_error)
+            },
+            "document delete",
+        )?;
 
         tracing::debug!(
             target: "frankensearch.storage",
