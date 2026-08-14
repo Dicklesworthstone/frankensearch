@@ -430,6 +430,7 @@ fn json_toon_parity_search_payload_with_degradation_advice()
             snippet: Some("quality refinement timed out".to_owned()),
             lexical_rank: Some(1),
             semantic_rank: Some(2),
+            hash_rank: None,
             in_both_sources: true,
         }],
     )

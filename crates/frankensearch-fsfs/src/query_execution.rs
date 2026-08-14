@@ -1020,6 +1020,7 @@ impl QueryExecutionOrchestrator {
                     .filter(|snippet| !snippet.trim().is_empty()),
                 lexical_rank: candidate.lexical_rank,
                 semantic_rank: candidate.semantic_rank,
+                hash_rank: None,
                 in_both_sources: candidate.in_both_sources,
             })
             .collect();

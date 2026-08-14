@@ -417,7 +417,8 @@ fn write_search_payload_csv<W: Write>(payload: &SearchPayload, writer: &mut W) -
             .map(|rank| rank.saturating_add(1).to_string())
             .unwrap_or_default();
         let semantic_rank = hit
-            .semantic_rank
+            .hash_rank
+            .or(hit.semantic_rank)
             .map(|rank| rank.saturating_add(1).to_string())
             .unwrap_or_default();
         write_csv_row(
@@ -557,7 +558,9 @@ fn render_search_table_with_options(
             hit.rank, path, line_segment, score, source_badge
         );
 
-        if let (Some(lexical_rank), Some(vector_rank)) = (hit.lexical_rank, hit.semantic_rank) {
+        if let (Some(lexical_rank), Some(vector_rank)) =
+            (hit.lexical_rank, hit.hash_rank.or(hit.semantic_rank))
+        {
             let vector_label = if payload.vector_generation_is_hash {
                 "H"
             } else {
@@ -648,10 +651,10 @@ fn source_badge(hit: &SearchHitPayload, hash_control: bool, color_enabled: bool)
     if hit.lexical_rank.is_some() {
         return paint("[lexical]", "33", color_enabled);
     }
+    if hit.hash_rank.is_some() || (hash_control && hit.semantic_rank.is_some()) {
+        return paint("[hash control]", "31", color_enabled);
+    }
     if hit.semantic_rank.is_some() {
-        if hash_control {
-            return paint("[hash control]", "31", color_enabled);
-        }
         return paint("[semantic]", "36", color_enabled);
     }
     paint("[unknown]", "90", color_enabled)
@@ -986,6 +989,7 @@ mod tests {
                     snippet: Some("fn authenticate(token: &str) -> bool".to_owned()),
                     lexical_rank: Some(0),
                     semantic_rank: Some(1),
+                    hash_rank: None,
                     in_both_sources: true,
                 },
                 SearchHitPayload {
@@ -995,6 +999,7 @@ mod tests {
                     snippet: None,
                     lexical_rank: Some(2),
                     semantic_rank: None,
+                    hash_rank: None,
                     in_both_sources: false,
                 },
             ],
@@ -1030,6 +1035,7 @@ mod tests {
                 snippet: Some("auth middleware validates bearer token".to_owned()),
                 lexical_rank: Some(0),
                 semantic_rank: Some(0),
+                hash_rank: None,
                 in_both_sources: true,
             }],
         );
@@ -1115,6 +1121,7 @@ mod tests {
                     snippet: Some("middleware validates bearer tokens".to_owned()),
                     lexical_rank: Some(0),
                     semantic_rank: Some(1),
+                    hash_rank: None,
                     in_both_sources: true,
                 },
                 SearchHitPayload {
@@ -1124,6 +1131,7 @@ mod tests {
                     snippet: Some("quoted \"token\" snippet, with comma".to_owned()),
                     lexical_rank: None,
                     semantic_rank: Some(2),
+                    hash_rank: None,
                     in_both_sources: false,
                 },
             ],
@@ -1156,6 +1164,7 @@ mod tests {
                 snippet: None,
                 lexical_rank: Some(0),
                 semantic_rank: Some(1),
+                hash_rank: None,
                 in_both_sources: true,
             }],
         )
@@ -1355,6 +1364,7 @@ mod tests {
                     snippet: Some("JWT validation middleware checks Bearer token".to_owned()),
                     lexical_rank: Some(0),
                     semantic_rank: Some(1),
+                    hash_rank: None,
                     in_both_sources: true,
                 },
                 SearchHitPayload {
@@ -1364,6 +1374,7 @@ mod tests {
                     snippet: Some("Login handler with bcrypt password hashing".to_owned()),
                     lexical_rank: Some(2),
                     semantic_rank: None,
+                    hash_rank: None,
                     in_both_sources: false,
                 },
                 SearchHitPayload {
@@ -1373,6 +1384,7 @@ mod tests {
                     snippet: None,
                     lexical_rank: None,
                     semantic_rank: Some(3),
+                    hash_rank: None,
                     in_both_sources: false,
                 },
             ],
@@ -1416,6 +1428,7 @@ mod tests {
                     snippet: None,
                     lexical_rank: Some(0),
                     semantic_rank: Some(0),
+                    hash_rank: None,
                     in_both_sources: true,
                 },
                 SearchHitPayload {
@@ -1425,6 +1438,7 @@ mod tests {
                     snippet: None,
                     lexical_rank: None,
                     semantic_rank: Some(1),
+                    hash_rank: None,
                     in_both_sources: false,
                 },
             ],
@@ -1463,6 +1477,7 @@ mod tests {
                     snippet: None,
                     lexical_rank: Some(0),
                     semantic_rank: None,
+                    hash_rank: None,
                     in_both_sources: false,
                 },
                 SearchHitPayload {
@@ -1472,6 +1487,7 @@ mod tests {
                     snippet: None,
                     lexical_rank: None,
                     semantic_rank: Some(0),
+                    hash_rank: None,
                     in_both_sources: false,
                 },
                 SearchHitPayload {
@@ -1481,6 +1497,7 @@ mod tests {
                     snippet: None,
                     lexical_rank: None,
                     semantic_rank: Some(1),
+                    hash_rank: None,
                     in_both_sources: false,
                 },
             ],
@@ -1516,6 +1533,7 @@ mod tests {
                 snippet: Some("validates bearer token from header".to_owned()),
                 lexical_rank: Some(0),
                 semantic_rank: Some(0),
+                hash_rank: None,
                 in_both_sources: true,
             }],
         );
@@ -1544,6 +1562,7 @@ mod tests {
                 snippet: None,
                 lexical_rank: Some(0),
                 semantic_rank: None,
+                hash_rank: None,
                 in_both_sources: false,
             }],
         );
@@ -1578,6 +1597,7 @@ mod tests {
                 snippet: Some(long_snippet),
                 lexical_rank: None,
                 semantic_rank: Some(0),
+                hash_rank: None,
                 in_both_sources: false,
             }],
         );
@@ -1602,6 +1622,7 @@ mod tests {
                 snippet: None,
                 lexical_rank: None,
                 semantic_rank: Some(0),
+                hash_rank: None,
                 in_both_sources: false,
             }],
         )

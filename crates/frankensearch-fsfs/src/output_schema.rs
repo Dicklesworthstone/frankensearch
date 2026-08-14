@@ -412,6 +412,10 @@ pub struct SearchHitPayload {
     pub lexical_rank: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_rank: Option<usize>,
+    /// Rank in the hash-control vector list. Never set together with
+    /// `semantic_rank`: a hash generation is not a semantic source.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub hash_rank: Option<usize>,
     pub in_both_sources: bool,
 }
 
@@ -489,7 +493,22 @@ impl SearchPayload {
     pub fn with_vector_generation(mut self, id: impl Into<String>, is_hash: bool) -> Self {
         self.vector_generation_id = Some(id.into());
         self.vector_generation_is_hash = is_hash;
+        self.remap_hash_control_ranks();
         self
+    }
+
+    /// Move vector ranks off `semantic_rank` when this payload is hash control.
+    pub fn remap_hash_control_ranks(&mut self) {
+        if !self.vector_generation_is_hash {
+            return;
+        }
+        for hit in &mut self.hits {
+            if hit.hash_rank.is_none() {
+                hit.hash_rank = hit.semantic_rank.take();
+            } else {
+                hit.semantic_rank = None;
+            }
+        }
     }
 
     #[must_use]
@@ -1264,6 +1283,7 @@ mod tests {
                     snippet: Some("fn authenticate(token: &str) -> bool".to_owned()),
                     lexical_rank: Some(0),
                     semantic_rank: Some(1),
+                    hash_rank: None,
                     in_both_sources: true,
                 },
                 SearchHitPayload {
@@ -1273,6 +1293,7 @@ mod tests {
                     snippet: None,
                     lexical_rank: Some(2),
                     semantic_rank: None,
+                    hash_rank: None,
                     in_both_sources: false,
                 },
             ],
@@ -1349,6 +1370,7 @@ mod tests {
                 snippet: None,
                 lexical_rank: None,
                 semantic_rank: Some(0),
+                hash_rank: None,
                 in_both_sources: false,
             }],
         )
@@ -1366,6 +1388,12 @@ mod tests {
         assert!(
             json.contains("fnv1a-256") && json.contains("vector_generation_is_hash"),
             "hash generation must be visible on the search wire: {json}"
+        );
+        assert_eq!(decoded.hits[0].hash_rank, Some(0));
+        assert_eq!(decoded.hits[0].semantic_rank, None);
+        assert!(
+            json.contains("hash_rank") && !json.contains("semantic_rank"),
+            "hash hits must not use the semantic_rank key: {json}"
         );
     }
 

@@ -6944,6 +6944,7 @@ impl FsfsRuntime {
                     snippet: snippets.get(path).map(|&s| s.to_owned()),
                     lexical_rank,
                     semantic_rank,
+                    hash_rank: None,
                     in_both_sources: in_multiple,
                 }
             })
@@ -6965,6 +6966,7 @@ impl FsfsRuntime {
                 .vector_generation_id
                 .clone_from(&source.vector_generation_id);
             payload.vector_generation_is_hash = source.vector_generation_is_hash;
+            payload.remap_hash_control_ranks();
         }
         payload
     }
@@ -7250,6 +7252,7 @@ impl FsfsRuntime {
             let is_hash = Self::is_legacy_hash_vector_generation(id);
             payload.vector_generation_id = Some(id.to_owned());
             payload.vector_generation_is_hash = is_hash;
+            payload.remap_hash_control_ranks();
             if is_hash && payload.skip_reason.is_none() {
                 payload.skip_reason = Some("non_semantic_fast_embedder_vector_control".to_owned());
             }
@@ -16792,12 +16795,19 @@ fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState
     let source_lexical = state
         .latest_hits()
         .iter()
-        .filter(|hit| hit.lexical_rank.is_some() && hit.semantic_rank.is_none())
+        .filter(|hit| {
+            hit.lexical_rank.is_some() && hit.semantic_rank.is_none() && hit.hash_rank.is_none()
+        })
         .count();
     let source_semantic = state
         .latest_hits()
         .iter()
         .filter(|hit| hit.semantic_rank.is_some() && hit.lexical_rank.is_none())
+        .count();
+    let source_hash = state
+        .latest_hits()
+        .iter()
+        .filter(|hit| hit.hash_rank.is_some() && hit.lexical_rank.is_none())
         .count();
     let phase_chain = render_phase_chain(&state.stage_chain);
     let telemetry_block = Block::new()
@@ -16824,10 +16834,11 @@ fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState
         )),
         Line::from(Span::styled(
             format!(
-                "sources => both={} lexical_only={} semantic_only={}",
+                "sources => both={} lexical_only={} semantic_only={} hash_only={}",
                 format_count_usize(source_both),
                 format_count_usize(source_lexical),
                 format_count_usize(source_semantic),
+                format_count_usize(source_hash),
             ),
             ui_fg(no_color, PackedRgba::rgb(168, 191, 228)),
         )),
@@ -17675,7 +17686,11 @@ fn payload_has_admitted_semantic_hits(payload: &SearchPayload) -> bool {
 }
 
 fn payload_has_hash_control_hits(payload: &SearchPayload) -> bool {
-    payload.vector_generation_is_hash && payload.hits.iter().any(|hit| hit.semantic_rank.is_some())
+    payload.vector_generation_is_hash
+        && payload
+            .hits
+            .iter()
+            .any(|hit| hit.hash_rank.is_some() || hit.semantic_rank.is_some())
 }
 
 const fn search_hit_source_label(hit: &SearchHitPayload, hash_control: bool) -> &'static str {
@@ -17683,12 +17698,10 @@ const fn search_hit_source_label(hit: &SearchHitPayload, hash_control: bool) -> 
         if hash_control { "lexical+hash" } else { "both" }
     } else if hit.lexical_rank.is_some() {
         "lexical"
+    } else if hit.hash_rank.is_some() || (hash_control && hit.semantic_rank.is_some()) {
+        "hash control"
     } else if hit.semantic_rank.is_some() {
-        if hash_control {
-            "hash control"
-        } else {
-            "semantic"
-        }
+        "semantic"
     } else {
         "unknown"
     }
@@ -26718,6 +26731,7 @@ mod tests {
                     snippet: Some("auth middleware".to_owned()),
                     lexical_rank: Some(0),
                     semantic_rank: Some(1),
+                    hash_rank: None,
                     in_both_sources: true,
                 },
                 SearchHitPayload {
@@ -26727,6 +26741,7 @@ mod tests {
                     snippet: None,
                     lexical_rank: Some(1),
                     semantic_rank: None,
+                    hash_rank: None,
                     in_both_sources: false,
                 },
             ],
@@ -26781,6 +26796,7 @@ mod tests {
                 snippet: None,
                 lexical_rank: Some(0),
                 semantic_rank: Some(0),
+                hash_rank: None,
                 in_both_sources: true,
             }],
         );
@@ -28472,10 +28488,13 @@ mod tests {
                 snippet: None,
                 lexical_rank: None,
                 semantic_rank: Some(0),
+                hash_rank: None,
                 in_both_sources: false,
             }],
         )
         .with_vector_generation("fnv1a-256", true);
+        assert_eq!(payload.hits[0].hash_rank, Some(0));
+        assert_eq!(payload.hits[0].semantic_rank, None);
         assert!(payload_has_hash_control_hits(&payload));
         assert!(!payload_has_admitted_semantic_hits(&payload));
         assert_eq!(
@@ -28490,10 +28509,33 @@ mod tests {
             "lexical+hash"
         );
 
+        // Remap is sticky: flipping the generation flag must not resurrect
+        // a semantic_rank that was already moved onto hash_rank.
         payload.vector_generation_is_hash = false;
-        assert!(payload_has_admitted_semantic_hits(&payload));
+        assert!(!payload_has_admitted_semantic_hits(&payload));
         assert!(!payload_has_hash_control_hits(&payload));
+        assert_eq!(payload.hits[0].semantic_rank, None);
         assert_eq!(search_hit_source_label(&payload.hits[0], false), "both");
+
+        let semantic = SearchPayload::new(
+            "ownership",
+            SearchOutputPhase::Initial,
+            1,
+            vec![SearchHitPayload {
+                rank: 1,
+                path: "src/lib.rs".to_owned(),
+                score: 0.2,
+                snippet: None,
+                lexical_rank: Some(0),
+                semantic_rank: Some(0),
+                hash_rank: None,
+                in_both_sources: true,
+            }],
+        )
+        .with_vector_generation("minilm-l6-v2", false);
+        assert!(payload_has_admitted_semantic_hits(&semantic));
+        assert!(!payload_has_hash_control_hits(&semantic));
+        assert_eq!(search_hit_source_label(&semantic.hits[0], false), "both");
     }
 
     #[test]
@@ -30005,6 +30047,7 @@ mod tests {
                     snippet: Some("cached snippet".to_owned()),
                     lexical_rank: Some(0),
                     semantic_rank: Some(0),
+                    hash_rank: None,
                     in_both_sources: true,
                 }],
             );
@@ -30083,6 +30126,7 @@ mod tests {
                     snippet: None,
                     lexical_rank: Some(0),
                     semantic_rank: Some(0),
+                    hash_rank: None,
                     in_both_sources: true,
                 }],
             )];
@@ -30200,6 +30244,7 @@ mod tests {
                     snippet: None,
                     lexical_rank: None,
                     semantic_rank: Some(0),
+                    hash_rank: None,
                     in_both_sources: false,
                 }],
             )];
@@ -30282,6 +30327,7 @@ mod tests {
                     snippet: None,
                     lexical_rank: Some(0),
                     semantic_rank: None,
+                    hash_rank: None,
                     in_both_sources: false,
                 }],
             )];
@@ -30439,14 +30485,19 @@ mod tests {
                 .expect("full request against repaired generation");
             assert!(!full_after_repair.cached);
             assert!(resources.fast_embedder_attempted);
+            // Serve-time auto-detect without models is HashEmbedder, so the
+            // repaired FSVI is a hash-control generation. The witness must
+            // still come back, but not under semantic_rank.
             assert!(
                 full_after_repair.payloads.iter().any(|payload| {
-                    payload
-                        .hits
-                        .iter()
-                        .any(|hit| hit.path == document_id && hit.semantic_rank.is_some())
+                    payload.vector_generation_is_hash
+                        && payload.hits.iter().any(|hit| {
+                            hit.path == document_id
+                                && hit.hash_rank.is_some()
+                                && hit.semantic_rank.is_none()
+                        })
                 }),
-                "full request must retrieve the witness from the rebound vector generation"
+                "full request must retrieve the rebound hash-control witness without calling it semantic"
             );
         });
     }
