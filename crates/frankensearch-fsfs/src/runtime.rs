@@ -2540,9 +2540,18 @@ struct FsfsIndexStatus {
     /// True when that identity is a hash/fnv control artifact.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     vector_generation_is_hash: bool,
+    /// Same operator label as the status table / dashboard (`ready`,
+    /// `no vector index`, `hash control (not semantic)`, `missing`).
+    #[serde(default)]
+    dashboard_state: String,
 }
 
 impl FsfsIndexStatus {
+    fn with_computed_dashboard_state(mut self) -> Self {
+        self.dashboard_state = self.dashboard_state_label().to_owned();
+        self
+    }
+
     /// Operator-facing readiness for dashboards and the status table.
     ///
     /// A present hash/fnv control artifact is not a ready semantic index.
@@ -10226,7 +10235,9 @@ impl FsfsRuntime {
                 vector_generation_is_hash: published_vector
                     .as_ref()
                     .is_some_and(|value| value.is_hash_control),
-            },
+                dashboard_state: String::new(),
+            }
+            .with_computed_dashboard_state(),
             models: self.collect_model_statuses()?,
             config: config_status,
             runtime: runtime_status,
@@ -20297,6 +20308,7 @@ mod tests {
                 vector_generation_id: Some("potion-multilingual-128m".to_owned()),
                 vector_generation_dimension: Some(256),
                 vector_generation_is_hash: false,
+                dashboard_state: "ready".to_owned(),
                 index_freshness: Some(IndexFreshnessPayload {
                     published_generation: 7,
                     last_publish_unix: Some(1_700_000_000),
@@ -27834,6 +27846,12 @@ mod tests {
         assert!(!payload.index.vector_generation_is_hash);
         assert_eq!(payload.index.dashboard_state_label(), "no vector index");
         assert!(!payload.index.dashboard_state_is_healthy());
+        assert_eq!(payload.index.dashboard_state, "no vector index");
+        let encoded = serde_json::to_string(&payload).expect("status json");
+        assert!(
+            encoded.contains("\"dashboard_state\":\"no vector index\""),
+            "robot status json must name the missing FSVI: {encoded}"
+        );
 
         let table = render_status_table(&payload, true);
         assert!(
