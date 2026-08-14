@@ -18982,3 +18982,60 @@ codes for an authority-valid statistical refusal, with no admission change.
 Then run one fresh exact cell and choose the next action from the named failed
 null/effect check. A performance lever remains blocked until an admissible
 same-invocation T/Q comparison plus T/T and Q/Q controls is actually emitted.
+
+### 2026-08-14 — REJECT: reusing per-term posting/position row buffers does not clear the indexing floor
+
+**Comparison class: SELF-SPEEDUP / MAINTENANCE, not a QG-1 win.** The current
+50k/8-thread profile attributed 2.35% exclusive CPU to `build_term_rows` plus
+allocator traffic around the term loop. The candidate kept one postings
+scratch `Vec` and one positions scratch `Vec` per shard seal, cleared and
+refilled them for each ordered term, and passed their slices synchronously to
+the unchanged canonical encoder. It changed no term order, posting order,
+position order, cancellation point, budget, or durable format. A focused test
+proved both allocations survived a positionful-to-positionless reuse and that
+the positions buffer was cleared.
+
+The release-perf binaries were built from clean HEAD
+`0219ac554725324ee9d7855fc398fb6e880798dd` with only the candidate
+`scribe.rs` overlay. Executing ELF SHA-256 identities were:
+
+- baseline: `caddd0f53ae2e968bfa2ed7d8b8025613da2681aa96448981b4624033e66e2a8`;
+- candidate: `bb81adea89ee6178a2b0c56aa4cad8710972b08e0aaf4d798a1b2e16e0d3b135`.
+
+The candidate source SHA-256 was
+`746e88397c8547dad5e461dc131af18339366bac3367bbaa041089ba573c8797`;
+its exact diff SHA-256 was
+`4b86f560cb3613397a807c4cbb7bab82b437deab28d3c75238407eb2a9eafd3f`.
+On `thinkstation1` (AMD Ryzen Threadripper PRO 5975WX, affinity CPUs 0-7),
+one warmup per arm preceded 21 seeded randomized rounds. Every round contained
+two independently timed baseline twins and one candidate; A/B used their
+geometric-mean baseline. The exact workload was the existing memory child with
+50,000 generated documents, 5,000-document batches, 120,000,000-byte heap,
+eight writer/Rayon threads, and positions enabled. All 65 children produced
+exactly 83,683,104 index bytes.
+
+| metric | result |
+|---|---:|
+| A/A median | 1.002964 |
+| A/A bootstrap median CI95 | [0.992274, 1.020851] |
+| baseline/candidate median ratio | **1.013276** |
+| A/B bootstrap median CI95 | **[0.999585, 1.016006]** |
+| pairs candidate faster | 13 / 21 |
+| pairs at or above 1.03 | 2 / 21 |
+| baseline / candidate median seconds | 0.613127 / 0.610495 |
+| baseline / candidate median docs/s | 81,549 / 81,901 |
+| baseline / candidate median peak RSS | 327,720,960 / 326,746,112 bytes |
+
+The null is centered and its CI contains 1.0. The candidate's 1.33% median
+improvement is too small and its lower CI is below both 1.0 and the predeclared
+1.03 maintenance floor. The small RSS decrease does not rescue a throughput
+miss. Raw JSON SHA-256 is
+`346222dd01f34b4025820380c081df85d74c8a9e3e8ee928a3cd775384ecb4f1`,
+preserved at
+`/data/tmp/quill-termrow-scratch-ab-50000-20260814T0032Z.json`.
+
+**Decision: REJECT / NO-SHIP.** Do not retry simple per-term capacity reuse on
+this workload. Reopen this allocation vein only if a fresh exact-corpus profile
+supports a materially different representation that removes row
+materialization or aggregate staging, with exact-byte parity and a new
+same-invocation null.
