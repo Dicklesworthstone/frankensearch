@@ -421,6 +421,23 @@ pub struct FusedCandidate {
     pub in_both_sources: bool,
 }
 
+impl FusedCandidate {
+    /// Move vector ranks and scores off semantic fields when this row is
+    /// hash control.
+    pub fn remap_hash_control_ranks(&mut self) {
+        if self.hash_rank.is_none() {
+            self.hash_rank = self.semantic_rank.take();
+        } else {
+            self.semantic_rank = None;
+        }
+        if self.hash_score.is_none() {
+            self.hash_score = self.semantic_score.take();
+        } else {
+            self.semantic_score = None;
+        }
+    }
+}
+
 /// Optional prior signals attached to a candidate.
 ///
 /// All signals are expected in the normalized range `[0.0, 1.0]`.
@@ -764,14 +781,34 @@ impl QueryExecutionOrchestrator {
         limit: usize,
         offset: usize,
     ) -> Vec<FusedCandidate> {
-        self.fuse_rankings_with_priors(
+        self.fuse_rankings_for_vector_lane(lexical, semantic, limit, offset, false)
+    }
+
+    /// Fuse rankings, placing the vector rank on `hash_rank` when the vector
+    /// lane is a hash-control generation.
+    #[must_use]
+    pub fn fuse_rankings_for_vector_lane(
+        &self,
+        lexical: &[LexicalCandidate],
+        semantic: &[SemanticCandidate],
+        limit: usize,
+        offset: usize,
+        vector_is_hash: bool,
+    ) -> Vec<FusedCandidate> {
+        let mut fused = self.fuse_rankings_with_priors(
             lexical,
             semantic,
             limit,
             offset,
             &HashMap::new(),
             RankingPriorTuning::default(),
-        )
+        );
+        if vector_is_hash {
+            for candidate in &mut fused {
+                candidate.remap_hash_control_ranks();
+            }
+        }
+        fused
     }
 
     /// Fuse lexical + semantic rankings and apply optional prior boosts.
@@ -1271,6 +1308,7 @@ fn fused_cmp(left: &FusedCandidate, right: &FusedCandidate) -> Ordering {
         .then_with(|| {
             option_score(right.semantic_score).total_cmp(&option_score(left.semantic_score))
         })
+        .then_with(|| option_score(right.hash_score).total_cmp(&option_score(left.hash_score)))
         .then_with(|| left.doc_id.cmp(&right.doc_id))
 }
 
@@ -1644,6 +1682,41 @@ mod tests {
             "hash-control payload must not keep a semantic rank: {:?}",
             payload.hits[0]
         );
+    }
+
+    #[test]
+    fn fuse_rankings_hash_lane_writes_hash_rank_not_semantic_rank() {
+        let orchestrator = QueryExecutionOrchestrator::default();
+        let fused = orchestrator.fuse_rankings_for_vector_lane(
+            &[],
+            &[SemanticCandidate::new("src/lib.rs", 0.4)],
+            10,
+            0,
+            true,
+        );
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].hash_rank, Some(0));
+        assert_eq!(fused[0].semantic_rank, None);
+        assert_eq!(fused[0].hash_score, Some(0.4));
+        assert_eq!(fused[0].semantic_score, None);
+
+        let both = orchestrator.fuse_rankings_for_vector_lane(
+            &[LexicalCandidate::new("src/lib.rs", 1.2)],
+            &[SemanticCandidate::new("src/lib.rs", 0.4)],
+            10,
+            0,
+            true,
+        );
+        assert_eq!(both.len(), 1);
+        assert!(both[0].in_both_sources);
+        assert_eq!(both[0].lexical_rank, Some(0));
+        assert_eq!(both[0].hash_rank, Some(0));
+        assert_eq!(both[0].semantic_rank, None);
+
+        let semantic =
+            orchestrator.fuse_rankings(&[], &[SemanticCandidate::new("src/lib.rs", 0.4)], 10, 0);
+        assert_eq!(semantic[0].semantic_rank, Some(0));
+        assert_eq!(semantic[0].hash_rank, None);
     }
 
     #[test]

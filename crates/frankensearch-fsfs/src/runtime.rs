@@ -8173,11 +8173,12 @@ impl FsfsRuntime {
             .len()
             .saturating_add(semantic_candidates.len())
             .max(planning_limit);
-        let fused_initial_head = orchestrator.fuse_rankings(
+        let fused_initial_head = orchestrator.fuse_rankings_for_vector_lane(
             &lexical_head_candidates,
             &semantic_candidates,
             fusion_budget,
             0,
+            Self::vector_generation_is_hash_control(resources),
         );
         let filtered_initial_head =
             Self::apply_search_filter(&fused_initial_head, filter_expr.as_ref());
