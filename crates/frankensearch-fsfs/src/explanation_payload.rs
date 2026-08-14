@@ -277,6 +277,9 @@ pub struct FusionContext {
     pub lexical_score: Option<f32>,
     pub semantic_score: Option<f32>,
     pub in_both_sources: bool,
+    /// True when the vector ranks came from a hash/fnv control generation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vector_generation_is_hash: bool,
 }
 
 impl From<&FusedCandidate> for FusionContext {
@@ -288,6 +291,7 @@ impl From<&FusedCandidate> for FusionContext {
             lexical_score: value.lexical_score,
             semantic_score: value.semantic_score,
             in_both_sources: value.in_both_sources,
+            vector_generation_is_hash: false,
         }
     }
 }
@@ -300,6 +304,7 @@ pub enum ScoreComponentSource {
     SemanticFast,
     SemanticQuality,
     Rerank,
+    HashControl,
 }
 
 impl std::fmt::Display for ScoreComponentSource {
@@ -309,6 +314,7 @@ impl std::fmt::Display for ScoreComponentSource {
             Self::SemanticFast => "semantic_fast",
             Self::SemanticQuality => "semantic_quality",
             Self::Rerank => "rerank",
+            Self::HashControl => "hash_control",
         };
         write!(f, "{value}")
     }
@@ -607,13 +613,25 @@ fn component_confidence_per_mille(component: &ScoreComponent) -> u16 {
     )
 }
 
-const fn source_from_explained(source: &ExplainedSource) -> ScoreComponentSource {
+fn source_from_explained(source: &ExplainedSource) -> ScoreComponentSource {
     match source {
         ExplainedSource::LexicalBm25 { .. } => ScoreComponentSource::LexicalBm25,
+        ExplainedSource::SemanticFast { embedder, .. } if is_hash_control_embedder(embedder) => {
+            ScoreComponentSource::HashControl
+        }
         ExplainedSource::SemanticFast { .. } => ScoreComponentSource::SemanticFast,
         ExplainedSource::SemanticQuality { .. } => ScoreComponentSource::SemanticQuality,
         ExplainedSource::Rerank { .. } => ScoreComponentSource::Rerank,
     }
+}
+
+fn is_hash_control_embedder(embedder: &str) -> bool {
+    let id = embedder.to_ascii_lowercase();
+    id.contains("hash control")
+        || id == "hash"
+        || id.starts_with("hash-")
+        || id.starts_with("fnv1a-")
+        || id.starts_with("jl-")
 }
 
 const fn phase_token(phase: ExplanationPhase) -> &'static str {
@@ -1045,6 +1063,10 @@ mod tests {
             "semantic_quality"
         );
         assert_eq!(ScoreComponentSource::Rerank.to_string(), "rerank");
+        assert_eq!(
+            ScoreComponentSource::HashControl.to_string(),
+            "hash_control"
+        );
     }
 
     // --- PolicyDomain Display tests ---
@@ -1228,6 +1250,13 @@ mod tests {
             ScoreComponentSource::SemanticFast
         );
         assert_eq!(
+            source_from_explained(&ExplainedSource::SemanticFast {
+                embedder: "fnv1a-256 (hash control)".to_owned(),
+                cosine_sim: 0.0,
+            }),
+            ScoreComponentSource::HashControl
+        );
+        assert_eq!(
             source_from_explained(&ExplainedSource::SemanticQuality {
                 embedder: String::new(),
                 cosine_sim: 0.0,
@@ -1304,6 +1333,7 @@ mod tests {
             ScoreComponentSource::SemanticFast,
             ScoreComponentSource::SemanticQuality,
             ScoreComponentSource::Rerank,
+            ScoreComponentSource::HashControl,
         ];
         for source in &sources {
             let json = serde_json::to_string(source).unwrap();

@@ -6463,6 +6463,7 @@ impl FsfsRuntime {
             lexical_score: hit.lexical_score,
             semantic_score: hit.semantic_score,
             in_both_sources: hit.in_both_sources,
+            vector_generation_is_hash: session.vector_generation_is_hash,
         });
         let payload = FsfsExplanationPayload::new(session.query.clone(), ranking);
         let warnings = if session.vector_generation_is_hash {

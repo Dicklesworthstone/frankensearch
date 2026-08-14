@@ -511,7 +511,17 @@ fn build_rank_movement_row(movement: &RankMovementSnapshot) -> RankMovementRow {
 }
 
 fn build_fusion_row(fusion: &FusionContext) -> FusionRow {
-    let overlap_label = if fusion.in_both_sources {
+    let overlap_label = if fusion.vector_generation_is_hash {
+        if fusion.in_both_sources {
+            "overlapping (lexical + hash control)".to_string()
+        } else {
+            match (fusion.lexical_rank, fusion.semantic_rank) {
+                (Some(_), None) => "lexical-only".to_string(),
+                (None, Some(_)) => "hash-control-only".to_string(),
+                _ => "unknown source".to_string(),
+            }
+        }
+    } else if fusion.in_both_sources {
         "overlapping (both lexical + semantic)".to_string()
     } else {
         match (fusion.lexical_rank, fusion.semantic_rank) {
@@ -552,6 +562,7 @@ const fn format_rank_placeholder(source: ScoreComponentSource) -> &'static str {
         ScoreComponentSource::SemanticFast => "rank_fast",
         ScoreComponentSource::SemanticQuality => "rank_qual",
         ScoreComponentSource::Rerank => "rank_rerank",
+        ScoreComponentSource::HashControl => "rank_hash",
     }
 }
 
@@ -561,6 +572,7 @@ fn source_label(source: ScoreComponentSource) -> String {
         ScoreComponentSource::SemanticFast => "FastSemantic".to_string(),
         ScoreComponentSource::SemanticQuality => "QualitySemantic".to_string(),
         ScoreComponentSource::Rerank => "Rerank".to_string(),
+        ScoreComponentSource::HashControl => "HashControl".to_string(),
     }
 }
 
@@ -607,6 +619,7 @@ mod tests {
                 lexical_score: Some(12.5),
                 semantic_score: Some(0.77),
                 in_both_sources: true,
+                vector_generation_is_hash: false,
             }),
             components: vec![
                 ScoreComponentBreakdown {
@@ -837,6 +850,7 @@ mod tests {
             lexical_score: None,
             semantic_score: None,
             in_both_sources: true,
+            vector_generation_is_hash: false,
         };
         let row = build_fusion_row(&fusion);
         assert!(row.overlap_label.contains("overlapping"));
@@ -852,6 +866,7 @@ mod tests {
             lexical_score: None,
             semantic_score: None,
             in_both_sources: false,
+            vector_generation_is_hash: false,
         };
         let row = build_fusion_row(&fusion);
         assert_eq!(row.overlap_label, "lexical-only");
@@ -866,9 +881,42 @@ mod tests {
             lexical_score: None,
             semantic_score: None,
             in_both_sources: false,
+            vector_generation_is_hash: false,
         };
         let row = build_fusion_row(&fusion);
         assert_eq!(row.overlap_label, "semantic-only");
+    }
+
+    #[test]
+    fn fusion_row_hash_control_is_not_semantic() {
+        let hash_only = FusionContext {
+            fused_score: 0.01,
+            lexical_rank: None,
+            semantic_rank: Some(10),
+            lexical_score: None,
+            semantic_score: None,
+            in_both_sources: false,
+            vector_generation_is_hash: true,
+        };
+        assert_eq!(
+            build_fusion_row(&hash_only).overlap_label,
+            "hash-control-only"
+        );
+
+        let both = FusionContext {
+            fused_score: 0.03,
+            lexical_rank: Some(3),
+            semantic_rank: Some(7),
+            lexical_score: None,
+            semantic_score: None,
+            in_both_sources: true,
+            vector_generation_is_hash: true,
+        };
+        assert_eq!(
+            build_fusion_row(&both).overlap_label,
+            "overlapping (lexical + hash control)"
+        );
+        assert!(!build_fusion_row(&both).overlap_label.contains("semantic"));
     }
 
     // -- Ranking Equation --
@@ -1017,5 +1065,9 @@ mod tests {
             "FastSemantic"
         );
         assert_eq!(source_label(ScoreComponentSource::Rerank), "Rerank");
+        assert_eq!(
+            source_label(ScoreComponentSource::HashControl),
+            "HashControl"
+        );
     }
 }
