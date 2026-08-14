@@ -199,8 +199,8 @@ fn ranked_snapshot(
         index
             .search_doc_ids(&cx, query, PARITY_K)
             .expect("run Quill profile query")
-            .into_iter()
-            .map(|hit| (hit.document_id, hit.score.to_bits()))
+            .iter()
+            .map(|hit| (hit.document_id.clone(), hit.score.to_bits()))
             .collect()
     })
     .collect()

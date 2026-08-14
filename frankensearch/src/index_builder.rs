@@ -2182,8 +2182,8 @@ mod tests {
                 lexical
                     .search_doc_ids(&cx, "admitted", 10)
                     .unwrap()
-                    .into_iter()
-                    .map(|hit| hit.document_id)
+                    .iter()
+                    .map(|hit| hit.document_id.clone())
                     .collect::<Vec<_>>()
             };
             #[cfg(all(feature = "lexical", not(feature = "quill")))]
@@ -2564,8 +2564,8 @@ mod tests {
             let gamma_ids = lexical
                 .search_doc_ids(&cx, "gamma", 10)
                 .unwrap()
-                .into_iter()
-                .map(|hit| hit.document_id)
+                .iter()
+                .map(|hit| hit.document_id.clone())
                 .collect::<Vec<_>>();
             assert_eq!(gamma_ids, vec!["doc-ok".to_owned()]);
         });

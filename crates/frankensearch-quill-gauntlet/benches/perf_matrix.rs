@@ -33,7 +33,7 @@ use frankensearch_core::bench_support::BenchExecutableIdentity;
 use frankensearch_core::{IndexableDocument, LexicalRead, LexicalWrite};
 use frankensearch_lexical::{
     BenchmarkMaterializedWidth, BenchmarkRetainedTantivyReader, BenchmarkWriterJoinReceipt,
-    BenchmarkWriterMode, BenchmarkWriterReceipt, SnippetConfig, TantivyIndex,
+    BenchmarkWriterMode, BenchmarkWriterReceipt, LexicalIdHit, SnippetConfig, TantivyIndex,
 };
 use frankensearch_quill::scribe::{FrankensearchTokenizer, TokenAnalyzer};
 use frankensearch_quill::{
@@ -41,114 +41,34 @@ use frankensearch_quill::{
     QuillIndex, SchemaDescriptor,
 };
 use frankensearch_quill_gauntlet::{
-    BuildIdentity,
-    ColdCacheEvidence,
-    ComparatorConfig,
-    ComparisonStatus,
-    CorpusIdentity,
-    CorpusManifest,
-    CountState,
-    DefaultFlipDisposition,
-    DistributionSummary,
-    EngineConcurrencyObservation,
-    EngineObservation,
-    EvidenceCell,
-    EvidenceCellBody,
-    EvidenceCellSpec,
-    EvidencePolicy,
-    EvidenceProvenance,
-    EvidenceRole,
-    ExecutionCapacitySemantics,
-    ExecutionProfileId,
-    HardwareClassId,
-    MachineClassRegistry,
-    MachineIdentity,
-    MachineProfileAvailability,
-    MachineProfileKey,
-    NativeTieKey,
-    PERF_ARTIFACT_SCHEMA_VERSION,
-    PERF_MIN_RUNS,
-    PairedEstimatorConfig,
-    PeakRssEvidence,
-    PerfApplicabilityPlan,
-    PerfCellApplicability,
-    PerfCellResult,
-    PerfCellSpec,
-    PerfConcurrencyEngine,
-    PerfConcurrencyObserver,
-    PerfConcurrencyWitness,
-    PerfCorpus,
-    PerfEvidenceArtifact,
-    PerfGate,
-    PerfGateArtifact,
-    PerfInputIdentity,
-    PerfMatrixSpec,
-    PerfMetricSemantics,
-    PerfOperationScope,
-    PerfQueryClass,
-    PerfRawSample,
-    PerfSampleArm,
-    PerfSampleOrder,
-    PerfSamplePhase,
-    PerfSampleProvenance,
-    PerfTopology,
-    PositionMode,
-    QG1_QUILL_ENGINE_ID,
-    QG1_STREAM_ROLE_EFFECT,
-    QG1_STREAM_ROLE_QUILL_NULL,
-    QG1_STREAM_ROLE_TANTIVY_NULL,
-    QG1_STREAM_ROLE_TANTIVY_PILOT_EFFECT,
-    QG1_STREAM_ROLE_TANTIVY_PILOT_NULL,
-    QG1_TANTIVY_ENGINE_ID,
-    QG6_QUERY_GROUP_IDS,
-    QG6_QUERY_GROUPS,
-    Qg1AuthorityRegisterEntryV1,
-    Qg1BatchCoverage,
-    Qg1ExpectedAuthority,
-    Qg1IncumbentScreenEvidence,
-    Qg1LifecycleProducer,
-    Qg1LifecycleWitness,
-    Qg1SampleBinding,
-    Qg1StartupHandshakeV1,
-    Qg1TantivyBoundStream,
-    Qg1TantivyDecisionStreamKind,
-    Qg1TantivyIncumbentDecision,
-    Qg1TantivyIncumbentPilot,
-    Qg1TantivyIncumbentScreen,
-    Qg1TantivyIncumbentScreenPlan,
-    Qg1TantivySemanticContract,
-    Qg1TantivyWriterMode,
-    Qg6ArmRole,
-    Qg6Comparison,
-    Qg6Phase,
-    Qg6PreparedExperiment,
-    Qg6QuerySpec,
-    Qg6SampleBinding,
-    Qg6SampleOrder,
-    Qg6SearchHit,
-    Qg6SearchResult,
-    Qg6SemanticContract,
-    RankClass,
-    RankedHit,
-    ScoreEpsilonReason,
-    SyntheticCorpus,
-    SyntheticCorpusSpec,
-    ZipfExponent,
-    command_sha256_from_argv,
-    // `estimate_paired_experiment` is deliberately NOT imported here: its only
-    // callers are `cfg(test)` helpers, which already import it locally, and a
-    // root import would be unused in the harness-false production build.
-    compare_observations,
-    estimate_paired_experiment_against_qg1_authority,
-    machine_fingerprint,
-    oracle_version_contract,
-    peak_rss_bytes,
-    perf_manifest_contract_sha256,
-    perf_writer_heap_bytes,
-    preregister_qg1_tantivy_incumbents,
-    seeded_balanced_pair_order,
-    seeded_interleaved_four_arm_schedule,
-    validate_matrix,
+    BuildIdentity, ColdCacheEvidence, ComparatorConfig, ComparisonStatus, CorpusIdentity,
+    CorpusManifest, CountState, DefaultFlipDisposition, DistributionSummary,
+    EngineConcurrencyObservation, EngineObservation, EvidenceCell, EvidenceCellBody,
+    EvidenceCellSpec, EvidencePolicy, EvidenceProvenance, EvidenceRole, ExecutionCapacitySemantics,
+    ExecutionProfileId, HardwareClassId, HierarchicalLatencyEstimate, MachineClassRegistry,
+    MachineIdentity, MachineProfileAvailability, MachineProfileKey, NativeTieKey,
+    PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS, PairedEstimatorConfig, PairedEvidenceStatus,
+    PeakRssEvidence, PerfApplicabilityPlan, PerfCellApplicability, PerfCellResult, PerfCellSpec,
+    PerfConcurrencyEngine, PerfConcurrencyObserver, PerfConcurrencyWitness, PerfCorpus,
+    PerfEvidenceArtifact, PerfGate, PerfGateArtifact, PerfInputIdentity, PerfMatrixSpec,
+    PerfMetricSemantics, PerfOperationScope, PerfQueryClass, PerfRawSample, PerfSampleArm,
+    PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance, PerfTopology, PositionMode,
+    QG1_QUILL_ENGINE_ID, QG1_STREAM_ROLE_EFFECT, QG1_STREAM_ROLE_QUILL_NULL,
+    QG1_STREAM_ROLE_TANTIVY_NULL, QG1_STREAM_ROLE_TANTIVY_PILOT_EFFECT,
+    QG1_STREAM_ROLE_TANTIVY_PILOT_NULL, QG1_TANTIVY_ENGINE_ID, QG6_QUERY_GROUP_IDS,
+    QG6_QUERY_GROUPS, Qg1AuthorityRegisterEntryV1, Qg1BatchCoverage, Qg1ExpectedAuthority,
+    Qg1IncumbentScreenEvidence, Qg1LifecycleProducer, Qg1LifecycleWitness, Qg1SampleBinding,
+    Qg1StartupHandshakeV1, Qg1TantivyBoundStream, Qg1TantivyDecisionStreamKind,
+    Qg1TantivyIncumbentDecision, Qg1TantivyIncumbentPilot, Qg1TantivyIncumbentScreen,
+    Qg1TantivyIncumbentScreenPlan, Qg1TantivySemanticContract, Qg1TantivyWriterMode, Qg6ArmRole,
+    Qg6Comparison, Qg6Phase, Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleBinding, Qg6SampleOrder,
+    Qg6SearchHit, Qg6SearchResult, Qg6SemanticContract, RankClass, RankedHit, ScoreEpsilonReason,
+    SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent, command_sha256_from_argv,
+    compare_observations, estimate_hierarchical_latency, estimate_paired_experiment,
+    estimate_paired_experiment_against_qg1_authority, machine_fingerprint, oracle_version_contract,
+    peak_rss_bytes, perf_manifest_contract_sha256, perf_writer_heap_bytes,
+    preregister_qg1_tantivy_incumbents, seeded_balanced_pair_order,
+    seeded_interleaved_four_arm_schedule, validate_matrix,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -179,9 +99,15 @@ const QG1_PROFILE_CHILD_SCHEMA_VERSION: &str = "frankensearch.qg1-profile-child.
 const QG1_PROFILE_HANDSHAKE_ENV: &str = "QUILL_PERF_CHILD_PROFILE_HANDSHAKE";
 const QG6_PROFILE_CHILD_MODE: &str = "qg6-profile";
 const QG6_PROFILE_CHILD_SCHEMA_VERSION: &str = "frankensearch.qg6-profile-child.v1";
+const QG6_HIT_PAGE_AB_MODE: &str = "qg6-hit-page-ab";
+const QG6_HIT_PAGE_AB_SCHEMA_VERSION: &str = "frankensearch.qg6-hit-page-ab.v1";
+const QG6_HIT_PAGE_RSS_MODE: &str = "qg6-hit-page-ab-rss";
+const QG6_HIT_PAGE_RSS_ARM_ENV: &str = "QUILL_PERF_QG6_HIT_PAGE_RSS_ARM";
 const QG6_PROFILE_FIXTURE: &str = "query/natural_language/k100/100k";
 const QG6_PROFILE_RUNS: usize = PERF_MIN_RUNS;
 const QG6_PROFILE_WARMUP_ROUNDS: usize = 1;
+const QG6_HIT_PAGE_MAX_EFFECT_RATIO: f64 = 0.95;
+const QG6_HIT_PAGE_MAX_RSS_RATIO: f64 = 1.05;
 const PERF_DEFAULT_BOOTSTRAP_SEED: u64 = 0x5155_494c_4c45_5644;
 const QG1_LIVE_STARTUP_ORDINARY_MARKER: &[u8] = b"qg1-live-startup-work-after-ack\n";
 #[cfg(test)]
@@ -1962,10 +1888,38 @@ enum PreparedQueryArm {
     },
 }
 
+enum PreparedQueryHits {
+    Quill(Arc<[frankensearch_quill::QuillHit]>),
+    Tantivy(Vec<LexicalIdHit>),
+    Normalized(Vec<(String, u32)>),
+}
+
 struct PreparedQueryResult {
-    native_hits: Vec<(String, u32)>,
+    hits: PreparedQueryHits,
     total_count: u64,
     doc_count: u64,
+}
+
+fn normalize_prepared_query_result(result: PreparedQueryResult) -> Qg6SearchResult {
+    let native_hits = match result.hits {
+        PreparedQueryHits::Quill(hits) => hits
+            .iter()
+            .map(|hit| (hit.document_id.clone(), hit.score.to_bits()))
+            .collect::<Vec<_>>(),
+        PreparedQueryHits::Tantivy(hits) => hits
+            .into_iter()
+            .map(|hit| (hit.doc_id.to_string(), hit.bm25_score.to_bits()))
+            .collect(),
+        PreparedQueryHits::Normalized(hits) => hits,
+    };
+    Qg6SearchResult::from_ranked_hits(
+        native_hits
+            .into_iter()
+            .map(|(doc_id, score_bits)| Qg6SearchHit::new(doc_id, score_bits))
+            .collect(),
+        result.total_count,
+        result.doc_count,
+    )
 }
 
 #[derive(Clone)]
@@ -5831,9 +5785,9 @@ fn qg6_preflight_result(
             let public_result_sha256 =
                 qg6_public_result_sha256(&native_hits, total_count, count_evidence.doc_count);
             let hits = native
-                .into_iter()
+                .iter()
                 .map(|hit| RankedHit {
-                    doc_id: hit.document_id,
+                    doc_id: hit.document_id.clone(),
                     score_bits: hit.score.to_bits(),
                     native_tie_key: NativeTieKey::QuillDocId {
                         doc_id: hit.global_docid,
@@ -6222,7 +6176,7 @@ fn prepared_qg6_streams(
         if phase == Qg6Phase::Postflight {
             let result = qg6_preflight_result(context, arm, query, k)?;
             return Ok(PreparedQueryResult {
-                native_hits: result.native_hits,
+                hits: PreparedQueryHits::Normalized(result.native_hits),
                 total_count: result.total_count,
                 doc_count: result.doc_count,
             });
@@ -6232,37 +6186,25 @@ fn prepared_qg6_streams(
             .and_then(|queries| queries.get(query.id()))
             .copied()
             .ok_or_else(|| "QG-6 timed query has no accepted preflight counts".to_owned())?;
-        let native_hits = match arm {
-            PreparedQueryArm::Quill { index, .. } => index
-                .search_doc_ids(&context.cx, query.text(), k)
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .map(|hit| (hit.document_id, hit.score.to_bits()))
-                .collect(),
-            PreparedQueryArm::Tantivy { index, .. } => index
-                .search_doc_ids(&context.cx, query.text(), k)
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .map(|hit| (hit.doc_id.to_string(), hit.bm25_score.to_bits()))
-                .collect(),
+        let hits = match arm {
+            PreparedQueryArm::Quill { index, .. } => PreparedQueryHits::Quill(
+                index
+                    .search_doc_ids(&context.cx, query.text(), k)
+                    .map_err(|error| error.to_string())?,
+            ),
+            PreparedQueryArm::Tantivy { index, .. } => PreparedQueryHits::Tantivy(
+                index
+                    .search_doc_ids(&context.cx, query.text(), k)
+                    .map_err(|error| error.to_string())?,
+            ),
         };
         Ok(PreparedQueryResult {
-            native_hits,
+            hits,
             total_count,
             doc_count,
         })
     };
-    let mut normalize = |result: PreparedQueryResult| {
-        Qg6SearchResult::from_ranked_hits(
-            result
-                .native_hits
-                .into_iter()
-                .map(|(doc_id, score_bits)| Qg6SearchHit::new(doc_id, score_bits))
-                .collect(),
-            result.total_count,
-            result.doc_count,
-        )
-    };
+    let mut normalize = normalize_prepared_query_result;
     let rounds_per_query = runs
         .div_ceil(QG6_QUERY_GROUPS)
         .max(evidence.policy.min_group_pairs);
@@ -9225,6 +9167,662 @@ fn run_qg6_profile_child() -> Result<(), String> {
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Qg6HitPageArm {
+    LegacyMaterialized,
+    CurrentShared,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Qg6HitPageStream {
+    LegacyNull,
+    CurrentNull,
+    Effect,
+}
+
+impl Qg6HitPageStream {
+    const fn arm(self, sample_arm: PerfSampleArm) -> Qg6HitPageArm {
+        match (self, sample_arm) {
+            (Self::LegacyNull, _) | (Self::Effect, PerfSampleArm::Control) => {
+                Qg6HitPageArm::LegacyMaterialized
+            }
+            (Self::CurrentNull, _) | (Self::Effect, PerfSampleArm::Treatment) => {
+                Qg6HitPageArm::CurrentShared
+            }
+        }
+    }
+
+    const fn id_base(self) -> u64 {
+        match self {
+            Self::LegacyNull => 0,
+            Self::CurrentNull => 1_000_000,
+            Self::Effect => 2_000_000,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::LegacyNull => "legacy_null",
+            Self::CurrentNull => "current_null",
+            Self::Effect => "effect",
+        }
+    }
+}
+
+enum Qg6RetainedHitPage {
+    Legacy {
+        shared: Arc<[frankensearch_quill::QuillHit]>,
+        materialized: Vec<frankensearch_quill::QuillHit>,
+    },
+    Current(Arc<[frankensearch_quill::QuillHit]>),
+}
+
+fn qg6_hit_page_matches(
+    hits: &[frankensearch_quill::QuillHit],
+    expected: &[(String, u32, u32)],
+) -> bool {
+    hits.len() == expected.len()
+        && hits.iter().zip(expected).all(|(hit, expected)| {
+            hit.document_id.as_bytes() == expected.0.as_bytes()
+                && hit.global_docid == expected.1
+                && hit.score.to_bits() == expected.2
+        })
+}
+
+fn qg6_hit_page_identity(hits: &[frankensearch_quill::QuillHit]) -> Vec<(String, u32, u32)> {
+    hits.iter()
+        .map(|hit| {
+            (
+                hit.document_id.clone(),
+                hit.global_docid,
+                hit.score.to_bits(),
+            )
+        })
+        .collect()
+}
+
+fn qg6_measure_hit_page_arm(
+    context: &BenchContext,
+    index: &QuillIndex,
+    query: &Qg6QuerySpec,
+    k: usize,
+    arm: Qg6HitPageArm,
+    canonical: &Arc<[frankensearch_quill::QuillHit]>,
+    expected: &[(String, u32, u32)],
+    origin: Instant,
+    latencies_ns: &mut Vec<u64>,
+) -> Result<(u64, u64, u64), String> {
+    latencies_ns.clear();
+    let started_ns = duration_as_u64_ns(origin.elapsed());
+    for _ in 0..QG6_TIMED_SEARCHES_PER_SAMPLE {
+        let timer = Instant::now();
+        let shared = index
+            .search_doc_ids(&context.cx, black_box(query.text()), black_box(k))
+            .map_err(|error| format!("QG-6 hit-page search {}: {error}", query.id()))?;
+        let observation = match arm {
+            Qg6HitPageArm::LegacyMaterialized => {
+                let materialized = shared.as_ref().to_vec();
+                Qg6RetainedHitPage::Legacy {
+                    shared,
+                    materialized,
+                }
+            }
+            Qg6HitPageArm::CurrentShared => Qg6RetainedHitPage::Current(shared),
+        };
+        let elapsed_ns = duration_as_u64_ns(timer.elapsed()).max(1);
+        latencies_ns.push(elapsed_ns);
+        match &observation {
+            Qg6RetainedHitPage::Current(shared) => {
+                if !Arc::ptr_eq(shared, canonical) || !qg6_hit_page_matches(shared, expected) {
+                    return Err(format!(
+                        "QG-6 current hit page missed the warmed cache or changed query {}",
+                        query.id()
+                    ));
+                }
+            }
+            Qg6RetainedHitPage::Legacy {
+                shared,
+                materialized,
+            } => {
+                if !Arc::ptr_eq(shared, canonical)
+                    || !qg6_hit_page_matches(shared, expected)
+                    || !qg6_hit_page_matches(materialized, expected)
+                {
+                    return Err(format!(
+                        "QG-6 legacy hit page missed the warmed cache or changed query {}",
+                        query.id()
+                    ));
+                }
+                for (source, copy) in shared.iter().zip(materialized) {
+                    if !source.document_id.is_empty()
+                        && source.document_id.as_ptr() == copy.document_id.as_ptr()
+                    {
+                        return Err(
+                            "legacy hit-page control did not deep-clone document IDs".into()
+                        );
+                    }
+                }
+            }
+        }
+        black_box(observation);
+    }
+    let ended_ns = duration_as_u64_ns(origin.elapsed()).max(started_ns.saturating_add(1));
+    if latencies_ns.len() != QG6_TIMED_SEARCHES_PER_SAMPLE {
+        return Err("QG-6 hit-page sample retained the wrong leaf count".to_owned());
+    }
+    latencies_ns.sort_unstable();
+    let middle = latencies_ns.len() / 2;
+    let median_ns = if latencies_ns.len() % 2 == 1 {
+        latencies_ns[middle]
+    } else {
+        let low = latencies_ns[middle - 1];
+        low + (latencies_ns[middle] - low) / 2
+    };
+    Ok((started_ns, ended_ns, median_ns))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qg6_hit_page_raw_sample(
+    block_id: u64,
+    sample_id: u64,
+    sample_arm: PerfSampleArm,
+    order: PerfSampleOrder,
+    query_index: usize,
+    started_ns: u64,
+    ended_ns: u64,
+    observed_latency_ns: u64,
+    scope: &PerfOperationScope,
+    provenance: &PerfSampleProvenance,
+) -> PerfRawSample {
+    PerfRawSample {
+        block_id,
+        sample_id,
+        arm: sample_arm,
+        order,
+        phase: PerfSamplePhase::Measurement,
+        scope: scope.clone(),
+        provenance: provenance.clone(),
+        started_ns,
+        ended_ns,
+        work_units: None,
+        byte_count: None,
+        observed_value: Some(observed_latency_ns as f64 / 1_000_000.0),
+        group_id: Some(u64::try_from(query_index).expect("QG-6 query index fits u64")),
+        qg6_sample_binding: None,
+        qg1_sample_binding: None,
+        tantivy_config_sha256: None,
+    }
+}
+
+fn qg6_hierarchical_null_valid(
+    estimate: &HierarchicalLatencyEstimate,
+    config: &PairedEstimatorConfig,
+) -> bool {
+    estimate.ci95_low_log <= 0.0
+        && estimate.ci95_high_log >= 0.0
+        && estimate.median_of_group_medians_log.abs() <= config.max_null_center_log
+        && estimate
+            .ci95_low_log
+            .abs()
+            .max(estimate.ci95_high_log.abs())
+            <= config.max_null_ci_half_width_log
+}
+
+fn emit_qg6_hit_page_ab_event(event: &serde_json::Value) -> Result<(), String> {
+    let wire = serde_json::to_string(event)
+        .map_err(|error| format!("serialize QG-6 hit-page A/B result: {error}"))?;
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    writeln!(stdout, "quill-qg6-hit-page-ab\t{wire}")
+        .map_err(|error| format!("emit QG-6 hit-page A/B result: {error}"))?;
+    stdout
+        .flush()
+        .map_err(|error| format!("flush QG-6 hit-page A/B result: {error}"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Qg6HitPageRssResult {
+    arm: String,
+    peak_rss_bytes: u64,
+    retained_pages: usize,
+    result_sequence_sha256: String,
+    executable_sha256: String,
+}
+
+fn run_qg6_hit_page_rss_child() -> Result<(), String> {
+    let arm = match std::env::var(QG6_HIT_PAGE_RSS_ARM_ENV).as_deref() {
+        Ok("legacy") => Qg6HitPageArm::LegacyMaterialized,
+        Ok("current") => Qg6HitPageArm::CurrentShared,
+        Ok(other) => return Err(format!("unknown QG-6 hit-page RSS arm {other:?}")),
+        Err(error) => return Err(format!("missing QG-6 hit-page RSS arm: {error}")),
+    };
+    if canonical_positive_u64_env("RAYON_NUM_THREADS")? != 1 {
+        return Err("QG-6 hit-page RSS child requires RAYON_NUM_THREADS=1".to_owned());
+    }
+    let spec = resolve_qg6_profile_spec(&PerfMatrixSpec::complete())?;
+    let executable = hash_bench_elf_sha256_silently()
+        .map_err(|error| format!("hash QG-6 hit-page RSS executable: {error}"))?;
+    let context = BenchContext::new(MatrixScale::Full);
+    let document_count = spec
+        .document_count
+        .expect("resolved QG-6 hit-page RSS document count");
+    let k = spec.k.expect("resolved QG-6 hit-page RSS k");
+    let corpus = corpus_for(document_count);
+    let queries = qg6_query_specs(&spec);
+    let index = quill_in_memory(&spec);
+    let _ = index_batches(&context, &index, &corpus, document_count, None);
+    let _ = commit(&context, &index);
+    let prepared_arm = PreparedQueryArm::Quill {
+        index: Box::new(index),
+    };
+    let preflight = queries
+        .iter()
+        .map(|query| qg6_preflight_result(&context, &prepared_arm, query, k))
+        .collect::<Result<Vec<_>, _>>()?;
+    let PreparedQueryArm::Quill { index } = &prepared_arm else {
+        unreachable!("QG-6 hit-page RSS child builds Quill only")
+    };
+    let mut canonical_pages = Vec::new();
+    for (query, expected) in queries.iter().zip(&preflight) {
+        let canonical = index
+            .search_doc_ids(&context.cx, query.text(), k)
+            .map_err(|error| format!("seed QG-6 RSS cache {}: {error}", query.id()))?;
+        if qg6_profile_native_hits(&canonical) != expected.native_hits {
+            return Err(format!(
+                "QG-6 RSS cache seed differs from preflight for query {}",
+                query.id()
+            ));
+        }
+        let repeated = index
+            .search_doc_ids(&context.cx, query.text(), k)
+            .map_err(|error| format!("confirm QG-6 RSS cache {}: {error}", query.id()))?;
+        if !Arc::ptr_eq(&canonical, &repeated) {
+            return Err(format!(
+                "QG-6 RSS fixture cannot retain query {} in the ranked cache",
+                query.id()
+            ));
+        }
+        canonical_pages.push(canonical);
+    }
+
+    let calls_per_query = QG6_TIMED_SEARCHES_PER_SAMPLE * 2;
+    let retained_page_count = queries
+        .len()
+        .checked_mul(calls_per_query)
+        .ok_or_else(|| "QG-6 RSS retained-page count overflowed".to_owned())?;
+    let mut legacy_pages = Vec::new();
+    let mut current_pages = Vec::new();
+    match arm {
+        Qg6HitPageArm::LegacyMaterialized => legacy_pages
+            .try_reserve_exact(retained_page_count)
+            .map_err(|_| "allocate legacy QG-6 RSS pages".to_owned())?,
+        Qg6HitPageArm::CurrentShared => current_pages
+            .try_reserve_exact(retained_page_count)
+            .map_err(|_| "allocate current QG-6 RSS pages".to_owned())?,
+    }
+    let mut result_hasher = Sha256::new();
+    result_hasher.update(b"frankensearch.qg6-hit-page-rss.results.v1\0");
+    for (query_index, query) in queries.iter().enumerate() {
+        let expected = qg6_hit_page_identity(&canonical_pages[query_index]);
+        for _ in 0..calls_per_query {
+            let shared = index
+                .search_doc_ids(&context.cx, query.text(), k)
+                .map_err(|error| format!("retain QG-6 RSS page {}: {error}", query.id()))?;
+            if !Arc::ptr_eq(&shared, &canonical_pages[query_index])
+                || !qg6_hit_page_matches(&shared, &expected)
+            {
+                return Err(format!(
+                    "QG-6 RSS page missed the warmed cache or changed query {}",
+                    query.id()
+                ));
+            }
+            for (document_id, global_docid, score_bits) in &expected {
+                hash_qg1_indexed_bytes(&mut result_hasher, document_id.as_bytes());
+                result_hasher.update(global_docid.to_le_bytes());
+                result_hasher.update(score_bits.to_le_bytes());
+            }
+            match arm {
+                Qg6HitPageArm::LegacyMaterialized => legacy_pages.push(shared.as_ref().to_vec()),
+                Qg6HitPageArm::CurrentShared => current_pages.push(shared),
+            }
+        }
+    }
+    let peak_rss_bytes = peak_rss_bytes()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "QG-6 hit-page RSS is unavailable on this host".to_owned())?;
+    black_box((&legacy_pages, &current_pages));
+    let result = Qg6HitPageRssResult {
+        arm: match arm {
+            Qg6HitPageArm::LegacyMaterialized => "legacy".to_owned(),
+            Qg6HitPageArm::CurrentShared => "current".to_owned(),
+        },
+        peak_rss_bytes,
+        retained_pages: retained_page_count,
+        result_sequence_sha256: lower_hex(&result_hasher.finalize()),
+        executable_sha256: executable.sha256,
+    };
+    println!(
+        "quill-qg6-hit-page-rss\t{}",
+        serde_json::to_string(&result)
+            .map_err(|error| format!("serialize QG-6 hit-page RSS result: {error}"))?
+    );
+    Ok(())
+}
+
+fn qg6_hit_page_rss_probe(arm: &str) -> Result<Qg6HitPageRssResult, String> {
+    let output = Command::new(std::env::current_exe().map_err(|error| error.to_string())?)
+        .env("QUILL_PERF_CHILD_MODE", QG6_HIT_PAGE_RSS_MODE)
+        .env(QG6_HIT_PAGE_RSS_ARM_ENV, arm)
+        .env("RAYON_NUM_THREADS", "1")
+        .output()
+        .map_err(|error| format!("spawn QG-6 hit-page RSS {arm} child: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "QG-6 hit-page RSS {arm} child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|error| format!("QG-6 hit-page RSS stdout is not UTF-8: {error}"))?;
+    let wire = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("quill-qg6-hit-page-rss\t"))
+        .ok_or_else(|| format!("QG-6 hit-page RSS {arm} child omitted its receipt"))?;
+    serde_json::from_str(wire)
+        .map_err(|error| format!("parse QG-6 hit-page RSS {arm} receipt: {error}"))
+}
+
+fn qg6_hit_page_rss_countermetric(
+    seed: u64,
+    expected_executable_sha256: &str,
+) -> Result<(u64, u64, f64), String> {
+    let order = seeded_balanced_pair_order(3, seed ^ 0x5253_535f_5041_4952)
+        .map_err(|error| format!("plan QG-6 hit-page RSS pairs: {error}"))?;
+    let mut legacy = Vec::new();
+    let mut current = Vec::new();
+    let mut expected_digest = None;
+    for first_arm in order {
+        let second_arm = match first_arm {
+            PerfSampleArm::Control => PerfSampleArm::Treatment,
+            PerfSampleArm::Treatment => PerfSampleArm::Control,
+        };
+        for sample_arm in [first_arm, second_arm] {
+            let arm = match sample_arm {
+                PerfSampleArm::Control => "legacy",
+                PerfSampleArm::Treatment => "current",
+            };
+            let result = qg6_hit_page_rss_probe(arm)?;
+            if result.arm != arm
+                || result.executable_sha256 != expected_executable_sha256
+                || result.retained_pages != QG6_QUERY_GROUPS * QG6_TIMED_SEARCHES_PER_SAMPLE * 2
+            {
+                return Err(format!("QG-6 hit-page RSS {arm} child identity drifted"));
+            }
+            match &expected_digest {
+                None => expected_digest = Some(result.result_sequence_sha256.clone()),
+                Some(expected) if expected == &result.result_sequence_sha256 => {}
+                Some(_) => return Err("QG-6 hit-page RSS result sequence drifted".to_owned()),
+            }
+            match sample_arm {
+                PerfSampleArm::Control => legacy.push(result.peak_rss_bytes),
+                PerfSampleArm::Treatment => current.push(result.peak_rss_bytes),
+            }
+        }
+    }
+    legacy.sort_unstable();
+    current.sort_unstable();
+    let legacy_median = legacy[legacy.len() / 2];
+    let current_median = current[current.len() / 2];
+    Ok((
+        legacy_median,
+        current_median,
+        current_median as f64 / legacy_median as f64,
+    ))
+}
+
+fn run_qg6_hit_page_ab() -> Result<(), String> {
+    let matrix = PerfMatrixSpec::complete();
+    let spec = resolve_qg6_profile_spec(&matrix)?;
+    let rayon_threads = canonical_positive_u64_env("RAYON_NUM_THREADS")?;
+    if rayon_threads != 1 {
+        return Err(format!(
+            "QG-6 hit-page A/B requires RAYON_NUM_THREADS=1, got {rayon_threads}"
+        ));
+    }
+    let executable = hash_bench_elf_sha256_silently()
+        .map_err(|error| format!("hash QG-6 hit-page A/B executable: {error}"))?;
+    let source_revision = git_revision(MatrixScale::Full);
+    let seed = production_cell_seed(qg6_profile_bootstrap_seed_from_env()?, &spec);
+    let context = BenchContext::new(MatrixScale::Full);
+    let document_count = spec
+        .document_count
+        .expect("resolved QG-6 hit-page document count");
+    let k = spec.k.expect("resolved QG-6 hit-page k");
+    let corpus = corpus_for(document_count);
+    let corpus_manifest = corpus
+        .manifest()
+        .map_err(|error| format!("materialize QG-6 hit-page corpus manifest: {error}"))?;
+    let queries = qg6_query_specs(&spec);
+    if queries.len() != QG6_QUERY_GROUPS {
+        return Err(format!(
+            "QG-6 hit-page A/B requires {QG6_QUERY_GROUPS} queries, got {}",
+            queries.len()
+        ));
+    }
+
+    let index = quill_in_memory(&spec);
+    let _ = index_batches(&context, &index, &corpus, document_count, None);
+    let _ = commit(&context, &index);
+    let arm = PreparedQueryArm::Quill {
+        index: Box::new(index),
+    };
+    let preflight = queries
+        .iter()
+        .map(|query| qg6_preflight_result(&context, &arm, query, k))
+        .collect::<Result<Vec<_>, _>>()?;
+    let PreparedQueryArm::Quill { index } = &arm else {
+        unreachable!("QG-6 hit-page A/B builds Quill only")
+    };
+    let mut canonical_pages = Vec::new();
+    canonical_pages
+        .try_reserve_exact(queries.len())
+        .map_err(|_| "allocate QG-6 canonical hit pages".to_owned())?;
+    let mut expected_pages = Vec::new();
+    expected_pages
+        .try_reserve_exact(queries.len())
+        .map_err(|_| "allocate QG-6 expected hit identities".to_owned())?;
+    for (query, expected) in queries.iter().zip(&preflight) {
+        let canonical = index
+            .search_doc_ids(&context.cx, query.text(), k)
+            .map_err(|error| format!("seed QG-6 hit-page cache {}: {error}", query.id()))?;
+        if qg6_profile_native_hits(&canonical) != expected.native_hits {
+            return Err(format!(
+                "QG-6 hit-page cache seed differs from preflight for query {}",
+                query.id()
+            ));
+        }
+        let repeated = index
+            .search_doc_ids(&context.cx, query.text(), k)
+            .map_err(|error| format!("confirm QG-6 hit-page cache {}: {error}", query.id()))?;
+        if !Arc::ptr_eq(&canonical, &repeated) {
+            return Err(format!(
+                "QG-6 hit-page fixture cannot retain query {} in the ranked cache",
+                query.id()
+            ));
+        }
+        expected_pages.push(qg6_hit_page_identity(&canonical));
+        canonical_pages.push(canonical);
+    }
+
+    let pair_count = queries
+        .len()
+        .checked_mul(PERF_MIN_RUNS)
+        .ok_or_else(|| "QG-6 hit-page pair count overflowed".to_owned())?;
+    let legacy_order = seeded_balanced_pair_order(pair_count, seed ^ 0x4c45_4741_4359_4e55)
+        .map_err(|error| format!("plan QG-6 legacy null: {error}"))?;
+    let current_order = seeded_balanced_pair_order(pair_count, seed ^ 0x4355_5252_454e_544e)
+        .map_err(|error| format!("plan QG-6 current null: {error}"))?;
+    let effect_order = seeded_balanced_pair_order(pair_count, seed ^ 0x4546_4645_4354_4142)
+        .map_err(|error| format!("plan QG-6 hit-page effect: {error}"))?;
+    let scope = PerfOperationScope {
+        operation_id: "diagnostic.qg6_hit_page_cache_hit".to_owned(),
+        version: 1,
+        semantics: PerfMetricSemantics::GaugeLowerIsBetter,
+        unit: "ms".to_owned(),
+    };
+    let provenance = PerfSampleProvenance {
+        run_id: format!("qg6-hit-page-ab-{}", &executable.sha256[..16]),
+        executable_sha256: executable.sha256.clone(),
+        corpus_sha256: corpus_manifest.content_sha256.clone(),
+        input_identity: None,
+        worker_id: "same-process".to_owned(),
+        build_profile: "release-perf".to_owned(),
+    };
+    let origin = Instant::now();
+    let mut latencies_ns = Vec::new();
+    latencies_ns
+        .try_reserve_exact(QG6_TIMED_SEARCHES_PER_SAMPLE)
+        .map_err(|_| "allocate QG-6 hit-page latency leaves".to_owned())?;
+    let mut legacy_null = Vec::new();
+    let mut current_null = Vec::new();
+    let mut effect = Vec::new();
+    for samples in [&mut legacy_null, &mut current_null, &mut effect] {
+        samples
+            .try_reserve_exact(pair_count * 2)
+            .map_err(|_| "allocate QG-6 hit-page raw samples".to_owned())?;
+    }
+    let mut result_hasher = Sha256::new();
+    result_hasher.update(b"frankensearch.qg6-hit-page-ab.results.v1\0");
+    let mut verified_leaves = 0_usize;
+
+    for (query_index, query) in queries.iter().enumerate() {
+        for round in 0..PERF_MIN_RUNS {
+            let flat_index = query_index * PERF_MIN_RUNS + round;
+            for slot in interleaved_stream_order(seed ^ query_index as u64, round) {
+                let stream = match slot {
+                    StreamSlot::OracleNull => Qg6HitPageStream::LegacyNull,
+                    StreamSlot::TreatmentNull => Qg6HitPageStream::CurrentNull,
+                    StreamSlot::Effect => Qg6HitPageStream::Effect,
+                };
+                let first_arm = match stream {
+                    Qg6HitPageStream::LegacyNull => legacy_order[flat_index],
+                    Qg6HitPageStream::CurrentNull => current_order[flat_index],
+                    Qg6HitPageStream::Effect => effect_order[flat_index],
+                };
+                let second_arm = match first_arm {
+                    PerfSampleArm::Control => PerfSampleArm::Treatment,
+                    PerfSampleArm::Treatment => PerfSampleArm::Control,
+                };
+                let block_id = stream.id_base()
+                    + u64::try_from(flat_index).map_err(|_| "QG-6 block index overflowed")?;
+                let mut measured = Vec::with_capacity(2);
+                for (sample_arm, order) in [
+                    (first_arm, PerfSampleOrder::First),
+                    (second_arm, PerfSampleOrder::Second),
+                ] {
+                    let (started_ns, ended_ns, observed_latency_ns) = qg6_measure_hit_page_arm(
+                        &context,
+                        index,
+                        query,
+                        k,
+                        stream.arm(sample_arm),
+                        &canonical_pages[query_index],
+                        &expected_pages[query_index],
+                        origin,
+                        &mut latencies_ns,
+                    )?;
+                    verified_leaves += latencies_ns.len();
+                    result_hasher.update(stream.label().as_bytes());
+                    result_hasher.update(block_id.to_le_bytes());
+                    result_hasher.update([match sample_arm {
+                        PerfSampleArm::Control => 0,
+                        PerfSampleArm::Treatment => 1,
+                    }]);
+                    for (document_id, global_docid, score_bits) in &expected_pages[query_index] {
+                        hash_qg1_indexed_bytes(&mut result_hasher, document_id.as_bytes());
+                        result_hasher.update(global_docid.to_le_bytes());
+                        result_hasher.update(score_bits.to_le_bytes());
+                    }
+                    let sample_id = stream.id_base()
+                        + u64::try_from(flat_index * 2)
+                            .map_err(|_| "QG-6 sample index overflowed")?
+                        + match sample_arm {
+                            PerfSampleArm::Control => 0,
+                            PerfSampleArm::Treatment => 1,
+                        };
+                    measured.push(qg6_hit_page_raw_sample(
+                        block_id,
+                        sample_id,
+                        sample_arm,
+                        order,
+                        query_index,
+                        started_ns,
+                        ended_ns,
+                        observed_latency_ns,
+                        &scope,
+                        &provenance,
+                    ));
+                }
+                let destination = match stream {
+                    Qg6HitPageStream::LegacyNull => &mut legacy_null,
+                    Qg6HitPageStream::CurrentNull => &mut current_null,
+                    Qg6HitPageStream::Effect => &mut effect,
+                };
+                destination.extend(measured);
+            }
+        }
+    }
+
+    let config = PairedEstimatorConfig::predeclared(seed ^ 0x4849_5450_4147_4541);
+    let policy = EvidencePolicy::predeclared();
+    let legacy_flat = estimate_paired_experiment(&effect, &legacy_null, &config)
+        .map_err(|error| format!("estimate QG-6 hit-page legacy null: {error}"))?;
+    let current_flat = estimate_paired_experiment(&effect, &current_null, &config)
+        .map_err(|error| format!("estimate QG-6 hit-page current null: {error}"))?;
+    let effect_hierarchical = estimate_hierarchical_latency(&effect, &config, &policy)
+        .map_err(|error| format!("estimate hierarchical QG-6 hit-page effect: {error}"))?;
+    let legacy_hierarchical = estimate_hierarchical_latency(&legacy_null, &config, &policy)
+        .map_err(|error| format!("estimate hierarchical QG-6 legacy null: {error}"))?;
+    let current_hierarchical = estimate_hierarchical_latency(&current_null, &config, &policy)
+        .map_err(|error| format!("estimate hierarchical QG-6 current null: {error}"))?;
+    let (legacy_peak_rss_bytes, current_peak_rss_bytes, current_over_legacy_rss) =
+        qg6_hit_page_rss_countermetric(seed, &executable.sha256)?;
+    let passed = legacy_flat.status == PairedEvidenceStatus::Valid
+        && current_flat.status == PairedEvidenceStatus::Valid
+        && qg6_hierarchical_null_valid(&legacy_hierarchical, &config)
+        && qg6_hierarchical_null_valid(&current_hierarchical, &config)
+        && effect_hierarchical.ci95_high_ratio <= QG6_HIT_PAGE_MAX_EFFECT_RATIO
+        && current_over_legacy_rss <= QG6_HIT_PAGE_MAX_RSS_RATIO;
+    emit_qg6_hit_page_ab_event(&serde_json::json!({
+        "schema_version": QG6_HIT_PAGE_AB_SCHEMA_VERSION,
+        "claim_status": "maintenance_only",
+        "promotion_capability": "none",
+        "no_claim": "same-ELF Quill ownership marginal; no Tantivy incumbent and not QG-6 evidence",
+        "decision": if passed { "keep_candidate" } else { "reject_candidate" },
+        "fixture": spec.fixture,
+        "source_revision": source_revision,
+        "executable_sha256": executable.sha256,
+        "corpus_sha256": corpus_manifest.content_sha256,
+        "query_manifest_sha256": qg6_profile_digest("query-manifest", &queries)?,
+        "result_sequence_sha256": lower_hex(&result_hasher.finalize()),
+        "pair_count_per_stream": pair_count,
+        "timed_search_calls": verified_leaves,
+        "verified_cache_hit_calls": verified_leaves,
+        "material_effect_ratio_ceiling": QG6_HIT_PAGE_MAX_EFFECT_RATIO,
+        "rss_ratio_ceiling": QG6_HIT_PAGE_MAX_RSS_RATIO,
+        "legacy_peak_rss_bytes": legacy_peak_rss_bytes,
+        "current_peak_rss_bytes": current_peak_rss_bytes,
+        "current_over_legacy_rss": current_over_legacy_rss,
+        "effect": effect_hierarchical,
+        "legacy_null": legacy_hierarchical,
+        "current_null": current_hierarchical,
+        "legacy_flat_status": legacy_flat.status,
+        "legacy_flat_reasons": legacy_flat.reasons,
+        "current_flat_status": current_flat.status,
+        "current_flat_reasons": current_flat.reasons,
+    }))
+}
+
 fn run_memory_child() {
     let arm = child_engine();
     let count = child_env::<u64>("QUILL_PERF_CHILD_COUNT");
@@ -9293,6 +9891,10 @@ fn run_child_mode() -> bool {
             .unwrap_or_else(|error| panic!("QG-1 profile child failed: {error}")),
         Ok(QG6_PROFILE_CHILD_MODE) => run_qg6_profile_child()
             .unwrap_or_else(|error| panic!("QG-6 profile child failed: {error}")),
+        Ok(QG6_HIT_PAGE_RSS_MODE) => run_qg6_hit_page_rss_child()
+            .unwrap_or_else(|error| panic!("QG-6 hit-page RSS child failed: {error}")),
+        Ok(QG6_HIT_PAGE_AB_MODE) => run_qg6_hit_page_ab()
+            .unwrap_or_else(|error| panic!("QG-6 hit-page A/B failed: {error}")),
         Ok(mode) => panic!("unknown QUILL_PERF_CHILD_MODE {mode:?}"),
         Err(_) => return false,
     }
@@ -9400,6 +10002,7 @@ fn main() {
     if std::env::var_os("QUILL_PERF_QG6_PROFILE_CHILD_SELF_CHECK").is_some() {
         tests::assert_qg6_profile_child_resolver_contract();
         tests::assert_qg6_profile_child_wire_contract();
+        tests::assert_qg6_native_result_normalization_contract();
         eprintln!("[quill-perf-self-check] exact QG-6 profile child contracts passed");
         return;
     }
@@ -12437,6 +13040,37 @@ mod tests {
             serde_json::from_str::<super::Qg1ProfileCompleteEvent>(&complete_wire).is_err(),
             "QG-6 diagnostic receipt must not deserialize as a QG-1 ingest receipt"
         );
+    }
+
+    pub fn assert_qg6_native_result_normalization_contract() {
+        let page: Arc<[frankensearch_quill::QuillHit]> = vec![frankensearch_quill::QuillHit {
+            document_id: "native-page".to_owned(),
+            global_docid: 19,
+            score: f32::from_bits(0x3f7a_19d2),
+        }]
+        .into();
+        let result = super::PreparedQueryResult {
+            hits: super::PreparedQueryHits::Quill(Arc::clone(&page)),
+            total_count: 1,
+            doc_count: 7,
+        };
+        let super::PreparedQueryHits::Quill(retained) = &result.hits else {
+            panic!("fixture must retain Quill's native hit page")
+        };
+        assert!(Arc::ptr_eq(&page, retained));
+        assert_eq!(
+            super::normalize_prepared_query_result(result),
+            Qg6SearchResult::from_ranked_hits(
+                vec![Qg6SearchHit::new("native-page", 0x3f7a_19d2)],
+                1,
+                7,
+            )
+        );
+    }
+
+    #[test]
+    fn qg6_native_result_normalization_keeps_quill_ownership_outside_search() {
+        assert_qg6_native_result_normalization_contract();
     }
 
     #[test]

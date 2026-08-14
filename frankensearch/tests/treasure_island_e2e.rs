@@ -606,8 +606,8 @@ mod lexical {
         index
             .search_doc_ids(cx, query, limit)
             .expect("Quill identifier search")
-            .into_iter()
-            .map(|hit| (hit.document_id, hit.score.to_bits()))
+            .iter()
+            .map(|hit| (hit.document_id.clone(), hit.score.to_bits()))
             .collect()
     }
 

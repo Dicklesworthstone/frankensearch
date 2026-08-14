@@ -105,8 +105,8 @@ fn quill_read_only_refresh_catches_up_across_multiple_generations() {
         let mut document_ids = reader
             .search_doc_ids(&cx, "alpha", 10)
             .expect("search caught-up read-only index")
-            .into_iter()
-            .map(|hit| hit.document_id)
+            .iter()
+            .map(|hit| hit.document_id.clone())
             .collect::<Vec<_>>();
         document_ids.sort_unstable();
         assert_eq!(document_ids, ["refresh-first", "refresh-second"]);

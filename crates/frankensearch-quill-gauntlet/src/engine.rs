@@ -7132,7 +7132,8 @@ mod tests {
                 document_id: "winner".to_owned(),
                 global_docid: 7,
                 score: 3.5,
-            }],
+            }]
+            .into(),
             total_count: Some(1),
             doc_count: 1,
             diagnostics: Vec::new(),
@@ -7143,12 +7144,17 @@ mod tests {
         };
         let expected_reason = "Quill observed and expanded collector pages differ";
 
-        let mut wrong_external_id = observed.clone();
-        wrong_external_id.hits[0].document_id = "other".to_owned();
-        let mut wrong_native_tie_key = observed.clone();
-        wrong_native_tie_key.hits[0].global_docid = 8;
-        let mut wrong_score_bits = observed;
-        wrong_score_bits.hits[0].score = f32::from_bits(3.5_f32.to_bits() + 1);
+        let with_mutated_hit = |mutate: fn(&mut frankensearch_quill::QuillHit)| {
+            let mut mismatch = observed.clone();
+            let mut hits = mismatch.hits.to_vec();
+            mutate(&mut hits[0]);
+            mismatch.hits = hits.into();
+            mismatch
+        };
+        let wrong_external_id = with_mutated_hit(|hit| hit.document_id = "other".to_owned());
+        let wrong_native_tie_key = with_mutated_hit(|hit| hit.global_docid = 8);
+        let wrong_score_bits =
+            with_mutated_hit(|hit| hit.score = f32::from_bits(3.5_f32.to_bits() + 1));
 
         for mismatch in [wrong_external_id, wrong_native_tie_key, wrong_score_bits] {
             assert!(matches!(
@@ -7166,13 +7172,14 @@ mod tests {
                 document_id: "test-cooking-015".to_owned(),
                 global_docid: 15,
                 score: native_score,
-            }],
+            }]
+            .into(),
             total_count: None,
             doc_count: 120,
             diagnostics: Vec::new(),
         };
         let count_evidence = QuillSearchResult {
-            hits: Vec::new(),
+            hits: Arc::from([]),
             total_count: Some(110),
             doc_count: 120,
             diagnostics: Vec::new(),
@@ -7198,13 +7205,14 @@ mod tests {
                 document_id: "winner".to_owned(),
                 global_docid: 7,
                 score: 3.5,
-            }],
+            }]
+            .into(),
             total_count: None,
             doc_count: 3,
             diagnostics: Vec::new(),
         };
         let count_evidence = QuillSearchResult {
-            hits: Vec::new(),
+            hits: Arc::from([]),
             total_count: Some(1),
             doc_count: 3,
             diagnostics: Vec::new(),

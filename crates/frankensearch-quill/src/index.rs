@@ -292,8 +292,11 @@ pub struct QuillSnippetHit {
 /// One globally paginated exhaustive result.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuillSearchResult {
-    /// Page-local hits in `(score desc, global_docid asc)` order.
-    pub hits: Vec<QuillHit>,
+    /// Immutable page-local hits in `(score desc, global_docid asc)` order.
+    ///
+    /// Cloning this page is constant-time and keeps the exact snapshot result
+    /// alive across cache eviction or a later publication.
+    pub hits: Arc<[QuillHit]>,
     /// Exact match count when requested.
     pub total_count: Option<u64>,
     /// Public live-document count for the committed snapshot.
@@ -9442,13 +9445,13 @@ impl QuillReader {
         results
             .try_reserve_exact(search.hits.len())
             .map_err(|_| invalid_state("could not allocate lexical results"))?;
-        for hit in search.hits {
+        for hit in search.hits.iter() {
             let metadata = hydrate_metadata
                 .then(|| snapshot.materialize_metadata(hit.global_docid))
                 .transpose()?
                 .flatten();
             results.push(ScoredResult {
-                doc_id: hit.document_id.into(),
+                doc_id: hit.document_id.clone().into(),
                 score: hit.score,
                 source: ScoreSource::Lexical,
                 index: None,
@@ -9951,7 +9954,7 @@ impl QuillReader {
             collect_span.record("total_count", total_count);
         }
         Ok(QuillSearchResult {
-            hits,
+            hits: hits.into(),
             total_count,
             doc_count: snapshot.live_doc_count(),
             diagnostics,
@@ -10358,7 +10361,7 @@ impl QuillReader {
         cx: &Cx,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<QuillHit>, QuillIndexError> {
+    ) -> Result<Arc<[QuillHit]>, QuillIndexError> {
         Ok(self.search_paginated(cx, query, limit, 0, false)?.hits)
     }
 
@@ -10443,7 +10446,7 @@ impl QuillReader {
         results
             .try_reserve_exact(search.hits.len())
             .map_err(|_| invalid_state("could not allocate enriched lexical results"))?;
-        for (rank, hit) in search.hits.into_iter().enumerate() {
+        for (rank, hit) in search.hits.iter().enumerate() {
             // Stored-content materialisation plus snippet analysis is per hit
             // and is the last span of the tail that admitted nothing at all: a
             // query cancelled after ranking still enriched every hit. Admitted
@@ -10461,7 +10464,7 @@ impl QuillReader {
                 .as_deref()
                 .and_then(|content| generator.snippet(content));
             results.push(QuillSnippetHit {
-                document_id: hit.document_id,
+                document_id: hit.document_id.clone(),
                 score: hit.score,
                 rank,
                 snippet,
@@ -10715,7 +10718,7 @@ impl QuillSearchIndex {
         self.reader.scored_results(cx, query, limit, true)
     }
 
-    /// Search the identifier-only lane.
+    /// Search the identifier-only lane and return an immutable shared hit page.
     ///
     /// # Errors
     ///
@@ -10725,7 +10728,7 @@ impl QuillSearchIndex {
         cx: &Cx,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<QuillHit>, QuillIndexError> {
+    ) -> Result<Arc<[QuillHit]>, QuillIndexError> {
         self.reader.search_doc_ids(cx, query, limit)
     }
 
@@ -11456,6 +11459,9 @@ impl QuillIndex {
 
     /// Search the identifier-only lane used by hot lexical consumers.
     ///
+    /// The returned immutable page can be cloned without copying document IDs
+    /// and remains valid across later snapshot publication.
+    ///
     /// # Errors
     ///
     /// Returns typed cancellation, parse/lowering, section-validation,
@@ -11465,7 +11471,7 @@ impl QuillIndex {
         cx: &Cx,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<QuillHit>, QuillIndexError> {
+    ) -> Result<Arc<[QuillHit]>, QuillIndexError> {
         let snapshot = self.checked_published_snapshot()?;
         Ok(self
             .reader
@@ -16757,7 +16763,8 @@ mod tests {
                 document_id: "raw-hit".to_owned(),
                 global_docid: 7,
                 score: 3.5,
-            }],
+            }]
+            .into(),
             total_count: None,
             doc_count: 11,
             diagnostics: Vec::new(),
@@ -16775,7 +16782,12 @@ mod tests {
             )
         };
 
-        assert_eq!(get_raw(4, "rust", 10, 2, false), Some(raw_result));
+        let first_hit = get_raw(4, "rust", 10, 2, false).expect("first exact cache hit");
+        let second_hit = get_raw(4, "rust", 10, 2, false).expect("second exact cache hit");
+        assert_eq!(first_hit, raw_result);
+        assert_eq!(second_hit, raw_result);
+        assert!(Arc::ptr_eq(&first_hit.hits, &second_hit.hits));
+        assert!(Arc::ptr_eq(&first_hit.hits, &raw_result.hits));
         assert!(get_raw(5, "rust", 10, 2, false).is_none());
         assert!(get_raw(4, "Rust", 10, 2, false).is_none());
         assert!(get_raw(4, "rust", 11, 2, false).is_none());
@@ -16787,7 +16799,7 @@ mod tests {
             factor: 2.0,
         };
         let preparsed_result = QuillSearchResult {
-            hits: Vec::new(),
+            hits: Arc::from([]),
             total_count: Some(11),
             doc_count: 11,
             diagnostics: Vec::new(),
@@ -18340,8 +18352,8 @@ mod tests {
                     .expect("Q1-OB4 ranked query");
                 let hits = ranked
                     .hits
-                    .into_iter()
-                    .map(|hit| (hit.document_id, hit.global_docid))
+                    .iter()
+                    .map(|hit| (hit.document_id.clone(), hit.global_docid))
                     .collect();
                 let docids = index
                     .collect_docids(cx, query)
@@ -19632,7 +19644,7 @@ mod tests {
                 0
             );
 
-            let cancelled = cx.clone();
+            let cancelled = Cx::for_testing();
             cancelled.set_cancel_requested(true);
             assert!(matches!(
                 LexicalRead::search(&index, &cancelled, "alpha", 10).await,
@@ -20831,13 +20843,46 @@ mod tests {
                 .await
                 .expect("open read-only handle while writer lease is live");
             assert_eq!(pinned.doc_count().expect("read pinned count"), 1);
+            let first_alpha_page = pinned
+                .search_doc_ids(&cx, "alpha", 10)
+                .expect("search pinned publication");
+            let first_alpha_identity = first_alpha_page
+                .iter()
+                .map(|hit| {
+                    (
+                        hit.document_id.clone(),
+                        hit.global_docid,
+                        hit.score.to_bits(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(first_alpha_identity[0].0, "first");
+            let cached_alpha_page = pinned
+                .search_doc_ids(&cx, "alpha", 10)
+                .expect("repeat pinned search through cache");
             assert_eq!(
-                pinned
-                    .search_doc_ids(&cx, "alpha", 10)
-                    .expect("search pinned publication")[0]
-                    .document_id,
-                "first"
+                cached_alpha_page
+                    .iter()
+                    .map(|hit| {
+                        (
+                            hit.document_id.clone(),
+                            hit.global_docid,
+                            hit.score.to_bits(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                first_alpha_identity,
             );
+            assert!(
+                Arc::ptr_eq(&first_alpha_page, &cached_alpha_page),
+                "a repeated public cache hit must share the immutable winner page"
+            );
+            let cancelled = Cx::for_testing();
+            cancelled.set_cancel_requested(true);
+            assert!(matches!(
+                pinned.search_doc_ids(&cancelled, "alpha", 10),
+                Err(QuillIndexError::Cancelled { phase }) if phase == "search"
+            ));
 
             LexicalWrite::index_document(
                 &writer,
@@ -20850,14 +20895,39 @@ mod tests {
                 .await
                 .expect("publish second document");
 
+            let still_pinned_alpha_page = pinned
+                .search_doc_ids(&cx, "alpha", 10)
+                .expect("old handle remains pinned");
+            assert!(Arc::ptr_eq(&first_alpha_page, &still_pinned_alpha_page));
             assert!(
                 pinned
                     .search_doc_ids(&cx, "beta", 10)
-                    .expect("old handle remains pinned")
+                    .expect("old handle excludes successor")
                     .is_empty()
             );
             assert!(pinned.refresh(&cx).await.expect("refresh publication"));
             assert_eq!(pinned.doc_count().expect("read refreshed count"), 2);
+            let refreshed_alpha_page = pinned
+                .search_doc_ids(&cx, "alpha", 10)
+                .expect("refreshed handle rebuilds the alpha page");
+            assert!(
+                !Arc::ptr_eq(&first_alpha_page, &refreshed_alpha_page),
+                "publication must invalidate the prior snapshot's cached page"
+            );
+            assert_eq!(
+                first_alpha_page
+                    .iter()
+                    .map(|hit| {
+                        (
+                            hit.document_id.clone(),
+                            hit.global_docid,
+                            hit.score.to_bits(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                first_alpha_identity,
+                "a retained page must remain readable and byte-stable after publication"
+            );
             assert_eq!(
                 pinned
                     .search_doc_ids(&cx, "beta", 10)
@@ -26378,7 +26448,7 @@ mod tests {
                     Some(u64::from(DOCS_PER_RESIDENCY) * 2)
                 );
                 assert_eq!(count_free.hits.len(), exhaustive.hits.len());
-                for (candidate, oracle) in count_free.hits.iter().zip(&exhaustive.hits) {
+                for (candidate, oracle) in count_free.hits.iter().zip(exhaustive.hits.iter()) {
                     assert_eq!(candidate.document_id, oracle.document_id);
                     assert_eq!(candidate.global_docid, oracle.global_docid);
                     assert_eq!(candidate.score.to_bits(), oracle.score.to_bits());
@@ -26395,7 +26465,11 @@ mod tests {
             assert_eq!(nested_count_free.total_count, None);
             assert_eq!(nested_exhaustive.total_count, Some(10_000));
             assert_eq!(nested_count_free.hits.len(), nested_exhaustive.hits.len());
-            for (candidate, oracle) in nested_count_free.hits.iter().zip(&nested_exhaustive.hits) {
+            for (candidate, oracle) in nested_count_free
+                .hits
+                .iter()
+                .zip(nested_exhaustive.hits.iter())
+            {
                 assert_eq!(candidate.document_id, oracle.document_id);
                 assert_eq!(candidate.global_docid, oracle.global_docid);
                 assert_eq!(candidate.score.to_bits(), oracle.score.to_bits());
@@ -28496,8 +28570,8 @@ mod tests {
                     .search_paginated(&cx, raw_query, corpus.len(), 0, true)
                     .expect("execute public Quill phrase-slop query")
                     .hits
-                    .into_iter()
-                    .map(|hit| (hit.document_id, hit.score.to_bits()))
+                    .iter()
+                    .map(|hit| (hit.document_id.clone(), hit.score.to_bits()))
                     .collect::<Vec<_>>();
                 let parsed = parser
                     .parse_query(raw_query)
@@ -28604,8 +28678,8 @@ mod tests {
             let mut quill_hits = quill
                 .search_doc_ids(&cx, "ord:*", corpus.len())
                 .expect("execute public Quill fast-field existence query")
-                .into_iter()
-                .map(|hit| (hit.document_id, hit.score.to_bits()))
+                .iter()
+                .map(|hit| (hit.document_id.clone(), hit.score.to_bits()))
                 .collect::<Vec<_>>();
             let parsed = parser
                 .parse_query("ord:*")
