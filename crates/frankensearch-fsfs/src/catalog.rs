@@ -342,7 +342,14 @@ fn bootstrap_catalog_schema_inner(conn: &Connection) -> SearchResult<()> {
             &params,
         )
         .map_err(catalog_error)?;
-        version = current_catalog_schema_version(conn)?;
+        version = current_catalog_schema_version_optional(conn)?.ok_or_else(|| {
+            SearchError::SubsystemError {
+                subsystem: SUBSYSTEM,
+                source: Box::new(io::Error::other(
+                    "fsfs_catalog_schema_version table has no rows",
+                )),
+            }
+        })?;
     }
 
     if version > CATALOG_SCHEMA_VERSION {
@@ -380,12 +387,19 @@ fn bootstrap_catalog_schema_inner(conn: &Connection) -> SearchResult<()> {
 /// Returns an error if the version table is missing/corrupt or cannot be
 /// queried.
 pub fn current_catalog_schema_version(conn: &Connection) -> SearchResult<i64> {
-    current_catalog_schema_version_optional(conn)?.ok_or_else(|| SearchError::SubsystemError {
-        subsystem: SUBSYSTEM,
-        source: Box::new(io::Error::other(
-            "fsfs_catalog_schema_version table has no rows",
-        )),
-    })
+    retry_catalog_op(
+        || {
+            current_catalog_schema_version_optional(conn)?.ok_or_else(|| {
+                SearchError::SubsystemError {
+                    subsystem: SUBSYSTEM,
+                    source: Box::new(io::Error::other(
+                        "fsfs_catalog_schema_version table has no rows",
+                    )),
+                }
+            })
+        },
+        "catalog schema version",
+    )
 }
 
 fn current_catalog_schema_version_optional(conn: &Connection) -> SearchResult<Option<i64>> {
