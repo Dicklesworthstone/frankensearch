@@ -44,6 +44,14 @@ pub struct SearchResults {
     pub result_count: u32,
     pub lexical_count: u32,
     pub semantic_count: u32,
+    /// Hash/fnv/JL control-vector hits. Absent from older payloads.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub hash_control_count: u32,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde skip_serializing_if requires fn(&Field)
+const fn u32_is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -224,4 +232,45 @@ pub struct TelemetryEnvelope {
     pub v: u32,
     pub ts: String,
     pub event: TelemetryPayload,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SearchResults;
+
+    #[test]
+    fn search_results_omits_zero_hash_control_count() {
+        let results = SearchResults {
+            result_count: 10,
+            lexical_count: 18,
+            semantic_count: 30,
+            hash_control_count: 0,
+        };
+        let json = serde_json::to_string(&results).expect("serialize");
+        assert!(
+            !json.contains("hash_control_count"),
+            "zero hash_control_count must stay omitted for older goldens: {json}"
+        );
+    }
+
+    #[test]
+    fn search_results_hash_control_count_is_not_semantic_count() {
+        let json =
+            r#"{"result_count":4,"lexical_count":0,"semantic_count":0,"hash_control_count":4}"#;
+        let results: SearchResults = serde_json::from_str(json).expect("parse");
+        assert_eq!(results.hash_control_count, 4);
+        assert_eq!(results.semantic_count, 0);
+        let encoded = serde_json::to_string(&results).expect("serialize");
+        assert!(
+            encoded.contains("hash_control_count") && encoded.contains("\"semantic_count\":0"),
+            "hash-only telemetry must keep hash_control_count: {encoded}"
+        );
+    }
+
+    #[test]
+    fn search_results_legacy_payload_defaults_hash_control_count() {
+        let json = r#"{"result_count":10,"lexical_count":18,"semantic_count":30}"#;
+        let results: SearchResults = serde_json::from_str(json).expect("parse");
+        assert_eq!(results.hash_control_count, 0);
+    }
 }
