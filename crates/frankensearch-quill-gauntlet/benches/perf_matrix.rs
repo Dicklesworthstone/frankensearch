@@ -57,10 +57,13 @@ use frankensearch_quill_gauntlet::{
     EvidencePolicy,
     EvidenceProvenance,
     EvidenceRole,
+    ExecutionCapacitySemantics,
     ExecutionProfileId,
+    DefaultFlipDisposition,
     HardwareClassId,
     MachineClassRegistry,
     MachineIdentity,
+    MachineProfileAvailability,
     MachineProfileKey,
     NativeTieKey,
     PERF_ARTIFACT_SCHEMA_VERSION,
@@ -166,6 +169,9 @@ const QG1_TERMINAL_NO_CLAIM_CODE: &str = "qg1.terminal_fact_unproved";
 const QG1_INCUMBENT_SCREEN_NO_CLAIM_CODE: &str = "qg1.incumbent_screen_incomplete";
 const QG1_TIMING_DIAGNOSTIC_NO_CLAIM_CODE: &str = "qg1.continuous_timing_unbound_diagnostic";
 const QG1_LIVE_STARTUP_DISCRIMINATOR_ENV: &str = "QUILL_PERF_QG1_LIVE_STARTUP_DISCRIMINATOR";
+const QG1_X86_DIAGNOSTIC_ENV: &str = "QUILL_PERF_QG1_X86_DIAGNOSTIC";
+const QG1_X86_DIAGNOSTIC_FIXTURE: &str = "bulk/medium/8/positions_on";
+const QG1_X86_DIAGNOSTIC_SCHEMA_VERSION: &str = "frankensearch.qg1-x86-diagnostic.v1";
 const QG1_LIVE_STARTUP_ORDINARY_MARKER: &[u8] = b"qg1-live-startup-work-after-ack\n";
 #[cfg(test)]
 const QG1_AUTHORITY_SUBPROCESS_ENV: &str = "QUILL_PERF_QG1_AUTHORITY_SUBPROCESS";
@@ -775,6 +781,160 @@ impl RunnerApplicabilityContext {
             execution_capacity,
             max_exercised_cell_width,
         })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Qg1X86DiagnosticRequest {
+    gate: String,
+    hardware_class: String,
+    execution_profile: String,
+    scale: String,
+    fixture: String,
+    runs: usize,
+    rayon_num_threads: usize,
+    forbidden_authority_claims: Vec<String>,
+}
+
+impl Qg1X86DiagnosticRequest {
+    fn from_env() -> Result<Self, String> {
+        const FORBIDDEN_AUTHORITY_ENV: [&str; 10] = [
+            "QUILL_PERF_EXECUTION_CAPACITY",
+            "QUILL_PERF_MAX_EXERCISED_CELL_WIDTH",
+            "QUILL_PERF_APPLICABILITY_PLAN_SCHEMA_VERSION",
+            "QUILL_PERF_APPLICABILITY_PLAN_SHA256",
+            "QUILL_PERF_GATE_MATRIX_CONTRACT_SHA256",
+            "QUILL_PERF_PROFILE_CONTRACT_SHA256",
+            "QUILL_PERF_REGISTRY_SCHEMA_VERSION",
+            "QUILL_PERF_REGISTRY_SHA256",
+            "QUILL_PERF_CALIBRATE_AA",
+            Qg1StartupHandshakeV1::ENV,
+        ];
+        let runs = canonical_positive_u64_env("QUILL_PERF_RUNS")?;
+        let runs = usize::try_from(runs)
+            .map_err(|_| "QUILL_PERF_RUNS is not representable on this host".to_owned())?;
+        let rayon_num_threads = canonical_positive_u64_env("RAYON_NUM_THREADS")?;
+        let rayon_num_threads = usize::try_from(rayon_num_threads)
+            .map_err(|_| "RAYON_NUM_THREADS is not representable on this host".to_owned())?;
+        Ok(Self {
+            gate: required_env("QUILL_PERF_GATE")?,
+            hardware_class: required_env("QUILL_PERF_HARDWARE_CLASS")?,
+            execution_profile: required_env("QUILL_PERF_EXECUTION_PROFILE")?,
+            scale: required_env("QUILL_PERF_SCALE")?,
+            fixture: required_env("QUILL_PERF_FIXTURE")?,
+            runs,
+            rayon_num_threads,
+            forbidden_authority_claims: FORBIDDEN_AUTHORITY_ENV
+                .into_iter()
+                .filter(|name| std::env::var_os(name).is_some())
+                .map(str::to_owned)
+                .collect(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Qg1X86DiagnosticPlan {
+    profile: MachineProfileKey,
+    spec: PerfCellSpec,
+    runs: usize,
+    rayon_num_threads: usize,
+}
+
+fn resolve_qg1_x86_diagnostic_plan(
+    matrix: &PerfMatrixSpec,
+    request: &Qg1X86DiagnosticRequest,
+    available_threads: usize,
+) -> Result<Qg1X86DiagnosticPlan, String> {
+    if request.gate != PerfGate::Qg1.label()
+        || request.hardware_class != HardwareClassId::X86VpsOvh.as_str()
+        || request.execution_profile != ExecutionProfileId::X86Diagnostic.as_str()
+        || request.scale != "full"
+        || request.fixture != QG1_X86_DIAGNOSTIC_FIXTURE
+    {
+        return Err(format!(
+            "QG-1 x86 diagnostics require exactly gate={:?}, profile={}.{}, scale=full, \
+             fixture={QG1_X86_DIAGNOSTIC_FIXTURE:?}",
+            PerfGate::Qg1.label(),
+            HardwareClassId::X86VpsOvh.as_str(),
+            ExecutionProfileId::X86Diagnostic.as_str(),
+        ));
+    }
+    if request.runs < PERF_MIN_RUNS || request.runs > 100 {
+        return Err(format!(
+            "QG-1 x86 diagnostics require {PERF_MIN_RUNS}..=100 runs"
+        ));
+    }
+    if !request.forbidden_authority_claims.is_empty() {
+        return Err(format!(
+            "QG-1 x86 diagnostics reject promotion-authority environment claims: {:?}",
+            request.forbidden_authority_claims
+        ));
+    }
+
+    let spec = matrix
+        .for_gate(PerfGate::Qg1)
+        .into_iter()
+        .find(|spec| spec.fixture == request.fixture)
+        .cloned()
+        .ok_or_else(|| "QG-1 x86 diagnostic fixture is absent from the canonical matrix".to_owned())?;
+    let configured_threads = spec
+        .threads
+        .ok_or_else(|| "QG-1 x86 diagnostic fixture has no configured thread width".to_owned())?;
+    if request.rayon_num_threads != configured_threads {
+        return Err(format!(
+            "RAYON_NUM_THREADS={} differs from canonical fixture width {configured_threads}",
+            request.rayon_num_threads
+        ));
+    }
+    if available_threads < configured_threads {
+        return Err(format!(
+            "canonical fixture width {configured_threads} exceeds process-available concurrency \
+             {available_threads}"
+        ));
+    }
+
+    let profile = MachineProfileKey::new(
+        HardwareClassId::X86VpsOvh,
+        ExecutionProfileId::X86Diagnostic,
+    )
+    .map_err(|error| format!("QG-1 x86 diagnostic profile is invalid: {error}"))?;
+    let registry = MachineClassRegistry::frozen()
+        .map_err(|error| format!("frozen machine registry is invalid: {error}"))?;
+    let registered = registry
+        .execution_profile(profile)
+        .map_err(|error| format!("QG-1 x86 diagnostic profile is not registered: {error}"))?;
+    let gate_policy = registered
+        .gate_policy(PerfGate::Qg1.label())
+        .ok_or_else(|| "QG-1 x86 diagnostic profile has no QG-1 policy".to_owned())?;
+    if registered.availability() != MachineProfileAvailability::Registered
+        || registered.capacity_semantics()
+            != ExecutionCapacitySemantics::DiagnosticWorkerBudget
+        || registered.execution_capacity().is_some()
+        || gate_policy.default_flip_disposition() != DefaultFlipDisposition::DiagnosticOnly
+        || gate_policy.max_exercised_cell_width().is_some()
+    {
+        return Err(
+            "QG-1 x86 diagnostic profile acquired promotion capacity or gate authority; use the \
+             promotion producer instead"
+                .to_owned(),
+        );
+    }
+
+    Ok(Qg1X86DiagnosticPlan {
+        profile,
+        spec,
+        runs: request.runs,
+        rayon_num_threads: request.rayon_num_threads,
+    })
+}
+
+fn qg1_x86_diagnostic_requested() -> Result<bool, String> {
+    match std::env::var(QG1_X86_DIAGNOSTIC_ENV) {
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Ok(value) if value == "1" => Ok(true),
+        Ok(value) => Err(format!("{QG1_X86_DIAGNOSTIC_ENV} must equal 1, got {value:?}")),
+        Err(error) => Err(format!("{QG1_X86_DIAGNOSTIC_ENV} is not valid Unicode: {error}")),
     }
 }
 
@@ -7752,6 +7912,177 @@ fn evidence_policy_from_env() -> EvidencePolicy {
     policy
 }
 
+#[derive(Serialize)]
+struct Qg1X86DiagnosticAttestation {
+    laws_attested: bool,
+    authority_acknowledged: bool,
+}
+
+#[derive(Serialize)]
+struct Qg1X86DiagnosticEnvelope<'a> {
+    schema_version: &'static str,
+    diagnostic_only: bool,
+    promotion_capability: &'static str,
+    attestation: Qg1X86DiagnosticAttestation,
+    gate: PerfGate,
+    hardware_class: &'static str,
+    execution_profile: &'static str,
+    fixture: &'a str,
+    cell_contract_sha256: &'a str,
+    runs: usize,
+    rayon_num_threads: usize,
+    run_id: &'a str,
+    run_window: &'a str,
+    git_revision: &'a str,
+    bench_elf_sha256: &'a str,
+    corpus_sha256: &'a str,
+    linked_oracle_runtime: &'a str,
+    oracle_contract: &'a frankensearch_quill_gauntlet::OracleVersionContract,
+    screen: &'a Qg1TantivyIncumbentScreen,
+    decision: &'a Qg1TantivyIncumbentDecision,
+    stream_sample_rows: [usize; 3],
+    streams_round_interleaved: bool,
+    selected_results: &'a [PerfCellResult],
+}
+
+fn run_qg1_x86_diagnostic(
+    bench_identity: &BenchExecutableIdentity,
+    linked_oracle_runtime: &str,
+) -> Result<(), String> {
+    let matrix = PerfMatrixSpec::complete();
+    validate_matrix(&matrix).map_err(|error| format!("normative QG matrix is invalid: {error}"))?;
+    let plan = resolve_qg1_x86_diagnostic_plan(
+        &matrix,
+        &Qg1X86DiagnosticRequest::from_env()?,
+        std::thread::available_parallelism().map_or(1, usize::from),
+    )?;
+    let selected_specs = vec![plan.spec.clone()];
+    let context = BenchContext::for_selected(MatrixScale::Full, &selected_specs);
+    let (corpus_sha256, _) =
+        authoritative_qg1_corpus_identity(&context, &matrix, &selected_specs)?;
+    let git_revision = git_revision(MatrixScale::Full);
+    let build_profile = build_profile_label(MatrixScale::Full);
+    let run_id = required_env("QUILL_PERF_RUN_ID")?;
+    let run_window = required_env("QUILL_PERF_RUN_WINDOW")?;
+    let bootstrap_seed = std::env::var("QUILL_PERF_BOOTSTRAP_SEED")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0x5155_494c_4c45_5644);
+    let evidence = EvidenceContext {
+        config: PairedEstimatorConfig::predeclared(bootstrap_seed),
+        policy: evidence_policy_from_env(),
+        sample_provenance: PerfSampleProvenance {
+            run_id: run_id.clone(),
+            executable_sha256: bench_identity.sha256.clone(),
+            corpus_sha256: corpus_sha256.clone(),
+            input_identity: None,
+            worker_id: machine_fingerprint(),
+            build_profile,
+        },
+    };
+    let startup = construct_qg1_startup_producers(
+        &context,
+        &selected_specs,
+        plan.runs,
+        &evidence,
+        plan.profile,
+        plan.rayon_num_threads,
+        &[plan.rayon_num_threads],
+    );
+    preflight_indexing_fixtures(&context, &matrix, &selected_specs);
+    let producer = startup
+        .for_spec(&plan.spec)
+        .ok_or_else(|| "QG-1 x86 diagnostic fixture has no engine lifecycle producer".to_owned())?;
+    let collection = qg1_collect_live_incumbent(
+        &context,
+        &plan.spec,
+        EvidenceRole::Diagnostic,
+        plan.runs,
+        &evidence,
+        producer,
+    );
+    let decision = collection.decision.as_ref().ok_or_else(|| {
+        format!(
+            "QG-1 x86 diagnostic incumbent screen made no fixed-width decision: {}",
+            collection
+                .screen
+                .no_decision_reason
+                .as_deref()
+                .unwrap_or("no reason supplied")
+        )
+    })?;
+    if collection.selected_cell.is_none()
+        || collection.selected_results.len() != 5
+        || collection.screen.selected_candidate.is_none()
+    {
+        return Err(
+            "QG-1 x86 diagnostic decision did not produce the complete diagnostic result set"
+                .to_owned(),
+        );
+    }
+    let expected_rows = plan
+        .runs
+        .checked_mul(2)
+        .ok_or_else(|| "QG-1 x86 diagnostic sample-row count overflowed".to_owned())?;
+    let stream_sample_rows = [
+        decision.tantivy_vs_quill.samples.len(),
+        decision.tantivy_null.samples.len(),
+        decision.quill_null.samples.len(),
+    ];
+    if stream_sample_rows != [expected_rows; 3] {
+        return Err(format!(
+            "QG-1 x86 diagnostic streams are incomplete: expected {expected_rows} rows each, got \
+             {stream_sample_rows:?}"
+        ));
+    }
+    let oracle_contract = oracle_version_contract()
+        .map_err(|error| format!("QG-1 x86 diagnostic oracle contract is invalid: {error}"))?;
+    let cell_contract_sha256 = plan
+        .spec
+        .contract_sha256()
+        .map_err(|error| format!("hash QG-1 x86 diagnostic cell: {error}"))?;
+    let envelope = Qg1X86DiagnosticEnvelope {
+        schema_version: QG1_X86_DIAGNOSTIC_SCHEMA_VERSION,
+        diagnostic_only: true,
+        promotion_capability: "none",
+        attestation: Qg1X86DiagnosticAttestation {
+            laws_attested: false,
+            authority_acknowledged: false,
+        },
+        gate: PerfGate::Qg1,
+        hardware_class: HardwareClassId::X86VpsOvh.as_str(),
+        execution_profile: ExecutionProfileId::X86Diagnostic.as_str(),
+        fixture: &plan.spec.fixture,
+        cell_contract_sha256: &cell_contract_sha256,
+        runs: plan.runs,
+        rayon_num_threads: plan.rayon_num_threads,
+        run_id: &run_id,
+        run_window: &run_window,
+        git_revision: &git_revision,
+        bench_elf_sha256: &bench_identity.sha256,
+        corpus_sha256: &corpus_sha256,
+        linked_oracle_runtime,
+        oracle_contract: &oracle_contract,
+        screen: &collection.screen,
+        decision,
+        stream_sample_rows,
+        streams_round_interleaved: true,
+        selected_results: &collection.selected_results,
+    };
+    println!("[quill-qg1-x86-diagnostic-json-begin]");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&envelope)
+            .map_err(|error| format!("serialize QG-1 x86 diagnostic envelope: {error}"))?
+    );
+    println!("[quill-qg1-x86-diagnostic-json-end]");
+    eprintln!(
+        "[quill-qg1-x86-diagnostic] no-claim: diagnostic-only profile; promotion_capability=none; \
+         laws_attested=false"
+    );
+    Ok(())
+}
+
 fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
     let bench_elf_sha256 = &bench_identity.sha256;
     let scale = MatrixScale::from_env();
@@ -8364,6 +8695,8 @@ fn main() {
         tests::assert_manifest_gate_contract();
         tests::assert_qg1_authority_handshake_contract();
         tests::assert_qg1_timed_fixed_writer_receipt_rejects_detached_fixed_one_substitution();
+        tests::assert_qg1_x86_diagnostic_exact_unpromotable_cell();
+        tests::assert_qg1_x86_diagnostic_rejects_spoofing();
         eprintln!(
             "[quill-perf-self-check] H1 immutable producer and continuous-timing contracts passed"
         );
@@ -8389,7 +8722,14 @@ fn main() {
         emit_bench_elf_sha256(&identity);
     }
     // Fail closed before a single cell is timed.
-    let _oracle = assert_incumbent_is_genuine_tantivy();
+    let oracle = assert_incumbent_is_genuine_tantivy();
+    if qg1_x86_diagnostic_requested()
+        .unwrap_or_else(|error| panic!("QG-1 x86 diagnostic dispatch rejected: {error}"))
+    {
+        run_qg1_x86_diagnostic(&identity, &oracle)
+            .unwrap_or_else(|error| panic!("QG-1 x86 diagnostic run rejected: {error}"));
+        return;
+    }
     let mut criterion = Criterion::default().configure_from_args();
     bench_matrix(&mut criterion, &identity);
     criterion.final_summary();
@@ -10513,6 +10853,109 @@ mod tests {
         );
         assert!(super::parse_execution_profile_id("64").is_err());
         assert!(super::parse_execution_profile_id("p-plus-e").is_err());
+    }
+
+    fn exact_qg1_x86_diagnostic_request() -> super::Qg1X86DiagnosticRequest {
+        super::Qg1X86DiagnosticRequest {
+            gate: PerfGate::Qg1.label().to_owned(),
+            hardware_class: HardwareClassId::X86VpsOvh.as_str().to_owned(),
+            execution_profile: ExecutionProfileId::X86Diagnostic.as_str().to_owned(),
+            scale: "full".to_owned(),
+            fixture: super::QG1_X86_DIAGNOSTIC_FIXTURE.to_owned(),
+            runs: PERF_MIN_RUNS,
+            rayon_num_threads: 8,
+            forbidden_authority_claims: Vec::new(),
+        }
+    }
+
+    pub fn assert_qg1_x86_diagnostic_exact_unpromotable_cell() {
+        let matrix = PerfMatrixSpec::complete();
+        let plan = super::resolve_qg1_x86_diagnostic_plan(
+            &matrix,
+            &exact_qg1_x86_diagnostic_request(),
+            8,
+        )
+        .expect("exact QG-1 x86 diagnostic request");
+        assert_eq!(plan.spec.gate, PerfGate::Qg1);
+        assert_eq!(plan.spec.fixture, super::QG1_X86_DIAGNOSTIC_FIXTURE);
+        assert_eq!(plan.spec.metric, "docs_per_second");
+        assert_eq!(plan.spec.threads, Some(8));
+        assert_eq!(plan.runs, PERF_MIN_RUNS);
+        assert_eq!(plan.rayon_num_threads, 8);
+        assert_eq!(
+            plan.profile,
+            MachineProfileKey::new(
+                HardwareClassId::X86VpsOvh,
+                ExecutionProfileId::X86Diagnostic,
+            )
+            .expect("canonical diagnostic profile")
+        );
+
+        let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
+        assert!(
+            matrix
+                .applicability_plan(&registry, plan.profile, PerfGate::Qg1)
+                .is_err(),
+            "the diagnostic branch must not acquire a promotion applicability plan"
+        );
+    }
+
+    #[test]
+    fn qg1_x86_diagnostic_derives_only_the_exact_unpromotable_cell() {
+        assert_qg1_x86_diagnostic_exact_unpromotable_cell();
+    }
+
+    pub fn assert_qg1_x86_diagnostic_rejects_spoofing() {
+        let matrix = PerfMatrixSpec::complete();
+        let mut request = exact_qg1_x86_diagnostic_request();
+        request.runs = PERF_MIN_RUNS - 1;
+        assert!(
+            super::resolve_qg1_x86_diagnostic_plan(&matrix, &request, 8)
+                .expect_err("under-sampled diagnostic")
+                .contains("10..=100")
+        );
+
+        let mut request = exact_qg1_x86_diagnostic_request();
+        request.rayon_num_threads = 7;
+        assert!(
+            super::resolve_qg1_x86_diagnostic_plan(&matrix, &request, 8)
+                .expect_err("wrong Rayon width")
+                .contains("canonical fixture width 8")
+        );
+
+        let mut request = exact_qg1_x86_diagnostic_request();
+        request.hardware_class = HardwareClassId::TrjZen35995wx.as_str().to_owned();
+        assert!(
+            super::resolve_qg1_x86_diagnostic_plan(&matrix, &request, 8)
+                .expect_err("promotion-profile relabel")
+                .contains("x86-vps-ovh")
+        );
+
+        let mut request = exact_qg1_x86_diagnostic_request();
+        request.forbidden_authority_claims = vec![
+            "QUILL_PERF_EXECUTION_CAPACITY".to_owned(),
+            "QUILL_PERF_APPLICABILITY_PLAN_SHA256".to_owned(),
+        ];
+        assert!(
+            super::resolve_qg1_x86_diagnostic_plan(&matrix, &request, 8)
+                .expect_err("spoofed promotion authority")
+                .contains("promotion-authority")
+        );
+
+        assert!(
+            super::resolve_qg1_x86_diagnostic_plan(
+                &matrix,
+                &exact_qg1_x86_diagnostic_request(),
+                7,
+            )
+            .expect_err("underwidth host")
+            .contains("process-available concurrency 7")
+        );
+    }
+
+    #[test]
+    fn qg1_x86_diagnostic_rejects_relabeling_spoofed_authority_and_underwidth_hosts() {
+        assert_qg1_x86_diagnostic_rejects_spoofing();
     }
 
     #[test]
