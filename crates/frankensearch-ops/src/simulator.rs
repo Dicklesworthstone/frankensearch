@@ -756,6 +756,7 @@ fn synthesize_phases(
             lexical_candidates: 32,
             fused_count: result_count,
             skip_reason: None,
+            hash_control_candidates: 0,
         },
     };
     phases.push(initial);
@@ -783,6 +784,7 @@ fn synthesize_phases(
             lexical_candidates: 96,
             fused_count: result_count.saturating_add(1),
             skip_reason: None,
+            hash_control_candidates: 0,
         },
         rank_changes: RankChanges {
             promoted: 1,
@@ -813,6 +815,7 @@ fn synthesize_phases(
                 lexical_candidates: 96,
                 fused_count: result_count.saturating_add(2),
                 skip_reason: None,
+                hash_control_candidates: 0,
             },
         };
         phases.push(reranked);
@@ -1573,6 +1576,7 @@ mod tests {
                 lexical_candidates: 0,
                 fused_count: 0,
                 skip_reason: None,
+                hash_control_candidates: 0,
             },
         };
         let refined = SearchPhase::Refined {
@@ -1584,6 +1588,7 @@ mod tests {
                 lexical_candidates: 0,
                 fused_count: 0,
                 skip_reason: None,
+                hash_control_candidates: 0,
             },
             rank_changes: RankChanges {
                 promoted: 0,
@@ -1618,6 +1623,7 @@ mod tests {
                 lexical_candidates: 0,
                 fused_count: 0,
                 skip_reason: None,
+                hash_control_candidates: 0,
             },
         };
         assert!(failure_kind_for_phase(&initial).is_none());
@@ -1724,6 +1730,7 @@ mod tests {
                 lexical_candidates: 0,
                 fused_count: 0,
                 skip_reason: None,
+                hash_control_candidates: 0,
             },
         };
         let (record_phase, latency_us, result_count) = phase_to_record_fields(&phase);

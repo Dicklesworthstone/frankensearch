@@ -4039,6 +4039,13 @@ pub struct PhaseMetrics {
     /// hits" must inspect this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip_reason: Option<String>,
+    /// Number of hash/fnv/JL control-vector candidates retrieved.
+    ///
+    /// Hash hits are not semantic. Absent from older payloads; deserializes
+    /// as `0`. Present on Initial when the fast lane is a hash-control
+    /// generation.
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
+    pub hash_control_candidates: usize,
 }
 
 /// Structured telemetry for a completed search request.
@@ -6369,6 +6376,7 @@ mod tests {
                 lexical_candidates: 50,
                 fused_count: 10,
                 skip_reason: None,
+                hash_control_candidates: 0,
             },
         };
         if let SearchPhase::Initial { latency, .. } = phase {
@@ -6803,17 +6811,45 @@ mod tests {
             lexical_candidates: 30,
             fused_count: 10,
             skip_reason: None,
+            hash_control_candidates: 0,
         };
         let json = serde_json::to_string(&metrics).unwrap();
         let decoded: PhaseMetrics = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.embedder_id, "test-embed");
         assert_eq!(decoded.vectors_searched, 500);
+        assert_eq!(decoded.hash_control_candidates, 0);
+        assert!(
+            !json.contains("hash_control_candidates"),
+            "zero hash-control count should omit the key: {json}"
+        );
 
         let cloned = metrics.clone();
         assert_eq!(cloned.fused_count, 10);
 
         let dbg = format!("{metrics:?}");
         assert!(dbg.contains("PhaseMetrics"));
+
+        let hash_metrics = PhaseMetrics {
+            embedder_id: "fnv1a-256".into(),
+            vectors_searched: 500,
+            lexical_candidates: 0,
+            fused_count: 4,
+            skip_reason: Some("non_semantic_fast_embedder_vector_control".into()),
+            hash_control_candidates: 4,
+        };
+        let hash_json = serde_json::to_string(&hash_metrics).unwrap();
+        let hash_decoded: PhaseMetrics = serde_json::from_str(&hash_json).unwrap();
+        assert_eq!(hash_decoded.hash_control_candidates, 4);
+        assert!(
+            hash_json.contains("hash_control_candidates"),
+            "non-zero hash-control count must be serialized: {hash_json}"
+        );
+
+        let legacy = serde_json::from_str::<PhaseMetrics>(
+            r#"{"embedder_id":"potion-128M","vectors_searched":10,"lexical_candidates":3,"fused_count":3}"#,
+        )
+        .expect("legacy PhaseMetrics without hash_control_candidates");
+        assert_eq!(legacy.hash_control_candidates, 0);
     }
 
     #[test]
@@ -6872,6 +6908,7 @@ mod tests {
                 lexical_candidates: 100,
                 fused_count: 20,
                 skip_reason: None,
+                hash_control_candidates: 0,
             },
             rank_changes: RankChanges {
                 promoted: 4,
@@ -6916,6 +6953,7 @@ mod tests {
                 lexical_candidates: 100,
                 fused_count: 20,
                 skip_reason: None,
+                hash_control_candidates: 0,
             },
         };
         assert!(matches!(phase, SearchPhase::Reranked { .. }));
@@ -6940,6 +6978,7 @@ mod tests {
                 lexical_candidates: 0,
                 fused_count: 0,
                 skip_reason: None,
+                hash_control_candidates: 0,
             },
         };
         let dbg = format!("{phase:?}");

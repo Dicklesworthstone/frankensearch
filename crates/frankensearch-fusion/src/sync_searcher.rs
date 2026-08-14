@@ -747,6 +747,7 @@ impl SyncTwoTierSearcher {
                     lexical_candidates: metrics.lexical_candidates,
                     fused_count: initial_results.len(),
                     skip_reason: metrics.skip_reason.clone(),
+                    hash_control_candidates: metrics.hash_control_candidates,
                 },
             });
         }
@@ -989,6 +990,7 @@ impl SyncTwoTierSearcher {
                     lexical_candidates: metrics.lexical_candidates,
                     fused_count: refined_results.len(),
                     skip_reason: None,
+                    hash_control_candidates: metrics.hash_control_candidates,
                 },
                 rank_changes,
             });
@@ -2003,6 +2005,34 @@ mod tests {
         );
         assert!(metrics.hash_control_candidates > 0);
         assert_eq!(metrics.semantic_candidates, 0);
+        let phases = searcher.search_iter(&query, 2).collect::<Vec<_>>();
+        assert!(
+            phases
+                .iter()
+                .any(|phase| matches!(phase, SearchPhase::Initial { .. }))
+        );
+        assert!(
+            !phases
+                .iter()
+                .any(|phase| matches!(phase, SearchPhase::Refined { .. })),
+            "hash-control Initial must not schedule a Refined phase"
+        );
+        assert!(
+            matches!(phases.first(), Some(SearchPhase::Initial { .. })),
+            "first hash-control phase must be Initial, got {:?}",
+            phases.first()
+        );
+        if let Some(SearchPhase::Initial {
+            metrics: phase_metrics,
+            ..
+        }) = phases.first()
+        {
+            assert_eq!(
+                phase_metrics.hash_control_candidates,
+                metrics.hash_control_candidates
+            );
+            assert!(phase_metrics.hash_control_candidates > 0);
+        }
     }
 
     #[test]

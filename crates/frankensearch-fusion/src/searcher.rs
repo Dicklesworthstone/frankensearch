@@ -1115,6 +1115,7 @@ impl TwoTierSearcher {
                 lexical_candidates: metrics.lexical_candidates,
                 fused_count: display_hits.len(),
                 skip_reason: metrics.skip_reason.clone(),
+                hash_control_candidates: metrics.hash_control_candidates,
             },
         });
 
@@ -1309,6 +1310,7 @@ impl TwoTierSearcher {
                                 lexical_candidates: metrics.lexical_candidates,
                                 fused_count: refined_count,
                                 skip_reason: None,
+                                hash_control_candidates: metrics.hash_control_candidates,
                             },
                             rank_changes: metrics.rank_changes.clone(),
                         });
@@ -1384,6 +1386,8 @@ impl TwoTierSearcher {
                                             lexical_candidates: metrics.lexical_candidates,
                                             fused_count: reranked_count,
                                             skip_reason: None,
+                                            hash_control_candidates: metrics
+                                                .hash_control_candidates,
                                         },
                                     });
                                 }
@@ -6904,6 +6908,7 @@ mod tests {
 
             let mut initial_skip = None;
             let mut initial_sources = Vec::new();
+            let mut initial_hash_control = 0;
             let metrics = searcher
                 .search(
                     &cx,
@@ -6917,6 +6922,7 @@ mod tests {
                         {
                             initial_sources = results.iter().map(|hit| hit.source).collect();
                             initial_skip = metrics.skip_reason;
+                            initial_hash_control = metrics.hash_control_candidates;
                         }
                     },
                 )
@@ -6941,6 +6947,11 @@ mod tests {
                 initial_skip.as_deref(),
                 Some("non_semantic_fast_embedder_vector_control")
             );
+            assert!(
+                initial_hash_control > 0,
+                "Initial PhaseMetrics must count hash-control hits, not hide them"
+            );
+            assert_eq!(metrics.hash_control_candidates, initial_hash_control);
         });
     }
 
