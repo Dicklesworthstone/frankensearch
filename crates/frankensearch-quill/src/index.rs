@@ -8021,6 +8021,61 @@ impl QuillWriterState {
         documents: &[IndexableDocument],
     ) -> Result<(), QuillIndexError> {
         check_cancel(cx, "upsert documents")?;
+        // Publish an unrelated pending batch before replacing a live document.
+        //
+        // The refusal below exists because the replacement MANIFEST is derived
+        // from the PUBLISHED snapshot, so pending shard state that has not been
+        // published yet cannot participate in it. That is a reason to publish
+        // first, not a reason to reject the call: `LexicalWrite` is the
+        // engine-neutral surface, and the pinned Tantivy backend accepts a
+        // replacement with writes outstanding, so refusing here made an
+        // ordinary interleaving succeed on one backend and fail on the other.
+        //
+        // Deliberately narrow, and gated on ORDINARY pending work only.
+        //
+        // A scalar retry sentinel does not mean "there is work to publish", it
+        // means "a prior mutation ended ambiguously and must be reconciled by
+        // an explicit commit before more is accepted". Publishing from here
+        // would resolve that state as a side effect of an unrelated call —
+        // committing a possibly-partial ingest and clearing the guard that
+        // exists to stop exactly that. Every such sentinel therefore keeps its
+        // existing typed refusal instead:
+        //
+        //   * `ingest_retry_required` — a prior scalar ingest returned after
+        //     mutation may have begun;
+        //   * `staged_flush`          — a seal is installed but not committed;
+        //   * `pending_manifest` / `pending_replacement_manifest` — a retained
+        //     publication proposal awaiting its retry;
+        //   * `pending_delta_seal`    — a retained Delta seal awaiting resume.
+        //
+        // An active Delta epoch likewise falls through untouched, so its own
+        // typed refusal still reports the real reason in the original order.
+        let scalar_retry_pending = self.ingest_retry_required
+            || self.staged_flush.is_some()
+            || self.pending_manifest.is_some()
+            || self.pending_replacement_manifest.is_some()
+            || self.pending_delta_seal.is_some();
+        if !scalar_retry_pending
+            && self.has_uncommitted_changes()
+            && !self.has_active_deltas()
+            && self.batch_replaces_published_document(cx, documents)?
+        {
+            // Refuse a malformed batch BEFORE publishing anything. Publication
+            // is a side effect of accepting this call, so a batch that
+            // admission will reject anyway must not be able to publish
+            // unrelated pending work on its way to failing
+            // (bd-quill-rejected-ingest-publishes-partial-batch-aihri): a
+            // rejected ingest stages nothing, and that has to keep holding for
+            // the publish-first path.
+            //
+            // Only the commit-INVARIANT conditions belong here. Whether an id
+            // is a duplicate or a legal replacement is decided against the
+            // published snapshot, and publishing is exactly what changes that
+            // answer, so those are left to the full admission pass that runs
+            // after the commit against the re-derived snapshot.
+            Self::validate_commit_invariant_batch_shape(cx, documents)?;
+            self.commit(cx).await?;
+        }
         let snapshot = self.authority_snapshot()?;
         let mut manifest = snapshot.next_manifest()?;
         let mut replacement_ids = BTreeSet::new();
@@ -8033,9 +8088,27 @@ impl QuillWriterState {
         if replacement_ids.is_empty() {
             return self.index_documents(cx, documents).await;
         }
-        if self.has_uncommitted_changes() {
+        // `ingest_retry_required` is checked HERE, next to the pending-state
+        // refusal, because `has_uncommitted_changes` does not include it: a
+        // cancelled ingest can arm the retry guard while leaving no accumulated
+        // documents, no staged flush and no retained proposal. Such a writer
+        // looks perfectly clean to the check below.
+        //
+        // Reaching the installation on that state loses data. The staged
+        // manifest already carries the tombstone for the document being
+        // replaced, so installing it and only then failing in
+        // `index_documents_with_replacements` — which does check the guard —
+        // leaves a retained replacement proposal that is a DELETION with no
+        // replacement rows behind it. The explicit retry commit the guard is
+        // asking for then publishes exactly that, and the live document is gone.
+        //
+        // Refusing before the installation keeps the retry state inert: nothing
+        // is staged, so the retry commit has nothing to publish.
+        if self.ingest_retry_required || self.has_uncommitted_changes() {
             let message = if self.pending_replacement_manifest.is_some() {
                 "a retained replacement MANIFEST awaits commit retry"
+            } else if self.ingest_retry_required {
+                "a prior scalar mutation requires commit retry before replacing live documents"
             } else {
                 "uncommitted changes must be committed before replacing live documents"
             };
@@ -8065,6 +8138,64 @@ impl QuillWriterState {
             self.apply_tier_policy(cx).await?;
         }
         Ok(())
+    }
+
+    /// The admission conditions that publishing cannot change.
+    ///
+    /// An empty identifier and an in-batch repeat are invalid against every
+    /// possible published state, so they can be refused before an implicit
+    /// publication without consulting the snapshot. Everything else admission
+    /// checks — an id already staged in `uncommitted_ids`, or live in the
+    /// published snapshot without being replaced — is exactly what a commit
+    /// resolves, so deciding it here would refuse batches that are legal once
+    /// the pending work is published.
+    ///
+    /// Documents are walked in admission's own order and produce admission's
+    /// own typed errors, so a batch rejected here is rejected the same way it
+    /// would have been one step later.
+    fn validate_commit_invariant_batch_shape(
+        cx: &Cx,
+        documents: &[IndexableDocument],
+    ) -> Result<(), QuillIndexError> {
+        let mut batch_ids = BTreeSet::new();
+        for document in documents {
+            check_cancel(cx, "upsert admission preflight")?;
+            if document.id.is_empty() {
+                return Err(invalid_state("document id must be nonempty"));
+            }
+            if !batch_ids.insert(document.id.as_str()) {
+                return Err(invalid_state(format!(
+                    "duplicate live document id {:?}",
+                    document.id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether any document in the batch replaces one that is already
+    /// published.
+    ///
+    /// Deliberately PURE, for the same reason
+    /// [`Self::validate_batch_admission`] is: it resolves identifiers against
+    /// the published snapshot and touches no shard, allocator, manifest or
+    /// uncommitted-id state. That is what makes it safe to consult BEFORE
+    /// deciding to publish pending work — a batch that turns out to replace
+    /// nothing leaves the writer exactly as it found it, so ordinary
+    /// accumulate-before-commit is unaffected.
+    fn batch_replaces_published_document(
+        &self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+    ) -> Result<bool, QuillIndexError> {
+        let snapshot = self.authority_snapshot()?;
+        for document in documents {
+            check_cancel(cx, "upsert replacement probe")?;
+            if snapshot.resolve_document_id(&document.id)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn delete_document(
@@ -19585,6 +19716,444 @@ mod tests {
                     .doc_count()
                     .expect("atomic upsert count is authoritative"),
                 3
+            );
+        });
+    }
+
+    /// A replacement issued while an unrelated batch is still accumulating
+    /// publishes that batch first instead of refusing the call.
+    ///
+    /// The engine-neutral `LexicalWrite` surface must not make an ordinary
+    /// interleaving succeed on one backend and fail on another, so the three
+    /// outcomes pinned here are: the call is accepted, the pending batch is not
+    /// lost, and the replacement actually replaces.
+    #[test]
+    fn lexical_trait_replacement_publishes_a_pending_batch_instead_of_refusing() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+            LexicalWrite::index_documents(
+                &index,
+                &cx,
+                &[IndexableDocument::new("seeded", "old alpha")],
+            )
+            .await
+            .expect("seed published document");
+            LexicalWrite::commit(&index, &cx)
+                .await
+                .expect("publish seed generation");
+
+            LexicalWrite::index_documents(
+                &index,
+                &cx,
+                &[IndexableDocument::new("pending", "fresh beta")],
+            )
+            .await
+            .expect("stage an unrelated pending batch");
+            assert!(
+                index.has_uncommitted_changes(),
+                "the pending batch must still be unpublished before the replacement"
+            );
+
+            LexicalWrite::index_documents(
+                &index,
+                &cx,
+                &[IndexableDocument::new("seeded", "new gamma")],
+            )
+            .await
+            .expect("replacement must be accepted while a batch is pending");
+            LexicalWrite::commit(&index, &cx)
+                .await
+                .expect("commit after replacement");
+
+            assert_eq!(
+                index
+                    .search_doc_ids(&cx, "gamma", 10)
+                    .expect("replacement is searchable")
+                    .len(),
+                1
+            );
+            assert!(
+                index
+                    .search_doc_ids(&cx, "alpha", 10)
+                    .expect("superseded revision is retired")
+                    .is_empty(),
+                "the replaced revision must not remain live"
+            );
+            assert_eq!(
+                index
+                    .search_doc_ids(&cx, "beta", 10)
+                    .expect("pending batch survives")
+                    .len(),
+                1,
+                "the batch that was pending must not be lost"
+            );
+            assert_eq!(
+                index.doc_count().expect("published count is authoritative"),
+                2
+            );
+        });
+    }
+
+    /// A rejected replacement batch must publish NOTHING, even though
+    /// accepting it would have published pending work first.
+    ///
+    /// Publication is a side effect of accepting the call, so the publish-first
+    /// path reopens `bd-quill-rejected-ingest-publishes-partial-batch-aihri`
+    /// unless malformed input is refused before the commit: otherwise
+    /// `[live replacement, invalid]` publishes an unrelated pending document
+    /// and only then fails. Each assertion below fails differently — the
+    /// generation catches the publish, the search catches the leaked document,
+    /// and the uncommitted flag catches the drained writer state.
+    #[test]
+    fn lexical_trait_rejected_replacement_batch_publishes_nothing() {
+        run_with_cx(|cx| async move {
+            // Only the empty identifier is reachable here. A repeated id is NOT
+            // an error on this surface: the facade collapses a batch to the
+            // final occurrence of each id before the writer sees it, which is
+            // the pinned last-write-wins behavior. The preflight still checks
+            // for repeats because the writer is also reached without that
+            // collapse; that arm is covered directly by
+            // [`commit_invariant_batch_shape_refuses_what_publishing_cannot_fix`].
+            for (label, batch) in [(
+                "empty id",
+                vec![
+                    IndexableDocument::new("seeded", "new gamma"),
+                    IndexableDocument::new("", "invalid"),
+                ],
+            )] {
+                let index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+                LexicalWrite::index_documents(
+                    &index,
+                    &cx,
+                    &[IndexableDocument::new("seeded", "old alpha")],
+                )
+                .await
+                .expect("seed published document");
+                LexicalWrite::commit(&index, &cx)
+                    .await
+                    .expect("publish seed generation");
+                let published = index
+                    .segment_stats()
+                    .expect("read seed segment stats")
+                    .published_generation;
+
+                LexicalWrite::index_documents(
+                    &index,
+                    &cx,
+                    &[IndexableDocument::new("pending", "fresh beta")],
+                )
+                .await
+                .expect("stage an unrelated pending batch");
+
+                let rejected = LexicalWrite::index_documents(&index, &cx, &batch).await;
+                assert!(rejected.is_err(), "{label} must be refused");
+                assert_eq!(
+                    index
+                        .segment_stats()
+                        .expect("read segment stats")
+                        .published_generation,
+                    published,
+                    "{label} must not advance the published generation"
+                );
+                assert!(
+                    index
+                        .search_doc_ids(&cx, "beta", 10)
+                        .expect("pending batch visibility")
+                        .is_empty(),
+                    "{label} must not publish the pending document"
+                );
+                assert_eq!(
+                    index
+                        .search_doc_ids(&cx, "alpha", 10)
+                        .expect("seeded revision is untouched")
+                        .len(),
+                    1,
+                    "{label} must leave the published revision in place"
+                );
+                assert!(
+                    index.has_uncommitted_changes(),
+                    "{label} must leave the pending batch staged"
+                );
+            }
+        });
+    }
+
+    /// An armed retry guard with NOTHING staged must still refuse, and must not
+    /// leave a deletion behind.
+    ///
+    /// This is the flag-only shape, and it is the dangerous one precisely
+    /// because it looks clean: `has_uncommitted_changes` does not consult
+    /// `ingest_retry_required`, so a cancelled ingest that accumulated no
+    /// documents leaves a writer with no shard rows, no staged flush and no
+    /// retained proposal. Installing the replacement MANIFEST on that state
+    /// stages a TOMBSTONE for the live document and then fails, and the
+    /// explicit retry commit the guard demands publishes that deletion with no
+    /// replacement rows — the document is destroyed by a call that returned an
+    /// error.
+    ///
+    /// The third assertion is the one that catches it: refusing is not enough
+    /// if a proposal survives the refusal.
+    #[test]
+    fn lexical_trait_armed_retry_guard_alone_refuses_without_staging_a_deletion() {
+        run_with_cx(|cx| async move {
+            let mut index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+            LexicalWrite::index_documents(
+                &index,
+                &cx,
+                &[IndexableDocument::new("seeded", "old alpha")],
+            )
+            .await
+            .expect("seed published document");
+            LexicalWrite::commit(&index, &cx)
+                .await
+                .expect("publish seed generation");
+            let published = index
+                .segment_stats()
+                .expect("read seed segment stats")
+                .published_generation;
+
+            // Flag only: no accumulated documents, no staged flush, no retained
+            // proposal. This is what a cancelled ingest can leave behind.
+            index.writer_mut().ingest_retry_required = true;
+            assert!(
+                !index.has_uncommitted_changes(),
+                "the writer must look clean to has_uncommitted_changes for this to be the flag-only shape"
+            );
+
+            let refused = LexicalWrite::index_documents(
+                &index,
+                &cx,
+                &[IndexableDocument::new("seeded", "new gamma")],
+            )
+            .await;
+            assert!(
+                refused.is_err(),
+                "an armed retry guard must refuse a replacement, got {refused:?}"
+            );
+            assert!(
+                index.writer_mut().pending_replacement_manifest.is_none(),
+                "a refused replacement must not retain a deletion-only MANIFEST proposal"
+            );
+
+            // The retry the guard asks for must publish nothing.
+            LexicalWrite::commit(&index, &cx)
+                .await
+                .expect("explicit retry commit");
+            assert_eq!(
+                index
+                    .search_doc_ids(&cx, "alpha", 10)
+                    .expect("published revision after retry")
+                    .len(),
+                1,
+                "the retry commit must not destroy the live document"
+            );
+            assert!(
+                index
+                    .search_doc_ids(&cx, "gamma", 10)
+                    .expect("refused replacement after retry")
+                    .is_empty(),
+                "the refused replacement must not appear"
+            );
+            assert_eq!(
+                index.doc_count().expect("document count after retry"),
+                1,
+                "the retry commit must not publish a deletion"
+            );
+            assert_eq!(
+                index
+                    .segment_stats()
+                    .expect("read segment stats after retry")
+                    .published_generation,
+                published,
+                "a refused replacement leaves nothing for the retry to publish"
+            );
+        });
+    }
+
+    /// A retained scalar retry state keeps its refusal; the publish-first path
+    /// must not resolve it as a side effect.
+    ///
+    /// These sentinels do not mean "there is work to publish" — they mean a
+    /// prior mutation ended ambiguously and must be reconciled by an EXPLICIT
+    /// commit. `commit_with_trigger` publishes pending segments and then clears
+    /// `ingest_retry_required`, so an implicit commit issued from an unrelated
+    /// replacement would publish a possibly-partial ingest and disarm the guard
+    /// that exists to prevent precisely that.
+    ///
+    /// Each assertion fails differently: the generation catches the publish,
+    /// the searches catch the leaked and the clobbered document, and the
+    /// sentinel check catches the disarmed guard.
+    #[test]
+    fn lexical_trait_retained_scalar_retry_states_still_refuse_a_replacement() {
+        run_with_cx(|cx| async move {
+            for label in ["ingest_retry_required", "staged_flush"] {
+                let mut index =
+                    QuillIndex::in_memory(deterministic_config()).expect("memory index");
+                LexicalWrite::index_documents(
+                    &index,
+                    &cx,
+                    &[IndexableDocument::new("seeded", "old alpha")],
+                )
+                .await
+                .expect("seed published document");
+                LexicalWrite::commit(&index, &cx)
+                    .await
+                    .expect("publish seed generation");
+                let published = index
+                    .segment_stats()
+                    .expect("read seed segment stats")
+                    .published_generation;
+
+                // Ambiguous pending work: staged, unpublished, and about to be
+                // marked unreconciled.
+                LexicalWrite::index_documents(
+                    &index,
+                    &cx,
+                    &[IndexableDocument::new("pending", "fresh beta")],
+                )
+                .await
+                .expect("stage pending scalar work");
+
+                match label {
+                    "ingest_retry_required" => index.writer_mut().ingest_retry_required = true,
+                    _ => index
+                        .writer_mut()
+                        .prepare_shard_flush(0)
+                        .expect("stage a seal without installing it"),
+                }
+
+                let refused = LexicalWrite::index_documents(
+                    &index,
+                    &cx,
+                    &[IndexableDocument::new("seeded", "new gamma")],
+                )
+                .await;
+                assert!(
+                    refused.is_err(),
+                    "{label} must keep refusing a replacement, got {refused:?}"
+                );
+                assert_eq!(
+                    index
+                        .segment_stats()
+                        .expect("read segment stats")
+                        .published_generation,
+                    published,
+                    "{label} must not advance the published generation"
+                );
+                assert!(
+                    index
+                        .search_doc_ids(&cx, "beta", 10)
+                        .expect("pending visibility")
+                        .is_empty(),
+                    "{label} must not publish the ambiguous pending work"
+                );
+                assert_eq!(
+                    index
+                        .search_doc_ids(&cx, "alpha", 10)
+                        .expect("seeded revision")
+                        .len(),
+                    1,
+                    "{label} must leave the published revision in place"
+                );
+                assert!(
+                    index
+                        .search_doc_ids(&cx, "gamma", 10)
+                        .expect("replacement visibility")
+                        .is_empty(),
+                    "{label} must not apply the refused replacement"
+                );
+                assert!(
+                    index.has_uncommitted_changes(),
+                    "{label} must leave the writer state staged"
+                );
+                let writer = index.writer_mut();
+                match label {
+                    "ingest_retry_required" => assert!(
+                        writer.ingest_retry_required,
+                        "the commit-retry guard must stay armed"
+                    ),
+                    _ => assert!(
+                        writer.staged_flush.is_some(),
+                        "the staged seal must stay retained"
+                    ),
+                }
+            }
+        });
+    }
+
+    /// The preflight refuses exactly the conditions a publication cannot fix,
+    /// and nothing else.
+    ///
+    /// The negative half matters as much as the positive: an id that is live in
+    /// the published snapshot, or one already staged in `uncommitted_ids`, must
+    /// NOT be refused here, because publishing the pending work is precisely
+    /// what makes those legal. Refusing them would turn the publish-first path
+    /// back into the refusal it replaced.
+    #[test]
+    fn commit_invariant_batch_shape_refuses_what_publishing_cannot_fix() {
+        run_with_cx(|cx| async move {
+            let refused = |documents: &[IndexableDocument]| {
+                QuillWriterState::validate_commit_invariant_batch_shape(&cx, documents)
+                    .expect_err("must refuse")
+                    .to_string()
+            };
+            assert!(
+                refused(&[IndexableDocument::new("", "body")]).contains("nonempty"),
+                "an empty id is invalid against every published state"
+            );
+            assert!(
+                refused(&[
+                    IndexableDocument::new("repeated", "one"),
+                    IndexableDocument::new("repeated", "two"),
+                ])
+                .contains("duplicate live document id"),
+                "an in-batch repeat is invalid against every published state"
+            );
+            QuillWriterState::validate_commit_invariant_batch_shape(
+                &cx,
+                &[
+                    IndexableDocument::new("alpha", "one"),
+                    IndexableDocument::new("beta", "two"),
+                ],
+            )
+            .expect("distinct nonempty ids are not this check's business");
+        });
+    }
+
+    /// The publish-first path is gated on an actual replacement, so a batch
+    /// that replaces nothing still accumulates rather than publishing early.
+    #[test]
+    fn lexical_trait_pure_append_still_accumulates_after_a_published_generation() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+            LexicalWrite::index_documents(
+                &index,
+                &cx,
+                &[IndexableDocument::new("seeded", "old alpha")],
+            )
+            .await
+            .expect("seed published document");
+            LexicalWrite::commit(&index, &cx)
+                .await
+                .expect("publish seed generation");
+            let published = index
+                .segment_stats()
+                .expect("read seed segment stats")
+                .published_generation;
+
+            for id in ["fresh-one", "fresh-two"] {
+                LexicalWrite::index_documents(&index, &cx, &[IndexableDocument::new(id, "beta")])
+                    .await
+                    .expect("stage a pure-append batch");
+            }
+            assert!(index.has_uncommitted_changes());
+            assert_eq!(
+                index
+                    .segment_stats()
+                    .expect("read segment stats")
+                    .published_generation,
+                published,
+                "a batch that replaces nothing must not publish a generation"
             );
         });
     }

@@ -1107,6 +1107,126 @@ mod lexical {
         });
     }
 
+    /// Replacing a published document while an unrelated batch is still
+    /// accumulating is ordinary backend-neutral usage, and both engines must
+    /// accept it.
+    ///
+    /// The interleaving is the whole point: a fresh document staged between
+    /// commits leaves pending writer state, and the replacement that follows
+    /// must still land. Tantivy has no state precondition at all — it deletes
+    /// the term and adds the row — so a Quill refusal here is a public
+    /// divergence in a sequence neither engine's contract forbids.
+    ///
+    /// This is deterministic rather than timing-dependent: the pending batch is
+    /// the first write after a commit, so the visibility-lag trigger cannot
+    /// have elapsed, and the replacement call is decided before any ingest runs.
+    #[cfg(feature = "lexical-tantivy")]
+    #[test]
+    fn public_replacement_after_pending_batch_matches_tantivy_oracle() {
+        super::quiet_logging();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let seed = vec![
+                IndexableDocument::new("seeded", "stalealpha"),
+                IndexableDocument::new("bystander", "haystack"),
+            ];
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let quill = build_quill_index(&cx, &tmp.path().join("quill"), &seed).await;
+            let tantivy = build_tantivy_index(&cx, &tmp.path().join("tantivy"), &seed).await;
+
+            // Oracle first: a Quill-only failure is then attributable, because
+            // the pinned engine has already been shown to accept the sequence.
+            for (label, index) in [
+                ("Tantivy", &tantivy as &dyn LexicalWrite),
+                ("Quill", &quill as &dyn LexicalWrite),
+            ] {
+                // Leaves pending writer state: a brand-new id, so nothing is
+                // replaced and no publication is forced.
+                LexicalWrite::index_documents(
+                    index,
+                    &cx,
+                    &[IndexableDocument::new("pending", "freshbeta")],
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{label} pending batch: {error}"));
+
+                // The replacement of an already-published id, issued while that
+                // pending batch is still unpublished.
+                let replaced = LexicalWrite::index_documents(
+                    index,
+                    &cx,
+                    &[IndexableDocument::new("seeded", "livegamma")],
+                )
+                .await;
+                assert!(
+                    replaced.is_ok(),
+                    "{label} must accept a replacement while an unrelated batch is pending, got {:?}",
+                    replaced.err()
+                );
+
+                LexicalWrite::commit(index, &cx)
+                    .await
+                    .unwrap_or_else(|error| panic!("{label} commit: {error}"));
+            }
+
+            for (label, index) in [
+                ("Quill", &quill as &dyn LexicalRead),
+                ("Tantivy", &tantivy as &dyn LexicalRead),
+            ] {
+                let live = LexicalRead::search(index, &cx, "livegamma", 10)
+                    .await
+                    .expect("search replacement revision");
+                assert_eq!(live.len(), 1, "{label} replacement count");
+                assert_eq!(live[0].doc_id.as_str(), "seeded");
+                assert!(
+                    LexicalRead::search(index, &cx, "stalealpha", 10)
+                        .await
+                        .expect("search superseded revision")
+                        .is_empty(),
+                    "{label} must retire the superseded revision"
+                );
+                assert_eq!(
+                    LexicalRead::search(index, &cx, "freshbeta", 10)
+                        .await
+                        .expect("search pending batch")
+                        .len(),
+                    1,
+                    "{label} must not lose the batch that was pending"
+                );
+                assert_eq!(
+                    index.doc_count().expect("published document count"),
+                    3,
+                    "{label} published document count"
+                );
+            }
+
+            // Identity and order, deliberately NOT score bits.
+            //
+            // This test pins that the interleaved replacement is accepted and
+            // publicly observable on both engines. It does not claim BM25
+            // parity for the sequence: the engines seal on different schedules,
+            // so the corpus counts behind `idf` differ here (measured on this
+            // fixture: Quill N=4 against the oracle's N=3, i.e. score bits
+            // 0x3F9A1BC8 against 0x3F7AF95F). That is the cross-call
+            // corpus-statistics concern, which is a separate question from
+            // whether the write was accepted, and asserting it here would make
+            // this test fail for a reason it was not written to detect.
+            let oracle = public_observation(&tantivy, &cx, "livegamma", 10)
+                .await
+                .into_iter()
+                .map(|(doc_id, _)| doc_id)
+                .collect::<Vec<_>>();
+            let subject = public_observation(&quill, &cx, "livegamma", 10)
+                .await
+                .into_iter()
+                .map(|(doc_id, _)| doc_id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                subject, oracle,
+                "the replacement must be publicly observable on both engines"
+            );
+        });
+    }
+
     #[test]
     fn fixture_source_qrels_and_chunk_manifest_are_frozen() {
         super::quiet_logging();
