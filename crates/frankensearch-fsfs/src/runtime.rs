@@ -9615,6 +9615,20 @@ impl FsfsRuntime {
                 };
             }
         };
+        if Self::is_legacy_hash_vector_generation(index.embedder_id()) {
+            return DoctorCheck {
+                name: "semantic.zero_signal".to_owned(),
+                verdict: DoctorVerdict::Warn,
+                detail: format!(
+                    "hash control generation `{}` is not a semantic lane",
+                    index.embedder_id()
+                ),
+                suggestion: Some(
+                    "see semantic.vector_generation; rebuild with a verified semantic embedder"
+                        .to_owned(),
+                ),
+            };
+        }
         let state = index.zero_signal_state();
         let census = format!(
             "records={} live={} tombstones={} wal={} usable={}",
@@ -12350,7 +12364,13 @@ impl FsfsRuntime {
     }
 
     #[must_use]
-    const fn semantic_runtime_failure_summary(error: &SearchError) -> &'static str {
+    fn semantic_runtime_failure_summary(error: &SearchError) -> &'static str {
+        if let SearchError::InvalidConfig { field, value, .. } = error
+            && field == "semantic.vector_generation"
+            && value == "legacy_hash"
+        {
+            return "hash control vector generation is not semantic search";
+        }
         match error {
             SearchError::EmbedderUnavailable { .. } => "semantic embedder is unavailable",
             SearchError::EmbeddingFailed { .. } => "semantic query embedding failed",
@@ -27925,6 +27945,43 @@ mod tests {
                 check.detail
             );
         }
+    }
+
+    #[test]
+    fn doctor_zero_signal_does_not_diagnose_hash_as_a_semantic_lane() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+        fs::create_dir_all(vector_path.parent().expect("vector path parent"))
+            .expect("create vector directory");
+        VectorIndex::create(&vector_path, "fnv1a-256", 256)
+            .expect("create hash control generation")
+            .finish()
+            .expect("finish hash control generation");
+
+        let check = FsfsRuntime::collect_zero_signal_doctor_check(&index_root);
+        assert_eq!(check.verdict, super::DoctorVerdict::Warn);
+        assert_eq!(check.name, "semantic.zero_signal");
+        assert!(
+            check.detail.contains("fnv1a-256") && check.detail.contains("not a semantic lane"),
+            "zero-signal check must not census a hash generation as semantic: {}",
+            check.detail
+        );
+        assert!(
+            !check.detail.contains("usable="),
+            "hash control must not be scored as a semantic census: {}",
+            check.detail
+        );
+
+        let summary = FsfsRuntime::semantic_runtime_failure_summary(&SearchError::InvalidConfig {
+            field: "semantic.vector_generation".to_owned(),
+            value: "legacy_hash".to_owned(),
+            reason: "hash".to_owned(),
+        });
+        assert_eq!(
+            summary,
+            "hash control vector generation is not semantic search"
+        );
     }
 
     #[test]
