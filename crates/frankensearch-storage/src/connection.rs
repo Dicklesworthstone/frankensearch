@@ -295,7 +295,7 @@ impl Storage {
     /// install only the exact schema surface under test. Keeping this seam
     /// test-only prevents production callers from bypassing bootstrap.
     #[cfg(all(test, feature = "fts5"))]
-    pub(crate) async fn open_unbootstrapped_in_memory_for_test(_cx: &Cx) -> SearchResult<Self> {
+    pub(crate) fn open_unbootstrapped_in_memory_for_test() -> SearchResult<Self> {
         let config = StorageConfig::in_memory();
         let path = config.db_path.to_string_lossy().to_string();
         let conn = open_connection_with_retry(&path)

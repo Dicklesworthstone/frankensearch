@@ -87,14 +87,10 @@ ftui-widgets = { workspace = true }
 ftui-tty = { workspace = true }
 ftui-backend = { workspace = true }
 ftui-extras = { workspace = true, features = ["markdown"] }
-# MIGRATION SHIM (temporary): fsfs's binary entrypoints still mint ambient
-# contexts via Cx::for_request() (main.rs:188, runtime.rs:1563, runtime.rs:6880),
-# which Asupersync 0.4.x cfg-gates behind test-internals. fsfs is a LEAF
-# binary crate — no lib crate or external consumer (e.g. HFDT) has it in
-# their graph, so this does NOT re-leak test-internals downstream. Proper fix:
-# migrate the three sites to runtime-injected contexts (spawn_with_cx /
-# runtime-attached Cx) per the asupersync capability model, then drop this.
-asupersync = { workspace = true, features = ["test-internals"] }
+# Production uses RuntimeBuilder + spawn + Cx::current() (main.rs).
+# Cx::for_request() / test_utils stay behind [dev-dependencies] so
+# test-internals does not unify into the shipping fsfs graph.
+asupersync = { workspace = true }
 ahash = { workspace = true }
 # compact_str: SSO short-string type (inline <=24 bytes, zero heap alloc) for
 # lexical token text — the per-token to_ascii_lowercase heap alloc dominated

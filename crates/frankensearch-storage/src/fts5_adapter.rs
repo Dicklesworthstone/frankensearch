@@ -34,7 +34,9 @@ use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument, warn};
 
-use crate::connection::{Storage, fsqlite_cx, map_storage_error_at};
+use crate::connection::{
+    Storage, fsqlite_cx, map_storage_error_at, retry_transient_storage, unretryable_rollback_error,
+};
 use crate::schema::PORTER_FTS5_REBUILD_TABLE;
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -482,16 +484,16 @@ impl frankensearch_core::LexicalRead for PersistedFts5LexicalSearch {
     }
 }
 
-/// Rebuild a persisted Porter FTS5 table for FrankenSQLite 0.3.
+/// Rebuild a persisted Porter FTS5 table for `FrankenSQLite` 0.3.
 ///
 /// The table's own DDL decides its content mode. Ordinary stored and external
 /// tables use FTS5's `rebuild` command; contentless tables are rejected because
 /// authoritative text and original rowids must be re-ingested instead.
 ///
-/// Rebuild and marker promotion share one synchronous worker transaction. The
-/// 0.3 synchronous cleanup path is independent of request cancellation, so an
-/// ordinary error, failed commit, or panic always attempts exactly one rollback
-/// before the original error or panic is returned to the caller.
+/// Rebuild and marker promotion share one synchronous worker transaction.
+/// Transient `FrankenSQLite` errors retry the whole transaction after a
+/// successful rollback. A failed rollback is not retried. Panic still
+/// rolls back once and resumes unwinding.
 pub async fn rebuild_porter_fts5_table(
     cx: &Cx,
     conn: &AsyncConnection,
@@ -516,6 +518,19 @@ pub async fn rebuild_porter_fts5_table(
         Some(_) | None => {}
     }
 
+    cx.checkpoint().map_err(|error| SearchError::Cancelled {
+        phase: "porter fts5 rebuild".to_owned(),
+        reason: cx
+            .cancel_reason()
+            .map_or_else(|| error.to_string(), |reason| reason.to_string()),
+    })?;
+    retry_transient_storage(
+        || rebuild_porter_fts5_table_once(conn, &table_name),
+        "porter fts5 rebuild",
+    )
+}
+
+fn rebuild_porter_fts5_table_once(conn: &AsyncConnection, table_name: &str) -> SearchResult<()> {
     conn.execute_sync("BEGIN IMMEDIATE;")
         .map_err(|error| map_storage_error_at("begin Porter FTS5 rebuild", error))?;
 
@@ -525,7 +540,7 @@ pub async fn rebuild_porter_fts5_table(
             .map_err(|error| map_storage_error_at("rebuild Porter FTS5 table", error))?;
 
         let params = [
-            SqliteValue::Text(table_name.clone().into()),
+            SqliteValue::Text(table_name.to_owned().into()),
             SqliteValue::Integer(PORTER_FTS5_REBUILD_VERSION),
         ];
         conn.execute_with_params_sync(
@@ -542,23 +557,30 @@ pub async fn rebuild_porter_fts5_table(
 
     match result {
         Ok(Ok(())) => conn.commit_transaction_sync().map_err(|commit_error| {
-            if let Err(rollback_error) = conn.rollback_transaction_sync() {
-                warn!(
-                    error = %rollback_error,
-                    "rollback failed after Porter FTS5 rebuild commit error"
-                );
+            match conn.rollback_transaction_sync() {
+                Ok(()) => map_storage_error_at("commit Porter FTS5 rebuild", commit_error),
+                Err(rollback_error) => {
+                    warn!(
+                        error = %rollback_error,
+                        "rollback failed after Porter FTS5 rebuild commit error"
+                    );
+                    unretryable_rollback_error(
+                        &map_storage_error_at("commit Porter FTS5 rebuild", commit_error),
+                        &rollback_error,
+                    )
+                }
             }
-            map_storage_error_at("commit Porter FTS5 rebuild", commit_error)
         }),
-        Ok(Err(error)) => {
-            if let Err(rollback_error) = conn.rollback_transaction_sync() {
+        Ok(Err(error)) => match conn.rollback_transaction_sync() {
+            Ok(()) => Err(error),
+            Err(rollback_error) => {
                 warn!(
                     error = %rollback_error,
                     "rollback failed after Porter FTS5 rebuild error"
                 );
+                Err(unretryable_rollback_error(&error, &rollback_error))
             }
-            Err(error)
-        }
+        },
         Err(payload) => {
             if let Err(rollback_error) = conn.rollback_transaction_sync() {
                 warn!(
@@ -1552,8 +1574,7 @@ mod tests {
     fn persisted_count_requires_async_authority_and_revalidates_the_marker() {
         run_with_cx(|cx| async move {
             let storage = Arc::new(
-                Storage::open_unbootstrapped_in_memory_for_test(&cx)
-                    .await
+                Storage::open_unbootstrapped_in_memory_for_test()
                     .expect("in-memory storage should open"),
             );
             let fsqlite_cx = fsqlite_cx(&cx);
