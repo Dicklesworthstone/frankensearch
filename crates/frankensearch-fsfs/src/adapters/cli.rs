@@ -1977,6 +1977,7 @@ mod tests {
             DegradationFailureKind::CorruptIndex,
             DegradationFailureKind::CacheMiss,
             DegradationFailureKind::SemanticZeroSignal,
+            DegradationFailureKind::HashControlGeneration,
         ];
         let mut emitted = Vec::new();
         for failure in failures {

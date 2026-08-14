@@ -19,6 +19,7 @@ pub enum DegradationFailureKind {
     CorruptIndex,
     CacheMiss,
     SemanticZeroSignal,
+    HashControlGeneration,
 }
 
 impl DegradationFailureKind {
@@ -33,6 +34,7 @@ impl DegradationFailureKind {
             Self::CorruptIndex => "degrade.advice.index_corrupt",
             Self::CacheMiss => "degrade.advice.cache_miss",
             Self::SemanticZeroSignal => "degrade.advice.semantic_zero_signal",
+            Self::HashControlGeneration => "degrade.advice.hash_control",
         }
     }
 
@@ -51,6 +53,9 @@ impl DegradationFailureKind {
             Self::SemanticZeroSignal => {
                 "semantic lane produced zero signal despite live records; results may be lexical-only"
             }
+            Self::HashControlGeneration => {
+                "vector generation is a hash control artifact, not semantic search"
+            }
         }
     }
 
@@ -63,7 +68,8 @@ impl DegradationFailureKind {
             | Self::UnverifiableEmbeddingSpace
             | Self::Timeout
             | Self::CacheMiss
-            | Self::SemanticZeroSignal => true,
+            | Self::SemanticZeroSignal
+            | Self::HashControlGeneration => true,
             Self::CorruptIndex => false,
         }
     }
@@ -196,7 +202,7 @@ pub fn advice_for_zero_signal(
 }
 
 #[must_use]
-pub const fn classify_search_error(error: &SearchError) -> DegradationFailureKind {
+pub fn classify_search_error(error: &SearchError) -> DegradationFailureKind {
     match error {
         SearchError::SearchTimeout { .. } => DegradationFailureKind::Timeout,
         SearchError::IndexCorrupted { .. }
@@ -207,6 +213,11 @@ pub const fn classify_search_error(error: &SearchError) -> DegradationFailureKin
         | SearchError::ModelLoadFailed { .. } => DegradationFailureKind::MissingQualityModel,
         SearchError::UnverifiableRemoteSpace { .. } => {
             DegradationFailureKind::UnverifiableEmbeddingSpace
+        }
+        SearchError::InvalidConfig { field, value, .. }
+            if field == "semantic.vector_generation" && value == "legacy_hash" =>
+        {
+            DegradationFailureKind::HashControlGeneration
         }
         SearchError::InvalidConfig { .. }
         | SearchError::IndexNotFound { .. }
@@ -236,6 +247,7 @@ pub fn synthetic_degradation_advice_fixture() -> Vec<DegradationAdvice> {
         DegradationFailureKind::CorruptIndex,
         DegradationFailureKind::CacheMiss,
         DegradationFailureKind::SemanticZeroSignal,
+        DegradationFailureKind::HashControlGeneration,
     ]
     .into_iter()
     .map(|failure| {
@@ -258,7 +270,8 @@ const fn severity_for(failure: DegradationFailureKind) -> DegradationAdviceSever
         | DegradationFailureKind::UnverifiableEmbeddingSpace
         | DegradationFailureKind::Timeout
         | DegradationFailureKind::CacheMiss
-        | DegradationFailureKind::SemanticZeroSignal => DegradationAdviceSeverity::Warn,
+        | DegradationFailureKind::SemanticZeroSignal
+        | DegradationFailureKind::HashControlGeneration => DegradationAdviceSeverity::Warn,
         DegradationFailureKind::LexicalFallback => DegradationAdviceSeverity::Info,
         DegradationFailureKind::CorruptIndex => DegradationAdviceSeverity::Error,
     }
@@ -392,6 +405,20 @@ fn next_actions_for(
                 Some(format!("fsfs index . --full --index-dir {index_dir}")),
             ),
         ],
+        DegradationFailureKind::HashControlGeneration => vec![
+            action(
+                1,
+                "degrade.action.do_not_treat_hash_as_semantic",
+                "Do not treat this result set as semantic search; the published FSVI is a hash/fnv control artifact.",
+                Some(format!("fsfs status --index-dir {index_dir} --format json")),
+            ),
+            action(
+                2,
+                "degrade.action.rebuild_semantic_generation",
+                "Rebuild with a verified semantic embedder; installing a model alone cannot repair hash vectors.",
+                Some(format!("fsfs index . --full --index-dir {index_dir}")),
+            ),
+        ],
     }
 }
 
@@ -449,6 +476,7 @@ mod tests {
                 "degrade.advice.index_corrupt",
                 "degrade.advice.cache_miss",
                 "degrade.advice.semantic_zero_signal",
+                "degrade.advice.hash_control",
             ]
         );
         assert!(
@@ -545,13 +573,34 @@ mod tests {
         let advice = advice_for_search_error("index discovery", None, &error);
 
         assert_eq!(advice.failure, DegradationFailureKind::CacheMiss);
-        assert_eq!(advice.reason_code, "degrade.advice.cache_miss");
+    }
+
+    #[test]
+    fn hash_control_invalid_config_is_not_a_cache_miss() {
+        let error = SearchError::InvalidConfig {
+            field: "semantic.vector_generation".to_owned(),
+            value: "legacy_hash".to_owned(),
+            reason: "vector generation `fnv1a-256` is a hash control artifact, not semantic search"
+                .to_owned(),
+        };
+        let advice = advice_for_search_error("ownership", Some(Path::new("/tmp/index")), &error);
+        assert_eq!(
+            advice.failure,
+            DegradationFailureKind::HashControlGeneration
+        );
+        assert_eq!(advice.reason_code, "degrade.advice.hash_control");
         assert!(
             advice
-                .original_error
-                .as_deref()
-                .is_some_and(|text| text.contains("vector.fast.idx"))
+                .next_actions
+                .iter()
+                .any(|action| action.action.contains("hash/fnv"))
         );
+        assert!(!advice.next_actions.iter().any(|action| {
+            action
+                .command
+                .as_deref()
+                .is_some_and(|command| command.contains("download-models"))
+        }));
     }
 
     #[test]

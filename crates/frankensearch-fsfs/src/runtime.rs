@@ -7912,6 +7912,12 @@ impl FsfsRuntime {
                 warn!(
                     "hash control vector generation has no admitted embedder; continuing lexical-only"
                 );
+                resources
+                    .degradation_advice
+                    .push(Self::hash_control_degradation_advice(
+                        &normalized_query,
+                        &resources.index_root,
+                    ));
             } else if Self::vector_generation_is_hash_control(resources) {
                 return Err(Self::hash_control_search_error(resources));
             } else {
@@ -12002,6 +12008,16 @@ impl FsfsRuntime {
         Self::vector_generation_is_hash_control(resources) && resources.lexical_index.is_some()
     }
 
+    fn hash_control_degradation_advice(query: &str, index_root: &Path) -> DegradationAdvice {
+        DegradationAdvice::from_input(DegradationAdviceInput {
+            failure: DegradationFailureKind::HashControlGeneration,
+            query,
+            index_dir: Some(index_root),
+            original_error: None,
+            replay_command: None,
+        })
+    }
+
     fn hash_control_search_error(resources: &SearchExecutionResources) -> SearchError {
         let generation = resources
             .vector_index
@@ -12009,7 +12025,7 @@ impl FsfsRuntime {
             .map_or("hash", |index| index.embedder_id());
         SearchError::InvalidConfig {
             field: "semantic.vector_generation".to_owned(),
-            value: generation.to_owned(),
+            value: "legacy_hash".to_owned(),
             reason: format!(
                 "vector generation `{generation}` is a hash control artifact, not semantic search; rebuild with a verified semantic embedder"
             ),
@@ -12845,6 +12861,12 @@ impl FsfsRuntime {
                             error = %error,
                             "hash control generation is not an admissible semantic lane; continuing lexical-only"
                         );
+                        resources
+                            .degradation_advice
+                            .push(Self::hash_control_degradation_advice(
+                                "",
+                                &resources.index_root,
+                            ));
                         return Ok(());
                     }
                     return Err(error);
@@ -12864,6 +12886,12 @@ impl FsfsRuntime {
                         error = %error,
                         "hash control generation has no admitted embedder; continuing lexical-only"
                     );
+                    resources
+                        .degradation_advice
+                        .push(Self::hash_control_degradation_advice(
+                            "",
+                            &resources.index_root,
+                        ));
                     return Ok(());
                 }
                 Err(error)
