@@ -906,6 +906,59 @@ mod lexical {
 
     #[cfg(feature = "lexical-tantivy")]
     #[test]
+    fn public_zero_limit_range_matches_tantivy_without_spending_query_fuel() {
+        super::quiet_logging();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            const FUEL_BUDGET: u64 = 6;
+            let documents = ["atlas", "boreal", "cinder", "dynamo"]
+                .into_iter()
+                .map(|term| IndexableDocument::new(format!("range-{term}"), term))
+                .collect::<Vec<_>>();
+            let tmp = tempfile::tempdir().expect("tempdir");
+
+            let quill = QuillIndex::create(
+                &cx,
+                tmp.path().join("quill"),
+                QuillConfig {
+                    deterministic_ingest: true,
+                    glob_expansion_limit: 1,
+                    query_fuel_budget: FUEL_BUDGET,
+                    ..QuillConfig::default()
+                },
+            )
+            .await
+            .expect("create low-fuel Quill index");
+            LexicalWrite::index_documents(&quill, &cx, &documents)
+                .await
+                .expect("index low-fuel Quill fixture");
+            LexicalWrite::commit(&quill, &cx)
+                .await
+                .expect("commit low-fuel Quill fixture");
+
+            let tantivy =
+                TantivyIndex::create(&tmp.path().join("tantivy")).expect("create Tantivy index");
+            LexicalWrite::index_documents(&tantivy, &cx, &documents)
+                .await
+                .expect("index Tantivy fixture");
+            LexicalWrite::commit(&tantivy, &cx)
+                .await
+                .expect("commit Tantivy fixture");
+
+            let query = "content:[a TO *]";
+            let oracle = LexicalRead::search(&tantivy, &cx, query, 0)
+                .await
+                .expect("pinned Tantivy zero-limit range search");
+            assert!(oracle.is_empty());
+
+            let subject = LexicalRead::search(&quill, &cx, query, 0)
+                .await
+                .expect("Quill zero-limit range must not lower or spend query fuel");
+            assert!(subject.is_empty());
+        });
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    #[test]
     fn public_redundant_deep_groups_match_tantivy_oracle() {
         super::quiet_logging();
         asupersync::test_utils::run_test_with_cx(|cx| async move {

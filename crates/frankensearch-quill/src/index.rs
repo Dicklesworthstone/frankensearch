@@ -9440,6 +9440,10 @@ impl QuillReader {
         hydrate_metadata: bool,
         snapshot: &QuillSearchSnapshot,
     ) -> Result<Vec<ScoredResult>, QuillIndexError> {
+        if limit == 0 {
+            check_cancel(cx, "search")?;
+            return Ok(Vec::new());
+        }
         let search = self.search_paginated_on(cx, query, limit, 0, false, snapshot)?;
         let mut results = Vec::new();
         results
