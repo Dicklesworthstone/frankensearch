@@ -1238,6 +1238,7 @@ fn fused_hits_to_scored_results(
         .take(k)
         .map(|hit| {
             let score = saturating_f64_to_f32(hit.rrf_score);
+            let source = crate::rrf::classify_fused_hit_source(&hit, fast_embedder_id);
             let explanation = config.explain.then(|| {
                 let mut components = Vec::with_capacity(2);
                 if let (Some(rank), Some(raw_score)) = (hit.lexical_rank, hit.lexical_score) {
@@ -1275,7 +1276,7 @@ fn fused_hits_to_scored_results(
             ScoredResult {
                 doc_id: hit.doc_id,
                 score,
-                source: ScoreSource::Hybrid,
+                source,
                 index: hit.semantic_index,
                 fast_score: hit.semantic_score,
                 quality_score: None,
@@ -2206,10 +2207,13 @@ mod tests {
             SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default()).with_lexical(lexical);
         let (results, _) = searcher.search_collect(&tiered(vec![1.0, 0.0]), 3).unwrap();
         assert!(results.iter().any(|result| result.doc_id == "lex-only"));
-        assert!(
+        assert_eq!(
             results
                 .iter()
-                .all(|result| result.source == ScoreSource::Hybrid)
+                .find(|result| result.doc_id == "lex-only")
+                .map(|result| result.source),
+            Some(ScoreSource::Lexical),
+            "a fused lexical-only hit is not hybrid semantic search"
         );
     }
 

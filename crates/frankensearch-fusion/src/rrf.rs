@@ -15,7 +15,9 @@
 use std::collections::hash_map::Entry;
 
 use ahash::AHashMap;
-use frankensearch_core::{FusedHit, FusionStrategy, ScoredResult, VectorHit};
+use frankensearch_core::{
+    FusedHit, FusionStrategy, ScoreSource, ScoredResult, VectorHit, is_hash_generation_id,
+};
 use tracing::{Level, debug, instrument};
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -133,6 +135,27 @@ fn sanitize_graph_weight(weight: f64) -> f64 {
         weight
     } else {
         0.0
+    }
+}
+
+/// Label a fused hit by the lanes that actually contributed.
+///
+/// Hash/fnv/jl vector-only hits are [`ScoreSource::HashControl`], never
+/// [`ScoreSource::SemanticFast`]. Lexical-only fused rows stay lexical.
+#[must_use]
+pub(crate) fn classify_fused_hit_source(hit: &FusedHit, fast_embedder_id: &str) -> ScoreSource {
+    if hit.in_both_sources {
+        ScoreSource::Hybrid
+    } else if hit.lexical_rank.is_some() {
+        ScoreSource::Lexical
+    } else if hit.semantic_rank.is_some() {
+        if is_hash_generation_id(fast_embedder_id) {
+            ScoreSource::HashControl
+        } else {
+            ScoreSource::SemanticFast
+        }
+    } else {
+        ScoreSource::Hybrid
     }
 }
 
@@ -1014,6 +1037,44 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    fn fused(
+        doc_id: &str,
+        lexical_rank: Option<usize>,
+        semantic_rank: Option<usize>,
+        in_both_sources: bool,
+    ) -> FusedHit {
+        FusedHit {
+            doc_id: doc_id.into(),
+            rrf_score: 1.0,
+            lexical_rank,
+            semantic_rank,
+            semantic_index: semantic_rank.map(|_| 0),
+            lexical_score: lexical_rank.map(|_| 1.0),
+            semantic_score: semantic_rank.map(|_| 0.5),
+            in_both_sources,
+        }
+    }
+
+    #[test]
+    fn classify_fused_hit_source_separates_hash_and_lexical() {
+        assert_eq!(
+            classify_fused_hit_source(&fused("both", Some(0), Some(0), true), "fnv1a-256"),
+            ScoreSource::Hybrid
+        );
+        assert_eq!(
+            classify_fused_hit_source(&fused("lex", Some(0), None, false), "fnv1a-256"),
+            ScoreSource::Lexical
+        );
+        assert_eq!(
+            classify_fused_hit_source(&fused("hash", None, Some(0), false), "fnv1a-256"),
+            ScoreSource::HashControl
+        );
+        assert_eq!(
+            classify_fused_hit_source(&fused("sem", None, Some(0), false), "minilm-l6-v2"),
+            ScoreSource::SemanticFast
+        );
+    }
 
     fn lexical_hit(doc_id: &str, score: f32) -> ScoredResult {
         ScoredResult {

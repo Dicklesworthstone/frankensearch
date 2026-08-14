@@ -3486,20 +3486,7 @@ fn fused_hits_to_scored_results(
         .map(|fh| {
             #[allow(clippy::cast_possible_truncation)]
             let score = fh.rrf_score as f32;
-            let source = if fh.in_both_sources {
-                ScoreSource::Hybrid
-            } else if fh.lexical_rank.is_some() {
-                ScoreSource::Lexical
-            } else if fh.semantic_rank.is_some() {
-                if frankensearch_core::is_hash_generation_id(fast_embedder_id) {
-                    ScoreSource::HashControl
-                } else {
-                    ScoreSource::SemanticFast
-                }
-            } else {
-                // Graph-only candidates (no lexical/semantic rank) still come from hybrid fusion.
-                ScoreSource::Hybrid
-            };
+            let source = crate::rrf::classify_fused_hit_source(fh, fast_embedder_id);
             let explanation = explain.then(|| {
                 let mut components = Vec::new();
 
