@@ -2417,50 +2417,52 @@ impl OpsStorage {
             });
         }
 
-        let conn = self.connection();
         let search_cutoff = now_ms.saturating_sub(policy.raw_search_event_retention_ms);
         let summary_cutoff = now_ms.saturating_sub(policy.search_summary_retention_ms);
         let resource_cutoff = now_ms.saturating_sub(policy.resource_sample_retention_ms);
         let downsample_cutoff = now_ms.saturating_sub(policy.resource_downsample_after_ms);
+        let downsample_stride = policy.resource_downsample_stride;
 
-        let downsampled_resource_samples = if policy.resource_downsample_stride > 1 {
-            conn.execute_with_params_sync(
-                "DELETE FROM resource_samples \
+        self.with_transaction(|conn| {
+            let downsampled_resource_samples = if downsample_stride > 1 {
+                conn.execute_with_params_sync(
+                    "DELETE FROM resource_samples \
              WHERE ts_ms < ?1 AND (sample_id % ?2) != 0;",
-                &[
-                    SqliteValue::Integer(downsample_cutoff),
-                    SqliteValue::Integer(i64::from(policy.resource_downsample_stride)),
-                ],
-            )
-            .map_err(ops_error)?
-        } else {
-            0
-        };
+                    &[
+                        SqliteValue::Integer(downsample_cutoff),
+                        SqliteValue::Integer(i64::from(downsample_stride)),
+                    ],
+                )
+                .map_err(ops_error)?
+            } else {
+                0
+            };
 
-        let deleted_search_events = conn
-            .execute_with_params_sync(
-                "DELETE FROM search_events WHERE ts_ms < ?1;",
-                &[SqliteValue::Integer(search_cutoff)],
-            )
-            .map_err(ops_error)?;
-        let deleted_search_summaries = conn
-            .execute_with_params_sync(
-                "DELETE FROM search_summaries WHERE window_start_ms < ?1;",
-                &[SqliteValue::Integer(summary_cutoff)],
-            )
-            .map_err(ops_error)?;
-        let deleted_resource_samples = conn
-            .execute_with_params_sync(
-                "DELETE FROM resource_samples WHERE ts_ms < ?1;",
-                &[SqliteValue::Integer(resource_cutoff)],
-            )
-            .map_err(ops_error)?;
+            let deleted_search_events = conn
+                .execute_with_params_sync(
+                    "DELETE FROM search_events WHERE ts_ms < ?1;",
+                    &[SqliteValue::Integer(search_cutoff)],
+                )
+                .map_err(ops_error)?;
+            let deleted_search_summaries = conn
+                .execute_with_params_sync(
+                    "DELETE FROM search_summaries WHERE window_start_ms < ?1;",
+                    &[SqliteValue::Integer(summary_cutoff)],
+                )
+                .map_err(ops_error)?;
+            let deleted_resource_samples = conn
+                .execute_with_params_sync(
+                    "DELETE FROM resource_samples WHERE ts_ms < ?1;",
+                    &[SqliteValue::Integer(resource_cutoff)],
+                )
+                .map_err(ops_error)?;
 
-        Ok(OpsRetentionResult {
-            deleted_search_events: usize_to_u64(deleted_search_events),
-            deleted_search_summaries: usize_to_u64(deleted_search_summaries),
-            deleted_resource_samples: usize_to_u64(deleted_resource_samples),
-            downsampled_resource_samples: usize_to_u64(downsampled_resource_samples),
+            Ok(OpsRetentionResult {
+                deleted_search_events: usize_to_u64(deleted_search_events),
+                deleted_search_summaries: usize_to_u64(deleted_search_summaries),
+                deleted_resource_samples: usize_to_u64(deleted_resource_samples),
+                downsampled_resource_samples: usize_to_u64(downsampled_resource_samples),
+            })
         })
     }
 
