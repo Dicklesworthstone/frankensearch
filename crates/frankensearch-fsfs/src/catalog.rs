@@ -10,7 +10,7 @@ use std::io;
 use std::path::Path;
 
 use frankensearch_core::{SearchError, SearchResult};
-use fsqlite::{Connection, Row};
+use fsqlite::{AsyncConnection as Connection, Row};
 use fsqlite_types::value::SqliteValue;
 
 pub const CATALOG_SCHEMA_VERSION: i64 = 1;
@@ -101,7 +101,7 @@ pub const CLEANUP_TOMBSTONES_SQL: &str = "DELETE FROM fsfs_catalog_files \
 ///
 /// Returns an error if `SQLite` execution fails.
 pub fn cleanup_tombstones(conn: &Connection, cutoff_ts_ms: i64) -> SearchResult<usize> {
-    conn.execute_with_params(
+    conn.execute_with_params_sync(
         CLEANUP_TOMBSTONES_SQL,
         &[SqliteValue::Integer(cutoff_ts_ms)],
     )
@@ -120,7 +120,7 @@ pub fn cleanup_tombstones_for_path(db_path: &Path, cutoff_ts_ms: i64) -> SearchR
     if !db_path.exists() {
         return Ok(0);
     }
-    let conn = Connection::open(db_path.display().to_string()).map_err(catalog_error)?;
+    let conn = Connection::open_sync(db_path.display().to_string()).map_err(catalog_error)?;
     bootstrap_catalog_schema(&conn)?;
     cleanup_tombstones(&conn, cutoff_ts_ms)
 }
@@ -247,21 +247,25 @@ pub const fn classify_replay_sequence(last_applied_seq: i64, incoming_seq: i64) 
 /// Returns an error if schema DDL fails, the version marker is invalid, or the
 /// transaction cannot be committed.
 pub fn bootstrap_catalog_schema(conn: &Connection) -> SearchResult<()> {
-    conn.execute("BEGIN IMMEDIATE;").map_err(catalog_error)?;
+    conn.execute_sync("BEGIN IMMEDIATE;")
+        .map_err(catalog_error)?;
     let result = bootstrap_catalog_schema_inner(conn);
     match result {
-        Ok(()) => conn.execute("COMMIT;").map(|_| ()).map_err(|commit_err| {
-            if let Err(rollback_err) = conn.execute("ROLLBACK;") {
-                tracing::warn!(
-                    target: "frankensearch.fsfs.catalog",
-                    error = %rollback_err,
-                    "rollback failed after catalog schema bootstrap commit error"
-                );
-            }
-            catalog_error(commit_err)
-        }),
+        Ok(()) => conn
+            .execute_sync("COMMIT;")
+            .map(|_| ())
+            .map_err(|commit_err| {
+                if let Err(rollback_err) = conn.execute_sync("ROLLBACK;") {
+                    tracing::warn!(
+                        target: "frankensearch.fsfs.catalog",
+                        error = %rollback_err,
+                        "rollback failed after catalog schema bootstrap commit error"
+                    );
+                }
+                catalog_error(commit_err)
+            }),
         Err(error) => {
-            if let Err(rollback_err) = conn.execute("ROLLBACK;") {
+            if let Err(rollback_err) = conn.execute_sync("ROLLBACK;") {
                 tracing::warn!(
                     target: "frankensearch.fsfs.catalog",
                     error = %rollback_err,
@@ -274,7 +278,7 @@ pub fn bootstrap_catalog_schema(conn: &Connection) -> SearchResult<()> {
 }
 
 fn bootstrap_catalog_schema_inner(conn: &Connection) -> SearchResult<()> {
-    conn.execute(
+    conn.execute_sync(
         "CREATE TABLE IF NOT EXISTS fsfs_catalog_schema_version (version INTEGER PRIMARY KEY);",
     )
     .map_err(catalog_error)?;
@@ -282,11 +286,11 @@ fn bootstrap_catalog_schema_inner(conn: &Connection) -> SearchResult<()> {
     let mut version = current_catalog_schema_version_optional(conn)?.unwrap_or(0);
     if version == 0 {
         for statement in LATEST_SCHEMA {
-            conn.execute(statement).map_err(catalog_error)?;
+            conn.execute_sync(statement).map_err(catalog_error)?;
         }
 
         let params = [SqliteValue::Integer(CATALOG_SCHEMA_VERSION)];
-        conn.execute_with_params(
+        conn.execute_with_params_sync(
             "INSERT OR REPLACE INTO fsfs_catalog_schema_version(version) VALUES (?1);",
             &params,
         )
@@ -313,7 +317,7 @@ fn bootstrap_catalog_schema_inner(conn: &Connection) -> SearchResult<()> {
     }
 
     let params = [SqliteValue::Integer(CATALOG_SCHEMA_VERSION)];
-    conn.execute_with_params(
+    conn.execute_with_params_sync(
         "INSERT OR REPLACE INTO fsfs_catalog_schema_version(version) VALUES (?1);",
         &params,
     )
@@ -339,7 +343,9 @@ pub fn current_catalog_schema_version(conn: &Connection) -> SearchResult<i64> {
 
 fn current_catalog_schema_version_optional(conn: &Connection) -> SearchResult<Option<i64>> {
     let rows = conn
-        .query("SELECT version FROM fsfs_catalog_schema_version ORDER BY version DESC LIMIT 1;")
+        .query_sync(
+            "SELECT version FROM fsfs_catalog_schema_version ORDER BY version DESC LIMIT 1;",
+        )
         .map_err(catalog_error)?;
     let Some(row) = rows.first() else {
         return Ok(None);
@@ -383,14 +389,14 @@ mod tests {
         bootstrap_catalog_schema, catalog_error, classify_replay_sequence, cleanup_tombstones,
         cleanup_tombstones_for_path, current_catalog_schema_version,
     };
-    use fsqlite::Connection;
+    use fsqlite::AsyncConnection as Connection;
     use fsqlite_types::value::SqliteValue;
 
     fn table_exists(conn: &Connection, table_name: &str) -> bool {
         // Probe table existence with a zero-row SELECT instead of
         // querying sqlite_master: FrankenSQLite's VDBE cannot open a
         // storage cursor on sqlite_master's btree root page.
-        conn.query(&format!("SELECT 1 FROM \"{table_name}\" LIMIT 0"))
+        conn.query_sync(&format!("SELECT 1 FROM \"{table_name}\" LIMIT 0"))
             .is_ok()
     }
 
@@ -399,7 +405,7 @@ mod tests {
         // sqlite_master: FrankenSQLite's VDBE cannot open a storage
         // cursor on sqlite_master's btree root page. If the index
         // doesn't exist, the query errors with "no such index".
-        conn.query(&format!(
+        conn.query_sync(&format!(
             "SELECT 1 FROM \"{table_name}\" INDEXED BY \"{index_name}\" LIMIT 0"
         ))
         .is_ok()
@@ -407,7 +413,7 @@ mod tests {
 
     #[test]
     fn bootstrap_creates_catalog_tables_and_indexes() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let conn = Connection::open_sync(":memory:".to_owned()).expect("in-memory connection");
 
         bootstrap_catalog_schema(&conn).expect("catalog bootstrap should succeed");
 
@@ -444,7 +450,7 @@ mod tests {
 
     #[test]
     fn bootstrap_is_idempotent() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let conn = Connection::open_sync(":memory:".to_owned()).expect("in-memory connection");
 
         bootstrap_catalog_schema(&conn).expect("first bootstrap should succeed");
         bootstrap_catalog_schema(&conn).expect("second bootstrap should succeed");
@@ -458,12 +464,12 @@ mod tests {
 
     #[test]
     fn bootstrap_rejects_legacy_schema_versions() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
-        conn.execute(
+        let conn = Connection::open_sync(":memory:".to_owned()).expect("in-memory connection");
+        conn.execute_sync(
             "CREATE TABLE IF NOT EXISTS fsfs_catalog_schema_version (version INTEGER PRIMARY KEY);",
         )
         .expect("schema version table should create");
-        conn.execute("INSERT INTO fsfs_catalog_schema_version(version) VALUES (-1);")
+        conn.execute_sync("INSERT INTO fsfs_catalog_schema_version(version) VALUES (-1);")
             .expect("legacy row should insert");
 
         let error = bootstrap_catalog_schema(&conn).expect_err("legacy schema should be rejected");
@@ -476,13 +482,13 @@ mod tests {
 
     #[test]
     fn bootstrap_rejects_future_schema_versions() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
-        conn.execute(
+        let conn = Connection::open_sync(":memory:".to_owned()).expect("in-memory connection");
+        conn.execute_sync(
             "CREATE TABLE IF NOT EXISTS fsfs_catalog_schema_version (version INTEGER PRIMARY KEY);",
         )
         .expect("schema version table should create");
         let params = [SqliteValue::Integer(CATALOG_SCHEMA_VERSION + 10)];
-        conn.execute_with_params(
+        conn.execute_with_params_sync(
             "INSERT INTO fsfs_catalog_schema_version(version) VALUES (?1);",
             &params,
         )
@@ -595,8 +601,8 @@ mod tests {
 
     #[test]
     fn current_version_errors_when_table_has_no_rows() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
-        conn.execute(
+        let conn = Connection::open_sync(":memory:".to_owned()).expect("in-memory connection");
+        conn.execute_sync(
             "CREATE TABLE IF NOT EXISTS fsfs_catalog_schema_version (version INTEGER PRIMARY KEY);",
         )
         .expect("create table");
@@ -608,7 +614,7 @@ mod tests {
 
     #[test]
     fn incremental_workload_queries_execute_and_have_index_support() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let conn = Connection::open_sync(":memory:".to_owned()).expect("in-memory connection");
         bootstrap_catalog_schema(&conn).expect("catalog bootstrap should succeed");
 
         for index in [
@@ -648,7 +654,7 @@ mod tests {
             SqliteValue::Integer(now),
             SqliteValue::Integer(now),
         ];
-        conn.execute_with_params(
+        conn.execute_with_params_sync(
             "INSERT INTO fsfs_catalog_files \
              (file_key, mount_id, canonical_path, content_hash, revision, ingestion_class, pipeline_status, eligible, first_seen_ts, last_seen_ts, updated_ts) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11);",
@@ -668,7 +674,7 @@ mod tests {
             SqliteValue::Text("corr-1".to_owned().into()),
             SqliteValue::Text("token-1".to_owned().into()),
         ];
-        conn.execute_with_params(
+        conn.execute_with_params_sync(
             "INSERT INTO fsfs_catalog_changelog \
              (stream_seq, file_key, revision, change_kind, ingestion_class, pipeline_status, content_hash, event_ts, correlation_id, replay_token) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10);",
@@ -677,28 +683,28 @@ mod tests {
         .expect("changelog seed row should insert");
 
         let dirty_rows = conn
-            .query_with_params(DIRTY_CATALOG_LOOKUP_SQL, &[SqliteValue::Integer(50)])
+            .query_with_params_sync(DIRTY_CATALOG_LOOKUP_SQL, &[SqliteValue::Integer(50)])
             .expect("dirty catalog lookup should execute");
         assert_eq!(dirty_rows.len(), 1);
 
         let replay_rows = conn
-            .query_with_params(
+            .query_with_params_sync(
                 CHANGELOG_REPLAY_BATCH_SQL,
                 &[SqliteValue::Integer(0), SqliteValue::Integer(100)],
             )
             .expect("replay batch query should execute");
         assert_eq!(replay_rows.len(), 1);
 
-        conn.execute_with_params(
+        conn.execute_with_params_sync(
             "UPDATE fsfs_catalog_files SET pipeline_status = 'tombstoned', deleted_ts = ?1 WHERE file_key = ?2;",
             &[SqliteValue::Integer(now), SqliteValue::Text("home:/tmp/a.txt".to_owned().into())],
         )
         .expect("tombstone update should succeed");
-        conn.execute_with_params(CLEANUP_TOMBSTONES_SQL, &[SqliteValue::Integer(now)])
+        conn.execute_with_params_sync(CLEANUP_TOMBSTONES_SQL, &[SqliteValue::Integer(now)])
             .expect("cleanup query should execute");
 
         let remaining = conn
-            .query("SELECT file_key FROM fsfs_catalog_files;")
+            .query_sync("SELECT file_key FROM fsfs_catalog_files;")
             .expect("remaining rows query should execute");
         assert!(remaining.is_empty(), "tombstone cleanup should remove row");
     }
@@ -789,9 +795,9 @@ mod tests {
     fn row_i64_unexpected_type_is_error() {
         use super::row_i64;
 
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let conn = Connection::open_sync(":memory:".to_owned()).expect("in-memory connection");
         let rows = conn
-            .query("SELECT 'not_an_integer';")
+            .query_sync("SELECT 'not_an_integer';")
             .expect("text query should succeed");
         let row = &rows[0];
         let err = row_i64(row, 0, "test_field").expect_err("text should fail");
@@ -803,8 +809,8 @@ mod tests {
     fn row_i64_missing_column_is_error() {
         use super::row_i64;
 
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
-        let rows = conn.query("SELECT 1;").expect("query should succeed");
+        let conn = Connection::open_sync(":memory:".to_owned()).expect("in-memory connection");
+        let rows = conn.query_sync("SELECT 1;").expect("query should succeed");
         let row = &rows[0];
         // Column index 5 doesn't exist (only column 0 present)
         let err = row_i64(row, 5, "missing_col").expect_err("missing column should fail");
@@ -816,8 +822,8 @@ mod tests {
     fn row_i64_valid_integer() {
         use super::row_i64;
 
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
-        let rows = conn.query("SELECT 42;").expect("query should succeed");
+        let conn = Connection::open_sync(":memory:".to_owned()).expect("in-memory connection");
+        let rows = conn.query_sync("SELECT 42;").expect("query should succeed");
         let row = &rows[0];
         let value = row_i64(row, 0, "version").expect("integer should succeed");
         assert_eq!(value, 42);
@@ -875,7 +881,7 @@ mod tests {
 
     #[test]
     fn cleanup_tombstones_executes_sql_against_existing_connection() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let conn = Connection::open_sync(":memory:".to_owned()).expect("in-memory connection");
         bootstrap_catalog_schema(&conn).expect("catalog bootstrap should succeed");
 
         let now = 1_710_000_000_000_i64;
@@ -893,7 +899,7 @@ mod tests {
             SqliteValue::Integer(now),
             SqliteValue::Integer(now),
         ];
-        conn.execute_with_params(
+        conn.execute_with_params_sync(
             "INSERT INTO fsfs_catalog_files \
              (file_key, mount_id, canonical_path, content_hash, revision, ingestion_class, pipeline_status, eligible, first_seen_ts, last_seen_ts, updated_ts, deleted_ts) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12);",
@@ -909,7 +915,7 @@ mod tests {
     fn cleanup_tombstones_for_path_prunes_old_tombstones() {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("catalog.db");
-        let conn = Connection::open(db_path.display().to_string()).expect("open sqlite file");
+        let conn = Connection::open_sync(db_path.display().to_string()).expect("open sqlite file");
         bootstrap_catalog_schema(&conn).expect("catalog bootstrap should succeed");
 
         let now = 1_710_000_000_000_i64;
@@ -929,7 +935,7 @@ mod tests {
             SqliteValue::Integer(now - 15_000),
             SqliteValue::Integer(now - 15_000),
         ];
-        conn.execute_with_params(
+        conn.execute_with_params_sync(
             "INSERT INTO fsfs_catalog_files \
              (file_key, mount_id, canonical_path, content_hash, revision, ingestion_class, pipeline_status, eligible, first_seen_ts, last_seen_ts, updated_ts, deleted_ts) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12);",
@@ -951,7 +957,7 @@ mod tests {
             SqliteValue::Integer(now - 5_000),
             SqliteValue::Integer(now - 5_000),
         ];
-        conn.execute_with_params(
+        conn.execute_with_params_sync(
             "INSERT INTO fsfs_catalog_files \
              (file_key, mount_id, canonical_path, content_hash, revision, ingestion_class, pipeline_status, eligible, first_seen_ts, last_seen_ts, updated_ts, deleted_ts) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12);",
@@ -968,9 +974,9 @@ mod tests {
         // `cleanup_tombstones_for_path` (which opens its own connection).
         drop(conn);
         let conn2 =
-            Connection::open(db_path.display().to_string()).expect("reopen for verification");
+            Connection::open_sync(db_path.display().to_string()).expect("reopen for verification");
         let remaining = conn2
-            .query("SELECT file_key FROM fsfs_catalog_files ORDER BY file_key;")
+            .query_sync("SELECT file_key FROM fsfs_catalog_files ORDER BY file_key;")
             .expect("remaining rows query should execute");
         assert_eq!(remaining.len(), 1);
         assert_eq!(

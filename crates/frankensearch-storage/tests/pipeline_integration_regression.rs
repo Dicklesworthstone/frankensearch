@@ -623,19 +623,17 @@ fn worker_reclaims_stale_jobs_on_startup_and_logs_exit() {
                 SqliteValue::Integer(1),
                 SqliteValue::Integer(claimed[0].job_id),
             ];
-            // Real async FrankenSQLite call through the same `Cx` the worker
-            // below uses. This is the actual production statement path, not a
-            // shim: it plants the stale `started_at` that the reclaim
-            // assertion depends on, so weakening it would make
-            // `reclaimed_on_startup` prove nothing.
+            // Plant a stale `started_at` through FrankenSQLite 0.3's
+            // synchronous facade. The 0.3 async statement API takes
+            // `fsqlite_types::Cx`, not `asupersync::Cx`; the worker below
+            // still uses the asupersync `Cx`. This remains a real SQL write
+            // against the same connection the reclaim assertion depends on.
             storage
                 .connection()
-                .execute_with_params(
-                    &cx,
+                .execute_with_params_sync(
                     "UPDATE embedding_jobs SET started_at = ?1 WHERE job_id = ?2;",
                     &params,
                 )
-                .await
                 .expect("stale timestamp update should succeed");
 
             let shutdown = AtomicBool::new(false);

@@ -190,22 +190,9 @@ ftui-tty = "0.5.0"
 ftui-backend = "0.5.0"
 ftui-extras = "0.5.0"
 
-# Frankensearch temporarily spans two FrankenSQLite API lines: fsfs and
-# durability still consume the synchronous 0.1.19 contract used by HFDT,
-# while storage and ops consume the current async 0.3.0 contract. Patch both
-# exact lines to audited commits that use Asupersync 0.4.3 so Cargo cannot
-# recreate a hidden 0.3.x runtime through either substrate edge.
-[patch.crates-io]
-fsqlite-hfdt = { package = "fsqlite", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
-fsqlite-core-hfdt = { package = "fsqlite-core", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
-fsqlite-error-hfdt = { package = "fsqlite-error", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
-fsqlite-ext-fts5-hfdt = { package = "fsqlite-ext-fts5", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
-fsqlite-types-hfdt = { package = "fsqlite-types", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "500f1f2670503cf838fc9b2d0b1a6b7b5f63d14d" }
-fsqlite-main = { package = "fsqlite", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4d09168fff2fdf5d7f8ede1607db5e040bca724b" }
-fsqlite-core-main = { package = "fsqlite-core", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4d09168fff2fdf5d7f8ede1607db5e040bca724b" }
-fsqlite-error-main = { package = "fsqlite-error", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4d09168fff2fdf5d7f8ede1607db5e040bca724b" }
-fsqlite-ext-fts5-main = { package = "fsqlite-ext-fts5", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4d09168fff2fdf5d7f8ede1607db5e040bca724b" }
-fsqlite-types-main = { package = "fsqlite-types", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4d09168fff2fdf5d7f8ede1607db5e040bca724b" }
+# FrankenSQLite production edge is crates.io 0.3.0 (async Connection plus
+# the AsyncConnection sync facade). Do not reintroduce a 0.1 compatibility
+# line here: it would split the Asupersync runtime universe again.
 
 [workspace.lints.rust]
 # `deny` instead of `forbid` so crates that need unsafe (e.g. mmap) can opt in.

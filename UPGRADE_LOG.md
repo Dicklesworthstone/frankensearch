@@ -1,5 +1,18 @@
 # Dependency Upgrade Log
 
+## 2026-08-14 — FrankenSQLite 0.3.0 crates.io cutover
+
+**Scope:** every frankensearch `fsqlite*` edge now resolves the published
+`0.3.0` registry crates. The remaining 0.1.2/0.1.19 compatibility line in
+fsfs and durability is gone, and the workspace git patches that split
+FrankenSQLite across two revs are removed.
+
+- **fsfs catalog** uses FrankenSQLite 0.3's `AsyncConnection` synchronous
+  facade (`open_sync` / `execute_sync` / `query_sync`).
+- **durability** RaptorQ `SymbolCodec` now binds `fsqlite-core` 0.3.0.
+- **storage / ops** keep the 0.3.0 API they already used, but now take it
+  from crates.io instead of a git rev behind the 0.3.0 tag.
+
 ## 2026-08-11 — Asupersync 0.4.3 and FrankenSQLite 0.3 migration: IN PROGRESS
 
 **Scope:** the workspace now resolves one Asupersync runtime family at 0.4.3.

@@ -19203,7 +19203,7 @@ mod tests {
         QuillConfig, QuillIndex, QuillSearchIndex, SegmentStatsProvider, publish_current,
         resolve_current,
     };
-    use fsqlite::Connection;
+    use fsqlite::AsyncConnection as Connection;
     use fsqlite_types::value::SqliteValue;
 
     use super::{
@@ -21932,7 +21932,7 @@ mod tests {
     fn runtime_cleanup_catalog_tombstones_prunes_old_rows() {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("fsfs.db");
-        let conn = Connection::open(db_path.display().to_string()).expect("open sqlite");
+        let conn = Connection::open_sync(db_path.display().to_string()).expect("open sqlite");
         bootstrap_catalog_schema(&conn).expect("bootstrap catalog schema");
 
         let now_ms = 1_710_000_000_000_u64;
@@ -21956,7 +21956,7 @@ mod tests {
             SqliteValue::Integer(old_deleted_ts),
             SqliteValue::Integer(old_deleted_ts),
         ];
-        conn.execute_with_params(
+        conn.execute_with_params_sync(
             "INSERT INTO fsfs_catalog_files \
              (file_key, mount_id, canonical_path, content_hash, revision, ingestion_class, pipeline_status, eligible, first_seen_ts, last_seen_ts, updated_ts, deleted_ts) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12);",
@@ -21978,7 +21978,7 @@ mod tests {
             SqliteValue::Integer(fresh_deleted_ts),
             SqliteValue::Integer(fresh_deleted_ts),
         ];
-        conn.execute_with_params(
+        conn.execute_with_params_sync(
             "INSERT INTO fsfs_catalog_files \
              (file_key, mount_id, canonical_path, content_hash, revision, ingestion_class, pipeline_status, eligible, first_seen_ts, last_seen_ts, updated_ts, deleted_ts) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12);",
@@ -22003,9 +22003,9 @@ mod tests {
         // MVCC snapshot that predates the DELETE from `cleanup_catalog_tombstones`.
         drop(conn);
         let conn2 =
-            Connection::open(db_path.display().to_string()).expect("reopen for verification");
+            Connection::open_sync(db_path.display().to_string()).expect("reopen for verification");
         let remaining = conn2
-            .query("SELECT file_key FROM fsfs_catalog_files ORDER BY file_key;")
+            .query_sync("SELECT file_key FROM fsfs_catalog_files ORDER BY file_key;")
             .expect("remaining rows query");
         assert_eq!(remaining.len(), 1);
         assert_eq!(
