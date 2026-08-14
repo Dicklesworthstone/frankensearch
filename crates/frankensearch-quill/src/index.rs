@@ -4485,6 +4485,13 @@ struct QueryWorkShape {
     phrase_fields: u64,
 }
 
+/// Pinned Tantivy 0.27.0 expands the final phrase-prefix term to at most 50
+/// terms independently inside each immutable leaf. This is deliberately not
+/// the configurable ordinary-glob ceiling: applying one snapshot-global glob
+/// limit here drops valid matches from later leaves and diverges from the
+/// oracle's public query parser.
+const TANTIVY_PHRASE_PREFIX_MAX_EXPANSIONS: usize = 50;
+
 impl QueryWorkShape {
     fn visit(
         &mut self,
@@ -4508,7 +4515,7 @@ impl QueryWorkShape {
                 let terms = u64::try_from(terms.len()).unwrap_or(u64::MAX);
                 let expansions = if *prefix {
                     self.dictionary_scans = self.dictionary_scans.saturating_add(fields);
-                    u64::try_from(glob_expansion_limit).unwrap_or(u64::MAX)
+                    u64::try_from(TANTIVY_PHRASE_PREFIX_MAX_EXPANSIONS).unwrap_or(u64::MAX)
                 } else {
                     1
                 };
@@ -13605,23 +13612,12 @@ fn lower_query_with_mode<'a>(
                         invalid_state("validated phrase prefix lost its final term")
                     })?;
                     let final_bytes = final_term.text.as_bytes();
-                    let pattern_len = final_bytes
-                        .len()
-                        .checked_add(1)
-                        .ok_or_else(|| invalid_state("phrase-prefix pattern length overflow"))?;
-                    let mut pattern = Vec::new();
-                    pattern.try_reserve_exact(pattern_len).map_err(|_| {
-                        invalid_state("could not allocate phrase-prefix dictionary pattern")
-                    })?;
-                    pattern.extend_from_slice(final_bytes);
-                    pattern.push(b'*');
-                    let expansions = snapshot_glob_terms(
-                        Some(checkpoint),
-                        snapshot,
+                    let expansions = leaf_phrase_prefix_terms(
+                        checkpoint,
+                        leaf,
                         schema,
                         field.field_id,
-                        &pattern,
-                        glob_expansion_limit,
+                        final_bytes,
                     )?;
                     clauses.try_reserve(expansions.len()).map_err(|_| {
                         invalid_state("could not allocate phrase-prefix expansion clauses")
@@ -14443,6 +14439,76 @@ fn lower_leaf_glob<'a>(
         #[cfg(feature = "pruning-conformance")]
         Some(checkpoint),
     )
+}
+
+fn leaf_phrase_prefix_terms(
+    checkpoint: &QueryCheckpointHandle<'_>,
+    leaf: QueryLeaf<'_>,
+    schema: SchemaDescriptor,
+    field_ord: u16,
+    prefix: &[u8],
+) -> Result<Vec<Vec<u8>>, QuillIndexError> {
+    validate_string_query_field(schema, field_ord, "phrase prefix")?;
+    let mut terms = Vec::new();
+    terms
+        .try_reserve_exact(TANTIVY_PHRASE_PREFIX_MAX_EXPANSIONS)
+        .map_err(|_| invalid_state("could not allocate leaf-local phrase-prefix expansions"))?;
+
+    match leaf {
+        QueryLeaf::Sealed(segment) => {
+            let dictionary = open_dictionary(segment, schema)?;
+            let mut cursor = dictionary.prefix_cursor(field_ord, prefix)?;
+            let mut admitted_block = None;
+            while terms.len() < TANTIVY_PHRASE_PREFIX_MAX_EXPANSIONS {
+                let Some(current) = cursor.current() else {
+                    break;
+                };
+                let block = cursor.current_block_index();
+                if block != admitted_block {
+                    checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
+                    admitted_block = block;
+                }
+                let mut owned = Vec::new();
+                owned
+                    .try_reserve_exact(current.term.len())
+                    .map_err(|_| invalid_state("could not copy sealed phrase-prefix expansion"))?;
+                owned.extend_from_slice(current.term);
+                terms.push(owned);
+                cursor.next()?;
+            }
+        }
+        QueryLeaf::Delta(delta) => {
+            // The ordered view is materialized and radix-sorted as one unit on
+            // first use, so admission must precede construction just as it does
+            // for ordinary glob expansion. The 50-term semantic cap remains
+            // leaf-local after that unavoidable generation-level work.
+            checkpoint.admit(
+                QueryWorkKind::DictionaryBlock,
+                delta_ordered_view_blocks(delta.segment().term_count()),
+            )?;
+            let field_terms = delta.ordered_terms_for_field(field_ord);
+            if delta.segment().term_count() != 0 {
+                checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
+            }
+            for (term_index, term) in field_terms.enumerate() {
+                if term_index != 0 && term_index % 16 == 0 {
+                    checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
+                }
+                if term.term().starts_with(prefix) {
+                    let mut owned = Vec::new();
+                    owned.try_reserve_exact(term.term().len()).map_err(|_| {
+                        invalid_state("could not copy Delta phrase-prefix expansion")
+                    })?;
+                    owned.extend_from_slice(term.term());
+                    terms.push(owned);
+                    if terms.len() == TANTIVY_PHRASE_PREFIX_MAX_EXPANSIONS {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Ok(terms)
 }
 
 fn snapshot_glob_terms(

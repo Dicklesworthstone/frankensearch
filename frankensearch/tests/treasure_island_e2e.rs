@@ -415,6 +415,9 @@ fn semantic_queries_do_not_leak_the_answer_vocabulary() {
 
 #[cfg(feature = "quill")]
 mod lexical {
+    #[cfg(feature = "lexical-tantivy")]
+    use std::collections::BTreeSet;
+
     use super::{LEXICAL_QUERIES, Passage, chapters_of, corpus};
     use frankensearch::{IndexableDocument, LexicalRead, LexicalWrite, QuillConfig, QuillIndex};
     #[cfg(feature = "lexical-tantivy")]
@@ -753,6 +756,80 @@ mod lexical {
                 .into_iter()
                 .map(|(id, _)| id)
                 .collect::<Vec<_>>();
+            assert_eq!(quill_ids, tantivy_ids);
+        });
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    #[test]
+    fn public_phrase_prefix_caps_expansions_per_leaf_like_tantivy() {
+        super::quiet_logging();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let first_content = format!(
+                "{} anchor p050",
+                (0..50)
+                    .map(|ordinal| format!("p{ordinal:03}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            let first_leaf = [IndexableDocument::new("first-leaf", first_content)];
+            let final_leaf = [IndexableDocument::new("final-leaf", "anchor p999")];
+            let tmp = tempfile::tempdir().expect("tempdir");
+
+            let mut quill_config = QuillConfig::default();
+            quill_config.glob_expansion_limit = 50;
+            let quill = QuillIndex::create(&cx, tmp.path().join("quill"), quill_config)
+                .await
+                .expect("create Quill index");
+            LexicalWrite::index_documents(&quill, &cx, &first_leaf)
+                .await
+                .expect("index first Quill leaf");
+            LexicalWrite::commit(&quill, &cx)
+                .await
+                .expect("commit first Quill leaf");
+            LexicalWrite::index_documents(&quill, &cx, &final_leaf)
+                .await
+                .expect("index final Quill leaf");
+            LexicalWrite::commit(&quill, &cx)
+                .await
+                .expect("commit final Quill leaf");
+
+            let tantivy =
+                TantivyIndex::create(&tmp.path().join("tantivy")).expect("create Tantivy index");
+            LexicalWrite::index_documents(&tantivy, &cx, &first_leaf)
+                .await
+                .expect("index first Tantivy leaf");
+            LexicalWrite::commit(&tantivy, &cx)
+                .await
+                .expect("commit first Tantivy leaf");
+            LexicalWrite::index_documents(&tantivy, &cx, &final_leaf)
+                .await
+                .expect("index final Tantivy leaf");
+            LexicalWrite::commit(&tantivy, &cx)
+                .await
+                .expect("commit final Tantivy leaf");
+
+            let query = r#""anchor p"*"#;
+            let tantivy_ids = public_observation(&tantivy, &cx, query, 100)
+                .await
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(tantivy_ids.len(), 1);
+            assert!(
+                !tantivy_ids.contains("first-leaf"),
+                "the 51st suffix in one leaf must be outside Tantivy's cap"
+            );
+            assert!(
+                tantivy_ids.contains("final-leaf"),
+                "Tantivy's 50-term phrase-prefix cap is leaf-local"
+            );
+
+            let quill_ids = public_observation(&quill, &cx, query, 100)
+                .await
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<BTreeSet<_>>();
             assert_eq!(quill_ids, tantivy_ids);
         });
     }
