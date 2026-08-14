@@ -1465,7 +1465,7 @@ impl OpsStorage {
     ///
     /// Returns an error if schema metadata cannot be read.
     pub fn current_schema_version(&self) -> SearchResult<i64> {
-        current_version(self.connection())
+        retry_ops_op(|| current_version(self.connection()), "schema version")
     }
 
     /// Current ingestion metrics snapshot used by dashboards and tests.
@@ -2028,23 +2028,27 @@ impl OpsStorage {
         window: SummaryWindow,
     ) -> SearchResult<Option<SloRollupSnapshot>> {
         ensure_non_empty(scope_key, "scope_key")?;
-        let rows = self
-            .connection()
-            .query_with_params_sync(
-                "SELECT scope, scope_key, project_key, window, window_start_ms, window_end_ms, \
+        let rows = retry_ops_op(
+            || {
+                self.connection()
+                    .query_with_params_sync(
+                        "SELECT scope, scope_key, project_key, window, window_start_ms, window_end_ms, \
                 total_requests, failed_requests, p95_latency_us, target_p95_latency_us, \
                 error_budget_ratio, error_rate, error_budget_burn, remaining_budget_ratio, \
                 health, reason_code, generated_at_ms \
          FROM slo_rollups \
          WHERE scope = ?1 AND scope_key = ?2 AND window = ?3 \
          ORDER BY window_start_ms DESC LIMIT 1;",
-                &[
-                    SqliteValue::Text(scope.as_str().to_owned().into()),
-                    SqliteValue::Text(scope_key.to_owned().into()),
-                    SqliteValue::Text(window.as_label().to_owned().into()),
-                ],
-            )
-            .map_err(ops_error)?;
+                        &[
+                            SqliteValue::Text(scope.as_str().to_owned().into()),
+                            SqliteValue::Text(scope_key.to_owned().into()),
+                            SqliteValue::Text(window.as_label().to_owned().into()),
+                        ],
+                    )
+                    .map_err(ops_error)
+            },
+            "slo rollup fetch",
+        )?;
         rows.first().map(row_to_slo_rollup).transpose()
     }
 
@@ -2060,23 +2064,28 @@ impl OpsStorage {
         limit: usize,
     ) -> SearchResult<Vec<SloRollupSnapshot>> {
         ensure_non_empty(scope_key, "scope_key")?;
-        let rows = self
-            .connection()
-            .query_with_params_sync(
-                "SELECT scope, scope_key, project_key, window, window_start_ms, window_end_ms, \
+        let limit_i64 = usize_to_i64(limit, "limit")?;
+        let rows = retry_ops_op(
+            || {
+                self.connection()
+                    .query_with_params_sync(
+                        "SELECT scope, scope_key, project_key, window, window_start_ms, window_end_ms, \
                 total_requests, failed_requests, p95_latency_us, target_p95_latency_us, \
                 error_budget_ratio, error_rate, error_budget_burn, remaining_budget_ratio, \
                 health, reason_code, generated_at_ms \
          FROM slo_rollups \
          WHERE scope = ?1 AND scope_key = ?2 \
          ORDER BY window_start_ms DESC, window ASC LIMIT ?3;",
-                &[
-                    SqliteValue::Text(scope.as_str().to_owned().into()),
-                    SqliteValue::Text(scope_key.to_owned().into()),
-                    SqliteValue::Integer(usize_to_i64(limit, "limit")?),
-                ],
-            )
-            .map_err(ops_error)?;
+                        &[
+                            SqliteValue::Text(scope.as_str().to_owned().into()),
+                            SqliteValue::Text(scope_key.to_owned().into()),
+                            SqliteValue::Integer(limit_i64),
+                        ],
+                    )
+                    .map_err(ops_error)
+            },
+            "slo rollup list",
+        )?;
         rows.iter().map(row_to_slo_rollup).collect()
     }
 
@@ -2092,10 +2101,12 @@ impl OpsStorage {
         limit: usize,
     ) -> SearchResult<Vec<AnomalyMaterializationSnapshot>> {
         ensure_non_empty(scope_key, "scope_key")?;
-        let rows = self
-            .connection()
-            .query_with_params_sync(
-                "SELECT anomaly_id, scope, scope_key, project_key, window, window_start_ms, \
+        let limit_i64 = usize_to_i64(limit, "limit")?;
+        let rows = retry_ops_op(
+            || {
+                self.connection()
+                    .query_with_params_sync(
+                        "SELECT anomaly_id, scope, scope_key, project_key, window, window_start_ms, \
                 metric_name, baseline_value, observed_value, deviation_ratio, severity, \
                 reason_code, correlation_id, state, opened_at_ms, updated_at_ms, \
                 resolved_at_ms \
@@ -2109,13 +2120,16 @@ impl OpsStorage {
                     ELSE 0 \
                   END DESC, \
                   updated_at_ms DESC LIMIT ?3;",
-                &[
-                    SqliteValue::Text(scope.as_str().to_owned().into()),
-                    SqliteValue::Text(scope_key.to_owned().into()),
-                    SqliteValue::Integer(usize_to_i64(limit, "limit")?),
-                ],
-            )
-            .map_err(ops_error)?;
+                        &[
+                            SqliteValue::Text(scope.as_str().to_owned().into()),
+                            SqliteValue::Text(scope_key.to_owned().into()),
+                            SqliteValue::Integer(limit_i64),
+                        ],
+                    )
+                    .map_err(ops_error)
+            },
+            "open anomaly list",
+        )?;
         rows.iter().map(row_to_anomaly).collect()
     }
 
@@ -2129,36 +2143,42 @@ impl OpsStorage {
         project_key: Option<&str>,
         limit: usize,
     ) -> SearchResult<Vec<AnomalyMaterializationSnapshot>> {
-        let rows = if let Some(project_key) = project_key {
-            ensure_non_empty(project_key, "project_key")?;
-            self.connection()
-                .query_with_params_sync(
-                    "SELECT anomaly_id, scope, scope_key, project_key, window, window_start_ms, \
+        let limit_i64 = usize_to_i64(limit, "limit")?;
+        let rows = retry_ops_op(
+            || {
+                if let Some(project_key) = project_key {
+                    ensure_non_empty(project_key, "project_key")?;
+                    self.connection()
+                        .query_with_params_sync(
+                            "SELECT anomaly_id, scope, scope_key, project_key, window, window_start_ms, \
                     metric_name, baseline_value, observed_value, deviation_ratio, severity, \
                     reason_code, correlation_id, state, opened_at_ms, updated_at_ms, \
                     resolved_at_ms \
              FROM anomaly_materializations \
              WHERE project_key = ?1 \
              ORDER BY opened_at_ms DESC LIMIT ?2;",
-                    &[
-                        SqliteValue::Text(project_key.to_owned().into()),
-                        SqliteValue::Integer(usize_to_i64(limit, "limit")?),
-                    ],
-                )
-                .map_err(ops_error)?
-        } else {
-            self.connection()
-                .query_with_params_sync(
-                    "SELECT anomaly_id, scope, scope_key, project_key, window, window_start_ms, \
+                            &[
+                                SqliteValue::Text(project_key.to_owned().into()),
+                                SqliteValue::Integer(limit_i64),
+                            ],
+                        )
+                        .map_err(ops_error)
+                } else {
+                    self.connection()
+                        .query_with_params_sync(
+                            "SELECT anomaly_id, scope, scope_key, project_key, window, window_start_ms, \
                     metric_name, baseline_value, observed_value, deviation_ratio, severity, \
                     reason_code, correlation_id, state, opened_at_ms, updated_at_ms, \
                     resolved_at_ms \
              FROM anomaly_materializations \
              ORDER BY opened_at_ms DESC LIMIT ?1;",
-                    &[SqliteValue::Integer(usize_to_i64(limit, "limit")?)],
-                )
-                .map_err(ops_error)?
-        };
+                            &[SqliteValue::Integer(limit_i64)],
+                        )
+                        .map_err(ops_error)
+                }
+            },
+            "anomaly timeline",
+        )?;
         rows.iter().map(row_to_anomaly).collect()
     }
 
@@ -2180,17 +2200,21 @@ impl OpsStorage {
             SqliteValue::Text(instance_id.to_owned().into()),
             SqliteValue::Text(window.as_label().to_owned().into()),
         ];
-        let rows = self
-            .connection()
-            .query_with_params_sync(
-                "SELECT window_start_ms, search_count, p50_latency_us, p95_latency_us, \
+        let rows = retry_ops_op(
+            || {
+                self.connection()
+                    .query_with_params_sync(
+                        "SELECT window_start_ms, search_count, p50_latency_us, p95_latency_us, \
                 p99_latency_us, avg_result_count \
          FROM search_summaries \
          WHERE project_key = ?1 AND instance_id = ?2 AND window = ?3 \
          ORDER BY window_start_ms DESC LIMIT 1;",
-                &params,
-            )
-            .map_err(ops_error)?;
+                        &params,
+                    )
+                    .map_err(ops_error)
+            },
+            "search summary fetch",
+        )?;
         let Some(row) = rows.first() else {
             return Ok(None);
         };
@@ -2212,12 +2236,17 @@ impl OpsStorage {
         let window_end_ms = window_start_ms
             .saturating_add(window.duration_ms())
             .saturating_sub(1);
-        let raw_stats = compute_window_event_stats(
-            self.connection(),
-            project_key,
-            instance_id,
-            window_start_ms,
-            window_end_ms,
+        let raw_stats = retry_ops_op(
+            || {
+                compute_window_event_stats(
+                    self.connection(),
+                    project_key,
+                    instance_id,
+                    window_start_ms,
+                    window_end_ms,
+                )
+            },
+            "search summary event stats",
         )?;
 
         Ok(Some(SearchSummarySnapshot {
@@ -2256,16 +2285,20 @@ impl OpsStorage {
             SqliteValue::Integer(now_ms),
             SqliteValue::Integer(usize_to_i64(limit, "limit")?),
         ];
-        let rows = self
-            .connection()
-            .query_with_params_sync(
-                "SELECT ts_ms, cpu_pct, rss_bytes, io_read_bytes, io_write_bytes, queue_depth \
+        let rows = retry_ops_op(
+            || {
+                self.connection()
+                    .query_with_params_sync(
+                        "SELECT ts_ms, cpu_pct, rss_bytes, io_read_bytes, io_write_bytes, queue_depth \
          FROM resource_samples \
          WHERE project_key = ?1 AND instance_id = ?2 AND ts_ms >= ?3 AND ts_ms <= ?4 \
          ORDER BY ts_ms DESC LIMIT ?5;",
-                &params,
-            )
-            .map_err(ops_error)?;
+                        &params,
+                    )
+                    .map_err(ops_error)
+            },
+            "resource trend",
+        )?;
 
         let mut points = rows
             .iter()
@@ -2320,16 +2353,20 @@ impl OpsStorage {
             SqliteValue::Integer(window_start_ms),
             SqliteValue::Integer(now_ms),
         ];
-        let rows = self
-            .connection()
-            .query_with_params_sync(
-                "SELECT completed_jobs, failed_jobs, retried_jobs, ts_ms \
+        let rows = retry_ops_op(
+            || {
+                self.connection()
+                    .query_with_params_sync(
+                        "SELECT completed_jobs, failed_jobs, retried_jobs, ts_ms \
          FROM embedding_job_snapshots \
          WHERE project_key = ?1 AND instance_id = ?2 AND ts_ms >= ?3 AND ts_ms <= ?4 \
          ORDER BY ts_ms ASC;",
-                &params,
-            )
-            .map_err(ops_error)?;
+                        &params,
+                    )
+                    .map_err(ops_error)
+            },
+            "embedding throughput",
+        )?;
         if rows.len() < 2 {
             return Ok(None);
         }
@@ -3794,7 +3831,14 @@ fn unretryable_ops_rollback_error(
     }
 }
 
-fn retry_ops_transaction<T>(mut op: impl FnMut() -> SearchResult<T>) -> SearchResult<T> {
+fn retry_ops_transaction<T>(op: impl FnMut() -> SearchResult<T>) -> SearchResult<T> {
+    retry_ops_op(op, "transaction")
+}
+
+fn retry_ops_op<T>(
+    mut op: impl FnMut() -> SearchResult<T>,
+    context: &'static str,
+) -> SearchResult<T> {
     const MAX_ATTEMPTS: u32 = 8;
     let mut attempt = 1;
     loop {
@@ -3805,11 +3849,12 @@ fn retry_ops_transaction<T>(mut op: impl FnMut() -> SearchResult<T>) -> SearchRe
                 let delay_ms = (1_u64 << growth).min(50);
                 tracing::debug!(
                     target: "frankensearch.ops.storage",
+                    context,
                     next_attempt = attempt.saturating_add(1),
                     max_attempts = MAX_ATTEMPTS,
                     delay_ms,
                     error = %error,
-                    "retrying ops storage transaction after transient contention"
+                    "retrying ops storage after transient contention"
                 );
                 std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                 attempt = attempt.saturating_add(1);
