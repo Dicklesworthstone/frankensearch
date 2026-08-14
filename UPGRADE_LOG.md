@@ -1,5 +1,15 @@
 # Dependency Upgrade Log
 
+## 2026-08-14 — FrankenSQLite 0.3.1 crates.io bump
+
+**Scope:** every frankensearch `fsqlite*` edge now resolves the published
+`0.3.1` registry crates. This is a lockstep bug-fix release on the 0.3 API
+(autocommit durability, concurrent-open prepare, committed-freelist safety,
+read-only open sidecars). No FrankenSearch call-site signature change.
+
+- **fsfs / storage / ops** stay on `AsyncConnection` plus the `*_sync` facade.
+- **durability** RaptorQ `SymbolCodec` now binds `fsqlite-core` 0.3.1.
+
 ## 2026-08-14 — FrankenSQLite 0.3.0 crates.io cutover
 
 **Scope:** every frankensearch `fsqlite*` edge now resolves the published

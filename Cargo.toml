@@ -190,7 +190,7 @@ ftui-tty = "0.5.0"
 ftui-backend = "0.5.0"
 ftui-extras = "0.5.0"
 
-# FrankenSQLite production edge is crates.io 0.3.0 (async Connection plus
+# FrankenSQLite production edge is crates.io 0.3.1 (async Connection plus
 # the AsyncConnection sync facade). Do not reintroduce a 0.1 compatibility
 # line here: it would split the Asupersync runtime universe again.
 
