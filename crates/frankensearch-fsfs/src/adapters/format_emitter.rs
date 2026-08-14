@@ -402,7 +402,11 @@ fn write_search_payload_csv<W: Write>(payload: &SearchPayload, writer: &mut W) -
             "score".to_owned(),
             "in_both_sources".to_owned(),
             "lexical_rank".to_owned(),
-            "semantic_rank".to_owned(),
+            if payload.vector_generation_is_hash {
+                "hash_rank".to_owned()
+            } else {
+                "semantic_rank".to_owned()
+            },
             "snippet".to_owned(),
         ],
     )?;
@@ -553,8 +557,18 @@ fn render_search_table_with_options(
             hit.rank, path, line_segment, score, source_badge
         );
 
-        if let (Some(lexical_rank), Some(semantic_rank)) = (hit.lexical_rank, hit.semantic_rank) {
-            let _ = write!(out, " [L{} S{}]", lexical_rank + 1, semantic_rank + 1);
+        if let (Some(lexical_rank), Some(vector_rank)) = (hit.lexical_rank, hit.semantic_rank) {
+            let vector_label = if payload.vector_generation_is_hash {
+                "H"
+            } else {
+                "S"
+            };
+            let _ = write!(
+                out,
+                " [L{} {vector_label}{}]",
+                lexical_rank + 1,
+                vector_rank + 1
+            );
         }
         let _ = writeln!(out);
         if let Some(snippet) = hit.snippet.as_deref() {
@@ -1130,6 +1144,32 @@ mod tests {
     }
 
     #[test]
+    fn emit_csv_hash_payload_names_hash_rank_not_semantic_rank() {
+        let payload = SearchPayload::new(
+            "ownership",
+            SearchOutputPhase::Initial,
+            1,
+            vec![SearchHitPayload {
+                rank: 1,
+                path: "src/lib.rs".to_owned(),
+                score: 0.4,
+                snippet: None,
+                lexical_rank: Some(0),
+                semantic_rank: Some(1),
+                in_both_sources: true,
+            }],
+        )
+        .with_vector_generation("fnv1a-256", true);
+        let env = OutputEnvelope::success(payload, sample_meta("csv"), sample_ts());
+        let output = emit_envelope_string(&env, OutputFormat::Csv).expect("csv output");
+        let header = output.lines().next().unwrap_or_default();
+        assert!(
+            header.contains("hash_rank") && !header.contains("semantic_rank"),
+            "hash CSV must not label the vector rank semantic: {header}"
+        );
+    }
+
+    #[test]
     fn emit_csv_error_outputs_error_row() {
         let err = OutputError::new(OutputErrorCode::MODEL_NOT_FOUND, "model missing", 78)
             .with_field("model")
@@ -1398,6 +1438,14 @@ mod tests {
         assert!(
             !output.contains("[semantic]") && !output.contains("[both]"),
             "hash control must not share the semantic badges: {output}"
+        );
+        assert!(
+            output.contains("[L1 H1]"),
+            "hash overlap ranks must not print S: {output}"
+        );
+        assert!(
+            !output.contains("[L1 S1]") && !output.contains(" S1]") && !output.contains(" S2]"),
+            "hash control must not use the semantic rank letter: {output}"
         );
     }
 

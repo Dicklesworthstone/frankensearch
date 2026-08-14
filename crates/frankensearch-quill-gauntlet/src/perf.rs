@@ -1288,17 +1288,22 @@ pub fn preregister_qg1_tantivy_incumbents(
     Ok(candidates)
 }
 
-fn qg1_valid_throughput_experiment(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Qg1ThroughputExperimentAdmission {
+    Valid,
+    StatisticalNoDecision,
+    InvalidConfigurationBinding,
+}
+
+fn qg1_throughput_experiment_admission(
     experiment: &PairedExperimentResult,
     external_qg1_authority: Option<&Qg1ExpectedAuthority>,
     expected_scope: &PerfOperationScope,
     expected_provenance: Option<&PerfSampleProvenance>,
     expected_work_units: u64,
     expected_content_bytes: u64,
-) -> bool {
-    experiment.recomputes_against_qg1_authority(external_qg1_authority)
-        && experiment.status == PairedEvidenceStatus::Valid
-        && experiment.claim_state == PairedClaimState::EligibleForDecision
+) -> Qg1ThroughputExperimentAdmission {
+    let configuration_bound = experiment.recomputes_against_qg1_authority(external_qg1_authority)
         && experiment.scope == *expected_scope
         && expected_provenance.is_none_or(|provenance| experiment.provenance == *provenance)
         && experiment
@@ -1308,7 +1313,55 @@ fn qg1_valid_throughput_experiment(
             .all(|sample| {
                 sample.work_units == Some(expected_work_units)
                     && sample.byte_count == Some(expected_content_bytes)
-            })
+            });
+    if !configuration_bound {
+        return Qg1ThroughputExperimentAdmission::InvalidConfigurationBinding;
+    }
+    if experiment.status == PairedEvidenceStatus::Valid
+        && experiment.claim_state == PairedClaimState::EligibleForDecision
+    {
+        Qg1ThroughputExperimentAdmission::Valid
+    } else {
+        Qg1ThroughputExperimentAdmission::StatisticalNoDecision
+    }
+}
+
+fn qg1_valid_throughput_experiment(
+    experiment: &PairedExperimentResult,
+    external_qg1_authority: Option<&Qg1ExpectedAuthority>,
+    expected_scope: &PerfOperationScope,
+    expected_provenance: Option<&PerfSampleProvenance>,
+    expected_work_units: u64,
+    expected_content_bytes: u64,
+) -> bool {
+    qg1_throughput_experiment_admission(
+        experiment,
+        external_qg1_authority,
+        expected_scope,
+        expected_provenance,
+        expected_work_units,
+        expected_content_bytes,
+    ) == Qg1ThroughputExperimentAdmission::Valid
+}
+
+fn qg1_statistical_no_decision_reason(pilot: &Qg1TantivyIncumbentPilot) -> String {
+    let status = match pilot.experiment.status {
+        PairedEvidenceStatus::Valid => "valid",
+        PairedEvidenceStatus::InvalidNull => "invalid_null",
+        PairedEvidenceStatus::InvalidExperiment => "invalid_experiment",
+        PairedEvidenceStatus::ContradictorySummaries => "contradictory_summaries",
+    };
+    let reason_codes = pilot
+        .experiment
+        .reasons
+        .iter()
+        .map(|reason| reason.code.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "candidate {} estimator no-decision: status={status}; reason_codes=[{reason_codes}]",
+        pilot.candidate.writer_mode.stable_id()
+    )
 }
 
 fn qg1_validate_pilot_observations(
@@ -1504,7 +1557,7 @@ impl Qg1TantivyIncumbentScreen {
                 screen_plan.work_units,
                 screen_plan.content_bytes,
             )?;
-            if !qg1_valid_throughput_experiment(
+            match qg1_throughput_experiment_admission(
                 &pilot.experiment,
                 resolve_qg1_expected_authority_for_live_decision(
                     external_qg1_authorities,
@@ -1515,10 +1568,16 @@ impl Qg1TantivyIncumbentScreen {
                 screen_plan.work_units,
                 screen_plan.content_bytes,
             ) {
-                return Ok(no_decision(
-                    "candidate pilot lacks valid configuration-bound throughput evidence"
-                        .to_owned(),
-                ));
+                Qg1ThroughputExperimentAdmission::Valid => {}
+                Qg1ThroughputExperimentAdmission::StatisticalNoDecision => {
+                    return Ok(no_decision(qg1_statistical_no_decision_reason(pilot)));
+                }
+                Qg1ThroughputExperimentAdmission::InvalidConfigurationBinding => {
+                    return Ok(no_decision(
+                        "candidate pilot lacks valid configuration-bound throughput evidence"
+                            .to_owned(),
+                    ));
+                }
             }
             if !qg1_streams_are_round_interleaved(&[
                 &pilot.experiment.effect_samples,
@@ -10428,6 +10487,115 @@ mod tests {
                 && candidate.config_sha256
                     == candidate.recomputed_config_sha256().expect("config hash")
         }));
+    }
+
+    #[test]
+    fn qg1_screen_preserves_statistical_no_decision_reason() {
+        let cell = qg1_bulk_cell(4);
+        let semantic_contract = qg1_semantic_contract();
+        let screen_plan = qg1_screen_plan(&cell, vec![1, 2, 4]);
+        let mut pilots = qg1_complete_pilots(
+            &cell,
+            &screen_plan,
+            &semantic_contract,
+            "authority-valid-statistical-no-decision",
+        );
+        let shipping_auto_config_sha256 = pilots[0].candidate.config_sha256.clone();
+        let candidate = pilots[0].candidate.clone();
+        let observed_writer_threads = pilots[0].observed_writer_threads;
+        let effect = pilots[0].experiment.effect_samples.clone();
+        let estimator_config = pilots[0].experiment.config.clone();
+        let authority = estimator_config
+            .qg1_lifecycle_authority
+            .as_ref()
+            .expect("live pilot carries its lifecycle authority");
+        let expected_authority = estimator_config
+            .qg1_expected_authority
+            .as_ref()
+            .expect("live pilot carries its retained expected authority");
+        let scope = qg1_throughput_scope(&cell);
+        let sample_provenance = provenance("authority-valid-statistical-no-decision");
+        let null_control_durations = [1_000_000; PERF_MIN_RUNS];
+        let mut null_treatment_durations = [1_000_000; PERF_MIN_RUNS];
+        for duration in &mut null_treatment_durations[PERF_MIN_RUNS / 2..] {
+            *duration = 2_000_000;
+        }
+        let mut null = qg1_duration_stream(
+            &scope,
+            &sample_provenance,
+            &null_control_durations,
+            &null_treatment_durations,
+            10_000,
+            1,
+            screen_plan.work_units,
+            screen_plan.content_bytes,
+            authority,
+            QG1_TANTIVY_ENGINE_ID,
+            QG1_TANTIVY_ENGINE_ID,
+            QG1_STREAM_ROLE_TANTIVY_PILOT_NULL,
+        );
+        qg1_bind_tantivy_candidate_identities(
+            &mut null,
+            QG1_TANTIVY_ENGINE_ID,
+            &shipping_auto_config_sha256,
+            QG1_TANTIVY_ENGINE_ID,
+            &shipping_auto_config_sha256,
+        );
+        let experiment = estimate_paired_experiment_against_qg1_authority(
+            &effect,
+            &null,
+            &estimator_config,
+            Some(expected_authority),
+        )
+        .expect("authority-valid null drift remains replayable evidence");
+        assert_eq!(experiment.status, PairedEvidenceStatus::InvalidNull);
+        assert_eq!(experiment.claim_state, PairedClaimState::NoDecision);
+        assert!(
+            experiment
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "paired.null_drift"),
+            "the planted first-half/second-half shift must trip the null-drift bound"
+        );
+        assert!(experiment.recomputes_against_qg1_authority(Some(expected_authority)));
+        let effect_observation_ids = qg1_observation_ids("statistical-effect", &effect);
+        let null_observation_ids = qg1_observation_ids("statistical-null", &null);
+        pilots[0] = Qg1TantivyIncumbentPilot::from_experiment(
+            candidate,
+            observed_writer_threads,
+            &shipping_auto_config_sha256,
+            experiment,
+            effect_observation_ids,
+            null_observation_ids,
+        )
+        .expect("seal authority-valid statistical no-decision pilot");
+        let retained_authorities = pilots
+            .iter()
+            .map(|pilot| {
+                pilot
+                    .experiment
+                    .config
+                    .qg1_expected_authority
+                    .as_ref()
+                    .expect("each live pilot retains its distinct expected authority")
+            })
+            .collect::<Vec<_>>();
+        let screen = Qg1TantivyIncumbentScreen::screen_against_qg1_authorities(
+            &cell,
+            screen_plan,
+            &semantic_contract,
+            pilots.clone(),
+            &retained_authorities,
+        )
+        .expect("statistical invalidity produces an explicit screen no-decision");
+        let reason = screen
+            .no_decision_reason
+            .as_deref()
+            .expect("statistically invalid pilot cannot select a candidate");
+        assert!(reason.contains("shipping_auto"), "reason: {reason}");
+        assert!(reason.contains("invalid_null"), "reason: {reason}");
+        assert!(reason.contains("paired.null_drift"), "reason: {reason}");
+        assert!(!reason.contains("configuration-bound"), "reason: {reason}");
     }
 
     /// A reloaded screen and decision have lost the never-serialized producer

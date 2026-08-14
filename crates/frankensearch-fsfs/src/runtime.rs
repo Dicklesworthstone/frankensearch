@@ -15332,9 +15332,15 @@ fn render_explain_table(
     }
     lines.push(format!("Semantic (quality): {quality_score}"));
     lines.push(format!("Reranker: {rerank_score}"));
-    lines.push(format!(
-        "RRF: k={rrf_k:.1}, lexical_rank={lexical_rank}, semantic_rank={semantic_rank}, lexical_contrib={lexical_rrf:.6}, semantic_contrib={semantic_rrf:.6}, total={total_rrf:.6}"
-    ));
+    if vector_generation_is_hash {
+        lines.push(format!(
+            "RRF: k={rrf_k:.1}, lexical_rank={lexical_rank}, hash_rank={semantic_rank}, lexical_contrib={lexical_rrf:.6}, hash_contrib={semantic_rrf:.6}, total={total_rrf:.6}"
+        ));
+    } else {
+        lines.push(format!(
+            "RRF: k={rrf_k:.1}, lexical_rank={lexical_rank}, semantic_rank={semantic_rank}, lexical_contrib={lexical_rrf:.6}, semantic_contrib={semantic_rrf:.6}, total={total_rrf:.6}"
+        ));
+    }
     lines.push(format!(
         "Final blended score: {:.6}",
         payload.ranking.final_score
@@ -28359,6 +28365,14 @@ mod tests {
         assert!(
             !table.contains("Semantic (fast):"),
             "explain table must not keep the semantic-fast label for hash: {table}"
+        );
+        assert!(
+            table.contains("hash_rank=1") && table.contains("hash_contrib="),
+            "explain RRF line must name hash ranks, not semantic ranks: {table}"
+        );
+        assert!(
+            !table.contains("semantic_rank=") && !table.contains("semantic_contrib="),
+            "explain RRF line must not keep semantic rank labels for hash: {table}"
         );
     }
 
