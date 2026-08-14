@@ -1452,6 +1452,7 @@ mod tests {
             result_count: 8,
             lexical_candidates: 30,
             semantic_candidates: 25,
+            hash_control_candidates: 0,
             refined: true,
         };
         let embedding_metrics = EmbeddingMetrics {

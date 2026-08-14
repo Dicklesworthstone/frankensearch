@@ -4059,9 +4059,25 @@ pub struct SearchMetrics {
     /// Number of lexical candidates retrieved.
     pub lexical_candidates: usize,
     /// Number of semantic candidates retrieved.
+    ///
+    /// Hash/fnv/JL control hits are counted in [`Self::hash_control_candidates`],
+    /// not here.
     pub semantic_candidates: usize,
+    /// Number of hash/fnv/JL control-vector candidates retrieved.
+    ///
+    /// Absent from older payloads; deserializes as `0`.
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
+    pub hash_control_candidates: usize,
     /// Whether quality refinement was applied.
     pub refined: bool,
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires fn(&Field)"
+)]
+const fn usize_is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// Structured telemetry for an embedding operation.
@@ -6414,6 +6430,7 @@ mod tests {
             result_count: 10,
             lexical_candidates: 60,
             semantic_candidates: 45,
+            hash_control_candidates: 0,
             refined: true,
         };
 
@@ -6423,7 +6440,20 @@ mod tests {
         assert_eq!(decoded.query_class, Some(QueryClass::NaturalLanguage));
         assert!((decoded.total_latency_ms - 12.5).abs() < f64::EPSILON);
         assert_eq!(decoded.result_count, 10);
+        assert_eq!(decoded.semantic_candidates, 45);
+        assert_eq!(decoded.hash_control_candidates, 0);
         assert!(decoded.refined);
+        assert!(
+            !json.contains("hash_control_candidates"),
+            "zero hash-control count should omit the key: {json}"
+        );
+
+        let legacy = serde_json::from_str::<SearchMetrics>(
+            r#"{"mode":"Hybrid","query_class":null,"total_latency_ms":1.0,"phase1_latency_ms":null,"phase2_latency_ms":null,"result_count":0,"lexical_candidates":0,"semantic_candidates":3,"refined":false}"#,
+        )
+        .expect("legacy SearchMetrics without hash_control_candidates");
+        assert_eq!(legacy.semantic_candidates, 3);
+        assert_eq!(legacy.hash_control_candidates, 0);
     }
 
     #[test]
