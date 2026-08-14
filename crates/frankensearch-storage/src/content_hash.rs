@@ -8,7 +8,7 @@ use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::connection::Storage;
+use crate::connection::{Storage, retry_transient_storage};
 use crate::document::EmbeddingStatus;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -115,13 +115,17 @@ pub fn lookup_content_hash(
     content_hash: &str,
 ) -> SearchResult<Option<ContentHashRecord>> {
     let params = [SqliteValue::Text(content_hash.to_owned().into())];
-    let rows = conn
-        .query_with_params_sync(
-            "SELECT content_hash, first_doc_id, seen_count, first_seen_at, last_seen_at \
+    let rows = retry_transient_storage(
+        || {
+            conn.query_with_params_sync(
+                "SELECT content_hash, first_doc_id, seen_count, first_seen_at, last_seen_at \
              FROM content_hashes WHERE content_hash = ?1;",
-            &params,
-        )
-        .map_err(storage_error)?;
+                &params,
+            )
+            .map_err(storage_error)
+        },
+        "content hash lookup",
+    )?;
 
     let Some(row) = rows.first() else {
         return Ok(None);

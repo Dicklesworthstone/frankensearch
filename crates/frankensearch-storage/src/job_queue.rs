@@ -9,7 +9,7 @@ use fsqlite::{AsyncConnection, Row};
 use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::{Storage, map_storage_error};
+use crate::connection::{Storage, map_storage_error, retry_transient_storage};
 
 const SUBSYSTEM: &str = "storage";
 const MAX_BACKOFF_EXPONENT: u32 = 20;
@@ -773,7 +773,10 @@ impl PersistentJobQueue {
     }
 
     pub fn queue_depth(&self) -> SearchResult<QueueDepth> {
-        fetch_queue_depth(self.storage.connection())
+        retry_transient_storage(
+            || fetch_queue_depth(self.storage.connection()),
+            "queue depth",
+        )
     }
 
     /// Reset all terminally-failed jobs for a given embedder back to pending.
