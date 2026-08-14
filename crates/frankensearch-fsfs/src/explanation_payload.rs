@@ -636,6 +636,7 @@ fn component_confidence_per_mille(component: &ScoreComponent) -> u16 {
 fn source_from_explained(source: &ExplainedSource) -> ScoreComponentSource {
     match source {
         ExplainedSource::LexicalBm25 { .. } => ScoreComponentSource::LexicalBm25,
+        ExplainedSource::HashControl { .. } => ScoreComponentSource::HashControl,
         ExplainedSource::SemanticFast { embedder, .. } if is_hash_control_embedder(embedder) => {
             ScoreComponentSource::HashControl
         }
@@ -1294,6 +1295,13 @@ mod tests {
         assert_eq!(
             source_from_explained(&ExplainedSource::SemanticFast {
                 embedder: "fnv1a-256 (hash control)".to_owned(),
+                cosine_sim: 0.0,
+            }),
+            ScoreComponentSource::HashControl
+        );
+        assert_eq!(
+            source_from_explained(&ExplainedSource::HashControl {
+                embedder: "fnv1a-256".to_owned(),
                 cosine_sim: 0.0,
             }),
             ScoreComponentSource::HashControl

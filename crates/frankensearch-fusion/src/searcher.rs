@@ -2438,10 +2438,7 @@ impl TwoTierSearcher {
             // Fast component
             if let Some(s) = fast_score {
                 components.push(ScoreComponent {
-                    source: ExplainedSource::SemanticFast {
-                        embedder: self.fast_embedder.id().to_owned(),
-                        cosine_sim: f64::from(s),
-                    },
+                    source: ExplainedSource::vector_fast(self.fast_embedder.id(), f64::from(s)),
                     raw_score: f64::from(s),
                     normalized_score: fast_norm(s),
                     rrf_contribution: 0.0,
@@ -3522,10 +3519,10 @@ fn fused_hits_to_scored_results(
 
                 if let (Some(rank), Some(raw_score)) = (fh.semantic_rank, fh.semantic_score) {
                     components.push(ScoreComponent {
-                        source: ExplainedSource::SemanticFast {
-                            embedder: fast_embedder_id.to_owned(),
-                            cosine_sim: f64::from(raw_score),
-                        },
+                        source: ExplainedSource::vector_fast(
+                            fast_embedder_id,
+                            f64::from(raw_score),
+                        ),
                         raw_score: f64::from(raw_score),
                         normalized_score: f64::from(raw_score),
                         rrf_contribution: rank_contribution(rrf_k, rank),
@@ -3616,10 +3613,7 @@ fn vector_hits_to_scored_results(
                 Some(Box::new(HitExplanation {
                     final_score: f64::from(h.score),
                     components: vec![ScoreComponent {
-                        source: ExplainedSource::SemanticFast {
-                            embedder: fast_embedder_id.to_owned(),
-                            cosine_sim: f64::from(h.score),
-                        },
+                        source: ExplainedSource::vector_fast(fast_embedder_id, f64::from(h.score)),
                         raw_score: f64::from(h.score),
                         normalized_score: f64::from(h.score),
                         rrf_contribution: 0.0,
@@ -8750,8 +8744,18 @@ mod tests {
             semantic_score: Some(0.9),
             in_both_sources: false,
         }];
-        let results = fused_hits_to_scored_results(&fused, &[], false, "fnv1a-256", 60.0);
+        let results = fused_hits_to_scored_results(&fused, &[], true, "fnv1a-256", 60.0);
         assert_eq!(results[0].source, ScoreSource::HashControl);
+        assert!(
+            matches!(
+                results[0].explanation.as_ref().and_then(|explanation| {
+                    explanation.components.first().map(|component| &component.source)
+                }),
+                Some(ExplainedSource::HashControl { embedder, .. }) if embedder == "fnv1a-256"
+            ),
+            "hash explanation must not use SemanticFast: {:?}",
+            results[0].explanation
+        );
         let semantic = fused_hits_to_scored_results(&fused, &[], false, "minilm-l6-v2", 60.0);
         assert_eq!(semantic[0].source, ScoreSource::SemanticFast);
     }

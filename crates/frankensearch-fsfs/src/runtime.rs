@@ -6421,16 +6421,19 @@ impl FsfsRuntime {
                 .vector_generation_id
                 .as_deref()
                 .unwrap_or("fast-tier");
-            let embedder = if session.vector_generation_is_hash {
-                format!("{embedder} (hash control)")
+            let source = if session.vector_generation_is_hash {
+                ExplainedSource::HashControl {
+                    embedder: embedder.to_owned(),
+                    cosine_sim: f64::from(semantic_score),
+                }
             } else {
-                embedder.to_owned()
+                ExplainedSource::SemanticFast {
+                    embedder: embedder.to_owned(),
+                    cosine_sim: f64::from(semantic_score),
+                }
             };
             components.push(ScoreComponent {
-                source: ExplainedSource::SemanticFast {
-                    embedder,
-                    cosine_sim: f64::from(semantic_score),
-                },
+                source,
                 raw_score: f64::from(semantic_score),
                 normalized_score: f64::from(semantic_score),
                 rrf_contribution: rrf_contribution_for_rank(session.rrf_k, hit.semantic_rank),

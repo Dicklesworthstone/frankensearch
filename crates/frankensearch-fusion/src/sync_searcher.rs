@@ -701,6 +701,7 @@ impl SyncTwoTierSearcher {
                     None,
                     None,
                     &self.config,
+                    sync_fast_embedder_id(&self.index),
                 )
             },
             |lexical| {
@@ -722,6 +723,7 @@ impl SyncTwoTierSearcher {
                     ),
                     k,
                     &self.config,
+                    sync_fast_embedder_id(&self.index),
                 )
             },
         );
@@ -899,6 +901,7 @@ impl SyncTwoTierSearcher {
                 ),
                 k,
                 &self.config,
+                sync_fast_embedder_id(&self.index),
             )
         } else {
             unique_vector_hits_to_scored_results_owned(blended, k, ScoreSource::SemanticQuality)
@@ -952,6 +955,7 @@ impl SyncTwoTierSearcher {
                     quality_min,
                     quality_max,
                     quality_weight,
+                    sync_fast_embedder_id(&self.index),
                 )));
             }
         }
@@ -1143,6 +1147,7 @@ fn build_refined_explanation(
     quality_min: f32,
     quality_max: f32,
     quality_weight: f32,
+    fast_embedder_id: &str,
 ) -> HitExplanation {
     let normalize = |score: f32, min: f32, max: f32| {
         if !score.is_finite() {
@@ -1158,10 +1163,7 @@ fn build_refined_explanation(
     let mut components = Vec::with_capacity(2);
     if let Some(score) = fast_score {
         components.push(ScoreComponent {
-            source: ExplainedSource::SemanticFast {
-                embedder: "sync-fast-query".to_owned(),
-                cosine_sim: f64::from(score),
-            },
+            source: ExplainedSource::vector_fast(fast_embedder_id, f64::from(score)),
             raw_score: f64::from(score),
             normalized_score: normalize(score, fast_min, fast_max),
             rrf_contribution: 0.0,
@@ -1227,6 +1229,7 @@ fn fused_hits_to_scored_results(
     hits: Vec<FusedHit>,
     k: usize,
     config: &TwoTierConfig,
+    fast_embedder_id: &str,
 ) -> Vec<ScoredResult> {
     // Take the `rrf_fuse` result by value and move each `doc_id` into the
     // `ScoredResult` instead of cloning it; the `FusedHit`s are a fresh
@@ -1252,10 +1255,10 @@ fn fused_hits_to_scored_results(
                 }
                 if let (Some(rank), Some(raw_score)) = (hit.semantic_rank, hit.semantic_score) {
                     components.push(ScoreComponent {
-                        source: ExplainedSource::SemanticFast {
-                            embedder: "sync-fast-query".to_owned(),
-                            cosine_sim: f64::from(raw_score),
-                        },
+                        source: ExplainedSource::vector_fast(
+                            fast_embedder_id,
+                            f64::from(raw_score),
+                        ),
                         raw_score: f64::from(raw_score),
                         normalized_score: f64::from(raw_score),
                         rrf_contribution: rrf_rank_contribution(config.rrf_k, rank),
@@ -1295,6 +1298,10 @@ fn rrf_rank_contribution(rrf_k: f64, rank: usize) -> f64 {
     1.0 / (rrf_k + f64::from(rank) + 1.0)
 }
 
+fn sync_fast_embedder_id(index: &InMemoryTwoTierIndex) -> &str {
+    index.fast_embedder_id().unwrap_or("sync-fast-query")
+}
+
 fn vector_hits_to_scored_results(
     hits: &[VectorHit],
     k: usize,
@@ -1302,6 +1309,7 @@ fn vector_hits_to_scored_results(
     fast_scores: Option<&AHashMap<&str, f32>>,
     quality_scores: Option<&AHashMap<&str, f32>>,
     config: &TwoTierConfig,
+    fast_embedder_id: &str,
 ) -> Vec<ScoredResult> {
     let mut seen = AHashSet::with_capacity(hits.len());
     hits.iter()
@@ -1319,10 +1327,10 @@ fn vector_hits_to_scored_results(
                 Box::new(HitExplanation {
                     final_score: f64::from(hit.score),
                     components: vec![ScoreComponent {
-                        source: ExplainedSource::SemanticFast {
-                            embedder: "sync-fast-query".to_owned(),
-                            cosine_sim: f64::from(hit.score),
-                        },
+                        source: ExplainedSource::vector_fast(
+                            fast_embedder_id,
+                            f64::from(hit.score),
+                        ),
                         raw_score: f64::from(hit.score),
                         normalized_score: f64::from(hit.score),
                         rrf_contribution: 0.0,

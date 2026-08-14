@@ -677,6 +677,7 @@ fn explained_source_kind(source: &ExplainedSource) -> &'static str {
         ExplainedSource::SemanticFast { .. } => "semantic_fast",
         ExplainedSource::SemanticQuality { .. } => "semantic_quality",
         ExplainedSource::Rerank { .. } => "rerank",
+        ExplainedSource::HashControl { .. } => "hash_control",
     }
 }
 

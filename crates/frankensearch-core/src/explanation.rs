@@ -101,6 +101,33 @@ pub enum ExplainedSource {
         /// Sigmoid-activated score (probability-like, 0.0-1.0).
         sigmoid: f64,
     },
+
+    /// Hash / FNV / JL control vector score. Not semantic.
+    HashControl {
+        /// Control embedder identity (`hash`, `fnv1a-*`, `jl-*`).
+        embedder: String,
+        /// Cosine similarity in the control space.
+        cosine_sim: f64,
+    },
+}
+
+impl ExplainedSource {
+    /// Fast-tier vector component. Hash/fnv/jl identities become [`Self::HashControl`].
+    #[must_use]
+    pub fn vector_fast(embedder: impl Into<String>, cosine_sim: f64) -> Self {
+        let embedder = embedder.into();
+        if crate::is_hash_generation_id(&embedder) {
+            Self::HashControl {
+                embedder,
+                cosine_sim,
+            }
+        } else {
+            Self::SemanticFast {
+                embedder,
+                cosine_sim,
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for ExplainedSource {
@@ -135,6 +162,12 @@ impl std::fmt::Display for ExplainedSource {
                 sigmoid,
             } => {
                 write!(f, "Rerank({model}, logit={logit:.4}, sig={sigmoid:.4})")
+            }
+            Self::HashControl {
+                embedder,
+                cosine_sim,
+            } => {
+                write!(f, "HashControl({embedder}, cos={cosine_sim:.4})")
             }
         }
     }
@@ -461,6 +494,13 @@ mod tests {
         };
         assert!(rerank.to_string().contains("Rerank"));
         assert!(rerank.to_string().contains("sig="));
+
+        let hash = ExplainedSource::HashControl {
+            embedder: "fnv1a-256".into(),
+            cosine_sim: 0.4,
+        };
+        assert!(hash.to_string().contains("HashControl"));
+        assert!(!hash.to_string().contains("FastSemantic"));
     }
 
     #[test]
@@ -564,6 +604,10 @@ mod tests {
                 logit: 1.2,
                 sigmoid: 0.77,
             },
+            ExplainedSource::HashControl {
+                embedder: "fnv1a-256".into(),
+                cosine_sim: 0.4,
+            },
         ];
 
         for source in &sources {
@@ -572,6 +616,22 @@ mod tests {
             // Verify the variant tag survived.
             let json2 = serde_json::to_string(&decoded).unwrap();
             assert_eq!(json, json2);
+        }
+    }
+
+    #[test]
+    fn vector_fast_classifies_hash_identities() {
+        match ExplainedSource::vector_fast("minilm-l6-v2", 0.8) {
+            ExplainedSource::SemanticFast { embedder, .. } => {
+                assert_eq!(embedder, "minilm-l6-v2");
+            }
+            other => panic!("semantic embedder must stay SemanticFast: {other}"),
+        }
+        match ExplainedSource::vector_fast("fnv1a-256", 0.4) {
+            ExplainedSource::HashControl { embedder, .. } => {
+                assert_eq!(embedder, "fnv1a-256");
+            }
+            other => panic!("hash identity must not stay SemanticFast: {other}"),
         }
     }
 
