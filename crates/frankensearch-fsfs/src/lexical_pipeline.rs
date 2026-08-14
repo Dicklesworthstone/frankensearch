@@ -565,6 +565,12 @@ impl<'a> QuillLexicalBackend<'a> {
     }
 
     async fn flush_inner(&mut self, cx: &Cx, resumable: bool) -> SearchResult<QuillResumeStats> {
+        cx.checkpoint().map_err(|error| SearchError::Cancelled {
+            phase: "fsfs.lexical.flush".to_owned(),
+            reason: cx
+                .cancel_reason()
+                .map_or_else(|| error.to_string(), |reason| reason.to_string()),
+        })?;
         let actions = std::mem::take(&mut self.pending);
         let mut documents = Vec::new();
         let mut stats = QuillResumeStats::default();
@@ -879,6 +885,7 @@ mod tests {
     use std::time::Instant;
 
     use asupersync::test_utils::run_test_with_cx;
+    use frankensearch_core::SearchError;
     use frankensearch_quill::{QuillConfig, QuillIndex, SegmentStatsProvider};
 
     use super::{
@@ -990,6 +997,45 @@ mod tests {
             .expect("incremental delete");
         assert_eq!(delete_stats.deleted, 1);
         assert!(!pipeline.backend().contains("doc-a"));
+    }
+
+    #[test]
+    fn lexical_flush_stops_at_checkpoint_when_cancelled() {
+        run_test_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(QuillConfig {
+                max_ingest_shards: 1,
+                deterministic_ingest: true,
+                ..QuillConfig::default()
+            })
+            .expect("create in-memory Quill index");
+            let mut pipeline = LexicalPipeline::new(QuillLexicalBackend::new(&index));
+            pipeline
+                .apply_initial(&[LexicalMutation::upsert(
+                    "doc-cancel",
+                    1,
+                    IngestionClass::FullSemanticLexical,
+                    "cancel body",
+                    "cancel",
+                )])
+                .expect("plan cancelled flush");
+            assert_eq!(pipeline.backend().pending_len(), 1);
+
+            cx.cancel_with(asupersync::CancelKind::User, Some("lexical flush cancel"));
+            let error = pipeline
+                .backend_mut()
+                .flush(&cx)
+                .await
+                .expect_err("cancelled flush must not apply pending actions");
+            assert!(
+                matches!(error, SearchError::Cancelled { ref phase, .. } if phase == "fsfs.lexical.flush"),
+                "expected lexical flush checkpoint cancel, got {error:?}"
+            );
+            assert_eq!(
+                pipeline.backend().pending_len(),
+                1,
+                "cancel before drain must leave pending actions in place"
+            );
+        });
     }
 
     #[test]

@@ -8966,11 +8966,7 @@ impl FsfsRuntime {
                     budget_ms,
                 });
             }
-            asupersync::time::sleep(
-                asupersync::time::wall_now(),
-                Duration::from_millis(FSFS_FLUSH_POLL_MS),
-            )
-            .await;
+            asupersync::time::sleep(cx.now(), Duration::from_millis(FSFS_FLUSH_POLL_MS)).await;
         }
     }
 
@@ -9259,8 +9255,7 @@ impl FsfsRuntime {
                 last_wal_len = current_wal_len;
             }
 
-            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(poll_ms))
-                .await;
+            asupersync::time::sleep(cx.now(), Duration::from_millis(poll_ms)).await;
         }
 
         Ok(())
@@ -15174,11 +15169,7 @@ impl FsfsRuntime {
                 );
             }
 
-            asupersync::time::sleep(
-                asupersync::time::wall_now(),
-                std::time::Duration::from_millis(25),
-            )
-            .await;
+            asupersync::time::sleep(cx.now(), std::time::Duration::from_millis(25)).await;
         }
     }
 

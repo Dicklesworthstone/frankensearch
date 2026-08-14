@@ -187,13 +187,13 @@ impl ShutdownCoordinator {
                 return reason;
             }
 
-            if cx.is_cancel_requested() {
+            if cx.checkpoint().is_err() || cx.is_cancel_requested() {
                 return ShutdownReason::Error(
                     "operation cancelled while waiting for shutdown".to_owned(),
                 );
             }
 
-            asupersync::time::sleep(asupersync::time::wall_now(), WAIT_POLL_INTERVAL).await;
+            asupersync::time::sleep(cx.now(), WAIT_POLL_INTERVAL).await;
         }
     }
 
