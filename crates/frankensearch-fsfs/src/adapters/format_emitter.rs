@@ -545,7 +545,7 @@ fn render_search_table_with_options(
             score_color_code(hit.score),
             color_enabled,
         );
-        let source_badge = source_badge(hit, color_enabled);
+        let source_badge = source_badge(hit, payload.vector_generation_is_hash, color_enabled);
 
         let _ = write!(
             out,
@@ -624,14 +624,20 @@ fn split_path_and_line_number(path: &str) -> (&str, Option<&str>) {
     (path, None)
 }
 
-fn source_badge(hit: &SearchHitPayload, color_enabled: bool) -> String {
+fn source_badge(hit: &SearchHitPayload, hash_control: bool, color_enabled: bool) -> String {
     if hit.in_both_sources {
+        if hash_control {
+            return paint("[lexical+hash]", "33", color_enabled);
+        }
         return paint("[both]", "1;32", color_enabled);
     }
     if hit.lexical_rank.is_some() {
         return paint("[lexical]", "33", color_enabled);
     }
     if hit.semantic_rank.is_some() {
+        if hash_control {
+            return paint("[hash control]", "31", color_enabled);
+        }
         return paint("[semantic]", "36", color_enabled);
     }
     paint("[unknown]", "90", color_enabled)
@@ -1354,6 +1360,45 @@ mod tests {
         assert!(output.contains("[both]"), "hit in both sources: {output}");
         assert!(output.contains("[lexical]"), "lexical-only hit: {output}");
         assert!(output.contains("[semantic]"), "semantic-only hit: {output}");
+    }
+
+    #[test]
+    fn render_search_table_does_not_badge_hash_hits_as_semantic() {
+        let payload = SearchPayload::new(
+            "ownership",
+            SearchOutputPhase::Initial,
+            2,
+            vec![
+                SearchHitPayload {
+                    rank: 1,
+                    path: "src/lib.rs".to_owned(),
+                    score: 0.4,
+                    snippet: None,
+                    lexical_rank: Some(0),
+                    semantic_rank: Some(0),
+                    in_both_sources: true,
+                },
+                SearchHitPayload {
+                    rank: 2,
+                    path: "src/hash.rs".to_owned(),
+                    score: 0.2,
+                    snippet: None,
+                    lexical_rank: None,
+                    semantic_rank: Some(1),
+                    in_both_sources: false,
+                },
+            ],
+        )
+        .with_vector_generation("fnv1a-256", true);
+        let output = render_search_table_for_cli(&payload, Some(2), true);
+        assert!(
+            output.contains("[lexical+hash]") && output.contains("[hash control]"),
+            "hash vector ranks must not use the semantic badge: {output}"
+        );
+        assert!(
+            !output.contains("[semantic]") && !output.contains("[both]"),
+            "hash control must not share the semantic badges: {output}"
+        );
     }
 
     #[test]

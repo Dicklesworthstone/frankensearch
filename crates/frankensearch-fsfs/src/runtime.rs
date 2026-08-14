@@ -472,6 +472,7 @@ enum DashboardSearchStage {
     Idle,
     Lexical,
     SemanticFast,
+    HashControl,
     QualitySkipped,
     QualityRefined,
     QualityRefinementFailed,
@@ -484,6 +485,7 @@ impl DashboardSearchStage {
             Self::Idle => "idle",
             Self::Lexical => "lexical",
             Self::SemanticFast => "semantic_fast",
+            Self::HashControl => "hash_control",
             Self::QualitySkipped => "quality_skipped",
             Self::QualityRefined => "quality_refined",
             Self::QualityRefinementFailed => "quality_refinement_failed",
@@ -14418,9 +14420,9 @@ impl FsfsRuntime {
             .await
         {
             Ok(payloads) => {
-                let has_semantic_hits = payloads.last().is_some_and(|payload| {
-                    payload.hits.iter().any(|hit| hit.semantic_rank.is_some())
-                });
+                let last = payloads.last();
+                let has_semantic_hits = last.is_some_and(payload_has_admitted_semantic_hits);
+                let has_hash_hits = last.is_some_and(payload_has_hash_control_hits);
                 let can_run_quality = !self.config.search.fast_only
                     && has_semantic_hits
                     && state.quality_model_cached()
@@ -14435,6 +14437,11 @@ impl FsfsRuntime {
                         DashboardSearchStage::Lexical,
                         DashboardSearchStage::SemanticFast,
                         DashboardSearchStage::QualitySkipped,
+                    ]
+                } else if has_hash_hits {
+                    vec![
+                        DashboardSearchStage::Lexical,
+                        DashboardSearchStage::HashControl,
                     ]
                 } else {
                     vec![DashboardSearchStage::Lexical]
@@ -14504,10 +14511,10 @@ impl FsfsRuntime {
             .await
         {
             Ok(payloads) => {
-                let has_semantic_hits = payloads.last().is_some_and(|payload| {
-                    payload.hits.iter().any(|hit| hit.semantic_rank.is_some())
-                });
-                let quality_stage = match payloads.last().map(|payload| payload.phase) {
+                let last = payloads.last();
+                let has_semantic_hits = last.is_some_and(payload_has_admitted_semantic_hits);
+                let has_hash_hits = last.is_some_and(payload_has_hash_control_hits);
+                let quality_stage = match last.map(|payload| payload.phase) {
                     Some(SearchOutputPhase::Refined) => DashboardSearchStage::QualityRefined,
                     Some(SearchOutputPhase::Initial) => DashboardSearchStage::QualitySkipped,
                     Some(SearchOutputPhase::RefinementFailed) => {
@@ -14520,6 +14527,11 @@ impl FsfsRuntime {
                         DashboardSearchStage::Lexical,
                         DashboardSearchStage::SemanticFast,
                         quality_stage,
+                    ]
+                } else if has_hash_hits {
+                    vec![
+                        DashboardSearchStage::Lexical,
+                        DashboardSearchStage::HashControl,
                     ]
                 } else {
                     vec![DashboardSearchStage::Lexical]
@@ -14552,11 +14564,13 @@ impl FsfsRuntime {
             .refresh_search_dashboard_mode(cx, state, SearchExecutionMode::Full, resources)
             .await
         {
-            let has_semantic_hits = payloads
-                .last()
-                .is_some_and(|payload| payload.hits.iter().any(|hit| hit.semantic_rank.is_some()));
+            let last = payloads.last();
+            let has_semantic_hits = last.is_some_and(payload_has_admitted_semantic_hits);
+            let has_hash_hits = last.is_some_and(payload_has_hash_control_hits);
             let mut stages = vec![DashboardSearchStage::Lexical];
-            if has_semantic_hits {
+            if has_hash_hits {
+                stages.push(DashboardSearchStage::HashControl);
+            } else if has_semantic_hits {
                 stages.push(DashboardSearchStage::SemanticFast);
                 if let Some(phase) = payloads.last().map(|payload| payload.phase) {
                     match phase {
@@ -16514,7 +16528,11 @@ fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState
         let semantic_rank = hit
             .semantic_rank
             .map_or_else(|| "–".to_owned(), |rank| format_count_usize(rank + 1));
-        let source = search_hit_source_label(hit);
+        let hash_control = state
+            .latest_payload()
+            .is_some_and(|payload| payload.vector_generation_is_hash);
+        let source = search_hit_source_label(hit, hash_control);
+        let vector_rank_label = if hash_control { "hash#" } else { "semantic#" };
         vec![
             Line::from(Span::styled(
                 truncate_middle(
@@ -16525,7 +16543,7 @@ fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState
             )),
             Line::from(Span::styled(
                 format!(
-                    "score={:.3}  source={}  lexical#={}  semantic#={}",
+                    "score={:.3}  source={}  lexical#={}  {vector_rank_label}={}",
                     hit.score, source, lexical_rank, semantic_rank
                 ),
                 ui_fg(no_color, PackedRgba::rgb(173, 194, 229)),
@@ -17107,7 +17125,12 @@ fn render_search_results_panel(
         let path_budget = usize::from(inner.width).saturating_sub(32).max(14);
         let snippet_budget = usize::from(inner.width).saturating_sub(8).max(18);
         let path = truncate_middle(&hit.path, path_budget);
-        let source_label = search_hit_source_label(hit);
+        let source_label = search_hit_source_label(
+            hit,
+            state
+                .latest_payload()
+                .is_some_and(|payload| payload.vector_generation_is_hash),
+        );
 
         let mut line_one_spans = Vec::new();
         line_one_spans.push(Span::styled(
@@ -17529,13 +17552,25 @@ fn collect_search_query_terms(query: &str) -> Vec<String> {
         .collect()
 }
 
-const fn search_hit_source_label(hit: &SearchHitPayload) -> &'static str {
+fn payload_has_admitted_semantic_hits(payload: &SearchPayload) -> bool {
+    !payload.vector_generation_is_hash && payload.hits.iter().any(|hit| hit.semantic_rank.is_some())
+}
+
+fn payload_has_hash_control_hits(payload: &SearchPayload) -> bool {
+    payload.vector_generation_is_hash && payload.hits.iter().any(|hit| hit.semantic_rank.is_some())
+}
+
+const fn search_hit_source_label(hit: &SearchHitPayload, hash_control: bool) -> &'static str {
     if hit.in_both_sources {
-        "both"
+        if hash_control { "lexical+hash" } else { "both" }
     } else if hit.lexical_rank.is_some() {
         "lexical"
     } else if hit.semantic_rank.is_some() {
-        "semantic"
+        if hash_control {
+            "hash control"
+        } else {
+            "semantic"
+        }
     } else {
         "unknown"
     }
@@ -19441,8 +19476,9 @@ mod tests {
         SemanticGateDecisionInput, SemanticRecallDecisionInput, VectorIndexWriteAction,
         VectorPipelineInput, VectorPipelinePlan, VectorSchedulingTier,
         degradation_controller_config_for_profile, detect_context_preview_format,
-        is_likely_html_fragment, normalize_html_fragment_for_markdown, read_durable_json,
-        render_explain_table, render_status_table,
+        is_likely_html_fragment, normalize_html_fragment_for_markdown,
+        payload_has_admitted_semantic_hits, payload_has_hash_control_hits, read_durable_json,
+        render_explain_table, render_status_table, search_hit_source_label,
     };
     use crate::adapters::cli::{CliCommand, CliInput, CompletionShell, OutputFormat};
     use crate::catalog::bootstrap_catalog_schema;
@@ -28175,6 +28211,43 @@ mod tests {
             !table.contains("Semantic (fast):"),
             "explain table must not keep the semantic-fast label for hash: {table}"
         );
+    }
+
+    #[test]
+    fn hash_vector_hits_are_not_admitted_as_semantic() {
+        let mut payload = SearchPayload::new(
+            "ownership",
+            SearchOutputPhase::Initial,
+            1,
+            vec![SearchHitPayload {
+                rank: 1,
+                path: "src/lib.rs".to_owned(),
+                score: 0.2,
+                snippet: None,
+                lexical_rank: None,
+                semantic_rank: Some(0),
+                in_both_sources: false,
+            }],
+        )
+        .with_vector_generation("fnv1a-256", true);
+        assert!(payload_has_hash_control_hits(&payload));
+        assert!(!payload_has_admitted_semantic_hits(&payload));
+        assert_eq!(
+            search_hit_source_label(&payload.hits[0], true),
+            "hash control"
+        );
+
+        payload.hits[0].lexical_rank = Some(0);
+        payload.hits[0].in_both_sources = true;
+        assert_eq!(
+            search_hit_source_label(&payload.hits[0], true),
+            "lexical+hash"
+        );
+
+        payload.vector_generation_is_hash = false;
+        assert!(payload_has_admitted_semantic_hits(&payload));
+        assert!(!payload_has_hash_control_hits(&payload));
+        assert_eq!(search_hit_source_label(&payload.hits[0], false), "both");
     }
 
     #[test]
