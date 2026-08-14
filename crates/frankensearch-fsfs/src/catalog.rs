@@ -101,11 +101,16 @@ pub const CLEANUP_TOMBSTONES_SQL: &str = "DELETE FROM fsfs_catalog_files \
 ///
 /// Returns an error if `SQLite` execution fails.
 pub fn cleanup_tombstones(conn: &Connection, cutoff_ts_ms: i64) -> SearchResult<usize> {
-    conn.execute_with_params_sync(
-        CLEANUP_TOMBSTONES_SQL,
-        &[SqliteValue::Integer(cutoff_ts_ms)],
+    retry_catalog_op(
+        || {
+            conn.execute_with_params_sync(
+                CLEANUP_TOMBSTONES_SQL,
+                &[SqliteValue::Integer(cutoff_ts_ms)],
+            )
+            .map_err(catalog_error)
+        },
+        "catalog tombstone cleanup",
     )
-    .map_err(catalog_error)
 }
 
 /// Open a catalog database file and prune tombstoned rows past retention.
@@ -135,7 +140,9 @@ fn open_catalog_connection(path: &str) -> SearchResult<Connection> {
     loop {
         match Connection::open_sync(path.clone()) {
             Ok(conn) => return Ok(conn),
-            Err(error) if error.is_transient() && attempt < CATALOG_OPEN_MAX_ATTEMPTS => {
+            Err(error)
+                if is_retryable_franken_error(&error) && attempt < CATALOG_OPEN_MAX_ATTEMPTS =>
+            {
                 let growth = attempt.saturating_sub(1).min(6);
                 let delay_ms = (CATALOG_OPEN_RETRY_BASE_DELAY_MS << growth)
                     .min(CATALOG_OPEN_RETRY_MAX_DELAY_MS);
@@ -278,6 +285,13 @@ pub const fn classify_replay_sequence(last_applied_seq: i64, incoming_seq: i64) 
 /// Returns an error if schema DDL fails, the version marker is invalid, or the
 /// transaction cannot be committed.
 pub fn bootstrap_catalog_schema(conn: &Connection) -> SearchResult<()> {
+    retry_catalog_op(
+        || bootstrap_catalog_schema_once(conn),
+        "catalog schema bootstrap",
+    )
+}
+
+fn bootstrap_catalog_schema_once(conn: &Connection) -> SearchResult<()> {
     conn.execute_sync("BEGIN IMMEDIATE;")
         .map_err(catalog_error)?;
     let result = bootstrap_catalog_schema_inner(conn);
@@ -285,26 +299,28 @@ pub fn bootstrap_catalog_schema(conn: &Connection) -> SearchResult<()> {
         Ok(()) => conn
             .execute_sync("COMMIT;")
             .map(|_| ())
-            .map_err(|commit_err| {
-                if let Err(rollback_err) = conn.execute_sync("ROLLBACK;") {
+            .map_err(|commit_err| match conn.execute_sync("ROLLBACK;") {
+                Ok(_) => catalog_error(commit_err),
+                Err(rollback_err) => {
                     tracing::warn!(
                         target: "frankensearch.fsfs.catalog",
                         error = %rollback_err,
                         "rollback failed after catalog schema bootstrap commit error"
                     );
+                    unretryable_catalog_rollback_error(&catalog_error(commit_err), &rollback_err)
                 }
-                catalog_error(commit_err)
             }),
-        Err(error) => {
-            if let Err(rollback_err) = conn.execute_sync("ROLLBACK;") {
+        Err(error) => match conn.execute_sync("ROLLBACK;") {
+            Ok(_) => Err(error),
+            Err(rollback_err) => {
                 tracing::warn!(
                     target: "frankensearch.fsfs.catalog",
                     error = %rollback_err,
                     "rollback failed after catalog schema bootstrap error"
                 );
+                Err(unretryable_catalog_rollback_error(&error, &rollback_err))
             }
-            Err(error)
-        }
+        },
     }
 }
 
@@ -407,6 +423,68 @@ where
     SearchError::SubsystemError {
         subsystem: SUBSYSTEM,
         source: Box::new(source),
+    }
+}
+
+fn is_retryable_franken_error(error: &fsqlite::FrankenError) -> bool {
+    error.is_transient()
+        || matches!(
+            error,
+            fsqlite::FrankenError::SnapshotTooOld { .. } | fsqlite::FrankenError::SchemaChanged
+        )
+}
+
+fn is_retryable_catalog_error(error: &SearchError) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(err) = current {
+        if let Some(franken) = err.downcast_ref::<fsqlite::FrankenError>() {
+            return is_retryable_franken_error(franken);
+        }
+        current = err.source();
+    }
+    false
+}
+
+fn unretryable_catalog_rollback_error(
+    original: &SearchError,
+    rollback_err: &fsqlite::FrankenError,
+) -> SearchError {
+    SearchError::SubsystemError {
+        subsystem: SUBSYSTEM,
+        source: Box::new(io::Error::other(format!(
+            "rollback failed ({rollback_err}); original error was: {original}"
+        ))),
+    }
+}
+
+fn retry_catalog_op<T>(
+    mut op: impl FnMut() -> SearchResult<T>,
+    context: &'static str,
+) -> SearchResult<T> {
+    let mut attempt = 1;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if is_retryable_catalog_error(&error) && attempt < CATALOG_OPEN_MAX_ATTEMPTS =>
+            {
+                let growth = attempt.saturating_sub(1).min(6);
+                let delay_ms = (CATALOG_OPEN_RETRY_BASE_DELAY_MS << growth)
+                    .min(CATALOG_OPEN_RETRY_MAX_DELAY_MS);
+                tracing::debug!(
+                    target: "frankensearch.fsfs.catalog",
+                    context,
+                    next_attempt = attempt.saturating_add(1),
+                    max_attempts = CATALOG_OPEN_MAX_ATTEMPTS,
+                    delay_ms,
+                    error = %error,
+                    "retrying transient catalog contention"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                attempt = attempt.saturating_add(1);
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -873,6 +951,34 @@ mod tests {
             }
             other => panic!("expected SubsystemError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn catalog_retry_accepts_busy_snapshot_and_snapshot_too_old() {
+        use fsqlite::FrankenError;
+
+        assert!(super::is_retryable_catalog_error(&catalog_error(
+            FrankenError::BusySnapshot {
+                conflicting_pages: "1".to_owned(),
+            }
+        )));
+        assert!(super::is_retryable_catalog_error(&catalog_error(
+            FrankenError::SnapshotTooOld { txn_id: 1 }
+        )));
+        assert!(super::is_retryable_catalog_error(&catalog_error(
+            FrankenError::SchemaChanged
+        )));
+        assert!(!super::is_retryable_catalog_error(&catalog_error(
+            FrankenError::NoSuchTable {
+                name: "missing".to_owned(),
+            }
+        )));
+        assert!(!super::is_retryable_catalog_error(
+            &super::unretryable_catalog_rollback_error(
+                &catalog_error(FrankenError::Busy),
+                &FrankenError::Busy,
+            )
+        ));
     }
 
     #[test]

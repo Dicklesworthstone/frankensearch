@@ -2500,9 +2500,16 @@ impl OpsStorage {
         Ok(())
     }
 
-    fn with_transaction<T, F>(&self, operation: F) -> SearchResult<T>
+    fn with_transaction<T, F>(&self, mut operation: F) -> SearchResult<T>
     where
-        F: FnOnce(&AsyncConnection) -> SearchResult<T>,
+        F: FnMut(&AsyncConnection) -> SearchResult<T>,
+    {
+        retry_ops_transaction(|| self.with_transaction_once(&mut operation))
+    }
+
+    fn with_transaction_once<T, F>(&self, operation: &mut F) -> SearchResult<T>
+    where
+        F: FnMut(&AsyncConnection) -> SearchResult<T>,
     {
         self.connection()
             .begin_transaction_sync()
@@ -2511,25 +2518,32 @@ impl OpsStorage {
         match result {
             Ok(Ok(value)) => {
                 if let Err(commit_err) = self.connection().commit_transaction_sync() {
-                    if let Err(rollback_err) = self.connection().rollback_transaction_sync() {
-                        tracing::warn!(
-                            target: "frankensearch.ops.storage",
-                            error = %rollback_err,
-                            "rollback failed after operations storage commit error"
-                        );
-                    }
-                    return Err(ops_error(commit_err));
+                    return Err(match self.connection().rollback_transaction_sync() {
+                        Ok(()) => ops_error(commit_err),
+                        Err(rollback_err) => {
+                            tracing::warn!(
+                                target: "frankensearch.ops.storage",
+                                error = %rollback_err,
+                                "rollback failed after operations storage commit error"
+                            );
+                            unretryable_ops_rollback_error(&ops_error(commit_err), &rollback_err)
+                        }
+                    });
                 }
                 Ok(value)
             }
             Ok(Err(error)) => {
-                if let Err(rollback_err) = self.connection().rollback_transaction_sync() {
-                    tracing::warn!(
-                        target: "frankensearch.ops.storage",
-                        error = %rollback_err,
-                        "rollback failed after operations storage transaction error"
-                    );
-                }
+                let error = match self.connection().rollback_transaction_sync() {
+                    Ok(()) => error,
+                    Err(rollback_err) => {
+                        tracing::warn!(
+                            target: "frankensearch.ops.storage",
+                            error = %rollback_err,
+                            "rollback failed after operations storage transaction error"
+                        );
+                        unretryable_ops_rollback_error(&error, &rollback_err)
+                    }
+                };
                 Err(error)
             }
             Err(payload) => {
@@ -3748,15 +3762,60 @@ where
     }
 }
 
+fn is_retryable_franken_error(error: &fsqlite::FrankenError) -> bool {
+    error.is_transient()
+        || matches!(
+            error,
+            fsqlite::FrankenError::SnapshotTooOld { .. } | fsqlite::FrankenError::SchemaChanged
+        )
+}
+
 fn is_retryable_storage_contention(error: &SearchError) -> bool {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(err) = current {
         if let Some(franken) = err.downcast_ref::<fsqlite::FrankenError>() {
-            return franken.is_transient();
+            return is_retryable_franken_error(franken);
         }
         current = err.source();
     }
     false
+}
+
+fn unretryable_ops_rollback_error(
+    original: &SearchError,
+    rollback_err: &fsqlite::FrankenError,
+) -> SearchError {
+    SearchError::SubsystemError {
+        subsystem: "ops-storage",
+        source: Box::new(std::io::Error::other(format!(
+            "rollback failed ({rollback_err}); original error was: {original}"
+        ))),
+    }
+}
+
+fn retry_ops_transaction<T>(mut op: impl FnMut() -> SearchResult<T>) -> SearchResult<T> {
+    const MAX_ATTEMPTS: u32 = 8;
+    let mut attempt = 1;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(error) if is_retryable_storage_contention(&error) && attempt < MAX_ATTEMPTS => {
+                let growth = attempt.saturating_sub(1).min(6);
+                let delay_ms = (1_u64 << growth).min(50);
+                tracing::debug!(
+                    target: "frankensearch.ops.storage",
+                    next_attempt = attempt.saturating_add(1),
+                    max_attempts = MAX_ATTEMPTS,
+                    delay_ms,
+                    error = %error,
+                    "retrying ops storage transaction after transient contention"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                attempt = attempt.saturating_add(1);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3822,6 +3881,25 @@ mod tests {
         let error = ops_error(FrankenError::NoSuchTable {
             name: "missing".to_owned(),
         });
+        assert!(!is_retryable_storage_contention(&error));
+    }
+
+    #[test]
+    fn open_retry_accepts_snapshot_too_old_and_schema_changed() {
+        assert!(is_retryable_storage_contention(&ops_error(
+            FrankenError::SnapshotTooOld { txn_id: 3 }
+        )));
+        assert!(is_retryable_storage_contention(&ops_error(
+            FrankenError::SchemaChanged
+        )));
+    }
+
+    #[test]
+    fn failed_rollback_error_is_not_retryable() {
+        let error = super::unretryable_ops_rollback_error(
+            &ops_error(FrankenError::Busy),
+            &FrankenError::Busy,
+        );
         assert!(!is_retryable_storage_contention(&error));
     }
 

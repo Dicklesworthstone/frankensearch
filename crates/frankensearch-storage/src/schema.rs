@@ -369,27 +369,37 @@ fn bootstrap_write_transaction(conn: &AsyncConnection) -> SearchResult<()> {
     let result = catch_unwind(AssertUnwindSafe(|| bootstrap_inner(conn)));
     match result {
         Ok(Ok(())) => conn.commit_transaction_sync().map_err(|commit_err| {
-            if let Err(rollback_err) = conn.rollback_transaction_sync() {
-                tracing::warn!(
-                    target: "frankensearch.storage",
-                    stage = "schema transaction rollback after commit",
-                    error = %rollback_err,
-                    "rollback failed after schema bootstrap commit error"
-                );
+            match conn.rollback_transaction_sync() {
+                Ok(()) => map_storage_error_at("schema transaction commit", commit_err),
+                Err(rollback_err) => {
+                    tracing::warn!(
+                        target: "frankensearch.storage",
+                        stage = "schema transaction rollback after commit",
+                        error = %rollback_err,
+                        "rollback failed after schema bootstrap commit error"
+                    );
+                    crate::connection::unretryable_rollback_error(
+                        &map_storage_error_at("schema transaction commit", commit_err),
+                        &rollback_err,
+                    )
+                }
             }
-            map_storage_error_at("schema transaction commit", commit_err)
         }),
-        Ok(Err(error)) => {
-            if let Err(rollback_err) = conn.rollback_transaction_sync() {
+        Ok(Err(error)) => match conn.rollback_transaction_sync() {
+            Ok(()) => Err(error),
+            Err(rollback_err) => {
                 tracing::warn!(
                     target: "frankensearch.storage",
                     stage = "schema transaction rollback after bootstrap",
                     error = %rollback_err,
                     "rollback failed after schema bootstrap error"
                 );
+                Err(crate::connection::unretryable_rollback_error(
+                    &error,
+                    &rollback_err,
+                ))
             }
-            Err(error)
-        }
+        },
         Err(payload) => {
             if let Err(rollback_err) = conn.rollback_transaction_sync() {
                 tracing::error!(

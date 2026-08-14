@@ -75,18 +75,28 @@ const CONNECTION_OPEN_MAX_ATTEMPTS: u32 = 8;
 const CONNECTION_OPEN_RETRY_BASE_DELAY_MS: u64 = 1;
 const CONNECTION_OPEN_RETRY_MAX_DELAY_MS: u64 = 50;
 
-fn is_retryable_connection_open_error(error: &FrankenError) -> bool {
-    // Prefer the engine's published retry family over a hand-rolled Busy
-    // subset. BusySnapshot / WriteConflict / SerializationFailure /
-    // PageBufferCapacityExhausted are the same transient class as Busy.
+fn is_retryable_franken_error(error: &FrankenError) -> bool {
+    // `is_transient()` is the published Busy/FCW/serialization family.
+    // SnapshotTooOld needs a fresh BEGIN after rollback; SchemaChanged
+    // needs the next execute to re-prepare. Both are retryable here
+    // because every attempt starts a new statement (we do not pool
+    // prepared handles across retries).
     error.is_transient()
+        || matches!(
+            error,
+            FrankenError::SnapshotTooOld { .. } | FrankenError::SchemaChanged
+        )
 }
 
-pub(crate) fn is_transient_storage_error(error: &SearchError) -> bool {
+fn is_retryable_connection_open_error(error: &FrankenError) -> bool {
+    is_retryable_franken_error(error)
+}
+
+pub(crate) fn is_retryable_storage_error(error: &SearchError) -> bool {
     let mut current: Option<&(dyn Error + 'static)> = Some(error);
     while let Some(err) = current {
         if let Some(franken) = err.downcast_ref::<FrankenError>() {
-            return franken.is_transient();
+            return is_retryable_franken_error(franken);
         }
         current = err.source();
     }
@@ -102,7 +112,7 @@ pub(crate) fn retry_transient_storage<T>(
         match op() {
             Ok(value) => return Ok(value),
             Err(error)
-                if is_transient_storage_error(&error) && attempt < CONNECTION_OPEN_MAX_ATTEMPTS =>
+                if is_retryable_storage_error(&error) && attempt < CONNECTION_OPEN_MAX_ATTEMPTS =>
             {
                 let delay = connection_open_retry_delay(attempt);
                 tracing::debug!(
@@ -119,6 +129,21 @@ pub(crate) fn retry_transient_storage<T>(
             }
             Err(error) => return Err(error),
         }
+    }
+}
+
+pub(crate) fn unretryable_rollback_error(
+    original: &SearchError,
+    rollback_err: &FrankenError,
+) -> SearchError {
+    // The connection may still be inside a transaction. Do not let the
+    // original Busy/Snapshot error (or a transient rollback error) trip
+    // another BEGIN on a dirty connection.
+    SearchError::SubsystemError {
+        subsystem: "storage",
+        source: Box::new(std::io::Error::other(format!(
+            "rollback failed ({rollback_err}); original error was: {original}"
+        ))),
     }
 }
 
@@ -347,27 +372,37 @@ impl Storage {
         match outcome {
             Ok(Ok(value)) => {
                 self.conn.commit_transaction_sync().map_err(|commit_err| {
-                    if let Err(rollback_err) = self.conn.rollback_transaction_sync() {
-                        tracing::warn!(
-                            target: "frankensearch.storage",
-                            error = %rollback_err,
-                            "rollback failed after commit error"
-                        );
+                    match self.conn.rollback_transaction_sync() {
+                        Ok(()) => map_storage_error(commit_err),
+                        Err(rollback_err) => {
+                            tracing::warn!(
+                                target: "frankensearch.storage",
+                                error = %rollback_err,
+                                "rollback failed after commit error"
+                            );
+                            unretryable_rollback_error(
+                                &map_storage_error(commit_err),
+                                &rollback_err,
+                            )
+                        }
                     }
-                    map_storage_error(commit_err)
                 })?;
                 self.metrics.record_commit();
                 tracing::trace!(target: "frankensearch.storage", "storage transaction committed");
                 Ok(value)
             }
             Ok(Err(error)) => {
-                if let Err(rollback_err) = self.conn.rollback_transaction_sync() {
-                    tracing::warn!(
-                        target: "frankensearch.storage",
-                        error = %rollback_err,
-                        "rollback failed after closure error"
-                    );
-                }
+                let error = match self.conn.rollback_transaction_sync() {
+                    Ok(()) => error,
+                    Err(rollback_err) => {
+                        tracing::warn!(
+                            target: "frankensearch.storage",
+                            error = %rollback_err,
+                            "rollback failed after closure error"
+                        );
+                        unretryable_rollback_error(&error, &rollback_err)
+                    }
+                };
                 self.metrics.record_rollback();
                 tracing::debug!(
                     target: "frankensearch.storage",
@@ -395,6 +430,10 @@ impl Storage {
     }
 
     fn apply_pragmas(&self) -> SearchResult<()> {
+        retry_transient_storage(|| self.apply_pragmas_once(), "storage pragmas")
+    }
+
+    fn apply_pragmas_once(&self) -> SearchResult<()> {
         tracing::trace!(
             target: "frankensearch.storage",
             wal_mode = self.config.wal_mode,
@@ -770,7 +809,26 @@ mod tests {
         let error = super::map_storage_error(FrankenError::BusySnapshot {
             conflicting_pages: "1,2".to_owned(),
         });
-        assert!(super::is_transient_storage_error(&error));
+        assert!(super::is_retryable_storage_error(&error));
+    }
+
+    #[test]
+    fn retryable_storage_error_includes_snapshot_too_old_and_schema_changed() {
+        assert!(super::is_retryable_storage_error(
+            &super::map_storage_error(FrankenError::SnapshotTooOld { txn_id: 7 })
+        ));
+        assert!(super::is_retryable_storage_error(
+            &super::map_storage_error(FrankenError::SchemaChanged)
+        ));
+    }
+
+    #[test]
+    fn failed_rollback_error_is_not_retryable() {
+        let error = super::unretryable_rollback_error(
+            &super::map_storage_error(FrankenError::Busy),
+            &FrankenError::Busy,
+        );
+        assert!(!super::is_retryable_storage_error(&error));
     }
 
     #[test]
@@ -780,7 +838,7 @@ mod tests {
             value: "busy snapshot locked".to_owned(),
             reason: "string match must not classify this as transient".to_owned(),
         };
-        assert!(!super::is_transient_storage_error(&error));
+        assert!(!super::is_retryable_storage_error(&error));
     }
 
     #[test]
