@@ -18925,3 +18925,60 @@ pairs on this workload: eliminating the ordering-map nodes did not offset the
 sort/adapter cost. The canonical-metadata ordering vein is closed unless a new
 profile and materially different representation remove ordering work entirely
 while retaining exact bytes and serde_json's tuned emitter.
+
+### 2026-08-14 — AUDIT: x86 QG-1 incumbent screen produced NoDecision in both 10- and 30-pair windows
+
+**Comparison class: INCUMBENT attempt, VOID / NO-DECISION. Actual legacy
+incumbent: Tantivy 0.27.0.** No Quill-versus-Tantivy decision stream ran, so
+this entry contains no performance ratio, target-distance claim, or campaign
+win/loss. It records a failed measurement attempt so later work does not cite
+the completed Tantivy pilot timings as if they were an admitted comparison.
+
+The diagnostic-only x86 lane ran the exact full QG-1 cell
+`bulk/medium/8/positions_on` on `ovh-a` (AMD Ryzen 7 5800X), with the 50,000
+document canonical corpus, 5,000-document batches, eight Rayon threads,
+positions enabled, and the live pinned oracle:
+`tantivy v0.27.0`, git revision
+`1f32c1a8af0eb9d68bd3f5576caf20941364b657`, index format v7. The clean RCH
+build was source revision `eb4e9914b7e5bde83f5f4cafb7798e2dc02b1eb5`;
+the executing benchmark ELF SHA-256 was
+`8fbe566a900f78d738d3be8233fd5c2c24116f8e53b65d54038836779aa92e89`.
+The later `5859c916` revision changed only query parsing and its end-to-end
+test, not the measured QG-1 indexing path.
+
+Two fresh-process windows completed every planned Tantivy semantic preflight,
+ShippingAuto pilot, and fixed-width pilot row before the screen refused to
+select a fixed-width incumbent:
+
+- 10 pairs: 89 searchable-and-quiescent Tantivy terminal intervals; run-log
+  SHA-256
+  `37e1884bb50864b92629ff023da25203638affea7d04d5d4b4c1f6b0d23972f9`.
+- 30 pairs: 249 searchable-and-quiescent Tantivy terminal intervals; run-log
+  SHA-256
+  `0a5d4f95569c6e1565d7cb048a80c7a435268882fdb71d1ba558e53a9f9f05df`.
+
+Both invocations stopped with
+`candidate pilot lacks valid configuration-bound throughput evidence` before
+the required T/Q, T/T, and Q/Q decision triple. Source audit proved that the
+pilot had already passed retained-authority estimation, writer-witness
+transcript verification, writer-width validation, raw observation binding,
+scope, work-unit, and byte-count checks. The failed predicate was therefore a
+legitimate estimator `NoDecision` (`InvalidNull`, `InvalidExperiment`, or
+contradictory summaries), but the screen collapsed its exact status and reason
+codes into the generic message. Increasing from 10 to 30 pairs did not clear
+the statistical refusal. The logs are preserved at
+`/data/tmp/qg1-x86-medium8-eb4e9914-r10.run.log` and
+`/data/tmp/qg1-x86-medium8-eb4e9914-r30.run.log`, and in the corresponding
+`~/.frankensearch-perf-diagnostics/x86-vps-ovh/` directories on `ovh-a`.
+
+**Status: AUDIT / MEASUREMENT BLOCKER; no comparison and no claim.** No threshold,
+null rule, incumbent identity, fixture, or selection rule was weakened. Do not
+use these pilot latencies to estimate the Quill gap and do not rerun the same
+opaque screen blindly.
+
+**Retry predicate:** first land the observability-only correction that retains
+the candidate writer mode, `PairedEvidenceStatus`, and exact estimator reason
+codes for an authority-valid statistical refusal, with no admission change.
+Then run one fresh exact cell and choose the next action from the named failed
+null/effect check. A performance lever remains blocked until an admissible
+same-invocation T/Q comparison plus T/T and Q/Q controls is actually emitted.
