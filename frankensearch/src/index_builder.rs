@@ -882,8 +882,7 @@ impl std::fmt::Debug for HybridIndexParts {
 }
 
 fn is_hash_generation_id(embedder_id: &str) -> bool {
-    let id = embedder_id.to_ascii_lowercase();
-    id == "hash" || id.starts_with("hash-") || id.starts_with("fnv1a-") || id.starts_with("jl-")
+    frankensearch_core::is_hash_generation_id(embedder_id)
 }
 
 /// Open every arm of an index directory produced by [`IndexBuilder`].

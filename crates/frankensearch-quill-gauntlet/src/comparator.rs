@@ -106,6 +106,7 @@ pub enum LexicalScoreSource {
     SemanticQuality,
     Hybrid,
     Reranked,
+    HashControl,
 }
 
 impl From<ScoreSource> for LexicalScoreSource {
@@ -116,6 +117,7 @@ impl From<ScoreSource> for LexicalScoreSource {
             ScoreSource::SemanticQuality => Self::SemanticQuality,
             ScoreSource::Hybrid => Self::Hybrid,
             ScoreSource::Reranked => Self::Reranked,
+            ScoreSource::HashControl => Self::HashControl,
         }
     }
 }
@@ -1246,6 +1248,7 @@ fn cancellation_result_sha256(results: &[ScoredResult]) -> Result<String, Gauntl
             ScoreSource::SemanticQuality => 2,
             ScoreSource::Hybrid => 3,
             ScoreSource::Reranked => 4,
+            ScoreSource::HashControl => 5,
         }]);
         match &result.metadata {
             None => hasher.update([0]),
@@ -4745,7 +4748,7 @@ fn hit_matches_boundary_score_contract(
                     && hit.quality_score_bits.is_none()
                     && hit.rerank_score_bits.is_none()
             }
-            LexicalScoreSource::SemanticFast => {
+            LexicalScoreSource::SemanticFast | LexicalScoreSource::HashControl => {
                 hit.index.is_some()
                     && hit.raw_lexical_score_bits.is_none()
                     && hit.fast_score_bits.is_some()

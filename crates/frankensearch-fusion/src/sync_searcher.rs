@@ -689,7 +689,15 @@ impl SyncTwoTierSearcher {
                 vector_hits_to_scored_results(
                     &fast_hits,
                     k,
-                    ScoreSource::SemanticFast,
+                    if self
+                        .index
+                        .fast_embedder_id()
+                        .is_some_and(frankensearch_core::is_hash_generation_id)
+                    {
+                        ScoreSource::HashControl
+                    } else {
+                        ScoreSource::SemanticFast
+                    },
                     None,
                     None,
                     &self.config,

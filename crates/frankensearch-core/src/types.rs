@@ -3942,10 +3942,22 @@ pub enum ScoreSource {
     SemanticFast,
     /// Quality-tier semantic search only.
     SemanticQuality,
-    /// Hybrid fusion (lexical + semantic via RRF).
+    /// Hybrid fusion (lexical + vector via RRF).
+    ///
+    /// Vector here may be semantic or a hash-control generation. Hash-only
+    /// vector hits use [`Self::HashControl`], not this variant.
     Hybrid,
     /// Result was reranked by cross-encoder.
     Reranked,
+    /// Hash / FNV / JL control vector search. Not semantic.
+    HashControl,
+}
+
+/// True when `embedder_id` is a hash/fnv/jl control identity, not a semantic model.
+#[must_use]
+pub fn is_hash_generation_id(embedder_id: &str) -> bool {
+    let id = embedder_id.to_ascii_lowercase();
+    id == "hash" || id.starts_with("hash-") || id.starts_with("fnv1a-") || id.starts_with("jl-")
 }
 
 /// The final scored search result delivered to consumers.
@@ -6634,12 +6646,26 @@ mod tests {
             ScoreSource::SemanticQuality,
             ScoreSource::Hybrid,
             ScoreSource::Reranked,
+            ScoreSource::HashControl,
         ];
         for variant in &variants {
             let json = serde_json::to_string(variant).unwrap();
             let decoded: ScoreSource = serde_json::from_str(&json).unwrap();
             assert_eq!(&decoded, variant);
         }
+    }
+
+    #[test]
+    fn is_hash_generation_id_matches_control_families() {
+        assert!(super::is_hash_generation_id("hash"));
+        assert!(super::is_hash_generation_id("HASH"));
+        assert!(super::is_hash_generation_id("hash-fnv1a-256"));
+        assert!(super::is_hash_generation_id("fnv1a-256"));
+        assert!(super::is_hash_generation_id("jl-128"));
+        assert!(!super::is_hash_generation_id("minilm-l6-v2"));
+        assert!(!super::is_hash_generation_id("potion-128m"));
+        assert!(!super::is_hash_generation_id("stub-384"));
+        assert!(!super::is_hash_generation_id("hashed-minilm"));
     }
 
     #[test]

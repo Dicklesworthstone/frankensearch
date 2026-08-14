@@ -204,5 +204,5 @@ pub use types::{
     TIER_COVERAGE_SCHEMA_VERSION_V1, TierCoveragePairV1, TierCoverageRealizationV1,
     TierCoverageRequestV1, TierCoverageV1, TierQueryCoverageV1, TieredQueryEmbeddings,
     TrustedTierCoverageContextV1, UntrustedDerivedRetrievalTopologyV1, UntrustedTierCoveragePairV1,
-    UntrustedTierCoverageV1, VectorHit, retrieval_topology_fits_request,
+    UntrustedTierCoverageV1, VectorHit, is_hash_generation_id, retrieval_topology_fits_request,
 };

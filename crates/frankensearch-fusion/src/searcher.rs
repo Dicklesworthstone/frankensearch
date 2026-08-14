@@ -2583,6 +2583,7 @@ impl TwoTierSearcher {
                 let source = if quality_score.is_some()
                     && original_source != ScoreSource::Lexical
                     && original_source != ScoreSource::Hybrid
+                    && original_source != ScoreSource::HashControl
                 {
                     ScoreSource::SemanticQuality
                 } else {
@@ -3493,7 +3494,11 @@ fn fused_hits_to_scored_results(
             } else if fh.lexical_rank.is_some() {
                 ScoreSource::Lexical
             } else if fh.semantic_rank.is_some() {
-                ScoreSource::SemanticFast
+                if frankensearch_core::is_hash_generation_id(fast_embedder_id) {
+                    ScoreSource::HashControl
+                } else {
+                    ScoreSource::SemanticFast
+                }
             } else {
                 // Graph-only candidates (no lexical/semantic rank) still come from hybrid fusion.
                 ScoreSource::Hybrid
@@ -3630,7 +3635,11 @@ fn vector_hits_to_scored_results(
             ScoredResult {
                 doc_id: h.doc_id.clone(),
                 score: h.score,
-                source: ScoreSource::SemanticFast,
+                source: if frankensearch_core::is_hash_generation_id(fast_embedder_id) {
+                    ScoreSource::HashControl
+                } else {
+                    ScoreSource::SemanticFast
+                },
                 index: Some(h.index),
                 fast_score: Some(h.score),
                 quality_score: None,
@@ -6905,8 +6914,8 @@ mod tests {
             assert!(
                 initial_sources
                     .iter()
-                    .all(|source| matches!(source, ScoreSource::SemanticFast)),
-                "hash control hits keep the vector source; skip_reason carries the truth"
+                    .all(|source| matches!(source, ScoreSource::HashControl)),
+                "hash control hits must not use the semantic-fast source tag"
             );
             assert_eq!(
                 metrics.skip_reason.as_deref(),
@@ -8727,6 +8736,24 @@ mod tests {
         }];
         let results = fused_hits_to_scored_results(&fused, &[], false, "fast-test", 60.0);
         assert_eq!(results[0].source, ScoreSource::SemanticFast);
+    }
+
+    #[test]
+    fn fused_hits_hash_control_is_not_semantic_fast() {
+        let fused = vec![frankensearch_core::types::FusedHit {
+            doc_id: "hash-only".into(),
+            rrf_score: 1.0,
+            lexical_rank: None,
+            semantic_rank: Some(0),
+            semantic_index: Some(0),
+            lexical_score: None,
+            semantic_score: Some(0.9),
+            in_both_sources: false,
+        }];
+        let results = fused_hits_to_scored_results(&fused, &[], false, "fnv1a-256", 60.0);
+        assert_eq!(results[0].source, ScoreSource::HashControl);
+        let semantic = fused_hits_to_scored_results(&fused, &[], false, "minilm-l6-v2", 60.0);
+        assert_eq!(semantic[0].source, ScoreSource::SemanticFast);
     }
 
     #[test]
