@@ -646,7 +646,19 @@ impl SearchExecutionResources {
                 CapabilityState::Disabled
             },
             fast_semantic: if !matches!(mode, SearchExecutionMode::LexicalOnly)
-                && self.vector_index.is_some()
+                && self.vector_index.as_ref().is_some_and(|index| {
+                    !FsfsRuntime::is_legacy_hash_vector_generation(index.embedder_id())
+                })
+                && (self.fast_embedder.is_some() || !self.fast_embedder_attempted)
+            {
+                CapabilityState::Enabled
+            } else {
+                CapabilityState::Disabled
+            },
+            hash_control: if !matches!(mode, SearchExecutionMode::LexicalOnly)
+                && self.vector_index.as_ref().is_some_and(|index| {
+                    FsfsRuntime::is_legacy_hash_vector_generation(index.embedder_id())
+                })
                 && (self.fast_embedder.is_some() || !self.fast_embedder_attempted)
             {
                 CapabilityState::Enabled

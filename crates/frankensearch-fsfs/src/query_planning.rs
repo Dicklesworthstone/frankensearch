@@ -261,6 +261,7 @@ pub enum QueryExecutionMode {
     Empty,
     HybridRrf,
     FastSemanticOnly,
+    HashControlOnly,
     LexicalOnly,
 }
 
@@ -270,6 +271,7 @@ pub enum FusionStrategy {
     None,
     Rrf,
     SemanticOnly,
+    HashControl,
     LexicalOnly,
 }
 
@@ -303,6 +305,8 @@ pub struct QueryExecutionCapabilities {
     pub fast_semantic: CapabilityState,
     pub quality_semantic: CapabilityState,
     pub rerank: CapabilityState,
+    /// Hash/fnv vector control lane. Not a semantic capability.
+    pub hash_control: CapabilityState,
 }
 
 impl QueryExecutionCapabilities {
@@ -313,6 +317,7 @@ impl QueryExecutionCapabilities {
             fast_semantic: CapabilityState::Enabled,
             quality_semantic: CapabilityState::Enabled,
             rerank: CapabilityState::Enabled,
+            hash_control: CapabilityState::Disabled,
         }
     }
 }
@@ -597,10 +602,15 @@ impl QueryPlanner {
         );
         let semantic_enabled = matches!(
             mode,
-            QueryExecutionMode::HybridRrf | QueryExecutionMode::FastSemanticOnly
+            QueryExecutionMode::HybridRrf
+                | QueryExecutionMode::FastSemanticOnly
+                | QueryExecutionMode::HashControlOnly
         );
 
-        let quality_enabled = semantic_enabled
+        let quality_enabled = matches!(
+            mode,
+            QueryExecutionMode::HybridRrf | QueryExecutionMode::FastSemanticOnly
+        ) && capabilities.fast_semantic.is_enabled()
             && budget.quality_enabled
             && capabilities.quality_semantic.is_enabled();
         let rerank_enabled =
@@ -627,7 +637,13 @@ impl QueryPlanner {
                 enabled: true,
                 candidate_budget: budget.semantic_fanout,
                 timeout_ms: budget.latency_budget_ms,
-                reason_code: "query.stage.semantic.enabled",
+                reason_code: if capabilities.hash_control.is_enabled()
+                    && !capabilities.fast_semantic.is_enabled()
+                {
+                    "query.stage.hash_control.enabled"
+                } else {
+                    "query.stage.semantic.enabled"
+                },
             }
         } else {
             StageDirective {
@@ -684,7 +700,14 @@ impl QueryPlanner {
 
         let fusion_policy = fusion_policy_for_mode(mode, self.config.rrf_k);
         let cancellation = cancellation_semantics_for_mode(mode, quality_enabled);
-        let reason_code = execution_reason_code(mode, decision.fallback);
+        let reason_code = if matches!(mode, QueryExecutionMode::HybridRrf)
+            && capabilities.hash_control.is_enabled()
+            && !capabilities.fast_semantic.is_enabled()
+        {
+            "query.execution.mode.hybrid.hash_control"
+        } else {
+            execution_reason_code(mode, decision.fallback)
+        };
 
         QueryExecutionPlan {
             intent: decision,
@@ -726,7 +749,9 @@ const fn resolve_execution_mode(
         return QueryExecutionMode::Empty;
     }
 
-    if !capabilities.lexical.is_enabled() && !capabilities.fast_semantic.is_enabled() {
+    let vector_lane =
+        capabilities.fast_semantic.is_enabled() || capabilities.hash_control.is_enabled();
+    if !capabilities.lexical.is_enabled() && !vector_lane {
         return QueryExecutionMode::Empty;
     }
 
@@ -740,7 +765,7 @@ const fn resolve_execution_mode(
         };
     }
 
-    if !capabilities.fast_semantic.is_enabled() || budget.semantic_fanout == 0 {
+    if !vector_lane || budget.semantic_fanout == 0 {
         return if capabilities.lexical.is_enabled() && budget.lexical_fanout > 0 {
             QueryExecutionMode::LexicalOnly
         } else {
@@ -752,7 +777,11 @@ const fn resolve_execution_mode(
         return QueryExecutionMode::HybridRrf;
     }
 
-    QueryExecutionMode::FastSemanticOnly
+    if capabilities.fast_semantic.is_enabled() {
+        QueryExecutionMode::FastSemanticOnly
+    } else {
+        QueryExecutionMode::HashControlOnly
+    }
 }
 
 #[must_use]
@@ -770,6 +799,7 @@ const fn execution_reason_code(
             }
         }
         QueryExecutionMode::FastSemanticOnly => "query.execution.mode.semantic_only",
+        QueryExecutionMode::HashControlOnly => "query.execution.mode.hash_control",
         QueryExecutionMode::LexicalOnly => {
             if matches!(fallback, QueryFallbackPath::MalformedLexicalOnly) {
                 "query.execution.mode.lexical_only.malformed"
@@ -806,6 +836,12 @@ fn fusion_policy_for_mode(mode: QueryExecutionMode, configured_rrf_k: f64) -> Fu
             tie_break_rules: vec![FusionTieBreakRule::ScoreDesc, FusionTieBreakRule::DocIdAsc],
             reason_code: "query.fusion.semantic_only",
         },
+        QueryExecutionMode::HashControlOnly => FusionPolicy {
+            strategy: FusionStrategy::HashControl,
+            rrf_k: None,
+            tie_break_rules: vec![FusionTieBreakRule::ScoreDesc, FusionTieBreakRule::DocIdAsc],
+            reason_code: "query.fusion.hash_control",
+        },
         QueryExecutionMode::LexicalOnly => FusionPolicy {
             strategy: FusionStrategy::LexicalOnly,
             rrf_k: None,
@@ -837,7 +873,9 @@ const fn cancellation_semantics_for_mode(
             after_initial_yield: CancellationOutcome::ReturnLexicalResults,
             reason_code: "query.cancel.lexical_only",
         },
-        QueryExecutionMode::HybridRrf | QueryExecutionMode::FastSemanticOnly => {
+        QueryExecutionMode::HybridRrf
+        | QueryExecutionMode::FastSemanticOnly
+        | QueryExecutionMode::HashControlOnly => {
             let reason_code = if quality_enabled {
                 "query.cancel.phase2_returns_initial"
             } else {
@@ -1491,6 +1529,7 @@ fn query_plan_seed_cases() -> Vec<QueryPlanSeedCase> {
                 fast_semantic: CapabilityState::Disabled,
                 quality_semantic: CapabilityState::Disabled,
                 rerank: CapabilityState::Enabled,
+                hash_control: CapabilityState::Disabled,
             },
         ),
         seed_case(
@@ -1945,6 +1984,7 @@ const fn mode_name(mode: QueryExecutionMode) -> &'static str {
         QueryExecutionMode::Empty => "empty",
         QueryExecutionMode::HybridRrf => "hybrid_rrf",
         QueryExecutionMode::FastSemanticOnly => "fast_semantic_only",
+        QueryExecutionMode::HashControlOnly => "hash_control_only",
         QueryExecutionMode::LexicalOnly => "lexical_only",
     }
 }
@@ -2125,6 +2165,7 @@ mod tests {
             fast_semantic: super::CapabilityState::Enabled,
             quality_semantic: super::CapabilityState::Enabled,
             rerank: super::CapabilityState::Disabled,
+            hash_control: super::CapabilityState::Disabled,
         };
         let plan = planner.execution_plan_for_query("distributed consensus", Some(10), caps);
 
@@ -2138,6 +2179,55 @@ mod tests {
     }
 
     #[test]
+    fn execution_plan_uses_hash_control_instead_of_semantic_only() {
+        let planner = QueryPlanner::from_fsfs(&FsfsConfig::default());
+        let caps = QueryExecutionCapabilities {
+            lexical: super::CapabilityState::Disabled,
+            fast_semantic: super::CapabilityState::Disabled,
+            quality_semantic: super::CapabilityState::Enabled,
+            rerank: super::CapabilityState::Enabled,
+            hash_control: super::CapabilityState::Enabled,
+        };
+        let plan = planner.execution_plan_for_query("distributed consensus", Some(10), caps);
+
+        assert_eq!(plan.mode, QueryExecutionMode::HashControlOnly);
+        assert_eq!(plan.reason_code, "query.execution.mode.hash_control");
+        assert_eq!(plan.fusion_policy.strategy, FusionStrategy::HashControl);
+        assert_eq!(plan.fusion_policy.reason_code, "query.fusion.hash_control");
+        assert!(!plan.lexical_stage.enabled);
+        assert!(plan.semantic_stage.enabled);
+        assert_eq!(
+            plan.semantic_stage.reason_code,
+            "query.stage.hash_control.enabled"
+        );
+        assert!(!plan.quality_stage.enabled);
+        assert!(!plan.rerank_stage.enabled);
+    }
+
+    #[test]
+    fn execution_plan_hybrid_hash_control_is_not_semantic() {
+        let planner = QueryPlanner::from_fsfs(&FsfsConfig::default());
+        let caps = QueryExecutionCapabilities {
+            lexical: super::CapabilityState::Enabled,
+            fast_semantic: super::CapabilityState::Disabled,
+            quality_semantic: super::CapabilityState::Enabled,
+            rerank: super::CapabilityState::Enabled,
+            hash_control: super::CapabilityState::Enabled,
+        };
+        let plan = planner.execution_plan_for_query("rust ownership", Some(8), caps);
+
+        assert_eq!(plan.mode, QueryExecutionMode::HybridRrf);
+        assert_eq!(plan.reason_code, "query.execution.mode.hybrid.hash_control");
+        assert!(plan.lexical_stage.enabled);
+        assert!(plan.semantic_stage.enabled);
+        assert_eq!(
+            plan.semantic_stage.reason_code,
+            "query.stage.hash_control.enabled"
+        );
+        assert!(!plan.quality_stage.enabled);
+    }
+
+    #[test]
     fn execution_plan_degrades_to_lexical_when_semantic_unavailable() {
         let planner = QueryPlanner::from_fsfs(&FsfsConfig::default());
         let caps = QueryExecutionCapabilities {
@@ -2145,6 +2235,7 @@ mod tests {
             fast_semantic: super::CapabilityState::Disabled,
             quality_semantic: super::CapabilityState::Disabled,
             rerank: super::CapabilityState::Enabled,
+            hash_control: super::CapabilityState::Disabled,
         };
         let plan = planner.execution_plan_for_query("rust ownership", Some(8), caps);
 
@@ -3095,6 +3186,7 @@ mod tests {
             fast_semantic: super::CapabilityState::Disabled,
             quality_semantic: super::CapabilityState::Disabled,
             rerank: super::CapabilityState::Disabled,
+            hash_control: super::CapabilityState::Disabled,
         };
         let mode = super::resolve_execution_mode(&decision, &budget, caps);
         assert_eq!(mode, QueryExecutionMode::Empty);
@@ -3168,6 +3260,7 @@ mod tests {
             fast_semantic: super::CapabilityState::Disabled,
             quality_semantic: super::CapabilityState::Enabled,
             rerank: super::CapabilityState::Enabled,
+            hash_control: super::CapabilityState::Disabled,
         };
         let plan = planner.execution_plan_for_query("hello world", Some(10), caps);
         assert_eq!(
@@ -3200,6 +3293,7 @@ mod tests {
             fast_semantic: super::CapabilityState::Enabled,
             quality_semantic: super::CapabilityState::Disabled,
             rerank: super::CapabilityState::Enabled,
+            hash_control: super::CapabilityState::Disabled,
         };
         let plan = planner.execution_plan_for_query("how does this work", Some(10), caps);
         assert_eq!(
@@ -3232,6 +3326,7 @@ mod tests {
             fast_semantic: super::CapabilityState::Enabled,
             quality_semantic: super::CapabilityState::Enabled,
             rerank: super::CapabilityState::Disabled,
+            hash_control: super::CapabilityState::Disabled,
         };
         let plan = planner.execution_plan_for_query("how does this work", Some(10), caps);
         assert_eq!(
