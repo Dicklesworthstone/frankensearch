@@ -197,8 +197,8 @@ fn is_shipped_hash_embedder(embedder: &dyn Embedder) -> bool {
     if embedder.is_semantic() || embedder.category() != ModelCategory::HashEmbedder {
         return false;
     }
-    let id = embedder.id();
-    id.starts_with("fnv1a-") || id.starts_with("jl-")
+    let id = embedder.id().to_ascii_lowercase();
+    id == "hash" || id.starts_with("hash-") || id.starts_with("fnv1a-") || id.starts_with("jl-")
 }
 
 /// Progressive two-tier search orchestrator.

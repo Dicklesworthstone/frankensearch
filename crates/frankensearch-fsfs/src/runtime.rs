@@ -5151,8 +5151,9 @@ impl FsfsRuntime {
         }
 
         let meta = meta_for_format("search", self.cli_input.format).with_duration_ms(elapsed_ms);
-        let envelope = OutputEnvelope::success(payload.clone(), meta, iso_timestamp_now())
-            .with_warnings(Self::search_hash_fallback_warnings(&payload));
+        let warnings = Self::search_hash_fallback_warnings(&payload);
+        let envelope =
+            OutputEnvelope::success(payload, meta, iso_timestamp_now()).with_warnings(warnings);
         let stdout = std::io::stdout();
         let mut writer = BufWriter::with_capacity(1 << 20, stdout.lock());
         emit_envelope(&envelope, self.cli_input.format, &mut writer)?;
@@ -8342,8 +8343,12 @@ impl FsfsRuntime {
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
 
         let embedder = self.resolve_fast_embedder()?;
-        let mut index = VectorIndex::open(&vector_path)?;
-        Self::admit_vector_generation_for_embedder(&index, embedder.as_ref())?;
+        {
+            // Admit against a shared reader so we do not hold a write mapping
+            // across stdin/file read and embedding (those can block forever).
+            let index = VectorIndex::open_read_only(&vector_path)?;
+            Self::admit_vector_generation_for_embedder(&index, embedder.as_ref())?;
+        }
         let dimension = embedder.dimension();
 
         // Read input lines from --file or stdin.
@@ -8438,10 +8443,12 @@ impl FsfsRuntime {
             entries.push((id.clone(), embedding));
         }
 
-        // The generation was admitted above. Re-check the lease at the
-        // publication boundary so a substituted lock file aborts before any
-        // WAL mutation.
+        // Re-check the lease, then reopen a write handle and re-admit so a
+        // replaced generation cannot be mutated after the earlier read-only
+        // check.
         publication_lease.fence("append-batch WAL publication")?;
+        let mut index = VectorIndex::open(&vector_path)?;
+        Self::admit_vector_generation_for_embedder(&index, embedder.as_ref())?;
         index.append_batch(&entries)?;
 
         let count = entries.len();
@@ -9303,12 +9310,9 @@ impl FsfsRuntime {
 
     /// Doctor check for the semantic lane's zero-signal census (bd-tqhc).
     ///
-    /// Reports the typed index state that classified searches would see,
-    /// without running any query: benign empty states (newly created, all
-    /// tombstoned, WAL-only) warn with the census, availability failures
-    /// (live records but zero usable vectors) fail, and a healthy populated
-    /// index passes with its counts. An unreadable artifact fails; a missing
-    /// artifact warns because the semantic lane is simply not built yet.
+    /// Classify the published FSVI identity. A hash/fnv/jl control artifact
+    /// fails; a missing file warns; an unreadable file fails. Semantic
+    /// identities pass with id and dimension.
     fn collect_vector_generation_doctor_check(index_root: &Path) -> DoctorCheck {
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
         if !vector_path.exists() {
@@ -11765,12 +11769,12 @@ impl FsfsRuntime {
 
     #[must_use]
     fn is_legacy_hash_vector_generation(embedder_id: &str) -> bool {
-        embedder_id.eq_ignore_ascii_case("hash")
-            || embedder_id.eq_ignore_ascii_case("hash-fnv1a")
-            || embedder_id.eq_ignore_ascii_case("fnv1a-custom")
-            || embedder_id
-                .get(..6)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("fnv1a-"))
+        // Same identity family as `frankensearch::is_hash_generation_id`:
+        // `hash-384` and `hash-fnv1a-256` are control artifacts, not
+        // semantic generations. A prefix-6 slice of `hash-384` is `hash-3`
+        // and would miss a `fnv1a-`/`hash-fnv1a` exact match.
+        let id = embedder_id.to_ascii_lowercase();
+        id == "hash" || id.starts_with("hash-") || id.starts_with("fnv1a-") || id.starts_with("jl-")
     }
 
     fn validate_fast_embedder_for_vector_index(
@@ -27488,6 +27492,33 @@ mod tests {
                 .is_some_and(|value| value.contains("rebuild")),
             "hash generation must tell the operator to rebuild"
         );
+        drop(check);
+
+        for (identity, label) in [
+            ("hash-384", "prefixed hash- id"),
+            ("hash-fnv1a-256", "hash-fnv1a- prefix"),
+            ("jl-256", "johnson-lindenstrauss id"),
+        ] {
+            let path = index_root.join(format!("{identity}.fsvi"));
+            VectorIndex::create(&path, identity, 256)
+                .expect(label)
+                .finish()
+                .expect(label);
+            // The doctor check reads FSFS_VECTOR_INDEX_FILE; swap the fixture.
+            std::fs::copy(&path, &vector_path).expect("install hash-id fixture");
+            let check = FsfsRuntime::collect_vector_generation_doctor_check(&index_root);
+            assert_eq!(
+                check.verdict,
+                super::DoctorVerdict::Fail,
+                "{label} must fail closed: {}",
+                check.detail
+            );
+            assert!(
+                check.detail.contains(identity),
+                "{label} must name `{identity}`: {}",
+                check.detail
+            );
+        }
     }
 
     #[test]
