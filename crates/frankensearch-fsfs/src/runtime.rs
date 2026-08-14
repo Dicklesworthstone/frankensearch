@@ -5230,6 +5230,10 @@ impl FsfsRuntime {
         allow(clippy::unnecessary_wraps, clippy::unused_self)
     )]
     fn search_mode_hint(&self) -> SearchResult<Option<String>> {
+        if let Some(hint) = self.published_generation_search_hint()? {
+            return Ok(Some(hint));
+        }
+
         #[cfg(not(feature = "semantic-loaders"))]
         {
             Ok(Some(model_free_semantic_recovery_guidance().to_owned()))
@@ -5268,6 +5272,30 @@ impl FsfsRuntime {
                     .to_owned(),
             ))
         }
+    }
+
+    fn published_generation_search_hint(&self) -> SearchResult<Option<String>> {
+        let index_root = self.resolve_status_index_root()?;
+        if let Some(published) = Self::inspect_published_vector_generation(&index_root) {
+            if published.is_hash_control {
+                return Ok(Some(format!(
+                    "Search readiness: published vector generation `{}` is a hash control artifact, not semantic search. Rebuild with a verified semantic embedder; installing a model alone cannot repair hash vectors.",
+                    published.id
+                )));
+            }
+            return Ok(None);
+        }
+        let looks_like_index = index_root.join(FSFS_SENTINEL_FILE).exists()
+            || index_root.join(FSFS_VECTOR_MANIFEST_FILE).exists()
+            || index_root.join(FSFS_LEXICAL_MANIFEST_FILE).exists()
+            || index_root.join("lexical").exists();
+        if looks_like_index {
+            return Ok(Some(
+                "Search readiness: this index has no readable vector generation. Run `fsfs index <dir>` to publish a semantic FSVI; model cache status alone is not a searchable semantic index."
+                    .to_owned(),
+            ));
+        }
+        Ok(None)
     }
 
     async fn run_search_stream_command(
@@ -27952,6 +27980,45 @@ mod tests {
         assert_eq!(ready["semantic_admitted"], false);
         assert_eq!(ready["vector_generation_is_hash"], false);
         assert!(ready["vector_generation_id"].is_null());
+    }
+
+    #[test]
+    fn search_mode_hint_names_hash_and_missing_published_generations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        fs::create_dir_all(index_root.join("lexical")).expect("create lexical marker");
+
+        let mut config = FsfsConfig::default();
+        config.storage.index_dir = index_root.display().to_string();
+        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            command: CliCommand::Search,
+            index_dir: Some(index_root.clone()),
+            ..CliInput::default()
+        });
+        let missing = runtime
+            .search_mode_hint()
+            .expect("hint must stay observational")
+            .expect("index without FSVI must name the gap");
+        assert!(
+            missing.contains("no readable vector generation"),
+            "missing FSVI must not hide behind model-cache readiness: {missing}"
+        );
+
+        let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+        fs::create_dir_all(vector_path.parent().expect("vector parent"))
+            .expect("create vector dir");
+        VectorIndex::create(&vector_path, "fnv1a-256", 256)
+            .expect("create hash generation")
+            .finish()
+            .expect("finish hash generation");
+        let hashed = runtime
+            .search_mode_hint()
+            .expect("hint must stay observational")
+            .expect("hash FSVI must name the control artifact");
+        assert!(
+            hashed.contains("fnv1a-256") && hashed.contains("hash control"),
+            "hash generation must beat model-cache readiness: {hashed}"
+        );
     }
 
     #[test]

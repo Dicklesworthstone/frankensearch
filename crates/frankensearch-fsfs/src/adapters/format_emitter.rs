@@ -508,6 +508,13 @@ fn render_search_table_with_options(
             paint("semantic", "32", color_enabled)
         };
         let _ = writeln!(out, "vector generation: {generation_id}  class={class}");
+    } else {
+        let _ = writeln!(
+            out,
+            "vector generation: {}  class={}",
+            paint("(none)", "31", color_enabled),
+            paint("missing", "31", color_enabled)
+        );
     }
     if let Some(skip_reason) = payload.skip_reason.as_deref() {
         let _ = writeln!(
@@ -1514,6 +1521,21 @@ mod tests {
         );
         assert!(
             output.contains("non_semantic_fast_embedder_vector_control"),
+            "search table must surface skip_reason: {output}"
+        );
+    }
+
+    #[test]
+    fn render_search_table_names_a_missing_vector_generation() {
+        let payload = SearchPayload::new("ownership", SearchOutputPhase::Initial, 0, Vec::new())
+            .with_skip_reason("no_vector_index");
+        let output = render_search_table_for_cli(&payload, Some(2), true);
+        assert!(
+            output.contains("vector generation: (none)") && output.contains("class=missing"),
+            "search table must name an absent generation: {output}"
+        );
+        assert!(
+            output.contains("no_vector_index"),
             "search table must surface skip_reason: {output}"
         );
     }
