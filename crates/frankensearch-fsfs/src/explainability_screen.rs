@@ -168,6 +168,8 @@ pub struct FusionRow {
     pub lexical_rank: Option<usize>,
     /// Semantic rank (if present).
     pub semantic_rank: Option<usize>,
+    /// Hash-control rank (if present). Never set together with `semantic_rank`.
+    pub hash_rank: Option<usize>,
     /// Whether the doc appeared in both lexical and semantic sources.
     pub in_both_sources: bool,
     /// Human-readable overlap label.
@@ -515,7 +517,10 @@ fn build_fusion_row(fusion: &FusionContext) -> FusionRow {
         if fusion.in_both_sources {
             "overlapping (lexical + hash control)".to_string()
         } else {
-            match (fusion.lexical_rank, fusion.semantic_rank) {
+            match (
+                fusion.lexical_rank,
+                fusion.hash_rank.or(fusion.semantic_rank),
+            ) {
                 (Some(_), None) => "lexical-only".to_string(),
                 (None, Some(_)) => "hash-control-only".to_string(),
                 _ => "unknown source".to_string(),
@@ -535,6 +540,7 @@ fn build_fusion_row(fusion: &FusionContext) -> FusionRow {
         fused_score: fusion.fused_score,
         lexical_rank: fusion.lexical_rank,
         semantic_rank: fusion.semantic_rank,
+        hash_rank: fusion.hash_rank,
         in_both_sources: fusion.in_both_sources,
         overlap_label,
     }
@@ -616,6 +622,7 @@ mod tests {
                 fused_score: 0.0234,
                 lexical_rank: Some(3),
                 semantic_rank: Some(7),
+                hash_rank: None,
                 lexical_score: Some(12.5),
                 semantic_score: Some(0.77),
                 in_both_sources: true,
@@ -847,6 +854,7 @@ mod tests {
             fused_score: 0.03,
             lexical_rank: Some(3),
             semantic_rank: Some(7),
+            hash_rank: None,
             lexical_score: None,
             semantic_score: None,
             in_both_sources: true,
@@ -863,6 +871,7 @@ mod tests {
             fused_score: 0.02,
             lexical_rank: Some(5),
             semantic_rank: None,
+            hash_rank: None,
             lexical_score: None,
             semantic_score: None,
             in_both_sources: false,
@@ -878,6 +887,7 @@ mod tests {
             fused_score: 0.01,
             lexical_rank: None,
             semantic_rank: Some(10),
+            hash_rank: None,
             lexical_score: None,
             semantic_score: None,
             in_both_sources: false,
@@ -889,29 +899,35 @@ mod tests {
 
     #[test]
     fn fusion_row_hash_control_is_not_semantic() {
-        let hash_only = FusionContext {
+        let mut hash_only = FusionContext {
             fused_score: 0.01,
             lexical_rank: None,
             semantic_rank: Some(10),
+            hash_rank: None,
             lexical_score: None,
             semantic_score: None,
             in_both_sources: false,
             vector_generation_is_hash: true,
         };
+        hash_only.remap_hash_control_ranks();
+        assert_eq!(hash_only.hash_rank, Some(10));
+        assert_eq!(hash_only.semantic_rank, None);
         assert_eq!(
             build_fusion_row(&hash_only).overlap_label,
             "hash-control-only"
         );
 
-        let both = FusionContext {
+        let mut both = FusionContext {
             fused_score: 0.03,
             lexical_rank: Some(3),
             semantic_rank: Some(7),
+            hash_rank: None,
             lexical_score: None,
             semantic_score: None,
             in_both_sources: true,
             vector_generation_is_hash: true,
         };
+        both.remap_hash_control_ranks();
         assert_eq!(
             build_fusion_row(&both).overlap_label,
             "overlapping (lexical + hash control)"

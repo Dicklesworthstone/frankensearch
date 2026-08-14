@@ -273,7 +273,12 @@ impl From<&RankMovement> for RankMovementSnapshot {
 pub struct FusionContext {
     pub fused_score: f64,
     pub lexical_rank: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub semantic_rank: Option<usize>,
+    /// Rank in the hash-control vector list. Never set together with
+    /// `semantic_rank`: a hash generation is not a semantic source.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub hash_rank: Option<usize>,
     pub lexical_score: Option<f32>,
     pub semantic_score: Option<f32>,
     pub in_both_sources: bool,
@@ -282,12 +287,27 @@ pub struct FusionContext {
     pub vector_generation_is_hash: bool,
 }
 
+impl FusionContext {
+    /// Move vector ranks off `semantic_rank` when this fusion is hash control.
+    pub fn remap_hash_control_ranks(&mut self) {
+        if !self.vector_generation_is_hash {
+            return;
+        }
+        if self.hash_rank.is_none() {
+            self.hash_rank = self.semantic_rank.take();
+        } else {
+            self.semantic_rank = None;
+        }
+    }
+}
+
 impl From<&FusedCandidate> for FusionContext {
     fn from(value: &FusedCandidate) -> Self {
         Self {
             fused_score: value.fused_score,
             lexical_rank: value.lexical_rank,
             semantic_rank: value.semantic_rank,
+            hash_rank: None,
             lexical_score: value.lexical_score,
             semantic_score: value.semantic_score,
             in_both_sources: value.in_both_sources,
@@ -653,8 +673,8 @@ fn bounded_signal(value: f64, max: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        FsfsExplanationPayload, PolicyDecisionExplanation, PolicyDomain, RankingExplanation,
-        ScoreComponentBreakdown, ScoreComponentSource,
+        FsfsExplanationPayload, FusionContext, PolicyDecisionExplanation, PolicyDomain,
+        RankingExplanation, ScoreComponentBreakdown, ScoreComponentSource,
     };
     use crate::config::{DiscoveryDecision, DiscoveryScopeDecision, IngestionClass};
     use crate::query_execution::{
@@ -1066,6 +1086,28 @@ mod tests {
         assert_eq!(
             ScoreComponentSource::HashControl.to_string(),
             "hash_control"
+        );
+    }
+
+    #[test]
+    fn fusion_context_hash_remap_omits_semantic_rank() {
+        let mut fusion = FusionContext {
+            fused_score: 0.01,
+            lexical_rank: None,
+            semantic_rank: Some(2),
+            hash_rank: None,
+            lexical_score: None,
+            semantic_score: Some(0.4),
+            in_both_sources: false,
+            vector_generation_is_hash: true,
+        };
+        fusion.remap_hash_control_ranks();
+        assert_eq!(fusion.hash_rank, Some(2));
+        assert_eq!(fusion.semantic_rank, None);
+        let json = serde_json::to_string(&fusion).expect("serialize fusion");
+        assert!(
+            json.contains("hash_rank") && !json.contains("semantic_rank"),
+            "hash fusion must not use the semantic_rank key: {json}"
         );
     }
 

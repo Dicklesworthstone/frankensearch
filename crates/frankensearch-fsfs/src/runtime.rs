@@ -6468,15 +6468,18 @@ impl FsfsRuntime {
             "query.explain.attached",
             920,
         );
-        ranking.fusion = Some(FusionContext {
+        let mut fusion = FusionContext {
             fused_score: hit.final_score,
             lexical_rank: hit.lexical_rank,
             semantic_rank: hit.semantic_rank,
+            hash_rank: None,
             lexical_score: hit.lexical_score,
             semantic_score: hit.semantic_score,
             in_both_sources: hit.in_both_sources,
             vector_generation_is_hash: session.vector_generation_is_hash,
-        });
+        };
+        fusion.remap_hash_control_ranks();
+        ranking.fusion = Some(fusion);
         let payload = FsfsExplanationPayload::new(session.query.clone(), ranking);
         let warnings = if session.vector_generation_is_hash {
             let generation = session.vector_generation_id.as_deref().unwrap_or("hash");
