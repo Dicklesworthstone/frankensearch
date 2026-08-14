@@ -15,7 +15,6 @@
 //! | `JLProjection`  | JL-guaranteed  | ~0.10ms  | Better distance preservation   |
 
 use asupersync::Cx;
-use frankensearch_core::SearchResult;
 use frankensearch_core::generation::{
     EMBEDDING_INPUT_CONTRACT_SCHEMA_V1, EMBEDDING_PRODUCER_ATTESTATION_SCHEMA_V1,
     EMBEDDING_SPACE_IDENTITY_SCHEMA_V1, EmbeddingIdentityBundleV1, EmbeddingInputContractV1,
@@ -24,6 +23,7 @@ use frankensearch_core::generation::{
     VECTOR_STORAGE_IDENTITY_SCHEMA_V1, VectorStorageIdentityV1,
 };
 use frankensearch_core::traits::{Embedder, ModelCategory, SearchFuture, l2_normalize_in_place};
+use frankensearch_core::{SearchError, SearchResult};
 use rayon::prelude::*;
 
 /// FNV-1a offset basis (64-bit).
@@ -519,18 +519,32 @@ fn jl_accumulate_lanes8_avx2(embedding: &mut [f32], states: &[u64; 8]) {
     }
 }
 
+fn embed_checkpoint(cx: &Cx, phase: &'static str) -> SearchResult<()> {
+    cx.checkpoint().map_err(|error| SearchError::Cancelled {
+        phase: phase.to_owned(),
+        reason: cx
+            .cancel_reason()
+            .map_or_else(|| error.to_string(), |reason| reason.to_string()),
+    })
+}
+
 impl Embedder for HashEmbedder {
-    fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
-        // Hash embedding is pure computation (~0.07ms) — no cancellation check needed
-        Box::pin(async move { Ok(self.embed_sync(text)) })
+    fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+        Box::pin(async move {
+            embed_checkpoint(cx, "hash.embed")?;
+            Ok(self.embed_sync(text))
+        })
     }
 
     fn embed_batch<'a>(
         &'a self,
-        _cx: &'a Cx,
+        cx: &'a Cx,
         texts: &'a [&'a str],
     ) -> SearchFuture<'a, Vec<Vec<f32>>> {
-        Box::pin(async move { Ok(self.embed_batch_sync(texts)) })
+        Box::pin(async move {
+            embed_checkpoint(cx, "hash.embed_batch")?;
+            Ok(self.embed_batch_sync(texts))
+        })
     }
 
     fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {

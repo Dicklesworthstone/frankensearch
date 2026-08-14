@@ -505,18 +505,32 @@ fn validate_registered_execution_contract(
     Ok(())
 }
 
+fn embed_checkpoint(cx: &Cx, phase: &'static str) -> SearchResult<()> {
+    cx.checkpoint().map_err(|error| SearchError::Cancelled {
+        phase: phase.to_owned(),
+        reason: cx
+            .cancel_reason()
+            .map_or_else(|| error.to_string(), |reason| reason.to_string()),
+    })
+}
+
 impl Embedder for Model2VecEmbedder {
-    fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
-        // Model2Vec is pure computation (~0.57ms) — no cancellation check needed
-        Box::pin(async move { self.embed_sync(text) })
+    fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+        Box::pin(async move {
+            embed_checkpoint(cx, "model2vec.embed")?;
+            self.embed_sync(text)
+        })
     }
 
     fn embed_batch<'a>(
         &'a self,
-        _cx: &'a Cx,
+        cx: &'a Cx,
         texts: &'a [&'a str],
     ) -> SearchFuture<'a, Vec<Vec<f32>>> {
-        Box::pin(async move { self.embed_batch_sync(texts) })
+        Box::pin(async move {
+            embed_checkpoint(cx, "model2vec.embed_batch")?;
+            self.embed_batch_sync(texts)
+        })
     }
 
     fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
