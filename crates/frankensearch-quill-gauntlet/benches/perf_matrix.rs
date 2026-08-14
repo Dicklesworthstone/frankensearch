@@ -67,8 +67,8 @@ use frankensearch_quill_gauntlet::{
     compare_observations, estimate_hierarchical_latency, estimate_paired_experiment,
     estimate_paired_experiment_against_qg1_authority, machine_fingerprint, oracle_version_contract,
     peak_rss_bytes, perf_manifest_contract_sha256, perf_writer_heap_bytes,
-    preregister_qg1_tantivy_incumbents, seeded_balanced_pair_order,
-    seeded_interleaved_four_arm_schedule, validate_matrix,
+    preregister_qg1_tantivy_incumbents, project_qg6_effect_leaf_distributions,
+    seeded_balanced_pair_order, seeded_interleaved_four_arm_schedule, validate_matrix,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -7055,12 +7055,21 @@ fn collect_cell(
         )
     };
 
-    let quill_distribution =
-        DistributionSummary::from_samples(&arm_values(&effect_samples, PerfSampleArm::Treatment))
-            .expect("Quill distribution");
-    let oracle_distribution =
-        DistributionSummary::from_samples(&arm_values(&effect_samples, PerfSampleArm::Control))
-            .expect("oracle distribution");
+    let (quill_distribution, oracle_distribution) = if spec.gate == PerfGate::Qg6 {
+        let leaves = project_qg6_effect_leaf_distributions(&effect_samples, &estimator_config)
+            .expect("authenticated QG-6 effect-leaf distributions");
+        (leaves.treatment, leaves.control)
+    } else {
+        (
+            DistributionSummary::from_samples(&arm_values(
+                &effect_samples,
+                PerfSampleArm::Treatment,
+            ))
+            .expect("Quill distribution"),
+            DistributionSummary::from_samples(&arm_values(&effect_samples, PerfSampleArm::Control))
+                .expect("oracle distribution"),
+        )
+    };
     let paired_distribution =
         DistributionSummary::from_samples(&block_ratios_treatment_over_control(&effect_samples))
             .expect("paired distribution");

@@ -1907,6 +1907,30 @@ fn reconcile_current_cell_with_projection(
     let treatment_null = legacy_cells.get(&ratio("quill_over_quill", "paired_null_quill"));
     let projected_effect = projected_ratio_distribution(&paired.effect_samples);
     let projected_null = projected_ratio_distribution(&paired.null_samples);
+    let qg6_absolute = if cell.spec.gate == PerfGate::Qg6 {
+        match crate::project_qg6_effect_leaf_distributions(&paired.effect_samples, &paired.config) {
+            Ok(distributions) => Some(distributions),
+            Err(error) => {
+                state.fatal(
+                    "perf.ratchet.qg6_leaf_projection_invalid",
+                    format!(
+                        "{role} cell {} cannot reconstruct authenticated QG-6 search leaves: \
+                         {error}",
+                        cell.cell_id
+                    ),
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let expected_treatment = qg6_absolute
+        .as_ref()
+        .map_or(&paired.effect.treatment, |projection| &projection.treatment);
+    let expected_control = qg6_absolute
+        .as_ref()
+        .map_or(&paired.effect.control, |projection| &projection.control);
     let treatment_null_aligned = if cell.spec.gate == PerfGate::Qg1 {
         treatment_arm_null.is_some_and(|evidence| {
             treatment_null.is_some_and(|projected| {
@@ -1919,8 +1943,8 @@ fn reconcile_current_cell_with_projection(
         treatment_arm_null.is_none() && treatment_null.is_none()
     };
     let aligned = treatment_null_aligned
-        && treatment.is_some_and(|projected| projected.distribution == paired.effect.treatment)
-        && control.is_some_and(|projected| projected.distribution == paired.effect.control)
+        && treatment.is_some_and(|projected| projected.distribution == *expected_treatment)
+        && control.is_some_and(|projected| projected.distribution == *expected_control)
         && effect.is_some_and(|projected| {
             projected_effect
                 .as_ref()
@@ -4160,6 +4184,7 @@ mod tests {
             10,
             100_000,
             "query/identifier/k10/100k",
+            false,
         )
     }
 
@@ -4172,6 +4197,7 @@ mod tests {
         k: usize,
         document_count: u64,
         fixture: &str,
+        hidden_leaf_tail: bool,
     ) -> (PerfGateArtifact, PerfEvidenceArtifact) {
         assert!(GROUPS > 0, "QG-6 test fixture requires a group pattern");
         let scope = crate::perf::perf_operation_scope(PerfGate::Qg6, fixture, "latency_ms");
@@ -4234,12 +4260,30 @@ mod tests {
         };
         let mut effect_samples = stream(&effect_group_ratios, 0);
         let mut null_samples = stream(&null_group_ratios, 100_000);
-        qg6_test_fixture::attach_stream(
-            &mut effect_samples,
-            true,
-            &input_identity,
-            &semantic_contract,
-        );
+        if hidden_leaf_tail {
+            qg6_test_fixture::attach_stream_with_leaf_latencies(
+                &mut effect_samples,
+                true,
+                &input_identity,
+                &semantic_contract,
+                |sample, parent_latency_ns| {
+                    let tail_latency_ns =
+                        if sample.arm == PerfSampleArm::Treatment && sample.block_id < 2 {
+                            parent_latency_ns * 100
+                        } else {
+                            parent_latency_ns
+                        };
+                    vec![parent_latency_ns, parent_latency_ns, tail_latency_ns]
+                },
+            );
+        } else {
+            qg6_test_fixture::attach_stream(
+                &mut effect_samples,
+                true,
+                &input_identity,
+                &semantic_contract,
+            );
+        }
         qg6_test_fixture::attach_stream(
             &mut null_samples,
             false,
@@ -4272,6 +4316,9 @@ mod tests {
             EvidenceCellBody::Paired { paired, .. } => paired,
             EvidenceCellBody::Facts { .. } => unreachable!("QG-6 must be paired"),
         };
+        let leaf_distributions =
+            crate::project_qg6_effect_leaf_distributions(&paired.effect_samples, &paired.config)
+                .expect("QG-6 effect-leaf projection");
         let artifact = PerfGateArtifact {
             schema_version: PERF_ARTIFACT_SCHEMA_VERSION.to_owned(),
             gate: PerfGate::Qg6,
@@ -4290,14 +4337,14 @@ mod tests {
                     metric: "latency_ms".to_owned(),
                     engine: "quill".to_owned(),
                     unit: "ms".to_owned(),
-                    distribution: paired.effect.treatment.clone(),
+                    distribution: leaf_distributions.treatment,
                 },
                 PerfCellResult {
                     fixture: fixture.to_owned(),
                     metric: "latency_ms".to_owned(),
                     engine: "tantivy".to_owned(),
                     unit: "ms".to_owned(),
-                    distribution: paired.effect.control.clone(),
+                    distribution: leaf_distributions.control,
                 },
                 PerfCellResult {
                     fixture: fixture.to_owned(),
@@ -4390,6 +4437,7 @@ mod tests {
                 k,
                 document_count,
                 &spec.fixture,
+                false,
             );
             rows.extend(cell_artifact.cells.iter().cloned());
             cells.push(cell_evidence.cells.remove(0));
@@ -6345,6 +6393,75 @@ mod tests {
             reason.code == "perf.ratchet.qg6_hierarchical_reproduction_failed"
                 && reason.message.contains("A/A null")
         }));
+    }
+
+    #[test]
+    fn qg6_ratchet_requires_leaf_derived_absolute_projection() {
+        let (mut artifact, evidence) = qg6_current_pair_for_cell(
+            "leaf-tail-projection",
+            [[1.0; 3]; 4],
+            [[1.0; 3]; 4],
+            crate::PerfQueryClass::Identifier,
+            10,
+            100_000,
+            "query/identifier/k10/100k",
+            true,
+        );
+        let cell = evidence.cells.first().expect("QG-6 evidence cell");
+        let paired = match &cell.body {
+            EvidenceCellBody::Paired { paired, .. } => paired,
+            EvidenceCellBody::Facts { .. } => unreachable!("QG-6 must be paired"),
+        };
+        let leaf_treatment = artifact
+            .cells
+            .iter()
+            .find(|row| row.engine == "quill")
+            .expect("QG-6 Quill absolute row")
+            .distribution
+            .clone();
+        assert!(
+            leaf_treatment.p99 > paired.effect.treatment.p99,
+            "fixture hides a treatment tail behind equal parent medians"
+        );
+
+        let rows = artifact
+            .cells
+            .iter()
+            .map(|row| (CellKey::from(row), row))
+            .collect::<BTreeMap<_, _>>();
+        let mut state = DecisionState::default();
+        reconcile_current_cell_with_projection(cell, paired, None, &rows, "candidate", &mut state);
+        assert!(
+            !state.fatal,
+            "leaf projection must reconcile: {:?}",
+            state.reasons
+        );
+
+        artifact
+            .cells
+            .iter_mut()
+            .find(|row| row.engine == "quill")
+            .expect("QG-6 Quill absolute row")
+            .distribution = paired.effect.treatment.clone();
+        let parent_rows = artifact
+            .cells
+            .iter()
+            .map(|row| (CellKey::from(row), row))
+            .collect::<BTreeMap<_, _>>();
+        let mut parent_state = DecisionState::default();
+        reconcile_current_cell_with_projection(
+            cell,
+            paired,
+            None,
+            &parent_rows,
+            "candidate",
+            &mut parent_state,
+        );
+        assert!(
+            parent_state.reasons.iter().any(|reason| {
+                reason.code == "perf.ratchet.current_evidence_projection_mismatch"
+            })
+        );
     }
 
     #[test]

@@ -182,11 +182,11 @@ pub use perf::{
     Qg1TantivyDecisionStreamKind, Qg1TantivyIncumbentCandidate, Qg1TantivyIncumbentDecision,
     Qg1TantivyIncumbentError, Qg1TantivyIncumbentPilot, Qg1TantivyIncumbentScreen,
     Qg1TantivyIncumbentScreenPlan, Qg1TantivySemanticContract, Qg1TantivyWriterMode,
-    Qg1TargetPinV1, Qg1VerifiedAuthorityRegistrationV1, Qg6SampleBinding,
-    estimate_paired_experiment, estimate_paired_experiment_against_qg1_authority,
+    Qg1TargetPinV1, Qg1VerifiedAuthorityRegistrationV1, Qg6EffectLeafDistributions,
+    Qg6SampleBinding, estimate_paired_experiment, estimate_paired_experiment_against_qg1_authority,
     machine_fingerprint, parse_macos_time_max_rss_bytes, peak_rss_bytes,
     perf_manifest_contract_sha256, perf_writer_heap_bytes, preregister_qg1_tantivy_incumbents,
-    seeded_balanced_pair_order, validate_matrix,
+    project_qg6_effect_leaf_distributions, seeded_balanced_pair_order, validate_matrix,
 };
 pub use perf::{PERF_RUN_PLAN_DOC_PATH, render_perf_run_plan_markdown};
 pub use perf_assembly::{

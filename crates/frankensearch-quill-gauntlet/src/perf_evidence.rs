@@ -4097,7 +4097,24 @@ pub mod qg6_test_fixture {
         identity: &PerfInputIdentity,
         contract: &Qg6SemanticContract,
     ) {
+        attach_stream_with_leaf_latencies(
+            samples,
+            effect_stream,
+            identity,
+            contract,
+            |_, parent_latency_ns| vec![parent_latency_ns],
+        );
+    }
+
+    pub fn attach_stream_with_leaf_latencies(
+        samples: &mut [PerfRawSample],
+        effect_stream: bool,
+        identity: &PerfInputIdentity,
+        contract: &Qg6SemanticContract,
+        mut leaf_latencies: impl FnMut(&PerfRawSample, u64) -> Vec<u64>,
+    ) {
         let mut timeline_ns = 0_u64;
+        let mut sample_leaf_latencies = BTreeMap::<u64, Vec<u64>>::new();
         let (pairs, remainder) = samples.as_chunks_mut::<2>();
         for pair in pairs {
             assert_eq!(pair[0].block_id, pair[1].block_id, "paired QG-6 fixture");
@@ -4114,10 +4131,33 @@ pub mod qg6_test_fixture {
                 let elapsed_ns =
                     u64::try_from(elapsed.as_nanos()).expect("bounded QG-6 fixture latency");
                 assert!(elapsed_ns > 0, "positive QG-6 fixture latency");
+                let latencies = leaf_latencies(sample, elapsed_ns);
+                assert!(!latencies.is_empty(), "QG-6 fixture has timing leaves");
+                assert!(
+                    latencies.iter().all(|latency| *latency > 0),
+                    "QG-6 fixture timing leaves are positive"
+                );
+                let mut sorted = latencies.clone();
+                sorted.sort_unstable();
+                assert_eq!(
+                    sorted[sorted.len() / 2],
+                    elapsed_ns,
+                    "QG-6 fixture leaves reproduce the parent median"
+                );
+                let total_elapsed_ns = latencies
+                    .iter()
+                    .try_fold(0_u64, |total, latency| total.checked_add(*latency))
+                    .expect("bounded QG-6 fixture leaf interval");
                 sample.started_ns = timeline_ns;
-                sample.ended_ns = timeline_ns + elapsed_ns;
+                sample.ended_ns = timeline_ns + total_elapsed_ns;
                 sample.observed_value = Some(elapsed_ns as f64 / 1_000_000.0);
                 timeline_ns = sample.ended_ns + 1_000;
+                assert!(
+                    sample_leaf_latencies
+                        .insert(sample.sample_id, latencies)
+                        .is_none(),
+                    "QG-6 fixture sample IDs are unique"
+                );
             }
         }
         assert!(remainder.is_empty(), "paired QG-6 fixture");
@@ -4126,7 +4166,6 @@ pub mod qg6_test_fixture {
             let group_index = usize::try_from(group_id).expect("QG-6 group index");
             let group = &contract.groups[group_index];
             let role = qg6_role(effect_stream, sample.arm);
-            sample.work_units = Some(1);
             sample.provenance.input_identity = Some(identity.clone());
             let comparison = if effect_stream {
                 Qg6Comparison::Effect
@@ -4137,20 +4176,43 @@ pub mod qg6_test_fixture {
                 PerfSampleOrder::First => Qg6SampleOrder::First,
                 PerfSampleOrder::Second => Qg6SampleOrder::Second,
             };
-            let leaf = Qg6SearchTimingLeafReceipt::from_observation(
-                sample.block_id,
-                sample.sample_id,
-                &group.query.query_id,
-                group_index,
-                comparison,
-                role,
-                order,
-                0,
-                sample.started_ns,
-                sample.ended_ns,
-                group.roles.get(role).receipt_sha256.clone(),
-            )
-            .expect("sealed QG-6 timing leaf");
+            let latencies = sample_leaf_latencies
+                .remove(&sample.sample_id)
+                .expect("prepared QG-6 fixture leaf latencies");
+            let mut leaf_started_ns = sample.started_ns;
+            let timing_leaves = latencies
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(leaf_ordinal, latency_ns)| {
+                    let leaf_ended_ns = leaf_started_ns + latency_ns;
+                    let leaf = Qg6SearchTimingLeafReceipt::from_observation(
+                        sample.block_id,
+                        sample.sample_id,
+                        &group.query.query_id,
+                        group_index,
+                        comparison,
+                        role,
+                        order,
+                        u64::try_from(leaf_ordinal).expect("bounded QG-6 fixture leaf ordinal"),
+                        leaf_started_ns,
+                        leaf_ended_ns,
+                        group.roles.get(role).receipt_sha256.clone(),
+                    )
+                    .expect("sealed QG-6 timing leaf");
+                    leaf_started_ns = leaf_ended_ns;
+                    leaf
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                leaf_started_ns, sample.ended_ns,
+                "QG-6 fixture leaves fill their parent interval"
+            );
+            let subsample_count =
+                u64::try_from(timing_leaves.len()).expect("bounded QG-6 fixture leaf cardinality");
+            let mut sorted_latencies = latencies.clone();
+            sorted_latencies.sort_unstable();
+            sample.work_units = Some(subsample_count);
             let mut timed_sample = Qg6TimedSample {
                 block_id: sample.block_id,
                 sample_id: sample.sample_id,
@@ -4161,11 +4223,11 @@ pub mod qg6_test_fixture {
                 order,
                 started_ns: sample.started_ns,
                 ended_ns: sample.ended_ns,
-                observed_latency_ns: sample.ended_ns - sample.started_ns,
-                subsample_count: 1,
-                result_sha256: qg6_result_sequence_sha256(group.roles.get(role), 1)
+                observed_latency_ns: sorted_latencies[sorted_latencies.len() / 2],
+                subsample_count,
+                result_sha256: qg6_result_sequence_sha256(group.roles.get(role), subsample_count)
                     .expect("QG-6 sequence digest"),
-                timing_leaves: vec![leaf],
+                timing_leaves,
                 timing_leaves_sha256: String::new(),
             };
             timed_sample.timing_leaves_sha256 = timed_sample
@@ -4180,6 +4242,10 @@ pub mod qg6_test_fixture {
                 timed_sample,
             });
         }
+        assert!(
+            sample_leaf_latencies.is_empty(),
+            "every QG-6 fixture leaf set is consumed"
+        );
     }
 }
 

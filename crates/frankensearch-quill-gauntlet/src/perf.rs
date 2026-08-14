@@ -30,7 +30,7 @@ use crate::machine_class_registry::{
 use crate::perf_assembly::PERF_EVIDENCE_ASSEMBLY_SCHEMA_VERSION;
 use crate::perf_evidence::PERF_EVIDENCE_SCHEMA_VERSION;
 use crate::perf_ratchet::PERF_HISTORY_POINTER_SCHEMA_VERSION;
-use crate::qg6_prepared::{Qg6ArmRole, Qg6SampleOrder, Qg6TimedSample};
+use crate::qg6_prepared::{Qg6ArmRole, Qg6Comparison, Qg6SampleOrder, Qg6TimedSample};
 
 /// Version of the JSON emitted by the QG matrix harness.
 pub const PERF_ARTIFACT_SCHEMA_VERSION: &str = "quill-perf-artifact-v7";
@@ -3552,6 +3552,195 @@ impl Qg6SampleBinding {
             && sample.observed_value
                 == Some(self.timed_sample.observed_latency_ns as f64 / 1_000_000.0)
     }
+}
+
+/// Absolute QG-6 arm distributions reconstructed from authenticated search leaves.
+///
+/// Parent [`PerfRawSample`] values are per-sample medians. They are retained for
+/// paired estimation, but their percentiles are percentiles of medians and
+/// therefore cannot represent the search tail. These summaries flatten the
+/// individually timed leaves only after the complete effect stream has been
+/// verified. This is an absolute compatibility projection, not the later
+/// query-first p99 estimator or its tail confidence interval.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Qg6EffectLeafDistributions {
+    /// Tantivy effect-control search-leaf distribution.
+    pub control: DistributionSummary,
+    /// Quill effect-treatment search-leaf distribution.
+    pub treatment: DistributionSummary,
+}
+
+/// Reconstruct absolute QG-6 effect-arm distributions from a prevalidated raw stream.
+///
+/// # Errors
+///
+/// Rejects non-measurement rows, missing or invalid QG-6 bindings, null-stream
+/// rows, duplicate sample or arm identities, incomplete blocks, mismatched
+/// query/leaf cardinality, and anything other than the exact frozen 16-query
+/// group-index set with equal blocks per query. The caller's evidence admission
+/// remains responsible for binding those indices to the frozen semantic query
+/// contract; this compatibility projection does not replace that proof.
+pub fn project_qg6_effect_leaf_distributions(
+    samples: &[PerfRawSample],
+    config: &PairedEstimatorConfig,
+) -> Result<Qg6EffectLeafDistributions, PairedEstimatorError> {
+    #[derive(Default)]
+    struct Block<'a> {
+        group_id: Option<u64>,
+        control: Option<&'a Qg6TimedSample>,
+        treatment: Option<&'a Qg6TimedSample>,
+    }
+
+    let invalid = |reason: &str| PairedEstimatorError::InvalidProvenance {
+        reason: format!("invalid QG-6 effect-leaf projection: {reason}"),
+    };
+    let _ = validate_paired_blocks(samples, config)?;
+    let mut sample_ids = BTreeSet::new();
+    let mut blocks = BTreeMap::<u64, Block<'_>>::new();
+    for sample in samples {
+        if sample.phase != PerfSamplePhase::Measurement {
+            return Err(PairedEstimatorError::WarmupInDecisionSet {
+                sample_id: sample.sample_id,
+            });
+        }
+        if !sample_ids.insert(sample.sample_id) {
+            return Err(PairedEstimatorError::DuplicateSampleId {
+                sample_id: sample.sample_id,
+            });
+        }
+        let binding = sample
+            .qg6_sample_binding
+            .as_ref()
+            .ok_or_else(|| invalid("sample has no authenticated QG-6 binding"))?;
+        if !binding.validate_against(sample)
+            || binding.timed_sample.comparison != Qg6Comparison::Effect
+        {
+            return Err(invalid(
+                "sample binding does not reproduce an effect-stream observation",
+            ));
+        }
+        let expected_role = match sample.arm {
+            PerfSampleArm::Control => Qg6ArmRole::EffectControl,
+            PerfSampleArm::Treatment => Qg6ArmRole::EffectTreatment,
+        };
+        if binding.timed_sample.arm != expected_role {
+            return Err(invalid("sample arm is not the exact QG-6 effect role"));
+        }
+        let group_id = sample
+            .group_id
+            .ok_or(PairedEstimatorError::MissingGroupId {
+                sample_id: sample.sample_id,
+            })?;
+        if usize::try_from(group_id).ok() != Some(binding.timed_sample.query_index) {
+            return Err(invalid("sample group does not name its bound query index"));
+        }
+        let block = blocks.entry(sample.block_id).or_default();
+        if block
+            .group_id
+            .replace(group_id)
+            .is_some_and(|previous| previous != group_id)
+        {
+            return Err(PairedEstimatorError::GroupMismatch {
+                block_id: sample.block_id,
+            });
+        }
+        let slot = match sample.arm {
+            PerfSampleArm::Control => &mut block.control,
+            PerfSampleArm::Treatment => &mut block.treatment,
+        };
+        if slot.replace(&binding.timed_sample).is_some() {
+            return Err(PairedEstimatorError::DuplicateArm {
+                block_id: sample.block_id,
+                arm: sample.arm,
+            });
+        }
+    }
+
+    if blocks.is_empty() {
+        return Err(invalid("effect stream is empty"));
+    }
+    let mut control_leaves = Vec::new();
+    let mut treatment_leaves = Vec::new();
+    let mut group_block_counts = BTreeMap::<u64, usize>::new();
+    let mut group_query_ids = BTreeMap::<u64, &str>::new();
+    let mut expected_leaves_per_sample = None;
+    for (block_id, block) in blocks {
+        let control = block
+            .control
+            .ok_or_else(|| PairedEstimatorError::IncompleteBlock {
+                block_id,
+                control_count: 0,
+                treatment_count: usize::from(block.treatment.is_some()),
+            })?;
+        let treatment = block
+            .treatment
+            .ok_or(PairedEstimatorError::IncompleteBlock {
+                block_id,
+                control_count: 1,
+                treatment_count: 0,
+            })?;
+        let group_id = block
+            .group_id
+            .ok_or_else(|| invalid("complete block has no query group"))?;
+        if control.query_index != treatment.query_index
+            || control.query_id != treatment.query_id
+            || control.timing_leaves.len() != treatment.timing_leaves.len()
+        {
+            return Err(PairedEstimatorError::Qg6BindingMismatch { block_id });
+        }
+        let leaf_count = control.timing_leaves.len();
+        if expected_leaves_per_sample
+            .replace(leaf_count)
+            .is_some_and(|expected| expected != leaf_count)
+        {
+            return Err(invalid(
+                "effect blocks do not have equal search-leaf cardinality",
+            ));
+        }
+        if group_query_ids
+            .insert(group_id, control.query_id.as_str())
+            .is_some_and(|previous| previous != control.query_id)
+        {
+            return Err(invalid("one query group names multiple query identities"));
+        }
+        *group_block_counts.entry(group_id).or_default() += 1;
+        control_leaves.extend(
+            control
+                .timing_leaves
+                .iter()
+                .map(|leaf| leaf.observed_latency_ms),
+        );
+        treatment_leaves.extend(
+            treatment
+                .timing_leaves
+                .iter()
+                .map(|leaf| leaf.observed_latency_ms),
+        );
+    }
+
+    let expected_groups = QG6_QUERY_GROUP_IDS.into_iter().collect::<BTreeSet<_>>();
+    let observed_groups = group_block_counts.keys().copied().collect::<BTreeSet<_>>();
+    let equal_blocks_per_group = group_block_counts
+        .values()
+        .next()
+        .is_some_and(|first| group_block_counts.values().all(|count| count == first));
+    if observed_groups != expected_groups || !equal_blocks_per_group {
+        return Err(invalid(
+            "effect stream does not cover every frozen query equally",
+        ));
+    }
+
+    let summarize = |values: &[f64]| {
+        DistributionSummary::from_samples(values).map_err(|error| {
+            PairedEstimatorError::InvalidProvenance {
+                reason: format!("invalid QG-6 effect-leaf distribution: {error}"),
+            }
+        })
+    };
+    Ok(Qg6EffectLeafDistributions {
+        control: summarize(&control_leaves)?,
+        treatment: summarize(&treatment_leaves)?,
+    })
 }
 
 /// One contiguous prepared-input interval consumed by a QG-1 engine sample.
@@ -8269,6 +8458,9 @@ pub fn render_perf_run_plan_markdown() -> Result<String, GauntletError> {
 mod tests {
     use super::*;
     use crate::machine_class_registry::{ExecutionProfileId, HardwareClassId};
+    use crate::qg6_prepared::{
+        Qg6ResultReceipt, Qg6SearchTimingLeafReceipt, qg6_result_sequence_sha256,
+    };
 
     const PERF_MANIFEST: &str = include_str!("../../../docs/contracts/quill-perf-gates.toml");
 
@@ -8412,6 +8604,193 @@ mod tests {
             worker_id: "synthetic-worker".to_owned(),
             build_profile: "release-perf".to_owned(),
         }
+    }
+
+    fn qg6_effect_sample_with_leaves(
+        query_index: usize,
+        arm: PerfSampleArm,
+        order: PerfSampleOrder,
+        latencies_ns: &[u64],
+    ) -> PerfRawSample {
+        let block_id = u64::try_from(query_index).expect("bounded QG-6 query index");
+        let sample_id = block_id * 2 + u64::from(arm == PerfSampleArm::Treatment);
+        let query_id = format!("qg6-tail-query-{query_index:02}");
+        let comparison = Qg6Comparison::Effect;
+        let role = match arm {
+            PerfSampleArm::Control => Qg6ArmRole::EffectControl,
+            PerfSampleArm::Treatment => Qg6ArmRole::EffectTreatment,
+        };
+        let qg6_order = match order {
+            PerfSampleOrder::First => Qg6SampleOrder::First,
+            PerfSampleOrder::Second => Qg6SampleOrder::Second,
+        };
+        let receipt = Qg6ResultReceipt::from_redacted_hits(Vec::new(), 0, 100_000, 100)
+            .expect("empty sealed QG-6 result receipt");
+        let started_ns = block_id * 1_000_000_000
+            + if arm == PerfSampleArm::Control {
+                0
+            } else {
+                200_000_000
+            };
+        let mut leaf_started_ns = started_ns;
+        let mut timing_leaves = Vec::with_capacity(latencies_ns.len());
+        for (leaf_ordinal, latency_ns) in latencies_ns.iter().copied().enumerate() {
+            let leaf_ended_ns = leaf_started_ns + latency_ns;
+            timing_leaves.push(
+                Qg6SearchTimingLeafReceipt::from_observation(
+                    block_id,
+                    sample_id,
+                    &query_id,
+                    query_index,
+                    comparison,
+                    role,
+                    qg6_order,
+                    u64::try_from(leaf_ordinal).expect("bounded leaf ordinal"),
+                    leaf_started_ns,
+                    leaf_ended_ns,
+                    receipt.receipt_sha256.clone(),
+                )
+                .expect("sealed QG-6 timing leaf"),
+            );
+            leaf_started_ns = leaf_ended_ns;
+        }
+        let mut sorted_latencies = latencies_ns.to_vec();
+        sorted_latencies.sort_unstable();
+        let observed_latency_ns = sorted_latencies[sorted_latencies.len() / 2];
+        let subsample_count = u64::try_from(latencies_ns.len()).expect("bounded leaf count");
+        let mut timed_sample = Qg6TimedSample {
+            block_id,
+            sample_id,
+            query_id: query_id.clone(),
+            query_index,
+            comparison,
+            arm: role,
+            order: qg6_order,
+            started_ns,
+            ended_ns: leaf_started_ns,
+            observed_latency_ns,
+            subsample_count,
+            result_sha256: qg6_result_sequence_sha256(&receipt, subsample_count)
+                .expect("sealed QG-6 result sequence"),
+            timing_leaves,
+            timing_leaves_sha256: String::new(),
+        };
+        timed_sample.timing_leaves_sha256 = timed_sample
+            .recomputed_timing_leaves_sha256()
+            .expect("sealed QG-6 parent sample");
+        timed_sample
+            .verify_timing_leaves()
+            .expect("valid QG-6 parent sample");
+        PerfRawSample {
+            block_id,
+            sample_id,
+            arm,
+            order,
+            phase: PerfSamplePhase::Measurement,
+            scope: operation_scope(PerfMetricSemantics::GaugeLowerIsBetter),
+            provenance: PerfSampleProvenance {
+                input_identity: Some(PerfInputIdentity {
+                    prepared_corpus_sha256: "c".repeat(64),
+                    query_manifest_sha256: "d".repeat(64),
+                    config_contract_sha256: "e".repeat(64),
+                    semantic_contract_sha256: Some("f".repeat(64)),
+                    query_group_count: QG6_QUERY_GROUPS,
+                    query_group_ids: QG6_QUERY_GROUP_IDS.to_vec(),
+                }),
+                ..provenance("qg6-tail-projection")
+            },
+            started_ns,
+            ended_ns: leaf_started_ns,
+            work_units: Some(subsample_count),
+            byte_count: None,
+            observed_value: Some(observed_latency_ns as f64 / 1_000_000.0),
+            group_id: Some(block_id),
+            qg6_sample_binding: Some(Qg6SampleBinding {
+                query_id,
+                result_sequence_sha256: timed_sample.result_sha256.clone(),
+                timed_sample,
+            }),
+            qg1_sample_binding: None,
+            tantivy_config_sha256: None,
+        }
+    }
+
+    #[test]
+    fn qg6_effect_leaf_projection_recovers_tail_hidden_by_parent_medians() {
+        let mut samples = Vec::new();
+        for query_index in 0..QG6_QUERY_GROUPS {
+            samples.push(qg6_effect_sample_with_leaves(
+                query_index,
+                PerfSampleArm::Control,
+                PerfSampleOrder::First,
+                &[1_000_000, 1_000_000, 1_000_000],
+            ));
+            samples.push(qg6_effect_sample_with_leaves(
+                query_index,
+                PerfSampleArm::Treatment,
+                PerfSampleOrder::Second,
+                if query_index == 0 {
+                    &[1_000_000, 1_000_000, 100_000_000]
+                } else {
+                    &[1_000_000, 1_000_000, 1_000_000]
+                },
+            ));
+        }
+
+        let parent_control = samples
+            .iter()
+            .filter(|sample| sample.arm == PerfSampleArm::Control)
+            .map(|sample| sample.observed_value.expect("parent control median"))
+            .collect::<Vec<_>>();
+        let parent_treatment = samples
+            .iter()
+            .filter(|sample| sample.arm == PerfSampleArm::Treatment)
+            .map(|sample| sample.observed_value.expect("parent treatment median"))
+            .collect::<Vec<_>>();
+        let old_control =
+            DistributionSummary::from_samples(&parent_control).expect("old control projection");
+        let old_treatment =
+            DistributionSummary::from_samples(&parent_treatment).expect("old treatment projection");
+        assert_eq!(old_control.p99.to_bits(), 1.0_f64.to_bits());
+        assert_eq!(old_treatment.p99.to_bits(), 1.0_f64.to_bits());
+
+        let config = estimator_config();
+        let leaves = project_qg6_effect_leaf_distributions(&samples, &config)
+            .expect("authenticated QG-6 effect leaves");
+        assert_eq!(leaves.control.runs, QG6_QUERY_GROUPS * 3);
+        assert_eq!(leaves.treatment.runs, QG6_QUERY_GROUPS * 3);
+        assert_eq!(leaves.control.p99.to_bits(), 1.0_f64.to_bits());
+        assert_eq!(leaves.treatment.p95.to_bits(), 1.0_f64.to_bits());
+        assert_eq!(leaves.treatment.p99.to_bits(), 100.0_f64.to_bits());
+
+        let mut authority_free = samples.clone();
+        authority_free[0].provenance.input_identity = None;
+        assert!(
+            project_qg6_effect_leaf_distributions(&authority_free, &config).is_err(),
+            "a QG-6 binding cannot replace the canonical input-identity proof"
+        );
+
+        let mut incomplete = samples.clone();
+        incomplete.pop();
+        assert!(matches!(
+            project_qg6_effect_leaf_distributions(&incomplete, &config),
+            Err(PairedEstimatorError::IncompleteBlock { .. })
+        ));
+
+        let mut unequal_leaves = samples;
+        unequal_leaves[0] = qg6_effect_sample_with_leaves(
+            0,
+            PerfSampleArm::Control,
+            PerfSampleOrder::First,
+            &[1_000_000, 1_000_000, 1_000_000, 1_000_000, 1_000_000],
+        );
+        unequal_leaves[1] = qg6_effect_sample_with_leaves(
+            0,
+            PerfSampleArm::Treatment,
+            PerfSampleOrder::Second,
+            &[1_000_000, 1_000_000, 1_000_000, 1_000_000, 100_000_000],
+        );
+        assert!(project_qg6_effect_leaf_distributions(&unequal_leaves, &config).is_err());
     }
 
     fn qg1_bulk_cell(threads: usize) -> PerfCellSpec {
