@@ -48,6 +48,7 @@ use frankensearch_quill_gauntlet::{
     CorpusIdentity,
     CorpusManifest,
     CountState,
+    DefaultFlipDisposition,
     DistributionSummary,
     EngineConcurrencyObservation,
     EngineObservation,
@@ -59,7 +60,6 @@ use frankensearch_quill_gauntlet::{
     EvidenceRole,
     ExecutionCapacitySemantics,
     ExecutionProfileId,
-    DefaultFlipDisposition,
     HardwareClassId,
     MachineClassRegistry,
     MachineIdentity,
@@ -147,6 +147,7 @@ use frankensearch_quill_gauntlet::{
     perf_writer_heap_bytes,
     preregister_qg1_tantivy_incumbents,
     seeded_balanced_pair_order,
+    seeded_interleaved_four_arm_schedule,
     validate_matrix,
 };
 use serde::{Deserialize, Serialize};
@@ -176,6 +177,12 @@ const QG1_X86_DIAGNOSTIC_SCHEMA_VERSION: &str = "frankensearch.qg1-x86-diagnosti
 const QG1_PROFILE_CHILD_MODE: &str = "qg1-profile";
 const QG1_PROFILE_CHILD_SCHEMA_VERSION: &str = "frankensearch.qg1-profile-child.v1";
 const QG1_PROFILE_HANDSHAKE_ENV: &str = "QUILL_PERF_CHILD_PROFILE_HANDSHAKE";
+const QG6_PROFILE_CHILD_MODE: &str = "qg6-profile";
+const QG6_PROFILE_CHILD_SCHEMA_VERSION: &str = "frankensearch.qg6-profile-child.v1";
+const QG6_PROFILE_FIXTURE: &str = "query/natural_language/k100/100k";
+const QG6_PROFILE_RUNS: usize = PERF_MIN_RUNS;
+const QG6_PROFILE_WARMUP_ROUNDS: usize = 1;
+const PERF_DEFAULT_BOOTSTRAP_SEED: u64 = 0x5155_494c_4c45_5644;
 const QG1_LIVE_STARTUP_ORDINARY_MARKER: &[u8] = b"qg1-live-startup-work-after-ack\n";
 #[cfg(test)]
 const QG1_AUTHORITY_SUBPROCESS_ENV: &str = "QUILL_PERF_QG1_AUTHORITY_SUBPROCESS";
@@ -881,7 +888,9 @@ fn resolve_qg1_x86_diagnostic_plan(
         .into_iter()
         .find(|spec| spec.fixture == request.fixture)
         .cloned()
-        .ok_or_else(|| "QG-1 x86 diagnostic fixture is absent from the canonical matrix".to_owned())?;
+        .ok_or_else(|| {
+            "QG-1 x86 diagnostic fixture is absent from the canonical matrix".to_owned()
+        })?;
     let configured_threads = spec
         .threads
         .ok_or_else(|| "QG-1 x86 diagnostic fixture has no configured thread width".to_owned())?;
@@ -912,8 +921,7 @@ fn resolve_qg1_x86_diagnostic_plan(
         .gate_policy(PerfGate::Qg1.label())
         .ok_or_else(|| "QG-1 x86 diagnostic profile has no QG-1 policy".to_owned())?;
     if registered.availability() != MachineProfileAvailability::Registered
-        || registered.capacity_semantics()
-            != ExecutionCapacitySemantics::DiagnosticWorkerBudget
+        || registered.capacity_semantics() != ExecutionCapacitySemantics::DiagnosticWorkerBudget
         || registered.execution_capacity().is_some()
         || gate_policy.default_flip_disposition() != DefaultFlipDisposition::DiagnosticOnly
         || gate_policy.max_exercised_cell_width().is_some()
@@ -937,8 +945,12 @@ fn qg1_x86_diagnostic_requested() -> Result<bool, String> {
     match std::env::var(QG1_X86_DIAGNOSTIC_ENV) {
         Err(std::env::VarError::NotPresent) => Ok(false),
         Ok(value) if value == "1" => Ok(true),
-        Ok(value) => Err(format!("{QG1_X86_DIAGNOSTIC_ENV} must equal 1, got {value:?}")),
-        Err(error) => Err(format!("{QG1_X86_DIAGNOSTIC_ENV} is not valid Unicode: {error}")),
+        Ok(value) => Err(format!(
+            "{QG1_X86_DIAGNOSTIC_ENV} must equal 1, got {value:?}"
+        )),
+        Err(error) => Err(format!(
+            "{QG1_X86_DIAGNOSTIC_ENV} is not valid Unicode: {error}"
+        )),
     }
 }
 
@@ -5220,6 +5232,10 @@ fn fixture_seed(fixture: &str) -> u64 {
     hash
 }
 
+fn production_cell_seed(bootstrap_seed: u64, spec: &PerfCellSpec) -> u64 {
+    bootstrap_seed ^ fixture_seed(&spec.fixture)
+}
+
 struct StreamPlan<'a> {
     control: EngineArm,
     treatment: EngineArm,
@@ -6965,7 +6981,7 @@ fn collect_cell(
     // Preserve the legacy origin for every non-QG-1 gate. QG-1 deliberately
     // defers clock creation until its authority has been parent-acknowledged.
     let origin = (spec.gate != PerfGate::Qg1).then(Instant::now);
-    let cell_seed = evidence.config.bootstrap_seed ^ fixture_seed(&spec.fixture);
+    let cell_seed = production_cell_seed(evidence.config.bootstrap_seed, spec);
     let (estimator_config, qg1_lifecycle_producer) = match qg1_producer_coverage(spec) {
         Some(Qg1ProducerCoverage::EngineIndexingLifecycle) => {
             let startup = qg1_startup_producer
@@ -7962,8 +7978,7 @@ fn run_qg1_x86_diagnostic(
     )?;
     let selected_specs = vec![plan.spec.clone()];
     let context = BenchContext::for_selected(MatrixScale::Full, &selected_specs);
-    let (corpus_sha256, _) =
-        authoritative_qg1_corpus_identity(&context, &matrix, &selected_specs)?;
+    let (corpus_sha256, _) = authoritative_qg1_corpus_identity(&context, &matrix, &selected_specs)?;
     let git_revision = git_revision(MatrixScale::Full);
     let build_profile = build_profile_label(MatrixScale::Full);
     let run_id = required_env("QUILL_PERF_RUN_ID")?;
@@ -7971,7 +7986,7 @@ fn run_qg1_x86_diagnostic(
     let bootstrap_seed = std::env::var("QUILL_PERF_BOOTSTRAP_SEED")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0x5155_494c_4c45_5644);
+        .unwrap_or(PERF_DEFAULT_BOOTSTRAP_SEED);
     let evidence = EvidenceContext {
         config: PairedEstimatorConfig::predeclared(bootstrap_seed),
         policy: evidence_policy_from_env(),
@@ -8141,7 +8156,7 @@ fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
     let bootstrap_seed = std::env::var("QUILL_PERF_BOOTSTRAP_SEED")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0x5155_494c_4c45_5644);
+        .unwrap_or(PERF_DEFAULT_BOOTSTRAP_SEED);
     let evidence_policy = evidence_policy_from_env();
     eprintln!(
         "[quill-perf-policy] warmup_rounds={}",
@@ -8746,21 +8761,21 @@ fn emit_qg1_profile_event<T: Serialize>(event: &T) -> Result<(), String> {
         .map_err(|error| format!("flush QG-1 profile event: {error}"))
 }
 
-fn wait_for_qg1_profile_command(expected: &str) -> Result<(), String> {
+fn wait_for_profile_command(profile: &str, expected: &str) -> Result<(), String> {
     let stdin = std::io::stdin();
     let mut line = String::new();
     let bytes = stdin
         .lock()
         .read_line(&mut line)
-        .map_err(|error| format!("read QG-1 profile command {expected:?}: {error}"))?;
+        .map_err(|error| format!("read {profile} profile command {expected:?}: {error}"))?;
     if bytes == 0 {
         return Err(format!(
-            "QG-1 profile handshake reached EOF while waiting for {expected:?}"
+            "{profile} profile handshake reached EOF while waiting for {expected:?}"
         ));
     }
     if line != format!("{expected}\n") {
         return Err(format!(
-            "QG-1 profile handshake expected {expected:?}, got {line:?}"
+            "{profile} profile handshake expected {expected:?}, got {line:?}"
         ));
     }
     Ok(())
@@ -8838,7 +8853,7 @@ fn run_qg1_profile_child() -> Result<(), String> {
             "next_command": "continue",
             "input": &input,
         }))?;
-        wait_for_qg1_profile_command("continue")?;
+        wait_for_profile_command("QG-1", "continue")?;
     }
 
     let ingest_started = Instant::now();
@@ -8858,7 +8873,7 @@ fn run_qg1_profile_child() -> Result<(), String> {
             "ingest_elapsed_ns": ingest_elapsed_ns,
             "next_command": "finalize",
         }))?;
-        wait_for_qg1_profile_command("finalize")?;
+        wait_for_profile_command("QG-1", "finalize")?;
     }
 
     let index_identity = qg1_profile_index_identity(&index, prepared_input.binding.document_count)?;
@@ -8872,6 +8887,341 @@ fn run_qg1_profile_child() -> Result<(), String> {
         ingest_elapsed_ns,
         input,
         index: index_identity,
+    })
+}
+
+fn resolve_qg6_profile_spec(matrix: &PerfMatrixSpec) -> Result<PerfCellSpec, String> {
+    validate_matrix(matrix).map_err(|error| format!("validate canonical QG-6 matrix: {error}"))?;
+    let matching = matrix
+        .for_gate(PerfGate::Qg6)
+        .into_iter()
+        .filter(|spec| spec.fixture == QG6_PROFILE_FIXTURE)
+        .collect::<Vec<_>>();
+    let [spec] = matching.as_slice() else {
+        return Err(format!(
+            "QG-6 profile child requires exactly one {QG6_PROFILE_FIXTURE:?} fixture, found {}",
+            matching.len()
+        ));
+    };
+    let expected_writer_heap_bytes = perf_writer_heap_bytes(1);
+    if spec.gate != PerfGate::Qg6
+        || spec.metric != "latency_ms"
+        || spec.document_count != Some(100_000)
+        || spec.threads != Some(1)
+        || spec.writer_heap_bytes != Some(expected_writer_heap_bytes)
+        || spec.positions != Some(PositionMode::On)
+        || spec.query_class != Some(PerfQueryClass::NaturalLanguage)
+        || spec.k != Some(100)
+    {
+        return Err(format!(
+            "QG-6 profile child fixture contract drifted: fixture={:?} metric={:?} \
+             documents={:?} threads={:?} heap={:?} positions={:?} class={:?} k={:?}",
+            spec.fixture,
+            spec.metric,
+            spec.document_count,
+            spec.threads,
+            spec.writer_heap_bytes,
+            spec.positions,
+            spec.query_class,
+            spec.k
+        ));
+    }
+    Ok((*spec).clone())
+}
+
+fn resolve_qg6_profile_handshake(value: Option<&str>) -> Result<Qg1ProfileHandshakeMode, String> {
+    match resolve_qg1_profile_handshake(value)? {
+        Qg1ProfileHandshakeMode::StdioV1 => Ok(Qg1ProfileHandshakeMode::StdioV1),
+        Qg1ProfileHandshakeMode::Disabled => Err(format!(
+            "QG-6 profile child requires {QG1_PROFILE_HANDSHAKE_ENV}=stdio-v1"
+        )),
+    }
+}
+
+fn qg6_profile_handshake_from_env() -> Result<Qg1ProfileHandshakeMode, String> {
+    match std::env::var(QG1_PROFILE_HANDSHAKE_ENV) {
+        Ok(value) => resolve_qg6_profile_handshake(Some(&value)),
+        Err(std::env::VarError::NotPresent) => resolve_qg6_profile_handshake(None),
+        Err(error) => Err(format!(
+            "{QG1_PROFILE_HANDSHAKE_ENV} is not valid Unicode: {error}"
+        )),
+    }
+}
+
+fn qg6_profile_bootstrap_seed_from_env() -> Result<u64, String> {
+    match std::env::var("QUILL_PERF_BOOTSTRAP_SEED") {
+        Ok(value) => value
+            .parse::<u64>()
+            .map_err(|error| format!("QUILL_PERF_BOOTSTRAP_SEED must be a u64: {error}")),
+        Err(std::env::VarError::NotPresent) => Ok(PERF_DEFAULT_BOOTSTRAP_SEED),
+        Err(error) => Err(format!(
+            "QUILL_PERF_BOOTSTRAP_SEED is not valid Unicode: {error}"
+        )),
+    }
+}
+
+fn qg6_profile_digest<T: Serialize>(domain: &str, value: &T) -> Result<String, String> {
+    let encoded = serde_json::to_vec(value)
+        .map_err(|error| format!("serialize QG-6 profile {domain}: {error}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"frankensearch-quill-qg6-profile-v1\0");
+    hash_qg1_indexed_bytes(&mut hasher, domain.as_bytes());
+    hash_qg1_indexed_bytes(&mut hasher, &encoded);
+    Ok(lower_hex(&hasher.finalize()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Qg6ProfileInputIdentity {
+    fixture: String,
+    fixture_contract_sha256: String,
+    query_manifest_sha256: String,
+    config_contract_sha256: String,
+    corpus_content_sha256: String,
+    schedule_sha256: String,
+    source_revision: String,
+    executable_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Qg6ProfileCompleteEvent {
+    schema_version: String,
+    event: String,
+    pid: u32,
+    claim_status: String,
+    promotion_capability: String,
+    no_claim: String,
+    timed_search_calls: usize,
+    retained_result_count: usize,
+    verified_result_count: usize,
+    result_sequence_sha256: String,
+    preflight_receipt_sha256: String,
+    input: Qg6ProfileInputIdentity,
+}
+
+fn emit_qg6_profile_event<T: Serialize>(event: &T) -> Result<(), String> {
+    let wire = serde_json::to_string(event)
+        .map_err(|error| format!("serialize QG-6 profile event: {error}"))?;
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    writeln!(stdout, "quill-qg6-profile\t{wire}")
+        .map_err(|error| format!("emit QG-6 profile event: {error}"))?;
+    stdout
+        .flush()
+        .map_err(|error| format!("flush QG-6 profile event: {error}"))
+}
+
+fn qg6_profile_native_hits(hits: &[frankensearch_quill::QuillHit]) -> Vec<(String, u32)> {
+    hits.iter()
+        .map(|hit| (hit.document_id.clone(), hit.score.to_bits()))
+        .collect()
+}
+
+fn run_qg6_profile_child() -> Result<(), String> {
+    let matrix = PerfMatrixSpec::complete();
+    let spec = resolve_qg6_profile_spec(&matrix)?;
+    let rayon_threads = canonical_positive_u64_env("RAYON_NUM_THREADS")?;
+    if rayon_threads != 1 {
+        return Err(format!(
+            "QG-6 profile child requires RAYON_NUM_THREADS=1, got {rayon_threads}"
+        ));
+    }
+    let _ = qg6_profile_handshake_from_env()?;
+    let source_revision = git_revision(MatrixScale::Full);
+    let executable = hash_bench_elf_sha256_silently()
+        .map_err(|error| format!("hash QG-6 profile executable: {error}"))?;
+    let context = BenchContext::new(MatrixScale::Full);
+    let document_count = spec
+        .document_count
+        .expect("resolved QG-6 profile document count");
+    let k = spec.k.expect("resolved QG-6 profile k");
+    let corpus = corpus_for(document_count);
+    let corpus_manifest = corpus
+        .manifest()
+        .map_err(|error| format!("materialize QG-6 profile corpus manifest: {error}"))?;
+    let queries = qg6_query_specs(&spec);
+    if queries.len() != QG6_QUERY_GROUPS {
+        return Err(format!(
+            "QG-6 profile child requires {QG6_QUERY_GROUPS} natural-language queries, got {}",
+            queries.len()
+        ));
+    }
+    let query_manifest_sha256 = qg6_profile_digest("query-manifest", &queries)?;
+    let rounds_per_query = QG6_PROFILE_RUNS
+        .div_ceil(QG6_QUERY_GROUPS)
+        .max(EvidencePolicy::predeclared().min_group_pairs);
+    let schedule_seed = production_cell_seed(qg6_profile_bootstrap_seed_from_env()?, &spec);
+    let schedule =
+        seeded_interleaved_four_arm_schedule(queries.len(), rounds_per_query, schedule_seed)
+            .map_err(|error| format!("construct exact QG-6 profile schedule: {error}"))?;
+    let schedule_sha256 = qg6_profile_digest("schedule", &schedule)?;
+    let treatment_blocks = schedule
+        .iter()
+        .filter(|block| block.comparison == Qg6Comparison::Effect)
+        .map(|block| {
+            if !matches!(
+                (block.first, block.second),
+                (Qg6ArmRole::EffectControl, Qg6ArmRole::EffectTreatment)
+                    | (Qg6ArmRole::EffectTreatment, Qg6ArmRole::EffectControl)
+            ) {
+                return Err("QG-6 profile effect block does not contain the treatment once".into());
+            }
+            Ok(block)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if treatment_blocks.len() != queries.len() * rounds_per_query {
+        return Err(format!(
+            "QG-6 profile schedule contains {} treatment blocks, expected {}",
+            treatment_blocks.len(),
+            queries.len() * rounds_per_query
+        ));
+    }
+
+    let index = quill_in_memory(&spec);
+    let _ = index_batches(&context, &index, &corpus, document_count, None);
+    let _ = commit(&context, &index);
+    let arm = PreparedQueryArm::Quill {
+        index: Box::new(index),
+    };
+    let preflight = queries
+        .iter()
+        .map(|query| qg6_preflight_result(&context, &arm, query, k))
+        .collect::<Result<Vec<_>, _>>()?;
+    let preflight_receipts = queries
+        .iter()
+        .zip(&preflight)
+        .map(|(query, result)| (query.id(), result.public_result_sha256.as_str()))
+        .collect::<Vec<_>>();
+    let preflight_receipt_sha256 = qg6_profile_digest("preflight-receipts", &preflight_receipts)?;
+
+    let PreparedQueryArm::Quill { index } = &arm else {
+        unreachable!("QG-6 profile child builds Quill only")
+    };
+    for _ in 0..QG6_PROFILE_WARMUP_ROUNDS {
+        for (query, expected) in queries.iter().zip(&preflight) {
+            let warm = index
+                .search_doc_ids(&context.cx, query.text(), k)
+                .map_err(|error| format!("warm QG-6 profile query {}: {error}", query.id()))?;
+            if qg6_profile_native_hits(&warm) != expected.native_hits {
+                return Err(format!(
+                    "QG-6 profile warm result drifted from preflight for query {}",
+                    query.id()
+                ));
+            }
+        }
+    }
+
+    let retained_result_capacity = treatment_blocks
+        .len()
+        .checked_mul(QG6_TIMED_SEARCHES_PER_SAMPLE)
+        .ok_or_else(|| "QG-6 profile retained-result capacity overflowed".to_owned())?;
+    let mut retained_results = Vec::new();
+    retained_results
+        .try_reserve_exact(retained_result_capacity)
+        .map_err(|_| "QG-6 profile retained-result allocation failed".to_owned())?;
+
+    let input = Qg6ProfileInputIdentity {
+        fixture: spec.fixture.clone(),
+        fixture_contract_sha256: spec
+            .contract_sha256()
+            .map_err(|error| format!("hash QG-6 profile fixture: {error}"))?,
+        query_manifest_sha256,
+        config_contract_sha256: qg6_config_contract_sha256(&spec),
+        corpus_content_sha256: corpus_manifest.content_sha256,
+        schedule_sha256,
+        source_revision,
+        executable_sha256: executable.sha256,
+    };
+    emit_qg6_profile_event(&serde_json::json!({
+        "schema_version": QG6_PROFILE_CHILD_SCHEMA_VERSION,
+        "event": "ready",
+        "pid": std::process::id(),
+        "claim_status": "diagnostic_only",
+        "promotion_capability": "none",
+        "no_claim": "profile output is not QG-6 evidence or a Tantivy comparison",
+        "next_command": "continue",
+        "document_count": document_count,
+        "k": k,
+        "query_class": PerfQueryClass::NaturalLanguage,
+        "query_count": queries.len(),
+        "warmup_rounds": QG6_PROFILE_WARMUP_ROUNDS,
+        "rounds_per_query": rounds_per_query,
+        "searches_per_sample": QG6_TIMED_SEARCHES_PER_SAMPLE,
+        "schedule_seed": schedule_seed,
+        "preflight_receipt_sha256": preflight_receipt_sha256,
+        "input": &input,
+    }))?;
+    wait_for_profile_command("QG-6", "continue")?;
+
+    for block in treatment_blocks {
+        let query = &queries[block.query_index];
+        let treatment_order = if block.first == Qg6ArmRole::EffectTreatment {
+            Qg6SampleOrder::First
+        } else {
+            Qg6SampleOrder::Second
+        };
+        for leaf_ordinal in 0..QG6_TIMED_SEARCHES_PER_SAMPLE {
+            let native = index
+                .search_doc_ids(&context.cx, black_box(query.text()), black_box(k))
+                .map_err(|error| format!("profile QG-6 treatment query {}: {error}", query.id()))?;
+            retained_results.push((
+                block.block_id,
+                block.query_index,
+                treatment_order,
+                leaf_ordinal,
+                native,
+            ));
+        }
+    }
+    if retained_results.len() != retained_result_capacity {
+        return Err("QG-6 profile treatment call count differs from the exact schedule".to_owned());
+    }
+    emit_qg6_profile_event(&serde_json::json!({
+        "schema_version": QG6_PROFILE_CHILD_SCHEMA_VERSION,
+        "event": "search_complete",
+        "pid": std::process::id(),
+        "claim_status": "diagnostic_only",
+        "timed_search_calls": retained_results.len(),
+        "retained_result_count": retained_results.len(),
+        "next_command": "finalize",
+    }))?;
+    wait_for_profile_command("QG-6", "finalize")?;
+
+    let mut result_receipts = Vec::new();
+    result_receipts
+        .try_reserve_exact(retained_results.len())
+        .map_err(|_| "QG-6 profile result-receipt allocation failed".to_owned())?;
+    for (block_id, query_index, order, leaf_ordinal, native) in retained_results {
+        let native_hits = qg6_profile_native_hits(&native);
+        let expected = &preflight[query_index];
+        if native_hits != expected.native_hits {
+            return Err(format!(
+                "QG-6 profile result drifted after timing for query {} block {block_id} \
+                 leaf {leaf_ordinal}",
+                queries[query_index].id()
+            ));
+        }
+        result_receipts.push((
+            block_id,
+            query_index,
+            order,
+            leaf_ordinal,
+            qg6_public_result_sha256(&native_hits, expected.total_count, expected.doc_count),
+        ));
+    }
+    let result_sequence_sha256 = qg6_profile_digest("result-sequence", &result_receipts)?;
+    emit_qg6_profile_event(&Qg6ProfileCompleteEvent {
+        schema_version: QG6_PROFILE_CHILD_SCHEMA_VERSION.to_owned(),
+        event: "complete".to_owned(),
+        pid: std::process::id(),
+        claim_status: "diagnostic_only".to_owned(),
+        promotion_capability: "none".to_owned(),
+        no_claim: "profile output is not QG-6 evidence or a Tantivy comparison".to_owned(),
+        timed_search_calls: retained_result_capacity,
+        retained_result_count: result_receipts.len(),
+        verified_result_count: result_receipts.len(),
+        result_sequence_sha256,
+        preflight_receipt_sha256,
+        input,
     })
 }
 
@@ -8941,6 +9291,8 @@ fn run_child_mode() -> bool {
         Ok("memory") => run_memory_child(),
         Ok(QG1_PROFILE_CHILD_MODE) => run_qg1_profile_child()
             .unwrap_or_else(|error| panic!("QG-1 profile child failed: {error}")),
+        Ok(QG6_PROFILE_CHILD_MODE) => run_qg6_profile_child()
+            .unwrap_or_else(|error| panic!("QG-6 profile child failed: {error}")),
         Ok(mode) => panic!("unknown QUILL_PERF_CHILD_MODE {mode:?}"),
         Err(_) => return false,
     }
@@ -9042,6 +9394,13 @@ fn main() {
         tests::assert_qg1_profile_child_resolver_contract();
         tests::assert_qg1_profile_child_wire_contract();
         eprintln!("[quill-perf-self-check] exact QG-1 profile child contracts passed");
+        return;
+    }
+    #[cfg(test)]
+    if std::env::var_os("QUILL_PERF_QG6_PROFILE_CHILD_SELF_CHECK").is_some() {
+        tests::assert_qg6_profile_child_resolver_contract();
+        tests::assert_qg6_profile_child_wire_contract();
+        eprintln!("[quill-perf-self-check] exact QG-6 profile child contracts passed");
         return;
     }
     if run_child_mode() {
@@ -11212,12 +11571,9 @@ mod tests {
 
     pub fn assert_qg1_x86_diagnostic_exact_unpromotable_cell() {
         let matrix = PerfMatrixSpec::complete();
-        let plan = super::resolve_qg1_x86_diagnostic_plan(
-            &matrix,
-            &exact_qg1_x86_diagnostic_request(),
-            8,
-        )
-        .expect("exact QG-1 x86 diagnostic request");
+        let plan =
+            super::resolve_qg1_x86_diagnostic_plan(&matrix, &exact_qg1_x86_diagnostic_request(), 8)
+                .expect("exact QG-1 x86 diagnostic request");
         assert_eq!(plan.spec.gate, PerfGate::Qg1);
         assert_eq!(plan.spec.fixture, super::QG1_X86_DIAGNOSTIC_FIXTURE);
         assert_eq!(plan.spec.metric, "docs_per_second");
@@ -11982,6 +12338,110 @@ mod tests {
     #[test]
     fn qg1_profile_child_serializes_replayable_diagnostic_events() {
         assert_qg1_profile_child_wire_contract();
+    }
+
+    pub fn assert_qg6_profile_child_resolver_contract() {
+        let matrix = frankensearch_quill_gauntlet::PerfMatrixSpec::complete();
+        let spec = super::resolve_qg6_profile_spec(&matrix)
+            .expect("resolve exact canonical QG-6 profile fixture");
+        assert_eq!(spec.fixture, super::QG6_PROFILE_FIXTURE);
+        assert_eq!(spec.document_count, Some(100_000));
+        assert_eq!(
+            spec.query_class,
+            Some(frankensearch_quill_gauntlet::PerfQueryClass::NaturalLanguage)
+        );
+        assert_eq!(spec.k, Some(100));
+
+        let rounds_per_query = super::QG6_PROFILE_RUNS
+            .div_ceil(super::QG6_QUERY_GROUPS)
+            .max(super::EvidencePolicy::predeclared().min_group_pairs);
+        let child_seed = super::production_cell_seed(super::PERF_DEFAULT_BOOTSTRAP_SEED, &spec);
+        let production_config =
+            super::PairedEstimatorConfig::predeclared(super::PERF_DEFAULT_BOOTSTRAP_SEED);
+        let production_seed = production_config.bootstrap_seed ^ super::fixture_seed(&spec.fixture);
+        assert_eq!(child_seed, production_seed);
+        let child_schedule = super::seeded_interleaved_four_arm_schedule(
+            super::QG6_QUERY_GROUPS,
+            rounds_per_query,
+            child_seed,
+        )
+        .expect("construct child QG-6 profile schedule");
+        let production_schedule = super::seeded_interleaved_four_arm_schedule(
+            super::QG6_QUERY_GROUPS,
+            rounds_per_query,
+            production_seed,
+        )
+        .expect("construct production QG-6 schedule");
+        assert_eq!(child_schedule, production_schedule);
+
+        let mut drifted = matrix;
+        drifted
+            .cells
+            .iter_mut()
+            .find(|cell| cell.fixture == super::QG6_PROFILE_FIXTURE)
+            .expect("profile fixture exists")
+            .k = Some(10);
+        assert!(super::resolve_qg6_profile_spec(&drifted).is_err());
+        assert_eq!(
+            super::resolve_qg6_profile_handshake(Some("stdio-v1")),
+            Ok(super::Qg1ProfileHandshakeMode::StdioV1)
+        );
+        assert!(super::resolve_qg6_profile_handshake(None).is_err());
+        assert!(super::resolve_qg6_profile_handshake(Some("continue-now")).is_err());
+    }
+
+    #[test]
+    fn qg6_profile_child_resolves_only_the_exact_canonical_fixture_and_handshake() {
+        assert_qg6_profile_child_resolver_contract();
+    }
+
+    fn qg6_profile_input_test_fixture() -> super::Qg6ProfileInputIdentity {
+        super::Qg6ProfileInputIdentity {
+            fixture: super::QG6_PROFILE_FIXTURE.to_owned(),
+            fixture_contract_sha256: "1".repeat(64),
+            query_manifest_sha256: "2".repeat(64),
+            config_contract_sha256: "3".repeat(64),
+            corpus_content_sha256: "4".repeat(64),
+            schedule_sha256: "5".repeat(64),
+            source_revision: "6".repeat(40),
+            executable_sha256: "7".repeat(64),
+        }
+    }
+
+    pub fn assert_qg6_profile_child_wire_contract() {
+        let complete = super::Qg6ProfileCompleteEvent {
+            schema_version: super::QG6_PROFILE_CHILD_SCHEMA_VERSION.to_owned(),
+            event: "complete".to_owned(),
+            pid: 23,
+            claim_status: "diagnostic_only".to_owned(),
+            promotion_capability: "none".to_owned(),
+            no_claim: "profile output is not QG-6 evidence or a Tantivy comparison".to_owned(),
+            timed_search_calls: 4_096,
+            retained_result_count: 4_096,
+            verified_result_count: 4_096,
+            result_sequence_sha256: "b".repeat(64),
+            preflight_receipt_sha256: "c".repeat(64),
+            input: qg6_profile_input_test_fixture(),
+        };
+        let complete_wire = serde_json::to_string(&complete).expect("serialize QG-6 complete");
+        assert!(!complete_wire.contains('\n'));
+        assert_eq!(
+            serde_json::from_str::<super::Qg6ProfileCompleteEvent>(&complete_wire)
+                .expect("deserialize QG-6 complete event"),
+            complete
+        );
+        assert!(complete_wire.contains("\"claim_status\":\"diagnostic_only\""));
+        assert!(complete_wire.contains("\"promotion_capability\":\"none\""));
+        assert!(complete_wire.contains("\"result_sequence_sha256\""));
+        assert!(
+            serde_json::from_str::<super::Qg1ProfileCompleteEvent>(&complete_wire).is_err(),
+            "QG-6 diagnostic receipt must not deserialize as a QG-1 ingest receipt"
+        );
+    }
+
+    #[test]
+    fn qg6_profile_child_serializes_a_distinct_unpromotable_receipt() {
+        assert_qg6_profile_child_wire_contract();
     }
 
     #[test]
