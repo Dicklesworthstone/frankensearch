@@ -280,7 +280,12 @@ pub struct FusionContext {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub hash_rank: Option<usize>,
     pub lexical_score: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub semantic_score: Option<f32>,
+    /// Vector score from a hash-control generation. Never set together with
+    /// `semantic_score`: a hash generation is not a semantic source.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub hash_score: Option<f32>,
     pub in_both_sources: bool,
     /// True when the vector ranks came from a hash/fnv control generation.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -288,7 +293,8 @@ pub struct FusionContext {
 }
 
 impl FusionContext {
-    /// Move vector ranks off `semantic_rank` when this fusion is hash control.
+    /// Move vector ranks and scores off semantic fields when this fusion is
+    /// hash control.
     pub fn remap_hash_control_ranks(&mut self) {
         if !self.vector_generation_is_hash {
             return;
@@ -297,6 +303,11 @@ impl FusionContext {
             self.hash_rank = self.semantic_rank.take();
         } else {
             self.semantic_rank = None;
+        }
+        if self.hash_score.is_none() {
+            self.hash_score = self.semantic_score.take();
+        } else {
+            self.semantic_score = None;
         }
     }
 }
@@ -310,6 +321,7 @@ impl From<&FusedCandidate> for FusionContext {
             hash_rank: None,
             lexical_score: value.lexical_score,
             semantic_score: value.semantic_score,
+            hash_score: None,
             in_both_sources: value.in_both_sources,
             vector_generation_is_hash: false,
         }
@@ -1095,16 +1107,23 @@ mod tests {
             hash_rank: None,
             lexical_score: None,
             semantic_score: Some(0.4),
+            hash_score: None,
             in_both_sources: false,
             vector_generation_is_hash: true,
         };
         fusion.remap_hash_control_ranks();
         assert_eq!(fusion.hash_rank, Some(2));
         assert_eq!(fusion.semantic_rank, None);
+        assert_eq!(fusion.hash_score, Some(0.4));
+        assert_eq!(fusion.semantic_score, None);
         let json = serde_json::to_string(&fusion).expect("serialize fusion");
         assert!(
             json.contains("hash_rank") && !json.contains("semantic_rank"),
             "hash fusion must not use the semantic_rank key: {json}"
+        );
+        assert!(
+            json.contains("hash_score") && !json.contains("semantic_score"),
+            "hash fusion must not use the semantic_score key: {json}"
         );
     }
 

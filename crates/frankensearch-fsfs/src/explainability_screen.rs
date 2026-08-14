@@ -625,6 +625,7 @@ mod tests {
                 hash_rank: None,
                 lexical_score: Some(12.5),
                 semantic_score: Some(0.77),
+                hash_score: None,
                 in_both_sources: true,
                 vector_generation_is_hash: false,
             }),
@@ -857,6 +858,7 @@ mod tests {
             hash_rank: None,
             lexical_score: None,
             semantic_score: None,
+            hash_score: None,
             in_both_sources: true,
             vector_generation_is_hash: false,
         };
@@ -874,6 +876,7 @@ mod tests {
             hash_rank: None,
             lexical_score: None,
             semantic_score: None,
+            hash_score: None,
             in_both_sources: false,
             vector_generation_is_hash: false,
         };
@@ -890,6 +893,7 @@ mod tests {
             hash_rank: None,
             lexical_score: None,
             semantic_score: None,
+            hash_score: None,
             in_both_sources: false,
             vector_generation_is_hash: false,
         };
@@ -906,6 +910,7 @@ mod tests {
             hash_rank: None,
             lexical_score: None,
             semantic_score: None,
+            hash_score: None,
             in_both_sources: false,
             vector_generation_is_hash: true,
         };
@@ -924,6 +929,7 @@ mod tests {
             hash_rank: None,
             lexical_score: None,
             semantic_score: None,
+            hash_score: None,
             in_both_sources: true,
             vector_generation_is_hash: true,
         };

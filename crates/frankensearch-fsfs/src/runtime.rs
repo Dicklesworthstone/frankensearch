@@ -1736,7 +1736,12 @@ struct ExplainSessionHit {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     hash_rank: Option<usize>,
     lexical_score: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     semantic_score: Option<f32>,
+    /// Vector score from a hash-control generation. Never set together with
+    /// `semantic_score`: a hash generation is not a semantic source.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    hash_score: Option<f32>,
     in_both_sources: bool,
 }
 
@@ -1760,6 +1765,7 @@ impl ExplainSession {
                 hash_rank: None,
                 lexical_score: candidate.lexical_score,
                 semantic_score: candidate.semantic_score,
+                hash_score: None,
                 in_both_sources: candidate.in_both_sources,
             })
             .collect();
@@ -1785,6 +1791,11 @@ impl ExplainSession {
                 hit.hash_rank = hit.semantic_rank.take();
             } else {
                 hit.semantic_rank = None;
+            }
+            if hit.hash_score.is_none() {
+                hit.hash_score = hit.semantic_score.take();
+            } else {
+                hit.semantic_score = None;
             }
         }
     }
@@ -6438,7 +6449,7 @@ impl FsfsRuntime {
             .map(str::to_owned)
             .collect::<Vec<_>>();
         let source_count = usize::from(hit.lexical_score.is_some())
-            .saturating_add(usize::from(hit.semantic_score.is_some()));
+            .saturating_add(usize::from(hit.hash_score.or(hit.semantic_score).is_some()));
         let shared_weight = if source_count == 0 {
             1.0
         } else {
@@ -6459,7 +6470,7 @@ impl FsfsRuntime {
                 weight: shared_weight,
             });
         }
-        if let Some(semantic_score) = hit.semantic_score {
+        if let Some(vector_score) = hit.hash_score.or(hit.semantic_score) {
             let embedder = session
                 .vector_generation_id
                 .as_deref()
@@ -6467,18 +6478,18 @@ impl FsfsRuntime {
             let source = if session.vector_generation_is_hash {
                 ExplainedSource::HashControl {
                     embedder: embedder.to_owned(),
-                    cosine_sim: f64::from(semantic_score),
+                    cosine_sim: f64::from(vector_score),
                 }
             } else {
                 ExplainedSource::SemanticFast {
                     embedder: embedder.to_owned(),
-                    cosine_sim: f64::from(semantic_score),
+                    cosine_sim: f64::from(vector_score),
                 }
             };
             components.push(ScoreComponent {
                 source,
-                raw_score: f64::from(semantic_score),
-                normalized_score: f64::from(semantic_score),
+                raw_score: f64::from(vector_score),
+                normalized_score: f64::from(vector_score),
                 rrf_contribution: rrf_contribution_for_rank(
                     session.rrf_k,
                     hit.hash_rank.or(hit.semantic_rank),
@@ -6524,6 +6535,7 @@ impl FsfsRuntime {
             hash_rank: hit.hash_rank,
             lexical_score: hit.lexical_score,
             semantic_score: hit.semantic_score,
+            hash_score: hit.hash_score,
             in_both_sources: hit.in_both_sources,
             vector_generation_is_hash: session.vector_generation_is_hash,
         };
@@ -15482,7 +15494,8 @@ fn render_explain_table(
         .lexical_score
         .map_or_else(|| "n/a".to_owned(), |value| format!("{value:.6}"));
     let semantic_fast_score = hit
-        .semantic_score
+        .hash_score
+        .or(hit.semantic_score)
         .map_or_else(|| "n/a".to_owned(), |value| format!("{value:.6}"));
     let quality_score = "n/a";
     let rerank_score = "n/a";
@@ -28725,6 +28738,7 @@ mod tests {
                 hash_rank: None,
                 lexical_score: None,
                 semantic_score: Some(0.1),
+                hash_score: None,
                 in_both_sources: false,
             },
             60.0,
