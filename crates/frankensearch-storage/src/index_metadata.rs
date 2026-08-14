@@ -14,7 +14,7 @@ use fsqlite::{AsyncConnection, Row};
 use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::{Storage, map_storage_error};
+use crate::connection::{Storage, map_storage_error, retry_transient_storage};
 
 /// What triggered an index build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,13 +314,17 @@ impl Storage {
             SqliteValue::Text(index_name.to_owned().into()),
         ];
 
-        let affected = self
-            .connection()
-            .execute_with_params_sync(
-                "UPDATE index_metadata SET last_verified_at = ?1 WHERE index_name = ?2;",
-                &params,
-            )
-            .map_err(map_storage_error)?;
+        let affected = retry_transient_storage(
+            || {
+                self.connection()
+                    .execute_with_params_sync(
+                        "UPDATE index_metadata SET last_verified_at = ?1 WHERE index_name = ?2;",
+                        &params,
+                    )
+                    .map_err(map_storage_error)
+            },
+            "index verification stamp",
+        )?;
 
         tracing::debug!(
             target: "frankensearch.storage",
@@ -343,15 +347,19 @@ impl Storage {
             SqliteValue::Text(index_name.to_owned().into()),
         ];
 
-        let affected = self
-            .connection()
-            .execute_with_params_sync(
-                "UPDATE index_metadata SET last_repair_at = ?1, \
+        let affected = retry_transient_storage(
+            || {
+                self.connection()
+                    .execute_with_params_sync(
+                        "UPDATE index_metadata SET last_repair_at = ?1, \
             repair_count = repair_count + 1 \
          WHERE index_name = ?2;",
-                &params,
-            )
-            .map_err(map_storage_error)?;
+                        &params,
+                    )
+                    .map_err(map_storage_error)
+            },
+            "index repair stamp",
+        )?;
 
         tracing::debug!(
             target: "frankensearch.storage",

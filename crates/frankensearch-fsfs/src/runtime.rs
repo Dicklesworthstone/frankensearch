@@ -6573,6 +6573,7 @@ impl FsfsRuntime {
         index_root.join(FSFS_EXPLAIN_SESSION_FILE)
     }
 
+    #[cfg(test)]
     fn persist_explain_session(
         &self,
         index_root: &Path,
@@ -6580,11 +6581,25 @@ impl FsfsRuntime {
         phase: SearchOutputPhase,
         fused: &[FusedCandidate],
     ) -> SearchResult<()> {
+        self.persist_explain_session_with_payload(index_root, query, phase, fused, None)
+    }
+
+    fn persist_explain_session_with_payload(
+        &self,
+        index_root: &Path,
+        query: &str,
+        phase: SearchOutputPhase,
+        fused: &[FusedCandidate],
+        payload: Option<&SearchPayload>,
+    ) -> SearchResult<()> {
         let mut session = ExplainSession::from_fused(query, phase, self.config.search.rrf_k, fused);
-        if let Some(published) = Self::inspect_published_vector_generation(index_root) {
-            session.vector_generation_id = Some(published.id);
-            session.vector_generation_is_hash = published.is_hash_control;
+        if let Some(payload) = payload {
+            for (hit, source) in session.hits.iter_mut().zip(payload.hits.iter()) {
+                hit.semantic_rank = source.semantic_rank;
+                hit.hash_rank = source.hash_rank;
+            }
         }
+        Self::attach_explain_session_generation(&mut session, index_root, payload);
         session.remap_hash_control_ranks();
         let path = Self::explain_session_path(index_root);
         if let Some(parent) = path.parent() {
@@ -6598,6 +6613,24 @@ impl FsfsRuntime {
         })?;
         write_durable(path, json)?;
         Ok(())
+    }
+
+    fn attach_explain_session_generation(
+        session: &mut ExplainSession,
+        index_root: &Path,
+        payload: Option<&SearchPayload>,
+    ) {
+        if let Some(published) = Self::inspect_published_vector_generation(index_root) {
+            session.vector_generation_id = Some(published.id);
+            session.vector_generation_is_hash = published.is_hash_control;
+            return;
+        }
+        if let Some(payload) = payload {
+            session
+                .vector_generation_id
+                .clone_from(&payload.vector_generation_id);
+            session.vector_generation_is_hash = payload.vector_generation_is_hash;
+        }
     }
 
     fn load_explain_session(&self) -> SearchResult<Option<ExplainSession>> {
@@ -7238,14 +7271,20 @@ impl FsfsRuntime {
                 fused_score: hit.score,
                 prior_boost: 0.0,
                 lexical_rank: hit.lexical_rank,
-                semantic_rank: hit.hash_rank.or(hit.semantic_rank),
+                semantic_rank: hit.semantic_rank,
                 lexical_score: None,
                 semantic_score: None,
                 in_both_sources: hit.in_both_sources,
             })
             .collect::<Vec<_>>();
         let index_root = self.resolve_status_index_root()?;
-        self.persist_explain_session(&index_root, query, last.phase, &fused)
+        self.persist_explain_session_with_payload(
+            &index_root,
+            query,
+            last.phase,
+            &fused,
+            Some(last),
+        )
     }
 
     fn apply_search_filter(
@@ -8273,11 +8312,12 @@ impl FsfsRuntime {
 
         if flags.persist_explain_session
             && let Some(last) = artifacts.last()
-            && let Err(error) = self.persist_explain_session(
+            && let Err(error) = self.persist_explain_session_with_payload(
                 &resources.index_root,
                 &normalized_query,
                 last.phase,
                 &last.fused,
+                Some(&last.payload),
             )
         {
             warn!(
@@ -28573,6 +28613,55 @@ mod tests {
         assert!(session.vector_generation_is_hash);
         assert_eq!(session.hits[0].hash_rank, Some(0));
         assert_eq!(session.hits[0].semantic_rank, None);
+    }
+
+    #[test]
+    fn persist_cached_hash_payload_keeps_hash_rank_without_fsvi() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        fs::create_dir_all(&index_root).expect("create index dir");
+        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            index_dir: Some(index_root),
+            ..CliInput::default()
+        });
+        let payload = SearchPayload::new(
+            "ownership",
+            SearchOutputPhase::Initial,
+            1,
+            vec![SearchHitPayload {
+                rank: 1,
+                path: "src/lib.rs".to_owned(),
+                score: 0.2,
+                snippet: None,
+                lexical_rank: None,
+                semantic_rank: None,
+                hash_rank: Some(0),
+                in_both_sources: false,
+            }],
+        )
+        .with_vector_generation("fnv1a-256", true);
+        runtime
+            .persist_explain_session_for_cached_payloads("ownership", &[payload])
+            .expect("persist cached hash explain session");
+        let session = runtime
+            .load_explain_session()
+            .expect("load explain session")
+            .expect("session exists");
+        assert_eq!(session.vector_generation_id.as_deref(), Some("fnv1a-256"));
+        assert!(session.vector_generation_is_hash);
+        assert_eq!(session.hits[0].hash_rank, Some(0));
+        assert_eq!(session.hits[0].semantic_rank, None);
+        let raw = fs::read_to_string(
+            runtime
+                .resolve_status_index_root()
+                .expect("index root")
+                .join(super::FSFS_EXPLAIN_SESSION_FILE),
+        )
+        .expect("read explain session");
+        assert!(
+            raw.contains("hash_rank") && !raw.contains("semantic_rank"),
+            "cached hash persist must not invent semantic_rank: {raw}"
+        );
     }
 
     #[test]
