@@ -933,6 +933,50 @@ mod lexical {
         });
     }
 
+    /// The same depth boundary as the sibling test above, but with the groups
+    /// carrying a field scope.
+    ///
+    /// The unfielded form survives because redundant leading groups are peeled
+    /// before the depth budget is charged. The historical field-scoped path
+    /// did not normalize `content:(` wrappers, so all `MAX_QUERY_DEPTH + 1`
+    /// groups were charged and the innermost one met the nesting limit — which
+    /// dropped the fragment and cascaded the whole query to match-none.
+    ///
+    /// Redundant field scopes are as semantically inert as redundant parens:
+    /// re-scoping `content` to `content` cannot change what matches. Pinned
+    /// Tantivy accepts the query and returns the sentinel, so a Quill-empty
+    /// observation here is a public divergence, not a policy difference.
+    #[cfg(feature = "lexical-tantivy")]
+    #[test]
+    fn public_deep_field_scoped_groups_match_tantivy_oracle() {
+        super::quiet_logging();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let docs = vec![
+                IndexableDocument::new("nested-hit", "depthneedle"),
+                IndexableDocument::new("negative-control", "haystack"),
+            ];
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let quill = build_quill_index(&cx, &tmp.path().join("quill"), &docs).await;
+            let tantivy = build_tantivy_index(&cx, &tmp.path().join("tantivy"), &docs).await;
+            let group_count = frankensearch::quill::MAX_QUERY_DEPTH + 1;
+            let query = format!(
+                "{}depthneedle{}",
+                "content:(".repeat(group_count),
+                ")".repeat(group_count)
+            );
+
+            let tantivy_hits = public_observation(&tantivy, &cx, &query, 10).await;
+            assert_eq!(tantivy_hits.len(), 1);
+            assert_eq!(tantivy_hits[0].0, "nested-hit");
+
+            let quill_hits = public_observation(&quill, &cx, &query, 10).await;
+            assert_eq!(
+                quill_hits, tantivy_hits,
+                "redundant field-scoped groups must not turn a valid public query into match-none"
+            );
+        });
+    }
+
     #[cfg(feature = "lexical-tantivy")]
     #[test]
     fn public_unfielded_three_term_or_matches_tantivy_score_bits_and_order() {

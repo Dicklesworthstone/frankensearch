@@ -1140,11 +1140,17 @@ enum LexToken {
     },
 }
 
-/// Remove balanced, unfielded, unboosted wrappers around the whole token
-/// stream before recursive descent. These groups are semantically inert, so
-/// charging them against the depth limit turns a valid term into match-none
-/// without protecting the parser from genuinely nested Boolean structure.
+/// Normalize depth-inert wrappers around the whole token stream before
+/// recursive descent.
+///
+/// Balanced unfielded, unboosted wrappers are removed. A pure chain of
+/// identical unboosted field scopes keeps one innermost wrapper so it still
+/// supplies the field to otherwise-unqualified leaves. Both rules avoid
+/// charging semantically redundant depth against the parser limit without
+/// weakening recovery for genuinely nested Boolean structure.
 fn peel_redundant_outer_groups(tokens: &mut Vec<LexToken>) {
+    peel_redundant_same_field_outer_scopes(tokens);
+
     let mut peel_count = tokens
         .iter()
         .take_while(|token| matches!(token, LexToken::LeftParen { field: None, .. }))
@@ -1174,6 +1180,56 @@ fn peel_redundant_outer_groups(tokens: &mut Vec<LexToken>) {
         return;
     }
 
+    tokens.drain(..peel_count);
+    tokens.truncate(tokens.len() - peel_count);
+}
+
+/// Collapse only a pure whole-stream chain of identical field scopes.
+///
+/// One innermost wrapper is retained: it still supplies the field scope to
+/// otherwise-unqualified leaves. Any nested grouping, different field, boost,
+/// unmatched closure, or material outside the closing suffix leaves the stream
+/// untouched for ordinary parser recovery.
+fn peel_redundant_same_field_outer_scopes(tokens: &mut Vec<LexToken>) {
+    let Some(LexToken::LeftParen {
+        field: Some(field), ..
+    }) = tokens.first()
+    else {
+        return;
+    };
+    let field = field.clone();
+    let opening_count = tokens
+        .iter()
+        .take_while(|token| matches!(token, LexToken::LeftParen { .. }))
+        .count();
+    let same_scope_count = tokens
+        .iter()
+        .take_while(|token| {
+            matches!(token, LexToken::LeftParen { field: Some(candidate), .. } if candidate == &field)
+        })
+        .count();
+    if same_scope_count < 2 || opening_count != same_scope_count {
+        return;
+    }
+
+    let Some(body_end) = tokens.len().checked_sub(same_scope_count) else {
+        return;
+    };
+    if body_end <= same_scope_count
+        || tokens[body_end..]
+            .iter()
+            .any(|token| !matches!(token, LexToken::RightParen { boost: None, .. }))
+        || tokens[same_scope_count..body_end].iter().any(|token| {
+            matches!(
+                token,
+                LexToken::LeftParen { .. } | LexToken::RightParen { .. }
+            )
+        })
+    {
+        return;
+    }
+
+    let peel_count = same_scope_count - 1;
     tokens.drain(..peel_count);
     tokens.truncate(tokens.len() - peel_count);
 }
@@ -7146,6 +7202,43 @@ mod tests {
                 .iter()
                 .all(|diagnostic| diagnostic.kind != QueryDiagnosticKind::DepthLimit)
         );
+    }
+
+    #[test]
+    fn redundant_same_field_outer_scopes_do_not_consume_the_depth_budget() {
+        let query = format!(
+            "{}needle{}",
+            "content:(".repeat(MAX_QUERY_DEPTH + 20),
+            ")".repeat(MAX_QUERY_DEPTH + 20)
+        );
+        let parsed = parser().parse(&query);
+        let scoped = parser().parse("content:(needle)");
+        assert_eq!(parsed.query, scoped.query);
+        assert!(
+            parsed
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.kind != QueryDiagnosticKind::DepthLimit)
+        );
+    }
+
+    #[test]
+    fn same_field_outer_scope_peeling_refuses_non_pure_wrappers() {
+        for raw in [
+            "content:(title:(needle))",
+            "content:(content:(needle)^2)",
+            "content:(content:(needle))^2",
+            "content:(content:(needle) title)",
+            "content:(content:(needle)) title",
+            "+content:(content:(needle))",
+            "content:(content:(needle)",
+        ] {
+            let mut diagnostics = Vec::new();
+            let mut tokens = lex(raw, &mut diagnostics);
+            let original = tokens.clone();
+            peel_redundant_outer_groups(&mut tokens);
+            assert_eq!(tokens, original, "{raw:?} must not be normalized");
+        }
     }
 
     #[test]
