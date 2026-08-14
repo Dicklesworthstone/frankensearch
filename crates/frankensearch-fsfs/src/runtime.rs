@@ -16844,14 +16844,13 @@ fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState
         let lexical_rank = hit
             .lexical_rank
             .map_or_else(|| "–".to_owned(), |rank| format_count_usize(rank + 1));
-        let semantic_rank = hit
-            .semantic_rank
-            .map_or_else(|| "–".to_owned(), |rank| format_count_usize(rank + 1));
         let hash_control = state
             .latest_payload()
             .is_some_and(|payload| payload.vector_generation_is_hash);
         let source = search_hit_source_label(hit, hash_control);
         let vector_rank_label = if hash_control { "hash#" } else { "semantic#" };
+        let vector_rank = search_hit_vector_rank(hit, hash_control)
+            .map_or_else(|| "–".to_owned(), |rank| format_count_usize(rank + 1));
         vec![
             Line::from(Span::styled(
                 truncate_middle(
@@ -16863,7 +16862,7 @@ fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState
             Line::from(Span::styled(
                 format!(
                     "score={:.3}  source={}  lexical#={}  {vector_rank_label}={}",
-                    hit.score, source, lexical_rank, semantic_rank
+                    hit.score, source, lexical_rank, vector_rank
                 ),
                 ui_fg(no_color, PackedRgba::rgb(173, 194, 229)),
             )),
@@ -17889,6 +17888,14 @@ fn payload_has_hash_control_hits(payload: &SearchPayload) -> bool {
             .hits
             .iter()
             .any(|hit| hit.hash_rank.is_some() || hit.semantic_rank.is_some())
+}
+
+fn search_hit_vector_rank(hit: &SearchHitPayload, hash_control: bool) -> Option<usize> {
+    if hash_control {
+        hit.hash_rank.or(hit.semantic_rank)
+    } else {
+        hit.semantic_rank
+    }
 }
 
 const fn search_hit_source_label(hit: &SearchHitPayload, hash_control: bool) -> &'static str {
@@ -19825,7 +19832,7 @@ mod tests {
         degradation_controller_config_for_profile, detect_context_preview_format,
         is_likely_html_fragment, normalize_html_fragment_for_markdown,
         payload_has_admitted_semantic_hits, payload_has_hash_control_hits, read_durable_json,
-        render_explain_table, render_status_table, search_hit_source_label,
+        render_explain_table, render_status_table, search_hit_source_label, search_hit_vector_rank,
     };
     use crate::adapters::cli::{CliCommand, CliInput, CompletionShell, OutputFormat};
     use crate::catalog::bootstrap_catalog_schema;
@@ -28977,6 +28984,30 @@ mod tests {
         assert!(payload_has_admitted_semantic_hits(&semantic));
         assert!(!payload_has_hash_control_hits(&semantic));
         assert_eq!(search_hit_source_label(&semantic.hits[0], false), "both");
+    }
+
+    #[test]
+    fn dashboard_detail_reads_hash_rank_not_empty_semantic_rank() {
+        let remapped = SearchHitPayload {
+            rank: 1,
+            path: "src/lib.rs".to_owned(),
+            score: 0.2,
+            snippet: None,
+            lexical_rank: Some(1),
+            semantic_rank: None,
+            hash_rank: Some(0),
+            in_both_sources: true,
+        };
+        assert_eq!(search_hit_vector_rank(&remapped, true), Some(0));
+        assert_eq!(search_hit_vector_rank(&remapped, false), None);
+
+        let unremapped = SearchHitPayload {
+            semantic_rank: Some(2),
+            hash_rank: None,
+            ..remapped.clone()
+        };
+        assert_eq!(search_hit_vector_rank(&unremapped, true), Some(2));
+        assert_eq!(search_hit_vector_rank(&unremapped, false), Some(2));
     }
 
     #[test]
