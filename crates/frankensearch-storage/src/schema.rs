@@ -489,8 +489,13 @@ pub fn current_version(conn: &AsyncConnection) -> SearchResult<i64> {
 }
 
 pub(crate) fn current_version_at(conn: &AsyncConnection, stage: &'static str) -> SearchResult<i64> {
-    current_version_optional_at(conn, stage)?
-        .ok_or_else(|| schema_contract_error(stage, "schema_version table has no rows"))
+    retry_transient_storage(
+        || {
+            current_version_optional_at(conn, stage)?
+                .ok_or_else(|| schema_contract_error(stage, "schema_version table has no rows"))
+        },
+        stage,
+    )
 }
 
 #[cfg(test)]
