@@ -7908,11 +7908,19 @@ impl FsfsRuntime {
             && resources.vector_index.is_some()
             && resources.fast_embedder.is_none()
         {
-            return Err(SearchError::EmbedderUnavailable {
-                model: "semantic".to_owned(),
-                reason: "the semantic vector generation has no admitted matching embedder"
-                    .to_owned(),
-            });
+            if Self::hash_control_can_degrade_to_lexical(resources) {
+                warn!(
+                    "hash control vector generation has no admitted embedder; continuing lexical-only"
+                );
+            } else if Self::vector_generation_is_hash_control(resources) {
+                return Err(Self::hash_control_search_error(resources));
+            } else {
+                return Err(SearchError::EmbedderUnavailable {
+                    model: "semantic".to_owned(),
+                    reason: "the semantic vector generation has no admitted matching embedder"
+                        .to_owned(),
+                });
+            }
         }
 
         let semantic_candidates = if plan.semantic_stage.enabled && semantic_decision.run_semantic {
@@ -11983,6 +11991,31 @@ impl FsfsRuntime {
         id == "hash" || id.starts_with("hash-") || id.starts_with("fnv1a-") || id.starts_with("jl-")
     }
 
+    fn vector_generation_is_hash_control(resources: &SearchExecutionResources) -> bool {
+        resources
+            .vector_index
+            .as_ref()
+            .is_some_and(|index| Self::is_legacy_hash_vector_generation(index.embedder_id()))
+    }
+
+    fn hash_control_can_degrade_to_lexical(resources: &SearchExecutionResources) -> bool {
+        Self::vector_generation_is_hash_control(resources) && resources.lexical_index.is_some()
+    }
+
+    fn hash_control_search_error(resources: &SearchExecutionResources) -> SearchError {
+        let generation = resources
+            .vector_index
+            .as_ref()
+            .map_or("hash", |index| index.embedder_id());
+        SearchError::InvalidConfig {
+            field: "semantic.vector_generation".to_owned(),
+            value: generation.to_owned(),
+            reason: format!(
+                "vector generation `{generation}` is a hash control artifact, not semantic search; rebuild with a verified semantic embedder"
+            ),
+        }
+    }
+
     fn validate_fast_embedder_for_vector_index(
         index: &VectorIndex,
         embedder: &dyn Embedder,
@@ -12800,12 +12833,21 @@ impl FsfsRuntime {
 
         match self.resolve_fast_embedder() {
             Ok(embedder) => {
-                if let Some(index) = resources.vector_index.as_ref() {
-                    Self::validate_fast_embedder_for_vector_index(
+                if let Some(index) = resources.vector_index.as_ref()
+                    && let Err(error) = Self::validate_fast_embedder_for_vector_index(
                         index,
                         embedder.as_ref(),
                         cfg!(test),
-                    )?;
+                    )
+                {
+                    if Self::hash_control_can_degrade_to_lexical(resources) {
+                        warn!(
+                            error = %error,
+                            "hash control generation is not an admissible semantic lane; continuing lexical-only"
+                        );
+                        return Ok(());
+                    }
+                    return Err(error);
                 }
                 info!(
                     event = "fsfs.fast_semantic_admitted",
@@ -12816,7 +12858,16 @@ impl FsfsRuntime {
                 resources.fast_embedder = Some(embedder);
                 Ok(())
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                if Self::hash_control_can_degrade_to_lexical(resources) {
+                    warn!(
+                        error = %error,
+                        "hash control generation has no admitted embedder; continuing lexical-only"
+                    );
+                    return Ok(());
+                }
+                Err(error)
+            }
         }
     }
 
@@ -28261,6 +28312,42 @@ mod tests {
         assert!(payload_has_admitted_semantic_hits(&payload));
         assert!(!payload_has_hash_control_hits(&payload));
         assert_eq!(search_hit_source_label(&payload.hits[0], false), "both");
+    }
+
+    #[test]
+    fn hash_only_search_without_embedder_names_hash_control() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let vector_path = temp.path().join("vector/index.fsvi");
+        fs::create_dir_all(vector_path.parent().expect("vector parent"))
+            .expect("create vector dir");
+        VectorIndex::create(&vector_path, "fnv1a-256", 256)
+            .expect("create hash generation")
+            .finish()
+            .expect("finish hash generation");
+        let resources = SearchExecutionResources {
+            index_root: temp.path().to_path_buf(),
+            generation_fingerprint: "test".to_owned(),
+            lexical_index: None,
+            shadow_observer: None,
+            shadow_pressure_sampler: None,
+            vector_index: Some(VectorIndex::open_read_only(&vector_path).expect("open hash index")),
+            fast_embedder: None,
+            quality_embedder: None,
+            fast_embedder_attempted: true,
+            quality_embedder_attempted: true,
+            degradation_advice: Vec::new(),
+        };
+        assert!(FsfsRuntime::vector_generation_is_hash_control(&resources));
+        assert!(!FsfsRuntime::hash_control_can_degrade_to_lexical(
+            &resources
+        ));
+        let error = FsfsRuntime::hash_control_search_error(&resources);
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("fnv1a-256") && rendered.contains("hash control"),
+            "hash-only search must not blame a missing semantic embedder: {rendered}"
+        );
+        assert!(!rendered.contains("no admitted matching embedder"));
     }
 
     #[test]
