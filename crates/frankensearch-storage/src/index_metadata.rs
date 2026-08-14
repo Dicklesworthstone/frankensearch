@@ -195,18 +195,22 @@ impl Storage {
         ensure_non_empty(index_name, "index_name")?;
 
         let params = [SqliteValue::Text(index_name.to_owned().into())];
-        let rows = self
-            .connection()
-            .query_with_params_sync(
-                "SELECT index_name, index_type, embedder_id, embedder_revision, \
+        let rows = retry_transient_storage(
+            || {
+                self.connection()
+                    .query_with_params_sync(
+                        "SELECT index_name, index_type, embedder_id, embedder_revision, \
             dimension, record_count, file_path, file_size_bytes, file_hash, \
             schema_version, built_at, build_duration_ms, source_doc_count, \
             config_json, fec_path, fec_size_bytes, last_verified_at, \
             last_repair_at, repair_count, mean_norm, variance \
          FROM index_metadata WHERE index_name = ?1 LIMIT 1;",
-                &params,
-            )
-            .map_err(map_storage_error)?;
+                        &params,
+                    )
+                    .map_err(map_storage_error)
+            },
+            "index metadata fetch",
+        )?;
 
         let Some(row) = rows.first() else {
             return Ok(None);
@@ -217,17 +221,21 @@ impl Storage {
 
     /// List all known index metadata entries.
     pub fn list_index_metadata(&self) -> SearchResult<Vec<IndexMetadata>> {
-        let rows = self
-            .connection()
-            .query_sync(
-                "SELECT index_name, index_type, embedder_id, embedder_revision, \
+        let rows = retry_transient_storage(
+            || {
+                self.connection()
+                    .query_sync(
+                        "SELECT index_name, index_type, embedder_id, embedder_revision, \
             dimension, record_count, file_path, file_size_bytes, file_hash, \
             schema_version, built_at, build_duration_ms, source_doc_count, \
             config_json, fec_path, fec_size_bytes, last_verified_at, \
             last_repair_at, repair_count, mean_norm, variance \
          FROM index_metadata ORDER BY index_name;",
-            )
-            .map_err(map_storage_error)?;
+                    )
+                    .map_err(map_storage_error)
+            },
+            "index metadata list",
+        )?;
 
         let mut result = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -395,10 +403,14 @@ impl Storage {
              WHERE index_name = '{escaped_index}' \
              ORDER BY built_at DESC, build_id DESC;"
         );
-        let rows = self
-            .connection()
-            .query_sync(&sql)
-            .map_err(map_storage_error)?;
+        let rows = retry_transient_storage(
+            || {
+                self.connection()
+                    .query_sync(&sql)
+                    .map_err(map_storage_error)
+            },
+            "index build history",
+        )?;
 
         let mut history = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -628,12 +640,16 @@ fn prune_build_history(conn: &AsyncConnection, index_name: &str, keep: i64) -> S
 
 fn count_modified_since(conn: &AsyncConnection, since: i64) -> SearchResult<i64> {
     let params = [SqliteValue::Integer(since), SqliteValue::Integer(since)];
-    let rows = conn
-        .query_with_params_sync(
-            "SELECT COUNT(*) FROM documents WHERE updated_at > ?1 AND created_at <= ?2;",
-            &params,
-        )
-        .map_err(map_storage_error)?;
+    let rows = retry_transient_storage(
+        || {
+            conn.query_with_params_sync(
+                "SELECT COUNT(*) FROM documents WHERE updated_at > ?1 AND created_at <= ?2;",
+                &params,
+            )
+            .map_err(map_storage_error)
+        },
+        "index staleness modified count",
+    )?;
     let Some(row) = rows.first() else {
         return Ok(0);
     };
@@ -642,12 +658,16 @@ fn count_modified_since(conn: &AsyncConnection, since: i64) -> SearchResult<i64>
 
 fn count_added_since(conn: &AsyncConnection, since: i64) -> SearchResult<i64> {
     let params = [SqliteValue::Integer(since)];
-    let rows = conn
-        .query_with_params_sync(
-            "SELECT COUNT(*) FROM documents WHERE created_at > ?1;",
-            &params,
-        )
-        .map_err(map_storage_error)?;
+    let rows = retry_transient_storage(
+        || {
+            conn.query_with_params_sync(
+                "SELECT COUNT(*) FROM documents WHERE created_at > ?1;",
+                &params,
+            )
+            .map_err(map_storage_error)
+        },
+        "index staleness added count",
+    )?;
     let Some(row) = rows.first() else {
         return Ok(0);
     };
@@ -655,9 +675,13 @@ fn count_added_since(conn: &AsyncConnection, since: i64) -> SearchResult<i64> {
 }
 
 fn count_total_documents(conn: &AsyncConnection) -> SearchResult<i64> {
-    let rows = conn
-        .query_sync("SELECT COUNT(*) FROM documents;")
-        .map_err(map_storage_error)?;
+    let rows = retry_transient_storage(
+        || {
+            conn.query_sync("SELECT COUNT(*) FROM documents;")
+                .map_err(map_storage_error)
+        },
+        "index staleness document count",
+    )?;
     let row = rows.first().ok_or_else(|| SearchError::SubsystemError {
         subsystem: "storage",
         source: Box::new(std::io::Error::other(
