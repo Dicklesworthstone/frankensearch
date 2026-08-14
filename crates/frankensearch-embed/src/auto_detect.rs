@@ -132,7 +132,7 @@ impl TwoTierAvailability {
                 "Quality model unavailable: search will return fast-tier results only (no refinement phase).",
             ),
             Self::HashOnly => Some(
-                "No semantic models available: search uses hash-based embedding only (reduced relevance).",
+                "No semantic models available: hash control embeddings are not semantic search.",
             ),
         }
     }
@@ -197,7 +197,7 @@ pub enum ModelStatus {
         /// The feature flag that would enable this tier.
         feature_flag: String,
     },
-    /// Model uses hash fallback (always available).
+    /// Hash control embedder is present; this is not a semantic model.
     HashFallback,
 }
 
@@ -239,7 +239,7 @@ impl fmt::Display for ModelStatus {
             Self::FeatureDisabled { feature_flag } => {
                 write!(f, "DISABLED (compile with --features {feature_flag})")
             }
-            Self::HashFallback => write!(f, "hash fallback (no semantic model)"),
+            Self::HashFallback => write!(f, "hash control (not a semantic model)"),
         }
     }
 }
@@ -728,7 +728,13 @@ impl EmbedderStack {
             msg.push_str("Offline mode: enabled (FRANKENSEARCH_OFFLINE=1)\n");
         }
         if !diag.suggestions.is_empty() {
-            msg.push_str("\nTo improve search quality:\n");
+            if matches!(self.availability, TwoTierAvailability::HashOnly) {
+                msg.push_str(
+                    "\nTo enable semantic search (installing a model cannot repair a hash-written index):\n",
+                );
+            } else {
+                msg.push_str("\nTo improve search quality:\n");
+            }
             for suggestion in &diag.suggestions {
                 let _ = writeln!(msg, "  - {suggestion}");
             }
@@ -2639,11 +2645,11 @@ mod tests {
                 .unwrap()
                 .contains("Quality model")
         );
+        let hash_summary = TwoTierAvailability::HashOnly.degradation_summary().unwrap();
         assert!(
-            TwoTierAvailability::HashOnly
-                .degradation_summary()
-                .unwrap()
-                .contains("semantic")
+            hash_summary.contains("not semantic search")
+                && !hash_summary.contains("reduced relevance"),
+            "hash-only must not be framed as weaker semantic search: {hash_summary}"
         );
     }
 
@@ -2703,6 +2709,13 @@ mod tests {
             .expect("should be present for hash-only");
         assert!(msg.contains("Model cache:"));
         assert!(msg.contains("FRANKENSEARCH_MODEL_DIR"));
+        assert!(
+            msg.contains("not semantic search")
+                && msg.contains("cannot repair a hash-written index")
+                && !msg.contains("reduced relevance")
+                && !msg.contains("To improve search quality"),
+            "hash-only message must not sound like a quality downgrade: {msg}"
+        );
     }
 
     #[cfg(feature = "hash")]
@@ -2887,14 +2900,14 @@ mod tests {
             .contains("DISABLED")
         );
 
-        assert!(clone_and_format(&ModelStatus::HashFallback).contains("hash fallback"));
+        assert!(clone_and_format(&ModelStatus::HashFallback).contains("hash control"));
     }
 
     #[test]
     fn model_status_hash_fallback_display() {
         let status = ModelStatus::HashFallback;
         let display = format!("{status}");
-        assert_eq!(display, "hash fallback (no semantic model)");
+        assert_eq!(display, "hash control (not a semantic model)");
     }
 
     #[test]

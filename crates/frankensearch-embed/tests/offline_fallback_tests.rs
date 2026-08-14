@@ -78,6 +78,11 @@ fn degradation_summary_present_when_hash_only() {
         summary.is_some(),
         "HashOnly should have a degradation summary"
     );
+    let msg = summary.unwrap();
+    assert!(
+        msg.contains("not semantic search") && !msg.contains("reduced relevance"),
+        "hash-only must not be framed as weaker semantic search: {msg}"
+    );
 }
 
 // ---------------------------------------------------------------------------

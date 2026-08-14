@@ -6,7 +6,7 @@ Embedder implementations for the frankensearch hybrid search library.
 
 This crate provides three tiers of text embedding, each feature-gated for granular dependency control:
 
-- **Hash** (`hash` feature, default): FNV-1a hash embedder with zero ML dependencies. Useful for development, testing, and low-latency scenarios.
+- **Hash** (`hash` feature, default): FNV-1a hash embedder with zero ML dependencies. An explicit control/test double, not a semantic search engine.
 - **Model2Vec** (`model2vec` feature): potion-128M static embedder (~0.57ms per embed). Serves as the fast tier in two-tier search.
 - **FastEmbed** (`fastembed` feature): MiniLM-L6-v2 ONNX embedder (~128ms per embed). Serves as the quality tier in two-tier search.
 
@@ -43,7 +43,7 @@ The `EmbedderStack` auto-detection system probes for locally available models an
 use std::path::Path;
 use frankensearch_embed::{EmbedderStack, HashEmbedder};
 
-// Simple: use the hash embedder for development and tests
+// Explicit control double for tests — not semantic search
 let embedder = HashEmbedder::default_256();
 
 // Production: refuse a hash-only stack. `auto_detect` / `auto_detect_with`
