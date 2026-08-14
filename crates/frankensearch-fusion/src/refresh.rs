@@ -897,10 +897,18 @@ impl RefreshWorker {
         );
 
         loop {
-            // Cancel-aware sleep.
-            asupersync::time::sleep(asupersync::time::wall_now(), self.config.poll_interval).await;
+            if cx.checkpoint().is_err() || cx.is_cancel_requested() {
+                info!(
+                    target: "frankensearch.refresh",
+                    "refresh worker shutting down (cancel requested)"
+                );
+                return Ok(());
+            }
 
-            if cx.is_cancel_requested() {
+            // Cancel-aware sleep: Instant must come from this Cx, not wall_now().
+            asupersync::time::sleep(cx.now(), self.config.poll_interval).await;
+
+            if cx.checkpoint().is_err() || cx.is_cancel_requested() {
                 info!(
                     target: "frankensearch.refresh",
                     "refresh worker shutting down (cancel requested)"

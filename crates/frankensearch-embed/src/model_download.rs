@@ -910,7 +910,7 @@ impl ModelDownloader {
                     delay_ms = delay.as_millis(),
                     "retrying download after failure"
                 );
-                asupersync::time::sleep(asupersync::time::wall_now(), delay).await;
+                asupersync::time::sleep(cx.now(), delay).await;
                 check_acquisition_cancel(cx, "download-backoff")?;
             }
 

@@ -556,11 +556,11 @@ impl ApiEmbedder {
                     backoff_ms = backoff.as_millis(),
                     "retrying API request"
                 );
-                asupersync::time::sleep(asupersync::time::wall_now(), backoff).await;
+                asupersync::time::sleep(cx.now(), backoff).await;
             }
 
             if let Some(wait) = self.rate_limiter.acquire() {
-                asupersync::time::sleep(asupersync::time::wall_now(), wait).await;
+                asupersync::time::sleep(cx.now(), wait).await;
             }
 
             let response = self
@@ -895,11 +895,11 @@ impl AssumedRemoteApi {
                     trust = "assumed-remote",
                     "retrying transient API request"
                 );
-                asupersync::time::sleep(asupersync::time::wall_now(), backoff).await;
+                asupersync::time::sleep(cx.now(), backoff).await;
             }
 
             if let Some(wait) = self.rate_limiter.acquire() {
-                asupersync::time::sleep(asupersync::time::wall_now(), wait).await;
+                asupersync::time::sleep(cx.now(), wait).await;
             }
 
             let response = self
