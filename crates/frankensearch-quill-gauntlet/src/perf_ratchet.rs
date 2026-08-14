@@ -4747,6 +4747,12 @@ mod tests {
         candidate_evidence: Option<&PerfEvidenceArtifact>,
         rerun_evidence: Option<&PerfEvidenceArtifact>,
     ) -> PerfRatchetEvaluation {
+        let candidate_qg6 = candidate_evidence
+            .map(retained_qg6_authorities)
+            .unwrap_or_default();
+        let rerun_qg6 = rerun_evidence
+            .map(retained_qg6_authorities)
+            .unwrap_or_default();
         evaluate_perf_ratchet_inner(
             PerfRatchetRequest {
                 baseline: Some(baseline),
@@ -4764,7 +4770,11 @@ mod tests {
                 evidence: Vec::new(),
             },
             PerfRatchetQg1AuthoritySets::empty(),
-            PerfRatchetQg6AuthoritySets::empty(),
+            PerfRatchetQg6AuthoritySets {
+                baseline: &[],
+                candidate: &candidate_qg6,
+                rerun: &rerun_qg6,
+            },
             DecisionState::default(),
             false,
         )
@@ -6486,8 +6496,11 @@ mod tests {
     #[test]
     fn qg6_promotion_requires_rerun_hierarchical_ci_to_pass_independently() {
         let (candidate, candidate_evidence) = qg6_complete_pair("candidate", [[1.0; 3]; 4]);
-        let (rerun, rerun_evidence) =
-            qg6_complete_pair("rerun", [[0.80; 3], [1.0; 3], [1.0; 3], [1.0; 3]]);
+        let mut rerun_ratios = [[1.0; 3]; crate::QG6_QUERY_GROUPS];
+        for ratios in &mut rerun_ratios[..7] {
+            *ratios = [0.80; 3];
+        }
+        let (rerun, rerun_evidence) = qg6_complete_pair("rerun", rerun_ratios);
         let mut baseline = candidate.clone();
         baseline.run_id = "baseline".to_owned();
         baseline.git_rev = "0".repeat(40);
@@ -6546,11 +6559,14 @@ mod tests {
             Some(&rerun_evidence),
         );
         assert_eq!(result.decision, PerfGateDecision::Block);
-        assert!(result.reasons.iter().any(|reason| {
-            reason.code == "perf.ratchet.gate_target_missed"
-                && reason.message.contains("joint true-leaf p99")
-                && reason.message.contains("does not clear oracle parity")
-        }));
+        assert!(
+            result.reasons.iter().any(|reason| {
+                reason.code == "perf.ratchet.gate_target_missed"
+                    && reason.message.contains("joint true-leaf p99")
+                    && reason.message.contains("does not clear oracle parity")
+            }),
+            "{result:#?}"
+        );
         assert!(!result.reasons.iter().any(|reason| {
             reason.code == "perf.ratchet.qg6_hierarchical_reproduction_failed"
                 || reason.code == "perf.ratchet.gate_target_ci_inconclusive"
