@@ -1195,9 +1195,9 @@ fn peel_redundant_outer_groups(tokens: &mut Vec<LexToken>) {
 /// depth limit turned a valid query into match-none.
 ///
 /// A chain mixing two DIFFERENT field scopes is not inert and is refused, as is
-/// any nested grouping, boost, unmatched closure, or material outside the
-/// closing suffix; those leave the stream untouched for ordinary parser
-/// recovery.
+/// an unbalanced nested body, a boost on the closing suffix, an unmatched
+/// closure, or material outside that suffix; those leave the stream untouched
+/// for ordinary parser recovery.
 fn peel_redundant_same_field_outer_scopes(tokens: &mut Vec<LexToken>) {
     if !matches!(tokens.first(), Some(LexToken::LeftParen { .. })) {
         return;
@@ -1247,13 +1247,29 @@ fn peel_redundant_same_field_outer_scopes(tokens: &mut Vec<LexToken>) {
         || tokens[body_end..]
             .iter()
             .any(|token| !matches!(token, LexToken::RightParen { boost: None, .. }))
-        || tokens[opening_count..body_end].iter().any(|token| {
-            matches!(
-                token,
-                LexToken::LeftParen { .. } | LexToken::RightParen { .. }
-            )
-        })
     {
+        return;
+    }
+
+    // Nested Boolean structure inside the repeated scopes does not make those
+    // scopes meaningful: retaining one identical fielded wrapper preserves the
+    // field inherited by every unqualified leaf. Prove that the body is
+    // independently balanced before removing any outer pair so malformed input
+    // still reaches the parser's ordinary recovery unchanged.
+    let mut body_depth = 0_usize;
+    for token in &tokens[opening_count..body_end] {
+        match token {
+            LexToken::LeftParen { .. } => body_depth += 1,
+            LexToken::RightParen { .. } => {
+                if body_depth == 0 {
+                    return;
+                }
+                body_depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    if body_depth != 0 {
         return;
     }
 

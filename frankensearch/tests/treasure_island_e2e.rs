@@ -1026,6 +1026,47 @@ mod lexical {
         });
     }
 
+    /// Repeating one field scope remains inert when its body contains real
+    /// nested Boolean structure. The title-only control prevents a false green
+    /// from an implementation that peels every wrapper and loses `content:`.
+    #[cfg(feature = "lexical-tantivy")]
+    #[test]
+    fn public_deep_field_scope_with_nested_boolean_body_matches_tantivy_oracle() {
+        super::quiet_logging();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let docs = vec![
+                IndexableDocument::new("content-hit", "depthneedle").with_title("neutral"),
+                IndexableDocument::new("title-only", "haystack").with_title("depthneedle"),
+                IndexableDocument::new("negative-control", "haystack").with_title("neutral"),
+            ];
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let quill = build_quill_index(&cx, &tmp.path().join("quill"), &docs).await;
+            let tantivy = build_tantivy_index(&cx, &tmp.path().join("tantivy"), &docs).await;
+            let scope_count = frankensearch::quill::MAX_QUERY_DEPTH + 1;
+            let query = format!(
+                "{}depthneedle OR (absent){}",
+                "content:(".repeat(scope_count),
+                ")".repeat(scope_count)
+            );
+
+            let tantivy_hits = public_observation(&tantivy, &cx, &query, 10).await;
+            assert_eq!(
+                tantivy_hits
+                    .iter()
+                    .map(|(document_id, _)| document_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["content-hit"],
+                "the oracle must match content without widening the field scope to title"
+            );
+
+            let quill_hits = public_observation(&quill, &cx, &query, 10).await;
+            assert_eq!(
+                quill_hits, tantivy_hits,
+                "nested Boolean structure must not make redundant field scopes consume the depth budget"
+            );
+        });
+    }
+
     #[cfg(feature = "lexical-tantivy")]
     #[test]
     fn public_unfielded_three_term_or_matches_tantivy_score_bits_and_order() {
