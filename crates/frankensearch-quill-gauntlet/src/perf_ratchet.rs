@@ -2248,6 +2248,75 @@ fn compare_qg6_hierarchical_reproduction(
             );
         }
     }
+
+    let (candidate_tail, rerun_tail) = match (&candidate_cell.body, &rerun_cell.body) {
+        (
+            EvidenceCellBody::Paired {
+                qg6_protocol: Some(candidate_protocol),
+                ..
+            },
+            EvidenceCellBody::Paired {
+                qg6_protocol: Some(rerun_protocol),
+                ..
+            },
+        ) => (&candidate_protocol.joint_tail, &rerun_protocol.joint_tail),
+        _ => {
+            state.quarantine(
+                "perf.ratchet.qg6_joint_tail_reproduction_missing",
+                format!(
+                    "QG-6 reproduction requires formal joint-tail estimates for {}",
+                    candidate_cell.cell_id
+                ),
+            );
+            return;
+        }
+    };
+    let compatible_tail_topology = candidate_tail.schema_version == rerun_tail.schema_version
+        && candidate_tail.query_count == rerun_tail.query_count
+        && candidate_tail.units_per_query == rerun_tail.units_per_query
+        && candidate_tail.leaves_per_arm_per_unit == rerun_tail.leaves_per_arm_per_unit
+        && candidate_tail.bootstrap_resamples == rerun_tail.bootstrap_resamples;
+    if !compatible_tail_topology {
+        state.quarantine(
+            "perf.ratchet.qg6_joint_tail_reproduction_incompatible",
+            format!(
+                "QG-6 candidate and rerun joint-tail topology differs for {}",
+                candidate_cell.cell_id
+            ),
+        );
+        return;
+    }
+
+    for (comparison, candidate, rerun) in [
+        ("Quill/Tantivy", &candidate_tail.effect, &rerun_tail.effect),
+        (
+            "Tantivy/Tantivy",
+            &candidate_tail.tantivy_null,
+            &rerun_tail.tantivy_null,
+        ),
+        (
+            "Quill/Quill",
+            &candidate_tail.quill_null,
+            &rerun_tail.quill_null,
+        ),
+    ] {
+        for (quantile, candidate_ratio, rerun_ratio) in [
+            ("p50", candidate.p50_ratio, rerun.p50_ratio),
+            ("p99", candidate.p99_ratio, rerun.p99_ratio),
+        ] {
+            let delta = (candidate_ratio.ln() - rerun_ratio.ln()).abs();
+            if !delta.is_finite() || delta > candidate_pair.config.max_reproduction_delta_log {
+                state.quarantine(
+                    "perf.ratchet.qg6_joint_tail_reproduction_failed",
+                    format!(
+                        "QG-6 joint-tail {comparison} {quantile} candidate and rerun differ by \
+                         {delta:.6} log-ratio for {}",
+                        candidate_cell.cell_id
+                    ),
+                );
+            }
+        }
+    }
 }
 
 fn validate_paired_evidence(
@@ -4374,6 +4443,67 @@ mod tests {
         )
     }
 
+    #[derive(Clone, Copy)]
+    enum Qg6TestLeafProfile {
+        Uniform,
+        HiddenEffectTail,
+        EffectP99 {
+            baseline_numerator: u64,
+            exceptional_numerator: u64,
+            denominator: u64,
+        },
+        QuillNullP99 {
+            exceptional_numerator: u64,
+            denominator: u64,
+        },
+    }
+
+    fn qg6_test_leaf_latencies(
+        profile: Qg6TestLeafProfile,
+        comparison: crate::Qg6Comparison,
+        sample: &PerfRawSample,
+        parent_latency_ns: u64,
+        searches_per_sample: usize,
+    ) -> Vec<u64> {
+        let uniform = || vec![parent_latency_ns; searches_per_sample];
+        match profile {
+            Qg6TestLeafProfile::Uniform => uniform(),
+            Qg6TestLeafProfile::HiddenEffectTail if comparison == crate::Qg6Comparison::Effect => {
+                let mut leaves = uniform();
+                if sample.arm == PerfSampleArm::Treatment
+                    && sample.group_id == Some(crate::QG6_QUERY_GROUP_IDS[0])
+                {
+                    *leaves.last_mut().expect("positive QG-6 leaf count") = parent_latency_ns * 100;
+                }
+                leaves
+            }
+            Qg6TestLeafProfile::EffectP99 {
+                baseline_numerator,
+                exceptional_numerator,
+                denominator,
+            } if comparison == crate::Qg6Comparison::Effect
+                && sample.arm == PerfSampleArm::Treatment =>
+            {
+                let numerator = if sample.group_id == Some(crate::QG6_QUERY_GROUP_IDS[0]) {
+                    exceptional_numerator
+                } else {
+                    baseline_numerator
+                };
+                vec![parent_latency_ns * numerator / denominator; searches_per_sample]
+            }
+            Qg6TestLeafProfile::QuillNullP99 {
+                exceptional_numerator,
+                denominator,
+            } if comparison == crate::Qg6Comparison::QuillNull
+                && sample.arm == PerfSampleArm::Treatment
+                && sample.group_id == Some(crate::QG6_QUERY_GROUP_IDS[0]) =>
+            {
+                vec![parent_latency_ns * exceptional_numerator / denominator; searches_per_sample]
+            }
+            _ => uniform(),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn qg6_current_pair_for_cell<const GROUPS: usize, const ROUNDS: usize>(
         run_id: &str,
@@ -4384,6 +4514,41 @@ mod tests {
         document_count: u64,
         fixture: &str,
         hidden_leaf_tail: bool,
+        searches_per_sample: usize,
+        bootstrap_resamples: usize,
+        full_top_k_receipts: bool,
+        authority: &Qg6ScheduleAuthority,
+    ) -> (PerfGateArtifact, PerfEvidenceArtifact) {
+        qg6_current_pair_for_cell_with_leaf_profile(
+            run_id,
+            effect_group_ratios,
+            null_group_ratios,
+            query_class,
+            k,
+            document_count,
+            fixture,
+            if hidden_leaf_tail {
+                Qg6TestLeafProfile::HiddenEffectTail
+            } else {
+                Qg6TestLeafProfile::Uniform
+            },
+            searches_per_sample,
+            bootstrap_resamples,
+            full_top_k_receipts,
+            authority,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qg6_current_pair_for_cell_with_leaf_profile<const GROUPS: usize, const ROUNDS: usize>(
+        run_id: &str,
+        effect_group_ratios: [[f64; ROUNDS]; GROUPS],
+        null_group_ratios: [[f64; ROUNDS]; GROUPS],
+        query_class: crate::PerfQueryClass,
+        k: usize,
+        document_count: u64,
+        fixture: &str,
+        leaf_profile: Qg6TestLeafProfile,
         searches_per_sample: usize,
         bootstrap_resamples: usize,
         full_top_k_receipts: bool,
@@ -4462,17 +4627,13 @@ mod tests {
             &input_identity,
             &semantic_contract,
             |sample, parent_latency_ns| {
-                if hidden_leaf_tail {
-                    let tail_latency_ns =
-                        if sample.arm == PerfSampleArm::Treatment && sample.group_id == Some(0) {
-                            parent_latency_ns * 100
-                        } else {
-                            parent_latency_ns
-                        };
-                    vec![parent_latency_ns, parent_latency_ns, tail_latency_ns]
-                } else {
-                    vec![parent_latency_ns; searches_per_sample]
-                }
+                qg6_test_leaf_latencies(
+                    leaf_profile,
+                    crate::Qg6Comparison::Effect,
+                    sample,
+                    parent_latency_ns,
+                    searches_per_sample,
+                )
             },
         );
         for (samples, comparison) in [
@@ -4485,7 +4646,15 @@ mod tests {
                 authority,
                 &input_identity,
                 &semantic_contract,
-                |_, parent_latency_ns| vec![parent_latency_ns; searches_per_sample],
+                |sample, parent_latency_ns| {
+                    qg6_test_leaf_latencies(
+                        leaf_profile,
+                        comparison,
+                        sample,
+                        parent_latency_ns,
+                        searches_per_sample,
+                    )
+                },
             );
         }
         let mut estimator_config = PairedEstimatorConfig::predeclared(QG6_TEST_SCHEDULE_SEED);
@@ -4649,6 +4818,22 @@ mod tests {
         )
     }
 
+    fn qg6_complete_pair_with_leaf_profile<const GROUPS: usize>(
+        run_id: &str,
+        group_ratios: [[f64; 3]; GROUPS],
+        leaf_profile: Qg6TestLeafProfile,
+    ) -> (PerfGateArtifact, PerfEvidenceArtifact) {
+        qg6_complete_pair_with_shape_and_seed_and_leaf_profile(
+            run_id,
+            group_ratios,
+            1,
+            crate::perf::PERF_BOOTSTRAP_RESAMPLES,
+            false,
+            QG6_TEST_SCHEDULE_SEED,
+            leaf_profile,
+        )
+    }
+
     fn qg6_fixture_authorities_for_shape<const ROUNDS: usize>(
         searches_per_sample: usize,
         full_top_k_receipts: bool,
@@ -4713,6 +4898,30 @@ mod tests {
         full_top_k_receipts: bool,
         schedule_seed: u64,
     ) -> (PerfGateArtifact, PerfEvidenceArtifact) {
+        qg6_complete_pair_with_shape_and_seed_and_leaf_profile(
+            run_id,
+            group_ratios,
+            searches_per_sample,
+            bootstrap_resamples,
+            full_top_k_receipts,
+            schedule_seed,
+            Qg6TestLeafProfile::Uniform,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qg6_complete_pair_with_shape_and_seed_and_leaf_profile<
+        const GROUPS: usize,
+        const ROUNDS: usize,
+    >(
+        run_id: &str,
+        group_ratios: [[f64; ROUNDS]; GROUPS],
+        searches_per_sample: usize,
+        bootstrap_resamples: usize,
+        full_top_k_receipts: bool,
+        schedule_seed: u64,
+        leaf_profile: Qg6TestLeafProfile,
+    ) -> (PerfGateArtifact, PerfEvidenceArtifact) {
         let mut rows = Vec::new();
         let mut cells = Vec::new();
         let authorities = qg6_fixture_authorities_for_shape_and_seed::<ROUNDS>(
@@ -4730,7 +4939,7 @@ mod tests {
             let query_class = spec.query_class.expect("QG-6 query class");
             let k = spec.k.expect("QG-6 k");
             let document_count = spec.document_count.expect("QG-6 document count");
-            let (cell_artifact, mut cell_evidence) = qg6_current_pair_for_cell(
+            let (cell_artifact, mut cell_evidence) = qg6_current_pair_for_cell_with_leaf_profile(
                 run_id,
                 group_ratios,
                 [[1.0; ROUNDS]; GROUPS],
@@ -4738,7 +4947,7 @@ mod tests {
                 k,
                 document_count,
                 &spec.fixture,
-                false,
+                leaf_profile,
                 searches_per_sample,
                 bootstrap_resamples,
                 full_top_k_receipts,
@@ -4879,6 +5088,40 @@ mod tests {
             DecisionState::default(),
             false,
         )
+    }
+
+    fn assert_qg6_target_passes(
+        artifact: &PerfGateArtifact,
+        evidence: &PerfEvidenceArtifact,
+        role: &str,
+    ) {
+        let authorities = qg6_default_fixture_authorities();
+        let authority_refs = authorities.iter().collect::<Vec<_>>();
+        evidence
+            .verify_integrity_against_authorities(&[], &authority_refs)
+            .expect("QG-6 test evidence must be bound and resealed against its schedule authority");
+
+        let mut state = DecisionState::default();
+        let cells = validate_artifact(
+            artifact,
+            PerfGate::Qg6,
+            &normalized_manifest_sha256(),
+            role,
+            &mut state,
+        );
+        let mut target = GateTargetEvaluator {
+            artifact,
+            cells: &cells,
+            activated: true,
+            observe_only: false,
+            state: &mut state,
+        };
+        evaluate_qg6(&mut target, Some(evidence));
+        assert!(
+            !state.fatal && !state.blocked && !state.quarantined,
+            "{role} must independently clear every QG-6 target: {:?}",
+            state.reasons
+        );
     }
 
     fn evaluate_verified_promotion_request(
@@ -7084,6 +7327,140 @@ mod tests {
         assert!(state.reasons.iter().any(|reason| {
             reason.code == "perf.ratchet.qg6_hierarchical_reproduction_failed"
                 && reason.message.contains("A/A null")
+        }));
+    }
+
+    #[test]
+    fn qg6_reproduction_rejects_p99_only_effect_tail_drift_after_independent_target_passes() {
+        let ratios = [[1.0; 3]; 4];
+        let (candidate, candidate_evidence) = qg6_complete_pair_with_leaf_profile(
+            "candidate",
+            ratios,
+            Qg6TestLeafProfile::EffectP99 {
+                baseline_numerator: 98,
+                exceptional_numerator: 98,
+                denominator: 100,
+            },
+        );
+        let (rerun, rerun_evidence) = qg6_complete_pair_with_leaf_profile(
+            "rerun",
+            ratios,
+            Qg6TestLeafProfile::EffectP99 {
+                baseline_numerator: 98,
+                exceptional_numerator: 100,
+                denominator: 100,
+            },
+        );
+        assert_qg6_target_passes(&candidate, &candidate_evidence, "candidate");
+        assert_qg6_target_passes(&rerun, &rerun_evidence, "rerun");
+
+        let candidate_tail =
+            exact_qg6_joint_tail_cell(&candidate_evidence, "query/identifier/k10/100k")
+                .expect("candidate joint tail");
+        let rerun_tail = exact_qg6_joint_tail_cell(&rerun_evidence, "query/identifier/k10/100k")
+            .expect("rerun joint tail");
+        let p50_delta =
+            (candidate_tail.effect.p50_ratio.ln() - rerun_tail.effect.p50_ratio.ln()).abs();
+        let p99_delta =
+            (candidate_tail.effect.p99_ratio.ln() - rerun_tail.effect.p99_ratio.ln()).abs();
+        assert!(
+            p50_delta
+                <= crate::PairedEstimatorConfig::predeclared(QG6_TEST_SCHEDULE_SEED)
+                    .max_reproduction_delta_log,
+            "fixture must hold the effect p50 constant"
+        );
+        assert!(
+            p99_delta
+                > crate::PairedEstimatorConfig::predeclared(QG6_TEST_SCHEDULE_SEED)
+                    .max_reproduction_delta_log,
+            "fixture must exceed reproduction tolerance through effect p99 alone"
+        );
+        assert_eq!(candidate_tail.tantivy_null, rerun_tail.tantivy_null);
+        assert_eq!(candidate_tail.quill_null, rerun_tail.quill_null);
+
+        let mut baseline = candidate.clone();
+        baseline.run_id = "baseline".to_owned();
+        baseline.git_rev = "0".repeat(40);
+        let result = evaluate_with_current(
+            &baseline,
+            &candidate,
+            Some(&rerun),
+            Some(&candidate_evidence),
+            Some(&rerun_evidence),
+        );
+        assert_eq!(result.decision, PerfGateDecision::Quarantine, "{result:#?}");
+        assert!(result.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.qg6_joint_tail_reproduction_failed"
+                && reason.message.contains("Quill/Tantivy p99")
+        }));
+        assert!(!result.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.qg6_hierarchical_reproduction_failed"
+                || reason.code == "perf.ratchet.reproduction_failed"
+                || reason.code == "perf.ratchet.gate_target_missed"
+                || reason.code == "perf.ratchet.gate_target_ci_inconclusive"
+        }));
+    }
+
+    #[test]
+    fn qg6_reproduction_rejects_p99_only_quill_null_tail_drift_after_independent_target_passes() {
+        let ratios = [[1.0; 3]; 4];
+        let (candidate, candidate_evidence) =
+            qg6_complete_pair_with_leaf_profile("candidate", ratios, Qg6TestLeafProfile::Uniform);
+        let (rerun, rerun_evidence) = qg6_complete_pair_with_leaf_profile(
+            "rerun",
+            ratios,
+            Qg6TestLeafProfile::QuillNullP99 {
+                exceptional_numerator: 1_021,
+                denominator: 1_000,
+            },
+        );
+        assert_qg6_target_passes(&candidate, &candidate_evidence, "candidate");
+        assert_qg6_target_passes(&rerun, &rerun_evidence, "rerun");
+
+        let candidate_tail =
+            exact_qg6_joint_tail_cell(&candidate_evidence, "query/identifier/k10/100k")
+                .expect("candidate joint tail");
+        let rerun_tail = exact_qg6_joint_tail_cell(&rerun_evidence, "query/identifier/k10/100k")
+            .expect("rerun joint tail");
+        let p50_delta =
+            (candidate_tail.quill_null.p50_ratio.ln() - rerun_tail.quill_null.p50_ratio.ln()).abs();
+        let p99_delta =
+            (candidate_tail.quill_null.p99_ratio.ln() - rerun_tail.quill_null.p99_ratio.ln()).abs();
+        assert!(
+            p50_delta
+                <= crate::PairedEstimatorConfig::predeclared(QG6_TEST_SCHEDULE_SEED)
+                    .max_reproduction_delta_log,
+            "fixture must hold the Quill-null p50 constant"
+        );
+        assert!(
+            p99_delta
+                > crate::PairedEstimatorConfig::predeclared(QG6_TEST_SCHEDULE_SEED)
+                    .max_reproduction_delta_log,
+            "fixture must exceed reproduction tolerance through Quill-null p99 alone"
+        );
+        assert_eq!(candidate_tail.effect, rerun_tail.effect);
+        assert_eq!(candidate_tail.tantivy_null, rerun_tail.tantivy_null);
+
+        let mut baseline = candidate.clone();
+        baseline.run_id = "baseline".to_owned();
+        baseline.git_rev = "0".repeat(40);
+        let result = evaluate_with_current(
+            &baseline,
+            &candidate,
+            Some(&rerun),
+            Some(&candidate_evidence),
+            Some(&rerun_evidence),
+        );
+        assert_eq!(result.decision, PerfGateDecision::Quarantine, "{result:#?}");
+        assert!(result.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.qg6_joint_tail_reproduction_failed"
+                && reason.message.contains("Quill/Quill p99")
+        }));
+        assert!(!result.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.qg6_hierarchical_reproduction_failed"
+                || reason.code == "perf.ratchet.reproduction_failed"
+                || reason.code == "perf.ratchet.gate_target_missed"
+                || reason.code == "perf.ratchet.gate_target_ci_inconclusive"
         }));
     }
 
