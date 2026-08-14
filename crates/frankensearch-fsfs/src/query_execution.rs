@@ -1007,21 +1007,42 @@ impl QueryExecutionOrchestrator {
         fused: &[FusedCandidate],
         snippets_by_doc: &HashMap<String, String>,
     ) -> SearchPayload {
+        self.build_search_payload_for_vector_lane(query, phase, fused, snippets_by_doc, false)
+    }
+
+    /// Build payload rows, placing the fused vector rank on `hash_rank` when
+    /// the vector lane is a hash-control generation.
+    #[must_use]
+    pub fn build_search_payload_for_vector_lane(
+        &self,
+        query: &str,
+        phase: SearchOutputPhase,
+        fused: &[FusedCandidate],
+        snippets_by_doc: &HashMap<String, String>,
+        vector_is_hash: bool,
+    ) -> SearchPayload {
         let hits = fused
             .iter()
             .enumerate()
-            .map(|(idx, candidate)| SearchHitPayload {
-                rank: idx.saturating_add(1),
-                path: candidate.doc_id.clone(),
-                score: sanitize_fused_score(candidate.fused_score),
-                snippet: snippets_by_doc
-                    .get(&candidate.doc_id)
-                    .cloned()
-                    .filter(|snippet| !snippet.trim().is_empty()),
-                lexical_rank: candidate.lexical_rank,
-                semantic_rank: candidate.semantic_rank,
-                hash_rank: None,
-                in_both_sources: candidate.in_both_sources,
+            .map(|(idx, candidate)| {
+                let (semantic_rank, hash_rank) = if vector_is_hash {
+                    (None, candidate.semantic_rank)
+                } else {
+                    (candidate.semantic_rank, None)
+                };
+                SearchHitPayload {
+                    rank: idx.saturating_add(1),
+                    path: candidate.doc_id.clone(),
+                    score: sanitize_fused_score(candidate.fused_score),
+                    snippet: snippets_by_doc
+                        .get(&candidate.doc_id)
+                        .cloned()
+                        .filter(|snippet| !snippet.trim().is_empty()),
+                    lexical_rank: candidate.lexical_rank,
+                    semantic_rank,
+                    hash_rank,
+                    in_both_sources: candidate.in_both_sources,
+                }
             })
             .collect();
 
@@ -1572,6 +1593,37 @@ mod tests {
         assert_eq!(payload.hits[1].rank, 2);
         assert!(payload.hits[1].score.abs() < f64::EPSILON);
         assert!(payload.hits[1].snippet.is_none());
+        assert_eq!(payload.hits[0].semantic_rank, Some(1));
+        assert_eq!(payload.hits[0].hash_rank, None);
+    }
+
+    #[test]
+    fn build_search_payload_hash_lane_writes_hash_rank_not_semantic_rank() {
+        let orchestrator = QueryExecutionOrchestrator::default();
+        let fused = vec![super::FusedCandidate {
+            doc_id: "src/lib.rs".into(),
+            fused_score: 0.1,
+            prior_boost: 0.0,
+            lexical_rank: None,
+            semantic_rank: Some(0),
+            lexical_score: None,
+            semantic_score: Some(0.4),
+            in_both_sources: false,
+        }];
+        let payload = orchestrator.build_search_payload_for_vector_lane(
+            "ownership",
+            SearchOutputPhase::Initial,
+            &fused,
+            &HashMap::new(),
+            true,
+        );
+        assert_eq!(payload.hits[0].hash_rank, Some(0));
+        assert_eq!(payload.hits[0].semantic_rank, None);
+        assert!(
+            payload.hits[0].hash_rank.is_some() && payload.hits[0].semantic_rank.is_none(),
+            "hash-control payload must not keep a semantic rank: {:?}",
+            payload.hits[0]
+        );
     }
 
     #[test]

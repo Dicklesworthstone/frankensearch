@@ -7335,14 +7335,20 @@ impl FsfsRuntime {
         fused: &[FusedCandidate],
         snippets_by_doc: &HashMap<String, String>,
         limit: usize,
+        vector_is_hash: bool,
     ) -> SearchPayload {
         let limited = if limit == FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL {
             fused.to_vec()
         } else {
             fused.iter().take(limit).cloned().collect::<Vec<_>>()
         };
-        let mut payload =
-            orchestrator.build_search_payload(query, phase, &limited, snippets_by_doc);
+        let mut payload = orchestrator.build_search_payload_for_vector_lane(
+            query,
+            phase,
+            &limited,
+            snippets_by_doc,
+            vector_is_hash,
+        );
         payload.total_candidates = fused.len();
         payload
     }
@@ -8189,6 +8195,7 @@ impl FsfsRuntime {
                 &fused_initial,
                 &snippets_by_doc,
                 output_limit,
+                Self::vector_generation_is_hash_control(resources),
             )
             .with_degradation_advice(resources.degradation_advice.clone()),
             index_freshness,
@@ -8287,6 +8294,7 @@ impl FsfsRuntime {
                             &fused_refined,
                             &snippets_by_doc,
                             output_limit,
+                            Self::vector_generation_is_hash_control(resources),
                         ),
                         index_freshness,
                         resources,
@@ -8336,6 +8344,7 @@ impl FsfsRuntime {
                             &fused_initial,
                             &snippets_by_doc,
                             output_limit,
+                            Self::vector_generation_is_hash_control(resources),
                         )
                         .with_degradation_advice(advice),
                         index_freshness,
@@ -8370,6 +8379,7 @@ impl FsfsRuntime {
                             &fused_initial,
                             &snippets_by_doc,
                             output_limit,
+                            Self::vector_generation_is_hash_control(resources),
                         )
                         .with_degradation_advice(advice),
                         index_freshness,
