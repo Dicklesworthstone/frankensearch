@@ -7481,6 +7481,15 @@ impl FsfsRuntime {
         }
     }
 
+    #[must_use]
+    const fn retrieval_completion_phase(hash_control: bool) -> &'static str {
+        if hash_control {
+            "hash_control_search"
+        } else {
+            "fast_search"
+        }
+    }
+
     /// Hash/fnv/JL generations are cheap control artifacts, not MiniLM-cost
     /// inference. Semantic VOI must not drop that lane when lexical looks strong.
     #[must_use]
@@ -8382,19 +8391,35 @@ impl FsfsRuntime {
             .last()
             .map_or(&payload, |artifact| &artifact.payload);
 
-        info!(
-            phase = "fast_search",
-            query = normalized_query,
-            lexical_candidates = lexical_candidates.len(),
-            semantic_candidates = semantic_candidates.len(),
-            fused_candidates = final_payload.total_candidates,
-            returned_hits = final_payload.returned_hits,
-            lexical_elapsed_ms,
-            semantic_elapsed_ms,
-            fusion_elapsed_ms,
-            total_elapsed_ms = search_start.elapsed().as_millis(),
-            "fsfs search retrieval pipeline completed"
-        );
+        if hash_control_lane {
+            info!(
+                phase = Self::retrieval_completion_phase(true),
+                query = normalized_query,
+                lexical_candidates = lexical_candidates.len(),
+                hash_control_candidates = semantic_candidates.len(),
+                fused_candidates = final_payload.total_candidates,
+                returned_hits = final_payload.returned_hits,
+                lexical_elapsed_ms,
+                hash_control_elapsed_ms = semantic_elapsed_ms,
+                fusion_elapsed_ms,
+                total_elapsed_ms = search_start.elapsed().as_millis(),
+                "fsfs search retrieval pipeline completed"
+            );
+        } else {
+            info!(
+                phase = Self::retrieval_completion_phase(false),
+                query = normalized_query,
+                lexical_candidates = lexical_candidates.len(),
+                semantic_candidates = semantic_candidates.len(),
+                fused_candidates = final_payload.total_candidates,
+                returned_hits = final_payload.returned_hits,
+                lexical_elapsed_ms,
+                semantic_elapsed_ms,
+                fusion_elapsed_ms,
+                total_elapsed_ms = search_start.elapsed().as_millis(),
+                "fsfs search retrieval pipeline completed"
+            );
+        }
         info!(
             phase = "fusion",
             rrf_k = plan.fusion_policy.rrf_k.unwrap_or(self.config.search.rrf_k),
@@ -21857,6 +21882,22 @@ mod tests {
         let semantic_untouched = FsfsRuntime::apply_hash_control_lane_policy(voi, false, true);
         assert!(!semantic_untouched.run_semantic);
         assert_eq!(semantic_untouched.reason_code, voi.reason_code);
+    }
+
+    #[test]
+    fn retrieval_completion_phase_is_not_named_semantic_for_hash_control() {
+        assert_eq!(
+            FsfsRuntime::retrieval_completion_phase(true),
+            "hash_control_search"
+        );
+        assert_eq!(
+            FsfsRuntime::retrieval_completion_phase(false),
+            "fast_search"
+        );
+        assert!(
+            !FsfsRuntime::retrieval_completion_phase(true).contains("semantic"),
+            "hash-control completion phase must not be labeled semantic"
+        );
     }
 
     #[test]
