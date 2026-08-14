@@ -505,7 +505,7 @@ asupersync::test_utils::run_test_with_cx(|cx| async move {
 ```
 
 Notes:
-- For production semantic quality, use `model2vec` + `fastembed` (or `EmbedderStack::auto_detect_with`).
+- For production semantic quality, use `model2vec` + `fastembed` (or `EmbedderStack::auto_detect_semantic_with`). `auto_detect` / `auto_detect_with` still return a hash-only stack when no model is present; that is a control policy, not a working semantic engine.
 - Enable `quill` for the native bulk-built lexical index; use `lexical-tantivy` only for the explicit Tantivy oracle/comparator lane during migration.
 - Enable `cass-compat` only when interoperating with the external CASS tool's
   schema-v8 Tantivy index at `<base>/index/v8/`. This foreign-format adapter is

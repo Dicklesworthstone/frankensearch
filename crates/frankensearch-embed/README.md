@@ -40,16 +40,18 @@ The `EmbedderStack` auto-detection system probes for locally available models an
 ## Usage
 
 ```rust
-use std::sync::Arc;
+use std::path::Path;
 use frankensearch_embed::{EmbedderStack, HashEmbedder};
-use frankensearch_core::traits::Embedder;
 
-// Simple: use the hash embedder for development
+// Simple: use the hash embedder for development and tests
 let embedder = HashEmbedder::default_256();
 
-// Production: auto-detect best available models
-let stack = EmbedderStack::auto_detect("/path/to/model/cache");
-// stack.fast()   -> fastest available embedder
+// Production: refuse a hash-only stack. `auto_detect` / `auto_detect_with`
+// still exist for tests and explicit control policy; they silently fall
+// back to FNV when no model is cached.
+let stack = EmbedderStack::auto_detect_semantic_with(Some(Path::new("/path/to/model/cache")))
+    .expect("semantic model must be present");
+// stack.fast()    -> fastest semantic embedder
 // stack.quality() -> highest quality embedder (if available)
 ```
 

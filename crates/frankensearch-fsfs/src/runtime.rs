@@ -2551,13 +2551,15 @@ impl FsfsIndexStatus {
             "missing"
         } else if self.vector_generation_is_hash {
             "hash control (not semantic)"
+        } else if self.vector_generation_id.is_none() {
+            "no vector index"
         } else {
             "ready"
         }
     }
 
     fn dashboard_state_is_healthy(&self) -> bool {
-        self.exists && !self.vector_generation_is_hash
+        self.exists && self.vector_generation_id.is_some() && !self.vector_generation_is_hash
     }
 }
 
@@ -5476,6 +5478,13 @@ impl FsfsRuntime {
         };
 
         let resources = self.prepare_search_serve_resources(cx).await?;
+        let ready = Self::search_serve_ready_event(self.cli_input.format.to_string(), &resources);
+        if let Err(error) = Self::emit_search_serve_json_line(&ready) {
+            warn!(
+                error = %error,
+                "fsfs daemon could not emit ready event to stdout"
+            );
+        }
         let hot_cache: HashMap<SearchCacheKey, Vec<SearchPayload>> = HashMap::new();
         let hot_cache_enabled = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
         let shared = Arc::new(asupersync::sync::Mutex::new((resources, hot_cache)));
@@ -5575,6 +5584,10 @@ impl FsfsRuntime {
         }
         if matches!(raw, "quit" | "exit" | ":quit" | ":exit" | ":shutdown") {
             stop_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        if matches!(raw, "ready" | ":ready") {
+            Self::write_search_serve_socket_ready(&runtime, &mut stream, shared);
             return;
         }
 
@@ -5828,12 +5841,12 @@ impl FsfsRuntime {
     }
 
     #[cfg(unix)]
-    fn write_search_serve_socket_response(
+    fn write_search_serve_socket_json<T: Serialize>(
         stream: &mut UnixStream,
-        response: &SearchServeResponse,
+        value: &T,
     ) -> SearchResult<()> {
         let response_bytes =
-            serde_json::to_vec(response).map_err(|source| SearchError::SubsystemError {
+            serde_json::to_vec(value).map_err(|source| SearchError::SubsystemError {
                 subsystem: "fsfs.search.serve",
                 source: Box::new(source),
             })?;
@@ -5841,6 +5854,68 @@ impl FsfsRuntime {
         stream.write_all(b"\n").map_err(SearchError::Io)?;
         stream.flush().map_err(SearchError::Io)?;
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn write_search_serve_socket_response(
+        stream: &mut UnixStream,
+        response: &SearchServeResponse,
+    ) -> SearchResult<()> {
+        Self::write_search_serve_socket_json(stream, response)
+    }
+
+    #[cfg(unix)]
+    fn write_search_serve_socket_ready(
+        runtime: &Self,
+        stream: &mut UnixStream,
+        shared: SharedSearchServeState,
+    ) {
+        let scheduler = match RuntimeBuilder::current_thread().build() {
+            Ok(scheduler) => scheduler,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "fsfs daemon failed to build a ready-event scheduler"
+                );
+                return;
+            }
+        };
+        let format = runtime.cli_input.format.to_string();
+        let ready_task = scheduler.handle().spawn(async move {
+            let cx = Cx::current().expect("asupersync runtime installs a request context");
+            let guard = asupersync::sync::OwnedMutexGuard::lock(shared, &cx)
+                .await
+                .map_err(|error| SearchError::SubsystemError {
+                    subsystem: "fsfs.search.serve",
+                    source: Box::new(std::io::Error::other(format!(
+                        "failed to lock shared daemon search state: {error}"
+                    ))),
+                })?;
+            let (resources, _) = &*guard;
+            Ok::<_, SearchError>(Self::search_serve_ready_event(format, resources))
+        });
+        match scheduler.block_on(ready_task) {
+            Ok(ready) => {
+                if let Err(error) = Self::write_search_serve_socket_json(stream, &ready) {
+                    warn!(
+                        error = %error,
+                        "fsfs daemon failed to write socket ready event"
+                    );
+                }
+            }
+            Err(error) => {
+                let response =
+                    Self::search_serve_error_response(String::new(), "full", error.to_string());
+                if let Err(write_error) =
+                    Self::write_search_serve_socket_response(stream, &response)
+                {
+                    warn!(
+                        error = %write_error,
+                        "fsfs daemon failed to write socket ready error"
+                    );
+                }
+            }
+        }
     }
 
     fn search_payloads_via_daemon(
@@ -13594,6 +13669,14 @@ impl FsfsRuntime {
             };
             writeln!(stdout, "vector generation: {generation_id}  class={class}")
                 .map_err(tui_io_error)?;
+        } else {
+            writeln!(
+                stdout,
+                "vector generation: {}  class={}",
+                paint("(none)", "31", no_color),
+                paint("missing", "31", no_color)
+            )
+            .map_err(tui_io_error)?;
         }
         writeln!(stdout, "{}", paint(&rule, "38;5;24", no_color)).map_err(tui_io_error)?;
         writeln!(stdout, "{}", paint("CORPUS", "1;38;5;81", no_color)).map_err(tui_io_error)?;
@@ -18204,6 +18287,13 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
             out,
             "  vector generation: {generation_id}  dim={dimension}  class={class}"
         );
+    } else {
+        let _ = writeln!(
+            out,
+            "  vector generation: {}  class={}",
+            paint("(none)", "31", no_color),
+            paint("missing", "31", no_color)
+        );
     }
     let _ = writeln!(
         out,
@@ -20166,8 +20256,8 @@ mod tests {
                 lexical_index_bytes: 512 * 1024,
                 metadata_bytes: 0,
                 embedding_cache_bytes: 0,
-                vector_generation_id: None,
-                vector_generation_dimension: None,
+                vector_generation_id: Some("potion-multilingual-128m".to_owned()),
+                vector_generation_dimension: Some(256),
                 vector_generation_is_hash: false,
                 index_freshness: Some(IndexFreshnessPayload {
                     published_generation: 7,
@@ -21086,6 +21176,65 @@ mod tests {
         let result = join_with_timeout(handle, Duration::from_secs(2));
         assert!(result.is_ok(), "serve exits cleanly: {result:?}");
         assert!(!socket_path.exists(), "socket path is removed on shutdown");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_socket_ready_control_names_the_published_generation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("project");
+        fs::create_dir_all(project.join("src")).expect("create project source dir");
+        fs::write(project.join("src/auth.rs"), "/// Authentication tokens.\n")
+            .expect("write source");
+        let index_root = project.join(".frankensearch");
+        let socket_path = temp.path().join("serve.sock");
+        let mut config = FsfsConfig::default();
+        config.storage.index_dir = ".frankensearch".to_owned();
+        futures_lite_block_on(async {
+            FsfsRuntime::new(config)
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&Cx::for_request(), InterfaceMode::Cli)
+                .await
+                .expect("index command should succeed");
+        });
+
+        let coordinator: Arc<ShutdownCoordinator> = Arc::new(ShutdownCoordinator::new());
+        let handle = spawn_socket_serve(
+            index_root.clone(),
+            socket_path.clone(),
+            Arc::clone(&coordinator),
+        );
+        let mut stream = connect_socket_with_retry(&socket_path);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+        stream.write_all(b":ready\n").expect("write ready control");
+        stream.flush().expect("flush ready control");
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .expect("half-close ready control");
+        let mut raw = String::new();
+        use std::io::Read as _;
+        stream.read_to_string(&mut raw).expect("read ready event");
+        let ready: serde_json::Value =
+            serde_json::from_str(raw.trim()).expect("ready event must be json");
+        assert_eq!(ready["event"], "ready");
+        assert_eq!(ready["ok"], true);
+        let published = FsfsRuntime::inspect_published_vector_generation(&index_root)
+            .expect("indexed FSVI must be readable");
+        assert_eq!(ready["vector_generation_id"], published.id);
+        assert_eq!(
+            ready["vector_generation_is_hash"],
+            published.is_hash_control
+        );
+        assert_eq!(ready["semantic_admitted"], !published.is_hash_control);
+        coordinator.request_shutdown(ShutdownReason::UserRequest);
+        let result = join_with_timeout(handle, Duration::from_secs(2));
+        assert!(result.is_ok(), "serve exits cleanly: {result:?}");
     }
 
     #[cfg(unix)]
@@ -27627,10 +27776,64 @@ mod tests {
     }
 
     #[test]
+    fn status_does_not_call_a_directory_without_fsvi_ready() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        fs::create_dir_all(&index_root).expect("create empty index root");
+
+        let mut config = FsfsConfig::default();
+        config.storage.index_dir = index_root.display().to_string();
+        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            command: CliCommand::Status,
+            index_dir: Some(index_root),
+            ..CliInput::default()
+        });
+        let payload = runtime
+            .collect_status_payload()
+            .expect("status must stay observational");
+        assert!(payload.index.exists);
+        assert!(payload.index.vector_generation_id.is_none());
+        assert!(!payload.index.vector_generation_is_hash);
+        assert_eq!(payload.index.dashboard_state_label(), "no vector index");
+        assert!(!payload.index.dashboard_state_is_healthy());
+
+        let table = render_status_table(&payload, true);
+        assert!(
+            table.contains("no vector index"),
+            "status table must not call a missing FSVI ready: {table}"
+        );
+        assert!(
+            !table.contains("state: ready"),
+            "empty index root must not share the ready label: {table}"
+        );
+    }
+
+    #[test]
     fn dashboard_state_label_refuses_to_call_a_hash_index_ready() {
         let mut payload = test_dashboard_status_payload();
         assert_eq!(payload.index.dashboard_state_label(), "ready");
         assert!(payload.index.dashboard_state_is_healthy());
+
+        payload.index.vector_generation_id = None;
+        payload.index.vector_generation_dimension = None;
+        payload.index.vector_generation_is_hash = false;
+        assert_eq!(payload.index.dashboard_state_label(), "no vector index");
+        assert!(!payload.index.dashboard_state_is_healthy());
+
+        let missing_table = render_status_table(&payload, true);
+        assert!(
+            missing_table.contains("no vector index"),
+            "missing FSVI must not be labeled ready: {missing_table}"
+        );
+        assert!(
+            missing_table.contains("vector generation: (none)")
+                && missing_table.contains("class=missing"),
+            "status table must name the absent generation: {missing_table}"
+        );
+        assert!(
+            !missing_table.contains("state: ready"),
+            "missing FSVI must not share the ready label: {missing_table}"
+        );
 
         payload.index.vector_generation_id = Some("fnv1a-256".to_owned());
         payload.index.vector_generation_dimension = Some(256);
