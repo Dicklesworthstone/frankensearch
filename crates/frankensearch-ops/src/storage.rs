@@ -4247,6 +4247,7 @@ mod tests {
                     result_count: 7,
                     lexical_count: 3,
                     semantic_count: 4,
+                    hash_control_count: 0,
                 },
                 metrics: TelemetrySearchMetrics {
                     latency_us: 1_200,

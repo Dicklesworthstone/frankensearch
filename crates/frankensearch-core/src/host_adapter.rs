@@ -850,12 +850,15 @@ fn validate_search_event(
             "latency_us should be > 0 for completed search telemetry",
         ));
     }
-    let source_total = results.lexical_count.saturating_add(results.semantic_count);
+    let source_total = results
+        .lexical_count
+        .saturating_add(results.semantic_count)
+        .saturating_add(results.hash_control_count);
     if results.result_count > 0 && source_total == 0 {
         violations.push(violation(
             "adapter.event.search.missing_source_counts",
             "search.results",
-            "result_count > 0 requires lexical_count or semantic_count to be non-zero",
+            "result_count > 0 requires lexical_count, semantic_count, or hash_control_count to be non-zero",
         ));
     }
     if source_total > 0 && results.result_count > source_total {
@@ -863,7 +866,7 @@ fn validate_search_event(
             code: "adapter.event.search.result_count_exceeds_sources".to_owned(),
             field: "search.results.result_count".to_owned(),
             message: format!(
-                "result_count {} exceeds lexical_count + semantic_count ({source_total})",
+                "result_count {} exceeds lexical_count + semantic_count + hash_control_count ({source_total})",
                 results.result_count
             ),
         });
@@ -1665,6 +1668,30 @@ mod tests {
         assert_golden_json(
             "adapter_conformance_violations_search_missing_source_counts_v1",
             &snapshot,
+        );
+    }
+
+    #[test]
+    fn hash_control_source_counts_satisfy_search_telemetry() {
+        let harness = ConformanceHarness::default();
+        let mut envelope = load_fixture("telemetry-search-v1.json");
+
+        if let TelemetryEvent::Search { results, .. } = &mut envelope.event {
+            results.result_count = 3;
+            results.lexical_count = 0;
+            results.semantic_count = 0;
+            results.hash_control_count = 5;
+        } else {
+            panic!("search fixture shape changed");
+        }
+
+        let violations = harness.validate_envelope(&envelope);
+        assert!(
+            violations.iter().all(|violation| {
+                violation.code != "adapter.event.search.missing_source_counts"
+                    && violation.code != "adapter.event.search.result_count_exceeds_sources"
+            }),
+            "hash-control-only results must be a valid source count: {violations:?}"
         );
     }
 

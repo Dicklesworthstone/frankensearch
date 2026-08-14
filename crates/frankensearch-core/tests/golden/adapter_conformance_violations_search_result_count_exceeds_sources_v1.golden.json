@@ -2,6 +2,6 @@
   {
     "code": "adapter.event.search.result_count_exceeds_sources",
     "field": "search.results.result_count",
-    "message": "result_count 5 exceeds lexical_count + semantic_count (2)"
+    "message": "result_count 5 exceeds lexical_count + semantic_count + hash_control_count (2)"
   }
 ]

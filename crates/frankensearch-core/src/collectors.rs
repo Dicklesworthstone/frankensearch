@@ -394,6 +394,7 @@ impl RuntimeMetricsCollector {
             result_count,
             lexical_count,
             semantic_count,
+            hash_control_count,
             latency_us,
             memory_bytes,
         } = sample;
@@ -413,6 +414,7 @@ impl RuntimeMetricsCollector {
                     result_count,
                     lexical_count,
                     semantic_count,
+                    hash_control_count,
                 },
                 metrics: TelemetrySearchMetrics {
                     latency_us,
@@ -630,6 +632,9 @@ pub struct TelemetrySearchResults {
     pub result_count: usize,
     pub lexical_count: usize,
     pub semantic_count: usize,
+    /// Hash/fnv/JL control-vector hits. Absent from older payloads.
+    #[serde(default)]
+    pub hash_control_count: usize,
 }
 
 /// Search metric sub-payload for `search` events.
@@ -808,6 +813,9 @@ pub struct SearchCollectorSample {
     pub result_count: usize,
     pub lexical_count: usize,
     pub semantic_count: usize,
+    /// Hash/fnv/JL control-vector hits. Absent from older payloads.
+    #[serde(default)]
+    pub hash_control_count: usize,
     pub latency_us: u64,
     pub memory_bytes: Option<u64>,
 }
@@ -937,6 +945,7 @@ mod tests {
                 result_count: 10,
                 lexical_count: 18,
                 semantic_count: 30,
+                hash_control_count: 0,
                 latency_us,
                 memory_bytes: Some(1_835_008),
             },
@@ -970,6 +979,7 @@ mod tests {
             result_count: 10,
             lexical_count: 18,
             semantic_count: 30,
+            hash_control_count: 0,
             latency_us: 8_421,
             memory_bytes: Some(1_835_008),
         };
@@ -1076,6 +1086,7 @@ mod tests {
                 result_count: 0,
                 lexical_count: 0,
                 semantic_count: 0,
+                hash_control_count: 0,
                 latency_us: 0,
                 memory_bytes: None,
             },
@@ -1901,6 +1912,7 @@ mod tests {
                 result_count: 0,
                 lexical_count: 0,
                 semantic_count: 0,
+                hash_control_count: 0,
                 latency_us: 0,
                 memory_bytes: None,
             },
@@ -1916,6 +1928,7 @@ mod tests {
                 result_count: 5,
                 lexical_count: 3,
                 semantic_count: 2,
+                hash_control_count: 0,
                 latency_us: 100,
                 memory_bytes: None,
             },
