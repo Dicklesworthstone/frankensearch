@@ -35,7 +35,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument, warn};
 
 use crate::connection::{
-    Storage, fsqlite_cx, map_storage_error_at, retry_transient_storage, unretryable_rollback_error,
+    Storage, fsqlite_cx, map_storage_error_at, retry_transient_storage,
+    retry_transient_storage_async, unretryable_rollback_error,
 };
 use crate::schema::PORTER_FTS5_REBUILD_TABLE;
 
@@ -418,8 +419,18 @@ impl PersistedFts5LexicalSearch {
     /// cannot be established.
     pub async fn current_doc_count(&self, cx: &Cx) -> SearchResult<usize> {
         let fsqlite_cx = fsqlite_cx(cx);
-        persisted_fts5_verified_doc_count(&fsqlite_cx, self.storage.connection(), &self.table_name)
-            .await
+        retry_transient_storage_async(
+            cx,
+            || {
+                persisted_fts5_verified_doc_count(
+                    &fsqlite_cx,
+                    self.storage.connection(),
+                    &self.table_name,
+                )
+            },
+            "persisted fts5 count",
+        )
+        .await
     }
 }
 
@@ -438,12 +449,6 @@ impl frankensearch_core::LexicalRead for PersistedFts5LexicalSearch {
             }
 
             let fsqlite_cx = fsqlite_cx(cx);
-            // This is intentionally in the live data path, not only in the
-            // rebuild helper: external DDL or marker changes fail the search
-            // closed before MATCH can return a stale Porter result.
-            ensure_porter_fts5_ready(&fsqlite_cx, self.storage.connection(), &self.table_name)
-                .await?;
-
             let limit = i64::try_from(limit).map_err(|_| SearchError::InvalidConfig {
                 field: "fts5.limit".to_owned(),
                 value: limit.to_string(),
@@ -453,24 +458,39 @@ impl frankensearch_core::LexicalRead for PersistedFts5LexicalSearch {
                 SqliteValue::Text(query.to_owned().into()),
                 SqliteValue::Integer(limit),
             ];
-            let rows = self
-                .storage
-                .connection()
-                .query_with_params(
-                    &fsqlite_cx,
-                    &format!(
-                        "SELECT doc_id, metadata_json, bm25({0}) FROM {0} \
+            let sql = format!(
+                "SELECT doc_id, metadata_json, bm25({0}) FROM {0} \
                          WHERE {0} MATCH ?1 ORDER BY bm25({0}), rowid LIMIT ?2;",
-                        self.table_name
-                    ),
-                    &params,
-                )
-                .await
-                .map_err(|error| map_storage_error_at("persisted Porter FTS5 search", error))?;
-
-            rows.iter()
-                .map(decode_persisted_fts5_row)
-                .collect::<SearchResult<Vec<_>>>()
+                self.table_name
+            );
+            retry_transient_storage_async(
+                cx,
+                || async {
+                    // This is intentionally in the live data path, not only in
+                    // the rebuild helper: external DDL or marker changes fail
+                    // the search closed before MATCH can return a stale Porter
+                    // result.
+                    ensure_porter_fts5_ready(
+                        &fsqlite_cx,
+                        self.storage.connection(),
+                        &self.table_name,
+                    )
+                    .await?;
+                    let rows = self
+                        .storage
+                        .connection()
+                        .query_with_params(&fsqlite_cx, &sql, &params)
+                        .await
+                        .map_err(|error| {
+                            map_storage_error_at("persisted Porter FTS5 search", error)
+                        })?;
+                    rows.iter()
+                        .map(decode_persisted_fts5_row)
+                        .collect::<SearchResult<Vec<_>>>()
+                },
+                "persisted fts5 search",
+            )
+            .await
         })
     }
 

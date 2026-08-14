@@ -1,5 +1,7 @@
 use std::error::Error;
 use std::fmt;
+#[cfg(feature = "fts5")]
+use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -125,6 +127,49 @@ pub(crate) fn retry_transient_storage<T>(
                     "retrying transient storage contention"
                 );
                 std::thread::sleep(delay);
+                attempt = attempt.saturating_add(1);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(feature = "fts5")]
+pub(crate) async fn retry_transient_storage_async<T, F, Fut>(
+    cx: &Cx,
+    mut op: F,
+    context: &'static str,
+) -> SearchResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = SearchResult<T>>,
+{
+    let mut attempt = 1;
+    loop {
+        if let Err(error) = cx.checkpoint() {
+            return Err(SearchError::Cancelled {
+                phase: context.to_owned(),
+                reason: cx
+                    .cancel_reason()
+                    .map_or_else(|| error.to_string(), |reason| reason.to_string()),
+            });
+        }
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if is_retryable_storage_error(&error) && attempt < CONNECTION_OPEN_MAX_ATTEMPTS =>
+            {
+                let delay = connection_open_retry_delay(attempt);
+                tracing::debug!(
+                    target: "frankensearch.storage",
+                    context,
+                    next_attempt = attempt.saturating_add(1),
+                    max_attempts = CONNECTION_OPEN_MAX_ATTEMPTS,
+                    ?delay,
+                    error = %error,
+                    "retrying transient storage contention"
+                );
+                asupersync::time::sleep(cx.now(), delay).await;
                 attempt = attempt.saturating_add(1);
             }
             Err(error) => return Err(error),
@@ -860,6 +905,35 @@ mod tests {
         .expect("BusySnapshot should succeed after bounded retries");
         assert_eq!(value, 7);
         assert_eq!(attempts, 3);
+    }
+
+    #[cfg(feature = "fts5")]
+    #[test]
+    fn retry_transient_storage_async_retries_busy_snapshot_then_succeeds() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let attempts = std::cell::Cell::new(0_u32);
+            let value = super::retry_transient_storage_async(
+                &cx,
+                || {
+                    let next = attempts.get().saturating_add(1);
+                    attempts.set(next);
+                    async move {
+                        if next < 3 {
+                            Err(super::map_storage_error(FrankenError::BusySnapshot {
+                                conflicting_pages: "p1".to_owned(),
+                            }))
+                        } else {
+                            Ok(7_i32)
+                        }
+                    }
+                },
+                "test",
+            )
+            .await
+            .expect("BusySnapshot should succeed after bounded retries");
+            assert_eq!(value, 7);
+            assert_eq!(attempts.get(), 3);
+        });
     }
 
     #[test]
