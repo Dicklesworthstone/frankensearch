@@ -200,6 +200,15 @@ fn is_shipped_hash_embedder(embedder: &dyn Embedder) -> bool {
     frankensearch_core::is_hash_generation_id(embedder.id())
 }
 
+#[must_use]
+fn vector_exclusion_source(embedder: &dyn Embedder) -> &'static str {
+    if is_shipped_hash_embedder(embedder) {
+        "hash_control"
+    } else {
+        "semantic"
+    }
+}
+
 /// Progressive two-tier search orchestrator.
 ///
 /// Coordinates fast-tier embedding, optional lexical search, RRF fusion,
@@ -1820,7 +1829,12 @@ impl TwoTierSearcher {
                 let prefilter_empty = fast_hits.is_empty();
                 self.apply_score_calibration_to_hits(&mut fast_hits);
                 let fast_hits = if let Some(exclusions) = normalized_exclusions {
-                    filter_vector_hits_by_negations(fast_hits, exclusions, text_fn, "semantic")
+                    filter_vector_hits_by_negations(
+                        fast_hits,
+                        exclusions,
+                        text_fn,
+                        vector_exclusion_source(self.fast_embedder.as_ref()),
+                    )
                 } else {
                     fast_hits
                 };
@@ -8962,6 +8976,15 @@ mod tests {
         let exclusions = to_exclusions(&parsed);
         let results = filter_vector_hits_by_negations(vec![], &exclusions, &|_| None, "test");
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn vector_exclusion_source_is_hash_control_for_hash_embedder() {
+        let hash = NonSemanticEmbedder::new("fnv1a-test", 4);
+        let semantic = StubEmbedder::new("fast", 4);
+        assert_eq!(vector_exclusion_source(&hash), "hash_control");
+        assert_eq!(vector_exclusion_source(&semantic), "semantic");
+        assert!(!vector_exclusion_source(&hash).contains("semantic"));
     }
 
     #[test]

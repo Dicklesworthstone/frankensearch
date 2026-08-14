@@ -3496,6 +3496,7 @@ mod tests {
 
     const TEST_MACHINE_FINGERPRINT: &str =
         "linux-x86_64-test-machine-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores";
+    const QG6_TEST_SCHEDULE_SEED: u64 = 0x5156_0006;
 
     fn reseal_evidence_without_verification(evidence: &mut PerfEvidenceArtifact) {
         const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -3512,11 +3513,13 @@ mod tests {
         evidence.artifact_sha256 = seal;
     }
 
-    fn seal_evidence(evidence: &mut PerfEvidenceArtifact) {
+    fn seal_evidence(
+        evidence: &mut PerfEvidenceArtifact,
+        qg6_authorities: &[&Qg6ScheduleAuthority],
+    ) {
         reseal_evidence_without_verification(evidence);
-        let qg6_authorities = retained_qg6_authorities(evidence);
         evidence
-            .verify_integrity_against_authorities(&[], &qg6_authorities)
+            .verify_integrity_against_authorities(&[], qg6_authorities)
             .expect("test evidence must be integrity-valid after sealing");
     }
 
@@ -3528,6 +3531,7 @@ mod tests {
         artifact: &PerfGateArtifact,
         evidence: &mut PerfEvidenceArtifact,
         run_label: &str,
+        qg6_authorities: &[&Qg6ScheduleAuthority],
     ) -> Result<(), EvidenceArtifactError> {
         evidence.machine_class = crate::MachineClassEvidenceBinding::unverified(
             "sealed runner receipt has not been bound",
@@ -3535,19 +3539,7 @@ mod tests {
         evidence.gate_decision = None;
         evidence.artifact_sha256.clear();
         reseal_evidence_without_verification(evidence);
-        let qg6_authorities = evidence
-            .cells
-            .iter()
-            .filter_map(|cell| match &cell.body {
-                EvidenceCellBody::Paired {
-                    qg6_protocol: Some(protocol),
-                    ..
-                } => Some(protocol.schedule_authority.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let qg6_authority_refs = qg6_authorities.iter().collect::<Vec<_>>();
-        evidence.verify_integrity_against_authorities(&[], &qg6_authority_refs)?;
+        evidence.verify_integrity_against_authorities(&[], qg6_authorities)?;
         let evidence_bytes =
             serde_json::to_vec_pretty(evidence).expect("pre-binding evidence bytes");
         let threshold_bytes = threshold_artifact_bytes(artifact);
@@ -3576,18 +3568,19 @@ mod tests {
             &threshold_bytes,
             &evidence_bytes,
             &[],
-            &qg6_authority_refs,
+            qg6_authorities,
         )?;
         reseal_evidence_without_verification(evidence);
-        evidence.verify_integrity_against_authorities(&[], &qg6_authority_refs)
+        evidence.verify_integrity_against_authorities(&[], qg6_authorities)
     }
 
     fn bind_test_evidence(
         artifact: &PerfGateArtifact,
         evidence: &mut PerfEvidenceArtifact,
         run_label: &str,
+        qg6_authorities: &[&Qg6ScheduleAuthority],
     ) {
-        try_bind_test_evidence(artifact, evidence, run_label)
+        try_bind_test_evidence(artifact, evidence, run_label, qg6_authorities)
             .expect("bind test evidence to exact receipt artifacts");
     }
 
@@ -3613,12 +3606,18 @@ mod tests {
             if let EvidenceCellBody::Paired {
                 paired,
                 treatment_arm_null,
+                qg6_protocol,
                 ..
             } = &mut cell.body
             {
                 mutate_experiment(paired, &mut mutate);
                 if let Some(treatment_arm_null) = treatment_arm_null {
                     mutate_experiment(treatment_arm_null, &mut mutate);
+                }
+                if let Some(qg6_protocol) = qg6_protocol {
+                    for sample in &mut qg6_protocol.quill_null_samples {
+                        mutate(&mut sample.provenance);
+                    }
                 }
             }
         }
@@ -4306,8 +4305,37 @@ mod tests {
             vec![cell],
         )
         .expect("evidence artifact");
-        bind_test_evidence(&artifact, &mut evidence, run_id);
+        bind_test_evidence(&artifact, &mut evidence, run_id, &[]);
         (artifact, evidence)
+    }
+
+    fn qg6_fixture_authority_for_cell<const ROUNDS: usize>(
+        query_class: crate::PerfQueryClass,
+        k: usize,
+        document_count: u64,
+        searches_per_sample: usize,
+        full_top_k_receipts: bool,
+        schedule_seed: u64,
+    ) -> Qg6ScheduleAuthority {
+        let (identity, contract) = if full_top_k_receipts {
+            qg6_test_fixture::contract_for_full_top_k(query_class, document_count, k)
+        } else {
+            qg6_test_fixture::contract_for(query_class, document_count, k)
+        };
+        Qg6ScheduleAuthority::for_experiment(
+            crate::Qg6ExperimentIdentity {
+                corpus_sha256: identity.prepared_corpus_sha256,
+                query_manifest_sha256: identity.query_manifest_sha256,
+                config_contract_sha256: identity.config_contract_sha256,
+                document_count: contract.document_count,
+                k: contract.k,
+            },
+            contract.groups.len(),
+            ROUNDS,
+            searches_per_sample,
+            schedule_seed,
+        )
+        .expect("independently construct QG-6 fixture authority")
     }
 
     fn qg6_current_pair<const GROUPS: usize>(
@@ -4322,6 +4350,14 @@ mod tests {
         effect_group_ratios: [[f64; 3]; GROUPS],
         null_group_ratios: [[f64; 3]; GROUPS],
     ) -> (PerfGateArtifact, PerfEvidenceArtifact) {
+        let authority = qg6_fixture_authority_for_cell::<3>(
+            crate::PerfQueryClass::Identifier,
+            10,
+            100_000,
+            1,
+            false,
+            QG6_TEST_SCHEDULE_SEED,
+        );
         qg6_current_pair_for_cell(
             run_id,
             effect_group_ratios,
@@ -4334,6 +4370,7 @@ mod tests {
             1,
             crate::perf::PERF_BOOTSTRAP_RESAMPLES,
             false,
+            &authority,
         )
     }
 
@@ -4350,6 +4387,7 @@ mod tests {
         searches_per_sample: usize,
         bootstrap_resamples: usize,
         full_top_k_receipts: bool,
+        authority: &Qg6ScheduleAuthority,
     ) -> (PerfGateArtifact, PerfEvidenceArtifact) {
         assert!(GROUPS > 0 && ROUNDS >= 2 && searches_per_sample > 0);
         let scope = crate::perf::perf_operation_scope(PerfGate::Qg6, fixture, "latency_ms");
@@ -4366,8 +4404,9 @@ mod tests {
             worker_id: TEST_MACHINE_FINGERPRINT.to_owned(),
             build_profile: "release-perf".to_owned(),
         };
-        let order = seeded_balanced_pair_order(crate::QG6_QUERY_GROUPS * ROUNDS, 0x5156_0006)
-            .expect("balanced QG-6 pair order");
+        let order =
+            seeded_balanced_pair_order(crate::QG6_QUERY_GROUPS * ROUNDS, authority.schedule_seed)
+                .expect("balanced QG-6 pair order");
         let stream = |group_ratios: &[[f64; ROUNDS]; GROUPS], sample_base: u64| {
             let mut samples = Vec::with_capacity(crate::QG6_QUERY_GROUPS * ROUNDS * 2);
             let mut ordinal = 0_usize;
@@ -4416,24 +4455,10 @@ mod tests {
         let mut effect_samples = stream(&effect_group_ratios, 0);
         let mut null_samples = stream(&null_group_ratios, 100_000);
         let mut quill_null_samples = stream(&[[1.0; ROUNDS]; GROUPS], 200_000);
-        let authority = crate::Qg6ScheduleAuthority::for_experiment(
-            crate::Qg6ExperimentIdentity {
-                corpus_sha256: input_identity.prepared_corpus_sha256.clone(),
-                query_manifest_sha256: input_identity.query_manifest_sha256.clone(),
-                config_contract_sha256: input_identity.config_contract_sha256.clone(),
-                document_count: semantic_contract.document_count,
-                k: semantic_contract.k,
-            },
-            semantic_contract.groups.len(),
-            ROUNDS,
-            searches_per_sample,
-            0x5156_0006,
-        )
-        .expect("QG-6 ratchet fixture authority");
         qg6_test_fixture::attach_stream_against_schedule_authority_with_leaf_latencies(
             &mut effect_samples,
             crate::Qg6Comparison::Effect,
-            &authority,
+            authority,
             &input_identity,
             &semantic_contract,
             |sample, parent_latency_ns| {
@@ -4457,13 +4482,13 @@ mod tests {
             qg6_test_fixture::attach_stream_against_schedule_authority_with_leaf_latencies(
                 samples,
                 comparison,
-                &authority,
+                authority,
                 &input_identity,
                 &semantic_contract,
                 |_, parent_latency_ns| vec![parent_latency_ns; searches_per_sample],
             );
         }
-        let mut estimator_config = PairedEstimatorConfig::predeclared(0x5156_0006);
+        let mut estimator_config = PairedEstimatorConfig::predeclared(QG6_TEST_SCHEDULE_SEED);
         estimator_config.bootstrap_resamples = bootstrap_resamples;
         let paired = estimate_paired_experiment(&effect_samples, &null_samples, &estimator_config)
             .expect("QG-6 paired evidence");
@@ -4472,7 +4497,7 @@ mod tests {
         let protocol = crate::Qg6FormalProtocolEvidence::new_against_authority(
             &paired,
             quill_null_samples,
-            &authority,
+            authority,
             &input_identity,
             &semantic_contract,
         )
@@ -4496,7 +4521,7 @@ mod tests {
         cell.attach_qg6_formal_protocol_against_authority(
             protocol,
             &EvidencePolicy::predeclared(),
-            &authority,
+            authority,
         )
         .expect("attach QG-6 ratchet fixture formal protocol");
         let paired = match &cell.body {
@@ -4607,7 +4632,7 @@ mod tests {
             vec![cell],
         )
         .expect("QG-6 evidence artifact");
-        bind_test_evidence(&artifact, &mut evidence, run_id);
+        bind_test_evidence(&artifact, &mut evidence, run_id, &[authority]);
         (artifact, evidence)
     }
 
@@ -4624,6 +4649,45 @@ mod tests {
         )
     }
 
+    fn qg6_fixture_authorities_for_shape<const ROUNDS: usize>(
+        searches_per_sample: usize,
+        full_top_k_receipts: bool,
+    ) -> Vec<Qg6ScheduleAuthority> {
+        qg6_fixture_authorities_for_shape_and_seed::<ROUNDS>(
+            searches_per_sample,
+            full_top_k_receipts,
+            QG6_TEST_SCHEDULE_SEED,
+        )
+    }
+
+    fn qg6_fixture_authorities_for_shape_and_seed<const ROUNDS: usize>(
+        searches_per_sample: usize,
+        full_top_k_receipts: bool,
+        schedule_seed: u64,
+    ) -> Vec<Qg6ScheduleAuthority> {
+        PerfMatrixSpec::complete()
+            .for_gate(PerfGate::Qg6)
+            .into_iter()
+            .map(|spec| {
+                let query_class = spec.query_class.expect("QG-6 query class");
+                let k = spec.k.expect("QG-6 k");
+                let document_count = spec.document_count.expect("QG-6 document count");
+                qg6_fixture_authority_for_cell::<ROUNDS>(
+                    query_class,
+                    k,
+                    document_count,
+                    searches_per_sample,
+                    full_top_k_receipts,
+                    schedule_seed,
+                )
+            })
+            .collect()
+    }
+
+    fn qg6_default_fixture_authorities() -> Vec<Qg6ScheduleAuthority> {
+        qg6_fixture_authorities_for_shape::<3>(1, false)
+    }
+
     fn qg6_complete_pair_with_shape<const GROUPS: usize, const ROUNDS: usize>(
         run_id: &str,
         group_ratios: [[f64; ROUNDS]; GROUPS],
@@ -4631,11 +4695,38 @@ mod tests {
         bootstrap_resamples: usize,
         full_top_k_receipts: bool,
     ) -> (PerfGateArtifact, PerfEvidenceArtifact) {
+        qg6_complete_pair_with_shape_and_seed(
+            run_id,
+            group_ratios,
+            searches_per_sample,
+            bootstrap_resamples,
+            full_top_k_receipts,
+            QG6_TEST_SCHEDULE_SEED,
+        )
+    }
+
+    fn qg6_complete_pair_with_shape_and_seed<const GROUPS: usize, const ROUNDS: usize>(
+        run_id: &str,
+        group_ratios: [[f64; ROUNDS]; GROUPS],
+        searches_per_sample: usize,
+        bootstrap_resamples: usize,
+        full_top_k_receipts: bool,
+        schedule_seed: u64,
+    ) -> (PerfGateArtifact, PerfEvidenceArtifact) {
         let mut rows = Vec::new();
         let mut cells = Vec::new();
+        let authorities = qg6_fixture_authorities_for_shape_and_seed::<ROUNDS>(
+            searches_per_sample,
+            full_top_k_receipts,
+            schedule_seed,
+        );
         let mut artifact_template = None;
         let mut evidence_template = None;
-        for spec in PerfMatrixSpec::complete().for_gate(PerfGate::Qg6) {
+        for (spec, authority) in PerfMatrixSpec::complete()
+            .for_gate(PerfGate::Qg6)
+            .into_iter()
+            .zip(&authorities)
+        {
             let query_class = spec.query_class.expect("QG-6 query class");
             let k = spec.k.expect("QG-6 k");
             let document_count = spec.document_count.expect("QG-6 document count");
@@ -4651,6 +4742,7 @@ mod tests {
                 searches_per_sample,
                 bootstrap_resamples,
                 full_top_k_receipts,
+                authority,
             );
             rows.extend(cell_artifact.cells.iter().cloned());
             cells.push(cell_evidence.cells.remove(0));
@@ -4668,7 +4760,8 @@ mod tests {
             cells,
         )
         .expect("complete QG-6 evidence");
-        bind_test_evidence(&artifact, &mut evidence, run_id);
+        let authority_refs = authorities.iter().collect::<Vec<_>>();
+        bind_test_evidence(&artifact, &mut evidence, run_id, &authority_refs);
         (artifact, evidence)
     }
 
@@ -4747,12 +4840,20 @@ mod tests {
         candidate_evidence: Option<&PerfEvidenceArtifact>,
         rerun_evidence: Option<&PerfEvidenceArtifact>,
     ) -> PerfRatchetEvaluation {
-        let candidate_qg6 = candidate_evidence
-            .map(retained_qg6_authorities)
+        let qg6_authorities = (candidate.gate == PerfGate::Qg6)
+            .then(qg6_default_fixture_authorities)
             .unwrap_or_default();
-        let rerun_qg6 = rerun_evidence
-            .map(retained_qg6_authorities)
-            .unwrap_or_default();
+        let qg6_authority_refs = qg6_authorities.iter().collect::<Vec<_>>();
+        let candidate_qg6 = if candidate_evidence.is_some() {
+            qg6_authority_refs.as_slice()
+        } else {
+            &[]
+        };
+        let rerun_qg6 = if rerun_evidence.is_some() {
+            qg6_authority_refs.as_slice()
+        } else {
+            &[]
+        };
         evaluate_perf_ratchet_inner(
             PerfRatchetRequest {
                 baseline: Some(baseline),
@@ -4772,50 +4873,43 @@ mod tests {
             PerfRatchetQg1AuthoritySets::empty(),
             PerfRatchetQg6AuthoritySets {
                 baseline: &[],
-                candidate: &candidate_qg6,
-                rerun: &rerun_qg6,
+                candidate: candidate_qg6,
+                rerun: rerun_qg6,
             },
             DecisionState::default(),
             false,
         )
     }
 
-    fn retained_qg6_authorities(evidence: &PerfEvidenceArtifact) -> Vec<&Qg6ScheduleAuthority> {
-        evidence
-            .cells
-            .iter()
-            .filter_map(|cell| match &cell.body {
-                EvidenceCellBody::Paired {
-                    qg6_protocol: Some(protocol),
-                    ..
-                } => Some(&protocol.schedule_authority),
-                _ => None,
-            })
-            .collect()
-    }
-
     fn evaluate_verified_promotion_request(
         request: PerfRatchetRequest<'_>,
     ) -> PerfRatchetEvaluation {
-        let baseline_qg6 = request
-            .baseline_evidence
-            .map(retained_qg6_authorities)
+        let qg6_authorities = (request.candidate.gate == PerfGate::Qg6)
+            .then(qg6_default_fixture_authorities)
             .unwrap_or_default();
-        let candidate_qg6 = request
-            .candidate_evidence
-            .map(retained_qg6_authorities)
-            .unwrap_or_default();
-        let rerun_qg6 = request
-            .rerun_evidence
-            .map(retained_qg6_authorities)
-            .unwrap_or_default();
+        let qg6_authority_refs = qg6_authorities.iter().collect::<Vec<_>>();
+        let baseline_qg6 = if request.baseline_evidence.is_some() {
+            qg6_authority_refs.as_slice()
+        } else {
+            &[]
+        };
+        let candidate_qg6 = if request.candidate_evidence.is_some() {
+            qg6_authority_refs.as_slice()
+        } else {
+            &[]
+        };
+        let rerun_qg6 = if request.rerun_evidence.is_some() {
+            qg6_authority_refs.as_slice()
+        } else {
+            &[]
+        };
         evaluate_perf_ratchet_against_authorities(
             request,
             PerfRatchetQg1AuthoritySets::empty(),
             PerfRatchetQg6AuthoritySets {
-                baseline: &baseline_qg6,
-                candidate: &candidate_qg6,
-                rerun: &rerun_qg6,
+                baseline: baseline_qg6,
+                candidate: candidate_qg6,
+                rerun: rerun_qg6,
             },
         )
     }
@@ -5011,9 +5105,10 @@ mod tests {
             .identity()
             .expect("candidate identity")
             .profile();
-        let baseline_authorities = retained_qg6_authorities(&baseline_evidence);
-        let mut candidate_authorities = retained_qg6_authorities(&candidate_evidence);
-        let rerun_authorities = retained_qg6_authorities(&rerun_evidence);
+        let retained_authorities = qg6_default_fixture_authorities();
+        let baseline_authorities = retained_authorities.iter().collect::<Vec<_>>();
+        let mut candidate_authorities = retained_authorities.iter().collect::<Vec<_>>();
+        let rerun_authorities = retained_authorities.iter().collect::<Vec<_>>();
         let original = candidate_authorities[0];
         let foreign = Qg6ScheduleAuthority::for_experiment(
             original.identity.clone(),
@@ -5056,6 +5151,69 @@ mod tests {
                 .iter()
                 .any(|reason| { reason.code == "perf.ratchet.machine_evidence_integrity_failed" })
         );
+        assert!(result.comparisons.is_empty());
+    }
+
+    #[test]
+    fn qg6_fixture_evaluator_refuses_self_authenticated_foreign_authorities() {
+        let ratios = [[1.0; 3]; 4];
+        let (baseline, baseline_evidence) = qg6_complete_pair("baseline", ratios);
+        let foreign_seed = QG6_TEST_SCHEDULE_SEED ^ 1;
+        let (candidate, candidate_evidence) = qg6_complete_pair_with_shape_and_seed(
+            "candidate",
+            ratios,
+            1,
+            crate::perf::PERF_BOOTSTRAP_RESAMPLES,
+            false,
+            foreign_seed,
+        );
+        let (rerun, rerun_evidence) = qg6_complete_pair("rerun", ratios);
+        let foreign_authorities =
+            qg6_fixture_authorities_for_shape_and_seed::<3>(1, false, foreign_seed);
+        let foreign_authority_refs = foreign_authorities.iter().collect::<Vec<_>>();
+        candidate_evidence
+            .verify_integrity_against_authorities(&[], &foreign_authority_refs)
+            .expect("foreign-seeded fixture must be internally self-consistent");
+        for (candidate_cell, rerun_cell) in
+            candidate_evidence.cells.iter().zip(&rerun_evidence.cells)
+        {
+            let EvidenceCellBody::Paired {
+                paired: candidate_paired,
+                ..
+            } = &candidate_cell.body
+            else {
+                panic!("QG-6 candidate cell must be paired");
+            };
+            let EvidenceCellBody::Paired {
+                paired: rerun_paired,
+                ..
+            } = &rerun_cell.body
+            else {
+                panic!("QG-6 rerun cell must be paired");
+            };
+            assert_eq!(candidate_paired.config, rerun_paired.config);
+        }
+        let expected_profile = candidate_evidence
+            .machine_class
+            .identity()
+            .expect("candidate identity")
+            .profile();
+
+        let result = evaluate_verified_promotion(
+            &baseline,
+            &baseline_evidence,
+            &candidate,
+            &candidate_evidence,
+            &rerun,
+            &rerun_evidence,
+            expected_profile,
+        );
+
+        assert_eq!(result.decision, PerfGateDecision::Block, "{result:#?}");
+        assert!(result.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.machine_evidence_integrity_failed"
+                && reason.message.contains("independently retained")
+        }));
         assert!(result.comparisons.is_empty());
     }
 
@@ -5160,11 +5318,13 @@ mod tests {
 
         let bytes = serde_json::to_vec_pretty(&evidence)
             .expect("serialize complete production-cardinality QG-6 evidence");
-        let qg6_authorities = retained_qg6_authorities(&evidence);
+        let qg6_authorities =
+            qg6_fixture_authorities_for_shape::<2>(crate::QG6_TIMED_SEARCHES_PER_SAMPLE, true);
+        let qg6_authority_refs = qg6_authorities.iter().collect::<Vec<_>>();
         let reparsed = PerfEvidenceArtifact::from_verified_slice_against_authorities(
             &bytes,
             &[],
-            &qg6_authorities,
+            &qg6_authority_refs,
         )
         .expect("reparse complete production-cardinality QG-6 evidence");
         assert_eq!(reparsed, evidence, "compact QG-6 wire changed evidence");
@@ -5330,10 +5490,13 @@ mod tests {
             .as_mut()
             .expect("current threshold projection")
             .host_identity = "caller-forged-host".to_owned();
+        let candidate_qg6_authorities = qg6_default_fixture_authorities();
+        let candidate_qg6_authority_refs = candidate_qg6_authorities.iter().collect::<Vec<_>>();
         bind_test_evidence(
             &candidate,
             &mut candidate_evidence,
             "candidate-forged-projection",
+            &candidate_qg6_authority_refs,
         );
         let expected_profile = candidate_evidence
             .machine_class
@@ -5371,10 +5534,13 @@ mod tests {
             .machine
             .execution
             .physical_cores = 63;
+        let candidate_qg6_authorities = qg6_default_fixture_authorities();
+        let candidate_qg6_authority_refs = candidate_qg6_authorities.iter().collect::<Vec<_>>();
         let error = try_bind_test_evidence(
             &candidate,
             &mut candidate_evidence,
             "candidate-forged-topology",
+            &candidate_qg6_authority_refs,
         )
         .expect_err("forged topology must fail before ratchet evaluation");
         assert!(matches!(
@@ -5878,11 +6044,13 @@ mod tests {
         let (baseline, baseline_evidence) = qg6_complete_pair("baseline", ratios);
         let (candidate, candidate_evidence) = qg6_complete_pair("candidate", ratios);
         let (rerun, mut rerun_evidence) = qg6_complete_pair("rerun", ratios);
+        let rerun_qg6_authorities = qg6_default_fixture_authorities();
+        let rerun_qg6_authority_refs = rerun_qg6_authorities.iter().collect::<Vec<_>>();
         rerun_evidence.machine_class = crate::MachineClassEvidenceBinding::unverified(
             "sealed runner receipt has not been bound",
         );
         rerun_evidence.artifact_sha256.clear();
-        seal_evidence(&mut rerun_evidence);
+        seal_evidence(&mut rerun_evidence, &rerun_qg6_authority_refs);
         let threshold_bytes = threshold_artifact_bytes(&rerun);
         let evidence_bytes =
             serde_json::to_vec_pretty(&rerun_evidence).expect("rerun pre-binding evidence");
@@ -5909,13 +6077,15 @@ mod tests {
                 &evidence_bytes,
             );
         rerun_evidence
-            .bind_machine_class_identity(
+            .bind_machine_class_identity_against_authorities(
                 alternate_producer.clone(),
                 &threshold_bytes,
                 &evidence_bytes,
+                &[],
+                &rerun_qg6_authority_refs,
             )
             .expect("bind alternate producer identity");
-        seal_evidence(&mut rerun_evidence);
+        seal_evidence(&mut rerun_evidence, &rerun_qg6_authority_refs);
         let expected_profile = candidate_evidence
             .machine_class
             .identity()
@@ -5954,6 +6124,8 @@ mod tests {
         let (baseline, baseline_evidence) = qg6_complete_pair("baseline", ratios);
         let (candidate, candidate_evidence) = qg6_complete_pair("candidate", ratios);
         let (rerun, mut rerun_evidence) = qg6_complete_pair("rerun", ratios);
+        let rerun_qg6_authorities = qg6_default_fixture_authorities();
+        let rerun_qg6_authority_refs = rerun_qg6_authorities.iter().collect::<Vec<_>>();
         let alternate_executable = "7".repeat(64);
         rerun_evidence
             .provenance
@@ -5969,7 +6141,7 @@ mod tests {
             "sealed runner receipt has not been bound",
         );
         rerun_evidence.artifact_sha256.clear();
-        seal_evidence(&mut rerun_evidence);
+        seal_evidence(&mut rerun_evidence, &rerun_qg6_authority_refs);
         let threshold_bytes = threshold_artifact_bytes(&rerun);
         let evidence_bytes =
             serde_json::to_vec_pretty(&rerun_evidence).expect("rerun pre-binding evidence");
@@ -5995,13 +6167,15 @@ mod tests {
                 &evidence_bytes,
             );
         rerun_evidence
-            .bind_machine_class_identity(
+            .bind_machine_class_identity_against_authorities(
                 alternate_benchmark.clone(),
                 &threshold_bytes,
                 &evidence_bytes,
+                &[],
+                &rerun_qg6_authority_refs,
             )
             .expect("bind alternate benchmark identity");
-        seal_evidence(&mut rerun_evidence);
+        seal_evidence(&mut rerun_evidence, &rerun_qg6_authority_refs);
         let expected_profile = candidate_evidence
             .machine_class
             .identity()
@@ -6041,7 +6215,14 @@ mod tests {
             "evidence.test_diagnostic_mutation",
             "candidate was explicitly downgraded after collection",
         );
-        bind_test_evidence(&candidate, &mut candidate_evidence, "candidate-diagnostic");
+        let candidate_qg6_authorities = qg6_default_fixture_authorities();
+        let candidate_qg6_authority_refs = candidate_qg6_authorities.iter().collect::<Vec<_>>();
+        bind_test_evidence(
+            &candidate,
+            &mut candidate_evidence,
+            "candidate-diagnostic",
+            &candidate_qg6_authority_refs,
+        );
         let expected_profile = candidate_evidence
             .machine_class
             .identity()
@@ -6133,7 +6314,14 @@ mod tests {
         mutate_cell_sample_provenance(&mut baseline_evidence, |provenance| {
             provenance.run_id.clone_from(&reused_run_id);
         });
-        bind_test_evidence(&baseline, &mut baseline_evidence, "baseline-reused-run");
+        let baseline_qg6_authorities = qg6_default_fixture_authorities();
+        let baseline_qg6_authority_refs = baseline_qg6_authorities.iter().collect::<Vec<_>>();
+        bind_test_evidence(
+            &baseline,
+            &mut baseline_evidence,
+            "baseline-reused-run",
+            &baseline_qg6_authority_refs,
+        );
         let expected_profile = candidate_evidence
             .machine_class
             .identity()
@@ -6172,12 +6360,14 @@ mod tests {
         let (baseline, mut baseline_evidence) = qg6_complete_pair("baseline", ratios);
         let (candidate, candidate_evidence) = qg6_complete_pair("candidate", ratios);
         let (rerun, rerun_evidence) = qg6_complete_pair("rerun", ratios);
+        let baseline_qg6_authorities = qg6_default_fixture_authorities();
+        let baseline_qg6_authority_refs = baseline_qg6_authorities.iter().collect::<Vec<_>>();
         baseline_evidence.machine_class = crate::MachineClassEvidenceBinding::unverified(
             "sealed runner receipt has not been bound",
         );
         baseline_evidence.provenance.build.command_sha256 = "0".repeat(64);
         baseline_evidence.artifact_sha256.clear();
-        seal_evidence(&mut baseline_evidence);
+        seal_evidence(&mut baseline_evidence, &baseline_qg6_authority_refs);
         let threshold_bytes = threshold_artifact_bytes(&baseline);
         let evidence_bytes =
             serde_json::to_vec_pretty(&baseline_evidence).expect("alternate argv evidence");
@@ -6196,9 +6386,15 @@ mod tests {
                 &evidence_bytes,
             );
         baseline_evidence
-            .bind_machine_class_identity(alternate_identity, &threshold_bytes, &evidence_bytes)
+            .bind_machine_class_identity_against_authorities(
+                alternate_identity,
+                &threshold_bytes,
+                &evidence_bytes,
+                &[],
+                &baseline_qg6_authority_refs,
+            )
             .expect("bind alternate exact argv identity");
-        seal_evidence(&mut baseline_evidence);
+        seal_evidence(&mut baseline_evidence, &baseline_qg6_authority_refs);
         let expected_profile = candidate_evidence
             .machine_class
             .identity()
@@ -6893,6 +7089,14 @@ mod tests {
 
     #[test]
     fn qg6_ratchet_requires_leaf_derived_absolute_projection() {
+        let authority = qg6_fixture_authority_for_cell::<3>(
+            crate::PerfQueryClass::Identifier,
+            10,
+            100_000,
+            3,
+            false,
+            QG6_TEST_SCHEDULE_SEED,
+        );
         let (mut artifact, evidence) = qg6_current_pair_for_cell(
             "leaf-tail-projection",
             [[1.0; 3]; 4],
@@ -6905,6 +7109,7 @@ mod tests {
             3,
             crate::perf::PERF_BOOTSTRAP_RESAMPLES,
             false,
+            &authority,
         );
         let cell = evidence.cells.first().expect("QG-6 evidence cell");
         let (paired, protocol) = match &cell.body {

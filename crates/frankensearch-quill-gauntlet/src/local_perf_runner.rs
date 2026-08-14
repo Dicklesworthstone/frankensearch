@@ -9577,22 +9577,58 @@ mod tests {
                 forwarder,
                 &mut handshake_log,
                 "qg1-authority-handshake-test-run",
-                EMBEDDED_PRODUCER_GIT_REVISION,
-                EMBEDDED_PRODUCER_GIT_DIRTY == "false",
+                // The fixture exercises the startup protocol, not the checkout
+                // that happened to compile libtest. A dirty shared worktree is
+                // correctly non-promotable in production, but must not preempt
+                // these ACK/refusal cases before their named boundary.
+                "dddddddddddddddddddddddddddddddddddddddd",
+                true,
             )
             .expect("drive the real QG-1 parent wait/kill/reap boundary");
         descendant_scope
             .restore()
             .expect("restore QG-1 test descendant scope");
-        // The ordering this fix establishes, asserted rather than assumed: a
-        // scope entered BEFORE the spawn contains the intended child, so
-        // reconciliation reports zero escaped descendants. Entering after the
-        // spawn made that same child pre-existing, which is what the central
-        // run refused.
-        let (_, escaped_descendants) = reconciliation;
+        // Successful children finish their short-lived shell helpers before
+        // exit and therefore prove an always-empty descendant tree. Rejected
+        // children are killed while blocked in `dd` or `sleep`; the shell and
+        // helper share the owned process group, but Linux may reparent the
+        // helper between the group signal and the first descendant scan. The
+        // production reconciliation contract explicitly admits that race only
+        // when it observes, kills, and reaps every such descendant.
+        let (quiescence, escaped_descendants) = reconciliation;
+        #[cfg(target_os = "linux")]
+        {
+            if matches!(case, "ack" | "tokenizer_zero" | "natural_exit") {
+                assert_eq!(
+                    (quiescence, escaped_descendants),
+                    (
+                        LocalPerfProcessTreeQuiescence::LinuxSubreaperVerifiedEmpty,
+                        0
+                    ),
+                    "a successful or naturally exited fixture must never leave a descendant"
+                );
+            } else {
+                match quiescence {
+                    LocalPerfProcessTreeQuiescence::LinuxSubreaperVerifiedEmpty => {
+                        assert_eq!(escaped_descendants, 0);
+                    }
+                    LocalPerfProcessTreeQuiescence::LinuxSubreaperReapedEscapedDescendants => {
+                        assert!(
+                            escaped_descendants > 0,
+                            "reaped-descendant quiescence must name at least one observed descendant"
+                        );
+                    }
+                    LocalPerfProcessTreeQuiescence::DirectChildOnly => {
+                        panic!("Linux QG-1 fixture must prove descendant-tree quiescence");
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
         assert_eq!(
-            escaped_descendants, 0,
-            "a scope entered before the spawn must contain the intended child, leaving no escaped descendant"
+            (quiescence, escaped_descendants),
+            (LocalPerfProcessTreeQuiescence::DirectChildOnly, 0),
+            "non-Linux fixtures can prove only direct-child completion"
         );
         let mut retained_log_reader = File::from(
             openat(
