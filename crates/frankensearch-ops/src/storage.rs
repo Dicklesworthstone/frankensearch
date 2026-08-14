@@ -3749,11 +3749,14 @@ where
 }
 
 fn is_retryable_storage_contention(error: &SearchError) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
-    message.contains("busysnapshot")
-        || message.contains("busy")
-        || message.contains("locked")
-        || message.contains("snapshot")
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(err) = current {
+        if let Some(franken) = err.downcast_ref::<fsqlite::FrankenError>() {
+            return franken.is_transient();
+        }
+        current = err.source();
+    }
+    false
 }
 
 #[cfg(test)]
@@ -3768,7 +3771,8 @@ mod tests {
         OpsIngestionMetrics, OpsRetentionPolicy, OpsStorage, PendingEventsReservation,
         ResourceSampleRecord, SearchEventPhase, SearchEventRecord, SloHealth,
         SloMaterializationConfig, SloScope, SummaryWindow, bootstrap, current_version,
-        evidence_link_id, ops_error, parse_slo_search_p99_ms_override,
+        evidence_link_id, is_retryable_storage_contention, ops_error,
+        parse_slo_search_p99_ms_override,
     };
     use frankensearch_core::{
         LifecycleSeverity, LifecycleState, SearchError,
@@ -3777,7 +3781,7 @@ mod tests {
         TelemetryQueryClass, TelemetryResourceSample, TelemetrySearchMetrics, TelemetrySearchQuery,
         TelemetrySearchResults,
     };
-    use fsqlite::AsyncConnection;
+    use fsqlite::{AsyncConnection, FrankenError};
     use fsqlite_types::value::SqliteValue;
 
     // ----------------------------------------------------------------------
@@ -3793,6 +3797,32 @@ mod tests {
 
     fn pending_events(metrics: &Arc<OpsIngestionMetrics>) -> usize {
         metrics.snapshot().pending_events
+    }
+
+    #[test]
+    fn open_retry_accepts_typed_busy_snapshot() {
+        let error = ops_error(FrankenError::BusySnapshot {
+            conflicting_pages: "1,2".to_owned(),
+        });
+        assert!(is_retryable_storage_contention(&error));
+    }
+
+    #[test]
+    fn open_retry_rejects_string_lookalike_that_is_not_franken_transient() {
+        let error = SearchError::InvalidConfig {
+            field: "test".to_owned(),
+            value: "busy snapshot locked".to_owned(),
+            reason: "message text must not classify this as transient".to_owned(),
+        };
+        assert!(!is_retryable_storage_contention(&error));
+    }
+
+    #[test]
+    fn open_retry_rejects_non_transient_franken_error() {
+        let error = ops_error(FrankenError::NoSuchTable {
+            name: "missing".to_owned(),
+        });
+        assert!(!is_retryable_storage_contention(&error));
     }
 
     #[test]

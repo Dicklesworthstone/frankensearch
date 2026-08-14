@@ -89,7 +89,7 @@ ftui-backend = { workspace = true }
 ftui-extras = { workspace = true, features = ["markdown"] }
 # MIGRATION SHIM (temporary): fsfs's binary entrypoints still mint ambient
 # contexts via Cx::for_request() (main.rs:188, runtime.rs:1563, runtime.rs:6880),
-# which Asupersync 0.4.3 cfg-gates behind test-internals. fsfs is a LEAF
+# which Asupersync 0.4.x cfg-gates behind test-internals. fsfs is a LEAF
 # binary crate — no lib crate or external consumer (e.g. HFDT) has it in
 # their graph, so this does NOT re-leak test-internals downstream. Proper fix:
 # migrate the three sites to runtime-injected contexts (spawn_with_cx /

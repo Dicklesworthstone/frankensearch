@@ -5042,7 +5042,7 @@ impl FsfsRuntime {
             return Ok(());
         }
         if command == CliCommand::Download {
-            self.run_download_command().await?;
+            self.run_download_command(cx).await?;
             return Ok(());
         }
         if command == CliCommand::Doctor {
@@ -8363,8 +8363,8 @@ impl FsfsRuntime {
         Ok(())
     }
 
-    async fn run_download_command(&self) -> SearchResult<()> {
-        let payload = self.collect_download_models_payload().await?;
+    async fn run_download_command(&self, cx: &Cx) -> SearchResult<()> {
+        let payload = self.collect_download_models_payload(cx).await?;
         if self.cli_input.format == OutputFormat::Table {
             let table = render_download_models_table(&payload, self.cli_input.no_color);
             print!("{table}");
@@ -8387,7 +8387,10 @@ impl FsfsRuntime {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn collect_download_models_payload(&self) -> SearchResult<FsfsDownloadModelsPayload> {
+    async fn collect_download_models_payload(
+        &self,
+        cx: &Cx,
+    ) -> SearchResult<FsfsDownloadModelsPayload> {
         let model_root = self.resolve_download_model_root()?;
         let manifests = self.resolve_download_manifests()?;
         let operation = if self.cli_input.download_list {
@@ -8403,6 +8406,12 @@ impl FsfsRuntime {
         let show_progress = self.cli_input.format == OutputFormat::Table && !self.cli_input.quiet;
 
         for manifest in manifests {
+            cx.checkpoint().map_err(|error| SearchError::Cancelled {
+                phase: "download_models".to_owned(),
+                reason: cx
+                    .cancel_reason()
+                    .map_or_else(|| error.to_string(), |reason| reason.to_string()),
+            })?;
             let install_dir = Self::manifest_install_dir_name(&manifest);
             let destination = model_root.join(&install_dir);
             if let Some(entry) = Self::non_production_manifest_entry(
@@ -8469,10 +8478,9 @@ impl FsfsRuntime {
                             DownloadConsent::granted(ConsentSource::Programmatic),
                         );
                         let downloader = ModelDownloader::with_defaults();
-                        let cx = Cx::for_request();
                         let staged = downloader
                             .download_model(
-                                &cx,
+                                cx,
                                 &manifest,
                                 &model_root,
                                 &mut lifecycle,
@@ -27366,7 +27374,7 @@ mod tests {
 
     #[test]
     fn runtime_download_models_list_reports_missing_models() {
-        run_test_with_cx(|_cx| async move {
+        run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
             let mut config = FsfsConfig::default();
             config.indexing.model_dir = temp.path().join("models").display().to_string();
@@ -27377,7 +27385,7 @@ mod tests {
             });
 
             let payload = runtime
-                .collect_download_models_payload()
+                .collect_download_models_payload(&cx)
                 .await
                 .expect("list payload");
             assert_eq!(payload.operation, "list");
@@ -27436,7 +27444,7 @@ mod tests {
 
     #[test]
     fn runtime_download_models_explicit_non_production_manifest_is_error() {
-        run_test_with_cx(|_cx| async move {
+        run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
             let mut config = FsfsConfig::default();
             config.indexing.model_dir = temp.path().join("models").display().to_string();
@@ -27447,7 +27455,7 @@ mod tests {
             });
 
             let err = runtime
-                .collect_download_models_payload()
+                .collect_download_models_payload(&cx)
                 .await
                 .expect_err("explicit non-production download should fail");
             let message = err.to_string();
@@ -27458,7 +27466,7 @@ mod tests {
 
     #[test]
     fn runtime_download_models_verify_reports_mismatch() {
-        run_test_with_cx(|_cx| async move {
+        run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
             let model_root = temp.path().join("models");
             let potion_dir = model_root.join("potion-multilingual-128M");
@@ -27486,7 +27494,7 @@ mod tests {
                 ..CliInput::default()
             });
 
-            let result = runtime.collect_download_models_payload().await;
+            let result = runtime.collect_download_models_payload(&cx).await;
             assert!(
                 result.is_err(),
                 "corrupt model verification must fail closed"
@@ -27504,7 +27512,7 @@ mod tests {
 
     #[test]
     fn runtime_download_models_verify_reports_missing_as_error() {
-        run_test_with_cx(|_cx| async move {
+        run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
             let model_root = temp.path().join("models");
 
@@ -27517,7 +27525,7 @@ mod tests {
                 ..CliInput::default()
             });
 
-            let result = runtime.collect_download_models_payload().await;
+            let result = runtime.collect_download_models_payload(&cx).await;
             assert!(
                 result.is_err(),
                 "missing model verification must fail closed"

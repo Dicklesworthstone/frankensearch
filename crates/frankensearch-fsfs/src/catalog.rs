@@ -120,9 +120,40 @@ pub fn cleanup_tombstones_for_path(db_path: &Path, cutoff_ts_ms: i64) -> SearchR
     if !db_path.exists() {
         return Ok(0);
     }
-    let conn = Connection::open_sync(db_path.display().to_string()).map_err(catalog_error)?;
+    let conn = open_catalog_connection(&db_path.display().to_string())?;
     bootstrap_catalog_schema(&conn)?;
     cleanup_tombstones(&conn, cutoff_ts_ms)
+}
+
+const CATALOG_OPEN_MAX_ATTEMPTS: u32 = 8;
+const CATALOG_OPEN_RETRY_BASE_DELAY_MS: u64 = 1;
+const CATALOG_OPEN_RETRY_MAX_DELAY_MS: u64 = 50;
+
+fn open_catalog_connection(path: &str) -> SearchResult<Connection> {
+    let path = path.to_owned();
+    let mut attempt = 1;
+    loop {
+        match Connection::open_sync(path.clone()) {
+            Ok(conn) => return Ok(conn),
+            Err(error) if error.is_transient() && attempt < CATALOG_OPEN_MAX_ATTEMPTS => {
+                let growth = attempt.saturating_sub(1).min(6);
+                let delay_ms = (CATALOG_OPEN_RETRY_BASE_DELAY_MS << growth)
+                    .min(CATALOG_OPEN_RETRY_MAX_DELAY_MS);
+                tracing::debug!(
+                    target: "frankensearch.fsfs.catalog",
+                    path,
+                    next_attempt = attempt.saturating_add(1),
+                    max_attempts = CATALOG_OPEN_MAX_ATTEMPTS,
+                    delay_ms,
+                    error = %error,
+                    "retrying transient catalog connection-open contention"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                attempt = attempt.saturating_add(1);
+            }
+            Err(error) => return Err(catalog_error(error)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

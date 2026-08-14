@@ -63,11 +63,12 @@ frankensearch-quill = { version = "0.2.1", path = "crates/frankensearch-quill" }
 #   asupersync = { workspace = true, features = ["test-internals"] }
 # Same fix shape as frankensqlite (#104).
 # Keep this pin aligned with HFDT and FrankenSQLite so downstream workspaces
-# resolve a single Asupersync runtime universe. The 0.4.3 floor carries the
-# scoped test-logging and timer fixes required by this workspace; the <0.5
-# ceiling permits compatible 0.4.x source overrides without admitting a future
-# semver-major API line. [bd-3h229]
-asupersync = { version = ">=0.4.3, <0.5", default-features = false, features = ["proc-macros"] }
+# resolve a single Asupersync runtime universe. The 0.4.4 floor carries the
+# native-task abort contract (acknowledged Cancelled is preserved) plus the
+# HTTP/1 streaming cancel/reuse fixes; the <0.5 ceiling permits compatible
+# 0.4.x source overrides without admitting a future semver-major API line.
+# [bd-3h229]
+asupersync = { version = ">=0.4.4, <0.5", default-features = false, features = ["proc-macros"] }
 arc-swap = "=1.9.2"
 
 # Descriptor-relative generation-root admission. Keep the syscall surface

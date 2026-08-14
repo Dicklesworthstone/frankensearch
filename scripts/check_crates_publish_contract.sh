@@ -241,7 +241,7 @@ run_self_test() {
     '' \
     '[[package]]' \
     'name = "asupersync"' \
-    'version = "0.4.3"' \
+    'version = "0.4.4"' \
     'source = "registry+https://github.com/rust-lang/crates.io-index"' \
     '' \
     '[[package]]' \
@@ -539,7 +539,7 @@ run_self_test() {
     '' \
     '[[package]]' \
     'name = "asupersync"' \
-    'version = "0.4.3"' \
+    'version = "0.4.4"' \
     'source = "registry+https://example.invalid/index"' \
     '' \
     '[[package]]' \
@@ -574,7 +574,7 @@ run_self_test() {
     '' \
     '[[package]]' \
     'name = "asupersync"' \
-    'version = "0.4.3"' \
+    'version = "0.4.4"' \
     'source = "registry+https://github.com/rust-lang/crates.io-index"' \
     '' \
     '[[package]]' \
@@ -609,7 +609,7 @@ run_self_test() {
     '' \
     '[[package]]' \
     'name = "asupersync"' \
-    'version = "0.4.3"' \
+    'version = "0.4.4"' \
     'source = "registry+https://github.com/rust-lang/crates.io-index"' \
     '' \
     '[[package]]' \
@@ -625,7 +625,7 @@ run_self_test() {
     '' \
     '[[package]]' \
     'name = "asupersync"' \
-    'version = "0.4.3"' \
+    'version = "0.4.4"' \
     'source = "registry+https://github.com/rust-lang/crates.io-index"' >>"${source_root}/Cargo.lock"
 
   if bash "$script_path" \
@@ -765,15 +765,15 @@ validate_dependency_universe_lock() {
     ' "$LOCKFILE"
   )
   if (( ${#asupersync_identities[@]} != 1 )) \
-    || [[ "${asupersync_identities[0]:-}" != "asupersync@0.4.3|${registry_source}" ]]; then
+    || [[ "${asupersync_identities[0]:-}" != "asupersync@0.4.4|${registry_source}" ]]; then
     asupersync_identity_csv="$(IFS=,; printf '%s' "${asupersync_identities[*]:-<none>}")"
     add_blocker \
       "DEPENDENCY_UNIVERSE_ASUPERSYNC_LOCK_IDENTITY_INVALID" \
       "" \
       "asupersync" \
       "bd-3h229" \
-      "Cargo.lock must resolve exactly one Asupersync identity, asupersync@0.4.3|${registry_source}; found ${asupersync_identity_csv}." \
-      "Regenerate the lockfile only after restoring the audited Asupersync 0.4.3 registry identity."
+      "Cargo.lock must resolve exactly one Asupersync identity, asupersync@0.4.4|${registry_source}; found ${asupersync_identity_csv}." \
+      "Regenerate the lockfile only after restoring the audited Asupersync 0.4.4 registry identity."
   fi
 
   mapfile -t fsqlite_patch_revisions < <(

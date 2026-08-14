@@ -76,10 +76,50 @@ const CONNECTION_OPEN_RETRY_BASE_DELAY_MS: u64 = 1;
 const CONNECTION_OPEN_RETRY_MAX_DELAY_MS: u64 = 50;
 
 fn is_retryable_connection_open_error(error: &FrankenError) -> bool {
-    matches!(
-        error,
-        FrankenError::Busy | FrankenError::BusyRecovery | FrankenError::DatabaseLocked { .. }
-    )
+    // Prefer the engine's published retry family over a hand-rolled Busy
+    // subset. BusySnapshot / WriteConflict / SerializationFailure /
+    // PageBufferCapacityExhausted are the same transient class as Busy.
+    error.is_transient()
+}
+
+pub(crate) fn is_transient_storage_error(error: &SearchError) -> bool {
+    let mut current: Option<&(dyn Error + 'static)> = Some(error);
+    while let Some(err) = current {
+        if let Some(franken) = err.downcast_ref::<FrankenError>() {
+            return franken.is_transient();
+        }
+        current = err.source();
+    }
+    false
+}
+
+pub(crate) fn retry_transient_storage<T>(
+    mut op: impl FnMut() -> SearchResult<T>,
+    context: &'static str,
+) -> SearchResult<T> {
+    let mut attempt = 1;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if is_transient_storage_error(&error) && attempt < CONNECTION_OPEN_MAX_ATTEMPTS =>
+            {
+                let delay = connection_open_retry_delay(attempt);
+                tracing::debug!(
+                    target: "frankensearch.storage",
+                    context,
+                    next_attempt = attempt.saturating_add(1),
+                    max_attempts = CONNECTION_OPEN_MAX_ATTEMPTS,
+                    ?delay,
+                    error = %error,
+                    "retrying transient storage contention"
+                );
+                std::thread::sleep(delay);
+                attempt = attempt.saturating_add(1);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn connection_open_retry_delay(failed_attempt: u32) -> Duration {
@@ -230,18 +270,17 @@ impl Storage {
     /// install only the exact schema surface under test. Keeping this seam
     /// test-only prevents production callers from bypassing bootstrap.
     #[cfg(all(test, feature = "fts5"))]
-    pub(crate) async fn open_unbootstrapped_in_memory_for_test(cx: &Cx) -> SearchResult<Self> {
+    pub(crate) async fn open_unbootstrapped_in_memory_for_test(_cx: &Cx) -> SearchResult<Self> {
         let config = StorageConfig::in_memory();
         let path = config.db_path.to_string_lossy().to_string();
-        let conn = open_connection_with_retry(cx, &path)
-            .await
+        let conn = open_connection_with_retry(&path)
             .map_err(|error| map_storage_error_at("test connection open", error))?;
         let storage = Self {
             conn,
             config,
             metrics: StorageMetrics::default(),
         };
-        storage.apply_pragmas(cx).await?;
+        storage.apply_pragmas()?;
         Ok(storage)
     }
 
@@ -262,7 +301,7 @@ impl Storage {
 
     pub fn transaction<F, T>(&self, f: F) -> SearchResult<T>
     where
-        F: FnOnce(&AsyncConnection) -> SearchResult<T>,
+        F: FnMut(&AsyncConnection) -> SearchResult<T>,
     {
         self.transaction_with_mode(self.config.begin_sql(), f)
     }
@@ -275,14 +314,24 @@ impl Storage {
     /// (e.g. `claim_batch`).
     pub fn immediate_transaction<F, T>(&self, f: F) -> SearchResult<T>
     where
-        F: FnOnce(&AsyncConnection) -> SearchResult<T>,
+        F: FnMut(&AsyncConnection) -> SearchResult<T>,
     {
         self.transaction_with_mode("BEGIN IMMEDIATE;", f)
     }
 
-    fn transaction_with_mode<F, T>(&self, begin_sql: &str, f: F) -> SearchResult<T>
+    fn transaction_with_mode<F, T>(&self, begin_sql: &str, mut f: F) -> SearchResult<T>
     where
-        F: FnOnce(&AsyncConnection) -> SearchResult<T>,
+        F: FnMut(&AsyncConnection) -> SearchResult<T>,
+    {
+        retry_transient_storage(
+            || self.transaction_with_mode_once(begin_sql, &mut f),
+            "storage transaction",
+        )
+    }
+
+    fn transaction_with_mode_once<F, T>(&self, begin_sql: &str, f: &mut F) -> SearchResult<T>
+    where
+        F: FnMut(&AsyncConnection) -> SearchResult<T>,
     {
         tracing::trace!(
             target: "frankensearch.storage",
@@ -695,6 +744,64 @@ mod tests {
             })
             .collect();
         assert_eq!(observed_retries, expected_retries);
+    }
+
+    #[test]
+    fn connection_open_retry_retries_busy_snapshot() {
+        let mut attempts = 0_u32;
+
+        let error = super::retry_connection_open(
+            || {
+                attempts = attempts.saturating_add(1);
+                Err::<(), _>(FrankenError::BusySnapshot {
+                    conflicting_pages: "1,2".to_owned(),
+                })
+            },
+            |_, _, _| {},
+        )
+        .expect_err("persistent BusySnapshot must exhaust the bounded retry budget");
+
+        assert!(matches!(error, FrankenError::BusySnapshot { .. }));
+        assert_eq!(attempts, super::CONNECTION_OPEN_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn transient_storage_error_detects_wrapped_busy_snapshot() {
+        let error = super::map_storage_error(FrankenError::BusySnapshot {
+            conflicting_pages: "1,2".to_owned(),
+        });
+        assert!(super::is_transient_storage_error(&error));
+    }
+
+    #[test]
+    fn transient_storage_error_rejects_invalid_config() {
+        let error = SearchError::InvalidConfig {
+            field: "test".to_owned(),
+            value: "busy snapshot locked".to_owned(),
+            reason: "string match must not classify this as transient".to_owned(),
+        };
+        assert!(!super::is_transient_storage_error(&error));
+    }
+
+    #[test]
+    fn retry_transient_storage_retries_busy_snapshot_then_succeeds() {
+        let mut attempts = 0_u32;
+        let value = super::retry_transient_storage(
+            || {
+                attempts = attempts.saturating_add(1);
+                if attempts < 3 {
+                    Err(super::map_storage_error(FrankenError::BusySnapshot {
+                        conflicting_pages: "p1".to_owned(),
+                    }))
+                } else {
+                    Ok(7_i32)
+                }
+            },
+            "test",
+        )
+        .expect("BusySnapshot should succeed after bounded retries");
+        assert_eq!(value, 7);
+        assert_eq!(attempts, 3);
     }
 
     #[test]

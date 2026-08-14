@@ -5,7 +5,7 @@ use frankensearch_core::{SearchError, SearchResult};
 use fsqlite::{AsyncConnection, FrankenError, Row};
 use fsqlite_types::value::SqliteValue;
 
-use crate::connection::map_storage_error_at;
+use crate::connection::{map_storage_error_at, retry_transient_storage};
 
 pub const SCHEMA_VERSION: i64 = 7;
 
@@ -360,6 +360,10 @@ pub fn bootstrap(conn: &AsyncConnection) -> SearchResult<()> {
         SchemaVersionState::MissingTable | SchemaVersionState::Empty => {}
     }
 
+    retry_transient_storage(|| bootstrap_write_transaction(conn), "schema bootstrap")
+}
+
+fn bootstrap_write_transaction(conn: &AsyncConnection) -> SearchResult<()> {
     conn.execute_sync("BEGIN IMMEDIATE;")
         .map_err(|error| map_storage_error_at("schema transaction begin", error))?;
     let result = catch_unwind(AssertUnwindSafe(|| bootstrap_inner(conn)));

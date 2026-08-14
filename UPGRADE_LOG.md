@@ -1,5 +1,27 @@
 # Dependency Upgrade Log
 
+## 2026-08-14 — Asupersync 0.4.4 lockstep + FrankenSQLite 0.3.1 usage
+
+**Scope:** workspace Asupersync floor is now `>=0.4.4, <0.5`. `Cargo.lock`
+resolves `asupersync` / `asupersync-macros` 0.4.4 from crates.io. FrankenSQLite
+stays on published `0.3.1` (latest). No public frankensearch API break.
+
+- **Asupersync 0.4.4:** native-task abort preserves an acknowledged
+  `Cancelled` result; HTTP/1 streaming cancel/reuse is additive. Download
+  now uses the caller `Cx` (plus `checkpoint()` in the manifest loop)
+  instead of minting `Cx::for_request()`. Watcher join already prefers the
+  typed task result over a generic join-cancel, which matches the 0.4.4
+  contract.
+- **FrankenSQLite 0.3.1 usage:** storage open, schema bootstrap, and
+  storage transactions retry the published `is_transient()` family
+  (`Busy` / `BusyRecovery` / `BusySnapshot` / `DatabaseLocked` /
+  `WriteConflict` / `SerializationFailure` / `PageBufferCapacityExhausted`)
+  with bounded backoff. Ops open retry walks the error source chain to
+  `FrankenError::is_transient()` instead of matching the word "busy" in
+  display text. Catalog file-open retries the same transient family.
+- **Contract:** publish-identity gate and gauntlet fuzz pin now bind
+  `asupersync@0.4.4`.
+
 ## 2026-08-14 — FrankenSQLite 0.3.1 crates.io bump
 
 **Scope:** every frankensearch `fsqlite*` edge now resolves the published
