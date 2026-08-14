@@ -130,7 +130,7 @@ jobs:
             --profile release-perf \
             -p frankensearch-quill-gauntlet \
             --lib \
-            perf_ratchet::tests::every_committed_unmeasured_placeholder_is_the_exact_current_manifest_sentinel \
+            perf_ratchet::tests::every_current_schema_bootstrap_sentinel_is_committed_and_exact \
             -- --exact
 
       - name: Prove hosted rehearsal remains fail-closed
@@ -145,7 +145,7 @@ jobs:
           QG_MODE: regression-alarm
         run: |
           set -euo pipefail
-          history=".bench-history/${QG_GATE}.unmeasured.latest.json"
+          history=".bench-history/${QG_GATE}.v8.unmeasured.latest.json"
 
           args=(
             --manifest docs/contracts/quill-perf-gates.toml
@@ -193,4 +193,4 @@ jobs:
           retention-days: 30
           path: |
             ci_artifacts/quill-perf/
-            .bench-history/${{ matrix.gate }}.unmeasured.latest.json
+            .bench-history/${{ matrix.gate }}.v8.unmeasured.latest.json

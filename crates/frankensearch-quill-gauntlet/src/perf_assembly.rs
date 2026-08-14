@@ -60,7 +60,8 @@ pub const PERF_ASSEMBLY_MAX_SHARDS: usize = 512;
 /// Maximum exact process receipt, runner receipt, or manifest input.
 pub const PERF_ASSEMBLY_MAX_RECEIPT_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum retained raw log, threshold artifact, or evidence artifact input.
-pub const PERF_ASSEMBLY_MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
+pub const PERF_ASSEMBLY_MAX_ARTIFACT_BYTES: usize =
+    crate::perf_evidence::PERF_EVIDENCE_MAX_ARTIFACT_BYTES;
 /// Stable source reason for missing engine-internal actual-work/lifecycle proof.
 pub const PERF_ASSEMBLY_ENGINE_LIFECYCLE_NO_CLAIM_CODE: &str = "qg1.engine_lifecycle_unavailable";
 /// Stable source reason for missing descendant/process-tree quiescence proof.

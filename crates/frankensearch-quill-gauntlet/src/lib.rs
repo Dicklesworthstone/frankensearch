@@ -146,8 +146,10 @@ pub use local_perf_runner::{
     LocalPerfInternalLifecycleGaps, LocalPerfInternalLifecycleUnavailable,
     LocalPerfProcessLifecycle, LocalPerfRetryPredicate, LocalPerfRunConfig, LocalPerfRunError,
     LocalPerfRunOutput, LocalPerfRunSelection, LocalPerfUnsupportedControl,
-    Qg1StartupControlFrameV1, Qg1StartupHandshakeV1, local_perf_producer_contract_json,
-    run_local_perf_command, run_selected_local_perf_command,
+    Qg1StartupControlFrameV1, Qg1StartupHandshakeV1, Qg6StartupAuthoritySetV1,
+    Qg6StartupHandshakeV1, local_perf_producer_contract_json,
+    publish_qg6_startup_authorities_and_wait_for_ack, run_local_perf_command,
+    run_selected_local_perf_command,
 };
 pub use machine_class_registry::{
     DefaultFlipDisposition, ExecutionCapacitySemantics, ExecutionProfileId, HardwareClassId,
@@ -209,18 +211,20 @@ pub use perf_evidence::{
     EvidenceArtifactError, EvidenceArtifactPaths, EvidenceCell, EvidenceCellBody, EvidenceCellSpec,
     EvidenceDecisionStatus, EvidenceEstimand, EvidencePolicy, EvidenceProvenance, EvidenceReason,
     EvidenceRole, EvidenceSeverity, HIERARCHICAL_LATENCY_SCHEMA_VERSION, HierarchicalGroupSummary,
-    HierarchicalLatencyEstimate, MachineIdentity, PERF_EVIDENCE_SCHEMA_VERSION, PeakRssEvidence,
-    PerfConcurrencyEngine, PerfConcurrencyObserver, PerfConcurrencyWitness, PerfEvidenceArtifact,
-    Qg1IncumbentScreenEvidence, command_sha256_from_argv, estimate_hierarchical_latency,
+    HierarchicalLatencyEstimate, MachineIdentity, PERF_EVIDENCE_MAX_ARTIFACT_BYTES,
+    PERF_EVIDENCE_SCHEMA_VERSION, PeakRssEvidence, PerfConcurrencyEngine, PerfConcurrencyObserver,
+    PerfConcurrencyWitness, PerfEvidenceArtifact, Qg1IncumbentScreenEvidence,
+    Qg6FormalProtocolEvidence, Qg6JointTailContrast, Qg6JointTailEstimate,
+    command_sha256_from_argv, estimate_hierarchical_latency, estimate_qg6_joint_tail,
     human_table_from_json, load_legacy_gate_artifact_v3, required_estimand,
 };
 pub use perf_ratchet::{
     PERF_HISTORY_POINTER_SCHEMA_VERSION, PERF_MAX_REGRESSION_PCT, PERF_MAX_REPRODUCTION_DELTA_PCT,
     PERF_RATCHET_SCHEMA_VERSION, PERF_REGRESSION_ROBUST_Z, PerfCellComparison, PerfEvidenceFile,
     PerfGateDecision, PerfRatchetEvaluation, PerfRatchetMode, PerfRatchetQg1AuthoritySets,
-    PerfRatchetReason, PerfRatchetRequest, evaluate_perf_ratchet,
-    evaluate_perf_ratchet_against_qg1_authorities, is_explicit_bootstrap,
-    is_explicit_bootstrap_for,
+    PerfRatchetQg6AuthoritySets, PerfRatchetReason, PerfRatchetRequest, evaluate_perf_ratchet,
+    evaluate_perf_ratchet_against_authorities, evaluate_perf_ratchet_against_qg1_authorities,
+    is_explicit_bootstrap, is_explicit_bootstrap_for,
 };
 pub use privacy::{
     ARTIFACT_PRIVACY_POLICY_SCHEMA_VERSION, ArtifactClassification, ArtifactContentKind,
@@ -241,18 +245,18 @@ pub use qg2_contract::{
     Qg2TopologySummary, validate_qg2_contract, validate_qg2_preflight,
 };
 pub use qg6_prepared::{
-    Qg6ArmLifecycle, Qg6ArmRole, Qg6Comparison, Qg6ExperimentIdentity, Qg6FourArmResultReceipts,
-    Qg6HarnessError, Qg6LifecycleReceipt, Qg6Measurement, Qg6PairBlock, Qg6Phase,
-    Qg6PreparedExperiment, Qg6QueryGroupReceipt, Qg6QueryIdentityReceipt, Qg6QuerySpec,
+    QG6_TIMED_SEARCHES_PER_SAMPLE, Qg6ArmLifecycle, Qg6ArmRole, Qg6Comparison,
+    Qg6ExperimentIdentity, Qg6HarnessError, Qg6LifecycleReceipt, Qg6Measurement, Qg6PairBlock,
+    Qg6Phase, Qg6PreparedExperiment, Qg6QueryGroupReceipt, Qg6QueryIdentityReceipt, Qg6QuerySpec,
     Qg6RankedHitReceipt, Qg6ResidualArmRole, Qg6ResidualCacheDisposition,
     Qg6ResidualJointContrastVector, Qg6ResidualLeafObservation, Qg6ResidualScheduleAdmission,
     Qg6ResidualStratum, Qg6ResidualValidationError, Qg6ResidualWilliamsLeaf, Qg6ResultReceipt,
-    Qg6SampleOrder, Qg6SearchHit, Qg6SearchResult, Qg6SelectionClaim, Qg6SelectionScope,
-    Qg6SemanticContract, Qg6SetupRecorder, Qg6TimedSample, Qg6ValidatedExperiment,
-    admit_qg6_residual_schedule_meta_block, qg6_residual_source_elf_consistency_sha256,
-    qg6_residual_standardized_workload_sha256, qg6_residual_williams_schedule,
-    qg6_result_sequence_sha256, seeded_interleaved_four_arm_schedule,
-    validate_qg6_residual_williams_schedule,
+    Qg6SampleOrder, Qg6ScheduleAuthority, Qg6SearchHit, Qg6SearchResult, Qg6SelectionClaim,
+    Qg6SelectionScope, Qg6SemanticContract, Qg6SetupRecorder, Qg6SixArmResultReceipts,
+    Qg6TimedSample, Qg6ValidatedExperiment, admit_qg6_residual_schedule_meta_block,
+    qg6_residual_source_elf_consistency_sha256, qg6_residual_standardized_workload_sha256,
+    qg6_residual_williams_schedule, qg6_result_sequence_sha256, query_manifest_sha256,
+    seeded_interleaved_six_arm_schedule, validate_qg6_residual_williams_schedule,
 };
 pub use runner::{
     CAMPAIGN_REPORT_SCHEMA_VERSION, CAMPAIGN_REPORT_V9_SCHEMA_VERSION,

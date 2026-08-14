@@ -43,7 +43,7 @@ reconstruction rather than falling back to explanatory text.
       # immutable threshold object
   QG-<n>.<hardware-class>.<execution-profile>.<date>.<run-id>.evidence.json
       # immutable receipt-bound evidence object
-  QG-<n>.v7.unmeasured.latest.json       # current explicit bootstrap quarantine
+  QG-<n>.v8.unmeasured.latest.json       # current explicit bootstrap quarantine
   QG-<n>.unmeasured.latest.json          # immutable historical v6 placeholder
 ```
 Measured latest pointers use schema
@@ -53,7 +53,7 @@ run_id, threshold_file,
 threshold_sha256, evidence_file, evidence_sha256}` and resolve both halves of
 one generation from the same directory. Neither half, its A/A band, nor its
 destination may cross the immutable hardware/profile key. Current threshold
-schema `quill-perf-artifact-v7` uses
+schema `quill-perf-artifact-v8` uses
 `{schema_version, gate, applicability_plan, bench_elf_sha256,
 machine_fingerprint, execution, git_rev,
 run_window, run_id, corpus_manifest_hash, manifest_sha256, cells: [{fixture,
@@ -77,13 +77,13 @@ replay to fail closed as `Block` or `Quarantine`, never `Allow`. A full,
 evidence-admissible candidate/rerun pair may establish
 the first measured baseline and activate the gate with either a PASS or MISS
 target verdict. The exemption is deliberately narrow: only the exact
-`quill-perf-artifact-v7` sentinel for the evaluated gate and manifest may omit
+`quill-perf-artifact-v8` sentinel for the evaluated gate and manifest may omit
 `applicability_plan`, execution, baseline evidence, and a baseline runner
 receipt. Supplying evidence or identity for that sentinel is rejected as
 fabrication; near-sentinels and measured legacy artifacts receive no exemption.
 The ten original v6 placeholders remain immutable historical inputs after the
-v7 bump and are rejected precisely as stale-schema artifacts. The separately
-versioned `QG-<n>.v7.unmeasured.latest.json` files are the current authoritative
+v8 bump and are rejected precisely as stale-schema artifacts. The separately
+versioned `QG-<n>.v8.unmeasured.latest.json` files are the current authoritative
 sentinels; their canonical pretty JSON has exactly one terminal newline.
 Candidate and rerun still require two independent, verified, post-exit
 `frankensearch.perf-runner-completion.v6` receipts. That first MISS baseline is
@@ -175,13 +175,24 @@ different operation scope, or when they are derived from the exact same raw
 blocks; a separate Criterion measurement stream cannot be reconciled as if it
 were the paired evidence.
 
-The v7 QG writer's `paired_ab`, `paired_null` (Tantivy/Tantivy), and
+The v8 QG writer's `paired_ab`, `paired_null` (Tantivy/Tantivy), and
 `paired_null_quill` rows are diagnostics only.
-Decision-grade output is the `quill-perf-evidence-v5` artifact (`bd-uh2f` /
-`bd-uh2f.1`), which the harness emits beside every v7 artifact from the
+Decision-grade output is the `quill-perf-evidence-v7` artifact (`bd-uh2f` /
+`bd-uh2f.1`), which the harness emits beside every v8 artifact from the
 exact same raw paired blocks.
 
-## Evidence artifacts (`quill-perf-evidence-v5`)
+QG-6 uses a stricter formal six-arm protocol. Before corpus or index setup, the
+parent durably publishes and the child acknowledges an external schedule
+authority for Tantivy/Tantivy, Quill/Quill, and Tantivy/Quill blocks. Every
+parent sample retains 128 authenticated search intervals; normalization and
+result sealing remain outside the measured interval. The joint tail estimator
+resamples the sixteen query groups first and complete query-round units second,
+carrying all six arms through the same draw. It reports true-leaf p50 and p99
+contrasts and confidence intervals. Either T/T or Q/Q p50/p99 null failure is
+`NoDecision`; it can never be replaced by the older flat or parent-median
+projection.
+
+## Evidence artifacts (`quill-perf-evidence-v7`)
 
 One `<gate>.evidence.json` (plus a derived `<gate>.evidence.md` table) per
 gate, sealed with an embedded SHA-256 over its own canonical JSON. Every cell
@@ -223,7 +234,7 @@ snapshots, every recomputed hardware/cpuset/snapshot/execution hash, and the
 SHA-256 plus exact bytes of one verified
 `frankensearch.perf-runner-completion.v6` receipt and its exact
 `frankensearch.perf-runner-artifact-manifest.v3` manifest. The manifest hashes
-the actual run log, canonical v7 threshold artifact, and exact pre-binding v5
+the actual run log, canonical v8 threshold artifact, and exact pre-binding v7
 evidence bytes. It also binds the exact matrix, normalized performance
 manifest, machine registry, profile contract, class/profile, capacity
 semantics, execution capacity, maximum exercised width, applicability-plan
@@ -260,7 +271,7 @@ re-admits the embedded receipt and manifest against the frozen registry;
 resealing an outer artifact cannot legitimize a stale, drifted, mixed,
 incomplete, or tampered identity. An explicit `unverified` binding remains
 durable for diagnosis but is never ratchet-admissible.
-The v7 threshold artifact's applicability and execution blocks are only
+The v8 threshold artifact's applicability and execution blocks are only
 compatibility projections:
 promotion requires it to equal the sealed current-evidence execution block and
 to agree with the verified receipt and reconstructed plan's hardware/profile
@@ -333,8 +344,8 @@ on `Allow`; original unverified producer evidence remains diagnostic provenance
 and is never copied into history.
 
 Estimands are metric-specific: flat paired log ratios (QG-1/2/3/4/5/8),
-two-stage hierarchical per-query resampling (QG-6, sixteen query groups per
-class), process RSS (QG-7), cold open requiring verified cache-state proof
+joint six-arm true-leaf p50/p99 resampling by query then whole unit (QG-6,
+sixteen query groups per class), process RSS (QG-7), cold open requiring verified cache-state proof
 (QG-9 currently persists `NoDecision` because the harness reopens in-process
 without dropping the OS page cache), and dependency facts outside timing A/A
 (QG-10, diagnostic).
@@ -362,7 +373,7 @@ advisory lock on the canonical history directory before resolving any baseline
 and holds that same directory-inode lock through immutable-generation
 publication and latest-pointer replacement. Under the lock, a profile with no
 measured latest pointer accepts only the canonical
-`QG-<n>.v7.unmeasured.latest.json` bootstrap in that promotion directory. Once a
+`QG-<n>.v8.unmeasured.latest.json` bootstrap in that promotion directory. Once a
 profile-qualified latest pointer exists, the baseline path must canonicalize to
 that exact pointer and parse as its measured v2 generation; copied, direct,
 stale, and bootstrap-replay baselines are rejected without a history write.

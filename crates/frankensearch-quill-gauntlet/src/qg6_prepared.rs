@@ -1,4 +1,4 @@
-//! Prepared, parity-gated four-arm execution for the QG-6 query benchmark.
+//! Prepared, parity-gated six-arm execution for the QG-6 query benchmark.
 //!
 //! The generic runner deliberately owns the lifecycle boundary: engines are
 //! constructed and populated through [`Qg6PreparedExperiment::prepare_with`],
@@ -8,7 +8,7 @@
 //! every timed interval.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::hint::black_box;
 use std::ops::Bound;
 use std::time::{Duration, Instant};
@@ -17,7 +17,7 @@ use frankensearch_quill::{
     BooleanOperator, DEFAULT_SCHEMA, DefaultQueryParser, Occur, Query, QueryValue,
     canonicalize_query,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
@@ -27,8 +27,9 @@ use crate::perf::{PerfQueryClass, QG6_QUERY_GROUPS};
 const QG6_QUERY_MANIFEST_VERSION: &str = "frankensearch-qg6-query-manifest-v3";
 const QG6_RESULT_RECEIPT_VERSION: &str = "frankensearch-qg6-result-receipt-v1";
 const QG6_RESULT_SEQUENCE_VERSION: &str = "frankensearch-qg6-result-sequence-v1";
-const QG6_TIMING_LEAF_RECEIPT_VERSION: &str = "frankensearch-qg6-timing-leaf-receipt-v1";
-const QG6_SEMANTIC_CONTRACT_VERSION: &str = "frankensearch-qg6-semantic-contract-v1";
+const QG6_TIMING_LEAF_RECEIPT_VERSION: &str = "frankensearch-qg6-timing-leaf-receipt-v3";
+const QG6_SEMANTIC_CONTRACT_VERSION: &str = "frankensearch-qg6-semantic-contract-v2";
+const QG6_SCHEDULE_AUTHORITY_VERSION: &str = "frankensearch-qg6-schedule-authority-v1";
 const QG6_QUERY_IDENTITY_VERSION: &str = "frankensearch-qg6-query-identity-v1";
 const QG6_QUERY_GENERATOR_REVISION: &str = "frankensearch-qg6-frozen-80-query-generator-v2";
 const QG6_CORPUS_GENERATOR_REVISION: &str =
@@ -72,7 +73,10 @@ const MAX_QUERY_TEXT_BYTES: usize = 16 * 1_024;
 const MAX_DOC_ID_BYTES: usize = 4 * 1_024;
 const MAX_UNSUPPORTED_REASON_CODE_BYTES: usize = 64;
 const MAX_K: usize = 100_000;
-const MAX_TIMING_LEAVES_PER_SAMPLE: usize = 128;
+/// Canonical number of individually timed searches in every QG-6 parent sample.
+pub const QG6_TIMED_SEARCHES_PER_SAMPLE: usize = 128;
+const QG6_TIMING_LEAF_MAX_DECIMAL_U64_BYTES: usize = 20;
+const QG6_TIMING_LEAF_MAX_PAIR_WIRE_BYTES: usize = QG6_TIMING_LEAF_MAX_DECIMAL_U64_BYTES * 2 + 2;
 
 /// Frozen support state and any reviewed cross-engine result divergence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,14 +161,18 @@ pub struct Qg6QueryLogIdentity {
     pub parsed_ast_sha256: String,
 }
 
-/// The four independent logical indexes in the QG-6 admission experiment.
+/// The six independent logical indexes in the QG-6 admission experiment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Qg6ArmRole {
     /// Left side of the Tantivy/Tantivy null comparison.
-    NullLeft,
+    TantivyNullLeft,
     /// Right side of the Tantivy/Tantivy null comparison.
-    NullRight,
+    TantivyNullRight,
+    /// Left side of the Quill/Quill null comparison.
+    QuillNullLeft,
+    /// Right side of the Quill/Quill null comparison.
+    QuillNullRight,
     /// Tantivy side of the Quill/Tantivy effect comparison.
     EffectControl,
     /// Quill side of the Quill/Tantivy effect comparison.
@@ -173,19 +181,23 @@ pub enum Qg6ArmRole {
 
 impl Qg6ArmRole {
     /// Stable order used by preparation, preflight, and lifecycle receipts.
-    pub const ALL: [Self; 4] = [
-        Self::NullLeft,
-        Self::NullRight,
+    pub const ALL: [Self; 6] = [
+        Self::TantivyNullLeft,
+        Self::TantivyNullRight,
+        Self::QuillNullLeft,
+        Self::QuillNullRight,
         Self::EffectControl,
         Self::EffectTreatment,
     ];
 
     const fn index(self) -> usize {
         match self {
-            Self::NullLeft => 0,
-            Self::NullRight => 1,
-            Self::EffectControl => 2,
-            Self::EffectTreatment => 3,
+            Self::TantivyNullLeft => 0,
+            Self::TantivyNullRight => 1,
+            Self::QuillNullLeft => 2,
+            Self::QuillNullRight => 3,
+            Self::EffectControl => 4,
+            Self::EffectTreatment => 5,
         }
     }
 }
@@ -195,13 +207,15 @@ impl Qg6ArmRole {
 #[serde(rename_all = "snake_case")]
 pub enum Qg6Comparison {
     /// Tantivy/Tantivy A/A null.
-    Null,
+    TantivyNull,
+    /// Quill/Quill A/A null.
+    QuillNull,
     /// Tantivy/Quill A/B effect.
     Effect,
 }
 
 /// First or second position inside one paired timing block.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Qg6SampleOrder {
     /// First arm invoked in the block.
@@ -212,17 +226,20 @@ pub enum Qg6SampleOrder {
 
 const fn qg6_arm_role_tag(role: Qg6ArmRole) -> u8 {
     match role {
-        Qg6ArmRole::NullLeft => 0,
-        Qg6ArmRole::NullRight => 1,
-        Qg6ArmRole::EffectControl => 2,
-        Qg6ArmRole::EffectTreatment => 3,
+        Qg6ArmRole::TantivyNullLeft => 0,
+        Qg6ArmRole::TantivyNullRight => 1,
+        Qg6ArmRole::QuillNullLeft => 2,
+        Qg6ArmRole::QuillNullRight => 3,
+        Qg6ArmRole::EffectControl => 4,
+        Qg6ArmRole::EffectTreatment => 5,
     }
 }
 
 const fn qg6_comparison_tag(comparison: Qg6Comparison) -> u8 {
     match comparison {
-        Qg6Comparison::Null => 0,
-        Qg6Comparison::Effect => 1,
+        Qg6Comparison::TantivyNull => 0,
+        Qg6Comparison::QuillNull => 1,
+        Qg6Comparison::Effect => 2,
     }
 }
 
@@ -963,13 +980,34 @@ impl From<Vec<String>> for Qg6SearchResult {
 }
 
 /// One redacted ranked hit in a sealed semantic receipt.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Qg6RankedHitReceipt {
     /// SHA-256 of the external document ID.
     pub document_id_sha256: String,
     /// Exact IEEE-754 score bits returned by the native engine.
     pub score_bits: u32,
+}
+
+impl Serialize for Qg6RankedHitReceipt {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        (&self.document_id_sha256, self.score_bits).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Qg6RankedHitReceipt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let (document_id_sha256, score_bits) = <(String, u32)>::deserialize(deserializer)?;
+        Ok(Self {
+            document_id_sha256,
+            score_bits,
+        })
+    }
 }
 
 /// Stable full result facts retained for parity and post-timing stability checks.
@@ -1056,27 +1094,33 @@ impl Qg6ResultReceipt {
     }
 }
 
-/// Named receipts for all four independent logical roles.
+/// Named receipts for all six independent logical roles.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Qg6FourArmResultReceipts {
+pub struct Qg6SixArmResultReceipts {
     /// Left Tantivy arm of the A/A null.
-    pub null_left: Qg6ResultReceipt,
+    pub tantivy_null_left: Qg6ResultReceipt,
     /// Right Tantivy arm of the A/A null.
-    pub null_right: Qg6ResultReceipt,
+    pub tantivy_null_right: Qg6ResultReceipt,
+    /// Left Quill arm of the A/A null.
+    pub quill_null_left: Qg6ResultReceipt,
+    /// Right Quill arm of the A/A null.
+    pub quill_null_right: Qg6ResultReceipt,
     /// Tantivy control arm of the A/B effect.
     pub effect_control: Qg6ResultReceipt,
     /// Quill treatment arm of the A/B effect.
     pub effect_treatment: Qg6ResultReceipt,
 }
 
-impl Qg6FourArmResultReceipts {
+impl Qg6SixArmResultReceipts {
     /// Resolve a named logical role without relying on array position.
     #[must_use]
     pub const fn get(&self, role: Qg6ArmRole) -> &Qg6ResultReceipt {
         match role {
-            Qg6ArmRole::NullLeft => &self.null_left,
-            Qg6ArmRole::NullRight => &self.null_right,
+            Qg6ArmRole::TantivyNullLeft => &self.tantivy_null_left,
+            Qg6ArmRole::TantivyNullRight => &self.tantivy_null_right,
+            Qg6ArmRole::QuillNullLeft => &self.quill_null_left,
+            Qg6ArmRole::QuillNullRight => &self.quill_null_right,
             Qg6ArmRole::EffectControl => &self.effect_control,
             Qg6ArmRole::EffectTreatment => &self.effect_treatment,
         }
@@ -1164,7 +1208,7 @@ impl Qg6QueryIdentityReceipt {
     }
 }
 
-/// Ordered query-to-group mapping and its complete four-role semantic receipts.
+/// Ordered query-to-group mapping and its complete six-role semantic receipts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Qg6QueryGroupReceipt {
@@ -1173,7 +1217,7 @@ pub struct Qg6QueryGroupReceipt {
     /// Full recomputable redacted query identity.
     pub query: Qg6QueryIdentityReceipt,
     /// Full receipts for every native role.
-    pub roles: Qg6FourArmResultReceipts,
+    pub roles: Qg6SixArmResultReceipts,
 }
 
 /// Cell-local sealed semantic contract consumed by QG-6 evidence validation.
@@ -1192,7 +1236,7 @@ pub struct Qg6SemanticContract {
     pub document_count: u64,
     /// Requested result cutoff.
     pub k: usize,
-    /// Canonically ordered query mapping and four-role results.
+    /// Canonically ordered query mapping and six-role results.
     pub groups: Vec<Qg6QueryGroupReceipt>,
     /// Domain-separated SHA-256 over all preceding fields.
     pub contract_sha256: String,
@@ -1207,7 +1251,7 @@ impl Qg6SemanticContract {
     pub(crate) fn from_receipts(
         identity: &Qg6ExperimentIdentity,
         queries: &[Qg6QuerySpec],
-        expected_results: &[Qg6FourArmResultReceipts],
+        expected_results: &[Qg6SixArmResultReceipts],
     ) -> Result<Self, Qg6HarnessError> {
         validate_experiment_inputs(identity.document_count, identity.k, queries)?;
         if queries.len() != expected_results.len()
@@ -1385,7 +1429,7 @@ pub struct Qg6ArmLifecycle {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Qg6LifecycleReceipt {
     /// One counter set for each [`Qg6ArmRole::ALL`] entry.
-    pub arms: [Qg6ArmLifecycle; 4],
+    pub arms: [Qg6ArmLifecycle; 6],
 }
 
 impl Qg6LifecycleReceipt {
@@ -1424,14 +1468,17 @@ impl Qg6SetupRecorder<'_> {
     }
 }
 
-/// One paired block in the deterministic four-arm schedule.
+/// One paired block in the deterministic six-arm schedule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Qg6PairBlock {
     /// Globally unique block identifier in this experiment.
     pub block_id: u64,
+    /// Query-round cluster containing all three formal comparisons.
+    pub unit_id: u64,
     /// Index into the frozen ordered query manifest.
     pub query_index: usize,
-    /// Null or effect comparison.
+    /// Tantivy null, Quill null, or cross-engine effect comparison.
     pub comparison: Qg6Comparison,
     /// Arm executed first.
     pub first: Qg6ArmRole,
@@ -1439,133 +1486,139 @@ pub struct Qg6PairBlock {
     pub second: Qg6ArmRole,
 }
 
-/// One exact same-invocation search interval retained within a timed sample.
+/// Externally retained authority for the exact schedule frozen before timing.
 ///
-/// The runner records the interval around the search call only. Result
-/// normalization and parity verification remain outside that interval, while
-/// the result receipt still binds the leaf to the observed native result.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// The prepared runner consumes this receipt by reference and executes its
+/// sealed schedule directly. The completed measurement can therefore be
+/// checked against an authority retained outside the observed sample table;
+/// timed rows never authorize their own schedule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Qg6SearchTimingLeafReceipt {
-    /// Schema identifier for this exact leaf receipt.
+pub struct Qg6ScheduleAuthority {
+    /// Schema identifier for this authority contract.
     pub schema_version: String,
-    /// Parent paired block identifier.
-    pub block_id: u64,
-    /// Parent timed-sample identifier.
-    pub sample_id: u64,
-    /// Stable redacted query identifier.
-    pub query_id: String,
-    /// Index into the frozen query manifest.
-    pub query_index: usize,
-    /// Null or effect comparison shared with the parent sample.
-    pub comparison: Qg6Comparison,
-    /// Logical arm shared with the parent sample.
-    pub arm: Qg6ArmRole,
-    /// Execution order shared with the parent sample.
-    pub order: Qg6SampleOrder,
-    /// Strictly increasing ordinal inside the parent sample.
-    pub leaf_ordinal: u64,
-    /// Monotonic start offset relative to the measurement origin.
-    pub started_ns: u64,
-    /// Monotonic end offset relative to the measurement origin.
-    pub ended_ns: u64,
-    /// Exact raw monotonic interval in nanoseconds.
-    pub observed_latency_ns: u64,
-    /// Same interval in milliseconds for later raw-sample binding.
-    pub observed_latency_ms: f64,
-    /// Self-sealed digest of the result observed for this exact invocation.
-    pub result_receipt_sha256: String,
-    /// Domain-separated self-seal over every leaf field above.
-    pub receipt_sha256: String,
+    /// Exact prepared experiment for which the schedule was frozen.
+    pub identity: Qg6ExperimentIdentity,
+    /// Number of frozen query groups scheduled.
+    pub query_count: usize,
+    /// Equal query-round units per query.
+    pub rounds_per_query: usize,
+    /// Individually timed searches summarized by every parent sample.
+    pub searches_per_sample: usize,
+    /// Seed that deterministically generated the schedule.
+    pub schedule_seed: u64,
+    /// Complete three-comparison-per-unit schedule frozen before timing.
+    pub schedule: Vec<Qg6PairBlock>,
+    /// Domain-separated self-seal over every preceding field.
+    pub authority_sha256: String,
 }
 
-impl Qg6SearchTimingLeafReceipt {
-    pub(crate) fn from_observation(
-        block_id: u64,
-        sample_id: u64,
-        query_id: &str,
-        query_index: usize,
-        comparison: Qg6Comparison,
-        arm: Qg6ArmRole,
-        order: Qg6SampleOrder,
-        leaf_ordinal: u64,
-        started_ns: u64,
-        ended_ns: u64,
-        result_receipt_sha256: String,
+impl Qg6ScheduleAuthority {
+    /// Freeze and seal one canonical schedule for an externally prepared experiment.
+    ///
+    /// Parent processes and evidence replay can retain this authority before
+    /// handing timing work to a child. Measurement still verifies the exact
+    /// authority against its validated experiment identity before any warmup.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed experiment identity, query, round, or timing-leaf
+    /// cardinality and any schedule allocation failure.
+    pub fn for_experiment(
+        identity: Qg6ExperimentIdentity,
+        query_count: usize,
+        rounds_per_query: usize,
+        searches_per_sample: usize,
+        schedule_seed: u64,
     ) -> Result<Self, Qg6HarnessError> {
-        let elapsed_ns = ended_ns
-            .checked_sub(started_ns)
-            .filter(|elapsed| *elapsed != 0)
-            .ok_or_else(|| Qg6HarnessError::InvalidSpec {
-                reason: "QG-6 timing leaf has an invalid monotonic interval".to_owned(),
-            })?;
-        let mut receipt = Self {
-            schema_version: QG6_TIMING_LEAF_RECEIPT_VERSION.to_owned(),
-            block_id,
-            sample_id,
-            query_id: query_id.to_owned(),
-            query_index,
-            comparison,
-            arm,
-            order,
-            leaf_ordinal,
-            started_ns,
-            ended_ns,
-            observed_latency_ns: elapsed_ns,
-            observed_latency_ms: nanoseconds_to_millis(elapsed_ns),
-            result_receipt_sha256,
-            receipt_sha256: String::new(),
+        if searches_per_sample == 0 || searches_per_sample > QG6_TIMED_SEARCHES_PER_SAMPLE {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: "QG-6 schedule authority has invalid timing-leaf cardinality".to_owned(),
+            });
+        }
+        let schedule =
+            seeded_interleaved_six_arm_schedule(query_count, rounds_per_query, schedule_seed)?;
+        let mut authority = Self {
+            schema_version: QG6_SCHEDULE_AUTHORITY_VERSION.to_owned(),
+            identity,
+            query_count,
+            rounds_per_query,
+            searches_per_sample,
+            schedule_seed,
+            schedule,
+            authority_sha256: String::new(),
         };
-        receipt.receipt_sha256 = receipt.recomputed_sha256()?;
-        receipt.verify()?;
-        Ok(receipt)
+        authority.authority_sha256 = authority.recomputed_sha256()?;
+        authority.verify()?;
+        Ok(authority)
     }
 
     fn recomputed_sha256(&self) -> Result<String, Qg6HarnessError> {
         let mut hasher = Sha256::new();
-        hash_len_prefixed(&mut hasher, QG6_TIMING_LEAF_RECEIPT_VERSION.as_bytes());
+        hash_len_prefixed(&mut hasher, QG6_SCHEDULE_AUTHORITY_VERSION.as_bytes());
         hash_len_prefixed(&mut hasher, self.schema_version.as_bytes());
-        hasher.update(self.block_id.to_le_bytes());
-        hasher.update(self.sample_id.to_le_bytes());
-        hash_len_prefixed(&mut hasher, self.query_id.as_bytes());
-        hasher.update(usize_to_u64(self.query_index)?.to_le_bytes());
-        hasher.update([qg6_comparison_tag(self.comparison)]);
-        hasher.update([qg6_arm_role_tag(self.arm)]);
-        hasher.update([qg6_sample_order_tag(self.order)]);
-        hasher.update(self.leaf_ordinal.to_le_bytes());
-        hasher.update(self.started_ns.to_le_bytes());
-        hasher.update(self.ended_ns.to_le_bytes());
-        hasher.update(self.observed_latency_ns.to_le_bytes());
-        hasher.update(self.observed_latency_ms.to_bits().to_le_bytes());
-        hash_len_prefixed(&mut hasher, self.result_receipt_sha256.as_bytes());
+        hash_len_prefixed(&mut hasher, self.identity.corpus_sha256.as_bytes());
+        hash_len_prefixed(&mut hasher, self.identity.query_manifest_sha256.as_bytes());
+        hash_len_prefixed(&mut hasher, self.identity.config_contract_sha256.as_bytes());
+        hasher.update(self.identity.document_count.to_le_bytes());
+        hasher.update(usize_to_u64(self.identity.k)?.to_le_bytes());
+        hasher.update(usize_to_u64(self.query_count)?.to_le_bytes());
+        hasher.update(usize_to_u64(self.rounds_per_query)?.to_le_bytes());
+        hasher.update(usize_to_u64(self.searches_per_sample)?.to_le_bytes());
+        hasher.update(self.schedule_seed.to_le_bytes());
+        hasher.update(usize_to_u64(self.schedule.len())?.to_le_bytes());
+        for block in &self.schedule {
+            hasher.update(block.block_id.to_le_bytes());
+            hasher.update(block.unit_id.to_le_bytes());
+            hasher.update(usize_to_u64(block.query_index)?.to_le_bytes());
+            hasher.update([qg6_comparison_tag(block.comparison)]);
+            hasher.update([qg6_arm_role_tag(block.first)]);
+            hasher.update([qg6_arm_role_tag(block.second)]);
+        }
         Ok(lower_hex(hasher.finalize()))
     }
 
-    fn verify(&self) -> Result<(), Qg6HarnessError> {
-        let elapsed_ns = self
-            .ended_ns
-            .checked_sub(self.started_ns)
-            .filter(|elapsed| *elapsed != 0)
-            .ok_or_else(|| Qg6HarnessError::InvalidSpec {
-                reason: "QG-6 timing leaf has an invalid monotonic interval".to_owned(),
-            })?;
-        if self.schema_version != QG6_TIMING_LEAF_RECEIPT_VERSION
-            || self.query_id.is_empty()
-            || self.query_id.len() > MAX_QUERY_ID_BYTES
-            || self.query_index >= MAX_QUERY_COUNT
-            || self.observed_latency_ns != elapsed_ns
-            || !self.observed_latency_ms.is_finite()
-            || self.observed_latency_ms <= 0.0
-            // Bit equality, not approximate equality: this field is required to
-            // BE the derived conversion, and the receipt hash at
-            // `recomputed_sha256` already seals it by bits. A tolerance here
-            // would admit a value the seal would then refuse.
-            || self.observed_latency_ms.to_bits() != nanoseconds_to_millis(elapsed_ns).to_bits()
-            || !is_lower_hex_sha256(&self.result_receipt_sha256)
-            || self.receipt_sha256 != self.recomputed_sha256()?
+    /// Verify that this authority is canonical and reproduces its full schedule.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed identities, invalid cardinalities, schedule mutations,
+    /// role relabeling, and a self-seal that no longer recomputes.
+    pub fn verify(&self) -> Result<(), Qg6HarnessError> {
+        if self.schema_version != QG6_SCHEDULE_AUTHORITY_VERSION
+            || !is_lower_hex_sha256(&self.identity.corpus_sha256)
+            || !is_lower_hex_sha256(&self.identity.query_manifest_sha256)
+            || !is_lower_hex_sha256(&self.identity.config_contract_sha256)
+            || self.identity.document_count == 0
+            || self.identity.k == 0
+            || self.identity.k > MAX_K
+            || self.searches_per_sample == 0
+            || self.searches_per_sample > QG6_TIMED_SEARCHES_PER_SAMPLE
+            || self.schedule
+                != seeded_interleaved_six_arm_schedule(
+                    self.query_count,
+                    self.rounds_per_query,
+                    self.schedule_seed,
+                )?
+            || self.authority_sha256 != self.recomputed_sha256()?
         {
             return Err(Qg6HarnessError::InvalidSpec {
-                reason: "QG-6 timing leaf receipt is malformed or has an invalid self-seal"
+                reason: "QG-6 schedule authority is malformed, mutated, or incorrectly sealed"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn verify_for(
+        &self,
+        identity: &Qg6ExperimentIdentity,
+        query_count: usize,
+    ) -> Result<(), Qg6HarnessError> {
+        self.verify()?;
+        if &self.identity != identity || self.query_count != query_count {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: "QG-6 schedule authority belongs to a different prepared experiment"
                     .to_owned(),
             });
         }
@@ -1573,8 +1626,77 @@ impl Qg6SearchTimingLeafReceipt {
     }
 }
 
+/// One exact same-invocation search interval retained within a timed sample.
+///
+/// Every fact shared by the leaves lives once on [`Qg6TimedSample`]. On the
+/// wire a standalone leaf serializes as `[started_ns, ended_ns]`. Inside a
+/// [`Qg6TimedSample`], the bounded ordered leaf vector is encoded once as
+/// canonical `start_delta:duration` decimal pairs relative to the parent.
+/// Result normalization and parity verification remain outside the interval,
+/// and the parent binds the one shared result receipt proven for every
+/// invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qg6SearchTimingLeafReceipt {
+    /// Monotonic start offset relative to the measurement origin.
+    pub started_ns: u64,
+    /// Monotonic end offset relative to the measurement origin.
+    pub ended_ns: u64,
+}
+
+impl Qg6SearchTimingLeafReceipt {
+    pub(crate) fn from_interval(started_ns: u64, ended_ns: u64) -> Result<Self, Qg6HarnessError> {
+        let receipt = Self {
+            started_ns,
+            ended_ns,
+        };
+        receipt.verify()?;
+        Ok(receipt)
+    }
+
+    /// Exact raw monotonic interval in nanoseconds.
+    #[must_use]
+    pub fn observed_latency_ns(&self) -> u64 {
+        self.ended_ns.saturating_sub(self.started_ns)
+    }
+
+    /// The exact raw interval converted to milliseconds.
+    #[must_use]
+    pub fn observed_latency_ms(&self) -> f64 {
+        nanoseconds_to_millis(self.observed_latency_ns())
+    }
+
+    fn verify(&self) -> Result<(), Qg6HarnessError> {
+        self.ended_ns
+            .checked_sub(self.started_ns)
+            .filter(|elapsed| *elapsed != 0)
+            .ok_or_else(|| Qg6HarnessError::InvalidSpec {
+                reason: "QG-6 timing leaf has an invalid monotonic interval".to_owned(),
+            })?;
+        Ok(())
+    }
+}
+
+impl Serialize for Qg6SearchTimingLeafReceipt {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        [self.started_ns, self.ended_ns].serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Qg6SearchTimingLeafReceipt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let [started_ns, ended_ns] = <[u64; 2]>::deserialize(deserializer)?;
+        Self::from_interval(started_ns, ended_ns).map_err(serde::de::Error::custom)
+    }
+}
+
 /// One directly observed timed sample.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Qg6TimedSample {
     /// Paired block shared with exactly one other arm.
     pub block_id: u64,
@@ -1584,7 +1706,7 @@ pub struct Qg6TimedSample {
     pub query_id: String,
     /// Index into the frozen ordered query manifest.
     pub query_index: usize,
-    /// Null or effect stream.
+    /// Formal Tantivy-null, Quill-null, or effect stream.
     pub comparison: Qg6Comparison,
     /// Logical arm.
     pub arm: Qg6ArmRole,
@@ -1598,12 +1720,215 @@ pub struct Qg6TimedSample {
     pub observed_latency_ns: u64,
     /// Number of individually timed searches summarized by this sample.
     pub subsample_count: u64,
+    /// One result receipt proven independently for every invocation in this sample.
+    pub result_receipt_sha256: String,
     /// Digest over every independently recomputed result receipt.
     pub result_sha256: String,
     /// Ordered same-invocation raw timing leaves summarized by this p50 sample.
+    /// The persisted v7 wire uses one bounded canonical parent-relative string.
     pub timing_leaves: Vec<Qg6SearchTimingLeafReceipt>,
     /// Domain-separated seal over the ordered leaf receipts and parent sample facts.
     pub timing_leaves_sha256: String,
+}
+
+struct Qg6TimingLeavesWire<'a> {
+    parent_started_ns: u64,
+    leaves: &'a [Qg6SearchTimingLeafReceipt],
+}
+
+impl Serialize for Qg6TimingLeavesWire<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let capacity = self
+            .leaves
+            .len()
+            .checked_mul(QG6_TIMING_LEAF_MAX_PAIR_WIRE_BYTES)
+            .ok_or_else(|| serde::ser::Error::custom("QG-6 timing leaf wire size overflows"))?;
+        let mut encoded = String::new();
+        encoded
+            .try_reserve_exact(capacity)
+            .map_err(|_| serde::ser::Error::custom("QG-6 timing leaf wire allocation failed"))?;
+        for leaf in self.leaves {
+            let started_delta_ns = leaf
+                .started_ns
+                .checked_sub(self.parent_started_ns)
+                .ok_or_else(|| {
+                    serde::ser::Error::custom("QG-6 timing leaf starts before its parent sample")
+                })?;
+            let duration_ns = leaf.ended_ns.checked_sub(leaf.started_ns).ok_or_else(|| {
+                serde::ser::Error::custom("QG-6 timing leaf has an inverted interval")
+            })?;
+            if !encoded.is_empty() {
+                encoded.push(',');
+            }
+            write!(&mut encoded, "{started_delta_ns}:{duration_ns}")
+                .map_err(serde::ser::Error::custom)?;
+        }
+        serializer.serialize_str(&encoded)
+    }
+}
+
+#[derive(Serialize)]
+struct Qg6TimedSampleWire<'a> {
+    block_id: u64,
+    sample_id: u64,
+    query_id: &'a str,
+    query_index: usize,
+    comparison: Qg6Comparison,
+    arm: Qg6ArmRole,
+    order: Qg6SampleOrder,
+    started_ns: u64,
+    ended_ns: u64,
+    observed_latency_ns: u64,
+    subsample_count: u64,
+    result_receipt_sha256: &'a str,
+    result_sha256: &'a str,
+    timing_leaves: Qg6TimingLeavesWire<'a>,
+    timing_leaves_sha256: &'a str,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Qg6TimedSampleWireOwned {
+    block_id: u64,
+    sample_id: u64,
+    query_id: String,
+    query_index: usize,
+    comparison: Qg6Comparison,
+    arm: Qg6ArmRole,
+    order: Qg6SampleOrder,
+    started_ns: u64,
+    ended_ns: u64,
+    observed_latency_ns: u64,
+    subsample_count: u64,
+    result_receipt_sha256: String,
+    result_sha256: String,
+    timing_leaves: String,
+    timing_leaves_sha256: String,
+}
+
+impl Serialize for Qg6TimedSample {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        Qg6TimedSampleWire {
+            block_id: self.block_id,
+            sample_id: self.sample_id,
+            query_id: &self.query_id,
+            query_index: self.query_index,
+            comparison: self.comparison,
+            arm: self.arm,
+            order: self.order,
+            started_ns: self.started_ns,
+            ended_ns: self.ended_ns,
+            observed_latency_ns: self.observed_latency_ns,
+            subsample_count: self.subsample_count,
+            result_receipt_sha256: &self.result_receipt_sha256,
+            result_sha256: &self.result_sha256,
+            timing_leaves: Qg6TimingLeavesWire {
+                parent_started_ns: self.started_ns,
+                leaves: &self.timing_leaves,
+            },
+            timing_leaves_sha256: &self.timing_leaves_sha256,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Qg6TimedSample {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = Qg6TimedSampleWireOwned::deserialize(deserializer)?;
+        let maximum_wire_bytes = QG6_TIMED_SEARCHES_PER_SAMPLE
+            .checked_mul(QG6_TIMING_LEAF_MAX_PAIR_WIRE_BYTES)
+            .ok_or_else(|| serde::de::Error::custom("QG-6 timing leaf wire limit overflows"))?;
+        if wire.timing_leaves.len() > maximum_wire_bytes {
+            return Err(serde::de::Error::custom(
+                "QG-6 timing leaf wire exceeds its bounded representation",
+            ));
+        }
+        let leaf_count = if wire.timing_leaves.is_empty() {
+            0
+        } else {
+            wire.timing_leaves.split(',').count()
+        };
+        if leaf_count > QG6_TIMED_SEARCHES_PER_SAMPLE {
+            return Err(serde::de::Error::custom(
+                "QG-6 timing leaf wire exceeds its bounded cardinality",
+            ));
+        }
+        let mut timing_leaves = Vec::new();
+        timing_leaves
+            .try_reserve_exact(leaf_count)
+            .map_err(serde::de::Error::custom)?;
+        if !wire.timing_leaves.is_empty() {
+            for pair in wire.timing_leaves.split(',') {
+                if pair.is_empty() {
+                    return Err(serde::de::Error::custom(
+                        "QG-6 timing leaf wire contains an empty pair",
+                    ));
+                }
+                let (started_delta_text, duration_text) =
+                    pair.split_once(':').ok_or_else(|| {
+                        serde::de::Error::custom("QG-6 timing leaf wire pair lacks its separator")
+                    })?;
+                let is_canonical_decimal = |value: &str| {
+                    !value.is_empty()
+                        && value.bytes().all(|byte| byte.is_ascii_digit())
+                        && (value.len() == 1 || !value.starts_with('0'))
+                };
+                if !is_canonical_decimal(started_delta_text) || !is_canonical_decimal(duration_text)
+                {
+                    return Err(serde::de::Error::custom(
+                        "QG-6 timing leaf wire contains noncanonical decimal data",
+                    ));
+                }
+                let started_delta_ns = started_delta_text
+                    .parse::<u64>()
+                    .map_err(serde::de::Error::custom)?;
+                let duration_ns = duration_text
+                    .parse::<u64>()
+                    .map_err(serde::de::Error::custom)?;
+                let started_ns = wire
+                    .started_ns
+                    .checked_add(started_delta_ns)
+                    .ok_or_else(|| serde::de::Error::custom("QG-6 timing leaf start overflows"))?;
+                let ended_ns = started_ns
+                    .checked_add(duration_ns)
+                    .ok_or_else(|| serde::de::Error::custom("QG-6 timing leaf end overflows"))?;
+                timing_leaves.push(
+                    Qg6SearchTimingLeafReceipt::from_interval(started_ns, ended_ns)
+                        .map_err(serde::de::Error::custom)?,
+                );
+            }
+        }
+        let sample = Self {
+            block_id: wire.block_id,
+            sample_id: wire.sample_id,
+            query_id: wire.query_id,
+            query_index: wire.query_index,
+            comparison: wire.comparison,
+            arm: wire.arm,
+            order: wire.order,
+            started_ns: wire.started_ns,
+            ended_ns: wire.ended_ns,
+            observed_latency_ns: wire.observed_latency_ns,
+            subsample_count: wire.subsample_count,
+            result_receipt_sha256: wire.result_receipt_sha256,
+            result_sha256: wire.result_sha256,
+            timing_leaves,
+            timing_leaves_sha256: wire.timing_leaves_sha256,
+        };
+        sample
+            .verify_timing_leaves()
+            .map_err(serde::de::Error::custom)?;
+        Ok(sample)
+    }
 }
 
 impl Qg6TimedSample {
@@ -1611,7 +1936,7 @@ impl Qg6TimedSample {
     ///
     /// # Errors
     ///
-    /// Rejects missing, extra, reordered, non-finite, overlapping, or
+    /// Rejects missing, extra, reordered, zero-width, overlapping, or
     /// out-of-parent intervals, as well as a leaf/result digest that cannot
     /// reproduce the parent sample's p50 and result sequence.
     pub fn verify_timing_leaves(&self) -> Result<(), Qg6HarnessError> {
@@ -1620,10 +1945,14 @@ impl Qg6TimedSample {
                 reason: "QG-6 timing leaf cardinality does not fit usize".to_owned(),
             })?;
         if expected_count == 0
-            || expected_count > MAX_TIMING_LEAVES_PER_SAMPLE
+            || expected_count > QG6_TIMED_SEARCHES_PER_SAMPLE
             || self.timing_leaves.len() != expected_count
             || self.started_ns >= self.ended_ns
             || self.observed_latency_ns == 0
+            || self.query_id.is_empty()
+            || self.query_id.len() > MAX_QUERY_ID_BYTES
+            || self.query_index >= MAX_QUERY_COUNT
+            || !is_lower_hex_sha256(&self.result_receipt_sha256)
             || !is_lower_hex_sha256(&self.result_sha256)
             || !is_lower_hex_sha256(&self.timing_leaves_sha256)
         {
@@ -1640,33 +1969,15 @@ impl Qg6TimedSample {
                 reason: "QG-6 timing leaf validation allocation failed".to_owned(),
             })?;
         let mut previous_ended_ns = None;
-        let mut result_receipt_sha256 = None;
-        for (index, leaf) in self.timing_leaves.iter().enumerate() {
+        for leaf in &self.timing_leaves {
             leaf.verify()?;
-            let expected_ordinal = usize_to_u64(index)?;
-            if leaf.block_id != self.block_id
-                || leaf.sample_id != self.sample_id
-                || leaf.query_id != self.query_id
-                || leaf.query_index != self.query_index
-                || leaf.comparison != self.comparison
-                || leaf.arm != self.arm
-                || leaf.order != self.order
-                || leaf.leaf_ordinal != expected_ordinal
-                || leaf.started_ns < self.started_ns
+            if leaf.started_ns < self.started_ns
                 || leaf.ended_ns > self.ended_ns
                 || previous_ended_ns.is_some_and(|previous| leaf.started_ns < previous)
             {
                 return Err(Qg6HarnessError::InvalidSpec {
                     reason: "QG-6 timing leaves do not have the exact parent order and interval"
                         .to_owned(),
-                });
-            }
-            if result_receipt_sha256
-                .replace(leaf.result_receipt_sha256.as_str())
-                .is_some_and(|previous| previous != leaf.result_receipt_sha256.as_str())
-            {
-                return Err(Qg6HarnessError::InvalidSpec {
-                    reason: "QG-6 timing leaves disagree on their result receipt".to_owned(),
                 });
             }
             previous_ended_ns = Some(leaf.ended_ns);
@@ -1678,13 +1989,12 @@ impl Qg6TimedSample {
             latencies_ns.push(latency_ns);
         }
         latencies_ns.sort_unstable();
-        let result_receipt_sha256 =
-            result_receipt_sha256.ok_or_else(|| Qg6HarnessError::InvalidSpec {
-                reason: "QG-6 timing leaf receipt has no result binding".to_owned(),
-            })?;
         if self.observed_latency_ns != median_sorted_u64(&latencies_ns)
             || self.result_sha256
-                != qg6_result_digest_sequence_sha256(result_receipt_sha256, self.subsample_count)?
+                != qg6_result_digest_sequence_sha256(
+                    &self.result_receipt_sha256,
+                    self.subsample_count,
+                )?
             || self.timing_leaves_sha256 != self.recomputed_timing_leaves_sha256()?
         {
             return Err(Qg6HarnessError::InvalidSpec {
@@ -1708,19 +2018,22 @@ impl Qg6TimedSample {
         hasher.update(self.ended_ns.to_le_bytes());
         hasher.update(self.observed_latency_ns.to_le_bytes());
         hasher.update(self.subsample_count.to_le_bytes());
+        hash_len_prefixed(&mut hasher, self.result_receipt_sha256.as_bytes());
         hash_len_prefixed(&mut hasher, self.result_sha256.as_bytes());
         hasher.update(usize_to_u64(self.timing_leaves.len())?.to_le_bytes());
         for leaf in &self.timing_leaves {
-            hash_len_prefixed(&mut hasher, leaf.receipt_sha256.as_bytes());
+            hasher.update(leaf.started_ns.to_le_bytes());
+            hasher.update(leaf.ended_ns.to_le_bytes());
         }
         Ok(lower_hex(hasher.finalize()))
     }
 }
 
-/// Output of one prepared four-arm measurement.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Output of one prepared six-arm measurement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Qg6Measurement {
-    /// Frozen identity shared by all four arms.
+    /// Frozen identity shared by all six arms.
     pub identity: Qg6ExperimentIdentity,
     /// Seed that fully determines the timed schedule.
     pub schedule_seed: u64,
@@ -1730,14 +2043,135 @@ pub struct Qg6Measurement {
     pub rounds_per_query: usize,
     /// Equal individually timed searches summarized by each arm sample.
     pub searches_per_sample: usize,
-    /// Interleaved null/effect schedule.
+    /// Interleaved three-comparison schedule.
     pub schedule: Vec<Qg6PairBlock>,
+    /// Exact pre-timing schedule authority supplied and retained by the caller.
+    pub schedule_authority: Qg6ScheduleAuthority,
     /// Raw per-arm monotonic intervals.
     pub samples: Vec<Qg6TimedSample>,
     /// Lifecycle contamination proof.
     pub lifecycle: Qg6LifecycleReceipt,
-    /// Sealed query mapping and full four-role semantic receipts.
+    /// Sealed query mapping and full six-role semantic receipts.
     pub semantic_contract: Qg6SemanticContract,
+}
+
+impl Qg6Measurement {
+    /// Verify every observed row against an independently retained pre-timing authority.
+    ///
+    /// # Errors
+    ///
+    /// Rejects authority substitution, schedule mutation, missing or relabeled
+    /// samples, duplicate identities, malformed leaves, or lifecycle drift.
+    pub fn verify_against_schedule_authority(
+        &self,
+        authority: &Qg6ScheduleAuthority,
+    ) -> Result<(), Qg6HarnessError> {
+        authority.verify_for(&self.identity, self.semantic_contract.groups.len())?;
+        self.semantic_contract.verify()?;
+        if &self.schedule_authority != authority
+            || self.schedule_seed != authority.schedule_seed
+            || self.warmup_rounds == 0
+            || self.rounds_per_query != authority.rounds_per_query
+            || self.searches_per_sample != authority.searches_per_sample
+            || self.schedule != authority.schedule
+            || self.semantic_contract.prepared_corpus_sha256 != self.identity.corpus_sha256
+            || self.semantic_contract.query_manifest_sha256 != self.identity.query_manifest_sha256
+            || self.semantic_contract.config_contract_sha256 != self.identity.config_contract_sha256
+            || self.semantic_contract.document_count != self.identity.document_count
+            || self.semantic_contract.k != self.identity.k
+        {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason:
+                    "QG-6 measurement does not carry the externally retained schedule authority"
+                        .to_owned(),
+            });
+        }
+        let expected_samples = authority.schedule.len().checked_mul(2).ok_or_else(|| {
+            Qg6HarnessError::InvalidSpec {
+                reason: "QG-6 authority sample cardinality overflow".to_owned(),
+            }
+        })?;
+        if self.samples.len() != expected_samples {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: "QG-6 measurement sample cardinality differs from its authority".to_owned(),
+            });
+        }
+        let mut sample_ids = BTreeSet::new();
+        let mut rows = BTreeMap::new();
+        for sample in &self.samples {
+            sample.verify_timing_leaves()?;
+            if !sample_ids.insert(sample.sample_id)
+                || rows
+                    .insert((sample.block_id, sample.order), sample)
+                    .is_some()
+            {
+                return Err(Qg6HarnessError::InvalidSpec {
+                    reason: "QG-6 measurement repeats one authority-bound sample identity"
+                        .to_owned(),
+                });
+            }
+        }
+        let mut previous_ended_ns = None;
+        for block in &authority.schedule {
+            for (order, role) in [
+                (Qg6SampleOrder::First, block.first),
+                (Qg6SampleOrder::Second, block.second),
+            ] {
+                let sample = rows.remove(&(block.block_id, order)).ok_or_else(|| {
+                    Qg6HarnessError::InvalidSpec {
+                        reason: "QG-6 measurement omits one authority-bound sample".to_owned(),
+                    }
+                })?;
+                let expected_sample_id = block
+                    .block_id
+                    .checked_mul(2)
+                    .and_then(|base| base.checked_add(u64::from(order == Qg6SampleOrder::Second)))
+                    .ok_or_else(|| Qg6HarnessError::InvalidSpec {
+                        reason: "QG-6 authority sample ID overflow".to_owned(),
+                    })?;
+                let expected_result_receipt = self.semantic_contract.groups[block.query_index]
+                    .roles
+                    .get(role);
+                let expected_result_sha256 = qg6_result_sequence_sha256(
+                    expected_result_receipt,
+                    usize_to_u64(authority.searches_per_sample)?,
+                )?;
+                if sample.sample_id != expected_sample_id
+                    || sample.query_index != block.query_index
+                    || sample.query_id
+                        != self.semantic_contract.groups[block.query_index]
+                            .query
+                            .query_id
+                    || sample.comparison != block.comparison
+                    || sample.arm != role
+                    || sample.subsample_count != usize_to_u64(authority.searches_per_sample)?
+                    || sample.result_receipt_sha256 != expected_result_receipt.receipt_sha256
+                    || sample.result_sha256 != expected_result_sha256
+                    || previous_ended_ns.is_some_and(|previous| sample.started_ns < previous)
+                {
+                    return Err(Qg6HarnessError::InvalidSpec {
+                        reason:
+                            "QG-6 measurement relabels or reorders an authority-bound schedule row"
+                                .to_owned(),
+                    });
+                }
+                previous_ended_ns = Some(sample.ended_ns);
+            }
+        }
+        if !rows.is_empty() {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: "QG-6 measurement contains rows outside its schedule authority".to_owned(),
+            });
+        }
+        verify_lifecycle(
+            &self.lifecycle,
+            self.identity.document_count,
+            authority.query_count,
+            self.warmup_rounds,
+            authority.rounds_per_query,
+            authority.searches_per_sample,
+        )
+    }
 }
 
 /// Bounded, non-sensitive failure surface for prepared QG-6 execution.
@@ -1887,43 +2321,47 @@ pub enum Qg6HarnessError {
     },
 }
 
-struct Qg6FourArms<A> {
-    null_left: A,
-    null_right: A,
+struct Qg6SixArms<A> {
+    tantivy_null_left: A,
+    tantivy_null_right: A,
+    quill_null_left: A,
+    quill_null_right: A,
     effect_control: A,
     effect_treatment: A,
 }
 
-impl<A> Qg6FourArms<A> {
+impl<A> Qg6SixArms<A> {
     fn get(&self, role: Qg6ArmRole) -> &A {
         match role {
-            Qg6ArmRole::NullLeft => &self.null_left,
-            Qg6ArmRole::NullRight => &self.null_right,
+            Qg6ArmRole::TantivyNullLeft => &self.tantivy_null_left,
+            Qg6ArmRole::TantivyNullRight => &self.tantivy_null_right,
+            Qg6ArmRole::QuillNullLeft => &self.quill_null_left,
+            Qg6ArmRole::QuillNullRight => &self.quill_null_right,
             Qg6ArmRole::EffectControl => &self.effect_control,
             Qg6ArmRole::EffectTreatment => &self.effect_treatment,
         }
     }
 }
 
-/// Four independently built arms before result parity has been established.
+/// Six independently built arms before result parity has been established.
 pub struct Qg6PreparedExperiment<A> {
     identity: Qg6ExperimentIdentity,
     queries: Vec<Qg6QuerySpec>,
-    arms: Qg6FourArms<A>,
+    arms: Qg6SixArms<A>,
     lifecycle: Qg6LifecycleReceipt,
 }
 
 /// Prepared arms whose complete frozen query set passed result parity.
 pub struct Qg6ValidatedExperiment<A> {
     prepared: Qg6PreparedExperiment<A>,
-    expected_results: Vec<Qg6FourArmResultReceipts>,
+    expected_results: Vec<Qg6SixArmResultReceipts>,
 }
 
 impl<A> Qg6PreparedExperiment<A> {
-    /// Build, populate, and commit four independent arms exactly once.
+    /// Build, populate, and commit six independent arms exactly once.
     ///
     /// The builder must record every population batch and the searchable
-    /// commit through [`Qg6SetupRecorder`]. All four builders receive the same
+    /// commit through [`Qg6SetupRecorder`]. All six builders receive the same
     /// immutable identity.
     ///
     /// # Errors
@@ -1964,8 +2402,30 @@ impl<A> Qg6PreparedExperiment<A> {
             k,
         };
         let mut lifecycle = Qg6LifecycleReceipt::default();
-        let null_left = build_one(Qg6ArmRole::NullLeft, &identity, &mut lifecycle, &mut build)?;
-        let null_right = build_one(Qg6ArmRole::NullRight, &identity, &mut lifecycle, &mut build)?;
+        let tantivy_null_left = build_one(
+            Qg6ArmRole::TantivyNullLeft,
+            &identity,
+            &mut lifecycle,
+            &mut build,
+        )?;
+        let tantivy_null_right = build_one(
+            Qg6ArmRole::TantivyNullRight,
+            &identity,
+            &mut lifecycle,
+            &mut build,
+        )?;
+        let quill_null_left = build_one(
+            Qg6ArmRole::QuillNullLeft,
+            &identity,
+            &mut lifecycle,
+            &mut build,
+        )?;
+        let quill_null_right = build_one(
+            Qg6ArmRole::QuillNullRight,
+            &identity,
+            &mut lifecycle,
+            &mut build,
+        )?;
         let effect_control = build_one(
             Qg6ArmRole::EffectControl,
             &identity,
@@ -1981,9 +2441,11 @@ impl<A> Qg6PreparedExperiment<A> {
         Ok(Self {
             identity,
             queries,
-            arms: Qg6FourArms {
-                null_left,
-                null_right,
+            arms: Qg6SixArms {
+                tantivy_null_left,
+                tantivy_null_right,
+                quill_null_left,
+                quill_null_right,
                 effect_control,
                 effect_treatment,
             },
@@ -1991,7 +2453,7 @@ impl<A> Qg6PreparedExperiment<A> {
         })
     }
 
-    /// Validate every frozen query against all four arms before timing.
+    /// Validate every frozen query against all six arms before timing.
     ///
     /// # Errors
     ///
@@ -2023,31 +2485,57 @@ impl<A> Qg6PreparedExperiment<A> {
     {
         let mut expected_results = Vec::with_capacity(self.queries.len());
         for query in &self.queries {
-            let null_left = invoke_search(
+            let tantivy_null_left = invoke_search(
                 &self.arms,
                 query,
                 self.identity.k,
                 self.identity.document_count,
-                Qg6ArmRole::NullLeft,
+                Qg6ArmRole::TantivyNullLeft,
                 Qg6Phase::Preflight,
                 search,
                 normalize,
             )?;
             self.lifecycle
-                .arm_mut(Qg6ArmRole::NullLeft)
+                .arm_mut(Qg6ArmRole::TantivyNullLeft)
                 .preflight_search_calls += 1;
-            let null_right = invoke_search(
+            let tantivy_null_right = invoke_search(
                 &self.arms,
                 query,
                 self.identity.k,
                 self.identity.document_count,
-                Qg6ArmRole::NullRight,
+                Qg6ArmRole::TantivyNullRight,
                 Qg6Phase::Preflight,
                 search,
                 normalize,
             )?;
             self.lifecycle
-                .arm_mut(Qg6ArmRole::NullRight)
+                .arm_mut(Qg6ArmRole::TantivyNullRight)
+                .preflight_search_calls += 1;
+            let quill_null_left = invoke_search(
+                &self.arms,
+                query,
+                self.identity.k,
+                self.identity.document_count,
+                Qg6ArmRole::QuillNullLeft,
+                Qg6Phase::Preflight,
+                search,
+                normalize,
+            )?;
+            self.lifecycle
+                .arm_mut(Qg6ArmRole::QuillNullLeft)
+                .preflight_search_calls += 1;
+            let quill_null_right = invoke_search(
+                &self.arms,
+                query,
+                self.identity.k,
+                self.identity.document_count,
+                Qg6ArmRole::QuillNullRight,
+                Qg6Phase::Preflight,
+                search,
+                normalize,
+            )?;
+            self.lifecycle
+                .arm_mut(Qg6ArmRole::QuillNullRight)
                 .preflight_search_calls += 1;
             let effect_control = invoke_search(
                 &self.arms,
@@ -2076,15 +2564,25 @@ impl<A> Qg6PreparedExperiment<A> {
                 .arm_mut(Qg6ArmRole::EffectTreatment)
                 .preflight_search_calls += 1;
             for (role, observed) in [
-                (Qg6ArmRole::NullRight, &null_right),
+                (Qg6ArmRole::TantivyNullRight, &tantivy_null_right),
+                (Qg6ArmRole::QuillNullLeft, &quill_null_left),
+                (Qg6ArmRole::QuillNullRight, &quill_null_right),
                 (Qg6ArmRole::EffectControl, &effect_control),
                 (Qg6ArmRole::EffectTreatment, &effect_treatment),
             ] {
-                compare_exact(query.id(), Qg6ArmRole::NullLeft, &null_left, role, observed)?;
+                compare_exact(
+                    query.id(),
+                    Qg6ArmRole::TantivyNullLeft,
+                    &tantivy_null_left,
+                    role,
+                    observed,
+                )?;
             }
-            expected_results.push(Qg6FourArmResultReceipts {
-                null_left: null_left.receipt,
-                null_right: null_right.receipt,
+            expected_results.push(Qg6SixArmResultReceipts {
+                tantivy_null_left: tantivy_null_left.receipt,
+                tantivy_null_right: tantivy_null_right.receipt,
+                quill_null_left: quill_null_left.receipt,
+                quill_null_right: quill_null_right.receipt,
                 effect_control: effect_control.receipt,
                 effect_treatment: effect_treatment.receipt,
             });
@@ -2101,8 +2599,8 @@ impl<A> Qg6PreparedExperiment<A> {
     /// evidence. `normalize` extracts the exact native top-k result whose
     /// per-arm receipt must remain stable during warmup, measurement, and
     /// postflight, while
-    /// `compare` proves that each compared result is semantically equivalent
-    /// to the baseline. This permits reviewed native tie-order differences
+    /// `compare` proves that each result is semantically equivalent to the
+    /// Tantivy null-left baseline. This permits reviewed native tie-order differences
     /// without requiring every engine to return the same external ID at a
     /// top-k cutoff.
     ///
@@ -2123,29 +2621,53 @@ impl<A> Qg6PreparedExperiment<A> {
     {
         let mut expected_results = Vec::with_capacity(self.queries.len());
         for query in &self.queries {
-            let (null_left_native, null_left) = invoke_search_borrowed(
+            let (tantivy_null_left_native, tantivy_null_left) = invoke_search_borrowed(
                 &self.arms,
                 query,
                 self.identity.k,
                 self.identity.document_count,
-                Qg6ArmRole::NullLeft,
+                Qg6ArmRole::TantivyNullLeft,
                 search,
                 normalize,
             )?;
             self.lifecycle
-                .arm_mut(Qg6ArmRole::NullLeft)
+                .arm_mut(Qg6ArmRole::TantivyNullLeft)
                 .preflight_search_calls += 1;
-            let (null_right_native, null_right) = invoke_search_borrowed(
+            let (tantivy_null_right_native, tantivy_null_right) = invoke_search_borrowed(
                 &self.arms,
                 query,
                 self.identity.k,
                 self.identity.document_count,
-                Qg6ArmRole::NullRight,
+                Qg6ArmRole::TantivyNullRight,
                 search,
                 normalize,
             )?;
             self.lifecycle
-                .arm_mut(Qg6ArmRole::NullRight)
+                .arm_mut(Qg6ArmRole::TantivyNullRight)
+                .preflight_search_calls += 1;
+            let (quill_null_left_native, quill_null_left) = invoke_search_borrowed(
+                &self.arms,
+                query,
+                self.identity.k,
+                self.identity.document_count,
+                Qg6ArmRole::QuillNullLeft,
+                search,
+                normalize,
+            )?;
+            self.lifecycle
+                .arm_mut(Qg6ArmRole::QuillNullLeft)
+                .preflight_search_calls += 1;
+            let (quill_null_right_native, quill_null_right) = invoke_search_borrowed(
+                &self.arms,
+                query,
+                self.identity.k,
+                self.identity.document_count,
+                Qg6ArmRole::QuillNullRight,
+                search,
+                normalize,
+            )?;
+            self.lifecycle
+                .arm_mut(Qg6ArmRole::QuillNullRight)
                 .preflight_search_calls += 1;
             let (effect_control_native, effect_control) = invoke_search_borrowed(
                 &self.arms,
@@ -2171,25 +2693,48 @@ impl<A> Qg6PreparedExperiment<A> {
             self.lifecycle
                 .arm_mut(Qg6ArmRole::EffectTreatment)
                 .preflight_search_calls += 1;
-            for (role, observed) in [
-                (Qg6ArmRole::NullRight, &null_right_native),
+            for (observed_role, observed) in [
+                (Qg6ArmRole::TantivyNullRight, &tantivy_null_right_native),
+                (Qg6ArmRole::QuillNullLeft, &quill_null_left_native),
+                (Qg6ArmRole::QuillNullRight, &quill_null_right_native),
                 (Qg6ArmRole::EffectControl, &effect_control_native),
                 (Qg6ArmRole::EffectTreatment, &effect_treatment_native),
             ] {
                 compare(
                     query,
-                    Qg6ArmRole::NullLeft,
-                    &null_left_native,
-                    role,
+                    Qg6ArmRole::TantivyNullLeft,
+                    &tantivy_null_left_native,
+                    observed_role,
                     observed,
                 )
                 .map_err(|error| {
-                    semantic_parity_failure(query.id(), Qg6ArmRole::NullLeft, role, &error)
+                    semantic_parity_failure(
+                        query.id(),
+                        Qg6ArmRole::TantivyNullLeft,
+                        observed_role,
+                        &error,
+                    )
                 })?;
             }
-            expected_results.push(Qg6FourArmResultReceipts {
-                null_left: null_left.receipt,
-                null_right: null_right.receipt,
+            compare_exact(
+                query.id(),
+                Qg6ArmRole::TantivyNullLeft,
+                &tantivy_null_left,
+                Qg6ArmRole::TantivyNullRight,
+                &tantivy_null_right,
+            )?;
+            compare_exact(
+                query.id(),
+                Qg6ArmRole::QuillNullLeft,
+                &quill_null_left,
+                Qg6ArmRole::QuillNullRight,
+                &quill_null_right,
+            )?;
+            expected_results.push(Qg6SixArmResultReceipts {
+                tantivy_null_left: tantivy_null_left.receipt,
+                tantivy_null_right: tantivy_null_right.receipt,
+                quill_null_left: quill_null_left.receipt,
+                quill_null_right: quill_null_right.receipt,
                 effect_control: effect_control.receipt,
                 effect_treatment: effect_treatment.receipt,
             });
@@ -2202,7 +2747,30 @@ impl<A> Qg6PreparedExperiment<A> {
 }
 
 impl<A> Qg6ValidatedExperiment<A> {
-    /// Run equal warmups and an interleaved, balanced four-arm timing schedule.
+    /// Freeze and seal the exact schedule that a later measurement must consume.
+    ///
+    /// The caller retains the returned authority and passes it by reference to
+    /// measurement. This call performs no search and occurs before timing.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid query, round, or timing-leaf cardinality.
+    pub fn schedule_authority(
+        &self,
+        rounds_per_query: usize,
+        searches_per_sample: usize,
+        schedule_seed: u64,
+    ) -> Result<Qg6ScheduleAuthority, Qg6HarnessError> {
+        Qg6ScheduleAuthority::for_experiment(
+            self.prepared.identity.clone(),
+            self.prepared.queries.len(),
+            rounds_per_query,
+            searches_per_sample,
+            schedule_seed,
+        )
+    }
+
+    /// Run equal warmups and an interleaved, balanced six-arm timing schedule.
     ///
     /// Result digest computation and stability checks occur after each timed
     /// interval. The engine adapter receives only an already prepared arm.
@@ -2214,20 +2782,13 @@ impl<A> Qg6ValidatedExperiment<A> {
     pub fn measure<F>(
         self,
         warmup_rounds: usize,
-        rounds_per_query: usize,
-        schedule_seed: u64,
+        authority: &Qg6ScheduleAuthority,
         search: &mut F,
     ) -> Result<Qg6Measurement, Qg6HarnessError>
     where
         F: FnMut(&A, &Qg6QuerySpec, usize, Qg6Phase) -> Result<Qg6SearchResult, String>,
     {
-        self.measure_with_normalizer(
-            warmup_rounds,
-            rounds_per_query,
-            schedule_seed,
-            search,
-            &mut |result| result,
-        )
+        self.measure_with_normalizer(warmup_rounds, authority, search, &mut |result| result)
     }
 
     /// Run the prepared measurement while converting engine-native results
@@ -2240,8 +2801,7 @@ impl<A> Qg6ValidatedExperiment<A> {
     pub fn measure_with_normalizer<R, F, N>(
         self,
         warmup_rounds: usize,
-        rounds_per_query: usize,
-        schedule_seed: u64,
+        authority: &Qg6ScheduleAuthority,
         search: &mut F,
         normalize: &mut N,
     ) -> Result<Qg6Measurement, Qg6HarnessError>
@@ -2249,14 +2809,7 @@ impl<A> Qg6ValidatedExperiment<A> {
         F: FnMut(&A, &Qg6QuerySpec, usize, Qg6Phase) -> Result<R, String>,
         N: FnMut(R) -> Qg6SearchResult,
     {
-        self.measure_query_p50_with_normalizer(
-            warmup_rounds,
-            rounds_per_query,
-            1,
-            schedule_seed,
-            search,
-            normalize,
-        )
+        self.measure_query_p50_with_normalizer(warmup_rounds, authority, search, normalize)
     }
 
     /// Run the prepared measurement with a fixed per-arm search subsample.
@@ -2273,9 +2826,7 @@ impl<A> Qg6ValidatedExperiment<A> {
     pub fn measure_query_p50_with_normalizer<R, F, N>(
         mut self,
         warmup_rounds: usize,
-        rounds_per_query: usize,
-        searches_per_sample: usize,
-        schedule_seed: u64,
+        authority: &Qg6ScheduleAuthority,
         search: &mut F,
         normalize: &mut N,
     ) -> Result<Qg6Measurement, Qg6HarnessError>
@@ -2289,24 +2840,11 @@ impl<A> Qg6ValidatedExperiment<A> {
                     .to_owned(),
             });
         }
-        if searches_per_sample == 0 {
-            return Err(Qg6HarnessError::InvalidSpec {
-                reason: "QG-6 prepared measurement requires at least one search per sample"
-                    .to_owned(),
-            });
-        }
-        if searches_per_sample > MAX_TIMING_LEAVES_PER_SAMPLE {
-            return Err(Qg6HarnessError::InvalidSpec {
-                reason: "QG-6 prepared measurement exceeds the bounded timing-leaf limit"
-                    .to_owned(),
-            });
-        }
-        let schedule = seeded_interleaved_four_arm_schedule(
-            self.prepared.queries.len(),
-            rounds_per_query,
-            schedule_seed,
-        )?;
-        self.run_warmups(warmup_rounds, schedule_seed, search, normalize)?;
+        authority.verify_for(&self.prepared.identity, self.prepared.queries.len())?;
+        let schedule = authority.schedule.clone();
+        let rounds_per_query = authority.rounds_per_query;
+        let searches_per_sample = authority.searches_per_sample;
+        self.run_warmups(warmup_rounds, authority.schedule_seed, search, normalize)?;
 
         let origin = Instant::now();
         let sample_capacity =
@@ -2348,7 +2886,7 @@ impl<A> Qg6ValidatedExperiment<A> {
                     .map_err(|_| Qg6HarnessError::InvalidSpec {
                         reason: "QG-6 timing-leaf allocation failed".to_owned(),
                     })?;
-                for leaf_ordinal in 0..searches_per_sample {
+                for _ in 0..searches_per_sample {
                     let search_started_ns = monotonic_ns(origin);
                     let result = search(
                         self.prepared.arms.get(role),
@@ -2382,20 +2920,11 @@ impl<A> Qg6ValidatedExperiment<A> {
                         self.expected_results[block.query_index].get(role),
                         &observed.receipt,
                     )?;
-                    let leaf = Qg6SearchTimingLeafReceipt::from_observation(
-                        block.block_id,
-                        sample_id,
-                        query.id(),
-                        block.query_index,
-                        block.comparison,
-                        role,
-                        order,
-                        usize_to_u64(leaf_ordinal)?,
+                    let leaf = Qg6SearchTimingLeafReceipt::from_interval(
                         search_started_ns,
                         search_ended_ns,
-                        observed.receipt.receipt_sha256,
                     )?;
-                    latencies_ns.push(leaf.observed_latency_ns);
+                    latencies_ns.push(leaf.observed_latency_ns());
                     timing_leaves.push(leaf);
                 }
                 let ended_ns = monotonic_ns(origin);
@@ -2419,6 +2948,10 @@ impl<A> Qg6ValidatedExperiment<A> {
                     ended_ns,
                     observed_latency_ns,
                     subsample_count,
+                    result_receipt_sha256: self.expected_results[block.query_index]
+                        .get(role)
+                        .receipt_sha256
+                        .clone(),
                     result_sha256: qg6_result_sequence_sha256(
                         self.expected_results[block.query_index].get(role),
                         subsample_count,
@@ -2445,17 +2978,20 @@ impl<A> Qg6ValidatedExperiment<A> {
             rounds_per_query,
             searches_per_sample,
         )?;
-        Ok(Qg6Measurement {
+        let measurement = Qg6Measurement {
             identity: self.prepared.identity,
-            schedule_seed,
+            schedule_seed: authority.schedule_seed,
             warmup_rounds,
             rounds_per_query,
             searches_per_sample,
             schedule,
+            schedule_authority: authority.clone(),
             samples,
             lifecycle: self.prepared.lifecycle,
             semantic_contract,
-        })
+        };
+        measurement.verify_against_schedule_authority(authority)?;
+        Ok(measurement)
     }
 
     fn run_warmups<R, F, N>(
@@ -2541,15 +3077,16 @@ impl<A> Qg6ValidatedExperiment<A> {
 
 /// Construct the deterministic schedule used by the prepared QG-6 runner.
 ///
-/// Every query receives `rounds_per_query` null and effect blocks. Each
-/// two-block unit contains one null and one effect comparison, while the
-/// comparison order and both within-pair arm orders are independently balanced.
+/// Every query receives `rounds_per_query` blocks for each formal comparison.
+/// Each three-block unit contains Tantivy/Tantivy, Quill/Quill, and effect
+/// comparisons. All six comparison permutations and every within-pair order
+/// are independently balanced.
 ///
 /// # Errors
 ///
 /// Requires at least one query and two rounds per query, and rejects arithmetic
 /// overflow.
-pub fn seeded_interleaved_four_arm_schedule(
+pub fn seeded_interleaved_six_arm_schedule(
     query_count: usize,
     rounds_per_query: usize,
     seed: u64,
@@ -2580,11 +3117,13 @@ pub fn seeded_interleaved_four_arm_schedule(
         query_units.extend(0..query_count);
     }
     shuffle(&mut query_units, seed ^ 0x8d58_ac26_afe1_2e47);
-    let comparison_order = balanced_bools(unit_count, seed ^ 0x243f_6a88_85a3_08d3)?;
-    let null_left_first = balanced_bools(unit_count, seed ^ 0x1319_8a2e_0370_7344)?;
+    let mut comparison_permutations = (0..unit_count).map(|index| index % 6).collect::<Vec<_>>();
+    shuffle(&mut comparison_permutations, seed ^ 0x243f_6a88_85a3_08d3);
+    let tantivy_null_left_first = balanced_bools(unit_count, seed ^ 0x1319_8a2e_0370_7344)?;
+    let quill_null_left_first = balanced_bools(unit_count, seed ^ 0x082e_fa98_ec4e_6c89)?;
     let effect_control_first = balanced_bools(unit_count, seed ^ 0xa409_3822_299f_31d0)?;
     let block_capacity = unit_count
-        .checked_mul(2)
+        .checked_mul(3)
         .ok_or_else(|| Qg6HarnessError::InvalidSpec {
             reason: "QG-6 block count overflow".to_owned(),
         })?;
@@ -2595,16 +3134,25 @@ pub fn seeded_interleaved_four_arm_schedule(
             reason: "QG-6 schedule block allocation failed".to_owned(),
         })?;
     for (unit_index, query_index) in query_units.into_iter().enumerate() {
-        let null = pair_roles(Qg6Comparison::Null, null_left_first[unit_index]);
+        let tantivy_null = pair_roles(
+            Qg6Comparison::TantivyNull,
+            tantivy_null_left_first[unit_index],
+        );
+        let quill_null = pair_roles(Qg6Comparison::QuillNull, quill_null_left_first[unit_index]);
         let effect = pair_roles(Qg6Comparison::Effect, effect_control_first[unit_index]);
-        let pairs = if comparison_order[unit_index] {
-            [null, effect]
-        } else {
-            [effect, null]
+        let pairs = match comparison_permutations[unit_index] {
+            0 => [tantivy_null, quill_null, effect],
+            1 => [tantivy_null, effect, quill_null],
+            2 => [quill_null, tantivy_null, effect],
+            3 => [quill_null, effect, tantivy_null],
+            4 => [effect, tantivy_null, quill_null],
+            5 => [effect, quill_null, tantivy_null],
+            _ => unreachable!("QG-6 comparison permutation is modulo six"),
         };
         for (comparison, first, second) in pairs {
             schedule.push(Qg6PairBlock {
                 block_id: usize_to_u64(schedule.len())?,
+                unit_id: usize_to_u64(unit_index)?,
                 query_index,
                 comparison,
                 first,
@@ -2639,7 +3187,7 @@ const QG6_R1_RESIDUAL_MAX_LATENCY: Duration = Duration::from_secs(60);
 /// Six physically independent timing roles for the QG-6 R1 residual diagnostic.
 ///
 /// This is deliberately separate from [`Qg6ArmRole`]:
-/// the latter is the four-arm formal QG-6 gate and cannot be relabelled into
+/// the latter is the six-arm formal QG-6 gate and cannot be relabelled into
 /// this diagnostic's Old/Current/Tantivy A/A and A/B topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -4215,7 +4763,8 @@ fn pair_roles(
     control_first: bool,
 ) -> (Qg6Comparison, Qg6ArmRole, Qg6ArmRole) {
     let (control, treatment) = match comparison {
-        Qg6Comparison::Null => (Qg6ArmRole::NullLeft, Qg6ArmRole::NullRight),
+        Qg6Comparison::TantivyNull => (Qg6ArmRole::TantivyNullLeft, Qg6ArmRole::TantivyNullRight),
+        Qg6Comparison::QuillNull => (Qg6ArmRole::QuillNullLeft, Qg6ArmRole::QuillNullRight),
         Qg6Comparison::Effect => (Qg6ArmRole::EffectControl, Qg6ArmRole::EffectTreatment),
     };
     if control_first {
@@ -4288,7 +4837,7 @@ struct ObservedResult {
 }
 
 fn invoke_search<A, R, F, N>(
-    arms: &Qg6FourArms<A>,
+    arms: &Qg6SixArms<A>,
     query: &Qg6QuerySpec,
     k: usize,
     document_count: u64,
@@ -4314,7 +4863,7 @@ where
 }
 
 fn invoke_phased_search<A, R, F, N>(
-    arms: &Qg6FourArms<A>,
+    arms: &Qg6SixArms<A>,
     query: &Qg6QuerySpec,
     k: usize,
     document_count: u64,
@@ -4340,7 +4889,7 @@ where
 }
 
 fn invoke_search_borrowed<A, R, F, N>(
-    arms: &Qg6FourArms<A>,
+    arms: &Qg6SixArms<A>,
     query: &Qg6QuerySpec,
     k: usize,
     document_count: u64,
@@ -4368,7 +4917,7 @@ where
 fn build_semantic_contract(
     identity: &Qg6ExperimentIdentity,
     queries: &[Qg6QuerySpec],
-    expected_results: &[Qg6FourArmResultReceipts],
+    expected_results: &[Qg6SixArmResultReceipts],
 ) -> Result<Qg6SemanticContract, Qg6HarnessError> {
     Qg6SemanticContract::from_receipts(identity, queries, expected_results)
 }
@@ -5436,32 +5985,58 @@ mod tests {
     }
 
     #[test]
-    fn schedule_is_deterministic_balanced_and_interleaves_comparisons() {
-        let first = seeded_interleaved_four_arm_schedule(4, 11, 0x5155_494c).expect("schedule");
-        let second = seeded_interleaved_four_arm_schedule(4, 11, 0x5155_494c).expect("schedule");
+    fn schedule_is_deterministic_balanced_and_interleaves_three_comparisons() {
+        let first = seeded_interleaved_six_arm_schedule(16, 2, 0x5155_494c).expect("schedule");
+        let second = seeded_interleaved_six_arm_schedule(16, 2, 0x5155_494c).expect("schedule");
         assert_eq!(first, second);
-        assert_eq!(first.len(), 4 * 11 * 2);
+        assert_eq!(first.len(), 16 * 2 * 3);
 
         let mut query_comparison_counts = BTreeMap::new();
         let mut first_counts = BTreeMap::new();
-        for pair in first.as_chunks::<2>().0 {
-            assert_ne!(pair[0].comparison, pair[1].comparison);
-            for block in pair {
+        let mut permutation_counts = BTreeMap::new();
+        let mut unit_ids = BTreeSet::new();
+        let (units, remainder) = first.as_chunks::<3>();
+        assert!(remainder.is_empty());
+        for unit in units {
+            assert!(unit_ids.insert(unit[0].unit_id));
+            assert!(unit.iter().all(|block| {
+                block.unit_id == unit[0].unit_id && block.query_index == unit[0].query_index
+            }));
+            assert_eq!(
+                unit.iter()
+                    .map(|block| block.comparison)
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([
+                    Qg6Comparison::TantivyNull,
+                    Qg6Comparison::QuillNull,
+                    Qg6Comparison::Effect,
+                ])
+            );
+            assert_eq!(
+                unit.iter()
+                    .flat_map(|block| [block.first, block.second])
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from(Qg6ArmRole::ALL)
+            );
+            *permutation_counts
+                .entry([unit[0].comparison, unit[1].comparison, unit[2].comparison])
+                .or_insert(0_usize) += 1;
+            for block in unit {
                 *query_comparison_counts
                     .entry((block.query_index, block.comparison))
                     .or_insert(0_usize) += 1;
                 *first_counts.entry(block.first).or_insert(0_usize) += 1;
             }
         }
-        for query_index in 0..4 {
-            assert_eq!(
-                query_comparison_counts[&(query_index, Qg6Comparison::Null)],
-                11
-            );
-            assert_eq!(
-                query_comparison_counts[&(query_index, Qg6Comparison::Effect)],
-                11
-            );
+        assert_eq!(unit_ids.len(), 32);
+        for query_index in 0..16 {
+            for comparison in [
+                Qg6Comparison::TantivyNull,
+                Qg6Comparison::QuillNull,
+                Qg6Comparison::Effect,
+            ] {
+                assert_eq!(query_comparison_counts[&(query_index, comparison)], 2);
+            }
         }
         assert!(
             first_counts
@@ -5471,6 +6046,88 @@ mod tests {
                 .abs_diff(*first_counts.values().min().expect("first counts"))
                 <= 1
         );
+        assert!(
+            permutation_counts
+                .values()
+                .max()
+                .expect("permutation counts")
+                .abs_diff(
+                    *permutation_counts
+                        .values()
+                        .min()
+                        .expect("permutation counts")
+                )
+                <= 1
+        );
+    }
+
+    #[test]
+    fn preparation_builds_all_six_roles_independently_once() {
+        let mut built_roles = Vec::new();
+        let prepared = Qg6PreparedExperiment::prepare_with(
+            "a".repeat(64),
+            "b".repeat(64),
+            100_000,
+            10,
+            queries(),
+            |role, identity, setup| {
+                built_roles.push(role);
+                setup.record_population_batch(identity.document_count);
+                setup.record_commit();
+                Ok(FakeArm { role })
+            },
+        )
+        .expect("six independent prepared roles");
+
+        assert_eq!(built_roles, Qg6ArmRole::ALL);
+        assert_eq!(
+            built_roles.iter().copied().collect::<BTreeSet<_>>().len(),
+            6
+        );
+        for role in Qg6ArmRole::ALL {
+            assert_eq!(prepared.arms.get(role).role, role);
+            assert_eq!(prepared.lifecycle.arm(role).build_calls, 1);
+        }
+    }
+
+    #[test]
+    fn schedule_authority_rejects_resealed_mutation_and_role_relabeling() {
+        let mut preflight = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize| {
+            black_box(arm.role);
+            Ok(Qg6SearchResult::from(canonical_result(query)))
+        };
+        let validated = prepare()
+            .validate_exact_parity(&mut preflight)
+            .expect("exact parity");
+        let authority = validated
+            .schedule_authority(2, 3, 0x5155_494c)
+            .expect("pre-timing authority");
+        assert_eq!(authority.schedule.len(), 4 * 2 * 3);
+        authority.verify().expect("canonical authority");
+        assert_eq!(
+            Qg6ScheduleAuthority::for_experiment(
+                authority.identity.clone(),
+                authority.query_count,
+                authority.rounds_per_query,
+                authority.searches_per_sample,
+                authority.schedule_seed,
+            )
+            .expect("external parent authority"),
+            authority
+        );
+
+        let mut mutated = authority.clone();
+        mutated.schedule[0].unit_id += 1;
+        mutated.authority_sha256 = mutated.recomputed_sha256().expect("reseal mutation");
+        assert!(mutated.verify().is_err());
+
+        let mut relabeled = authority;
+        relabeled.schedule[0].first = match relabeled.schedule[0].first {
+            Qg6ArmRole::EffectTreatment => Qg6ArmRole::EffectControl,
+            _ => Qg6ArmRole::EffectTreatment,
+        };
+        relabeled.authority_sha256 = relabeled.recomputed_sha256().expect("reseal relabeling");
+        assert!(relabeled.verify().is_err());
     }
 
     #[test]
@@ -6279,6 +6936,18 @@ mod tests {
             10,
         )
         .expect("sealed result receipt");
+        let ranked_hit = &receipt.ordered_hits[0];
+        let ranked_hit_json = serde_json::to_value(ranked_hit).expect("compact ranked-hit JSON");
+        assert_eq!(
+            ranked_hit_json,
+            serde_json::json!([ranked_hit.document_id_sha256, ranked_hit.score_bits]),
+            "ranked-hit receipts must remain compact ordered tuples"
+        );
+        assert_eq!(
+            serde_json::from_value::<Qg6RankedHitReceipt>(ranked_hit_json)
+                .expect("compact ranked-hit round trip"),
+            *ranked_hit,
+        );
 
         let mut mutations = Vec::new();
         let mut returned_count = receipt.clone();
@@ -6337,7 +7006,7 @@ mod tests {
             10,
             100_000,
             Qg6Phase::Preflight,
-            Qg6ArmRole::NullLeft,
+            Qg6ArmRole::TantivyNullLeft,
             "identifier-underfill",
         )
         .err()
@@ -6416,7 +7085,7 @@ mod tests {
                 10,
                 100_000,
                 Qg6Phase::Preflight,
-                Qg6ArmRole::NullLeft,
+                Qg6ArmRole::TantivyNullLeft,
                 "identifier-invalid-hit",
             )
             .err()
@@ -6445,9 +7114,11 @@ mod tests {
                     10,
                 )
                 .expect("result receipt");
-                Qg6FourArmResultReceipts {
-                    null_left: receipt.clone(),
-                    null_right: receipt.clone(),
+                Qg6SixArmResultReceipts {
+                    tantivy_null_left: receipt.clone(),
+                    tantivy_null_right: receipt.clone(),
+                    quill_null_left: receipt.clone(),
+                    quill_null_right: receipt.clone(),
                     effect_control: receipt.clone(),
                     effect_treatment: receipt,
                 }
@@ -6489,15 +7160,22 @@ mod tests {
         let validated = prepare()
             .validate_exact_parity(&mut preflight)
             .expect("exact parity");
+        let authority = validated
+            .schedule_authority(10, 1, 0x5eed)
+            .expect("pre-timing schedule authority");
         let mut search = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize, _phase: Qg6Phase| {
             black_box(arm.role);
             Ok(Qg6SearchResult::from(canonical_result(query)))
         };
         let measurement = validated
-            .measure(2, 10, 0x5eed, &mut search)
+            .measure(2, &authority, &mut search)
             .expect("measurement");
 
-        assert_eq!(measurement.samples.len(), 4 * 10 * 4);
+        assert_eq!(measurement.samples.len(), 4 * 10 * 6);
+        assert_eq!(measurement.schedule_authority, authority);
+        measurement
+            .verify_against_schedule_authority(&authority)
+            .expect("external authority remains binding");
         assert_eq!(
             measurement
                 .samples
@@ -6523,6 +7201,40 @@ mod tests {
             .semantic_contract
             .verify()
             .expect("sealed semantic contract");
+
+        let mut relabeled = measurement.clone();
+        let replacement = match relabeled.samples[0].arm {
+            Qg6ArmRole::EffectTreatment => Qg6ArmRole::EffectControl,
+            _ => Qg6ArmRole::EffectTreatment,
+        };
+        relabeled.samples[0].arm = replacement;
+        relabeled.samples[0].timing_leaves_sha256 = relabeled.samples[0]
+            .recomputed_timing_leaves_sha256()
+            .expect("reseal relabeled sample");
+        relabeled.samples[0]
+            .verify_timing_leaves()
+            .expect("self-consistent relabeling");
+        assert!(
+            relabeled
+                .verify_against_schedule_authority(&authority)
+                .is_err(),
+            "externally retained authority must reject self-consistent relabeling"
+        );
+
+        let mut mutated_id = measurement;
+        mutated_id.samples[0].sample_id += 10_000;
+        mutated_id.samples[0].timing_leaves_sha256 = mutated_id.samples[0]
+            .recomputed_timing_leaves_sha256()
+            .expect("reseal mutated sample");
+        mutated_id.samples[0]
+            .verify_timing_leaves()
+            .expect("self-consistent sample-ID mutation");
+        assert!(
+            mutated_id
+                .verify_against_schedule_authority(&authority)
+                .is_err(),
+            "externally retained authority must reject self-consistent sample-ID mutation"
+        );
     }
 
     #[test]
@@ -6534,34 +7246,59 @@ mod tests {
         let validated = prepare()
             .validate_exact_parity(&mut preflight)
             .expect("exact parity");
+        let authority = validated
+            .schedule_authority(2, 3, 0x5eed)
+            .expect("pre-timing schedule authority");
         let mut search = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize, _phase: Qg6Phase| {
             black_box(arm.role);
             Ok(Qg6SearchResult::from(canonical_result(query)))
         };
         let measurement = validated
-            .measure_query_p50_with_normalizer(1, 2, 3, 0x5eed, &mut search, &mut |result| result)
+            .measure_query_p50_with_normalizer(1, &authority, &mut search, &mut |result| result)
             .expect("p50 subsample measurement");
 
         assert_eq!(measurement.searches_per_sample, 3);
-        assert_eq!(measurement.samples.len(), 4 * 2 * 4);
+        assert_eq!(measurement.samples.len(), 4 * 2 * 6);
         assert!(measurement.samples.iter().all(|sample| {
             sample.subsample_count == 3
                 && sample.observed_latency_ns > 0
                 && sample.verify_timing_leaves().is_ok()
                 && sample.timing_leaves.len() == 3
-                && sample
-                    .timing_leaves
-                    .iter()
-                    .enumerate()
-                    .all(|(index, leaf)| {
-                        leaf.leaf_ordinal == u64::try_from(index).expect("bounded leaf ordinal")
-                            && leaf.started_ns < leaf.ended_ns
-                            && leaf.observed_latency_ms.is_finite()
-                            && leaf.observed_latency_ms > 0.0
-                            && leaf.result_receipt_sha256
-                                == sample.timing_leaves[0].result_receipt_sha256
-                    })
+                && sample.timing_leaves.iter().all(|leaf| {
+                    leaf.started_ns < leaf.ended_ns
+                        && leaf.observed_latency_ms().is_finite()
+                        && leaf.observed_latency_ms() > 0.0
+                })
         }));
+        let leaf = &measurement.samples[0].timing_leaves[0];
+        assert_eq!(
+            serde_json::to_value(leaf).expect("compact timing leaf JSON"),
+            serde_json::json!([leaf.started_ns, leaf.ended_ns]),
+            "timing leaves must remain compact numeric tuples without repeated parent facts"
+        );
+        let sample = &measurement.samples[0];
+        let sample_json = serde_json::to_value(sample).expect("compact timed-sample JSON");
+        let expected_leaf_wire = sample
+            .timing_leaves
+            .iter()
+            .map(|leaf| {
+                format!(
+                    "{}:{}",
+                    leaf.started_ns - sample.started_ns,
+                    leaf.observed_latency_ns()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            sample_json["timing_leaves"], expected_leaf_wire,
+            "timed samples must encode parent-relative leaf starts and durations"
+        );
+        assert_eq!(
+            serde_json::from_value::<Qg6TimedSample>(sample_json)
+                .expect("compact timed-sample round trip"),
+            *sample,
+        );
         for role in Qg6ArmRole::ALL {
             assert_eq!(
                 measurement.lifecycle.arm(role).timed_search_calls,
@@ -6572,7 +7309,7 @@ mod tests {
     }
 
     #[test]
-    fn timing_leaves_fail_closed_on_cardinality_order_nonfinite_interval_and_result_mutations() {
+    fn timed_sample_relative_leaf_wire_round_trips_gaps_and_rejects_absolute_legacy_tuples() {
         let mut preflight = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize| {
             black_box(arm.role);
             Ok(Qg6SearchResult::from(canonical_result(query)))
@@ -6580,12 +7317,80 @@ mod tests {
         let validated = prepare()
             .validate_exact_parity(&mut preflight)
             .expect("exact parity");
+        let authority = validated
+            .schedule_authority(2, 3, 0x5eed)
+            .expect("pre-timing schedule authority");
         let mut search = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize, _phase: Qg6Phase| {
             black_box(arm.role);
             Ok(Qg6SearchResult::from(canonical_result(query)))
         };
         let measurement = validated
-            .measure_query_p50_with_normalizer(1, 2, 3, 0x5eed, &mut search, &mut |result| result)
+            .measure_query_p50_with_normalizer(1, &authority, &mut search, &mut |result| result)
+            .expect("p50 subsample measurement");
+        let mut sample = measurement.samples[0].clone();
+        sample.started_ns = 1_000;
+        sample.ended_ns = 1_050;
+        sample.observed_latency_ns = 5;
+        sample.timing_leaves = vec![
+            Qg6SearchTimingLeafReceipt::from_interval(1_005, 1_008).expect("first leaf"),
+            Qg6SearchTimingLeafReceipt::from_interval(1_020, 1_025).expect("second leaf"),
+            Qg6SearchTimingLeafReceipt::from_interval(1_040, 1_047).expect("third leaf"),
+        ];
+        sample.timing_leaves_sha256 = sample
+            .recomputed_timing_leaves_sha256()
+            .expect("reseal gapped sample");
+        sample
+            .verify_timing_leaves()
+            .expect("gapped sample remains valid");
+
+        let compact = serde_json::to_value(&sample).expect("serialize relative leaf wire");
+        assert_eq!(compact["timing_leaves"], serde_json::json!("5:3,20:5,40:7"));
+        assert_eq!(
+            serde_json::from_value::<Qg6TimedSample>(compact.clone())
+                .expect("gapped relative leaf round trip"),
+            sample,
+        );
+
+        let mut legacy_absolute = compact;
+        legacy_absolute["timing_leaves"] = serde_json::json!("1005:1008,20:5,40:7");
+        assert!(
+            serde_json::from_value::<Qg6TimedSample>(legacy_absolute).is_err(),
+            "absolute start/end tuples from the superseded wire must fail closed"
+        );
+        for malformed_wire in [
+            "05:3,20:5,40:7",
+            "5:03,20:5,40:7",
+            "5:3,20:5,40:7,",
+            "5::3,20:5,40:7",
+            "18446744073709551616:3,20:5,40:7",
+        ] {
+            let mut malformed = serde_json::to_value(&sample).expect("serialize valid sample");
+            malformed["timing_leaves"] = serde_json::json!(malformed_wire);
+            assert!(
+                serde_json::from_value::<Qg6TimedSample>(malformed).is_err(),
+                "malformed compact timing wire escaped: {malformed_wire}"
+            );
+        }
+    }
+
+    #[test]
+    fn timing_leaves_fail_closed_on_cardinality_order_interval_and_result_mutations() {
+        let mut preflight = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize| {
+            black_box(arm.role);
+            Ok(Qg6SearchResult::from(canonical_result(query)))
+        };
+        let validated = prepare()
+            .validate_exact_parity(&mut preflight)
+            .expect("exact parity");
+        let authority = validated
+            .schedule_authority(2, 3, 0x5eed)
+            .expect("pre-timing schedule authority");
+        let mut search = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize, _phase: Qg6Phase| {
+            black_box(arm.role);
+            Ok(Qg6SearchResult::from(canonical_result(query)))
+        };
+        let measurement = validated
+            .measure_query_p50_with_normalizer(1, &authority, &mut search, &mut |result| result)
             .expect("timing leaves");
         let sample = measurement.samples[0].clone();
         sample
@@ -6606,33 +7411,15 @@ mod tests {
             .expect("reseal reordered leaves");
         assert!(reordered.verify_timing_leaves().is_err());
 
-        let mut nonfinite = sample.clone();
-        nonfinite.timing_leaves[0].observed_latency_ms = f64::NAN;
-        nonfinite.timing_leaves[0].receipt_sha256 = nonfinite.timing_leaves[0]
-            .recomputed_sha256()
-            .expect("reseal nonfinite leaf");
-        nonfinite.timing_leaves_sha256 = nonfinite
-            .recomputed_timing_leaves_sha256()
-            .expect("reseal nonfinite leaves");
-        assert!(nonfinite.verify_timing_leaves().is_err());
-
         let mut invalid_interval = sample.clone();
         invalid_interval.timing_leaves[0].ended_ns = invalid_interval.timing_leaves[0].started_ns;
-        invalid_interval.timing_leaves[0].observed_latency_ns = 0;
-        invalid_interval.timing_leaves[0].observed_latency_ms = 0.0;
-        invalid_interval.timing_leaves[0].receipt_sha256 = invalid_interval.timing_leaves[0]
-            .recomputed_sha256()
-            .expect("reseal invalid interval leaf");
         invalid_interval.timing_leaves_sha256 = invalid_interval
             .recomputed_timing_leaves_sha256()
             .expect("reseal invalid interval leaves");
         assert!(invalid_interval.verify_timing_leaves().is_err());
 
         let mut changed_result = sample;
-        changed_result.timing_leaves[0].result_receipt_sha256 = "f".repeat(64);
-        changed_result.timing_leaves[0].receipt_sha256 = changed_result.timing_leaves[0]
-            .recomputed_sha256()
-            .expect("reseal changed result leaf");
+        changed_result.result_receipt_sha256 = "f".repeat(64);
         changed_result.timing_leaves_sha256 = changed_result
             .recomputed_timing_leaves_sha256()
             .expect("reseal changed result leaves");
@@ -6648,11 +7435,8 @@ mod tests {
         let validated = prepare()
             .validate_exact_parity(&mut preflight)
             .expect("exact parity");
-        let mut search = |_arm: &FakeArm, query: &Qg6QuerySpec, _k: usize, _phase: Qg6Phase| {
-            Ok(Qg6SearchResult::from(canonical_result(query)))
-        };
         let error = validated
-            .measure_query_p50_with_normalizer(1, 2, 0, 0x5eed, &mut search, &mut |result| result)
+            .schedule_authority(2, 0, 0x5eed)
             .expect_err("zero-sized p50 subsample");
 
         assert!(matches!(error, Qg6HarnessError::InvalidSpec { .. }));
@@ -6667,20 +7451,8 @@ mod tests {
         let validated = prepare()
             .validate_exact_parity(&mut preflight)
             .expect("exact parity");
-        let mut search = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize, _phase: Qg6Phase| {
-            black_box(arm.role);
-            Ok(Qg6SearchResult::from(canonical_result(query)))
-        };
-
         let error = validated
-            .measure_query_p50_with_normalizer(
-                1,
-                1,
-                MAX_TIMING_LEAVES_PER_SAMPLE + 1,
-                0x5eed,
-                &mut search,
-                &mut |result| result,
-            )
+            .schedule_authority(2, QG6_TIMED_SEARCHES_PER_SAMPLE + 1, 0x5eed)
             .expect_err("unbounded timing leaves must fail closed");
 
         assert!(matches!(error, Qg6HarnessError::InvalidSpec { .. }));
@@ -6713,12 +7485,15 @@ mod tests {
         let validated = prepare()
             .validate_semantic_parity_with(&mut preflight, &mut normalize, &mut compare)
             .expect("semantic tie-envelope parity");
+        let authority = validated
+            .schedule_authority(2, 1, 0x5eed)
+            .expect("pre-timing schedule authority");
         let mut timed_search =
             |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize, _phase: Qg6Phase| {
                 Ok(Qg6SearchResult::from(native_result(arm.role, query).1))
             };
         let measurement = validated
-            .measure(1, 2, 0x5eed, &mut timed_search)
+            .measure(1, &authority, &mut timed_search)
             .expect("per-arm native receipts remain stable");
 
         assert!(
@@ -6727,6 +7502,41 @@ mod tests {
                 .iter()
                 .any(|sample| sample.arm == Qg6ArmRole::EffectTreatment)
         );
+    }
+
+    #[test]
+    fn semantic_parity_keeps_tantivy_and_quill_nulls_independently_exact() {
+        for drift_role in [Qg6ArmRole::TantivyNullRight, Qg6ArmRole::QuillNullRight] {
+            let mut preflight = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize| {
+                let mut ids = canonical_result(query);
+                if arm.role == drift_role {
+                    ids.swap(0, 1);
+                }
+                Ok((arm.role, ids))
+            };
+            let mut normalize =
+                |result: &(Qg6ArmRole, Vec<String>)| Qg6SearchResult::from(result.1.clone());
+            let mut permissive_compare =
+                |_query: &Qg6QuerySpec,
+                 _expected_role: Qg6ArmRole,
+                 _expected: &(Qg6ArmRole, Vec<String>),
+                 _observed_role: Qg6ArmRole,
+                 _observed: &(Qg6ArmRole, Vec<String>)| { Ok(()) };
+
+            let error = prepare()
+                .validate_semantic_parity_with(
+                    &mut preflight,
+                    &mut normalize,
+                    &mut permissive_compare,
+                )
+                .err()
+                .expect("same-engine null drift must fail before timing");
+            assert!(matches!(
+                error,
+                Qg6HarnessError::OrderedDocIdsMismatch { observed_arm, .. }
+                    if observed_arm == drift_role
+            ));
+        }
     }
 
     #[test]
@@ -6789,7 +7599,7 @@ mod tests {
         let canary = "SECRET-CANARY-DOC-ID";
         let mut search = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize| {
             let mut result = vec![canary.to_owned(), format!("{}-other", query.id())];
-            if arm.role == Qg6ArmRole::NullRight {
+            if arm.role == Qg6ArmRole::TantivyNullRight {
                 result.swap(0, 1);
             }
             Ok(Qg6SearchResult::from(result))
@@ -6801,7 +7611,7 @@ mod tests {
         assert!(matches!(
             error,
             Qg6HarnessError::OrderedDocIdsMismatch {
-                observed_arm: Qg6ArmRole::NullRight,
+                observed_arm: Qg6ArmRole::TantivyNullRight,
                 first_differing_rank: 0,
                 ..
             }
@@ -6822,7 +7632,7 @@ mod tests {
             error,
             Qg6HarnessError::ResultDigestMismatch {
                 phase: Qg6Phase::Preflight,
-                arm: Qg6ArmRole::NullLeft,
+                arm: Qg6ArmRole::TantivyNullLeft,
                 ..
             }
         ));
@@ -6836,6 +7646,9 @@ mod tests {
         let validated = prepare()
             .validate_exact_parity(&mut preflight)
             .expect("preflight");
+        let authority = validated
+            .schedule_authority(2, 1, 7)
+            .expect("pre-timing schedule authority");
         let mut search = |_arm: &FakeArm, query: &Qg6QuerySpec, _k: usize, phase: Qg6Phase| {
             let mut result = canonical_result(query);
             if phase == Qg6Phase::Warmup {
@@ -6844,7 +7657,7 @@ mod tests {
             Ok(Qg6SearchResult::from(result))
         };
         let error = validated
-            .measure(1, 2, 7, &mut search)
+            .measure(1, &authority, &mut search)
             .expect_err("warmup drift");
         assert!(matches!(
             error,
@@ -6863,6 +7676,9 @@ mod tests {
         let validated = prepare()
             .validate_exact_parity(&mut preflight)
             .expect("preflight");
+        let authority = validated
+            .schedule_authority(2, 1, 7)
+            .expect("pre-timing schedule authority");
         let mut search = |_arm: &FakeArm, query: &Qg6QuerySpec, k: usize, phase: Qg6Phase| {
             if phase == Qg6Phase::Postflight {
                 Ok(ranked_result(query, 2.0_f32.to_bits(), 8, k))
@@ -6871,7 +7687,7 @@ mod tests {
             }
         };
         let error = validated
-            .measure(1, 2, 7, &mut search)
+            .measure(1, &authority, &mut search)
             .expect_err("postflight result drift");
         assert!(matches!(
             error,
@@ -6901,7 +7717,7 @@ mod tests {
         assert!(matches!(
             error,
             Qg6HarnessError::InvalidSetup {
-                arm: Qg6ArmRole::NullLeft,
+                arm: Qg6ArmRole::TantivyNullLeft,
                 ..
             }
         ));

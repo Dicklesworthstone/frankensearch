@@ -30,10 +30,12 @@ use crate::machine_class_registry::{
 use crate::perf_assembly::PERF_EVIDENCE_ASSEMBLY_SCHEMA_VERSION;
 use crate::perf_evidence::PERF_EVIDENCE_SCHEMA_VERSION;
 use crate::perf_ratchet::PERF_HISTORY_POINTER_SCHEMA_VERSION;
-use crate::qg6_prepared::{Qg6ArmRole, Qg6Comparison, Qg6SampleOrder, Qg6TimedSample};
+use crate::qg6_prepared::{
+    Qg6ArmRole, Qg6Comparison, Qg6SampleOrder, Qg6SearchTimingLeafReceipt, Qg6TimedSample,
+};
 
 /// Version of the JSON emitted by the QG matrix harness.
-pub const PERF_ARTIFACT_SCHEMA_VERSION: &str = "quill-perf-artifact-v7";
+pub const PERF_ARTIFACT_SCHEMA_VERSION: &str = "quill-perf-artifact-v8";
 /// Read-only schema identifier for historical gate artifacts that lack
 /// auditable host topology and effective-thread provenance.
 pub const LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3: &str = "quill-perf-artifact-v3";
@@ -3503,7 +3505,7 @@ pub enum PerfSamplePhase {
 /// before the authenticated leaf table existed fails to decode rather than
 /// presenting an asserted leaf digest that the evidence layer cannot
 /// recompute.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Qg6SampleBinding {
     /// Stable redacted query ID resolved through `group_id`.
@@ -3526,15 +3528,13 @@ impl Qg6SampleBinding {
     }
 
     fn validate_against(&self, sample: &PerfRawSample) -> bool {
-        let expected_arm = match sample.arm {
-            PerfSampleArm::Control => matches!(
-                self.timed_sample.arm,
-                Qg6ArmRole::NullLeft | Qg6ArmRole::EffectControl
-            ),
-            PerfSampleArm::Treatment => matches!(
-                self.timed_sample.arm,
-                Qg6ArmRole::NullRight | Qg6ArmRole::EffectTreatment
-            ),
+        let expected_arm = match (self.timed_sample.comparison, sample.arm) {
+            (Qg6Comparison::TantivyNull, PerfSampleArm::Control) => Qg6ArmRole::TantivyNullLeft,
+            (Qg6Comparison::TantivyNull, PerfSampleArm::Treatment) => Qg6ArmRole::TantivyNullRight,
+            (Qg6Comparison::QuillNull, PerfSampleArm::Control) => Qg6ArmRole::QuillNullLeft,
+            (Qg6Comparison::QuillNull, PerfSampleArm::Treatment) => Qg6ArmRole::QuillNullRight,
+            (Qg6Comparison::Effect, PerfSampleArm::Control) => Qg6ArmRole::EffectControl,
+            (Qg6Comparison::Effect, PerfSampleArm::Treatment) => Qg6ArmRole::EffectTreatment,
         };
         let expected_order = match sample.order {
             PerfSampleOrder::First => Qg6SampleOrder::First,
@@ -3544,7 +3544,7 @@ impl Qg6SampleBinding {
             && self.timed_sample.block_id == sample.block_id
             && self.timed_sample.sample_id == sample.sample_id
             && self.timed_sample.order == expected_order
-            && expected_arm
+            && self.timed_sample.arm == expected_arm
             && sample.group_id == u64::try_from(self.timed_sample.query_index).ok()
             && sample.work_units == Some(self.timed_sample.subsample_count)
             && self.timed_sample.started_ns == sample.started_ns
@@ -3708,13 +3708,13 @@ pub fn project_qg6_effect_leaf_distributions(
             control
                 .timing_leaves
                 .iter()
-                .map(|leaf| leaf.observed_latency_ms),
+                .map(Qg6SearchTimingLeafReceipt::observed_latency_ms),
         );
         treatment_leaves.extend(
             treatment
                 .timing_leaves
                 .iter()
-                .map(|leaf| leaf.observed_latency_ms),
+                .map(Qg6SearchTimingLeafReceipt::observed_latency_ms),
         );
     }
 
@@ -7716,7 +7716,7 @@ fn expected_result_contracts(gate: PerfGate, spec: &PerfCellSpec) -> Vec<PerfCel
             "ratio".to_owned(),
         ),
     ];
-    if gate == PerfGate::Qg1 {
+    if matches!(gate, PerfGate::Qg1 | PerfGate::Qg6) {
         contracts.push((
             spec.fixture.clone(),
             format!("{}_quill_over_quill", spec.metric),
@@ -7733,15 +7733,15 @@ fn expected_result_contracts(gate: PerfGate, spec: &PerfCellSpec) -> Vec<PerfCel
 pub struct PerfGateArtifact {
     pub schema_version: String,
     pub gate: PerfGate,
-    /// Required on every measured v7 artifact. `None` exists only for the
-    /// exact unmeasured v7 sentinel and explicit read-only legacy loaders.
+    /// Required on every measured v8 artifact. `None` exists only for the
+    /// exact unmeasured v8 sentinel and explicit read-only legacy loaders.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applicability_plan: Option<PerfApplicabilityPlanBinding>,
     /// SHA-256 emitted by the benchmark process for its own executing ELF.
     pub bench_elf_sha256: String,
     pub machine_fingerprint: String,
-    /// Required on measured v7 artifacts. `None` exists only for the exact
-    /// unmeasured v7 sentinel and the explicit read-only v3 loader.
+    /// Required on measured v8 artifacts. `None` exists only for the exact
+    /// unmeasured v8 sentinel and the explicit read-only v3 loader.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<PerfExecutionProvenance>,
     pub git_rev: String,
@@ -8458,9 +8458,7 @@ pub fn render_perf_run_plan_markdown() -> Result<String, GauntletError> {
 mod tests {
     use super::*;
     use crate::machine_class_registry::{ExecutionProfileId, HardwareClassId};
-    use crate::qg6_prepared::{
-        Qg6ResultReceipt, Qg6SearchTimingLeafReceipt, qg6_result_sequence_sha256,
-    };
+    use crate::qg6_prepared::{Qg6ResultReceipt, qg6_result_sequence_sha256};
 
     const PERF_MANIFEST: &str = include_str!("../../../docs/contracts/quill-perf-gates.toml");
 
@@ -8606,8 +8604,9 @@ mod tests {
         }
     }
 
-    fn qg6_effect_sample_with_leaves(
+    fn qg6_sample_with_leaves(
         query_index: usize,
+        comparison: Qg6Comparison,
         arm: PerfSampleArm,
         order: PerfSampleOrder,
         latencies_ns: &[u64],
@@ -8615,10 +8614,13 @@ mod tests {
         let block_id = u64::try_from(query_index).expect("bounded QG-6 query index");
         let sample_id = block_id * 2 + u64::from(arm == PerfSampleArm::Treatment);
         let query_id = format!("qg6-tail-query-{query_index:02}");
-        let comparison = Qg6Comparison::Effect;
-        let role = match arm {
-            PerfSampleArm::Control => Qg6ArmRole::EffectControl,
-            PerfSampleArm::Treatment => Qg6ArmRole::EffectTreatment,
+        let role = match (comparison, arm) {
+            (Qg6Comparison::TantivyNull, PerfSampleArm::Control) => Qg6ArmRole::TantivyNullLeft,
+            (Qg6Comparison::TantivyNull, PerfSampleArm::Treatment) => Qg6ArmRole::TantivyNullRight,
+            (Qg6Comparison::QuillNull, PerfSampleArm::Control) => Qg6ArmRole::QuillNullLeft,
+            (Qg6Comparison::QuillNull, PerfSampleArm::Treatment) => Qg6ArmRole::QuillNullRight,
+            (Qg6Comparison::Effect, PerfSampleArm::Control) => Qg6ArmRole::EffectControl,
+            (Qg6Comparison::Effect, PerfSampleArm::Treatment) => Qg6ArmRole::EffectTreatment,
         };
         let qg6_order = match order {
             PerfSampleOrder::First => Qg6SampleOrder::First,
@@ -8634,23 +8636,11 @@ mod tests {
             };
         let mut leaf_started_ns = started_ns;
         let mut timing_leaves = Vec::with_capacity(latencies_ns.len());
-        for (leaf_ordinal, latency_ns) in latencies_ns.iter().copied().enumerate() {
+        for latency_ns in latencies_ns.iter().copied() {
             let leaf_ended_ns = leaf_started_ns + latency_ns;
             timing_leaves.push(
-                Qg6SearchTimingLeafReceipt::from_observation(
-                    block_id,
-                    sample_id,
-                    &query_id,
-                    query_index,
-                    comparison,
-                    role,
-                    qg6_order,
-                    u64::try_from(leaf_ordinal).expect("bounded leaf ordinal"),
-                    leaf_started_ns,
-                    leaf_ended_ns,
-                    receipt.receipt_sha256.clone(),
-                )
-                .expect("sealed QG-6 timing leaf"),
+                Qg6SearchTimingLeafReceipt::from_interval(leaf_started_ns, leaf_ended_ns)
+                    .expect("sealed QG-6 timing leaf"),
             );
             leaf_started_ns = leaf_ended_ns;
         }
@@ -8670,6 +8660,7 @@ mod tests {
             ended_ns: leaf_started_ns,
             observed_latency_ns,
             subsample_count,
+            result_receipt_sha256: receipt.receipt_sha256.clone(),
             result_sha256: qg6_result_sequence_sha256(&receipt, subsample_count)
                 .expect("sealed QG-6 result sequence"),
             timing_leaves,
@@ -8713,6 +8704,15 @@ mod tests {
             qg1_sample_binding: None,
             tantivy_config_sha256: None,
         }
+    }
+
+    fn qg6_effect_sample_with_leaves(
+        query_index: usize,
+        arm: PerfSampleArm,
+        order: PerfSampleOrder,
+        latencies_ns: &[u64],
+    ) -> PerfRawSample {
+        qg6_sample_with_leaves(query_index, Qg6Comparison::Effect, arm, order, latencies_ns)
     }
 
     #[test]
@@ -8791,6 +8791,42 @@ mod tests {
             &[1_000_000, 1_000_000, 1_000_000, 1_000_000, 100_000_000],
         );
         assert!(project_qg6_effect_leaf_distributions(&unequal_leaves, &config).is_err());
+    }
+
+    #[test]
+    fn qg6_effect_leaf_projection_rejects_authenticated_quill_and_tantivy_null_rows() {
+        let config = estimator_config();
+        for (label, comparison) in [
+            ("TantivyNull", Qg6Comparison::TantivyNull),
+            ("QuillNull", Qg6Comparison::QuillNull),
+        ] {
+            let mut samples = Vec::new();
+            for query_index in 0..QG6_QUERY_GROUPS {
+                samples.push(qg6_sample_with_leaves(
+                    query_index,
+                    comparison,
+                    PerfSampleArm::Control,
+                    PerfSampleOrder::First,
+                    &[1_000_000, 1_000_000, 1_000_000],
+                ));
+                samples.push(qg6_sample_with_leaves(
+                    query_index,
+                    comparison,
+                    PerfSampleArm::Treatment,
+                    PerfSampleOrder::Second,
+                    &[1_000_000, 1_000_000, 1_000_000],
+                ));
+            }
+
+            assert!(
+                matches!(
+                    project_qg6_effect_leaf_distributions(&samples, &config),
+                    Err(PairedEstimatorError::InvalidProvenance { reason })
+                        if reason.contains("effect-stream observation")
+                ),
+                "an authenticated {label} stream must not enter the effect compatibility projection"
+            );
+        }
     }
 
     fn qg1_bulk_cell(threads: usize) -> PerfCellSpec {
@@ -11456,17 +11492,15 @@ mod tests {
         pilot.stream_receipt_sha256 = pilot
             .recomputed_stream_receipt_sha256()
             .expect("unrelated-scope pilot receipt");
-        let rejected_pilots = Qg1TantivyIncumbentScreen::screen(
-            &cell,
-            screen_plan,
-            &semantic_contract,
-            wrong_scope_pilots,
-        )
-        .expect("wrong-scope pilot is a fail-closed no-decision receipt");
-        assert!(rejected_pilots.selected_candidate.is_none());
         assert_eq!(
-            rejected_pilots.no_decision_reason.as_deref(),
-            Some("candidate pilot lacks valid configuration-bound throughput evidence")
+            Qg1TantivyIncumbentScreen::screen(
+                &cell,
+                screen_plan,
+                &semantic_contract,
+                wrong_scope_pilots,
+            ),
+            Err(Qg1TantivyIncumbentError::WriterReceiptMismatch),
+            "removing the timed writer bindings must fail before a generic scope no-decision"
         );
     }
 
@@ -12682,16 +12716,16 @@ mod tests {
 
     #[test]
     fn qg1_profile_plans_have_frozen_exhaustive_applicability_counts() {
-        // GOLDEN-CHANGE (QG-5 xlarge re-pin, 02b5ec25): a plan identity binds
-        // the normalized normative manifest, so re-pinning QG-5 from medium to
-        // xlarge advances all three profile plan hashes. Every structural
+        // GOLDEN-CHANGE (QG-6 authenticated six-arm protocol): a plan identity
+        // binds the normalized normative manifest, so advancing the artifact,
+        // evidence, timing-leaf, semantic-contract, and startup-handshake
+        // schemas advances all three profile plan hashes. Every structural
         // assertion below is unchanged and still passes -- 74 cells, the same
         // Required/Diagnostic/NotApplicable split per profile, the same
-        // capacities and primary target width -- which is what distinguishes a
-        // manifest-identity advance from a matrix change. That commit did not
-        // re-freeze here, and this gate stayed red on the trunk until bd-916qm.
-        // The three hashes are the values the frozen registry and manifest now
-        // recompute to; they are read from the plan, never chosen.
+        // capacities, matrix identity, and primary target width -- which is
+        // what distinguishes this manifest-identity advance from a gate or
+        // matrix change. The hashes are recomputed from the frozen registry and
+        // manifest; they are not selected from measured performance outcomes.
         let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
         let cases = [
             (
@@ -12701,7 +12735,7 @@ mod tests {
                 16,
                 Some(64),
                 Some(64),
-                "e59deedec99d6d7d8ce7d7c53d2627997fefece864b500a5362c6b301d7a14c3",
+                "662970b25201a99444abc57b80987bea85ce5a71ae277361300bf8abb63e0858",
             ),
             (
                 ExecutionProfileId::Smt2_128,
@@ -12710,7 +12744,7 @@ mod tests {
                 0,
                 Some(128),
                 Some(128),
-                "13ad902a710627eaee8cf8a1a4fb3674e73322c431c7fd7c8848059c2024c89b",
+                "f1ae1f063c0c697bab84e3f4f0ddf789cd3ff9ab2cd5471544954d3390ae0c51",
             ),
             (
                 ExecutionProfileId::Scheduler10,
@@ -12719,7 +12753,7 @@ mod tests {
                 40,
                 Some(10),
                 Some(8),
-                "cb90d7d60f5f9a25bd36510121828d934a5a61cc5dc438057b7685a349079ae4",
+                "e62f636c6f745c88fc5182d2a1f5bd3a0a526f8b22039de846e538595cad324d",
             ),
         ];
         let mut plan_hashes = BTreeSet::new();
@@ -13619,14 +13653,14 @@ mod tests {
     fn manifest_contract_hash_ignores_only_activation_state() {
         let manifest = PERF_MANIFEST;
         assert_eq!(manifest.matches("activated = false").count(), 10);
-        // GOLDEN-CHANGE (Tantivy 0.27.0 dependency identity rebind): the
-        // executable oracle had already moved to the exact v3 dependency
-        // contract, so the stale 0.26.1 declaration is corrected without
-        // changing any threshold, estimator, fixture, or activation policy.
-        // Activation is still the sole administrative normalization exception.
+        // GOLDEN-CHANGE (QG-6 authenticated six-arm protocol): the manifest
+        // now binds artifact v8, evidence v7, timing-leaf v3, semantic-contract
+        // v2, and the external startup-authority handshake. No threshold,
+        // fixture, or activation policy changed. Activation remains the sole
+        // administrative normalization exception.
         assert_eq!(
             perf_manifest_contract_sha256(manifest),
-            "daf337373b63e41a86a09e7b8b6500c52323dde6ae1357e979451fbbd49b7561",
+            "dc4aee8548433ab9c3c5b71f684a626f65136eeb88c21bfeb5607a0fa467da1b",
             "the normalized all-inactive manifest digest must remain frozen"
         );
         assert_eq!(
@@ -13766,7 +13800,7 @@ mod tests {
         };
         let json = artifact.to_json_pretty().expect("artifact JSON");
         let value: serde_json::Value = serde_json::from_str(&json).expect("decode artifact");
-        assert_eq!(PERF_ARTIFACT_SCHEMA_VERSION, "quill-perf-artifact-v7");
+        assert_eq!(PERF_ARTIFACT_SCHEMA_VERSION, "quill-perf-artifact-v8");
         assert_eq!(
             value["schema_version"].as_str(),
             Some(PERF_ARTIFACT_SCHEMA_VERSION)
@@ -13789,7 +13823,7 @@ mod tests {
             assert!(value.get(key).is_some(), "missing required field {key}");
         }
         let decoded = PerfGateArtifact::from_verified_measured_slice(json.as_bytes())
-            .expect("round-trip verified typed v7 artifact");
+            .expect("round-trip verified typed v8 artifact");
         assert_eq!(decoded, artifact);
         assert_eq!(
             decoded.applicability_plan.as_ref(),

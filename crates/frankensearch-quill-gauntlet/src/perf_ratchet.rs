@@ -14,13 +14,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::perf::PERF_NULL_MARGIN_MULTIPLIER;
+use crate::perf_evidence::QG6_NULL_EFFECT_MARGIN;
 use crate::{
-    DistributionSummary, EvidenceCellBody, EvidenceDecisionStatus, EvidenceRole,
-    ExecutionProfileId, HardwareClassId, MachineClassRegistry, MachineProfileKey,
-    PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS, PerfApplicabilityPlan,
-    PerfApplicabilityPlanBinding, PerfCellApplicability, PerfCellResult, PerfEvidenceArtifact,
-    PerfExecutionProvenance, PerfGate, PerfGateArtifact, PerfMatrixSpec, Qg1ExpectedAuthority,
-    VerifiedRunnerIdentity,
+    DistributionSummary, EvidenceCellBody, EvidenceRole, ExecutionProfileId, HardwareClassId,
+    MachineClassRegistry, MachineProfileKey, PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS,
+    PerfApplicabilityPlan, PerfApplicabilityPlanBinding, PerfCellApplicability, PerfCellResult,
+    PerfEvidenceArtifact, PerfExecutionProvenance, PerfGate, PerfGateArtifact, PerfMatrixSpec,
+    Qg1ExpectedAuthority, Qg6ScheduleAuthority, VerifiedRunnerIdentity,
 };
 
 /// Version of the machine-readable ratchet decision artifact.
@@ -200,6 +200,43 @@ impl<'a> PerfRatchetQg1AuthoritySets<'a> {
     }
 
     fn for_role(self, role: PerfRatchetEvidenceRole) -> &'a [&'a Qg1ExpectedAuthority] {
+        match role {
+            PerfRatchetEvidenceRole::Baseline => self.baseline,
+            PerfRatchetEvidenceRole::Candidate => self.candidate,
+            PerfRatchetEvidenceRole::Rerun => self.rerun,
+        }
+    }
+}
+
+/// Externally retained QG-6 pre-timing schedule authorities for each ratchet
+/// role.
+///
+/// Baseline, candidate, and rerun come from independent invocations. Their
+/// authority sets therefore remain disjoint inputs instead of one pooled set
+/// that could authenticate a swapped artifact.
+#[derive(Debug, Clone, Copy)]
+pub struct PerfRatchetQg6AuthoritySets<'a> {
+    /// Authorities retained for the committed baseline invocation.
+    pub baseline: &'a [&'a Qg6ScheduleAuthority],
+    /// Authorities retained for the first candidate invocation.
+    pub candidate: &'a [&'a Qg6ScheduleAuthority],
+    /// Authorities retained for the same-revision rerun invocation.
+    pub rerun: &'a [&'a Qg6ScheduleAuthority],
+}
+
+impl<'a> PerfRatchetQg6AuthoritySets<'a> {
+    /// No external authority is available. QG-6 evidence consequently fails
+    /// closed while evidence for other gates remains unaffected.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            baseline: &[],
+            candidate: &[],
+            rerun: &[],
+        }
+    }
+
+    fn for_role(self, role: PerfRatchetEvidenceRole) -> &'a [&'a Qg6ScheduleAuthority] {
         match role {
             PerfRatchetEvidenceRole::Baseline => self.baseline,
             PerfRatchetEvidenceRole::Candidate => self.candidate,
@@ -400,7 +437,7 @@ fn candidate_applicability_plan(
     let Some(binding) = request.candidate.applicability_plan.as_ref() else {
         state.fatal(
             "perf.ratchet.measured_applicability_plan_missing",
-            "measured v7 candidate threshold artifact requires an exact applicability-plan \
+            "measured candidate threshold artifact requires an exact applicability-plan \
              binding",
         );
         return None;
@@ -447,7 +484,7 @@ fn validate_threshold_plan_scope(
         None => state.fatal(
             "perf.ratchet.measured_applicability_plan_missing",
             format!(
-                "{role} measured v7 threshold artifact requires an exact applicability-plan \
+                "{role} measured v8 threshold artifact requires an exact applicability-plan \
                  binding"
             ),
         ),
@@ -457,7 +494,11 @@ fn validate_threshold_plan_scope(
 /// Evaluate a candidate against the committed pass-over-pass baseline.
 #[must_use]
 pub fn evaluate_perf_ratchet(request: PerfRatchetRequest<'_>) -> PerfRatchetEvaluation {
-    evaluate_perf_ratchet_against_qg1_authorities(request, PerfRatchetQg1AuthoritySets::empty())
+    evaluate_perf_ratchet_against_authorities(
+        request,
+        PerfRatchetQg1AuthoritySets::empty(),
+        PerfRatchetQg6AuthoritySets::empty(),
+    )
 }
 
 /// Evaluate a candidate against the committed baseline with externally
@@ -466,6 +507,21 @@ pub fn evaluate_perf_ratchet(request: PerfRatchetRequest<'_>) -> PerfRatchetEval
 pub fn evaluate_perf_ratchet_against_qg1_authorities(
     request: PerfRatchetRequest<'_>,
     qg1_authority_sets: PerfRatchetQg1AuthoritySets<'_>,
+) -> PerfRatchetEvaluation {
+    evaluate_perf_ratchet_against_authorities(
+        request,
+        qg1_authority_sets,
+        PerfRatchetQg6AuthoritySets::empty(),
+    )
+}
+
+/// Evaluate a candidate with every externally retained QG-1 lifecycle and
+/// QG-6 pre-timing schedule authority, partitioned by invocation role.
+#[must_use]
+pub fn evaluate_perf_ratchet_against_authorities(
+    request: PerfRatchetRequest<'_>,
+    qg1_authority_sets: PerfRatchetQg1AuthoritySets<'_>,
+    qg6_authority_sets: PerfRatchetQg6AuthoritySets<'_>,
 ) -> PerfRatchetEvaluation {
     let gate = request.candidate.gate;
     let mut state = DecisionState::default();
@@ -480,7 +536,13 @@ pub fn evaluate_perf_ratchet_against_qg1_authorities(
         );
     };
     if request.mode == PerfRatchetMode::Promotion {
-        validate_machine_profile_promotion(&request, &plan, qg1_authority_sets, &mut state);
+        validate_machine_profile_promotion(
+            &request,
+            &plan,
+            qg1_authority_sets,
+            qg6_authority_sets,
+            &mut state,
+        );
         if state.fatal || state.blocked || state.quarantined {
             return finish_evaluation(
                 gate,
@@ -499,7 +561,13 @@ pub fn evaluate_perf_ratchet_against_qg1_authorities(
         );
     }
     let require_current_evidence = request.mode == PerfRatchetMode::Promotion;
-    evaluate_perf_ratchet_inner(request, qg1_authority_sets, state, require_current_evidence)
+    evaluate_perf_ratchet_inner(
+        request,
+        qg1_authority_sets,
+        qg6_authority_sets,
+        state,
+        require_current_evidence,
+    )
 }
 
 /// The append-only quarantine register, embedded at build time.
@@ -559,6 +627,7 @@ fn validate_machine_profile_promotion(
     request: &PerfRatchetRequest<'_>,
     plan: &PerfApplicabilityPlan,
     qg1_authority_sets: PerfRatchetQg1AuthoritySets<'_>,
+    qg6_authority_sets: PerfRatchetQg6AuthoritySets<'_>,
     state: &mut DecisionState,
 ) {
     let Some(expected_profile) = request.expected_machine_profile else {
@@ -636,7 +705,7 @@ fn validate_machine_profile_promotion(
             state.fatal(
                 "perf.ratchet.evidence_applicability_plan_mismatch",
                 format!(
-                    "{role} v5 evidence does not bind the exact candidate profile/applicability \
+                    "{role} v6 evidence does not bind the exact candidate profile/applicability \
                      plan"
                 ),
             );
@@ -703,9 +772,10 @@ fn validate_machine_profile_promotion(
             );
             continue;
         }
-        if let Err(error) =
-            evidence.verify_integrity_against_qg1_authorities(qg1_authority_sets.for_role(role))
-        {
+        if let Err(error) = evidence.verify_integrity_against_authorities(
+            qg1_authority_sets.for_role(role),
+            qg6_authority_sets.for_role(role),
+        ) {
             state.fatal(
                 "perf.ratchet.machine_evidence_integrity_failed",
                 format!("{role} current evidence no longer verifies: {error}"),
@@ -722,8 +792,7 @@ fn validate_machine_profile_promotion(
             );
             continue;
         };
-        let qg6_tail_hold = qg6_tail_protocol_hold(evidence);
-        if evidence.gate_decision.is_some() || (!evidence.ratchet_admissible() && !qg6_tail_hold) {
+        if evidence.gate_decision.is_some() || !evidence.ratchet_admissible() {
             state.quarantine(
                 "perf.ratchet.current_evidence_not_admissible",
                 format!(
@@ -1089,6 +1158,7 @@ fn validate_execution_projection_binding(
 fn evaluate_perf_ratchet_inner(
     request: PerfRatchetRequest<'_>,
     qg1_authority_sets: PerfRatchetQg1AuthoritySets<'_>,
+    qg6_authority_sets: PerfRatchetQg6AuthoritySets<'_>,
     mut state: DecisionState,
     require_current_evidence: bool,
 ) -> PerfRatchetEvaluation {
@@ -1123,18 +1193,6 @@ fn evaluate_perf_ratchet_inner(
     let baseline_is_bootstrap = request.baseline.is_some_and(|baseline| {
         is_explicit_bootstrap_for(baseline, gate, request.expected_manifest_sha256)
     });
-    let every_required_qg6_role_is_tail_held = request.mode == PerfRatchetMode::Promotion
-        && gate == PerfGate::Qg6
-        && request.baseline.is_some()
-        && (baseline_is_bootstrap
-            || request
-                .baseline_evidence
-                .is_some_and(qg6_tail_protocol_hold))
-        && request
-            .candidate_evidence
-            .is_some_and(qg6_tail_protocol_hold)
-        && request.rerun.is_some()
-        && request.rerun_evidence.is_some_and(qg6_tail_protocol_hold);
     let candidate_cells = validate_artifact(
         request.candidate,
         gate,
@@ -1153,6 +1211,7 @@ fn evaluate_perf_ratchet_inner(
                 request.expected_manifest_sha256,
                 PerfRatchetEvidenceRole::Candidate,
                 qg1_authority_sets.for_role(PerfRatchetEvidenceRole::Candidate),
+                qg6_authority_sets.for_role(PerfRatchetEvidenceRole::Candidate),
                 &mut state,
             ) {
                 return finish_evaluation(
@@ -1205,6 +1264,7 @@ fn evaluate_perf_ratchet_inner(
                     request.expected_manifest_sha256,
                     PerfRatchetEvidenceRole::Baseline,
                     qg1_authority_sets.for_role(PerfRatchetEvidenceRole::Baseline),
+                    qg6_authority_sets.for_role(PerfRatchetEvidenceRole::Baseline),
                     &mut state,
                 ) {
                     return finish_evaluation(
@@ -1231,7 +1291,6 @@ fn evaluate_perf_ratchet_inner(
             request.mode,
             &mut comparisons,
             &mut state,
-            every_required_qg6_role_is_tail_held,
         );
     } else {
         state.quarantine(
@@ -1266,6 +1325,7 @@ fn evaluate_perf_ratchet_inner(
                         request.expected_manifest_sha256,
                         PerfRatchetEvidenceRole::Rerun,
                         qg1_authority_sets.for_role(PerfRatchetEvidenceRole::Rerun),
+                        qg6_authority_sets.for_role(PerfRatchetEvidenceRole::Rerun),
                         &mut state,
                     ) {
                         return finish_evaluation(
@@ -1288,7 +1348,7 @@ fn evaluate_perf_ratchet_inner(
                 }
                 None => None,
             };
-            if candidate_is_complete(&plan, &rerun_cells) && !every_required_qg6_role_is_tail_held {
+            if candidate_is_complete(&plan, &rerun_cells) {
                 // Promotion requires both independent passes to satisfy every
                 // gate target. Reproduction tolerance cannot substitute for
                 // independently clearing a threshold; QG-6 additionally
@@ -1333,9 +1393,7 @@ fn evaluate_perf_ratchet_inner(
         );
     }
 
-    if request.mode == PerfRatchetMode::Promotion
-        && candidate_is_complete(&plan, &candidate_cells)
-        && !every_required_qg6_role_is_tail_held
+    if request.mode == PerfRatchetMode::Promotion && candidate_is_complete(&plan, &candidate_cells)
     {
         evaluate_gate_targets(
             request.candidate,
@@ -1354,15 +1412,6 @@ fn evaluate_perf_ratchet_inner(
                 ),
             );
         }
-    }
-
-    if every_required_qg6_role_is_tail_held && !state.fatal && !state.blocked && !state.quarantined
-    {
-        state.quarantine(
-            "qg6.tail_protocol_not_implemented",
-            "QG-6 semantic receipts are verified, but true-leaf p50/p99 resampling and \
-             tail-validity evidence are not implemented",
-        );
     }
 
     finish_evaluation(
@@ -1413,7 +1462,7 @@ fn validate_artifact<'a>(
         state.fatal(
             "perf.ratchet.measured_applicability_plan_missing",
             format!(
-                "{role} measured v7 threshold artifact requires an exact applicability-plan \
+                "{role} measured v8 threshold artifact requires an exact applicability-plan \
                  binding"
             ),
         );
@@ -1519,25 +1568,6 @@ fn expected_evidence_cells(
         .collect()
 }
 
-fn qg6_tail_protocol_hold(evidence: &PerfEvidenceArtifact) -> bool {
-    evidence.gate == PerfGate::Qg6
-        && evidence.gate_decision.is_none()
-        && evidence.admission_no_claim.is_none()
-        && !evidence.cells.is_empty()
-        && evidence.cells.iter().all(|cell| {
-            cell.status == EvidenceDecisionStatus::NoDecision
-                && cell.reasons.iter().any(|reason| {
-                    reason.code == "qg6.tail_protocol_not_implemented"
-                        && reason.severity == crate::EvidenceSeverity::NoClaim
-                })
-                && cell
-                    .reasons
-                    .iter()
-                    .filter(|reason| reason.severity >= crate::EvidenceSeverity::NoClaim)
-                    .all(|reason| reason.code == "qg6.tail_protocol_not_implemented")
-        })
-}
-
 fn validate_current_evidence(
     evidence: &PerfEvidenceArtifact,
     legacy: &PerfGateArtifact,
@@ -1546,6 +1576,7 @@ fn validate_current_evidence(
     expected_manifest_sha256: &str,
     role: PerfRatchetEvidenceRole,
     qg1_authorities: &[&Qg1ExpectedAuthority],
+    qg6_authorities: &[&Qg6ScheduleAuthority],
     state: &mut DecisionState,
 ) -> bool {
     let role = role.label();
@@ -1553,12 +1584,14 @@ fn validate_current_evidence(
         state.fatal(
             "perf.ratchet.evidence_applicability_plan_mismatch",
             format!(
-                "{role} v5 evidence does not bind the exact threshold profile/applicability plan"
+                "{role} v6 evidence does not bind the exact threshold profile/applicability plan"
             ),
         );
         return false;
     }
-    if let Err(error) = evidence.verify_integrity_against_qg1_authorities(qg1_authorities) {
+    if let Err(error) =
+        evidence.verify_integrity_against_authorities(qg1_authorities, qg6_authorities)
+    {
         let (code, message) = if is_lower_hex_sha256(&evidence.artifact_sha256) {
             (
                 "perf.ratchet.current_evidence_integrity_failed",
@@ -1769,7 +1802,7 @@ fn validate_current_evidence(
             "QG-10 dependency facts remain diagnostic until typed structural facts become \
              decision-capable",
         );
-    } else if !evidence.ratchet_admissible() && !qg6_tail_protocol_hold(evidence) {
+    } else if !evidence.ratchet_admissible() {
         state.quarantine(
             "perf.ratchet.current_evidence_not_admissible",
             format!(
@@ -1793,6 +1826,7 @@ fn validate_current_evidence_cell(
         EvidenceCellBody::Paired {
             paired,
             treatment_arm_null,
+            qg6_protocol,
             hierarchical,
             hierarchical_null,
             ..
@@ -1816,12 +1850,13 @@ fn validate_current_evidence_cell(
                 );
             }
             if cell.spec.gate == PerfGate::Qg6
-                && (hierarchical.is_none() || hierarchical_null.is_none())
+                && (hierarchical.is_none() || hierarchical_null.is_none() || qg6_protocol.is_none())
             {
                 state.fatal(
-                    "perf.ratchet.qg6_hierarchical_evidence_missing",
+                    "perf.ratchet.qg6_joint_tail_evidence_missing",
                     format!(
-                        "{role} QG-6 cell {} lacks a verified hierarchical effect or null estimate",
+                        "{role} QG-6 cell {} lacks a verified hierarchical compatibility estimate \
+                         or formal six-arm joint tail estimate",
                         cell.cell_id
                     ),
                 );
@@ -1831,6 +1866,7 @@ fn validate_current_evidence_cell(
                     cell,
                     paired,
                     treatment_arm_null.as_deref(),
+                    qg6_protocol.as_deref(),
                     legacy_cells,
                     role,
                     state,
@@ -1879,6 +1915,7 @@ fn reconcile_current_cell_with_projection(
     cell: &crate::EvidenceCell,
     paired: &crate::PairedExperimentResult,
     treatment_arm_null: Option<&crate::PairedExperimentResult>,
+    qg6_protocol: Option<&crate::Qg6FormalProtocolEvidence>,
     legacy_cells: &BTreeMap<CellKey, &PerfCellResult>,
     role: &str,
     state: &mut DecisionState,
@@ -1931,16 +1968,22 @@ fn reconcile_current_cell_with_projection(
     let expected_control = qg6_absolute
         .as_ref()
         .map_or(&paired.effect.control, |projection| &projection.control);
-    let treatment_null_aligned = if cell.spec.gate == PerfGate::Qg1 {
-        treatment_arm_null.is_some_and(|evidence| {
+    let treatment_null_aligned = match cell.spec.gate {
+        PerfGate::Qg1 => treatment_arm_null.is_some_and(|evidence| {
             treatment_null.is_some_and(|projected| {
                 projected_ratio_distribution(&evidence.null_samples)
                     .as_ref()
                     .is_some_and(|summary| projected.distribution == *summary)
             })
-        })
-    } else {
-        treatment_arm_null.is_none() && treatment_null.is_none()
+        }),
+        PerfGate::Qg6 => qg6_protocol.is_some_and(|evidence| {
+            treatment_null.is_some_and(|projected| {
+                projected_ratio_distribution(&evidence.quill_null_samples)
+                    .as_ref()
+                    .is_some_and(|summary| projected.distribution == *summary)
+            })
+        }),
+        _ => treatment_arm_null.is_none() && qg6_protocol.is_none() && treatment_null.is_none(),
     };
     let aligned = treatment_null_aligned
         && treatment.is_some_and(|projected| projected.distribution == *expected_treatment)
@@ -2430,7 +2473,6 @@ fn compare_baseline(
     mode: PerfRatchetMode,
     comparisons: &mut Vec<PerfCellComparison>,
     state: &mut DecisionState,
-    suppress_regression_verdicts: bool,
 ) {
     let explicit_bootstrap = is_explicit_bootstrap(baseline);
     if explicit_bootstrap {
@@ -2548,7 +2590,7 @@ fn compare_baseline(
             continue;
         }
 
-        if threshold_exceeded && !suppress_regression_verdicts {
+        if threshold_exceeded {
             let message = format!(
                 "{}/{}/{} regressed {:.3}% (baseline median CI [{:.6}, {:.6}], \
                  candidate median CI [{:.6}, {:.6}], robust_z provenance={robust_z:.3})",
@@ -2901,7 +2943,7 @@ impl GateTargetEvaluator<'_, '_> {
         if ci_high < threshold {
             self.target(false, message);
         } else {
-            self.target_inconclusive(format!("{message}; the median CI crosses {threshold:.6}"));
+            self.target_inconclusive(format!("{message}; the CI crosses {threshold:.6}"));
         }
     }
 
@@ -2919,7 +2961,7 @@ impl GateTargetEvaluator<'_, '_> {
         if ci_low > threshold {
             self.target(false, message);
         } else {
-            self.target_inconclusive(format!("{message}; the median CI crosses {threshold:.6}"));
+            self.target_inconclusive(format!("{message}; the CI crosses {threshold:.6}"));
         }
     }
 
@@ -3136,7 +3178,7 @@ fn evaluate_qg6(
                 1.10,
                 format!(
                     "QG-6 {fixture} hierarchical median-ratio CI \
-                    [{ci_low:.6}, {ci_high:.6}] is not contained in [0.90, 1.10]"
+                     [{ci_low:.6}, {ci_high:.6}] is not contained in [0.90, 1.10]"
                 ),
             );
             let null_floor = (null.ci95_low_ratio - 1.0)
@@ -3147,7 +3189,7 @@ fn evaluate_qg6(
                 target.state.quarantine(
                     "perf.ratchet.inconclusive_equivalence",
                     format!(
-                        "QG-6 {fixture} cannot establish ±10% equivalence: hierarchical A/A \
+                        "QG-6 {fixture} cannot establish +/-10% equivalence: hierarchical A/A \
                          median-ratio CI [{:.6}, {:.6}] fails identity containment or the required \
                          {:.1}x null margin",
                         null.ci95_low_ratio, null.ci95_high_ratio, PERF_NULL_MARGIN_MULTIPLIER,
@@ -3163,17 +3205,102 @@ fn evaluate_qg6(
                 ),
             );
         }
-        if let (Some(quill_p99), Some(oracle_p99)) = (
-            target.p99(&fixture, "latency_ms", "quill"),
-            target.p99(&fixture, "latency_ms", "tantivy"),
-        ) {
-            target.target(
-                quill_p99 <= oracle_p99,
+
+        let joint_tail =
+            current_evidence.and_then(|artifact| exact_qg6_joint_tail_cell(artifact, &fixture));
+        if let Some(tail) = joint_tail {
+            let ci_low = tail.effect.p50_ci95_low_ratio;
+            let ci_high = tail.effect.p50_ci95_high_ratio;
+            target.target_interval_ci(
+                ci_low,
+                ci_high,
+                0.90,
+                1.10,
                 format!(
-                    "QG-6 {fixture} Quill p99 {quill_p99:.6}ms exceeds oracle {oracle_p99:.6}ms"
+                    "QG-6 {fixture} joint true-leaf p50 ratio CI \
+                    [{ci_low:.6}, {ci_high:.6}] is not contained in [0.90, 1.10]"
+                ),
+            );
+            target.target_lower_ci(
+                tail.effect.p99_ci95_low_ratio,
+                tail.effect.p99_ci95_high_ratio,
+                1.0,
+                format!(
+                    "QG-6 {fixture} joint true-leaf p99 ratio CI [{:.6}, {:.6}] does not clear \
+                     oracle parity",
+                    tail.effect.p99_ci95_low_ratio, tail.effect.p99_ci95_high_ratio,
+                ),
+            );
+            for (engine, null) in [
+                ("Tantivy/Tantivy", &tail.tantivy_null),
+                ("Quill/Quill", &tail.quill_null),
+            ] {
+                for (quantile, low, high) in [
+                    ("p50", null.p50_ci95_low_ratio, null.p50_ci95_high_ratio),
+                    ("p99", null.p99_ci95_low_ratio, null.p99_ci95_high_ratio),
+                ] {
+                    let null_floor = (low - 1.0).abs().max((high - 1.0).abs());
+                    if low > 1.0
+                        || high < 1.0
+                        || PERF_NULL_MARGIN_MULTIPLIER * null_floor > QG6_NULL_EFFECT_MARGIN
+                    {
+                        target.state.quarantine(
+                            "perf.ratchet.inconclusive_equivalence",
+                            format!(
+                                "QG-6 {fixture} {engine} {quantile} null CI \
+                                 [{low:.6}, {high:.6}] fails identity containment or the required \
+                                 {PERF_NULL_MARGIN_MULTIPLIER:.1}x margin",
+                            ),
+                        );
+                    }
+                }
+            }
+        } else {
+            target.state.quarantine(
+                "perf.ratchet.qg6_joint_tail_evidence_missing",
+                format!(
+                    "QG-6 {fixture} requires verified six-arm query-first joint p50/p99 evidence; \
+                     flat threshold projections are not decision inputs"
                 ),
             );
         }
+    }
+}
+
+fn exact_qg6_joint_tail_cell<'a>(
+    artifact: &'a PerfEvidenceArtifact,
+    fixture: &str,
+) -> Option<&'a crate::Qg6JointTailEstimate> {
+    let expected_cell_id = format!("{}/{fixture}/latency_ms", PerfGate::Qg6);
+    let mut exact = artifact.cells.iter().filter(|cell| {
+        cell.cell_id == expected_cell_id
+            && cell.spec.gate == PerfGate::Qg6
+            && cell.spec.fixture == fixture
+            && cell.spec.metric == "latency_ms"
+            && cell.spec.unit == "ms"
+            && cell.spec.role == EvidenceRole::Required
+            && cell
+                .spec
+                .input_identity
+                .as_ref()
+                .is_some_and(|identity| identity.validate().is_ok())
+    });
+    let cell = exact.next()?;
+    if exact.next().is_some() {
+        return None;
+    }
+    match &cell.body {
+        EvidenceCellBody::Paired {
+            paired,
+            qg6_protocol: Some(protocol),
+            ..
+        } if paired.provenance.corpus_sha256 == artifact.provenance.corpus.corpus_sha256
+            && paired.provenance.input_identity == cell.spec.input_identity
+            && cell.claim_eligible() =>
+        {
+            Some(&protocol.joint_tail)
+        }
+        _ => None,
     }
 }
 
@@ -3387,8 +3514,9 @@ mod tests {
 
     fn seal_evidence(evidence: &mut PerfEvidenceArtifact) {
         reseal_evidence_without_verification(evidence);
+        let qg6_authorities = retained_qg6_authorities(evidence);
         evidence
-            .verify_integrity()
+            .verify_integrity_against_authorities(&[], &qg6_authorities)
             .expect("test evidence must be integrity-valid after sealing");
     }
 
@@ -3407,7 +3535,19 @@ mod tests {
         evidence.gate_decision = None;
         evidence.artifact_sha256.clear();
         reseal_evidence_without_verification(evidence);
-        evidence.verify_integrity()?;
+        let qg6_authorities = evidence
+            .cells
+            .iter()
+            .filter_map(|cell| match &cell.body {
+                EvidenceCellBody::Paired {
+                    qg6_protocol: Some(protocol),
+                    ..
+                } => Some(protocol.schedule_authority.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let qg6_authority_refs = qg6_authorities.iter().collect::<Vec<_>>();
+        evidence.verify_integrity_against_authorities(&[], &qg6_authority_refs)?;
         let evidence_bytes =
             serde_json::to_vec_pretty(evidence).expect("pre-binding evidence bytes");
         let threshold_bytes = threshold_artifact_bytes(artifact);
@@ -3431,9 +3571,15 @@ mod tests {
             &threshold_bytes,
             &evidence_bytes,
         );
-        evidence.bind_machine_class_identity(identity, &threshold_bytes, &evidence_bytes)?;
+        evidence.bind_machine_class_identity_against_authorities(
+            identity,
+            &threshold_bytes,
+            &evidence_bytes,
+            &[],
+            &qg6_authority_refs,
+        )?;
         reseal_evidence_without_verification(evidence);
-        evidence.verify_integrity()
+        evidence.verify_integrity_against_authorities(&[], &qg6_authority_refs)
     }
 
     fn bind_test_evidence(
@@ -4185,24 +4331,33 @@ mod tests {
             100_000,
             "query/identifier/k10/100k",
             false,
+            1,
+            crate::perf::PERF_BOOTSTRAP_RESAMPLES,
+            false,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn qg6_current_pair_for_cell<const GROUPS: usize>(
+    fn qg6_current_pair_for_cell<const GROUPS: usize, const ROUNDS: usize>(
         run_id: &str,
-        effect_group_ratios: [[f64; 3]; GROUPS],
-        null_group_ratios: [[f64; 3]; GROUPS],
+        effect_group_ratios: [[f64; ROUNDS]; GROUPS],
+        null_group_ratios: [[f64; ROUNDS]; GROUPS],
         query_class: crate::PerfQueryClass,
         k: usize,
         document_count: u64,
         fixture: &str,
         hidden_leaf_tail: bool,
+        searches_per_sample: usize,
+        bootstrap_resamples: usize,
+        full_top_k_receipts: bool,
     ) -> (PerfGateArtifact, PerfEvidenceArtifact) {
-        assert!(GROUPS > 0, "QG-6 test fixture requires a group pattern");
+        assert!(GROUPS > 0 && ROUNDS >= 2 && searches_per_sample > 0);
         let scope = crate::perf::perf_operation_scope(PerfGate::Qg6, fixture, "latency_ms");
-        let (input_identity, semantic_contract) =
-            qg6_test_fixture::contract_for(query_class, document_count, k);
+        let (input_identity, semantic_contract) = if full_top_k_receipts {
+            qg6_test_fixture::contract_for_full_top_k(query_class, document_count, k)
+        } else {
+            qg6_test_fixture::contract_for(query_class, document_count, k)
+        };
         let sample_provenance = PerfSampleProvenance {
             run_id: run_id.to_owned(),
             executable_sha256: "c".repeat(64),
@@ -4211,10 +4366,10 @@ mod tests {
             worker_id: TEST_MACHINE_FINGERPRINT.to_owned(),
             build_profile: "release-perf".to_owned(),
         };
-        let order = seeded_balanced_pair_order(crate::QG6_QUERY_GROUPS * 3, 0x5156_0006)
+        let order = seeded_balanced_pair_order(crate::QG6_QUERY_GROUPS * ROUNDS, 0x5156_0006)
             .expect("balanced QG-6 pair order");
-        let stream = |group_ratios: &[[f64; 3]; GROUPS], sample_base: u64| {
-            let mut samples = Vec::with_capacity(crate::QG6_QUERY_GROUPS * 3 * 2);
+        let stream = |group_ratios: &[[f64; ROUNDS]; GROUPS], sample_base: u64| {
+            let mut samples = Vec::with_capacity(crate::QG6_QUERY_GROUPS * ROUNDS * 2);
             let mut ordinal = 0_usize;
             for (group_index, group_id) in crate::QG6_QUERY_GROUP_IDS.into_iter().enumerate() {
                 let ratios = &group_ratios[group_index % GROUPS];
@@ -4260,43 +4415,69 @@ mod tests {
         };
         let mut effect_samples = stream(&effect_group_ratios, 0);
         let mut null_samples = stream(&null_group_ratios, 100_000);
-        if hidden_leaf_tail {
-            qg6_test_fixture::attach_stream_with_leaf_latencies(
-                &mut effect_samples,
-                true,
-                &input_identity,
-                &semantic_contract,
-                |sample, parent_latency_ns| {
+        let mut quill_null_samples = stream(&[[1.0; ROUNDS]; GROUPS], 200_000);
+        let authority = crate::Qg6ScheduleAuthority::for_experiment(
+            crate::Qg6ExperimentIdentity {
+                corpus_sha256: input_identity.prepared_corpus_sha256.clone(),
+                query_manifest_sha256: input_identity.query_manifest_sha256.clone(),
+                config_contract_sha256: input_identity.config_contract_sha256.clone(),
+                document_count: semantic_contract.document_count,
+                k: semantic_contract.k,
+            },
+            semantic_contract.groups.len(),
+            ROUNDS,
+            searches_per_sample,
+            0x5156_0006,
+        )
+        .expect("QG-6 ratchet fixture authority");
+        qg6_test_fixture::attach_stream_against_schedule_authority_with_leaf_latencies(
+            &mut effect_samples,
+            crate::Qg6Comparison::Effect,
+            &authority,
+            &input_identity,
+            &semantic_contract,
+            |sample, parent_latency_ns| {
+                if hidden_leaf_tail {
                     let tail_latency_ns =
-                        if sample.arm == PerfSampleArm::Treatment && sample.block_id < 2 {
+                        if sample.arm == PerfSampleArm::Treatment && sample.group_id == Some(0) {
                             parent_latency_ns * 100
                         } else {
                             parent_latency_ns
                         };
                     vec![parent_latency_ns, parent_latency_ns, tail_latency_ns]
-                },
-            );
-        } else {
-            qg6_test_fixture::attach_stream(
-                &mut effect_samples,
-                true,
+                } else {
+                    vec![parent_latency_ns; searches_per_sample]
+                }
+            },
+        );
+        for (samples, comparison) in [
+            (&mut null_samples[..], crate::Qg6Comparison::TantivyNull),
+            (&mut quill_null_samples[..], crate::Qg6Comparison::QuillNull),
+        ] {
+            qg6_test_fixture::attach_stream_against_schedule_authority_with_leaf_latencies(
+                samples,
+                comparison,
+                &authority,
                 &input_identity,
                 &semantic_contract,
+                |_, parent_latency_ns| vec![parent_latency_ns; searches_per_sample],
             );
         }
-        qg6_test_fixture::attach_stream(
-            &mut null_samples,
-            false,
+        let mut estimator_config = PairedEstimatorConfig::predeclared(0x5156_0006);
+        estimator_config.bootstrap_resamples = bootstrap_resamples;
+        let paired = estimate_paired_experiment(&effect_samples, &null_samples, &estimator_config)
+            .expect("QG-6 paired evidence");
+        let quill_null_projection =
+            projected_ratio_distribution(&quill_null_samples).expect("QG-6 Quill-null projection");
+        let protocol = crate::Qg6FormalProtocolEvidence::new_against_authority(
+            &paired,
+            quill_null_samples,
+            &authority,
             &input_identity,
             &semantic_contract,
-        );
-        let paired = estimate_paired_experiment(
-            &effect_samples,
-            &null_samples,
-            &PairedEstimatorConfig::predeclared(0x5156_0006),
         )
-        .expect("QG-6 paired evidence");
-        let cell = EvidenceCell::evaluate(
+        .expect("QG-6 ratchet fixture formal protocol");
+        let mut cell = EvidenceCell::evaluate(
             EvidenceCellSpec {
                 gate: PerfGate::Qg6,
                 fixture: fixture.to_owned(),
@@ -4312,6 +4493,12 @@ mod tests {
             &EvidencePolicy::predeclared(),
         )
         .expect("QG-6 evidence cell");
+        cell.attach_qg6_formal_protocol_against_authority(
+            protocol,
+            &EvidencePolicy::predeclared(),
+            &authority,
+        )
+        .expect("attach QG-6 ratchet fixture formal protocol");
         let paired = match &cell.body {
             EvidenceCellBody::Paired { paired, .. } => paired,
             EvidenceCellBody::Facts { .. } => unreachable!("QG-6 must be paired"),
@@ -4361,6 +4548,13 @@ mod tests {
                     unit: "ratio".to_owned(),
                     distribution: projected_ratio_distribution(&paired.null_samples)
                         .expect("QG-6 null projection"),
+                },
+                PerfCellResult {
+                    fixture: fixture.to_owned(),
+                    metric: "latency_ms_quill_over_quill".to_owned(),
+                    engine: "paired_null_quill".to_owned(),
+                    unit: "ratio".to_owned(),
+                    distribution: quill_null_projection,
                 },
             ],
             laws_attested: true,
@@ -4417,9 +4611,25 @@ mod tests {
         (artifact, evidence)
     }
 
-    fn qg6_complete_pair(
+    fn qg6_complete_pair<const GROUPS: usize>(
         run_id: &str,
-        group_ratios: [[f64; 3]; 4],
+        group_ratios: [[f64; 3]; GROUPS],
+    ) -> (PerfGateArtifact, PerfEvidenceArtifact) {
+        qg6_complete_pair_with_shape(
+            run_id,
+            group_ratios,
+            1,
+            crate::perf::PERF_BOOTSTRAP_RESAMPLES,
+            false,
+        )
+    }
+
+    fn qg6_complete_pair_with_shape<const GROUPS: usize, const ROUNDS: usize>(
+        run_id: &str,
+        group_ratios: [[f64; ROUNDS]; GROUPS],
+        searches_per_sample: usize,
+        bootstrap_resamples: usize,
+        full_top_k_receipts: bool,
     ) -> (PerfGateArtifact, PerfEvidenceArtifact) {
         let mut rows = Vec::new();
         let mut cells = Vec::new();
@@ -4432,12 +4642,15 @@ mod tests {
             let (cell_artifact, mut cell_evidence) = qg6_current_pair_for_cell(
                 run_id,
                 group_ratios,
-                [[1.0; 3]; 4],
+                [[1.0; ROUNDS]; GROUPS],
                 query_class,
                 k,
                 document_count,
                 &spec.fixture,
                 false,
+                searches_per_sample,
+                bootstrap_resamples,
+                full_top_k_receipts,
             );
             rows.extend(cell_artifact.cells.iter().cloned());
             cells.push(cell_evidence.cells.remove(0));
@@ -4521,6 +4734,7 @@ mod tests {
                 evidence: Vec::new(),
             },
             PerfRatchetQg1AuthoritySets::empty(),
+            PerfRatchetQg6AuthoritySets::empty(),
             DecisionState::default(),
             false,
         )
@@ -4550,8 +4764,49 @@ mod tests {
                 evidence: Vec::new(),
             },
             PerfRatchetQg1AuthoritySets::empty(),
+            PerfRatchetQg6AuthoritySets::empty(),
             DecisionState::default(),
             false,
+        )
+    }
+
+    fn retained_qg6_authorities(evidence: &PerfEvidenceArtifact) -> Vec<&Qg6ScheduleAuthority> {
+        evidence
+            .cells
+            .iter()
+            .filter_map(|cell| match &cell.body {
+                EvidenceCellBody::Paired {
+                    qg6_protocol: Some(protocol),
+                    ..
+                } => Some(&protocol.schedule_authority),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn evaluate_verified_promotion_request(
+        request: PerfRatchetRequest<'_>,
+    ) -> PerfRatchetEvaluation {
+        let baseline_qg6 = request
+            .baseline_evidence
+            .map(retained_qg6_authorities)
+            .unwrap_or_default();
+        let candidate_qg6 = request
+            .candidate_evidence
+            .map(retained_qg6_authorities)
+            .unwrap_or_default();
+        let rerun_qg6 = request
+            .rerun_evidence
+            .map(retained_qg6_authorities)
+            .unwrap_or_default();
+        evaluate_perf_ratchet_against_authorities(
+            request,
+            PerfRatchetQg1AuthoritySets::empty(),
+            PerfRatchetQg6AuthoritySets {
+                baseline: &baseline_qg6,
+                candidate: &candidate_qg6,
+                rerun: &rerun_qg6,
+            },
         )
     }
 
@@ -4564,7 +4819,7 @@ mod tests {
         rerun_evidence: &PerfEvidenceArtifact,
         expected_machine_profile: MachineProfileKey,
     ) -> PerfRatchetEvaluation {
-        evaluate_perf_ratchet(PerfRatchetRequest {
+        evaluate_verified_promotion_request(PerfRatchetRequest {
             baseline: Some(baseline),
             baseline_evidence: Some(baseline_evidence),
             candidate,
@@ -4579,23 +4834,6 @@ mod tests {
             expected_manifest_sha256: &normalized_manifest_sha256(),
             evidence: Vec::new(),
         })
-    }
-
-    fn assert_only_qg6_tail_hold(result: &PerfRatchetEvaluation) {
-        assert_eq!(
-            result.decision,
-            PerfGateDecision::Quarantine,
-            "strict-tail QG-6 evidence escaped its forced hold: {result:#?}"
-        );
-        assert_eq!(
-            result
-                .reasons
-                .iter()
-                .map(|reason| reason.code.as_str())
-                .collect::<Vec<_>>(),
-            ["qg6.tail_protocol_not_implemented"],
-            "strict-tail QG-6 evidence reached another adjudication path: {result:#?}"
-        );
     }
 
     /// bd-h4sqj: the whole point of the quarantine. This artifact is INTACT —
@@ -4698,7 +4936,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_verified_qg6_matrix_is_tail_held_and_nonpromotable() {
+    fn complete_verified_qg6_matrix_reaches_joint_tail_promotion() {
         let ratios = [[1.0; 3]; 4];
         let (baseline, baseline_evidence) = qg6_complete_pair("baseline", ratios);
         let (candidate, candidate_evidence) = qg6_complete_pair("candidate", ratios);
@@ -4719,7 +4957,7 @@ mod tests {
             expected_profile,
         );
 
-        assert_only_qg6_tail_hold(&result);
+        assert_eq!(result.decision, PerfGateDecision::Allow, "{result:#?}");
 
         let mut tampered_evidence = candidate_evidence.clone();
         let EvidenceCellBody::Paired { paired, .. } = &mut tampered_evidence.cells[0].body else {
@@ -4742,7 +4980,7 @@ mod tests {
         assert_eq!(
             tampered.decision,
             PerfGateDecision::Block,
-            "tampered QG-6 evidence was hidden by the tail hold: {tampered:#?}"
+            "tampered QG-6 evidence escaped authenticated replay: {tampered:#?}"
         );
         assert!(
             tampered
@@ -4753,7 +4991,193 @@ mod tests {
     }
 
     #[test]
-    fn strict_tail_qg6_bad_hierarchical_point_estimate_remains_no_decision() {
+    fn qg6_ratchet_refuses_a_foreign_external_schedule_authority() {
+        let ratios = [[1.0; 3]; 4];
+        let (baseline, baseline_evidence) = qg6_complete_pair("baseline", ratios);
+        let (candidate, candidate_evidence) = qg6_complete_pair("candidate", ratios);
+        let (rerun, rerun_evidence) = qg6_complete_pair("rerun", ratios);
+        let expected_profile = candidate_evidence
+            .machine_class
+            .identity()
+            .expect("candidate identity")
+            .profile();
+        let baseline_authorities = retained_qg6_authorities(&baseline_evidence);
+        let mut candidate_authorities = retained_qg6_authorities(&candidate_evidence);
+        let rerun_authorities = retained_qg6_authorities(&rerun_evidence);
+        let original = candidate_authorities[0];
+        let foreign = Qg6ScheduleAuthority::for_experiment(
+            original.identity.clone(),
+            original.query_count,
+            original.rounds_per_query,
+            original.searches_per_sample,
+            original.schedule_seed ^ 1,
+        )
+        .expect("foreign but valid QG-6 authority");
+        candidate_authorities[0] = &foreign;
+
+        let result = evaluate_perf_ratchet_against_authorities(
+            PerfRatchetRequest {
+                baseline: Some(&baseline),
+                baseline_evidence: Some(&baseline_evidence),
+                candidate: &candidate,
+                rerun: Some(&rerun),
+                candidate_evidence: Some(&candidate_evidence),
+                rerun_evidence: Some(&rerun_evidence),
+                expected_machine_profile: Some(expected_profile),
+                candidate_runner_identity: candidate_evidence.machine_class.identity(),
+                rerun_runner_identity: rerun_evidence.machine_class.identity(),
+                gate_activated: true,
+                mode: PerfRatchetMode::Promotion,
+                expected_manifest_sha256: &normalized_manifest_sha256(),
+                evidence: Vec::new(),
+            },
+            PerfRatchetQg1AuthoritySets::empty(),
+            PerfRatchetQg6AuthoritySets {
+                baseline: &baseline_authorities,
+                candidate: &candidate_authorities,
+                rerun: &rerun_authorities,
+            },
+        );
+
+        assert_eq!(result.decision, PerfGateDecision::Block, "{result:#?}");
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| { reason.code == "perf.ratchet.machine_evidence_integrity_failed" })
+        );
+        assert!(result.comparisons.is_empty());
+    }
+
+    #[test]
+    fn complete_qg6_production_cardinality_wire_fits_assembly_cap() {
+        let (_, evidence) = qg6_complete_pair_with_shape(
+            "qg6-production-wire-size",
+            [[1.0; 2]; 4],
+            crate::QG6_TIMED_SEARCHES_PER_SAMPLE,
+            crate::perf::PERF_BOOTSTRAP_RESAMPLES,
+            true,
+        );
+        assert_eq!(evidence.cells.len(), 20, "canonical QG-6 matrix drifted");
+        let expected_rounds = crate::PERF_MIN_RUNS
+            .div_ceil(crate::QG6_QUERY_GROUPS)
+            .max(EvidencePolicy::predeclared().min_group_pairs);
+        assert_eq!(
+            expected_rounds, 2,
+            "production QG-6 round cardinality changed; update the wire proof"
+        );
+        let mut sample_count = 0_usize;
+        let mut leaf_count = 0_usize;
+        for cell in &evidence.cells {
+            let EvidenceCellBody::Paired {
+                paired,
+                qg6_protocol: Some(protocol),
+                ..
+            } = &cell.body
+            else {
+                panic!("every QG-6 cell must carry formal six-arm evidence");
+            };
+            assert_eq!(
+                protocol.schedule_authority.rounds_per_query,
+                expected_rounds
+            );
+            assert_eq!(
+                protocol.schedule_authority.searches_per_sample,
+                crate::QG6_TIMED_SEARCHES_PER_SAMPLE,
+            );
+            assert_eq!(
+                paired.config.bootstrap_resamples,
+                crate::perf::PERF_BOOTSTRAP_RESAMPLES,
+            );
+            assert_eq!(
+                protocol.joint_tail.bootstrap_resamples,
+                crate::perf::PERF_BOOTSTRAP_RESAMPLES,
+            );
+            for sample in paired
+                .effect_samples
+                .iter()
+                .chain(&paired.null_samples)
+                .chain(&protocol.quill_null_samples)
+            {
+                sample_count += 1;
+                leaf_count += sample
+                    .qg6_sample_binding
+                    .as_ref()
+                    .expect("production-cardinality timed sample")
+                    .timed_sample
+                    .timing_leaves
+                    .len();
+            }
+        }
+        assert_eq!(
+            sample_count,
+            20 * crate::QG6_QUERY_GROUPS * expected_rounds * 6,
+        );
+        assert_eq!(
+            leaf_count,
+            20 * crate::QG6_QUERY_GROUPS
+                * expected_rounds
+                * 6
+                * crate::QG6_TIMED_SEARCHES_PER_SAMPLE,
+        );
+        let expected_hit_count = PerfMatrixSpec::complete()
+            .for_gate(PerfGate::Qg6)
+            .into_iter()
+            .map(|spec| {
+                crate::QG6_QUERY_GROUPS * crate::Qg6ArmRole::ALL.len() * spec.k.expect("QG-6 k")
+            })
+            .sum::<usize>();
+        let observed_hit_count = evidence
+            .cells
+            .iter()
+            .map(|cell| {
+                cell.spec
+                    .qg6_semantic_contract
+                    .as_ref()
+                    .expect("production-cardinality semantic contract")
+                    .groups
+                    .iter()
+                    .map(|group| {
+                        crate::Qg6ArmRole::ALL
+                            .into_iter()
+                            .map(|role| group.roles.get(role).ordered_hits.len())
+                            .sum::<usize>()
+                    })
+                    .sum::<usize>()
+            })
+            .sum::<usize>();
+        assert_eq!(observed_hit_count, expected_hit_count);
+
+        let bytes = serde_json::to_vec_pretty(&evidence)
+            .expect("serialize complete production-cardinality QG-6 evidence");
+        let qg6_authorities = retained_qg6_authorities(&evidence);
+        let reparsed = PerfEvidenceArtifact::from_verified_slice_against_authorities(
+            &bytes,
+            &[],
+            &qg6_authorities,
+        )
+        .expect("reparse complete production-cardinality QG-6 evidence");
+        assert_eq!(reparsed, evidence, "compact QG-6 wire changed evidence");
+        const MIN_WIRE_HEADROOM_PERCENT: usize = 5;
+        let cap = crate::perf_assembly::PERF_ASSEMBLY_MAX_ARTIFACT_BYTES;
+        let maximum_with_headroom = cap * (100 - MIN_WIRE_HEADROOM_PERCENT) / 100;
+        eprintln!(
+            "complete production-cardinality QG-6 evidence wire: {} bytes (cap {}, required maximum {})",
+            bytes.len(),
+            cap,
+            maximum_with_headroom,
+        );
+        assert!(
+            bytes.len() <= maximum_with_headroom,
+            "complete compact QG-6 evidence is {} bytes, cap is {} bytes, required headroom is {}%",
+            bytes.len(),
+            cap,
+            MIN_WIRE_HEADROOM_PERCENT,
+        );
+    }
+
+    #[test]
+    fn qg6_bad_joint_p50_interval_blocks_promotion() {
         let (baseline, baseline_evidence) = qg6_complete_pair("baseline", [[1.0; 3]; 4]);
         let (candidate, candidate_evidence) = qg6_complete_pair("candidate", [[0.70; 3]; 4]);
         let (rerun, rerun_evidence) = qg6_complete_pair("rerun", [[0.70; 3]; 4]);
@@ -4773,11 +5197,18 @@ mod tests {
             expected_profile,
         );
 
-        assert_only_qg6_tail_hold(&result);
+        assert_eq!(result.decision, PerfGateDecision::Block, "{result:#?}");
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "perf.ratchet.gate_target_missed"),
+            "bad p50 interval did not reach the gate target: {result:#?}"
+        );
     }
 
     #[test]
-    fn strict_tail_qg6_bad_provisional_p99_remains_no_decision() {
+    fn qg6_bad_joint_p99_upper_interval_blocks_promotion() {
         let (baseline, baseline_evidence) = qg6_complete_pair("baseline", [[1.0; 3]; 4]);
         let (candidate, candidate_evidence) = qg6_complete_pair("candidate", [[1.01; 3]; 4]);
         let (rerun, rerun_evidence) = qg6_complete_pair("rerun", [[1.01; 3]; 4]);
@@ -4797,11 +5228,59 @@ mod tests {
             expected_profile,
         );
 
-        assert_only_qg6_tail_hold(&result);
+        assert_eq!(result.decision, PerfGateDecision::Block, "{result:#?}");
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "perf.ratchet.gate_target_missed"),
+            "bad p99 interval did not reach the gate target: {result:#?}"
+        );
     }
 
     #[test]
-    fn strict_tail_qg6_baseline_regression_remains_diagnostic_only() {
+    fn qg6_joint_p99_interval_straddling_parity_quarantines() {
+        let baseline_ratios = [[1.0; 3]; crate::QG6_QUERY_GROUPS];
+        let mut straddling_ratios = [[0.97; 3]; crate::QG6_QUERY_GROUPS];
+        straddling_ratios[crate::QG6_QUERY_GROUPS - 1] = [1.04; 3];
+        let (baseline, baseline_evidence) = qg6_complete_pair("baseline", baseline_ratios);
+        let (candidate, candidate_evidence) = qg6_complete_pair("candidate", straddling_ratios);
+        let (rerun, rerun_evidence) = qg6_complete_pair("rerun", straddling_ratios);
+        let expected_profile = candidate_evidence
+            .machine_class
+            .identity()
+            .expect("candidate identity")
+            .profile();
+
+        let result = evaluate_verified_promotion(
+            &baseline,
+            &baseline_evidence,
+            &candidate,
+            &candidate_evidence,
+            &rerun,
+            &rerun_evidence,
+            expected_profile,
+        );
+
+        assert_eq!(result.decision, PerfGateDecision::Quarantine, "{result:#?}");
+        assert!(
+            result.reasons.iter().any(|reason| {
+                reason.code == "perf.ratchet.gate_target_ci_inconclusive"
+                    && reason.message.contains("joint true-leaf p99")
+            }),
+            "straddling p99 interval did not remain inconclusive: {result:#?}"
+        );
+        assert!(
+            !result
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "perf.ratchet.gate_target_missed"),
+            "straddling p99 interval was misclassified as a hard loss: {result:#?}"
+        );
+    }
+
+    #[test]
+    fn qg6_baseline_regression_and_joint_tail_failure_are_decision_inputs() {
         let (baseline, baseline_evidence) = qg6_complete_pair("baseline", [[1.0; 3]; 4]);
         let (candidate, candidate_evidence) = qg6_complete_pair("candidate", [[1.10; 3]; 4]);
         let (rerun, rerun_evidence) = qg6_complete_pair("rerun", [[1.10; 3]; 4]);
@@ -4827,7 +5306,7 @@ mod tests {
             }),
             "fixture did not exercise the numeric regression path: {result:#?}"
         );
-        assert_only_qg6_tail_hold(&result);
+        assert_eq!(result.decision, PerfGateDecision::Block, "{result:#?}");
     }
 
     #[test]
@@ -4974,7 +5453,7 @@ mod tests {
             .expect("candidate identity")
             .profile();
 
-        let result = evaluate_perf_ratchet(PerfRatchetRequest {
+        let result = evaluate_verified_promotion_request(PerfRatchetRequest {
             baseline: Some(&baseline),
             baseline_evidence: None,
             candidate: &candidate,
@@ -5018,7 +5497,7 @@ mod tests {
             serde_json::from_value(binding).expect("stale binding JSON");
         reseal_evidence_without_verification(&mut candidate_evidence);
 
-        let result = evaluate_perf_ratchet(PerfRatchetRequest {
+        let result = evaluate_verified_promotion_request(PerfRatchetRequest {
             baseline: Some(&baseline),
             baseline_evidence: Some(&baseline_evidence),
             candidate: &candidate,
@@ -5059,7 +5538,7 @@ mod tests {
             .expect("candidate identity")
             .profile();
 
-        let result = evaluate_perf_ratchet(PerfRatchetRequest {
+        let result = evaluate_verified_promotion_request(PerfRatchetRequest {
             baseline: Some(&baseline),
             baseline_evidence: Some(&baseline_evidence),
             candidate: &candidate,
@@ -5433,7 +5912,7 @@ mod tests {
             .expect("candidate identity")
             .profile();
 
-        let result = evaluate_perf_ratchet(PerfRatchetRequest {
+        let result = evaluate_verified_promotion_request(PerfRatchetRequest {
             baseline: Some(&baseline),
             baseline_evidence: Some(&baseline_evidence),
             candidate: &candidate,
@@ -5519,7 +5998,7 @@ mod tests {
             .expect("candidate identity")
             .profile();
 
-        let result = evaluate_perf_ratchet(PerfRatchetRequest {
+        let result = evaluate_verified_promotion_request(PerfRatchetRequest {
             baseline: Some(&baseline),
             baseline_evidence: Some(&baseline_evidence),
             candidate: &candidate,
@@ -5559,7 +6038,7 @@ mod tests {
             .expect("candidate identity")
             .profile();
 
-        let result = evaluate_perf_ratchet(PerfRatchetRequest {
+        let result = evaluate_verified_promotion_request(PerfRatchetRequest {
             baseline: Some(&baseline),
             baseline_evidence: Some(&baseline_evidence),
             candidate: &candidate,
@@ -5603,7 +6082,7 @@ mod tests {
             .expect("candidate identity")
             .profile();
 
-        let result = evaluate_perf_ratchet(PerfRatchetRequest {
+        let result = evaluate_verified_promotion_request(PerfRatchetRequest {
             baseline: Some(&baseline),
             baseline_evidence: Some(&baseline_evidence),
             candidate: &candidate,
@@ -5651,7 +6130,7 @@ mod tests {
             .expect("candidate identity")
             .profile();
 
-        let result = evaluate_perf_ratchet(PerfRatchetRequest {
+        let result = evaluate_verified_promotion_request(PerfRatchetRequest {
             baseline: Some(&baseline),
             baseline_evidence: Some(&baseline_evidence),
             candidate: &candidate,
@@ -5716,7 +6195,7 @@ mod tests {
             .expect("candidate identity")
             .profile();
 
-        let result = evaluate_perf_ratchet(PerfRatchetRequest {
+        let result = evaluate_verified_promotion_request(PerfRatchetRequest {
             baseline: Some(&baseline),
             baseline_evidence: Some(&baseline_evidence),
             candidate: &candidate,
@@ -5872,6 +6351,7 @@ mod tests {
                 evidence: Vec::new(),
             },
             PerfRatchetQg1AuthoritySets::empty(),
+            PerfRatchetQg6AuthoritySets::empty(),
             DecisionState::default(),
             true,
         );
@@ -6301,7 +6781,7 @@ mod tests {
             missing_state
                 .reasons
                 .iter()
-                .any(|reason| reason.code == "perf.ratchet.qg6_hierarchical_evidence_missing")
+                .any(|reason| reason.code == "perf.ratchet.qg6_joint_tail_evidence_missing")
         );
     }
 
@@ -6406,11 +6886,21 @@ mod tests {
             100_000,
             "query/identifier/k10/100k",
             true,
+            3,
+            crate::perf::PERF_BOOTSTRAP_RESAMPLES,
+            false,
         );
         let cell = evidence.cells.first().expect("QG-6 evidence cell");
-        let paired = match &cell.body {
-            EvidenceCellBody::Paired { paired, .. } => paired,
+        let (paired, protocol) = match &cell.body {
+            EvidenceCellBody::Paired {
+                paired,
+                qg6_protocol: Some(protocol),
+                ..
+            } => (paired, protocol.as_ref()),
             EvidenceCellBody::Facts { .. } => unreachable!("QG-6 must be paired"),
+            EvidenceCellBody::Paired {
+                qg6_protocol: None, ..
+            } => unreachable!("QG-6 must carry formal protocol evidence"),
         };
         let leaf_treatment = artifact
             .cells
@@ -6430,7 +6920,15 @@ mod tests {
             .map(|row| (CellKey::from(row), row))
             .collect::<BTreeMap<_, _>>();
         let mut state = DecisionState::default();
-        reconcile_current_cell_with_projection(cell, paired, None, &rows, "candidate", &mut state);
+        reconcile_current_cell_with_projection(
+            cell,
+            paired,
+            None,
+            Some(protocol),
+            &rows,
+            "candidate",
+            &mut state,
+        );
         assert!(
             !state.fatal,
             "leaf projection must reconcile: {:?}",
@@ -6453,6 +6951,7 @@ mod tests {
             cell,
             paired,
             None,
+            Some(protocol),
             &parent_rows,
             "candidate",
             &mut parent_state,
@@ -6555,7 +7054,6 @@ mod tests {
             PerfRatchetMode::Promotion,
             &mut comparisons,
             &mut state,
-            false,
         );
         assert!(
             !state.reasons.iter().any(|reason| {
@@ -6925,31 +7423,26 @@ mod tests {
     }
 
     #[test]
-    fn versioned_v7_placeholders_are_exact_current_bootstrap_sentinels() {
+    fn every_current_schema_bootstrap_sentinel_is_committed_and_exact() {
         let manifest = include_str!("../../../docs/contracts/quill-perf-gates.toml");
         let manifest_sha256 = crate::perf_manifest_contract_sha256(manifest);
-        for raw in [
-            include_str!("../../../.bench-history/QG-1.v7.unmeasured.latest.json"),
-            include_str!("../../../.bench-history/QG-2.v7.unmeasured.latest.json"),
-            include_str!("../../../.bench-history/QG-3.v7.unmeasured.latest.json"),
-            include_str!("../../../.bench-history/QG-4.v7.unmeasured.latest.json"),
-            include_str!("../../../.bench-history/QG-5.v7.unmeasured.latest.json"),
-            include_str!("../../../.bench-history/QG-6.v7.unmeasured.latest.json"),
-            include_str!("../../../.bench-history/QG-7.v7.unmeasured.latest.json"),
-            include_str!("../../../.bench-history/QG-8.v7.unmeasured.latest.json"),
-            include_str!("../../../.bench-history/QG-9.v7.unmeasured.latest.json"),
-            include_str!("../../../.bench-history/QG-10.v7.unmeasured.latest.json"),
-        ] {
-            let artifact =
-                serde_json::from_str::<PerfGateArtifact>(raw).expect("current placeholder");
+        let version = PERF_ARTIFACT_SCHEMA_VERSION
+            .strip_prefix("quill-perf-artifact-")
+            .expect("current threshold schema is version-tagged");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.bench-history");
+        for gate in PerfGate::ALL {
+            let path = root.join(format!("{}.{version}.unmeasured.latest.json", gate.label()));
+            let raw = std::fs::read(&path)
+                .unwrap_or_else(|error| panic!("{} is missing: {error}", path.display()));
+            let artifact = serde_json::from_slice::<PerfGateArtifact>(&raw)
+                .unwrap_or_else(|error| panic!("{} is malformed: {error}", path.display()));
             let mut canonical =
                 serde_json::to_vec_pretty(&artifact).expect("canonical current placeholder");
             canonical.push(b'\n');
-            assert_eq!(raw.as_bytes(), canonical.as_slice());
+            assert_eq!(raw, canonical, "{} is not canonical", path.display());
             assert!(
-                is_explicit_bootstrap_for(&artifact, artifact.gate, &manifest_sha256),
-                "{} current placeholder must satisfy the narrow sentinel exemption",
-                artifact.gate
+                is_explicit_bootstrap_for(&artifact, gate, &manifest_sha256),
+                "{gate} current placeholder must satisfy the narrow sentinel exemption"
             );
         }
     }

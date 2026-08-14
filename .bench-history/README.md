@@ -41,8 +41,8 @@ bootstrap placeholders, not performance evidence. Their exact bytes remain the
 canonical pretty-JSON serialization of the old `quill-perf-artifact-v6`
 sentinel, with no trailing newline. They contain no cells, have
 `laws_attested=false`, and cannot produce `Allow` when replayed as evidence.
-The current v7 loader rejects them as stale-schema inputs. The separately
-versioned `QG-<n>.v7.unmeasured.latest.json` files are the authoritative current
+The current v8 loader rejects them as stale-schema inputs. The separately
+versioned `QG-<n>.v8.unmeasured.latest.json` files are the authoritative current
 sentinels; each is exact canonical pretty JSON with one terminal newline and is
 bound to the current normalized manifest hash. Candidate and rerun require two independent typed-producer
 finalizations, including their actual logs, exact v3 manifests, and verified
@@ -52,12 +52,12 @@ baseline committed with its separate PASS/MISS target verdict. A target MISS
 remains a MISS in every claim surface even though the measurement gate is
 active.
 
-Current threshold schema `quill-perf-artifact-v7` records the profile applicability
+Current threshold schema `quill-perf-artifact-v8` records the profile applicability
 binding, SHA-256 self-reported by the executing benchmark ELF, auditable
 execution topology, exact runtime ISA, configured engine widths, per-cell
 observed concurrency where required, and a deterministic bootstrap 95%
 confidence interval on every median. Current decision evidence is
-`quill-perf-evidence-v5`; it reconstructs the frozen registry-v2 applicability
+`quill-perf-evidence-v7`; it reconstructs the frozen registry-v2 applicability
 plan and rejects any measured `NotApplicable` cell. Bounded partial selections
 remain durable, non-adjudicable diagnostic evidence; their stored fold may be
 `NoDecision` or `MeasuredProvisional`, but they are never ratchet-admissible.
@@ -68,7 +68,7 @@ manifest, and v6 completion receipt. QG-1 carries same-invocation
 Tantivy/Tantivy and Quill/Quill A/A nulls. The ratchet uses those median
 intervals and the required 2x null-floor margin; `cv_pct` remains provenance
 and never decides admission. Historical measured v3 threshold artifacts remain
-read-only and cannot silently become v7 claims.
+read-only and cannot silently become v8 claims.
 
 The retained `QG-2.trj-zen3-16c.latest.json` and dated 2026-07-28 siblings are
 legacy pre-fix diagnostic evidence, not an activated baseline and not a

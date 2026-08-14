@@ -13,12 +13,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use frankensearch_quill_gauntlet::{
     ExecutionProfileId, HardwareClassId, MachineClassAdmissionContext, MachineClassRegistry,
-    MachineProfileKey, PERF_ARTIFACT_SCHEMA_VERSION, PERF_EVIDENCE_SCHEMA_VERSION,
-    PERF_HISTORY_POINTER_SCHEMA_VERSION, PerfEvidenceArtifact, PerfEvidenceFile, PerfGate,
-    PerfGateArtifact, PerfGateDecision, PerfRatchetMode, PerfRatchetQg1AuthoritySets,
-    PerfRatchetRequest, Qg1AuthorityRegisterEntryV1, Qg1ExpectedAuthority, Qg1StartupHandshakeV1,
-    Qg1TargetPinV1, VerifiedRunnerIdentity, evaluate_perf_ratchet_against_qg1_authorities,
-    is_explicit_bootstrap, is_explicit_bootstrap_for, perf_manifest_contract_sha256,
+    MachineProfileKey, PERF_ARTIFACT_SCHEMA_VERSION, PERF_ASSEMBLY_MAX_ARTIFACT_BYTES,
+    PERF_EVIDENCE_SCHEMA_VERSION, PERF_HISTORY_POINTER_SCHEMA_VERSION, PerfEvidenceArtifact,
+    PerfEvidenceFile, PerfGate, PerfGateArtifact, PerfGateDecision, PerfRatchetMode,
+    PerfRatchetQg1AuthoritySets, PerfRatchetQg6AuthoritySets, PerfRatchetRequest,
+    Qg1AuthorityRegisterEntryV1, Qg1ExpectedAuthority, Qg1StartupHandshakeV1, Qg1TargetPinV1,
+    Qg6ScheduleAuthority, Qg6StartupAuthoritySetV1, Qg6StartupHandshakeV1, VerifiedRunnerIdentity,
+    evaluate_perf_ratchet_against_authorities, is_explicit_bootstrap, is_explicit_bootstrap_for,
+    perf_manifest_contract_sha256,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -26,6 +28,10 @@ use std::collections::BTreeSet;
 
 const USAGE: &str = "\
 Usage:
+  quill-perf-ratchet --emit-current-bootstraps \\
+    --manifest <docs/contracts/quill-perf-gates.toml> \\
+    --output-dir <empty-or-new-directory>
+
   quill-perf-ratchet \\
     --manifest <docs/contracts/quill-perf-gates.toml> \\
     --baseline <authoritative-latest-pointer-or-bootstrap.json> \\
@@ -34,6 +40,9 @@ Usage:
     [--candidate-evidence <QG-N.evidence.json>] \\
     [--rerun <QG-N.json>] \\
     [--rerun-evidence <QG-N.rerun.evidence.json>] \\
+    [--baseline-qg6-authority-set <baseline.qg6-authorities.json>] \\
+    [--candidate-qg6-authority-set <candidate.qg6-authorities.json>] \\
+    [--rerun-qg6-authority-set <rerun.qg6-authorities.json>] \\
     [--candidate-runner-receipt <candidate.runner.json>] \\
     [--rerun-runner-receipt <rerun.runner.json>] \\
     [--candidate-artifact-manifest <candidate.artifacts.json>] \\
@@ -53,6 +62,7 @@ Exit status: 0=Allow, 1=Block, 2=Quarantine, 64=invalid invocation.";
 
 type LoadedEvidence = (PerfEvidenceArtifact, Vec<u8>);
 type AdmittedRunnerReceipt = (VerifiedRunnerIdentity, Vec<u8>, Vec<u8>, Vec<u8>);
+type LoadedQg6AuthoritySet = (Qg6StartupAuthoritySetV1, Vec<u8>, PerfEvidenceFile);
 
 fn current_bootstrap_basename(gate: PerfGate) -> String {
     let Some(version) = PERF_ARTIFACT_SCHEMA_VERSION.strip_prefix("quill-perf-artifact-") else {
@@ -90,6 +100,15 @@ struct Args {
     candidate_authority_dir: Option<PathBuf>,
     rerun_target_pin: Option<PathBuf>,
     rerun_authority_dir: Option<PathBuf>,
+    baseline_qg6_authority_set: Option<PathBuf>,
+    candidate_qg6_authority_set: Option<PathBuf>,
+    rerun_qg6_authority_set: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BootstrapEmitArgs {
+    manifest: PathBuf,
+    output_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,7 +129,7 @@ struct LoadedBaseline {
     artifact: PerfGateArtifact,
     artifact_bytes: Vec<u8>,
     artifact_path: PathBuf,
-    evidence: Option<LoadedEvidence>,
+    evidence_bytes: Option<Vec<u8>>,
     evidence_path: Option<PathBuf>,
     pointer: Option<(PathBuf, Vec<u8>)>,
 }
@@ -321,11 +340,20 @@ fn read_no_follow(path: &Path, limit: usize) -> Result<Vec<u8>, Box<dyn Error>> 
         Mode::empty(),
     )
     .map_err(|error| format!("{} is not a regular readable file: {error}", path.display()))?;
-    read_bounded(
-        std::fs::File::from(file),
-        limit,
-        &path.display().to_string(),
-    )
+    let file = std::fs::File::from(file);
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()).into());
+    }
+    if metadata.len() > u64::try_from(limit)? {
+        return Err(format!(
+            "{} exceeds its {limit}-byte bound (declared length {})",
+            path.display(),
+            metadata.len()
+        )
+        .into());
+    }
+    read_bounded(file, limit, &path.display().to_string())
 }
 
 /// Read at most `limit` bytes, refusing anything larger.
@@ -339,10 +367,10 @@ fn read_bounded(
     context: &str,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
     let mut bytes = Vec::new();
-    std::io::Read::read_to_end(
-        &mut std::io::Read::take(&mut file, limit as u64 + 1),
-        &mut bytes,
-    )?;
+    let read_limit = u64::try_from(limit)?
+        .checked_add(1)
+        .ok_or("bounded file read limit overflowed u64")?;
+    std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, read_limit), &mut bytes)?;
     if bytes.len() > limit {
         return Err(format!("{context} exceeds its {limit}-byte bound").into());
     }
@@ -402,6 +430,8 @@ struct HistoryPublicationPlan {
     threshold_bytes: Vec<u8>,
     rolling_evidence: PathBuf,
     evidence_bytes: Vec<u8>,
+    rolling_qg6_authority: Option<PathBuf>,
+    qg6_authority_bytes: Option<Vec<u8>>,
     latest_pointer: PathBuf,
     pointer_bytes: Vec<u8>,
 }
@@ -422,7 +452,18 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
-    let args = parse_args(env::args_os().skip(1))?;
+    let mut values = env::args_os().skip(1);
+    let first = values.next();
+    if first.as_deref() == Some(OsStr::new("--emit-current-bootstraps")) {
+        let args = parse_bootstrap_emit_args(values)?;
+        let emitted = emit_current_bootstraps(&args.manifest, &args.output_dir)?;
+        println!(
+            "emitted {emitted} current-schema bootstrap sentinels into {}",
+            args.output_dir.display()
+        );
+        return Ok(PerfGateDecision::Allow);
+    }
+    let args = parse_args(first.into_iter().chain(values))?;
     validate_decision_output_is_separate(&args)?;
     let manifest_bytes = fs::read(&args.manifest)?;
     let manifest_text = std::str::from_utf8(&manifest_bytes)?;
@@ -436,14 +477,14 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
     let baseline = loaded_baseline.artifact;
     let baseline_bytes = loaded_baseline.artifact_bytes;
     let baseline_artifact_path = loaded_baseline.artifact_path;
-    let baseline_evidence = loaded_baseline.evidence;
+    let baseline_evidence_bytes = loaded_baseline.evidence_bytes;
     let baseline_evidence_path = loaded_baseline.evidence_path;
     let baseline_pointer = loaded_baseline.pointer;
     let (candidate, candidate_bytes) = read_artifact(&args.candidate)?;
-    let mut candidate_evidence = args
+    let candidate_evidence_bytes = args
         .candidate_evidence
         .as_deref()
-        .map(read_evidence_artifact)
+        .map(read_perf_artifact_file)
         .transpose()?;
     let baseline_is_bootstrap =
         is_explicit_bootstrap_for(&baseline, candidate.gate, &manifest_sha256);
@@ -456,18 +497,124 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
     validate_baseline_identity_inputs(
         args.mode,
         baseline_is_bootstrap,
-        baseline_evidence.is_some(),
+        baseline_evidence_bytes.is_some(),
     )?;
     let rerun = args.rerun.as_deref().map(read_artifact).transpose()?;
-    let mut rerun_evidence = args
+    let rerun_evidence_bytes = args
         .rerun_evidence
         .as_deref()
-        .map(read_evidence_artifact)
+        .map(read_perf_artifact_file)
         .transpose()?;
     let activated = gate_activated(&manifest, candidate.gate)?;
     let registry = (args.mode == PerfRatchetMode::Promotion)
         .then(MachineClassRegistry::frozen)
         .transpose()?;
+
+    // Resolve every trust input before parsing any evidence. QG-6 evidence is
+    // never opened through the authority-free parser and no authority is ever
+    // recovered from the evidence it will authenticate.
+    let (baseline_authorities, baseline_authority_evidence) = resolve_arm_authorities(
+        "baseline",
+        args.baseline_target_pin.as_ref(),
+        args.baseline_authority_dir.as_ref(),
+        &baseline.run_id,
+        &baseline.git_rev,
+    )?;
+    let (candidate_authorities, candidate_authority_evidence) = resolve_arm_authorities(
+        "candidate",
+        args.candidate_target_pin.as_ref(),
+        args.candidate_authority_dir.as_ref(),
+        &candidate.run_id,
+        &candidate.git_rev,
+    )?;
+    let (rerun_authorities, rerun_authority_evidence) = match rerun.as_ref() {
+        Some((artifact, _)) => resolve_arm_authorities(
+            "rerun",
+            args.rerun_target_pin.as_ref(),
+            args.rerun_authority_dir.as_ref(),
+            &artifact.run_id,
+            &artifact.git_rev,
+        )?,
+        None => (Vec::new(), Vec::new()),
+    };
+    let baseline_authority_refs = baseline_authorities.iter().collect::<Vec<_>>();
+    let candidate_authority_refs = candidate_authorities.iter().collect::<Vec<_>>();
+    let rerun_authority_refs = rerun_authorities.iter().collect::<Vec<_>>();
+
+    let baseline_qg6_set = resolve_arm_qg6_authority_set(
+        "baseline",
+        args.baseline_qg6_authority_set.as_deref(),
+        &baseline,
+        baseline_evidence_bytes.is_some(),
+    )?;
+    let candidate_qg6_set = resolve_arm_qg6_authority_set(
+        "candidate",
+        args.candidate_qg6_authority_set.as_deref(),
+        &candidate,
+        candidate_evidence_bytes.is_some(),
+    )?;
+    let rerun_qg6_set = match rerun.as_ref() {
+        Some((artifact, _)) => resolve_arm_qg6_authority_set(
+            "rerun",
+            args.rerun_qg6_authority_set.as_deref(),
+            artifact,
+            rerun_evidence_bytes.is_some(),
+        )?,
+        None if args.rerun_qg6_authority_set.is_some() => {
+            return Err("--rerun-qg6-authority-set requires --rerun and --rerun-evidence".into());
+        }
+        None => None,
+    };
+    let baseline_qg6_refs = qg6_authority_refs(baseline_qg6_set.as_ref());
+    let candidate_qg6_refs = qg6_authority_refs(candidate_qg6_set.as_ref());
+    let rerun_qg6_refs = qg6_authority_refs(rerun_qg6_set.as_ref());
+
+    let baseline_evidence = match (baseline_evidence_bytes, baseline_evidence_path.as_deref()) {
+        (Some(bytes), Some(path)) => Some(admit_evidence_artifact(
+            "baseline",
+            path,
+            bytes,
+            &baseline_authority_refs,
+            baseline_qg6_set.as_ref(),
+        )?),
+        (None, None) => None,
+        _ => return Err("loaded baseline evidence path/bytes are incomplete".into()),
+    };
+    if let (Some((_, pointer_bytes)), Some((evidence, evidence_bytes))) =
+        (baseline_pointer.as_ref(), baseline_evidence.as_ref())
+    {
+        let pointer: HistoryPointer = serde_json::from_slice(pointer_bytes)?;
+        if sha256_hex(evidence_bytes) != pointer.evidence_sha256
+            || evidence.gate != pointer.gate
+            || evidence.provenance.run_id != pointer.run_id
+            || evidence.applicability_plan.profile != pointer.profile
+        {
+            return Err("history pointer does not bind its externally admitted evidence".into());
+        }
+    }
+    let mut candidate_evidence =
+        match (candidate_evidence_bytes, args.candidate_evidence.as_deref()) {
+            (Some(bytes), Some(path)) => Some(admit_evidence_artifact(
+                "candidate",
+                path,
+                bytes,
+                &candidate_authority_refs,
+                candidate_qg6_set.as_ref(),
+            )?),
+            (None, None) => None,
+            _ => return Err("candidate evidence path/bytes are incomplete".into()),
+        };
+    let mut rerun_evidence = match (rerun_evidence_bytes, args.rerun_evidence.as_deref()) {
+        (Some(bytes), Some(path)) => Some(admit_evidence_artifact(
+            "rerun",
+            path,
+            bytes,
+            &rerun_authority_refs,
+            rerun_qg6_set.as_ref(),
+        )?),
+        (None, None) => None,
+        _ => return Err("rerun evidence path/bytes are incomplete".into()),
+    };
     let candidate_runner = read_runner_identity(
         registry.as_ref(),
         args.candidate_runner_receipt.as_deref(),
@@ -498,6 +645,8 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
             &candidate_bytes,
             &mut candidate_evidence,
             candidate_runner.as_ref(),
+            &candidate_authority_refs,
+            &candidate_qg6_refs,
         )?;
         bind_evidence_to_runner(
             "rerun",
@@ -507,6 +656,8 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
                 .ok_or("promotion rerun bytes are missing")?,
             &mut rerun_evidence,
             rerun_runner.as_ref(),
+            &rerun_authority_refs,
+            &rerun_qg6_refs,
         )?;
     }
 
@@ -600,46 +751,21 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
         }
     }
 
-    // Each arm's authority set is resolved from its OWN pin/directory pair and
-    // bound to that arm's evidence identity. The ratchet is handed the sets; it
-    // never derives authority from the artifacts it is about to admit.
-    let (baseline_authorities, baseline_authority_evidence) = resolve_arm_authorities(
-        "baseline",
-        args.baseline_target_pin.as_ref(),
-        args.baseline_authority_dir.as_ref(),
-        &baseline.run_id,
-        &baseline.git_rev,
-    )?;
-    let (candidate_authorities, candidate_authority_evidence) = resolve_arm_authorities(
-        "candidate",
-        args.candidate_target_pin.as_ref(),
-        args.candidate_authority_dir.as_ref(),
-        &candidate.run_id,
-        &candidate.git_rev,
-    )?;
-    let (rerun_authorities, rerun_authority_evidence) = match rerun.as_ref() {
-        Some((artifact, _)) => resolve_arm_authorities(
-            "rerun",
-            args.rerun_target_pin.as_ref(),
-            args.rerun_authority_dir.as_ref(),
-            &artifact.run_id,
-            &artifact.git_rev,
-        )?,
-        None => (Vec::new(), Vec::new()),
-    };
-    // The sets borrow these vectors, so they must outlive the call rather than
-    // being built inline as temporaries.
-    let baseline_authority_refs: Vec<&Qg1ExpectedAuthority> = baseline_authorities.iter().collect();
-    let candidate_authority_refs: Vec<&Qg1ExpectedAuthority> =
-        candidate_authorities.iter().collect();
-    let rerun_authority_refs: Vec<&Qg1ExpectedAuthority> = rerun_authorities.iter().collect();
+    // Keep each invocation's authority namespaces disjoint all the way into
+    // ratchet replay. Pooling these slices would allow a swapped artifact to
+    // borrow another arm's otherwise-valid authority.
     let qg1_authorities = PerfRatchetQg1AuthoritySets {
         baseline: &baseline_authority_refs,
         candidate: &candidate_authority_refs,
         rerun: &rerun_authority_refs,
     };
+    let qg6_authorities = PerfRatchetQg6AuthoritySets {
+        baseline: &baseline_qg6_refs,
+        candidate: &candidate_qg6_refs,
+        rerun: &rerun_qg6_refs,
+    };
 
-    let mut evaluation = evaluate_perf_ratchet_against_qg1_authorities(
+    let mut evaluation = evaluate_perf_ratchet_against_authorities(
         PerfRatchetRequest {
             baseline: Some(&baseline),
             baseline_evidence: baseline_evidence.as_ref().map(|(artifact, _)| artifact),
@@ -658,6 +784,7 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
             evidence: evidence_files,
         },
         qg1_authorities,
+        qg6_authorities,
     );
 
     // Archive the trust inputs alongside the artifacts they admitted, in
@@ -666,6 +793,16 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
     evaluation.evidence.extend(baseline_authority_evidence);
     evaluation.evidence.extend(candidate_authority_evidence);
     evaluation.evidence.extend(rerun_authority_evidence);
+    for set in [
+        baseline_qg6_set.as_ref(),
+        candidate_qg6_set.as_ref(),
+        rerun_qg6_set.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        evaluation.evidence.push(set.2.clone());
+    }
 
     let history_plan = plan_history_if_allowed(
         &args,
@@ -675,6 +812,9 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
         candidate_evidence
             .as_ref()
             .map(|(_, bytes)| bytes.as_slice()),
+        candidate_qg6_set
+            .as_ref()
+            .map(|(_, bytes, _)| bytes.as_slice()),
         candidate_runner
             .as_ref()
             .map(|(identity, _, _, _)| identity.profile()),
@@ -697,6 +837,42 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
         println!("{}: {}", reason.code, reason.message);
     }
     Ok(evaluation.decision)
+}
+
+fn parse_bootstrap_emit_args<I>(mut values: I) -> Result<BootstrapEmitArgs, Box<dyn Error>>
+where
+    I: Iterator<Item = OsString>,
+{
+    let mut manifest = None;
+    let mut output_dir = None;
+    while let Some(flag) = values.next() {
+        match flag.to_string_lossy().as_ref() {
+            "-h" | "--help" => return Err(USAGE.into()),
+            "--manifest" => {
+                let path = PathBuf::from(next_value(&mut values, "--manifest")?);
+                if manifest.replace(path).is_some() {
+                    return Err("duplicate --manifest".into());
+                }
+            }
+            "--output-dir" => {
+                let path = PathBuf::from(next_value(&mut values, "--output-dir")?);
+                if output_dir.replace(path).is_some() {
+                    return Err("duplicate --output-dir".into());
+                }
+            }
+            other => {
+                return Err(format!(
+                    "unknown bootstrap-emitter argument {other:?}; this invocation accepts only \
+                     --manifest and --output-dir"
+                )
+                .into());
+            }
+        }
+    }
+    Ok(BootstrapEmitArgs {
+        manifest: manifest.ok_or("missing --manifest")?,
+        output_dir: output_dir.ok_or("missing --output-dir")?,
+    })
 }
 
 fn parse_args<I>(mut values: I) -> Result<Args, Box<dyn Error>>
@@ -728,6 +904,9 @@ where
     let mut candidate_authority_dir = None;
     let mut rerun_target_pin = None;
     let mut rerun_authority_dir = None;
+    let mut baseline_qg6_authority_set = None;
+    let mut candidate_qg6_authority_set = None;
+    let mut rerun_qg6_authority_set = None;
 
     while let Some(flag) = values.next() {
         match flag.to_string_lossy().as_ref() {
@@ -779,6 +958,24 @@ where
                     &mut values,
                     "--rerun-authority-dir",
                 )?));
+            }
+            "--baseline-qg6-authority-set" => {
+                let path = PathBuf::from(next_value(&mut values, "--baseline-qg6-authority-set")?);
+                if baseline_qg6_authority_set.replace(path).is_some() {
+                    return Err("duplicate --baseline-qg6-authority-set".into());
+                }
+            }
+            "--candidate-qg6-authority-set" => {
+                let path = PathBuf::from(next_value(&mut values, "--candidate-qg6-authority-set")?);
+                if candidate_qg6_authority_set.replace(path).is_some() {
+                    return Err("duplicate --candidate-qg6-authority-set".into());
+                }
+            }
+            "--rerun-qg6-authority-set" => {
+                let path = PathBuf::from(next_value(&mut values, "--rerun-qg6-authority-set")?);
+                if rerun_qg6_authority_set.replace(path).is_some() {
+                    return Err("duplicate --rerun-qg6-authority-set".into());
+                }
             }
             "--candidate" => {
                 candidate = Some(PathBuf::from(next_value(&mut values, "--candidate")?));
@@ -964,6 +1161,9 @@ where
         candidate_authority_dir,
         rerun_target_pin,
         rerun_authority_dir,
+        baseline_qg6_authority_set,
+        candidate_qg6_authority_set,
+        rerun_qg6_authority_set,
     })
 }
 
@@ -990,6 +1190,178 @@ fn resolve_arm_authorities(
         (Some(_), None) => Err(format!("--{arm}-target-pin requires --{arm}-authority-dir").into()),
         (None, Some(_)) => Err(format!("--{arm}-authority-dir requires --{arm}-target-pin").into()),
     }
+}
+
+fn qg6_selected_cell_ids_from_threshold(
+    artifact: &PerfGateArtifact,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    if artifact.gate != PerfGate::Qg6 {
+        return Ok(Vec::new());
+    }
+    let mut selected = BTreeSet::new();
+    for cell in &artifact.cells {
+        if cell.engine != "paired_ab" {
+            continue;
+        }
+        let metric = cell
+            .metric
+            .strip_suffix("_quill_over_tantivy")
+            .ok_or_else(|| {
+                format!(
+                    "QG-6 paired threshold metric {:?} has no canonical effect suffix",
+                    cell.metric
+                )
+            })?;
+        let cell_id = format!("QG-6/{}/{metric}", cell.fixture);
+        if !selected.insert(cell_id.clone()) {
+            return Err(format!("QG-6 threshold repeats selected cell {cell_id:?}").into());
+        }
+    }
+    if selected.is_empty() {
+        return Err("measured QG-6 threshold selects no paired effect cells".into());
+    }
+    Ok(selected.into_iter().collect())
+}
+
+fn load_qg6_authority_set(
+    arm: &str,
+    path: &Path,
+    artifact: &PerfGateArtifact,
+) -> Result<LoadedQg6AuthoritySet, Box<dyn Error>> {
+    let bytes = read_no_follow(path, Qg6StartupHandshakeV1::MAX_SET_BYTES)?;
+    let set = Qg6StartupAuthoritySetV1::from_verified_slice(&bytes)
+        .map_err(|error| format!("{arm} QG-6 authority set was rejected: {error}"))?;
+    if set.campaign_run_id() != artifact.run_id {
+        return Err(format!(
+            "{arm} QG-6 authority set names run {}, but its threshold names {}",
+            set.campaign_run_id(),
+            artifact.run_id
+        )
+        .into());
+    }
+    if set.source_git_revision() != artifact.git_rev {
+        return Err(format!(
+            "{arm} QG-6 authority set names source {}, but its threshold names {}",
+            set.source_git_revision(),
+            artifact.git_rev
+        )
+        .into());
+    }
+    if !set.source_worktree_clean() {
+        return Err(format!("{arm} QG-6 authority set does not attest a clean source").into());
+    }
+    let selected = qg6_selected_cell_ids_from_threshold(artifact)?;
+    if set.selected_cell_ids() != selected {
+        return Err(format!(
+            "{arm} QG-6 authority set selection {:?} differs from threshold selection {:?}",
+            set.selected_cell_ids(),
+            selected
+        )
+        .into());
+    }
+    let record = evidence(&format!("{arm}_qg6_authority_set"), path, &bytes);
+    Ok((set, bytes, record))
+}
+
+fn resolve_arm_qg6_authority_set(
+    arm: &str,
+    path: Option<&Path>,
+    artifact: &PerfGateArtifact,
+    has_evidence: bool,
+) -> Result<Option<LoadedQg6AuthoritySet>, Box<dyn Error>> {
+    match (artifact.gate, has_evidence, path) {
+        (PerfGate::Qg6, true, Some(path)) => load_qg6_authority_set(arm, path, artifact).map(Some),
+        (PerfGate::Qg6, true, None) => {
+            Err(format!("QG-6 {arm} evidence requires --{arm}-qg6-authority-set").into())
+        }
+        (PerfGate::Qg6, false, Some(_)) => {
+            Err(format!("--{arm}-qg6-authority-set cannot be used without {arm} evidence").into())
+        }
+        (PerfGate::Qg6, false, None) => Ok(None),
+        (_, _, Some(_)) => Err(format!(
+            "--{arm}-qg6-authority-set cannot authenticate a non-QG-6 threshold"
+        )
+        .into()),
+        (_, _, None) => Ok(None),
+    }
+}
+
+fn qg6_authority_refs(set: Option<&LoadedQg6AuthoritySet>) -> Vec<&Qg6ScheduleAuthority> {
+    set.map_or_else(Vec::new, |(set, _, _)| set.authorities().values().collect())
+}
+
+fn verify_qg6_authority_cell_mapping(
+    arm: &str,
+    artifact: &PerfEvidenceArtifact,
+    set: Option<&LoadedQg6AuthoritySet>,
+) -> Result<(), Box<dyn Error>> {
+    if artifact.gate != PerfGate::Qg6 {
+        return Ok(());
+    }
+    let (set, _, _) = set.ok_or_else(|| format!("QG-6 {arm} evidence has no external set"))?;
+    let selected = artifact
+        .cells
+        .iter()
+        .map(|cell| cell.cell_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if selected != set.selected_cell_ids() {
+        return Err(format!(
+            "{arm} QG-6 evidence cell order/selection {:?} differs from its external set {:?}",
+            selected,
+            set.selected_cell_ids()
+        )
+        .into());
+    }
+    for cell in &artifact.cells {
+        let frankensearch_quill_gauntlet::EvidenceCellBody::Paired { qg6_protocol, .. } =
+            &cell.body
+        else {
+            return Err(format!("QG-6 {arm} cell {} is not paired", cell.cell_id).into());
+        };
+        let protocol = qg6_protocol
+            .as_ref()
+            .ok_or_else(|| format!("QG-6 {arm} cell {} has no formal protocol", cell.cell_id))?;
+        let retained = set.authorities().get(&cell.cell_id).ok_or_else(|| {
+            format!(
+                "QG-6 {arm} external set has no authority for {}",
+                cell.cell_id
+            )
+        })?;
+        if &protocol.schedule_authority != retained {
+            return Err(format!(
+                "QG-6 {arm} cell {} is bound to another cell's retained authority",
+                cell.cell_id
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn admit_evidence_artifact(
+    arm: &str,
+    path: &Path,
+    bytes: Vec<u8>,
+    qg1_authorities: &[&Qg1ExpectedAuthority],
+    qg6_set: Option<&LoadedQg6AuthoritySet>,
+) -> Result<LoadedEvidence, Box<dyn Error>> {
+    let qg6_authorities = qg6_authority_refs(qg6_set);
+    let artifact = PerfEvidenceArtifact::from_verified_slice_against_authorities(
+        &bytes,
+        qg1_authorities,
+        &qg6_authorities,
+    )?;
+    verify_qg6_authority_cell_mapping(arm, &artifact, qg6_set)?;
+    if serde_json::to_vec_pretty(&artifact)? != bytes {
+        return Err(format!(
+            "evidence artifact {} is not exact canonical pretty JSON",
+            path.display()
+        )
+        .into());
+    }
+    Ok((artifact, bytes))
 }
 
 fn next_value<I>(values: &mut I, flag: &str) -> Result<OsString, Box<dyn Error>>
@@ -1061,6 +1433,12 @@ fn validate_decision_output_is_separate(args: &Args) -> Result<(), Box<dyn Error
         args.rerun_artifact_manifest.as_deref(),
         args.candidate_run_log.as_deref(),
         args.rerun_run_log.as_deref(),
+        args.baseline_target_pin.as_deref(),
+        args.candidate_target_pin.as_deref(),
+        args.rerun_target_pin.as_deref(),
+        args.baseline_qg6_authority_set.as_deref(),
+        args.candidate_qg6_authority_set.as_deref(),
+        args.rerun_qg6_authority_set.as_deref(),
     ];
     for input in inputs.into_iter().flatten() {
         if output == normalize_path(input)? {
@@ -1213,22 +1591,22 @@ fn read_baseline(
     path: &Path,
     explicit_evidence_path: Option<&Path>,
 ) -> Result<LoadedBaseline, Box<dyn Error>> {
-    let bytes = fs::read(path)?;
+    let bytes = read_perf_artifact_file(path)?;
     let probe = serde_json::from_slice::<serde_json::Value>(&bytes)?;
     let schema_version = probe
         .get("schema_version")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| format!("baseline {} has no string schema_version", path.display()))?;
     if schema_version == PERF_ARTIFACT_SCHEMA_VERSION {
-        let (artifact, artifact_bytes) = read_artifact(path)?;
-        let evidence = explicit_evidence_path
-            .map(read_evidence_artifact)
+        let (artifact, artifact_bytes) = parse_artifact_bytes(path, bytes)?;
+        let evidence_bytes = explicit_evidence_path
+            .map(read_perf_artifact_file)
             .transpose()?;
         return Ok(LoadedBaseline {
             artifact,
             artifact_bytes,
             artifact_path: path.to_path_buf(),
-            evidence,
+            evidence_bytes,
             evidence_path: explicit_evidence_path.map(Path::to_path_buf),
             pointer: None,
         });
@@ -1282,18 +1660,15 @@ fn read_baseline(
     let threshold_path = parent.join(&pointer.threshold_file);
     let evidence_path = parent.join(&pointer.evidence_file);
     let (artifact, artifact_bytes) = read_artifact(&threshold_path)?;
-    let evidence = read_evidence_artifact(&evidence_path)?;
+    let evidence_bytes = read_perf_artifact_file(&evidence_path)?;
     if sha256_hex(&artifact_bytes) != pointer.threshold_sha256
-        || sha256_hex(&evidence.1) != pointer.evidence_sha256
+        || sha256_hex(&evidence_bytes) != pointer.evidence_sha256
         || artifact.gate != pointer.gate
         || artifact.run_id != pointer.run_id
-        || evidence.0.gate != pointer.gate
-        || evidence.0.provenance.run_id != pointer.run_id
         || artifact
             .applicability_plan
             .as_ref()
             .is_none_or(|binding| binding.profile != pointer.profile)
-        || evidence.0.applicability_plan.profile != pointer.profile
     {
         return Err(format!(
             "history pointer {} does not bind its exact threshold/evidence generation",
@@ -1305,14 +1680,34 @@ fn read_baseline(
         artifact,
         artifact_bytes,
         artifact_path: threshold_path,
-        evidence: Some(evidence),
+        evidence_bytes: Some(evidence_bytes),
         evidence_path: Some(evidence_path),
         pointer: Some((path.to_path_buf(), bytes)),
     })
 }
 
-fn read_artifact(path: &Path) -> Result<(PerfGateArtifact, Vec<u8>), Box<dyn Error>> {
-    let bytes = fs::read(path)?;
+fn current_bootstrap_artifact(gate: PerfGate, manifest_sha256: &str) -> PerfGateArtifact {
+    PerfGateArtifact {
+        schema_version: PERF_ARTIFACT_SCHEMA_VERSION.to_owned(),
+        gate,
+        applicability_plan: None,
+        bench_elf_sha256: "unmeasured".to_owned(),
+        machine_fingerprint: "unmeasured".to_owned(),
+        execution: None,
+        git_rev: "unmeasured".to_owned(),
+        run_window: "unmeasured".to_owned(),
+        run_id: "unmeasured".to_owned(),
+        corpus_manifest_hash: "0".repeat(64),
+        manifest_sha256: manifest_sha256.to_owned(),
+        cells: Vec::new(),
+        laws_attested: false,
+    }
+}
+
+fn parse_artifact_bytes(
+    path: &Path,
+    bytes: Vec<u8>,
+) -> Result<(PerfGateArtifact, Vec<u8>), Box<dyn Error>> {
     let probe = serde_json::from_slice::<serde_json::Value>(&bytes)?;
     if let Some(schema_version) = probe
         .get("schema_version")
@@ -1336,18 +1731,120 @@ fn read_artifact(path: &Path) -> Result<(PerfGateArtifact, Vec<u8>), Box<dyn Err
     Ok((artifact, bytes))
 }
 
-fn read_evidence_artifact(path: &Path) -> Result<LoadedEvidence, Box<dyn Error>> {
-    let bytes = fs::read(path)?;
-    let artifact = PerfEvidenceArtifact::from_verified_slice(&bytes)?;
-    let canonical = serde_json::to_vec_pretty(&artifact)?;
-    if bytes != canonical {
-        return Err(format!(
-            "evidence artifact {} is not exact canonical pretty JSON",
-            path.display()
-        )
-        .into());
+fn read_artifact(path: &Path) -> Result<(PerfGateArtifact, Vec<u8>), Box<dyn Error>> {
+    parse_artifact_bytes(path, read_perf_artifact_file(path)?)
+}
+
+fn read_perf_artifact_file(path: &Path) -> Result<Vec<u8>, Box<dyn Error>> {
+    read_no_follow(path, PERF_ASSEMBLY_MAX_ARTIFACT_BYTES)
+}
+
+fn emit_current_bootstraps(
+    manifest_path: &Path,
+    output_dir: &Path,
+) -> Result<usize, Box<dyn Error>> {
+    let manifest_bytes = fs::read(manifest_path)?;
+    let manifest_text = std::str::from_utf8(&manifest_bytes)?;
+    let manifest = toml::from_str::<toml::Value>(manifest_text)?;
+    validate_manifest_gate_set(&manifest)?;
+    validate_manifest_schema_bindings(&manifest)?;
+    let manifest_sha256 = perf_manifest_contract_sha256(manifest_text);
+
+    let mut names = BTreeSet::new();
+    let mut outputs = Vec::with_capacity(PerfGate::ALL.len());
+    for gate in PerfGate::ALL {
+        let path = output_dir.join(current_bootstrap_basename(gate));
+        if !names.insert(path.clone()) {
+            return Err(format!("duplicate bootstrap destination {}", path.display()).into());
+        }
+        let artifact = current_bootstrap_artifact(gate, &manifest_sha256);
+        let mut bytes = serde_json::to_vec_pretty(&artifact)?;
+        bytes.push(b'\n');
+
+        // Exercise the exact parser used by normal baseline admission before
+        // touching the destination. The intended path is supplied so a typed
+        // schema failure names the same object the operator asked to create.
+        let (parsed, parsed_bytes) = parse_artifact_bytes(&path, bytes.clone())?;
+        if parsed_bytes != bytes
+            || parsed != artifact
+            || !is_explicit_bootstrap_for(&parsed, gate, &manifest_sha256)
+        {
+            return Err(format!(
+                "generated bootstrap {} does not satisfy the exact current-schema sentinel contract",
+                path.display()
+            )
+            .into());
+        }
+        outputs.push((gate, path, bytes));
     }
-    Ok((artifact, bytes))
+
+    preflight_bootstrap_destinations(output_dir, &outputs)?;
+    fs::create_dir_all(output_dir)?;
+    // Recheck after directory creation closes the ordinary race between the
+    // initial census and opening the first destination. Every actual open also
+    // uses create_new, so no path is ever replaced.
+    preflight_bootstrap_destinations(output_dir, &outputs)?;
+    for (gate, path, bytes) in &outputs {
+        write_new_file(path, bytes)?;
+        let (parsed, read_bytes) = read_artifact(path)?;
+        if read_bytes != *bytes || !is_explicit_bootstrap_for(&parsed, *gate, &manifest_sha256) {
+            return Err(format!(
+                "new bootstrap {} failed production-path readback",
+                path.display()
+            )
+            .into());
+        }
+    }
+    #[cfg(unix)]
+    {
+        File::open(output_dir)?.sync_all()?;
+        if let Some(parent) = output_dir
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            File::open(parent)?.sync_all()?;
+        }
+    }
+    Ok(outputs.len())
+}
+
+fn preflight_bootstrap_destinations(
+    output_dir: &Path,
+    outputs: &[(PerfGate, PathBuf, Vec<u8>)],
+) -> Result<(), Box<dyn Error>> {
+    match fs::symlink_metadata(output_dir) {
+        Ok(metadata) if !metadata.file_type().is_dir() => {
+            return Err(format!(
+                "bootstrap output directory {} is not a real directory",
+                output_dir.display()
+            )
+            .into());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    for (_, path, _) in outputs {
+        match fs::symlink_metadata(path) {
+            Ok(_) => {
+                return Err(format!(
+                    "bootstrap destination {} is occupied; no files were written",
+                    path.display()
+                )
+                .into());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn read_runner_identity(
@@ -1425,15 +1922,19 @@ fn bind_evidence_to_runner(
     threshold_artifact_bytes: &[u8],
     evidence: &mut Option<LoadedEvidence>,
     runner: Option<&AdmittedRunnerReceipt>,
+    qg1_authorities: &[&Qg1ExpectedAuthority],
+    qg6_authorities: &[&Qg6ScheduleAuthority],
 ) -> Result<(), Box<dyn Error>> {
     let (Some((artifact, bytes)), Some((identity, _, _, _))) = (evidence.as_mut(), runner) else {
         return Err(format!("{role} evidence/runner finalization inputs are incomplete").into());
     };
     let prebinding_bytes = bytes.clone();
-    *bytes = artifact.bind_machine_class_identity_and_seal(
+    *bytes = artifact.bind_machine_class_identity_and_seal_against_authorities(
         identity.clone(),
         threshold_artifact_bytes,
         &prebinding_bytes,
+        qg1_authorities,
+        qg6_authorities,
     )?;
     Ok(())
 }
@@ -1538,6 +2039,8 @@ fn validate_manifest_schema_bindings(manifest: &toml::Value) -> Result<(), Box<d
         "local_producer_contract",
         "history_pointer",
         "runner_attempt_receipt",
+        "runner_lease_release_receipt",
+        "runner_booking_receipt",
         "precommit_inventory",
     ];
     for (field, expected) in [
@@ -1596,6 +2099,7 @@ fn plan_history_if_requested(
     candidate_run_id: &str,
     candidate_bytes: &[u8],
     candidate_evidence_bytes: Option<&[u8]>,
+    candidate_qg6_authority_bytes: Option<&[u8]>,
     verified_machine_profile: Option<MachineProfileKey>,
     updates: &mut Vec<PerfEvidenceFile>,
 ) -> Result<Option<HistoryPublicationPlan>, Box<dyn Error>> {
@@ -1608,6 +2112,15 @@ fn plan_history_if_requested(
     };
     let evidence_bytes =
         candidate_evidence_bytes.ok_or("allowed promotion is missing receipt-bound evidence")?;
+    match (gate, candidate_qg6_authority_bytes) {
+        (PerfGate::Qg6, None) => {
+            return Err("allowed QG-6 promotion is missing its external authority set".into());
+        }
+        (PerfGate::Qg6, Some(_)) | (_, None) => {}
+        (_, Some(_)) => {
+            return Err("non-QG-6 history cannot archive a QG-6 authority set".into());
+        }
+    }
     validate_component(candidate_run_id, "candidate run ID")?;
 
     let stem = format!(
@@ -1619,10 +2132,16 @@ fn plan_history_if_requested(
     let rolling_stem = format!("{stem}.{date}.{candidate_run_id}");
     let threshold_file = format!("{rolling_stem}.json");
     let evidence_file = format!("{rolling_stem}.evidence.json");
+    let qg6_authority_file =
+        candidate_qg6_authority_bytes.map(|_| format!("{rolling_stem}.qg6-authorities.json"));
     validate_filename_component(&threshold_file, "rolling threshold filename", 240)?;
     validate_filename_component(&evidence_file, "rolling evidence filename", 240)?;
+    if let Some(file) = qg6_authority_file.as_deref() {
+        validate_filename_component(file, "rolling QG-6 authority filename", 240)?;
+    }
     let rolling_threshold = history_dir.join(&threshold_file);
     let rolling_evidence = history_dir.join(&evidence_file);
+    let rolling_qg6_authority = qg6_authority_file.map(|file| history_dir.join(file));
     let latest_pointer = history_dir.join(format!("{stem}.latest.json"));
     let pointer = HistoryPointer {
         schema_version: PERF_HISTORY_POINTER_SCHEMA_VERSION.to_owned(),
@@ -1645,6 +2164,12 @@ fn plan_history_if_requested(
         &rolling_evidence,
         evidence_bytes,
     ));
+    if let (Some(path), Some(bytes)) = (
+        rolling_qg6_authority.as_ref(),
+        candidate_qg6_authority_bytes,
+    ) {
+        updates.push(evidence("history_qg6_authority_window", path, bytes));
+    }
     updates.push(evidence(
         "history_latest_pointer",
         &latest_pointer,
@@ -1655,6 +2180,8 @@ fn plan_history_if_requested(
         threshold_bytes: candidate_bytes.to_vec(),
         rolling_evidence,
         evidence_bytes: evidence_bytes.to_vec(),
+        rolling_qg6_authority,
+        qg6_authority_bytes: candidate_qg6_authority_bytes.map(<[u8]>::to_vec),
         latest_pointer,
         pointer_bytes,
     }))
@@ -1666,6 +2193,7 @@ fn plan_history_if_allowed(
     candidate_run_id: &str,
     candidate_bytes: &[u8],
     candidate_evidence_bytes: Option<&[u8]>,
+    candidate_qg6_authority_bytes: Option<&[u8]>,
     verified_machine_profile: Option<MachineProfileKey>,
     evaluation: &mut frankensearch_quill_gauntlet::PerfRatchetEvaluation,
 ) -> Result<Option<HistoryPublicationPlan>, Box<dyn Error>> {
@@ -1678,6 +2206,7 @@ fn plan_history_if_allowed(
         candidate_run_id,
         candidate_bytes,
         candidate_evidence_bytes,
+        candidate_qg6_authority_bytes,
         verified_machine_profile,
         &mut evaluation.history_updates,
     )
@@ -1686,6 +2215,12 @@ fn plan_history_if_allowed(
 fn apply_history_plan(plan: &HistoryPublicationPlan) -> Result<(), Box<dyn Error>> {
     write_immutable_file(&plan.rolling_threshold, &plan.threshold_bytes)?;
     write_immutable_file(&plan.rolling_evidence, &plan.evidence_bytes)?;
+    if let (Some(path), Some(bytes)) = (
+        plan.rolling_qg6_authority.as_ref(),
+        plan.qg6_authority_bytes.as_deref(),
+    ) {
+        write_immutable_file(path, bytes)?;
+    }
     // This one atomic pointer replacement is the only baseline advancement.
     // It happens after the complete immutable generation and decision record
     // are durable, so a crash cannot expose a mixed threshold/evidence pair.
@@ -1760,6 +2295,23 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    fn canonical_manifest_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/contracts/quill-perf-gates.toml")
+    }
+
+    fn write_oversize_sparse_file(path: &Path) {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("create oversize sparse artifact");
+        file.set_len(
+            u64::try_from(PERF_ASSEMBLY_MAX_ARTIFACT_BYTES).expect("artifact cap fits u64") + 1,
+        )
+        .expect("extend sparse artifact past cap");
+        file.sync_all().expect("sync sparse artifact");
+    }
+
     fn test_profile() -> MachineProfileKey {
         MachineProfileKey::new(HardwareClassId::TrjZen35995wx, ExecutionProfileId::Smt2_128)
             .expect("registered Threadripper SMT profile")
@@ -1793,6 +2345,9 @@ mod tests {
             candidate_authority_dir: None,
             rerun_target_pin: None,
             rerun_authority_dir: None,
+            baseline_qg6_authority_set: None,
+            candidate_qg6_authority_set: None,
+            rerun_qg6_authority_set: None,
         }
     }
 
@@ -1930,7 +2485,7 @@ mod tests {
             .to_string();
         assert!(
             stale_error.contains("schemas.evidence_artifact")
-                && stale_error.contains("quill-perf-evidence-v5"),
+                && stale_error.contains("quill-perf-evidence-v7"),
             "unexpected stale-schema error: {stale_error}"
         );
 
@@ -2029,6 +2584,116 @@ mod tests {
     }
 
     #[test]
+    fn qg6_authority_set_flags_are_independent_per_arm() {
+        let args = parse_args(
+            [
+                "--manifest",
+                "manifest.toml",
+                "--baseline",
+                "baseline.json",
+                "--baseline-evidence",
+                "baseline.evidence.json",
+                "--baseline-qg6-authority-set",
+                "baseline.qg6-authorities.json",
+                "--candidate",
+                "candidate.json",
+                "--candidate-evidence",
+                "candidate.evidence.json",
+                "--candidate-qg6-authority-set",
+                "candidate.qg6-authorities.json",
+                "--rerun",
+                "rerun.json",
+                "--rerun-evidence",
+                "rerun.evidence.json",
+                "--rerun-qg6-authority-set",
+                "rerun.qg6-authorities.json",
+                "--output",
+                "ratchet.json",
+                "--mode",
+                "regression-alarm",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )
+        .expect("three explicit QG-6 authority-set flags");
+        assert_eq!(
+            args.baseline_qg6_authority_set.as_deref(),
+            Some(Path::new("baseline.qg6-authorities.json"))
+        );
+        assert_eq!(
+            args.candidate_qg6_authority_set.as_deref(),
+            Some(Path::new("candidate.qg6-authorities.json"))
+        );
+        assert_eq!(
+            args.rerun_qg6_authority_set.as_deref(),
+            Some(Path::new("rerun.qg6-authorities.json"))
+        );
+
+        let duplicate = parse_args(
+            [
+                "--manifest",
+                "manifest.toml",
+                "--baseline",
+                "baseline.json",
+                "--candidate",
+                "candidate.json",
+                "--candidate-qg6-authority-set",
+                "first.json",
+                "--candidate-qg6-authority-set",
+                "second.json",
+                "--output",
+                "ratchet.json",
+                "--mode",
+                "regression-alarm",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )
+        .expect_err("duplicate per-arm QG-6 authority input must refuse");
+        assert!(
+            duplicate
+                .to_string()
+                .contains("duplicate --candidate-qg6-authority-set")
+        );
+    }
+
+    #[test]
+    fn bootstrap_emitter_parser_is_a_distinct_closed_invocation() {
+        let args = parse_bootstrap_emit_args(
+            ["--manifest", "manifest.toml", "--output-dir", "generated"]
+                .into_iter()
+                .map(OsString::from),
+        )
+        .expect("exact emitter arguments");
+        assert_eq!(args.manifest, Path::new("manifest.toml"));
+        assert_eq!(args.output_dir, Path::new("generated"));
+
+        for invalid in [
+            vec![
+                "--manifest",
+                "manifest.toml",
+                "--output-dir",
+                "generated",
+                "--baseline",
+                "baseline.json",
+            ],
+            vec![
+                "--manifest",
+                "first.toml",
+                "--manifest",
+                "second.toml",
+                "--output-dir",
+                "generated",
+            ],
+        ] {
+            assert!(
+                parse_bootstrap_emit_args(invalid.into_iter().map(OsString::from)).is_err(),
+                "emitter admitted mixed or duplicate arguments"
+            );
+        }
+    }
+
+    #[test]
     fn direct_historical_thresholds_return_typed_rebaseline_incompatibility() {
         let directory = tempfile::tempdir().expect("baseline directory");
         for schema in [
@@ -2058,6 +2723,104 @@ mod tests {
                 "unexpected typed stale-schema diagnostic: {error}"
             );
         }
+    }
+
+    #[test]
+    fn direct_v7_bootstrap_returns_typed_current_schema_incompatibility() {
+        let directory = tempfile::tempdir().expect("baseline directory");
+        let path = directory.path().join("QG-2.v7.unmeasured.latest.json");
+        let manifest = include_str!("../../../../docs/contracts/quill-perf-gates.toml");
+        let mut artifact =
+            current_bootstrap_artifact(PerfGate::Qg2, &perf_manifest_contract_sha256(manifest));
+        artifact.schema_version = "quill-perf-artifact-v7".to_owned();
+        let mut bytes = serde_json::to_vec_pretty(&artifact).expect("canonical v7 bootstrap");
+        bytes.push(b'\n');
+        fs::write(&path, bytes).expect("write v7 bootstrap probe");
+
+        let error = read_baseline(&path, None)
+            .expect_err("v7 bootstrap must not enter a v8 ratchet")
+            .downcast::<BaselineLoadError>()
+            .expect("v7 denial must preserve the typed schema incompatibility");
+        assert_eq!(error.incompatibility.code, "baseline_schema_incompatible");
+        assert_eq!(error.incompatibility.baseline_path, path);
+        assert_eq!(error.incompatibility.found_schema, "quill-perf-artifact-v7");
+        assert_eq!(
+            error.incompatibility.expected_schema,
+            PERF_ARTIFACT_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn oversize_threshold_and_direct_evidence_refuse_before_json_parsing() {
+        let directory = tempfile::tempdir().expect("oversize artifact directory");
+        let threshold = directory.path().join("oversize-threshold.json");
+        let evidence = directory.path().join("oversize-evidence.json");
+        write_oversize_sparse_file(&threshold);
+        write_oversize_sparse_file(&evidence);
+
+        for error in [
+            read_artifact(&threshold).expect_err("oversize threshold must refuse"),
+            read_perf_artifact_file(&evidence).expect_err("oversize direct evidence must refuse"),
+        ] {
+            assert!(error.to_string().contains(&format!(
+                "exceeds its {PERF_ASSEMBLY_MAX_ARTIFACT_BYTES}-byte bound"
+            )));
+            assert!(
+                !error.is::<serde_json::Error>(),
+                "declared oversize input reached serde instead of the byte ceiling"
+            );
+        }
+    }
+
+    #[test]
+    fn oversize_baseline_and_history_pointer_evidence_refuse_at_the_shared_cap() {
+        let directory = tempfile::tempdir().expect("baseline directory");
+        emit_current_bootstraps(&canonical_manifest_path(), directory.path())
+            .expect("emit current bootstrap set");
+        let threshold_path = directory
+            .path()
+            .join(current_bootstrap_basename(PerfGate::Qg2));
+        let threshold_bytes = fs::read(&threshold_path).expect("generated threshold bytes");
+        let evidence_path = directory.path().join("oversize.evidence.json");
+        write_oversize_sparse_file(&evidence_path);
+
+        let direct_error = read_baseline(&threshold_path, Some(&evidence_path))
+            .expect_err("oversize direct baseline evidence must refuse");
+        assert!(direct_error.to_string().contains(&format!(
+            "exceeds its {PERF_ASSEMBLY_MAX_ARTIFACT_BYTES}-byte bound"
+        )));
+
+        let profile = test_profile();
+        let pointer_path = directory.path().join(
+            profile
+                .latest_basename(PerfGate::Qg2.label())
+                .expect("latest pointer basename"),
+        );
+        let pointer = HistoryPointer {
+            schema_version: PERF_HISTORY_POINTER_SCHEMA_VERSION.to_owned(),
+            gate: PerfGate::Qg2,
+            profile,
+            run_id: "unmeasured".to_owned(),
+            threshold_file: current_bootstrap_basename(PerfGate::Qg2),
+            threshold_sha256: sha256_hex(&threshold_bytes),
+            evidence_file: "oversize.evidence.json".to_owned(),
+            evidence_sha256: "0".repeat(64),
+        };
+        fs::write(
+            &pointer_path,
+            serde_json::to_vec_pretty(&pointer).expect("canonical pointer"),
+        )
+        .expect("write history pointer");
+
+        let pointer_error = read_baseline(&pointer_path, None)
+            .expect_err("oversize history-pointer evidence must refuse");
+        assert!(pointer_error.to_string().contains(&format!(
+            "exceeds its {PERF_ASSEMBLY_MAX_ARTIFACT_BYTES}-byte bound"
+        )));
+        assert!(
+            !pointer_error.is::<serde_json::Error>(),
+            "oversize history evidence reached serde"
+        );
     }
 
     #[test]
@@ -2112,19 +2875,87 @@ mod tests {
     #[test]
     fn current_versioned_bootstrap_loads_without_rebaseline_incompatibility() {
         let directory = tempfile::tempdir().expect("baseline directory");
+        assert_eq!(
+            emit_current_bootstraps(&canonical_manifest_path(), directory.path())
+                .expect("emit current bootstrap set"),
+            PerfGate::ALL.len()
+        );
         let path = directory
             .path()
             .join(current_bootstrap_basename(PerfGate::Qg2));
-        fs::write(
-            &path,
-            include_bytes!("../../../../.bench-history/QG-2.v7.unmeasured.latest.json"),
-        )
-        .expect("write current bootstrap");
 
         let loaded = read_baseline(&path, None)
             .expect("current versioned bootstrap must load without a rebaseline incompatibility");
         assert_eq!(loaded.artifact.schema_version, PERF_ARTIFACT_SCHEMA_VERSION);
-        assert!(loaded.evidence.is_none());
+        assert!(loaded.evidence_bytes.is_none());
+    }
+
+    #[test]
+    fn bootstrap_emitter_writes_the_exact_all_gate_current_schema_set() {
+        let directory = tempfile::tempdir().expect("bootstrap parent");
+        let output_dir = directory.path().join("generated");
+        let manifest_path = canonical_manifest_path();
+        let manifest = fs::read_to_string(&manifest_path).expect("canonical manifest");
+        let manifest_sha256 = perf_manifest_contract_sha256(&manifest);
+
+        assert_eq!(
+            emit_current_bootstraps(&manifest_path, &output_dir)
+                .expect("emit exact current-schema bootstraps"),
+            PerfGate::ALL.len()
+        );
+
+        let actual_names = fs::read_dir(&output_dir)
+            .expect("generated directory")
+            .map(|entry| {
+                entry
+                    .expect("generated entry")
+                    .file_name()
+                    .into_string()
+                    .expect("UTF-8 bootstrap name")
+            })
+            .collect::<BTreeSet<_>>();
+        let expected_names = PerfGate::ALL
+            .into_iter()
+            .map(current_bootstrap_basename)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual_names, expected_names);
+
+        for gate in PerfGate::ALL {
+            let path = output_dir.join(current_bootstrap_basename(gate));
+            let (artifact, bytes) = read_artifact(&path).expect("production-path admission");
+            let mut canonical =
+                serde_json::to_vec_pretty(&artifact).expect("canonical generated bootstrap");
+            canonical.push(b'\n');
+            assert_eq!(bytes, canonical);
+            assert_eq!(artifact.schema_version, "quill-perf-artifact-v8");
+            assert_eq!(artifact.gate, gate);
+            assert!(is_explicit_bootstrap_for(&artifact, gate, &manifest_sha256));
+        }
+    }
+
+    #[test]
+    fn bootstrap_emitter_refuses_an_occupied_destination_before_writing_any_gate() {
+        let directory = tempfile::tempdir().expect("bootstrap output");
+        let occupied = directory
+            .path()
+            .join(current_bootstrap_basename(PerfGate::Qg10));
+        fs::write(&occupied, b"operator-owned-bytes\n").expect("occupy last gate destination");
+        let before = snapshot(directory.path());
+
+        let error = emit_current_bootstraps(&canonical_manifest_path(), directory.path())
+            .expect_err("an occupied destination must refuse the entire set");
+        assert!(error.to_string().contains("is occupied"));
+        assert_eq!(
+            snapshot(directory.path()),
+            before,
+            "preflight refusal must leave every destination byte-identical"
+        );
+        assert!(
+            !directory
+                .path()
+                .join(current_bootstrap_basename(PerfGate::Qg1))
+                .exists()
+        );
     }
 
     #[test]
@@ -2157,7 +2988,7 @@ mod tests {
                 "--manifest",
                 "manifest.toml",
                 "--baseline",
-                "QG-2.v7.unmeasured.latest.json",
+                "QG-2.v8.unmeasured.latest.json",
                 "--candidate",
                 "candidate.json",
                 "--candidate-evidence",
@@ -2230,12 +3061,12 @@ mod tests {
     #[test]
     fn promotion_baseline_authority_rejects_copies_stale_bootstrap_and_direct_latest() {
         let bootstrap_directory = tempfile::tempdir().expect("bootstrap history directory");
+        emit_current_bootstraps(&canonical_manifest_path(), bootstrap_directory.path())
+            .expect("emit current bootstrap set");
         let canonical_bootstrap = bootstrap_directory
             .path()
             .join(current_bootstrap_basename(PerfGate::Qg2));
-        let bootstrap_bytes =
-            include_bytes!("../../../../.bench-history/QG-2.v7.unmeasured.latest.json");
-        fs::write(&canonical_bootstrap, bootstrap_bytes).expect("canonical bootstrap");
+        let bootstrap_bytes = fs::read(&canonical_bootstrap).expect("canonical bootstrap");
         let mut bootstrap_args = test_args(bootstrap_directory.path());
         bootstrap_args.baseline = canonical_bootstrap.clone();
         let loaded = read_baseline(&canonical_bootstrap, None)
@@ -2254,7 +3085,7 @@ mod tests {
         );
 
         let copied_bootstrap = bootstrap_directory.path().join("copied-bootstrap.json");
-        fs::write(&copied_bootstrap, bootstrap_bytes).expect("copied bootstrap");
+        fs::write(&copied_bootstrap, &bootstrap_bytes).expect("copied bootstrap");
         bootstrap_args.baseline = copied_bootstrap;
         let before_copy_rejection = snapshot(bootstrap_directory.path());
         assert!(
@@ -2278,7 +3109,7 @@ mod tests {
         let measured_bootstrap = measured_directory
             .path()
             .join(current_bootstrap_basename(PerfGate::Qg2));
-        fs::write(&measured_bootstrap, bootstrap_bytes).expect("retained bootstrap");
+        fs::write(&measured_bootstrap, &bootstrap_bytes).expect("retained bootstrap");
         let mut measured_args = test_args(measured_directory.path());
 
         measured_args.baseline = stale_pointer_copy;
@@ -2328,7 +3159,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_rejects_preserved_v6_bootstrap_as_stale_after_v7_schema_bump() {
+    fn cli_rejects_preserved_v6_bootstrap_as_stale_after_current_schema_bump() {
         let baseline = serde_json::from_str::<PerfGateArtifact>(include_str!(
             "../../../../.bench-history/QG-2.unmeasured.latest.json"
         ))
@@ -2366,6 +3197,7 @@ mod tests {
             "candidate-1",
             b"forbidden-candidate",
             Some(b"forbidden-evidence"),
+            None,
             Some(test_profile()),
             &mut evaluation,
         )
@@ -2418,6 +3250,7 @@ mod tests {
             "candidate-1",
             b"forbidden-candidate",
             Some(b"forbidden-receipt-bound-evidence"),
+            None,
             Some(test_profile()),
             &mut evaluation,
         )
@@ -2436,6 +3269,7 @@ mod tests {
         let candidate = b"candidate-threshold-artifact\n";
         let unverified_producer_evidence = b"candidate-unverified-producer-evidence\n";
         let receipt_bound_evidence = b"candidate-receipt-bound-evidence\n";
+        let qg6_authority = b"candidate-qg6-authority-set\n";
 
         let plan = plan_history_if_allowed(
             &args,
@@ -2443,6 +3277,7 @@ mod tests {
             "candidate-1",
             candidate,
             Some(receipt_bound_evidence),
+            Some(qg6_authority),
             Some(test_profile()),
             &mut evaluation,
         )
@@ -2460,6 +3295,15 @@ mod tests {
         assert_eq!(
             fs::read(&paths[1]).expect("rolling evidence"),
             receipt_bound_evidence
+        );
+        assert_eq!(
+            fs::read(
+                plan.rolling_qg6_authority
+                    .as_ref()
+                    .expect("rolling QG-6 authority")
+            )
+            .expect("rolling QG-6 authority bytes"),
+            qg6_authority
         );
         let pointer_bytes = fs::read(&paths[2]).expect("latest pointer");
         let pointer =
@@ -2489,6 +3333,7 @@ mod tests {
             [
                 "history_window",
                 "history_evidence_window",
+                "history_qg6_authority_window",
                 "history_latest_pointer",
             ]
         );
@@ -2511,6 +3356,7 @@ mod tests {
             "candidate-1",
             b"threshold",
             Some(b"bound-evidence"),
+            Some(b"qg6-authority"),
             Some(test_profile()),
             &mut evaluation,
         )
@@ -2534,6 +3380,7 @@ mod tests {
             "candidate-1",
             b"threshold-one",
             Some(b"evidence-one"),
+            Some(b"qg6-authority-one"),
             Some(test_profile()),
             &mut first_evaluation,
         )
@@ -2549,6 +3396,7 @@ mod tests {
             "candidate-1",
             b"threshold-two",
             Some(b"evidence-two"),
+            Some(b"qg6-authority-two"),
             Some(test_profile()),
             &mut second_evaluation,
         )
@@ -2576,6 +3424,7 @@ mod tests {
                     run_id,
                     b"threshold",
                     Some(b"evidence"),
+                    Some(b"qg6-authority"),
                     Some(test_profile()),
                     &mut evaluation,
                 )
@@ -2595,6 +3444,161 @@ mod tests {
 
         args.output = directory.path().join("decision.json");
         assert!(validate_decision_output_is_separate(&args).is_err());
+    }
+
+    fn qg6_threshold(run_id: &str, revision: &str, fixtures: &[&str]) -> PerfGateArtifact {
+        let mut artifact = current_bootstrap_artifact(
+            PerfGate::Qg6,
+            &perf_manifest_contract_sha256(include_str!(
+                "../../../../docs/contracts/quill-perf-gates.toml"
+            )),
+        );
+        artifact.run_id = run_id.to_owned();
+        artifact.git_rev = revision.to_owned();
+        artifact.cells = fixtures
+            .iter()
+            .map(|fixture| {
+                serde_json::from_value(serde_json::json!({
+                    "fixture": fixture,
+                    "metric": "latency_ms_quill_over_tantivy",
+                    "engine": "paired_ab",
+                    "unit": "ratio",
+                    "value": 1.0,
+                    "p50": 1.0,
+                    "median_ci95_low": 0.99,
+                    "median_ci95_high": 1.01,
+                    "p95": 1.0,
+                    "p99": 1.0,
+                    "mad": 0.0,
+                    "cv_pct": 0.0,
+                    "runs": 16
+                }))
+                .expect("threshold cell")
+            })
+            .collect();
+        artifact
+    }
+
+    fn qg6_authority(seed: u64) -> Qg6ScheduleAuthority {
+        Qg6ScheduleAuthority::for_experiment(
+            frankensearch_quill_gauntlet::Qg6ExperimentIdentity {
+                corpus_sha256: format!("{seed:064x}"),
+                query_manifest_sha256: format!("{:064x}", seed + 1),
+                config_contract_sha256: format!("{:064x}", seed + 2),
+                document_count: 100,
+                k: 10,
+            },
+            1,
+            2,
+            1,
+            seed,
+        )
+        .expect("valid focused QG-6 authority")
+    }
+
+    fn qg6_set(run_id: &str, revision: &str, cells: &[(&str, u64)]) -> Qg6StartupAuthoritySetV1 {
+        Qg6StartupAuthoritySetV1::new(
+            run_id.to_owned(),
+            revision.to_owned(),
+            true,
+            cells
+                .iter()
+                .map(|(cell_id, seed)| ((*cell_id).to_owned(), qg6_authority(*seed)))
+                .collect(),
+        )
+        .expect("valid focused QG-6 authority set")
+    }
+
+    #[test]
+    fn qg6_authority_set_is_mandatory_and_bound_to_run_source_and_selection() {
+        let directory = tempfile::tempdir().expect("authority directory");
+        let revision = "a".repeat(40);
+        let cell = "QG-6/query/natural/k10/1k/latency_ms";
+        let threshold = qg6_threshold("candidate-run", &revision, &["query/natural/k10/1k"]);
+
+        let missing = resolve_arm_qg6_authority_set("candidate", None, &threshold, true)
+            .expect_err("QG-6 evidence without an external set must refuse");
+        assert!(
+            missing
+                .to_string()
+                .contains("--candidate-qg6-authority-set")
+        );
+
+        let valid_path = directory.path().join("candidate.qg6-authorities.json");
+        fs::write(
+            &valid_path,
+            qg6_set("candidate-run", &revision, &[(cell, 11)])
+                .to_json_bytes()
+                .expect("canonical set"),
+        )
+        .expect("write valid set");
+        let (_, retained_bytes, record) =
+            load_qg6_authority_set("candidate", &valid_path, &threshold)
+                .expect("exact run/source/selection set");
+        assert_eq!(record.role, "candidate_qg6_authority_set");
+        assert_eq!(record.sha256, sha256_hex(&retained_bytes));
+        assert_eq!(record.path, valid_path.to_string_lossy());
+
+        let wrong_run_path = directory.path().join("wrong-run.qg6-authorities.json");
+        fs::write(
+            &wrong_run_path,
+            qg6_set("rerun", &revision, &[(cell, 12)])
+                .to_json_bytes()
+                .expect("canonical wrong-run set"),
+        )
+        .expect("write wrong-run set");
+        assert!(load_qg6_authority_set("candidate", &wrong_run_path, &threshold).is_err());
+
+        let wrong_source_path = directory.path().join("wrong-source.qg6-authorities.json");
+        fs::write(
+            &wrong_source_path,
+            qg6_set("candidate-run", &"b".repeat(40), &[(cell, 13)])
+                .to_json_bytes()
+                .expect("canonical wrong-source set"),
+        )
+        .expect("write wrong-source set");
+        assert!(load_qg6_authority_set("candidate", &wrong_source_path, &threshold).is_err());
+
+        let wrong_selection_path = directory
+            .path()
+            .join("wrong-selection.qg6-authorities.json");
+        fs::write(
+            &wrong_selection_path,
+            qg6_set(
+                "candidate-run",
+                &revision,
+                &[("QG-6/query/code/k10/1k/latency_ms", 14)],
+            )
+            .to_json_bytes()
+            .expect("canonical wrong-selection set"),
+        )
+        .expect("write wrong-selection set");
+        assert!(load_qg6_authority_set("candidate", &wrong_selection_path, &threshold).is_err());
+    }
+
+    #[test]
+    fn qg6_authority_set_rejects_duplicate_fields_and_cross_arm_swap() {
+        let directory = tempfile::tempdir().expect("authority directory");
+        let revision = "c".repeat(40);
+        let cell = "QG-6/query/natural/k10/1k/latency_ms";
+        let set = qg6_set("candidate-run", &revision, &[(cell, 21)]);
+        let bytes = set.to_json_bytes().expect("canonical set");
+        let duplicate = String::from_utf8(bytes.clone())
+            .expect("JSON is UTF-8")
+            .replacen(
+                "\"campaign_run_id\":\"candidate-run\",",
+                "\"campaign_run_id\":\"candidate-run\",\"campaign_run_id\":\"candidate-run\",",
+                1,
+            );
+        assert!(Qg6StartupAuthoritySetV1::from_verified_slice(duplicate.as_bytes()).is_err());
+
+        let path = directory.path().join("candidate.qg6-authorities.json");
+        fs::write(&path, bytes).expect("write candidate set");
+        let rerun_threshold = qg6_threshold("rerun", &revision, &["query/natural/k10/1k"]);
+        assert!(
+            load_qg6_authority_set("rerun", &path, &rerun_threshold).is_err(),
+            "a candidate set must not authenticate the rerun arm"
+        );
     }
 
     /// A pin without its register directory has nothing to admit, and a

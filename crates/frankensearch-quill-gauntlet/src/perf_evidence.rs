@@ -22,27 +22,28 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
 use std::fs::{self, File};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::perf::{
-    DistributionSummary, LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3, PairedClaimState,
-    PairedEstimatorConfig, PairedEstimatorError, PairedEvidenceStatus, PairedExperimentResult,
-    PerfApplicabilityPlan, PerfApplicabilityPlanBinding, PerfCellApplicability, PerfCellSpec,
-    PerfExecutionProvenance, PerfGate, PerfGateArtifact, PerfInputIdentity, PerfMatrixSpec,
-    PerfRawSample, PerfSampleArm, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg1ExpectedAuthority,
-    Qg1TantivyIncumbentDecision, Qg1TantivyIncumbentError, Qg1TantivyIncumbentScreen,
-    Qg1TantivySemanticContract, Qg1TantivyWriterMode, median_sorted, parse_cpu_list_ids,
-    percentile, perf_metric_unit, perf_operation_scope, resolve_qg1_expected_authority_for_replay,
-    splitmix64, validate_paired_blocks,
+    DistributionSummary, LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3, PERF_NULL_MARGIN_MULTIPLIER,
+    PairedClaimState, PairedEstimatorConfig, PairedEstimatorError, PairedEvidenceStatus,
+    PairedExperimentResult, PerfApplicabilityPlan, PerfApplicabilityPlanBinding,
+    PerfCellApplicability, PerfCellSpec, PerfExecutionProvenance, PerfGate, PerfGateArtifact,
+    PerfInputIdentity, PerfMatrixSpec, PerfRawSample, PerfSampleArm, QG6_QUERY_GROUP_IDS,
+    QG6_QUERY_GROUPS, Qg1ExpectedAuthority, Qg1TantivyIncumbentDecision, Qg1TantivyIncumbentError,
+    Qg1TantivyIncumbentScreen, Qg1TantivySemanticContract, Qg1TantivyWriterMode, median_sorted,
+    parse_cpu_list_ids, percentile, perf_metric_unit, perf_operation_scope,
+    resolve_qg1_expected_authority_for_replay, splitmix64, validate_paired_blocks,
 };
 use crate::qg6_prepared::{
-    Qg6ArmRole, Qg6QueryIdentityReceipt, Qg6QuerySpec, Qg6SemanticContract,
-    qg6_result_sequence_sha256,
+    Qg6ArmRole, Qg6Comparison, Qg6QueryIdentityReceipt, Qg6QuerySpec, Qg6SampleOrder,
+    Qg6ScheduleAuthority, Qg6SemanticContract, qg6_result_sequence_sha256,
 };
 use crate::{MachineClassEvidenceBinding, MachineClassRegistry, VerifiedRunnerIdentity};
 
@@ -53,9 +54,14 @@ use crate::{MachineClassEvidenceBinding, MachineClassRegistry, VerifiedRunnerIde
 /// [`EvidenceArtifactError::SchemaMismatch`], and legacy v3 gate artifacts are
 /// only readable through the explicit, read-only
 /// [`load_legacy_gate_artifact_v3`].
-pub const PERF_EVIDENCE_SCHEMA_VERSION: &str = "quill-perf-evidence-v5";
+pub const PERF_EVIDENCE_SCHEMA_VERSION: &str = "quill-perf-evidence-v7";
 /// Version of the hierarchical latency estimate carried by latency cells.
 pub const HIERARCHICAL_LATENCY_SCHEMA_VERSION: &str = "quill-hierarchical-latency-v1";
+/// Version of the joint six-arm QG-6 p50/p99 estimate.
+pub const QG6_JOINT_TAIL_SCHEMA_VERSION: &str = "quill-qg6-joint-tail-v1";
+pub const QG6_NULL_EFFECT_MARGIN: f64 = 0.10;
+/// Maximum serialized evidence artifact admitted by the public loader.
+pub const PERF_EVIDENCE_MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 /// Upper bound on retained reasons per artifact or cell.
 pub const EVIDENCE_MAX_REASONS: usize = 64;
 /// Upper bound on one bounded reason message, in bytes.
@@ -677,6 +683,54 @@ pub struct HierarchicalLatencyEstimate {
     pub groups: Vec<HierarchicalGroupSummary>,
 }
 
+/// One jointly bootstrapped treatment/control latency contrast.
+///
+/// QG-6 keeps p50 and p99 in the same resample so a favorable point estimate
+/// cannot borrow a confidence interval from another bootstrap population.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg6JointTailContrast {
+    /// Point p50 treatment/control ratio.
+    pub p50_ratio: f64,
+    /// Lower 95% p50 ratio bound.
+    pub p50_ci95_low_ratio: f64,
+    /// Upper 95% p50 ratio bound.
+    pub p50_ci95_high_ratio: f64,
+    /// Point p99 treatment/control ratio.
+    pub p99_ratio: f64,
+    /// Lower 95% p99 ratio bound.
+    pub p99_ci95_low_ratio: f64,
+    /// Upper 95% p99 ratio bound.
+    pub p99_ci95_high_ratio: f64,
+}
+
+/// Joint query-first, unit-cluster QG-6 p50/p99 estimate.
+///
+/// Every bootstrap draw selects queries first and then complete query-round
+/// units. One unit carries T/T, Q/Q, and T/Q together, so all six logical arms
+/// share the exact same resample. Individual timing leaves are observations
+/// inside a selected unit, never independent bootstrap units.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg6JointTailEstimate {
+    /// Version of the joint estimator contract.
+    pub schema_version: String,
+    /// Canonical query groups resampled at stage one.
+    pub query_count: usize,
+    /// Complete three-comparison units per query.
+    pub units_per_query: usize,
+    /// Individually timed leaves per arm in every unit.
+    pub leaves_per_arm_per_unit: usize,
+    /// Bootstrap draws from the frozen paired-estimator configuration.
+    pub bootstrap_resamples: usize,
+    /// Tantivy/Tantivy null contrast.
+    pub tantivy_null: Qg6JointTailContrast,
+    /// Quill/Quill null contrast.
+    pub quill_null: Qg6JointTailContrast,
+    /// Quill/Tantivy effect contrast.
+    pub effect: Qg6JointTailContrast,
+}
+
 /// Estimate a per-query latency effect with two-stage resampling.
 ///
 /// Every sample must carry a `group_id`; blocks never mix groups. Each group
@@ -800,6 +854,338 @@ pub fn estimate_hierarchical_latency(
         ci95_low_ratio: ci95_low_log.exp(),
         ci95_high_ratio: ci95_high_log.exp(),
         groups: summaries,
+    })
+}
+
+#[derive(Debug)]
+struct Qg6TailUnit {
+    query_index: usize,
+    role_leaves_ms: [Vec<f64>; 6],
+}
+
+const fn qg6_tail_role_index(role: Qg6ArmRole) -> usize {
+    match role {
+        Qg6ArmRole::TantivyNullLeft => 0,
+        Qg6ArmRole::TantivyNullRight => 1,
+        Qg6ArmRole::QuillNullLeft => 2,
+        Qg6ArmRole::QuillNullRight => 3,
+        Qg6ArmRole::EffectControl => 4,
+        Qg6ArmRole::EffectTreatment => 5,
+    }
+}
+
+fn qg6_tail_arm_quantiles(role_leaves_ms: &mut [Vec<f64>; 6]) -> [(f64, f64); 6] {
+    std::array::from_fn(|role_index| {
+        let leaves = &mut role_leaves_ms[role_index];
+        leaves.sort_unstable_by(f64::total_cmp);
+        (median_sorted(leaves), percentile(leaves, 0.99))
+    })
+}
+
+fn qg6_tail_contrast_logs(quantiles: &[(f64, f64); 6]) -> [f64; 6] {
+    let log_ratio = |left: usize, right: usize, quantile: usize| {
+        let control = if quantile == 0 {
+            quantiles[left].0
+        } else {
+            quantiles[left].1
+        };
+        let treatment = if quantile == 0 {
+            quantiles[right].0
+        } else {
+            quantiles[right].1
+        };
+        (treatment / control).ln()
+    };
+    [
+        log_ratio(0, 1, 0),
+        log_ratio(0, 1, 1),
+        log_ratio(2, 3, 0),
+        log_ratio(2, 3, 1),
+        log_ratio(4, 5, 0),
+        log_ratio(4, 5, 1),
+    ]
+}
+
+fn qg6_joint_tail_contrast(
+    point_p50_log: f64,
+    point_p99_log: f64,
+    p50_bootstrap: &mut [f64],
+    p99_bootstrap: &mut [f64],
+) -> Qg6JointTailContrast {
+    p50_bootstrap.sort_unstable_by(f64::total_cmp);
+    p99_bootstrap.sort_unstable_by(f64::total_cmp);
+    Qg6JointTailContrast {
+        p50_ratio: point_p50_log.exp(),
+        p50_ci95_low_ratio: percentile(p50_bootstrap, 0.025).exp(),
+        p50_ci95_high_ratio: percentile(p50_bootstrap, 0.975).exp(),
+        p99_ratio: point_p99_log.exp(),
+        p99_ci95_low_ratio: percentile(p99_bootstrap, 0.025).exp(),
+        p99_ci95_high_ratio: percentile(p99_bootstrap, 0.975).exp(),
+    }
+}
+
+fn qg6_joint_tail_decision_reasons(estimate: &Qg6JointTailEstimate) -> Vec<EvidenceReason> {
+    let mut reasons = Vec::new();
+    for (engine, null) in [
+        ("Tantivy/Tantivy", &estimate.tantivy_null),
+        ("Quill/Quill", &estimate.quill_null),
+    ] {
+        for (quantile, low, high) in [
+            ("p50", null.p50_ci95_low_ratio, null.p50_ci95_high_ratio),
+            ("p99", null.p99_ci95_low_ratio, null.p99_ci95_high_ratio),
+        ] {
+            let null_floor = (low - 1.0).abs().max((high - 1.0).abs());
+            if low > 1.0
+                || high < 1.0
+                || PERF_NULL_MARGIN_MULTIPLIER * null_floor > QG6_NULL_EFFECT_MARGIN
+            {
+                reasons.push(EvidenceReason::new(
+                    "qg6.joint_tail_null_invalid",
+                    format!(
+                        "QG-6 {engine} {quantile} null CI [{low:.6}, {high:.6}] fails identity \
+                         containment or the required {PERF_NULL_MARGIN_MULTIPLIER:.1}x margin"
+                    ),
+                    EvidenceSeverity::NoClaim,
+                ));
+            }
+        }
+    }
+    reasons
+}
+
+fn for_each_qg6_joint_tail_bootstrap_unit(
+    seed: &mut u64,
+    query_count: usize,
+    units_per_query: usize,
+    mut visit: impl FnMut(usize, usize),
+) -> Result<(), EvidenceArtifactError> {
+    let query_count_u64 =
+        u64::try_from(query_count).map_err(|_| EvidenceArtifactError::InconsistentArtifact {
+            reason: "QG-6 joint tail query count does not fit u64".to_owned(),
+        })?;
+    let units_per_query_u64 = u64::try_from(units_per_query).map_err(|_| {
+        EvidenceArtifactError::InconsistentArtifact {
+            reason: "QG-6 joint tail unit count does not fit u64".to_owned(),
+        }
+    })?;
+    if query_count_u64 == 0 || units_per_query_u64 == 0 {
+        return Err(EvidenceArtifactError::InconsistentArtifact {
+            reason: "QG-6 joint tail bootstrap requires positive query and unit counts".to_owned(),
+        });
+    }
+    for _ in 0..query_count {
+        *seed = splitmix64(*seed);
+        let query_index = usize::try_from(*seed % query_count_u64).map_err(|_| {
+            EvidenceArtifactError::InconsistentArtifact {
+                reason: "QG-6 joint tail query draw does not fit usize".to_owned(),
+            }
+        })?;
+        for _ in 0..units_per_query {
+            *seed = splitmix64(*seed);
+            let unit_index = usize::try_from(*seed % units_per_query_u64).map_err(|_| {
+                EvidenceArtifactError::InconsistentArtifact {
+                    reason: "QG-6 joint tail unit draw does not fit usize".to_owned(),
+                }
+            })?;
+            visit(query_index, unit_index);
+        }
+    }
+    Ok(())
+}
+
+/// Estimate the formal six-arm QG-6 p50 and p99 contrasts jointly.
+///
+/// The function first replays the complete external schedule authority and
+/// semantic contract. It then resamples queries, followed by whole
+/// query-round units. All six roles from a selected unit travel together;
+/// timing leaves are never resampled as if they were independent queries.
+///
+/// # Errors
+///
+/// Returns a fail-closed evidence error for any authority, schedule, semantic,
+/// cardinality, or finite-positive-latency defect.
+pub fn estimate_qg6_joint_tail(
+    paired: &PairedExperimentResult,
+    protocol: &Qg6FormalProtocolEvidence,
+    external_authority: &Qg6ScheduleAuthority,
+    identity: &PerfInputIdentity,
+    contract: &Qg6SemanticContract,
+) -> Result<Qg6JointTailEstimate, EvidenceArtifactError> {
+    validate_qg6_formal_protocol(paired, protocol, external_authority, identity, contract)?;
+    let estimate = estimate_qg6_joint_tail_from_validated_rows(
+        paired,
+        &protocol.quill_null_samples,
+        external_authority,
+    )?;
+    Ok(estimate)
+}
+
+fn estimate_qg6_joint_tail_from_validated_rows(
+    paired: &PairedExperimentResult,
+    quill_null_samples: &[PerfRawSample],
+    external_authority: &Qg6ScheduleAuthority,
+) -> Result<Qg6JointTailEstimate, EvidenceArtifactError> {
+    if paired.config.bootstrap_resamples == 0 {
+        return Err(EvidenceArtifactError::InconsistentArtifact {
+            reason: "QG-6 joint tail estimator requires positive bootstrap resamples".to_owned(),
+        });
+    }
+
+    let mut units = BTreeMap::<u64, Qg6TailUnit>::new();
+    for (samples, stream) in [
+        (&paired.null_samples[..], Qg6FormalStream::TantivyNull),
+        (quill_null_samples, Qg6FormalStream::QuillNull),
+        (&paired.effect_samples[..], Qg6FormalStream::Effect),
+    ] {
+        for sample in samples {
+            let binding = sample.qg6_sample_binding.as_ref().ok_or_else(|| {
+                EvidenceArtifactError::InconsistentArtifact {
+                    reason: "QG-6 joint tail row is missing its timed-sample binding".to_owned(),
+                }
+            })?;
+            let block_index = usize::try_from(sample.block_id).map_err(|_| {
+                EvidenceArtifactError::InconsistentArtifact {
+                    reason: "QG-6 joint tail block ID does not fit the platform".to_owned(),
+                }
+            })?;
+            let block = external_authority
+                .schedule
+                .get(block_index)
+                .ok_or_else(|| EvidenceArtifactError::InconsistentArtifact {
+                    reason: "QG-6 joint tail row is outside the external schedule".to_owned(),
+                })?;
+            let role = qg6_role(stream, sample.arm);
+            let unit = units.entry(block.unit_id).or_insert_with(|| Qg6TailUnit {
+                query_index: block.query_index,
+                role_leaves_ms: std::array::from_fn(|_| Vec::new()),
+            });
+            if unit.query_index != block.query_index {
+                return Err(EvidenceArtifactError::InconsistentArtifact {
+                    reason: "QG-6 joint tail unit mixes query groups".to_owned(),
+                });
+            }
+            let leaves = &mut unit.role_leaves_ms[qg6_tail_role_index(role)];
+            if !leaves.is_empty() {
+                return Err(EvidenceArtifactError::InconsistentArtifact {
+                    reason: "QG-6 joint tail unit repeats one logical role".to_owned(),
+                });
+            }
+            for leaf in &binding.timed_sample.timing_leaves {
+                let latency_ms =
+                    Duration::from_nanos(leaf.observed_latency_ns()).as_secs_f64() * 1_000.0;
+                if !latency_ms.is_finite() || latency_ms <= 0.0 {
+                    return Err(EvidenceArtifactError::InconsistentArtifact {
+                        reason: "QG-6 joint tail leaf is not finite and positive".to_owned(),
+                    });
+                }
+                leaves.push(latency_ms);
+            }
+        }
+    }
+
+    let mut queries = (0..external_authority.query_count)
+        .map(|_| Vec::<Qg6TailUnit>::new())
+        .collect::<Vec<_>>();
+    for unit in units.into_values() {
+        let query = queries.get_mut(unit.query_index).ok_or_else(|| {
+            EvidenceArtifactError::InconsistentArtifact {
+                reason: "QG-6 joint tail unit names an unknown query".to_owned(),
+            }
+        })?;
+        if unit
+            .role_leaves_ms
+            .iter()
+            .any(|leaves| leaves.len() != external_authority.searches_per_sample)
+        {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: "QG-6 joint tail unit lacks exact equal leaf cardinality".to_owned(),
+            });
+        }
+        query.push(unit);
+    }
+    if queries
+        .iter()
+        .any(|units| units.len() != external_authority.rounds_per_query)
+    {
+        return Err(EvidenceArtifactError::InconsistentArtifact {
+            reason: "QG-6 joint tail queries lack exact equal unit cardinality".to_owned(),
+        });
+    }
+
+    let append_unit = |target: &mut [Vec<f64>; 6], unit: &Qg6TailUnit| {
+        for (target, source) in target.iter_mut().zip(&unit.role_leaves_ms) {
+            target.extend_from_slice(source);
+        }
+    };
+    let mut point_leaves = std::array::from_fn(|_| Vec::new());
+    for query in &queries {
+        for unit in query {
+            append_unit(&mut point_leaves, unit);
+        }
+    }
+    let point_logs = qg6_tail_contrast_logs(&qg6_tail_arm_quantiles(&mut point_leaves));
+
+    let mut authority_seed = Sha256::new();
+    authority_seed.update(external_authority.authority_sha256.as_bytes());
+    authority_seed.update(paired.config.bootstrap_seed.to_le_bytes());
+    let authority_seed = authority_seed.finalize();
+    let mut seed = u64::from_le_bytes(
+        authority_seed[..std::mem::size_of::<u64>()]
+            .try_into()
+            .map_err(|_| EvidenceArtifactError::InconsistentArtifact {
+                reason: "QG-6 joint tail seed digest is malformed".to_owned(),
+            })?,
+    );
+    let mut bootstrap: [Vec<f64>; 6] =
+        std::array::from_fn(|_| Vec::with_capacity(paired.config.bootstrap_resamples));
+    for _ in 0..paired.config.bootstrap_resamples {
+        let mut role_leaves = std::array::from_fn(|_| Vec::new());
+        for_each_qg6_joint_tail_bootstrap_unit(
+            &mut seed,
+            queries.len(),
+            external_authority.rounds_per_query,
+            |query_index, unit_index| {
+                append_unit(&mut role_leaves, &queries[query_index][unit_index]);
+            },
+        )?;
+        let logs = qg6_tail_contrast_logs(&qg6_tail_arm_quantiles(&mut role_leaves));
+        for (values, value) in bootstrap.iter_mut().zip(logs) {
+            values.push(value);
+        }
+    }
+
+    let [
+        mut tantivy_p50,
+        mut tantivy_p99,
+        mut quill_p50,
+        mut quill_p99,
+        mut effect_p50,
+        mut effect_p99,
+    ] = bootstrap;
+    Ok(Qg6JointTailEstimate {
+        schema_version: QG6_JOINT_TAIL_SCHEMA_VERSION.to_owned(),
+        query_count: external_authority.query_count,
+        units_per_query: external_authority.rounds_per_query,
+        leaves_per_arm_per_unit: external_authority.searches_per_sample,
+        bootstrap_resamples: paired.config.bootstrap_resamples,
+        tantivy_null: qg6_joint_tail_contrast(
+            point_logs[0],
+            point_logs[1],
+            &mut tantivy_p50,
+            &mut tantivy_p99,
+        ),
+        quill_null: qg6_joint_tail_contrast(
+            point_logs[2],
+            point_logs[3],
+            &mut quill_p50,
+            &mut quill_p99,
+        ),
+        effect: qg6_joint_tail_contrast(
+            point_logs[4],
+            point_logs[5],
+            &mut effect_p50,
+            &mut effect_p99,
+        ),
     })
 }
 
@@ -955,6 +1341,12 @@ pub enum EvidenceCellBody {
         /// `paired.null` carries Tantivy/Tantivy.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         treatment_arm_null: Option<Box<PairedExperimentResult>>,
+        /// Formal six-arm QG-6 protocol evidence. This is deliberately
+        /// separate from the QG-1 treatment-arm null: it carries the
+        /// independently retained pre-timing schedule authority plus the
+        /// Quill/Quill raw stream needed to complete T/T, Q/Q, and T/Q.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        qg6_protocol: Option<Box<Qg6FormalProtocolEvidence>>,
         /// Two-stage A/B effect estimate for hierarchical latency cells.
         hierarchical: Option<HierarchicalLatencyEstimate>,
         /// Two-stage same-invocation A/A null estimate for hierarchical latency
@@ -972,6 +1364,53 @@ pub enum EvidenceCellBody {
         /// Summary recomputable from `raw_values`.
         summary: DistributionSummary,
     },
+}
+
+/// QG-6-only evidence that completes the formal six-arm measurement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg6FormalProtocolEvidence {
+    /// Exact schedule frozen and retained before any timed search.
+    pub schedule_authority: Qg6ScheduleAuthority,
+    /// Same-invocation Quill/Quill null rows, including authenticated leaves.
+    pub quill_null_samples: Vec<PerfRawSample>,
+    /// Joint query-first p50/p99 estimate recomputed from all six raw arms.
+    pub joint_tail: Qg6JointTailEstimate,
+}
+
+impl Qg6FormalProtocolEvidence {
+    /// Build formal protocol evidence from raw Quill/Quill rows and an
+    /// independently retained pre-timing authority.
+    ///
+    /// # Errors
+    ///
+    /// Rejects any invalid six-arm row, authority, semantic receipt, or joint
+    /// tail estimate input.
+    pub fn new_against_authority(
+        paired: &PairedExperimentResult,
+        quill_null_samples: Vec<PerfRawSample>,
+        external_authority: &Qg6ScheduleAuthority,
+        identity: &PerfInputIdentity,
+        contract: &Qg6SemanticContract,
+    ) -> Result<Self, EvidenceArtifactError> {
+        validate_qg6_formal_protocol_rows(
+            paired,
+            &quill_null_samples,
+            external_authority,
+            identity,
+            contract,
+        )?;
+        let joint_tail = estimate_qg6_joint_tail_from_validated_rows(
+            paired,
+            &quill_null_samples,
+            external_authority,
+        )?;
+        Ok(Self {
+            schedule_authority: external_authority.clone(),
+            quill_null_samples,
+            joint_tail,
+        })
+    }
 }
 
 /// One decision-grade evidence cell.
@@ -1020,22 +1459,31 @@ fn hierarchical_groups_match_input(
             .eq(identity.query_group_ids.iter().copied())
 }
 
-fn qg6_role(effect_stream: bool, arm: PerfSampleArm) -> Qg6ArmRole {
-    match (effect_stream, arm) {
-        (false, PerfSampleArm::Control) => Qg6ArmRole::NullLeft,
-        (false, PerfSampleArm::Treatment) => Qg6ArmRole::NullRight,
-        (true, PerfSampleArm::Control) => Qg6ArmRole::EffectControl,
-        (true, PerfSampleArm::Treatment) => Qg6ArmRole::EffectTreatment,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Qg6FormalStream {
+    TantivyNull,
+    QuillNull,
+    Effect,
+}
+
+fn qg6_role(stream: Qg6FormalStream, arm: PerfSampleArm) -> Qg6ArmRole {
+    match (stream, arm) {
+        (Qg6FormalStream::TantivyNull, PerfSampleArm::Control) => Qg6ArmRole::TantivyNullLeft,
+        (Qg6FormalStream::TantivyNull, PerfSampleArm::Treatment) => Qg6ArmRole::TantivyNullRight,
+        (Qg6FormalStream::QuillNull, PerfSampleArm::Control) => Qg6ArmRole::QuillNullLeft,
+        (Qg6FormalStream::QuillNull, PerfSampleArm::Treatment) => Qg6ArmRole::QuillNullRight,
+        (Qg6FormalStream::Effect, PerfSampleArm::Control) => Qg6ArmRole::EffectControl,
+        (Qg6FormalStream::Effect, PerfSampleArm::Treatment) => Qg6ArmRole::EffectTreatment,
     }
 }
 
 fn validate_qg6_sample_stream(
     samples: &[PerfRawSample],
-    effect_stream: bool,
+    stream: Qg6FormalStream,
     identity: &PerfInputIdentity,
     contract: &Qg6SemanticContract,
     represented: &mut BTreeMap<(u64, Qg6ArmRole), usize>,
-    row_keys: &mut BTreeSet<(bool, u64, Qg6ArmRole)>,
+    row_keys: &mut BTreeSet<(Qg6FormalStream, u64, Qg6ArmRole)>,
 ) -> Result<(), EvidenceArtifactError> {
     for sample in samples {
         if sample.provenance.input_identity.as_ref() != Some(identity) {
@@ -1081,8 +1529,8 @@ fn validate_qg6_sample_stream(
                 reason: "QG-6 raw row requires a positive explicit result-sequence length"
                     .to_owned(),
             })?;
-        let role = qg6_role(effect_stream, sample.arm);
-        if !row_keys.insert((effect_stream, sample.block_id, role)) {
+        let role = qg6_role(stream, sample.arm);
+        if !row_keys.insert((stream, sample.block_id, role)) {
             return Err(EvidenceArtifactError::InconsistentArtifact {
                 reason: "QG-6 semantic stream repeats one logical role in a paired block"
                     .to_owned(),
@@ -1195,7 +1643,7 @@ fn evaluate_qg6(
     let mut row_keys = BTreeSet::new();
     validate_qg6_sample_stream(
         &paired.effect_samples,
-        true,
+        Qg6FormalStream::Effect,
         identity,
         contract,
         &mut represented,
@@ -1203,7 +1651,7 @@ fn evaluate_qg6(
     )?;
     validate_qg6_sample_stream(
         &paired.null_samples,
-        false,
+        Qg6FormalStream::TantivyNull,
         identity,
         contract,
         &mut represented,
@@ -1212,9 +1660,14 @@ fn evaluate_qg6(
     let expected = QG6_QUERY_GROUP_IDS
         .into_iter()
         .flat_map(|group_id| {
-            Qg6ArmRole::ALL
-                .into_iter()
-                .map(move |role| (group_id, role))
+            [
+                Qg6ArmRole::TantivyNullLeft,
+                Qg6ArmRole::TantivyNullRight,
+                Qg6ArmRole::EffectControl,
+                Qg6ArmRole::EffectTreatment,
+            ]
+            .into_iter()
+            .map(move |role| (group_id, role))
         })
         .collect::<BTreeSet<_>>();
     if represented.keys().copied().collect::<BTreeSet<_>>() != expected
@@ -1234,6 +1687,229 @@ fn evaluate_qg6(
          evidence are not implemented",
         EvidenceSeverity::NoClaim,
     )])
+}
+
+fn validate_qg6_formal_protocol_rows(
+    paired: &PairedExperimentResult,
+    quill_null_samples: &[PerfRawSample],
+    external_authority: &Qg6ScheduleAuthority,
+    identity: &PerfInputIdentity,
+    contract: &Qg6SemanticContract,
+) -> Result<(), EvidenceArtifactError> {
+    paired
+        .verify_recomputed()
+        .map_err(|error| EvidenceArtifactError::InconsistentArtifact {
+            reason: format!("QG-6 paired T/T and T/Q rows failed authenticated replay: {error}"),
+        })?;
+    let authority = external_authority;
+    authority
+        .verify()
+        .map_err(|error| EvidenceArtifactError::InconsistentArtifact {
+            reason: format!("QG-6 schedule authority failed verification: {error}"),
+        })?;
+    if authority.identity.corpus_sha256 != identity.prepared_corpus_sha256
+        || authority.identity.query_manifest_sha256 != identity.query_manifest_sha256
+        || authority.identity.config_contract_sha256 != identity.config_contract_sha256
+        || authority.identity.document_count != contract.document_count
+        || authority.identity.k != contract.k
+        || authority.query_count != contract.groups.len()
+    {
+        return Err(EvidenceArtifactError::InconsistentArtifact {
+            reason: "QG-6 schedule authority does not bind the exact prepared cell identity"
+                .to_owned(),
+        });
+    }
+    validate_paired_blocks(quill_null_samples, &paired.config).map_err(|error| {
+        EvidenceArtifactError::InconsistentArtifact {
+            reason: format!("QG-6 Quill/Quill null stream is invalid: {error}"),
+        }
+    })?;
+    let mut represented = BTreeMap::new();
+    let mut row_keys = BTreeSet::new();
+    for (samples, stream) in [
+        (&paired.null_samples[..], Qg6FormalStream::TantivyNull),
+        (quill_null_samples, Qg6FormalStream::QuillNull),
+        (&paired.effect_samples[..], Qg6FormalStream::Effect),
+    ] {
+        validate_qg6_sample_stream(
+            samples,
+            stream,
+            identity,
+            contract,
+            &mut represented,
+            &mut row_keys,
+        )?;
+    }
+    let expected_roles = QG6_QUERY_GROUP_IDS
+        .into_iter()
+        .flat_map(|group_id| {
+            Qg6ArmRole::ALL
+                .into_iter()
+                .map(move |role| (group_id, role))
+        })
+        .collect::<BTreeSet<_>>();
+    if represented.keys().copied().collect::<BTreeSet<_>>() != expected_roles
+        || represented
+            .values()
+            .any(|count| *count != authority.rounds_per_query)
+    {
+        return Err(EvidenceArtifactError::InconsistentArtifact {
+            reason:
+                "QG-6 formal rows do not provide the exact schedule multiplicity for all six roles"
+                    .to_owned(),
+        });
+    }
+
+    let mut observed_schedule_rows = BTreeSet::new();
+    for (samples, stream) in [
+        (&paired.null_samples[..], Qg6FormalStream::TantivyNull),
+        (quill_null_samples, Qg6FormalStream::QuillNull),
+        (&paired.effect_samples[..], Qg6FormalStream::Effect),
+    ] {
+        let expected_comparison = match stream {
+            Qg6FormalStream::TantivyNull => Qg6Comparison::TantivyNull,
+            Qg6FormalStream::QuillNull => Qg6Comparison::QuillNull,
+            Qg6FormalStream::Effect => Qg6Comparison::Effect,
+        };
+        for sample in samples {
+            if sample.scope != paired.scope || sample.provenance != paired.provenance {
+                return Err(EvidenceArtifactError::InvalidProvenance {
+                    reason:
+                        "QG-6 formal rows do not share the exact effect-stream scope and provenance"
+                            .to_owned(),
+                });
+            }
+            let binding = sample.qg6_sample_binding.as_ref().ok_or_else(|| {
+                EvidenceArtifactError::InconsistentArtifact {
+                    reason: "QG-6 formal row is missing its authenticated timed sample".to_owned(),
+                }
+            })?;
+            let block_index = usize::try_from(sample.block_id).map_err(|_| {
+                EvidenceArtifactError::InconsistentArtifact {
+                    reason: "QG-6 formal block ID does not fit the platform".to_owned(),
+                }
+            })?;
+            let block = authority.schedule.get(block_index).ok_or_else(|| {
+                EvidenceArtifactError::InconsistentArtifact {
+                    reason: "QG-6 formal row names a block outside the retained authority"
+                        .to_owned(),
+                }
+            })?;
+            let expected_role = qg6_role(stream, sample.arm);
+            let scheduled_role = match binding.timed_sample.order {
+                Qg6SampleOrder::First => block.first,
+                Qg6SampleOrder::Second => block.second,
+            };
+            let expected_sample_id = block
+                .block_id
+                .checked_mul(2)
+                .and_then(|base| {
+                    base.checked_add(u64::from(
+                        binding.timed_sample.order == Qg6SampleOrder::Second,
+                    ))
+                })
+                .ok_or_else(|| EvidenceArtifactError::InconsistentArtifact {
+                    reason: "QG-6 formal sample ID overflowed".to_owned(),
+                })?;
+            if block.block_id != sample.block_id
+                || block.query_index != binding.timed_sample.query_index
+                || block.comparison != expected_comparison
+                || binding.timed_sample.comparison != expected_comparison
+                || binding.timed_sample.arm != expected_role
+                || scheduled_role != expected_role
+                || sample.sample_id != expected_sample_id
+                || binding.timed_sample.timing_leaves.len() != authority.searches_per_sample
+                || !observed_schedule_rows.insert((block.block_id, expected_role))
+            {
+                return Err(EvidenceArtifactError::InconsistentArtifact {
+                    reason:
+                        "QG-6 formal row does not match the externally retained pre-timing schedule"
+                            .to_owned(),
+                });
+            }
+        }
+    }
+    let expected_schedule_rows = authority
+        .schedule
+        .iter()
+        .flat_map(|block| {
+            [
+                (block.block_id, block.first),
+                (block.block_id, block.second),
+            ]
+        })
+        .collect::<BTreeSet<_>>();
+    if observed_schedule_rows != expected_schedule_rows {
+        return Err(EvidenceArtifactError::InconsistentArtifact {
+            reason: "QG-6 formal evidence is missing or repeats a retained schedule row".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_qg6_formal_protocol(
+    paired: &PairedExperimentResult,
+    protocol: &Qg6FormalProtocolEvidence,
+    external_authority: &Qg6ScheduleAuthority,
+    identity: &PerfInputIdentity,
+    contract: &Qg6SemanticContract,
+) -> Result<(), EvidenceArtifactError> {
+    if &protocol.schedule_authority != external_authority {
+        return Err(EvidenceArtifactError::InvalidProvenance {
+            reason: "persisted QG-6 schedule authority does not match the independently retained authority"
+                .to_owned(),
+        });
+    }
+    validate_qg6_formal_protocol_rows(
+        paired,
+        &protocol.quill_null_samples,
+        external_authority,
+        identity,
+        contract,
+    )?;
+    let recomputed = estimate_qg6_joint_tail_from_validated_rows(
+        paired,
+        &protocol.quill_null_samples,
+        external_authority,
+    )?;
+    if recomputed != protocol.joint_tail {
+        return Err(EvidenceArtifactError::InconsistentArtifact {
+            reason: "persisted QG-6 joint tail estimate does not recompute from raw leaves"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn resolve_qg6_schedule_authority_for_replay<'authority>(
+    external_authorities: &[&'authority Qg6ScheduleAuthority],
+    protocol: &Qg6FormalProtocolEvidence,
+) -> Result<&'authority Qg6ScheduleAuthority, EvidenceArtifactError> {
+    let mut matching = external_authorities.iter().copied().filter(|authority| {
+        authority.authority_sha256 == protocol.schedule_authority.authority_sha256
+    });
+    let selected = matching
+        .next()
+        .ok_or_else(|| EvidenceArtifactError::InvalidProvenance {
+            reason: "QG-6 evidence has no independently retained schedule authority".to_owned(),
+        })?;
+    if matching.next().is_some() {
+        return Err(EvidenceArtifactError::InvalidProvenance {
+            reason: "QG-6 evidence matches more than one retained schedule authority".to_owned(),
+        });
+    }
+    selected
+        .verify()
+        .map_err(|error| EvidenceArtifactError::InvalidProvenance {
+            reason: format!("retained QG-6 schedule authority failed verification: {error}"),
+        })?;
+    if selected != &protocol.schedule_authority {
+        return Err(EvidenceArtifactError::InvalidProvenance {
+            reason: "QG-6 evidence substituted schedule bytes under a retained authority digest"
+                .to_owned(),
+        });
+    }
+    Ok(selected)
 }
 
 impl EvidenceCell {
@@ -1485,6 +2161,7 @@ impl EvidenceCell {
             body: EvidenceCellBody::Paired {
                 paired: Box::new(paired),
                 treatment_arm_null: None,
+                qg6_protocol: None,
                 hierarchical,
                 hierarchical_null,
                 reconciliation,
@@ -1492,6 +2169,94 @@ impl EvidenceCell {
             status,
             reasons,
         })
+    }
+
+    /// Attach the externally authorized Quill/Quill stream that completes a
+    /// formal six-arm QG-6 measurement.
+    ///
+    /// A successfully replayed protocol replaces the temporary tail hold with
+    /// the joint query-first p50/p99 measurement. Invalid T/T or Q/Q nulls
+    /// remain durable no-decisions; the effect intervals stay measured so the
+    /// ratchet can apply the standing p50 and p99 targets without re-estimating.
+    ///
+    /// # Errors
+    ///
+    /// Rejects non-QG-6 cells, duplicate attachment, unbounded raw rows,
+    /// malformed Q/Q pairs, authority substitution, and any row that does not
+    /// exactly match the schedule frozen before timing.
+    pub fn attach_qg6_formal_protocol_against_authority(
+        &mut self,
+        protocol: Qg6FormalProtocolEvidence,
+        policy: &EvidencePolicy,
+        external_authority: &Qg6ScheduleAuthority,
+    ) -> Result<(), EvidenceArtifactError> {
+        if self.spec.gate != PerfGate::Qg6 {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: "only QG-6 cells may carry formal six-arm protocol evidence".to_owned(),
+            });
+        }
+        let identity = self.spec.input_identity.clone().ok_or_else(|| {
+            EvidenceArtifactError::InconsistentArtifact {
+                reason: "QG-6 formal protocol is missing the prepared input identity".to_owned(),
+            }
+        })?;
+        let contract = self.spec.qg6_semantic_contract.clone().ok_or_else(|| {
+            EvidenceArtifactError::InconsistentArtifact {
+                reason: "QG-6 formal protocol is missing the semantic contract".to_owned(),
+            }
+        })?;
+        let EvidenceCellBody::Paired {
+            paired,
+            treatment_arm_null,
+            qg6_protocol,
+            ..
+        } = &mut self.body
+        else {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: "QG-6 formal protocol requires a paired evidence cell".to_owned(),
+            });
+        };
+        if treatment_arm_null.is_some() || qg6_protocol.is_some() {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: "QG-6 formal protocol is duplicated or collides with a QG-1 null"
+                    .to_owned(),
+            });
+        }
+        let retained = paired
+            .effect_samples
+            .len()
+            .checked_add(paired.null_samples.len())
+            .and_then(|count| count.checked_add(protocol.quill_null_samples.len()))
+            .ok_or_else(|| EvidenceArtifactError::UnboundedRawSamples {
+                cell_id: self.cell_id.clone(),
+                count: usize::MAX,
+                max: policy.max_raw_samples,
+            })?;
+        if retained > policy.max_raw_samples {
+            return Err(EvidenceArtifactError::UnboundedRawSamples {
+                cell_id: self.cell_id.clone(),
+                count: retained,
+                max: policy.max_raw_samples,
+            });
+        }
+        validate_qg6_formal_protocol(paired, &protocol, external_authority, &identity, &contract)?;
+        let tail_reasons = qg6_joint_tail_decision_reasons(&protocol.joint_tail);
+        self.reasons
+            .retain(|reason| reason.code != "qg6.tail_protocol_not_implemented");
+        let has_no_claim = self
+            .reasons
+            .iter()
+            .chain(&tail_reasons)
+            .any(|reason| reason.severity >= EvidenceSeverity::NoClaim);
+        *qg6_protocol = Some(Box::new(protocol));
+        self.reasons.extend(tail_reasons);
+        self.reasons.truncate(EVIDENCE_MAX_REASONS);
+        self.status = if has_no_claim {
+            EvidenceDecisionStatus::NoDecision
+        } else {
+            EvidenceDecisionStatus::MeasuredProvisional
+        };
+        Ok(())
     }
 
     /// Attach the treatment arm's independently measured same-invocation A/A
@@ -1642,11 +2407,13 @@ impl EvidenceCell {
                 paired: _,
                 hierarchical,
                 hierarchical_null,
+                qg6_protocol,
                 ..
             } if self.spec.gate == PerfGate::Qg6 => {
                 self.status == EvidenceDecisionStatus::MeasuredProvisional
                     && hierarchical.is_some()
                     && hierarchical_null.is_some()
+                    && qg6_protocol.is_some()
             }
             EvidenceCellBody::Paired {
                 paired,
@@ -1672,7 +2439,7 @@ impl EvidenceCell {
     /// Returns [`EvidenceArtifactError::InconsistentArtifact`] on any
     /// mismatch between stored summaries and their raw sources.
     pub fn verify_recomputed(&self, policy: &EvidencePolicy) -> Result<(), EvidenceArtifactError> {
-        self.verify_recomputed_against_qg1_authorities(policy, &[])
+        self.verify_recomputed_against_authorities(policy, &[], &[])
     }
 
     /// Recompute this cell, selecting the retained QG-1 expectation it was
@@ -1693,12 +2460,48 @@ impl EvidenceCell {
         policy: &EvidencePolicy,
         external_qg1_authorities: &[&Qg1ExpectedAuthority],
     ) -> Result<(), EvidenceArtifactError> {
+        self.verify_recomputed_against_authorities(policy, external_qg1_authorities, &[])
+    }
+
+    /// Recompute this cell against every independently retained authority it
+    /// requires. QG-1 selects its producer expectation; QG-6 selects the exact
+    /// pre-timing schedule authority. Neither gate may authenticate itself
+    /// from authority bytes serialized inside the cell.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::verify_recomputed`], plus a typed
+    /// provenance refusal for an absent, duplicate, malformed, or substituted
+    /// external authority.
+    pub fn verify_recomputed_against_authorities(
+        &self,
+        policy: &EvidencePolicy,
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+        external_qg6_authorities: &[&Qg6ScheduleAuthority],
+    ) -> Result<(), EvidenceArtifactError> {
         match &self.body {
             EvidenceCellBody::Paired {
                 paired,
                 treatment_arm_null,
+                qg6_protocol,
                 ..
             } => {
+                if self.spec.gate == PerfGate::Qg6 && qg6_protocol.is_none() {
+                    return Err(EvidenceArtifactError::InconsistentArtifact {
+                        reason: format!(
+                            "QG-6 cell {} is missing formal six-arm protocol evidence",
+                            self.cell_id
+                        ),
+                    });
+                }
+                if self.spec.gate != PerfGate::Qg6 && qg6_protocol.is_some() {
+                    return Err(EvidenceArtifactError::InconsistentArtifact {
+                        reason: format!(
+                            "non-QG-6 cell {} carries formal six-arm protocol evidence",
+                            self.cell_id
+                        ),
+                    });
+                }
                 // Replay context: only an externally retained expectation that
                 // names this cell's producer can authenticate it. An empty set
                 // is not permission to fall back to the expectation a live
@@ -1720,6 +2523,17 @@ impl EvidenceCell {
                         treatment_arm_null.as_ref().clone(),
                         policy,
                         expected,
+                    )?;
+                }
+                if let Some(qg6_protocol) = qg6_protocol {
+                    let external_authority = resolve_qg6_schedule_authority_for_replay(
+                        external_qg6_authorities,
+                        qg6_protocol,
+                    )?;
+                    rebuilt.attach_qg6_formal_protocol_against_authority(
+                        qg6_protocol.as_ref().clone(),
+                        policy,
+                        external_authority,
                     )?;
                 }
                 if rebuilt == *self {
@@ -2339,6 +3153,7 @@ impl PerfEvidenceArtifact {
         let EvidenceCellBody::Paired {
             paired,
             treatment_arm_null,
+            qg6_protocol,
             ..
         } = &cell.body
         else {
@@ -2389,6 +3204,22 @@ impl PerfEvidenceArtifact {
                 ),
             });
         }
+        if cell.spec.gate == PerfGate::Qg6 && qg6_protocol.is_none() {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: format!(
+                    "QG-6 cell {} is missing formal six-arm protocol evidence",
+                    cell.cell_id
+                ),
+            });
+        }
+        if cell.spec.gate != PerfGate::Qg6 && qg6_protocol.is_some() {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: format!(
+                    "only QG-6 cells may carry formal six-arm protocol evidence: {}",
+                    cell.cell_id
+                ),
+            });
+        }
         if let Some(treatment_arm_null) = treatment_arm_null {
             if treatment_arm_null.scope != expected_scope
                 || treatment_arm_null.provenance != expected_provenance
@@ -2403,6 +3234,29 @@ impl PerfEvidenceArtifact {
                     ),
                 });
             }
+        }
+        if let Some(qg6_protocol) = qg6_protocol {
+            validate_qg6_formal_protocol(
+                paired,
+                qg6_protocol,
+                &qg6_protocol.schedule_authority,
+                cell.spec.input_identity.as_ref().ok_or_else(|| {
+                    EvidenceArtifactError::InvalidProvenance {
+                        reason: format!(
+                            "cell {} has formal QG-6 rows without an input identity",
+                            cell.cell_id
+                        ),
+                    }
+                })?,
+                cell.spec.qg6_semantic_contract.as_ref().ok_or_else(|| {
+                    EvidenceArtifactError::InvalidProvenance {
+                        reason: format!(
+                            "cell {} has formal QG-6 rows without a semantic contract",
+                            cell.cell_id
+                        ),
+                    }
+                })?,
+            )?;
         }
         Ok(())
     }
@@ -3006,10 +3860,11 @@ impl PerfEvidenceArtifact {
         threshold_artifact_bytes: &[u8],
         prebinding_evidence_bytes: &[u8],
     ) -> Result<(), EvidenceArtifactError> {
-        self.bind_machine_class_identity_against_qg1_authorities(
+        self.bind_machine_class_identity_against_authorities(
             identity,
             threshold_artifact_bytes,
             prebinding_evidence_bytes,
+            &[],
             &[],
         )
     }
@@ -3032,9 +3887,34 @@ impl PerfEvidenceArtifact {
         prebinding_evidence_bytes: &[u8],
         external_qg1_authorities: &[&Qg1ExpectedAuthority],
     ) -> Result<(), EvidenceArtifactError> {
-        let source = Self::from_verified_slice_against_qg1_authorities(
+        self.bind_machine_class_identity_against_authorities(
+            identity,
+            threshold_artifact_bytes,
             prebinding_evidence_bytes,
             external_qg1_authorities,
+            &[],
+        )
+    }
+
+    /// Bind the exact runner identity after replaying all QG-1 and QG-6
+    /// components against independently retained authority sets.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::bind_machine_class_identity`],
+    /// including fail-closed authority selection failures.
+    pub fn bind_machine_class_identity_against_authorities(
+        &mut self,
+        identity: VerifiedRunnerIdentity,
+        threshold_artifact_bytes: &[u8],
+        prebinding_evidence_bytes: &[u8],
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+        external_qg6_authorities: &[&Qg6ScheduleAuthority],
+    ) -> Result<(), EvidenceArtifactError> {
+        let source = Self::from_verified_slice_against_authorities(
+            prebinding_evidence_bytes,
+            external_qg1_authorities,
+            external_qg6_authorities,
         )?;
         if source != *self {
             return Err(EvidenceArtifactError::InvalidProvenance {
@@ -3126,10 +4006,11 @@ impl PerfEvidenceArtifact {
         threshold_artifact_bytes: &[u8],
         prebinding_evidence_bytes: &[u8],
     ) -> Result<Vec<u8>, EvidenceArtifactError> {
-        self.bind_machine_class_identity_and_seal_against_qg1_authorities(
+        self.bind_machine_class_identity_and_seal_against_authorities(
             identity,
             threshold_artifact_bytes,
             prebinding_evidence_bytes,
+            &[],
             &[],
         )
     }
@@ -3152,18 +4033,46 @@ impl PerfEvidenceArtifact {
         prebinding_evidence_bytes: &[u8],
         external_qg1_authorities: &[&Qg1ExpectedAuthority],
     ) -> Result<Vec<u8>, EvidenceArtifactError> {
-        let mut bound = self.clone();
-        bound.bind_machine_class_identity_against_qg1_authorities(
+        self.bind_machine_class_identity_and_seal_against_authorities(
             identity,
             threshold_artifact_bytes,
             prebinding_evidence_bytes,
             external_qg1_authorities,
+            &[],
+        )
+    }
+
+    /// Bind and seal evidence after replaying every authority-bound component
+    /// against independently retained QG-1 and QG-6 authority sets.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as
+    /// [`Self::bind_machine_class_identity_and_seal`].
+    pub fn bind_machine_class_identity_and_seal_against_authorities(
+        &mut self,
+        identity: VerifiedRunnerIdentity,
+        threshold_artifact_bytes: &[u8],
+        prebinding_evidence_bytes: &[u8],
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+        external_qg6_authorities: &[&Qg6ScheduleAuthority],
+    ) -> Result<Vec<u8>, EvidenceArtifactError> {
+        let mut bound = self.clone();
+        bound.bind_machine_class_identity_against_authorities(
+            identity,
+            threshold_artifact_bytes,
+            prebinding_evidence_bytes,
+            external_qg1_authorities,
+            external_qg6_authorities,
         )?;
         bound.artifact_sha256.clear();
         let unsealed = serde_json::to_string_pretty(&bound)?;
         bound.artifact_sha256 = lower_hex(&Sha256::digest(unsealed.as_bytes()));
         let sealed = serde_json::to_vec_pretty(&bound)?;
-        bound.verify_integrity_against_qg1_authorities(external_qg1_authorities)?;
+        bound.verify_integrity_against_authorities(
+            external_qg1_authorities,
+            external_qg6_authorities,
+        )?;
         *self = bound;
         Ok(sealed)
     }
@@ -3265,7 +4174,7 @@ impl PerfEvidenceArtifact {
     /// broken content seal, invalid policy or provenance, malformed cell set,
     /// non-recomputable cell or gate fold, or inadmissible recorded decision.
     pub fn verify_integrity(&self) -> Result<(), EvidenceArtifactError> {
-        self.verify_integrity_against_qg1_authorities(&[])
+        self.verify_integrity_against_authorities(&[], &[])
     }
 
     /// Verify this artifact against the QG-1 expectations its consumer
@@ -3283,6 +4192,26 @@ impl PerfEvidenceArtifact {
     pub fn verify_integrity_against_qg1_authorities(
         &self,
         external_qg1_authorities: &[&Qg1ExpectedAuthority],
+    ) -> Result<(), EvidenceArtifactError> {
+        self.verify_integrity_against_authorities(external_qg1_authorities, &[])
+    }
+
+    /// Verify this artifact against every independently retained authority
+    /// required by its cells.
+    ///
+    /// QG-1 authorities prove producer-issued throughput expectations. QG-6
+    /// authorities prove schedules frozen before timing. Serialized authority
+    /// receipts remain replay inputs, never self-authenticating capabilities.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::verify_integrity`], including the
+    /// fail-closed refusal of any authority-bound cell whose unique external
+    /// authority is absent or substituted.
+    pub fn verify_integrity_against_authorities(
+        &self,
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+        external_qg6_authorities: &[&Qg6ScheduleAuthority],
     ) -> Result<(), EvidenceArtifactError> {
         if self.schema_version != PERF_EVIDENCE_SCHEMA_VERSION {
             return Err(EvidenceArtifactError::SchemaMismatch {
@@ -3359,7 +4288,11 @@ impl PerfEvidenceArtifact {
         }
         for cell in &self.cells {
             self.verify_cell_provenance(cell)?;
-            cell.verify_recomputed_against_qg1_authorities(&self.policy, external_qg1_authorities)?;
+            cell.verify_recomputed_against_authorities(
+                &self.policy,
+                external_qg1_authorities,
+                external_qg6_authorities,
+            )?;
         }
         if !self.qg1_incumbent_screens.is_empty() {
             if self.gate != PerfGate::Qg1 {
@@ -3513,10 +4446,20 @@ impl PerfEvidenceArtifact {
         &self,
         output_dir: &Path,
     ) -> Result<EvidenceArtifactPaths, EvidenceArtifactError> {
-        if !self.qg1_incumbent_screens.is_empty() {
+        if !self.qg1_incumbent_screens.is_empty()
+            || self.cells.iter().any(|cell| {
+                matches!(
+                    &cell.body,
+                    EvidenceCellBody::Paired {
+                        qg6_protocol: Some(_),
+                        ..
+                    }
+                )
+            })
+        {
             return Err(EvidenceArtifactError::InvalidProvenance {
-                reason: "evidence carrying QG-1 incumbent screens may only be persisted through \
-                         write_atomic_against_qg1_authorities with its complete retained set"
+                reason: "authority-bound evidence may only be persisted through \
+                         write_atomic_against_authorities with its complete retained sets"
                     .to_owned(),
             });
         }
@@ -3540,6 +4483,22 @@ impl PerfEvidenceArtifact {
         output_dir: &Path,
         external_qg1_authorities: &[&Qg1ExpectedAuthority],
     ) -> Result<EvidenceArtifactPaths, EvidenceArtifactError> {
+        self.write_atomic_against_authorities(output_dir, external_qg1_authorities, &[])
+    }
+
+    /// Persist authority-bound evidence after replaying every QG-1 and QG-6
+    /// component against independently retained authority sets.
+    ///
+    /// # Errors
+    ///
+    /// Returns every failure [`Self::verify_integrity_against_authorities`]
+    /// can, plus typed serialization and I/O errors.
+    pub fn write_atomic_against_authorities(
+        &self,
+        output_dir: &Path,
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+        external_qg6_authorities: &[&Qg6ScheduleAuthority],
+    ) -> Result<EvidenceArtifactPaths, EvidenceArtifactError> {
         // Verify the sealed form, which is exactly what reaches disk. Checking
         // the in-memory copy instead would refuse an artifact whose seal is
         // legitimately pending, and would prove nothing about the bytes.
@@ -3547,7 +4506,10 @@ impl PerfEvidenceArtifact {
         sealed.artifact_sha256.clear();
         let unsealed = serde_json::to_string_pretty(&sealed)?;
         sealed.artifact_sha256 = lower_hex(&Sha256::digest(unsealed.as_bytes()));
-        sealed.verify_integrity_against_qg1_authorities(external_qg1_authorities)?;
+        sealed.verify_integrity_against_authorities(
+            external_qg1_authorities,
+            external_qg6_authorities,
+        )?;
         sealed.write_atomic_unchecked(output_dir)
     }
 
@@ -3579,7 +4541,7 @@ impl PerfEvidenceArtifact {
     ///
     /// Returns the specific [`EvidenceArtifactError`] for each defect class.
     pub fn from_verified_slice(contents: &[u8]) -> Result<Self, EvidenceArtifactError> {
-        Self::from_verified_slice_against_qg1_authorities(contents, &[])
+        Self::from_verified_slice_against_authorities(contents, &[], &[])
     }
 
     /// Parse exact artifact bytes and verify them against the QG-1
@@ -3597,6 +4559,21 @@ impl PerfEvidenceArtifact {
     pub fn from_verified_slice_against_qg1_authorities(
         contents: &[u8],
         external_qg1_authorities: &[&Qg1ExpectedAuthority],
+    ) -> Result<Self, EvidenceArtifactError> {
+        Self::from_verified_slice_against_authorities(contents, external_qg1_authorities, &[])
+    }
+
+    /// Parse exact artifact bytes and verify all QG-1 and QG-6 authority-bound
+    /// components against independently retained authority sets.
+    ///
+    /// # Errors
+    ///
+    /// Returns the specific [`EvidenceArtifactError`] for each syntax, seal,
+    /// replay, or authority mismatch.
+    pub fn from_verified_slice_against_authorities(
+        contents: &[u8],
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+        external_qg6_authorities: &[&Qg6ScheduleAuthority],
     ) -> Result<Self, EvidenceArtifactError> {
         let probe =
             crate::machine_class_registry::parse_strict_json(contents).map_err(|error| {
@@ -3629,7 +4606,10 @@ impl PerfEvidenceArtifact {
                 reason: "artifact bytes are not exact canonical pretty JSON".to_owned(),
             });
         }
-        artifact.verify_integrity_against_qg1_authorities(external_qg1_authorities)?;
+        artifact.verify_integrity_against_authorities(
+            external_qg1_authorities,
+            external_qg6_authorities,
+        )?;
         Ok(artifact)
     }
 
@@ -3643,7 +4623,7 @@ impl PerfEvidenceArtifact {
     ///
     /// Returns the specific [`EvidenceArtifactError`] for each defect class.
     pub fn load_verified(path: &Path) -> Result<Self, EvidenceArtifactError> {
-        Self::load_verified_against_qg1_authorities(path, &[])
+        Self::load_verified_against_authorities(path, &[], &[])
     }
 
     /// Load one artifact and verify it against the QG-1 expectations its
@@ -3656,8 +4636,26 @@ impl PerfEvidenceArtifact {
         path: &Path,
         external_qg1_authorities: &[&Qg1ExpectedAuthority],
     ) -> Result<Self, EvidenceArtifactError> {
-        let contents = fs::read(path)?;
-        Self::from_verified_slice_against_qg1_authorities(&contents, external_qg1_authorities)
+        Self::load_verified_against_authorities(path, external_qg1_authorities, &[])
+    }
+
+    /// Load one artifact and verify all authority-bound components against
+    /// independently retained QG-1 and QG-6 authority sets.
+    ///
+    /// # Errors
+    ///
+    /// Returns the specific [`EvidenceArtifactError`] for each defect class.
+    pub fn load_verified_against_authorities(
+        path: &Path,
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+        external_qg6_authorities: &[&Qg6ScheduleAuthority],
+    ) -> Result<Self, EvidenceArtifactError> {
+        let contents = read_evidence_artifact_bounded(path)?;
+        Self::from_verified_slice_against_authorities(
+            &contents,
+            external_qg1_authorities,
+            external_qg6_authorities,
+        )
     }
 
     /// Load one artifact as ADMISSIBLE EVIDENCE: verified exactly as
@@ -3681,7 +4679,7 @@ impl PerfEvidenceArtifact {
         path: &Path,
         register: &PerfQuarantineRegister,
     ) -> Result<Self, EvidenceArtifactError> {
-        Self::load_admissible_evidence_against_qg1_authorities(path, register, &[])
+        Self::load_admissible_evidence_against_authorities(path, register, &[], &[])
     }
 
     /// Load admissible evidence whose QG-1 cells are authenticated against the
@@ -3695,7 +4693,31 @@ impl PerfEvidenceArtifact {
         register: &PerfQuarantineRegister,
         external_qg1_authorities: &[&Qg1ExpectedAuthority],
     ) -> Result<Self, EvidenceArtifactError> {
-        let artifact = Self::load_verified_against_qg1_authorities(path, external_qg1_authorities)?;
+        Self::load_admissible_evidence_against_authorities(
+            path,
+            register,
+            external_qg1_authorities,
+            &[],
+        )
+    }
+
+    /// Load admissible evidence after replaying every QG-1 and QG-6 component
+    /// against independently retained authority sets.
+    ///
+    /// # Errors
+    ///
+    /// Returns every error [`Self::load_admissible_evidence`] can.
+    pub fn load_admissible_evidence_against_authorities(
+        path: &Path,
+        register: &PerfQuarantineRegister,
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+        external_qg6_authorities: &[&Qg6ScheduleAuthority],
+    ) -> Result<Self, EvidenceArtifactError> {
+        let artifact = Self::load_verified_against_authorities(
+            path,
+            external_qg1_authorities,
+            external_qg6_authorities,
+        )?;
         register.screen(&artifact)?;
         Ok(artifact)
     }
@@ -3947,6 +4969,39 @@ fn lower_hex(bytes: &[u8]) -> String {
 }
 
 /// Typed fail-closed errors for evidence assembly, persistence, and loading.
+fn read_evidence_artifact_bounded(path: &Path) -> Result<Vec<u8>, EvidenceArtifactError> {
+    let file = File::open(path)?;
+    let declared_len = file.metadata()?.len();
+    if declared_len
+        > u64::try_from(PERF_EVIDENCE_MAX_ARTIFACT_BYTES).expect("evidence byte cap fits u64")
+    {
+        return Err(EvidenceArtifactError::UnboundedArtifactBytes {
+            count: declared_len,
+            max: PERF_EVIDENCE_MAX_ARTIFACT_BYTES,
+        });
+    }
+
+    let mut contents = Vec::new();
+    contents
+        .try_reserve_exact(
+            usize::try_from(declared_len).unwrap_or(PERF_EVIDENCE_MAX_ARTIFACT_BYTES),
+        )
+        .map_err(|error| EvidenceArtifactError::Malformed {
+            reason: format!("cannot reserve bounded evidence artifact buffer: {error}"),
+        })?;
+    file.take(
+        u64::try_from(PERF_EVIDENCE_MAX_ARTIFACT_BYTES).expect("evidence byte cap fits u64") + 1,
+    )
+    .read_to_end(&mut contents)?;
+    if contents.len() > PERF_EVIDENCE_MAX_ARTIFACT_BYTES {
+        return Err(EvidenceArtifactError::UnboundedArtifactBytes {
+            count: u64::try_from(contents.len()).unwrap_or(u64::MAX),
+            max: PERF_EVIDENCE_MAX_ARTIFACT_BYTES,
+        });
+    }
+    Ok(contents)
+}
+
 #[derive(Debug, Error)]
 pub enum EvidenceArtifactError {
     /// The artifact bytes are not a parseable artifact at all.
@@ -3956,7 +5011,7 @@ pub enum EvidenceArtifactError {
         reason: String,
     },
     /// The artifact carries a non-current schema version.
-    #[error("evidence artifact schema is {found}; current is quill-perf-evidence-v5")]
+    #[error("evidence artifact schema is {found}; current is quill-perf-evidence-v7")]
     SchemaMismatch {
         /// The version string found in the file.
         found: String,
@@ -3984,6 +5039,14 @@ pub enum EvidenceArtifactError {
         /// Retained sample count.
         count: usize,
         /// Predeclared bound.
+        max: usize,
+    },
+    /// The serialized evidence file exceeds the public loader's memory bound.
+    #[error("evidence artifact retains {count} bytes; bound is {max}")]
+    UnboundedArtifactBytes {
+        /// Observed file or bounded-read byte count.
+        count: u64,
+        /// Maximum admitted serialized byte count.
         max: usize,
     },
     /// A promotion decision was requested on non-eligible evidence.
@@ -4033,8 +5096,8 @@ pub mod qg6_test_fixture {
     use super::*;
     use crate::perf::{PerfSampleOrder, Qg6SampleBinding};
     use crate::qg6_prepared::{
-        Qg6Comparison, Qg6ExperimentIdentity, Qg6FourArmResultReceipts, Qg6RankedHitReceipt,
-        Qg6ResultReceipt, Qg6SampleOrder, Qg6SearchTimingLeafReceipt, Qg6TimedSample,
+        Qg6Comparison, Qg6ExperimentIdentity, Qg6RankedHitReceipt, Qg6ResultReceipt,
+        Qg6SampleOrder, Qg6SearchTimingLeafReceipt, Qg6SixArmResultReceipts, Qg6TimedSample,
         query_manifest_sha256,
     };
 
@@ -4049,22 +5112,49 @@ pub mod qg6_test_fixture {
         document_count: u64,
         k: usize,
     ) -> (PerfInputIdentity, Qg6SemanticContract) {
+        contract_for_hit_count(query_class, document_count, k, 1)
+    }
+
+    pub fn contract_for_full_top_k(
+        query_class: crate::PerfQueryClass,
+        document_count: u64,
+        k: usize,
+    ) -> (PerfInputIdentity, Qg6SemanticContract) {
+        let hit_count = k.min(usize::try_from(document_count).unwrap_or(usize::MAX));
+        contract_for_hit_count(query_class, document_count, k, hit_count)
+    }
+
+    fn contract_for_hit_count(
+        query_class: crate::PerfQueryClass,
+        document_count: u64,
+        k: usize,
+        hit_count: usize,
+    ) -> (PerfInputIdentity, Qg6SemanticContract) {
         let queries =
             Qg6QuerySpec::normative_for_class(query_class).expect("frozen QG-6 query slice");
         let receipts = queries
             .iter()
             .map(|query| {
-                let hit = Qg6RankedHitReceipt {
-                    document_id_sha256: lower_hex(&Sha256::digest(
-                        format!("{}-document", query.id()).as_bytes(),
-                    )),
-                    score_bits: 1.0_f32.to_bits(),
-                };
-                let receipt = Qg6ResultReceipt::from_redacted_hits(vec![hit], 1, document_count, k)
-                    .expect("sealed QG-6 result receipt");
-                Qg6FourArmResultReceipts {
-                    null_left: receipt.clone(),
-                    null_right: receipt.clone(),
+                let hits = (0..hit_count)
+                    .map(|rank| Qg6RankedHitReceipt {
+                        document_id_sha256: lower_hex(&Sha256::digest(
+                            format!("{}-document-{rank}", query.id()).as_bytes(),
+                        )),
+                        score_bits: 1.0_f32.to_bits(),
+                    })
+                    .collect::<Vec<_>>();
+                let receipt = Qg6ResultReceipt::from_redacted_hits(
+                    hits,
+                    u64::try_from(hit_count).expect("QG-6 fixture hit count"),
+                    document_count,
+                    k,
+                )
+                .expect("sealed QG-6 result receipt");
+                Qg6SixArmResultReceipts {
+                    tantivy_null_left: receipt.clone(),
+                    tantivy_null_right: receipt.clone(),
+                    quill_null_left: receipt.clone(),
+                    quill_null_right: receipt.clone(),
                     effect_control: receipt.clone(),
                     effect_treatment: receipt,
                 }
@@ -4109,6 +5199,100 @@ pub mod qg6_test_fixture {
     pub fn attach_stream_with_leaf_latencies(
         samples: &mut [PerfRawSample],
         effect_stream: bool,
+        identity: &PerfInputIdentity,
+        contract: &Qg6SemanticContract,
+        leaf_latencies: impl FnMut(&PerfRawSample, u64) -> Vec<u64>,
+    ) {
+        let stream = if effect_stream {
+            Qg6FormalStream::Effect
+        } else {
+            Qg6FormalStream::TantivyNull
+        };
+        attach_formal_stream_with_leaf_latencies(
+            samples,
+            stream,
+            identity,
+            contract,
+            leaf_latencies,
+        );
+    }
+
+    pub fn attach_stream_against_schedule_authority(
+        samples: &mut [PerfRawSample],
+        comparison: Qg6Comparison,
+        authority: &Qg6ScheduleAuthority,
+        identity: &PerfInputIdentity,
+        contract: &Qg6SemanticContract,
+    ) {
+        attach_stream_against_schedule_authority_with_leaf_latencies(
+            samples,
+            comparison,
+            authority,
+            identity,
+            contract,
+            |_, parent_latency_ns| vec![parent_latency_ns],
+        );
+    }
+
+    pub fn attach_stream_against_schedule_authority_with_leaf_latencies(
+        samples: &mut [PerfRawSample],
+        comparison: Qg6Comparison,
+        authority: &Qg6ScheduleAuthority,
+        identity: &PerfInputIdentity,
+        contract: &Qg6SemanticContract,
+        leaf_latencies: impl FnMut(&PerfRawSample, u64) -> Vec<u64>,
+    ) {
+        let stream = match comparison {
+            Qg6Comparison::TantivyNull => Qg6FormalStream::TantivyNull,
+            Qg6Comparison::QuillNull => Qg6FormalStream::QuillNull,
+            Qg6Comparison::Effect => Qg6FormalStream::Effect,
+        };
+        let mut query_rounds = [0_usize; QG6_QUERY_GROUPS];
+        let (pairs, remainder) = samples.as_chunks_mut::<2>();
+        assert!(remainder.is_empty(), "paired QG-6 fixture");
+        for pair in pairs {
+            assert_eq!(pair[0].group_id, pair[1].group_id, "QG-6 fixture group");
+            let query_index = usize::try_from(pair[0].group_id.expect("QG-6 fixture group"))
+                .expect("bounded QG-6 query index");
+            let round = query_rounds[query_index];
+            query_rounds[query_index] += 1;
+            let block = authority
+                .schedule
+                .iter()
+                .filter(|block| block.query_index == query_index && block.comparison == comparison)
+                .nth(round)
+                .expect("authority schedules every QG-6 fixture pair");
+            for sample in pair {
+                let role = qg6_role(stream, sample.arm);
+                let order = if role == block.first {
+                    PerfSampleOrder::First
+                } else {
+                    assert_eq!(role, block.second, "authority schedules both fixture arms");
+                    PerfSampleOrder::Second
+                };
+                sample.order = order;
+                sample.block_id = block.block_id;
+                sample.sample_id = block.block_id * 2 + u64::from(order == PerfSampleOrder::Second);
+            }
+        }
+        assert!(
+            query_rounds
+                .iter()
+                .all(|rounds| *rounds == authority.rounds_per_query),
+            "fixture provides the authority's exact per-query unit count"
+        );
+        attach_formal_stream_with_leaf_latencies(
+            samples,
+            stream,
+            identity,
+            contract,
+            leaf_latencies,
+        );
+    }
+
+    fn attach_formal_stream_with_leaf_latencies(
+        samples: &mut [PerfRawSample],
+        stream: Qg6FormalStream,
         identity: &PerfInputIdentity,
         contract: &Qg6SemanticContract,
         mut leaf_latencies: impl FnMut(&PerfRawSample, u64) -> Vec<u64>,
@@ -4165,12 +5349,12 @@ pub mod qg6_test_fixture {
             let group_id = sample.group_id.expect("QG-6 fixture group");
             let group_index = usize::try_from(group_id).expect("QG-6 group index");
             let group = &contract.groups[group_index];
-            let role = qg6_role(effect_stream, sample.arm);
+            let role = qg6_role(stream, sample.arm);
             sample.provenance.input_identity = Some(identity.clone());
-            let comparison = if effect_stream {
-                Qg6Comparison::Effect
-            } else {
-                Qg6Comparison::Null
+            let comparison = match stream {
+                Qg6FormalStream::TantivyNull => Qg6Comparison::TantivyNull,
+                Qg6FormalStream::QuillNull => Qg6Comparison::QuillNull,
+                Qg6FormalStream::Effect => Qg6Comparison::Effect,
             };
             let order = match sample.order {
                 PerfSampleOrder::First => Qg6SampleOrder::First,
@@ -4183,23 +5367,11 @@ pub mod qg6_test_fixture {
             let timing_leaves = latencies
                 .iter()
                 .copied()
-                .enumerate()
-                .map(|(leaf_ordinal, latency_ns)| {
+                .map(|latency_ns| {
                     let leaf_ended_ns = leaf_started_ns + latency_ns;
-                    let leaf = Qg6SearchTimingLeafReceipt::from_observation(
-                        sample.block_id,
-                        sample.sample_id,
-                        &group.query.query_id,
-                        group_index,
-                        comparison,
-                        role,
-                        order,
-                        u64::try_from(leaf_ordinal).expect("bounded QG-6 fixture leaf ordinal"),
-                        leaf_started_ns,
-                        leaf_ended_ns,
-                        group.roles.get(role).receipt_sha256.clone(),
-                    )
-                    .expect("sealed QG-6 timing leaf");
+                    let leaf =
+                        Qg6SearchTimingLeafReceipt::from_interval(leaf_started_ns, leaf_ended_ns)
+                            .expect("sealed QG-6 timing leaf");
                     leaf_started_ns = leaf_ended_ns;
                     leaf
                 })
@@ -4225,6 +5397,7 @@ pub mod qg6_test_fixture {
                 ended_ns: sample.ended_ns,
                 observed_latency_ns: sorted_latencies[sorted_latencies.len() / 2],
                 subsample_count,
+                result_receipt_sha256: group.roles.get(role).receipt_sha256.clone(),
                 result_sha256: qg6_result_sequence_sha256(group.roles.get(role), subsample_count)
                     .expect("QG-6 sequence digest"),
                 timing_leaves,
@@ -4258,11 +5431,32 @@ mod tests {
         Qg1LifecycleProducer, Qg1LifecycleWitness, Qg1SampleBinding, estimate_paired_experiment,
         estimate_paired_experiment_against_qg1_authority, seeded_balanced_pair_order,
     };
-    use crate::qg6_prepared::Qg6ResultReceipt;
+    use crate::qg6_prepared::{Qg6ExperimentIdentity, Qg6ResultReceipt};
 
     const CANARY: &str = "CANARY_DOCUMENT_TEXT_MUST_NEVER_PERSIST";
     const TEST_MACHINE_FINGERPRINT: &str =
         "linux-x86_64-test-machine-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores";
+
+    #[test]
+    fn public_evidence_loader_refuses_artifact_above_memory_bound() {
+        let directory = tempfile::tempdir().expect("bounded evidence directory");
+        let path = directory.path().join("oversized-evidence.json");
+        let file = File::create(&path).expect("create sparse oversized evidence file");
+        file.set_len(
+            u64::try_from(PERF_EVIDENCE_MAX_ARTIFACT_BYTES).expect("evidence byte cap fits u64")
+                + 1,
+        )
+        .expect("size sparse oversized evidence file");
+
+        assert!(matches!(
+            PerfEvidenceArtifact::load_verified(&path),
+            Err(EvidenceArtifactError::UnboundedArtifactBytes {
+                count,
+                max: PERF_EVIDENCE_MAX_ARTIFACT_BYTES,
+            }) if count == u64::try_from(PERF_EVIDENCE_MAX_ARTIFACT_BYTES)
+                .expect("evidence byte cap fits u64") + 1
+        ));
+    }
 
     fn gauge_scope() -> PerfOperationScope {
         perf_operation_scope(
@@ -4856,13 +6050,22 @@ mod tests {
         artifact: &mut PerfEvidenceArtifact,
         external_qg1_authorities: &[&Qg1ExpectedAuthority],
     ) -> Vec<u8> {
+        seal_unbound_artifact_against_authorities(artifact, external_qg1_authorities, &[])
+    }
+
+    fn seal_unbound_artifact_against_authorities(
+        artifact: &mut PerfEvidenceArtifact,
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+        external_qg6_authorities: &[&Qg6ScheduleAuthority],
+    ) -> Vec<u8> {
         let bytes = artifact
             .sealed_json()
             .expect("seal unbound test evidence")
             .into_bytes();
-        *artifact = PerfEvidenceArtifact::from_verified_slice_against_qg1_authorities(
+        *artifact = PerfEvidenceArtifact::from_verified_slice_against_authorities(
             &bytes,
             external_qg1_authorities,
+            external_qg6_authorities,
         )
         .expect("reload unbound test evidence");
         bytes
@@ -4900,6 +6103,32 @@ mod tests {
         artifact
             .bind_machine_class_identity(identity, threshold_artifact_bytes, &source)
             .expect("bind admitted test identity");
+        source
+    }
+
+    fn bind_test_identity_against_authorities(
+        artifact: &mut PerfEvidenceArtifact,
+        gate: PerfGate,
+        threshold_artifact_bytes: &[u8],
+        run_label: &str,
+        external_qg1_authorities: &[&Qg1ExpectedAuthority],
+        external_qg6_authorities: &[&Qg6ScheduleAuthority],
+    ) -> Vec<u8> {
+        let source = seal_unbound_artifact_against_authorities(
+            artifact,
+            external_qg1_authorities,
+            external_qg6_authorities,
+        );
+        let identity = admitted_identity(gate, threshold_artifact_bytes, &source, run_label);
+        artifact
+            .bind_machine_class_identity_against_authorities(
+                identity,
+                threshold_artifact_bytes,
+                &source,
+                external_qg1_authorities,
+                external_qg6_authorities,
+            )
+            .expect("bind admitted test identity against retained authorities");
         source
     }
 
@@ -5082,7 +6311,7 @@ mod tests {
         artifact
     }
 
-    fn qg6_artifact() -> PerfEvidenceArtifact {
+    fn qg6_artifact() -> (PerfEvidenceArtifact, Qg6ScheduleAuthority) {
         let spec = cell_spec(PerfGate::Qg6, EvidenceRole::Required);
         let input_identity = spec.input_identity.as_ref().expect("QG-6 input identity");
         let semantic_contract = spec
@@ -5091,13 +6320,58 @@ mod tests {
             .expect("QG-6 semantic contract");
         let mut effect = qg6_hierarchical_stream_with_ratio(1.02, 0);
         let mut null = qg6_hierarchical_stream_with_ratio(1.0, 10_000);
+        let mut quill_null = qg6_hierarchical_stream_with_ratio(1.0, 20_000);
         bind_samples_to_spec(&mut effect, &spec);
         bind_samples_to_spec(&mut null, &spec);
-        qg6_test_fixture::attach_stream(&mut effect, true, input_identity, semantic_contract);
-        qg6_test_fixture::attach_stream(&mut null, false, input_identity, semantic_contract);
+        bind_samples_to_spec(&mut quill_null, &spec);
+        let authority = Qg6ScheduleAuthority::for_experiment(
+            Qg6ExperimentIdentity {
+                corpus_sha256: input_identity.prepared_corpus_sha256.clone(),
+                query_manifest_sha256: input_identity.query_manifest_sha256.clone(),
+                config_contract_sha256: input_identity.config_contract_sha256.clone(),
+                document_count: semantic_contract.document_count,
+                k: semantic_contract.k,
+            },
+            semantic_contract.groups.len(),
+            5,
+            1,
+            config().bootstrap_seed,
+        )
+        .expect("retained QG-6 schedule authority");
+        qg6_test_fixture::attach_stream_against_schedule_authority(
+            &mut effect,
+            Qg6Comparison::Effect,
+            &authority,
+            input_identity,
+            semantic_contract,
+        );
+        qg6_test_fixture::attach_stream_against_schedule_authority(
+            &mut null,
+            Qg6Comparison::TantivyNull,
+            &authority,
+            input_identity,
+            semantic_contract,
+        );
+        qg6_test_fixture::attach_stream_against_schedule_authority(
+            &mut quill_null,
+            Qg6Comparison::QuillNull,
+            &authority,
+            input_identity,
+            semantic_contract,
+        );
         let paired =
             estimate_paired_experiment(&effect, &null, &config()).expect("QG-6 paired estimate");
-        let cell = EvidenceCell::evaluate(spec, paired, &policy()).expect("QG-6 evidence cell");
+        let protocol = Qg6FormalProtocolEvidence::new_against_authority(
+            &paired,
+            quill_null,
+            &authority,
+            input_identity,
+            semantic_contract,
+        )
+        .expect("construct retained QG-6 formal protocol");
+        let mut cell = EvidenceCell::evaluate(spec, paired, &policy()).expect("QG-6 evidence cell");
+        cell.attach_qg6_formal_protocol_against_authority(protocol, &policy(), &authority)
+            .expect("attach retained QG-6 formal protocol");
         let mut provenance = evidence_provenance(PerfGate::Qg6);
         provenance.corpus.query_set_sha256 = Some("d".repeat(64));
         let mut artifact = PerfEvidenceArtifact::assemble(
@@ -5108,13 +6382,15 @@ mod tests {
             vec![cell],
         )
         .expect("QG-6 artifact");
-        bind_test_identity(
+        bind_test_identity_against_authorities(
             &mut artifact,
             PerfGate::Qg6,
             b"qg6-threshold",
             "qg6-primary",
+            &[],
+            &[&authority],
         );
-        artifact
+        (artifact, authority)
     }
 
     fn fully_reseal_qg6_query_mutation(
@@ -5161,16 +6437,100 @@ mod tests {
             sample.provenance.input_identity = Some(identity.clone());
             let group_index =
                 usize::try_from(sample.group_id.expect("QG-6 sample group")).expect("group index");
-            sample
+            let binding = sample
                 .qg6_sample_binding
                 .as_mut()
-                .expect("QG-6 authenticated binding")
-                .query_id = query_ids[group_index].clone();
+                .expect("QG-6 authenticated binding");
+            binding.query_id = query_ids[group_index].clone();
+            binding.timed_sample.query_id.clone_from(&binding.query_id);
+            binding.timed_sample.timing_leaves_sha256 = binding
+                .timed_sample
+                .recomputed_timing_leaves_sha256()
+                .expect("re-seal query-bound timing leaves");
         }
+    }
+
+    fn reauthorize_qg6_test_artifact(
+        artifact: &mut PerfEvidenceArtifact,
+        previous_authority: &Qg6ScheduleAuthority,
+    ) -> Qg6ScheduleAuthority {
+        let cell = &mut artifact.cells[0];
+        let contract = cell
+            .spec
+            .qg6_semantic_contract
+            .as_ref()
+            .expect("QG-6 semantic contract")
+            .clone();
+        let identity = cell
+            .spec
+            .input_identity
+            .as_ref()
+            .expect("QG-6 input identity")
+            .clone();
+        let authority = Qg6ScheduleAuthority::for_experiment(
+            Qg6ExperimentIdentity {
+                corpus_sha256: identity.prepared_corpus_sha256.clone(),
+                query_manifest_sha256: identity.query_manifest_sha256.clone(),
+                config_contract_sha256: identity.config_contract_sha256.clone(),
+                document_count: contract.document_count,
+                k: contract.k,
+            },
+            contract.groups.len(),
+            previous_authority.rounds_per_query,
+            previous_authority.searches_per_sample,
+            previous_authority.schedule_seed,
+        )
+        .expect("re-authorize fully resealed QG-6 test artifact");
+        let query_ids = contract
+            .groups
+            .iter()
+            .map(|group| group.query.query_id.clone())
+            .collect::<Vec<_>>();
+        let EvidenceCellBody::Paired {
+            paired,
+            qg6_protocol,
+            ..
+        } = &mut cell.body
+        else {
+            unreachable!("QG-6 must be paired");
+        };
+        paired.provenance.input_identity = Some(identity.clone());
+        let protocol = qg6_protocol
+            .as_mut()
+            .expect("QG-6 formal protocol evidence");
+        for sample in paired
+            .effect_samples
+            .iter_mut()
+            .chain(&mut paired.null_samples)
+            .chain(&mut protocol.quill_null_samples)
+        {
+            sample.provenance.input_identity = Some(identity.clone());
+            let group_index =
+                usize::try_from(sample.group_id.expect("QG-6 sample group")).expect("group index");
+            let binding = sample
+                .qg6_sample_binding
+                .as_mut()
+                .expect("QG-6 authenticated binding");
+            binding.query_id = query_ids[group_index].clone();
+            binding.timed_sample.query_id.clone_from(&binding.query_id);
+            binding.timed_sample.timing_leaves_sha256 = binding
+                .timed_sample
+                .recomputed_timing_leaves_sha256()
+                .expect("re-seal query-bound timing leaves");
+        }
+        protocol.schedule_authority = authority.clone();
+        protocol.joint_tail = estimate_qg6_joint_tail_from_validated_rows(
+            paired,
+            &protocol.quill_null_samples,
+            &authority,
+        )
+        .expect("recompute fully resealed QG-6 joint tail");
+        authority
     }
 
     fn fully_reseal_qg6_result_receipt_mutation(
         artifact: &mut PerfEvidenceArtifact,
+        authority: &Qg6ScheduleAuthority,
         mutate: impl FnOnce(&mut Qg6ResultReceipt),
     ) {
         unbind_test_artifact(artifact);
@@ -5204,19 +6564,40 @@ mod tests {
                     .expect("group index");
                 let group = &contract.groups[group_index];
                 let work_units = sample.work_units.expect("QG-6 sample work units");
-                let role = qg6_role(effect_stream, sample.arm);
+                let stream = if effect_stream {
+                    Qg6FormalStream::Effect
+                } else {
+                    Qg6FormalStream::TantivyNull
+                };
+                let role = qg6_role(stream, sample.arm);
                 let binding = sample
                     .qg6_sample_binding
                     .as_mut()
                     .expect("QG-6 authenticated binding");
                 binding.query_id.clone_from(&group.query.query_id);
-                binding.result_sequence_sha256 =
-                    qg6_result_sequence_sha256(group.roles.get(role), work_units)
-                        .expect("fully resealed result sequence");
+                let receipt = group.roles.get(role);
+                let result_sequence_sha256 = qg6_result_sequence_sha256(receipt, work_units)
+                    .expect("fully resealed result sequence");
+                binding
+                    .result_sequence_sha256
+                    .clone_from(&result_sequence_sha256);
+                binding
+                    .timed_sample
+                    .result_receipt_sha256
+                    .clone_from(&receipt.receipt_sha256);
+                binding
+                    .timed_sample
+                    .result_sha256
+                    .clone_from(&result_sequence_sha256);
+                binding.timed_sample.timing_leaves_sha256 = binding
+                    .timed_sample
+                    .recomputed_timing_leaves_sha256()
+                    .expect("fully resealed timing-leaf sequence");
             }
         };
         rebind_stream(&mut paired.effect_samples, true);
         rebind_stream(&mut paired.null_samples, false);
+        reauthorize_qg6_test_artifact(artifact, authority);
     }
 
     #[test]
@@ -5837,6 +7218,212 @@ mod tests {
     }
 
     #[test]
+    fn qg6_joint_tail_recovers_p99_hidden_by_every_parent_median() {
+        let spec = cell_spec(PerfGate::Qg6, EvidenceRole::Required);
+        let identity = spec.input_identity.as_ref().expect("QG-6 input identity");
+        let contract = spec
+            .qg6_semantic_contract
+            .as_ref()
+            .expect("QG-6 semantic contract");
+        let mut effect = qg6_hierarchical_stream_with_ratio(1.0, 0);
+        let mut tantivy_null = qg6_hierarchical_stream_with_ratio(1.0, 10_000);
+        let mut quill_null = qg6_hierarchical_stream_with_ratio(1.0, 20_000);
+        for samples in [&mut effect, &mut tantivy_null, &mut quill_null] {
+            for sample in samples {
+                sample.observed_value = Some(1.0);
+            }
+        }
+        bind_samples_to_spec(&mut effect, &spec);
+        bind_samples_to_spec(&mut tantivy_null, &spec);
+        bind_samples_to_spec(&mut quill_null, &spec);
+        let estimator_config = config();
+        let authority = Qg6ScheduleAuthority::for_experiment(
+            Qg6ExperimentIdentity {
+                corpus_sha256: identity.prepared_corpus_sha256.clone(),
+                query_manifest_sha256: identity.query_manifest_sha256.clone(),
+                config_contract_sha256: identity.config_contract_sha256.clone(),
+                document_count: contract.document_count,
+                k: contract.k,
+            },
+            contract.groups.len(),
+            5,
+            101,
+            estimator_config.bootstrap_seed,
+        )
+        .expect("tail authority");
+        qg6_test_fixture::attach_stream_against_schedule_authority_with_leaf_latencies(
+            &mut effect,
+            Qg6Comparison::Effect,
+            &authority,
+            identity,
+            contract,
+            |sample, parent| {
+                let mut leaves = vec![parent; 101];
+                if sample.arm == PerfSampleArm::Treatment
+                    && sample.group_id.is_some_and(|group_id| group_id % 2 == 1)
+                {
+                    for leaf in &mut leaves[96..] {
+                        *leaf = parent * 100;
+                    }
+                }
+                leaves
+            },
+        );
+        for (samples, comparison) in [
+            (&mut tantivy_null[..], Qg6Comparison::TantivyNull),
+            (&mut quill_null[..], Qg6Comparison::QuillNull),
+        ] {
+            qg6_test_fixture::attach_stream_against_schedule_authority_with_leaf_latencies(
+                samples,
+                comparison,
+                &authority,
+                identity,
+                contract,
+                |_, parent| vec![parent; 101],
+            );
+        }
+        let paired = estimate_paired_experiment(&effect, &tantivy_null, &estimator_config)
+            .expect("parent-median stream remains exactly null");
+        assert!((paired.effect.treatment_over_control - 1.0).abs() < 1.0e-12);
+        let mut mutated_paired = paired.clone();
+        let mutated_leaf = mutated_paired.effect_samples[0]
+            .qg6_sample_binding
+            .as_mut()
+            .expect("timed QG-6 binding")
+            .timed_sample
+            .timing_leaves
+            .first_mut()
+            .expect("timing leaf");
+        mutated_leaf.ended_ns = mutated_leaf.ended_ns.saturating_add(1);
+        assert!(matches!(
+            Qg6FormalProtocolEvidence::new_against_authority(
+                &mutated_paired,
+                quill_null.clone(),
+                &authority,
+                identity,
+                contract,
+            ),
+            Err(EvidenceArtifactError::InconsistentArtifact { ref reason })
+                if reason.contains("failed authenticated replay")
+        ));
+        let protocol = Qg6FormalProtocolEvidence::new_against_authority(
+            &paired, quill_null, &authority, identity, contract,
+        )
+        .expect("construct formal tail protocol");
+        let tail = estimate_qg6_joint_tail(&paired, &protocol, &authority, identity, contract)
+            .expect("joint tail estimate");
+        assert!((tail.tantivy_null.p50_ratio - 1.0).abs() < 1.0e-12);
+        assert!((tail.tantivy_null.p99_ratio - 1.0).abs() < 1.0e-12);
+        assert!((tail.quill_null.p50_ratio - 1.0).abs() < 1.0e-12);
+        assert!((tail.quill_null.p99_ratio - 1.0).abs() < 1.0e-12);
+        assert!((tail.effect.p50_ratio - 1.0).abs() < 1.0e-12);
+        assert!(
+            tail.effect.p99_ratio > 50.0,
+            "true-leaf p99 must expose the hidden treatment tail: {tail:?}"
+        );
+        assert!(tail.effect.p99_ci95_low_ratio > 1.0);
+        let mut tampered = protocol.clone();
+        tampered.joint_tail.effect.p99_ratio = 1.0;
+        assert!(matches!(
+            estimate_qg6_joint_tail(&paired, &tampered, &authority, identity, contract),
+            Err(EvidenceArtifactError::InconsistentArtifact { ref reason })
+                if reason.contains("does not recompute from raw leaves")
+        ));
+    }
+
+    #[test]
+    fn qg6_joint_tail_bootstrap_draws_queries_then_whole_units() {
+        let mut seed = 7;
+        let mut draws = Vec::new();
+        for_each_qg6_joint_tail_bootstrap_unit(&mut seed, 3, 2, |query, unit| {
+            draws.push((query, unit));
+        })
+        .expect("bounded query-first draw schedule");
+        assert_eq!(draws, [(0, 1), (0, 0), (2, 0), (2, 0), (2, 0), (2, 1)]);
+    }
+
+    #[test]
+    fn qg6_joint_tail_bootstrap_carries_all_six_roles_in_one_cluster_draw() {
+        let spec = cell_spec(PerfGate::Qg6, EvidenceRole::Required);
+        let identity = spec.input_identity.as_ref().expect("QG-6 input identity");
+        let contract = spec
+            .qg6_semantic_contract
+            .as_ref()
+            .expect("QG-6 semantic contract");
+        let mut effect = qg6_hierarchical_stream_with_ratio(0.8, 0);
+        let mut tantivy_null = qg6_hierarchical_stream_with_ratio(1.0, 10_000);
+        let mut quill_null = qg6_hierarchical_stream_with_ratio(1.0, 20_000);
+        bind_samples_to_spec(&mut effect, &spec);
+        bind_samples_to_spec(&mut tantivy_null, &spec);
+        bind_samples_to_spec(&mut quill_null, &spec);
+        let estimator_config = config();
+        let authority = Qg6ScheduleAuthority::for_experiment(
+            Qg6ExperimentIdentity {
+                corpus_sha256: identity.prepared_corpus_sha256.clone(),
+                query_manifest_sha256: identity.query_manifest_sha256.clone(),
+                config_contract_sha256: identity.config_contract_sha256.clone(),
+                document_count: contract.document_count,
+                k: contract.k,
+            },
+            contract.groups.len(),
+            5,
+            3,
+            estimator_config.bootstrap_seed,
+        )
+        .expect("shared-draw authority");
+        for (samples, comparison) in [
+            (&mut effect[..], Qg6Comparison::Effect),
+            (&mut tantivy_null[..], Qg6Comparison::TantivyNull),
+            (&mut quill_null[..], Qg6Comparison::QuillNull),
+        ] {
+            qg6_test_fixture::attach_stream_against_schedule_authority_with_leaf_latencies(
+                samples,
+                comparison,
+                &authority,
+                identity,
+                contract,
+                |_, parent| vec![parent, parent, parent],
+            );
+        }
+        let paired = estimate_paired_experiment(&effect, &tantivy_null, &estimator_config)
+            .expect("paired six-role stream");
+        let protocol = Qg6FormalProtocolEvidence::new_against_authority(
+            &paired, quill_null, &authority, identity, contract,
+        )
+        .expect("formal six-role protocol");
+        let tail = estimate_qg6_joint_tail(&paired, &protocol, &authority, identity, contract)
+            .expect("joint clustered estimate");
+        for ratio in [
+            tail.tantivy_null.p50_ci95_low_ratio,
+            tail.tantivy_null.p50_ci95_high_ratio,
+            tail.tantivy_null.p99_ci95_low_ratio,
+            tail.tantivy_null.p99_ci95_high_ratio,
+            tail.quill_null.p50_ci95_low_ratio,
+            tail.quill_null.p50_ci95_high_ratio,
+            tail.quill_null.p99_ci95_low_ratio,
+            tail.quill_null.p99_ci95_high_ratio,
+        ] {
+            assert!(
+                (ratio - 1.0).abs() < 1.0e-12,
+                "null draw split roles: {tail:?}"
+            );
+        }
+        for ratio in [
+            tail.effect.p50_ratio,
+            tail.effect.p50_ci95_low_ratio,
+            tail.effect.p50_ci95_high_ratio,
+            tail.effect.p99_ratio,
+            tail.effect.p99_ci95_low_ratio,
+            tail.effect.p99_ci95_high_ratio,
+        ] {
+            assert!(
+                (ratio - 0.8).abs() < 1.0e-12,
+                "effect draw split roles: {tail:?}"
+            );
+        }
+    }
+
+    #[test]
     fn hierarchical_known_answer_covers_heteroskedastic_groups() {
         let estimate = estimate_hierarchical_latency(&hierarchical_stream(), &config(), &policy())
             .expect("hierarchical estimate");
@@ -5942,7 +7529,7 @@ mod tests {
 
     #[test]
     fn qg6_verified_roundtrip_distinguishes_query_universe_from_exact_cell_manifest() {
-        let artifact = qg6_artifact();
+        let (artifact, authority) = qg6_artifact();
         let exact_query_manifest = artifact.cells[0]
             .spec
             .input_identity
@@ -5964,10 +7551,45 @@ mod tests {
 
         let directory = tempfile::tempdir().expect("QG-6 artifact directory");
         let paths = artifact
-            .write_atomic(directory.path())
+            .write_atomic_against_authorities(directory.path(), &[], &[&authority])
             .expect("persist QG-6 artifact");
-        let verified =
-            PerfEvidenceArtifact::load_verified(&paths.json).expect("verify QG-6 artifact");
+        let verified = PerfEvidenceArtifact::load_verified_against_authorities(
+            &paths.json,
+            &[],
+            &[&authority],
+        )
+        .expect("verify QG-6 artifact");
+        assert!(matches!(
+            PerfEvidenceArtifact::load_verified(&paths.json),
+            Err(EvidenceArtifactError::InvalidProvenance { ref reason })
+                if reason.contains("no independently retained schedule authority")
+        ));
+        let wrong_authority = Qg6ScheduleAuthority::for_experiment(
+            authority.identity.clone(),
+            authority.query_count,
+            authority.rounds_per_query,
+            authority.searches_per_sample,
+            authority.schedule_seed.wrapping_add(1),
+        )
+        .expect("different valid QG-6 authority");
+        assert!(matches!(
+            PerfEvidenceArtifact::load_verified_against_authorities(
+                &paths.json,
+                &[],
+                &[&wrong_authority],
+            ),
+            Err(EvidenceArtifactError::InvalidProvenance { ref reason })
+                if reason.contains("no independently retained schedule authority")
+        ));
+        assert!(matches!(
+            PerfEvidenceArtifact::load_verified_against_authorities(
+                &paths.json,
+                &[],
+                &[&authority, &authority],
+            ),
+            Err(EvidenceArtifactError::InvalidProvenance { ref reason })
+                if reason.contains("more than one retained schedule authority")
+        ));
         assert_eq!(
             verified.cells[0].spec.input_identity,
             match &verified.cells[0].body {
@@ -5981,7 +7603,7 @@ mod tests {
 
     #[test]
     fn current_schema_qg6_missing_new_semantic_fields_deserializes_but_fails_closed() {
-        let mut artifact = qg6_artifact();
+        let (mut artifact, authority) = qg6_artifact();
         unbind_test_artifact(&mut artifact);
         let cell = &mut artifact.cells[0];
         cell.spec.qg6_semantic_contract = None;
@@ -5990,9 +7612,15 @@ mod tests {
             .as_mut()
             .expect("QG-6 input identity")
             .semantic_contract_sha256 = None;
-        let EvidenceCellBody::Paired { paired, .. } = &mut cell.body else {
+        let EvidenceCellBody::Paired {
+            paired,
+            qg6_protocol,
+            ..
+        } = &mut cell.body
+        else {
             unreachable!("QG-6 must be paired");
         };
+        *qg6_protocol = None;
         paired.provenance.input_identity = cell.spec.input_identity.clone();
         for sample in paired
             .effect_samples
@@ -6012,7 +7640,7 @@ mod tests {
         let path = directory.path().join("qg6-current-schema-old-shape.json");
         fs::write(&path, json).expect("persist old-shaped current schema");
         assert!(matches!(
-            PerfEvidenceArtifact::load_verified(&path),
+            PerfEvidenceArtifact::load_verified_against_authorities(&path, &[], &[&authority]),
             Err(EvidenceArtifactError::InconsistentArtifact { .. })
         ));
     }
@@ -6031,7 +7659,7 @@ mod tests {
 
     #[test]
     fn qg6_verified_load_rejects_sealed_cell_identity_divergence() {
-        let mut artifact = qg6_artifact();
+        let (mut artifact, authority) = qg6_artifact();
         unbind_test_artifact(&mut artifact);
         artifact.cells[0]
             .spec
@@ -6048,7 +7676,7 @@ mod tests {
         .expect("persist sealed mismatch");
 
         assert!(matches!(
-            PerfEvidenceArtifact::load_verified(&path),
+            PerfEvidenceArtifact::load_verified_against_authorities(&path, &[], &[&authority]),
             Err(EvidenceArtifactError::InvalidProvenance { .. })
         ));
     }
@@ -6065,7 +7693,7 @@ mod tests {
             "query_generator_revision",
             "corpus_generator_revision",
         ] {
-            let mut artifact = qg6_artifact();
+            let (mut artifact, previous_authority) = qg6_artifact();
             fully_reseal_qg6_query_mutation(&mut artifact, |query| match mutation {
                 "query_id" => query.query_id = "identifier-000".to_owned(),
                 "normalized_text" => query.normalized_text_sha256 = "9".repeat(64),
@@ -6087,6 +7715,7 @@ mod tests {
                 }
                 _ => unreachable!("enumerated mutation"),
             });
+            let authority = reauthorize_qg6_test_artifact(&mut artifact, &previous_authority);
             let directory = tempfile::tempdir().expect("QG-6 artifact directory");
             let path = directory
                 .path()
@@ -6099,13 +7728,16 @@ mod tests {
             )
             .expect("persist hostile artifact");
 
+            let error =
+                PerfEvidenceArtifact::load_verified_against_authorities(&path, &[], &[&authority])
+                    .expect_err("fully re-sealed query mutation must fail verified reload");
             assert!(
                 matches!(
-                    PerfEvidenceArtifact::load_verified(&path),
-                    Err(EvidenceArtifactError::InconsistentArtifact { ref reason })
+                    error,
+                    EvidenceArtifactError::InconsistentArtifact { ref reason }
                         if reason.contains("frozen normative query slice")
                 ),
-                "fully re-sealed mutation {mutation} escaped the frozen anchor"
+                "fully re-sealed mutation {mutation} failed outside the frozen anchor: {error}"
             );
         }
     }
@@ -6113,7 +7745,7 @@ mod tests {
     #[test]
     fn qg6_outer_reseal_rejects_invalid_class_supported_k_and_query_self_seal() {
         for mutation in ["class", "supported_k", "query_identity_sha256"] {
-            let mut artifact = qg6_artifact();
+            let (mut artifact, authority) = qg6_artifact();
             if mutation == "query_identity_sha256" {
                 unbind_test_artifact(&mut artifact);
                 artifact.cells[0]
@@ -6144,7 +7776,11 @@ mod tests {
             .expect("persist invalid query identity");
             assert!(
                 matches!(
-                    PerfEvidenceArtifact::load_verified(&path),
+                    PerfEvidenceArtifact::load_verified_against_authorities(
+                        &path,
+                        &[],
+                        &[&authority],
+                    ),
                     Err(EvidenceArtifactError::InconsistentArtifact { .. })
                 ),
                 "invalid query identity field {mutation} escaped verification"
@@ -6154,7 +7790,7 @@ mod tests {
 
     #[test]
     fn qg6_verified_load_rejects_fully_resealed_unsupported_contract_cutoff() {
-        let mut artifact = qg6_artifact();
+        let (mut artifact, previous_authority) = qg6_artifact();
         unbind_test_artifact(&mut artifact);
         let cell = &mut artifact.cells[0];
         let contract = cell
@@ -6184,6 +7820,7 @@ mod tests {
         {
             sample.provenance.input_identity = Some(identity.clone());
         }
+        let authority = reauthorize_qg6_test_artifact(&mut artifact, &previous_authority);
 
         let directory = tempfile::tempdir().expect("QG-6 artifact directory");
         let path = directory.path().join("qg6-resealed-unsupported-k99.json");
@@ -6194,8 +7831,9 @@ mod tests {
                 .expect("outer-reseal unsupported cutoff"),
         )
         .expect("persist fully resealed unsupported cutoff");
-        let error = PerfEvidenceArtifact::load_verified(&path)
-            .expect_err("fully resealed unsupported cutoff must fail verified reload");
+        let error =
+            PerfEvidenceArtifact::load_verified_against_authorities(&path, &[], &[&authority])
+                .expect_err("fully resealed unsupported cutoff must fail verified reload");
         assert!(
             matches!(
                 error,
@@ -6216,7 +7854,7 @@ mod tests {
             "doc_count",
             "receipt_sha256",
         ] {
-            let mut artifact = qg6_artifact();
+            let (mut artifact, authority) = qg6_artifact();
             unbind_test_artifact(&mut artifact);
             let receipt = &mut artifact.cells[0]
                 .spec
@@ -6248,7 +7886,11 @@ mod tests {
             .expect("persist mutated receipt");
             assert!(
                 matches!(
-                    PerfEvidenceArtifact::load_verified(&path),
+                    PerfEvidenceArtifact::load_verified_against_authorities(
+                        &path,
+                        &[],
+                        &[&authority],
+                    ),
                     Err(EvidenceArtifactError::InconsistentArtifact { .. })
                 ),
                 "outer seal hid nested receipt mutation {mutation}"
@@ -6264,21 +7906,24 @@ mod tests {
             "duplicate_document_id",
             "non_finite_score",
         ] {
-            let mut artifact = qg6_artifact();
-            fully_reseal_qg6_result_receipt_mutation(&mut artifact, |receipt| match mutation {
-                "underfilled_top_k" => receipt.total_count = 2,
-                "empty_document_id" => {
-                    receipt.ordered_hits[0].document_id_sha256 = lower_hex(&Sha256::digest(b""));
+            let (mut artifact, authority) = qg6_artifact();
+            fully_reseal_qg6_result_receipt_mutation(&mut artifact, &authority, |receipt| {
+                match mutation {
+                    "underfilled_top_k" => receipt.total_count = 2,
+                    "empty_document_id" => {
+                        receipt.ordered_hits[0].document_id_sha256 =
+                            lower_hex(&Sha256::digest(b""));
+                    }
+                    "duplicate_document_id" => {
+                        receipt.ordered_hits.push(receipt.ordered_hits[0].clone());
+                        receipt.returned_count = 2;
+                        receipt.total_count = 2;
+                    }
+                    "non_finite_score" => {
+                        receipt.ordered_hits[0].score_bits = f32::NAN.to_bits();
+                    }
+                    _ => unreachable!("enumerated mutation"),
                 }
-                "duplicate_document_id" => {
-                    receipt.ordered_hits.push(receipt.ordered_hits[0].clone());
-                    receipt.returned_count = 2;
-                    receipt.total_count = 2;
-                }
-                "non_finite_score" => {
-                    receipt.ordered_hits[0].score_bits = f32::NAN.to_bits();
-                }
-                _ => unreachable!("enumerated mutation"),
             });
             let directory = tempfile::tempdir().expect("QG-6 artifact directory");
             let path = directory
@@ -6292,8 +7937,9 @@ mod tests {
             )
             .expect("persist fully resealed invalid ranked hit");
 
-            let error = PerfEvidenceArtifact::load_verified(&path)
-                .expect_err("fully resealed invalid ranked hit must fail verified reload");
+            let error =
+                PerfEvidenceArtifact::load_verified_against_authorities(&path, &[], &[&authority])
+                    .expect_err("fully resealed invalid ranked hit must fail verified reload");
             assert!(
                 matches!(&error, EvidenceArtifactError::InconsistentArtifact { .. }),
                 "unexpected reload error for {mutation}: {error}"
@@ -6310,7 +7956,7 @@ mod tests {
     #[test]
     fn qg6_outer_reseal_rejects_both_compact_binding_field_mutations() {
         for mutation in ["query_id", "result_sequence_sha256"] {
-            let mut artifact = qg6_artifact();
+            let (mut artifact, authority) = qg6_artifact();
             unbind_test_artifact(&mut artifact);
             let EvidenceCellBody::Paired { paired, .. } = &mut artifact.cells[0].body else {
                 unreachable!("QG-6 must be paired");
@@ -6339,7 +7985,11 @@ mod tests {
             .expect("persist binding mutation");
             assert!(
                 matches!(
-                    PerfEvidenceArtifact::load_verified(&path),
+                    PerfEvidenceArtifact::load_verified_against_authorities(
+                        &path,
+                        &[],
+                        &[&authority],
+                    ),
                     Err(EvidenceArtifactError::InconsistentArtifact { .. })
                 ),
                 "authenticated binding field {mutation} escaped reload verification"
@@ -6349,7 +7999,7 @@ mod tests {
 
     #[test]
     fn qg6_outer_reseal_rejects_authenticated_timing_leaf_mutation() {
-        let mut artifact = qg6_artifact();
+        let (mut artifact, authority) = qg6_artifact();
         unbind_test_artifact(&mut artifact);
         let EvidenceCellBody::Paired { paired, .. } = &mut artifact.cells[0].body else {
             unreachable!("QG-6 must be paired");
@@ -6360,8 +8010,8 @@ mod tests {
             .expect("authenticated QG-6 binding")
             .timed_sample
             .timing_leaves[0];
-        leaf.observed_latency_ns = leaf
-            .observed_latency_ns
+        leaf.ended_ns = leaf
+            .ended_ns
             .checked_add(1)
             .expect("bounded hostile latency");
 
@@ -6374,12 +8024,16 @@ mod tests {
                 .expect("outer-reseal timing leaf mutation"),
         )
         .expect("persist timing leaf mutation");
-        let error = PerfEvidenceArtifact::load_verified(&path)
-            .expect_err("mutated authenticated QG-6 timing leaf must fail closed");
+        let error =
+            PerfEvidenceArtifact::load_verified_against_authorities(&path, &[], &[&authority])
+                .expect_err("mutated authenticated QG-6 timing leaf must fail closed");
         assert!(
             matches!(
                 error,
-                EvidenceArtifactError::Estimator(PairedEstimatorError::InvalidProvenance { .. })
+                EvidenceArtifactError::Malformed { ref reason }
+                    if reason.contains(
+                        "QG-6 timing leaves do not have the exact parent order and interval"
+                    )
             ),
             "unexpected timing-leaf rejection: {error:?}"
         );
@@ -6387,7 +8041,7 @@ mod tests {
 
     #[test]
     fn qg6_sealed_reload_rejects_one_groups_extra_balanced_pair() {
-        let mut artifact = qg6_artifact();
+        let (mut artifact, authority) = qg6_artifact();
         unbind_test_artifact(&mut artifact);
         let identity = artifact.cells[0]
             .spec
@@ -6450,16 +8104,22 @@ mod tests {
                 .expect("outer-reseal extra balanced pair"),
         )
         .expect("persist extra balanced pair");
-        assert!(matches!(
-            PerfEvidenceArtifact::load_verified(&path),
-            Err(EvidenceArtifactError::InconsistentArtifact { ref reason })
-                if reason.contains("common positive multiplicity")
-        ));
+        let error =
+            PerfEvidenceArtifact::load_verified_against_authorities(&path, &[], &[&authority])
+                .expect_err("extra QG-6 pair must fail verified reload");
+        assert!(
+            matches!(
+                error,
+                EvidenceArtifactError::InconsistentArtifact { ref reason }
+                    if reason.contains("exact schedule multiplicity for all six roles")
+            ),
+            "unexpected extra-pair rejection: {error}"
+        );
     }
 
     #[test]
     fn qg6_sealed_reload_rejects_a_missing_named_role_receipt() {
-        let mut artifact = qg6_artifact();
+        let (mut artifact, authority) = qg6_artifact();
         unbind_test_artifact(&mut artifact);
         let mut value = serde_json::to_value(&artifact).expect("QG-6 artifact value");
         value["cells"][0]["spec"]["qg6_semantic_contract"]["groups"][0]["roles"]
@@ -6476,14 +8136,14 @@ mod tests {
         let path = directory.path().join("qg6-missing-role.json");
         fs::write(&path, sealed).expect("persist role-missing artifact");
         assert!(matches!(
-            PerfEvidenceArtifact::load_verified(&path),
+            PerfEvidenceArtifact::load_verified_against_authorities(&path, &[], &[&authority]),
             Err(EvidenceArtifactError::Malformed { .. })
         ));
     }
 
     #[test]
     fn qg6_verified_load_recomputes_hierarchical_null_from_raw_groups() {
-        let mut artifact = qg6_artifact();
+        let (mut artifact, authority) = qg6_artifact();
         unbind_test_artifact(&mut artifact);
         let EvidenceCellBody::Paired {
             hierarchical_null: Some(null),
@@ -6503,14 +8163,14 @@ mod tests {
         .expect("persist sealed mismatch");
 
         assert!(matches!(
-            PerfEvidenceArtifact::load_verified(&path),
+            PerfEvidenceArtifact::load_verified_against_authorities(&path, &[], &[&authority]),
             Err(EvidenceArtifactError::InconsistentArtifact { .. })
         ));
     }
 
     #[test]
     fn qg6_partial_query_group_removal_is_rejected_as_inconsistent() {
-        let original = qg6_artifact();
+        let (original, _authority) = qg6_artifact();
         let original_cell = &original.cells[0];
         let EvidenceCellBody::Paired { paired, .. } = &original_cell.body else {
             unreachable!("QG-6 must carry paired evidence");
@@ -6537,7 +8197,7 @@ mod tests {
     }
 
     #[test]
-    fn qg6_hierarchical_null_is_retained_but_tail_protocol_forces_no_claim() {
+    fn qg6_hierarchical_null_is_retained_by_formal_tail_protocol() {
         let spec = cell_spec(PerfGate::Qg6, EvidenceRole::Required);
         let identity = spec.input_identity.as_ref().expect("QG-6 identity");
         let contract = spec
@@ -6550,31 +8210,69 @@ mod tests {
             .collect::<Vec<_>>();
         let mut null_pairs = Vec::new();
         for group_id in QG6_QUERY_GROUP_IDS {
-            null_pairs.extend((0..25).map(|_| (group_id, 100.0, 80.0)));
-            null_pairs.extend((0..49).map(|_| (group_id, 100.0, 100.0)));
-            null_pairs.extend((0..26).map(|_| (group_id, 100.0, 125.0)));
+            for _ in 0..10 {
+                null_pairs.extend([
+                    (group_id, 100.0, 80.0),
+                    (group_id, 100.0, 100.0),
+                    (group_id, 100.0, 100.0),
+                    (group_id, 100.0, 125.0),
+                    (group_id, 100.0, 100.0),
+                    (group_id, 100.0, 100.0),
+                    (group_id, 100.0, 80.0),
+                    (group_id, 100.0, 100.0),
+                    (group_id, 100.0, 125.0),
+                    (group_id, 100.0, 100.0),
+                ]);
+            }
         }
+        let quill_null_pairs = QG6_QUERY_GROUP_IDS
+            .into_iter()
+            .flat_map(|group_id| [(group_id, 100.0, 100.0); 100])
+            .collect::<Vec<_>>();
         let mut effect = grouped_gauge_stream(&effect_pairs, 0, None);
         let mut null = grouped_gauge_stream(&null_pairs, 10_000, None);
+        let mut quill_null = grouped_gauge_stream(&quill_null_pairs, 20_000, None);
         bind_samples_to_spec(&mut effect, &spec);
         bind_samples_to_spec(&mut null, &spec);
-        qg6_test_fixture::attach_stream(&mut effect, true, identity, contract);
-        qg6_test_fixture::attach_stream(&mut null, false, identity, contract);
+        bind_samples_to_spec(&mut quill_null, &spec);
+        let estimator_config = config();
+        let authority = Qg6ScheduleAuthority::for_experiment(
+            Qg6ExperimentIdentity {
+                corpus_sha256: identity.prepared_corpus_sha256.clone(),
+                query_manifest_sha256: identity.query_manifest_sha256.clone(),
+                config_contract_sha256: identity.config_contract_sha256.clone(),
+                document_count: contract.document_count,
+                k: contract.k,
+            },
+            contract.groups.len(),
+            100,
+            1,
+            estimator_config.bootstrap_seed,
+        )
+        .expect("retained QG-6 schedule authority");
+        for (samples, comparison) in [
+            (&mut effect[..], Qg6Comparison::Effect),
+            (&mut null[..], Qg6Comparison::TantivyNull),
+            (&mut quill_null[..], Qg6Comparison::QuillNull),
+        ] {
+            qg6_test_fixture::attach_stream_against_schedule_authority(
+                samples, comparison, &authority, identity, contract,
+            );
+        }
 
-        let paired =
-            estimate_paired_experiment(&effect, &null, &config()).expect("QG-6 paired estimate");
-        assert_eq!(paired.status, PairedEvidenceStatus::InvalidNull);
-        assert_eq!(paired.claim_state, PairedClaimState::NoDecision);
-        assert!(
-            paired
-                .reasons
-                .iter()
-                .all(|reason| qg6_flat_inference_only(&reason.code)),
-            "fixture accidentally carries a structural/design failure: {:?}",
-            paired.reasons
-        );
+        let paired = estimate_paired_experiment(&effect, &null, &estimator_config)
+            .expect("QG-6 paired estimate");
+        assert_eq!(paired.status, PairedEvidenceStatus::Valid);
+        assert_eq!(paired.claim_state, PairedClaimState::EligibleForDecision);
+        assert!(paired.reasons.is_empty());
 
-        let cell = EvidenceCell::evaluate(spec, paired, &policy()).expect("QG-6 evidence cell");
+        let protocol = Qg6FormalProtocolEvidence::new_against_authority(
+            &paired, quill_null, &authority, identity, contract,
+        )
+        .expect("construct retained QG-6 formal protocol");
+        let mut cell = EvidenceCell::evaluate(spec, paired, &policy()).expect("QG-6 evidence cell");
+        cell.attach_qg6_formal_protocol_against_authority(protocol, &policy(), &authority)
+            .expect("attach retained QG-6 formal protocol");
         let EvidenceCellBody::Paired {
             hierarchical_null: Some(null),
             ..
@@ -6587,9 +8285,23 @@ mod tests {
         assert_eq!(cell.status, EvidenceDecisionStatus::NoDecision);
         assert!(!cell.claim_eligible());
         assert!(cell.reasons.iter().any(|reason| {
-            reason.code == "qg6.tail_protocol_not_implemented"
+            reason.code == "qg6.joint_tail_null_invalid"
                 && reason.severity == EvidenceSeverity::NoClaim
         }));
+        assert!(
+            cell.reasons
+                .iter()
+                .filter(|reason| reason.severity == EvidenceSeverity::NoClaim)
+                .all(|reason| reason.code == "qg6.joint_tail_null_invalid"),
+            "the formal joint-tail check must be the only no-claim source: {:?}",
+            cell.reasons
+        );
+        assert!(
+            !cell
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "qg6.tail_protocol_not_implemented")
+        );
 
         let mut artifact = PerfEvidenceArtifact::assemble(
             PerfGate::Qg6,
@@ -6599,19 +8311,25 @@ mod tests {
             vec![cell],
         )
         .expect("QG-6 artifact");
-        bind_test_identity(
+        bind_test_identity_against_authorities(
             &mut artifact,
             PerfGate::Qg6,
             b"qg6-threshold",
             "qg6-hierarchy-primary",
+            &[],
+            &[&authority],
         );
         assert!(!artifact.ratchet_admissible());
         let directory = tempfile::tempdir().expect("QG-6 hierarchy-native artifact directory");
         let paths = artifact
-            .write_atomic(directory.path())
+            .write_atomic_against_authorities(directory.path(), &[], &[&authority])
             .expect("seal hierarchy-native QG-6 artifact");
-        let verified = PerfEvidenceArtifact::load_verified(&paths.json)
-            .expect("hierarchy-native QG-6 artifact must recompute");
+        let verified = PerfEvidenceArtifact::load_verified_against_authorities(
+            &paths.json,
+            &[],
+            &[&authority],
+        )
+        .expect("hierarchy-native QG-6 artifact must recompute");
         assert!(!verified.ratchet_admissible());
     }
 
@@ -6631,25 +8349,69 @@ mod tests {
             effect_pairs.extend((0..38).map(|_| (group_id, 1.0, 100_000.0)));
             null_pairs.extend([(group_id, 100.0, 100.0); 100]);
         }
+        let quill_null_pairs = QG6_QUERY_GROUP_IDS
+            .into_iter()
+            .flat_map(|group_id| [(group_id, 100.0, 100.0); 100])
+            .collect::<Vec<_>>();
         let mut effect = grouped_gauge_stream(&effect_pairs, 0, None);
         let mut null = grouped_gauge_stream(&null_pairs, 10_000, None);
+        let mut quill_null = grouped_gauge_stream(&quill_null_pairs, 20_000, None);
         bind_samples_to_spec(&mut effect, &spec);
         bind_samples_to_spec(&mut null, &spec);
-        qg6_test_fixture::attach_stream(&mut effect, true, identity, contract);
-        qg6_test_fixture::attach_stream(&mut null, false, identity, contract);
+        bind_samples_to_spec(&mut quill_null, &spec);
+        let estimator_config = config();
+        let authority = Qg6ScheduleAuthority::for_experiment(
+            Qg6ExperimentIdentity {
+                corpus_sha256: identity.prepared_corpus_sha256.clone(),
+                query_manifest_sha256: identity.query_manifest_sha256.clone(),
+                config_contract_sha256: identity.config_contract_sha256.clone(),
+                document_count: contract.document_count,
+                k: contract.k,
+            },
+            contract.groups.len(),
+            100,
+            1,
+            estimator_config.bootstrap_seed,
+        )
+        .expect("retained QG-6 schedule authority");
+        for (samples, comparison) in [
+            (&mut effect[..], Qg6Comparison::Effect),
+            (&mut null[..], Qg6Comparison::TantivyNull),
+            (&mut quill_null[..], Qg6Comparison::QuillNull),
+        ] {
+            qg6_test_fixture::attach_stream_against_schedule_authority(
+                samples, comparison, &authority, identity, contract,
+            );
+        }
 
-        let paired =
-            estimate_paired_experiment(&effect, &null, &config()).expect("QG-6 paired estimate");
-        assert_eq!(paired.status, PairedEvidenceStatus::ContradictorySummaries);
+        let paired = estimate_paired_experiment(&effect, &null, &estimator_config)
+            .expect("QG-6 paired estimate");
+        assert!(
+            matches!(
+                paired.status,
+                PairedEvidenceStatus::InvalidExperiment
+                    | PairedEvidenceStatus::ContradictorySummaries
+            ),
+            "fixture must remain non-admissible only through flat diagnostics: {:?}",
+            paired.reasons
+        );
         assert_eq!(paired.claim_state, PairedClaimState::NoDecision);
         assert!(
             paired
                 .reasons
                 .iter()
-                .all(|reason| qg6_flat_inference_only(&reason.code))
+                .all(|reason| qg6_flat_inference_only(&reason.code)),
+            "fixture accidentally carries a structural experiment failure: {:?}",
+            paired.reasons
         );
 
-        let cell = EvidenceCell::evaluate(spec, paired, &policy()).expect("QG-6 evidence cell");
+        let protocol = Qg6FormalProtocolEvidence::new_against_authority(
+            &paired, quill_null, &authority, identity, contract,
+        )
+        .expect("construct retained QG-6 formal protocol");
+        let mut cell = EvidenceCell::evaluate(spec, paired, &policy()).expect("QG-6 evidence cell");
+        cell.attach_qg6_formal_protocol_against_authority(protocol, &policy(), &authority)
+            .expect("attach retained QG-6 formal protocol");
         let EvidenceCellBody::Paired {
             hierarchical: Some(effect),
             reconciliation,
@@ -6663,8 +8425,8 @@ mod tests {
             !reconciliation.direction_agrees,
             "fixture must preserve the flat marginal conflict as a diagnostic"
         );
-        assert_eq!(cell.status, EvidenceDecisionStatus::NoDecision);
-        assert!(!cell.claim_eligible());
+        assert_eq!(cell.status, EvidenceDecisionStatus::MeasuredProvisional);
+        assert!(cell.claim_eligible());
         assert!(!cell.reasons.iter().any(|reason| {
             reason.code == "evidence.absolute_relative_direction_conflict"
                 || reason.code == "evidence.paired_invalid"
@@ -6678,13 +8440,23 @@ mod tests {
             vec![cell],
         )
         .expect("QG-6 artifact");
-        bind_test_identity(
+        bind_test_identity_against_authorities(
             &mut artifact,
             PerfGate::Qg6,
             b"qg6-threshold",
             "qg6-conflict-primary",
+            &[],
+            &[&authority],
         );
-        assert!(!artifact.ratchet_admissible());
+        assert_eq!(
+            artifact.gate_status,
+            EvidenceDecisionStatus::MeasuredProvisional
+        );
+        assert!(!artifact.has_exact_runnable_plan_coverage());
+        assert!(
+            !artifact.ratchet_admissible(),
+            "one-cell fixture cannot satisfy the complete runnable matrix even when its cell is eligible"
+        );
     }
 
     #[test]

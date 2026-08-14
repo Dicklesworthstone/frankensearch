@@ -2414,7 +2414,7 @@ mod tests {
 
         let manifest_sha256 = perf_manifest_contract_sha256(&manifest);
         let template = serde_json::from_str::<PerfGateArtifact>(include_str!(
-            "../../../.bench-history/QG-1.v7.unmeasured.latest.json"
+            "../../../.bench-history/QG-1.v8.unmeasured.latest.json"
         ))
         .expect("sentinel template");
         for gate in PerfGate::ALL {
@@ -3104,7 +3104,7 @@ mod tests {
 
         let manifest_sha256 = perf_manifest_contract_sha256(&manifest);
         let template = serde_json::from_str::<PerfGateArtifact>(include_str!(
-            "../../../.bench-history/QG-1.v7.unmeasured.latest.json"
+            "../../../.bench-history/QG-1.v8.unmeasured.latest.json"
         ))
         .expect("sentinel template");
         for gate in PerfGate::ALL {

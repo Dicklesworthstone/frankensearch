@@ -56,19 +56,22 @@ use frankensearch_quill_gauntlet::{
     QG1_QUILL_ENGINE_ID, QG1_STREAM_ROLE_EFFECT, QG1_STREAM_ROLE_QUILL_NULL,
     QG1_STREAM_ROLE_TANTIVY_NULL, QG1_STREAM_ROLE_TANTIVY_PILOT_EFFECT,
     QG1_STREAM_ROLE_TANTIVY_PILOT_NULL, QG1_TANTIVY_ENGINE_ID, QG6_QUERY_GROUP_IDS,
-    QG6_QUERY_GROUPS, Qg1AuthorityRegisterEntryV1, Qg1BatchCoverage, Qg1ExpectedAuthority,
-    Qg1IncumbentScreenEvidence, Qg1LifecycleProducer, Qg1LifecycleWitness, Qg1SampleBinding,
-    Qg1StartupHandshakeV1, Qg1TantivyBoundStream, Qg1TantivyDecisionStreamKind,
+    QG6_QUERY_GROUPS, QG6_TIMED_SEARCHES_PER_SAMPLE, Qg1AuthorityRegisterEntryV1, Qg1BatchCoverage,
+    Qg1ExpectedAuthority, Qg1IncumbentScreenEvidence, Qg1LifecycleProducer, Qg1LifecycleWitness,
+    Qg1SampleBinding, Qg1StartupHandshakeV1, Qg1TantivyBoundStream, Qg1TantivyDecisionStreamKind,
     Qg1TantivyIncumbentDecision, Qg1TantivyIncumbentPilot, Qg1TantivyIncumbentScreen,
     Qg1TantivyIncumbentScreenPlan, Qg1TantivySemanticContract, Qg1TantivyWriterMode, Qg6ArmRole,
-    Qg6Comparison, Qg6Phase, Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleBinding, Qg6SampleOrder,
-    Qg6SearchHit, Qg6SearchResult, Qg6SemanticContract, RankClass, RankedHit, ScoreEpsilonReason,
-    SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent, command_sha256_from_argv,
-    compare_observations, estimate_hierarchical_latency, estimate_paired_experiment,
-    estimate_paired_experiment_against_qg1_authority, machine_fingerprint, oracle_version_contract,
-    peak_rss_bytes, perf_manifest_contract_sha256, perf_writer_heap_bytes,
-    preregister_qg1_tantivy_incumbents, project_qg6_effect_leaf_distributions,
-    seeded_balanced_pair_order, seeded_interleaved_four_arm_schedule, validate_matrix,
+    Qg6Comparison, Qg6ExperimentIdentity, Qg6FormalProtocolEvidence, Qg6Phase,
+    Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleBinding, Qg6SampleOrder, Qg6ScheduleAuthority,
+    Qg6SearchHit, Qg6SearchResult, Qg6SemanticContract, Qg6StartupAuthoritySetV1, RankClass,
+    RankedHit, ScoreEpsilonReason, SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent,
+    command_sha256_from_argv, compare_observations, estimate_hierarchical_latency,
+    estimate_paired_experiment, estimate_paired_experiment_against_qg1_authority,
+    machine_fingerprint, oracle_version_contract, peak_rss_bytes, perf_manifest_contract_sha256,
+    perf_writer_heap_bytes, preregister_qg1_tantivy_incumbents,
+    project_qg6_effect_leaf_distributions, publish_qg6_startup_authorities_and_wait_for_ack,
+    query_manifest_sha256, seeded_balanced_pair_order, seeded_interleaved_six_arm_schedule,
+    validate_matrix,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -85,7 +88,6 @@ const SMOKE_SEGMENTS: usize = 4;
 // incumbent boundary group is preflight-only and is required to distinguish a
 // true rank mismatch from a native-order substitution inside a large BM25 tie.
 const QG6_TIE_EXPANSION_LIMIT: usize = 1_000_000;
-const QG6_TIMED_SEARCHES_PER_SAMPLE: usize = 128;
 const QG1_CORPUS_GENERATOR_REVISION: &str = "frankensearch-quill-qg1-synthetic-corpus-v1";
 const QG1_TERMINAL_NO_CLAIM_CODE: &str = "qg1.terminal_fact_unproved";
 const QG1_INCUMBENT_SCREEN_NO_CLAIM_CODE: &str = "qg1.incumbent_screen_incomplete";
@@ -98,7 +100,7 @@ const QG1_PROFILE_CHILD_MODE: &str = "qg1-profile";
 const QG1_PROFILE_CHILD_SCHEMA_VERSION: &str = "frankensearch.qg1-profile-child.v1";
 const QG1_PROFILE_HANDSHAKE_ENV: &str = "QUILL_PERF_CHILD_PROFILE_HANDSHAKE";
 const QG6_PROFILE_CHILD_MODE: &str = "qg6-profile";
-const QG6_PROFILE_CHILD_SCHEMA_VERSION: &str = "frankensearch.qg6-profile-child.v1";
+const QG6_PROFILE_CHILD_SCHEMA_VERSION: &str = "frankensearch.qg6-profile-child.v3";
 const QG6_HIT_PAGE_AB_MODE: &str = "qg6-hit-page-ab";
 const QG6_HIT_PAGE_AB_SCHEMA_VERSION: &str = "frankensearch.qg6-hit-page-ab.v1";
 const QG6_HIT_PAGE_RSS_MODE: &str = "qg6-hit-page-ab-rss";
@@ -1880,12 +1882,62 @@ struct Qg1ContinuousTimingRecord {
 
 enum PreparedQueryArm {
     Quill {
+        role: Qg6ArmRole,
         index: Box<QuillIndex>,
     },
     Tantivy {
         role: Qg6ArmRole,
         index: Box<TantivyIndex>,
     },
+}
+
+impl PreparedQueryArm {
+    const fn role(&self) -> Qg6ArmRole {
+        match self {
+            Self::Quill { role, .. } | Self::Tantivy { role, .. } => *role,
+        }
+    }
+
+    fn instance_identity(&self) -> usize {
+        match self {
+            Self::Quill { index, .. } => std::ptr::from_ref(index.as_ref()).addr(),
+            Self::Tantivy { index, .. } => std::ptr::from_ref(index.as_ref()).addr(),
+        }
+    }
+}
+
+fn validate_qg6_producer_arm_instances(
+    arm_instances: &BTreeMap<Qg6ArmRole, usize>,
+) -> Result<(), String> {
+    if arm_instances.len() != Qg6ArmRole::ALL.len()
+        || Qg6ArmRole::ALL
+            .into_iter()
+            .any(|role| !arm_instances.contains_key(&role))
+    {
+        return Err("QG-6 producer did not build every formal arm exactly once".to_owned());
+    }
+    if arm_instances
+        .values()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .len()
+        != Qg6ArmRole::ALL.len()
+    {
+        return Err("QG-6 producer reused one physical index for multiple formal arms".to_owned());
+    }
+    Ok(())
+}
+
+fn verify_qg6_schedule_authority_unchanged(
+    retained: &Qg6ScheduleAuthority,
+    observed: &Qg6ScheduleAuthority,
+) -> Result<(), String> {
+    retained.verify().map_err(|error| error.to_string())?;
+    observed.verify().map_err(|error| error.to_string())?;
+    if retained != observed {
+        return Err("QG-6 schedule authority changed after the pre-timing boundary".to_owned());
+    }
+    Ok(())
 }
 
 enum PreparedQueryHits {
@@ -5614,7 +5666,7 @@ fn values_checksum(samples: &[PerfRawSample]) -> u64 {
 
 fn qg6_config_contract_sha256(spec: &PerfCellSpec) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"frankensearch/qg6/semantic-config/v2\0");
+    hasher.update(b"frankensearch/qg6/semantic-config/v3\0");
     hasher.update(
         Qg6QuerySpec::normative_manifest_sha256()
             .expect("frozen 80-query manifest")
@@ -5819,6 +5871,59 @@ fn qg6_query_specs(spec: &PerfCellSpec) -> Vec<Qg6QuerySpec> {
     query_specs(spec.query_class.expect("QG-6 query class"))
 }
 
+fn precompute_qg6_startup_schedule_authorities(
+    scale: MatrixScale,
+    selected: &[PerfCellSpec],
+    runs: usize,
+    evidence_policy: &EvidencePolicy,
+    bootstrap_seed: u64,
+) -> Result<BTreeMap<String, Qg6ScheduleAuthority>, String> {
+    let mut authorities = BTreeMap::new();
+    for spec in selected.iter().filter(|spec| spec.gate == PerfGate::Qg6) {
+        let document_count = scale
+            .document_count(spec.document_count.ok_or_else(|| {
+                format!("QG-6 cell {:?} has no corpus cardinality", spec.fixture)
+            })?);
+        let corpus_sha256 = corpus_for(document_count)
+            .manifest()
+            .map_err(|error| format!("hash QG-6 corpus for {:?}: {error}", spec.fixture))?
+            .content_sha256;
+        let queries = qg6_query_specs(spec);
+        let query_count = queries.len();
+        let rounds_per_query = runs
+            .div_ceil(QG6_QUERY_GROUPS)
+            .max(evidence_policy.min_group_pairs);
+        let authority = Qg6ScheduleAuthority::for_experiment(
+            Qg6ExperimentIdentity {
+                corpus_sha256,
+                query_manifest_sha256: query_manifest_sha256(&queries),
+                config_contract_sha256: qg6_config_contract_sha256(spec),
+                document_count,
+                k: spec
+                    .k
+                    .ok_or_else(|| format!("QG-6 cell {:?} has no result cutoff", spec.fixture))?,
+            },
+            query_count,
+            rounds_per_query,
+            QG6_TIMED_SEARCHES_PER_SAMPLE,
+            production_cell_seed(bootstrap_seed, spec),
+        )
+        .map_err(|error| {
+            format!(
+                "freeze pre-setup QG-6 schedule authority for {:?}: {error}",
+                spec.fixture
+            )
+        })?;
+        let cell_id = format!("{}/{}/{}", spec.gate, spec.fixture, spec.metric);
+        if authorities.insert(cell_id.clone(), authority).is_some() {
+            return Err(format!(
+                "QG-6 startup authority set contains duplicate cell {cell_id:?}"
+            ));
+        }
+    }
+    Ok(authorities)
+}
+
 fn qg6_raw_sample(
     sample: &frankensearch_quill_gauntlet::Qg6TimedSample,
     provenance: &PerfSampleProvenance,
@@ -5827,16 +5932,23 @@ fn qg6_raw_sample(
     debug_assert!(matches!(
         (sample.comparison, sample.arm),
         (
-            Qg6Comparison::Null,
-            Qg6ArmRole::NullLeft | Qg6ArmRole::NullRight
+            Qg6Comparison::TantivyNull,
+            Qg6ArmRole::TantivyNullLeft | Qg6ArmRole::TantivyNullRight
+        ) | (
+            Qg6Comparison::QuillNull,
+            Qg6ArmRole::QuillNullLeft | Qg6ArmRole::QuillNullRight
         ) | (
             Qg6Comparison::Effect,
             Qg6ArmRole::EffectControl | Qg6ArmRole::EffectTreatment
         )
     ));
     let arm = match sample.arm {
-        Qg6ArmRole::NullLeft | Qg6ArmRole::EffectControl => PerfSampleArm::Control,
-        Qg6ArmRole::NullRight | Qg6ArmRole::EffectTreatment => PerfSampleArm::Treatment,
+        Qg6ArmRole::TantivyNullLeft | Qg6ArmRole::QuillNullLeft | Qg6ArmRole::EffectControl => {
+            PerfSampleArm::Control
+        }
+        Qg6ArmRole::TantivyNullRight | Qg6ArmRole::QuillNullRight | Qg6ArmRole::EffectTreatment => {
+            PerfSampleArm::Treatment
+        }
     };
     let order = match sample.order {
         Qg6SampleOrder::First => PerfSampleOrder::First,
@@ -5873,7 +5985,9 @@ fn prepared_qg6_streams(
     evidence: &EvidenceContext,
     scope: &PerfOperationScope,
     cell_seed: u64,
+    schedule_authority: &Qg6ScheduleAuthority,
 ) -> (
+    Vec<PerfRawSample>,
     Vec<PerfRawSample>,
     Vec<PerfRawSample>,
     PerfInputIdentity,
@@ -5890,6 +6004,7 @@ fn prepared_qg6_streams(
         .expect("QG-6 exact corpus manifest")
         .content_sha256;
     let queries = qg6_query_specs(spec);
+    let mut arm_instances = BTreeMap::new();
     let prepared = Qg6PreparedExperiment::prepare_with(
         corpus_sha256,
         qg6_config_contract_sha256(spec),
@@ -5897,7 +6012,12 @@ fn prepared_qg6_streams(
         spec.k.expect("QG-6 k"),
         queries,
         |role, identity, setup| {
-            if role == Qg6ArmRole::EffectTreatment {
+            let arm = if matches!(
+                role,
+                Qg6ArmRole::QuillNullLeft
+                    | Qg6ArmRole::QuillNullRight
+                    | Qg6ArmRole::EffectTreatment
+            ) {
                 let index = quill_in_memory(spec);
                 let _ = index_batches_observed(
                     context,
@@ -5909,9 +6029,10 @@ fn prepared_qg6_streams(
                 );
                 let _ = commit(context, &index);
                 setup.record_commit();
-                Ok(PreparedQueryArm::Quill {
+                PreparedQueryArm::Quill {
+                    role,
                     index: Box::new(index),
-                })
+                }
             } else {
                 let index = tantivy_in_memory(spec);
                 let _ = index_batches_observed(
@@ -5924,21 +6045,27 @@ fn prepared_qg6_streams(
                 );
                 let _ = commit(context, &index);
                 setup.record_commit();
-                Ok(PreparedQueryArm::Tantivy {
+                PreparedQueryArm::Tantivy {
                     role,
                     index: Box::new(index),
-                })
+                }
+            };
+            if arm_instances
+                .insert(role, arm.instance_identity())
+                .is_some()
+            {
+                return Err("QG-6 producer requested one formal arm more than once".to_owned());
             }
+            Ok(arm)
         },
     )
-    .expect("prepare four independent QG-6 arms");
+    .expect("prepare six independent QG-6 arms");
+    validate_qg6_producer_arm_instances(&arm_instances)
+        .expect("QG-6 producer built six distinct formal arm instances");
     let mut preflight_counts = BTreeMap::<Qg6ArmRole, BTreeMap<String, (u64, u64)>>::new();
     let mut preflight_search = |arm: &PreparedQueryArm, query: &Qg6QuerySpec, k: usize| {
         let result = qg6_preflight_result(context, arm, query, k)?;
-        let role = match arm {
-            PreparedQueryArm::Quill { .. } => Qg6ArmRole::EffectTreatment,
-            PreparedQueryArm::Tantivy { role, .. } => *role,
-        };
+        let role = arm.role();
         if preflight_counts
             .entry(role)
             .or_default()
@@ -5968,8 +6095,8 @@ fn prepared_qg6_streams(
                                 expected: &PreparedQueryPreflight,
                                 observed_role: Qg6ArmRole,
                                 observed: &PreparedQueryPreflight| {
-        if expected_role != Qg6ArmRole::NullLeft {
-            return Err("QG-6 semantic comparator baseline is not null-left".to_owned());
+        if expected_role != Qg6ArmRole::TantivyNullLeft {
+            return Err("QG-6 semantic comparator baseline is not Tantivy null-left".to_owned());
         }
         if expected.total_count != observed.total_count || expected.doc_count != observed.doc_count
         {
@@ -5983,14 +6110,17 @@ fn prepared_qg6_streams(
                 observed.doc_count,
             ));
         }
-        if observed_role != Qg6ArmRole::EffectTreatment {
+        if matches!(
+            observed_role,
+            Qg6ArmRole::TantivyNullRight | Qg6ArmRole::EffectControl
+        ) {
             return if expected.native_hits == observed.native_hits
                 && expected.public_result_sha256 == observed.public_result_sha256
             {
                 Ok(())
             } else {
                 Err(format!(
-                    "Tantivy A/A total-result preflight changed for query_id={} \
+                    "Tantivy same-engine result preflight changed for query_id={} \
                      expected_sha256={} observed_sha256={}",
                     query.id(),
                     expected.public_result_sha256,
@@ -6169,10 +6299,7 @@ fn prepared_qg6_streams(
         )
         .expect("QG-6 score/tie-envelope preflight parity");
     let mut search = |arm: &PreparedQueryArm, query: &Qg6QuerySpec, k: usize, phase: Qg6Phase| {
-        let role = match arm {
-            PreparedQueryArm::Quill { .. } => Qg6ArmRole::EffectTreatment,
-            PreparedQueryArm::Tantivy { role, .. } => *role,
-        };
+        let role = arm.role();
         if phase == Qg6Phase::Postflight {
             let result = qg6_preflight_result(context, arm, query, k)?;
             return Ok(PreparedQueryResult {
@@ -6208,16 +6335,31 @@ fn prepared_qg6_streams(
     let rounds_per_query = runs
         .div_ceil(QG6_QUERY_GROUPS)
         .max(evidence.policy.min_group_pairs);
+    assert_eq!(
+        schedule_authority.rounds_per_query, rounds_per_query,
+        "parent-acknowledged QG-6 authority has the wrong round cardinality"
+    );
+    assert_eq!(
+        schedule_authority.searches_per_sample, QG6_TIMED_SEARCHES_PER_SAMPLE,
+        "parent-acknowledged QG-6 authority has the wrong timing-leaf cardinality"
+    );
+    assert_eq!(
+        schedule_authority.schedule_seed, cell_seed,
+        "parent-acknowledged QG-6 authority has the wrong schedule seed"
+    );
     let measurement = validated
         .measure_query_p50_with_normalizer(
             evidence.policy.warmup_rounds,
-            rounds_per_query,
-            QG6_TIMED_SEARCHES_PER_SAMPLE,
-            cell_seed,
+            schedule_authority,
             &mut search,
             &mut normalize,
         )
         .expect("prepared QG-6 measurement");
+    measurement
+        .verify_against_schedule_authority(schedule_authority)
+        .expect("QG-6 measurement remains bound to the parent-acknowledged authority");
+    verify_qg6_schedule_authority_unchanged(schedule_authority, &measurement.schedule_authority)
+        .expect("QG-6 schedule authority is unchanged after timing");
     let mut result_receipt_hasher = Sha256::new();
     for sample in &measurement.samples {
         result_receipt_hasher.update(sample.result_sha256.as_bytes());
@@ -6237,7 +6379,8 @@ fn prepared_qg6_streams(
         "[qg6-prepared] fixture={} query_class={} query_count={} \
          global_query_manifest_sha256={} query_generator_revision={} corpus_generator_revision={} \
          corpus_sha256={} query_manifest_sha256={} \
-         config_contract_sha256={} schedule_seed={} warmup_rounds={} rounds_per_query={} \
+         config_contract_sha256={} schedule_seed={} schedule_authority_sha256={} \
+         warmup_rounds={} rounds_per_query={} \
          searches_per_sample={} \
          sample_input_sha256={} result_receipt_sha256={} lifecycle={}",
         spec.fixture,
@@ -6250,6 +6393,7 @@ fn prepared_qg6_streams(
         measurement.identity.query_manifest_sha256,
         measurement.identity.config_contract_sha256,
         measurement.schedule_seed,
+        measurement.schedule_authority.authority_sha256,
         measurement.warmup_rounds,
         measurement.rounds_per_query,
         measurement.searches_per_sample,
@@ -6257,18 +6401,21 @@ fn prepared_qg6_streams(
         lower_hex(&result_receipt_hasher.finalize()),
         serde_json::to_string(&measurement.lifecycle).expect("serialize QG-6 lifecycle"),
     );
-    let mut null_samples = Vec::new();
+    let mut tantivy_null_samples = Vec::new();
+    let mut quill_null_samples = Vec::new();
     let mut effect_samples = Vec::new();
     for sample in measurement.samples {
         let comparison = sample.comparison;
         let sample = qg6_raw_sample(&sample, &sample_provenance, scope);
         match comparison {
-            Qg6Comparison::Null => null_samples.push(sample),
+            Qg6Comparison::TantivyNull => tantivy_null_samples.push(sample),
+            Qg6Comparison::QuillNull => quill_null_samples.push(sample),
             Qg6Comparison::Effect => effect_samples.push(sample),
         }
     }
     (
-        null_samples,
+        tantivy_null_samples,
+        quill_null_samples,
         effect_samples,
         input_identity,
         semantic_contract,
@@ -6856,6 +7003,7 @@ fn collect_cell(
     runs: usize,
     evidence: &EvidenceContext,
     qg1_startup_producer: Option<&Qg1StartupProducer>,
+    qg6_schedule_authority: Option<&Qg6ScheduleAuthority>,
 ) -> CellCollection {
     if spec.gate == PerfGate::Qg10 {
         let samples = (0..runs)
@@ -6941,7 +7089,7 @@ fn collect_cell(
     let origin = origin.unwrap_or_else(Instant::now);
 
     // Every non-query gate establishes its A/A floor through the exact paired
-    // routine. QG-6 uses the prepared four-arm runner so setup is impossible
+    // routine. QG-6 uses the prepared six-arm runner so setup is impossible
     // inside timed samples. For every other gate the null and effect streams
     // are interleaved round-by-round under one seeded schedule (bd-yo5by): a
     // null band sampled in an earlier, quieter phase says nothing about the
@@ -6953,17 +7101,33 @@ fn collect_cell(
         effect_samples,
         input_identity,
         qg6_semantic_contract,
+        qg6_quill_null_samples,
     ) = if spec.gate == PerfGate::Qg6 {
-        let (null, effect, input_identity, semantic_contract) =
-            prepared_qg6_streams(context, spec, runs, evidence, &scope, cell_seed);
+        let schedule_authority = qg6_schedule_authority
+            .expect("selected QG-6 cell must consume its parent-acknowledged startup authority");
+        let (tantivy_null, quill_null, effect, input_identity, semantic_contract) =
+            prepared_qg6_streams(
+                context,
+                spec,
+                runs,
+                evidence,
+                &scope,
+                cell_seed,
+                schedule_authority,
+            );
         (
-            null,
+            tantivy_null,
             None,
             effect,
             Some(input_identity),
             Some(semantic_contract),
+            Some(quill_null),
         )
     } else {
+        assert!(
+            qg6_schedule_authority.is_none(),
+            "only QG-6 cells may consume a startup schedule authority"
+        );
         let mut oracle_null = PairedStreamRunner::new(
             context,
             spec,
@@ -7052,6 +7216,7 @@ fn collect_cell(
             effect.into_samples(),
             None,
             None,
+            None,
         )
     };
 
@@ -7077,7 +7242,10 @@ fn collect_cell(
         &block_ratios_treatment_over_control(&oracle_null_samples),
     )
     .expect("oracle null distribution");
-    let treatment_null_distribution = treatment_null_samples.as_ref().map(|samples| {
+    let quill_null_samples = treatment_null_samples
+        .as_deref()
+        .or(qg6_quill_null_samples.as_deref());
+    let treatment_null_distribution = quill_null_samples.map(|samples| {
         DistributionSummary::from_samples(&block_ratios_treatment_over_control(samples))
             .expect("treatment-arm null distribution")
     });
@@ -7112,8 +7280,7 @@ fn collect_cell(
         paired_distribution.median_ci95_high,
         paired_distribution.cv_pct,
         values_checksum(&oracle_null_samples)
-            ^ treatment_null_samples
-                .as_deref()
+            ^ quill_null_samples
                 .map_or(0, values_checksum)
                 .rotate_left(17)
             ^ values_checksum(&effect_samples).rotate_left(29),
@@ -7139,6 +7306,20 @@ fn collect_cell(
         qg1_expected_authority,
     )
     .expect("paired estimator rejected harness-produced streams");
+    let qg6_formal_protocol = qg6_quill_null_samples.map(|quill_null_samples| {
+        Qg6FormalProtocolEvidence::new_against_authority(
+            &experiment,
+            quill_null_samples,
+            qg6_schedule_authority.expect("QG-6 formal evidence must retain its startup authority"),
+            input_identity
+                .as_ref()
+                .expect("QG-6 formal evidence must retain its input identity"),
+            qg6_semantic_contract
+                .as_ref()
+                .expect("QG-6 formal evidence must retain its semantic contract"),
+        )
+        .expect("construct externally authorized formal QG-6 streams")
+    });
     let treatment_null_experiment = treatment_null_samples.as_ref().map(|samples| {
         estimate_paired_experiment_against_qg1_authority(
             &effect_samples,
@@ -7166,7 +7347,15 @@ fn collect_cell(
         &evidence.policy,
     )
     .expect("evidence cell evaluation");
-    if let Some(treatment_null_experiment) = treatment_null_experiment {
+    if let Some(qg6_formal_protocol) = qg6_formal_protocol {
+        cell.attach_qg6_formal_protocol_against_authority(
+            qg6_formal_protocol,
+            &evidence.policy,
+            qg6_schedule_authority
+                .expect("QG-6 attach must reuse the parent-acknowledged startup authority"),
+        )
+        .expect("attach externally authorized formal QG-6 streams");
+    } else if let Some(treatment_null_experiment) = treatment_null_experiment {
         // The QG-1 null is authenticated by the same retained producer
         // expectation as the effect stream. Authority-free attachment refuses
         // a config that carries a sealed QG-1 authority, so the live producer
@@ -8125,6 +8314,41 @@ fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
             build_profile: build_profile.clone(),
         },
     };
+    let retained_qg6_schedule_authorities = precompute_qg6_startup_schedule_authorities(
+        scale,
+        &selected_specs,
+        configured_runs,
+        &evidence_context.policy,
+        evidence_context.config.bootstrap_seed,
+    )
+    .expect("precompute the complete selected QG-6 schedule-authority set before setup");
+    if runner.plan.binding().gate == PerfGate::Qg6 {
+        assert_eq!(
+            retained_qg6_schedule_authorities.len(),
+            selected.len(),
+            "every selected QG-6 cell must have one precomputed startup authority"
+        );
+        let source_worktree_clean = std::env::var("QUILL_PERF_GIT_CLEAN").as_deref() == Ok("1");
+        let startup_authority_set = Qg6StartupAuthoritySetV1::new(
+            run_id.clone(),
+            revision.clone(),
+            source_worktree_clean,
+            retained_qg6_schedule_authorities.clone(),
+        )
+        .expect("seal the complete selected QG-6 startup authority set");
+        publish_qg6_startup_authorities_and_wait_for_ack(&startup_authority_set)
+            .expect("parent must durably acknowledge QG-6 authorities before setup or timing");
+        assert_eq!(
+            startup_authority_set.authorities(),
+            &retained_qg6_schedule_authorities,
+            "QG-6 startup authority set changed across the durable-ACK boundary"
+        );
+    } else {
+        assert!(
+            retained_qg6_schedule_authorities.is_empty(),
+            "non-QG-6 selections must not precompute QG-6 authorities"
+        );
+    }
     let configured_widths = configured_engine_widths(&selected);
     // The selected-cell order is the canonical startup transcript order.  All
     // engine producers are frozen and parent-acknowledged before preflight can
@@ -8183,6 +8407,7 @@ fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
     let mut qg1_incumbent_evidence = BTreeMap::new();
     for planned in &selected {
         let spec = &planned.spec;
+        let cell_id = format!("{}/{}/{}", spec.gate, spec.fixture, spec.metric);
         let collection = collect_cell(
             &context,
             spec,
@@ -8190,6 +8415,7 @@ fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
             configured_runs,
             &evidence_context,
             qg1_startup_producers.for_spec(spec),
+            retained_qg6_schedule_authorities.get(&cell_id),
         );
         let CellCollection {
             results,
@@ -8208,7 +8434,6 @@ fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
                 .expect("QG-1 screen retains its candidate universe")
                 .semantic_contract
                 .clone();
-            let cell_id = format!("{}/{}/{}", spec.gate, spec.fixture, spec.metric);
             let previous = qg1_incumbent_evidence.insert(
                 cell_id.clone(),
                 Qg1IncumbentScreenEvidence {
@@ -8252,6 +8477,25 @@ fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
         .expect("assemble QG evidence artifact");
         let retained_qg1_authorities = qg1_startup_producers.retained_authorities();
         let authority_bound_qg1 = gate == PerfGate::Qg1 && !retained_qg1_authorities.is_empty();
+        let retained_qg6_authorities = if gate == PerfGate::Qg6 {
+            artifact
+                .cells
+                .iter()
+                .map(|cell| {
+                    retained_qg6_schedule_authorities
+                        .get(&cell.cell_id)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "QG-6 cell {} lost its independently retained schedule authority",
+                                cell.cell_id
+                            )
+                        })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let authority_bound_qg6 = gate == PerfGate::Qg6 && !retained_qg6_authorities.is_empty();
         let incumbent_screens = if gate == PerfGate::Qg1 {
             std::mem::take(&mut qg1_incumbent_evidence)
                 .into_values()
@@ -8329,15 +8573,20 @@ fn bench_matrix(c: &mut Criterion, bench_identity: &BenchExecutableIdentity) {
                 "screenless partial or tokenizer-only QG-1 evidence cannot claim"
             );
         }
-        let (paths, reloaded) = if authority_bound_qg1 {
+        let (paths, reloaded) = if authority_bound_qg1 || authority_bound_qg6 {
             let paths = artifact
-                .write_atomic_against_qg1_authorities(&output_dir, &retained_qg1_authorities)
-                .expect("write authority-bound QG-1 evidence artifact");
-            let reloaded = PerfEvidenceArtifact::load_verified_against_qg1_authorities(
+                .write_atomic_against_authorities(
+                    &output_dir,
+                    &retained_qg1_authorities,
+                    &retained_qg6_authorities,
+                )
+                .expect("write externally authorized QG evidence artifact");
+            let reloaded = PerfEvidenceArtifact::load_verified_against_authorities(
                 &paths.json,
                 &retained_qg1_authorities,
+                &retained_qg6_authorities,
             )
-            .expect("reload QG-1 incumbent evidence with the retained authority set");
+            .expect("reload QG evidence with the retained external authority sets");
             (paths, reloaded)
         } else {
             let paths = artifact
@@ -9002,7 +9251,7 @@ fn run_qg6_profile_child() -> Result<(), String> {
         .max(EvidencePolicy::predeclared().min_group_pairs);
     let schedule_seed = production_cell_seed(qg6_profile_bootstrap_seed_from_env()?, &spec);
     let schedule =
-        seeded_interleaved_four_arm_schedule(queries.len(), rounds_per_query, schedule_seed)
+        seeded_interleaved_six_arm_schedule(queries.len(), rounds_per_query, schedule_seed)
             .map_err(|error| format!("construct exact QG-6 profile schedule: {error}"))?;
     let schedule_sha256 = qg6_profile_digest("schedule", &schedule)?;
     let treatment_blocks = schedule
@@ -9031,6 +9280,7 @@ fn run_qg6_profile_child() -> Result<(), String> {
     let _ = index_batches(&context, &index, &corpus, document_count, None);
     let _ = commit(&context, &index);
     let arm = PreparedQueryArm::Quill {
+        role: Qg6ArmRole::EffectTreatment,
         index: Box::new(index),
     };
     let preflight = queries
@@ -9044,7 +9294,7 @@ fn run_qg6_profile_child() -> Result<(), String> {
         .collect::<Vec<_>>();
     let preflight_receipt_sha256 = qg6_profile_digest("preflight-receipts", &preflight_receipts)?;
 
-    let PreparedQueryArm::Quill { index } = &arm else {
+    let PreparedQueryArm::Quill { index, .. } = &arm else {
         unreachable!("QG-6 profile child builds Quill only")
     };
     for _ in 0..QG6_PROFILE_WARMUP_ROUNDS {
@@ -9125,6 +9375,9 @@ fn run_qg6_profile_child() -> Result<(), String> {
     }
     if retained_results.len() != retained_result_capacity {
         return Err("QG-6 profile treatment call count differs from the exact schedule".to_owned());
+    }
+    if qg6_profile_digest("schedule", &schedule)? != input.schedule_sha256 {
+        return Err("QG-6 profile schedule changed after the ready boundary".to_owned());
     }
     emit_qg6_profile_event(&serde_json::json!({
         "schema_version": QG6_PROFILE_CHILD_SCHEMA_VERSION,
@@ -9422,13 +9675,14 @@ fn run_qg6_hit_page_rss_child() -> Result<(), String> {
     let _ = index_batches(&context, &index, &corpus, document_count, None);
     let _ = commit(&context, &index);
     let prepared_arm = PreparedQueryArm::Quill {
+        role: Qg6ArmRole::EffectTreatment,
         index: Box::new(index),
     };
     let preflight = queries
         .iter()
         .map(|query| qg6_preflight_result(&context, &prepared_arm, query, k))
         .collect::<Result<Vec<_>, _>>()?;
-    let PreparedQueryArm::Quill { index } = &prepared_arm else {
+    let PreparedQueryArm::Quill { index, .. } = &prepared_arm else {
         unreachable!("QG-6 hit-page RSS child builds Quill only")
     };
     let mut canonical_pages = Vec::new();
@@ -9623,13 +9877,14 @@ fn run_qg6_hit_page_ab() -> Result<(), String> {
     let _ = index_batches(&context, &index, &corpus, document_count, None);
     let _ = commit(&context, &index);
     let arm = PreparedQueryArm::Quill {
+        role: Qg6ArmRole::EffectTreatment,
         index: Box::new(index),
     };
     let preflight = queries
         .iter()
         .map(|query| qg6_preflight_result(&context, &arm, query, k))
         .collect::<Result<Vec<_>, _>>()?;
-    let PreparedQueryArm::Quill { index } = &arm else {
+    let PreparedQueryArm::Quill { index, .. } = &arm else {
         unreachable!("QG-6 hit-page A/B builds Quill only")
     };
     let mut canonical_pages = Vec::new();
@@ -10009,6 +10264,8 @@ fn main() {
     }
     #[cfg(test)]
     if std::env::var_os("QUILL_PERF_QG6_PROFILE_CHILD_SELF_CHECK").is_some() {
+        tests::assert_qg6_producer_arm_instance_contract();
+        tests::assert_qg6_schedule_authority_freeze_contract();
         tests::assert_qg6_profile_child_resolver_contract();
         tests::assert_qg6_profile_child_wire_contract();
         tests::assert_qg6_native_result_normalization_contract();
@@ -12952,6 +13209,72 @@ mod tests {
         assert_qg1_profile_child_wire_contract();
     }
 
+    pub fn assert_qg6_producer_arm_instance_contract() {
+        let distinct = super::Qg6ArmRole::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, role)| (role, index + 1))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert!(super::validate_qg6_producer_arm_instances(&distinct).is_ok());
+
+        let mut reused_treatment = distinct.clone();
+        let treatment_identity = reused_treatment[&super::Qg6ArmRole::EffectTreatment];
+        reused_treatment.insert(super::Qg6ArmRole::QuillNullRight, treatment_identity);
+        assert!(super::validate_qg6_producer_arm_instances(&reused_treatment).is_err());
+
+        let mut missing_role = distinct;
+        missing_role.remove(&super::Qg6ArmRole::QuillNullLeft);
+        assert!(super::validate_qg6_producer_arm_instances(&missing_role).is_err());
+    }
+
+    #[test]
+    fn qg6_producer_requires_all_six_distinct_physical_arm_instances() {
+        assert_qg6_producer_arm_instance_contract();
+    }
+
+    pub fn assert_qg6_schedule_authority_freeze_contract() {
+        let query = super::Qg6QuerySpec::new("identifier-00", "term00042")
+            .expect("construct QG-6 authority test query");
+        let prepared = super::Qg6PreparedExperiment::prepare_with(
+            "a".repeat(64),
+            "b".repeat(64),
+            1,
+            10,
+            vec![query],
+            |role, _identity, setup| {
+                setup.record_population_batch(1);
+                setup.record_commit();
+                Ok::<_, String>(role)
+            },
+        )
+        .expect("prepare six authority test arms");
+        let validated = prepared
+            .validate_exact_parity(&mut |_role, _query, _k| {
+                Ok(super::Qg6SearchResult::from_ranked_hits(
+                    vec![super::Qg6SearchHit::new("doc-0", 1.0_f32.to_bits())],
+                    1,
+                    1,
+                ))
+            })
+            .expect("validate authority test arms");
+        let retained = validated
+            .schedule_authority(2, 1, 0x5eed)
+            .expect("freeze authority before ready");
+        assert!(super::verify_qg6_schedule_authority_unchanged(&retained, &retained).is_ok());
+
+        let mut changed_after_ready = retained.clone();
+        changed_after_ready.schedule_seed ^= 1;
+        assert!(
+            super::verify_qg6_schedule_authority_unchanged(&retained, &changed_after_ready,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn qg6_producer_rejects_schedule_authority_changes_after_ready() {
+        assert_qg6_schedule_authority_freeze_contract();
+    }
+
     pub fn assert_qg6_profile_child_resolver_contract() {
         let matrix = frankensearch_quill_gauntlet::PerfMatrixSpec::complete();
         let spec = super::resolve_qg6_profile_spec(&matrix)
@@ -12972,13 +13295,13 @@ mod tests {
             super::PairedEstimatorConfig::predeclared(super::PERF_DEFAULT_BOOTSTRAP_SEED);
         let production_seed = production_config.bootstrap_seed ^ super::fixture_seed(&spec.fixture);
         assert_eq!(child_seed, production_seed);
-        let child_schedule = super::seeded_interleaved_four_arm_schedule(
+        let child_schedule = super::seeded_interleaved_six_arm_schedule(
             super::QG6_QUERY_GROUPS,
             rounds_per_query,
             child_seed,
         )
         .expect("construct child QG-6 profile schedule");
-        let production_schedule = super::seeded_interleaved_four_arm_schedule(
+        let production_schedule = super::seeded_interleaved_six_arm_schedule(
             super::QG6_QUERY_GROUPS,
             rounds_per_query,
             production_seed,

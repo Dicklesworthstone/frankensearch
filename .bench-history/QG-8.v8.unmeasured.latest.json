@@ -1,0 +1,13 @@
+{
+  "schema_version": "quill-perf-artifact-v8",
+  "gate": "Qg8",
+  "bench_elf_sha256": "unmeasured",
+  "machine_fingerprint": "unmeasured",
+  "git_rev": "unmeasured",
+  "run_window": "unmeasured",
+  "run_id": "unmeasured",
+  "corpus_manifest_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "manifest_sha256": "dc4aee8548433ab9c3c5b71f684a626f65136eeb88c21bfeb5607a0fa467da1b",
+  "cells": [],
+  "laws_attested": false
+}
