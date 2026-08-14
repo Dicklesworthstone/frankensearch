@@ -2405,7 +2405,7 @@ fn expected_gate_keys(plan: &PerfApplicabilityPlan) -> BTreeSet<CellKey> {
                     unit: "ratio".to_owned(),
                 },
             ];
-            if plan.binding.gate == PerfGate::Qg1 {
+            if matches!(plan.binding.gate, PerfGate::Qg1 | PerfGate::Qg6) {
                 keys.push(CellKey {
                     fixture: spec.fixture.clone(),
                     metric: format!("{}_quill_over_quill", spec.metric),
@@ -6487,7 +6487,7 @@ mod tests {
     fn qg6_promotion_requires_rerun_hierarchical_ci_to_pass_independently() {
         let (candidate, candidate_evidence) = qg6_complete_pair("candidate", [[1.0; 3]; 4]);
         let (rerun, rerun_evidence) =
-            qg6_complete_pair("rerun", [[0.80; 3], [1.0; 3], [1.0; 3], [1.25; 3]]);
+            qg6_complete_pair("rerun", [[0.80; 3], [1.0; 3], [1.0; 3], [1.0; 3]]);
         let mut baseline = candidate.clone();
         baseline.run_id = "baseline".to_owned();
         baseline.git_rev = "0".repeat(40);
@@ -6548,8 +6548,8 @@ mod tests {
         assert_eq!(result.decision, PerfGateDecision::Block);
         assert!(result.reasons.iter().any(|reason| {
             reason.code == "perf.ratchet.gate_target_missed"
-                && reason.message.contains("Quill p99")
-                && reason.message.contains("exceeds oracle")
+                && reason.message.contains("joint true-leaf p99")
+                && reason.message.contains("does not clear oracle parity")
         }));
         assert!(!result.reasons.iter().any(|reason| {
             reason.code == "perf.ratchet.qg6_hierarchical_reproduction_failed"
