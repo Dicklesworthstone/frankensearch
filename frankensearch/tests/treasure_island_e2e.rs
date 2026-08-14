@@ -979,6 +979,53 @@ mod lexical {
         });
     }
 
+    /// The same depth boundary again, with the wrapper chain MIXED.
+    ///
+    /// Each sibling above is inert for its own reason, and each was normalized
+    /// separately: unfielded wrappers are peeled as a leading run, and a pure
+    /// chain of one repeated field scope collapses to a single scope. A chain
+    /// that interleaves the two is inert for both reasons at once — an
+    /// unfielded group inside `content:(...)` still inherits the scope, so it
+    /// cannot change what matches — yet neither normalization claimed it, so
+    /// every group was charged and the innermost met the nesting limit.
+    ///
+    /// One unfielded paren anywhere in the leading run was enough to defeat the
+    /// whole peel, which is why this shape stayed match-none while both pure
+    /// forms passed.
+    #[cfg(feature = "lexical-tantivy")]
+    #[test]
+    fn public_deep_mixed_scope_groups_match_tantivy_oracle() {
+        super::quiet_logging();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let docs = vec![
+                IndexableDocument::new("nested-hit", "depthneedle"),
+                IndexableDocument::new("negative-control", "haystack"),
+            ];
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let quill = build_quill_index(&cx, &tmp.path().join("quill"), &docs).await;
+            let tantivy = build_tantivy_index(&cx, &tmp.path().join("tantivy"), &docs).await;
+            // One unfielded group innermost, so the leading run is neither a
+            // pure unfielded prefix nor a pure same-field chain.
+            let scoped_count = frankensearch::quill::MAX_QUERY_DEPTH;
+            let group_count = scoped_count + 1;
+            let query = format!(
+                "{}(depthneedle{}",
+                "content:(".repeat(scoped_count),
+                ")".repeat(group_count)
+            );
+
+            let tantivy_hits = public_observation(&tantivy, &cx, &query, 10).await;
+            assert_eq!(tantivy_hits.len(), 1);
+            assert_eq!(tantivy_hits[0].0, "nested-hit");
+
+            let quill_hits = public_observation(&quill, &cx, &query, 10).await;
+            assert_eq!(
+                quill_hits, tantivy_hits,
+                "a mixed unfielded/field-scoped wrapper chain must not turn a valid public query into match-none"
+            );
+        });
+    }
+
     #[cfg(feature = "lexical-tantivy")]
     #[test]
     fn public_unfielded_three_term_or_matches_tantivy_score_bits_and_order() {

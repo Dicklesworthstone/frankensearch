@@ -1184,42 +1184,70 @@ fn peel_redundant_outer_groups(tokens: &mut Vec<LexToken>) {
     tokens.truncate(tokens.len() - peel_count);
 }
 
-/// Collapse only a pure whole-stream chain of identical field scopes.
+/// Collapse a pure whole-stream chain of one field scope, including any
+/// unfielded groups interleaved with it.
 ///
-/// One innermost wrapper is retained: it still supplies the field scope to
-/// otherwise-unqualified leaves. Any nested grouping, different field, boost,
-/// unmatched closure, or material outside the closing suffix leaves the stream
-/// untouched for ordinary parser recovery.
+/// One fielded wrapper is retained: it still supplies the field scope to
+/// otherwise-unqualified leaves. The interleaved unfielded groups need no
+/// replacement because a group inside a field scope already inherits it, so
+/// `content:((x))`, `(content:(x))` and `content:(content:(x))` all denote the
+/// same query as `content:(x)` — which is exactly why charging them against the
+/// depth limit turned a valid query into match-none.
+///
+/// A chain mixing two DIFFERENT field scopes is not inert and is refused, as is
+/// any nested grouping, boost, unmatched closure, or material outside the
+/// closing suffix; those leave the stream untouched for ordinary parser
+/// recovery.
 fn peel_redundant_same_field_outer_scopes(tokens: &mut Vec<LexToken>) {
-    let Some(LexToken::LeftParen {
-        field: Some(field), ..
-    }) = tokens.first()
-    else {
+    if !matches!(tokens.first(), Some(LexToken::LeftParen { .. })) {
         return;
-    };
-    let field = field.clone();
+    }
     let opening_count = tokens
         .iter()
         .take_while(|token| matches!(token, LexToken::LeftParen { .. }))
         .count();
-    let same_scope_count = tokens
+    if opening_count < 2 {
+        return;
+    }
+    let opening = &tokens[..opening_count];
+
+    // The retained wrapper must be a FIELDED one. Keeping whichever opener
+    // happened to be innermost would silently drop the scope when that opener
+    // is an unfielded group, turning a field-scoped query into a default-field
+    // one — a wrong answer rather than a refused one.
+    let Some(scope_index) = opening
         .iter()
-        .take_while(|token| {
-            matches!(token, LexToken::LeftParen { field: Some(candidate), .. } if candidate == &field)
-        })
-        .count();
-    if same_scope_count < 2 || opening_count != same_scope_count {
+        .position(|token| matches!(token, LexToken::LeftParen { field: Some(_), .. }))
+    else {
+        // A wholly unfielded run is the other normalization's job.
+        return;
+    };
+    let LexToken::LeftParen {
+        field: Some(field), ..
+    } = &opening[scope_index]
+    else {
+        return;
+    };
+    let uniform_scope = opening.iter().all(|token| match token {
+        LexToken::LeftParen { field: None, .. } => true,
+        LexToken::LeftParen {
+            field: Some(candidate),
+            ..
+        } => candidate == field,
+        _ => false,
+    });
+    if !uniform_scope {
         return;
     }
 
-    let Some(body_end) = tokens.len().checked_sub(same_scope_count) else {
+    let Some(body_end) = tokens.len().checked_sub(opening_count) else {
         return;
     };
-    if body_end <= same_scope_count
+    if body_end <= opening_count
         || tokens[body_end..]
             .iter()
             .any(|token| !matches!(token, LexToken::RightParen { boost: None, .. }))
-        || tokens[same_scope_count..body_end].iter().any(|token| {
+        || tokens[opening_count..body_end].iter().any(|token| {
             matches!(
                 token,
                 LexToken::LeftParen { .. } | LexToken::RightParen { .. }
@@ -1229,8 +1257,10 @@ fn peel_redundant_same_field_outer_scopes(tokens: &mut Vec<LexToken>) {
         return;
     }
 
-    let peel_count = same_scope_count - 1;
-    tokens.drain(..peel_count);
+    let retained = tokens[scope_index].clone();
+    let peel_count = opening_count - 1;
+    tokens.drain(..opening_count);
+    tokens.insert(0, retained);
     tokens.truncate(tokens.len() - peel_count);
 }
 
@@ -7222,10 +7252,64 @@ mod tests {
         );
     }
 
+    /// A chain that interleaves unfielded groups with one repeated field scope
+    /// is inert for both reasons at once, so neither pure normalization claimed
+    /// it and every group was charged against the depth limit.
+    #[test]
+    fn redundant_mixed_scope_outer_groups_do_not_consume_the_depth_budget() {
+        let scoped = parser().parse("content:(needle)");
+        for (label, query) in [
+            (
+                "unfielded innermost",
+                format!(
+                    "{}(needle{}",
+                    "content:(".repeat(MAX_QUERY_DEPTH + 20),
+                    ")".repeat(MAX_QUERY_DEPTH + 21)
+                ),
+            ),
+            (
+                "unfielded outermost",
+                format!(
+                    "({}needle{}",
+                    "content:(".repeat(MAX_QUERY_DEPTH + 20),
+                    ")".repeat(MAX_QUERY_DEPTH + 21)
+                ),
+            ),
+        ] {
+            let parsed = parser().parse(&query);
+            assert_eq!(parsed.query, scoped.query, "{label}");
+            assert!(
+                parsed
+                    .diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.kind != QueryDiagnosticKind::DepthLimit),
+                "{label} must not charge the depth budget"
+            );
+        }
+    }
+
+    /// The retained wrapper must be the FIELDED one.
+    ///
+    /// Keeping whichever opener happened to be innermost would drop the scope
+    /// whenever that opener is an unfielded group, quietly widening a
+    /// `content`-scoped query to the default fields. That is a wrong answer,
+    /// not a refused one, so it is pinned separately from the depth property.
+    #[test]
+    fn mixed_scope_peeling_retains_the_field_scope() {
+        let peeled = parser().parse("content:((needle))");
+        assert_eq!(peeled.query, parser().parse("content:(needle)").query);
+        assert_ne!(
+            peeled.query,
+            parser().parse("(needle)").query,
+            "peeling must not widen a scoped query to the default fields"
+        );
+    }
+
     #[test]
     fn same_field_outer_scope_peeling_refuses_non_pure_wrappers() {
         for raw in [
             "content:(title:(needle))",
+            "content:((title:(needle)))",
             "content:(content:(needle)^2)",
             "content:(content:(needle))^2",
             "content:(content:(needle) title)",
