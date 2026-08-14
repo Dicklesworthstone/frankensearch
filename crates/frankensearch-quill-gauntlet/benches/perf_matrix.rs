@@ -18,7 +18,7 @@ use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::hint::black_box;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -144,6 +144,7 @@ use frankensearch_quill_gauntlet::{
     oracle_version_contract,
     peak_rss_bytes,
     perf_manifest_contract_sha256,
+    perf_writer_heap_bytes,
     preregister_qg1_tantivy_incumbents,
     seeded_balanced_pair_order,
     validate_matrix,
@@ -172,6 +173,9 @@ const QG1_LIVE_STARTUP_DISCRIMINATOR_ENV: &str = "QUILL_PERF_QG1_LIVE_STARTUP_DI
 const QG1_X86_DIAGNOSTIC_ENV: &str = "QUILL_PERF_QG1_X86_DIAGNOSTIC";
 const QG1_X86_DIAGNOSTIC_FIXTURE: &str = "bulk/medium/8/positions_on";
 const QG1_X86_DIAGNOSTIC_SCHEMA_VERSION: &str = "frankensearch.qg1-x86-diagnostic.v1";
+const QG1_PROFILE_CHILD_MODE: &str = "qg1-profile";
+const QG1_PROFILE_CHILD_SCHEMA_VERSION: &str = "frankensearch.qg1-profile-child.v1";
+const QG1_PROFILE_HANDSHAKE_ENV: &str = "QUILL_PERF_CHILD_PROFILE_HANDSHAKE";
 const QG1_LIVE_STARTUP_ORDINARY_MARKER: &[u8] = b"qg1-live-startup-work-after-ack\n";
 #[cfg(test)]
 const QG1_AUTHORITY_SUBPROCESS_ENV: &str = "QUILL_PERF_QG1_AUTHORITY_SUBPROCESS";
@@ -8542,6 +8546,335 @@ fn run_open_child() {
     println!("quill-perf-child\t{}", timer.elapsed().as_nanos());
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Qg1ProfileHandshakeMode {
+    Disabled,
+    StdioV1,
+}
+
+fn resolve_qg1_profile_handshake(value: Option<&str>) -> Result<Qg1ProfileHandshakeMode, String> {
+    match value {
+        None => Ok(Qg1ProfileHandshakeMode::Disabled),
+        Some("stdio-v1") => Ok(Qg1ProfileHandshakeMode::StdioV1),
+        Some(other) => Err(format!(
+            "{QG1_PROFILE_HANDSHAKE_ENV} must be stdio-v1 when present, got {other:?}"
+        )),
+    }
+}
+
+fn qg1_profile_handshake_from_env() -> Result<Qg1ProfileHandshakeMode, String> {
+    match std::env::var(QG1_PROFILE_HANDSHAKE_ENV) {
+        Ok(value) => resolve_qg1_profile_handshake(Some(&value)),
+        Err(std::env::VarError::NotPresent) => resolve_qg1_profile_handshake(None),
+        Err(error) => Err(format!(
+            "{QG1_PROFILE_HANDSHAKE_ENV} is not valid Unicode: {error}"
+        )),
+    }
+}
+
+fn resolve_qg1_profile_spec(matrix: &PerfMatrixSpec) -> Result<PerfCellSpec, String> {
+    let canonical_sha256 = matrix
+        .gate_contract_sha256(PerfGate::Qg1)
+        .map_err(|error| format!("hash canonical QG-1 matrix: {error}"))?;
+    if canonical_sha256 != PerfMatrixSpec::QG1_CANONICAL_SHA256 {
+        return Err(format!(
+            "QG-1 profile child requires canonical matrix {}, got {canonical_sha256}",
+            PerfMatrixSpec::QG1_CANONICAL_SHA256
+        ));
+    }
+
+    let matching = matrix
+        .for_gate(PerfGate::Qg1)
+        .into_iter()
+        .filter(|spec| spec.fixture == QG1_X86_DIAGNOSTIC_FIXTURE)
+        .collect::<Vec<_>>();
+    let [spec] = matching.as_slice() else {
+        return Err(format!(
+            "QG-1 profile child requires exactly one {:?} fixture, found {}",
+            QG1_X86_DIAGNOSTIC_FIXTURE,
+            matching.len()
+        ));
+    };
+    let expected_document_count = PerfCorpus::Medium.document_count();
+    let expected_writer_heap_bytes = perf_writer_heap_bytes(8);
+    if spec.gate != PerfGate::Qg1
+        || spec.metric != "docs_per_second"
+        || spec.corpus != Some(PerfCorpus::Medium)
+        || spec.document_count != Some(expected_document_count)
+        || spec.threads != Some(8)
+        || spec.writer_heap_bytes != Some(expected_writer_heap_bytes)
+        || spec.positions != Some(PositionMode::On)
+    {
+        return Err(format!(
+            "QG-1 profile child fixture contract drifted: fixture={:?} metric={:?} \
+             corpus={:?} documents={:?} threads={:?} heap={:?} positions={:?}",
+            spec.fixture,
+            spec.metric,
+            spec.corpus,
+            spec.document_count,
+            spec.threads,
+            spec.writer_heap_bytes,
+            spec.positions
+        ));
+    }
+    Ok((*spec).clone())
+}
+
+fn qg1_profile_corpus_source_sha256(manifest: &CorpusManifest) -> Result<String, String> {
+    let source = serde_json::to_vec(&manifest.source)
+        .map_err(|error| format!("serialize QG-1 corpus source identity: {error}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"frankensearch-quill-qg1-profile-source-v1\0");
+    hash_qg1_indexed_bytes(&mut hasher, manifest.generator_id.as_bytes());
+    hash_qg1_indexed_bytes(&mut hasher, &source);
+    Ok(lower_hex(&hasher.finalize()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Qg1ProfileInputIdentity {
+    fixture: String,
+    fixture_contract_sha256: String,
+    document_count: u64,
+    batch_documents: usize,
+    batch_count: usize,
+    writer_threads: usize,
+    writer_heap_bytes: usize,
+    positions: bool,
+    canonical_corpus_sha256: String,
+    corpus_manifest_sha256: String,
+    corpus_content_sha256: String,
+    indexed_content_sha256: String,
+    corpus_source_sha256: String,
+    source_revision: String,
+    executable_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Qg1ProfileIndexIdentity {
+    manifest_generation: u64,
+    document_count: u64,
+    segment_count: usize,
+    file_bytes: u64,
+    file_sha256: String,
+}
+
+fn qg1_profile_index_identity(
+    index: &QuillIndex,
+    expected_document_count: u64,
+) -> Result<Qg1ProfileIndexIdentity, String> {
+    let snapshot = index
+        .snapshot()
+        .map_err(|error| format!("capture committed QG-1 profile snapshot: {error}"))?;
+    if snapshot.doc_count() != expected_document_count {
+        return Err(format!(
+            "QG-1 profile index contains {} live documents but expected \
+             {expected_document_count}",
+            snapshot.doc_count()
+        ));
+    }
+
+    let mut file_bytes = 0_u64;
+    let mut aggregate = Sha256::new();
+    aggregate.update(b"frankensearch-quill-qg1-profile-index-bytes-v1\0");
+    aggregate.update(
+        u64::try_from(snapshot.segments().len())
+            .map_err(|_| "QG-1 profile segment count does not fit u64".to_owned())?
+            .to_le_bytes(),
+    );
+    for (ordinal, segment) in snapshot.segments().iter().enumerate() {
+        segment
+            .verify()
+            .map_err(|error| format!("verify QG-1 profile segment {ordinal}: {error}"))?;
+        let manifest = segment.manifest();
+        let bytes = segment.source_bytes();
+        let observed_file_bytes = u64::try_from(bytes.len())
+            .map_err(|_| format!("QG-1 profile segment {ordinal} length does not fit u64"))?;
+        if observed_file_bytes != manifest.file_len {
+            return Err(format!(
+                "QG-1 profile segment {ordinal} has {observed_file_bytes} bytes but its \
+                 manifest names {}",
+                manifest.file_len
+            ));
+        }
+        file_bytes = file_bytes
+            .checked_add(observed_file_bytes)
+            .ok_or_else(|| "QG-1 profile index byte count overflowed".to_owned())?;
+        aggregate.update(
+            u64::try_from(ordinal)
+                .map_err(|_| "QG-1 profile segment ordinal does not fit u64".to_owned())?
+                .to_le_bytes(),
+        );
+        hash_qg1_indexed_bytes(&mut aggregate, bytes);
+    }
+    if file_bytes == 0 || snapshot.segments().is_empty() {
+        return Err("QG-1 profile index produced no committed segment bytes".to_owned());
+    }
+    Ok(Qg1ProfileIndexIdentity {
+        manifest_generation: snapshot.loaded_manifest().manifest.generation,
+        document_count: snapshot.doc_count(),
+        segment_count: snapshot.segments().len(),
+        file_bytes,
+        file_sha256: lower_hex(&aggregate.finalize()),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Qg1ProfileCompleteEvent {
+    schema_version: String,
+    event: String,
+    pid: u32,
+    claim_status: String,
+    feed_elapsed_ns: u64,
+    commit_elapsed_ns: u64,
+    ingest_elapsed_ns: u64,
+    input: Qg1ProfileInputIdentity,
+    index: Qg1ProfileIndexIdentity,
+}
+
+fn qg1_profile_wire<T: Serialize>(event: &T) -> Result<String, String> {
+    serde_json::to_string(event).map_err(|error| format!("serialize QG-1 profile event: {error}"))
+}
+
+fn emit_qg1_profile_event<T: Serialize>(event: &T) -> Result<(), String> {
+    let wire = qg1_profile_wire(event)?;
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    writeln!(stdout, "quill-qg1-profile\t{wire}")
+        .map_err(|error| format!("emit QG-1 profile event: {error}"))?;
+    stdout
+        .flush()
+        .map_err(|error| format!("flush QG-1 profile event: {error}"))
+}
+
+fn wait_for_qg1_profile_command(expected: &str) -> Result<(), String> {
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    let bytes = stdin
+        .lock()
+        .read_line(&mut line)
+        .map_err(|error| format!("read QG-1 profile command {expected:?}: {error}"))?;
+    if bytes == 0 {
+        return Err(format!(
+            "QG-1 profile handshake reached EOF while waiting for {expected:?}"
+        ));
+    }
+    if line != format!("{expected}\n") {
+        return Err(format!(
+            "QG-1 profile handshake expected {expected:?}, got {line:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn duration_as_u64_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn run_qg1_profile_child() -> Result<(), String> {
+    let matrix = PerfMatrixSpec::complete();
+    let spec = resolve_qg1_profile_spec(&matrix)?;
+    let source_revision = git_revision(MatrixScale::Full);
+    let executable = hash_bench_elf_sha256_silently()
+        .map_err(|error| format!("hash QG-1 profile executable: {error}"))?;
+    let context = BenchContext::for_selected(MatrixScale::Full, std::slice::from_ref(&spec));
+    let (canonical_corpus_sha256, _) =
+        authoritative_qg1_corpus_identity(&context, &matrix, std::slice::from_ref(&spec))?;
+    let prepared_input = context.qg1_sample_input(PerfCorpus::Medium.document_count());
+    prepared_input.validate()?;
+    if prepared_input.binding.batch_count != 10
+        || prepared_input
+            .batches
+            .iter()
+            .any(|batch| batch.len() != FULL_BATCH_DOCUMENTS)
+    {
+        return Err(format!(
+            "QG-1 profile child requires ten exact {FULL_BATCH_DOCUMENTS}-document batches, \
+             got {:?}",
+            prepared_input
+                .batches
+                .iter()
+                .map(|batch| batch.len())
+                .collect::<Vec<_>>()
+        ));
+    }
+    let (prefix, _) = context.qg1_prefix(prepared_input.binding.document_count);
+    let input = Qg1ProfileInputIdentity {
+        fixture: spec.fixture.clone(),
+        fixture_contract_sha256: spec
+            .contract_sha256()
+            .map_err(|error| format!("hash QG-1 profile fixture: {error}"))?,
+        document_count: prepared_input.binding.document_count,
+        batch_documents: FULL_BATCH_DOCUMENTS,
+        batch_count: prepared_input.binding.batch_count,
+        writer_threads: spec.threads.expect("resolved QG-1 profile threads"),
+        writer_heap_bytes: spec
+            .writer_heap_bytes
+            .expect("resolved QG-1 profile writer heap"),
+        positions: spec
+            .positions
+            .expect("resolved QG-1 profile positions")
+            .enabled(),
+        canonical_corpus_sha256,
+        corpus_manifest_sha256: prepared_input.binding.manifest_sha256.clone(),
+        corpus_content_sha256: prefix.manifest.content_sha256.clone(),
+        indexed_content_sha256: prepared_input.binding.indexed_content_sha256.clone(),
+        corpus_source_sha256: qg1_profile_corpus_source_sha256(&prefix.manifest)?,
+        source_revision,
+        executable_sha256: executable.sha256,
+    };
+
+    // Construct the production index before the optional barrier. A profiler
+    // can attach to this PID after the exact corpus and QuillIndex exist, then
+    // send `continue`. The second barrier lets it stop after terminal commit
+    // and before exact segment-byte hashing begins.
+    let index = quill_in_memory(&spec);
+    let handshake = qg1_profile_handshake_from_env()?;
+    if handshake == Qg1ProfileHandshakeMode::StdioV1 {
+        emit_qg1_profile_event(&serde_json::json!({
+            "schema_version": QG1_PROFILE_CHILD_SCHEMA_VERSION,
+            "event": "ready",
+            "pid": std::process::id(),
+            "claim_status": "diagnostic_only",
+            "next_command": "continue",
+            "input": &input,
+        }))?;
+        wait_for_qg1_profile_command("continue")?;
+    }
+
+    let ingest_started = Instant::now();
+    let feed_elapsed = index_prepared_qg1_batches(&context, &index, prepared_input.documents);
+    let commit_elapsed = commit(&context, &index);
+    let ingest_elapsed = ingest_started.elapsed();
+    let feed_elapsed_ns = duration_as_u64_ns(feed_elapsed);
+    let commit_elapsed_ns = duration_as_u64_ns(commit_elapsed);
+    let ingest_elapsed_ns = duration_as_u64_ns(ingest_elapsed);
+    if handshake == Qg1ProfileHandshakeMode::StdioV1 {
+        emit_qg1_profile_event(&serde_json::json!({
+            "schema_version": QG1_PROFILE_CHILD_SCHEMA_VERSION,
+            "event": "ingest_complete",
+            "pid": std::process::id(),
+            "feed_elapsed_ns": feed_elapsed_ns,
+            "commit_elapsed_ns": commit_elapsed_ns,
+            "ingest_elapsed_ns": ingest_elapsed_ns,
+            "next_command": "finalize",
+        }))?;
+        wait_for_qg1_profile_command("finalize")?;
+    }
+
+    let index_identity = qg1_profile_index_identity(&index, prepared_input.binding.document_count)?;
+    emit_qg1_profile_event(&Qg1ProfileCompleteEvent {
+        schema_version: QG1_PROFILE_CHILD_SCHEMA_VERSION.to_owned(),
+        event: "complete".to_owned(),
+        pid: std::process::id(),
+        claim_status: "diagnostic_only".to_owned(),
+        feed_elapsed_ns,
+        commit_elapsed_ns,
+        ingest_elapsed_ns,
+        input,
+        index: index_identity,
+    })
+}
+
 fn run_memory_child() {
     let arm = child_engine();
     let count = child_env::<u64>("QUILL_PERF_CHILD_COUNT");
@@ -8606,6 +8939,8 @@ fn run_child_mode() -> bool {
         Ok("search") => run_search_child(),
         Ok("open") => run_open_child(),
         Ok("memory") => run_memory_child(),
+        Ok(QG1_PROFILE_CHILD_MODE) => run_qg1_profile_child()
+            .unwrap_or_else(|error| panic!("QG-1 profile child failed: {error}")),
         Ok(mode) => panic!("unknown QUILL_PERF_CHILD_MODE {mode:?}"),
         Err(_) => return false,
     }
@@ -8700,6 +9035,13 @@ fn main() {
         eprintln!(
             "[quill-perf-self-check] H1 immutable producer and continuous-timing contracts passed"
         );
+        return;
+    }
+    #[cfg(test)]
+    if std::env::var_os("QUILL_PERF_QG1_PROFILE_CHILD_SELF_CHECK").is_some() {
+        tests::assert_qg1_profile_child_resolver_contract();
+        tests::assert_qg1_profile_child_wire_contract();
+        eprintln!("[quill-perf-self-check] exact QG-1 profile child contracts passed");
         return;
     }
     if run_child_mode() {
@@ -11538,6 +11880,108 @@ mod tests {
                 .expect_err("mutated canonical matrix")
                 .contains("cannot reconstruct runner applicability plan")
         );
+    }
+
+    pub fn assert_qg1_profile_child_resolver_contract() {
+        let matrix = frankensearch_quill_gauntlet::PerfMatrixSpec::complete();
+        let spec = super::resolve_qg1_profile_spec(&matrix)
+            .expect("resolve exact canonical QG-1 profile fixture");
+        assert_eq!(spec.fixture, super::QG1_X86_DIAGNOSTIC_FIXTURE);
+        assert_eq!(
+            spec.corpus,
+            Some(frankensearch_quill_gauntlet::PerfCorpus::Medium)
+        );
+        assert_eq!(spec.document_count, Some(50_000));
+        assert_eq!(spec.threads, Some(8));
+        assert_eq!(
+            spec.writer_heap_bytes,
+            Some(frankensearch_quill_gauntlet::perf_writer_heap_bytes(8))
+        );
+        assert_eq!(
+            spec.positions,
+            Some(frankensearch_quill_gauntlet::PositionMode::On)
+        );
+
+        let mut drifted = matrix;
+        drifted
+            .cells
+            .iter_mut()
+            .find(|cell| cell.fixture == super::QG1_X86_DIAGNOSTIC_FIXTURE)
+            .expect("profile fixture exists")
+            .threads = Some(4);
+        assert!(
+            super::resolve_qg1_profile_spec(&drifted)
+                .expect_err("mutated canonical profile fixture must fail closed")
+                .contains("canonical matrix")
+        );
+        assert_eq!(
+            super::resolve_qg1_profile_handshake(None),
+            Ok(super::Qg1ProfileHandshakeMode::Disabled)
+        );
+        assert_eq!(
+            super::resolve_qg1_profile_handshake(Some("stdio-v1")),
+            Ok(super::Qg1ProfileHandshakeMode::StdioV1)
+        );
+        assert!(super::resolve_qg1_profile_handshake(Some("continue-now")).is_err());
+    }
+
+    #[test]
+    fn qg1_profile_child_resolves_only_the_exact_canonical_fixture() {
+        assert_qg1_profile_child_resolver_contract();
+    }
+
+    fn qg1_profile_input_test_fixture() -> super::Qg1ProfileInputIdentity {
+        super::Qg1ProfileInputIdentity {
+            fixture: super::QG1_X86_DIAGNOSTIC_FIXTURE.to_owned(),
+            fixture_contract_sha256: "a".repeat(64),
+            document_count: 50_000,
+            batch_documents: 5_000,
+            batch_count: 10,
+            writer_threads: 8,
+            writer_heap_bytes: frankensearch_quill_gauntlet::perf_writer_heap_bytes(8),
+            positions: true,
+            canonical_corpus_sha256: "b".repeat(64),
+            corpus_manifest_sha256: "c".repeat(64),
+            corpus_content_sha256: "d".repeat(64),
+            indexed_content_sha256: "e".repeat(64),
+            corpus_source_sha256: "f".repeat(64),
+            source_revision: "1".repeat(40),
+            executable_sha256: "2".repeat(64),
+        }
+    }
+
+    pub fn assert_qg1_profile_child_wire_contract() {
+        let complete = super::Qg1ProfileCompleteEvent {
+            schema_version: super::QG1_PROFILE_CHILD_SCHEMA_VERSION.to_owned(),
+            event: "complete".to_owned(),
+            pid: 17,
+            claim_status: "diagnostic_only".to_owned(),
+            feed_elapsed_ns: 11,
+            commit_elapsed_ns: 13,
+            ingest_elapsed_ns: 29,
+            input: qg1_profile_input_test_fixture(),
+            index: super::Qg1ProfileIndexIdentity {
+                manifest_generation: 2,
+                document_count: 50_000,
+                segment_count: 1,
+                file_bytes: 101,
+                file_sha256: "3".repeat(64),
+            },
+        };
+        let complete_wire = super::qg1_profile_wire(&complete).expect("serialize complete event");
+        assert!(!complete_wire.contains('\n'));
+        assert_eq!(
+            serde_json::from_str::<super::Qg1ProfileCompleteEvent>(&complete_wire)
+                .expect("deserialize complete event"),
+            complete
+        );
+        assert!(complete_wire.contains("\"claim_status\":\"diagnostic_only\""));
+        assert!(complete_wire.contains("\"file_sha256\""));
+    }
+
+    #[test]
+    fn qg1_profile_child_serializes_replayable_diagnostic_events() {
+        assert_qg1_profile_child_wire_contract();
     }
 
     #[test]
