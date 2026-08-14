@@ -496,7 +496,15 @@ pub struct TwoTierMetrics {
     /// Number of candidates retrieved from lexical search.
     pub lexical_candidates: usize,
     /// Number of candidates retrieved from semantic search.
+    ///
+    /// Hash/fnv/JL control hits are counted in [`Self::hash_control_candidates`],
+    /// not here.
     pub semantic_candidates: usize,
+    /// Number of hash/fnv/JL control-vector candidates retrieved.
+    ///
+    /// Absent from older payloads; deserializes as `0`.
+    #[serde(default)]
+    pub hash_control_candidates: usize,
     /// Number of candidates lacking a quality-tier embedding.
     pub incomplete_embeddings: usize,
     /// Embedder used for fast tier.
@@ -521,6 +529,19 @@ pub struct TwoTierMetrics {
     /// `serde(default)` keeps older payloads readable.
     #[serde(default)]
     pub coverage: Option<crate::types::SearchCoverageV1>,
+}
+
+impl TwoTierMetrics {
+    /// Record the fast-lane vector candidate count without calling hash a semantic hit.
+    pub fn publish_vector_candidates(&mut self, count: usize, hash_control: bool) {
+        if hash_control {
+            self.hash_control_candidates = count;
+            self.semantic_candidates = 0;
+        } else {
+            self.semantic_candidates = count;
+            self.hash_control_candidates = 0;
+        }
+    }
 }
 
 /// Schema version for zero-signal classification payloads.
@@ -798,6 +819,7 @@ mod tests {
         assert!(metrics.query_class.is_none());
         assert_eq!(metrics.lexical_candidates, 0);
         assert_eq!(metrics.semantic_candidates, 0);
+        assert_eq!(metrics.hash_control_candidates, 0);
         assert_eq!(metrics.phase1_vectors_searched, 0);
         assert_eq!(metrics.phase2_vectors_searched, 0);
     }
@@ -825,6 +847,20 @@ mod tests {
         assert!((decoded.phase2_total_ms - 150.0).abs() < 1e-10);
         assert_eq!(decoded.kendall_tau, Some(0.85));
         assert_eq!(decoded.query_class, Some(QueryClass::NaturalLanguage));
+        assert_eq!(decoded.hash_control_candidates, 0);
+    }
+
+    #[test]
+    fn publish_vector_candidates_does_not_call_hash_semantic() {
+        let mut hash = TwoTierMetrics::default();
+        hash.publish_vector_candidates(9, true);
+        assert_eq!(hash.semantic_candidates, 0);
+        assert_eq!(hash.hash_control_candidates, 9);
+
+        let mut semantic = TwoTierMetrics::default();
+        semantic.publish_vector_candidates(9, false);
+        assert_eq!(semantic.semantic_candidates, 9);
+        assert_eq!(semantic.hash_control_candidates, 0);
     }
 
     #[test]

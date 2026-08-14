@@ -659,7 +659,10 @@ impl SyncTwoTierSearcher {
         // searcher's metric contract and `TwoTierMetrics` documentation.
         let phase1_vectors_searched = self.index.doc_count();
         metrics.phase1_vectors_searched = phase1_vectors_searched;
-        metrics.semantic_candidates = fast_hits.len();
+        metrics.publish_vector_candidates(
+            fast_hits.len(),
+            frankensearch_core::is_hash_generation_id(sync_fast_embedder_id(&self.index)),
+        );
         // Typed zero-signal classification (bd-tqhc): an empty semantic lane
         // must carry why. Lazy — the non-empty path pays nothing.
         metrics.zero_signal = if fast_hits.is_empty() {

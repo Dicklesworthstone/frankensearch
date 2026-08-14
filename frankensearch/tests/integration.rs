@@ -336,7 +336,8 @@ fn search_with_corpus_of_100_documents() {
             .unwrap();
 
         assert!(results.len() <= 10);
-        assert!(metrics.semantic_candidates > 0);
+        assert_eq!(metrics.semantic_candidates, 0);
+        assert!(metrics.hash_control_candidates > 0);
     });
 }
 

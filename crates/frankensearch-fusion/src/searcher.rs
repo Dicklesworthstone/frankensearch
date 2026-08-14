@@ -209,18 +209,6 @@ fn vector_exclusion_source(embedder: &dyn Embedder) -> &'static str {
     }
 }
 
-#[must_use]
-fn exported_vector_candidate_counts(
-    embedder: &dyn Embedder,
-    vector_candidates: usize,
-) -> (usize, usize) {
-    if is_shipped_hash_embedder(embedder) {
-        (0, vector_candidates)
-    } else {
-        (vector_candidates, 0)
-    }
-}
-
 /// Progressive two-tier search orchestrator.
 ///
 /// Coordinates fast-tier embedding, optional lexical search, RRF fusion,
@@ -1857,7 +1845,10 @@ impl TwoTierSearcher {
                 let fast_hits = self.correct_phase1_pool(fast_hits);
 
                 metrics.vector_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
-                metrics.semantic_candidates = fast_hits.len();
+                metrics.publish_vector_candidates(
+                    fast_hits.len(),
+                    is_shipped_hash_embedder(self.fast_embedder.as_ref()),
+                );
                 metrics.phase1_vectors_searched = self.index.doc_count();
                 metrics.zero_signal = if fast_hits.is_empty() {
                     if prefilter_empty {
@@ -2766,10 +2757,6 @@ impl TwoTierSearcher {
         let Some(exporter) = self.config.metrics_exporter.as_ref() else {
             return;
         };
-        let vector_candidate_counts = exported_vector_candidate_counts(
-            self.fast_embedder.as_ref(),
-            metrics.semantic_candidates,
-        );
         let payload = SearchMetrics {
             mode: SearchMode::TwoTier,
             query_class: Some(query_class),
@@ -2787,8 +2774,8 @@ impl TwoTierSearcher {
             },
             result_count,
             lexical_candidates: metrics.lexical_candidates,
-            semantic_candidates: vector_candidate_counts.0,
-            hash_control_candidates: vector_candidate_counts.1,
+            semantic_candidates: metrics.semantic_candidates,
+            hash_control_candidates: metrics.hash_control_candidates,
             refined,
         };
         exporter.on_search_completed(&payload);
@@ -9002,14 +8989,6 @@ mod tests {
         assert_eq!(vector_exclusion_source(&hash), "hash_control");
         assert_eq!(vector_exclusion_source(&semantic), "semantic");
         assert!(!vector_exclusion_source(&hash).contains("semantic"));
-    }
-
-    #[test]
-    fn exported_vector_candidate_counts_do_not_call_hash_semantic() {
-        let hash = NonSemanticEmbedder::new("fnv1a-test", 4);
-        let semantic = StubEmbedder::new("fast", 4);
-        assert_eq!(exported_vector_candidate_counts(&hash, 9), (0, 9));
-        assert_eq!(exported_vector_candidate_counts(&semantic, 9), (9, 0));
     }
 
     #[test]
